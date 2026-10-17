@@ -696,6 +696,12 @@ transforms retain serial retrieval.
 | Satellite | – | ✓ | ✓ | ✓ | – | – | n/a | – | GOES-R, Himawari-9 (ISatSS) and the GMGSI global mosaic, whose values are 8-bit display counts (unit `1`), not brightness temperatures; its grid wraps at 180°, so a position either side of the seam, or an area given west > east across it, reads the pixels there. Each product is a parameter on its own time axis: the time axis of a response is the union of the selected products' scans (null where a product has none), an instant is only a scan at exactly that time, per product, never the scan a map at that time renders (#967), no scan at all → 404, and `parameter_names` carries each product's own `extent.temporal`. RGB composites (`[[satellite.composites]]`) are map layers, not EDR parameters: naming one in `parameter-name` → 400. Position = the pixel under the point per scan; behind the Earth or off the mosaic's 72°S–72°N → 404. Area = grid over the bbox at the nadir pixel size (≤ 256 cells/axis), sampled through a coarse projection grid, masked to the polygon; polygon outside the imagery → 404; `t` axis when several scans. A query may download at most 8 scans the cache evicted and decode at most 1024 image blocks (summed per product grid; a GOES-R block is a strip of 24 full-width rows, a GMGSI block a 793 × 1322 chunk) → 400 |
 | CAP, GeoJSON | — no `EdrEngine` (Features/Maps only) — | | | | | | | | |
 
+PostGIS checks timestamp mappings and point/SRID requirements before publishing
+data. A schema mismatch blocks data queries and degrades collection health;
+a successful reachability ping cannot clear it. Generic geometry views remain
+supported with bounded startup checks and validation of returned coordinates.
+See [database validation](../engine-postgis/README.md#column-requirements).
+
 Radius, corridor, items and location lists have no engine-specific code:
 radius is answered by every engine that answers area, items by every engine
 that implements `FeatureEngine` for its EDR collection (the Features engine

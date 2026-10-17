@@ -5731,8 +5731,9 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
 }
 
 /// A postgis collection's entry in the load/reload snapshot: degraded only
-/// for an unreachable database. A station list cut at `max_locations`
-/// (#1061) is still served, so it stays `Ready` here and `effective_health`
+/// for an unreachable database or pending/invalid schema validation. A station
+/// list cut at `max_locations` (#1061) is still served, so it stays `Ready`
+/// here and `effective_health`
 /// reports it live: kept out of the snapshot, it cannot mask a later
 /// database outage (an `Unreachable` verdict keeps a recorded error), and a
 /// reload of cut collections still passes the zero-`Ready` guard.
@@ -5740,9 +5741,11 @@ fn postgis_load_status(
     live: Option<engine_postgis::LiveHealth>,
 ) -> (CollectionStatus, Option<String>) {
     match live {
-        Some(live @ engine_postgis::LiveHealth::Unreachable) => {
-            (CollectionStatus::Degraded, live.degraded_reason())
-        }
+        Some(
+            live @ (engine_postgis::LiveHealth::Unreachable
+            | engine_postgis::LiveHealth::ValidationPending
+            | engine_postgis::LiveHealth::SchemaInvalid),
+        ) => (CollectionStatus::Degraded, live.degraded_reason()),
         _ => (CollectionStatus::Ready, None),
     }
 }
@@ -5764,7 +5767,9 @@ fn apply_postgis_live_health(h: &mut CollectionHealth, live: engine_postgis::Liv
                 h.error = live.degraded_reason();
             }
         }
-        engine_postgis::LiveHealth::LocationsTruncated { .. } => {
+        engine_postgis::LiveHealth::LocationsTruncated { .. }
+        | engine_postgis::LiveHealth::ValidationPending
+        | engine_postgis::LiveHealth::SchemaInvalid => {
             h.status = CollectionStatus::Degraded;
             h.error = live.degraded_reason();
         }
@@ -9656,6 +9661,13 @@ colormap = "no_such_map"
                 postgis_load_status(verdict),
                 (CollectionStatus::Ready, None)
             );
+        }
+
+        for verdict in [LiveHealth::ValidationPending, LiveHealth::SchemaInvalid] {
+            let expected = (CollectionStatus::Degraded, verdict.degraded_reason());
+            assert_eq!(postgis_load_status(Some(verdict)), expected);
+            let snapshot = entry((CollectionStatus::Ready, None));
+            assert_eq!(live(&snapshot, verdict), expected);
         }
 
         let failed_boot = entry((

@@ -797,3 +797,6 @@ async fn timing_set_based_and_fan_out_on_a_hypertable() {
     }
     exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
 }
+
+#[path = "support/schema_validation.rs"]
+mod schema_validation;

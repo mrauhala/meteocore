@@ -8,7 +8,7 @@
 //! entering `block_in_place`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -67,6 +67,10 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// Per-ping deadline; a slower response counts as unreachable.
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
+const SCHEMA_PENDING: u8 = 0;
+const SCHEMA_VALID: u8 = 1;
+const SCHEMA_INVALID: u8 = 2;
+
 /// Collection-scoped engine. Cheap to clone (Arcs inside); axum handlers
 /// hold it behind `Arc<dyn EdrEngine>` as is done for every engine.
 pub struct PostgisEngine {
@@ -74,8 +78,10 @@ pub struct PostgisEngine {
     config: Arc<PostgisEngineConfig>,
     pool: Arc<Pool>,
     cache: Arc<MetadataCache>,
-    /// Live health (DB-reachability) + metrics counters; updated by `poll_loop`.
+    /// DB reachability and metrics counters, independent of schema validity.
     health: Health,
+    schema_state: AtomicU8,
+    refresh_lock: tokio::sync::Mutex<()>,
     /// `<user>@<host>:<port>/<db>` (or `pool_label`) — the `/metrics` pool label.
     pool_key_label: String,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481);
@@ -118,6 +124,8 @@ impl PostgisEngine {
             pool,
             cache,
             health: Health::new(),
+            schema_state: AtomicU8::new(SCHEMA_PENDING),
+            refresh_lock: tokio::sync::Mutex::new(()),
             pool_key_label,
             shutdown: Shutdown::new(),
         }
@@ -139,12 +147,14 @@ impl PostgisEngine {
         &self.cache
     }
 
-    /// Authoritative live `/health` verdict: the `SELECT 1` ping's status
-    /// with the metadata snapshot's cut on top (#1061). `None` until the
-    /// first ping has run and while nothing is cut (so the caller keeps the
-    /// boot snapshot rather than the optimistic seed). O(1): two atomic loads
-    /// and one `ArcSwap` load.
+    /// O(1) live health: schema validity, then reachability and inventory caps.
+    /// A successful ping cannot clear a pending or invalid schema.
     pub fn live_health(&self) -> Option<LiveHealth> {
+        match self.schema_state.load(Ordering::Acquire) {
+            SCHEMA_INVALID => return Some(LiveHealth::SchemaInvalid),
+            SCHEMA_PENDING => return Some(LiveHealth::ValidationPending),
+            _ => {}
+        }
         LiveHealth::from_parts(
             self.health.live_status(),
             self.locations_cut(),
@@ -174,30 +184,14 @@ impl PostgisEngine {
     }
 
     /// Run a one-shot metadata refresh. Used at construction and by the
-    /// `/admin/collections/reload` path. Records the duration + outcome for
-    /// `/metrics` (a failure does NOT flip `/health` — the ping owns that).
+    /// `/admin/collections/reload` path. Validates the schema before publishing
+    /// metadata; transient failures retain the previous snapshot, while a
+    /// confirmed mismatch blocks data access and degrades health.
     pub async fn refresh_metadata(&self) -> Result<(), DataServerError> {
         let start = Instant::now();
         let was_cut = self.locations_cut();
-        let result = self
-            .cache
-            .refresh(&self.config, &self.pool)
-            .await
-            .map_err(|e| {
-                // Full detail (including the underlying Postgres error) goes to
-                // the log only. The returned error's Display is stored on
-                // CollectionHealth.error at boot (admin.rs) and served verbatim
-                // by the public /health endpoint, so it must stay generic — the
-                // "no internal error details to clients" rule.
-                tracing::warn!(
-                    collection = %self.collection_id,
-                    error = %e,
-                    "postgis: metadata refresh failed"
-                );
-                DataServerError::Engine(
-                    "metadata refresh failed (database error; see server logs)".to_string(),
-                )
-            });
+        let _refresh = self.refresh_lock.lock().await;
+        let result = self.refresh_metadata_checked().await;
         self.health.record_refresh(result.is_ok(), start.elapsed());
         let now_cut = self.locations_cut();
         if result.is_ok() && now_cut != was_cut {
@@ -218,6 +212,71 @@ impl PostgisEngine {
             }
         }
         result
+    }
+
+    // These errors reach public /health at boot: diagnostics belong in logs.
+    async fn refresh_metadata_checked(&self) -> Result<(), DataServerError> {
+        if let Err(e) = crate::validation::validate(&self.config).await {
+            tracing::warn!(
+                collection = %self.collection_id, error = ?e,
+                "postgis: schema validation failed"
+            );
+            if matches!(e, crate::validation::ValidationError::Mismatch(_)) {
+                self.schema_state.store(SCHEMA_INVALID, Ordering::Release);
+            }
+            self.reject_invalid_schema()?;
+            return Err(DataServerError::Engine(
+                "database schema validation unavailable (see server logs)".into(),
+            ));
+        }
+        if let Err(e) = self.cache.refresh(&self.config, &self.pool).await {
+            tracing::warn!(
+                collection = %self.collection_id, error = %e,
+                "postgis: metadata refresh failed"
+            );
+            if matches!(e, crate::metadata::MetadataError::GeometryMismatch) {
+                self.schema_state.store(SCHEMA_INVALID, Ordering::Release);
+                return Err(DataServerError::Engine(
+                    crate::validation::SCHEMA_ERROR.into(),
+                ));
+            }
+            return Err(DataServerError::Engine(
+                "metadata refresh failed (database error; see server logs)".into(),
+            ));
+        }
+        self.schema_state.store(SCHEMA_VALID, Ordering::Release);
+        Ok(())
+    }
+
+    /// Requests only consult this atomic state; database validation runs on refresh.
+    pub(crate) fn require_validated(&self) -> Result<(), DataServerError> {
+        match self.schema_state.load(Ordering::Acquire) {
+            SCHEMA_VALID => Ok(()),
+            SCHEMA_INVALID => Err(DataServerError::Engine(
+                crate::validation::SCHEMA_ERROR.into(),
+            )),
+            _ => Err(DataServerError::Engine(
+                crate::validation::PENDING_ERROR.into(),
+            )),
+        }
+    }
+
+    /// A pending engine may still expose its empty, config-seeded inventory.
+    pub(crate) fn reject_invalid_schema(&self) -> Result<(), DataServerError> {
+        if self.schema_state.load(Ordering::Acquire) == SCHEMA_INVALID {
+            return Err(DataServerError::Engine(
+                crate::validation::SCHEMA_ERROR.into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_geometry_row(&self, row: &Row) -> Result<(), DataServerError> {
+        if !crate::validation::geometry_row_valid(row) {
+            self.schema_state.store(SCHEMA_INVALID, Ordering::Release);
+            tracing::warn!(collection = %self.collection_id, "postgis: returned geometry is not a Point with SRID 4326");
+        }
+        self.reject_invalid_schema()
     }
 
     /// `SELECT 1` with a 2 s deadline — the `/health` reachability probe.
@@ -256,7 +315,7 @@ impl PostgisEngine {
     }
 
     /// Background loop: a `SELECT 1` ping every [`PING_INTERVAL`] (the `/health`
-    /// authority — flips `Ready`/`Degraded` on DB reachability) and a metadata
+    /// reachability probe) and a metadata
     /// refresh every `metadata_refresh_secs` (keeps the location list / extents /
     /// `locations_window` set current — a failed refresh keeps the previous
     /// snapshot, so a blip never empties the cache). Spawned on the dedicated
@@ -285,16 +344,20 @@ impl PostgisEngine {
                 _ = ping_iv.tick() => {
                     // Log only on a transition (not every tick) so log-based
                     // alerting sees DB down/recovery without spam.
-                    match self.health.record_ping(self.ping().await) {
+                    let reachable = self.ping().await;
+                    match self.health.record_ping(reachable) {
                         Some(HealthStatus::Degraded) => tracing::warn!(
                             collection = %self.collection_id,
                             "postgis: DB unreachable (health ping failed) — collection degraded"
                         ),
                         Some(HealthStatus::Ready) => tracing::info!(
                             collection = %self.collection_id,
-                            "postgis: DB reachable again — collection recovered"
+                            "postgis: DB reachable again"
                         ),
                         None => {}
+                    }
+                    if reachable && self.schema_state.load(Ordering::Acquire) != SCHEMA_VALID {
+                        let _ = self.refresh_metadata().await;
                     }
                 }
                 _ = refresh_iv.tick() => {
@@ -358,6 +421,9 @@ impl PostgisEngine {
             .map_err(|e| DataServerError::Engine(format!("build_events_area: {e}")))?;
 
         let rows = run_single_query_sync(&self.pool, built)?;
+        for row in &rows {
+            self.check_geometry_row(row)?;
+        }
         if rows.len() * per_row > MAX_RESPONSE_VALUES {
             return Err(events_budget_exceeded());
         }
@@ -390,6 +456,7 @@ impl ds_core::events::EventSource for PostgisEngine {
         end: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<ds_core::events::EventPoint>, DataServerError> {
+        self.require_validated()?;
         let Some(shape) = self.config.events() else {
             return Err(DataServerError::Engine(
                 "recent_events requires an events-shape postgis collection".into(),
@@ -398,6 +465,9 @@ impl ds_core::events::EventSource for PostgisEngine {
         let built = build_events_window(shape, (start, end), limit, WindowAttrs::Include)
             .map_err(|e| DataServerError::Engine(format!("build_events_window: {e}")))?;
         let rows = run_single_query_sync(&self.pool, built)?;
+        for row in &rows {
+            self.check_geometry_row(row)?;
+        }
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let time: DateTime<Utc> = row
@@ -442,6 +512,7 @@ impl ds_core::events::EventSource for PostgisEngine {
 
 impl EdrEngine for PostgisEngine {
     fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        self.reject_invalid_schema()?;
         Ok(Arc::clone(&self.load_meta().locations))
     }
 
@@ -495,6 +566,7 @@ impl EdrEngine for PostgisEngine {
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         reject_station_query_on_events(&self.config)?;
+        self.require_validated()?;
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
 
@@ -532,6 +604,7 @@ impl EdrEngine for PostgisEngine {
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         reject_station_query_on_events(&self.config)?;
+        self.require_validated()?;
         let (lon, lat) = parse_coords(coords)?;
         // Observations-derived modes (A/B) resolve the nearest station in-memory
         // from the cached location set — a scan over a few thousand points is
@@ -547,7 +620,7 @@ impl EdrEngine for PostgisEngine {
                 },
             )?
         } else {
-            resolve_nearest_station(&self.pool, &self.config, lon, lat)?
+            resolve_nearest_station(self, &self.config, lon, lat)?
         };
         self.query_location(&station_id, datetime, parameters, z, reference_time)
     }
@@ -586,6 +659,7 @@ impl PostgisEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
     ) -> Result<CoverageResponse, DataServerError> {
+        self.require_validated()?;
         if let ObservationSchema::Events(ev) = &self.config.observations {
             // Clone the shape so the borrow on `self.config` ends here —
             // `query_area_events` needs `&self` too.
@@ -609,7 +683,7 @@ impl PostgisEngine {
             stations_in_polygon(&meta.locations, &polygon)
         } else {
             let polygon_wkt = normalize_area_wkt(coords)?;
-            run_stations_in_polygon_sync(&self.pool, &self.config, &polygon_wkt)?
+            run_stations_in_polygon_sync(self, &self.config, &polygon_wkt)?
         };
         if stations.is_empty() {
             return Ok(CoverageResponse::Collection(vec![]));
@@ -1140,13 +1214,13 @@ fn run_single_query_sync(pool: &Pool, built: BuiltQuery) -> Result<Vec<Row>, Dat
 }
 
 fn run_stations_in_polygon_sync(
-    pool: &Pool,
+    engine: &PostgisEngine,
     cfg: &PostgisEngineConfig,
     polygon_wkt: &str,
 ) -> Result<Vec<Location>, DataServerError> {
     let built = build_stations_in_polygon(cfg, polygon_wkt)
         .map_err(|e| DataServerError::Engine(format!("build_stations_in_polygon: {e}")))?;
-    let pool = pool.clone();
+    let pool = engine.pool.clone();
     let sql = built.sql;
     let params = built.params;
     block_on_async(async move {
@@ -1162,6 +1236,7 @@ fn run_stations_in_polygon_sync(
 
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
+            engine.check_geometry_row(row)?;
             let id: String = row
                 .try_get("id")
                 .map_err(|e| DataServerError::Engine(format!("decode station id: {e}")))?;
@@ -1186,14 +1261,14 @@ fn run_stations_in_polygon_sync(
 }
 
 fn resolve_nearest_station(
-    pool: &Pool,
+    engine: &PostgisEngine,
     cfg: &PostgisEngineConfig,
     lon: f64,
     lat: f64,
 ) -> Result<String, DataServerError> {
     let built = build_position(cfg, lon, lat, DEFAULT_POSITION_RADIUS_M)
         .map_err(|e| DataServerError::Engine(format!("build_position: {e}")))?;
-    let pool = pool.clone();
+    let pool = engine.pool.clone();
     let sql = built.sql;
     let params = built.params;
     block_on_async(async move {
@@ -1211,6 +1286,7 @@ fn resolve_nearest_station(
                 "no station within {DEFAULT_POSITION_RADIUS_M:.0} m of ({lon}, {lat})"
             )));
         };
+        engine.check_geometry_row(&row)?;
         let id: String = row
             .try_get("id")
             .map_err(|e| DataServerError::Engine(format!("decode station id: {e}")))?;
@@ -2402,6 +2478,7 @@ mod tests {
         engine
             .cache()
             .store(CollectionMeta::build(engine.config(), set, None, 1));
+        engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
 
         assert!(engine.locations_truncated());
         assert_eq!(engine.locations_cut(), Some(LocationsCut::Stations));
@@ -2432,6 +2509,7 @@ mod tests {
             engine
                 .cache()
                 .store(CollectionMeta::build(engine.config(), set, None, 1));
+            engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
             assert!(!engine.locations_truncated());
             assert_eq!(served_ids(&engine).len(), n);
             assert_eq!(
@@ -2476,6 +2554,7 @@ mod tests {
         engine
             .cache()
             .store(CollectionMeta::build(engine.config(), set, None, 1));
+        engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
 
         assert!(engine.locations_truncated());
         assert_eq!(served_ids(&engine), ["a", "b", "c"]);

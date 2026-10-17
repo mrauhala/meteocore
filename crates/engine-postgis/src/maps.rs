@@ -196,6 +196,7 @@ fn fetch_window(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Arc<Vec<Strike>>, DataServerError> {
+    engine.require_validated()?;
     let key: WindowKey = (window_key_source(engine, shape), start, end);
     strike_window_cache().get_or_insert_with(&key, || {
         let built = build_events_window(
@@ -211,6 +212,7 @@ fn fetch_window(
         // Rows arrive newest-first (truncation keeps the newest); take the
         // cap then reverse to ascending so the splat paints newest LAST.
         for row in rows.iter().take(MAX_WINDOW_STRIKES) {
+            engine.check_geometry_row(row)?;
             let time: DateTime<Utc> = row
                 .try_get("time")
                 .map_err(|e| DataServerError::Engine(format!("decode strike time: {e}")))?;
@@ -343,6 +345,7 @@ impl MapEngine for PostgisEngine {
         _z: Option<f64>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
+        self.require_validated()?;
         let Some(shape) = self.config().events() else {
             // Station shapes have no raster surface; config validation and
             // the admin allowlist keep them out of the map registries.

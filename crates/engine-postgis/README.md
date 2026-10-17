@@ -153,12 +153,13 @@ from the first configured table.
 
 ### Column requirements
 
-- Use consistent text station keys and a unique registry ID. Geometry must
-  be `geometry(Point, 4326)` (X = longitude, Y = latitude).
+- Use consistent text station keys and a unique registry ID. Non-empty
+  geometry must contain Points with SRID 4326 (X = longitude, Y = latitude); prefer
+  `geometry(Point, 4326)` to enforce this in the database.
 - For `timestamptz`, omit `time_col_tz`. For `timestamp without time zone`,
   set it to the stored values' timezone, such as `"UTC"` or `"Europe/Helsinki"`.
-  The engine does not check the database timestamp type or geometry SRID at
-  startup; these are requirements on your source schema.
+  Initialization and metadata refresh check every resolved timestamp mapping
+  and ask PostgreSQL to validate each timezone. Session timezone need not be UTC.
 - Measurements are cast to `double precision`; NULL remains missing. Units
   describe stored values and do not perform conversion. Station properties
   support boolean, integer, real/double precision and text types, including
@@ -166,6 +167,15 @@ from the first configured table.
 - Table names accept `schema.table` or a bare name in `public`. Identifiers
   must match `^[A-Za-z_][A-Za-z0-9_]{0,62}$`. Use a SQL view for joins,
   expressions, type conversions or coordinate transformations.
+
+Database checks cover tables, hypertables, views and materialized views. Known
+non-point geometry declarations or SRIDs other than 4326 are rejected, even on
+empty sources. Generic geometry columns/views are allowed: validation examines
+at most 128 rows per source, including NULL/empty rows, within a five-second
+deadline for the whole collection. This is not a full data audit. Every returned
+geometry is checked before its coordinates are used, including rows outside the
+sample or inserted later. NULL/empty handling is unchanged. Use typed views to
+make the contract explicit; the engine does not transform source geometries.
 
 ### Locations without a complete registry
 
@@ -308,13 +318,17 @@ stations and their properties: the representative snapshot test stays below
 snapshots plus database rows; responses need additional memory. Raising the
 inventory cap does not raise query limits.
 
-A failed metadata refresh keeps the previous snapshot. An initial failure
-registers the engine as degraded with no loaded stations. `/health` then uses
-a dedicated `SELECT 1` probe every 30 seconds (two-second deadline), plus
-station-list truncation. A successful ping does not prove queries or metadata
-refreshes work. Config resolution or pool construction failures leave the
-collection failed. `/metrics` exposes `postgis_*` pool, reachability and
-refresh metrics, and `lightning_strike_cache_*` for event maps.
+A database outage keeps the previous snapshot; an initial outage registers a
+degraded engine with no loaded stations. Database queries wait for successful
+schema validation and metadata publication. `/health` combines a dedicated
+`SELECT 1` probe every 30 seconds (two-second deadline), schema validation and
+station-list truncation. Confirmed schema mismatches block data access and stay
+degraded even when pings succeed. Pending/failed validation is retried on a
+successful ping and on metadata refresh; recovery requires a successful refresh.
+Detailed database diagnostics are logged, while public health errors stay generic.
+Config resolution or pool construction failures leave the collection failed.
+`/metrics` exposes `postgis_*` pool, reachability and refresh metrics, and
+`lightning_strike_cache_*` for event maps.
 
 `POST /admin/collections/reload` reuses unchanged engines and rebuilds changed
 mappings. Pools are shared by `(host, port, database, user, sslmode)`; the first

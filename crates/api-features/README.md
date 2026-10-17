@@ -282,6 +282,12 @@ layer but has no effect on this engine.
 | Nowcast | one tracked storm cell (Point + fact-sheet properties) from one generation | cell centroid inside box | with none: latest generation; with `datetime`: the newest retained generation inside the interval (~4 h history) | ✓ significance, significance_rank, max_dbz, area_km2, track_age, speed_ms, bearing_deg, intensity_trend_dbz_min + lightning / impact / radar extras when those sources are wired | ✓ all base cell properties except `significance_contributions` + wired lightning/impact/radar groups | ✓ | ✓ (retained history span) | ✓ |
 | GeoTIFF, GRIB, QueryData, Zarr, ODIM composite, ODIM PVOL site | — no `FeatureEngine` (EDR / Maps only) — | | | | — | | | |
 
+PostGIS checks timestamp mappings and point/SRID requirements before publishing
+data. A schema mismatch blocks data queries and degrades collection health;
+a successful reachability ping cannot clear it. Generic geometry views remain
+supported with bounded startup checks and validation of returned coordinates.
+See [database validation](../engine-postgis/README.md#column-requirements).
+
 CSV pagination uses an immutable station inventory built at load time, in
 first-observation order. Unfiltered pages slice that inventory directly;
 filtered pages count matching stations but clone only the requested page.

@@ -19,3 +19,5 @@ pub use schema::{
     LongShape, ObservationSchema, PerParameterShape, PerParameterTable, QualifiedTable,
     SchemaError, StationsMapping, WideShape,
 };
+
+mod validation;
