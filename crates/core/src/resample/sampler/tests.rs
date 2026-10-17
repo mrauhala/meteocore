@@ -517,14 +517,17 @@ fn meps() -> GeoTransform {
 
 /// #1110: the 256 px WMS meta-tiles of an EPSG:3067 and an EPSG:3035
 /// request near the pole, on MEPS's grid sampled and in full. Past the
-/// grid's footprint their output→source map jumps: EPSG:3067's inverse
-/// breaks down in the first tile's north-east corner, and the Lambert
-/// forward transform jumps where longitude wraps, half a turn from the
-/// grid, in the second. Only the footprint is sampled, so only its error
-/// counts: a few hundred nodes instead of the 256 × 256 cap's 66 049.
+/// grid's footprint the Lambert forward transform jumps where longitude
+/// wraps, half a turn from the grid, in the second tile. Only the footprint
+/// is sampled, so only its error counts: a few hundred nodes instead of the
+/// 256 × 256 cap's 66 049. EPSG:3067's area ends 50° east of its meridian
+/// across the first tile (#1113), and the cells that edge crosses inside
+/// the footprint get the sampler's boundary sub-grids.
 /// Every pixel with a place on the Earth is what the same map projected
 /// per pixel draws, except where its own position error, under the half
-/// pixel nearest-neighbour resolves, reaches across the sampler's edge.
+/// pixel nearest-neighbour resolves, reaches across the sampler's edge,
+/// and within a sub-grid step of the area's edge. A pixel with none is
+/// empty.
 #[test]
 fn polar_meta_tiles_refine_only_the_footprint() {
     let tiles = [
@@ -536,12 +539,6 @@ fn polar_meta_tiles_refine_only_the_footprint() {
                 2896309.3757400983,
                 8688928.127220295,
             ],
-            [
-                -651.893197248287,
-                57.99572959596767,
-                168.97855020194945,
-                143.55146987202554,
-            ],
         ),
         (
             "EPSG:3035",
@@ -550,12 +547,6 @@ fn polar_meta_tiles_refine_only_the_footprint() {
                 5792618.7514801975,
                 5792618.751480197,
                 8688928.127220295,
-            ],
-            [
-                -165.5766516894288,
-                70.8962238105685,
-                189.14274294709074,
-                77.91855602096956,
             ],
         ),
     ];
@@ -570,39 +561,54 @@ fn polar_meta_tiles_refine_only_the_footprint() {
         };
         let values = field_of(&gt);
         let (nx, ny) = (f64::from(gt.width), f64::from(gt.height));
-        for (epsg, projected, bbox) in tiles {
+        for (epsg, projected) in tiles {
             let out = projected_output_crs(epsg).unwrap();
+            // The read window the meta-tile path passes with the tile.
+            let bbox = crate::geo::wgs84_envelope(&out, projected).unwrap();
             let crs = OutputCrs::Projected {
                 crs: out.clone(),
                 bbox: projected,
             };
             let label = format!("{label} {epsg}");
             let map = grid.output_map(bbox, width, height, &crs);
-            let nodes = map.grid.node_count();
-            assert!(nodes <= 400, "{label}: {nodes} nodes");
+            let g = &map.grid;
+            // A few hundred nodes of the grid itself, and in EPSG:3067 the
+            // 2 px sub-grids of the seven 32 px cells its area's edge
+            // crosses.
+            let nodes = g.node_count();
+            let edge_cells = g.boundary.len();
+            let edge_nodes: usize = g.boundary.iter().map(|(_, s)| s.nodes.len()).sum();
+            assert!(nodes - edge_nodes <= 400, "{label}: {nodes} nodes");
+            assert!(
+                edge_cells <= if epsg == "EPSG:3067" { 7 } else { 0 },
+                "{label}: {edge_cells} cells on the area's edge"
+            );
             let tile = map.sample_f32(&values, None).unwrap();
             let (x_lo, x_hi, y_lo, y_hi) = map.window.unwrap();
-            // Whether output position (fx, fy) has a reproducible place on
-            // the Earth: a latitude within 90° and, its longitude taken
-            // within ±180°, a forward transform that returns to the point.
-            // Some 60° from its central meridian EPSG:3067's inverse breaks
-            // down (#1113), into positions that land anywhere, differently
-            // with each platform's libm. A pixel there has no per-pixel
-            // truth, nor does a pixel of a cell with a corner there,
-            // interpolated from it or from a sub-grid around it.
-            let on_earth = |fx: f64, fy: f64| {
-                let [min_e, min_n, max_e, max_n] = projected;
-                let (x, y) = (min_e + fx * (max_e - min_e), max_n - fy * (max_n - min_n));
-                let (lon, lat) = crs.project_node(bbox, fx, fy);
-                let (bx, by) = out.forward((lon + 180.0).rem_euclid(360.0) - 180.0, lat);
-                lat.abs() <= 90.0 && (bx - x).hypot(by - y) < 1.0
-            };
-            let g = &map.grid;
-            let node_on_earth: Vec<bool> = (0..=g.cells_y)
-                .flat_map(|j| (0..=g.cells_x).map(move |i| (i, j)))
-                .map(|(i, j)| on_earth(i as f64 / g.cells_x as f64, j as f64 / g.cells_y as f64))
+            // Whether each pixel has a place on the Earth: EPSG:3067's
+            // inverse has none past 50° from its meridian (#1113).
+            let on_earth: Vec<bool> = (0..width * height)
+                .map(|i| {
+                    let (fx, fy) = (
+                        (f64::from(i % width) + 0.5) / f64::from(width),
+                        (f64::from(i / width) + 0.5) / f64::from(height),
+                    );
+                    crs.position_on_earth(bbox, fx, fy).is_some()
+                })
                 .collect();
-            let (mut filled, mut skipped) = (0, 0);
+            // Whether pixel (ox, oy) lies within a sub-grid step, 2 px, of
+            // the area's edge. The area narrows away from its centre, so
+            // the corners of the box 2 px around the pixel tell.
+            let near_edge = |ox: u32, oy: u32| {
+                [(-2, -2), (2, -2), (-2, 2), (2, 2)]
+                    .iter()
+                    .any(|&(dx, dy)| {
+                        let x = ox.saturating_add_signed(dx).min(width - 1);
+                        let y = oy.saturating_add_signed(dy).min(height - 1);
+                        !on_earth[(y * width + x) as usize]
+                    })
+            };
+            let (mut filled, mut off_earth, mut skipped) = (0, 0, 0);
             for (i, got) in pixels(&tile).into_iter().enumerate() {
                 let (ox, oy) = (i as u32 % width, i as u32 / width);
                 let (fx, fy) = (
@@ -610,12 +616,16 @@ fn polar_meta_tiles_refine_only_the_footprint() {
                     (f64::from(oy) + 0.5) / f64::from(height),
                 );
                 let read = (x_lo..=x_hi).contains(&ox) && (y_lo..=y_hi).contains(&oy);
-                let cx = ((f64::from(ox) + 0.5) / g.cell_w) as usize;
-                let cy = ((f64::from(oy) + 0.5) / g.cell_h) as usize;
-                let n = cy.min(g.cells_y - 1) * g.stride + cx.min(g.cells_x - 1);
-                let corners = [n, n + 1, n + g.stride, n + g.stride + 1];
-                if !on_earth(fx, fy) || (read && !corners.iter().all(|&k| node_on_earth[k])) {
-                    skipped += usize::from(read);
+                if !on_earth[i] {
+                    // No place on the Earth: nothing drawn.
+                    assert_eq!(got, None, "{label}: pixel ({ox}, {oy}) off the Earth");
+                    off_earth += usize::from(read);
+                    continue;
+                }
+                if read && near_edge(ox, oy) {
+                    // Its sub-cell may reach past the edge, and the
+                    // sub-grid then leaves it empty.
+                    skipped += 1;
                     continue;
                 }
                 let (lon, lat) = crs.project_node(bbox, fx, fy);
@@ -661,9 +671,14 @@ fn polar_meta_tiles_refine_only_the_footprint() {
                     }
                 }
             }
-            // EPSG:3067's tile reads one 16 px cell with a corner where the
-            // inverse breaks down, and a few pixels there.
-            assert!(skipped < 100, "{label}: {skipped} read pixels skipped");
+            // EPSG:3067's footprint reaches past the area's edge: a strip a
+            // few pixels wide along it is left out.
+            if epsg == "EPSG:3067" {
+                assert!(off_earth > 0, "{label}: the area's edge is not read");
+                assert!(skipped < 1000, "{label}: {skipped} read pixels skipped");
+            } else {
+                assert_eq!((off_earth, skipped), (0, 0), "{label}");
+            }
             // The sample's 250 km cells reach past the full grid's east
             // edge, into the EPSG:3067 tile.
             if label != "full EPSG:3067" {

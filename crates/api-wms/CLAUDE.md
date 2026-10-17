@@ -94,16 +94,21 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   call the engine directly: a box just past the LAEA disk has covering
   tiles that cross it.
 - `params::parse_bbox` asks `outside_projection_domain` before
-  `wgs84_envelope`, which samples only the box's edges. Wholly outside is
-  the empty image, with read window `NO_READ_WINDOW` (NaN, never read). An
-  envelope of `None` for any other box means the edges miss a valid area
-  inside it: an EPSG:3035 box wider than the disk, or a tall one crossing
-  it between samples. That stays `InvalidParameterValue`: there is no read
-  window, and a global one would read whole datasets. Malformed boxes are
-  rejected before either. An envelope of `Some` does not mean inside:
-  TM's inverse is finite past its strip, |N| > 19 995 930 m for
-  EPSG:3067. So `outside_projection_domain` tests that strip itself, and in
-  a box partly past it those pixels still reach the engine.
+  `wgs84_envelope`, which samples the box's edges and adds a pole the box
+  holds and, for EPSG:3067, where the meridians 50° out enter and leave it
+  (`geo::area_edge_points`). Wholly outside is the empty image, with read
+  window `NO_READ_WINDOW` (NaN, never read). An envelope of `None` for any
+  other box means the edges miss a valid area inside it: an EPSG:3035 box
+  wider than the disk, or a tall one crossing the disk between samples.
+  That stays `InvalidParameterValue`: there is no read window, and a global
+  one would read whole datasets. An EPSG:3067 box that meets the area
+  always has an envelope. Malformed boxes are rejected before
+  either. Both projections' inverses are `None` past their area: the LAEA
+  disk, and for EPSG:3067 past a pole or more than
+  `ds_core::geo::TM_MAX_LON_OFFSET_DEG` (50°) from 27°E (#1113). In a box
+  partly outside, `project_node` gives those pixels NaN and they stay
+  empty. A meta-tile wholly outside is an all-nodata tile with no engine
+  call, so a zoomed-out view of the north stays meta-tiled.
 
 ## Rendered-image cache (#1010)
 
@@ -360,10 +365,9 @@ meta-tiles by nearest neighbour).
   JSON `geometry` and `value` are null. That is every pixel of a map whose
   `domain_rows` is `None` (GetMap's empty image without a read, #1089), a
   centre past a pole, and a projected centre outside the projection's
-  valid area, which `position_on_earth` tests with
-  `outside_projection_domain` before the inverse: past TM's strip the
-  inverse is finite but names no place, inside it past a pole it gives a
-  latitude past 90°. `I`/`J` outside the image, negative or non-integer is
+  valid area, where its inverse is `None`: past the LAEA disk, and past a
+  pole or `ds_core::geo::TM_MAX_LON_OFFSET_DEG` (50°) from TM's meridian
+  (#1113). `I`/`J` outside the image, negative or non-integer is
   `InvalidPoint`.
 - **Dimensions.** The resolved time as `datetime` `(t, t)`, the resolved run
   as `reference_time`, and as `z` the level GetMap draws:

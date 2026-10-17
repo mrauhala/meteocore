@@ -826,11 +826,10 @@ async fn no_data_at_the_point_is_an_empty_answer() {
 
 /// A projected map never queries a point that is not on the Earth (#1089).
 /// A BBOX wholly outside its projection, which GetMap draws as the empty
-/// image, has no position at any pixel, and so has a pixel centre past the
-/// strip Transverse Mercator maps the Earth into, where its inverse is
-/// finite but names no place, far east even a latitude inside ±90°: the
-/// empty answer, without an engine call. A point on the Earth still
-/// answers.
+/// image, has no position at any pixel, and so has a pixel centre past a
+/// pole or 50° from Transverse Mercator's meridian, where its inverse names
+/// no place (#1113): the empty answer, without an engine call. A point on
+/// the Earth still answers.
 #[tokio::test]
 async fn a_projected_pixel_off_the_earth_is_an_empty_answer() {
     let engine = Nwp::new(Answer::Value(280.0));
@@ -859,11 +858,13 @@ async fn a_projected_pixel_off_the_earth_is_an_empty_answer() {
         );
     };
 
-    // Wholly outside: past the TM strip, north and south, and past the
-    // LAEA disk. Every pixel is empty, the corners and the centre alike.
+    // Wholly outside: past TM's poles, north and south, past 50° east of its
+    // meridian, and past the LAEA disk. Every pixel is empty, the corners
+    // and the centre alike.
     for (crs, bbox) in [
         ("EPSG:3067", "0,21000000,1000000,22000000"),
         ("EPSG:3067", "0,-22000000,1000000,-21000000"),
+        ("EPSG:3067", "5000000,6500000,6000000,7000000"),
         ("EPSG:3035", "20000000,20000000,21000000,21000000"),
     ] {
         let reply = get(
@@ -881,10 +882,10 @@ async fn a_projected_pixel_off_the_earth_is_an_empty_answer() {
     }
     assert!(engine.calls().is_empty(), "{:?}", engine.calls());
 
-    // A TM map from 9 000 km north of the equator, 81°N, over the pole to
-    // past the strip, 12 rows of 1 000 km: row 0 is centred past the strip
-    // (20 500 km), row 5 inside it past the pole (15 500 km), both empty;
-    // row 11 (9 500 km) is on the Earth and answers.
+    // A TM map from 9 000 km north of the equator, 81°N, over the pole and
+    // on, 12 rows of 1 000 km: rows 0 (20 500 km) and 5 (15 500 km) are
+    // centred past the pole, empty; row 11 (9 500 km) is on the Earth and
+    // answers.
     let across = "0,9000000,1000000,21000000";
     for j in [0, 5] {
         assert_empty(
@@ -892,17 +893,17 @@ async fn a_projected_pixel_off_the_earth_is_an_empty_answer() {
             &format!("row {j}"),
         );
     }
-    // Far east of the central meridian, rows 0 and 1 of 4 lie past the
-    // strip, where TM's inverse lands some centres inside ±90° (ds-core's
-    // `position_on_earth_is_none_off_the_earth` pins that): none is asked.
-    let far_east = "15000000,19000000,25000000,21000000";
-    for j in 0..2 {
-        for i in 0..20 {
-            assert_empty(
-                &get(&app, &info_at("EPSG:3067", far_east, 4, (i, j))).await,
-                &format!("far east ({i}, {j})"),
-            );
-        }
+    // The #1110 meta-tile's top row runs from 36° to 62° east of the
+    // meridian. Its columns 14 to 19 of 20 lie past 50°, where TM's inverse
+    // once gave centres anywhere (ds-core's
+    // `position_on_earth_is_none_off_the_earth` pins it, #1113): none is
+    // asked.
+    let far_east = "1448154.7,7240773.4,2896309.4,8688928.1";
+    for i in 14..20 {
+        assert_empty(
+            &get(&app, &info_at("EPSG:3067", far_east, 4, (i, 0))).await,
+            &format!("far east ({i}, 0)"),
+        );
     }
     assert!(engine.calls().is_empty(), "{:?}", engine.calls());
     let reply = get(&app, &info_at("EPSG:3067", across, 12, (9, 11))).await;

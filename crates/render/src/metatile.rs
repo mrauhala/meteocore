@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use ds_core::error::DataServerError;
-use ds_core::geo::{projected_output_crs, wgs84_envelope};
+use ds_core::geo::{outside_projection_domain, projected_output_crs, wgs84_envelope};
 use ds_core::map_engine::{OutputCrs, RasterTile};
 
 use crate::colorize;
@@ -312,9 +312,10 @@ pub enum MetaTile {
     /// existing all-nodata fast path). `stats` still carries the tile-loop
     /// timing (assemble/encode are skipped, so 0).
     Empty { stats: MetaTileStats },
-    /// Meta-tiling declined (degenerate bbox, over-zoom past the ladder, or a
-    /// covering tile count above [`tile_budget`]); the caller should fall back
-    /// to a direct single-shot render.
+    /// Meta-tiling declined (degenerate bbox, over-zoom past the ladder, a
+    /// covering tile count above [`tile_budget`], or a projected tile whose
+    /// edges miss the valid area reaching into it); the caller should fall
+    /// back to a direct single-shot render.
     Fallback,
 }
 
@@ -323,7 +324,9 @@ pub enum MetaTile {
 ///
 /// `bbox_deg` is the WGS84 source-read envelope; projected viewport metres
 /// come from `output_crs`. Each closure call receives its OWN projected tile
-/// bounds plus their WGS84 envelope, never the original viewport's bounds.
+/// bounds plus their WGS84 envelope, never the original viewport's bounds. A
+/// covering tile wholly outside the projection's valid area is all nodata,
+/// with no closure call (`ds_core::geo::outside_projection_domain`).
 ///
 /// `background` (`Some` = opaque output, WMS `TRANSPARENT=FALSE`) is applied
 /// only when encoding the assembled view: the cached tiles stay RGBA, so
@@ -559,36 +562,45 @@ where
                 let tx1 = tx0 + span;
                 let ty_top = origin_y - row as f64 * span;
                 let ty_bot = ty_top - span;
-                let (tbbox, tile_output) = match output_crs {
+                let pixels = match output_crs {
                     OutputCrs::Projected { crs, .. } => {
                         let bbox = [tx0, ty_bot, tx1, ty_top];
-                        let Some(envelope) = wgs84_envelope(crs, bbox) else {
-                            // An edge tile can extend outside a projection's
-                            // domain. Preserve the direct path's handling.
-                            return Ok(MetaTile::Fallback);
-                        };
-                        (
-                            envelope,
-                            OutputCrs::Projected {
+                        if outside_projection_domain(crs, bbox) {
+                            // Wholly past the projection's valid area, as a
+                            // cover's tiles past a pole, past the LAEA disk
+                            // or 50° from TM's meridian are: no pixel has a
+                            // place to read, all nodata (#1113).
+                            None
+                        } else {
+                            let Some(envelope) = wgs84_envelope(crs, bbox) else {
+                                // The tile's edges miss the valid area
+                                // reaching into it. Preserve the direct
+                                // path's handling.
+                                return Ok(MetaTile::Fallback);
+                            };
+                            let tile_output = OutputCrs::Projected {
                                 crs: crs.clone(),
                                 bbox,
-                            },
-                        )
+                            };
+                            tile_pixels(envelope, TILE_PX, TILE_PX, &tile_output, &mut times)?
+                        }
                     }
-                    _ => (
+                    _ => tile_pixels(
                         [
                             x_to_lon(tx0),
                             y_to_lat(ty_bot),
                             x_to_lon(tx1),
                             y_to_lat(ty_top),
                         ],
-                        OutputCrs::WebMercator,
-                    ),
+                        TILE_PX,
+                        TILE_PX,
+                        &OutputCrs::WebMercator,
+                        &mut times,
+                    )?,
                 };
                 // All-nodata tiles are cached as a `None` marker: cheap to store
                 // (no 256 KB buffer) yet still a cache hit, so a sparse extent is
                 // not re-decoded every request nor crowds out real-data tiles.
-                let pixels = tile_pixels(tbbox, TILE_PX, TILE_PX, &tile_output, &mut times)?;
                 let entry: Option<Arc<[u8]>> = match pixels {
                     None => None,
                     Some(rgba) => {
@@ -1837,6 +1849,60 @@ mod tests {
             }
         }
         assert_eq!(cache.stats(), (0, 0));
+    }
+
+    /// Zoomed-out EPSG:3067 views of the north have covering tiles past the
+    /// pole or 50° from the meridian, where no pixel has a place (#1113).
+    /// They are all-nodata tiles, never read, and the view stays meta-tiled
+    /// instead of falling back to an uncached direct render.
+    #[test]
+    fn projected_tiles_wholly_outside_the_area_are_empty_without_a_read() {
+        let crs = projected_output_crs("EPSG:3067").unwrap();
+        for (bbox, width, height) in [
+            ([-2.0e6, 5.0e6, 3.0e6, 9.5e6], 1000, 900),
+            ([-1.0e6, 6.0e6, 2.0e6, 1.05e7], 1000, 1500),
+        ] {
+            let cache = TilePixelCache::new(64);
+            let read = std::sync::Mutex::new(Vec::new());
+            let output = OutputCrs::Projected {
+                crs: crs.clone(),
+                bbox,
+            };
+            let result = render_metatiled(
+                wgs84_envelope(&crs, bbox).unwrap(),
+                &output,
+                width,
+                height,
+                &projected_prefix(),
+                &SolidRed,
+                ImageFormat::Png,
+                None,
+                &cache,
+                |b, w, h, tile: &OutputCrs| {
+                    let OutputCrs::Projected { bbox, .. } = tile else {
+                        panic!("projected tile must retain its CRS");
+                    };
+                    read.lock().unwrap().push(*bbox);
+                    solid_tile(b, w, h, tile)
+                },
+            )
+            .unwrap();
+            let MetaTile::Image { stats, .. } = result else {
+                panic!("{bbox:?}: expected meta-tiles");
+            };
+            let read = read.into_inner().unwrap();
+            assert!(
+                read.iter().all(|t| !outside_projection_domain(&crs, *t)),
+                "{bbox:?}: a tile wholly outside was read"
+            );
+            let skipped = stats.tiles as usize - read.len();
+            assert!(
+                skipped >= 2,
+                "{bbox:?}: {skipped} of {} tiles skipped",
+                stats.tiles
+            );
+            assert_eq!(stats.misses, stats.tiles, "{bbox:?}");
+        }
     }
 
     /// A composite layer's meta-tiles hold the composed RGBA: the view shows
