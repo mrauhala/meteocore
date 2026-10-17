@@ -803,3 +803,6 @@ mod schema_validation;
 
 #[path = "support/privileges.rs"]
 mod privileges;
+
+#[path = "support/indexes.rs"]
+mod indexes;

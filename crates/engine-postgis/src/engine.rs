@@ -83,6 +83,7 @@ pub struct PostgisEngine {
     schema_state: AtomicU8,
     refresh_lock: tokio::sync::Mutex<()>,
     privileges: crate::privileges::PrivilegeAudit,
+    indexes: crate::indexes::IndexAudit,
     /// `<user>@<host>:<port>/<db>` (or `pool_label`) — the `/metrics` pool label.
     pool_key_label: String,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481);
@@ -120,6 +121,7 @@ impl PostgisEngine {
         // column (#1024) are served before the first refresh lands.
         let cache = Arc::new(MetadataCache::new(&config));
         let privileges = crate::privileges::PrivilegeAudit::new(&config, &pool);
+        let indexes = crate::indexes::IndexAudit::new(&config, &pool);
         Self {
             collection_id,
             config,
@@ -129,6 +131,7 @@ impl PostgisEngine {
             schema_state: AtomicU8::new(SCHEMA_PENDING),
             refresh_lock: tokio::sync::Mutex::new(()),
             privileges,
+            indexes,
             pool_key_label,
             shutdown: Shutdown::new(),
         }
@@ -197,7 +200,7 @@ impl PostgisEngine {
         let result = self.refresh_metadata_checked().await;
         // Advisory and independent of schema/metadata success. Completed audits
         // do no further I/O; unchecked audits retry without changing health.
-        self.privileges.check(&self.collection_id, &self.pool).await;
+        self.check_advisories().await;
         self.health.record_refresh(result.is_ok(), start.elapsed());
         let now_cut = self.locations_cut();
         if result.is_ok() && now_cut != was_cut {
@@ -218,6 +221,13 @@ impl PostgisEngine {
             }
         }
         result
+    }
+
+    async fn check_advisories(&self) {
+        tokio::join!(
+            self.privileges.check(&self.collection_id, &self.pool),
+            self.indexes.check(&self.collection_id, &self.pool),
+        );
     }
 
     // These errors reach public /health at boot: diagnostics belong in logs.
@@ -366,7 +376,7 @@ impl PostgisEngine {
                         if self.schema_state.load(Ordering::Acquire) != SCHEMA_VALID {
                             let _ = self.refresh_metadata().await;
                         } else {
-                            self.privileges.check(&self.collection_id, &self.pool).await;
+                            self.check_advisories().await;
                         }
                     }
                 }

@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
 #[derive(Clone, Default)]
-struct Logs(Arc<Mutex<Vec<u8>>>);
+pub(super) struct Logs(Arc<Mutex<Vec<u8>>>);
 
 impl Write for Logs {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -19,10 +19,10 @@ impl Write for Logs {
 }
 
 impl Logs {
-    fn text(&self) -> String {
+    pub(super) fn text(&self) -> String {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
-    async fn capture<F: std::future::Future>(&self, future: F) -> F::Output {
+    pub(super) async fn capture<F: std::future::Future>(&self, future: F) -> F::Output {
         let writer = self.clone();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
@@ -31,12 +31,12 @@ impl Logs {
             .finish();
         future.with_subscriber(subscriber).await
     }
-    fn count(&self, message: &str) -> usize {
+    pub(super) fn count(&self, message: &str) -> usize {
         self.text().matches(message).count()
     }
 }
 
-async fn fixture(schema: &str, roles: &[&str]) -> Option<tokio_postgres::Client> {
+pub(super) async fn fixture(schema: &str, roles: &[&str]) -> Option<tokio_postgres::Client> {
     let client = connect(&dsn()?).await;
     let _setup = SETUP.lock().await;
     client
@@ -72,7 +72,7 @@ async fn fixture(schema: &str, roles: &[&str]) -> Option<tokio_postgres::Client>
     Some(client)
 }
 
-async fn cleanup(client: &tokio_postgres::Client, schema: &str, roles: &[&str]) {
+pub(super) async fn cleanup(client: &tokio_postgres::Client, schema: &str, roles: &[&str]) {
     exec(client, schema, "DROP SCHEMA __S__ CASCADE").await;
     for role in roles {
         client
@@ -84,7 +84,7 @@ async fn cleanup(client: &tokio_postgres::Client, schema: &str, roles: &[&str]) 
 
 /// Startup SET ROLE makes the effective role differ from the superuser login,
 /// including on replacement connections after a failed audit is discarded.
-async fn role_engine(schema: &str, role: Option<&str>) -> Arc<PostgisEngine> {
+pub(super) async fn role_engine(schema: &str, role: Option<&str>) -> Arc<PostgisEngine> {
     let mut cfg = PostgisEngineConfig::resolve(&long_config(schema)).unwrap();
     let parsed: tokio_postgres::Config = cfg.dsn.parse().unwrap();
     let mut options = parsed.get_options().unwrap_or_default().to_string();
@@ -217,7 +217,7 @@ async fn effective_privilege_matrix_and_read_only_audit() {
                 writes.is_empty(),
                 "extra readable columns must be quiet: {text}"
             );
-            assert!(!text.contains("WARN"), "{text}");
+            // Index diagnostics are independent; only privilege warnings must be quiet.
         } else {
             assert_eq!(writes.len(), if role.is_none() { 2 } else { 1 }, "{text}");
             let obs = writes
@@ -464,11 +464,20 @@ async fn pool_wait_has_a_deadline_without_failing_metadata() {
         .unwrap();
     assert!(start.elapsed() < Duration::from_secs(4));
     assert_eq!(logs.count(UNCHECKED), 1, "{}", logs.text());
+    assert_eq!(
+        logs.count("postgis: index audit unchecked"),
+        1,
+        "{}",
+        logs.text()
+    );
+    assert_eq!(logs.count("postgis: index audit completed"), 0);
+    assert_eq!(logs.count("postgis: missing query index"), 0);
     assert_eq!(logs.count(COMPLETE), 0);
     assert_eq!(engine.health_snapshot().refresh_failures, 0);
     assert_eq!(engine.get_locations().unwrap().len(), 1);
     drop(held);
     logs.capture(engine.refresh_metadata()).await.unwrap();
     assert_eq!(logs.count(COMPLETE), 1);
+    assert_eq!(logs.count("postgis: index audit completed"), 1);
     cleanup(&client, schema, &roles).await;
 }

@@ -57,23 +57,40 @@ CREATE INDEX observations_station_time_idx
 For `per_parameter`, grant and index every observation table. For events,
 start with a B-tree on time and a GiST index on geometry. Check plans for
 queries and metadata refreshes against your data, and adjust timeouts and
-indexes accordingly. Index checks are not implemented.
+indexes accordingly. With registry-only locations, nearest-station SQL uses
+`geom::geography`; its spatial index needs that expression, whereas area SQL
+uses plain geometry.
 
-At initialization and after a changed mapping is rebuilt, an advisory audit
-warns about superusers and effective `INSERT`, `UPDATE` or `DELETE` privileges
-on mapped relations, including inherited, ownership and column-level grants.
-It uses read-only catalog queries with a two-second deadline, including pool
-acquisition. It neither attempts writes nor changes grants. Extra readable
-columns are allowed.
+At initialization and after a changed mapping is rebuilt, two advisory audits
+use read-only catalog queries, each with a two-second deadline including pool
+acquisition. They never scan data, run query plans, attempt writes or change
+indexes/grants.
 
-An unsuccessful audit logs **unchecked** and retries on metadata refresh or a
-successful health ping, without changing collection availability. A completed
-audit is not repeated on requests or periodic refreshes. Identical warnings for
-a role/relation are shared across collections using the same pool; the warning
-names the first collection that detected it. Rebuild a collection or restart
-to recheck changed grants. Diagnostics stay in server logs. This checks mapped
-write grants, not every way a role could modify the database; keep the role
-settings above even when the audit finds no write privileges.
+The privilege audit warns about superusers and effective `INSERT`, `UPDATE`
+or `DELETE` on mapped relations, including inherited, ownership and column-level
+grants. Extra readable columns are allowed. Keep the role settings above even
+when no write grants are found: this is not a guarantee that the role cannot
+modify the database.
+
+Index diagnostics check station/time B-tree prefixes on every station
+observation table, leading-time indexes for events, and live SQL spatial paths.
+Valid ASC/DESC and longer composite keys are accepted; INCLUDE-only columns and
+invalid indexes do not count. Geometry checks recognize 2D GiST/SP-GiST support.
+Missing paths warn with quoted relation/column names and an index suggestion.
+Views, potentially relevant partial/expression indexes (including geography),
+unfamiliar operator classes, separate/reordered keys and alternative access
+methods log **not assessed** when applicability is uncertain. Partitioned/TimescaleDB parent
+indexes count; independent child/chunk index changes are not verified. Without
+a matching parent index, coverage is not assessed. Materialized views are
+inspected directly. These are bounded heuristics, not a
+query-plan guarantee; investigate plans before adding indexes.
+
+Failed audits log **unchecked** and retry on metadata refresh or a successful
+health ping, without changing collection availability. Completed audits do no
+further work on requests or refreshes. Shared pools deduplicate identical
+findings; logs name the first collection that detected each one. Rebuild a
+collection or restart to recheck changed grants/indexes. Diagnostics stay in
+server logs.
 
 Supply the DSN through the server process's environment:
 

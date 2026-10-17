@@ -20,5 +20,7 @@ pub use schema::{
     SchemaError, StationsMapping, WideShape,
 };
 
+mod catalog;
+mod indexes;
 mod privileges;
 mod validation;
