@@ -20,9 +20,11 @@ as a property.
 
 ## Source & SSRF guard
 
-- **Exactly one of `data_path`** (local dir of `*.xml`; a temporary
-  basename such as an in-progress `.name.xml` is skipped,
-  `ds_core::temp_files`, #1009), **`feed_url`**
+- **Exactly one of `data_path`** (local dir of `*.xml`, subfolders
+  included; a temporary basename such as an in-progress `.name.xml`, #1009,
+  and any file in a hidden folder below `data_path`, such as rsync
+  `--delay-updates`' `.~tmp~/`, #1029, are skipped:
+  `ds_core::temp_files::is_temporary_below`), **`feed_url`**
   (Atom/RSS index → linked CAP docs) **or `[cap.wis2]`** (WIS2 push, see
   below). The first two go through `ds-storage` from the background poll
   runtime only. The feed fetches the index then the linked

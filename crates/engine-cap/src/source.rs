@@ -136,7 +136,9 @@ impl Source {
 
 /// List `.xml` files under `base`, fetch them (bounded), and parse each. A
 /// publisher's in-progress `.name.xml` is skipped: it would parse truncated
-/// and count as a failed document (#1009).
+/// and count as a failed document (#1009). So is a file in a hidden folder
+/// below `base`, such as rsync `--delay-updates`' `.~tmp~/`: the listing
+/// walks subfolders (#1029).
 fn load_local(
     store: &DataStore,
     base: &ObjectPath,
@@ -148,7 +150,7 @@ fn load_local(
         .map(|m| m.location)
         .filter(|p| {
             p.as_ref().to_ascii_lowercase().ends_with(".xml")
-                && !temp_files::is_temporary_key(p.as_ref())
+                && !temp_files::is_temporary_below(base.as_ref(), p.as_ref())
         })
         .collect();
     paths.sort_unstable();
@@ -574,6 +576,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("helsinki-flood.xml"), &doc).unwrap();
         std::fs::write(dir.path().join(".helsinki-heat.xml"), &doc[..doc.len() / 2]).unwrap();
+        let (store, base) = build_store(dir.path().to_str().unwrap()).unwrap();
+
+        let load = load_local(&store, &base, &Mutex::default()).unwrap();
+        assert_eq!(load.failed_documents, 0);
+        assert!(!load.alerts.is_empty());
+    }
+
+    /// rsync `--delay-updates` stages documents under their final names in
+    /// a `.~tmp~/` folder, and the listing walks subfolders: a truncated
+    /// document there, at any depth, is never fetched or parsed, while a
+    /// normal subfolder's document is (#1029).
+    #[test]
+    fn local_load_skips_documents_in_hidden_folders() {
+        let doc = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/cap/helsinki-flood.xml"),
+        )
+        .unwrap();
+        let half = &doc[..doc.len() / 2];
+        let dir = tempfile::tempdir().unwrap();
+        for sub in [".~tmp~", "fi/.~tmp~"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(dir.path().join("fi/helsinki-flood.xml"), &doc).unwrap();
+        std::fs::write(dir.path().join(".~tmp~/helsinki-heat.xml"), half).unwrap();
+        std::fs::write(dir.path().join("fi/.~tmp~/espoo-heat.xml"), half).unwrap();
         let (store, base) = build_store(dir.path().to_str().unwrap()).unwrap();
 
         let load = load_local(&store, &base, &Mutex::default()).unwrap();

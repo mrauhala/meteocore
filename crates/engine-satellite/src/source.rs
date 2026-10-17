@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
+use ds_core::temp_files;
 use ds_storage::object_store::path::Path as ObjectPath;
 use ds_storage::object_store::ObjectMeta;
 use ds_storage::{DataStore, FetchBudget};
@@ -45,6 +46,11 @@ impl Source {
     /// made once per poll whichever products need it (`listings`); a
     /// window's prefixes are capped by [`Naming::validate_window`]
     /// (Critical Rule 9).
+    ///
+    /// The `list` is recursive and the file name alone selects a scan, so a
+    /// file in a hidden folder below the prefix is dropped from the listing:
+    /// rsync `--delay-updates` stages a mirror's files under their final
+    /// names in `.~tmp~/` while they are written (#1029).
     pub fn list(
         &self,
         naming: &Naming,
@@ -56,7 +62,12 @@ impl Source {
             if let Some(listed) = listings.get(&prefix) {
                 return Ok(listed.clone());
             }
-            let listed: Arc<[ObjectMeta]> = store.list(&ObjectPath::from(prefix.as_str()))?.into();
+            let path = ObjectPath::from(prefix.as_str());
+            let listed: Arc<[ObjectMeta]> = store
+                .list(&path)?
+                .into_iter()
+                .filter(|meta| !temp_files::in_hidden_folder(path.as_ref(), meta.location.as_ref()))
+                .collect();
             listings.insert(prefix, listed.clone());
             Ok(listed)
         };
@@ -203,5 +214,43 @@ mod tests {
                 .contains(&format!("C{band}-T001")));
         }
         assert_eq!(listings.len(), 1);
+    }
+
+    /// A local mirror filled by rsync `--delay-updates` holds each file
+    /// under its final name in a `.~tmp~/` folder until the transfer ends.
+    /// The directory is listed recursively and the name alone selects a
+    /// scan, so a scan there, at any depth, is never found; a normal
+    /// subfolder's is (#1029).
+    #[test]
+    fn a_directory_never_finds_scans_in_hidden_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |minute: &str| {
+            format!(
+                "OR_ABI-L2-CMIPF-M6C13_G19_s202626819{minute}199_e20262681959519_c20262681959592.nc"
+            )
+        };
+        for (folder, minute) in [
+            ("2026/268/19", "00"),
+            ("2026/268/19/.~tmp~", "10"),
+            (".~tmp~", "20"),
+        ] {
+            let folder = dir.path().join(folder);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join(file(minute)), b"x").unwrap();
+        }
+        let (store, base) = ds_storage::build_store(dir.path().to_str().unwrap()).unwrap();
+        let source = Source::Directory { store, base };
+
+        let found = source
+            .list(
+                &Naming::goes_r("ABI-L2-CMIPF", Some(13)),
+                None,
+                |_| false,
+                &mut Listings::new(),
+            )
+            .unwrap();
+        let times: Vec<_> = found.iter().map(|f| f.time.to_rfc3339()).collect();
+        assert_eq!(times, ["2026-09-25T19:00:00+00:00"]);
+        assert!(found[0].paths[0].as_ref().starts_with("2026/268/19/OR_"));
     }
 }

@@ -1444,7 +1444,7 @@ fn enumerate_remote(
     let mut candidates: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    for (prefix, listed) in prefixes.iter().zip(listings) {
+    for ((prefix, object_prefix), listed) in prefixes.iter().zip(&object_prefixes).zip(listings) {
         let listed = match listed {
             Ok(objects) => objects,
             Err(e) => {
@@ -1454,7 +1454,12 @@ fn enumerate_remote(
         };
         for obj in listed {
             let key = obj.location.to_string();
-            if !is_volume_name(key.rsplit('/').next().unwrap_or(&key)) {
+            // The LIST is recursive: a volume staged in a hidden folder
+            // below the prefix (rsync `--delay-updates`' `.~tmp~/`) is
+            // still being written under its final name (#1029).
+            if !is_volume_name(key.rsplit('/').next().unwrap_or(&key))
+                || temp_files::in_hidden_folder(object_prefix.as_ref(), &key)
+            {
                 continue;
             }
             let ts = parse_key_timestamp(&key);
@@ -7863,6 +7868,43 @@ mod tests {
         let (remote, _) = enumerate_remote("t", &store, "", &None, ScanDepth::Full).unwrap();
         let remote: Vec<String> = remote.iter().map(|p| basename(&p.id)).collect();
         assert_eq!(remote, ["202605150000_fivih_PVOL.h5"]);
+    }
+
+    /// rsync `--delay-updates` stages volumes under their final names in a
+    /// `.~tmp~/` folder, and the remote LIST is recursive: a volume there,
+    /// at any depth below the prefix, is never fetched. The prefix's own dot
+    /// folder and a normal subfolder hide nothing; the local enumeration
+    /// never descends (#1029).
+    #[test]
+    fn enumerations_skip_volumes_in_hidden_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let base = root.join(".archive/pvol");
+        for name in [
+            "202605150000_fivih_PVOL.h5",
+            "fivih/202605150005_fivih_PVOL.h5",
+            ".~tmp~/202605150010_fivih_PVOL.h5",
+            "fivih/.~tmp~/202605150015_fivih_PVOL.h5",
+        ] {
+            let path = base.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+        let basename = |id: &str| id.rsplit('/').next().unwrap().to_string();
+
+        let (store, _) = ds_storage::build_store(root.to_str().unwrap()).unwrap();
+        let (remote, _) =
+            enumerate_remote("t", &store, ".archive/pvol", &None, ScanDepth::Full).unwrap();
+        let mut remote: Vec<String> = remote.iter().map(|p| basename(&p.id)).collect();
+        remote.sort();
+        assert_eq!(
+            remote,
+            ["202605150000_fivih_PVOL.h5", "202605150005_fivih_PVOL.h5"]
+        );
+
+        let local = enumerate_local("t", &base).unwrap();
+        let local: Vec<String> = local.iter().map(|p| basename(&p.id)).collect();
+        assert_eq!(local, ["202605150000_fivih_PVOL.h5"]);
     }
 
     #[test]

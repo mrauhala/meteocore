@@ -47,7 +47,10 @@ catalog scan. Engines call `scan_local` for a directory and `scan_remote` for
 an object store's date-expanded prefixes. Both keep a file when its basename
 is not excluded, matches and has a timestamp inside the inclusive window.
 Exclusion comes first, so an excluded partial upload never displaces the
-finished file of the same timestamp or takes a `max_files` slot. They return the
+finished file of the same timestamp or takes a `max_files` slot. A hidden
+basename is always excluded (#1009). A LIST is recursive, so `scan_remote`
+also skips an object in a hidden folder below its prefix, such as rsync's
+`.~tmp~/`; `scan_local` never descends (#1029). They return the
 kept files oldest first, one per timestamp, capped to the newest `max_files`.
 Of files sharing a timestamp the greatest key or path wins, whatever the
 listing order, and each dropped file is logged at WARN.
@@ -63,7 +66,8 @@ from the background poll runtime, never from a request handler.
 
 An engine that recognises its files without a matcher, like the PVOL network
 scan, which keeps every site's volume at each timestamp, lists through
-`list_prefixes` and applies its own rules.
+`list_prefixes` and applies its own rules, the hidden-folder one through
+`ds_core::temp_files::in_hidden_folder` or `is_temporary_below`.
 
 A matcher may read a forecast lead as well as a timestamp: a template's
 `{lead}`, two zero-padded digits, or a pattern's `lead` capture. A template's

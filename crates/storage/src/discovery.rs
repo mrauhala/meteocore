@@ -20,10 +20,11 @@
 //!    template or an explicit regex (#817).
 //! 4. [`scan_remote`] / [`scan_local`] — the catalog scan: list the
 //!    prefixes, at most [`MAX_CONCURRENT_LISTS`] at a time, or read the
-//!    directory, then skip hidden names (#1009), exclude, match, window,
-//!    dedup and cap into `(key, timestamp)` entries (#817). [`list_prefixes`] is its bounded
-//!    concurrent LIST, for an engine that recognises files without a
-//!    matcher.
+//!    directory, then skip hidden names (#1009) and, remote, files in a
+//!    hidden folder below the prefix (#1029), exclude, match, window,
+//!    dedup and cap into `(key, timestamp)` entries (#817).
+//!    [`list_prefixes`] is its bounded concurrent LIST, for an engine that
+//!    recognises files without a matcher.
 //!
 //! 5. [`TemplateProber`] — discovery without listing, for HTTP servers
 //!    that cannot be listed: render the keys files would have from a prefix
@@ -1036,7 +1037,12 @@ pub const MAX_FILENAME_LEN: usize = 255;
 ///
 /// A hidden name is skipped whatever `exclude` holds: it is the temporary
 /// name of a file written and then renamed into place, which an unanchored
-/// `filename_pattern` would otherwise match mid-write (#1009).
+/// `filename_pattern` would otherwise match mid-write (#1009). So is an
+/// object [`scan_remote`] lists inside a hidden folder below its prefix
+/// ([`ds_core::temp_files::in_hidden_folder`], #1029), such as rsync
+/// `--delay-updates`' `.~tmp~/`, where files wait under their final names:
+/// a LIST is recursive. [`scan_local`] reads one directory and never
+/// descends into a folder.
 #[derive(Debug, Clone, Copy)]
 pub struct ScanSpec<'a> {
     /// Recognises the collection's files and reads their timestamps. A
@@ -1200,7 +1206,9 @@ impl RemoteScan {
 /// Call it where [`DataStore::list`] may be called: from the background
 /// poll runtime, never from a request handler (Critical Rule 7). An engine
 /// that recognises its files without a [`FilenameMatcher`] lists through
-/// this; the others use [`scan_remote`].
+/// this; the others use [`scan_remote`]. The listings are raw and recursive:
+/// such an engine skips temporary names and files in a hidden folder below
+/// each prefix itself ([`ds_core::temp_files::is_temporary_below`], #1029).
 #[allow(clippy::type_complexity)]
 pub fn list_prefixes(
     store: &DataStore,
@@ -1211,8 +1219,9 @@ pub fn list_prefixes(
 
 /// Scan an object store's prefixes for a collection's files.
 ///
-/// The prefixes are listed concurrently ([`list_prefixes`]). Each object's
-/// basename goes through `spec` (see [`ScanSpec`]), and objects over
+/// The prefixes are listed concurrently ([`list_prefixes`]). An object in a
+/// hidden folder below its prefix is skipped, each other object's basename
+/// goes through `spec` (see [`ScanSpec`]), and objects over
 /// `spec.max_size` are skipped. A prefix that fails to list is reported in
 /// [`RemoteScan::prefixes`] and does not stop the scan; the outer `Err` is a
 /// runtime-bridge failure only.
@@ -1229,6 +1238,9 @@ pub fn scan_remote(
             let count = objects.len();
             for object in objects {
                 let key = object.location.as_ref();
+                if temp_files::in_hidden_folder(prefix.as_ref(), key) {
+                    continue;
+                }
                 let name = key.rsplit('/').next().unwrap_or(key);
                 let Some((time, lead)) = spec.matched(name) else {
                     continue;
@@ -2035,6 +2047,49 @@ mod scan_tests {
         };
         let scan = scan_remote(&store, &[ObjectPath::from("d")], &spec).unwrap();
         assert_eq!(remote_keys(&scan), ["d/radar_20260324T2315Z.tif"]);
+    }
+
+    /// rsync `--delay-updates` stages files under their final names in
+    /// `.~tmp~/`, and a LIST is recursive. The staged files hold the newest
+    /// timestamps here, so caught by the matcher they would be the two kept
+    /// by `max_files`. A hidden folder below the prefix hides them at any
+    /// depth; the prefix's own dot folder and a normal subfolder do not
+    /// (#1029).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_scan_skips_files_in_hidden_folders_below_the_prefix() {
+        use object_store::{ObjectStoreExt, PutPayload};
+        let probe = ListProbe::default();
+        for key in [
+            ".archive/d/radar_20260324T2310Z.tif",
+            ".archive/d/2026/radar_20260324T2315Z.tif",
+            ".archive/d/.~tmp~/radar_20260324T2320Z.tif",
+            ".archive/d/2026/.~tmp~/radar_20260324T2325Z.tif",
+        ] {
+            // `parse` keeps `~` as an S3 listing returns it.
+            let path = ObjectPath::parse(key).unwrap();
+            probe
+                .inner
+                .put(&path, PutPayload::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        let store = DataStore::new(Arc::new(probe));
+        let matcher = FilenameMatcher::from_pattern(UNANCHORED, "%Y%m%dT%H%MZ").unwrap();
+        let spec = ScanSpec {
+            max_files: Some(2),
+            ..ScanSpec::new(&matcher, "t")
+        };
+        let prefix = ObjectPath::parse(".archive/d").unwrap();
+        let scan = scan_remote(&store, &[prefix], &spec).unwrap();
+        assert_eq!(
+            remote_keys(&scan),
+            [
+                ".archive/d/radar_20260324T2310Z.tif",
+                ".archive/d/2026/radar_20260324T2315Z.tif"
+            ]
+        );
+        assert_eq!(scan.prefixes[0].listed.as_ref().ok(), Some(&4));
+        assert_eq!(scan.prefixes[0].kept, 2);
     }
 
     fn meps_names(names: &[&str]) -> Vec<String> {

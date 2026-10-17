@@ -524,8 +524,13 @@ impl GribEngine {
                         let loc = obj.location.as_ref();
                         // A publisher's in-progress `.name.index` is not an
                         // index yet: once parsed it would be marked known
-                        // under its temporary name (#1009).
-                        if !loc.ends_with(index_suffix) || temp_files::is_temporary_key(loc) {
+                        // under its temporary name (#1009). Nor is one in a
+                        // hidden folder below the prefix, where rsync
+                        // `--delay-updates` stages files under their final
+                        // names: the LIST is recursive (#1029).
+                        if !loc.ends_with(index_suffix)
+                            || temp_files::is_temporary_below(obj_prefix.as_ref(), loc)
+                        {
                             continue;
                         }
                         if let Some(needle) = filename_contains {

@@ -310,8 +310,12 @@ not guarantee monotonic improvement. This baseline does not enable #642.
 - Both PVOL enumerations (`enumerate_local`, `enumerate_remote`) keep a
   basename only when `is_volume_name` accepts it: `.h5`, and not a
   temporary name (`ds_core::temp_files`), so a volume written as `.name.h5`
-  is never HDF5-parsed truncated (#1009). The COMP scans get the hidden-name
-  skip from the shared catalog scan and pass
+  is never HDF5-parsed truncated (#1009). `enumerate_remote`'s LIST is
+  recursive, so it also skips a key in a hidden folder below its prefix
+  (`temp_files::in_hidden_folder`, #1029: rsync `--delay-updates` stages
+  files under their final names in `.~tmp~/`); `enumerate_local` never
+  descends. The COMP scans get the hidden-name and, remote, hidden-folder
+  skips from the shared catalog scan and pass
   `temp_files::partial_exclude_patterns()` as `ScanSpec.exclude`: COMP has
   no `exclude_patterns` setting, and an unanchored explicit pattern matches
   inside `….h5.part`.

@@ -657,8 +657,17 @@ one never implies the other.
   `is_temporary_key`; the shared `ds_storage::discovery` scan skips hidden
   names always and leaves the suffixes to `ScanSpec.exclude`
   (`exclude_patterns`, or `partial_exclude_patterns()` for an engine
-  without that setting). A new engine's file listing does the same. A
-  store-internal listing (Zarr v2's `.zarray`) is not a data scan.
+  without that setting). A listing that reaches below its base — every
+  object-store `list`, including a local `data_path` through `ds-storage`,
+  is recursive — also skips files in a hidden folder below that base
+  (#1029; rsync `--delay-updates` stages files under their final names in
+  `.~tmp~/`): `in_hidden_folder(base, key)`, or `is_temporary_below(base,
+  key)` for both rules. The base's own segments are never judged, so a
+  dot folder in the configured path or prefix is fine; the suffixes are
+  file rules only. `discovery::scan_remote` applies the folder rule;
+  `list_prefixes` and `DataStore::list` callers apply it themselves. A new
+  engine's file listing does the same. A store-internal listing (Zarr v2's
+  `.zarray`) is not a data scan.
 - **`ds_core::instances`** — model-run (forecast reference time) machinery
   shared by ALL forecast engines (#337), so run selection, instance lists and
   instance-id encoding are identical everywhere:
