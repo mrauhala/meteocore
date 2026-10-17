@@ -297,6 +297,70 @@ impl ProjectionGrid {
         out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) -> Self {
+        Self::refined(
+            out_width,
+            out_height,
+            src_cols,
+            src_rows,
+            col_period,
+            None,
+            out_to_world,
+            world_to_src_px,
+        )
+    }
+
+    /// Like [`build_2d`](Self::build_2d) for a caller that samples only the
+    /// output pixels of `read`, an inclusive window `(px_lo, px_hi, py_lo,
+    /// py_hi)` such as [`OutputCrs::footprint_pixel_window`] gives. Only the
+    /// cells holding one of its pixels count toward the error estimate and
+    /// get boundary sub-grids, so a pixel outside it is interpolated without
+    /// the error budget and must not be read.
+    ///
+    /// Outside a source's footprint the mapping need not be smooth, and
+    /// refining for it then never converges (#1110). A projected output's
+    /// inverse breaks down far from the area it is made for: EPSG:3067's
+    /// returns latitudes of hundreds of degrees some 60° east of its central
+    /// meridian. A conic source's forward transform jumps a cone's gap
+    /// where longitude wraps, half a turn from the source. Over the pole,
+    /// either drove a 256 px meta-tile to [`MAX_CELLS`]: a million and a
+    /// half projections for pixels the footprint guard then left empty.
+    ///
+    /// [`OutputCrs::footprint_pixel_window`]: crate::map_engine::OutputCrs::footprint_pixel_window
+    pub fn build_2d_within(
+        out_width: u32,
+        out_height: u32,
+        read: (u32, u32, u32, u32),
+        src_cols: u32,
+        src_rows: u32,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
+        world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
+    ) -> Self {
+        Self::refined(
+            out_width,
+            out_height,
+            src_cols,
+            src_rows,
+            None,
+            Some(read),
+            out_to_world,
+            world_to_src_px,
+        )
+    }
+
+    /// The adaptive build behind every constructor: `col_period` as
+    /// [`Self::build_2d_periodic`] takes it, `read` as
+    /// [`Self::build_2d_within`] does (`None` reads every pixel).
+    #[allow(clippy::too_many_arguments)] // output dims + source dims + period + window + 2 mapping closures are all genuine inputs
+    fn refined(
+        out_width: u32,
+        out_height: u32,
+        src_cols: u32,
+        src_rows: u32,
+        col_period: Option<f64>,
+        read: Option<(u32, u32, u32, u32)>,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
+        world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
+    ) -> Self {
         let col_period = col_period.filter(|p| p.is_finite() && *p > 0.0);
         let mut cells_x = out_width.div_ceil(GRID_STEP_PX).clamp(MIN_CELLS, MAX_CELLS);
         let mut cells_y = out_height
@@ -312,7 +376,8 @@ impl ProjectionGrid {
                 &out_to_world,
                 &world_to_src_px,
             );
-            let error = grid.estimate_error(src_cols, src_rows, &out_to_world, &world_to_src_px);
+            let error =
+                grid.estimate_error(src_cols, src_rows, read, &out_to_world, &world_to_src_px);
             if error <= MAX_INTERP_ERROR_PX {
                 break grid;
             }
@@ -336,8 +401,21 @@ impl ProjectionGrid {
             cells_x = (cells_x * 2).min(MAX_CELLS);
             cells_y = (cells_y * 2).min(MAX_CELLS);
         };
-        grid.refine_boundary(out_width, out_height, &out_to_world, &world_to_src_px);
+        grid.refine_boundary(out_width, out_height, read, &out_to_world, &world_to_src_px);
         grid
+    }
+
+    /// Whether cell `(cx, cy)` holds a pixel of `read`, the inclusive output
+    /// window `(px_lo, px_hi, py_lo, py_hi)` the caller samples; every cell
+    /// does without one.
+    fn reads_cell(&self, read: Option<(u32, u32, u32, u32)>, cx: usize, cy: usize) -> bool {
+        let Some((x_lo, x_hi, y_lo, y_hi)) = read else {
+            return true;
+        };
+        let overlaps = |c: usize, size: f64, lo: u32, hi: u32| {
+            (c as f64 * size) < f64::from(hi) + 1.0 && ((c + 1) as f64 * size) > f64::from(lo)
+        };
+        overlaps(cx, self.cell_w, x_lo, x_hi) && overlaps(cy, self.cell_h, y_lo, y_hi)
     }
 
     /// Give every cell on a domain boundary — some corner nodes finite,
@@ -352,11 +430,13 @@ impl ProjectionGrid {
     /// on the order of its perimeter in pixels times four. Total sub-grid
     /// nodes are capped at a quarter of the per-pixel cost; a mapping with
     /// scattered non-finite nodes stops refining there, and its remaining
-    /// boundary cells stay unfilled.
+    /// boundary cells stay unfilled. A cell holding no pixel of `read` is
+    /// never sampled and gets none.
     fn refine_boundary(
         &mut self,
         out_width: u32,
         out_height: u32,
+        read: Option<(u32, u32, u32, u32)>,
         out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) {
@@ -367,6 +447,9 @@ impl ProjectionGrid {
         let mut budget = (out_width as usize * out_height as usize / 4).max(4096);
         for cy in 0..self.cells_y {
             for cx in 0..self.cells_x {
+                if !self.reads_cell(read, cx, cy) {
+                    continue;
+                }
                 let n = cy * self.stride + cx;
                 let corners = [
                     self.nodes[n],
@@ -464,10 +547,15 @@ impl ProjectionGrid {
     /// global grid's pixel is tens of kilometres, several output pixels of a
     /// regional view, so a fifth of a source pixel would still be visibly
     /// misregistered there.
+    ///
+    /// A cell holding no pixel of `read`, the output window the caller
+    /// samples, is skipped whole: no error there is ever seen (see
+    /// [`Self::build_2d_within`]).
     fn estimate_error(
         &self,
         src_cols: u32,
         src_rows: u32,
+        read: Option<(u32, u32, u32, u32)>,
         out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) -> f64 {
@@ -480,6 +568,9 @@ impl ProjectionGrid {
         let mut max = 0.0_f64;
         for j in 0..self.cells_y {
             for i in 0..self.cells_x {
+                if !self.reads_cell(read, i, j) {
+                    continue;
+                }
                 let n = j * self.stride + i;
                 let corners = unwrap_cols(
                     [
@@ -522,6 +613,17 @@ impl ProjectionGrid {
             }
         }
         max
+    }
+
+    /// Exact projections the grid holds: its nodes and its sub-grids'.
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
+            + self
+                .boundary
+                .iter()
+                .map(|(_, s)| s.nodes.len())
+                .sum::<usize>()
     }
 
     /// Interpolated source `(col, row)` for the centre of output pixel
@@ -951,6 +1053,43 @@ mod tests {
         );
     }
 
+    /// #1110: a caller that reads only part of the output gets a grid
+    /// refined for that part. Past the read window this mapping jumps 37
+    /// source columns, then is undefined: without the window the jump
+    /// alone refines to the cap, and the undefined part's edge would get
+    /// sub-grids. With it the grid stays at its starting 8 × 8 cells, exact
+    /// where it is read. A cell holding a single read pixel counts whole.
+    #[test]
+    fn a_read_window_refines_only_what_is_read() {
+        let map = |x: f64, y: f64| {
+            if x < 0.6 {
+                (x * 100.0, y * 100.0)
+            } else if x < 0.8 {
+                (x * 100.0 + 37.0, y * 100.0)
+            } else {
+                (f64::NAN, f64::NAN)
+            }
+        };
+        let size = 256;
+        let build =
+            |read| ProjectionGrid::build_2d_within(size, size, read, 100, 100, |x, y| (x, y), map);
+        let grid = build((0, 127, 0, 255));
+        assert_eq!((grid.cells_x, grid.cells_y, grid.node_count()), (8, 8, 81));
+        for oy in 0..size {
+            for ox in 0..=127 {
+                let (c, r) = grid.sample(ox, oy);
+                let (x, y) = ((ox as f64 + 0.5) / 256.0, (oy as f64 + 0.5) / 256.0);
+                assert!((c - x * 100.0).abs() < 1e-9 && (r - y * 100.0).abs() < 1e-9);
+            }
+        }
+        // Pixel 128 shares the 8 × 8 cell [128, 160) with the jump at 153.6.
+        let grid = build((0, 128, 0, 255));
+        assert_eq!(
+            (grid.cells_x, grid.cells_y, grid.node_count()),
+            (16, 16, 289)
+        );
+    }
+
     /// Great-circle distance in km (sphere) — the ground misregistration
     /// between a sampled and a reference position.
     fn ground_km((lon1, lat1): (f64, f64), (lon2, lat2): (f64, f64)) -> f64 {
@@ -981,7 +1120,7 @@ mod tests {
             ProjectionGrid::build_2d_periodic(size, size, 1440, 721, Some(1440.0), node, to_src);
         assert!(grid.pole_cells, "the pole cell gets a sub-grid");
         // Converged within budget: no MAX_CELLS warning for the pole tile.
-        let err = grid.estimate_error(1440, 721, node, to_src);
+        let err = grid.estimate_error(1440, 721, None, node, to_src);
         assert!(err <= MAX_INTERP_ERROR_PX, "estimate {err} over budget");
         let at = |ox: u32, oy: u32| {
             let (c, r) = grid.sample(ox, oy);

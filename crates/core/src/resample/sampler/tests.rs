@@ -491,3 +491,126 @@ fn a_grid_holding_the_pole_is_drawn_to_the_pole() {
         }
     }
 }
+
+/// MEPS's grid as the engine-netcdf fixture samples it, every 100th
+/// point: 10 × 11 cells 250 km apart.
+fn meps_sample() -> GeoTransform {
+    let crs = lambert(63.3, 15.0);
+    GeoTransform::from_cell_centres(
+        -1_060_084.0,
+        250_000.0,
+        1_167_482.1,
+        -250_000.0,
+        10,
+        11,
+        crs,
+    )
+    .unwrap()
+}
+
+/// MEPS's grid in full: 949 × 1069 cells at 2.5 km.
+fn meps() -> GeoTransform {
+    let crs = lambert(63.3, 15.0);
+    GeoTransform::from_cell_centres(-1_060_084.0, 2_500.0, 1_337_482.1, -2_500.0, 949, 1069, crs)
+        .unwrap()
+}
+
+/// #1110: the 256 px WMS meta-tiles of an EPSG:3067 and an EPSG:3035
+/// request near the pole, on MEPS's grid sampled and in full. Past the
+/// grid's footprint their output→source map jumps: EPSG:3067's inverse
+/// breaks down in the first tile's north-east corner, and the Lambert
+/// forward transform jumps where longitude wraps, half a turn from the
+/// grid, in the second. Only the footprint is sampled, so only its error
+/// counts: a few hundred nodes instead of the 256 × 256 cap's 66 049.
+/// Every pixel is what the same map projected per pixel draws, except
+/// where that source position lies within the error budget of the
+/// sampler's edge.
+#[test]
+fn polar_meta_tiles_refine_only_the_footprint() {
+    let tiles = [
+        (
+            "EPSG:3067",
+            [
+                1448154.6878700492,
+                7240773.439350246,
+                2896309.3757400983,
+                8688928.127220295,
+            ],
+            [
+                -651.893197248287,
+                57.99572959596767,
+                168.97855020194945,
+                143.55146987202554,
+            ],
+        ),
+        (
+            "EPSG:3035",
+            [
+                2896309.3757400983,
+                5792618.7514801975,
+                5792618.751480197,
+                8688928.127220295,
+            ],
+            [
+                -165.5766516894288,
+                70.8962238105685,
+                189.14274294709074,
+                77.91855602096956,
+            ],
+        ),
+    ];
+    let (width, height) = (256, 256);
+    for (label, gt) in [("sample", meps_sample()), ("full", meps())] {
+        let grid = SourceGrid::new(gt.clone());
+        let Layout::Projected {
+            envelope: Some([w, _, e, _]),
+        } = grid.layout
+        else {
+            panic!("{label}: no envelope");
+        };
+        let values = field_of(&gt);
+        let (nx, ny) = (f64::from(gt.width), f64::from(gt.height));
+        for (epsg, projected, bbox) in tiles {
+            let crs = OutputCrs::Projected {
+                crs: projected_output_crs(epsg).unwrap(),
+                bbox: projected,
+            };
+            let label = format!("{label} {epsg}");
+            let map = grid.output_map(bbox, width, height, &crs);
+            let nodes = map.grid.node_count();
+            assert!(nodes <= 400, "{label}: {nodes} nodes");
+            let tile = map.sample_f32(&values, None).unwrap();
+            let reference = centres(bbox, width, height, &crs);
+            let mut filled = 0;
+            for (i, (got, &(lon, lat))) in pixels(&tile).iter().zip(&reference).enumerate() {
+                let (col, row) =
+                    centred(gt.world_to_pixel_f64(within_half_turn(lon, (w + e) / 2.0), lat));
+                let want = grid.sample(&values, None, col, row);
+                // The sampler draws positions in [-1, n) along each axis.
+                let edge = [col + 1.0, col - nx, row + 1.0, row - ny]
+                    .iter()
+                    .fold(f64::MAX, |d, x| d.min(x.abs()));
+                match (got, want) {
+                    (Some(got), Some(want)) => {
+                        filled += 1;
+                        assert!(
+                            (got - want).abs() < 0.01,
+                            "{label}: pixel {i} is {got}, per pixel {want}"
+                        );
+                    }
+                    (None, None) => {}
+                    _ => assert!(
+                        edge < crate::resample::MAX_INTERP_ERROR_PX,
+                        "{label}: pixel {i} is {got:?}, per pixel {want:?}, \
+                         {edge:.3} px from the edge"
+                    ),
+                }
+            }
+            // The sample's 250 km cells reach past the full grid's east
+            // edge, into the EPSG:3067 tile.
+            if label != "full EPSG:3067" {
+                assert!(filled > 300, "{label}: {filled} filled");
+            }
+        }
+    }
+}
