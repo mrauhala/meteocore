@@ -1426,6 +1426,11 @@
           "expr": "rate(satellite_strip_cache_hits_total[$__rate_interval]) / clamp_min(rate(satellite_strip_cache_hits_total[$__rate_interval]) + rate(satellite_strip_cache_misses_total[$__rate_interval]), 1e-9)",
           "refId": "H",
           "legendFormat": "Satellite decoded strips (#819)"
+        },
+        {
+          "expr": "rate(netcdf_field_cache_hits_total[$__rate_interval]) / clamp_min(rate(netcdf_field_cache_hits_total[$__rate_interval]) + rate(netcdf_field_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "I",
+          "legendFormat": "NetCDF decoded fields (#1067)"
         }
       ]
     },
@@ -1539,6 +1544,11 @@
           "expr": "rate(satellite_strip_cache_misses_total[$__rate_interval])",
           "refId": "G",
           "legendFormat": "Satellite decoded strips (#819)"
+        },
+        {
+          "expr": "rate(netcdf_field_cache_misses_total[$__rate_interval])",
+          "refId": "I",
+          "legendFormat": "NetCDF decoded fields (#1067)"
         }
       ]
     },
@@ -1654,6 +1664,11 @@
           "expr": "satellite_strip_cache_bytes / clamp_min(satellite_strip_cache_capacity_bytes, 1)",
           "refId": "H",
           "legendFormat": "Satellite decoded strips (#819)"
+        },
+        {
+          "expr": "netcdf_field_cache_bytes / clamp_min(netcdf_field_cache_capacity_bytes, 1)",
+          "refId": "J",
+          "legendFormat": "NetCDF decoded fields (#1067)"
         }
       ]
     },
@@ -3821,6 +3836,89 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 80,
+      "type": "timeseries",
+      "title": "NetCDF field-read memory admission",
+      "description": "Process-wide transient memory reserved by NetCDF field reads in progress: each cold field's read owner reserves 3 × its decoded chunk + 3 × its compressed chunk (~24 MB for a MEPS field); cache hits and readers waiting for that read reserve nothing. MC_NETCDF_READ_MEMORY_MB defaults to 1024 MiB. An admission estimate, not measured RSS; resident fields are the netcdf_field_cache family.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 254
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "netcdf_read_reserved_bytes",
+          "legendFormat": "Reserved estimate",
+          "refId": "A"
+        },
+        {
+          "expr": "netcdf_read_capacity_bytes",
+          "legendFormat": "Capacity",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 81,
+      "type": "timeseries",
+      "title": "NetCDF field-read admission rejections",
+      "description": "Field reads turned away with 503 because their transient peak did not fit what other reads held. Admission fails at once; it does not wait while holding a render slot.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 254
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(netcdf_read_rejected_total[$__rate_interval])",
+          "legendFormat": "Rejected reads/s",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
         }
       }
     }

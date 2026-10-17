@@ -277,6 +277,8 @@ pub struct CollectionConfig {
     pub bufr: Option<BufrConfig>,
     /// Geostationary satellite imagery (`engine_type = "satellite"`).
     pub satellite: Option<SatelliteConfig>,
+    /// CF-NetCDF gridded data (`engine_type = "netcdf"`).
+    pub netcdf: Option<NetcdfConfig>,
     /// Preview-SPA-specific tuning (e.g. bound the time slider). Optional.
     pub preview: Option<PreviewConfig>,
     /// Wind speed and direction derived from u/v component pairs (#897,
@@ -1704,6 +1706,132 @@ fn validate_satellite_composites(
                 return Err(Config(format!(
                     "{prefix} {label} channel: gamma must be finite and greater than 0, got {}",
                     channel.gamma
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// CF-NetCDF gridded data (`engine_type = "netcdf"`, #1067): one file family
+/// of a model or analysis, such as MEPS's per-lead surface files. Every file
+/// carries the collection's variables on one grid; a file's valid times come
+/// from its `time` variable and its model run from `forecast_reference_time`
+/// (files without one form a single timeline without runs). Unknown keys are
+/// a load error: a mistyped `variables` would serve every variable.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NetcdfConfig {
+    /// Local directory holding the files, read non-recursively.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub data_path: Option<String>,
+    /// The files' names, as a strftime template with `{run}` for the run
+    /// hour and `{lead}` for a two-digit lead, as MET Norway's
+    /// `meps_sfc_{lead}_%Y%m%dT{run}Z.nc` (`ds_storage::discovery`'s
+    /// vocabulary): a whole name must match. Default: every name ending in
+    /// `.nc`. Names a publisher writes before renaming a finished file
+    /// (`.name`, `*.tmp`, `*.part`) are always skipped. The name only
+    /// selects a file and orders the opening, newest first: its valid times
+    /// and run come from its own variables.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub filename_template: Option<String>,
+    /// Serve only these variables, in this order; the first is the default
+    /// layer. A file missing one is skipped. Default: every variable on the
+    /// first file's grid (MEPS sfc has 221).
+    #[serde(default)]
+    pub variables: Option<Vec<String>>,
+    /// Layer titles by variable name, in place of the file's `long_name`,
+    /// e.g. `{ precipitation_amount_acc = "Precipitation since run start" }`.
+    #[serde(default)]
+    pub titles: BTreeMap<String, String>,
+    /// Ensemble member read from files with an ensemble dimension
+    /// (`standard_name = "realization"`), by index.
+    #[serde(default)]
+    pub member: u32,
+    /// Model runs kept, newest first (each one a WMS `reference_time`
+    /// value).
+    #[serde(default = "default_netcdf_max_runs")]
+    pub max_runs: usize,
+    /// Most files kept open, over all runs: older runs, or without runs the
+    /// files of the oldest times, are dropped first.
+    #[serde(default = "default_netcdf_max_files")]
+    pub max_files: usize,
+    #[serde(default = "default_netcdf_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_netcdf_max_runs() -> usize {
+    4
+}
+
+fn default_netcdf_max_files() -> usize {
+    1024
+}
+
+fn default_netcdf_poll_interval_secs() -> u64 {
+    60
+}
+
+/// Hard-fail validation for a [`NetcdfConfig`]. The `filename_template` is
+/// parsed by engine-netcdf, through ds-storage's `FilenameMatcher`.
+pub fn validate_netcdf(id: &str, cfg: &NetcdfConfig) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    if cfg.data_path.as_deref().is_none_or(str::is_empty) {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf] needs a 'data_path' directory"
+        )));
+    }
+    if cfg.filename_template.as_deref() == Some("") {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf].filename_template must not be empty; omit it for '*.nc'"
+        )));
+    }
+    for (field, value) in [("max_runs", cfg.max_runs), ("max_files", cfg.max_files)] {
+        if value == 0 {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].{field} must be > 0"
+            )));
+        }
+    }
+    if cfg.poll_interval_secs == 0 {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf].poll_interval_secs must be > 0"
+        )));
+    }
+    if let Some(variables) = &cfg.variables {
+        if variables.is_empty() {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].variables must not be empty; omit it to serve \
+                 every variable"
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for name in variables {
+            if name.trim().is_empty() || name.trim() != name {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].variables entry '{name}' must be a variable \
+                     name without surrounding spaces"
+                )));
+            }
+            if !seen.insert(name.as_str()) {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].variables lists '{name}' twice"
+                )));
+            }
+        }
+    }
+    for (name, title) in &cfg.titles {
+        if title.trim().is_empty() {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].titles entry '{name}' must not be empty"
+            )));
+        }
+        if let Some(variables) = &cfg.variables {
+            if !variables.contains(name) {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].titles names '{name}', which is not in \
+                     [netcdf].variables"
                 )));
             }
         }
@@ -4191,6 +4319,22 @@ impl ServerConfig {
             }
             if let Some(satellite) = &collection.satellite {
                 validate_satellite(id, satellite)?;
+            }
+
+            // NetCDF engine requires its config section, and vice versa.
+            if collection.engine_type == "netcdf" && collection.netcdf.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'netcdf' requires a [collections.netcdf] config section"
+                )));
+            }
+            if collection.netcdf.is_some() && collection.engine_type != "netcdf" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.netcdf] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(netcdf) = &collection.netcdf {
+                validate_netcdf(id, netcdf)?;
             }
 
             // style_bundle: reference must resolve. Inline [wms] fields are
@@ -7740,5 +7884,103 @@ mod satellite_composite_tests {
             let message = config(composites).expect_err("unknown key").to_string();
             assert!(message.contains("unknown field"), "{message}");
         }
+    }
+}
+
+#[cfg(test)]
+mod netcdf_tests {
+    use super::{validate_netcdf, NetcdfConfig, ServerConfig};
+
+    fn netcdf(toml: &str) -> Result<NetcdfConfig, toml::de::Error> {
+        toml::from_str(toml)
+    }
+
+    fn error(toml: &str) -> String {
+        let cfg = netcdf(toml).expect("parses");
+        validate_netcdf("meps", &cfg)
+            .expect_err("invalid")
+            .to_string()
+    }
+
+    #[test]
+    fn defaults_and_a_full_table() {
+        let cfg = netcdf(r#"data_path = " testdata/meps-netcdf ""#).unwrap();
+        assert_eq!(cfg.data_path.as_deref(), Some("testdata/meps-netcdf"));
+        assert_eq!(
+            (
+                cfg.max_runs,
+                cfg.max_files,
+                cfg.poll_interval_secs,
+                cfg.member
+            ),
+            (4, 1024, 60, 0)
+        );
+        assert!(cfg.variables.is_none() && cfg.titles.is_empty());
+        validate_netcdf("meps", &cfg).unwrap();
+        let cfg = netcdf(
+            r#"
+            data_path = "/data/meps"
+            filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"
+            variables = ["air_temperature_2m", "precipitation_amount_acc"]
+            titles = { precipitation_amount_acc = "Precipitation since run start" }
+            member = 2
+            max_runs = 2
+            max_files = 200
+            poll_interval_secs = 30
+            "#,
+        )
+        .unwrap();
+        validate_netcdf("meps", &cfg).unwrap();
+    }
+
+    #[test]
+    fn mistakes_are_load_errors() {
+        // A mistyped key would otherwise serve every variable.
+        assert!(netcdf("data_path = \"d\"\nvariable = [\"t\"]").is_err());
+        assert!(error("max_runs = 4").contains("data_path"));
+        assert!(error("data_path = \"\"").contains("data_path"));
+        assert!(error("data_path = \"d\"\nfilename_template = \"\"").contains("filename_template"));
+        assert!(error("data_path = \"d\"\nmax_runs = 0").contains("max_runs"));
+        assert!(error("data_path = \"d\"\nmax_files = 0").contains("max_files"));
+        assert!(error("data_path = \"d\"\npoll_interval_secs = 0").contains("poll_interval"));
+        assert!(error("data_path = \"d\"\nvariables = []").contains("variables"));
+        assert!(error("data_path = \"d\"\nvariables = [\"t\", \"t\"]").contains("twice"));
+        assert!(error("data_path = \"d\"\nvariables = [\" t\"]").contains("spaces"));
+        let titled = "data_path = \"d\"\nvariables = [\"t\"]\ntitles = { p = \"P\" }";
+        assert!(error(titled).contains("not in"));
+        assert!(error("data_path = \"d\"\ntitles = { t = \" \" }").contains("empty"));
+    }
+
+    #[test]
+    fn the_engine_type_and_its_table_go_together() {
+        let config = |engine: &str, table: bool| {
+            let table = if table {
+                "[collections.netcdf]\ndata_path = \"testdata/meps-netcdf\""
+            } else {
+                ""
+            };
+            format!(
+                r#"
+                [server]
+                host = "127.0.0.1"
+                port = 8000
+
+                [[collections]]
+                id = "meps"
+                title = "MEPS"
+                description = "MEPS"
+                data_path = "testdata/weather.csv"
+                engine_type = "{engine}"
+                apis = ["wms"]
+                {table}
+                "#
+            )
+        };
+        let validate = |toml: &str| toml::from_str::<ServerConfig>(toml).unwrap().validate();
+        validate(&config("netcdf", true)).unwrap();
+        let error = validate(&config("netcdf", false)).unwrap_err().to_string();
+        assert!(error.contains("requires a [collections.netcdf]"), "{error}");
+        let error = validate(&config("csv", true)).unwrap_err().to_string();
+        assert!(error.contains("[collections.netcdf] is set"), "{error}");
     }
 }

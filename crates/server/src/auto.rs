@@ -395,6 +395,7 @@ fn mk_collection(
         nowcast: None,
         bufr: None,
         satellite: None,
+        netcdf: None,
         preview: None,
         derive_wind: None,
     }

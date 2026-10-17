@@ -163,6 +163,7 @@ fn collection(id: &str) -> CollectionConfig {
         nowcast: None,
         bufr: None,
         satellite: None,
+        netcdf: None,
         preview: None,
         derive_wind: None,
     }

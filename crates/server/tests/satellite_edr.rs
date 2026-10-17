@@ -97,6 +97,7 @@ fn router(engine: Arc<SatelliteEngine>, dir: &Path) -> axum::Router {
         nowcast: None,
         bufr: None,
         satellite: Some(satellite_config(dir)),
+        netcdf: None,
         preview: None,
         derive_wind: None,
     };

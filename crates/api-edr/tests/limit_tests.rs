@@ -253,6 +253,7 @@ fn app(per_point: usize) -> App {
         nowcast: None,
         bufr: None,
         satellite: None,
+        netcdf: None,
         preview: None,
         derive_wind: None,
     };

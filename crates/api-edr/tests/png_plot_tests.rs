@@ -175,6 +175,7 @@ fn router_with(engine: Arc<dyn EdrEngine>) -> axum::Router {
             nowcast: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
             derive_wind: None,
         },

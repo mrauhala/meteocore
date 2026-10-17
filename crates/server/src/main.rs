@@ -555,6 +555,12 @@ async fn main() {
             poller.poll_loop().await;
         });
     }
+    for engine in &result.netcdf_engines {
+        let poller = engine.clone();
+        poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
     for engine in &result.odim_engines {
         let poller = engine.clone();
         poll_runtime().spawn(async move {
@@ -726,6 +732,8 @@ async fn main() {
         grib_engines: RwLock::new(result.grib_engines),
         zarr_engines: RwLock::new(result.zarr_engines),
         satellite_engines: RwLock::new(result.satellite_engines),
+        netcdf_engines: RwLock::new(result.netcdf_engines),
+        netcdf_parameters: RwLock::new(result.netcdf_parameters),
         odim_engines: RwLock::new(result.odim_engines),
         odim_volume_engines: RwLock::new(result.odim_volume_engines),
         cap_engines: RwLock::new(result.cap_engines),
@@ -931,6 +939,13 @@ async fn main() {
         .read()
         .unwrap_or_else(|e| e.into_inner());
     for engine in satellite.iter() {
+        engine.shutdown();
+    }
+    let netcdf = server_state
+        .netcdf_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    for engine in netcdf.iter() {
         engine.shutdown();
     }
     let odim = server_state

@@ -1495,6 +1495,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-netcdf"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "chrono",
+ "ds-cache",
+ "ds-core",
+ "ds-executor",
+ "ds-poll",
+ "ds-storage",
+ "hdf5-reader",
+ "netcdf-reader",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "engine-nowcast"
 version = "0.1.0"
 dependencies = [
@@ -4736,6 +4755,7 @@ dependencies = [
  "engine-geojson",
  "engine-geotiff",
  "engine-grib",
+ "engine-netcdf",
  "engine-nowcast",
  "engine-odim",
  "engine-postgis",
