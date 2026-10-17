@@ -114,7 +114,7 @@ of cases, takes its first value: `LAYERS=a&layers=b` requests layer `a`.
 | `SERVICE` | yes | Must be `WMS` |
 | `VERSION` | no | Must be `1.3.0`, the default when omitted. Deliberate: ets-wms13's `getmap:no-version` expects an exception |
 | `REQUEST` | yes | `GetMap` |
-| `LAYERS` | yes | Layer name (= collection ID). Only one layer per request (`LayerLimit` 1): a list naming a layer or style the server does not serve answers `LayerNotDefined` / `StyleNotDefined`, a list of served layers `InvalidParameterValue` |
+| `LAYERS` | yes | Layer name: a collection ID, or `collection/parameter` for one parameter of a multi-parameter collection. A multi-parameter collection's own layer is not advertised, but `LAYERS=collection` is accepted and draws its default parameter with that parameter's style: the image and legend `collection/<default parameter>` gives. Only one layer per request (`LayerLimit` 1): a list naming a layer or style the server does not serve answers `LayerNotDefined` / `StyleNotDefined`, a list of served layers `InvalidParameterValue` |
 | `CRS` | yes | Coordinate reference system (see below) |
 | `BBOX` | yes | Bounding box (axis order depends on CRS) |
 | `WIDTH` | yes | Output image width in pixels (1–8000) |

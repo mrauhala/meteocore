@@ -1673,7 +1673,7 @@ A layer name is either:
 - `{collection-id}/{parameter}` — for multi-parameter engines (GRIB, multi-param QueryData)
 - `{collection-id}/{composite}` — an RGB composite of a satellite collection (see [RGB composites](#rgb-composites))
 
-For multi-parameter engines, GetCapabilities emits a non-requestable parent layer (no `<Name>`) wrapping one child layer per parameter, then one per RGB composite. A composite's child layer carries its own `time` dimension, the scans every band it reads has, an `<Abstract>` naming what each channel reads, and a single `default` style whose LegendURL is the channel list. `LAYERS=ecmwf-ifs/2t` requests the `2t` parameter; `LAYERS=ecmwf-ifs` returns `LayerNotDefined` because the parent is not directly requestable. A parameter that the engine doesn't advertise also returns `LayerNotDefined` (rather than silently falling back to the default), so callers can't cache a wrong-parameter image under a typo.
+For multi-parameter engines, GetCapabilities emits a parent layer with no `<Name>` wrapping one child layer per parameter, then one per RGB composite. A composite's child layer carries its own `time` dimension, the scans every band it reads has, an `<Abstract>` naming what each channel reads, and a single `default` style whose LegendURL is the channel list. `LAYERS=ecmwf-ifs/2t` requests the `2t` parameter. The parent is not advertised, but `LAYERS=ecmwf-ifs` is accepted: it draws the default parameter with that parameter's own style, the image and legend `ecmwf-ifs/<default parameter>` gives (#1133). A parameter that the engine doesn't advertise returns `LayerNotDefined` (rather than silently falling back to the default), so callers can't cache a wrong-parameter image under a typo.
 
 ### GetMap Parameters
 
@@ -1713,7 +1713,7 @@ Internally the handler normalizes everything to WGS84 `[west, south, east, north
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `LAYER` (or `LAYERS`) | yes | — | Collection ID (`{id}/{param}` is accepted but the legend depends only on the collection's styles) |
+| `LAYER` (or `LAYERS`) | yes | — | A layer name, `{id}` or `{id}/{param}`. The legend resolves its style as GetMap does: a `{id}/{param}` layer uses that parameter's style, and the `{id}` of a multi-parameter collection its default parameter's |
 | `STYLES` | no | `default` | Style name. Note: only the plural form works on this endpoint, unlike GetMap which accepts both. Tracked in #165. |
 | `WIDTH` | no | `40` | Pixels, capped at 256 |
 | `HEIGHT` | no | `200` | Pixels, capped at 1024 |
@@ -1822,7 +1822,10 @@ over the collection-level colormap for those parameters; opt out per
 collection with
 `[wms] parameter_defaults = false`, or add/override rules globally with
 top-level `[[parameter_defaults]]` blocks (`names`/`contains`, `colormap`,
-`min`/`max` or `[[parameter_defaults.unit_ranges]]`).
+`min`/`max` or `[[parameter_defaults.unit_ranges]]`). A request naming no
+parameter, a WMS `LAYERS=<collection>` or a Maps or Tiles request without
+`parameter-name`, draws the default parameter with that parameter's style
+too (#1133).
 
 For multi-parameter rasters, defaults and legend labels use each selected
 parameter's own unit: GRIB display units, Zarr and NetCDF CF units as the
@@ -1960,7 +1963,7 @@ REST-based map image API. Maps shares the `MapEngine` trait, render semaphore, r
 | `datetime` | no | latest | An RFC 3339 instant, snapped to an available time step, or an interval (`a/b`, `../b`, `a/..`), rendering the latest time step inside it; an interval holding none is a 404. Not with `subset=time(…)` (400). |
 | `elevation` | no | the engine's default level | One vertical level as a number: a radar elevation angle in degrees, or a pressure or model level. Each engine sets its default and how a level is matched. On a collection with no vertical dimension, or not a finite number: 400. |
 | `f` | no | `image/png` | `image/png`, `image/jpeg`, or `image/webp` |
-| `parameter-name` | no | engine default | Selects a parameter on multi-parameter raster engines (GRIB, multi-param QueryData), or an RGB composite of a satellite collection, which renders with the `default` style only (another style is 404). The valid names are the keys of the collection's `parameter_names`. Single-parameter engines ignore the value. Unknown names against a multi-parameter engine return 400. Non-OGC for OGC API - Maps today, but the `/preview` SPA dropdown depends on it. |
+| `parameter-name` | no | engine default | Selects a parameter on multi-parameter raster engines (GRIB, multi-param QueryData), or an RGB composite of a satellite collection, which renders with the `default` style only (another style is 404). The valid names are the keys of the collection's `parameter_names`. Without it, a multi-parameter collection's default parameter is drawn with that parameter's own style, so the map and the style legend are the ones naming it gives. Single-parameter engines ignore the value. Unknown names against a multi-parameter engine return 400. Non-OGC for OGC API - Maps today, but the `/preview` SPA dropdown depends on it. |
 | `transparent` | no | — | Accepted but currently a no-op |
 | `quality` | no | see description | MeteoCore extension: encoder quality, an integer from 1 to 100, for `image/webp` and `image/jpeg`. WebP 1–99 is lossy, 100 lossless; without it WebP uses the collection's `[wms] webp_quality`, else lossless. JPEG defaults to 85. With `image/png`, or out of range: 400. |
 

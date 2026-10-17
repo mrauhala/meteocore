@@ -232,15 +232,18 @@ pub(crate) fn cache_control_value(pinned_time: bool, content_version: u64) -> &'
 /// pixels are painted, and the metadata snapshot validation reads.
 struct MapLayer {
     collection_id: String,
-    /// The `/param` segment of a `collection/param` layer name.
-    layer_parameter: Option<String>,
+    /// The style layer the style resolved on ([`ds_render::LayerStyle`]):
+    /// `collection/param`, or `collection`; for a composite, its layer.
+    style_layer: String,
     engine: Arc<dyn MapEngine>,
     paint: Paint,
     /// The resolved style's name: `STYLES=` and `STYLES=default` resolve to
     /// the same one.
     style_name: String,
-    /// The parameter the style is configured for, if any.
-    style_parameter: Option<String>,
+    /// The parameter drawn: the `/param` of `LAYERS=collection/param`, else
+    /// the style's, else the default parameter whose style layer the root
+    /// layer's style came from (#1133); for a composite, its name.
+    parameter: Option<String>,
     info: Arc<ds_core::map_engine::RasterInfo>,
 }
 
@@ -266,9 +269,17 @@ fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLa
     // come from its channels, and its one style is `default`.
     let composite = composite_layer(engine.as_ref(), layer);
 
-    // Look up style: try full layer name first (e.g., "ecmwf-kenya/2t" for
-    // per-parameter defaults), then fall back to collection ID
-    let (paint, style_name, style_parameter) = match &composite {
+    // Share one metadata snapshot across style resolution and parameter,
+    // ELEVATION and reference_time validation.
+    let info = engine.raster_info_shared();
+
+    // Look up style, through the resolution Maps and Tiles share: a
+    // "collection/param" layer (e.g. "ecmwf-kenya/2t") styles from that
+    // parameter's own style layer, else the collection's. The root layer
+    // "collection" of a multi-parameter collection draws the default
+    // parameter with that parameter's style layer when it has one (#1133),
+    // as `collection/<default>` does.
+    let (style_layer, paint, style_name, parameter) = match &composite {
         Some(spec) => {
             if style != ds_render::COMPOSITE_STYLE {
                 return Err(WmsError::StyleNotDefined(format!(
@@ -277,35 +288,37 @@ fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLa
                 )));
             }
             (
+                layer.to_string(),
                 Paint::Composite(spec.clone()),
                 ds_render::COMPOSITE_STYLE.to_string(),
-                None,
+                layer_parameter.clone(),
             )
         }
         None => {
-            let layer_styles = state
-                .styles
-                .get(layer)
-                .or_else(|| state.styles.get(&collection_id))
-                .ok_or_else(|| WmsError::layer_not_found(layer))?;
-
-            let style_info = layer_styles.get(style).ok_or_else(|| {
-                WmsError::StyleNotDefined(format!(
-                    "Style '{style}' not defined for layer '{layer}'. Available: {}",
-                    layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
-                ))
+            let resolved = ds_render::resolve_layer_style(
+                &state.styles,
+                &collection_id,
+                layer_parameter.as_deref(),
+                Some(&info),
+                style,
+            )
+            .map_err(|error| match error {
+                ds_render::LayerStyleError::UnknownLayer => WmsError::layer_not_found(layer),
+                ds_render::LayerStyleError::UnknownStyle(offered) => {
+                    WmsError::StyleNotDefined(format!(
+                        "Style '{style}' not defined for layer '{layer}'. Available: {}",
+                        offered.keys().cloned().collect::<Vec<_>>().join(", ")
+                    ))
+                }
             })?;
             (
-                Paint::Colormap(style_info.colormap.clone()),
-                style_info.name.clone(),
-                style_info.parameter.clone(),
+                resolved.layer.to_string(),
+                Paint::Colormap(resolved.style.colormap.clone()),
+                resolved.style.name.clone(),
+                resolved.parameter.map(str::to_string),
             )
         }
     };
-
-    // Share one metadata snapshot across parameter, ELEVATION and
-    // reference_time validation.
-    let info = engine.raster_info_shared();
 
     // Validate `LAYERS=collection/parameter` against the engine's
     // advertised list (mirroring Maps + Tiles). Without this, an
@@ -335,11 +348,11 @@ fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLa
 
     Ok(MapLayer {
         collection_id,
-        layer_parameter,
+        style_layer,
         engine,
         paint,
         style_name,
-        style_parameter,
+        parameter,
         info,
     })
 }
@@ -353,11 +366,18 @@ pub(crate) struct ResolvedMap {
     pub collection_id: String,
     pub engine: Arc<dyn MapEngine>,
     pub paint: Paint,
+    /// The style layer the style resolved on: `collection/param` or
+    /// `collection`, for a composite its layer. With `style_name` it names
+    /// the colormap, so the rendered and meta-tile caches key on it: the
+    /// root layer drawing its default parameter keys as
+    /// `collection/<default>` does (#1133).
+    pub style_layer: String,
     /// The resolved style's name.
     pub style_name: String,
     pub info: Arc<ds_core::map_engine::RasterInfo>,
     /// The parameter drawn: the `/param` of `LAYERS=collection/param`, else
-    /// the style's; for a composite, the composite's name.
+    /// the style's, else on the root layer the default parameter whose style
+    /// it draws with (#1133); for a composite, the composite's name.
     pub parameter: Option<String>,
     /// The timestep drawn: `TIME`, or the layer's default, snapped by the
     /// engine (#507). `None` when the engine has nothing to draw.
@@ -377,11 +397,11 @@ pub(crate) fn resolve_map(
 ) -> Result<ResolvedMap, WmsError> {
     let MapLayer {
         collection_id,
-        layer_parameter,
+        style_layer,
         engine,
         paint,
         style_name,
-        style_parameter,
+        parameter,
         info,
     } = resolve_map_layer(state, &params.layer, &params.style)?;
 
@@ -430,11 +450,11 @@ pub(crate) fn resolve_map(
         }
     }
 
-    // WMS picks the parameter via `LAYERS=collection/param` (parsed
-    // into layer_parameter) and then `style_info.parameter`. Settle it
+    // WMS picks the parameter via `LAYERS=collection/param`, then
+    // `style_info.parameter`, then on the root layer the default parameter
+    // whose style layer it draws with (`resolve_map_layer`). It is settled
     // first: a parameter can have its own time axis, and so can a
     // composite, whose name the engine resolves like a parameter's.
-    let parameter = layer_parameter.or(style_parameter);
 
     // Engine-owned default first (CAP: active now), then the
     // parameter's (else the collection's) latest time. Resolve before
@@ -494,6 +514,7 @@ pub(crate) fn resolve_map(
         collection_id,
         engine,
         paint,
+        style_layer,
         style_name,
         info,
         parameter,
@@ -540,6 +561,7 @@ pub async fn wms_handler(
                 collection_id,
                 engine,
                 paint,
+                style_layer,
                 style_name,
                 info: _,
                 parameter,
@@ -565,8 +587,12 @@ pub async fn wms_handler(
 
             // Build cache key
             let cache_key = CacheKey {
-                layer: params.layer.clone(),
-                style: params.style.clone(),
+                // The RESOLVED style layer and style, which name the
+                // colormap: the root layer drawing its default parameter
+                // with that parameter's style keys as `collection/<default>`
+                // does, so the two share entries (#1133).
+                layer: style_layer.clone(),
+                style: style_name.clone(),
                 // Quality included; the meta-tile key below needs none, its
                 // tiles are RGBA encoded per request.
                 format,
@@ -688,10 +714,12 @@ pub async fn wms_handler(
             // `Copy`; it flows into both the direct and meta-tile render
             // closures below.
             let z_q = elevation.map(ds_render::quantize_z);
-            let layer = params.layer.clone();
-            // Key meta-tiles on the *resolved* style name, not the raw STYLES
-            // param: `STYLES=` (empty → default) and `STYLES=default` resolve to
-            // the same StyleInfo, so they must share cached tiles.
+            // Key meta-tiles on the *resolved* style layer and style name,
+            // not the raw LAYERS and STYLES: `STYLES=` (empty → default) and
+            // `STYLES=default` resolve to the same StyleInfo, and so do the
+            // root layer and `collection/<default>` (#1133), so they must
+            // share cached tiles.
+            let layer = style_layer;
             let style = style_name;
             let rendered_cache = state.rendered_cache.clone();
             let tile_cache = state.tile_cache.clone();
@@ -1101,25 +1129,37 @@ pub async fn wms_handler(
             }
 
             // Support "collection/parameter" layer names for legend. Resolve
-            // the FULL layer key first, exactly as GetMap does: a
-            // "{collection}/{param}" layer carries its own style map (the
+            // the style exactly as GetMap does (`ds_render::resolve_layer_style`):
+            // a "{collection}/{param}" layer carries its own style map (the
             // parameter's colormap from `[[wms.parameters]]`, a bundle
-            // parameter entry, or a built-in default), and the collection map
-            // only has the collection default. Falling straight through to the
-            // collection made the legend describe a different palette than the
-            // GetMap of the same LAYER rendered.
-            let legend_collection_id = layer_name.split('/').next().unwrap_or(layer_name);
-            let layer_styles = state
-                .styles
-                .get(layer_name)
-                .or_else(|| state.styles.get(legend_collection_id))
-                .ok_or_else(|| WmsError::layer_not_found(layer_name))?;
-
-            let style_info = layer_styles.get(style_name).ok_or_else(|| {
-                WmsError::StyleNotDefined(format!(
+            // parameter entry, or a built-in default), and a multi-parameter
+            // collection's root layer draws its default parameter from that
+            // parameter's map (#1133).
+            // Falling straight through to the collection made the legend
+            // describe a different palette than the GetMap of the same LAYER
+            // rendered.
+            let (legend_collection_id, layer_parameter) = match layer_name.split_once('/') {
+                Some((collection_id, parameter)) => (collection_id, Some(parameter)),
+                None => (layer_name, None),
+            };
+            let info = state
+                .engines
+                .get(legend_collection_id)
+                .map(|e| e.raster_info_shared());
+            let resolved = ds_render::resolve_layer_style(
+                &state.styles,
+                legend_collection_id,
+                layer_parameter,
+                info.as_deref(),
+                style_name,
+            )
+            .map_err(|error| match error {
+                ds_render::LayerStyleError::UnknownLayer => WmsError::layer_not_found(layer_name),
+                ds_render::LayerStyleError::UnknownStyle(_) => WmsError::StyleNotDefined(format!(
                     "Style '{style_name}' not defined for layer '{layer_name}'"
-                ))
+                )),
             })?;
+            let style_info = resolved.style;
 
             let format = crate::params::parse_legend_format(query.format.as_deref())?;
 
@@ -1130,20 +1170,11 @@ pub async fn wms_handler(
             // after selecting the parameter.
             // Both feed the rendered legend's title and the JSON legend, so the
             // two representations describe the same thing.
-            let info = state
-                .engines
-                .get(legend_collection_id)
-                .map(|e| e.raster_info_shared());
-            let param = layer_name
-                .split('/')
-                .nth(1)
-                .map(str::to_string)
-                .or_else(|| style_info.parameter.clone())
-                .or_else(|| {
-                    info.as_ref()
-                        .map(|i| i.parameter.clone())
-                        .filter(|p| !p.is_empty())
-                });
+            let param = resolved.parameter.map(str::to_string).or_else(|| {
+                info.as_ref()
+                    .map(|i| i.parameter.clone())
+                    .filter(|p| !p.is_empty())
+            });
             let unit = info
                 .as_ref()
                 .and_then(|i| i.parameter_unit(param.as_deref()))

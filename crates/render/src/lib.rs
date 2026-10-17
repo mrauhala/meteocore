@@ -5,6 +5,7 @@ mod encode;
 /// 5×7 bitmap font for in-image text (legend labels). Crate-internal — an
 /// implementation detail of the legend renderer, not part of the public API.
 pub(crate) mod font;
+mod layer_style;
 pub mod metatile;
 pub mod palette;
 pub mod palette_formats;
@@ -22,6 +23,7 @@ pub use composite::{
     COMPOSITE_STYLE,
 };
 pub use encode::{encode_jpeg, encode_png, encode_webp, flatten_onto};
+pub use layer_style::{resolve_layer_style, LayerStyle, LayerStyleError};
 pub use metatile::{
     render_metatiled, render_metatiled_composite, MetaTile, MetaTileStats, TileKeyPrefix,
     TilePixelCache,

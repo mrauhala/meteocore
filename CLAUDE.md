@@ -791,6 +791,18 @@ one never implies the other.
   `MapEngine`s (engine-cap today) may depend on ds-render for it — an
   approved exception; engines still return `RasterTile` domain types and
   colorization stays in the API layer.
+- **`ds_render::resolve_layer_style`** — the one style lookup for WMS GetMap
+  and GetLegendGraphic, and the Maps and Tiles map, tile and legend routes
+  (#1133). A named parameter styles from `"{collection}/{param}"`, else the
+  collection; on a multi-parameter collection (`RasterInfo.parameters`
+  longer than one) a request naming none draws the engine's default
+  parameter with its own layer's style, so `LAYERS=coll` and Maps/Tiles
+  without `parameter-name` match `coll/<default>`. A single-parameter
+  collection keeps its collection style, the one WMS advertises for its
+  one layer. The rendered and meta-tile caches key on the `LayerStyle` it
+  returns (layer, style, parameter), never the raw request. Never resolve
+  the style a map, tile or legend is drawn with by hand; the capability
+  and collection-metadata style listings read the style maps directly.
 - **`ds_core::wind`** — wind speed and direction derived from u/v
   components (#897), the one home for the formulas (`hypot(u, v)`; the
   direction the wind blows **from**, `atan2(-u, -v)`, calm → null), the frame
