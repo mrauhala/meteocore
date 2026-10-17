@@ -35,6 +35,11 @@ runtime).
   stored corners have only six significant digits, so corner anchoring lands
   within ~5 m of the file's world rect — pinned in `parse_meps_lcc`. The
   stereographic record carries no radius line and still projects on WGS84.
+- The shared map sampler `ds_core::resample::SourceGrid` (#1067) is this
+  engine's projected render path, pinned value for value on the MEPS
+  fixture (`engine/sampler_tests.rs`). A change to the map sampling here
+  (`world_to_grid_px`, `sample_grid_bilinear`) breaks that test: change
+  both, or move this engine onto the shared sampler.
 - EDR position queries and map rendering use bilinear interpolation. EDR area (and radius via the shared default) returns a
   CRS84 `Grid` over the polygon bbox at native resolution (≤ 256 cells per
   axis, 1M-value budget across time × cells × parameters), every cell
