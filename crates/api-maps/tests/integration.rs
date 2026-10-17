@@ -4591,12 +4591,11 @@ mod part1 {
         }
     }
 
-    /// The map routes on every surface that serves them: the per-API
-    /// service and the shared OGC API root (#789), composed by
+    /// Every surface that serves the Maps routes: the per-API service and
+    /// the shared OGC API root (#789), composed by
     /// `api_common::shared::router` as the server composes it, whose Maps
-    /// block reuses the same handlers; each with the collection and a
-    /// styled map.
-    fn map_surfaces(engine: Arc<Recorder>) -> Vec<(axum::Router, &'static str)> {
+    /// block reuses the same handlers.
+    fn surfaces(engine: Arc<Recorder>) -> [axum::Router; 2] {
         let state = build_state_with_engine_and_wms(engine, None);
         let per_api = api_maps::router(state.clone());
         let shared = api_common::shared::router(api_common::shared::SharedApi::new(
@@ -4604,8 +4603,14 @@ mod part1 {
             vec![Arc::new(api_maps::MapsBlock::new(state))],
             vec![],
         ));
+        [per_api, shared]
+    }
+
+    /// The map routes on every [`surfaces`] entry, each with the collection
+    /// and a styled map.
+    fn map_surfaces(engine: Arc<Recorder>) -> Vec<(axum::Router, &'static str)> {
         let mut surfaces = Vec::new();
-        for app in [per_api, shared] {
+        for app in self::surfaces(engine) {
             for path in [
                 "/collections/radar/map",
                 "/collections/radar/styles/default/map",
@@ -4643,6 +4648,81 @@ mod part1 {
                     "{uri}"
                 );
             }
+        }
+        assert!(engine.renders().is_empty());
+    }
+
+    const LEGEND: &str = "/collections/radar/styles/default/legend";
+
+    /// The legend takes `f` and `parameter-name`; any other parameter is
+    /// the map routes' 400 naming those two, never silently ignored
+    /// (#1073), on the per-API service and the shared root alike.
+    #[tokio::test]
+    async fn legend_unknown_parameters_are_400_naming_the_accepted_ones() {
+        for app in surfaces(radar()) {
+            for (query, name) in [
+                ("width=100", "width"),
+                ("f=png&parameter_name=t", "parameter_name"),
+                ("_=1700000000000", "_"),
+                ("F=png", "F"),
+            ] {
+                let uri = format!("{LEGEND}?{query}");
+                let (status, json) = get_on(app.clone(), &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+                assert_eq!(json["code"], "BadRequest", "{uri}");
+                assert_eq!(
+                    json["description"],
+                    format!("Unknown query parameter '{name}'. Supported: f, parameter-name"),
+                    "{uri}"
+                );
+            }
+            for query in [
+                "",
+                "f=json",
+                "f=png",
+                "parameter-name=reflectivity&f=image/png",
+            ] {
+                let uri = format!("{LEGEND}?{query}");
+                let (status, _, body) = fetch(&app, &uri).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{uri}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        }
+    }
+
+    /// A parameter given twice fails the query extractor before the handler
+    /// runs. It is the JSON 400 every other bad parameter gets, not axum's
+    /// plain text (#1073), on the map and legend routes of every surface.
+    #[tokio::test]
+    async fn repeated_parameters_are_the_json_400() {
+        let engine = radar();
+        let mut requests: Vec<(axum::Router, String, &str)> = map_surfaces(engine.clone())
+            .into_iter()
+            .map(|(app, path)| (app, format!("{path}?width=8&height=8&width=16"), "width"))
+            .collect();
+        for app in surfaces(engine.clone()) {
+            requests.push((app, format!("{LEGEND}?f=png&f=json"), "f"));
+        }
+        for (app, uri, name) in requests {
+            let (status, headers, body) = fetch(&app, &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                header(&headers, "content-type"),
+                Some("application/json"),
+                "{uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["code"], "BadRequest", "{uri}");
+            let description = json["description"].as_str().unwrap();
+            assert!(
+                description.contains(&format!("duplicate field `{name}`")),
+                "{uri}: {description}"
+            );
         }
         assert!(engine.renders().is_empty());
     }
@@ -4685,15 +4765,25 @@ mod part1 {
         }
     }
 
-    /// The parameters each map operation documents are exactly the ones
-    /// the routes accept.
+    /// The parameters each map and legend operation documents are exactly
+    /// the ones the routes accept.
     #[tokio::test]
     async fn openapi_documents_exactly_the_accepted_parameters() {
         let (status, doc) = get("/api").await;
         assert_eq!(status, StatusCode::OK);
-        for path in [
-            "/maps/collections/radar/map",
-            "/maps/collections/radar/styles/{styleId}/map",
+        for (path, accepted) in [
+            (
+                "/maps/collections/radar/map",
+                api_maps::params::MAP_PARAMETERS,
+            ),
+            (
+                "/maps/collections/radar/styles/{styleId}/map",
+                api_maps::params::MAP_PARAMETERS,
+            ),
+            (
+                "/maps/collections/radar/styles/{styleId}/legend",
+                api_maps::params::LEGEND_PARAMETERS,
+            ),
         ] {
             let query: Vec<&str> = doc["paths"][path]["get"]["parameters"]
                 .as_array()
@@ -4709,7 +4799,7 @@ mod part1 {
                 .filter(|parameter| parameter["in"] == "query")
                 .map(|parameter| parameter["name"].as_str().unwrap())
                 .collect();
-            assert_eq!(query, api_maps::params::MAP_PARAMETERS, "{path}");
+            assert_eq!(query, accepted, "{path}");
         }
     }
 }

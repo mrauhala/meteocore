@@ -9,6 +9,7 @@ pub mod workbench;
 
 use std::sync::Arc;
 
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{FromRequestParts, Query};
 use axum::http::{header, request::Parts, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -166,6 +167,27 @@ impl<S: Send + Sync> FromRequestParts<S> for CollectionRequest {
             search,
             wanted,
         })
+    }
+}
+
+/// axum's [`Query`] whose rejection is the JSON 400 every other invalid
+/// parameter gets, not axum's plain-text one. A struct-shaped query fails
+/// before the handler runs on a parameter given twice (`width=1&width=2`);
+/// the description is axum's, which names it (#1073).
+pub struct JsonQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for JsonQuery<T>
+where
+    Query<T>: FromRequestParts<S, Rejection = QueryRejection>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(Self(value)),
+            Err(rejection) => Err(bad_request(&rejection.body_text())),
+        }
     }
 }
 
@@ -750,6 +772,57 @@ mod tests {
             .get::<ErrorReason>()
             .expect("5xx must also attach ErrorReason");
         assert_eq!(reason.0, "ServerError: Internal server error");
+    }
+
+    /// The output of an extractor future that is ready at once, as
+    /// [`JsonQuery`]'s is: it does no I/O.
+    fn ready<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let waker = std::task::Waker::noop();
+        match future
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(waker))
+        {
+            std::task::Poll::Ready(output) => output,
+            std::task::Poll::Pending => panic!("the extractor did not complete"),
+        }
+    }
+
+    /// A query the target type cannot hold is the JSON 400 with axum's
+    /// description, not axum's plain text (#1073).
+    #[test]
+    fn json_query_rejection_is_the_json_400() {
+        type Values = std::collections::BTreeMap<String, u32>;
+        let extract = |uri: &str| {
+            let (mut parts, ()) = axum::http::Request::builder()
+                .uri(uri)
+                .body(())
+                .unwrap()
+                .into_parts();
+            ready(JsonQuery::<Values>::from_request_parts(&mut parts, &())).map_err(Box::new)
+        };
+
+        let Ok(JsonQuery(values)) = extract("/?width=8") else {
+            panic!("a well-formed query is extracted")
+        };
+        assert_eq!(values["width"], 8);
+
+        let Err(response) = extract("/?width=eight") else {
+            panic!("a malformed query is rejected")
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let reason = response
+            .extensions()
+            .get::<ErrorReason>()
+            .expect("attached");
+        assert!(
+            reason
+                .0
+                .starts_with("BadRequest: Failed to deserialize query string: "),
+            "{}",
+            reason.0
+        );
     }
 
     #[test]

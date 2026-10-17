@@ -105,9 +105,8 @@ pub fn reject_unknown_parameters(
     accepted: &[&str],
 ) -> Result<(), TilesError> {
     match subset::unknown_parameter(raw_query, accepted) {
-        Some(name) => Err(TilesError::BadRequest(format!(
-            "Unknown query parameter '{name}'. Supported: {}",
-            accepted.join(", ")
+        Some(name) => Err(TilesError::BadRequest(subset::unknown_parameter_message(
+            &name, accepted,
         ))),
         None => Ok(()),
     }
@@ -134,6 +133,11 @@ pub struct LegendQueryParams {
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
 }
+
+/// Every query parameter the legend route accepts: the
+/// [`LegendQueryParams`] fields, in the order its OpenAPI operation lists
+/// them. Anything else is the tile routes' 400 (#1073).
+pub const LEGEND_PARAMETERS: &[&str] = &["f", "parameter-name"];
 
 /// Representation a legend request asked for.
 pub enum LegendFormat {
@@ -314,9 +318,9 @@ impl TileQueryParams {
             return Err(if MAP_TILE_PARAMETERS.contains(&name.as_str()) {
                 bad(format!("'{name}' is not supported for vector tiles"))
             } else {
-                bad(format!(
-                    "Unknown query parameter '{name}'. Supported: {}",
-                    VECTOR_TILE_PARAMETERS.join(", ")
+                bad(subset::unknown_parameter_message(
+                    &name,
+                    VECTOR_TILE_PARAMETERS,
                 ))
             });
         }
@@ -634,5 +638,29 @@ mod tests {
             panic!("expected BadRequest")
         };
         assert!(msg.starts_with("Unknown query parameter 'bbox'. Supported: f, datetime, subset"));
+    }
+
+    /// `LEGEND_PARAMETERS` is exactly the `LegendQueryParams` fields: the
+    /// exhaustive destructuring stops a new field compiling until it is
+    /// listed, so the list cannot drift from what the handler reads.
+    #[test]
+    fn legend_parameters_are_the_query_fields() {
+        let query: Vec<String> = LEGEND_PARAMETERS
+            .iter()
+            .map(|name| format!("{name}=x"))
+            .collect();
+        let uri: axum::http::Uri = format!("/legend?{}", query.join("&")).parse().unwrap();
+        let axum::extract::Query(params) =
+            axum::extract::Query::<LegendQueryParams>::try_from_uri(&uri).unwrap();
+        let LegendQueryParams {
+            format,
+            parameter_name,
+        } = params;
+        let fields = [format, parameter_name];
+        assert!(
+            fields.iter().all(|f| f.as_deref() == Some("x")),
+            "{fields:?}"
+        );
+        assert_eq!(fields.len(), LEGEND_PARAMETERS.len());
     }
 }

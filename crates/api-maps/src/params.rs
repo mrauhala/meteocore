@@ -140,10 +140,7 @@ pub fn reject_unknown_parameters(
     accepted: &[&str],
 ) -> Result<(), MapsError> {
     match subset::unknown_parameter(raw_query, accepted) {
-        Some(name) => Err(bad(format!(
-            "Unknown query parameter '{name}'. Supported: {}",
-            accepted.join(", ")
-        ))),
+        Some(name) => Err(bad(subset::unknown_parameter_message(&name, accepted))),
         None => Ok(()),
     }
 }
@@ -159,6 +156,11 @@ pub struct LegendQueryParams {
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
 }
+
+/// Every query parameter the legend route accepts: the
+/// [`LegendQueryParams`] fields, in the order its OpenAPI operation lists
+/// them. Anything else is the map routes' 400 (#1073).
+pub const LEGEND_PARAMETERS: &[&str] = &["f", "parameter-name"];
 
 /// Representation a legend request asked for.
 pub enum LegendFormat {
@@ -896,6 +898,30 @@ mod tests {
         );
         assert_eq!(fields.len(), MAP_PARAMETERS.len() - 1);
         assert!(MAP_PARAMETERS.contains(&"subset"));
+    }
+
+    /// `LEGEND_PARAMETERS` is exactly the `LegendQueryParams` fields, held
+    /// to them as [`map_parameters_are_the_query_fields_and_subset`] holds
+    /// the map routes'.
+    #[test]
+    fn legend_parameters_are_the_query_fields() {
+        let query: Vec<String> = LEGEND_PARAMETERS
+            .iter()
+            .map(|name| format!("{name}=x"))
+            .collect();
+        let uri: axum::http::Uri = format!("/legend?{}", query.join("&")).parse().unwrap();
+        let axum::extract::Query(params) =
+            axum::extract::Query::<LegendQueryParams>::try_from_uri(&uri).unwrap();
+        let LegendQueryParams {
+            format,
+            parameter_name,
+        } = params;
+        let fields = [format, parameter_name];
+        assert!(
+            fields.iter().all(|f| f.as_deref() == Some("x")),
+            "{fields:?}"
+        );
+        assert_eq!(fields.len(), LEGEND_PARAMETERS.len());
     }
 
     #[test]

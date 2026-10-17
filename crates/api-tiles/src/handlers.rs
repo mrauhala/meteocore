@@ -12,7 +12,7 @@ use serde_json::json;
 use api_common::map_frame;
 use api_common::subset::{self, RequestedTime, TimeSelection};
 use api_common::workbench::Surface;
-use api_common::{rel, Mount};
+use api_common::{rel, JsonQuery, Mount};
 use ds_core::config::CollectionConfig;
 use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, FeatureQuery};
@@ -1765,7 +1765,7 @@ pub async fn vector_tileset(
 pub async fn map_tile(
     headers: HeaderMap,
     Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
-    Query(params): Query<TileQueryParams>,
+    JsonQuery(params): JsonQuery<TileQueryParams>,
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Response, TilesError> {
@@ -1796,7 +1796,7 @@ pub async fn map_tile(
 pub async fn vector_tile(
     headers: HeaderMap,
     Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
-    Query(params): Query<TileQueryParams>,
+    JsonQuery(params): JsonQuery<TileQueryParams>,
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Response, TilesError> {
@@ -2060,7 +2060,7 @@ async fn render_vector_tile(
 pub async fn get_tile(
     headers: HeaderMap,
     Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
-    Query(params): Query<TileQueryParams>,
+    JsonQuery(params): JsonQuery<TileQueryParams>,
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, TilesError> {
@@ -2106,9 +2106,13 @@ pub async fn get_tile(
 /// immutable: palettes are hot-reloadable.
 pub async fn style_legend(
     Path((id, style_id)): Path<(String, String)>,
-    Query(params): Query<LegendQueryParams>,
+    JsonQuery(params): JsonQuery<LegendQueryParams>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Response, TilesError> {
+    // As on the tile routes, a parameter the legend does not take is a 400,
+    // never dropped (#1073).
+    params::reject_unknown_parameters(query.as_deref(), params::LEGEND_PARAMETERS)?;
     let state = state.load_full();
     let (engine, _config) = lookup_engine(&state, &id)?;
     let format = params.validate()?;
@@ -2266,7 +2270,7 @@ pub async fn get_styled_tile(
         u64,
         u64,
     )>,
-    Query(params): Query<TileQueryParams>,
+    JsonQuery(params): JsonQuery<TileQueryParams>,
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, TilesError> {

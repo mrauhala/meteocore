@@ -73,6 +73,16 @@ pub fn unknown_parameter(raw_query: Option<&str>, accepted: &[&str]) -> Option<S
         .map(|key| key.into_owned())
 }
 
+/// The 400 message for the [`unknown_parameter`] `name`, naming the
+/// `accepted` ones: one wording for every route that rejects unknown
+/// parameters, so Maps and Tiles cannot drift apart (#1073).
+pub fn unknown_parameter_message(name: &str, accepted: &[&str]) -> String {
+    format!(
+        "Unknown query parameter '{name}'. Supported: {}",
+        accepted.join(", ")
+    )
+}
+
 /// Every value of the query parameter `name` in `raw_query`, in request
 /// order. `subset` may repeat, which a struct-shaped query extractor cannot
 /// represent.
@@ -870,6 +880,14 @@ mod tests {
         assert_eq!(
             unknown_parameter(Some("date%74ime=b&sub+set=c"), &accepted),
             Some("sub set".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_parameter_message_names_the_accepted_ones_in_order() {
+        assert_eq!(
+            unknown_parameter_message("bbox", &["f", "datetime", "subset"]),
+            "Unknown query parameter 'bbox'. Supported: f, datetime, subset"
         );
     }
 
