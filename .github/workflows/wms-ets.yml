@@ -117,10 +117,11 @@ jobs:
         run: cargo build --locked -p server
 
       # A debug build renders several times slower than release. The render
-      # deadline goes from 3 s to 60 s so that build speed cannot turn into
-      # 503s; the suite tests the protocol, not the deadline. Its largest
-      # map, getmap:large-size, is the advertised MaxWidth x MaxHeight,
-      # 8000 x 8000, which takes about 9 s in a local debug build.
+      # deadline goes from 3 s to 60 s, and GetFeatureInfo's own deadline
+      # from 10 s, so that build speed cannot turn into 503s; the suite tests
+      # the protocol, not the deadline. Its largest map, getmap:large-size,
+      # is the advertised MaxWidth x MaxHeight, 8000 x 8000, which takes
+      # about 9 s in a local debug build.
       #
       # The render memory budget admits that map. Admission charges 32 B
       # per output pixel against MC_RENDER_MEMORY_MB, whose 1024 MiB default
@@ -134,6 +135,7 @@ jobs:
       - name: Start the server on the fixture config
         env:
           MC_RENDER_TIMEOUT_MS: 60000
+          MC_FEATURE_INFO_TIMEOUT_MS: 60000
           MC_RENDER_MEMORY_MB: 2560
         run: |
           mkdir -p ets-report

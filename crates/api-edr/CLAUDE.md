@@ -355,11 +355,16 @@ Features `items` handler).
 
 ## Query execution and limits (#178, #585)
 
-Every data query uses `executor`: normal engines run on a dedicated multi-thread
-runtime (storage sync bridges are valid there), cross-section trajectories use
-its blocking pool for their explicit-handle I/O. Never call synchronous engines directly on
+Every data query uses `executor`: normal engines run as tasks on ds-executor's
+shared query runtime, `ds_executor::query_runtime()` (storage sync bridges are
+valid there), cross-section trajectories on its blocking pool for their
+explicit-handle I/O. WMS GetFeatureInfo runs on the same runtime (#1103):
+never build a runtime of this crate's own again. The admission and the
+30-second `QUERY_TIMEOUT` stay this crate's, apart from GetFeatureInfo's
+render slots and deadline: `ds_executor::query_workers()` queries run at once
+(2–8, one per runtime worker). Never call synchronous engines directly on
 HTTP workers. The admission queue is bounded to 32 waiting requests; deadlines include queue
-time. Beyond the queue, admission fails fast. Permits live with the
+time and any wait for a runtime worker, which GetFeatureInfo queries share. Beyond the queue, admission fails fast. Permits live with the
 work, including after client timeout/disconnect. Check `QueryBudget::expired`
 between MULTIPOINT elements and between listed location ids. Validate the whole coordinate list before dispatch;
 keep point, byte and combined-value limits and OpenAPI/README documentation aligned.

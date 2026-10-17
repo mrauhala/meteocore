@@ -264,11 +264,14 @@ engine. These layers stay `queryable="0"` and answer `LayerNotQueryable`:
 - CAP alert layers, PostGIS events-shape (lightning) layers and nowcast
   layers: their engines answer no position query.
 
-GetFeatureInfo runs on the same render slots, queue and deadline as GetMap
-(`MC_RENDER_TIMEOUT_MS`): an overloaded or timed-out request is HTTP 503 with
-`Retry-After: 1`. Like an EDR query, the engine call runs on a dedicated
-query runtime, never on the threads that serve requests. An engine failure
-is a generic exception, its detail only in the server log.
+GetFeatureInfo runs on the same render slots and queue as GetMap, under a
+deadline of its own, `MC_FEATURE_INFO_TIMEOUT_MS` (10 s by default), not
+GetMap's 3 s render deadline: a cold position query can take longer than a
+render. The deadline counts from admission, so it covers both the wait for a
+render slot and the query. An overloaded or timed-out request is HTTP 503
+with `Retry-After: 1`. The engine call runs on the query runtime EDR queries
+also run on, never on the threads that serve requests. An engine failure is
+a generic exception, its detail only in the server log.
 
 ## WMS Configuration
 
@@ -486,6 +489,8 @@ Uncached GetMap requests have a configurable 3 s queue/render deadline
 (`MC_RENDER_TIMEOUT_MS`) and a bounded waiting queue (`MC_RENDER_QUEUE_CAPACITY`,
 default 3× CPU slots). Overload or expiry returns HTTP 503 with `Retry-After: 1`;
 cached images remain available. GeoTIFF remote reads use the same deadline.
+GetFeatureInfo waits in the same queue under its own 10 s deadline
+(`MC_FEATURE_INFO_TIMEOUT_MS`).
 
 GRIB metadata is shared through cached descriptors for capabilities and map
 requests. Bounds come from a header probe of each level collection's latest-run
@@ -498,10 +503,11 @@ WMS 1.3.0 executable test suite, [ets-wms13](https://github.com/opengeospatial/e
 under TEAM Engine from the suite's published container, pinned by digest. It
 runs weekly, on demand, and on pull requests that change this crate, the
 workflow, its config in `ci/wms-ets/` or the fixtures that config serves. It
-builds the server, a debug build with the render deadline raised to 60 s and
-the render memory budget to 2560 MiB, which admits the advertised 8000 × 8000
-maximum, and starts it on `ci/wms-ets/config.toml`, whose collections use
-only fixtures committed to the repository:
+builds the server, a debug build with the render and GetFeatureInfo
+deadlines raised to 60 s and the render memory budget to 2560 MiB, which
+admits the advertised 8000 × 8000 maximum, and starts it on
+`ci/wms-ets/config.toml`, whose collections use only fixtures committed to
+the repository:
 
 | Layer | Covers |
 |-------|--------|

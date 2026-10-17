@@ -385,7 +385,7 @@ pub enum TrajectoryShape {
     /// Values sampled along the path (OGC API - EDR trajectory): a
     /// CoverageJSON `Trajectory` domain. Accepts `LINESTRING`,
     /// `LINESTRING Z`, `M` and `ZM`; CoverageJSON output only. Runs on the
-    /// EDR query runtime's workers, like position and area.
+    /// shared query runtime's workers, like position and area.
     AlongPath,
     /// A vertical cross-section under a 2-D `LINESTRING` (radar polar
     /// volumes): a CoverageJSON `Section` domain, also as a PNG heatmap.

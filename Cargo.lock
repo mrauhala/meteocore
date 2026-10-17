@@ -152,6 +152,7 @@ dependencies = [
  "axum",
  "chrono",
  "ds-core",
+ "ds-executor",
  "ds-render",
  "http-body-util",
  "jsonschema",

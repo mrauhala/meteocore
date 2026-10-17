@@ -369,9 +369,15 @@ meta-tiles by nearest neighbour).
   first level, and an ODIM volume the nearest sweep carrying the quantity,
   where the position query matches `z` to one sweep exactly. The response
   reports the time, the run and the level when the layer has them.
-- **Execution.** `RenderJob::acquire` (the render slots, queue and deadline
-  GetMap uses, no memory reservation: one point) and `job.run_query`, a task
-  on ds-executor's dedicated query runtime, as api-edr runs its queries.
+- **Execution.** `RenderJob::acquire_feature_info` (the render slots and
+  queue GetMap uses, no memory reservation: one point) and `job.run_query`,
+  a task on ds-executor's shared query runtime, the one api-edr runs its
+  queries on (#1103). The deadline is GetFeatureInfo's own,
+  `MC_FEATURE_INFO_TIMEOUT_MS` (10 s), never the render deadline: a cold
+  GRIB position query can need more than GetMap's 3 s. It starts at
+  admission, so it bounds the slot wait and the query together; expiry is
+  the 503. `tests/get_feature_info.rs`
+  `get_feature_info_has_a_deadline_of_its_own` pins it in a child process.
   Never `job.run`: on a `spawn_blocking` worker of the serving runtime,
   GRIB's field jobs and the `DataStore` bridge take `Handle::current()` and
   put their blocking work back on request workers (root Critical Rule 7).

@@ -45,9 +45,11 @@ static QUEUE_CAPACITY: LazyLock<usize> = LazyLock::new(|| {
 });
 static WAITING: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(*QUEUE_CAPACITY)));
-static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
-    Duration::from_millis(env_usize("MC_RENDER_TIMEOUT_MS", 3000).min(86_400_000) as u64)
-});
+static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| env_millis("MC_RENDER_TIMEOUT_MS", 3000));
+/// WMS GetFeatureInfo's deadline, its own and not the render deadline
+/// (#1103): a cold position query can need longer than a render.
+static FEATURE_INFO_TIMEOUT: LazyLock<Duration> =
+    LazyLock::new(|| env_millis("MC_FEATURE_INFO_TIMEOUT_MS", 10_000));
 static REJECTED: AtomicU64 = AtomicU64::new(0);
 /// Deadline expiries by stage: waiting for memory or a slot, or admitted.
 static TIMED_OUT_QUEUE: AtomicU64 = AtomicU64::new(0);
@@ -59,6 +61,11 @@ fn env_usize(name: &str, default: usize) -> usize {
         .and_then(|v| v.parse().ok())
         .filter(|&v| v <= Semaphore::MAX_PERMITS)
         .unwrap_or(default)
+}
+
+/// A deadline from a millisecond env var, at most one day.
+fn env_millis(name: &str, default: usize) -> Duration {
+    Duration::from_millis(env_usize(name, default).min(86_400_000) as u64)
 }
 
 pub struct Metrics {
@@ -308,6 +315,15 @@ impl RenderJob {
         Self::acquire_on(slots, WAITING.clone(), Duration::from_secs(30)).await
     }
 
+    /// WMS GetFeatureInfo's admission, for [`Self::run_query`]: the render
+    /// slots and queue, no memory (one point), under its own deadline,
+    /// `MC_FEATURE_INFO_TIMEOUT_MS` (10 s), instead of the render deadline
+    /// (#1103). As for every job, the deadline starts here, so it bounds the
+    /// wait for a slot and the query together.
+    pub async fn acquire_feature_info(slots: Arc<Semaphore>) -> Result<Self, ExecutionError> {
+        Self::acquire_on(slots, WAITING.clone(), *FEATURE_INFO_TIMEOUT).await
+    }
+
     async fn acquire_on(
         slots: Arc<Semaphore>,
         waiting: Arc<Semaphore>,
@@ -345,19 +361,19 @@ impl RenderJob {
 
     /// Run a synchronous engine query, such as the EDR position query WMS
     /// GetFeatureInfo reads (#1064), with the slot and deadline of
-    /// [`Self::run`], as a task on [`QUERY_RUNTIME`], never on the runtime
+    /// [`Self::run`], as a task on [`query_runtime`], never on the runtime
     /// that serves the request. `block_in_place` is valid there, and an
     /// engine that takes `Handle::current()`, as GRIB's field jobs and the
     /// `DataStore` bridge do, spawns onto the query runtime (root CLAUDE.md
-    /// Critical Rule 7). api-edr runs its queries on a runtime of its own
-    /// the same way.
+    /// Critical Rule 7). api-edr runs its queries on the same runtime,
+    /// under its own admission and deadline (#1103).
     pub async fn run_query<T: Send + 'static>(
         self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, ExecutionError> {
         let deadline = self.deadline;
         let worker = self.worker(work);
-        let task = QUERY_RUNTIME.spawn(async move { worker() });
+        let task = query_runtime().spawn(async move { worker() });
         join(task, deadline).await
     }
 
@@ -379,22 +395,40 @@ impl RenderJob {
     }
 }
 
-/// The runtime [`RenderJob::run_query`] runs engine queries on, sized like
-/// api-edr's query runtime: two to eight workers. The render slots bound how
-/// many queries it holds. A query waiting here for a worker still counts
-/// against its deadline, and is aborted when that expires first.
-static QUERY_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    let workers = std::thread::available_parallelism()
+/// The name of every [`query_runtime`] thread, its workers and its blocking
+/// pool alike.
+pub const QUERY_THREAD_NAME: &str = "mc-query";
+
+/// How many workers [`query_runtime`] has: the available CPUs, two to
+/// eight. api-edr admits this many queries at once.
+pub fn query_workers() -> usize {
+    std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(2)
-        .clamp(2, 8);
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
-        .thread_name("render-query")
-        .enable_all()
-        .build()
-        .expect("render query runtime")
-});
+        .clamp(2, 8)
+}
+
+/// The one process-wide runtime synchronous engine queries run on, off the
+/// runtime that serves requests (root CLAUDE.md Critical Rules 6 and 7,
+/// #1103): api-edr's data queries, under its own admission and 30 s
+/// deadline, and WMS GetFeatureInfo through [`RenderJob::run_query`], under
+/// the render slots and `MC_FEATURE_INFO_TIMEOUT_MS`. Each API's admission
+/// bounds how many queries it holds; a query waiting here for a worker
+/// still counts against its own deadline, and is aborted when that expires
+/// first. `block_in_place` is valid on its workers, and an engine that takes
+/// `Handle::current()` spawns onto it. Its blocking pool serves the engines
+/// that need a blocking thread (EDR cross-section trajectories).
+pub fn query_runtime() -> &'static tokio::runtime::Handle {
+    static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(query_workers())
+            .thread_name(QUERY_THREAD_NAME)
+            .enable_all()
+            .build()
+            .expect("query runtime")
+    });
+    RUNTIME.handle()
+}
 
 /// Await a worker `task` until `deadline`.
 async fn join<T>(
@@ -724,6 +758,61 @@ mod tests {
         assert_eq!(render_concurrency(), default);
     }
 
+    /// GetFeatureInfo's deadline is `MC_FEATURE_INFO_TIMEOUT_MS`, 10 s by
+    /// default, apart from the render deadline (#1103). Both are fixed by
+    /// their first read, so each case runs in a child process of its own.
+    #[test]
+    fn feature_info_has_a_deadline_of_its_own() {
+        const TEST: &str = "tests::feature_info_has_a_deadline_of_its_own";
+        const CHILD: &str = "MC_TEST_FEATURE_INFO_DEADLINE_CHILD";
+        let Some(case) = std::env::var_os(CHILD) else {
+            for (case, render, feature_info) in
+                [("default", None, None), ("set", Some("50"), Some("700"))]
+            {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, case);
+                for (name, value) in [
+                    ("MC_RENDER_TIMEOUT_MS", render),
+                    ("MC_FEATURE_INFO_TIMEOUT_MS", feature_info),
+                ] {
+                    match value {
+                        Some(value) => child.env(name, value),
+                        None => child.env_remove(name),
+                    };
+                }
+                assert!(child.status().unwrap().success(), "{TEST} {case}");
+            }
+            return;
+        };
+        let (render, feature_info) = if case == "default" {
+            (3_000, 10_000)
+        } else {
+            (50, 700)
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let slots = Arc::new(Semaphore::new(2));
+            let start = Instant::now();
+            for (job, millis) in [
+                (RenderJob::acquire(slots.clone()).await.unwrap(), render),
+                (
+                    RenderJob::acquire_feature_info(slots.clone())
+                        .await
+                        .unwrap(),
+                    feature_info,
+                ),
+            ] {
+                let timeout = Duration::from_millis(millis);
+                let budget = job.deadline - start;
+                assert!(
+                    timeout <= budget && budget < timeout + Duration::from_secs(1),
+                    "{budget:?} for a {timeout:?} deadline"
+                );
+            }
+        });
+    }
+
     #[tokio::test]
     async fn queue_overflow_sheds_immediately_and_disconnect_releases_waiter() {
         let slots = Arc::new(Semaphore::new(1));
@@ -807,7 +896,7 @@ mod tests {
         .await
         .unwrap();
         let thread_name = || std::thread::current().name().map(str::to_owned);
-        let (ran_on, spawned_on, deadline) = job
+        let (runtime, ran_on, spawned_on, deadline) = job
             .run_query(move || {
                 let handle = tokio::runtime::Handle::current();
                 let spawned_on = tokio::task::block_in_place(|| {
@@ -816,12 +905,19 @@ mod tests {
                     )
                 })
                 .unwrap();
-                (thread_name(), spawned_on, ds_core::deadline::current())
+                (
+                    handle.id(),
+                    thread_name(),
+                    spawned_on,
+                    ds_core::deadline::current(),
+                )
             })
             .await
             .unwrap();
-        assert_eq!(ran_on.as_deref(), Some("render-query"));
-        assert_eq!(spawned_on.as_deref(), Some("render-query"));
+        assert_eq!(runtime, query_runtime().id());
+        assert_ne!(runtime, tokio::runtime::Handle::current().id());
+        assert_eq!(ran_on.as_deref(), Some(QUERY_THREAD_NAME));
+        assert_eq!(spawned_on.as_deref(), Some(QUERY_THREAD_NAME));
         assert!(deadline.is_some(), "the work runs under the deadline");
 
         let expired = RenderJob::acquire_on(

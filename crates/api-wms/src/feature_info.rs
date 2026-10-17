@@ -142,12 +142,13 @@ pub(crate) async fn get_feature_info(
     let sample = match position {
         None => Sample::default(),
         Some((lon, lat)) => {
-            // The render slots, queue and deadline of a GetMap render, but
-            // the query runs on the dedicated query runtime, as EDR's do:
-            // engines `block_in_place` and spawn their own tasks there,
-            // never on the runtime serving requests (root CLAUDE.md
-            // Critical Rule 7).
-            let job = ds_executor::RenderJob::acquire(state.render_semaphore.clone())
+            // The render slots and queue of a GetMap render, under
+            // GetFeatureInfo's own deadline (`MC_FEATURE_INFO_TIMEOUT_MS`,
+            // #1103), which covers the slot wait and the query. The query
+            // runs on the shared query runtime, as EDR's do: engines
+            // `block_in_place` and spawn their own tasks there, never on the
+            // runtime serving requests (root CLAUDE.md Critical Rule 7).
+            let job = ds_executor::RenderJob::acquire_feature_info(state.render_semaphore.clone())
                 .await
                 .map_err(WmsError::from)?;
             let coords = format!("POINT({lon} {lat})");
