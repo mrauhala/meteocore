@@ -194,6 +194,23 @@ pub(crate) struct Variable {
     pub levels: Vec<Level>,
 }
 
+impl Variable {
+    /// Whether `other` holds this variable's quantity at its levels: the
+    /// same units and level units in any spelling
+    /// (`ds_core::units::same_unit`: `kg/m^2` is `kg m-2`), the same level
+    /// values. The served spelling stays the first file's.
+    pub(crate) fn same_quantity(&self, other: &Variable) -> bool {
+        use ds_core::units::same_unit;
+        same_unit(&self.units, &other.units)
+            && self.levels.len() == other.levels.len()
+            && self
+                .levels
+                .iter()
+                .zip(&other.levels)
+                .all(|(a, b)| a.value == b.value && same_unit(&a.units, &b.units))
+    }
+}
+
 /// A file's grid: the CF grid of its fields' `(y, x)` axes.
 #[derive(Debug, Clone)]
 pub(crate) struct FileGrid {

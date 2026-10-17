@@ -1297,6 +1297,132 @@ mod tests {
         assert_eq!(style("10u").palette.name, "wind_speed");
     }
 
+    /// #1067 PR 6: a NetCDF MEPS collection's layers, with the names,
+    /// titles and units engine-netcdf reports from testdata/meps-netcdf and
+    /// only a collection-level colormap, as the shipped example has. Every
+    /// layer gets its own default, and representative values render
+    /// distinct colours: the fraction palettes span 0..1 rather than sitting
+    /// in the percent palettes' bottom 1 % (#872), and the run-start
+    /// accumulation still separates 100 from 200 mm.
+    #[test]
+    fn meps_netcdf_parameters_render_their_defaults() {
+        let ctx = StyleContext::with_builtins();
+        let c = coll("colormap = \"temperature\"\nmin = 183.15\nmax = 323.15\n");
+        let params = [
+            ("air_temperature_2m", "Screen level temperature (T2M)", "K"),
+            (
+                "relative_humidity_2m",
+                "Screen level relative humidity (RH2M)",
+                "1",
+            ),
+            ("x_wind_10m", "10 m wind along the grid's x axis", "m/s"),
+            ("y_wind_10m", "10 m wind along the grid's y axis", "m/s"),
+            ("wind_speed_of_gust", "Wind gust", "m/s"),
+            (
+                "air_pressure_at_sea_level",
+                "Mean Sea Level Pressure (MSLP)",
+                "Pa",
+            ),
+            (
+                "precipitation_amount_acc",
+                "Precipitation accumulated since run start",
+                "kg/m^2",
+            ),
+            ("cloud_area_fraction", "Total cloud cover (TCC)", "1"),
+        ]
+        .map(|(name, title, unit)| ds_core::map_engine::ParameterInfo {
+            name: name.into(),
+            title: title.into(),
+            unit: unit.into(),
+        });
+        let maps = ctx
+            .parameter_layer_styles(&c, None, &params, &|_, cm| cm)
+            .unwrap();
+        let style = |name: &str| &maps[&format!("c1/{name}")]["default"];
+        type Case = (&'static str, &'static str, (f64, f64), &'static [f64]);
+        let cases: [Case; 8] = [
+            (
+                "air_temperature_2m",
+                "temperature",
+                (183.15, 323.15),
+                &[253.15, 272.15, 274.15, 293.15],
+            ),
+            (
+                "relative_humidity_2m",
+                "humidity_fraction",
+                (0.0, 1.0),
+                &[0.1, 0.5, 0.9],
+            ),
+            (
+                "x_wind_10m",
+                "diverging",
+                (-40.0, 40.0),
+                &[-10.0, 0.0, 10.0],
+            ),
+            (
+                "y_wind_10m",
+                "diverging",
+                (-40.0, 40.0),
+                &[-10.0, 0.0, 10.0],
+            ),
+            (
+                "wind_speed_of_gust",
+                "wind_speed",
+                (0.0, 40.0),
+                &[5.0, 15.0, 30.0],
+            ),
+            (
+                "air_pressure_at_sea_level",
+                "pressure",
+                (95_000.0, 105_000.0),
+                &[97_000.0, 101_300.0, 104_000.0],
+            ),
+            (
+                "precipitation_amount_acc",
+                "precipitation_accumulation",
+                (0.0, 200.0),
+                &[1.0, 10.0, 50.0, 100.0, 150.0],
+            ),
+            (
+                "cloud_area_fraction",
+                "cloud_cover_fraction",
+                (0.0, 1.0),
+                &[0.0, 0.25, 0.5, 1.0],
+            ),
+        ];
+        for (name, palette, (min, max), values) in cases {
+            let s = style(name);
+            assert_eq!(s.palette.name, palette, "{name}");
+            assert_eq!((s.min, s.max), (min, max), "{name}");
+            let colors: Vec<[u8; 4]> = values.iter().map(|v| s.colormap.color(Some(*v))).collect();
+            for (i, a) in colors.iter().enumerate() {
+                for b in &colors[i + 1..] {
+                    assert_ne!(a, b, "{name}: {values:?} rendered {colors:?}");
+                }
+            }
+        }
+        // A fraction draws the colour its percentage draws on the percent
+        // palette, and clear sky stays transparent.
+        let percent = ctx
+            .build_colormap(&StyleSpec {
+                colormap: Some("cloud_cover"),
+                ..StyleSpec::default()
+            })
+            .unwrap();
+        let cloud = style("cloud_area_fraction");
+        for f in [0.1, 0.4, 0.8] {
+            assert!(
+                close(
+                    cloud.colormap.color(Some(f)),
+                    percent.colormap.color(Some(f * 100.0))
+                ),
+                "{f}"
+            );
+        }
+        assert_eq!(cloud.colormap.color(Some(0.0))[3], 0);
+        assert_eq!(cloud.colormap.color(Some(1.0))[3], 255);
+    }
+
     #[test]
     fn parameter_defaults_opt_out_and_inline_override() {
         let ctx = StyleContext::with_builtins();

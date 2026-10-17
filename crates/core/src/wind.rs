@@ -599,7 +599,7 @@ impl WindPlan {
                     .push(refuse("u and v are at different levels".into()));
                 continue;
             }
-            if u.unit != v.unit {
+            if !crate::units::same_unit(&u.unit, &v.unit) {
                 plan.outcomes.push(refuse(format!(
                     "u and v have different units ('{}', '{}')",
                     u.unit, v.unit

@@ -1026,7 +1026,7 @@ impl NetcdfEngine {
         }
         for (served, field) in layout.variables.iter().zip(&inspected.fields) {
             let found = &field.variable;
-            if (&found.units, &found.levels) != (&served.units, &served.levels) {
+            if !served.same_quantity(found) {
                 return Err(format!(
                     "variable '{}' has units '{}' at levels {:?}, the collection's has '{}' at {:?}",
                     served.name, found.units, found.levels, served.units, served.levels

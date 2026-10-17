@@ -8108,6 +8108,49 @@ mod tests {
         assert!(!Arc::ptr_eq(&live, &third.netcdf_engines[0]));
     }
 
+    /// #1067 PR 6: the shipped local MEPS example, loaded over its
+    /// committed sample. Every layer has its style at load: the layers the
+    /// example no longer configures take the built-in default their name
+    /// and the file's unit select (the gusts, MSLP in pascals, the run-start
+    /// accumulation in `kg/m^2`), the rest keep their entries.
+    #[test]
+    fn meps_netcdf_example_layers_get_default_styles() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text =
+            std::fs::read_to_string(root.join("collections.d/meps-netcdf-local.toml")).unwrap();
+        let mut collection: CollectionConfig = toml::from_str(&text).unwrap();
+        collection.netcdf.as_mut().unwrap().data_path = Some(
+            root.join("testdata/meps-netcdf")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let loaded = load_with_reuse(&[collection], super::EngineReuse::default());
+        let styles = &loaded.wms_state.styles;
+        let style = |name: &str| {
+            let s = &styles[&format!("meps-netcdf-local/{name}")]["default"];
+            (s.palette.name.as_str(), s.min, s.max)
+        };
+        for (name, expected) in [
+            ("air_temperature_2m", ("temperature", 183.15, 323.15)),
+            ("wind_speed_of_gust", ("wind_speed", 0.0, 40.0)),
+            (
+                "air_pressure_at_sea_level",
+                ("pressure", 95_000.0, 105_000.0),
+            ),
+            (
+                "precipitation_amount_acc",
+                ("precipitation_accumulation", 0.0, 200.0),
+            ),
+            // Configured by the example.
+            ("relative_humidity_2m", ("viridis", 0.0, 1.0)),
+            ("x_wind_10m", ("diverging", -20.0, 20.0)),
+            ("y_wind_10m", ("diverging", -20.0, 20.0)),
+            ("cloud_area_fraction", ("grayscale", 0.0, 1.0)),
+        ] {
+            assert_eq!(style(name), expected, "{name}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nowcast_geojson_reload_preserves_serving_and_adopts_edited_file() {
         use ds_core::feature::{DatetimeInterval, FeatureQuery, PropertyValue};
