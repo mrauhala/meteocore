@@ -129,6 +129,14 @@ Derivation rules (hard-won from production timeouts):
   background runtime (spawned at boot AND on reload; `shutdown()` on
   reload). A failed refresh WARNs and keeps the previous snapshot — never
   empties the cache, and does NOT flip health.
+- **The snapshot before the first refresh is `CollectionMeta::build` over no
+  rows** (`CollectionMeta::empty`), so whatever the config alone determines
+  is served from construction even when the database is unreachable at
+  boot: the EDR parameter descriptions (#1072: labels, units,
+  `observedProperty`; without them the collection document lists no
+  `parameter_names`), the seeded filterables (below) and the events shape's
+  `extent_bbox`. Stations, the extents read from the database and the
+  events TIME steps stay empty until a refresh lands.
 - **Features `filterables` = the configured `stations.property_cols` ∪ the
   names the cached rows carry** (#1024). `MetadataCache::new(cfg)` seeds them
   at construction, so an empty stations table or a failed first refresh
