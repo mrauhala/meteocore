@@ -18,6 +18,12 @@ pub fn escape(s: &str) -> String {
     out
 }
 
+/// The page icon: the brand mark as an inline SVG `data:` URL, so no HTML
+/// page requests `/favicon.ico` (#1131). Every workbench page and the API
+/// reference declare it. It holds no `"`, `&` or `<`: it goes into an
+/// attribute as it is.
+pub const FAVICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23095c49'/%3E%3Cg fill='none' stroke='white' stroke-width='2.2' stroke-linecap='round'%3E%3Ccircle cx='16' cy='16' r='10'/%3E%3Ccircle cx='16' cy='16' r='5'/%3E%3Cpath d='M16 16 24 8'/%3E%3C/g%3E%3C/svg%3E";
+
 /// Which representation a request resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wanted {
@@ -106,6 +112,8 @@ pub struct LinkView {
     pub href: String,
     pub rel: String,
     pub title: Option<String>,
+    /// The link's media type (`type`), shown in an HTML link table.
+    pub media_type: Option<String>,
 }
 
 impl LinkView {
@@ -114,7 +122,14 @@ impl LinkView {
             href: href.into(),
             rel: rel.into(),
             title: title.map(str::to_string),
+            media_type: None,
         }
+    }
+
+    /// The same link with its media type.
+    pub fn with_type(mut self, media_type: impl Into<String>) -> Self {
+        self.media_type = Some(media_type.into());
+        self
     }
 }
 

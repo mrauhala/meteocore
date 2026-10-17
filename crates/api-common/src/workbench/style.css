@@ -2563,11 +2563,11 @@ a {
 .shell{min-height:100vh}.enhanced{display:none!important}.js .enhanced{display:revert!important}.js .theme-label.enhanced{display:flex!important}.js .btn.enhanced{display:inline-flex!important}
 [hidden]{display:none!important}.field{display:block;margin-bottom:16px}.field .hint{display:block;font-size:14px;color:var(--muted);font-weight:400;margin:3px 0 8px}.field input{margin-top:5px}
 .query-form .fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}.query-form.item-query{padding:22px;margin-bottom:24px}.query-form.item-query>h2{margin-bottom:18px}.query-form>details{margin-bottom:18px}.query-form>.btn{margin-right:8px}.draft{margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}.draft code{display:block;overflow-wrap:anywhere;color:var(--teal)}
-.table-scroll{overflow:auto;max-width:100%}.properties th{font-weight:400;width:42%;overflow-wrap:anywhere;background:transparent;color:var(--muted)}.properties td{overflow-wrap:anywhere}.properties pre,pre{white-space:pre-wrap;overflow-wrap:anywhere}.properties pre{padding:12px;border-radius:5px}code{overflow-wrap:anywhere}.conformance{padding:24px 40px}.conformance li{padding:8px 0;overflow-wrap:anywhere}
+.table-scroll{overflow:auto;max-width:100%}.properties th{font-weight:400;overflow-wrap:anywhere;background:transparent;color:var(--muted)}.properties td{overflow-wrap:anywhere}.properties pre,pre{white-space:pre-wrap;overflow-wrap:anywhere}.properties pre{padding:12px;border-radius:5px}code{overflow-wrap:anywhere}.conformance{padding:24px 40px}.conformance li{padding:8px 0;overflow-wrap:anywhere}
 .map-panel{position:relative}#feature-map,#coverage-map{height:340px}.map-selection{padding:18px;display:flex;flex-wrap:wrap;gap:8px}.map-selection p{flex-basis:100%}#map-status{padding:10px 18px;font-size:14px}.geometry-details{padding:16px 20px;border-top:1px solid var(--line)}.geometry-details pre{margin-top:12px}.maplibregl-map .maplibregl-ctrl-attrib,.maplibregl-map .maplibregl-ctrl-scale{font-family:var(--font-ui);font-size:14px;color:#172e27;background:#fff}.maplibregl-map .maplibregl-ctrl-attrib a{color:#172e27}.maplibregl-map .maplibregl-ctrl button{min-height:44px;min-width:44px}
 .warning{background:var(--amber-bg);color:var(--amber)}.toast.visible,#toast.visible{opacity:1;transform:translate(-50%,0);display:block}.empty{padding:35px;text-align:center}.spaced{margin-top:24px}.feature-summary{padding:18px}.property-search{display:block;padding:18px}.property-search input{margin-top:8px}.results-head{display:flex;justify-content:space-between;gap:18px;margin-bottom:18px;flex-wrap:wrap}.results-head p{font-size:14px}
 .resource-links .endpoint{align-items:start}.resource-links .endpoint>div{min-width:0}.resource-links code{font-size:14px}.resource-links .btn{flex-shrink:0}.coverage-facts strong{overflow-wrap:anywhere}.collection-row .license{font-size:14px}.metadata-section{margin-top:24px}.collection-view:target{scroll-margin-top:95px}
-@media(max-width:800px){.query-form .fields{grid-template-columns:1fr}.resource-links .endpoint{flex-wrap:wrap}.properties{table-layout:fixed}.properties th{width:45%}.topbar{height:auto;min-height:71px}.item-table{min-width:420px}}
+@media(max-width:800px){.query-form .fields{grid-template-columns:1fr}.resource-links .endpoint{flex-wrap:wrap}.topbar{height:auto;min-height:71px}.item-table{min-width:420px}}
 .country-label{font:600 14px var(--font-ui);color:var(--ink);text-shadow:0 1px 2px var(--white),1px 0 2px var(--white);pointer-events:none}.mini-inspector .mini-facts{margin:18px 0}.map-selection:empty{display:none}.js .collection-view.metadata-section{margin-top:0}
 .equal-fields{display:flex;gap:12px;align-items:end;flex-wrap:wrap}.equal-fields label{flex:1;min-width:160px}.equal-fields select{width:100%}.mini-facts strong{overflow-wrap:anywhere}.collection-view .license{margin-top:16px}.item-layout .table-link small{display:block}.item-layout .chip-row{display:flex;flex-wrap:wrap;gap:6px}.map-selection .btn{white-space:normal}.filters-grid .field{margin-bottom:0}.chip-row{overflow-wrap:anywhere}
 
@@ -2668,20 +2668,20 @@ a {
   .collection-facts{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 @media(max-width:800px){
-  :is(.catalog-page,.items-page) .sidebar{display:grid;grid-template-columns:minmax(0,1fr) 110px;gap:10px 12px;padding:12px 16px}
-  :is(.catalog-page,.items-page) .brand{margin:0;font-size:20px;gap:8px}
-  :is(.catalog-page,.items-page) .brand small{display:none}
-  :is(.catalog-page,.items-page) .brand-mark{width:30px;height:30px;flex:none}
-  :is(.catalog-page,.items-page) .api-switch{grid-column:2;grid-row:1;margin:0}
-  :is(.catalog-page,.items-page) .api-switch label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
-  :is(.catalog-page,.items-page) .api-switch select{height:40px;min-height:40px;margin:0}
-  :is(.catalog-page,.items-page) .sidebar #primary-nav{grid-column:1/-1;grid-row:2;margin:0;gap:6px;padding-bottom:0}
-  :is(.catalog-page,.items-page) #primary-nav a{padding:6px 9px;min-height:36px}
-  :is(.catalog-page,.items-page) .topbar{position:static;padding:8px 16px}
-  :is(.catalog-page,.items-page) .topbar-actions{margin-top:6px}
-  :is(.catalog-page,.items-page) #request-context{padding:8px 16px}
-  :is(.catalog-page,.items-page) .catalog-request>summary code{margin-left:6px}
-  :is(.catalog-page,.items-page) main{padding:18px 16px}
+  .sidebar{display:grid;grid-template-columns:minmax(0,1fr) 110px;gap:10px 12px;padding:12px 16px}
+  .brand{margin:0;font-size:20px;gap:8px}
+  .brand small{display:none}
+  .brand-mark{width:30px;height:30px;flex:none}
+  .api-switch{grid-column:2;grid-row:1;margin:0}
+  .api-switch label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+  .api-switch select{height:40px;min-height:40px;margin:0}
+  .sidebar #primary-nav{grid-column:1/-1;grid-row:2;margin:0;gap:6px;padding-bottom:0;flex-wrap:wrap;overflow:visible}
+  #primary-nav a{padding:6px 9px;min-height:36px}
+  .topbar{position:static;padding:8px 16px}
+  .topbar-actions{margin-top:6px}
+  #request-context.catalog-request{padding:8px 16px}
+  .catalog-request>summary code{margin-left:6px}
+  main{padding:18px 16px}
   .catalog-page .page-title .eyebrow{display:none}
   .catalog-page .page-title h1{font-size:26px}
   .catalog-page .page-title p{font-size:14px;line-height:21px}
@@ -2689,7 +2689,7 @@ a {
   .catalog-page .query-builder{margin-bottom:16px}
 }
 @media(max-width:560px){
-  :is(.catalog-page,.items-page) .catalog-request>summary code{display:none}
+  .catalog-request>summary code{display:none}
   .catalog-page .search-panel{grid-template-columns:minmax(0,1fr)}
   .catalog-page .search-row{gap:8px}
   .catalog-page .search-row>.btn{font-size:14px;padding:8px 10px}
@@ -2741,9 +2741,7 @@ a {
 .item-result-scroll th,.item-result-scroll td{padding:12px 14px;font-size:14px}
 .property-value summary{cursor:pointer;white-space:nowrap;font-size:14px}
 .property-value pre{max-height:260px;overflow:auto;min-width:180px;max-width:500px;font-size:14px}
-.typed-properties th:first-child{width:30%}
-.typed-properties th:nth-child(2){width:90px}
-.typed-properties .value-type{color:var(--muted);font-size:14px;white-space:nowrap}
+.typed-properties .value-type{width:90px;color:var(--muted);font-size:14px;white-space:nowrap}
 .items-page .detail-layout{align-items:start}
 @media(max-width:800px){
  .items-page .detail-heading h1{font-size:24px}
@@ -2765,3 +2763,88 @@ a {
 /* One column: the map, full width and short, before the table (#1135).
    Without a map the "No geometry available" note stays after the results. */
 @media(max-width:1100px){.items-page .item-layout{grid-template-columns:minmax(0,1fr)}.items-page .item-layout>aside{display:flex}.items-page .item-layout>aside:has(#feature-map){order:-1}.items-page .item-layout #feature-map{height:240px}}
+
+/* Layout fixes (#1131). Header cells of data and link tables take their
+   width from their column, never from the key/value table's row header. */
+th{vertical-align:top}
+tbody th{padding-top:15px;padding-bottom:15px}
+.property-table tbody th[scope=row]{width:28%;vertical-align:top}
+.properties tbody th{white-space:normal}
+:is(.properties,.data-table) tbody tr:last-child th{border-bottom:0}
+
+/* Link tables: Relation, Title, Type, Link. Merged relations stack. Titles
+   wrap between words; the link and the type break anywhere and relation
+   URIs wrap inside their code (the global code rule), else those tokens
+   hold the table wider than the content area at 1440 px. Below 600 px
+   each row is a card: the title is the link text, relation and type are
+   secondary text. */
+.link-table{table-layout:auto}
+.link-table .link-rel{width:24%}
+.link-table .link-title{width:18%}
+.link-table .link-type{width:18%}
+.link-table .link-href{width:40%}
+.link-table td{overflow-wrap:break-word}
+.link-table td:first-child code{display:block}
+.link-table td:nth-child(3){overflow-wrap:anywhere}
+.link-table td:last-child{min-width:24ch;overflow-wrap:anywhere}
+.link-table .link-label{display:none}
+@media(max-width:600px){
+  .link-table,.link-table tbody{display:block}
+  .link-table colgroup,.link-table thead{display:none}
+  .link-table tr{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;padding:12px 14px;border-bottom:1px solid var(--line)}
+  .link-table tr:last-child{border-bottom:0}
+  .link-table td{display:block;padding:0;border:0;min-width:0;font-size:var(--text-small);color:var(--muted)}
+  .link-table td:nth-child(2){display:none}
+  .link-table td:last-child{order:-1;flex-basis:100%;min-width:0}
+  .link-table .table-link{font-weight:400;color:var(--teal)}
+  .link-table .link-label{display:block;font-size:var(--text-body);font-weight:600;overflow-wrap:break-word}
+}
+
+/* EDR data tables: auto layout inside .table-scroll. A wide table scrolls
+   sideways; no column is squeezed to a few characters. */
+.data-table{table-layout:auto}
+.data-table td,.data-table th,.data-table code{overflow-wrap:normal}
+.data-table tbody th{white-space:normal;border-bottom:1px solid var(--line)}
+.data-table a,.data-table .coords{overflow-wrap:anywhere}
+.data-table a.word{overflow-wrap:normal;white-space:nowrap}
+.data-table caption{text-align:left;padding:12px 14px;font-weight:600;caption-side:top}
+/* A nested member list (CoverageJSON referencing) halves the width at
+   every level: below 600 px its keys sit above their values. */
+@media(max-width:600px){
+  .definition .definition{grid-template-columns:minmax(0,1fr);gap:2px 0}
+  .definition .definition dd{margin-bottom:8px}
+}
+
+/* Model runs: one full-width card per run, not a catalog row. */
+.collection-row.instance-row{grid-template-columns:minmax(0,1fr)}
+.instance-row h2{font-size:var(--text-subheading)}
+.instance-row .collection-main>code{display:block;margin-top:3px}
+.instance-row .chip-row{margin-top:12px}
+
+/* Long ids wrap instead of widening the page. */
+h1{overflow-wrap:anywhere}
+.page-title>div{min-width:0}
+#breadcrumbs a:last-child{min-width:0;overflow-wrap:anywhere}
+.geometry-details summary{overflow-wrap:anywhere}
+
+/* Key/value tables below 600 px: the key (and a feature property's type)
+   on one line, the value below at full width. */
+@media(max-width:600px){
+  .property-table{display:block;min-width:0}
+  .property-table thead{display:none}
+  .property-table tbody{display:block}
+  .property-table tbody tr{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;padding:12px 14px;border-bottom:1px solid var(--line)}
+  .property-table tbody tr:last-child{border-bottom:0}
+  .property-table tbody th[scope=row],.property-table tbody td{display:block;width:auto;min-width:0;padding:0;border:0}
+  .property-table tbody th[scope=row]{overflow-wrap:break-word}
+  .property-table tbody td:last-child{flex-basis:100%;overflow-wrap:break-word}
+  .property-table tbody td:last-child pre{margin-top:6px}
+}
+
+/* Shell: the request bar folds and the topbar scrolls away below 800 px;
+   a wider screen shows the bar open and keeps the sidebar in view. */
+@media(min-width:801px){
+  .sidebar{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto}
+  .resource-page #request-context>summary{display:none}
+  .resource-page .catalog-request .request-content{padding-top:0}
+}

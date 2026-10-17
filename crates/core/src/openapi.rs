@@ -48,6 +48,7 @@ pub fn swagger_ui_html(title: &str, spec_url: &str) -> String {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{title}</title>
+  <link rel="icon" href="{icon}">
   <link rel="stylesheet" href="docs/swagger-ui-5.33.0.css">
   <link rel="stylesheet" href="docs/layout.css">
 </head>
@@ -59,6 +60,7 @@ pub fn swagger_ui_html(title: &str, spec_url: &str) -> String {
 </html>"##,
         title = crate::html::escape(title),
         spec_url = crate::html::escape(spec_url),
+        icon = crate::html::FAVICON,
     )
 }
 
@@ -84,5 +86,18 @@ mod tests {
         }
         assert!(swagger_ui_asset("../Cargo.toml").is_none());
         assert!(swagger_ui_asset("unknown.js").is_none());
+    }
+
+    /// #1131: the API reference declares the workbench's inline icon, which
+    /// its CSP admits (`img-src data:`), so it requests no `/favicon.ico`.
+    #[test]
+    fn docs_declare_the_inline_icon() {
+        let html = swagger_ui_html("API", "/api");
+        assert!(html.contains(&format!(
+            "<link rel=\"icon\" href=\"{}\">",
+            crate::html::FAVICON
+        )));
+        assert!(crate::html::FAVICON.starts_with("data:image/svg+xml,"));
+        assert!(SWAGGER_UI_CSP.contains("img-src 'self' data:"));
     }
 }

@@ -551,13 +551,21 @@ pub(crate) fn features_html(
         body.push_str(&format!("<section class=\"panel panel-body\"><span class=\"eyebrow\">PART OF THIS COLLECTION</span><h3>{}</h3>{}</section>",escape(title),ui::anchor(&ui::with_format(&collection_url,"html"),"Collection overview →","quiet")));
     }
     body.push_str("</aside></div>");
+    // Tabs and history tell pages apart (#1131): an items page by its
+    // range and filtering, a feature by its label.
+    let document_title = if is_list {
+        let query = href_for(doc, "self").split_once('?').map_or("", |(_, q)| q);
+        format!("{} · {title}", ui::items_title(query, features.len()))
+    } else {
+        format!("{page_title} · {title}")
+    };
     ui::Page {
         surface: ui::Surface {
             base,
             root,
             api: "features",
         },
-        title: &page_title,
+        title: &document_title,
         json_url: &json_url,
     }
     .render_with_breadcrumbs(
@@ -614,6 +622,52 @@ mod tests {
             "42"
         );
         assert_eq!(coordinate(&json!(51.88055000000001)), "51.88055");
+    }
+
+    /// #1131: an items page's tab title names its item range, whether it
+    /// is filtered, and the collection; a feature's names its label.
+    #[test]
+    fn items_and_feature_pages_have_distinct_titles() {
+        let feature = |id: &str| {
+            json!({"id": id, "geometry": null, "properties": {"name": format!("Town {id}")},
+            "links": [{"rel": "self", "href": format!("/features/collections/a/items/{id}?f=html")}]})
+        };
+        let page = |query: &str| {
+            let doc = json!({"features": [feature("a"), feature("b")], "numberMatched": 300,
+                "links": [{"rel": "self", "href": format!("/features/collections/a/items?{query}")}]});
+            features_html(
+                &doc,
+                "Towns",
+                "a",
+                "",
+                "/features",
+                &FeatureControls::default(),
+            )
+        };
+        assert!(page("limit=2&f=html").contains("<title>Items 1–2 · Towns · MeteoCore</title>"));
+        assert!(page("limit=2&offset=100&f=html")
+            .contains("<title>Items 101–102 · Towns · MeteoCore</title>"));
+        assert!(page("name=x&limit=2&offset=2&f=html")
+            .contains("<title>Items 3–4 · filtered · Towns · MeteoCore</title>"));
+        // Ordering, columns and CRS filter nothing.
+        assert!(
+            page("sortby=-name&properties=name&crs=EPSG%3A4326&bbox-crs=CRS84&f=html")
+                .contains("<title>Items 1–2 · Towns · MeteoCore</title>")
+        );
+        assert!(page("bbox=0,0,1,1&bbox-crs=CRS84&f=html")
+            .contains("<title>Items 1–2 · filtered · Towns · MeteoCore</title>"));
+        let detail = features_html(
+            &feature("a"),
+            "Towns",
+            "a",
+            "",
+            "/features",
+            &FeatureControls::default(),
+        );
+        assert!(
+            detail.contains("<title>Town a · Towns · MeteoCore</title>"),
+            "{detail}"
+        );
     }
 
     #[test]

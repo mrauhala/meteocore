@@ -78,7 +78,8 @@ impl DataPage<'_> {
                 root: &root,
                 api: "edr",
             },
-            title: &self.title,
+            // The tab names the query and the collection (#1131).
+            title: &format!("{} · {}", self.title, self.collection_title),
             json_url: &self.json_url,
         }
         .render_with_breadcrumbs(SLOT, "", &[(&collection_url, self.collection_title)]);
@@ -146,7 +147,7 @@ fn locations_panel(locations: &Locations) -> String {
     }
     let _ = write!(
         out,
-        "<dt><code>numberReturned</code></dt><dd>{}</dd></dl></div><div class=\"table-scroll\"><table class=\"properties\"><thead><tr><th scope=\"col\">Coverage</th><th scope=\"col\">Location id</th><th scope=\"col\">Label</th><th scope=\"col\">Datetime</th><th scope=\"col\">EDR query endpoint</th></tr></thead><tbody>",
+        "<dt><code>numberReturned</code></dt><dd>{}</dd></dl></div><div class=\"table-scroll\"><table class=\"data-table\"><thead><tr><th scope=\"col\">Coverage</th><th scope=\"col\">Location id</th><th scope=\"col\">Label</th><th scope=\"col\">Datetime</th><th scope=\"col\">EDR query endpoint</th></tr></thead><tbody>",
         locations.rows.len()
     );
     for (i, row) in locations.rows.iter().enumerate() {
@@ -328,21 +329,19 @@ fn request_panel(raw_query: Option<&str>) -> String {
     format!("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Request</h2></div><div class=\"panel-body\"><dl class=\"definition\">{rows}</dl></div></section>")
 }
 
-/// Every link, each an `<a>` (`/req/html/content` A).
+/// Every link, each an `<a>` (`/req/html/content` A), in the workbench's
+/// link table: the layout every other page's links have.
 fn links_panel(links: &[Link]) -> String {
-    let mut out = String::from("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Links</h2></div><div class=\"table-scroll\"><table class=\"properties\"><thead><tr><th scope=\"col\">Relation</th><th scope=\"col\">Title</th><th scope=\"col\">Type</th><th scope=\"col\">Link</th></tr></thead><tbody>");
-    for link in links {
-        let _ = write!(
-            out,
-            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape(&link.rel),
-            escape(&link.title),
-            escape(&link.kind),
-            ui::anchor(&link.href, &link.href, "table-link")
-        );
-    }
-    out.push_str("</tbody></table></div></section>");
-    out
+    let links: Vec<Value> = links
+        .iter()
+        .map(
+            |l| serde_json::json!({"href": l.href, "rel": l.rel, "type": l.kind, "title": l.title}),
+        )
+        .collect();
+    format!(
+        "<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Links</h2></div>{}</section>",
+        ui::link_table(&Value::Array(links))
+    )
 }
 
 /// The members of `doc` other than `skip`, as a definition list.
@@ -371,7 +370,7 @@ fn parameters_panel(parameters: &Value) -> String {
     let Some(parameters) = parameters.as_object() else {
         return String::new();
     };
-    let mut out = String::from("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Parameters</h2></div><div class=\"table-scroll\"><table class=\"properties\"><thead><tr><th scope=\"col\">Parameter</th><th scope=\"col\">Label</th><th scope=\"col\">Unit</th><th scope=\"col\">Observed property</th><th scope=\"col\">All fields</th></tr></thead><tbody>");
+    let mut out = String::from("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Parameters</h2></div><div class=\"table-scroll\"><table class=\"data-table\"><thead><tr><th scope=\"col\">Parameter</th><th scope=\"col\">Label</th><th scope=\"col\">Unit</th><th scope=\"col\">Observed property</th><th scope=\"col\">All fields</th></tr></thead><tbody>");
     for (key, parameter) in parameters {
         let observed = &parameter["observedProperty"];
         let _ = write!(
@@ -395,7 +394,7 @@ fn coverage_section(out: &mut String, heading: &str, coverage: &Value, parameter
     let domain = &coverage["domain"];
     let _ = write!(
         out,
-        "<section class=\"panel spaced\"><div class=\"panel-head\"><h2>{}</h2><span class=\"chip\">{}</span></div><div class=\"panel-body\"><h3>Domain axes</h3><div class=\"table-scroll\"><table class=\"properties\"><thead><tr><th scope=\"col\">Axis</th><th scope=\"col\">Count</th><th scope=\"col\">Values</th></tr></thead><tbody>",
+        "<section class=\"panel spaced\"><div class=\"panel-head\"><h2>{}</h2><span class=\"chip\">{}</span></div><div class=\"panel-body\"><h3>Domain axes</h3><div class=\"table-scroll\"><table class=\"data-table\"><thead><tr><th scope=\"col\">Axis</th><th scope=\"col\">Count</th><th scope=\"col\">Values</th></tr></thead><tbody>",
         escape(heading),
         escape(domain["domainType"].as_str().unwrap_or("Domain"))
     );
@@ -562,7 +561,7 @@ fn grid_tables(
             }
             let _ = write!(
                 out,
-                "<div class=\"table-scroll\"><table class=\"properties\"><caption>{caption}</caption><thead><tr><th scope=\"col\">y \\ x</th>{x_header}</tr></thead><tbody>"
+                "<div class=\"table-scroll\"><table class=\"data-table\"><caption>{caption}</caption><thead><tr><th scope=\"col\">y \\ x</th>{x_header}</tr></thead><tbody>"
             );
             let offset = lead * ny * nx;
             for yi in 0..ny {
@@ -591,7 +590,7 @@ fn row_table(
     members: &[(&str, &Value)],
     parameters: &Value,
 ) {
-    out.push_str("<div class=\"table-scroll\"><table class=\"properties\"><thead><tr>");
+    out.push_str("<div class=\"table-scroll\"><table class=\"data-table\"><thead><tr>");
     // A composite axis's width: its coordinates; any other axis: one column.
     let mut widths = Vec::with_capacity(axes.len());
     for axis in axes {
@@ -833,23 +832,14 @@ fn members_len(doc: &Value, skip: &[&str]) -> usize {
 }
 
 /// The bytes of a page's heading, request and links panels, from above:
-/// the request is decoded then escaped (at most 6 bytes per raw byte),
-/// each link's href shown twice.
+/// the request is decoded then escaped (at most 6 bytes per raw byte); the
+/// links panel exactly.
 fn panels_estimate(page: &DataPage) -> usize {
     let raw = page.raw_query.unwrap_or("");
     let heading = 1024 + 6 * (page.title.len() + page.collection_title.len());
     let request = 512 + 6 * raw.len() + 40 * (raw.matches('&').count() + 1);
-    let links = 512
-        + page
-            .links
-            .iter()
-            .map(|l| {
-                160 + 2 * escaped_len(&l.href)
-                    + escaped_len(&l.rel)
-                    + escaped_len(&l.title)
-                    + escaped_len(&l.kind)
-            })
-            .sum::<usize>();
+    // A handful of links: measured by writing them.
+    let links = links_panel(&page.links).len();
     heading + request + links
 }
 
@@ -878,7 +868,7 @@ fn feature_row_len(feature: &Value, columns: &[&str]) -> usize {
             feature_link_len(text("rel"), text("title"), text("type"), text("href")) + 4
         })
         .sum();
-    48 + id_cell
+    63 + id_cell
         + escaped_len(geometry["type"].as_str().unwrap_or("null"))
         + coordinates.0
         + cells
@@ -966,7 +956,7 @@ pub(crate) fn write_locations(
         escape(&datetime),
         escape(&ctx.parameter_names.join(", "))
     );
-    body.push_str("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Locations</h2></div><div class=\"table-scroll\"><table class=\"properties\"><thead><tr><th scope=\"col\">id</th><th scope=\"col\">label</th><th scope=\"col\">geometry</th><th scope=\"col\">Longitude</th><th scope=\"col\">Latitude</th><th scope=\"col\">edrqueryendpoint</th><th scope=\"col\">links</th><th scope=\"col\">View</th></tr></thead><tbody>");
+    body.push_str("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Locations</h2></div><div class=\"table-scroll\"><table class=\"data-table\"><thead><tr><th scope=\"col\">id</th><th scope=\"col\">label</th><th scope=\"col\">geometry</th><th scope=\"col\">Longitude</th><th scope=\"col\">Latitude</th><th scope=\"col\">edrqueryendpoint</th><th scope=\"col\">links</th><th scope=\"col\">View</th></tr></thead><tbody>");
     w.write_all(body.as_bytes())?;
     for loc in locations.iter() {
         let endpoint = format!(
@@ -990,7 +980,7 @@ pub(crate) fn write_locations(
             loc.longitude,
             loc.latitude,
             ui::anchor(&endpoint, &endpoint, "table-link"),
-            ui::anchor(&ui::with_format(&endpoint, "html"), "HTML", "table-link")
+            ui::anchor(&ui::with_format(&endpoint, "html"), "HTML", "table-link word")
         );
         w.write_all(row.as_bytes())?;
     }
@@ -1123,7 +1113,7 @@ fn features_body(
         }
         body.push_str(&members);
     }
-    body.push_str("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Features</h2></div><div class=\"table-scroll\"><table class=\"properties\"><thead><tr><th scope=\"col\">id</th><th scope=\"col\">geometry</th>");
+    body.push_str("<section class=\"panel spaced\"><div class=\"panel-head\"><h2>Features</h2></div><div class=\"table-scroll\"><table class=\"data-table\"><thead><tr><th scope=\"col\">id</th><th scope=\"col\">geometry</th>");
     for column in columns {
         let _ = write!(body, "<th scope=\"col\">{}</th>", escape(column));
     }
@@ -1137,7 +1127,7 @@ fn features_body(
         let geometry = &feature["geometry"];
         let _ = write!(
             body,
-            "<tr><th scope=\"row\">{id_cell}</th><td>{} <code>{}</code></td>",
+            "<tr><th scope=\"row\">{id_cell}</th><td>{} <code class=\"coords\">{}</code></td>",
             escape(geometry["type"].as_str().unwrap_or("null")),
             escape(&geometry["coordinates"].to_string())
         );

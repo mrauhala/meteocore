@@ -386,6 +386,12 @@ names. Display titles use case-insensitive common label keys in priority order:
 `name`, `label`, `title`, `display_name`, `displayname`, `nimi`, `namn`, `nom`,
 `nombre`, `naam`, `bezeichnung`, then the feature ID. Coordinates are rounded to
 five decimal places in the summary; raw geometry retains full precision.
+A feature page's title is that label and the collection title; an items page's
+names its item range, whether filters apply, and the collection
+(`Items 101–110 · filtered · Towns`), so pages differ in tabs and history
+(#1131); paging, `sortby`, `properties`, `crs` and `bbox-crs` alone filter
+nothing. Below 600 px the property table stacks: key and type on one line, the
+value below at full width.
 
 Listings derive selectable columns from response properties and advertised
 filter fields, defaulting to the first four non-null scalar fields other than

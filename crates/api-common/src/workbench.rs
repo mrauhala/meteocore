@@ -4,7 +4,7 @@
 //! for JSON; this module supplies only presentation and progressive enhancement.
 use ds_core::collection_search::{CollectionParameter, SearchParams, SearchQueryParams};
 use ds_core::config::LicenseConfig;
-use ds_core::html::{escape, LinkView};
+use ds_core::html::{escape, LinkView, FAVICON};
 use serde_json::{json, Value};
 
 use crate::{mounts, rel};
@@ -178,9 +178,26 @@ impl Page<'_> {
         head: &str,
         labels: &[(&str, &str)],
     ) -> String {
+        let document_title = format!("{} · MeteoCore", self.title);
+        self.render_shell(body, head, labels, &document_title)
+    }
+
+    /// A landing page: its title already names the server, so the tab
+    /// shows it as it is (#1131).
+    fn render_landing(&self, body: &str) -> String {
+        self.render_shell(body, "", &[], self.title)
+    }
+
+    fn render_shell(
+        &self,
+        body: &str,
+        head: &str,
+        labels: &[(&str, &str)],
+        document_title: &str,
+    ) -> String {
         let Self {
             surface: Surface { base, root, api },
-            title,
+            title: _,
             json_url,
         } = self;
         let html_url = with_format(json_url, "html");
@@ -282,12 +299,7 @@ impl Page<'_> {
                 for segment in rest.split('/').filter(|s| !s.is_empty()) {
                     path.push('/');
                     path.push_str(segment);
-                    let decoded = form_urlencoded::parse(
-                        format!("x={}", segment.replace('+', "%2B")).as_bytes(),
-                    )
-                    .next()
-                    .map(|(_, v)| v.into_owned())
-                    .unwrap_or_default();
+                    let decoded = decode_path(segment);
                     let label = labels
                         .iter()
                         .find(|(href, label)| {
@@ -313,30 +325,32 @@ impl Page<'_> {
         let items = current_path
             .strip_prefix(&format!("{root}/collections/"))
             .is_some_and(|tail| tail.split('/').nth(1) == Some("items"));
-        let json_type = if items {
-            "application/geo+json"
-        } else {
-            "application/json"
-        };
+        let (json_label, json_type) = representation(json_url, items);
         let curl = format!("curl --get '{}'", json_url.replace('\'', "'\"'\"'"));
         let catalog = current_path.trim_end_matches('/') == format!("{root}/collections");
         let request_content = format!(
-            r#"<div class="request-identity"><span class="method">GET</span><code id="request-url">{json_url}</code></div><div class="request-tools"><span class="request-note">Applied request · JSON representation</span><button class="btn small enhanced" data-copy="{json_url}">Copy URL</button><button class="btn small enhanced" data-copy="{curl}">Copy cURL</button><a class="btn small" href="{json_url}">Open JSON ↗</a></div>"#,
+            r#"<div class="request-identity"><span class="method">GET</span><code id="request-url">{json_url}</code></div><div class="request-tools"><span class="request-note">Applied request · {json_label} representation</span><button class="btn small enhanced" data-copy="{json_url}">Copy URL</button><button class="btn small enhanced" data-copy="{curl}">Copy cURL</button><a class="btn small" href="{json_url}">Open {json_label} ↗</a></div>"#,
             json_url = escape(safe_href(json_url)),
             curl = escape(&curl)
         );
-        let request_context = if catalog || items {
-            format!("<details id=\"request-context\" class=\"catalog-request\"><summary>Current API request <code>GET {}</code></summary><div class=\"request-content\">{request_content}</div></details>",escape(current_path.strip_prefix(base).unwrap_or(current_path)))
-        } else {
-            format!("<section id=\"request-context\" aria-label=\"Current API request\">{request_content}</section>")
-        };
+        // The request folds into its summary on catalog and items pages,
+        // and on every page below 800 px: there the script right after it
+        // closes it before the page paints (without JavaScript it stays
+        // open, as on a wide screen, where its summary is hidden: the
+        // `aria-label` names the bar then).
+        let request_context = format!(
+            "<details id=\"request-context\" class=\"catalog-request\" aria-label=\"Current API request\"{}><summary>Current API request <code>GET {}</code></summary><div class=\"request-content\">{request_content}</div></details>{}",
+            if catalog || items { "" } else { " open" },
+            escape(&request_summary(json_url.strip_prefix(base).unwrap_or(json_url))),
+            if catalog || items { "" } else { REQUEST_FOLD }
+        );
         format!(
-            r##"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · MeteoCore</title><link rel="alternate" type="{json_type}" href="{json_url}"><style>{CSS}</style><script>{THEME}</script>{head}</head>
-<body class="{page_class}"><a class="skip" href="#main">Skip to content</a><div class="shell"><aside class="sidebar" aria-label="API navigation"><a class="brand" href="{base}/?f=html"><span class="brand-mark"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><circle cx="16" cy="16" r="11"/><circle cx="16" cy="16" r="6"/><path d="M16 16 27 5M16 3v3M3 16h3M16 26v3M26 16h3"/></svg></span><span>MeteoCore<small>API WORKBENCH</small></span></a><div class="api-switch enhanced"><label for="api-select">API workspace</label><select id="api-select">{options}</select></div><noscript><nav aria-label="APIs">{api_nav}</nav></noscript><nav id="primary-nav" aria-label="Workspace">{nav}</nav><div class="sidebar-note"><span class="eyebrow">OPEN STANDARDS</span><p>One data platform.<br>Different ways to explore.</p><a href="{base}/?f=html">Explore all APIs ↗</a></div><div class="sidebar-footer">MeteoCore<small>OGC API · Developer workspace</small></div></aside>
+            r##"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{document_title}</title><link rel="icon" href="{FAVICON}"><link rel="alternate" type="{json_type}" href="{json_url}"><style>{CSS}</style><script>{THEME}</script>{head}</head>
+<body class="{page_class}"><a class="skip" href="#main">Skip to content</a><div class="shell"><aside class="sidebar" aria-label="API navigation"><a class="brand" href="{base}/?f=html"><span class="brand-mark"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><circle cx="16" cy="16" r="11"/><circle cx="16" cy="16" r="6"/><path d="M16 16 27 5M16 3v3M3 16h3M16 26v3M26 16h3"/></svg></span><span>MeteoCore<small>API WORKBENCH</small></span></a><div class="api-switch enhanced"><label for="api-select">API workspace</label><select id="api-select">{options}</select></div><noscript><nav aria-label="APIs">{api_nav}</nav></noscript><nav id="primary-nav" aria-label="Workspace">{nav}</nav><div class="sidebar-note"><span class="eyebrow">OPEN STANDARDS</span><p>One data platform.<br>Different ways to explore.</p></div><div class="sidebar-footer">MeteoCore<small>OGC API · Developer workspace</small></div></aside>
 <div class="workspace"><header class="topbar"><nav id="breadcrumbs" aria-label="Breadcrumb">{crumbs}</nav><div class="topbar-actions"><button class="quiet enhanced" id="help-button">Help</button><label class="theme-label enhanced" for="theme">Theme<select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label><nav class="representation-switch" aria-label="Representation"><a aria-current="page" href="{html_url}">HTML</a><a rel="alternate" id="json-link" href="{json_url}">JSON</a></nav></div></header>
 {request_context}
 <main id="main" tabindex="-1">{body}</main><footer class="page-footer"><span>MeteoCore · Open weather data</span><span>HTML representation · Times in UTC</span></footer></div></div><dialog id="help-dialog"><div class="dialog-head"><h2>Find a collection, then request data</h2><button class="icon-button" id="close-help" aria-label="Close help">×</button></div><div class="panel-body"><p><strong>1. Find a collection.</strong> Collection search matches titles, descriptions and keywords. Commas separate alternatives; words form a phrase.</p><p>Advanced search adds required (+) and excluded (-) terms. Area and time narrow coverage; unknown extents remain eligible.</p><p><strong>2. Request data.</strong> Open a collection to see its data operations. Feature filters select items within that collection; discovery filters are not copied into the data request. The JSON switch always opens the current resource with its applied filters and paging.</p></div></dialog><div id="toast" role="status" aria-live="polite"></div><script>{SCRIPT}</script></body></html>"##,
-            title = escape(title),
+            document_title = escape(document_title),
             json_url = escape(safe_href(json_url)),
             html_url = escape(safe_href(&html_url)),
             base = escape(base),
@@ -349,6 +363,60 @@ impl Page<'_> {
             }
         )
     }
+}
+
+/// Keeps a resource page's request bar open on a wide screen and folded
+/// below 800 px, also when the window is resized across that width.
+const REQUEST_FOLD: &str = "<script>(()=>{const d=document.getElementById('request-context'),m=matchMedia('(max-width: 800px)'),s=()=>{d.open=!m.matches};s();m.addEventListener('change',s)})()</script>";
+
+/// The name and media type of the representation the page's JSON switch
+/// opens, from the `f` of its URL: CoverageJSON for an EDR data query,
+/// GeoJSON for feature items, else JSON.
+fn representation(json_url: &str, items: bool) -> (&'static str, &'static str) {
+    let query = json_url
+        .split('#')
+        .next()
+        .and_then(|href| href.split_once('?'))
+        .map_or("", |(_, query)| query);
+    let format = form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == "f")
+        .map(|(_, value)| value.to_ascii_lowercase());
+    match format.as_deref() {
+        Some("coveragejson") => ("CoverageJSON", "application/vnd.cov+json"),
+        Some("geojson") => ("GeoJSON", "application/geo+json"),
+        Some("csv") => ("CSV", "text/csv"),
+        Some("png") => ("PNG", "image/png"),
+        _ if items => ("GeoJSON", "application/geo+json"),
+        _ => ("JSON", "application/json"),
+    }
+}
+
+/// The request bar's summary: the path and the applied query, decoded,
+/// without `f` (the representation is the bar's own choice).
+fn request_summary(href: &str) -> String {
+    let href = href.split('#').next().unwrap_or_default();
+    let (path, query) = href.split_once('?').unwrap_or((href, ""));
+    let path = decode_path(path);
+    let pairs: Vec<String> = form_urlencoded::parse(query.as_bytes())
+        .filter(|(key, _)| key != "f")
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    if pairs.is_empty() {
+        path
+    } else {
+        format!("{path}?{}", pairs.join("&"))
+    }
+}
+
+/// A URL path, or one segment of it, with its `%XX` escapes decoded, for
+/// display only (a CAP feature id is mostly escapes). As in a path, `+` and
+/// `&` stay themselves; a malformed escape stays as it is.
+fn decode_path(path: &str) -> String {
+    let protected = path.replace('+', "%2B").replace('&', "%26");
+    form_urlencoded::parse(format!("x={protected}").as_bytes())
+        .next()
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default()
 }
 
 pub fn page_heading(title: &str, description: &str) -> String {
@@ -396,19 +464,45 @@ pub fn property_table(properties: &Value) -> String {
 /// Every link of `links` as a table row with its relation, title and media
 /// type, and an `<a>` to the link's own href (OGC API - EDR
 /// `/req/html/content` A: all of a response's information in the body).
-/// Unlike [`document_links`] nothing is skipped or merged, and no href is
-/// rewritten to its HTML view: a `rel=data` query end point stays itself.
+/// Links that differ only in relation (the short and the registered URI
+/// form of one) share a row that lists every relation; nothing is skipped,
+/// and no href is rewritten to its HTML view: a `rel=data` query end point
+/// stays itself. The anchor also carries the title, its text when a phone
+/// stacks each row as a card (#1131).
 pub fn link_table(links: &Value) -> String {
-    let mut out = String::from("<div class=\"table-scroll\"><table class=\"properties link-table\"><thead><tr><th scope=\"col\">Relation</th><th scope=\"col\">Title</th><th scope=\"col\">Type</th><th scope=\"col\">Link</th></tr></thead><tbody>");
+    fn text<'a>(link: &'a Value, key: &str) -> &'a str {
+        link[key].as_str().unwrap_or_default()
+    }
+    /// A row's (href, title, type).
+    type Target<'a> = (&'a str, &'a str, &'a str);
+    // Each target with the relations that list it.
+    let mut rows: Vec<(Target, Vec<&str>)> = Vec::new();
     for link in links.as_array().into_iter().flatten() {
-        let text = |key: &str| link[key].as_str().unwrap_or_default();
-        let href = text("href");
+        let target = (text(link, "href"), text(link, "title"), text(link, "type"));
+        let rel = text(link, "rel");
+        match rows.iter_mut().find(|(t, _)| *t == target) {
+            Some((_, rels)) if rels.contains(&rel) => {}
+            Some((_, rels)) => rels.push(rel),
+            None => rows.push((target, vec![rel])),
+        }
+    }
+    let mut out = String::from("<div class=\"table-scroll\"><table class=\"properties link-table\"><colgroup><col class=\"link-rel\"><col class=\"link-title\"><col class=\"link-type\"><col class=\"link-href\"></colgroup><thead><tr><th scope=\"col\">Relation</th><th scope=\"col\">Title</th><th scope=\"col\">Type</th><th scope=\"col\">Link</th></tr></thead><tbody>");
+    for ((href, title, media_type), rels) in rows {
+        let rels: String = rels
+            .iter()
+            .map(|rel| format!("<code>{}</code>", escape(rel)))
+            .collect();
+        let label = if title.is_empty() {
+            String::new()
+        } else {
+            format!("<span class=\"link-label\">{}</span>", escape(title))
+        };
         out.push_str(&format!(
-            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape(text("rel")),
-            escape(text("title")),
-            escape(text("type")),
-            anchor(href, href, "table-link")
+            "<tr><td>{rels}</td><td>{}</td><td>{}</td><td><a class=\"table-link\" href=\"{}\">{label}{}</a></td></tr>",
+            escape(title),
+            escape(media_type),
+            escape(safe_href(href)),
+            escape(href)
         ));
     }
     out.push_str("</tbody></table></div>");
@@ -481,7 +575,7 @@ pub fn landing_html(
     description: &str,
     links: &[LinkView],
 ) -> String {
-    let doc = json!({"links":links.iter().map(|l|json!({"href":l.href,"rel":l.rel,"title":l.title})).collect::<Vec<_>>()});
+    let doc = json!({"links":links.iter().map(|l|json!({"href":l.href,"rel":l.rel,"type":l.media_type,"title":l.title})).collect::<Vec<_>>()});
     landing_document(surface, title, description, &doc)
 }
 
@@ -528,7 +622,7 @@ pub fn landing_document(
         title,
         json_url: &url,
     }
-    .render(&body, "")
+    .render_landing(&body)
 }
 
 pub fn conformance_html(surface: Surface<'_>, classes: &[&str], nav: &[LinkView]) -> String {
@@ -1459,6 +1553,38 @@ pub fn collections_html(
     .render(&body, "")
 }
 
+/// An items page's title, from the page's query string and its item
+/// count: the item range and whether a filter narrows it
+/// (`Items 101–110 · filtered`), so pages differ in tabs and history
+/// (#1131). Paging, ordering, column, CRS and representation controls
+/// filter nothing. Features and EDR `items` share it.
+pub fn items_title(query: &str, count: usize) -> String {
+    let mut offset = 0usize;
+    let mut filtered = false;
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "offset" => offset = value.parse().unwrap_or(0),
+            "f" | "limit" | "sortby" | "properties" | "crs" | "bbox-crs" | "filter-lang"
+            | "filter-crs" => {}
+            _ => filtered = true,
+        }
+    }
+    let range = if count == 0 {
+        "Items".to_owned()
+    } else {
+        format!(
+            "Items {}–{}",
+            offset.saturating_add(1),
+            offset.saturating_add(count)
+        )
+    };
+    if filtered {
+        format!("{range} · filtered")
+    } else {
+        range
+    }
+}
+
 pub fn pagination(nav: &[LinkView]) -> String {
     let mut body = String::from("<nav class=\"pagination\" aria-label=\"Pagination\">");
     for rel in ["prev", "next"] {
@@ -1485,6 +1611,37 @@ pub fn pagination(nav: &[LinkView]) -> String {
     }
     body.push_str("</nav>");
     body
+}
+
+/// A run card's valid-time span and step count, from the run's temporal
+/// extent: its `values`, else an advertised grid's `cellsCount`. A fact the
+/// run does not advertise is left out; with neither, so is the list.
+fn run_facts(temporal: &Value) -> String {
+    let mut facts = String::new();
+    if temporal["interval"][0].is_array() {
+        // The span names its time zone itself.
+        facts.push_str(&format!(
+            "<div><dt>Valid time</dt><dd>{}</dd></div>",
+            collection_time_html(temporal)
+        ));
+    }
+    let steps = temporal["values"]
+        .as_array()
+        .filter(|values| !values.is_empty())
+        .map(|values| values.len() as u64)
+        .or_else(|| temporal["grid"]["cellsCount"].as_u64())
+        .filter(|steps| *steps > 0);
+    if let Some(steps) = steps {
+        facts.push_str(&format!(
+            "<div><dt>Time steps</dt><dd>{steps} {}</dd></div>",
+            if steps == 1 { "step" } else { "steps" }
+        ));
+    }
+    if facts.is_empty() {
+        facts
+    } else {
+        format!("<dl class=\"collection-facts run-facts\">{facts}</dl>")
+    }
 }
 
 /// Model-run navigation uses the same shell without claiming collection search.
@@ -1532,10 +1689,13 @@ pub fn instances_html(surface: Surface<'_>, title: &str, doc: &Value, nav: &[Lin
                 anchor(&with_format(href, "html"), label, "")
             })
             .unwrap_or_else(|| escape(title));
+        // One full-width column: a run card is not a catalog row with an
+        // icon, a side column and an arrow (#1131).
         body.push_str(&format!(
-            "<article class=\"collection-row\"><div class=\"collection-main\"><h2>{heading}</h2><code>{}</code><p>{}</p><div class=\"chip-row\">{}</div>{}</div></article>",
+            "<article class=\"collection-row instance-row\"><div class=\"collection-main\"><h2>{heading}</h2><code>{}</code><p>{}</p>{}<div class=\"chip-row\">{}</div>{}</div></article>",
             escape(id),
             escape(instance["description"].as_str().unwrap_or_default()),
+            run_facts(&instance["extent"]["temporal"]),
             data_query_links(instance),
             entry_details(instance)
         ));
@@ -2164,5 +2324,280 @@ mod tests {
             assert!(html.contains(text), "{text}");
         }
         assert!(!html.contains("position?f=html"));
+    }
+
+    /// The stylesheet's rules as (selector list, declarations, inside an
+    /// at-rule), comments removed.
+    fn css_rules() -> Vec<(String, String, bool)> {
+        fn walk(css: &str, nested: bool, out: &mut Vec<(String, String, bool)>) {
+            let mut rest = css;
+            while let Some(open) = rest.find('{') {
+                let selector = rest[..open].trim().to_owned();
+                let mut depth = 1;
+                let mut end = rest.len();
+                for (i, c) in rest[open + 1..].char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + 1 + i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let body = &rest[open + 1..end];
+                if selector.starts_with('@') {
+                    walk(body, true, out);
+                } else {
+                    out.push((selector, body.to_owned(), nested));
+                }
+                rest = rest.get(end + 1..).unwrap_or_default();
+            }
+        }
+        let mut css = String::new();
+        let mut rest = CSS;
+        while let Some(start) = rest.find("/*") {
+            css.push_str(&rest[..start]);
+            rest = rest[start..]
+                .split_once("*/")
+                .map_or("", |(_, after)| after);
+        }
+        css.push_str(rest);
+        let mut out = Vec::new();
+        walk(&css, false, &mut out);
+        out
+    }
+
+    /// A selector list's selectors (commas inside `:is(…)` kept), each
+    /// with its subject: the last compound selector.
+    fn subjects(list: &str) -> Vec<(&str, &str)> {
+        let mut out = Vec::new();
+        let (mut depth, mut start) = (0, 0);
+        for (i, c) in list.char_indices().chain([(list.len(), ',')]) {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    let selector = list[start..i].trim();
+                    let subject = selector
+                        .rsplit(|c: char| c.is_whitespace() || matches!(c, '>' | '+' | '~'))
+                        .next()
+                        .unwrap_or_default();
+                    out.push((selector, subject));
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn declares(body: &str, property: &str) -> Option<String> {
+        body.split(';').find_map(|d| {
+            let (name, value) = d.split_once(':')?;
+            (name.trim() == property).then(|| value.trim().to_owned())
+        })
+    }
+
+    fn is_th(subject: &str) -> bool {
+        subject == "th" || ["th[", "th:", "th."].iter().any(|p| subject.starts_with(p))
+    }
+
+    /// #1131: a width on header cells is for the row headers of key/value
+    /// tables only. A column header with one (`.properties th{width:42%}`
+    /// once) squeezed every link table's Link column to 55 px. Every
+    /// header cell is top-aligned, as data cells are.
+    #[test]
+    fn only_row_headers_have_a_width_and_every_header_is_top_aligned() {
+        let rules = css_rules();
+        for (list, body, _) in &rules {
+            if declares(body, "width").is_none() {
+                continue;
+            }
+            for (selector, subject) in subjects(list) {
+                if is_th(subject) {
+                    assert!(subject.contains("[scope=row]"), "{selector}{{{body}}}");
+                }
+            }
+        }
+        assert!(rules.iter().any(|(list, body, nested)| list == "th"
+            && !nested
+            && declares(body, "vertical-align").as_deref() == Some("top")));
+        for (list, body, _) in &rules {
+            if let Some(align) = declares(body, "vertical-align") {
+                for (selector, subject) in subjects(list) {
+                    if is_th(subject) {
+                        assert_eq!(align, "top", "{selector}");
+                    }
+                }
+            }
+        }
+        // The link table sizes its own columns, the link at least 24ch.
+        assert!(rules
+            .iter()
+            .any(|(list, body, nested)| list == ".link-table td:last-child"
+                && !nested
+                && declares(body, "min-width").as_deref() == Some("24ch")));
+    }
+
+    /// #1131: the landing's link table carries each link's type, lists a
+    /// link offered under two relation forms once, and sizes its columns
+    /// with a `<colgroup>`; the anchor carries the title for the phone
+    /// card.
+    #[test]
+    fn landing_link_table_merges_relation_forms_and_keeps_types() {
+        let conformance = "https://x/conformance";
+        let links = [
+            LinkView::new("https://x/", "self", Some("This document"))
+                .with_type("application/json"),
+            LinkView::new(conformance, "conformance", Some("Conformance classes"))
+                .with_type("application/json"),
+            LinkView::new(conformance, rel::CONFORMANCE, Some("Conformance classes"))
+                .with_type("application/json"),
+            // Another title or type is another row.
+            LinkView::new(conformance, "conformance", Some("Conformance as HTML"))
+                .with_type("text/html"),
+        ];
+        let html = landing_html(
+            Surface {
+                base: "https://x",
+                root: "https://x",
+                api: crate::shared::WORKSPACE,
+            },
+            "MeteoCore",
+            "",
+            &links,
+        );
+        let table = html
+            .split("class=\"properties link-table\">")
+            .nth(1)
+            .unwrap();
+        assert!(table.starts_with("<colgroup>"), "{table}");
+        assert_eq!(
+            table.matches(&format!("href=\"{conformance}\"")).count(),
+            2,
+            "{table}"
+        );
+        assert!(table.contains(&format!(
+            "<td><code>conformance</code><code>{}</code></td><td>Conformance classes</td><td>application/json</td>",
+            rel::CONFORMANCE
+        )));
+        assert!(table.contains("<td>text/html</td>"));
+        assert!(table.contains(&format!(
+            "<a class=\"table-link\" href=\"{conformance}\"><span class=\"link-label\">Conformance classes</span>{conformance}</a>"
+        )));
+        // The landing's title names the server once.
+        assert!(html.contains("<title>MeteoCore</title>"), "{html}");
+    }
+
+    /// #1131: a run card is one full-width column (not the catalog grid's
+    /// icon column) and shows the run's valid-time span and step count.
+    #[test]
+    fn run_cards_are_full_width_with_span_and_step_count() {
+        let run = json!({"id": "2026-01-01T00:00:00Z", "title": "A", "description": "A",
+            "extent": {"temporal": {"interval": [["2026-01-01T00:00:00Z", "2026-01-02T12:00:00Z"]],
+                "values": ["2026-01-01T00:00:00Z", "2026-01-01T06:00:00Z", "2026-01-02T12:00:00Z"]}},
+            "links": []});
+        let list = json!({"instances": [run], "links": []});
+        let html = instances_html(MAPS_PROXY, "A — instances", &list, &[]);
+        assert!(html.contains(
+            "<article class=\"collection-row instance-row\"><div class=\"collection-main\">"
+        ));
+        assert!(!html.contains("collection-icon\">"));
+        assert!(
+            html.contains(
+                "<span>2026-01-01 00:00</span><span>→</span><span>2026-01-02 12:00</span>"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("<dt>Time steps</dt><dd>3 steps</dd>"));
+        // The span names its time zone once.
+        assert!(html.contains("<dt>Valid time</dt>"), "{html}");
+        // The card's one column overrides the catalog row's grid at every width.
+        assert!(css_rules().iter().any(|(list, body, nested)| list
+            == ".collection-row.instance-row"
+            && !nested
+            && declares(body, "grid-template-columns").as_deref() == Some("minmax(0,1fr)")));
+        // A fact the run does not advertise is left out, not shown empty.
+        assert_eq!(run_facts(&json!({"values": []})), "");
+        let span_only = run_facts(&json!({"interval": [["2026-01-01T00:00:00Z", null]],
+            "values": []}));
+        assert!(span_only.contains("<dt>Valid time</dt>"), "{span_only}");
+        assert!(!span_only.contains("Time steps"), "{span_only}");
+        assert_eq!(
+            run_facts(&json!({"grid": {"cellsCount": 1}})),
+            "<dl class=\"collection-facts run-facts\"><div><dt>Time steps</dt><dd>1 step</dd></div></dl>"
+        );
+    }
+
+    /// #1131: the shell declares an icon, names the page once, summarises
+    /// the request with its query, names the representation in use, folds
+    /// the request bar below 800 px and links no page to itself.
+    #[test]
+    fn shell_summarises_the_request_and_names_its_representation() {
+        let edr = Surface {
+            base: "https://x",
+            root: "https://x/edr",
+            api: "edr",
+        };
+        let page = Page {
+            surface: edr,
+            title: "Position query · Forecast",
+            json_url:
+                "https://x/edr/collections/c/position?coords=POINT%2824%2060%29&f=CoverageJSON",
+        }
+        .render("", "");
+        assert!(page.contains("<title>Position query · Forecast · MeteoCore</title>"));
+        assert!(page.contains("<link rel=\"icon\" href=\"data:image/svg+xml,"));
+        assert!(page.contains("Applied request · CoverageJSON representation"));
+        assert!(page.contains("type=\"application/vnd.cov+json\""));
+        assert!(page.contains(
+            "<summary>Current API request <code>GET /edr/collections/c/position?coords=POINT(24 60)</code></summary>"
+        ));
+        // The bar keeps its name where its summary is hidden.
+        assert!(page.contains(
+            "<details id=\"request-context\" class=\"catalog-request\" aria-label=\"Current API request\" open>"
+        ));
+        assert!(page.contains(REQUEST_FOLD));
+        assert!(!page.contains("Explore all APIs"));
+        // Catalog and items pages fold the request at every width.
+        let items = Page {
+            surface: edr,
+            title: "Items 1–10 · Forecast",
+            json_url: "https://x/edr/collections/c/items?limit=10&f=json",
+        }
+        .render("", "");
+        assert!(items.contains(
+            "<details id=\"request-context\" class=\"catalog-request\" aria-label=\"Current API request\"><summary>"
+        ));
+        assert!(!items.contains(REQUEST_FOLD));
+        assert!(items.contains("Applied request · GeoJSON representation"));
+        assert!(items.contains("<code>GET /edr/collections/c/items?limit=10</code>"));
+        // A feature id shows decoded; `+` and `&` stay themselves, as in a
+        // path, and a bad escape stays as it is.
+        assert_eq!(
+            request_summary("/c/items/cap%3A22%3Aa%40b%2Fc+d&e=1%zz%2?f=html#x"),
+            "/c/items/cap:22:a@b/c+d&e=1%zz%2"
+        );
+        // So do the breadcrumbs.
+        let feature = Page {
+            surface: edr,
+            title: "A",
+            json_url: "https://x/edr/collections/c/items/a+b&c%3Ad?f=json",
+        }
+        .render("", "");
+        assert!(feature.contains(">a+b&amp;c:d</a></nav>"), "{feature}");
+        // Only a landing page's title goes without the server's name, not
+        // every title that mentions it.
+        let named = Page {
+            surface: edr,
+            title: "MeteoCore demo radar",
+            json_url: "https://x/edr/collections/c?f=json",
+        }
+        .render("", "");
+        assert!(named.contains("<title>MeteoCore demo radar · MeteoCore</title>"));
     }
 }
