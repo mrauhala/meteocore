@@ -828,6 +828,38 @@ mod errors {
         assert!(json["description"].is_string());
     }
 
+    /// An `f` given twice on a metadata route is the JSON 400 every other
+    /// bad parameter gets, naming it, not axum's plain text (#1121).
+    /// `/collections` already rejected it through `CollectionRequest`. A
+    /// single `f` still negotiates.
+    #[tokio::test]
+    async fn repeated_format_on_metadata_routes_is_the_json_400() {
+        for path in ["/", "/conformance", "/collections", "/collections/cities"] {
+            let uri = format!("{path}?f=json&f=html");
+            let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
+            let resp = build_router().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(resp.headers()["content-type"], "application/json", "{uri}");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["code"], "BadRequest", "{uri}");
+            let description = json["description"].as_str().unwrap();
+            assert!(
+                description.contains("duplicate field `f`")
+                    || description.contains("Duplicate collection query parameter 'f'"),
+                "{uri}: {description}"
+            );
+            for f in ["json", "html"] {
+                let req = Request::builder()
+                    .uri(format!("{path}?f={f}"))
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = build_router().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{path}?f={f}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn bad_bbox_returns_400_with_error_body() {
         let (status, json) = get("/collections/cities/items?bbox=invalid").await;

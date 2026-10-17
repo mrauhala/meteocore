@@ -173,7 +173,10 @@ impl<S: Send + Sync> FromRequestParts<S> for CollectionRequest {
 /// axum's [`Query`] whose rejection is the JSON 400 every other invalid
 /// parameter gets, not axum's plain-text one. A struct-shaped query fails
 /// before the handler runs on a parameter given twice (`width=1&width=2`);
-/// the description is axum's, which names it (#1073).
+/// the description is axum's, which names it (#1073). Every struct-shaped
+/// query of the Maps, Tiles, EDR and Features routes and of the shared
+/// root's Common routes extracts with it, so none answers in plain text
+/// (#1121).
 pub struct JsonQuery<T>(pub T);
 
 impl<T, S> FromRequestParts<S> for JsonQuery<T>

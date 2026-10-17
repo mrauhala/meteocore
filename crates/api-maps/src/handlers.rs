@@ -4,7 +4,7 @@ use std::sync::Arc;
 use api_common::map_frame::MapCrs;
 use api_common::subset::{self, TimeSelection};
 use arc_swap::ArcSwap;
-use axum::extract::{Path, Query, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Extension;
@@ -355,7 +355,7 @@ fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Va
 pub async fn landing_page(
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, MapsError> {
     use ds_core::html::{LinkView, Wanted};
@@ -939,7 +939,7 @@ pub(crate) const CONFORMANCE: &[&str] = &[
 pub async fn conformance(
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, MapsError> {
     use ds_core::html::{LinkView, Wanted};
@@ -1028,7 +1028,7 @@ pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, MapsError> {
     use ds_core::html::Wanted;

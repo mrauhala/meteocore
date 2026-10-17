@@ -442,6 +442,100 @@ async fn every_status_a_route_answers_is_documented_for_it() {
     }
 }
 
+/// A query string that does not parse into a route's parameters, a field
+/// given twice, missing or of the wrong type, is the documented JSON 400
+/// naming the field, not axum's plain text (#1121): on the metadata routes'
+/// `f` and every data query, instance routes included.
+#[tokio::test]
+async fn unparsable_query_strings_are_the_json_400_naming_the_field() {
+    let app = app();
+    let api = api(&app).await;
+    let point = "coords=POINT(1%201)";
+    let polygon = "coords=POLYGON((0%200,2%200,2%202,0%202,0%200))";
+    let line = "coords=LINESTRING(0%200,2%202)";
+    let run = format!("/instances/{RUN}");
+    let cases: Vec<(String, &str, &str)> = vec![
+        ("/?f=json&f=html".into(), "/edr/", "duplicate field `f`"),
+        (
+            "/conformance?f=json&f=html".into(),
+            "/edr/conformance",
+            "duplicate field `f`",
+        ),
+        (
+            "/collections/obs?f=json&f=html".into(),
+            "/edr/collections/obs",
+            "duplicate field `f`",
+        ),
+        (
+            format!("/collections/obs{run}?f=json&f=html"),
+            "/edr/collections/obs/instances/{instanceId}",
+            "duplicate field `f`",
+        ),
+        (
+            "/collections/obs/locations/a?f=CoverageJSON&f=GeoJSON".into(),
+            "/edr/collections/obs/locations/{locationId}",
+            "duplicate field `f`",
+        ),
+        (
+            "/collections/obs/locations/a?width=wide".into(),
+            "/edr/collections/obs/locations/{locationId}",
+            "width",
+        ),
+        (
+            format!("/collections/obs/position?{point}&{point}"),
+            "/edr/collections/obs/position",
+            "duplicate field `coords`",
+        ),
+        (
+            "/collections/obs/position".into(),
+            "/edr/collections/obs/position",
+            "missing field `coords`",
+        ),
+        (
+            format!("/collections/obs{run}/position?{point}&z=1&z=2"),
+            "/edr/collections/obs/instances/{instanceId}/position",
+            "duplicate field `z`",
+        ),
+        (
+            format!("/collections/obs/area?{polygon}&datetime=a&datetime=b"),
+            "/edr/collections/obs/area",
+            "duplicate field `datetime`",
+        ),
+        (
+            format!("/collections/obs{run}/area"),
+            "/edr/collections/obs/instances/{instanceId}/area",
+            "missing field `coords`",
+        ),
+        (
+            format!("/collections/obs/radius?{point}&within=1"),
+            "/edr/collections/obs/radius",
+            "missing field `within-units`",
+        ),
+        (
+            format!("/collections/obs{run}/radius?{point}&within=1&within-units=km&within=2"),
+            "/edr/collections/obs/instances/{instanceId}/radius",
+            "duplicate field `within`",
+        ),
+        (
+            format!("/collections/obs/trajectory?{line}&crs=CRS84&crs=CRS84"),
+            "/edr/collections/obs/trajectory",
+            "duplicate field `crs`",
+        ),
+    ];
+    for (uri, path, field) in cases {
+        let reply = send(&app, &uri, None).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(reply.content_type, "application/json", "{uri}");
+        assert_eq!(reply.body["code"], "BadRequest", "{uri}: {}", reply.body);
+        let description = reply.body["description"].as_str().unwrap_or_default();
+        assert!(description.contains(field), "{uri}: {description}");
+        assert!(
+            api["paths"][path]["get"]["responses"]["400"].is_object(),
+            "{uri}: 400 is not documented for {path}"
+        );
+    }
+}
+
 /// A repeated request naming the representation's ETag is a 304, on
 /// metadata and data routes alike, and every operation documents it.
 #[tokio::test]
