@@ -1873,4 +1873,6 @@ mod tests {
 }
 
 #[cfg(test)]
+mod sampler_tests;
+#[cfg(test)]
 mod wind_tests;
