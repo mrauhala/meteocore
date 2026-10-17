@@ -77,10 +77,15 @@ pool: they do not use the Icechunk runtime bridge.
   plain generations never enable Icechunk decoded caching or worker fan-out.
 - **Catalog** (`catalog::build`): opens the root group, lists child arrays,
   treats 1-D arrays named after their dim as CF coordinate variables,
-  classifies dims via `cf::classify_axis` (coord-var
-  `standard_name`/`units` first, name heuristic second — projected metre
-  axes resolve to `Other`, not degrees), validates lat/lon monotonic,
-  exposes remaining geographic data variables as parameters. **A time axis
+  classifies dims via the shared `ds_core::cf::classify_axis` (coord-var
+  `standard_name`/`units` first, name heuristic second), validates lat/lon
+  monotonic, exposes remaining geographic data variables as parameters.
+  Only `Lat`/`Lon` are geolocated: `ProjectionX`/`ProjectionY` (and metre
+  axes, which are `Other`) never become degrees, so a projected store has
+  no lat/lon pair and `build` rejects it (pinned by
+  `catalog::tests::a_projected_store_is_rejected`); an `Ensemble` dim is
+  pinned to index 0 like any other. CF time units and `decode_times` are
+  `ds_core::cf`'s too. **A time axis
   is required** (PointSeries needs `t`). Unsupported-dtype variables are
   skipped at build with a WARN. Bounded-codec setup failures likewise warn and
   skip only the affected variable; never expose it with unbounded decoders as

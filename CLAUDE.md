@@ -593,9 +593,22 @@ one never implies the other.
   `forward` is NaN on the far side of the Earth and `inverse` `None` off the
   disk, so code mapping many points must skip non-finite results; its
   `GeoTransform::bbox` comes from the limb and may be `west > east` (#819).
-- **`ds_core::cf`** — CF grid mapping → `Crs` and coordinate-unit scale,
-  shared by NetCDF readers. Unsupported mappings and missing earth figures
-  are errors, never a WGS84 guess.
+- **`ds_core::cf`** — CF semantics shared by NetCDF and Zarr readers,
+  which pass plain values or an attribute lookup (no reader library here):
+  - time units and `decode_times` (`… since 1970-01-01 00:00:00 +00:00`,
+    `… UTC`, `…Z`, offsets moved to UTC);
+  - `classify_axis` → `AxisRole`, including projected x/y (by
+    `standard_name`) and ensemble (`realization` / `ensemble_member`);
+  - `crs_from_grid_mapping`: `latitude_longitude`, `geostationary`,
+    `lambert_conformal_conic` (one or two parallels, a sphere or WGS84,
+    pinned to PROJ). Unsupported mappings, ellipsoids, scale factors and
+    missing earth figures are errors, never a WGS84 guess;
+  - `CfAttr::Numbers` keeps a multi-element attribute whole, and a
+    one-number parameter rejects it rather than reading its first element;
+  - `grid(crs, &x, &y)` over `RegularAxis` values: units through
+    `coordinate_scale`, a north-up `GeoTransform`, and `flipped` for an
+    ascending `y` (row 0 south, as MEPS), which the reader reverses once at
+    decode.
 - **`ds_core::temp_files`** — the names a data scan never reads (#1009): a
   hidden `.name` (written, then renamed into place) or a `PARTIAL_SUFFIXES`
   ending (`.tmp` / `.part`, the default `exclude_patterns`). An engine that
