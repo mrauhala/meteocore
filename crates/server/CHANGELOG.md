@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.12.0](https://github.com/mrauhala/meteocore/compare/v0.11.0...v0.12.0) (2026-10-17)
+
+
+### ⚠ Breaking Changes
+
+* **edr:** list /instances newest first ([#1054](https://github.com/mrauhala/meteocore/issues/1054)) ([4473443](https://github.com/mrauhala/meteocore/commit/4473443bf27bb40ce931355b8e0290573f52e8f5))
+
+
+### Features
+
+* **server:** log user agent and referer in the request log ([#1069](https://github.com/mrauhala/meteocore/issues/1069)) ([7d2887e](https://github.com/mrauhala/meteocore/commit/7d2887e197a62c462bb960b4c75633314f268ea0))
+* **edr:** offer CSV output for station series ([#1085](https://github.com/mrauhala/meteocore/issues/1085)) ([40d43cb](https://github.com/mrauhala/meteocore/commit/40d43cb86e604b193cba334e7bbd7ffffc051a3d))
+* license MeteoCore and ship third-party notices ([#1086](https://github.com/mrauhala/meteocore/issues/1086)) ([e3953b5](https://github.com/mrauhala/meteocore/commit/e3953b5874499003b61c47e8a3f71b24dec4b554))
+* **engine-postgis:** set-based area path, value budget instead of a station ceiling ([#1098](https://github.com/mrauhala/meteocore/issues/1098)) ([6b84996](https://github.com/mrauhala/meteocore/commit/6b84996e87fc3b8618e34984f1bd78ddc9c65d74))
+* **api-wms:** GetFeatureInfo answers the EDR position value at the clicked pixel ([#1099](https://github.com/mrauhala/meteocore/issues/1099)) ([3a5b1f0](https://github.com/mrauhala/meteocore/commit/3a5b1f0ee64e4cb7077e0560faeaeef93a38bd8b))
+* **core:** ds_core::cf groundwork for CF-NetCDF grids ([#1104](https://github.com/mrauhala/meteocore/issues/1104)) ([7c0153d](https://github.com/mrauhala/meteocore/commit/7c0153dabc6a8be0aeb22401c7297e0400497d22))
+* **core:** shared f32 map sampler over a regular source grid ([#1105](https://github.com/mrauhala/meteocore/issues/1105)) ([360ed9c](https://github.com/mrauhala/meteocore/commit/360ed9c0b646381d030d6ced6a71e1f5a595156a))
+* **storage:** template discovery with runs and leads, conditional range reads ([#1107](https://github.com/mrauhala/meteocore/issues/1107)) ([2126118](https://github.com/mrauhala/meteocore/commit/21261189fb98b9d73bcb36be448ae7d299d0dd41))
+* **engine-netcdf:** CF-NetCDF engine for local files, with runs, for WMS, Maps and Tiles ([#1109](https://github.com/mrauhala/meteocore/issues/1109)) ([bcff869](https://github.com/mrauhala/meteocore/commit/bcff869c5b5bb5392b157d1b04c6f308f0d9a79a))
+* **engine-netcdf:** remote files read in place by HTTP range, with caches, for MEPS on thredds.met.no ([#1117](https://github.com/mrauhala/meteocore/issues/1117)) ([04dc3fe](https://github.com/mrauhala/meteocore/commit/04dc3fe7bdbe98944c2bd43be9a1660013ab5c52))
+
+
+### Bug Fixes
+
+* **engine-bufr:** default the WIS2 warm-up to the shorter of retention and a day ([#1053](https://github.com/mrauhala/meteocore/issues/1053)) ([5cef7de](https://github.com/mrauhala/meteocore/commit/5cef7de55a22d751ff0ec23158cc08ab0f1ed027))
+* **deps:** bump quinn-proto and rustls for new RustSec advisories ([#1070](https://github.com/mrauhala/meteocore/issues/1070)) ([9225635](https://github.com/mrauhala/meteocore/commit/9225635eb07e88476f9f876027378aa1af06025b))
+* **api-maps:** reject unknown query parameters on the map routes ([#1078](https://github.com/mrauhala/meteocore/issues/1078)) ([1ba74d2](https://github.com/mrauhala/meteocore/commit/1ba74d2452408284a31539ca5772978be6be048d))
+* **cap:** over the per-render area cap, leave out the least severe warnings ([#1068](https://github.com/mrauhala/meteocore/issues/1068)) ([7523814](https://github.com/mrauhala/meteocore/commit/75238145294aae9346a985aba13cc7917b414866))
+* **engine-postgis:** keep configured station properties filterable with no stations loaded ([#1071](https://github.com/mrauhala/meteocore/issues/1071)) ([c26fc19](https://github.com/mrauhala/meteocore/commit/c26fc1962cc5aef18de54a842cb165ed3919ecdb))
+* **engine-geotiff:** fail the read when a remote COG tile fetch keeps failing ([#1076](https://github.com/mrauhala/meteocore/issues/1076)) ([37c0efe](https://github.com/mrauhala/meteocore/commit/37c0efed35b5e5226d60b48b2d3c3f64c40c657e))
+* **render:** make rendered, cell-set and strike-window cache weights count their allocation ([#1079](https://github.com/mrauhala/meteocore/issues/1079)) ([63061ba](https://github.com/mrauhala/meteocore/commit/63061ba5048b4cde3c66a8bf51ba267840b780bc))
+* **engine-geotiff:** bound the EDR polygon mask and cold STAC metadata loads ([#1077](https://github.com/mrauhala/meteocore/issues/1077)) ([e165017](https://github.com/mrauhala/meteocore/commit/e165017fa8ddbfda8ff3426cc65e79932973b30f))
+* **engine-grib:** advertise parameters from every retained run ([#1080](https://github.com/mrauhala/meteocore/issues/1080)) ([f742ec1](https://github.com/mrauhala/meteocore/commit/f742ec143a5f16194a88ce4968de6027f6544b62))
+* **engine-postgis:** report station lists cut at a configurable max_locations ([#1084](https://github.com/mrauhala/meteocore/issues/1084)) ([3263f11](https://github.com/mrauhala/meteocore/commit/3263f11816984fdded00e61688814292184edba5))
+* **api-wms:** case-insensitive parameter names, schema-valid capabilities, text/xml exceptions ([#1088](https://github.com/mrauhala/meteocore/issues/1088)) ([21a96d7](https://github.com/mrauhala/meteocore/commit/21a96d76e745c4734ad905ec316c38e690a86d59))
+* **api-wms:** Table E.1 exception codes and no content past the poles ([#1090](https://github.com/mrauhala/meteocore/issues/1090)) ([e3b48f1](https://github.com/mrauhala/meteocore/commit/e3b48f16552c042ee1ba29bb32d07c1e7dbfbb74))
+* **render:** encode empty and error images in the requested format ([#1092](https://github.com/mrauhala/meteocore/issues/1092)) ([450cee4](https://github.com/mrauhala/meteocore/commit/450cee4ab69facfd81150174d1303654c2f251a8))
+* **api-wms:** empty image for a projected BBOX wholly outside its CRS ([#1096](https://github.com/mrauhala/meteocore/issues/1096)) ([ddf9f6b](https://github.com/mrauhala/meteocore/commit/ddf9f6b1c6922e604c3e5ad95912686094a14173))
+* **engine-postgis:** serve configured parameter descriptions before the first refresh ([#1111](https://github.com/mrauhala/meteocore/issues/1111)) ([d821ba7](https://github.com/mrauhala/meteocore/commit/d821ba7e9243d99d2bef105f51f8fffed2eb15c6))
+* **api-wms:** list capabilities layers in collection-id order, so the WMS ETS tests the same layers every run ([#1118](https://github.com/mrauhala/meteocore/issues/1118)) ([f715883](https://github.com/mrauhala/meteocore/commit/f715883936636b354e92173c07e88f79f86eecb9))
+* **engine-geotiff:** a remote COG gone after the scan draws nodata and leaves the catalog instead of a 503 loop ([#1120](https://github.com/mrauhala/meteocore/issues/1120)) ([7e13007](https://github.com/mrauhala/meteocore/commit/7e13007fc7acd6e73aa8252dc2bdd327987d5e54))
+* **api-maps:** reject unknown legend parameters, JSON 400 for duplicate parameters ([#1122](https://github.com/mrauhala/meteocore/issues/1122)) ([b958d47](https://github.com/mrauhala/meteocore/commit/b958d47a631076331d58a2b151b8c65c69a73e19))
+
+
+### Performance Improvements
+
+* **api-wms:** memoize the error tile and encode empty and error images in the render job ([#1094](https://github.com/mrauhala/meteocore/issues/1094)) ([c934fe7](https://github.com/mrauhala/meteocore/commit/c934fe779386f7493572289306cfb491f348af46))
+* **edr:** share the location snapshot instead of copying it per request ([#1095](https://github.com/mrauhala/meteocore/issues/1095)) ([a1b252f](https://github.com/mrauhala/meteocore/commit/a1b252f88d24b91b30a6214c4784b1df268ca4f9))
+* **engine-geotiff:** check STAC EDR budgets before cold loads and long listings ([#1116](https://github.com/mrauhala/meteocore/issues/1116)) ([8a78922](https://github.com/mrauhala/meteocore/commit/8a78922e623553500553c8328f5d438b11f73021))
+* **executor:** one query runtime for EDR and GetFeatureInfo, which gets its own deadline ([#1115](https://github.com/mrauhala/meteocore/issues/1115)) ([4736f64](https://github.com/mrauhala/meteocore/commit/4736f645d13a9b3355f338f8fad1590a261dfa92))
+* **core:** refine SourceGrid's projection grid only over the footprint it samples ([#1112](https://github.com/mrauhala/meteocore/issues/1112)) ([27fe584](https://github.com/mrauhala/meteocore/commit/27fe5846f091368d266966fb76ceddefda75a20f))
+
 ## [0.11.0](https://github.com/mrauhala/meteocore/compare/v0.10.0...v0.11.0) (2026-10-11)
 
 
