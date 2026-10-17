@@ -2666,7 +2666,13 @@ fn param_layer_styles() -> HashMap<String, HashMap<String, StyleInfo>> {
 }
 
 fn build_router_with_styles(styles: HashMap<String, HashMap<String, StyleInfo>>) -> axum::Router {
-    let engine: Arc<dyn MapEngine> = Arc::new(MultiParamMockMapEngine);
+    build_router_with_engine_and_styles(Arc::new(MultiParamMockMapEngine), styles)
+}
+
+fn build_router_with_engine_and_styles(
+    engine: Arc<dyn MapEngine>,
+    styles: HashMap<String, HashMap<String, StyleInfo>>,
+) -> axum::Router {
     let mut engines = HashMap::new();
     engines.insert("radar".to_string(), engine);
 
@@ -2880,6 +2886,293 @@ mod parameter_styles {
             params.iter().any(|p| p["name"] == "parameter-name"),
             "legend must advertise parameter-name; got {params:?}"
         );
+    }
+}
+
+/// #1133: a request without `parameter-name` draws the engine's default
+/// parameter, so it must draw it with that parameter's own style, exactly
+/// as a request naming it, never with the collection-level palette.
+mod default_parameter_styles {
+    use super::*;
+
+    const SIZE: (u32, u32) = (32, 16);
+    const MAP: &str = "/collections/radar/map?bbox=10,55,30,70&width=32&height=16";
+
+    /// [`MultiParamMockMapEngine`] whose default parameter is `T`, the
+    /// parameter [`param_layer_styles`] gives a style layer of its own
+    /// (grayscale over the collection's viridis).
+    struct DefaultTMockMapEngine;
+
+    impl MapEngine for DefaultTMockMapEngine {
+        fn get_raster_tile(
+            &self,
+            bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<chrono::DateTime<chrono::Utc>>,
+            output_crs: &OutputCrs,
+            parameter: Option<&str>,
+            z: Option<f64>,
+            reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            MultiParamMockMapEngine.get_raster_tile(
+                bbox,
+                width,
+                height,
+                time,
+                output_crs,
+                parameter,
+                z,
+                reference_time,
+            )
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                parameter: "T".to_string(),
+                unit: "°C".to_string(),
+                ..MultiParamMockMapEngine.raster_info()
+            }
+        }
+    }
+
+    fn app_with(styles: HashMap<String, HashMap<String, StyleInfo>>) -> axum::Router {
+        build_router_with_engine_and_styles(Arc::new(DefaultTMockMapEngine), styles)
+    }
+
+    fn app() -> axum::Router {
+        app_with(param_layer_styles())
+    }
+
+    /// Status, `x-cache` and body of one request.
+    async fn fetch(app: &axum::Router, uri: &str) -> (StatusCode, String, Vec<u8>) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let x_cache = resp
+            .headers()
+            .get("x-cache")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, x_cache, body)
+    }
+
+    /// The bug: the default `T` drew with the collection's viridis. It now
+    /// draws with its own grayscale, the same image as `parameter-name=T`.
+    #[tokio::test]
+    async fn map_without_parameter_name_draws_the_default_parameter_style() {
+        let (status, _, unnamed) = fetch(&app(), MAP).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, named) = fetch(&app(), &format!("{MAP}&parameter-name=T")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(unnamed, named, "the default parameter draws as when named");
+        assert_eq!(unnamed, reference_png(SIZE.0, SIZE.1, "grayscale"));
+        assert_ne!(unnamed, reference_png(SIZE.0, SIZE.1, "viridis"));
+    }
+
+    /// A named style without `parameter-name` is the default parameter's
+    /// copy of it too.
+    #[tokio::test]
+    async fn styled_map_without_parameter_name_draws_the_default_parameter_style() {
+        let styled = "/collections/radar/styles/alt/map?bbox=10,55,30,70&width=32&height=16";
+        let (status, _, unnamed) = fetch(&app(), styled).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, named) = fetch(&app(), &format!("{styled}&parameter-name=T")).await;
+        assert_eq!(unnamed, named);
+        assert_eq!(unnamed, reference_png(SIZE.0, SIZE.1, "temperature"));
+    }
+
+    /// The rendered cache keys on the resolved style layer and parameter,
+    /// so the two requests share one entry: the second is a hit.
+    #[tokio::test]
+    async fn map_without_parameter_name_shares_the_cache_entry_of_the_named_parameter() {
+        let app = app();
+        let (_, x_cache, unnamed) = fetch(&app, MAP).await;
+        assert_eq!(x_cache, "MISS");
+        let (_, x_cache, named) = fetch(&app, &format!("{MAP}&parameter-name=T")).await;
+        assert_eq!(
+            x_cache, "HIT",
+            "parameter-name=T keys as the unnamed request"
+        );
+        assert_eq!(unnamed, named);
+    }
+
+    /// A style only the collection layer offers stays reachable without
+    /// `parameter-name`, on the collection's palette.
+    #[tokio::test]
+    async fn style_missing_from_the_default_parameter_layer_keeps_the_collection_style() {
+        let mut styles = param_layer_styles();
+        styles.get_mut("radar/T").unwrap().remove("alt");
+        let (status, _, body) = fetch(
+            &app_with(styles),
+            "/collections/radar/styles/alt/map?bbox=10,55,30,70&width=32&height=16",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, reference_png(SIZE.0, SIZE.1, "radar_dbz"));
+    }
+
+    /// The legend without `parameter-name` is the default parameter's
+    /// legend: the palette drawn, not the collection's under its label.
+    #[tokio::test]
+    async fn legend_without_parameter_name_is_the_default_parameter_legend() {
+        let legend = "/collections/radar/styles/default/legend";
+        let (status, _, unnamed) = fetch(&app(), legend).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, named) = fetch(&app(), &format!("{legend}?parameter-name=T")).await;
+        let unnamed: Value = serde_json::from_slice(&unnamed).unwrap();
+        let named: Value = serde_json::from_slice(&named).unwrap();
+        assert_eq!(unnamed, named);
+        assert_eq!(unnamed["parameter"], "T");
+        assert_eq!(unnamed["unit"], "°C");
+        assert_eq!(unnamed["stops"][0]["color"], "#000000", "grayscale");
+
+        let png = format!("{legend}?f=png");
+        let (status, _, unnamed) = fetch(&app(), &png).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, named) = fetch(&app(), &format!("{png}&parameter-name=T")).await;
+        assert_eq!(unnamed, named);
+    }
+
+    /// [`DefaultTMockMapEngine`] with `T` its only parameter.
+    struct SingleTMockMapEngine;
+
+    impl MapEngine for SingleTMockMapEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(ramp_tile(width, height))
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            let mut info = DefaultTMockMapEngine.raster_info();
+            info.parameters.truncate(1);
+            info
+        }
+    }
+
+    /// A single-parameter collection is unchanged: its one layer is the
+    /// collection's, so a request without `parameter-name` draws the
+    /// collection's palette even though the server registered a style
+    /// layer for its parameter, as it does when that parameter matches a
+    /// built-in parameter default.
+    #[tokio::test]
+    async fn single_parameter_collection_keeps_the_collection_style() {
+        let app = build_router_with_engine_and_styles(
+            Arc::new(SingleTMockMapEngine),
+            param_layer_styles(),
+        );
+        let (status, _, body) = fetch(&app, MAP).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, reference_png(SIZE.0, SIZE.1, "viridis"));
+
+        let (status, _, legend) = fetch(&app, "/collections/radar/styles/default/legend").await;
+        assert_eq!(status, StatusCode::OK);
+        let legend: Value = serde_json::from_slice(&legend).unwrap();
+        assert_eq!(legend["stops"][0]["color"], "#440154", "viridis");
+    }
+
+    const T0: &str = "2024-01-01T00:00:00Z";
+    const T1: &str = "2024-01-01T01:00:00Z";
+
+    /// [`DefaultTMockMapEngine`] whose default `T` has a time axis of its
+    /// own, `T0` only, inside the collection's `T0, T1`: `RH` has both.
+    struct DefaultTAxisMockMapEngine;
+
+    impl MapEngine for DefaultTAxisMockMapEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(ramp_tile(width, height))
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            DefaultTMockMapEngine.raster_info()
+        }
+
+        fn parameter_times(&self, parameter: &str) -> Option<Arc<[chrono::DateTime<chrono::Utc>]>> {
+            let times: &[&str] = match parameter {
+                "T" => &[T0],
+                "RH" => &[T0, T1],
+                _ => return None,
+            };
+            Some(times.iter().map(|t| t.parse().unwrap()).collect())
+        }
+
+        /// Latest-not-after on the parameter's own axis; `None` is the
+        /// default `T`, as `get_raster_tile` draws it.
+        fn resolve_parameter_time(
+            &self,
+            parameter: Option<&str>,
+            time: Option<chrono::DateTime<chrono::Utc>>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Option<chrono::DateTime<chrono::Utc>> {
+            let axis = self.parameter_times(parameter.unwrap_or("T"))?;
+            let time = time?;
+            axis.iter().rev().find(|t| **t <= time).copied()
+        }
+    }
+
+    /// Status and `Content-Datetime` of one request.
+    async fn fetch_time(app: &axum::Router, uri: &str) -> (StatusCode, Option<String>) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let datetime = resp
+            .headers()
+            .get("content-datetime")
+            .map(|v| v.to_str().unwrap().to_string());
+        (resp.status(), datetime)
+    }
+
+    /// Without `parameter-name` the time resolves on the default
+    /// parameter's own axis, as with `parameter-name=T`: an omitted
+    /// `datetime` draws `T`'s latest step, and an interval holding only a
+    /// step `T` lacks is the 404 naming `T` gives. It used to select `T1`
+    /// on the collection's axis and draw `T0`, outside the interval.
+    #[tokio::test]
+    async fn map_without_parameter_name_resolves_time_on_the_default_parameter_axis() {
+        let app = build_router_with_engine_and_styles(
+            Arc::new(DefaultTAxisMockMapEngine),
+            param_layer_styles(),
+        );
+        let named = format!("{MAP}&parameter-name=T");
+        assert_eq!(
+            fetch_time(&app, MAP).await,
+            (StatusCode::OK, Some(T0.into()))
+        );
+        assert_eq!(
+            fetch_time(&app, &named).await,
+            (StatusCode::OK, Some(T0.into()))
+        );
+
+        let interval = "&datetime=2024-01-01T00:30:00Z/..";
+        let (named_status, _) = fetch_time(&app, &format!("{named}{interval}")).await;
+        assert_eq!(named_status, StatusCode::NOT_FOUND);
+        let (unnamed_status, _) = fetch_time(&app, &format!("{MAP}{interval}")).await;
+        assert_eq!(unnamed_status, named_status);
     }
 }
 

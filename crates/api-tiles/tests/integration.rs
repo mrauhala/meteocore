@@ -2778,7 +2778,44 @@ fn reference_tile_png(palette: &str) -> Vec<u8> {
 /// `T` (as the server does for `[[wms.parameters]]`, bundle parameter entries
 /// and built-in parameter defaults) but not for `RH`.
 fn build_param_layer_router() -> axum::Router {
-    let engine: Arc<dyn MapEngine> = Arc::new(MultiParamMockMapEngine);
+    build_param_layer_router_with(Arc::new(MultiParamMockMapEngine), param_layer_styles())
+}
+
+/// The style registry the server builds for a multi-parameter collection: the
+/// collection-level map plus a per-parameter map for `T` only, so `RH` has to
+/// fall back to the collection map.
+fn param_layer_styles() -> HashMap<String, HashMap<String, StyleInfo>> {
+    HashMap::from([
+        (
+            "radar".to_string(),
+            HashMap::from([
+                (
+                    "default".to_string(),
+                    palette_style("default", "viridis", None),
+                ),
+                ("alt".to_string(), palette_style("alt", "radar_dbz", None)),
+            ]),
+        ),
+        (
+            "radar/T".to_string(),
+            HashMap::from([
+                (
+                    "default".to_string(),
+                    palette_style("default", "grayscale", Some("T")),
+                ),
+                (
+                    "alt".to_string(),
+                    palette_style("alt", "temperature", Some("T")),
+                ),
+            ]),
+        ),
+    ])
+}
+
+fn build_param_layer_router_with(
+    engine: Arc<dyn MapEngine>,
+    styles: HashMap<String, HashMap<String, StyleInfo>>,
+) -> axum::Router {
     let mut engines = HashMap::new();
     engines.insert("radar".to_string(), engine);
 
@@ -2811,35 +2848,10 @@ fn build_param_layer_router() -> axum::Router {
         },
     );
 
-    let mut styles_map = HashMap::new();
-    styles_map.insert(
-        "radar".to_string(),
-        HashMap::from([
-            (
-                "default".to_string(),
-                palette_style("default", "viridis", None),
-            ),
-            ("alt".to_string(), palette_style("alt", "radar_dbz", None)),
-        ]),
-    );
-    styles_map.insert(
-        "radar/T".to_string(),
-        HashMap::from([
-            (
-                "default".to_string(),
-                palette_style("default", "grayscale", Some("T")),
-            ),
-            (
-                "alt".to_string(),
-                palette_style("alt", "temperature", Some("T")),
-            ),
-        ]),
-    );
-
     let state = Arc::new(ArcSwap::from_pointee(TilesState {
         map_engines: engines,
         collections,
-        styles: styles_map,
+        styles,
         feature_engines: HashMap::new(),
         feature_collections: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -2989,6 +3001,149 @@ mod parameter_styles {
             params.iter().any(|p| p["name"] == "parameter-name"),
             "legend must advertise parameter-name; got {params:?}"
         );
+    }
+}
+
+/// #1133: a tile without `parameter-name` draws the engine's default
+/// parameter, so it must draw it with that parameter's own style, exactly
+/// as a tile naming it, never with the collection-level palette.
+mod default_parameter_styles {
+    use super::*;
+
+    const TILE: &str = "/collections/radar/tiles/WebMercatorQuad/0/0/0";
+
+    /// [`MultiParamMockMapEngine`] whose default parameter is `T`, the
+    /// parameter [`param_layer_styles`] gives a style layer of its own
+    /// (grayscale over the collection's viridis).
+    struct DefaultTMockMapEngine;
+
+    impl MapEngine for DefaultTMockMapEngine {
+        fn get_raster_tile(
+            &self,
+            bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<chrono::DateTime<chrono::Utc>>,
+            output_crs: &OutputCrs,
+            parameter: Option<&str>,
+            z: Option<f64>,
+            reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            MultiParamMockMapEngine.get_raster_tile(
+                bbox,
+                width,
+                height,
+                time,
+                output_crs,
+                parameter,
+                z,
+                reference_time,
+            )
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                parameter: "T".to_string(),
+                unit: "°C".to_string(),
+                ..MultiParamMockMapEngine.raster_info()
+            }
+        }
+    }
+
+    fn app_with(styles: HashMap<String, HashMap<String, StyleInfo>>) -> axum::Router {
+        build_param_layer_router_with(Arc::new(DefaultTMockMapEngine), styles)
+    }
+
+    fn app() -> axum::Router {
+        app_with(param_layer_styles())
+    }
+
+    /// Status, `x-cache` and body of one request.
+    async fn fetch(app: &axum::Router, uri: &str) -> (StatusCode, String, Vec<u8>) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let x_cache = resp
+            .headers()
+            .get("x-cache")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, x_cache, body)
+    }
+
+    /// The bug: the default `T` drew with the collection's viridis. It now
+    /// draws with its own grayscale, the same tile as `parameter-name=T`.
+    #[tokio::test]
+    async fn tile_without_parameter_name_draws_the_default_parameter_style() {
+        let (status, _, unnamed) = fetch(&app(), TILE).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, named) = fetch(&app(), &format!("{TILE}?parameter-name=T")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(unnamed, named, "the default parameter draws as when named");
+        assert_eq!(unnamed, reference_tile_png("grayscale"));
+        assert_ne!(unnamed, reference_tile_png("viridis"));
+
+        let styled = "/collections/radar/styles/alt/tiles/WebMercatorQuad/0/0/0";
+        let (_, _, unnamed) = fetch(&app(), styled).await;
+        let (_, _, named) = fetch(&app(), &format!("{styled}?parameter-name=T")).await;
+        assert_eq!(unnamed, named);
+        assert_eq!(unnamed, reference_tile_png("temperature"));
+    }
+
+    /// The rendered cache keys on the resolved style layer and parameter,
+    /// so the two requests share one entry: the second is a hit.
+    #[tokio::test]
+    async fn tile_without_parameter_name_shares_the_cache_entry_of_the_named_parameter() {
+        let app = app();
+        let (_, x_cache, unnamed) = fetch(&app, TILE).await;
+        assert_eq!(x_cache, "MISS");
+        let (_, x_cache, named) = fetch(&app, &format!("{TILE}?parameter-name=T")).await;
+        assert_eq!(x_cache, "HIT", "parameter-name=T keys as the unnamed tile");
+        assert_eq!(unnamed, named);
+    }
+
+    /// A style only the collection layer offers stays reachable without
+    /// `parameter-name`, on the collection's palette.
+    #[tokio::test]
+    async fn style_missing_from_the_default_parameter_layer_keeps_the_collection_style() {
+        let mut styles = param_layer_styles();
+        styles.get_mut("radar/T").unwrap().remove("alt");
+        let (status, _, body) = fetch(
+            &app_with(styles),
+            "/collections/radar/styles/alt/tiles/WebMercatorQuad/0/0/0",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, reference_tile_png("radar_dbz"));
+    }
+
+    /// The legend without `parameter-name` is the default parameter's
+    /// legend: the palette drawn, not the collection's under its label.
+    #[tokio::test]
+    async fn legend_without_parameter_name_is_the_default_parameter_legend() {
+        let legend = "/collections/radar/styles/default/legend";
+        let (status, _, unnamed) = fetch(&app(), legend).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, named) = fetch(&app(), &format!("{legend}?parameter-name=T")).await;
+        let unnamed: Value = serde_json::from_slice(&unnamed).unwrap();
+        let named: Value = serde_json::from_slice(&named).unwrap();
+        assert_eq!(unnamed, named);
+        assert_eq!(unnamed["parameter"], "T");
+        assert_eq!(unnamed["unit"], "°C");
+        assert_eq!(unnamed["stops"][0]["color"], "#000000", "grayscale");
+
+        let png = format!("{legend}?f=png");
+        let (status, _, unnamed) = fetch(&app(), &png).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, named) = fetch(&app(), &format!("{png}&parameter-name=T")).await;
+        assert_eq!(unnamed, named);
     }
 }
 

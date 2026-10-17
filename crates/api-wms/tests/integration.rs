@@ -3673,6 +3673,334 @@ fn capabilities_legend_url_carries_the_full_layer_name() {
     );
 }
 
+/// #1133: the root layer of a multi-parameter collection draws the engine's
+/// default parameter, so it must draw it with that parameter's own style,
+/// exactly as `collection/<default>` does, never with the collection-level
+/// palette. Its legend and its cache entries follow.
+mod default_parameter_styles {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A multi-parameter collection whose default parameter `T` has a style
+    /// layer of its own: grayscale over the collection's viridis, and an
+    /// `alt` style on both layers.
+    struct DefaultTEngine {
+        calls: Arc<AtomicUsize>,
+        /// `T` is the only parameter: a single-parameter collection.
+        single: bool,
+    }
+
+    impl MapEngine for DefaultTEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let pixel_count = (width * height) as usize;
+            let values: Vec<Option<f64>> = (0..pixel_count)
+                .map(|i| Some(i as f64 / pixel_count as f64))
+                .collect();
+            Ok(RasterTile {
+                width,
+                height,
+                values: values.into(),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            let parameter = |name: &str, unit: &str| ds_core::map_engine::ParameterInfo {
+                name: name.to_string(),
+                title: format!("Parameter {name}"),
+                unit: unit.to_string(),
+            };
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some([-20.0, 30.0, 40.0, 80.0]),
+                times: vec![chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)],
+                parameter: "T".into(),
+                unit: "°C".into(),
+                parameters: if self.single {
+                    vec![parameter("T", "°C")]
+                } else {
+                    vec![parameter("T", "°C"), parameter("RH", "%")]
+                },
+                vertical: None,
+                grid_size: None,
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
+    fn styles() -> HashMap<String, HashMap<String, StyleInfo>> {
+        HashMap::from([
+            (
+                "nwp".to_string(),
+                HashMap::from([
+                    (
+                        "default".to_string(),
+                        param_palette_style("default", "viridis", None),
+                    ),
+                    (
+                        "alt".to_string(),
+                        param_palette_style("alt", "radar_dbz", None),
+                    ),
+                ]),
+            ),
+            (
+                "nwp/T".to_string(),
+                HashMap::from([
+                    (
+                        "default".to_string(),
+                        param_palette_style("default", "grayscale", Some("T")),
+                    ),
+                    (
+                        "alt".to_string(),
+                        param_palette_style("alt", "temperature", Some("T")),
+                    ),
+                ]),
+            ),
+        ])
+    }
+
+    struct Fixture {
+        app: axum::Router,
+        calls: Arc<AtomicUsize>,
+        tile_cache: Arc<ds_render::TilePixelCache>,
+    }
+
+    fn fixture() -> Fixture {
+        fixture_with(false)
+    }
+
+    fn fixture_with(single: bool) -> Fixture {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine: Arc<dyn MapEngine> = Arc::new(DefaultTEngine {
+            calls: calls.clone(),
+            single,
+        });
+        let mut config = site_collection_config("nwp");
+        config.title = "Forecast".to_string();
+        config.engine_type = "grib".to_string();
+        let tile_cache = Arc::new(ds_render::TilePixelCache::new(64));
+        let state = Arc::new(ArcSwap::from_pointee(WmsState {
+            engines: HashMap::from([("nwp".to_string(), engine)]),
+            collections: HashMap::from([("nwp".to_string(), config)]),
+            styles: styles(),
+            point_engines: HashMap::new(),
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            tile_cache: tile_cache.clone(),
+            base_url: String::new(),
+            trust_proxy_headers: false,
+        }));
+        Fixture {
+            app: api_wms::router(state),
+            calls,
+            tile_cache,
+        }
+    }
+
+    /// Status, `x-cache` and body of one WMS request.
+    async fn fetch(app: &axum::Router, query: &str) -> (StatusCode, String, Vec<u8>) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/?SERVICE=WMS&VERSION=1.3.0&{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let x_cache = resp
+            .headers()
+            .get("x-cache")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, x_cache, body.to_vec())
+    }
+
+    fn get_map(layer: &str, style: &str, crs: &str, bbox: &str, size: u32) -> String {
+        format!(
+            "REQUEST=GetMap&LAYERS={layer}&STYLES={style}&FORMAT=image/png\
+             &CRS={crs}&BBOX={bbox}&WIDTH={size}&HEIGHT={size}\
+             &TIME=2024-01-01T00:00:00Z"
+        )
+    }
+
+    /// The direct path and the meta-tiled one.
+    const VIEWS: [(&str, &str); 2] = [
+        ("CRS:84", "10,55,30,70"),
+        ("EPSG:3857", "2000000,8000000,3000000,9000000"),
+    ];
+
+    /// The bug: `LAYERS=nwp` drew the default `T` with the collection's
+    /// viridis. It now draws with `T`'s grayscale, the image `LAYERS=nwp/T`
+    /// draws, on both render paths. Each request has a router of its own, so
+    /// the images are each a render, not a cache entry the other filled.
+    #[tokio::test]
+    async fn root_layer_draws_the_default_parameter_with_its_own_style() {
+        for (crs, bbox) in VIEWS {
+            let (status, _, root) = fetch(&fixture().app, &get_map("nwp", "", crs, bbox, 64)).await;
+            assert_eq!(status, StatusCode::OK, "{crs}");
+            let (status, _, child) =
+                fetch(&fixture().app, &get_map("nwp/T", "", crs, bbox, 64)).await;
+            assert_eq!(status, StatusCode::OK, "{crs}");
+            assert_eq!(root, child, "{crs}: the root layer draws as nwp/T");
+            let pixels = png_pixels(&root);
+            assert!(
+                pixels
+                    .iter()
+                    .any(|&[r, g, b, a]| a > 0 && (r, g) != (0, 0) && r == g && g == b),
+                "{crs}: drawn"
+            );
+            assert!(
+                pixels
+                    .iter()
+                    .all(|&[r, g, b, a]| a == 0 || (r == g && g == b)),
+                "{crs}: grayscale, not the collection's viridis"
+            );
+
+            // A named style the default parameter's layer also has is that
+            // layer's copy of it.
+            let (_, _, root_alt) =
+                fetch(&fixture().app, &get_map("nwp", "alt", crs, bbox, 64)).await;
+            let (_, _, child_alt) =
+                fetch(&fixture().app, &get_map("nwp/T", "alt", crs, bbox, 64)).await;
+            assert_eq!(root_alt, child_alt, "{crs}: STYLES=alt");
+            assert_ne!(root_alt, root, "{crs}: alt is its own palette");
+        }
+    }
+
+    /// The rendered cache keys on the resolved style layer and parameter:
+    /// `LAYERS=nwp/T` after `LAYERS=nwp` is a hit, with no engine call.
+    #[tokio::test]
+    async fn root_layer_shares_the_rendered_cache_entry_of_its_default_parameter() {
+        for (crs, bbox) in VIEWS {
+            let Fixture { app, calls, .. } = fixture();
+            let (_, x_cache, root) = fetch(&app, &get_map("nwp", "", crs, bbox, 64)).await;
+            assert_eq!(x_cache, "MISS", "{crs}");
+            let rendered = calls.load(Ordering::Relaxed);
+            assert!(rendered > 0, "{crs}");
+            let (_, x_cache, child) = fetch(&app, &get_map("nwp/T", "", crs, bbox, 64)).await;
+            assert_eq!(x_cache, "HIT", "{crs}: nwp/T keys as the root layer");
+            assert_eq!(root, child, "{crs}");
+            assert_eq!(calls.load(Ordering::Relaxed), rendered, "{crs}");
+        }
+    }
+
+    /// The meta-tile key does too: a view inside one the root layer drew,
+    /// at the same resolution, is a rendered-cache miss whose every tile
+    /// is cached, so `LAYERS=nwp/T` calls no engine.
+    #[tokio::test]
+    async fn root_layer_shares_the_meta_tiles_of_its_default_parameter() {
+        let Fixture {
+            app,
+            calls,
+            tile_cache,
+        } = fixture();
+        let (status, x_cache, _) = fetch(
+            &app,
+            &get_map(
+                "nwp",
+                "",
+                "EPSG:3857",
+                "2000000,8000000,3000000,9000000",
+                512,
+            ),
+        )
+        .await;
+        assert_eq!((status, x_cache.as_str()), (StatusCode::OK, "MISS"));
+        let rendered = calls.load(Ordering::Relaxed);
+        assert!(rendered > 0);
+        let (hits_before, _) = tile_cache.stats();
+
+        let (status, x_cache, _) = fetch(
+            &app,
+            &get_map(
+                "nwp/T",
+                "",
+                "EPSG:3857",
+                "2000000,8000000,2500000,8500000",
+                256,
+            ),
+        )
+        .await;
+        assert_eq!((status, x_cache.as_str()), (StatusCode::OK, "MISS"));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            rendered,
+            "every tile of nwp/T was cached by the root layer"
+        );
+        assert!(tile_cache.stats().0 > hits_before);
+    }
+
+    /// GetLegendGraphic on the root layer is `nwp/T`'s legend: the palette
+    /// the root layer draws, under the default parameter's name and unit.
+    #[tokio::test]
+    async fn root_layer_legend_is_the_default_parameter_legend() {
+        let app = fixture().app;
+        let legend = |layer: &str, format: &str| {
+            format!("REQUEST=GetLegendGraphic&LAYER={layer}&STYLE=default&FORMAT={format}")
+        };
+        let json = |body: &[u8]| serde_json::from_slice::<serde_json::Value>(body).unwrap();
+
+        let (status, _, root) = fetch(&app, &legend("nwp", "application/json")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, child) = fetch(&app, &legend("nwp/T", "application/json")).await;
+        let (root, child) = (json(&root), json(&child));
+        assert_eq!(root, child);
+        assert_eq!(root["parameter"], "T");
+        assert_eq!(root["unit"], "°C");
+        assert_eq!(root["stops"][0]["color"], "#000000", "grayscale");
+
+        let (status, _, root) = fetch(&app, &legend("nwp", "image/png")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, child) = fetch(&app, &legend("nwp/T", "image/png")).await;
+        assert_eq!(root, child);
+    }
+
+    /// A single-parameter collection is unchanged: GetCapabilities
+    /// advertises its one layer with the collection's styles, and that
+    /// layer draws them, though the server registered a style layer for its
+    /// parameter, as it does when that parameter matches a built-in
+    /// parameter default. Its legend is the collection's too.
+    #[tokio::test]
+    async fn single_parameter_layer_keeps_the_collection_style() {
+        for (crs, bbox) in VIEWS {
+            let app = fixture_with(true).app;
+            let (status, _, body) = fetch(&app, &get_map("nwp", "", crs, bbox, 64)).await;
+            assert_eq!(status, StatusCode::OK, "{crs}");
+            assert!(
+                png_pixels(&body)
+                    .iter()
+                    .any(|&[r, g, b, a]| a > 0 && !(r == g && g == b)),
+                "{crs}: the collection's viridis, not T's grayscale"
+            );
+        }
+        let (status, _, legend) = fetch(
+            &fixture_with(true).app,
+            "REQUEST=GetLegendGraphic&LAYER=nwp&STYLE=default&FORMAT=application/json",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let legend: serde_json::Value = serde_json::from_slice(&legend).unwrap();
+        assert_eq!(legend["stops"][0]["color"], "#440154", "viridis");
+    }
+}
+
 #[tokio::test]
 async fn oversized_render_is_rejected_before_engine_dispatch() {
     let (app, _, calls) = build_counting_router(16);

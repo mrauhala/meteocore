@@ -113,7 +113,14 @@ path can leave the WMS symptom unchanged (#448 vs #452).
 ## Rendered-image cache (#1010)
 
 `ds_render::RenderedCache`, shared with Maps and Tiles, holds encoded images
-under the exact request (`CacheKey`). Every successful non-empty render is
+under the request as resolved (`CacheKey`): the style layer and style name
+`ds_render::resolve_layer_style` returns, not the raw `LAYERS`/`STYLES`, so
+`STYLES=` and `STYLES=default`, and a multi-parameter collection's root
+layer and `coll/<default>`, share entries (#1133); the meta-tile
+`TileKeyPrefix` keys the same pair. Maps keys the same way into the same
+instance, so a WMS view and a Maps request whose keys match (CRS code,
+envelope, size, style, parameter, time) share one entry, whichever render
+path filled it; Tiles keys its TileMatrixSet id as the CRS. Every successful non-empty render is
 inserted on its first render, a meta-tiled viewport included; empty and
 error images never are. Measured on a day of a live deployment's GetMaps
 (85 000, every one an EPSG:3857 viewport, none tile-shaped):
@@ -153,7 +160,8 @@ error images never are. Measured on a day of a live deployment's GetMaps
   layer (`coll/param`) re-declares `<Dimension name="time">` with its own
   values and default — WMS 1.3.0 Table 7 makes Dimension inheritance
   "replace". GetMap settles the parameter (`LAYERS=coll/param`, then the
-  style's) before defaulting TIME, resolves the run with
+  style's, then on a multi-parameter collection's root layer the default
+  parameter whose style layer it draws with, #1133) before defaulting TIME, resolves the run with
   `resolve_parameter_reference_time` (GRIB's run depends on the parameter,
   #1005) and snaps with `resolve_parameter_time`, so the caches key the
   parameter's own run and timestep.
