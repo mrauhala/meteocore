@@ -1,8 +1,9 @@
 # engine-netcdf
 
 MeteoCore engine that serves gridded CF-NetCDF forecasts and analyses through
-WMS 1.3.0, OGC API - Maps and OGC API - Tiles (`engine_type = "netcdf"`,
-issue [#1067](https://github.com/mrauhala/meteocore/issues/1067)). The first
+WMS 1.3.0, OGC API - Maps, OGC API - Tiles and OGC API - EDR
+(`engine_type = "netcdf"`, issue
+[#1067](https://github.com/mrauhala/meteocore/issues/1067)). The first
 target is MET Norway's MEPS, as published per lead time on thredds.met.no.
 
 ## Scope
@@ -24,11 +25,19 @@ target is MET Norway's MEPS, as published per lead time on thredds.met.no.
   value. Ensemble files are read at one member.
 - CF packing and masking: `scale_factor`/`add_offset`, `_FillValue`,
   `missing_value`, NaN.
+- EDR position (one point or several), area and radius, each model run an
+  EDR instance; WMS GetFeatureInfo reads a layer's value through the
+  position query.
+- Wind speed derived from u/v components the CF `standard_name` identifies
+  (`x_wind`/`y_wind`, `eastward_wind`/`northward_wind`), on every API:
+  MEPS's `x_wind_10m`/`y_wind_10m` give `wind_speed_10m`. Grid-relative
+  components on a projected grid give no direction yet.
 
 **Out (later phases of #1067):**
 
-- EDR position/area/radius and derived wind speed (PR 7), pressure levels
-  as a vertical axis (PR 8).
+- Pressure levels as a vertical axis (PR 8), EDR trajectory and cube, wind
+  direction from grid-relative components (rotation by the convergence
+  angle, #897).
 - Per-variable file layouts, curvilinear 2-D latitude/longitude grids,
   `polar_stereographic`/`lambert_azimuthal_equal_area`/`transverse_mercator`
   mappings, ensemble members as a dimension.
@@ -38,7 +47,7 @@ target is MET Norway's MEPS, as published per lead time on thredds.met.no.
 ```toml
 id = "meps-netcdf-local"
 engine_type = "netcdf"
-apis = ["wms", "maps", "tiles"]     # required: the default ["edr"] is rejected
+apis = ["edr", "wms", "maps", "tiles"]   # default ["edr"]
 
 [netcdf]
 data_path = "testdata/meps-netcdf"  # local directory, read non-recursively
@@ -63,6 +72,36 @@ pascals, wind speed and gusts, the grid-relative `x_wind_10m`/`y_wind_10m`
 components (±40 m/s), relative humidity and cloud and fog area fractions in
 unit `1` (0–1), and the run-start `precipitation_amount_acc` (0–200 mm,
 `precipitation_accumulation`).
+
+### EDR
+
+- **Run and steps:** an `/instances/{id}/…` query reads that run; otherwise
+  a `datetime` window reads the newest run with a step inside it that also
+  spans the window's start, else the newest with any step inside it. An
+  instant matches a step valid at exactly that time. No step in the window
+  is a 404, so a `datetime` list skips that instant. Without `datetime`, a
+  position series is every step of the newest run, and an area is the step
+  a map without `TIME` draws (the newest run's last).
+- **Position** projects the point onto the grid once and samples every step
+  bilinearly in the grid's x/y, as the map draws it, so GetFeatureInfo
+  answers what GetMap drew. A point off the grid is null.
+- **Area and radius** are a CRS84 grid over the polygon's bbox at the
+  grid's mean cell size in degrees, at most 256 cells per axis; each cell
+  centre is projected once, and cells outside the polygon are null. A
+  polygon outside the grid's extent is a 404. A `datetime` interval puts
+  its steps on a `t` axis.
+- **Cost:** each field is read once per query for every point, at most four
+  at a time. A field a map has just drawn is reused; any other is decoded
+  for the query and not kept, so a series never evicts the frames being
+  drawn. A remote field's ~1.5 MB chunk is cached, and a read that outlives
+  the 30 s query deadline still lands in that cache, so a retry makes
+  progress. A query may decode at most `MC_NETCDF_EDR_QUERY_MB` (544 MiB):
+  one parameter over one MEPS run of 67 leads as the client sees it,
+  including a derived wind speed; more is a 400 that names the fields and
+  the limit, before anything is read. The cap counts the variables read: a
+  derived wind speed reads both of its components, 134 fields over a whole
+  run, and three variables over a run do not fit. A query whose points all
+  lie off the grid reads nothing.
 
 ### Remote files
 
@@ -102,6 +141,7 @@ parsed metadata, so 67 leads × 2 runs is some 110 MB.
 | `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote files (~1.5 MB per MEPS field) |
 | `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote files; at least 8 |
 | `MC_NETCDF_READ_MEMORY_MB` | `1024` | Transient buffers of field reads in progress; a read that does not fit is a 503 |
+| `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read, counted from the metadata before any read: steps × variables read × one field (4.06 MB for MEPS); over it a 400. The default admits one parameter over one MEPS run, including a derived wind speed, which reads both components |
 
 Each catalogued file stays open with its metadata while the catalog keeps
 it, one file descriptor each for local files. Developer notes, measurements

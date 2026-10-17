@@ -2,8 +2,11 @@ id = "meps-netcdf-local"
 title = "MEPS Surface (CF-NetCDF, local sample)"
 description = "MetCoOp MEPS 2.5 km surface forecast, control member, read from MET Norway's per-lead CF-NetCDF files on their Lambert conformal conic grid. A committed sample: every 100th grid point of two runs (2026-10-15 06Z leads 0-3, 09Z leads 0-2)."
 engine_type = "netcdf"
-# EDR comes with the engine's position queries (#1067).
-apis = ["wms", "maps", "tiles"]
+# EDR position, area and radius, model runs as instances; the WMS layers
+# answer GetFeatureInfo. The 10 m wind's speed is derived from its
+# grid-relative x/y components (`wind_speed_10m`, no direction on this
+# Lambert grid).
+apis = ["edr", "wms", "maps", "tiles"]
 keywords = ["forecast", "NWP", "MEPS", "NetCDF"]
 
 [license]

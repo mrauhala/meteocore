@@ -329,7 +329,7 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
 centre of pixel `(I, J)`, never a 1×1 `get_raster_tile` or a meta-tile
 pixel: the same engine call answers EDR `position`, so the two report the
 same value (the source value, sampled as the engine's position query does:
-bilinear for GRIB, QueryData and Zarr, while a projected GetMap resamples
+bilinear for GRIB, QueryData, Zarr and NetCDF, while a projected GetMap resamples
 meta-tiles by nearest neighbour).
 
 - **Engines.** `WmsState::point_engines` holds the `EdrEngine` of every WMS

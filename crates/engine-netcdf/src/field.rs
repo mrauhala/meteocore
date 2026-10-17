@@ -16,7 +16,10 @@
 //! [`ds_storage::FetchBudget::Background`]), and waits for it only until its
 //! own deadline. A fetch that outlives one request's 3 s still fills the
 //! cache for the next. At most [`MAX_DETACHED_FILLS`] run at once; past
-//! that a fill runs inline, under the request's deadline.
+//! that a fill runs inline, under the request's deadline. An EDR or
+//! GetFeatureInfo read ([`read_uncached`]) detaches from a pool of its own,
+//! [`MAX_QUERY_DETACHED_READS`], so query load never takes the slots render
+//! fills need to leave a warm cache behind a missed 3 s deadline.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -74,39 +77,79 @@ pub fn field_cache_metrics() -> ds_cache::CacheMetrics {
 /// piling up work no request still waits for.
 pub(crate) const MAX_DETACHED_FILLS: usize = 16;
 
-static DETACHED_PENDING: AtomicUsize = AtomicUsize::new(0);
-static DETACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
-static DETACHED_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+/// Detached EDR and GetFeatureInfo reads running at once, over every
+/// collection: a pool apart from the render fills', half their size. One
+/// cold series runs four reads at once (`ds_executor::field_jobs`), each for
+/// as long as a 1.5 MB fetch takes, so a few concurrent series would
+/// otherwise hold every render slot, and the renders' cold fills would run
+/// inline, under their 3 s deadline, where a fetch cut off caches nothing.
+pub(crate) const MAX_QUERY_DETACHED_READS: usize = MAX_DETACHED_FILLS / 2;
 
-/// Detached fills: `(running now, started in total, filled inline because
-/// MAX_DETACHED_FILLS were running)`.
-pub fn detached_fill_metrics() -> (usize, u64, u64) {
-    (
-        DETACHED_PENDING.load(Ordering::Relaxed),
-        DETACHED_TOTAL.load(Ordering::Relaxed),
-        DETACHED_OVERFLOW.load(Ordering::Relaxed),
-    )
+/// A cap on reads running detached from the request that started them, and
+/// its counters.
+pub(crate) struct DetachedPool {
+    cap: usize,
+    pending: AtomicUsize,
+    total: AtomicU64,
+    overflow: AtomicU64,
 }
 
-/// One running detached fill, counted until dropped.
-struct Detached;
+impl DetachedPool {
+    const fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            pending: AtomicUsize::new(0),
+            total: AtomicU64::new(0),
+            overflow: AtomicU64::new(0),
+        }
+    }
 
-impl Detached {
-    /// A slot for a detached fill, unless [`MAX_DETACHED_FILLS`] are running.
-    fn claim() -> Option<Self> {
-        DETACHED_PENDING
+    /// A slot for a detached read, unless `cap` are running: then `None`,
+    /// counted as a read run inline.
+    fn claim(&'static self) -> Option<Detached> {
+        let claimed = self
+            .pending
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_DETACHED_FILLS).then_some(n + 1)
+                (n < self.cap).then_some(n + 1)
             })
-            .ok()?;
-        DETACHED_TOTAL.fetch_add(1, Ordering::Relaxed);
-        Some(Self)
+            .is_ok();
+        if !claimed {
+            self.overflow.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.total.fetch_add(1, Ordering::Relaxed);
+        Some(Detached(self))
+    }
+
+    /// `(running now, started in total, run inline past the cap)`.
+    pub(crate) fn metrics(&self) -> (usize, u64, u64) {
+        (
+            self.pending.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+            self.overflow.load(Ordering::Relaxed),
+        )
     }
 }
 
+/// The render fills' pool ([`MAX_DETACHED_FILLS`]).
+static RENDER_FILLS: DetachedPool = DetachedPool::new(MAX_DETACHED_FILLS);
+
+/// The EDR and GetFeatureInfo reads' pool ([`MAX_QUERY_DETACHED_READS`]).
+pub(crate) static QUERY_READS: DetachedPool = DetachedPool::new(MAX_QUERY_DETACHED_READS);
+
+/// The render fills' detached reads: `(running now, started in total,
+/// filled inline because MAX_DETACHED_FILLS were running)`. Query reads
+/// ([`QUERY_READS`]) are not counted here.
+pub fn detached_fill_metrics() -> (usize, u64, u64) {
+    RENDER_FILLS.metrics()
+}
+
+/// One running detached read, counted in its pool until dropped.
+struct Detached(&'static DetachedPool);
+
 impl Drop for Detached {
     fn drop(&mut self) {
-        DETACHED_PENDING.fetch_sub(1, Ordering::AcqRel);
+        self.0.pending.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -173,6 +216,73 @@ pub(crate) fn read(
     result
 }
 
+/// Variable `index` of `file` at step `time` for an EDR query (#1067): the
+/// decoded field when the cache holds it (a frame being drawn), else decoded
+/// for this query alone and not cached, so a series over a whole run never
+/// evicts the frames being drawn. A remote file's compressed chunk still
+/// lands in the chunk cache ([`crate::remote`]), so the same field read
+/// again costs a decode, not a fetch. The lookup is not counted in the
+/// field cache's hits and misses, which measure the renders it serves.
+///
+/// A remote read is detached, as a render's fill is: it runs on the I/O
+/// runtime under [`Mode::Detached`] (no deadline, the background fetch
+/// budget), and the query waits for it only until its own deadline. A
+/// query that misses its deadline fails, while the reads it started go on
+/// into the chunk cache, so a retry makes progress. The slot comes from
+/// [`QUERY_READS`], never the render fills' pool; past
+/// [`MAX_QUERY_DETACHED_READS`] the read runs here, under the deadline.
+/// Each read reserves its transient peak from the decode budget.
+pub(crate) fn read_uncached(
+    file: &Arc<OpenFile>,
+    index: usize,
+    time: u32,
+    flipped: bool,
+    decodes: &Arc<AtomicU64>,
+) -> Result<Values, DataServerError> {
+    deadline::check()?;
+    let key = FieldKey {
+        file: file.id,
+        variable: file.reads[index].name.clone(),
+        time,
+        level: 0,
+    };
+    if let Some(values) = FIELDS.get_untracked(&key) {
+        return Ok(values);
+    }
+    let end = deadline::current();
+    let result = io::blocking(|| {
+        let slot = file.remote.as_ref().and_then(|_| QUERY_READS.claim());
+        let Some(slot) = slot else {
+            return fill(file, index, time, flipped, decodes);
+        };
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (file, decodes) = (file.clone(), decodes.clone());
+        io::handle().spawn_blocking(move || {
+            let _slot = slot;
+            let _mode = io::enter(Mode::Detached);
+            // The query may have given up: the chunk is cached anyway.
+            let _ = sender.send(fill(&file, index, time, flipped, &decodes));
+        });
+        let wait = end.map_or(Duration::from_secs(30), |end| {
+            end.saturating_duration_since(Instant::now())
+        });
+        match receiver.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if end.is_some() => {
+                Err(DataServerError::DeadlineExceeded)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(DataServerError::Storage(
+                "timed out waiting for a NetCDF field read".into(),
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(DataServerError::Engine(
+                "a detached NetCDF field read stopped".into(),
+            )),
+        }
+    });
+    deadline::check()?;
+    result
+}
+
 /// One reader's fill of one field.
 struct Fill<'a> {
     file: &'a Arc<OpenFile>,
@@ -226,8 +336,7 @@ impl Fill<'_> {
             }
             CacheEntry::Vacant(guard) => {
                 FIELDS.record_miss();
-                let Some(slot) = Detached::claim() else {
-                    DETACHED_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                let Some(slot) = RENDER_FILLS.claim() else {
                     let values =
                         fill(self.file, self.index, self.time, self.flipped, self.decodes)?;
                     let _ = guard.insert(values.clone());
@@ -472,6 +581,22 @@ mod tests {
         );
         assert!(values.iter().all(|v| Arc::ptr_eq(v, &values[0])));
         assert_eq!(values[0].len(), 110);
+    }
+
+    /// A pool lends at most its cap of slots, counts a claim past it as a
+    /// read run inline, and takes a slot back when its read drops it. Query
+    /// reads have a pool of their own, half the render fills'.
+    #[test]
+    fn a_detached_pool_lends_at_most_its_cap() {
+        let pool: &'static DetachedPool = Box::leak(Box::new(DetachedPool::new(2)));
+        let first = pool.claim().unwrap();
+        let _second = pool.claim().unwrap();
+        assert!(pool.claim().is_none());
+        assert_eq!(pool.metrics(), (2, 2, 1));
+        drop(first);
+        let _third = pool.claim().unwrap();
+        assert_eq!(pool.metrics(), (2, 3, 1));
+        assert_eq!((RENDER_FILLS.cap, QUERY_READS.cap), (16, 8));
     }
 
     #[test]

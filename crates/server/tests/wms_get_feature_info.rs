@@ -9,8 +9,11 @@
 //!   served as components only and wrapped in `DerivedWind` as the server
 //!   registers it, so the speed is derived; GRIB samples bilinearly between
 //!   nodes.
+//! - NetCDF: `testdata/meps-netcdf`, a crop of MET Norway's MEPS files on
+//!   their Lambert grid, two runs, wrapped in `DerivedWind` for the speed of
+//!   its grid-relative 10 m wind (#1067).
 //!
-//! Neither collection lists `edr` for the WMS: the WMS state carries the
+//! No collection lists `edr` for the WMS: the WMS state carries the
 //! engine's EDR side in `point_engines`, as the server wires it.
 //!
 //! A probe engine checks that both APIs run their engine queries on the one
@@ -41,6 +44,7 @@ use ds_core::wind::DerivedWind;
 use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 use engine_geotiff::GeoTiffEngine;
 use engine_grib::GribEngine;
+use engine_netcdf::NetcdfEngine;
 
 fn testdata(dir: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -390,6 +394,109 @@ async fn grib_pixels_read_the_edr_position_value(wms: axum::Router, edr: axum::R
     }
 }
 
+fn meps() -> Apis {
+    let config = serde_json::from_value(serde_json::json!({
+        "data_path": testdata("meps-netcdf").to_str().unwrap(),
+        "filename_template": "meps_sfc_{lead}_%Y%m%dT{run}Z.nc",
+        "variables": ["air_temperature_2m", "x_wind_10m", "y_wind_10m"],
+    }))
+    .unwrap();
+    let netcdf = Arc::new(NetcdfEngine::new("meps", &config).unwrap());
+    let engine = Arc::new(DerivedWind::new(
+        "meps",
+        netcdf,
+        Arc::new(|_: &str, _: &ds_core::wind::PairOutcome| {}),
+    ));
+    apis(
+        "meps",
+        "netcdf",
+        engine,
+        &[
+            "air_temperature_2m",
+            "x_wind_10m",
+            "y_wind_10m",
+            "wind_speed_10m",
+        ],
+    )
+}
+
+/// Fixture cell (row 5 from the south, column 4) of
+/// `testdata/meps-netcdf`: MET Norway's latitude and longitude of it, and
+/// its 11Z values in `meps_sfc_02_20261015T09Z` (2 m temperature in K, 10 m
+/// wind along the grid's x and y in m/s), as the CDL holds them.
+const MEPS_CELL: (f64, f64) = (13.827_727_538_778_511, 62.552_981_178_508_49);
+const MEPS_CELL_11Z: (f64, f64, f64) = (278.38034, 1.137_076_4, 5.762_552_3);
+
+/// NetCDF (#1067): MEPS on its Lambert grid, south-up rows. The pixel over
+/// a grid cell's centre reads the cell's stored value; every pixel reads
+/// the EDR position value at its centre, from the step and run GetMap
+/// draws: the newest run without `TIME`, the run that has a time the
+/// newest lacks. The derived speed is the wrapper's in both. Served by a
+/// current-thread runtime, as GRIB's above: the field jobs run on the
+/// query runtime.
+#[test]
+fn a_netcdf_pixel_reads_the_edr_position_value() {
+    let Apis { wms, edr } = meps();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(netcdf_pixels_read_the_edr_position_value(wms, edr));
+}
+
+async fn netcdf_pixels_read_the_edr_position_value(wms: axum::Router, edr: axum::Router) {
+    let (lon, lat) = MEPS_CELL;
+    let d = 0.01;
+    let bbox = format!("{},{},{},{}", lon - d, lat - d, lon + d, lat + d);
+    let (t2m, u, v) = MEPS_CELL_11Z;
+    for (parameter, stored) in [("air_temperature_2m", t2m), ("wind_speed_10m", u.hypot(v))] {
+        let layer = format!("meps/{parameter}");
+        let info = feature_info(&wms, &layer, "CRS:84", &bbox, (3, 3), (1, 1), "").await;
+        assert_eq!(info.time, "2026-10-15T11:00:00Z", "{parameter}");
+        assert_eq!(info.reference_time, "2026-10-15T09:00:00Z", "{parameter}");
+        let value = info.value.as_f64().unwrap();
+        assert!(
+            (value - stored).abs() < 1e-3,
+            "{parameter}: {value} {stored}"
+        );
+        let position = edr_position(
+            &edr,
+            "meps",
+            parameter,
+            (info.lon, info.lat),
+            "2026-10-15T11:00:00Z",
+        )
+        .await;
+        assert_eq!(info.value, position, "{parameter}");
+    }
+
+    // 08Z only the 06Z run has; a pixel between cell centres, in EPSG:3857.
+    for parameter in ["air_temperature_2m", "wind_speed_10m"] {
+        let info = feature_info(
+            &wms,
+            &format!("meps/{parameter}"),
+            "EPSG:3857",
+            "2700000,8400000,2800000,8500000",
+            (4, 4),
+            (1, 2),
+            "&TIME=2026-10-15T08:00:00Z",
+        )
+        .await;
+        assert_eq!(info.time, "2026-10-15T08:00:00Z");
+        assert_eq!(info.reference_time, "2026-10-15T06:00:00Z");
+        let position = edr_position(
+            &edr,
+            "meps",
+            parameter,
+            (info.lon, info.lat),
+            "2026-10-15T08:00:00Z",
+        )
+        .await;
+        assert!(info.value.is_number(), "{parameter}: {}", info.value);
+        assert_eq!(info.value, position, "{parameter}");
+    }
+}
+
 /// The layers GetCapabilities marks queryable are the ones answered above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capabilities_mark_the_layers_queryable() {
@@ -398,6 +505,10 @@ async fn capabilities_mark_the_layers_queryable() {
         (
             arpege().wms,
             &["arpege-uv/10u", "arpege-uv/10v", "arpege-uv/10si"][..],
+        ),
+        (
+            meps().wms,
+            &["meps/air_temperature_2m", "meps/wind_speed_10m"][..],
         ),
     ] {
         let reply = get(&wms, "/?SERVICE=WMS&REQUEST=GetCapabilities").await;

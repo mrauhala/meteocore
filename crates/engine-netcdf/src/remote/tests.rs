@@ -574,3 +574,120 @@ fn the_thredds_example_names_met_norways_files() {
          meps_sfc_12_20261016T06Z.nc"
     );
 }
+
+/// An EDR position series of `parameter` at the middle of the fixture's
+/// grid over both leads, under a deadline `ms` from now.
+fn series_within(
+    engine: &NetcdfEngine,
+    ms: u64,
+    parameter: &str,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    use ds_core::edr_engine::EdrEngine;
+    let _deadline = deadline::enter(Some(Instant::now() + Duration::from_millis(ms)));
+    let [w, s, e, n] = engine.raster_info().spatial_extent.unwrap();
+    let response = engine.query_position(
+        &format!("POINT({} {})", (w + e) / 2.0, (s + n) / 2.0),
+        None,
+        Some(&[parameter.to_string()]),
+        None,
+        None,
+    )?;
+    let ds_core::model::CoverageResponse::Single(result) = response else {
+        panic!("not one coverage");
+    };
+    Ok(result.ranges[parameter].values.clone())
+}
+
+/// Critical Rule 7 for queries (#1067 PR 7): remote reads complete on the
+/// shared query runtime's async workers, as api-edr runs a query, and in a
+/// GetFeatureInfo job (`RenderJob::run_query`) under a current-thread
+/// serving runtime. A series reads each field's chunk once, as a render
+/// does, and caches no decoded field: the next render decodes.
+#[test]
+fn queries_read_on_the_query_runtime_for_edr_and_get_feature_info() {
+    let server = server();
+    let engine = Arc::new(engine(&server, ""));
+    server.take();
+    let worker = engine.clone();
+    let on_edr = ds_executor::query_runtime()
+        .block_on(
+            ds_executor::query_runtime()
+                .spawn(async move { series_within(&worker, 30_000, "air_temperature_2m") }),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(on_edr.len(), 2);
+    assert!(on_edr.iter().all(Option::is_some));
+    assert_eq!(gets(&server.take()).len(), 2, "one chunk per lead");
+    let local = local();
+    assert_eq!(
+        on_edr,
+        series_within(&local, 30_000, "air_temperature_2m").unwrap()
+    );
+
+    let serving = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let worker = engine.clone();
+    let from_feature_info = serving
+        .block_on(async move {
+            let job = ds_executor::RenderJob::acquire_feature_info(Arc::new(
+                tokio::sync::Semaphore::new(1),
+            ))
+            .await
+            .unwrap();
+            job.run_query(move || series_within(&worker, 30_000, "wind_speed_of_gust"))
+                .await
+        })
+        .unwrap()
+        .unwrap();
+    assert!(from_feature_info.iter().all(Option::is_some));
+    assert_eq!(gets(&server.take()).len(), 2);
+
+    // The decoded fields were not kept; their chunks were.
+    let decodes = engine.field_decodes();
+    render(&engine, LEAD_0, "air_temperature_2m").unwrap();
+    assert_eq!(engine.field_decodes(), decodes + 1);
+    assert!(gets(&server.take()).is_empty(), "the chunk is cached");
+}
+
+/// A cold series slower than its query's deadline fails with the deadline,
+/// and the reads it started go on into the chunk cache: a retry makes
+/// progress, and the series costs one GET per field however often it is
+/// retried. Its reads detach from the query reads' pool, never the render
+/// fills' (other tests read concurrently, so only a lower bound holds).
+#[test]
+fn a_query_past_its_deadline_leaves_its_chunks_cached() {
+    let server = server();
+    let engine = engine(&server, "");
+    server.take();
+    server.slow_over(TUNING.bypass_over, Duration::from_millis(800));
+    let (_, query_reads, _) = crate::field::QUERY_READS.metrics();
+    let started = Instant::now();
+    let late = series_within(&engine, 100, "wind_speed_of_gust");
+    assert!(
+        matches!(late, Err(DataServerError::DeadlineExceeded)),
+        "{late:?}"
+    );
+    let (_, detached, _) = crate::field::QUERY_READS.metrics();
+    assert!(
+        detached >= query_reads + 2,
+        "both leads detached from the query pool"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "the query waited past its deadline"
+    );
+    let series = loop {
+        match series_within(&engine, 300, "wind_speed_of_gust") {
+            Ok(series) => break series,
+            Err(DataServerError::DeadlineExceeded) => {
+                assert!(started.elapsed() < Duration::from_secs(5), "never cached");
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert!(series.iter().all(Option::is_some));
+    assert_eq!(gets(&server.take()).len(), 2, "the first query's GETs only");
+}

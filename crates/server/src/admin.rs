@@ -2096,8 +2096,7 @@ pub fn load_collections(
             "grib" => &["edr", "wms", "maps", "tiles"],
             "zarr" => &["edr", "wms", "maps", "tiles"],
             "satellite" => &["edr", "wms", "maps", "tiles"],
-            // EDR and GetFeatureInfo come with its position queries (#1067).
-            "netcdf" => &["wms", "maps", "tiles"],
+            "netcdf" => &["edr", "wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
@@ -3041,8 +3040,10 @@ pub fn load_collections(
                     }
                 };
 
+                let mut reused_engine = false;
                 let engine = match engine_reuse.take_netcdf(&collection.id) {
                     Some(e) => {
+                        reused_engine = true;
                         info!(
                             "Collection '{}': config unchanged — reusing live engine",
                             collection.id
@@ -3070,15 +3071,44 @@ pub fn load_collections(
                 engines_by_id.insert(collection.id.clone(), EngineHandle::Netcdf(engine.clone()));
                 netcdf_engines.push(engine.clone());
 
-                // One WMS/Maps/Tiles layer per variable. The layers come from
+                // One WMS/Maps/Tiles layer per variable, and the wind speed
+                // derived from u/v components (#897). The layers come from
                 // the files, so a fresh engine has none until the immediate
                 // first tick of its poll loop; the recovery loop then
-                // registers the collection again with their styles.
-                let map_engine = engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>;
+                // registers the collection again with their styles. It
+                // compares the engine's own variables, so those are kept.
+                let (map_engine, edr_engine) = wind_wrapped(
+                    &collection.id,
+                    collection,
+                    &engine,
+                    reused_engine,
+                    &mut engine_reuse,
+                    &mut wind_by_id,
+                );
+                netcdf_parameters.insert(
+                    collection.id.clone(),
+                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters,
+                );
                 let raster_params = map_engine.raster_info().parameters;
-                netcdf_parameters.insert(collection.id.clone(), raster_params.clone());
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(collection.id.clone(), edr_engine.clone());
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                    edr_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to EDR API", collection.id);
+                }
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(collection.id.clone(), map_engine.clone());
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        edr_engine.clone(),
+                    );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -8066,11 +8096,13 @@ mod tests {
         assert_eq!(rebuilt.frame_window(), held);
     }
 
-    /// A NetCDF collection serves WMS, Maps and Tiles only until its EDR
-    /// lands; a reload keeping its config keeps its engine and open files,
-    /// a changed config builds a new one.
+    /// A NetCDF collection serves EDR (#1067), its default `apis` included,
+    /// and its WMS layers answer GetFeatureInfo whether or not it lists
+    /// `edr`; every API serves the wind speed derived from its grid-relative
+    /// 10 m components, and no direction. A reload keeping its config keeps
+    /// its engine, open files and wrapper; a changed config builds anew.
     #[test]
-    fn netcdf_is_a_map_engine_reused_across_reloads() {
+    fn netcdf_serves_edr_and_derived_wind_and_is_reused_across_reloads() {
         let meps = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../testdata/meps-netcdf")
             .to_string_lossy()
@@ -8079,30 +8111,53 @@ mod tests {
         collection.apis = vec!["wms".into(), "maps".into(), "tiles".into()];
         collection.netcdf = Some(
             toml::from_str(&format!(
-                "data_path = {meps:?}\nvariables = [\"air_temperature_2m\"]"
+                "data_path = {meps:?}\n\
+                 variables = [\"air_temperature_2m\", \"x_wind_10m\", \"y_wind_10m\"]"
             ))
             .unwrap(),
         );
         let mut with_edr = collection.clone();
         with_edr.id = "meps-edr".into();
-        with_edr.apis = vec!["edr".into(), "wms".into()];
+        // The default: `apis` left out of the config.
+        with_edr.apis = vec!["edr".into()];
         let configs = vec![collection, with_edr];
         let first = load_with_reuse(&configs, super::EngineReuse::default());
-        assert_eq!(first.netcdf_engines.len(), 1, "EDR is not served yet");
-        let failed = first.health.iter().find(|h| h.id == "meps-edr").unwrap();
-        assert_eq!(failed.status, super::CollectionStatus::Failed);
-        assert!(first.wms_state.engines.contains_key("meps-reload"));
+        assert_eq!(first.netcdf_engines.len(), 2);
+        for id in ["meps-reload", "meps-edr"] {
+            let health = first.health.iter().find(|h| h.id == id).unwrap();
+            assert_eq!(health.status, super::CollectionStatus::Ready, "{id}");
+        }
+        let edr = &first.edr_state.engines;
+        assert!(edr.contains_key("meps-edr") && !edr.contains_key("meps-reload"));
+        let parameters = edr["meps-edr"].get_parameters();
+        assert!(parameters.contains(&"wind_speed_10m".to_string()));
+        assert!(!parameters.iter().any(|p| p.contains("direction")));
+        assert!(first.wms_state.point_engines.contains_key("meps-reload"));
+        assert!(!first.wms_state.point_engines.contains_key("meps-edr"));
+        let speed = &first.wms_state.styles["meps-reload/wind_speed_10m"]["default"];
+        assert_eq!(speed.palette.name, "wind_speed");
         assert!(first.maps_state.engines.contains_key("meps-reload"));
         assert!(first.tiles_state.map_engines.contains_key("meps-reload"));
+        // The recovery loop compares the engine's own variables.
+        assert_eq!(first.netcdf_parameters["meps-reload"].len(), 3);
         let live = first.netcdf_engines[0].clone();
         live.poll_once();
         assert_eq!(live.times().len(), 6);
 
         let second = load_with_reuse(
             &configs,
-            reuse_pool(&configs, &configs, &first.engines_by_id),
+            super::EngineReuse {
+                wind: first.wind_by_id.clone(),
+                ..reuse_pool(&configs, &configs, &first.engines_by_id)
+            },
         );
         assert!(Arc::ptr_eq(&live, &second.netcdf_engines[0]));
+        let ptr = |e: &Arc<dyn ds_core::map_engine::MapEngine>| Arc::as_ptr(e) as *const ();
+        assert_eq!(
+            ptr(&second.wms_state.engines["meps-reload"]),
+            ptr(&first.wms_state.engines["meps-reload"]),
+            "the reused engine keeps its wrapper"
+        );
 
         let mut changed = configs.clone();
         changed[0].title = "renamed".to_string();

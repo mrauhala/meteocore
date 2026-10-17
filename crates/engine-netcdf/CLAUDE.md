@@ -3,9 +3,9 @@
 CF-NetCDF gridded forecasts and analyses (#1067), first for MET Norway's
 MEPS. Read the root `CLAUDE.md` first — Critical Rules 5, 6, 7, 9 and 10
 shape this crate. Today: local directories and remote files read in place
-by HTTP range (thredds.met.no), WMS/Maps/Tiles. EDR and derived wind
-(PR 7) and pressure levels (PR 8) come later; keep the seams below where
-they are.
+by HTTP range (thredds.met.no), WMS/Maps/Tiles, EDR position/area/radius
+with runs as instances, GetFeatureInfo, derived wind speed. Pressure
+levels (PR 8) come later; keep the seams below where they are.
 
 ## Model
 
@@ -179,8 +179,10 @@ Read in place by HTTP range, never downloaded whole (decision 4).
   scoped thread on a current-thread runtime. The deadline is the calling
   thread's (`ds_storage` captures it). Pinned by
   `io::tests::every_calling_thread_reaches_the_runtime` and
-  `remote::tests::reads_run_on_the_poll_runtime_render_jobs_and_async_workers`.
-  EDR and GetFeatureInfo query workers: PR 7 adds their tests.
+  `remote::tests::reads_run_on_the_poll_runtime_render_jobs_and_async_workers`;
+  EDR queries on the shared query runtime's workers and GetFeatureInfo's
+  `RenderJob::run_query` by
+  `remote::tests::queries_read_on_the_query_runtime_for_edr_and_get_feature_info`.
 - **Fetch modes** (`io::Mode`, a thread-local like `ds_core::deadline`):
   `Request` (default: the host's whole limit, `FetchBudget::Request`, the
   request's deadline), `Detached` (a fill a request handed off: whole
@@ -206,7 +208,8 @@ Read in place by HTTP range, never downloaded whole (decision 4).
   over 256 KiB, cached whole by (identity, offset, length), single-flight:
   8 renders of a cold field make one GET. Equivalent to the issue's
   (identity, variable, time, level) key without passing a field context
-  down to the storage callback; PR 7's EDR series inserts here.
+  down to the storage callback. An EDR query's fields land here, never in
+  `FIELDS` (see EDR below).
 - **Replaced file** (decision 7): `RangeRead::Changed` (412, 404, or another
   size/`Last-Modified`/ETag) marks the `RemoteFile` replaced (every later
   read fails at once), drops its blocks and chunks (`retain` by `FileId`)
@@ -284,7 +287,15 @@ Read in place by HTTP range, never downloaded whole (decision 4).
   the guard: a waiting reader then fills inline and gets the error itself.
   At most `MAX_DETACHED_FILLS` (16) run at once, over every collection;
   past that the fill runs inline under the deadline. Local files fill
-  inline. Note for PR 7: derived wind reads u and v one after the other.
+  inline. EDR and GetFeatureInfo reads (`read_uncached`) detach from a pool
+  of their own, `QUERY_READS` (`MAX_QUERY_DETACHED_READS`, 8), never the
+  render fills': one cold series holds four reads for as long as a 1.5 MB
+  fetch takes, and a few would otherwise push the renders' cold fills
+  inline, where a fetch cut off by the 3 s deadline caches nothing and
+  retries never progress. Both pools' fetches still share the host's
+  request limit (`Mode::Detached`). A derived wind speed tile (`DerivedWind`) reads u, then v: on a
+  cold remote pair the second fetch starts once the first has landed, so
+  a slow link may take a retry or two, each making progress.
 - **Prewarm** (`prewarm_variables`, remote only, off by default): after a
   poll publishes, the newest run's fields of those variables are read in
   `Mode::Background` on `BACKGROUND_SHARE` threads, until the next poll is
@@ -296,7 +307,10 @@ Read in place by HTTP range, never downloaded whole (decision 4).
 - **Metrics** (server `metrics_handler`, while a NetCDF collection is
   loaded): `netcdf_{field,block,chunk}_cache_{hits_total,misses_total,
   bytes,capacity_bytes}`, `netcdf_read_{reserved_bytes,capacity_bytes,
-  rejected_total}`, `netcdf_detached_fills_{pending,total,inline_total}`;
+  rejected_total}`, `netcdf_detached_fills_{pending,total,inline_total}`
+  (render fills only: EDR reads count in neither these nor the field
+  cache's hits and misses, which measure the renders; they show in the
+  chunk cache and the per-host request gauges);
   and, for every host behind `build_http_store_limited`,
   `storage_host_{requests_in_flight,requests_queued,request_limit}{host}`.
   Grafana: the cache-family panels, the two "NetCDF field-read" panels,
@@ -325,6 +339,86 @@ unit-keyed match read them through `ds_core::units::canonical_unit`
 (`kg/m^2` is `kg m-2`), so the layers need no `[[wms.parameters]]` for the
 defaults ds-render's table gives MEPS names (PR 6).
 
+## EDR (`edr.rs`) — #1067 PR 7
+
+`EdrEngine`: position (one point, or `query_positions`' several), area and
+radius (the trait default: a 64-vertex polygon through area); no
+locations, trajectory or cube.
+
+- **Run and steps** (`Catalog::query_run`, engine-grib's `resolve_run`
+  rule): a pinned run is exactly that run (absent ⇒ 404
+  `ReferenceTimeNotFound`); unpinned with a `datetime` window, the newest
+  run with a step inside it that also spans the window's start, else the
+  newest with any step inside; none ⇒ `LocationNotFound` (404), so a
+  `datetime` list skips the instant (#968). An instant needs a step at
+  exactly it. Without a window: a position series is every step of the
+  newest run, an area the newest run's last step (the map's default). An
+  interval puts an area's steps on a `t` axis, even one (grib's rule).
+  GetFeatureInfo passes the run and step its map resolved
+  (`resolve_reference_time`, `resolve_time`), so it reads that field.
+- **Sampling:** `ds_core::resample::SourceGrid::position` projects a point,
+  or an area cell centre, once (Critical Rule 5); `value_at` samples it as
+  the map does (bilinear in x/y, nearest at a nodata neighbour, the half
+  cell past the edges). A point off the grid is null, not an error. An
+  area is a CRS84 grid over the polygon's bbox at the extent's mean degree
+  size per cell (`crs84_bbox_spans` ÷ cells), ≤ `MAX_AREA_DIM`, masked by
+  `cell_mask`, as engine-querydata's; a polygon missing the extent is 404.
+  A point or cell off the grid (`SourceGrid::covers`, the rule `value_at`
+  applies) is dropped before sampling, and a query with none on the grid
+  reads no field: `POINT(-100 10)` on remote MEPS costs no fetch.
+- **Field jobs:** one per (variable, step), through
+  `ds_executor::field_jobs::run_field_jobs` (engine-grib's scheduler, moved
+  there): four at once as tasks on the query runtime (fallback
+  `ds_executor::query_runtime()` outside any runtime), each re-entering
+  the query's deadline. Each job reads its field and returns only the
+  samples at every point: one read per field for all points.
+- **Reads:** `field::read_uncached`: a `FIELDS` hit (a frame a render just
+  drew) is used; a miss is decoded for the query and **not inserted**, so
+  a series over a run never evicts the frames being drawn; the lookup is
+  not counted in `netcdf_field_cache_*`. A remote miss runs detached on
+  the I/O runtime (`Mode::Detached`, a `QUERY_READS` slot, inline past
+  them) and the job waits until its deadline: a query that misses the
+  30 s `QUERY_TIMEOUT` is a `DeadlineExceeded` (EDR 504, GetFeatureInfo
+  503) while its fetches go on into `CHUNKS`, so a retry makes progress
+  (`remote::tests::a_query_past_its_deadline_leaves_its_chunks_cached`).
+  Every read reserves the decode budget; a failed read fails the query,
+  never a null: a replaced file or the budget is `ResourceExhausted` (503),
+  the deadline `DeadlineExceeded` (504), any other remote failure
+  `Storage` (an opaque 500 in EDR).
+- **Query-shape cap** (`QUERY_BYTES`, `MC_NETCDF_EDR_QUERY_MB`, default 544
+  MiB): steps × the sum over the variables of `FieldRead::decoded_bytes`
+  (the `f32` field, or its chunk when larger), from the first step's file,
+  before any read; over it a 400 `QueryTooLarge` naming the fields, the
+  MiB and the limit. The default admits one parameter over one MEPS run
+  as the client sees it, including a derived wind speed (decided on
+  #1067, twice the issue's 272 MiB). It counts the variables the engine
+  reads, and `DerivedWind` asks for both components of a derived speed: a
+  `wind_speed_10m` series over a whole run is 134 × 4.06 MB, 519 MiB, and
+  three variables over a run (201 fields) are a 400; every doc of the cap
+  says so (root and engine READMEs, api-edr's matrix, the pixel-budget
+  row, the thredds example). Then `check_area_budget` (values) and, for
+  areas, `check_mask_budget`. Measured live 2026-10-17 (laptop link, debug
+  build, `tests/live_thredds.rs`): a 3-lead series whose first field a map
+  had drawn, 2 GETs, 3.1 MB, 3.6 s.
+- **Metadata:** parameters from the layout and the catalog's `RasterInfo`
+  (titles, units as spelled), CF `standard_name` → `observedProperty.id`;
+  temporal extent and available times are the union over runs; instances
+  from the run map (`get_instances`, O(1) `has_instances`,
+  `instance_reference_times` from its keys, `find_instance` one run); a
+  run-less timeline has none.
+
+## Derived wind
+
+`WindSource::wind_facts` is the layout's `Arc<WindFacts>`, built once with
+the layout (`catalog::wind_facts`): per variable its CF `standard_name`,
+the frame `VectorFrame::from_standard_name` gives (`x_wind`/`y_wind` ⇒
+`Grid`), the unit, and the level (`"10 m"`: the single level's value and
+units) as the pairing level; the grid's `GridAxes::of(crs)`. MEPS's Lambert
+grid is `Rotated`, so `x_wind_10m`/`y_wind_10m` give `wind_speed_10m` and no
+direction (decision 6; rotation by the convergence angle is a follow-up on
+#897). The server wraps the engine in `DerivedWind` (`wind_wrapped`), which
+derives on every API from the components' own reads.
+
 ## Runs (`catalog.rs`)
 
 `BTreeMap<Option<DateTime<Utc>>, Run>`, `None` the run-less timeline.
@@ -344,8 +438,13 @@ version), or by a remote read at once (`Changes::bumps`).
 
 ## Server wiring
 
-`engine_type = "netcdf"`, allowlist `["wms", "maps", "tiles"]` (an `edr`
-collection is rejected until PR 7; examples set `apis`). Poll loop in all
+`engine_type = "netcdf"`, allowlist `["edr", "wms", "maps", "tiles"]` (the
+default `apis` works). Registered through `wind_wrapped` (in
+`DERIVE_WIND_ENGINES`; `derive_wind = false` opts out), its EDR side
+through `register_point_engine` for GetFeatureInfo whether or not it lists
+`edr`. `netcdf_parameters` keeps the engine's own variables, which the
+recovery loop compares, while the styles are resolved for the wrapper's
+(with the derived speed). Poll loop in all
 three places (boot spawn, `rotate_poll_loops!`, shutdown); a remote
 source's first tick is immediate. Health: live
 status from `live_health`; data age = the newest run's reference time, or
@@ -355,7 +454,6 @@ the newest valid time without runs. Layer styles resolve at load from
 (`netcdf_registration_changed`, ≤ 30 s, mirroring
 `grib_registration_changed`) registers the collection again once a poll
 has read them, reusing the engine and evicting any tiles drawn meanwhile.
-Not in `DERIVE_WIND_ENGINES` (PR 7).
 
 ## Tests and fixtures
 
@@ -377,10 +475,13 @@ Not in `DERIVE_WIND_ENGINES` (PR 7).
   renders, a detached fill outliving its request's deadline and leaving
   the cache warm, a replaced file (412 → 503, content version, re-probe,
   new file), prewarm, the bounded first scan opening only the newest run,
-  the runtime contexts, and the shipped thredds example (offline).
+  the runtime contexts, EDR and GetFeatureInfo queries on the query
+  runtime, a query past its deadline leaving its chunks cached, and the
+  shipped thredds example (offline).
 - `tests/live_thredds.rs`: `#[ignore]`, against thredds.met.no: leads
-  00-02 of the newest run, `air_temperature_2m`, one field, ~5 MB, and a
-  1 KiB ranged GET of an archived file. Run by hand only (`cargo test -p
+  00-02 of the newest run, `air_temperature_2m`, one field and an EDR
+  position series over the three leads, ~9 MB, and a 1 KiB ranged GET of
+  an archived file. Run by hand only (`cargo test -p
   engine-netcdf --test live_thredds -- --ignored --nocapture`); it prints
   requests, bytes, timings and the heap per kept handle
   (`NetcdfEngine::remote_traffic`).
@@ -391,9 +492,23 @@ Not in `DERIVE_WIND_ENGINES` (PR 7).
   170,10,-170,20, packing and fill, a failed read, a replaced file, the
   initial scan and a poll picking up new files, an unusable
   `filename_template`, and renders on `RenderJob` blocking workers and an
-  async worker.
+  async worker. Its EDR tests (`edr_*`, `derived_wind_*`): position values
+  pinned to the stored cells in the run EDR selects, the 404s a `datetime`
+  list skips, position and area sampling what the map draws, several
+  points sharing each field read and nothing cached, area and radius
+  masking and `t` axes, instances, the derived speed against the stored
+  components, and queries on the query runtime and a GetFeatureInfo job.
+  `edr::tests` pin the query-shape cap; the server's
+  `wms_get_feature_info` test reads a pixel at a fixture cell.
   `field::tests` pins single-flight with a slow storage (8 readers, one
   decode). `ingest::tests`, `catalog::tests`, `discover::tests` are unit
-  tests; `server` has `netcdf_is_a_map_engine_reused_across_reloads` and
+  tests; `server` has
+  `netcdf_serves_edr_and_derived_wind_and_is_reused_across_reloads` and
   `netcdf_recovery_registers_layer_styles_once_variables_are_found`.
+- `crates/server/tests/netcdf_edr.rs`: every query shape on the committed
+  MEPS fixture through the EDR router (position, an instant, MULTIPOINT, a
+  `datetime` list, area, radius, instance queries, the derived wind
+  speed, the 404s), each CoverageJSON body validated against
+  `schemas/coveragejson.json`, and the collection and instances documents
+  against the EDR 1.1 and 1.2 schemas.
 - Regenerate a fixture's `.nc` with `ncgen -k nc4 -o <name>.nc <name>.cdl`.

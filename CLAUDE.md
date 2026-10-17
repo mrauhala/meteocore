@@ -18,7 +18,9 @@ per-host request limits for files read in place),
 `ds-executor` (shared Tokio render admission/deadline execution and the one
 query runtime EDR and WMS GetFeatureInfo share; API-facing infrastructure,
 plus `budget::ByteBudget`, the fail-fast byte budget each engine's source-read
-admission is an instance of — never another copy, #1067),
+admission is an instance of — never another copy, #1067 — and
+`field_jobs::run_field_jobs`, the bounded field-read scheduler of an EDR
+query that GRIB and NetCDF share),
 `ds-poll` (shared poll-loop lifecycle: the `Shutdown` handle + `PollTicker`
 every engine's background poll loop uses — never hand-roll a
 `tokio::select!` shutdown signal, #481),
@@ -146,8 +148,9 @@ Violating these has caused production incidents. Never break them.
      thread. Ingest on a poll-runtime worker, renders on `RenderJob` blocking
      workers and on async workers are covered by
      `remote::tests::reads_run_on_the_poll_runtime_render_jobs_and_async_workers`
-     and `io::tests::every_calling_thread_reaches_the_runtime`; its EDR and
-     GetFeatureInfo query workers come with #1067 PR 7.
+     and `io::tests::every_calling_thread_reaches_the_runtime`; EDR queries
+     on the query runtime's workers and GetFeatureInfo's `run_query` by
+     `remote::tests::queries_read_on_the_query_runtime_for_edr_and_get_feature_info`.
    - Never from a non-Tokio thread such as a rayon pool — that hits a
      construct-a-new-`Runtime`-per-call fallback (#222). For parallel remote
      fetches, use async concurrency (`join_all`) on the runtime, or pass a
@@ -570,8 +573,11 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   Mercator sources get the periodic map; any other gets the longitude
   within half a turn of the grid's centre and the `footprint_pixel_window`
   guard (#449/#453). Build the `SourceGrid` once per grid, not per request:
-  `new` inverse-projects the envelope. querydata, grib and satellite keep
-  their own samplers for now.
+  `new` inverse-projects the envelope. Its point queries (an EDR position, an
+  area's cell centre) project each point once with `position` and sample
+  every field there with `value_at`, the map's own sampling, so
+  GetFeatureInfo answers what GetMap drew (engine-netcdf). querydata, grib
+  and satellite keep their own samplers for now.
 - **Before blaming a mechanism for a latency spike, check the magnitude adds
   up.** A 2.3 MB local read from page cache is tens of ms, not seconds.
   Multi-second stalls at low load almost always mean blocking/contention
@@ -596,6 +602,7 @@ one never implies the other.
 | `engine_geotiff::decode_budget::BUDGET` (a `ByteBudget`) | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
 | engine-zarr `read_budget::BUDGET` (over a `ByteBudget`) | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
 | engine-netcdf `decode_budget::BUDGET` (a `ByteBudget`) | bytes of one field read in progress: 3 × decoded + 3 × compressed, the decoded chunk bounding the compressed one (~24 MB per MEPS field); cache waiters and hits reserve nothing; a remote fill detached from its request and a poll's prewarm reserve it too | `MC_NETCDF_READ_MEMORY_MB`, 1024 MiB | 503 |
+| engine-netcdf `edr::QUERY_BYTES` | decoded bytes of the fields one EDR query reads: steps × levels × variables read × one field (`FieldRead::decoded_bytes`, 4.06 MB for MEPS), from the file metadata | `MC_NETCDF_EDR_QUERY_MB`, 544 MiB: one parameter over one MEPS run (67 leads) as the client sees it, including a derived wind speed, which reads both components (134 fields); not three variables over a run | 400 "Query too large: Query would decode N fields …", before any read |
 | `ds_core::feature::MAX_AREA_DIM` / `MAX_AREA_VALUES` | EDR area output cells per axis / values per response | 256 / 1 M | coarsened / 400 "Query too large: …" |
 | `engine_geotiff::STAC_REQUEST_MAX_COLD_ITEMS` | STAC items whose header one EDR query reads (items in its window with no metadata yet; without `datetime`, in the whole catalog) | 400 (a closed day of 5-minute frames is 289) | 400 "Query too large: …", counted from the STAC response before it is installed or anything loads (#889) |
 | EDR `f=png` plot, WMS `GetLegendGraphic` | output px | 160–2000 × 120–2000 / ≤ 512 × 1024 | never: clamped silently |
@@ -711,9 +718,9 @@ one never implies the other.
     `instance_reference_times` (the map's keys, #1006) from the same
     snapshot; honour the trailing `reference_time` parameter on query
     methods and `MapEngine::get_raster_tile` (`None` ⇒ latest); populate
-    `RasterInfo.reference_times`. GRIB, QueryData, Zarr (forecast stores)
-    and Nowcast (generations = runs, #661) implement this; other engines
-    accept-and-ignore.
+    `RasterInfo.reference_times`. GRIB, QueryData, Zarr (forecast stores),
+    NetCDF (`forecast_reference_time`) and Nowcast (generations = runs,
+    #661) implement this; other engines accept-and-ignore.
   - API surface: EDR `/instances` (listed newest first: the handler sorts
     it, engines and `build_instances` stay ascending), `/instances/{id}`,
     `/instances/{id}/{position,area}` — gated on `get_instances()` being
@@ -816,7 +823,7 @@ one never implies the other.
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
-| NetCDF | `MapEngine` | WMS, Maps, Tiles — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields only. EDR and pressure levels are #1067 PRs 7 and 8 |
+| NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields only. EDR samples each point or area cell as the map draws it (one projection per point, a CRS84 area grid), runs as instances, GetFeatureInfo through position; a query decodes at most `MC_NETCDF_EDR_QUERY_MB`; derived wind speed from CF `x_wind`/`y_wind` (no direction on MEPS's Lambert grid). Pressure levels are #1067 PR 8 |
 | BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
 
 ## Config Format
@@ -965,7 +972,7 @@ style_bundle = "radar_multi"
 [collections.preview]
 time_window = "PT12H"
 
-# grib / querydata / zarr collections derive wind speed (and, where the
+# grib / querydata / zarr / netcdf collections derive wind speed (and, where the
 # source states the u/v frame, direction) from u/v components (#897).
 [[collections]]
 id = "nwp"
@@ -1024,7 +1031,7 @@ colormap = "radar_dbz"
 [[collections]]
 id = "meps-netcdf-local"
 engine_type = "netcdf"
-apis = ["wms", "maps", "tiles"]   # the default ["edr"] is rejected until EDR lands
+apis = ["edr", "wms", "maps", "tiles"]
 
 [collections.netcdf]
 data_path = "testdata/meps-netcdf"

@@ -183,44 +183,60 @@ impl SourceGrid {
         }
     }
 
+    /// The fractional source position of WGS84 `(lon, lat)`, measured from
+    /// the first cell's centre: the one forward projection a point query
+    /// makes (an EDR position, or an area's cell centre), reused for every
+    /// field it samples with [`Self::value_at`]. As in a map, a projected
+    /// grid takes the longitude within half a turn of its own centre, and a
+    /// longitude-linear grid's columns repeat every turn ([`Self::value_at`]
+    /// wraps them), so a point given at 190°E or -170°E is the same point.
+    pub fn position(&self, lon: f64, lat: f64) -> (f64, f64) {
+        let lon = match self.layout {
+            Layout::Projected {
+                envelope: Some([w, _, e, _]),
+            } => within_half_turn(lon, (w + e) / 2.0),
+            _ => lon,
+        };
+        centred(self.transform.world_to_pixel_f64(lon, lat))
+    }
+
+    /// The value of `values`, the grid's row-major field (row 0 north) with
+    /// `nodata` as its sentinel, at `position` ([`Self::position`]): what a
+    /// map draws there. Bilinear between the four surrounding cell centres,
+    /// or the nearest cell's value where one of them is nodata or off the
+    /// grid; `None` off the grid (beyond the half cell past its edges), at
+    /// nodata, or for a field of the wrong length.
+    pub fn value_at(
+        &self,
+        values: &[f32],
+        nodata: Option<f32>,
+        (col, row): (f64, f64),
+    ) -> Option<f64> {
+        let cells = self.transform.width as usize * self.transform.height as usize;
+        if values.len() != cells {
+            return None;
+        }
+        self.sample(values, nodata, col, row)
+    }
+
+    /// Whether `position` ([`Self::position`]) lies on the grid, within the
+    /// half cell past its edges: where [`Self::value_at`] finds a cell to
+    /// read. A query whose positions all lie off the grid answers nothing
+    /// but `None` and can skip reading its fields.
+    pub fn covers(&self, (col, row): (f64, f64)) -> bool {
+        self.locate(col, row).is_some()
+    }
+
     /// The value at fractional source position `(col, row)`
     /// ([`centred`]): bilinear, or the nearest cell's where a neighbour is
     /// nodata or off the grid; `None` off the grid (beyond the half cell
-    /// past its edges) or where the mapping is undefined.
-    ///
-    /// The non-finite check comes first: NaN fails every comparison and
-    /// `NaN as i64` is 0, so it would otherwise pass the bounds checks and
-    /// read the grid's first cell.
+    /// past its edges, [`Self::locate`]) or where the mapping is undefined.
     fn sample(&self, values: &[f32], nodata: Option<f32>, col: f64, row: f64) -> Option<f64> {
-        if !col.is_finite() || !row.is_finite() {
-            return None;
-        }
+        let (col, global) = self.locate(col, row)?;
         let nx = i64::from(self.transform.width);
         let ny = i64::from(self.transform.height);
-        let (col, global) = match self.layout {
-            // A global grid's columns run [0, period); one past its last
-            // column reads its first.
-            Layout::Periodic {
-                period,
-                global: true,
-            } => (col.rem_euclid(period), true),
-            // A regional one is drawn in the turn centred on it.
-            Layout::Periodic { period, .. } => {
-                let start = (nx - 1) as f64 / 2.0 - period / 2.0;
-                let col = if (start..start + period).contains(&col) {
-                    col
-                } else {
-                    start + (col - start).rem_euclid(period)
-                };
-                (col, false)
-            }
-            Layout::Projected { .. } => (col, false),
-        };
         let col0 = col.floor() as i64;
         let row0 = row.floor() as i64;
-        if row0 < -1 || row0 >= ny || (!global && (col0 < -1 || col0 >= nx)) {
-            return None;
-        }
         let column = |c: i64| {
             if global && c >= nx {
                 Some(0)
@@ -255,6 +271,49 @@ impl SourceGrid {
                 at(nc, nearest(row, ny))
             }
         }
+    }
+
+    /// Where `(col, row)` ([`centred`]) falls on the grid: the column moved
+    /// into the turn the grid is drawn in (a periodic grid's) and whether
+    /// the grid is global, or `None` off the grid (beyond the half cell past
+    /// its edges) or where the mapping is undefined. [`Self::sample`] and
+    /// [`Self::covers`] share it, so a query's skip and a map's draw agree.
+    ///
+    /// The non-finite check comes first: NaN fails every comparison and
+    /// `NaN as i64` is 0, so it would otherwise pass the bounds checks and
+    /// read the grid's first cell.
+    #[inline]
+    fn locate(&self, col: f64, row: f64) -> Option<(f64, bool)> {
+        if !col.is_finite() || !row.is_finite() {
+            return None;
+        }
+        let nx = i64::from(self.transform.width);
+        let ny = i64::from(self.transform.height);
+        let (col, global) = match self.layout {
+            // A global grid's columns run [0, period); one past its last
+            // column reads its first.
+            Layout::Periodic {
+                period,
+                global: true,
+            } => (col.rem_euclid(period), true),
+            // A regional one is drawn in the turn centred on it.
+            Layout::Periodic { period, .. } => {
+                let start = (nx - 1) as f64 / 2.0 - period / 2.0;
+                let col = if (start..start + period).contains(&col) {
+                    col
+                } else {
+                    start + (col - start).rem_euclid(period)
+                };
+                (col, false)
+            }
+            Layout::Projected { .. } => (col, false),
+        };
+        let col0 = col.floor() as i64;
+        let row0 = row.floor() as i64;
+        if row0 < -1 || row0 >= ny || (!global && (col0 < -1 || col0 >= nx)) {
+            return None;
+        }
+        Some((col, global))
     }
 }
 

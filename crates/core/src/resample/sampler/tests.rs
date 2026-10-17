@@ -239,6 +239,134 @@ fn renders_f32_with_nan_for_nodata() {
     assert!(data.iter().any(|v| v.is_nan()) && data.iter().any(|v| v.is_finite()));
 }
 
+/// A point query projects the point once and samples it as a map does:
+/// the geography's value inside the grid, nothing off it or from a field of
+/// the wrong length, and on a global lat/lon grid the same value a turn
+/// either way and across the seam; a Lambert grid centred on the
+/// antimeridian answers a point given either side of it.
+#[test]
+fn a_point_position_samples_what_the_map_draws() {
+    let gt = meps_shaped();
+    let grid = SourceGrid::new(gt.clone());
+    let values = field_of(&gt);
+    for (lon, lat) in [(15.0, 63.3), (25.0, 60.17), (5.3, 60.4), (28.0, 70.0)] {
+        let position = grid.position(lon, lat);
+        assert_eq!(
+            position,
+            centred(gt.world_to_pixel_f64(lon, lat)),
+            "({lon}, {lat})"
+        );
+        let value = grid.value_at(&values, None, position).unwrap();
+        assert!(
+            (value - geography(lon, lat)).abs() < 1e-3,
+            "({lon}, {lat}): {value}"
+        );
+        // A 1 × 1 map of a box around the point draws the same value.
+        let d = 1e-4;
+        let tile = grid
+            .render_f32(
+                &values,
+                None,
+                [lon - d, lat - d, lon + d, lat + d],
+                1,
+                1,
+                &OutputCrs::Wgs84,
+            )
+            .unwrap();
+        assert!((tile.values.value_at(0).unwrap() - value).abs() < 1e-4);
+    }
+    assert_eq!(
+        grid.value_at(&values, None, grid.position(100.0, 0.0)),
+        None
+    );
+    assert_eq!(
+        grid.value_at(&values[1..], None, grid.position(15.0, 63.3)),
+        None
+    );
+
+    let global = lat_lon(0.5, 1.0, 89.5, -1.0, 360, 180);
+    let grid = SourceGrid::new(global.clone());
+    let values = field_of(&global);
+    for (lon, lat) in [(179.8, 10.2), (-179.8, 10.2), (0.1, -45.0)] {
+        let want = grid
+            .value_at(&values, None, grid.position(lon, lat))
+            .unwrap();
+        // Bilinear over 1° cells: within a few thousandths of the geography.
+        assert!((want - geography(lon, lat)).abs() < 5e-3, "({lon}, {lat})");
+        for turn in [-360.0, 360.0] {
+            let turned = grid
+                .value_at(&values, None, grid.position(lon + turn, lat))
+                .unwrap();
+            assert!((turned - want).abs() < 1e-9, "({lon} + {turn}, {lat})");
+        }
+    }
+
+    let across = GeoTransform::from_cell_centres(
+        -1_490_000.0,
+        20_000.0,
+        790_000.0,
+        -20_000.0,
+        150,
+        80,
+        lambert(15.0, 180.0),
+    )
+    .unwrap();
+    let grid = SourceGrid::new(across.clone());
+    let values = field_of(&across);
+    for lon in [175.0, -175.0, 185.0] {
+        let value = grid
+            .value_at(&values, None, grid.position(lon, 15.0))
+            .unwrap();
+        assert!((value - geography(lon, 15.0)).abs() < 1e-3, "{lon}");
+    }
+}
+
+/// `covers` is exactly where `value_at` reads a cell of a field without
+/// nodata: on a projected grid, a regional lat/lon grid a turn either way
+/// and a global one across the seam, inside, at the half-cell margins and
+/// past them, so a query that skips positions off the grid drops no value
+/// a map would draw.
+#[test]
+fn covers_is_where_value_at_finds_a_cell() {
+    let regional = three_by_three(Crs::Wgs84);
+    let global = SourceGrid::new(lat_lon(0.5, 1.0, 89.5, -1.0, 360, 180));
+    let meps = SourceGrid::new(meps_shaped());
+    for grid in [&regional, &global, &meps] {
+        let cells = grid.transform.width as usize * grid.transform.height as usize;
+        let values = vec![1.0f32; cells];
+        let (nx, ny) = (
+            f64::from(grid.transform.width),
+            f64::from(grid.transform.height),
+        );
+        let mut on = 0;
+        for col in [
+            -400.0,
+            -1.5,
+            -1.0,
+            -0.99,
+            0.0,
+            0.5,
+            nx - 1.0,
+            nx - 0.01,
+            nx,
+            360.0,
+        ] {
+            for row in [-1.01, -1.0, 0.0, ny - 0.01, ny, f64::NAN] {
+                let covered = grid.covers((col, row));
+                assert_eq!(
+                    covered,
+                    grid.value_at(&values, None, (col, row)).is_some(),
+                    "({col}, {row}) on a {nx} x {ny} grid"
+                );
+                on += usize::from(covered);
+            }
+        }
+        assert!(on > 0);
+    }
+    assert!(!meps.covers(meps.position(-100.0, 10.0)));
+    assert!(meps.covers(meps.position(15.0, 63.3)));
+}
+
 #[test]
 fn a_field_of_the_wrong_length_is_an_error() {
     let grid = SourceGrid::new(meps_shaped());

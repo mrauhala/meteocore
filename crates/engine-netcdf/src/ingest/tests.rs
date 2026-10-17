@@ -308,6 +308,7 @@ fn same_quantity_reads_units_in_any_spelling() {
     let var = |units: &str, level: f64, level_units: &str| Variable {
         name: "precipitation_amount_acc".into(),
         title: "Accumulated total precipitation".into(),
+        standard_name: None,
         units: units.into(),
         levels: vec![Level {
             value: level,

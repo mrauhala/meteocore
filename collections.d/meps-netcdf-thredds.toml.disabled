@@ -30,13 +30,22 @@
 #     about 340 fields) and 256 MB decoded (MC_NETCDF_FIELD_CACHE_MB).
 #   - per prewarm variable: about 100 MB per run (67 fields), 0.8 GB a day,
 #     fetched by the poll whether or not anyone draws them. Off here.
+#   - per EDR query: the same ~1.5 MB GET for each field not yet cached, so
+#     a position series over a whole run is up to 67 GETs, ~100 MB, and a
+#     wind_speed_10m series, which reads both wind components, up to 134
+#     GETs, ~200 MB. A query decodes at most MC_NETCDF_EDR_QUERY_MB (544 MiB:
+#     one parameter over one run as the client sees it, including
+#     wind_speed_10m); name the variables with `parameter-name`.
 
 id = "meps-netcdf-thredds"
 title = "MEPS Surface (CF-NetCDF, thredds.met.no)"
 description = "MetCoOp MEPS 2.5 km surface forecast, control member, read in place by HTTP range from MET Norway's per-lead CF-NetCDF files on thredds.met.no, on their Lambert conformal conic grid."
 engine_type = "netcdf"
-# EDR comes with the engine's position queries (#1067).
-apis = ["wms", "maps", "tiles"]
+# EDR position, area and radius, model runs as instances; the WMS layers
+# answer GetFeatureInfo. The 10 m wind's speed is derived from its
+# grid-relative x/y components (`wind_speed_10m`, no direction on this
+# Lambert grid).
+apis = ["edr", "wms", "maps", "tiles"]
 keywords = ["forecast", "NWP", "MEPS", "NetCDF"]
 
 [license]
