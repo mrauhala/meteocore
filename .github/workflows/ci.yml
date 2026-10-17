@@ -123,7 +123,7 @@ jobs:
       # Composite action (no Node runtime): fetches a prebuilt cargo-audit
       # binary in seconds rather than `cargo install`-ing it from source.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-audit
 
@@ -159,7 +159,7 @@ jobs:
 
       # Same composite action as cargo-audit above, with the version pinned.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-deny@0.20.2
 

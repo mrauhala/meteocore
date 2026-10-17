@@ -169,7 +169,7 @@ jobs:
       # there and its archives hold README.md only, as they did.
       - name: Install cargo-about
         if: hashFiles('scripts/third_party_notices.sh') != ''
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0  # v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8  # v2
         with:
           tool: cargo-about@0.9.2
 
@@ -207,7 +207,7 @@ jobs:
       # Upload v7 + download v8 (release.yml's upload job) is the intended
       # pairing: both use the post-v4 artifact API. Artifacts uploaded here
       # belong to the calling run, so that job can download them.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: meteocore-${{ matrix.target }}
           path: dist/*
