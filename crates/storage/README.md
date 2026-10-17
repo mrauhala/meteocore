@@ -37,7 +37,8 @@ decides whether that retry gets to run, so a whole-object fetch names its
 `get_range_if_unmodified` and `get_many_with_budget` take the budget; `get`,
 `get_range`, `get_range_on`, `get_range_or_refusal` and `get_many` are the request budget. Don't pass the background budget where a
 request can wait on the result, directly or through a single-flight cache
-fill.
+fill. `start_get_opt` is a `FetchBudget::Request` read too: it runs ahead on
+the runtime carrying the deadline of the thread that started it (#999).
 
 # Catalog discovery
 

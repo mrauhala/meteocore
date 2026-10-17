@@ -127,6 +127,9 @@ Violating these has caused production incidents. Never break them.
    - On `spawn_blocking` workers, use its explicit-runtime APIs (`get_on`,
      `get_range_on`, `get_range_on_with_budget`,
      `get_range_if_unmodified_on`). Do not rely on an ambient runtime handle.
+     To overlap whole-object reads from synchronous code, start them with
+     `DataStore::start_get_opt` and collect each with
+     `PendingGet::wait(Some(handle))`, bounding how many you start (#999).
      The plain-Zarr adapter is a tested exception: the same synchronous
      `get_opt`/cache-fill path serves EDR async workers and `RenderJob` blocking
      workers. Its `block_in_place` bridge releases an async worker and runs

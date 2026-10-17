@@ -106,10 +106,10 @@ around `ds-storage` calls (Critical Rules 6–7).
   and a 720 × 1000 f32 sweep (2.75 MiB) must fit — pinned by
   `full_f32_sweep_is_admitted_at_every_sensible_size`.
 - **Multi-moment walks prefetch per file (#994).** Every walk over several
-  moments of one volume file — EDR `volume_profile`, `level_series`
-  (volume-major: one volume's batch at a time, all levels and quantities),
-  the cross-section (`volume_section`: gates computed once per cell, the
-  sweeps they hit prefetched), the point cloud and voxel grid
+  moments of one volume file — EDR profiles (`profile_targets`),
+  `level_series` (volume-major: one volume's batch at a time, all levels
+  and quantities), the cross-section (`section_plan`: gates computed once
+  per cell, the sweeps they hit prefetched), the point cloud and voxel grid
   (`volume_moments`) — first resolves exactly the moments it will read with
   `Pixels::prefetch`/`load_moments` (one GET + one HDF5 open through
   `PixelCache::load_many`, #993 classification intact) and samples through
@@ -119,6 +119,38 @@ around `ds-storage` calls (Critical Rules 6–7).
   samples — anything left out reads as nodata — so share the target helper
   (`level_target`, `slant_cell_moment`) between prefetch and sampler.
   Pinned by the `*_fetches_*_volume_file_once` tests (`file_fetches`).
+- **EDR walks over several volumes download ahead (#999).** The profiles
+  and `level_series` of `site_coverages` and the sections of
+  `site_trajectory` go through `walk_volumes`: `prepare` names each
+  volume's moments first (`profile_targets`, `level_target`,
+  `section_plan`), and for up to `MAX_WALK_VOLUMES_IN_FLIGHT` (4) volumes,
+  the one being sampled included, the remote files their batch will read
+  (a target neither resident nor known bad, no held bytes) download
+  concurrently through `DataStore::start_get_opt`: async tasks on the
+  runtime that runs the query (`Pixels::handle` for a cross-section on the
+  blocking pool, else the query runtime worker's own), never a rayon pool,
+  a thread per file or a new `Runtime` (root Critical Rules 7 and 9). Each
+  volume is then decoded and sampled in time order on the walk's thread,
+  from the same batch the sequential walk reads (`Pixels::prefetch` with
+  the downloaded bytes), and dropped before the next download starts: at
+  most four volumes fetched or decoded per request, so up to
+  4 × `MAX_REMOTE_FILE_SIZE` (64 MiB) of downloaded bytes per query, times
+  the EDR queries admitted at once (`ds_executor::query_workers()`), plus
+  about 3.3 MB of section cell geometry per volume (`SectionPlan`: 1024
+  nodes × 100 levels × 32 B). The cap is a maintainer decision, pinned by a
+  const assert. Errors map as before: the deadline (checked per
+  volume, carried by every download) or a transient failure ends the walk
+  and aborts the downloads in flight; a missing object is nodata and known
+  bad. A local source, a one-volume walk (GetFeatureInfo, a single
+  `datetime`) and a thread without a multi-thread runtime read each file
+  as the walk reaches it, inside the per-file lock. Downloads started ahead
+  do not coalesce with another request's cold read of the same file
+  (#1127). Never
+  loop `Pixels::prefetch` over remote volumes outside `walk_volumes`.
+  Pinned by `walks_download_volumes_concurrently_at_most_four_at_once`
+  (wall time ≈ ceil(V/4) GET delays, each file once),
+  `read_ahead_walks_answer_as_the_sequential_walk` and
+  `read_ahead_walk_stops_at_the_deadline`.
 - **Cold single-moment misses (#293, #994):** only a map render reads one
   moment at a time. A `Pixels::moment` miss fetches the source-qualified
   file once, decodes **only the requested moment** on the caller's thread
@@ -169,7 +201,7 @@ around `ds-storage` calls (Critical Rules 6–7).
   (composite `[t,x,y]` axis + numeric `z` = height above antenna via the
   4/3-Earth beam model). `z` selects sweeps exactly as position/area do
   (`resolve_levels`, `SWEEP_MATCH_TOLERANCE_DEG`; none matching → 400), and
-  `volume_section` keeps only the cells whose nearest sweep is selected —
+  `section_plan` keeps only the cells whose nearest sweep is selected —
   never the nearest *selected* sweep, and never a ±1° band around `z`
   (#983, EDR 1.2 `/req/edr/z-response` B). Vertical axis is elevation angle
   (`VerticalKind::ElevationAngle`). The per-site view
