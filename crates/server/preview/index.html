@@ -11,7 +11,11 @@
     <div id="map" role="application" aria-label="MeteoCore preview map"></div>
     <aside id="sidebar" aria-label="Collection list">
         <header>
-            <h1>MeteoCore</h1>
+            <div class="sidebar-title">
+                <h1>MeteoCore</h1>
+                <button id="sheet-toggle" type="button" aria-expanded="true"
+                        aria-controls="collections" aria-label="Collection list">Hide list</button>
+            </div>
             <p id="status">Loading manifest…</p>
         </header>
         <ul id="collections"></ul>
