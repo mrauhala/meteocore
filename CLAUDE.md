@@ -7,8 +7,12 @@ weather data (radar, NWP models, observations, alerts).
 Crates: `ds-core` (traits + types + shared utilities, directory `crates/core`),
 `ds-storage` (S3/HTTP/local object store, directory `crates/storage`; its
 `discovery` module is the one home for time windows, strftime prefix
-expansion, the filename → timestamp matcher and the catalog scan with
-bounded concurrent prefix LISTs, #816/#817),
+expansion, the filename → timestamp (and `{lead}`) matcher, the catalog scan
+with bounded concurrent prefix LISTs (#816/#817), listing-free template
+probing (`TemplateProber`: `{run}`/`{lead}` keys, sentinel HEADs, settling,
+per-run publication) and the shared `PendingFile` settling rule (#1067);
+`DataStore` adds budgeted and `If-Unmodified-Since` range reads and
+per-host request limits for files read in place),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
 `ds-executor` (shared Tokio render admission/deadline execution; API-facing infrastructure,
@@ -118,7 +122,8 @@ Violating these has caused production incidents. Never break them.
      for WMS GetFeatureInfo (#1064).
    - Never from a request-handler task — it parks a request worker.
    - On `spawn_blocking` workers, use its explicit-runtime APIs (`get_on`,
-     `get_range_on`). Do not rely on an ambient runtime handle.
+     `get_range_on`, `get_range_on_with_budget`,
+     `get_range_if_unmodified_on`). Do not rely on an ambient runtime handle.
      The plain-Zarr adapter is a tested exception: the same synchronous
      `get_opt`/cache-fill path serves EDR async workers and `RenderJob` blocking
      workers. Its `block_in_place` bridge releases an async worker and runs

@@ -33,8 +33,9 @@ decides whether that retry gets to run, so a whole-object fetch names its
   scan, GeoTIFF full downloads). Room for the stalled attempt, its retry and
   one more. A request deadline in scope still applies.
 
-`get_with_budget` and `get_many_with_budget` take the budget; `get` and
-`get_many` are the request budget. Don't pass the background budget where a
+`get_with_budget`, `get_range_with_budget`, `get_range_on_with_budget`,
+`get_range_if_unmodified` and `get_many_with_budget` take the budget; `get`,
+`get_range`, `get_range_on` and `get_many` are the request budget. Don't pass the background budget where a
 request can wait on the result, directly or through a single-flight cache
 fill.
 
@@ -63,3 +64,78 @@ from the background poll runtime, never from a request handler.
 An engine that recognises its files without a matcher, like the PVOL network
 scan, which keeps every site's volume at each timestamp, lists through
 `list_prefixes` and applies its own rules.
+
+A matcher may read a forecast lead as well as a timestamp: a template's
+`{lead}`, two zero-padded digits, or a pattern's `lead` capture. A template's
+`{run}` is the timestamp's hour, read at minute 0. The scan then keeps one
+file per (timestamp, lead), and `max_files` counts timestamps, each keeping
+all its leads. MET Norway's `meps_sfc_{lead}_%Y%m%dT{run}Z.nc` reads lead 5
+of the 06 UTC run from `meps_sfc_05_20261017T06Z.nc`.
+
+# Template discovery
+
+Some HTTP servers cannot be listed: an Apache autoindex answers no WebDAV
+`PROPFIND`, and thredds.met.no's fileServer answers it with 400. For these,
+`TemplateProber` renders the keys files would have and HEADs them, at most 16
+at a time on one storage-bridge call (`head_many`). A key is a literal base,
+a strftime prefix template and a strftime filename template, rendered for a
+slot time: every cadence step back from now (`Schedule::Cadence`, the DWD
+radar composites), or every model run at its `run_hours`
+(`Schedule::Runs`, with the run hour as `{run}`). A slot holds one file per
+configured lead, `{lead}` in the filename. MEPS per-lead files are base
+`thredds/fileServer`, prefix `meps25epsarchive/%Y/%m/%d/{run}/member_00`
+and filename `meps_sfc_{lead}_%Y%m%dT{run}Z.nc`, run hours every 3 hours and
+leads 0 to 66.
+
+The prober keeps what it found between polls:
+
+- The first lead is the sentinel. A slot whose sentinel has not been seen
+  costs one HEAD per poll; its other leads are HEADed once it exists.
+- A file seen goes from unsettled to settled: on sight (`Settling::OnSight`),
+  or once two more polls see the same size and `Last-Modified`, or at once
+  when its `Last-Modified` is `min_age` old (`Settling::Stable`). An
+  unsettled file is re-HEADed on every poll.
+- A slot is published all at once, when every lead has settled or
+  `run_grace` after its sentinel appeared. A partial slot is published with
+  the leads that have settled, with a WARN listing the missing ones; they
+  are looked for again with the recheck below.
+- Unless the source is `immutable`, every 30 minutes a published slot's
+  sentinel is re-HEADed. A sentinel that changed or vanished has every file
+  of its slot re-HEADed on the next poll. A file whose version changed is
+  withdrawn and settles again as its new version.
+- One poll makes at most `max_heads_per_poll` HEADs: unsettled files first,
+  then files to recheck, then newest slot first the unpublished slots'
+  sentinels and leads, then the due rechecks. The rest waits for the next
+  poll. A slot is never published partially while some of its leads have
+  not been HEADed yet.
+
+Each poll's `ProbeReport` lists the files that joined and left `files()`,
+the published files, so an engine can open new files and drop what it holds
+for withdrawn ones. Call `poll` where `head` may be called: from the
+background poll runtime. engine-geotiff's local scan settles new files with
+the same `PendingFile` rule, by size alone.
+
+# Range reads of files read in place
+
+`get_range_if_unmodified` reads a byte range only while the key still names
+the `ObjectVersion` (size, `Last-Modified`, ETag) the caller catalogued. The
+GET carries `If-Unmodified-Since`, and `If-Match` for a strong ETag, and the
+response's own size, `Last-Modified` and ETag are compared with the version
+as well, since a server may ignore the preconditions. A 412, a 404 or a
+response naming another version is `RangeRead::Changed`, not an error: the
+caller drops what it holds for the file and re-ingests it. A rewrite within
+the same second at the same size, on a server without ETags, is beyond any
+HTTP check. `get_range_if_unmodified_on` drives the read on a supplied
+runtime handle.
+
+# Request limits
+
+`DataStore::with_request_limit(n)` wraps a store in object_store's
+`LimitStore`: at most `n` operations in flight, a GET holding its permit
+until its body is read. Limits stack, so a background share of 2 within a
+host's 8 is `host.with_request_limit(2)`. Waiting for a permit counts
+against the operation's budget and the request deadline.
+`build_http_store_limited(url, n)` gives every store built for the same
+scheme, host and port one shared limit, so collections reading one server
+stay under it together; the first limit named for a host is kept for the
+life of the process.
