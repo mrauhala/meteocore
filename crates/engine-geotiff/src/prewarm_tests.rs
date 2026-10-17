@@ -244,11 +244,7 @@ fn remote_frame() -> (
     let (metadata, tile_info) = TiffMetadata::from_header_read(&store, &path, size)
         .expect("the header range read succeeds")
         .expect("the fixture is a COG");
-    let source = Arc::new(DataSource::Remote {
-        store: store.clone(),
-        path,
-        tile_info,
-    });
+    let source = Arc::new(DataSource::remote(store.clone(), path, tile_info));
     (store, source, metadata, PathBuf::from(FRAMES[0]))
 }
 
@@ -516,11 +512,7 @@ async fn benchmark_first_view_over_latency() {
         let (metadata, tile_info) = TiffMetadata::from_header_read(&store, &path, size)
             .expect("the header range read succeeds")
             .expect("the fixture is a COG");
-        let source = DataSource::Remote {
-            store: store.clone(),
-            path,
-            tile_info,
-        };
+        let source = DataSource::remote(store.clone(), path, tile_info);
         let mut catalog = Catalog::empty();
         catalog.entries.insert(
             time,

@@ -2,6 +2,9 @@ mod cache;
 mod catalog;
 pub mod decode_budget;
 mod decoded_cache;
+mod gone;
+#[cfg(test)]
+mod gone_object_tests;
 mod parse;
 mod prewarm;
 #[cfg(test)]
@@ -222,6 +225,11 @@ pub struct GeoTiffEngine {
     /// found files ([`Self::poll_age`]). Not the data's age: a poll that finds
     /// the same files again stamps it too (#1007).
     catalog_updated_at: Mutex<Option<DateTime<Utc>>>,
+    /// Remote objects a tile read found gone after the scan, and the
+    /// `content_version` that moves when one's timestep comes back (#1074).
+    gone: gone::GoneObjects,
+    /// Rate limit for the WARN about forbidden tile ranges (#1074).
+    forbidden_warnings: gone::ForbiddenWarnings,
 }
 
 /// Most newly discovered STAC items whose metadata one poll cycle preloads
@@ -433,10 +441,70 @@ impl GeoTiffEngine {
     }
 
     /// Store a STAC catalog update, applying max_files eviction if configured.
+    /// The listing it merged may still name an item whose asset a tile read
+    /// found gone: [`gone::GoneObjects::screen`] keeps that item out (#1074).
     fn store_stac_catalog(&self, mut catalog: Catalog) {
+        self.screen_gone(&mut catalog, false);
         self.trim_stac_catalog(&mut catalog);
         self.catalog.store(Arc::new(catalog));
         self.refresh_raster_info();
+    }
+
+    /// Screen a catalog through the gone objects before it is stored (#1074),
+    /// logging what that did. `complete`: see [`gone::GoneObjects::screen`].
+    /// The removals are a debug line: a listing that still names a gone
+    /// object meets it at every poll, and its WARN was logged when a read
+    /// found it gone.
+    fn screen_gone(&self, catalog: &mut Catalog, complete: bool) {
+        let screened = self.gone.screen(catalog, complete);
+        if screened.removed > 0 {
+            tracing::debug!(
+                "[{}] {} catalog entr{} left out: a tile read found the object gone",
+                self.collection_id,
+                screened.removed,
+                if screened.removed == 1 { "y" } else { "ies" }
+            );
+        }
+        if screened.version_moved {
+            tracing::info!(
+                "[{}] A timestep dropped as gone holds a new object: renders cached before \
+                 are no longer served",
+                self.collection_id
+            );
+        }
+    }
+
+    /// Act on what a read of the entry at `timestamp` learned about its
+    /// remote object (#1074). A gone object's timestep has already left every
+    /// accessor ([`catalog::FileEntry::is_gone`]): refresh the `RasterInfo`
+    /// snapshot without it and say so, once. A forbidden range failed its
+    /// read with a 503 and keeps the timestep, since a 401/403 is the
+    /// server's credentials rather than the object; it is a WARN at most
+    /// once a minute per collection. Runs however the read ended.
+    fn note_object_health(&self, timestamp: &DateTime<Utc>, entry: &catalog::FileEntry) {
+        let Some(health) = entry.source().and_then(|source| source.health()) else {
+            return;
+        };
+        if let Some(refusal) = health.take_gone() {
+            tracing::warn!(
+                "[{}] Tile read of {}: {refusal}. Timestep {} leaves the catalog.",
+                self.collection_id,
+                entry.path.display(),
+                timestamp.to_rfc3339()
+            );
+            self.refresh_raster_info();
+        }
+        let forbidden = health.take_forbidden();
+        if forbidden > 0 {
+            if let Some(count) = self.forbidden_warnings.note(forbidden) {
+                tracing::warn!(
+                    "[{}] {count} tile range read(s) forbidden (401/403) since the last \
+                     warning, answered 503; latest {}. Check the storage credentials.",
+                    self.collection_id,
+                    entry.path.display()
+                );
+            }
+        }
     }
 
     /// Rebuild the cached [`RasterInfo`] from the current catalog and publish it.
@@ -461,21 +529,19 @@ impl GeoTiffEngine {
     fn build_raster_info(&self) -> ds_core::map_engine::RasterInfo {
         let catalog = self.catalog.load();
         let crs_name = catalog
-            .entries
-            .values()
-            .find_map(|entry| entry.metadata().map(|m| crs_label(&m.geo_transform.crs)))
+            .live()
+            .find_map(|(_, entry)| entry.metadata().map(|m| crs_label(&m.geo_transform.crs)))
             // No metadata could be read; the engine works internally in
             // lon-first geographic coordinates, so default to CRS:84.
             .unwrap_or_else(|| "CRS:84".to_string());
 
-        let times: Vec<DateTime<Utc>> = catalog.entries.keys().cloned().collect();
+        let times: Vec<DateTime<Utc>> = catalog.live().map(|(t, _)| *t).collect();
 
         // Native full-resolution grid dimensions, taken from the first loaded
         // entry (all entries in a collection share the same grid).
         let grid_size = catalog
-            .entries
-            .values()
-            .find_map(|entry| entry.metadata().map(|m| [m.width, m.height]));
+            .live()
+            .find_map(|(_, entry)| entry.metadata().map(|m| [m.width, m.height]));
 
         ds_core::map_engine::RasterInfo {
             native_crs: crs_name,
@@ -527,7 +593,7 @@ impl GeoTiffEngine {
     /// when the newest timestep lies in the future; `None` while the
     /// catalog is empty.
     pub fn data_age(&self) -> Option<chrono::Duration> {
-        let newest = *self.catalog.load().entries.keys().next_back()?;
+        let newest = *self.catalog.load().live().next_back()?.0;
         Some(Utc::now() - newest)
     }
 
@@ -682,6 +748,8 @@ impl GeoTiffEngine {
             stac_consecutive_failures: AtomicU32::new(0),
             stac_last_attempt: Mutex::new(None),
             catalog_updated_at: Mutex::new(Some(Utc::now())),
+            gone: gone::GoneObjects::default(),
+            forbidden_warnings: gone::ForbiddenWarnings::default(),
         };
 
         // Initial scan — STAC mode fetches collection extent only (no items)
@@ -772,12 +840,19 @@ impl GeoTiffEngine {
     /// Applies max_files limit if configured.
     /// `current` is the previous catalog, used to reuse metadata for unchanged files.
     fn do_scan(&self, current: &Catalog) -> Result<Catalog, DataServerError> {
-        // Build path-based index from current catalog (references only, no cloning)
-        let path_index: HashMap<&Path, &catalog::FileEntry> = current
-            .entries
-            .values()
+        // Build path-based index from current catalog (references only, no
+        // cloning), and the entries removed as gone: a key still listed with
+        // the same size reuses one rather than reading its header, and the
+        // screen below removes it again (#1074).
+        let kept = self.gone.kept_entries();
+        let path_index: HashMap<&Path, &catalog::FileEntry> = kept
+            .iter()
+            .chain(current.entries.values())
             .map(|e| (e.path.as_path(), e))
             .collect();
+        // Whether the scan listed the whole source window, so that a gone
+        // object it did not list again is no longer named by the listing.
+        let mut complete = true;
 
         let mut catalog = match &self.store_mode {
             StoreMode::Local { directory, pending } => {
@@ -839,6 +914,7 @@ impl GeoTiffEngine {
                     ..self.scan_spec()?
                 };
                 let (catalog, failed) = scan_remote(store, &prefixes, &spec, &path_index)?;
+                complete = failed.is_empty();
                 if !failed.is_empty() {
                     tracing::warn!(
                         "[{}] {}/{} prefix scan(s) failed: {}",
@@ -855,6 +931,8 @@ impl GeoTiffEngine {
                 catalog
             }
             StoreMode::RemoteStac { client } => {
+                // A poll lists only the newest items.
+                complete = false;
                 let current_catalog = self.catalog.load();
                 catalog::poll_stac_latest(client, &current_catalog, &self.collection_id)?
             }
@@ -876,6 +954,8 @@ impl GeoTiffEngine {
             }
         }
 
+        // Before the trim, so a gone object holds no `max_files` slot.
+        self.screen_gone(&mut catalog, complete);
         if let Some(max) = self.max_files {
             catalog.trim_to_latest(max);
         }
@@ -928,11 +1008,7 @@ impl GeoTiffEngine {
                     asset_url,
                     tile_info.tile_offsets.len()
                 );
-                let source = reader::DataSource::HttpDirect {
-                    url: asset_url.to_string(),
-                    http,
-                    tile_info,
-                };
+                let source = reader::DataSource::http(asset_url.to_string(), http, tile_info);
                 return Ok((metadata, source));
             }
         }
@@ -1262,7 +1338,9 @@ impl GeoTiffEngine {
         if let Some(range) = fetch {
             let current = self.catalog.load();
             let mut updated = self.list_stac_window(client, &current, range, datetime)?;
-            // Count what the query would load from the catalog it would see.
+            // Count what the query would load from the catalog it would see,
+            // without the items whose asset is gone (#1074).
+            self.screen_gone(&mut updated, false);
             self.trim_stac_catalog(&mut updated);
             check_cold_stac_budget(
                 cold_stac_items(&updated, datetime).len(),
@@ -1649,7 +1727,7 @@ impl GeoTiffEngine {
             let pixel = metadata.geo_transform.world_to_pixel(lon, lat);
             let value = match pixel {
                 Some((col, row)) => {
-                    match reader::read_pixel(
+                    let read = reader::read_pixel(
                         source,
                         metadata,
                         col,
@@ -1657,7 +1735,9 @@ impl GeoTiffEngine {
                         Some(&self.tile_cache),
                         &entry.path,
                         self.band_index,
-                    ) {
+                    );
+                    self.note_object_health(timestamp, entry);
+                    match read {
                         Ok(v) => v,
                         Err(
                             e @ (DataServerError::ResourceExhausted
@@ -1781,7 +1861,7 @@ impl GeoTiffEngine {
                 }
             };
 
-            match reader::read_bbox(
+            let read = reader::read_bbox(
                 source,
                 metadata,
                 col_start,
@@ -1791,7 +1871,9 @@ impl GeoTiffEngine {
                 Some(&self.tile_cache),
                 &entry.path,
                 self.band_index,
-            ) {
+            );
+            self.note_object_health(timestamp, entry);
+            match read {
                 Ok(grid_values) => {
                     all_values.extend(grid_values);
                 }
@@ -1875,14 +1957,16 @@ fn is_unreadable_file(e: &DataServerError) -> bool {
 }
 
 /// Filter catalog entries by an optional datetime range.
-/// Returns references to matching (timestamp, entry) pairs.
+/// Returns references to matching (timestamp, entry) pairs, without the
+/// entries whose object a tile read found gone (#1074).
 fn filter_by_datetime(
     entries: &BTreeMap<DateTime<Utc>, catalog::FileEntry>,
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Vec<(&DateTime<Utc>, &catalog::FileEntry)> {
+    let live = |(_, entry): &(&DateTime<Utc>, &catalog::FileEntry)| !entry.is_gone();
     match datetime {
-        Some((start, end)) => entries.range(start..=end).collect(),
-        None => entries.iter().collect(),
+        Some((start, end)) => entries.range(start..=end).filter(live).collect(),
+        None => entries.iter().filter(live).collect(),
     }
 }
 
@@ -2016,6 +2100,13 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         let source = entry
             .source()
             .ok_or_else(|| DataServerError::Engine("Entry source not loaded".into()))?;
+        // However the read below ends, act on what it learned about the
+        // object (#1074).
+        let _health = HealthNote {
+            engine: self,
+            timestamp: target_timestamp,
+            entry,
+        };
 
         let [west, south, east, north] = bbox;
         let total_pixels = (width as usize) * (height as usize);
@@ -2237,6 +2328,28 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         // falls back to the requested time: the render will error and cache
         // nothing, so the key value is moot.
         self.catalog.load().select_timestamp(time).or(time)
+    }
+
+    fn content_version(&self) -> u64 {
+        // 0 until a timestep dropped because its object was gone holds a new
+        // object (#1074). Renders cached under that timestep before may show
+        // the gap the dropping request drew, or the timestep the time
+        // snapped to while it was gone.
+        self.gone.version()
+    }
+}
+
+/// Calls [`GeoTiffEngine::note_object_health`] when dropped, so a map render
+/// acts on what its read learned about the object however the read ended.
+struct HealthNote<'a> {
+    engine: &'a GeoTiffEngine,
+    timestamp: DateTime<Utc>,
+    entry: &'a catalog::FileEntry,
+}
+
+impl Drop for HealthNote<'_> {
+    fn drop(&mut self) {
+        self.engine.note_object_health(&self.timestamp, self.entry);
     }
 }
 

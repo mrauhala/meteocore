@@ -110,6 +110,16 @@ impl FileEntry {
         }
     }
 
+    /// Whether a tile read found this entry's remote object gone after the
+    /// scan (#1074): a 404, or a range past its end. Every catalog accessor
+    /// skips such an entry, and the next catalog swap removes it
+    /// ([`crate::gone`]).
+    pub fn is_gone(&self) -> bool {
+        self.source()
+            .and_then(|source| source.health())
+            .is_some_and(|health| health.gone().is_some())
+    }
+
     /// Get the STAC stub if this is a stub entry.
     pub fn stac_stub_info(&self) -> Option<&StacStub> {
         match &self.state {
@@ -158,10 +168,16 @@ impl Catalog {
         self.spatial_extent = compute_spatial_union(self.entries.values());
     }
 
+    /// The entries no tile read has found gone (#1074), oldest first.
+    pub fn live(&self) -> impl DoubleEndedIterator<Item = (&DateTime<Utc>, &FileEntry)> {
+        self.entries.iter().filter(|(_, entry)| !entry.is_gone())
+    }
+
     /// The timestep `get_raster_tile` renders for a requested `time` (#507):
     /// the newest entry not after `time`, falling back to the earliest entry
-    /// for pre-range requests; `None` request ⇒ the newest entry. Returns
-    /// `None` only for an empty catalog. This is the ONLY implementation of
+    /// for pre-range requests; `None` request ⇒ the newest entry. Entries
+    /// whose object a read found gone are skipped (#1074). Returns `None`
+    /// only when no entry is left. This is the ONLY implementation of
     /// that selection — `MapEngine::resolve_time` (the cache-key authority)
     /// and the render path both call it, so they cannot drift.
     pub fn select_timestamp(&self, time: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
@@ -169,10 +185,11 @@ impl Catalog {
             Some(t) => self
                 .entries
                 .range(..=t)
-                .next_back()
-                .or_else(|| self.entries.iter().next())
+                .rev()
+                .find(|(_, entry)| !entry.is_gone())
+                .or_else(|| self.live().next())
                 .map(|(ts, _)| *ts),
-            None => self.entries.keys().next_back().copied(),
+            None => self.live().next_back().map(|(ts, _)| *ts),
         }
     }
 
@@ -510,11 +527,7 @@ fn load_remote(
         match TiffMetadata::from_header_read(store, location, file_size) {
             Ok(Some((metadata, tile_info))) => {
                 tracing::debug!("[{}] {} — range read OK", collection_id, key);
-                let source = DataSource::Remote {
-                    store: store.clone(),
-                    path: location.clone(),
-                    tile_info,
-                };
+                let source = DataSource::remote(store.clone(), location.clone(), tile_info);
                 entries.insert(
                     datetime,
                     FileEntry::loaded(pseudo_path, source, metadata, file_size, None, None),

@@ -371,15 +371,18 @@ pub(crate) struct RangeObject {
     /// Answer a GET whatever its `If-Unmodified-Since`, as a server that
     /// does not implement it would.
     pub ignore_preconditions: bool,
+    /// Answer every request for the object with this status line instead,
+    /// such as `403 Forbidden`.
+    pub status: Option<&'static str>,
     /// The head of the last request, lowercased.
     pub last_request: String,
 }
 
-/// A one-object HTTP/1.1 server on 127.0.0.1, for the conditional range
-/// read tests: HEAD and ranged GET (206) of `/object`, a 412 when the
-/// object was modified after a request's `If-Unmodified-Since`, and a 404
-/// for any other path. One connection at a time, each closed after its
-/// response.
+/// A one-object HTTP/1.1 server on 127.0.0.1, for the range read tests:
+/// HEAD and ranged GET (206) of `/object`, a 412 when the object was
+/// modified after a request's `If-Unmodified-Since`, a 416 for a range
+/// starting past its end, and a 404 for any other path. One connection at
+/// a time, each closed after its response.
 pub(crate) struct RangeServer {
     pub url: String,
     pub object: Arc<Mutex<RangeObject>>,
@@ -397,6 +400,7 @@ impl RangeServer {
             body: body.to_vec(),
             last_modified,
             ignore_preconditions: false,
+            status: None,
             last_request: String::new(),
         }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -468,6 +472,9 @@ fn respond(object: &mut RangeObject, request: &str) -> Vec<u8> {
     if path != "/object" {
         return status("404 Not Found").into_bytes();
     }
+    if let Some(code) = object.status {
+        return status(code).into_bytes();
+    }
     let unmodified_since =
         header("if-unmodified-since").and_then(|date| DateTime::parse_from_rfc2822(date).ok());
     if !object.ignore_preconditions
@@ -481,6 +488,13 @@ fn respond(object: &mut RangeObject, request: &str) -> Vec<u8> {
         Some(range) => {
             let (start, end) = range.split_once('-').unwrap();
             let (start, end): (usize, usize) = (start.parse().unwrap(), end.parse().unwrap());
+            if start >= total {
+                return format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes();
+            }
             let end = end.min(total - 1);
             (
                 "206 Partial Content",
