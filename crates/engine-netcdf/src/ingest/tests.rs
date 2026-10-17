@@ -299,3 +299,40 @@ fn fill_values_compare_in_the_stored_type() {
     assert!(packing.decode(f64::NAN).is_nan());
     assert_eq!(packing.decode(4.0), 12.0);
 }
+
+/// #1067 PR 6: a later file of the family spelling a unit another way
+/// (`kg m-2` for the first file's `kg/m^2`) holds the same quantity and is
+/// served; another unit, level or level unit is not.
+#[test]
+fn same_quantity_reads_units_in_any_spelling() {
+    let var = |units: &str, level: f64, level_units: &str| Variable {
+        name: "precipitation_amount_acc".into(),
+        title: "Accumulated total precipitation".into(),
+        units: units.into(),
+        levels: vec![Level {
+            value: level,
+            units: level_units.into(),
+        }],
+    };
+    let served = var("kg/m^2", 0.0, "m");
+    for same in [
+        var("kg/m^2", 0.0, "m"),
+        var("kg m-2", 0.0, "m"),
+        var("kg m**-2", 0.0, " m "),
+        var("kg.m-2", 0.0, "m"),
+    ] {
+        assert!(served.same_quantity(&same), "{same:?}");
+    }
+    for other in [
+        var("m", 0.0, "m"),
+        var("kg m-2 s-1", 0.0, "m"),
+        var("kg/m^2", 2.0, "m"),
+        var("kg/m^2", 0.0, "km"),
+        Variable {
+            levels: Vec::new(),
+            ..var("kg/m^2", 0.0, "m")
+        },
+    ] {
+        assert!(!served.same_quantity(&other), "{other:?}");
+    }
+}

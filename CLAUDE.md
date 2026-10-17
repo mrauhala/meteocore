@@ -656,6 +656,17 @@ one never implies the other.
     `coordinate_scale`, a north-up `GeoTransform`, and `flipped` for an
     ascending `y` (row 0 south, as MEPS), which the reader reverses once at
     decode.
+- **`ds_core::units`** — unit spellings, display conversions and vocabularies
+  (#1067 PR 6). `canonical_unit` reduces every spelling of a product of
+  powers to one (`kg/m^2`, `kg m**-2`, `kg.m-2` → `kg m-2`; `m/s` → `m s-1`;
+  `degC` → `°C`); a scale factor or free text stays as written. Every
+  unit-keyed match goes through it — `display_conversion` (engine-bufr;
+  engine-grib's enum-keyed `default_display` is its twin, rule for rule),
+  `qudt_unit` (EDR), ds-render's defaults table and `[[parameter_defaults]]`
+  unit ranges, `same_unit` (wind u/v pairing, engine-netcdf's per-file
+  check, the satellite recipes' K check) — never a raw string compare. The
+  canonical spelling is a matching key and is never served: engines serve
+  units as their source spells them, or as a display conversion names them.
 - **`ds_core::temp_files`** — the names a data scan never reads (#1009): a
   hidden `.name` (written, then renamed into place) or a `PARTIAL_SUFFIXES`
   ending (`.tmp` / `.part`, the default `exclude_patterns`). An engine that
@@ -876,14 +887,16 @@ color_stops = [
 # with no explicit style match built-in defaults — temperature palette for
 # t2m/2t/TMP/dew point by unit K|C over one all-levels range, −90…50 °C =
 # 183.15…323.15 K, pressure for msl by unit Pa|hPa, radar_dbz for
-# DBZH, etc. — BEFORE the collection-level colormap; opt out per collection
-# with `[wms] parameter_defaults = false`). Top-level config.toml only.
+# DBZH, fraction twins of the humidity/cloud palettes for unit 1, etc. —
+# BEFORE the collection-level colormap; opt out per collection with
+# `[wms] parameter_defaults = false`). Top-level config.toml only.
 [[parameter_defaults]]
 names = ["td", "dewpoint_2m"]   # exact matches (normalized: lowercase alnum)
 contains = ["dew_point"]        # substring matches vs name and title
 colormap = "temperature"
 [[parameter_defaults.unit_ranges]]
-unit = "K"
+unit = "K"                      # any spelling (ds_core::units::canonical_unit):
+                                # "kelvin" matches too, "m/s" matches "m s-1"
 min = 183.15
 max = 323.15
 

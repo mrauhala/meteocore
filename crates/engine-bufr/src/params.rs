@@ -415,6 +415,40 @@ mod tests {
         );
     }
 
+    /// #1067 PR 6: an override's unit converts in any spelling
+    /// (`ds_core::units::canonical_unit`); a unit without a rule is served
+    /// as spelled.
+    #[test]
+    fn override_units_convert_in_any_spelling() {
+        let entry = |name: &str, unit: &str| BufrParameterConfig {
+            name: name.into(),
+            descriptors: vec!["013011".into()],
+            unit: unit.into(),
+            label: None,
+            period_hours: None,
+            observed_property: None,
+        };
+        let t = ParameterTable::build(
+            false,
+            &[
+                entry("rain_a", "kg/m2"),
+                entry("rain_b", "kg m**-2"),
+                entry("t_a", "kelvin"),
+                entry("p_a", " Pa "),
+                entry("wind_a", "m/s"),
+            ],
+        );
+        let unit = |n: &str| t.params[t.index_of(n).unwrap()].unit.as_str();
+        assert_eq!(unit("rain_a"), "mm");
+        assert_eq!(unit("rain_b"), "mm");
+        assert_eq!(unit("t_a"), "°C");
+        assert_eq!(unit("p_a"), "hPa");
+        assert_eq!(unit("wind_a"), "m/s");
+        let t_a = &t.params[t.index_of("t_a").unwrap()];
+        assert_eq!(t_a.source_unit, "kelvin");
+        assert!((t_a.display.unwrap().convert(273.15)).abs() < 1e-9);
+    }
+
     #[test]
     fn display_units_follow_the_source_unit_not_the_name() {
         let t = ParameterTable::build(true, &[]);

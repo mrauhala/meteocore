@@ -13,7 +13,10 @@ they are.
   file carries the collection's variables on one grid. The first file a
   poll ingests fixes the `Layout` (variables in allowlist or file order,
   grid); a later file missing a variable, on another grid, or with another
-  level or units is skipped with a WARN. The layout lives as long as the
+  level or units is skipped with a WARN. Units, and level units, compare in
+  any spelling (`Variable::same_quantity`, `ds_core::units::same_unit`):
+  `kg m-2` in a later file is the first file's `kg/m^2`, whose spelling
+  stays the served one. The layout lives as long as the
   engine.
 - **Time from the file, never its name:** valid times from the fields'
   `time` axis (`ds_core::cf::decode_times`, which reads MEPS's
@@ -316,7 +319,11 @@ Rule 10): `native_crs` `CRS:84` only for latitude/longitude axes, else
 `projected` (`geos` for geostationary), so the Common `storageCrs` and
 degree grid are omitted for MEPS; `grid_size` `[nx, ny]`; `reference_times`
 ascending; `times` the union over runs; titles from `titles`, else
-`long_name`; units as the file spells them (`kg/m^2`: PR 6 normalises).
+`long_name`; units as the file spells them (`kg/m^2`), never converted
+(#1067 decision: the files' own units). Style defaults and every other
+unit-keyed match read them through `ds_core::units::canonical_unit`
+(`kg/m^2` is `kg m-2`), so the layers need no `[[wms.parameters]]` for the
+defaults ds-render's table gives MEPS names (PR 6).
 
 ## Runs (`catalog.rs`)
 

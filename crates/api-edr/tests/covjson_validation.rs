@@ -1037,6 +1037,11 @@ fn coverage_parameters_follow_metocean_profile() {
             ("DBZH", "dBZ", vec![Some(12.5), None]),
             ("KDP", "deg/km", vec![Some(0.4), None]),
             ("RHOHV", "", vec![Some(0.98), Some(0.97)]),
+            (
+                "precipitation_amount_acc",
+                "kg/m^2",
+                vec![Some(0.2), Some(1.4)],
+            ),
         ],
     );
     let t2m = result.parameters.get_mut("t2m").unwrap();
@@ -1088,6 +1093,18 @@ fn coverage_parameters_follow_metocean_profile() {
     let rhohv = &params["RHOHV"];
     assert!(rhohv.get("unit").is_none());
     assert_eq!(rhohv["description"]["en"], "RHOHV (unit not specified)");
+
+    // A UDUNITS spelling QUDT's table does not list as written
+    // (`ds_core::units::canonical_unit`, #1067): typed by QUDT, labelled as
+    // the engine spells it.
+    let acc = &params["precipitation_amount_acc"];
+    assert_eq!(
+        acc["unit"],
+        serde_json::json!({
+            "label": {"en": "kg/m^2"},
+            "symbol": {"value": "kg/m²", "type": "https://qudt.org/vocab/unit/KiloGM-PER-M2"}
+        })
+    );
 
     validate(&json, &schema);
 }

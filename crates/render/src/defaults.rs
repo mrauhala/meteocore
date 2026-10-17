@@ -11,6 +11,13 @@
 //! a unit hint, and fails soft: no match ⇒ the existing fallback chain.
 //! Unit-gated rules (temperature, pressure) NEVER guess the unit: with no
 //! matching unit alias and no fallback range, the rule does not apply.
+//!
+//! Units are matched by spelling-independent key ([`unit_key`]): the unit's
+//! `ds_core::units::canonical_unit` spelling, [`normalize`]d, with `%` read
+//! as `percent`. So `kg/m^2`, `kg m**-2` and `kg m-2` are one unit (`kgm2`),
+//! `m/s` and `m s-1` another (`ms1`), `degC` and `°C` a third (`c`); config
+//! `[[parameter_defaults]]` unit ranges are keyed the same way, and also
+//! still match by their plain [`normalize`]d spelling, as before #1067.
 
 /// One built-in matching rule. All name/`contains` matching happens on
 /// [`normalize`]d strings (lowercase, alphanumeric only).
@@ -21,7 +28,8 @@ struct DefaultRule {
     contains: &'static [&'static str],
     /// Palette name (must exist in the builtin table).
     palette: &'static str,
-    /// Unit-alias groups → value range, checked against the unit hint.
+    /// Unit-key groups → value range, checked against the unit hint's
+    /// [`unit_key`] (canonical spelling, normalized: `kgm2`, `ms1`, `c`).
     unit_ranges: &'static [(&'static [&'static str], f64, f64)],
     /// Range when no unit alias matched. `None` with a non-empty
     /// `unit_ranges` means the rule REQUIRES a unit match (never guess
@@ -29,6 +37,19 @@ struct DefaultRule {
     /// stop range applies (data-valued palettes like radar_dbz).
     fallback_range: Option<(f64, f64)>,
 }
+
+/// Unit keys of a fraction (CF's dimensionless `1`, GRIB's `(0 - 1)`).
+const FRACTION: &[&str] = &["1", "01"];
+/// Unit keys of a percentage ([`unit_key`] reads `%` as `percent`, so a
+/// unit with no letters or digits, such as `-`, is not one).
+const PERCENT: &[&str] = &["percent", "pct"];
+const RH_NAMES: &[&str] = &["rh", "r", "2r", "r2", "humidity"];
+const RH_CONTAINS: &[&str] = &["relativehumidity"];
+const CLOUD_NAMES: &[&str] = &["tcc", "cc", "n", "nt", "clct"];
+const CLOUD_CONTAINS: &[&str] = &["cloudcover", "cloudiness", "totalcloud"];
+/// CF area fractions (#1067): `cloud_area_fraction`, its
+/// `low_/medium_/high_type_…` and `convective_…` layers, `fog_area_fraction`.
+const CF_CLOUD_CONTAINS: &[&str] = &["cloudareafraction", "fogareafraction"];
 
 /// First match wins — order the specific before the generic.
 static RULES: &[DefaultRule] = &[
@@ -83,8 +104,27 @@ static RULES: &[DefaultRule] = &[
         names: &["prate", "rr", "rri", "prr"],
         contains: &["precipitationrate", "rainrate", "rainintensity"],
         palette: "precipitation_rate",
-        unit_ranges: &[(&["mmh", "mmhr", "mmh1", "kgm2s1"], 0.0, 30.0)],
+        unit_ranges: &[(&["mmh", "mmhr", "mmh1", "mmhr1", "kgm2s1"], 0.0, 30.0)],
         fallback_range: Some((0.0, 30.0)),
+    },
+    // Precipitation accumulated from the run's start (#1067): MET Norway's
+    // MEPS `precipitation_amount_acc`, and the `…fall_amount_acc` names of
+    // the same pattern, grow through a 66-hour run far past the per-step
+    // scale, so they get their own palette over 0–200 mm. Exact names: a
+    // title saying "accumulated" says nothing about since when. Unit-gated
+    // (kg m-2 = mm of water); before the per-step rules, which also claim
+    // these names.
+    DefaultRule {
+        names: &[
+            "precipitationamountacc",
+            "rainfallamountacc",
+            "snowfallamountacc",
+            "graupelfallamountacc",
+        ],
+        contains: &[],
+        palette: "precipitation_accumulation",
+        unit_ranges: &[(&["kgm2", "mm"], 0.0, 200.0)],
+        fallback_range: None,
     },
     // Precipitation amount / accumulation.
     DefaultRule {
@@ -106,10 +146,13 @@ static RULES: &[DefaultRule] = &[
     },
     // Signed wind components (u/v) — diverging about zero, on the wind-speed
     // rule's scale. Before it, so a "u-component of wind gust" title stays
-    // signed.
+    // signed. CF's grid-relative `x_wind`/`y_wind` and MET Norway's
+    // `x_wind_10m`/`y_wind_10m` (#1067) are exact names: a `contains`
+    // "xwind" would claim every `max_wind…`.
     DefaultRule {
         names: &[
             "u", "v", "10u", "10v", "100u", "100v", "u10", "v10", "u100", "v100", "ugrd", "vgrd",
+            "xwind", "ywind", "xwind10m", "ywind10m",
         ],
         contains: &[
             "componentofwind",
@@ -233,25 +276,61 @@ static RULES: &[DefaultRule] = &[
         unit_ranges: &[(&["mm", "kgm2"], 0.0, 70.0)],
         fallback_range: None,
     },
-    // Relative humidity. `contains` names relative humidity explicitly:
-    // "Specific humidity" must not reach the percent range. A bare
-    // `Humidity` short name (FMI QueryData, no unit metadata) still matches.
+    // Relative humidity as a fraction (CF's unit 1, MEPS
+    // `relative_humidity_2m`): the fraction-valued twin of the percent
+    // palette. The percent palette over 0..1 would overlap its stops, so
+    // #823 clips instead of rescaling and the field sits in its bottom 1 %
+    // (#872). `contains` names relative humidity explicitly: "Specific
+    // humidity" must not reach these ranges.
     DefaultRule {
-        names: &["rh", "r", "2r", "r2", "humidity"],
-        contains: &["relativehumidity"],
+        names: RH_NAMES,
+        contains: RH_CONTAINS,
+        palette: "humidity_fraction",
+        unit_ranges: &[(FRACTION, 0.0, 1.0)],
+        fallback_range: None,
+    },
+    // Relative humidity in percent. A bare `Humidity` short name (FMI
+    // QueryData, no unit metadata) still matches.
+    DefaultRule {
+        names: RH_NAMES,
+        contains: RH_CONTAINS,
         palette: "humidity",
-        unit_ranges: &[(&["", "percent", "pct"], 0.0, 100.0), (&["1"], 0.0, 1.0)],
+        unit_ranges: &[(PERCENT, 0.0, 100.0)],
         fallback_range: Some((0.0, 100.0)),
     },
-    // Cloud cover.
+    // Cloud and fog cover as a fraction, on the fraction-valued twin of the
+    // percent palette (as for relative humidity above), including the CF
+    // area fractions MEPS publishes in unit 1.
     DefaultRule {
-        names: &["tcc", "cc", "n", "nt", "clct"],
-        contains: &["cloudcover", "cloudiness", "totalcloud"],
-        palette: "cloud_cover",
-        unit_ranges: &[
-            (&["", "percent", "pct"], 0.0, 100.0),
-            (&["1", "01"], 0.0, 1.0),
+        names: CLOUD_NAMES,
+        contains: &[
+            "cloudcover",
+            "cloudiness",
+            "totalcloud",
+            "cloudareafraction",
+            "fogareafraction",
         ],
+        palette: "cloud_cover_fraction",
+        unit_ranges: &[(FRACTION, 0.0, 1.0)],
+        fallback_range: None,
+    },
+    // The CF area fractions in percent. Unit-gated: CF's unit for them is
+    // 1, so without a known unit their names guess nothing (unlike the cover
+    // names below, whose percent fallback serves QueryData). A title naming
+    // cloud cover still reaches that fallback.
+    DefaultRule {
+        names: &[],
+        contains: CF_CLOUD_CONTAINS,
+        palette: "cloud_cover",
+        unit_ranges: &[(PERCENT, 0.0, 100.0)],
+        fallback_range: None,
+    },
+    // Cloud cover in percent.
+    DefaultRule {
+        names: CLOUD_NAMES,
+        contains: CLOUD_CONTAINS,
+        palette: "cloud_cover",
+        unit_ranges: &[(PERCENT, 0.0, 100.0)],
         fallback_range: Some((0.0, 100.0)),
     },
     // CAPE.
@@ -305,7 +384,10 @@ impl ParameterDefaults {
     ) -> Option<ResolvedDefault> {
         let name_n = normalize(short_name);
         let title_n = normalize(title);
-        let unit_n = unit.map(normalize);
+        let unit_n = unit.map(unit_key);
+        // Config aliases also match as plain normalized strings, as they did
+        // before unit keys: a key-like alias (`ms1`, `degc`) keeps working.
+        let unit_plain = unit.map(normalize);
 
         for rule in &self.overrides {
             let name_hit = rule.names.iter().any(|n| normalize(n) == name_n)
@@ -317,7 +399,7 @@ impl ParameterDefaults {
             if !name_hit {
                 continue;
             }
-            let range = match resolve_range_owned(rule, unit_n.as_deref()) {
+            let range = match resolve_range_owned(rule, unit_n.as_deref(), unit_plain.as_deref()) {
                 Ok(r) => r,
                 Err(()) => continue, // unit-gated rule, no unit match
             };
@@ -368,16 +450,24 @@ fn resolve_range(rule: &DefaultRule, unit: Option<&str>) -> Result<Option<(f64, 
     }
 }
 
+/// As [`resolve_range`], for a config rule: an alias matches the hint's
+/// [`unit_key`], or its plain [`normalize`]d spelling (`plain`) when that is
+/// not empty, so a symbol-only `%` alias never matches a `-` unit.
 fn resolve_range_owned(
     rule: &DefaultOverride,
     unit: Option<&str>,
+    plain: Option<&str>,
 ) -> Result<Option<(f64, f64)>, ()> {
     if rule.unit_ranges.is_empty() {
         return Ok(rule.fallback_range);
     }
     if let Some(u) = unit {
+        let plain = plain.filter(|p| !p.is_empty());
         for (aliases, min, max) in &rule.unit_ranges {
-            if aliases.iter().any(|a| normalize(a) == u) {
+            if aliases
+                .iter()
+                .any(|a| unit_key(a) == u || plain.is_some_and(|p| normalize(a) == p))
+            {
                 return Ok(Some((*min, *max)));
             }
         }
@@ -386,6 +476,15 @@ fn resolve_range_owned(
         Some(r) => Ok(Some(r)),
         None => Err(()),
     }
+}
+
+/// The key a unit is matched by, in the embedded table and in config
+/// unit ranges alike: its canonical spelling
+/// (`ds_core::units::canonical_unit`), [`normalize`]d, with `%` read as
+/// `percent`. `kg/m^2` → `kgm2`, `m/s` → `ms1`, `degC` → `c`,
+/// `%` → `percent`; a unit with no letters or digits (`-`) → `""`.
+pub fn unit_key(unit: &str) -> String {
+    normalize(&ds_core::units::canonical_unit(unit).replace('%', "percent"))
 }
 
 /// Lowercase alphanumerics only: `"10 m wind speed"` → `"10mwindspeed"`,
@@ -730,7 +829,7 @@ mod tests {
                 "2r",
                 "2 metre relative humidity",
                 Some("1"),
-                "humidity",
+                "humidity_fraction",
                 (0.0, 1.0),
             ),
             ("Humidity", "Humidity", None, "humidity", (0.0, 100.0)),
@@ -772,6 +871,588 @@ mod tests {
             d.match_default("t2m", "", Some("K")).unwrap().palette,
             "temperature"
         );
+    }
+
+    /// #1067 PR 6: a unit matches in every spelling (`unit_key`), in the
+    /// embedded table and in config unit ranges alike.
+    #[test]
+    fn unit_spellings_match_one_rule() {
+        let d = builtin();
+        for (name, title, spellings, palette, range) in [
+            (
+                "t2m",
+                "",
+                &["K", "kelvin", "degK"][..],
+                "temperature",
+                (183.15, 323.15),
+            ),
+            (
+                "t2m",
+                "",
+                &["°C", "degC", "degree_Celsius", "Cel", "C"][..],
+                "temperature",
+                (-90.0, 50.0),
+            ),
+            (
+                "ws",
+                "",
+                &["m s-1", "m/s", "m s**-1", "m s^-1", "m.s-1", "m·s⁻¹"][..],
+                "wind_speed",
+                (0.0, 40.0),
+            ),
+            (
+                "u",
+                "",
+                &["m s-1", "m/s", "m s^-1"][..],
+                "diverging",
+                (-40.0, 40.0),
+            ),
+            (
+                "prate",
+                "",
+                &["kg m-2 s-1", "kg/m2/s", "kg/(m2 s)", "kg m**-2 s**-1"][..],
+                "precipitation_rate",
+                (0.0, 30.0),
+            ),
+            (
+                "prate",
+                "",
+                &["mm/h", "mm h-1", "mm/hr", "mm hr-1"][..],
+                "precipitation_rate",
+                (0.0, 30.0),
+            ),
+            (
+                "w",
+                "Vertical velocity",
+                &["Pa s-1", "Pa/s", "Pa s**-1"][..],
+                "diverging",
+                (-2.0, 2.0),
+            ),
+            (
+                "vo",
+                "",
+                &["s-1", "/s", "1/s", "s**-1"][..],
+                "diverging",
+                (-2e-4, 2e-4),
+            ),
+            (
+                "z",
+                "",
+                &["m2 s-2", "m**2 s**-2", "m^2/s^2", "m²/s²"][..],
+                "viridis",
+                (0.0, 206_000.0),
+            ),
+            (
+                "tcwv",
+                "",
+                &["kg m-2", "kg/m^2", "kg m**-2", "kg.m-2", "mm"][..],
+                "viridis",
+                (0.0, 70.0),
+            ),
+            (
+                "q",
+                "",
+                &["kg kg-1", "kg/kg", "1"][..],
+                "viridis",
+                (0.0, 0.02),
+            ),
+            ("rh", "", &["%", "percent"][..], "humidity", (0.0, 100.0)),
+        ] {
+            for unit in spellings {
+                let m = d
+                    .match_default(name, title, Some(unit))
+                    .unwrap_or_else(|| panic!("no default for {name} in {unit:?}"));
+                assert_eq!(m.palette, palette, "{name} in {unit:?}");
+                assert_eq!(m.range, Some(range), "{name} in {unit:?}");
+            }
+        }
+        // A config unit range in one spelling matches the others.
+        let d = ParameterDefaults::with_overrides(vec![DefaultOverride {
+            names: vec!["gust".into()],
+            contains: vec![],
+            palette: "viridis".into(),
+            unit_ranges: vec![(vec!["m/s".into()], 0.0, 30.0)],
+            fallback_range: None,
+        }]);
+        for unit in ["m/s", "m s-1", "m s**-1"] {
+            assert_eq!(
+                d.match_default("gust", "", Some(unit)).unwrap(),
+                ResolvedDefault {
+                    palette: "viridis".into(),
+                    range: Some((0.0, 30.0)),
+                },
+                "{unit}"
+            );
+        }
+        // …and never another unit: km/h falls through to the embedded rule,
+        // which has no km/h range either and falls back to m/s.
+        assert_eq!(
+            d.match_default("gust", "", Some("km/h")).unwrap().palette,
+            "wind_speed"
+        );
+    }
+
+    /// A config alias written in the key-like form the embedded table uses
+    /// (`ms1`, `degc`, `pas1`) still matches every unit it matched before
+    /// unit keys: those whose plain normalized spelling it is. A symbol-only
+    /// `%` alias matches `%` and `percent`, never a `-` unit.
+    #[test]
+    fn key_like_config_aliases_keep_matching() {
+        for (alias, units, missed) in [
+            (
+                "ms1",
+                &["m s-1", "m s**-1", "m s^-1", "m.s-1"][..],
+                &["m s-2", "K"][..],
+            ),
+            ("degc", &["degC", "deg C", "deg_C"][..], &["K"][..]),
+            ("pas1", &["Pa s-1", "Pa s**-1"][..], &["Pa"][..]),
+            ("mmh1", &["mm h-1", "mm h**-1"][..], &["mm"][..]),
+            ("%", &["%", "percent", " % "][..], &["-", "~", "1"][..]),
+        ] {
+            let d = ParameterDefaults::with_overrides(vec![DefaultOverride {
+                names: vec!["param".into()],
+                contains: vec![],
+                palette: "viridis".into(),
+                unit_ranges: vec![(vec![alias.into()], 1.0, 2.0)],
+                fallback_range: None,
+            }]);
+            for unit in units {
+                assert_eq!(
+                    d.match_default("param", "", Some(unit)).map(|m| m.range),
+                    Some(Some((1.0, 2.0))),
+                    "{alias} vs {unit:?}"
+                );
+            }
+            for unit in missed {
+                assert_eq!(
+                    d.match_default("param", "", Some(unit)),
+                    None,
+                    "{alias} vs {unit:?}"
+                );
+            }
+        }
+    }
+
+    /// #1067 PR 6: MET Norway's MEPS sfc variables, with the titles and
+    /// units engine-netcdf reports for them (`long_name` and `units` as in
+    /// testdata/meps-netcdf, or the example's `[netcdf.titles]`).
+    #[test]
+    fn meps_names_get_their_defaults() {
+        let d = builtin();
+        for (name, title, unit, palette, range) in [
+            (
+                "air_temperature_2m",
+                "Screen level temperature (T2M)",
+                "K",
+                "temperature",
+                Some((183.15, 323.15)),
+            ),
+            (
+                "relative_humidity_2m",
+                "Screen level relative humidity (RH2M)",
+                "1",
+                "humidity_fraction",
+                Some((0.0, 1.0)),
+            ),
+            (
+                "x_wind_10m",
+                "10 metre wind along x-coordinate (U10M)",
+                "m/s",
+                "diverging",
+                Some((-40.0, 40.0)),
+            ),
+            (
+                "y_wind_10m",
+                "10 m wind along the grid's y axis",
+                "m/s",
+                "diverging",
+                Some((-40.0, 40.0)),
+            ),
+            (
+                "x_wind",
+                "x_wind",
+                "m s-1",
+                "diverging",
+                Some((-40.0, 40.0)),
+            ),
+            (
+                "wind_speed_of_gust",
+                "Wind gust",
+                "m/s",
+                "wind_speed",
+                Some((0.0, 40.0)),
+            ),
+            (
+                "air_pressure_at_sea_level",
+                "Mean Sea Level Pressure (MSLP)",
+                "Pa",
+                "pressure",
+                Some((95_000.0, 105_000.0)),
+            ),
+            (
+                "precipitation_amount_acc",
+                "Accumulated total precipitation",
+                "kg/m^2",
+                "precipitation_accumulation",
+                Some((0.0, 200.0)),
+            ),
+            (
+                "precipitation_amount_acc",
+                "Precipitation accumulated since run start",
+                "kg/m^2",
+                "precipitation_accumulation",
+                Some((0.0, 200.0)),
+            ),
+            (
+                "snowfall_amount_acc",
+                "Accumulated snowfall",
+                "kg/m^2",
+                "precipitation_accumulation",
+                Some((0.0, 200.0)),
+            ),
+            (
+                "cloud_area_fraction",
+                "Total cloud cover (TCC)",
+                "1",
+                "cloud_cover_fraction",
+                Some((0.0, 1.0)),
+            ),
+            (
+                "low_type_cloud_area_fraction",
+                "Low cloud cover (LCC)",
+                "1",
+                "cloud_cover_fraction",
+                Some((0.0, 1.0)),
+            ),
+            (
+                "fog_area_fraction",
+                "Fog",
+                "1",
+                "cloud_cover_fraction",
+                Some((0.0, 1.0)),
+            ),
+        ] {
+            let m = d
+                .match_default(name, title, Some(unit))
+                .unwrap_or_else(|| panic!("no default for {name}"));
+            assert_eq!(m.palette, palette, "{name} / {title}");
+            assert_eq!(m.range, range, "{name} / {title}");
+        }
+    }
+
+    /// The CF cloud and fog fractions: 0..1 in unit `1`, 0..100 in percent.
+    /// CF's unit for them being 1, their names guess nothing without a known
+    /// unit, nor in a unit with no letters (`-` is not `%`). A title that
+    /// names cloud cover still takes the cover rule's percent fallback, as
+    /// for any cloud-cover title (QueryData's have no units).
+    #[test]
+    fn cloud_and_fog_fractions_follow_their_unit() {
+        let d = builtin();
+        for name in [
+            "cloud_area_fraction",
+            "high_type_cloud_area_fraction",
+            "medium_type_cloud_area_fraction",
+            "convective_cloud_area_fraction",
+            "fog_area_fraction",
+        ] {
+            let fraction = d.match_default(name, "", Some("1")).unwrap();
+            assert_eq!(
+                (fraction.palette.as_str(), fraction.range),
+                ("cloud_cover_fraction", Some((0.0, 1.0))),
+                "{name}"
+            );
+            let percent = d.match_default(name, "", Some("%")).unwrap();
+            assert_eq!(
+                (percent.palette.as_str(), percent.range),
+                ("cloud_cover", Some((0.0, 100.0))),
+                "{name}"
+            );
+            assert_eq!(d.match_default(name, "", None), None, "{name}");
+            for unit in ["m", "-", "~"] {
+                assert_eq!(d.match_default(name, "", Some(unit)), None, "{name} {unit}");
+            }
+        }
+        // MEPS's own title, in unit 1 and with no unit.
+        let title = "Total cloud cover (TCC)";
+        let fraction = d
+            .match_default("cloud_area_fraction", title, Some("1"))
+            .unwrap();
+        assert_eq!(
+            (fraction.palette.as_str(), fraction.range),
+            ("cloud_cover_fraction", Some((0.0, 1.0)))
+        );
+        let untitled = d.match_default("cloud_area_fraction", title, None).unwrap();
+        assert_eq!(
+            (untitled.palette.as_str(), untitled.range),
+            ("cloud_cover", Some((0.0, 100.0)))
+        );
+        for (name, unit, palette, range) in [
+            ("tcc", None, "cloud_cover", (0.0, 100.0)),
+            ("tcc", Some("%"), "cloud_cover", (0.0, 100.0)),
+            ("tcc", Some("(0 - 1)"), "cloud_cover_fraction", (0.0, 1.0)),
+            ("TotalCloudCover", None, "cloud_cover", (0.0, 100.0)),
+        ] {
+            let m = d.match_default(name, "", unit).unwrap();
+            assert_eq!(
+                (m.palette.as_str(), m.range),
+                (palette, Some(range)),
+                "{name}"
+            );
+        }
+    }
+
+    /// Run-start accumulations are unit-gated and exact: per-step
+    /// precipitation keeps its 0..50 mm, and an `_acc` name in another unit
+    /// gets the per-step rule as before rather than a guess.
+    #[test]
+    fn run_start_accumulations_have_their_own_range() {
+        let d = builtin();
+        for unit in ["kg m-2", "kg/m^2", "kg m**-2", "mm"] {
+            let m = d
+                .match_default("precipitation_amount_acc", "", Some(unit))
+                .unwrap();
+            assert_eq!(
+                (m.palette.as_str(), m.range),
+                ("precipitation_accumulation", Some((0.0, 200.0))),
+                "{unit}"
+            );
+        }
+        for (name, title, unit) in [
+            ("tp", "Total precipitation", Some("mm")),
+            (
+                "precipitation_amount",
+                "Precipitation amount",
+                Some("kg m-2"),
+            ),
+            ("Precipitation1h", "Precipitation1h", None),
+            ("precipitation_amount_acc", "", Some("m")),
+            // A title saying "accumulated" says nothing about since when.
+            (
+                "apcp",
+                "Precipitation amount accumulated over 3 h",
+                Some("kg m-2"),
+            ),
+        ] {
+            let m = d.match_default(name, title, unit).unwrap();
+            assert_eq!(
+                (m.palette.as_str(), m.range),
+                ("precipitation", Some((0.0, 50.0))),
+                "{name}"
+            );
+        }
+        // Per-step snowfall stays on the per-step scale and stays unit-gated.
+        assert_eq!(
+            d.match_default("sf", "Snowfall", Some("kg/m^2"))
+                .unwrap()
+                .range,
+            Some((0.0, 50.0))
+        );
+        assert_eq!(d.match_default("snowfall_amount_acc", "", Some("m")), None);
+    }
+
+    /// GRIB (display units), Zarr (CF units as stored) and QueryData (no
+    /// units) parameters keep the defaults they had before units were
+    /// normalised, apart from fractions, which leave the percent palettes'
+    /// bottom 1 % for their fraction twins (#872).
+    #[test]
+    fn engine_parameters_keep_their_defaults() {
+        let d = builtin();
+        for (name, title, unit, palette, range) in [
+            // GRIB, after engine-grib's display conversion.
+            (
+                "2t",
+                "Temperature (2 m above ground)",
+                Some("°C"),
+                "temperature",
+                Some((-90.0, 50.0)),
+            ),
+            (
+                "TMP",
+                "Temperature",
+                Some("°C"),
+                "temperature",
+                Some((-90.0, 50.0)),
+            ),
+            (
+                "msl",
+                "Pressure reduced to MSL",
+                Some("hPa"),
+                "pressure",
+                Some((950.0, 1050.0)),
+            ),
+            (
+                "10u",
+                "u-component of wind",
+                Some("m s-1"),
+                "diverging",
+                Some((-40.0, 40.0)),
+            ),
+            (
+                "10si",
+                "Wind speed",
+                Some("m s-1"),
+                "wind_speed",
+                Some((0.0, 40.0)),
+            ),
+            (
+                "tp",
+                "Total precipitation",
+                Some("mm"),
+                "precipitation",
+                Some((0.0, 50.0)),
+            ),
+            (
+                "PRATE",
+                "Precipitation rate",
+                Some("kg m-2 s-1"),
+                "precipitation_rate",
+                Some((0.0, 30.0)),
+            ),
+            (
+                "r",
+                "Relative humidity",
+                Some("%"),
+                "humidity",
+                Some((0.0, 100.0)),
+            ),
+            (
+                "tcc",
+                "Total cloud cover",
+                Some("%"),
+                "cloud_cover",
+                Some((0.0, 100.0)),
+            ),
+            (
+                "q",
+                "Specific humidity",
+                Some("kg kg-1"),
+                "viridis",
+                Some((0.0, 0.02)),
+            ),
+            (
+                "gh",
+                "Geopotential height",
+                Some("gpm"),
+                "viridis",
+                Some((0.0, 21_000.0)),
+            ),
+            (
+                "cape",
+                "Convective available potential energy",
+                Some("J kg-1"),
+                "viridis",
+                Some((0.0, 4000.0)),
+            ),
+            // Zarr: CF units as the store spells them.
+            (
+                "t2m",
+                "2 metre temperature",
+                Some("K"),
+                "temperature",
+                Some((183.15, 323.15)),
+            ),
+            (
+                "2m_temperature",
+                "2 metre temperature",
+                Some("K"),
+                "temperature",
+                Some((183.15, 323.15)),
+            ),
+            (
+                "u10",
+                "10 metre U wind component",
+                Some("m s**-1"),
+                "diverging",
+                Some((-40.0, 40.0)),
+            ),
+            (
+                "mean_sea_level_pressure",
+                "Mean sea level pressure",
+                Some("Pa"),
+                "pressure",
+                Some((95_000.0, 105_000.0)),
+            ),
+            (
+                "si10",
+                "10 metre wind speed",
+                Some("m s**-1"),
+                "wind_speed",
+                Some((0.0, 40.0)),
+            ),
+            (
+                "tcwv",
+                "Total column vertically-integrated water vapour",
+                Some("kg m**-2"),
+                "viridis",
+                Some((0.0, 70.0)),
+            ),
+            (
+                "z",
+                "Geopotential",
+                Some("m**2 s**-2"),
+                "viridis",
+                Some((0.0, 206_000.0)),
+            ),
+            // QueryData: no units.
+            ("Humidity", "Humidity", None, "humidity", Some((0.0, 100.0))),
+            (
+                "TotalCloudCover",
+                "TotalCloudCover",
+                None,
+                "cloud_cover",
+                Some((0.0, 100.0)),
+            ),
+            (
+                "WindSpeedMS",
+                "Wind speed",
+                None,
+                "wind_speed",
+                Some((0.0, 40.0)),
+            ),
+            (
+                "Precipitation1h",
+                "Precipitation1h",
+                None,
+                "precipitation",
+                Some((0.0, 50.0)),
+            ),
+            // Radar.
+            ("DBZH", "", Some("dBZ"), "radar_dbz", None),
+            (
+                "VRADH",
+                "",
+                Some("m/s"),
+                "radial_velocity",
+                Some((-48.0, 48.0)),
+            ),
+        ] {
+            let m = d
+                .match_default(name, title, unit)
+                .unwrap_or_else(|| panic!("no default for {name}"));
+            assert_eq!(m.palette, palette, "{name}");
+            assert_eq!(m.range, range, "{name}");
+        }
+        // Unit-gated rules still never guess.
+        for (name, title) in [
+            ("Temperature", "Temperature"),
+            ("Pressure", "Pressure"),
+            ("WindUMS", "u-component of wind"),
+        ] {
+            assert_eq!(d.match_default(name, title, None), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn unit_keys() {
+        assert_eq!(unit_key("kg/m^2"), "kgm2");
+        assert_eq!(unit_key("kg m**-2"), "kgm2");
+        assert_eq!(unit_key("m/s"), "ms1");
+        assert_eq!(unit_key("degC"), "c");
+        assert_eq!(unit_key("percent"), "percent");
+        assert_eq!(unit_key("%"), "percent");
+        assert_eq!(unit_key("-"), "");
+        assert_eq!(unit_key("(0 - 1)"), "01");
+        assert_eq!(unit_key("1"), "1");
     }
 
     #[test]

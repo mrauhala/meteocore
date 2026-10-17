@@ -34,7 +34,10 @@ x_wind_10m = "10 m wind along the grid's x axis"
 y_wind_10m = "10 m wind along the grid's y axis"
 
 # Values are served in the files' own units: K, Pa, m/s, kg/m^2 and
-# fractions (units "1").
+# fractions (units "1"). Each layer without an entry below takes the
+# built-in default its name and unit select: temperature over -90…50 °C in
+# kelvin, pressure over 950…1050 hPa in pascals, wind speed for the gusts,
+# 0-200 mm for the accumulated precipitation.
 [wms]
 # The °C temperature palette over -90…50 °C in kelvin.
 colormap = "temperature"
@@ -47,6 +50,7 @@ colormap = "viridis"
 min = 0.0
 max = 1.0
 
+# Narrower than the default's ±40 m/s for wind components.
 [[wms.parameters]]
 name = "x_wind_10m"
 colormap = "diverging"
@@ -58,22 +62,6 @@ name = "y_wind_10m"
 colormap = "diverging"
 min = -20.0
 max = 20.0
-
-[[wms.parameters]]
-name = "wind_speed_of_gust"
-colormap = "wind_speed"
-
-# The hPa pressure palette over 950…1050 hPa in pascals.
-[[wms.parameters]]
-name = "air_pressure_at_sea_level"
-colormap = "pressure"
-min = 95000.0
-max = 105000.0
-
-# 1 kg/m^2 of water is 1 mm.
-[[wms.parameters]]
-name = "precipitation_amount_acc"
-colormap = "precipitation"
 
 [[wms.parameters]]
 name = "cloud_area_fraction"

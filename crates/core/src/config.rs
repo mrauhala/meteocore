@@ -45,12 +45,14 @@ pub struct ParameterDefault {
     /// and no `min`/`max`, an unmatched unit means the rule does not apply.
     pub min: Option<f64>,
     pub max: Option<f64>,
-    /// Unit-gated ranges, matched against the collection's unit hint.
+    /// Unit-gated ranges, matched against the parameter's unit in any
+    /// spelling ([`crate::units::canonical_unit`]: `unit = "m/s"` matches
+    /// `m s-1`, `kg/m^2` matches `kg m-2`).
     #[serde(default)]
     pub unit_ranges: Vec<UnitRange>,
 }
 
-/// One unit-alias → range entry inside `[[parameter_defaults]]`.
+/// One unit → range entry inside `[[parameter_defaults]]`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnitRange {
     pub unit: String,
@@ -1594,7 +1596,7 @@ pub fn satellite_composite_def(
             .collect();
         match products.as_slice() {
             [] => missing.push(band),
-            [product] if product.unit != "K" => {
+            [product] if !crate::units::same_unit(&product.unit, "K") => {
                 return Err(Config(format!(
                     "{prefix}: recipe '{recipe_name}' reads brightness temperatures in K, \
                      but {instrument} band {band} is '{}' in '{}'",
@@ -8014,10 +8016,16 @@ mod satellite_composite_tests {
     }
 
     /// Recipes read brightness temperatures: a band declared in another
-    /// unit (an L1b radiance), or a provider without them, is refused.
+    /// unit (an L1b radiance), or a provider without them, is refused. A
+    /// band in kelvin spelled another way is kelvin.
     #[test]
     fn recipes_need_brightness_temperatures() {
         let recipe = "[[composites]]\nname = \"rgb\"\nrecipe = \"night_microphysics\"";
+        for unit in ["kelvin", "degK", " K "] {
+            let mut spelled = bands_config("goes-r", &ABI, recipe);
+            spelled.products[0].unit = unit.into();
+            validate_satellite("goes", &spelled).unwrap_or_else(|e| panic!("{unit:?}: {e}"));
+        }
         let mut radiance = bands_config("goes-r", &ABI, recipe);
         radiance.products[0].unit = "mW m-2 sr-1 (cm-1)-1".into();
         let message = validate_satellite("goes", &radiance)

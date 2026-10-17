@@ -54,8 +54,15 @@ precipitation_amount_acc = "Precipitation accumulated since run start"
 ```
 
 `collections.d/meps-netcdf-local.toml` is a runnable example on the
-committed MEPS sample with a palette per variable. Values are served in the
-files' own units (K, Pa, m/s, kg/m², fractions).
+committed MEPS sample. Values are served in the files' own units (K, Pa,
+m/s, kg/m², fractions), never converted, and units are reported as the
+files spell them (`kg/m^2`). Layers without a `[[wms.parameters]]` entry
+take the built-in default style their name and unit select, matched in any
+unit spelling (`kg/m^2` is `kg m-2`): temperature in kelvin, MSLP in
+pascals, wind speed and gusts, the grid-relative `x_wind_10m`/`y_wind_10m`
+components (±40 m/s), relative humidity and cloud and fog area fractions in
+unit `1` (0–1), and the run-start `precipitation_amount_acc` (0–200 mm,
+`precipitation_accumulation`).
 
 ### Remote files
 

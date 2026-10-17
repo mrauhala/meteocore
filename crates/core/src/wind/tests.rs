@@ -313,6 +313,21 @@ fn a_pair_needs_one_level_one_unit_and_component_metadata() {
     assert_eq!(plan, WindPlan::default());
 }
 
+/// Two spellings of one unit are one unit (`crate::units::same_unit`): a
+/// store whose u says `m s-1` and v `m/s` still pairs, and the speed takes
+/// u's spelling.
+#[test]
+fn spellings_of_one_unit_pair() {
+    let u = grib("10u", U, VectorFrame::Earth, "sfc");
+    let mut v = grib("10v", V, VectorFrame::Earth, "sfc");
+    for spelling in ["m/s", "m s**-1", "m.s-1"] {
+        v.unit = spelling.into();
+        let plan = WindPlan::build(&facts(GridAxes::NorthAligned, vec![u.clone(), v.clone()]));
+        assert_eq!(names(&plan), ["10si", "10wdir"], "{spelling}");
+        assert_eq!(plan.map_parameter("10si").unwrap().unit, "m s-1");
+    }
+}
+
 fn cf(name: &str, standard_name: Option<&str>) -> ParameterFacts {
     ParameterFacts {
         frame: standard_name.map_or(VectorFrame::Unknown, VectorFrame::from_standard_name),

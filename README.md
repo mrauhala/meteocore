@@ -1506,7 +1506,7 @@ poll_interval_secs = 60
 precipitation_amount_acc = "Precipitation accumulated since run start"
 ```
 
-`apis` must be set (`["wms", "maps", "tiles"]`): the default `["edr"]` is rejected until the engine answers EDR queries. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs) with a palette per variable.
+`apis` must be set (`["wms", "maps", "tiles"]`): the default `["edr"]` is rejected until the engine answers EDR queries. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs). Values are served in the files' own units, never converted; layers the example does not style take the per-parameter default their name and unit select, in any unit spelling (see [Styling](#styling-shared-with-maps-and-tiles)).
 
 **Remote files.** An `http(s)://` `data_path` is a server whose files are found by name and read in place by HTTP range, never downloaded whole: MEPS on thredds.met.no's fileServer, which cannot be listed.
 
@@ -1751,11 +1751,14 @@ Styles live under each collection's `[wms]` block — Maps and Tiles read the sa
 | `temperature` | One scale for every level: ink → purple → blue → ice white, a hard edge at 0 °C to green → yellow → orange → red → wine | -90 to 50 °C |
 | `temperature_classic` | The pre-widening `temperature`: purple → blue → cyan → green → yellow → red | -40 to 50 °C |
 | `precipitation` | Transparent → blue → purple → white | 0–50 mm |
+| `precipitation_accumulation` | `precipitation`'s colours at four times its values, for accumulations over a forecast run | 0–200 mm |
 | `precipitation_rate` | Precipitation-rate ramp | 0–30 mm/h |
 | `wind_speed` | Green → yellow → orange → red → purple | 0–50 m/s |
 | `pressure` | Mean sea-level pressure, purple low → neutral → red high | 950–1050 hPa |
 | `humidity` | Relative humidity, dry brown → pale → green → blue | 0–100 % |
+| `humidity_fraction` | `humidity` for a fraction | 0–1 |
 | `cloud_cover` | White overlay with increasing opacity | 0–100 % |
+| `cloud_cover_fraction` | `cloud_cover` for a fraction | 0–1 |
 | `cap_severity` | CAP alert severity codes, grey/green/yellow/orange/red | 0–4 |
 | `lightning_age` | Lightning strike age, near-white → orange → dark violet | 0–60 min |
 | `ir_bt_grey` | Satellite IR brightness temperature, cold white → warm black | 180–330 K |
@@ -1774,7 +1777,7 @@ palette's title keeps its original unit. The same rule applies to inline
 `color_stops`.
 
 **Per-parameter default styles** (#320) — parameters of multi-parameter
-collections (GRIB, QueryData, Zarr, radar volumes) with no explicit style
+collections (GRIB, QueryData, Zarr, NetCDF, radar volumes) with no explicit style
 are matched against a built-in defaults table by normalized name/title plus
 each parameter's unit: temperature and dew point such as `t`/`t2m`/`2t`/`TMP`/`2d`
 (unit K or C) → `temperature` over one range for every level, −90…50 °C or
@@ -1783,25 +1786,43 @@ the stratosphere,
 `msl`/`mslp` (Pa or hPa) → `pressure`, `DBZH`/`dbz` → `radar_dbz`,
 `VRADH` → `radial_velocity`, satellite brightness temperature / cloud top
 temperature (unit K) → `ir_bt_enhanced`, relative humidity/cloud/wind
-speed/precipitation likewise. Signed fields take `diverging` centred on
-zero: `u`/`v`/`10u`/`10v` wind components (±40 m/s, ±80 kt), vertical
-velocity `w` (±2 Pa/s; geometric ±1 m/s), vorticity `vo` (±2·10⁻⁴ s⁻¹) and
+speed/precipitation likewise. Relative humidity and cloud cover in unit `1`
+(CF fractions, such as MEPS `relative_humidity_2m`) take the fraction twins
+`humidity_fraction` and `cloud_cover_fraction` over 0–1, since the percent
+palettes would clip a 0–1 range to their bottom 1 %; the CF area fractions
+`cloud_area_fraction`, its `low_`/`medium_`/`high_type_` layers and
+`fog_area_fraction` take them in unit `1` and the percent palettes in `%`;
+without a known unit their names select nothing, though a title naming
+cloud cover takes the cover rule's percent fallback, as any cloud-cover
+title does. Precipitation accumulated from a run's start
+(`precipitation_amount_acc`, and `rainfall_`, `snowfall_` and
+`graupelfall_amount_acc`; kg m⁻² or mm) takes `precipitation_accumulation`
+over 0–200 mm. Signed fields take
+`diverging` centred on zero: `u`/`v`/`10u`/`10v` wind components and the
+grid-relative `x_wind`/`y_wind`/`x_wind_10m`/`y_wind_10m` (±40 m/s,
+±80 kt), vertical velocity `w` (±2 Pa/s; geometric ±1 m/s), vorticity
+`vo` (±2·10⁻⁴ s⁻¹) and
 divergence `d` (±1·10⁻⁴ s⁻¹). `viridis` covers geopotential `z`/`gh`
 (0–21 000 gpm, every pressure level up to 50 hPa), surface pressure `sp`
 (500–1050 hPa, apart from MSLP), specific humidity `q` (0–0.02 kg/kg or
 0–20 g/kg, never the relative-humidity percent range) and total column
 water vapour `tcwv` (0–70 mm); snowfall `sf` (mm) takes `precipitation`.
 Unit-gated rules never guess (a temperature with no unit hint stays on the
-collection style). Defaults win over the collection-level colormap for
-those parameters; opt out per collection with
+collection style). Units match in any spelling, here and in
+`[[parameter_defaults.unit_ranges]]`: `kg/m^2`, `kg m**-2` and `kg m-2`
+are one unit, as are `m/s` and `m s-1`, or `degC` and `°C`. Defaults win
+over the collection-level colormap for those parameters; opt out per
+collection with
 `[wms] parameter_defaults = false`, or add/override rules globally with
 top-level `[[parameter_defaults]]` blocks (`names`/`contains`, `colormap`,
 `min`/`max` or `[[parameter_defaults.unit_ranges]]`).
 
 For multi-parameter rasters, defaults and legend labels use each selected
-parameter's own unit: GRIB display units, Zarr CF units, or ODIM quantity units.
+parameter's own unit: GRIB display units, Zarr and NetCDF CF units as the
+files spell them, or ODIM quantity units.
 Temperature, pressure and the signed, geopotential, specific-humidity,
-column-water and snowfall defaults above require a known unit; unknown units (including
+column-water, snowfall, run-start accumulation and CF area-fraction defaults
+above require a known unit; unknown units (including
 QueryData descriptors without unit metadata) stay unlabelled and use the
 configured fallback style. Explicit parameter styles still take precedence.
 
