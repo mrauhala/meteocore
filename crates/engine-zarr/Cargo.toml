@@ -14,7 +14,7 @@ ds-cache = { path = "../ds-cache" }
 ds-executor = { path = "../ds-executor" }
 bytes = "1"
 flate2 = "1"
-zstd = { version = "0.13", default-features = false, features = ["experimental"] }
+zstd = { version = "0.14", default-features = false, features = ["experimental"] }
 async-trait = { version = "0.1", optional = true }
 rayon = "1"
 # Borrow one output view at a time for serial zarrs decode-into calls.
