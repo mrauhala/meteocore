@@ -133,6 +133,16 @@ Violating these has caused production incidents. Never break them.
      in `crates/engine-zarr/src/store/coalescing_tests.rs` and `refresh_tests.rs`.
      engine-satellite's evicted-scan fetch is the same exception (EDR on
      async workers, renders on blocking ones): `tests/refetch.rs`.
+     So are engine-netcdf's remote files (#1067): hdf5-reader's synchronous
+     storage callback crosses into the engine's persistent I/O runtime
+     (`crates/engine-netcdf/src/io.rs`: `block_in_place` on a worker,
+     directly on a blocking or plain thread, a scoped thread on a
+     current-thread runtime), with the deadline captured on the calling
+     thread. Ingest on a poll-runtime worker, renders on `RenderJob` blocking
+     workers and on async workers are covered by
+     `remote::tests::reads_run_on_the_poll_runtime_render_jobs_and_async_workers`
+     and `io::tests::every_calling_thread_reaches_the_runtime`; its EDR and
+     GetFeatureInfo query workers come with #1067 PR 7.
    - Never from a non-Tokio thread such as a rayon pool — that hits a
      construct-a-new-`Runtime`-per-call fallback (#222). For parallel remote
      fetches, use async concurrency (`join_all`) on the runtime, or pass a
@@ -577,7 +587,7 @@ one never implies the other.
 | `engine_geotiff::reader::MAX_MAP_PIXELS` | native source px of one full-resolution map read | 64 M | Maps/Tiles 400 "Invalid parameter: Map render source area N pixels exceeds maximum 64000000."; WMS red error tile, HTTP 200 `x-cache: ERROR` |
 | `engine_geotiff::decode_budget::BUDGET` (a `ByteBudget`) | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
 | engine-zarr `read_budget::BUDGET` (over a `ByteBudget`) | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
-| engine-netcdf `decode_budget::BUDGET` (a `ByteBudget`) | bytes of one field read in progress: 3 × decoded + 3 × compressed, the decoded chunk bounding the compressed one (~24 MB per MEPS field); cache waiters and hits reserve nothing | `MC_NETCDF_READ_MEMORY_MB`, 1024 MiB | 503 |
+| engine-netcdf `decode_budget::BUDGET` (a `ByteBudget`) | bytes of one field read in progress: 3 × decoded + 3 × compressed, the decoded chunk bounding the compressed one (~24 MB per MEPS field); cache waiters and hits reserve nothing; a remote fill detached from its request and a poll's prewarm reserve it too | `MC_NETCDF_READ_MEMORY_MB`, 1024 MiB | 503 |
 | `ds_core::feature::MAX_AREA_DIM` / `MAX_AREA_VALUES` | EDR area output cells per axis / values per response | 256 / 1 M | coarsened / 400 "Query too large: …" |
 | `engine_geotiff::STAC_REQUEST_MAX_COLD_ITEMS` | STAC items whose header one EDR query reads (items in its window with no metadata yet; without `datetime`, in the whole catalog) | 400 (a closed day of 5-minute frames is 289) | 400 "Query too large: …", counted from the STAC response before it is installed or anything loads (#889) |
 | EDR `f=png` plot, WMS `GetLegendGraphic` | output px | 160–2000 × 120–2000 / ≤ 512 × 1024 | never: clamped silently |
@@ -771,7 +781,7 @@ one never implies the other.
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
-| NetCDF | `MapEngine` | WMS, Maps, Tiles — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory; one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields only. EDR, remote files and pressure levels are #1067 PRs 7, 5 and 8 |
+| NetCDF | `MapEngine` | WMS, Maps, Tiles — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields only. EDR and pressure levels are #1067 PRs 7 and 8 |
 | BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
 
 ## Config Format
@@ -969,7 +979,9 @@ lightning_jump = 0.9
 [collections.wms]
 colormap = "radar_dbz"
 
-# CF-NetCDF gridded data (#1067): a local directory of one file family. Valid
+# CF-NetCDF gridded data (#1067): one file family, in a local directory or,
+# with an http(s) data_path, read in place by HTTP range from a server found
+# by template probing (collections.d/meps-netcdf-thredds.toml.disabled). Valid
 # times come from each file's `time`, runs from `forecast_reference_time`.
 # See crates/engine-netcdf/CLAUDE.md.
 [[collections]]
@@ -983,6 +995,13 @@ filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"  # default: *.nc
 variables = ["air_temperature_2m", "precipitation_amount_acc"]  # default: all on the grid
 max_runs = 4                      # newest runs kept
 # max_files = 1024                # most files kept open; member = 0 (ensemble axis)
+# Remote instead: data_path = "https://thredds.met.no/thredds/fileServer/meps25epsarchive/"
+# prefix_pattern = "%Y/%m/%d/{run}/member_00/"   # {run}: the run hour
+# run_hours = [0, 3, 6, 9, 12, 15, 18, 21]       # required
+# leads = [0, 1, 2]                              # {lead}; the first is the sentinel
+# time_window = "-PT12H"                         # required
+# min_age = "PT10M"; run_grace = "PT30M"         # settling (defaults)
+# prewarm_variables = []                         # newest run fetched ahead, ~100 MB/variable
 [collections.netcdf.titles]
 precipitation_amount_acc = "Precipitation accumulated since run start"
 

@@ -103,6 +103,10 @@ The prober keeps what it found between polls:
   sentinel is re-HEADed. A sentinel that changed or vanished has every file
   of its slot re-HEADed on the next poll. A file whose version changed is
   withdrawn and settles again as its new version.
+- `recheck(key)` has a settled file re-HEADed on the next poll, ahead of
+  discovery: for a reader whose conditional range read answered
+  `RangeRead::Changed` (below), so a replaced lead is found at once, not at
+  its run's next sentinel recheck.
 - One poll makes at most `max_heads_per_poll` HEADs: unsettled files first,
   then files to recheck, then newest slot first the unpublished slots'
   sentinels and leads, then the due rechecks. The rest waits for the next
@@ -138,4 +142,8 @@ against the operation's budget and the request deadline.
 `build_http_store_limited(url, n)` gives every store built for the same
 scheme, host and port one shared limit, so collections reading one server
 stay under it together; the first limit named for a host is kept for the
-life of the process.
+life of the process. `host_requests()` reports, per host and port, the
+requests holding one of its permits and those waiting for one (two counting
+stores around its `LimitStore`), for the server's
+`storage_host_requests_{in_flight,queued}` and `storage_host_request_limit`
+gauges.

@@ -575,6 +575,69 @@ static NETCDF_READ_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
         "NetCDF field reads rejected by memory admission",
     )
 });
+// Remote NetCDF files read by HTTP range (#1067 PR 5): the metadata-block and
+// compressed-chunk caches under the reader, the field fills detached from
+// the requests that started them, and the per-host request limit.
+static NETCDF_BLOCK_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "netcdf_block_cache",
+        "NetCDF remote metadata-block cache",
+        None,
+        Some("block GETs"),
+        false,
+    )
+});
+static NETCDF_CHUNK_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "netcdf_chunk_cache",
+        "NetCDF remote compressed-chunk cache",
+        None,
+        Some("chunk GETs"),
+        false,
+    )
+});
+static NETCDF_DETACHED_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "netcdf_detached_fills_pending",
+        "Remote NetCDF field fills running detached from the request that started them",
+    )
+});
+static NETCDF_DETACHED_TOTAL: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "netcdf_detached_fills_total",
+        "Remote NetCDF field fills detached from their request",
+    )
+});
+static NETCDF_DETACHED_INLINE: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "netcdf_detached_fills_inline_total",
+        "Remote NetCDF field fills run inline because the detached ones were at their cap",
+    )
+});
+// One series per configured remote host: a bounded label set.
+fn host_gauge(name: &str, help: &str) -> IntGaugeVec {
+    let gauge = IntGaugeVec::new(Opts::new(name, help), &["host"]).unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+}
+static STORAGE_HOST_REQUESTS_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    host_gauge(
+        "storage_host_requests_in_flight",
+        "Requests holding one of a remote host's request permits",
+    )
+});
+static STORAGE_HOST_REQUESTS_QUEUED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    host_gauge(
+        "storage_host_requests_queued",
+        "Requests waiting for one of a remote host's request permits",
+    )
+});
+static STORAGE_HOST_REQUEST_LIMIT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    host_gauge(
+        "storage_host_request_limit",
+        "Requests a remote host allows in flight at once",
+    )
+});
 
 // Lightning strike-window cache (#504) — process-global, byte-bounded LRU of
 // decoded event windows for the events-shape map layer, so the ~50-190
@@ -6151,6 +6214,26 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         NETCDF_READ_LIMIT.set(limit.min(i64::MAX as u64) as i64);
         NETCDF_READ_REJECTED.feed(rejected);
         NETCDF_FIELD_CACHE_METRICS.update(engine_netcdf::field_cache_metrics(), None);
+        NETCDF_BLOCK_CACHE_METRICS.update(engine_netcdf::block_cache_metrics(), None);
+        NETCDF_CHUNK_CACHE_METRICS.update(engine_netcdf::chunk_cache_metrics(), None);
+        let (pending, detached, inline) = engine_netcdf::detached_fill_metrics();
+        NETCDF_DETACHED_PENDING.set(pending.min(i64::MAX as usize) as i64);
+        NETCDF_DETACHED_TOTAL.feed(detached);
+        NETCDF_DETACHED_INLINE.feed(inline);
+    }
+    // Hosts behind `ds_storage::build_http_store_limited`: today the remote
+    // NetCDF sources.
+    for host in ds_storage::host_requests() {
+        let label = [host.host.as_str()];
+        STORAGE_HOST_REQUESTS_IN_FLIGHT
+            .with_label_values(&label)
+            .set(host.in_flight.min(i64::MAX as usize) as i64);
+        STORAGE_HOST_REQUESTS_QUEUED
+            .with_label_values(&label)
+            .set(host.queued.min(i64::MAX as usize) as i64);
+        STORAGE_HOST_REQUEST_LIMIT
+            .with_label_values(&label)
+            .set(host.limit.min(i64::MAX as usize) as i64);
     }
     let satellite_engines = state
         .satellite_engines

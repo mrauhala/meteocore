@@ -6,21 +6,32 @@
 //! concurrent renders of one cold field decode it once: the first reader
 //! owns the fill and reserves the transient peak from the decode budget,
 //! the others wait for its value and reserve nothing, and a hit reserves
-//! nothing either. The wait and the fill run inside `block_in_place` on a
-//! Tokio worker, as engine-zarr's store does (root CLAUDE.md Critical
-//! Rule 7), so a waiting async worker does not hold up the runtime.
+//! nothing either. The wait and the fill run through [`io::blocking`]
+//! (`block_in_place` on a Tokio worker, root CLAUDE.md Critical Rule 7), so
+//! a waiting async worker does not hold up the runtime.
+//!
+//! A remote file's cold field is filled **detached** (#1067): the request
+//! claims the fill, hands the claim to a task on the I/O runtime that reads
+//! under [`Mode::Detached`] (no request deadline,
+//! [`ds_storage::FetchBudget::Background`]), and waits for it only until its
+//! own deadline. A fetch that outlives one request's 3 s still fills the
+//! cache for the next. At most [`MAX_DETACHED_FILLS`] run at once; past
+//! that a fill runs inline, under the request's deadline.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use ds_cache::ByteBoundedCache;
+use ds_cache::{ByteBoundedCache, CacheEntry};
 use ds_core::deadline;
 use ds_core::error::DataServerError;
 use netcdf_reader::NcFile;
 
+use crate::catalog::OpenFile;
 use crate::decode_budget::BUDGET;
 use crate::ingest::{FieldRead, Stored};
+use crate::io::{self, Mode};
+use crate::remote::ReadFailure;
 
 /// A decoded 2-D field: rows north to south, NaN for nodata.
 pub(crate) type Values = Arc<[f32]>;
@@ -57,6 +68,54 @@ pub fn field_cache_metrics() -> ds_cache::CacheMetrics {
     FIELDS.metrics()
 }
 
+/// Detached fills running at once, over every collection: twice the
+/// requests a host takes at once ([`crate::remote::HOST_REQUEST_LIMIT`]),
+/// so the next frames' fetches queue behind the current ones without
+/// piling up work no request still waits for.
+pub(crate) const MAX_DETACHED_FILLS: usize = 16;
+
+static DETACHED_PENDING: AtomicUsize = AtomicUsize::new(0);
+static DETACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DETACHED_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+/// Detached fills: `(running now, started in total, filled inline because
+/// MAX_DETACHED_FILLS were running)`.
+pub fn detached_fill_metrics() -> (usize, u64, u64) {
+    (
+        DETACHED_PENDING.load(Ordering::Relaxed),
+        DETACHED_TOTAL.load(Ordering::Relaxed),
+        DETACHED_OVERFLOW.load(Ordering::Relaxed),
+    )
+}
+
+/// One running detached fill, counted until dropped.
+struct Detached;
+
+impl Detached {
+    /// A slot for a detached fill, unless [`MAX_DETACHED_FILLS`] are running.
+    fn claim() -> Option<Self> {
+        DETACHED_PENDING
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_DETACHED_FILLS).then_some(n + 1)
+            })
+            .ok()?;
+        DETACHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        Some(Self)
+    }
+}
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        DETACHED_PENDING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Drop the decoded fields of the ingest `file`: its file was found
+/// replaced.
+pub(crate) fn evict_file(file: u64) {
+    FIELDS.retain(|key, _| key.file != file);
+}
+
 /// The transient peak of decoding `read`, which the fill reserves: three
 /// times the decoded bytes (the stored-type result, the inflated chunk and
 /// its unshuffled copy) and three times the compressed chunk. hdf5-reader
@@ -69,22 +128,20 @@ fn peak_bytes(read: &FieldRead) -> u64 {
         .saturating_add(read.chunk_bytes.saturating_mul(3))
 }
 
-/// The field `read` of `nc` at time step `time`, from the cache or decoded
-/// once for every concurrent reader. `file` is the file's ingest id
-/// ([`FieldKey::file`]); `flipped` reverses the stored rows to north-up;
-/// `decodes` counts the fills this call makes.
+/// Variable `index` of `file` at time step `time`, from the cache or decoded
+/// once for every concurrent reader. `flipped` reverses the stored rows to
+/// north-up; `decodes` counts the fills this call makes.
 pub(crate) fn read(
-    nc: &NcFile,
-    file: u64,
-    read: &FieldRead,
+    file: &Arc<OpenFile>,
+    index: usize,
     time: u32,
     flipped: bool,
-    decodes: &AtomicU64,
+    decodes: &Arc<AtomicU64>,
 ) -> Result<Values, DataServerError> {
     deadline::check()?;
     let key = FieldKey {
-        file,
-        variable: read.name.clone(),
+        file: file.id,
+        variable: file.reads[index].name.clone(),
         time,
         level: 0,
     };
@@ -92,56 +149,195 @@ pub(crate) fn read(
         FIELDS.record_hit();
         return Ok(values);
     }
-    let end = deadline::current();
-    let wait = end.map_or(Duration::from_secs(30), |end| {
-        end.saturating_duration_since(Instant::now())
-    });
-    let fill = || {
-        FIELDS.get_or_insert_with_timeout(
-            &key,
-            wait,
-            || {
-                // A failed owner hands the fill to a waiter: recheck that
-                // caller's deadline before reading.
-                deadline::check()?;
-                let _permit = BUDGET.reserve(peak_bytes(read))?;
-                decodes.fetch_add(1, Ordering::Relaxed);
-                decode(nc, read, time, flipped)
-                    .map(Values::from)
-                    .map_err(DataServerError::Storage)
-            },
-            || {
-                if end.is_some() {
-                    DataServerError::DeadlineExceeded
-                } else {
-                    DataServerError::Storage("timed out waiting for a NetCDF field read".into())
-                }
-            },
-        )
+    let fill = Fill {
+        file,
+        index,
+        time,
+        flipped,
+        decodes,
+        end: deadline::current(),
     };
     // A waiting async worker must not hold up the runtime the owner may
     // need. On RenderJob's blocking threads `block_in_place` runs the
     // closure as is.
-    let result = if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(fill)
-    } else {
-        fill()
-    };
+    let result = io::blocking(|| {
+        if file.remote.is_some() {
+            fill.detached(&key)
+        } else {
+            fill.inline(&key)
+        }
+    });
     // A fill can complete after this caller's deadline passed: the value
     // stays cached for the next request.
     deadline::check()?;
     result
 }
 
+/// One reader's fill of one field.
+struct Fill<'a> {
+    file: &'a Arc<OpenFile>,
+    index: usize,
+    time: u32,
+    flipped: bool,
+    decodes: &'a Arc<AtomicU64>,
+    /// The reader's deadline.
+    end: Option<Instant>,
+}
+
+impl Fill<'_> {
+    /// How long the reader waits for another's fill: until its deadline,
+    /// 30 s without one.
+    fn wait(&self) -> Duration {
+        self.end.map_or(Duration::from_secs(30), |end| {
+            end.saturating_duration_since(Instant::now())
+        })
+    }
+
+    fn timed_out(&self) -> DataServerError {
+        if self.end.is_some() {
+            DataServerError::DeadlineExceeded
+        } else {
+            DataServerError::Storage("timed out waiting for a NetCDF field read".into())
+        }
+    }
+
+    /// Fill in this thread, or wait for the reader that does.
+    fn inline(&self, key: &FieldKey) -> Result<Values, DataServerError> {
+        FIELDS.get_or_insert_with_timeout(
+            key,
+            self.wait(),
+            || {
+                // A failed owner hands the fill to a waiter: recheck that
+                // caller's deadline before reading.
+                deadline::check()?;
+                fill(self.file, self.index, self.time, self.flipped, self.decodes)
+            },
+            || self.timed_out(),
+        )
+    }
+
+    /// Claim the fill and detach it to the I/O runtime, or wait for the
+    /// reader that has; inline past [`MAX_DETACHED_FILLS`].
+    fn detached(&self, key: &FieldKey) -> Result<Values, DataServerError> {
+        match FIELDS.get_value_or_guard_untracked(key, Duration::ZERO) {
+            CacheEntry::Value(values) => {
+                FIELDS.record_hit();
+                return Ok(values);
+            }
+            CacheEntry::Vacant(guard) => {
+                FIELDS.record_miss();
+                let Some(slot) = Detached::claim() else {
+                    DETACHED_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                    let values =
+                        fill(self.file, self.index, self.time, self.flipped, self.decodes)?;
+                    let _ = guard.insert(values.clone());
+                    return Ok(values);
+                };
+                let (file, decodes) = (self.file.clone(), self.decodes.clone());
+                let (index, time, flipped) = (self.index, self.time, self.flipped);
+                io::handle().spawn_blocking(move || {
+                    let _slot = slot;
+                    let _mode = io::enter(Mode::Detached);
+                    match fill(&file, index, time, flipped, &decodes) {
+                        Ok(values) => {
+                            let _ = guard.insert(values);
+                        }
+                        // The guard drops: a waiting reader fills it and
+                        // gets the error itself.
+                        Err(e) => tracing::debug!("detached NetCDF field read failed: {e}"),
+                    }
+                });
+                return self.wait_for(key, true);
+            }
+            CacheEntry::Timeout => {}
+        }
+        self.wait_for(key, false)
+    }
+
+    /// Wait for another fill of `key` until the deadline; fill it here if
+    /// that one failed. `own` is this reader's own detached fill, already
+    /// counted as a miss.
+    fn wait_for(&self, key: &FieldKey, own: bool) -> Result<Values, DataServerError> {
+        match FIELDS.get_value_or_guard_untracked(key, self.wait()) {
+            CacheEntry::Value(values) => {
+                if !own {
+                    FIELDS.record_hit();
+                }
+                Ok(values)
+            }
+            CacheEntry::Vacant(guard) => {
+                deadline::check()?;
+                if !own {
+                    FIELDS.record_miss();
+                }
+                let values = fill(self.file, self.index, self.time, self.flipped, self.decodes)?;
+                let _ = guard.insert(values.clone());
+                Ok(values)
+            }
+            CacheEntry::Timeout => Err(self.timed_out()),
+        }
+    }
+}
+
+/// Reserve the decode's transient peak and decode variable `index` of
+/// `file` at step `time`: one cache fill.
+fn fill(
+    file: &OpenFile,
+    index: usize,
+    time: u32,
+    flipped: bool,
+    decodes: &AtomicU64,
+) -> Result<Values, DataServerError> {
+    let read = &file.reads[index];
+    let _permit = BUDGET.reserve(peak_bytes(read))?;
+    decodes.fetch_add(1, Ordering::Relaxed);
+    decode(&file.nc, read, time, flipped).map(Values::from)
+}
+
+/// Fetch variable `index` of `file` at step `time` ahead of requests, for
+/// the poll's prewarm: its compressed chunk lands in the chunk cache
+/// ([`crate::remote`]); the decoded field is dropped, not cached, so a
+/// prewarm never evicts the fields being drawn. `Ok(false)` when the field
+/// is decoded already.
+pub(crate) fn prewarm(
+    file: &OpenFile,
+    index: usize,
+    time: u32,
+    flipped: bool,
+) -> Result<bool, DataServerError> {
+    let read = &file.reads[index];
+    let key = FieldKey {
+        file: file.id,
+        variable: read.name.clone(),
+        time,
+        level: 0,
+    };
+    if FIELDS.contains_key(&key) {
+        return Ok(false);
+    }
+    let _permit = BUDGET.reserve(peak_bytes(read))?;
+    decode(&file.nc, read, time, flipped).map(|_| true)
+}
+
 /// Read and decode one field: the typed hyperslab, CF masking and packing,
 /// and the rows reversed to north-up when the file stores them south-up.
-fn decode(nc: &NcFile, read: &FieldRead, time: u32, flipped: bool) -> Result<Vec<f32>, String> {
+/// A failed remote read keeps its meaning ([`ReadFailure::to_error`]): a
+/// deadline, or a replaced file's 503.
+fn decode(
+    nc: &NcFile,
+    read: &FieldRead,
+    time: u32,
+    flipped: bool,
+) -> Result<Vec<f32>, DataServerError> {
     let selection = read.selection(time);
     let name = &*read.name;
     let packing = &read.packing;
     let (ny, nx) = read.shape();
     let cells = ny * nx;
-    let fail = |e: netcdf_reader::Error| format!("variable '{name}' step {time}: {e}");
+    let fail = |e: netcdf_reader::Error| match ReadFailure::find(&e) {
+        Some(failure) => failure.to_error(),
+        None => DataServerError::Storage(format!("variable '{name}' step {time}: {e}")),
+    };
     macro_rules! typed {
         ($t:ty) => {{
             let array = nc
@@ -179,10 +375,10 @@ fn decode(nc: &NcFile, read: &FieldRead, time: u32, flipped: bool) -> Result<Vec
         Stored::Double => typed!(f64),
     };
     if values.len() != cells {
-        return Err(format!(
+        return Err(DataServerError::Storage(format!(
             "variable '{name}' step {time}: read {} values for a {nx} x {ny} field",
             values.len()
-        ));
+        )));
     }
     Ok(values)
 }
@@ -235,7 +431,7 @@ mod tests {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../testdata/meps-netcdf/meps_sfc_01_20261015T06Z.nc");
         let storage = Arc::new(Slow {
-            inner: FileStorage::open(path).unwrap(),
+            inner: FileStorage::open(&path).unwrap(),
             slow: false.into(),
             reads: AtomicU64::new(0),
         });
@@ -243,16 +439,26 @@ mod tests {
         let nc = open_storage(dynamic.clone()).unwrap();
         let names = vec!["wind_speed_of_gust".to_string()];
         let inspected = inspect(&nc, &dynamic, &Wanted::Listed(&names), 0).unwrap();
-        let field = &inspected.fields[0].read;
+        let flipped = inspected.grid.flipped;
+        let file = Arc::new(OpenFile {
+            id: crate::next_file_id(),
+            path: path.clone(),
+            identity: crate::catalog::Identity::sized(0),
+            nc,
+            remote: None,
+            run: None,
+            times: Vec::new(),
+            reads: vec![inspected.fields[0].read.clone()],
+        });
         storage.slow.store(true, Ordering::Relaxed);
-        let (file, decodes) = (crate::next_file_id(), AtomicU64::new(0));
+        let decodes = Arc::new(AtomicU64::new(0));
         let start = Barrier::new(8);
         let values: Vec<Values> = std::thread::scope(|scope| {
             let readers: Vec<_> = (0..8)
                 .map(|_| {
                     scope.spawn(|| {
                         start.wait();
-                        read(&nc, file, field, 0, inspected.grid.flipped, &decodes).unwrap()
+                        read(&file, 0, 0, flipped, &decodes).unwrap()
                     })
                 })
                 .collect();

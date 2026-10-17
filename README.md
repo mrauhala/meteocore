@@ -29,7 +29,7 @@ Each engine implements one or more of the core traits.
 | `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
 | `engine-zarr` | `EdrEngine` + `MapEngine` | Zarr V2/V3 multidimensional arrays with CF metadata (local, S3, HTTP); optional Icechunk repositories |
 | `engine-satellite` | `EdrEngine` + `MapEngine` | Geostationary satellite imagery: GOES-R ABI NetCDF-4 scans, Himawari-9 AHI ISatSS tiles and NOAA's hourly GMGSI global mosaic (NOAA open data on AWS, or a local mirror), one parameter per band/product, each with its own time axis |
-| `engine-netcdf` | `MapEngine` | CF-NetCDF gridded forecasts and analyses (MET Norway MEPS per-lead files first) from a local directory: one layer per variable, model runs from `forecast_reference_time` |
+| `engine-netcdf` | `MapEngine` | CF-NetCDF gridded forecasts and analyses (MET Norway MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server that cannot be listed (thredds.met.no): one layer per variable, model runs from `forecast_reference_time` |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
 
 ### OGC API Plugins
@@ -200,6 +200,8 @@ not re-scan the auto roots.
 | `MC_SATELLITE_FRAME_CACHE_MB` | `1024` | Satellite scans held in memory (the compressed NetCDF file plus its overview, ~30 MB per 2 km full disk), in MB, shared by every satellite collection. Size it above the scans in the `time_window` of **all** satellite collections together (see [Satellite](#satellite)). While they fit, a poll downloads back any in-window scan evicted here; when they do not, it logs a WARN with the sizes and requests download the missing scans themselves. |
 | `MC_SATELLITE_STRIP_CACHE_MB` | `256` | Satellite decoded blocks (GOES-R: strips of 24 full-width rows, ~260 KB each at 2 km; GMGSI: 793 × 1322 chunks, ~2 MB each), in MB. |
 | `MC_NETCDF_FIELD_CACHE_MB` | `256` | NetCDF decoded fields (`f32`, ~4 MB per MEPS field), in MB, shared by every NetCDF collection. Concurrent renders of one field decode it once. `0` disables retention. |
+| `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote NetCDF files (~1.5 MB per MEPS field, about 340 fields), in MB, shared by every NetCDF collection. A field drawn again after its decoded copy was evicted is decoded from here without a request. `0` disables retention. |
+| `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote NetCDF files, in MB, shared by every NetCDF collection: what the reader parses when it opens a file (its first 1 MiB) and the blocks of the chunk indexes. At least 8: without it every metadata read would be a request. |
 | `MC_NETCDF_READ_MEMORY_MB` | `1024` | Process-wide admission budget for NetCDF field reads in progress, in MiB: a cold field read reserves three times its decoded chunk plus three times its compressed chunk (~24 MB for MEPS); cache hits and readers waiting for another's read reserve nothing. A read that does not fit fails at once with 503. Restart to change. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool, across all renders. A projected WMS view (EPSG:3857/3067/3035) renders one meta-tile at a time with only a few fetches in flight, so raising this does not shorten its first view; a whole-viewport render (WMS EPSG:4326, a Maps image) fetches all its missing tiles at once and does wait on the pool. Raise it (e.g. 32–64) when cold renders queue on a high-latency object store. Value must be ≥ 1. |
 | `MC_COG_PREWARM_MB` | `32` | Per-frame cap, in MiB of encoded tiles, on the poll-time pre-warm of newly discovered remote COG frames, which reads them into the collection's tile cache so their first view needs no storage round trips. Also at most 1/8 of the collection's `tile_cache_mb`. Levels are taken coarsest first while they fit, so a larger file still gets its overviews. `0` turns the pre-warm off. Restart to change. |
@@ -1476,7 +1478,7 @@ max = 255.0
 
 ### NetCDF
 
-Gridded CF-NetCDF data (`engine_type = "netcdf"`, #1067), served through WMS, OGC API Maps and Tiles. One collection is one file family in a local directory, such as MET Norway's MEPS surface files, one per lead time: every file carries the collection's variables on one grid. Each variable is a layer: a WMS child layer `coll/<variable>`, Maps/Tiles `parameter-name=<variable>`.
+Gridded CF-NetCDF data (`engine_type = "netcdf"`, #1067), served through WMS, OGC API Maps and Tiles. One collection is one file family, such as MET Norway's MEPS surface files, one per lead time: every file carries the collection's variables on one grid. The files lie in a local directory, or on an HTTP server that is read in place (below). Each variable is a layer: a WMS child layer `coll/<variable>`, Maps/Tiles `parameter-name=<variable>`.
 
 - **Times come from the files.** Each file's valid times are its `time` axis and its model run its `forecast_reference_time`. Runs are the WMS `reference_time` dimension: a map draws from the newest run whose steps span the requested time, so a newer run still arriving does not hide an older one, and a pinned run draws from that run or fails. Files without `forecast_reference_time` form one timeline without runs. File names only select the files and order the opening (`filename_template`, with `{run}` and `{lead}` as in ds-storage's discovery, default `*.nc`), and global time attributes are never read.
 - **Grids:** 1-D latitude/longitude, or 1-D projected x/y with a CF `grid_mapping` (`lambert_conformal_conic`, as MEPS; `geostationary`). Rows stored south to north are drawn north-up. A projected grid has no `storageCrs`: its native CRS has no OGC URI.
@@ -1500,7 +1502,30 @@ precipitation_amount_acc = "Precipitation accumulated since run start"
 
 `apis` must be set (`["wms", "maps", "tiles"]`): the default `["edr"]` is rejected until the engine answers EDR queries. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs) with a palette per variable.
 
-Not yet: remote files by HTTP range, EDR, derived wind, pressure levels as a vertical axis, and per-variable file layouts (#1067).
+**Remote files.** An `http(s)://` `data_path` is a server whose files are found by name and read in place by HTTP range, never downloaded whole: MEPS on thredds.met.no's fileServer, which cannot be listed.
+
+- **Finding the files:** each poll HEADs the names `prefix_pattern` and `filename_template` give for every run in `time_window` (`{run}` is the run hour, `{lead}` each of `leads`). A run not out yet costs one HEAD, its first lead's; once that exists the other leads are HEADed. A file is used once two polls see the same size and `Last-Modified`, or once it is `min_age` old, and a run is served when all its leads are, or `run_grace` after its first appeared, without the missing ones (WARN). A served file is HEADed again every 30 min to catch a replacement.
+- **Reading:** opening a file reads its first 1 MiB in one request (MEPS keeps all its metadata there) and a few 64 KiB blocks of its chunk indexes; a field is one request for its compressed chunk (~1.5 MB). Both are cached: metadata blocks (`MC_NETCDF_BLOCK_CACHE_MB`), compressed chunks (`MC_NETCDF_CHUNK_CACHE_MB`), decoded fields (`MC_NETCDF_FIELD_CACHE_MB`). Every request is conditional on the version opened: a file replaced on the server answers 503, has what was read from it dropped, and is opened again by the next poll.
+- **Requests:** at most 8 go to one host at once, over every collection on it, and a poll's take at most 2 of them. A request waiting for one counts against its deadline. A cold field a render cannot fetch within its 3 s still lands in the cache: its fetch carries on without the request, so the next request draws it.
+- **Load:** the collection opens the newest run when it loads, for at most 15 s, and its poll loop opens the rest at once. `prewarm_variables` fetches the newest run's fields of those variables on every poll, before any request: about 100 MB per MEPS variable and run.
+
+```toml
+[netcdf]
+data_path = "https://thredds.met.no/thredds/fileServer/meps25epsarchive/"
+prefix_pattern = "%Y/%m/%d/{run}/member_00/"          # {run}: the run hour
+filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"
+run_hours = [0, 3, 6, 9, 12, 15, 18, 21]               # required
+leads = [0, 1, 2]                                      # {lead}; the first is the run's sentinel
+time_window = "-PT12H"                                 # required: runs probed
+variables = ["air_temperature_2m"]
+# min_age = "PT10M"                                    # a file this old is used at once
+# run_grace = "PT30M"                                  # serve a run missing leads after this
+# prewarm_variables = ["air_temperature_2m"]           # ~100 MB per MEPS variable and run
+```
+
+`collections.d/meps-netcdf-thredds.toml.disabled` is the MEPS surface family, control member, all 67 leads, with its traffic stated, measured over a laptop link: about 1.2-1.3 MB of metadata per file serving one or two variables, some 125 MB per run serving its eight (1 GB a day at eight runs), and one ~1.5 MB request per field first drawn. Each kept file holds about 820 KB of parsed metadata, so the example keeps `max_runs = 2`: 67 leads × 2 runs is some 110 MB. It ships disabled; a local mirror of the files, served from a directory, is the fallback should the fileServer change.
+
+Not yet: EDR, derived wind, pressure levels as a vertical axis, and per-variable file layouts (#1067).
 
 ## OGC 3D Tiles
 

@@ -43,7 +43,9 @@
 //! slot's sentinel is re-HEADed, together with its leads still missing (a
 //! late upload). A sentinel found changed or gone has every settled file of
 //! its slot re-HEADed on the next poll. A changed file is withdrawn and
-//! settles again as its new version; a vanished one is withdrawn.
+//! settles again as its new version; a vanished one is withdrawn. A reader
+//! that finds a file changed calls [`TemplateProber::recheck`] to have it
+//! re-HEADed on the next poll.
 //!
 //! # The per-poll cap
 //!
@@ -337,6 +339,36 @@ impl TemplateProber {
             .filter(|(_, slot)| slot.published)
             .flat_map(|(&time, slot)| self.settled(time, slot))
             .collect()
+    }
+
+    /// HEAD the settled file `key` again on the next poll, ahead of
+    /// discovery: a reader found that the key no longer names the version
+    /// it was listed with (#1067 decision 7), as a conditional read
+    /// answering [`crate::RangeRead::Changed`] does. A version that differs
+    /// then is withdrawn and settles again, as on a due recheck; the same
+    /// version stays listed. Returns whether `key` is a settled file of a
+    /// slot in the window.
+    pub fn recheck(&mut self, key: &str) -> bool {
+        let found = self.slots.iter().find_map(|(&time, slot)| {
+            self.leads
+                .iter()
+                .find(|&&lead| {
+                    matches!(slot.files.get(&lead), Some(FileState::Settled { .. }))
+                        && self.key(time, lead) == key
+                })
+                .map(|&lead| (time, lead))
+        });
+        let Some((time, lead)) = found else {
+            return false;
+        };
+        if let Some(FileState::Settled { recheck, .. }) = self
+            .slots
+            .get_mut(&time)
+            .and_then(|slot| slot.files.get_mut(&lead))
+        {
+            *recheck = true;
+        }
+        true
     }
 
     /// Probe once at `now`: forget the slots that left the window, HEAD
@@ -1141,6 +1173,33 @@ mod tests {
         assert_eq!(report.heads, 2, "leads 1 and 2, rechecked");
         assert_eq!(keys(&report.withdrawn), [meps_key(RUN_06, 2)]);
         assert_eq!(keys(&prober.files()), [meps_key(RUN_06, 1)]);
+    }
+
+    /// A lead a reader found replaced is HEADed on the next poll, long
+    /// before its run's due recheck, and withdrawn; the same version stays
+    /// listed. An unknown key is not tracked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rechecked_file_is_headed_on_the_next_poll() {
+        let (meta, store, mut prober) = setup(meps_spec(3));
+        let t0 = at("2026-10-17T08:00:00Z");
+        upload(&meta, RUN_06, 0..3, 100, "2026-10-17T07:00:00Z");
+        prober.poll(&store, t0).unwrap();
+        prober.poll(&store, t0).unwrap();
+        assert_eq!(prober.files().len(), 3);
+        meta.take_headed();
+
+        assert!(prober.recheck(&meps_key(RUN_06, 2)));
+        assert!(!prober.recheck("elsewhere/meps_sfc_02_20261017T06Z.nc"));
+        let report = prober.poll(&store, t0).unwrap();
+        assert!(meta.take_headed().contains(&meps_key(RUN_06, 2)));
+        assert!(!report.changed(), "the same version stays listed");
+
+        upload(&meta, RUN_06, [2], 120, "2026-10-17T07:50:00Z");
+        assert!(prober.recheck(&meps_key(RUN_06, 2)));
+        let report = prober.poll(&store, t0).unwrap();
+        assert_eq!(keys(&report.withdrawn), [meps_key(RUN_06, 2)]);
+        assert_eq!(keys(&report.added), [meps_key(RUN_06, 2)]);
+        assert_eq!(report.added[0].version.size, 120);
     }
 
     /// Keys that cannot name one file per slot and lead are config errors.

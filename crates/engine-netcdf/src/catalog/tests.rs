@@ -12,11 +12,9 @@ fn file() -> Arc<OpenFile> {
     Arc::new(OpenFile {
         id: 0,
         path,
-        identity: Identity {
-            size: 0,
-            modified: None,
-        },
+        identity: Identity::sized(0),
         nc,
+        remote: None,
         run: None,
         times: Vec::new(),
         reads: Vec::new(),

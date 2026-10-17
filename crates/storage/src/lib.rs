@@ -6,6 +6,7 @@
 mod admitted;
 pub mod discovery;
 mod error;
+mod gauge;
 #[cfg(test)]
 mod test_store;
 
@@ -24,6 +25,7 @@ use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 
 pub use bytes;
 pub use error::StorageError;
+pub use gauge::HostRequests;
 pub use object_store;
 
 /// Widen a byte range for `object_store`, which switched `get_range` from
@@ -987,11 +989,19 @@ pub fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), Data
     Ok((DataStore::new(http_object_store(&base_url)?), path))
 }
 
-/// The HTTP stores [`build_http_store_limited`] has built, by base URL,
-/// with the limit each was built with.
-type HostStores = std::collections::HashMap<String, (usize, Arc<dyn ObjectStore>)>;
-static HOST_STORES: std::sync::LazyLock<std::sync::Mutex<HostStores>> =
-    std::sync::LazyLock::new(Default::default);
+/// A host store [`build_http_store_limited`] built: its limit, the limited
+/// store, and its request counters.
+#[derive(Clone)]
+struct HostStore {
+    limit: usize,
+    store: Arc<dyn ObjectStore>,
+    gauges: Arc<gauge::HostGauges>,
+}
+
+/// The HTTP stores [`build_http_store_limited`] has built, by base URL.
+static HOST_STORES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, HostStore>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// [`build_http_store`] with at most `max_requests` (at least 1) requests
 /// in flight to the URL's host at once ([`DataStore::with_request_limit`]).
@@ -1002,7 +1012,8 @@ static HOST_STORES: std::sync::LazyLock<std::sync::Mutex<HostStores>> =
 /// base (every request carries it), so URLs that differ in it get limits
 /// of their own. The first call for a base fixes its limit for the life of
 /// the process: a later call naming another limit shares the first and
-/// logs a WARN.
+/// logs a WARN. [`host_requests`] reports the requests in flight and
+/// waiting under each limit.
 pub fn build_http_store_limited(
     data_path: &str,
     max_requests: usize,
@@ -1012,23 +1023,73 @@ pub fn build_http_store_limited(
     let mut hosts = HOST_STORES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (limit, store) = match hosts.get(base_url.as_str()) {
-        Some(entry) => entry.clone(),
+    let host = match hosts.get(base_url.as_str()) {
+        Some(host) => host.clone(),
         None => {
-            let limited = DataStore::new(http_object_store(&base_url)?)
+            let gauges = Arc::new(gauge::HostGauges::default());
+            let counted: Arc<dyn ObjectStore> = Arc::new(gauge::Gauged {
+                inner: http_object_store(&base_url)?,
+                count: gauges.in_flight.clone(),
+            });
+            let limited = DataStore::new(counted)
                 .with_request_limit(max_requests)
                 .inner;
-            hosts.insert(base_url.to_string(), (max_requests, limited.clone()));
-            (max_requests, limited)
+            let host = HostStore {
+                limit: max_requests,
+                store: Arc::new(gauge::Gauged {
+                    inner: limited,
+                    count: gauges.requested.clone(),
+                }),
+                gauges,
+            };
+            hosts.insert(base_url.to_string(), host.clone());
+            host
         }
     };
-    if limit != max_requests {
+    if host.limit != max_requests {
         tracing::warn!(
-            "{base_url} is already limited to {limit} concurrent requests; \
-             keeping that limit, not {max_requests}"
+            "{base_url} is already limited to {} concurrent requests; \
+             keeping that limit, not {max_requests}",
+            host.limit
         );
     }
-    Ok((DataStore::new(store), path))
+    Ok((DataStore::new(host.store), path))
+}
+
+/// The requests in flight and waiting under each limit
+/// [`build_http_store_limited`] has made, one entry per host and port:
+/// the bases of one host that differ in their query strings are summed.
+/// One entry per configured host, so a bounded label set for `/metrics`.
+pub fn host_requests() -> Vec<HostRequests> {
+    let hosts = HOST_STORES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut by_host: std::collections::BTreeMap<String, HostRequests> = Default::default();
+    for (base, host) in hosts.iter() {
+        let label = url::Url::parse(base)
+            .ok()
+            .and_then(|url| {
+                let name = url.host_str()?.to_string();
+                Some(match url.port() {
+                    Some(port) => format!("{name}:{port}"),
+                    None => name,
+                })
+            })
+            .unwrap_or_default();
+        let (in_flight, queued) = host.gauges.read();
+        let entry = by_host
+            .entry(label.clone())
+            .or_insert_with(|| HostRequests {
+                host: label,
+                limit: 0,
+                in_flight: 0,
+                queued: 0,
+            });
+        entry.limit += host.limit;
+        entry.in_flight += in_flight;
+        entry.queued += queued;
+    }
+    by_host.into_values().collect()
 }
 
 /// The base URL an HTTP store is built on (the URL without its path or
@@ -1679,6 +1740,12 @@ mod range_tests {
         assert!(Arc::ptr_eq(a.inner(), b.inner()));
         assert!(!Arc::ptr_eq(a.inner(), c.inner()));
         let limited = HOST_STORES.lock().unwrap();
-        assert_eq!(limited["http://127.0.0.1:9/"].0, 8);
+        assert_eq!(limited["http://127.0.0.1:9/"].limit, 8);
+        drop(limited);
+        let idle = host_requests()
+            .into_iter()
+            .find(|host| host.host == "127.0.0.1:9")
+            .unwrap();
+        assert_eq!((idle.limit, idle.in_flight, idle.queued), (8, 0, 0));
     }
 }
