@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
-use ds_storage::discovery::{self, FilenameMatcher, RemoteFile, RemoteScan, ScanSpec};
+use ds_storage::discovery::{self, FilenameMatcher, PendingFile, RemoteFile, RemoteScan, ScanSpec};
 use ds_storage::object_store::path::Path as ObjectPath;
+use ds_storage::ObjectVersion;
 
 use crate::reader::{DataSource, TiffMetadata};
 
@@ -213,14 +214,6 @@ fn compute_spatial_union<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Op
     result
 }
 
-/// Tracks files seen but not yet confirmed as fully written.
-#[derive(Debug)]
-pub struct PendingFile {
-    pub size: u64,
-    /// Number of consecutive polls with the same size.
-    pub stable_count: u8,
-}
-
 /// Scan a directory for GeoTIFF files matching a filename pattern.
 ///
 /// Lists and matches with the shared catalog scan
@@ -274,31 +267,21 @@ pub fn scan_directory(
 
         // File readiness: check size stability for genuinely NEW files only.
         // Files already in the catalog (existing) skip the readiness check.
+        // The shared `PendingFile` settles a file once its size is unchanged
+        // on two polls after the first; a size change restarts the count.
         let existing_entry = existing.get(path.as_path());
 
         if existing_entry.is_none() {
             if let Some(prev) = pending.get_mut(&path) {
-                if prev.size != file_size {
-                    // Size changed — still being written, reset counter
-                    prev.size = file_size;
-                    prev.stable_count = 0;
+                if !prev.observe(ObjectVersion::sized(file_size)) {
                     continue;
                 }
-                prev.stable_count += 1;
-                if prev.stable_count < 2 {
-                    // Need 2 consecutive stable polls before accepting
-                    continue;
-                }
-                // Size stable for 2 polls — promote from pending
                 pending.remove(&path);
             } else if !existing.is_empty() {
                 // Genuinely new file during a poll cycle — add to pending, skip this cycle
                 pending.insert(
                     path.clone(),
-                    PendingFile {
-                        size: file_size,
-                        stable_count: 0,
-                    },
+                    PendingFile::new(ObjectVersion::sized(file_size)),
                 );
                 continue;
             }
@@ -1035,6 +1018,75 @@ mod tests {
             cached_lock_ptr, reused_lock_ptr,
             "scan_directory must clone the prior DataSource (sharing Arc<OnceLock<...>>) for unchanged files"
         );
+    }
+
+    /// A file that appears between polls waits in `pending` until the
+    /// shared `PendingFile` has seen its size unchanged on two polls after
+    /// the first; a size change restarts the count. The initial scan
+    /// accepts every file at once.
+    #[test]
+    fn scan_directory_holds_a_new_file_until_its_size_is_stable() {
+        use std::io::Write;
+        use std::time::SystemTime;
+
+        let src_dir = ["testdata/radar", "../../testdata/radar"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .expect("testdata/radar fixture");
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "meteocore_pending_test_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(tmp_dir.clone());
+        let copy = |name: &str| {
+            std::fs::copy(src_dir.join(name), tmp_dir.join(name)).unwrap();
+        };
+        let pattern = FilenameMatcher::from_pattern(
+            r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif",
+            "%Y%m%dT%H%MZ",
+        )
+        .unwrap();
+        let mut pending = BTreeMap::new();
+        let mut scan = |previous: &Catalog| {
+            let existing: HashMap<&Path, &FileEntry> = previous
+                .entries
+                .values()
+                .map(|e| (e.path.as_path(), e))
+                .collect();
+            scan_directory(&tmp_dir, &pattern, &[], &mut pending, &existing).unwrap()
+        };
+
+        copy("radar_20260324T2315Z.tif");
+        let catalog = scan(&Catalog::empty());
+        assert_eq!(catalog.entries.len(), 1, "the initial scan accepts at once");
+
+        copy("radar_20260324T2320Z.tif");
+        let catalog = scan(&catalog);
+        assert_eq!(catalog.entries.len(), 1, "first seen: pending");
+        // Still being written: the size grows, which restarts the count.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(tmp_dir.join("radar_20260324T2320Z.tif"))
+            .unwrap()
+            .write_all(b"tail")
+            .unwrap();
+        let catalog = scan(&catalog);
+        let catalog = scan(&catalog);
+        assert_eq!(catalog.entries.len(), 1, "one unchanged poll is not enough");
+        let catalog = scan(&catalog);
+        assert_eq!(catalog.entries.len(), 2, "two unchanged polls settle it");
     }
 
     /// Regression test for the #253 round-2 reviewer catch: when a local file

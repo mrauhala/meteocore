@@ -42,10 +42,14 @@ apply here.
   review). The scan also skips hidden names (`.name`) whatever
   `exclude_patterns` holds (#1009). The engine keeps its post-processing:
   the pending-file readiness check and metadata reuse (local), header reads
-  (remote). The local scan skips symlinks, because metadata reuse compares
-  the directory entry's own size, mtime and inode. A dynamic source passes
-  no `max_files` to the scan: `do_scan` trims after the metadata pass, so a
-  file that fails to parse does not cost a slot.
+  (remote). The readiness check is the shared
+  `ds_storage::discovery::PendingFile` over the file's size
+  (`ObjectVersion::sized`, #1067): a file that appears between polls is
+  catalogued once two more polls see its size unchanged, and the initial
+  scan accepts every file at once. The local scan skips symlinks, because
+  metadata reuse compares the directory entry's own size, mtime and inode.
+  A dynamic source passes no `max_files` to the scan: `do_scan` trims after
+  the metadata pass, so a file that fails to parse does not cost a slot.
 - **Remote header read (#1003):** `TiffMetadata::from_header_read` returns
   `Err` when the range read fails and `Ok(None)` when the bytes are not a
   COG header. Only `Ok(None)` takes the full-download fallback. On `Err`
@@ -105,7 +109,9 @@ as transparent pixels or an error image. This is separate from render output
 admission and does not cover other engines or the final source-window buffer.
 A full-resolution map window has its own source-pixel cap,
 `reader::MAX_MAP_PIXELS`; the root CLAUDE.md "Pixel budgets" lists each
-budget and its client-visible failure.
+budget and its client-visible failure. `decode_budget` owns the static and
+env var; the accounting is `ds_executor::budget::ByteBudget`, shared with
+engine-zarr.
 
 ## Caches
 

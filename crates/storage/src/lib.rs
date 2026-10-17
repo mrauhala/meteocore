@@ -68,6 +68,70 @@ impl FetchBudget {
     }
 }
 
+/// Which version of an object a key names, as a HEAD or a GET reports it:
+/// its size, its `Last-Modified` and its ETag where the store sends one.
+/// With the key it is a file's identity (#1067): a file replaced under the
+/// same key has another version.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjectVersion {
+    pub size: u64,
+    /// `None` when the store sent no `Last-Modified`, which object_store
+    /// reports as the Unix epoch.
+    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    pub e_tag: Option<String>,
+}
+
+impl ObjectVersion {
+    /// A version known only by its size, for a caller that compares no
+    /// modification time (engine-geotiff's local readiness check).
+    pub fn sized(size: u64) -> Self {
+        Self {
+            size,
+            last_modified: None,
+            e_tag: None,
+        }
+    }
+
+    /// Whether a response naming `other` can be this version. The sizes
+    /// must be equal; `Last-Modified` and the ETag are compared when both
+    /// sides carry one, since a header only one response sent is no
+    /// evidence of a change.
+    pub fn matches(&self, other: &ObjectVersion) -> bool {
+        fn agree<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+            match (a, b) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+        }
+        self.size == other.size
+            && agree(&self.last_modified, &other.last_modified)
+            && agree(&self.e_tag, &other.e_tag)
+    }
+}
+
+impl From<&ObjectMeta> for ObjectVersion {
+    fn from(meta: &ObjectMeta) -> Self {
+        Self {
+            size: meta.size,
+            last_modified: (meta.last_modified != chrono::DateTime::UNIX_EPOCH)
+                .then_some(meta.last_modified),
+            e_tag: meta.e_tag.clone(),
+        }
+    }
+}
+
+/// What [`DataStore::get_range_if_unmodified`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum RangeRead {
+    /// The bytes, from the expected version.
+    Read(Bytes),
+    /// The key no longer names the expected version: the store answered
+    /// 412 Precondition Failed or 404, or its response named another size,
+    /// `Last-Modified` or ETag. No bytes are returned.
+    Changed,
+}
+
 /// Synchronous wrapper around an `ObjectStore`.
 ///
 /// Methods use `tokio::runtime::Handle::current().block_on()` to bridge
@@ -151,12 +215,101 @@ impl DataStore {
         range: Range<usize>,
         handle: &tokio::runtime::Handle,
     ) -> Result<Bytes, DataServerError> {
-        let result = self.block_on_with(Some(handle), FetchBudget::Request, async {
+        self.get_range_on_with_budget(path, range, handle, FetchBudget::Request)
+    }
+
+    /// [`Self::get_range_on`] under an explicit `budget`. Ingest on the
+    /// poll runtime passes [`FetchBudget::Background`]; a read a request
+    /// waits on, directly or through a single-flight fill, keeps
+    /// [`FetchBudget::Request`]. A request deadline in scope still applies.
+    pub fn get_range_on_with_budget(
+        &self,
+        path: &ObjectPath,
+        range: Range<usize>,
+        handle: &tokio::runtime::Handle,
+        budget: FetchBudget,
+    ) -> Result<Bytes, DataServerError> {
+        let result = self.block_on_with(Some(handle), budget, async {
             self.inner.get_range(path, to_u64(range)).await
         })?;
         self.bytes_read
             .fetch_add(result.len() as u64, Ordering::Relaxed);
         Ok(result)
+    }
+
+    /// Read `range` of `path` only if the key still names `version`.
+    ///
+    /// The GET carries `If-Unmodified-Since` with the version's
+    /// `Last-Modified` and, for a strong ETag, `If-Match`, so a store that
+    /// honours them answers 412 for a replaced object. The response's own
+    /// size (the total from `Content-Range`), `Last-Modified` and ETag are
+    /// then compared with `version` ([`ObjectVersion::matches`]), which
+    /// catches a store that ignores the preconditions and a replacement
+    /// within the same second. Either way, and on a 404, the answer is
+    /// [`RangeRead::Changed`] rather than an error, so the caller can drop
+    /// what it holds for that version and re-ingest the file. Any other
+    /// failure is an `Err`.
+    ///
+    /// Same runtime rules as [`Self::get_range_with_budget`];
+    /// [`Self::get_range_if_unmodified_on`] drives it on a supplied handle.
+    pub fn get_range_if_unmodified(
+        &self,
+        path: &ObjectPath,
+        range: Range<usize>,
+        version: &ObjectVersion,
+        budget: FetchBudget,
+    ) -> Result<RangeRead, DataServerError> {
+        self.range_if_unmodified(None, path, range, version, budget)
+    }
+
+    /// [`Self::get_range_if_unmodified`] driven on an explicitly-provided
+    /// runtime `Handle`, as [`Self::get_range_on`] is to
+    /// [`Self::get_range`].
+    pub fn get_range_if_unmodified_on(
+        &self,
+        path: &ObjectPath,
+        range: Range<usize>,
+        version: &ObjectVersion,
+        handle: &tokio::runtime::Handle,
+        budget: FetchBudget,
+    ) -> Result<RangeRead, DataServerError> {
+        self.range_if_unmodified(Some(handle), path, range, version, budget)
+    }
+
+    fn range_if_unmodified(
+        &self,
+        handle: Option<&tokio::runtime::Handle>,
+        path: &ObjectPath,
+        range: Range<usize>,
+        version: &ObjectVersion,
+        budget: FetchBudget,
+    ) -> Result<RangeRead, DataServerError> {
+        let options = object_store::GetOptions {
+            range: Some(object_store::GetRange::Bounded(to_u64(range))),
+            if_unmodified_since: version.last_modified,
+            // `If-Match` compares strongly: a weak ETag would never match.
+            if_match: version.e_tag.clone().filter(|tag| !tag.starts_with("W/")),
+            ..Default::default()
+        };
+        let read = self.block_on_result(handle, budget, async {
+            let storage = |e| DataServerError::from(StorageError::from(e));
+            let result = match self.inner.get_opts(path, options).await {
+                Ok(result) => result,
+                Err(
+                    object_store::Error::Precondition { .. } | object_store::Error::NotFound { .. },
+                ) => return Ok(RangeRead::Changed),
+                Err(e) => return Err(storage(e)),
+            };
+            if !version.matches(&ObjectVersion::from(&result.meta)) {
+                return Ok(RangeRead::Changed);
+            }
+            Ok(RangeRead::Read(result.bytes().await.map_err(storage)?))
+        })?;
+        if let RangeRead::Read(bytes) = &read {
+            self.bytes_read
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        Ok(read)
     }
 
     /// Like [`Self::get`], but drives the fetch on an explicitly-provided
@@ -565,6 +718,25 @@ impl DataStore {
     pub fn inner(&self) -> &Arc<dyn ObjectStore> {
         &self.inner
     }
+
+    /// This store with at most `max_requests` (at least 1) of its
+    /// operations in flight at once, through object_store's `LimitStore`.
+    ///
+    /// Clones of the result share the limit, and it stacks on any limit
+    /// this store already has: a share of 2 for background traffic within
+    /// a host's limit of 8 is `host_store.with_request_limit(2)`. A GET
+    /// holds its permit until its body has been read. The wait for a permit
+    /// counts against the operation's budget and the request deadline, like
+    /// the request itself. The byte counter is shared with this store.
+    pub fn with_request_limit(&self, max_requests: usize) -> DataStore {
+        DataStore {
+            inner: Arc::new(object_store::limit::LimitStore::new(
+                self.inner.clone(),
+                max_requests.max(1),
+            )),
+            bytes_read: self.bytes_read.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for DataStore {
@@ -811,6 +983,57 @@ impl object_store::client::HttpConnector for NoRedirectConnector {
 /// Use for feeds and allowlisted document URLs, including S3-hosted objects.
 /// The source query string is preserved on each request.
 pub fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
+    let (base_url, path) = http_base(data_path)?;
+    Ok((DataStore::new(http_object_store(&base_url)?), path))
+}
+
+/// The HTTP stores [`build_http_store_limited`] has built, by base URL,
+/// with the limit each was built with.
+type HostStores = std::collections::HashMap<String, (usize, Arc<dyn ObjectStore>)>;
+static HOST_STORES: std::sync::LazyLock<std::sync::Mutex<HostStores>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// [`build_http_store`] with at most `max_requests` (at least 1) requests
+/// in flight to the URL's host at once ([`DataStore::with_request_limit`]).
+///
+/// The limit is shared by every store built through this function for the
+/// same scheme, host and port, whatever their paths, so collections reading
+/// one server together stay under it. A URL's query string is part of its
+/// base (every request carries it), so URLs that differ in it get limits
+/// of their own. The first call for a base fixes its limit for the life of
+/// the process: a later call naming another limit shares the first and
+/// logs a WARN.
+pub fn build_http_store_limited(
+    data_path: &str,
+    max_requests: usize,
+) -> Result<(DataStore, ObjectPath), DataServerError> {
+    let (base_url, path) = http_base(data_path)?;
+    let max_requests = max_requests.max(1);
+    let mut hosts = HOST_STORES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (limit, store) = match hosts.get(base_url.as_str()) {
+        Some(entry) => entry.clone(),
+        None => {
+            let limited = DataStore::new(http_object_store(&base_url)?)
+                .with_request_limit(max_requests)
+                .inner;
+            hosts.insert(base_url.to_string(), (max_requests, limited.clone()));
+            (max_requests, limited)
+        }
+    };
+    if limit != max_requests {
+        tracing::warn!(
+            "{base_url} is already limited to {limit} concurrent requests; \
+             keeping that limit, not {max_requests}"
+        );
+    }
+    Ok((DataStore::new(store), path))
+}
+
+/// The base URL an HTTP store is built on (the URL without its path or
+/// fragment) and the path within it.
+fn http_base(data_path: &str) -> Result<(url::Url, ObjectPath), DataServerError> {
     // For HTTP, the URL up to the last '/' is the base, the rest is prefix
     let url = url::Url::parse(data_path)
         .map_err(|e| DataServerError::Storage(format!("Invalid URL {data_path}: {e}")))?;
@@ -823,13 +1046,18 @@ pub fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), Data
     let mut base_url = url.clone();
     base_url.set_path("");
     base_url.set_fragment(None);
+    let path = url.path().trim_start_matches('/').trim_end_matches('/');
+    Ok((base_url, ObjectPath::from(path)))
+}
 
+/// A no-redirect HTTP object store on `base_url`.
+fn http_object_store(base_url: &url::Url) -> Result<Arc<dyn ObjectStore>, DataServerError> {
     // Own all transport options here rather than using ClientOptions (whose
     // reqwest builder is private). Disable transparent decompression to keep
     // GRIB/COG byte ranges and Content-Length exact even with feature unification.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .https_only(url.scheme() != "http")
+        .https_only(base_url.scheme() != "http")
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(DataStore::ATTEMPT_TIMEOUT)
         .no_gzip()
@@ -845,9 +1073,7 @@ pub fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), Data
         .map_err(|e| {
             DataServerError::Storage(format!("Cannot create HTTP store for {base_url}: {e}"))
         })?;
-
-    let path = url.path().trim_start_matches('/').trim_end_matches('/');
-    Ok((DataStore::new(Arc::new(store)), ObjectPath::from(path)))
+    Ok(Arc::new(store))
 }
 
 #[cfg(test)]
@@ -1266,5 +1492,193 @@ mod budget_tests {
             .unwrap();
         assert_eq!(many[0].as_ref().unwrap(), &b"abc"[..]);
         assert_eq!(store.bytes_read(), 6);
+    }
+}
+
+/// Range reads for remote files read in place (#1067): budgeted reads on a
+/// supplied runtime, reads conditional on the object's version, and
+/// per-host request limits.
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use crate::test_store::{MetaStore, RangeServer};
+    use chrono::{DateTime, Utc};
+    use object_store::PutPayload;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// The budgeted range read works from a thread without a runtime and
+    /// counts its bytes; a request deadline still bounds it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_budgeted_range_read_runs_on_the_supplied_handle() {
+        let inner = object_store::memory::InMemory::new();
+        let path = ObjectPath::from("meps.nc");
+        inner
+            .put(&path, PutPayload::from_static(b"0123456789"))
+            .await
+            .unwrap();
+        let store = DataStore::new(Arc::new(inner));
+        let handle = tokio::runtime::Handle::current();
+        let read = std::thread::scope(|s| {
+            s.spawn(|| {
+                let read = store
+                    .get_range_on_with_budget(&path, 2..6, &handle, FetchBudget::Background)
+                    .unwrap();
+                let _scope = ds_core::deadline::enter(Some(std::time::Instant::now()));
+                let expired =
+                    store.get_range_on_with_budget(&path, 2..6, &handle, FetchBudget::Background);
+                assert!(matches!(expired, Err(DataServerError::DeadlineExceeded)));
+                read
+            })
+            .join()
+            .unwrap()
+        });
+        assert_eq!(read, &b"2345"[..]);
+        assert_eq!(store.bytes_read(), 4);
+    }
+
+    /// An object store that honours the preconditions: a rewrite of the
+    /// same size or a delete is `Changed`, never the new bytes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_conditional_read_of_a_replaced_object_is_changed() {
+        let store = DataStore::new(Arc::new(object_store::memory::InMemory::new()));
+        let path = ObjectPath::from("meps.nc");
+        store
+            .inner()
+            .put(&path, PutPayload::from_static(b"0123456789"))
+            .await
+            .unwrap();
+        let version = ObjectVersion::from(&store.head(&path).unwrap());
+        let read = |version: &ObjectVersion| {
+            store
+                .get_range_if_unmodified(&path, 2..5, version, FetchBudget::Request)
+                .unwrap()
+        };
+        assert_eq!(read(&version), RangeRead::Read(Bytes::from_static(b"234")));
+        assert_eq!(store.bytes_read(), 3);
+
+        store
+            .inner()
+            .put(&path, PutPayload::from_static(b"abcdefghij"))
+            .await
+            .unwrap();
+        assert_eq!(read(&version), RangeRead::Changed, "If-Match");
+        let undated = ObjectVersion {
+            e_tag: None,
+            ..version.clone()
+        };
+        assert_eq!(read(&undated), RangeRead::Changed, "If-Unmodified-Since");
+        store.inner().delete(&path).await.unwrap();
+        assert_eq!(read(&version), RangeRead::Changed, "gone");
+        assert_eq!(
+            store.bytes_read(),
+            3,
+            "a changed object's bytes are not read"
+        );
+    }
+
+    /// Over HTTP: the GET carries `If-Unmodified-Since`, a 412 is
+    /// `Changed`, and so is a 206 from a server that ignores the header but
+    /// names another `Last-Modified` or size. A 404 is `Changed` too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_conditional_read_over_http_sends_and_checks_the_version() {
+        let modified = at("2026-10-17T08:00:00Z");
+        let server = RangeServer::new(b"0123456789", modified);
+        let (store, path) = build_http_store(&format!("{}/object", server.url)).unwrap();
+        let version = ObjectVersion::from(&store.head(&path).unwrap());
+        assert_eq!(
+            version,
+            ObjectVersion {
+                size: 10,
+                last_modified: Some(modified),
+                e_tag: None
+            }
+        );
+        let read = |path: &ObjectPath| {
+            store
+                .get_range_if_unmodified(path, 2..5, &version, FetchBudget::Request)
+                .unwrap()
+        };
+
+        assert_eq!(read(&path), RangeRead::Read(Bytes::from_static(b"234")));
+        let request = server.object.lock().unwrap().last_request.clone();
+        assert!(request.contains("range: bytes=2-4"), "{request}");
+        let since = modified.format("%a, %d %b %Y %H:%M:%S gmt").to_string();
+        assert!(
+            request.contains(&format!("if-unmodified-since: {}", since.to_lowercase())),
+            "{request}"
+        );
+
+        server.replace(b"abcdefghij", at("2026-10-17T09:00:00Z"));
+        assert_eq!(read(&path), RangeRead::Changed, "412");
+        server.object.lock().unwrap().ignore_preconditions = true;
+        assert_eq!(read(&path), RangeRead::Changed, "another Last-Modified");
+        server.replace(b"abcdefghijk", modified);
+        assert_eq!(read(&path), RangeRead::Changed, "another size");
+        server.replace(b"abcdefghij", modified);
+        assert_eq!(
+            read(&path),
+            RangeRead::Read(Bytes::from_static(b"cde")),
+            "a same-second rewrite of the same size is beyond any HTTP check"
+        );
+        assert_eq!(
+            read(&ObjectPath::from("missing")),
+            RangeRead::Changed,
+            "404"
+        );
+    }
+
+    /// A request limit bounds the operations in flight, and a limit taken
+    /// from a limited store stacks on it: a background share of 2 within a
+    /// host's 4.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_limits_bound_and_stack() {
+        let meta = Arc::new(MetaStore {
+            delay: std::time::Duration::from_millis(20),
+            ..MetaStore::default()
+        });
+        let paths: Vec<ObjectPath> = (0..12).map(|i| ObjectPath::from(format!("k{i}"))).collect();
+        for path in &paths {
+            meta.set(path.as_ref(), 1, None);
+        }
+        let host = DataStore::new(meta.clone()).with_request_limit(4);
+        let background = host.with_request_limit(2);
+        let peak = |store: &DataStore| {
+            meta.peak.store(0, Ordering::SeqCst);
+            assert!(store
+                .head_many(&paths, 16)
+                .unwrap()
+                .iter()
+                .all(|head| matches!(head, Ok(Some(_)))));
+            meta.peak.load(Ordering::SeqCst)
+        };
+        assert_eq!(peak(&host), 4);
+        assert_eq!(peak(&background), 2);
+
+        meta.peak.store(0, Ordering::SeqCst);
+        let both = [host.clone(), background.clone()].map(|store| {
+            let paths = paths.clone();
+            tokio::task::spawn_blocking(move || store.head_many(&paths, 16).unwrap())
+        });
+        for task in both {
+            task.await.unwrap();
+        }
+        assert_eq!(meta.peak.load(Ordering::SeqCst), 4, "the host limit holds");
+    }
+
+    /// Stores built for one host share its limit, whatever their paths; the
+    /// first limit named for a host is kept.
+    #[test]
+    fn stores_for_one_host_share_its_limit() {
+        let (a, path) = build_http_store_limited("http://127.0.0.1:9/meps/a.nc", 8).unwrap();
+        let (b, _) = build_http_store_limited("http://127.0.0.1:9/other/", 3).unwrap();
+        let (c, _) = build_http_store_limited("http://127.0.0.2:9/meps/a.nc", 8).unwrap();
+        assert_eq!(path.as_ref(), "meps/a.nc");
+        assert!(Arc::ptr_eq(a.inner(), b.inner()));
+        assert!(!Arc::ptr_eq(a.inner(), c.inner()));
+        let limited = HOST_STORES.lock().unwrap();
+        assert_eq!(limited["http://127.0.0.1:9/"].0, 8);
     }
 }

@@ -10,6 +10,8 @@ ds-poll = { path = "../ds-poll" }
 ds-storage = { path = "../storage" }
 # Compressed chunk-bytes LRU cache for the remote byte-range reader.
 ds-cache = { path = "../ds-cache" }
+# The fail-fast byte budget behind `read_budget`.
+ds-executor = { path = "../ds-executor" }
 bytes = "1"
 flate2 = "1"
 zstd = { version = "0.13", default-features = false, features = ["experimental"] }
@@ -62,5 +64,4 @@ zarrs_icechunk = { version = "0.5.1", optional = true, default-features = false,
 icechunk = ["dep:icechunk", "dep:zarrs_icechunk", "dep:futures", "dep:async-trait", "zarrs/async"]
 
 [dev-dependencies]
-ds-executor = { path = "../ds-executor" }
 tempfile = "3"

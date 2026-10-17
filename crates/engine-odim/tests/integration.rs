@@ -1903,21 +1903,21 @@ fn comp_template_discovery_probes_present_slots_only() {
     .expect("DataStore over the tempdir");
 
     // Empty base prefix → probe the store root, where the files live.
-    let catalog = engine_odim::OdimEngine::discover_template_for_test(
-        now,
-        store,
+    let mut prober = engine_odim::OdimEngine::template_prober_for_test(
         "",
         template,
         cadence_secs,
         Some("-PT30M"),
         None,
-        &[], // cold scan — no prior catalog
     )
-    .expect("template probe succeeds");
+    .expect("template prober builds");
+    let report = prober.poll(&store, now).expect("template probe succeeds");
+    assert_eq!(report.heads, 7, "one HEAD per slot of the -PT30M window");
 
     // Exactly the four present dated slots, ascending; the 11:45 gap and the
     // empty 11:30/11:35 slots are excluded, and `LATEST` is never probed.
-    let times: Vec<String> = catalog.iter().map(|e| e.time.to_rfc3339()).collect();
+    let files = prober.files();
+    let times: Vec<String> = files.iter().map(|f| f.time.to_rfc3339()).collect();
     assert_eq!(
         times,
         [
@@ -1929,32 +1929,32 @@ fn comp_template_discovery_probes_present_slots_only() {
         "probe must discover exactly the present dated slots"
     );
     // Keys are the template-rendered names under the (empty) base prefix.
-    assert!(catalog
-        .iter()
-        .all(|e| e.location.id().starts_with("composite_hx_")));
+    assert!(files.iter().all(|f| f.key.starts_with("composite_hx_")));
 }
 
-/// #287 — incremental polling: a slot already in `known` is carried
-/// forward WITHOUT being re-probed (radar files are immutable), so only
+/// #287 — incremental polling: a slot already found is carried forward
+/// WITHOUT being re-probed (radar files are immutable), so only
 /// genuinely-new slots cost a `HEAD`.
 ///
-/// Proven by making the known slots' files **absent from disk**: if the
-/// probe re-`HEAD`-ed them they'd 404 and drop out; their survival proves
-/// they were carried forward, not re-probed. Meanwhile a new slot that
-/// *does* exist on disk is discovered.
+/// Proven by deleting the found slots' files from disk: if the probe
+/// re-`HEAD`-ed them they'd 404 and drop out; their survival proves they
+/// were carried forward, not re-probed. Meanwhile a new slot that *does*
+/// exist on disk is discovered.
 #[test]
 fn comp_template_discovery_carries_forward_known_without_reprobe() {
     use chrono::{TimeZone, Utc};
-    use engine_odim::catalog::{CatalogEntry, Location};
 
     let dir = tempfile::tempdir().expect("create tempdir");
     let template = "composite_hx_%Y%m%d_%H%M-hd5";
     let now = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
-
-    // On disk: ONLY the freshest slot (now). The two older slots are NOT
-    // written — they exist only in `known`.
-    let now_name = now.format(template).to_string();
-    std::fs::write(dir.path().join(&now_name), b"x").unwrap();
+    let slot = |back: i64| {
+        (now - chrono::Duration::minutes(back))
+            .format(template)
+            .to_string()
+    };
+    for back in [5, 10] {
+        std::fs::write(dir.path().join(slot(back)), b"x").unwrap();
+    }
 
     let (store, _base) = ds_storage::build_store(
         dir.path()
@@ -1964,37 +1964,31 @@ fn comp_template_discovery_carries_forward_known_without_reprobe() {
             .expect("utf8 path"),
     )
     .unwrap();
+    let mut prober =
+        engine_odim::OdimEngine::template_prober_for_test("", template, 300, Some("-PT30M"), None)
+            .unwrap();
+    // Five minutes ago: 11:50 and 11:55 are found.
+    prober
+        .poll(&store, now - chrono::Duration::minutes(5))
+        .expect("first probe succeeds");
+    assert_eq!(prober.files().len(), 2);
 
-    // `known` carries the two older slots (11:55, 11:50) whose files are absent.
-    let known: Vec<CatalogEntry> = [5i64, 10]
-        .iter()
-        .map(|&back| {
-            let t = now - chrono::Duration::minutes(back);
-            CatalogEntry {
-                time: t,
-                location: Location::Remote {
-                    store: store.clone(),
-                    key: t.format(template).to_string(),
-                },
-            }
-        })
-        .collect();
+    // Both files vanish from disk; the freshest slot (now) arrives.
+    for back in [5, 10] {
+        std::fs::remove_file(dir.path().join(slot(back))).unwrap();
+    }
+    std::fs::write(dir.path().join(slot(0)), b"x").unwrap();
 
-    let catalog = engine_odim::OdimEngine::discover_template_for_test(
-        now,
-        store,
-        "",
-        template,
-        300,
-        Some("-PT30M"),
-        None,
-        &known,
-    )
-    .expect("incremental probe succeeds");
-
+    let report = prober
+        .poll(&store, now)
+        .expect("incremental probe succeeds");
+    assert_eq!(
+        report.heads, 5,
+        "the 7 slots of the window less the 2 already found"
+    );
     // All three present: the two carried-forward (file-less) known slots and
     // the one freshly-probed slot — proving known slots were NOT re-HEADed.
-    let times: Vec<String> = catalog.iter().map(|e| e.time.to_rfc3339()).collect();
+    let times: Vec<String> = prober.files().iter().map(|f| f.time.to_rfc3339()).collect();
     assert_eq!(
         times,
         [

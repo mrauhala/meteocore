@@ -7,11 +7,17 @@ weather data (radar, NWP models, observations, alerts).
 Crates: `ds-core` (traits + types + shared utilities, directory `crates/core`),
 `ds-storage` (S3/HTTP/local object store, directory `crates/storage`; its
 `discovery` module is the one home for time windows, strftime prefix
-expansion, the filename → timestamp matcher and the catalog scan with
-bounded concurrent prefix LISTs, #816/#817),
+expansion, the filename → timestamp (and `{lead}`) matcher, the catalog scan
+with bounded concurrent prefix LISTs (#816/#817), listing-free template
+probing (`TemplateProber`: `{run}`/`{lead}` keys, sentinel HEADs, settling,
+per-run publication) and the shared `PendingFile` settling rule (#1067);
+`DataStore` adds budgeted and `If-Unmodified-Since` range reads and
+per-host request limits for files read in place),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
-`ds-executor` (shared Tokio render admission/deadline execution; API-facing infrastructure),
+`ds-executor` (shared Tokio render admission/deadline execution; API-facing infrastructure,
+plus `budget::ByteBudget`, the fail-fast byte budget each engine's source-read
+admission is an instance of — never another copy, #1067),
 `ds-poll` (shared poll-loop lifecycle: the `Shutdown` handle + `PollTicker`
 every engine's background poll loop uses — never hand-roll a
 `tokio::select!` shutdown signal, #481),
@@ -31,7 +37,8 @@ with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
 **Per-crate notes live in `crates/<crate>/CLAUDE.md`.** Before working on one
 of these crates, read its file — it holds that crate's rules and gotchas:
 
-- `crates/ds-executor/CLAUDE.md` — bounded render queue, deadlines, worker permit ownership.
+- `crates/ds-executor/CLAUDE.md` — bounded render queue, deadlines, worker permit ownership,
+  the engines' fail-fast `ByteBudget`.
 - `crates/server/CLAUDE.md` — CLI flags, no-config boot, auto-collections,
   reload/watcher trust model, proxy headers.
 - `crates/api-common/CLAUDE.md` — shared discovery validation, metadata/navigation, OpenAPI and conformance.
@@ -115,7 +122,8 @@ Violating these has caused production incidents. Never break them.
      for WMS GetFeatureInfo (#1064).
    - Never from a request-handler task — it parks a request worker.
    - On `spawn_blocking` workers, use its explicit-runtime APIs (`get_on`,
-     `get_range_on`). Do not rely on an ambient runtime handle.
+     `get_range_on`, `get_range_on_with_budget`,
+     `get_range_if_unmodified_on`). Do not rely on an ambient runtime handle.
      The plain-Zarr adapter is a tested exception: the same synchronous
      `get_opt`/cache-fill path serves EDR async workers and `RenderJob` blocking
      workers. Its `block_in_place` bridge releases an async worker and runs
@@ -566,12 +574,19 @@ one never implies the other.
 | `api_tiles::params::TILE_SIZE` | output, a map tile's default (`width`/`height`/`scale-denominator` resize it within the caps above) | 256 × 256 | never |
 | `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss; an RGB composite adds 16 B per band plane past the first (`acquire_raster_planes`) | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
 | `engine_geotiff::reader::MAX_MAP_PIXELS` | native source px of one full-resolution map read | 64 M | Maps/Tiles 400 "Invalid parameter: Map render source area N pixels exceeds maximum 64000000."; WMS red error tile, HTTP 200 `x-cache: ERROR` |
-| `engine_geotiff::decode_budget::BUDGET` | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
-| engine-zarr `read_budget::BUDGET` | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
+| `engine_geotiff::decode_budget::BUDGET` (a `ByteBudget`) | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
+| engine-zarr `read_budget::BUDGET` (over a `ByteBudget`) | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
 | `ds_core::feature::MAX_AREA_DIM` / `MAX_AREA_VALUES` | EDR area output cells per axis / values per response | 256 / 1 M | coarsened / 400 "Query too large: …" |
 | `engine_geotiff::STAC_REQUEST_MAX_COLD_ITEMS` | STAC items whose header one EDR query reads (items in its window with no metadata yet; without `datetime`, in the whole catalog) | 400 (a closed day of 5-minute frames is 289) | 400 "Query too large: …", counted from the STAC response before it is installed or anything loads (#889) |
 | EDR `f=png` plot, WMS `GetLegendGraphic` | output px | 160–2000 × 120–2000 / ≤ 512 × 1024 | never: clamped silently |
 
+- The engines' source byte budgets are each their own instance of
+  `ds_executor::budget::ByteBudget`, with their own env var and static; a new
+  engine's is one more instance, never a copy (#1067). Unlike
+  `RENDER_MEMORY`, a waiting `RenderBudget`, they fail at once. A refused
+  batch probe (`try_reserve`) or background reservation
+  (`try_reserve_background`, at most half the budget) is not a counted
+  rejection.
 - At the default `MC_RENDER_MEMORY_MB` the API caps' full 64 M px is
   unreachable: anything over 33 554 432 output px (e.g. 5793 × 5793) is a 503
   on every retry. To serve larger images, raise the budget (README "Sizing

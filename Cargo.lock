@@ -1456,6 +1456,7 @@ dependencies = [
  "criterion",
  "ds-cache",
  "ds-core",
+ "ds-executor",
  "ds-poll",
  "ds-storage",
  "flate2",

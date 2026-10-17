@@ -25,7 +25,14 @@
 //!    concurrent LIST, for an engine that recognises files without a
 //!    matcher.
 //!
-//! This module is the shared home for all four. `engine-odim` and
+//! 5. [`TemplateProber`] — discovery without listing, for HTTP servers
+//!    that cannot be listed: render the keys files would have from a prefix
+//!    and filename template, slot times and leads, HEAD them, settle and
+//!    publish (#287, #1067).
+//! 6. [`PendingFile`] — when a file seen being written has settled, shared
+//!    by the prober and engine-geotiff's local readiness check.
+//!
+//! This module is the shared home for all of these. `engine-odim` and
 //! `engine-geotiff` use it; `engine-grib` expands its model-run
 //! prefixes, a strftime date plus a `{run}` hour, with
 //! [`expand_run_prefixes`].
@@ -35,7 +42,7 @@ use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
 use chrono::format::{Fixed, Item, Numeric, StrftimeItems};
-use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 use ds_core::error::DataServerError;
 use ds_core::temp_files;
 use object_store::path::Path as ObjectPath;
@@ -43,6 +50,16 @@ use object_store::ObjectMeta;
 use regex::Regex;
 
 use crate::DataStore;
+
+mod settle;
+mod template;
+
+pub use settle::{PendingFile, STABLE_POLLS};
+pub use template::{
+    ProbeReport, ProbedFile, Schedule, Settling, TemplateProber, TemplateSpec,
+    DEFAULT_MAX_HEADS_PER_POLL, DEFAULT_MIN_AGE, DEFAULT_RUN_GRACE, MAX_TEMPLATE_SLOTS,
+    PROBE_CONCURRENCY, SETTLED_RECHECK,
+};
 
 /// A signed ISO 8601 duration describing how far back (or forward)
 /// from "now" a collection's useful data extends.
@@ -337,8 +354,18 @@ pub fn expand_prefix_pattern(
 /// The placeholder a prefix template names a model run's hour with, as in
 /// ECMWF's `%Y%m%d/{run}z/ifs/0p25/oper/`. Each run hour is substituted as
 /// two digits (`00`, `06`, …). The date part stays strftime: to strftime,
-/// `{run}` is literal text.
+/// `{run}` is literal text. A filename template may use it too: a
+/// [`FilenameMatcher`] reads it as the timestamp's hour, and a
+/// [`TemplateProber`] substitutes it like a prefix's.
 pub const RUN_PLACEHOLDER: &str = "{run}";
+
+/// The placeholder a filename template names a forecast lead with, as in
+/// MET Norway's `meps_sfc_{lead}_%Y%m%dT{run}Z.nc`. A lead is written with
+/// [`LEAD_DIGITS`] digits, zero-padded (`00`, `01`, …, `66`).
+pub const LEAD_PLACEHOLDER: &str = "{lead}";
+
+/// The digits a [`LEAD_PLACEHOLDER`] stands for.
+pub const LEAD_DIGITS: usize = 2;
 
 /// The prefix one model run's files are listed under.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -688,6 +715,8 @@ pub enum FilenameError {
     },
     #[error("filename_pattern `{pattern}` is missing the required `(?P<timestamp>…)` named capture group")]
     NoTimestampCapture { pattern: String },
+    #[error("filename_template `{template}` names {{lead}} more than once")]
+    RepeatedLead { template: String },
 }
 
 /// Recognises a collection's data files by name and reads the timestamp
@@ -706,6 +735,11 @@ pub enum FilenameError {
 ///   that is not anchored `^…$` is logged at WARN, since it admits partial
 ///   uploads.
 ///
+/// A file that belongs to a forecast lead names it too: a template's
+/// [`LEAD_PLACEHOLDER`] or a pattern's `lead` named capture, read by
+/// [`match_file`](Self::match_file). Several files then share a timestamp,
+/// one per lead, and a catalog scan keeps one per (timestamp, lead).
+///
 /// Match basenames, not object keys or paths: a template describes a file
 /// name.
 #[derive(Debug, Clone)]
@@ -723,6 +757,12 @@ impl FilenameMatcher {
     /// they round-trip through the chrono format. The codes must form one
     /// contiguous block: `%Y_STATION_%H%M.h5` is an error, which the
     /// explicit [`from_pattern`](Self::from_pattern) form can express.
+    ///
+    /// [`RUN_PLACEHOLDER`] is the timestamp's hour, like `%H`: a run's
+    /// files are timestamped with its reference time. [`LEAD_PLACEHOLDER`]
+    /// becomes a `lead` capture of [`LEAD_DIGITS`] digits, outside the
+    /// timestamp, so `meps_sfc_{lead}_%Y%m%dT{run}Z.nc` reads lead 5 of the
+    /// 06 UTC run from `meps_sfc_05_20261017T06Z.nc`.
     pub fn from_template(template: &str) -> Result<Self, FilenameError> {
         let (pattern, timestamp_format) = expand_template(template)?;
         let regex = Regex::new(&pattern)
@@ -776,12 +816,36 @@ impl FilenameMatcher {
     /// valid time under the format (a month 13, say), which a scan may want
     /// to log rather than skip silently.
     pub fn match_timestamp<'h>(&self, filename: &'h str) -> Option<Result<DateTime<Utc>, &'h str>> {
-        let stamp = self.regex.captures(filename)?.name("timestamp")?.as_str();
+        Some(self.match_file(filename)?.map(|(time, _)| time))
+    }
+
+    /// The timestamp and lead `filename` encodes, as
+    /// [`match_timestamp`](Self::match_timestamp) reports the timestamp.
+    /// The lead is `None` for a matcher without a `lead` capture.
+    ///
+    /// A format with an hour but no minute (a template's `{run}`) reads
+    /// the time at minute 0.
+    #[allow(clippy::type_complexity)]
+    pub fn match_file<'h>(
+        &self,
+        filename: &'h str,
+    ) -> Option<Result<(DateTime<Utc>, Option<u32>), &'h str>> {
+        let captures = self.regex.captures(filename)?;
+        let stamp = captures.name("timestamp")?.as_str();
+        let lead = captures
+            .name("lead")
+            .and_then(|lead| lead.as_str().parse().ok());
         Some(
-            NaiveDateTime::parse_from_str(stamp, &self.timestamp_format)
-                .map(|t| t.and_utc())
-                .map_err(|_| stamp),
+            parse_stamp(stamp, &self.timestamp_format)
+                .map(|time| (time, lead))
+                .ok_or(stamp),
         )
+    }
+
+    /// The lead `filename` encodes, or `None` when it is not one of this
+    /// collection's files or names no lead.
+    pub fn parse_lead(&self, filename: &str) -> Option<u32> {
+        self.match_file(filename)?.ok()?.1
     }
 
     /// The timestamp `filename` encodes, or `None` when it is not one of
@@ -801,6 +865,18 @@ impl FilenameMatcher {
     }
 }
 
+/// Parse a captured timestamp with its chrono `format`, as
+/// `NaiveDateTime::parse_from_str` does, except that an hour without a
+/// minute is read at minute 0, which chrono would reject.
+fn parse_stamp(stamp: &str, format: &str) -> Option<DateTime<Utc>> {
+    let mut parsed = chrono::format::Parsed::new();
+    chrono::format::parse(&mut parsed, stamp, StrftimeItems::new(format)).ok()?;
+    if parsed.hour_mod_12().is_some() && parsed.minute().is_none() {
+        parsed.set_minute(0).ok()?;
+    }
+    Some(parsed.to_naive_datetime_with_offset(0).ok()?.and_utc())
+}
+
 /// The regex a strftime template code stands for, when it is one.
 fn template_code(code: char) -> Option<&'static str> {
     TEMPLATE_CODES
@@ -809,12 +885,20 @@ fn template_code(code: char) -> Option<&'static str> {
         .map(|(_, digits)| *digits)
 }
 
+/// Whether `placeholder` starts at `chars[i]`.
+fn placeholder_at(chars: &[char], i: usize, placeholder: &str) -> bool {
+    let mut at = chars.get(i..).unwrap_or_default().iter();
+    placeholder.chars().all(|c| at.next() == Some(&c))
+}
+
 /// Invert a strftime filename template into an anchored regex with a
 /// `timestamp` capture, plus the chrono format of that capture.
 ///
 /// E.g. `OPERA@%Y%m%dT%H%M@0@ACRR.tiff` becomes
 /// `^OPERA@(?P<timestamp>\d{4}\d{2}\d{2}T\d{2}\d{2})@0@ACRR\.tiff$` and
-/// `%Y%m%dT%H%M`.
+/// `%Y%m%dT%H%M`; `meps_sfc_{lead}_%Y%m%dT{run}Z.nc` becomes
+/// `^meps_sfc_(?P<lead>\d{2})_(?P<timestamp>\d{4}\d{2}\d{2}T\d{2}Z)\.nc$`
+/// and `%Y%m%dT%HZ`.
 fn expand_template(template: &str) -> Result<(String, String), FilenameError> {
     #[derive(PartialEq)]
     enum Region {
@@ -824,19 +908,41 @@ fn expand_template(template: &str) -> Result<(String, String), FilenameError> {
     }
 
     let chars: Vec<char> = template.chars().collect();
+    let run_len = RUN_PLACEHOLDER.chars().count();
+    let lead_len = LEAD_PLACEHOLDER.chars().count();
     let code_at = |i: usize| {
-        chars.get(i) == Some(&'%') && chars.get(i + 1).and_then(|&c| template_code(c)).is_some()
+        (chars.get(i) == Some(&'%') && chars.get(i + 1).and_then(|&c| template_code(c)).is_some())
+            || placeholder_at(&chars, i, RUN_PLACEHOLDER)
     };
     let mut regex = String::from("^");
     let mut format = String::new();
     let mut region = Region::Before;
     let mut literal = [0u8; 4];
+    let mut has_lead = false;
     let mut i = 0;
 
     while i < chars.len() {
         let ch = chars[i];
-        if ch == '%' && i + 1 < chars.len() {
-            let code = chars[i + 1];
+        if placeholder_at(&chars, i, LEAD_PLACEHOLDER) {
+            if has_lead {
+                return Err(FilenameError::RepeatedLead {
+                    template: template.to_string(),
+                });
+            }
+            has_lead = true;
+            // A lead is not part of the time: it ends the timestamp.
+            if region == Region::Inside {
+                regex.push(')');
+                region = Region::After;
+            }
+            regex.push_str(&format!(r"(?P<lead>\d{{{LEAD_DIGITS}}})"));
+            i += lead_len;
+            continue;
+        }
+        let run = placeholder_at(&chars, i, RUN_PLACEHOLDER);
+        if run || (ch == '%' && i + 1 < chars.len()) {
+            // `{run}` is the run's hour, so it reads as `%H`.
+            let code = if run { 'H' } else { chars[i + 1] };
             let digits = template_code(code).ok_or_else(|| FilenameError::UnknownCode {
                 template: template.to_string(),
                 code: format!("%{code}"),
@@ -856,7 +962,7 @@ fn expand_template(template: &str) -> Result<(String, String), FilenameError> {
             format.push('%');
             format.push(code);
             regex.push_str(digits);
-            i += 2;
+            i += if run { run_len } else { 2 };
             continue;
         }
         if region == Region::Inside {
@@ -921,8 +1027,9 @@ pub const MAX_FILENAME_LEN: usize = 255;
 /// A scan keeps a file when its basename is not hidden
 /// ([`ds_core::temp_files::is_hidden`]), not `exclude`d, matches the
 /// [`FilenameMatcher`] and has a timestamp inside `time_filter`. It then
-/// returns the kept files oldest first, one per timestamp, capped to the
-/// newest `max_files` timestamps. Of files that share a timestamp, the
+/// returns the kept files oldest first, one per timestamp, or one per
+/// (timestamp, lead) for a matcher that reads leads, capped to the newest
+/// `max_files` timestamps. Of files that share a timestamp and lead, the
 /// greatest key or path wins, and each file dropped for it is logged at
 /// WARN. A hidden or excluded file is dropped before any of that, so it
 /// never wins a timestamp or takes a `max_files` slot.
@@ -940,7 +1047,8 @@ pub struct ScanSpec<'a> {
     pub exclude: &'a [String],
     /// Keep only files timestamped inside this inclusive `(start, end)`.
     pub time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
-    /// Keep only the newest N timestamps, counted after deduplication.
+    /// Keep only the newest N timestamps, counted after deduplication. A
+    /// timestamp keeps all its leads.
     pub max_files: Option<usize>,
     /// [`scan_remote`] only: skip an otherwise kept object larger than this,
     /// logged at WARN.
@@ -995,16 +1103,16 @@ impl<'a> ScanSpec<'a> {
         }
     }
 
-    /// The timestamp of a file this scan keeps by name, or `None`.
-    fn timestamp(&self, name: &str) -> Option<DateTime<Utc>> {
+    /// The timestamp and lead of a file this scan keeps by name, or `None`.
+    fn matched(&self, name: &str) -> Option<(DateTime<Utc>, Option<u32>)> {
         if name.len() > MAX_FILENAME_LEN
             || temp_files::is_hidden(name)
             || is_excluded(name, self.exclude)
         {
             return None;
         }
-        let time = match self.matcher.match_timestamp(name)? {
-            Ok(time) => time,
+        let (time, lead) = match self.matcher.match_file(name)? {
+            Ok(file) => file,
             Err(stamp) => {
                 tracing::warn!(
                     "[{}] Cannot parse timestamp '{stamp}' from file '{name}'",
@@ -1015,7 +1123,7 @@ impl<'a> ScanSpec<'a> {
         };
         match self.time_filter {
             Some((start, end)) if time < start || time > end => None,
-            _ => Some(time),
+            _ => Some((time, lead)),
         }
     }
 }
@@ -1025,6 +1133,8 @@ impl<'a> ScanSpec<'a> {
 pub struct LocalFile {
     pub path: PathBuf,
     pub time: DateTime<Utc>,
+    /// The lead its name encodes, for a matcher that reads leads.
+    pub lead: Option<u32>,
     /// The regular file's metadata: the directory entry's own, or a
     /// followed symlink's target's.
     pub metadata: std::fs::Metadata,
@@ -1035,6 +1145,8 @@ pub struct LocalFile {
 pub struct RemoteFile {
     pub object: ObjectMeta,
     pub time: DateTime<Utc>,
+    /// The lead its name encodes, for a matcher that reads leads.
+    pub lead: Option<u32>,
 }
 
 impl RemoteFile {
@@ -1118,7 +1230,7 @@ pub fn scan_remote(
             for object in objects {
                 let key = object.location.as_ref();
                 let name = key.rsplit('/').next().unwrap_or(key);
-                let Some(time) = spec.timestamp(name) else {
+                let Some((time, lead)) = spec.matched(name) else {
                     continue;
                 };
                 if spec.max_size.is_some_and(|max| object.size > max) {
@@ -1131,6 +1243,7 @@ pub fn scan_remote(
                 }
                 found.push(Found {
                     time,
+                    lead,
                     key: key.to_string(),
                     origin,
                     item: object,
@@ -1154,6 +1267,7 @@ pub fn scan_remote(
             .map(|file| RemoteFile {
                 object: file.item,
                 time: file.time,
+                lead: file.lead,
             })
             .collect(),
         prefixes: reports,
@@ -1183,7 +1297,7 @@ pub fn scan_local(dir: &Path, spec: &ScanSpec<'_>) -> std::io::Result<Vec<LocalF
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        let Some(time) = spec.timestamp(&name) else {
+        let Some((time, lead)) = spec.matched(&name) else {
             continue;
         };
         let Some(metadata) = regular_file_metadata(&entry, spec.symlinks) else {
@@ -1192,6 +1306,7 @@ pub fn scan_local(dir: &Path, spec: &ScanSpec<'_>) -> std::io::Result<Vec<LocalF
         let path = entry.path();
         found.push(Found {
             time,
+            lead,
             key: path.to_string_lossy().into_owned(),
             origin: 0,
             item: (path, metadata),
@@ -1204,6 +1319,7 @@ pub fn scan_local(dir: &Path, spec: &ScanSpec<'_>) -> std::io::Result<Vec<LocalF
             LocalFile {
                 path,
                 time: file.time,
+                lead: file.lead,
                 metadata,
             }
         })
@@ -1227,6 +1343,7 @@ fn regular_file_metadata(entry: &std::fs::DirEntry, symlinks: Symlinks) -> Optio
 /// A file a scan matched, before [`finish`].
 struct Found<T> {
     time: DateTime<Utc>,
+    lead: Option<u32>,
     /// The object key or path: the dedup tie-break.
     key: String,
     /// Index of the prefix it was listed under.
@@ -1234,18 +1351,24 @@ struct Found<T> {
     item: T,
 }
 
-/// Sort `found` oldest first, keep one file per timestamp and cap to the
-/// newest `spec.max_files`. Of files that share a timestamp the greatest
-/// key wins, so the choice does not depend on listing order.
+/// Sort `found` oldest first, keep one file per (timestamp, lead) and cap
+/// to the newest `spec.max_files` timestamps. Of files that share a
+/// timestamp and lead the greatest key wins, so the choice does not depend
+/// on listing order.
 fn finish<T>(mut found: Vec<Found<T>>, spec: &ScanSpec<'_>) -> Vec<Found<T>> {
-    // Within a timestamp, the greatest key sorts first, and `dedup_by`
-    // keeps the first of each run.
-    found.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| b.key.cmp(&a.key)));
+    // Within a (timestamp, lead), the greatest key sorts first, and
+    // `dedup_by` keeps the first of each run.
+    found.sort_by(|a, b| {
+        (a.time, a.lead)
+            .cmp(&(b.time, b.lead))
+            .then_with(|| b.key.cmp(&a.key))
+    });
     found.dedup_by(|dropped, kept| {
-        let duplicate = dropped.time == kept.time;
+        let duplicate = (dropped.time, dropped.lead) == (kept.time, kept.lead);
         if duplicate {
+            let lead = kept.lead.map(|l| format!(" lead {l}")).unwrap_or_default();
             tracing::warn!(
-                "[{}] Duplicate timestamp {}: using {}, replacing {}",
+                "[{}] Duplicate timestamp {}{lead}: using {}, replacing {}",
                 spec.label,
                 kept.time,
                 kept.key,
@@ -1255,8 +1378,19 @@ fn finish<T>(mut found: Vec<Found<T>>, spec: &ScanSpec<'_>) -> Vec<Found<T>> {
         duplicate
     });
     if let Some(max) = spec.max_files {
-        let excess = found.len().saturating_sub(max);
-        found.drain(..excess);
+        // Count timestamps, not files: a timestamp keeps all its leads.
+        // `found` is sorted, so the newest `max` timestamps are its tail.
+        let (mut start, mut times) = (found.len(), 0);
+        while start > 0 {
+            if found.get(start).map(|f| f.time) != Some(found[start - 1].time) {
+                if times == max {
+                    break;
+                }
+                times += 1;
+            }
+            start -= 1;
+        }
+        found.drain(..start);
     }
     found
 }
@@ -1559,6 +1693,57 @@ mod tests {
         }
     }
 
+    /// `{run}` reads as the timestamp's hour, at minute 0, and `{lead}` as
+    /// a two-digit lead outside the timestamp (#1067).
+    #[test]
+    fn template_reads_run_and_lead_placeholders() {
+        let m = template("meps_sfc_{lead}_%Y%m%dT{run}Z.nc");
+        assert_eq!(
+            m.pattern(),
+            r"^meps_sfc_(?P<lead>\d{2})_(?P<timestamp>\d{4}\d{2}\d{2}T\d{2}Z)\.nc$"
+        );
+        assert_eq!(m.timestamp_format(), "%Y%m%dT%HZ");
+        let run = time("2026-10-17T06:00:00Z").unwrap();
+        assert_eq!(
+            m.match_file("meps_sfc_05_20261017T06Z.nc"),
+            Some(Ok((run, Some(5))))
+        );
+        assert_eq!(m.parse_timestamp("meps_sfc_05_20261017T06Z.nc"), Some(run));
+        assert_eq!(m.parse_lead("meps_sfc_66_20261017T06Z.nc"), Some(66));
+        for other in [
+            "meps_sfc_5_20261017T06Z.nc",
+            "meps_sfc_005_20261017T06Z.nc",
+            "meps_sfc_05_20261017T06Z.nc.part",
+        ] {
+            assert_eq!(m.match_file(other), None, "{other}");
+        }
+        // A matcher without a lead reads none.
+        assert_eq!(
+            template("radar_%Y%m%dT%H%MZ.tif").match_file("radar_20260324T2315Z.tif"),
+            Some(Ok((time("2026-03-24T23:15:00Z").unwrap(), None)))
+        );
+        // A lead between codes splits the timestamp; two leads are an error.
+        assert!(matches!(
+            FilenameMatcher::from_template("%Y%m%d{lead}%H.nc"),
+            Err(FilenameError::SplitTimestamp { .. })
+        ));
+        assert!(matches!(
+            FilenameMatcher::from_template("{lead}_%Y%m%d%H_{lead}.nc"),
+            Err(FilenameError::RepeatedLead { .. })
+        ));
+        // An explicit pattern may capture a lead, and an hour without
+        // minutes reads at minute 0.
+        let m = FilenameMatcher::from_pattern(
+            r"^f(?P<lead>\d{3})_(?P<timestamp>\d{10})\.grib$",
+            "%Y%m%d%H",
+        )
+        .unwrap();
+        assert_eq!(
+            m.match_file("f120_2026101706.grib"),
+            Some(Ok((run, Some(120))))
+        );
+    }
+
     #[test]
     fn explicit_pattern_uses_its_capture_and_format() {
         let m = FilenameMatcher::from_pattern(r"^comp-(?P<timestamp>\d{12})\.h5$", "%Y%m%d%H%M")
@@ -1852,6 +2037,81 @@ mod scan_tests {
         assert_eq!(remote_keys(&scan), ["d/radar_20260324T2315Z.tif"]);
     }
 
+    fn meps_names(names: &[&str]) -> Vec<String> {
+        names
+            .iter()
+            .map(|name| format!("meps_sfc_{name}Z.nc"))
+            .collect()
+    }
+
+    /// A matcher that reads leads keeps one file per (timestamp, lead), the
+    /// greatest key winning, and `max_files` counts timestamps, each
+    /// keeping all its leads (#1067).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_scan_keeps_one_file_per_timestamp_and_lead() {
+        let names = meps_names(&[
+            "00_20261017T03",
+            "01_20261017T03",
+            "00_20261017T06",
+            "01_20261017T06",
+            "02_20261017T06",
+        ]);
+        let mut keys: Vec<String> = names.iter().map(|name| format!("a/{name}")).collect();
+        keys.push(format!("b/{}", names[2]));
+        let probe = ListProbe::default()
+            .with_objects(&keys.iter().map(String::as_str).collect::<Vec<_>>())
+            .await;
+        let store = DataStore::new(Arc::new(probe));
+        let matcher = FilenameMatcher::from_template("meps_sfc_{lead}_%Y%m%dT{run}Z.nc").unwrap();
+        let prefixes = [ObjectPath::from("a"), ObjectPath::from("b")];
+
+        let scan = scan_remote(&store, &prefixes, &ScanSpec::new(&matcher, "t")).unwrap();
+        let entries: Vec<(DateTime<Utc>, Option<u32>, &str)> = scan
+            .entries
+            .iter()
+            .map(|file| (file.time, file.lead, file.key()))
+            .collect();
+        let (run_03, run_06) = (at("2026-10-17T03:00:00Z"), at("2026-10-17T06:00:00Z"));
+        assert_eq!(
+            entries,
+            [
+                (run_03, Some(0), keys[0].as_str()),
+                (run_03, Some(1), keys[1].as_str()),
+                (run_06, Some(0), keys[5].as_str()),
+                (run_06, Some(1), keys[3].as_str()),
+                (run_06, Some(2), keys[4].as_str()),
+            ]
+        );
+
+        let newest = ScanSpec {
+            max_files: Some(1),
+            ..ScanSpec::new(&matcher, "t")
+        };
+        let scan = scan_remote(&store, &prefixes, &newest).unwrap();
+        assert_eq!(remote_keys(&scan), [&keys[5], &keys[3], &keys[4]]);
+    }
+
+    /// A local mirror of the same layout scans the same way.
+    #[test]
+    fn local_scan_keeps_every_lead_of_the_newest_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = meps_names(&["00_20261017T03", "00_20261017T06", "01_20261017T06"]);
+        for name in &names {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let matcher = FilenameMatcher::from_template("meps_sfc_{lead}_%Y%m%dT{run}Z.nc").unwrap();
+        let spec = ScanSpec {
+            max_files: Some(1),
+            ..ScanSpec::new(&matcher, "t")
+        };
+        let files = scan_local(dir.path(), &spec).unwrap();
+        assert_eq!(local_names(&files), names[1..]);
+        assert_eq!(
+            files.iter().map(|file| file.lead).collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+    }
+
     /// A name over `MAX_FILENAME_LEN` is skipped even when it matches.
     #[test]
     fn overlong_names_are_skipped_unmatched() {
@@ -1859,7 +2119,7 @@ mod scan_tests {
         let matcher = FilenameMatcher::from_template(&format!("{prefix}%Y%m%d%H%M.h5")).unwrap();
         let name = format!("{prefix}202605150000.h5");
         assert!(matcher.parse_timestamp(&name).is_some());
-        assert_eq!(ScanSpec::new(&matcher, "t").timestamp(&name), None);
+        assert_eq!(ScanSpec::new(&matcher, "t").matched(&name), None);
     }
 
     /// The remote scan merges its prefixes and applies the same window,
