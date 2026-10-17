@@ -840,8 +840,31 @@ async fn link_tables_keep_rel_type_and_title() {
     assert!(body.contains(&format!(
         "<code>data</code> <a class=\"table-link\" href=\"{base}/locations/here\">Data for &lt;b&gt;Here&lt;/b&gt;</a> <code>application/vnd.cov+json</code>"
     )), "{body}");
+    // A data table has its own layout, never the key/value table's row
+    // header width (#1131).
+    assert!(body.contains("<table class=\"data-table\">"), "{body}");
+    assert!(!body.contains("<table class=\"properties\">"), "{body}");
     let (_, _, body) = get("/collections/c/items?limit=2&f=html", None).await;
     assert!(body.contains("<code>application/geo+json</code>"), "{body}");
+}
+
+/// An items page's tab and heading name its item range and whether a
+/// filter narrows it, as Features items pages do (#1131).
+#[tokio::test]
+async fn items_pages_name_their_range() {
+    let (_, _, body) = get("/collections/c/items?limit=2&offset=1&f=html", None).await;
+    assert!(
+        body.contains(
+            "<title>Items 2–3 · Every &lt;query&gt; &amp; &quot;more&quot; · MeteoCore</title>"
+        ),
+        "{body}"
+    );
+    assert!(body.contains("<h1>Items 2–3</h1>"), "{body}");
+    let (_, _, body) = get("/collections/c/items?bbox=0,0,90,90&limit=1&f=html", None).await;
+    assert!(body.contains("<title>Items 1–1 · filtered · "), "{body}");
+    // A single item keeps its id.
+    let (_, _, body) = get("/collections/c/items/s1?f=html", None).await;
+    assert!(body.contains("<title>Item s1 · "), "{body}");
 }
 
 /// An items page's `timeStamp` changes per request; its ETag does not.

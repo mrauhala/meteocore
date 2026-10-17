@@ -562,15 +562,18 @@ pub async fn landing_page(
         Wanted::Html => {
             let mut views: Vec<LinkView> = links
                 .iter()
-                .map(|(h, r, _, ti)| LinkView::new(h.clone(), *r, Some(ti)))
+                .map(|(h, r, t, ti)| LinkView::new(h.clone(), *r, Some(ti)).with_type(*t))
                 .collect();
             // rel="alternate" to the JSON representation (parity with the
             // collection-detail HTML page).
-            views.push(LinkView::new(
-                format!("{root}/?f=json"),
-                "alternate",
-                Some("This document as JSON"),
-            ));
+            views.push(
+                LinkView::new(
+                    format!("{root}/?f=json"),
+                    "alternate",
+                    Some("This document as JSON"),
+                )
+                .with_type("application/json"),
+            );
             Html(api_common::workbench::landing_html(
                 Surface {
                     base,

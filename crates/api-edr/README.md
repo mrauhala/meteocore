@@ -1042,7 +1042,8 @@ data explicitly.
 
 - **CoverageJSON queries** (position, area, radius, trajectory, cube, their
   instance routes, `/locations/{id}` and id lists): the request's parameters;
-  the page's links (`self`, an `alternate` per data format, the collection);
+  the page's links (`self`, an `alternate` per data format, the collection),
+  in the workbench's link table;
   every parameter (label, unit, observed property, and all its fields); and
   per coverage the domain axes with every value, the referencing, any foreign
   member (`meteocore:beamCoverage`), and every range value. A grid range is
@@ -1079,7 +1080,9 @@ data explicitly.
   with its relation, title and type),
   the members (`numberMatched`, `numberReturned`, `timeStamp`), and the
   page links. The ETag hashes the page with `timeStamp` empty, like the
-  GeoJSON's.
+  GeoJSON's. The heading and tab title name the item range and whether
+  `bbox` or `datetime` narrows it (`Items 101–110 · filtered`), as the
+  Features items pages do (#1131); a single item's page names its id.
 - Everything shown is HTML-escaped and every href goes through the
   workbench's `safe_href`; URI values (observed-property ids, CRS ids) are
   anchors.

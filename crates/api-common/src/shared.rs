@@ -260,18 +260,25 @@ async fn landing_page(
             let mut views: Vec<LinkView> = links
                 .iter()
                 .map(|l| {
-                    LinkView::new(
+                    let view = LinkView::new(
                         l["href"].as_str().unwrap_or_default(),
                         l["rel"].as_str().unwrap_or_default(),
                         l["title"].as_str(),
-                    )
+                    );
+                    match l["type"].as_str() {
+                        Some(media_type) => view.with_type(media_type),
+                        None => view,
+                    }
                 })
                 .collect();
-            views.push(LinkView::new(
-                format!("{root}/?f=json"),
-                "alternate",
-                Some("This document as JSON"),
-            ));
+            views.push(
+                LinkView::new(
+                    format!("{root}/?f=json"),
+                    "alternate",
+                    Some("This document as JSON"),
+                )
+                .with_type(json),
+            );
             Html(workbench::landing_html(
                 Surface {
                     base,

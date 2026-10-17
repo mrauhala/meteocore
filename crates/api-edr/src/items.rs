@@ -195,9 +195,13 @@ fn html_page<'a>(
         base: root.strip_suffix(api_common::mounts::EDR).unwrap_or(root),
         collection_id,
         collection_title,
+        // A page's range and filtering tell pages apart (#1131).
         title: match doc["id"].as_str() {
             Some(id) => format!("Item {id}"),
-            None => "Items".into(),
+            None => api_common::workbench::items_title(
+                raw_query.unwrap_or_default(),
+                doc["features"].as_array().map_or(0, Vec::len),
+            ),
         },
         raw_query,
         json_url,

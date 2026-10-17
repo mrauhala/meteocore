@@ -866,17 +866,44 @@ async fn workbench_exposes_supported_queries_and_same_resource_json_on_every_sur
 
 /// Common Part 1 Req 13 names the registered conformance relation; Features
 /// and EDR (and their test suites) require the short `conformance`/`data`.
-/// Every landing page carries both, pointing at the same resources.
+/// Every landing page carries both, pointing at the same resources. Its
+/// HTML link table lists the two forms in one row and every link's type
+/// (#1131: the landings once dropped the type, leaving the column empty).
 #[tokio::test]
 async fn landing_pages_advertise_short_and_registered_relations() {
     for surface in SURFACES {
         let (app, prefix) = app(surface);
         let doc = get_json(&app, &prefix).await;
+        let (status, _, html) = get(&app, &format!("{prefix}?f=html"), None).await;
+        assert_eq!(status, StatusCode::OK, "{surface}: {html}");
         for (short, registered) in [
             ("conformance", api_common::rel::CONFORMANCE),
             ("data", api_common::rel::DATA),
         ] {
-            assert_eq!(link(&doc, short), link(&doc, registered), "{surface}");
+            let href = link(&doc, short);
+            assert_eq!(href, link(&doc, registered), "{surface}");
+            assert_eq!(
+                html.matches(&format!("href=\"{href}\"")).count(),
+                1,
+                "{surface}: one row for {href}"
+            );
+            assert!(
+                html.contains(&format!(
+                    "<td><code>{short}</code><code>{registered}</code></td>"
+                )),
+                "{surface}: {html}"
+            );
+        }
+        for media_type in doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l["type"].as_str())
+        {
+            assert!(
+                html.contains(&format!("<td>{}</td>", ds_core::html::escape(media_type))),
+                "{surface}: {media_type}"
+            );
         }
     }
 }

@@ -207,12 +207,41 @@ link to their endpoint, next to the API reference button.
 Links are rendered in full (`link_table`, OGC API - EDR `/req/html/content`,
 #984): the landing page's "API definitions & resource links" and the collection
 page's metadata tab list every link with its relation, title and type, at its
-own href, `self`, `alternate` and duplicate relation forms included. The
+own href, `self` and `alternate` included. Links that differ only in relation
+(the short and the registered URI form of one) share a row listing every
+relation (#1131); the landing pages pass each link's type through. The table
+sizes its own columns (the link at least 24ch) and becomes one card per link
+below 600 px: the title as link text, relation and type beneath. Titles wrap
+between words. The link and type cells may break anywhere, and a long
+relation URI wraps inside its `code`, mid-word where it must, so no URI or
+media type widens the table: with only the link cell breaking anywhere, the
+registered relation URIs and the OpenAPI media type hold the table at least
+1184 px wide, wider than the content area at 1440 px. Only just above the
+800 px phone layout can the 24ch link column and the titles still scroll the
+table a little inside its own box. The
 collection overview's resource list stays a navigation aid, without the
 `rel=data` links of `data_queries` end points listed under "Request data". The
 collection list adds each collection's full metadata and links under its card,
 lists every keyword, and closes with the page's links; EDR model-run lists do
 the same per instance.
+
+Layout rules (#1131): only a key/value table's row headers (`property_table`,
+`th[scope=row]`) take a width, 28%; column headers size with their column, and
+every header cell is top-aligned. Below 600 px a key/value table stacks each
+key above its value. api-edr data tables use their own `data-table` class:
+auto layout inside a sideways scroll, words kept whole. Model runs are
+full-width cards with their valid-time span and step count, each shown only
+when the run advertises it. Long ids wrap in the heading, the last breadcrumb
+and the geometry summary. Below 800 px the request bar folds into its summary
+on every page, the top bar scrolls away and the workspace navigation wraps;
+wider, the sidebar stays in view. Every workbench page and the API reference
+declare the inline SVG icon `ds_core::html::FAVICON`, so none of them requests
+`/favicon.ico`. Only landing pages are titled without the " · MeteoCore"
+suffix, their titles already name the server; Features and EDR items pages are
+titled by their item range and whether a filter narrows it (`items_title`).
+The request summary shows the path and its query without `f`; the request note
+names the representation the JSON switch opens (JSON, GeoJSON or
+CoverageJSON).
 
 The HTML structure and theme styles follow the approved #744 mockup: API workspace
 selector and branded sidebar, grouped collection query controls, removable applied
