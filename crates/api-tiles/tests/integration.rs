@@ -4504,6 +4504,46 @@ mod map_tile_parameters {
         }
         assert_eq!(render_count(&engine), 0);
     }
+
+    /// An `f` given twice on a metadata route is the same JSON 400 naming
+    /// it, not axum's plain text (#1121): the landing page, conformance and
+    /// collection of the per-API service, and of the shared root composed
+    /// over the Tiles block. `/collections` already rejected it through
+    /// `CollectionRequest`. A single `f` still negotiates.
+    #[tokio::test]
+    async fn repeated_format_on_metadata_routes_is_the_json_400() {
+        let state = state(Arc::new(Engine::default()));
+        let shared = api_common::shared::router(api_common::shared::SharedApi::new(
+            "",
+            vec![Arc::new(api_tiles::TilesBlock::new(state.clone()))],
+            vec![],
+        ));
+        for app in [api_tiles::router(state), shared] {
+            for path in ["/", "/conformance", "/collections", "/collections/radar"] {
+                let uri = format!("{path}?f=json&f=html");
+                let (status, headers, body) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+                assert_eq!(
+                    header(&headers, "content-type"),
+                    Some("application/json"),
+                    "{uri}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["code"], "BadRequest", "{uri}");
+                let description = json["description"].as_str().unwrap();
+                assert!(
+                    description.contains("duplicate field `f`")
+                        || description.contains("Duplicate collection query parameter 'f'"),
+                    "{uri}: {description}"
+                );
+                for f in ["json", "html"] {
+                    let uri = format!("{path}?f={f}");
+                    assert_eq!(fetch(&app, &uri).await.0, StatusCode::OK, "{uri}");
+                }
+            }
+        }
+    }
 }
 
 /// Vector tiles honour time (#794, #946): OGC API - Tiles DateTime on

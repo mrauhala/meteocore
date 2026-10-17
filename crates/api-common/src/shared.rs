@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -31,7 +31,9 @@ use ds_core::html::{FormatParams, LinkView, Wanted};
 use serde_json::{json, map::Entry, Map, Value};
 
 use crate::workbench::{self, Surface};
-use crate::{caching, openapi_tags, rel, tag_api_kind, CollectionEntry, CollectionRequest, Mount};
+use crate::{
+    caching, openapi_tags, rel, tag_api_kind, CollectionEntry, CollectionRequest, JsonQuery, Mount,
+};
 
 /// API kind of the shared root's own Common resources in logs and metrics.
 pub const COMMON: &str = "common";
@@ -198,7 +200,7 @@ fn link(href: String, rel: &str, media_type: &str, title: &str) -> Value {
 /// GET {mount}/ — Landing page
 async fn landing_page(
     State(api): State<AppState>,
-    Query(format): Query<FormatParams>,
+    JsonQuery(format): JsonQuery<FormatParams>,
     headers: HeaderMap,
 ) -> Response {
     let wanted = match negotiate(&format, &headers) {
@@ -288,7 +290,7 @@ async fn landing_page(
 /// GET {mount}/conformance — the union of the blocks' classes
 async fn conformance(
     State(api): State<AppState>,
-    Query(format): Query<FormatParams>,
+    JsonQuery(format): JsonQuery<FormatParams>,
     headers: HeaderMap,
 ) -> Response {
     let wanted = match negotiate(&format, &headers) {
@@ -647,7 +649,7 @@ async fn collections(
 async fn collection(
     Path(id): Path<String>,
     State(api): State<AppState>,
-    Query(format): Query<FormatParams>,
+    JsonQuery(format): JsonQuery<FormatParams>,
     headers: HeaderMap,
 ) -> Response {
     let wanted = match negotiate(&format, &headers) {

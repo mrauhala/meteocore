@@ -9,7 +9,7 @@ and API-specific fields.
 | Shared component | Responsibility |
 |---|---|
 | `CollectionRequest` | Decode controls, reject unsupported/duplicate names, validate values, negotiate representation before consulting engines |
-| `JsonQuery` | axum's `Query` whose rejection, such as a parameter given twice, is the JSON 400 body instead of axum's plain text; the Maps and Tiles render and legend routes extract with it |
+| `JsonQuery` | axum's `Query` whose rejection, such as a parameter given twice, is the JSON 400 body instead of axum's plain text. Every struct-shaped query of the OGC API routes extracts with it: the `f` of each landing page, `/conformance` and `/collections/{id}` in Maps, Tiles, EDR, Features and the shared root, EDR's instance and data queries, and the Maps and Tiles render and legend routes |
 | `collections_response` | Sort by ID, filter before paging, counts, JSON/HTML, explicit-format self/next/prev and alternate links |
 | `collection_metadata`, `collection_card` | Common descriptive fields, keywords, license and HTML alternate links; API fields may override defaults for EDR instances |
 | `collection_operation` | OpenAPI discovery operation, supported parameters, JSON/HTML responses and structured 400 errors |

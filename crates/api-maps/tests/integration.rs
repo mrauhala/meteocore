@@ -4727,6 +4727,40 @@ mod part1 {
         assert!(engine.renders().is_empty());
     }
 
+    /// An `f` given twice on a metadata route is the same JSON 400 naming
+    /// it, not axum's plain text (#1121): the landing page, conformance and
+    /// collection of the per-API service, and the shared root's own Common
+    /// routes. `/collections` already rejected it through
+    /// `CollectionRequest`. A single `f` still negotiates.
+    #[tokio::test]
+    async fn repeated_format_on_metadata_routes_is_the_json_400() {
+        for app in surfaces(radar()) {
+            for path in ["/", "/conformance", "/collections", "/collections/radar"] {
+                let uri = format!("{path}?f=json&f=html");
+                let (status, headers, body) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+                assert_eq!(
+                    header(&headers, "content-type"),
+                    Some("application/json"),
+                    "{uri}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["code"], "BadRequest", "{uri}");
+                let description = json["description"].as_str().unwrap();
+                assert!(
+                    description.contains("duplicate field `f`")
+                        || description.contains("Duplicate collection query parameter 'f'"),
+                    "{uri}: {description}"
+                );
+                for f in ["json", "html"] {
+                    let uri = format!("{path}?f={f}");
+                    assert_eq!(fetch(&app, &uri).await.0, StatusCode::OK, "{uri}");
+                }
+            }
+        }
+    }
+
     /// Every accepted parameter still renders, the workbench's map request
     /// among them, and `elevation` reaches its own validation rather than
     /// the unknown-parameter 400.

@@ -487,6 +487,9 @@ Same pattern for api-edr, api-features, api-maps, api-tiles:
    returns 200 having done nothing — indistinguishable from success at the
    call site. That was the `sortby` bug (#605): validate against what the
    engine actually supports and return 400 naming the valid options.
+   Extract a struct-shaped query with `api_common::JsonQuery`, never axum's
+   `Query`, so a malformed or repeated parameter is the JSON 400, not
+   axum's plain text (#1121).
 4. **When a parameter comes from a standard, copy its schema verbatim** into
    `api_definition()` — including `style`/`explode` for array parameters,
    which is what makes the comma-separated form normative rather than

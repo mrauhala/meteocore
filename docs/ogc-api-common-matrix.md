@@ -222,6 +222,8 @@ collection.
 1. Metadata routes share `f=json/html` and Accept negotiation, but do not fully
    rank competing media types by quality values. Features item routes separately
    accept media-type aliases; that does not extend every Common metadata route.
+   An `f` given twice on the landing page, `/conformance` or `/collections/{id}`
+   is a JSON `BadRequest` naming it on every API and at the shared root (#1121).
 2. The shared extractor rejects unsupported and duplicate collection parameters
    with a JSON `BadRequest` response. Part 1 §8.3 permits some tolerance, but the
    project's stricter policy avoids misleading draft-testing clients. Unsupported

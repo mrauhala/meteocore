@@ -72,6 +72,11 @@ imply a regular sampling grid.
 | `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links; takes only `f` and `crs` — any other parameter (`bbox-crs`, `properties`, a filter, a duplicate) → 400 (#681) |
 | `/features/collections/{id}/queryables`, `/schema`, `/sortables` | ✗ | not routed |
 
+On the landing page, `/conformance` and `/collections/{id}`, an `f` given
+twice is the JSON 400 `{code, description}` naming it, like every other 400
+here, not the HTTP framework's plain text (`api_common::JsonQuery`, #1121);
+the shared root's Common routes answer it the same way.
+
 ## Shared OGC API root
 
 Features is the third building block of the shared root

@@ -8,7 +8,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-use api_common::JsonError;
+use api_common::{JsonError, JsonQuery};
 use ds_core::config::CollectionConfig;
 use ds_core::edr_engine::{EdrEngine, TrajectoryShape};
 
@@ -742,7 +742,7 @@ fn request_datetime(raw: Option<&str>) -> Result<Option<DatetimeSelector>, Handl
 
 pub async fn landing_page(
     State(state): State<AppState>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     use ds_core::html::Wanted;
@@ -865,9 +865,9 @@ const SHARED_RESPONSES: [(u16, &str, &str); 6] = [
     (
         400,
         "BadRequest",
-        "Bad request: an invalid, unknown or repeated query parameter, or an unsupported f. \
-         A query string that does not parse into the operation's parameters at all, such as a \
-         missing coords, is answered as text/plain.",
+        "Bad request: an invalid, unknown, missing or repeated query parameter, or an \
+         unsupported f. A path segment that is not valid UTF-8, which the HTTP framework \
+         rejects before the operation runs, is answered as text/plain.",
     ),
     (
         404,
@@ -910,7 +910,9 @@ const ROUTER_RESPONSES: [u16; 2] = [304, 500];
 
 /// The OpenAPI response of an error `status`: `description` and the body
 /// every JSON error carries, the `exception` schema. A 400 may also be the
-/// framework's text/plain message (see [`SHARED_RESPONSES`]).
+/// framework's text/plain message for a path it cannot decode (see
+/// [`SHARED_RESPONSES`]); a query string that does not parse is the JSON
+/// 400 of `api_common::JsonQuery` (#1121).
 pub(crate) fn error_response(status: u16, description: &str) -> serde_json::Value {
     let mut content = json!({
         "application/json": {"schema": {"$ref": "#/components/schemas/exception"}}
@@ -1935,7 +1937,7 @@ pub async fn api_docs_asset(Path(asset): Path<String>) -> Response {
 
 pub async fn conformance(
     State(state): State<AppState>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     use ds_core::html::{LinkView, Wanted};
@@ -2045,7 +2047,7 @@ pub async fn collections(
 pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     use ds_core::html::Wanted;
@@ -2302,7 +2304,7 @@ fn instances_list_links(
 pub async fn instance(
     Path((id, instance_id)): Path<(String, String)>,
     State(state): State<AppState>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     use ds_core::html::Wanted;
@@ -2613,7 +2615,7 @@ fn locations_html_page<'a>(
 /// request order, each named by its own id.
 pub async fn location_query(
     Path((id, loc_id)): Path<(String, String)>,
-    Query(params): Query<LocationQueryParams>,
+    JsonQuery(params): JsonQuery<LocationQueryParams>,
     RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2905,7 +2907,7 @@ fn require_query_type(
 
 pub async fn position_query(
     Path(id): Path<String>,
-    Query(params): Query<PositionQueryParams>,
+    JsonQuery(params): JsonQuery<PositionQueryParams>,
     RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2922,7 +2924,7 @@ pub async fn position_query(
 /// against a specific forecast model run.
 pub async fn instance_position_query(
     Path((id, instance_id)): Path<(String, String)>,
-    Query(params): Query<PositionQueryParams>,
+    JsonQuery(params): JsonQuery<PositionQueryParams>,
     RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3129,7 +3131,7 @@ async fn run_position_query(
 
 pub async fn area_query(
     Path(id): Path<String>,
-    Query(params): Query<AreaQueryParams>,
+    JsonQuery(params): JsonQuery<AreaQueryParams>,
     RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3146,7 +3148,7 @@ pub async fn area_query(
 /// specific forecast model run.
 pub async fn instance_area_query(
     Path((id, instance_id)): Path<(String, String)>,
-    Query(params): Query<AreaQueryParams>,
+    JsonQuery(params): JsonQuery<AreaQueryParams>,
     RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3235,7 +3237,7 @@ async fn run_area_query(
 
 pub async fn radius_query(
     Path(id): Path<String>,
-    Query(params): Query<RadiusQueryParams>,
+    JsonQuery(params): JsonQuery<RadiusQueryParams>,
     RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3252,7 +3254,7 @@ pub async fn radius_query(
 /// against a specific forecast model run.
 pub async fn instance_radius_query(
     Path((id, instance_id)): Path<(String, String)>,
-    Query(params): Query<RadiusQueryParams>,
+    JsonQuery(params): JsonQuery<RadiusQueryParams>,
     RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3492,7 +3494,7 @@ async fn run_cube_query(
 
 pub async fn trajectory_query(
     Path(id): Path<String>,
-    Query(params): Query<TrajectoryQueryParams>,
+    JsonQuery(params): JsonQuery<TrajectoryQueryParams>,
     RawQuery(raw_query): RawQuery,
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -91,7 +91,7 @@ ones and `api_definition()` assigns them by class:
 | Status | Operations | Why |
 |---|---|---|
 | 304 | every one | `If-None-Match` naming the current ETag (`conditional_get`) |
-| 400 | every one taking parameters or `f` | an invalid, unknown or repeated parameter, an unsupported `f` or `crs` |
+| 400 | every one taking parameters or `f` | an invalid, unknown, missing or repeated parameter, an unsupported `f` or `crs` |
 | 404 | collection, instances and every data query (`/locations` and items included) | an unknown collection, instance or location, an unsupported query type, no data |
 | 500 | every one | an internal error, without details |
 | 503 | every data query | the query executor at capacity (`ServerBusy`), the `/locations` byte budget (`ResponseLimit`) |
@@ -100,8 +100,12 @@ ones and `api_definition()` assigns them by class:
 
 Every JSON error is the `exception` schema, `{code, description}`, both
 strings. A query string that does not parse into an operation's parameters
-at all, such as a position query without `coords`, is answered by the HTTP
-framework as `text/plain`, which the 400 also lists. Metadata 200s list
+at all, such as a position query without `coords`, a `width` that is not a
+number or an `f` given twice, is that JSON 400 too, on the landing page,
+conformance, collection and instance routes and every data query
+(`api_common::JsonQuery`, #1121). Only a path segment that is not valid
+UTF-8 is still answered by the HTTP framework as `text/plain`, which the 400
+also lists. Metadata 200s list
 `application/json` and `text/html`. `f` is declared on every operation that
 reads it, area and trajectory included, its `enum` built in one place
 (`data_format_parameter`), and `crs` on every data query. Only the

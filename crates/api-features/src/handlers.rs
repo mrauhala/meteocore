@@ -9,7 +9,7 @@ use axum::{Extension, Json};
 use chrono::Utc;
 use serde_json::{json, Map, Value};
 
-use api_common::{JsonError, Mount};
+use api_common::{JsonError, JsonQuery, Mount};
 
 use ds_core::config::CollectionConfig;
 use ds_core::feature::FeatureQuery;
@@ -192,7 +192,7 @@ fn with_content_crs(mut resp: Response, crs: &ResponseCrs) -> Response {
 pub async fn landing_page(
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     use ds_core::html::{LinkView, Wanted};
@@ -286,7 +286,7 @@ pub async fn landing_page(
 pub async fn conformance(
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     use ds_core::html::{LinkView, Wanted};
@@ -775,7 +775,7 @@ pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
     use ds_core::html::Wanted;
