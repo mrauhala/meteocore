@@ -36,10 +36,7 @@ pub(crate) enum Names {
 /// by the time and lead the name encodes for a template, else by
 /// modification time.
 pub(crate) fn list(dir: &Path, names: &Names, label: &str) -> std::io::Result<Vec<Listed>> {
-    let identity = |metadata: &std::fs::Metadata| Identity {
-        size: metadata.len(),
-        modified: metadata.modified().ok(),
-    };
+    let identity = crate::catalog::local_identity;
     match names {
         Names::Template(matcher) => {
             let exclude = ds_core::temp_files::partial_exclude_patterns();
@@ -83,8 +80,8 @@ pub(crate) fn list(dir: &Path, names: &Names, label: &str) -> std::io::Result<Ve
             }
             found.sort_by(|a, b| {
                 b.identity
-                    .modified
-                    .cmp(&a.identity.modified)
+                    .last_modified
+                    .cmp(&a.identity.last_modified)
                     .then_with(|| b.path.cmp(&a.path))
             });
             Ok(found)

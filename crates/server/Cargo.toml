@@ -39,6 +39,8 @@ ds-render = { path = "../render" }
 ds-executor = { path = "../ds-executor" }
 ds-mvt = { path = "../ds-mvt" }
 ds-cache = { path = "../ds-cache" }
+# The per-host request gauges of `/metrics` (`ds_storage::host_requests`).
+ds-storage = { path = "../storage" }
 arc-swap = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }

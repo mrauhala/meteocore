@@ -1431,6 +1431,16 @@
           "expr": "rate(netcdf_field_cache_hits_total[$__rate_interval]) / clamp_min(rate(netcdf_field_cache_hits_total[$__rate_interval]) + rate(netcdf_field_cache_misses_total[$__rate_interval]), 1e-9)",
           "refId": "I",
           "legendFormat": "NetCDF decoded fields (#1067)"
+        },
+        {
+          "expr": "rate(netcdf_block_cache_hits_total[$__rate_interval]) / clamp_min(rate(netcdf_block_cache_hits_total[$__rate_interval]) + rate(netcdf_block_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "K",
+          "legendFormat": "NetCDF remote metadata blocks (#1067)"
+        },
+        {
+          "expr": "rate(netcdf_chunk_cache_hits_total[$__rate_interval]) / clamp_min(rate(netcdf_chunk_cache_hits_total[$__rate_interval]) + rate(netcdf_chunk_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "L",
+          "legendFormat": "NetCDF remote compressed chunks (#1067)"
         }
       ]
     },
@@ -1549,6 +1559,16 @@
           "expr": "rate(netcdf_field_cache_misses_total[$__rate_interval])",
           "refId": "I",
           "legendFormat": "NetCDF decoded fields (#1067)"
+        },
+        {
+          "expr": "rate(netcdf_block_cache_misses_total[$__rate_interval])",
+          "refId": "J",
+          "legendFormat": "NetCDF remote metadata blocks (#1067)"
+        },
+        {
+          "expr": "rate(netcdf_chunk_cache_misses_total[$__rate_interval])",
+          "refId": "L",
+          "legendFormat": "NetCDF remote compressed chunks (#1067)"
         }
       ]
     },
@@ -1669,6 +1689,16 @@
           "expr": "netcdf_field_cache_bytes / clamp_min(netcdf_field_cache_capacity_bytes, 1)",
           "refId": "J",
           "legendFormat": "NetCDF decoded fields (#1067)"
+        },
+        {
+          "expr": "netcdf_block_cache_bytes / clamp_min(netcdf_block_cache_capacity_bytes, 1)",
+          "refId": "K",
+          "legendFormat": "NetCDF remote metadata blocks (#1067)"
+        },
+        {
+          "expr": "netcdf_chunk_cache_bytes / clamp_min(netcdf_chunk_cache_capacity_bytes, 1)",
+          "refId": "M",
+          "legendFormat": "NetCDF remote compressed chunks (#1067)"
         }
       ]
     },
@@ -3910,6 +3940,104 @@
           "expr": "rate(netcdf_read_rejected_total[$__rate_interval])",
           "legendFormat": "Rejected reads/s",
           "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 82,
+      "type": "timeseries",
+      "title": "Remote requests per host",
+      "description": "Requests to each remote host through its request limit (ds_storage::build_http_store_limited; today the remote NetCDF sources, #1067): in flight, waiting for a permit, and the limit. thredds.met.no allows 8 at once, shared by every collection on it; polls (probing, ingest, prewarm) take at most 2. A queue that stays up means requests wait on the host, and that wait counts against their deadline.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 262
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "storage_host_requests_in_flight",
+          "legendFormat": "{{host}} in flight",
+          "refId": "A"
+        },
+        {
+          "expr": "storage_host_requests_queued",
+          "legendFormat": "{{host}} queued",
+          "refId": "B"
+        },
+        {
+          "expr": "storage_host_request_limit",
+          "legendFormat": "{{host}} limit",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 83,
+      "type": "timeseries",
+      "title": "NetCDF detached field fills",
+      "description": "Cold remote NetCDF fields are fetched by a task the request hands its fill to, which finishes after the request's 3 s deadline and leaves the field cached (#1067). Pending: running now, at most 16. Inline: fills a request ran itself, under its deadline, because 16 were running. A steady inline rate means fetches cannot keep up with the frames asked for.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 262
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "netcdf_detached_fills_pending",
+          "legendFormat": "Pending",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(netcdf_detached_fills_total[$__rate_interval])",
+          "legendFormat": "Detached/s",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(netcdf_detached_fills_inline_total[$__rate_interval])",
+          "legendFormat": "Inline past the cap/s",
+          "refId": "C"
         }
       ],
       "options": {

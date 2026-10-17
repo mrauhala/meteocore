@@ -1722,7 +1722,11 @@ fn validate_satellite_composites(
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NetcdfConfig {
-    /// Local directory holding the files, read non-recursively.
+    /// Local directory holding the files, read non-recursively; or an
+    /// `http(s)://` URL under which the files are found by template probing
+    /// (`prefix_pattern`, `filename_template`, `run_hours`, `leads`,
+    /// `time_window`) and read in place by HTTP range, as MEPS on
+    /// thredds.met.no's fileServer, which cannot be listed.
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
     pub data_path: Option<String>,
     /// The files' names, as a strftime template with `{run}` for the run
@@ -1758,6 +1762,50 @@ pub struct NetcdfConfig {
     pub max_files: usize,
     #[serde(default = "default_netcdf_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    /// Remote only: the strftime prefix under `data_path` of one run's
+    /// files, with `{run}` for the run hour, as MEPS's
+    /// `%Y/%m/%d/{run}/member_00/`. Default: none, the files lie directly
+    /// under `data_path`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub prefix_pattern: Option<String>,
+    /// Remote only, required: the hours (0-23) model runs start at each
+    /// day, as MEPS's `[0, 3, 6, 9, 12, 15, 18, 21]`.
+    #[serde(default)]
+    pub run_hours: Option<Vec<u32>>,
+    /// Remote only: the leads `{lead}` stands for in `filename_template`,
+    /// written with two digits; the first is the run's sentinel, the one
+    /// file probed until the run appears. Required with `{lead}`.
+    #[serde(default)]
+    pub leads: Option<Vec<u32>>,
+    /// Remote only, required: how far back from now runs are probed, an
+    /// ISO 8601 duration such as `-PT12H` (the sign is ignored).
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub time_window: Option<String>,
+    /// Remote only: a file is used once two polls see the same size and
+    /// `Last-Modified`, or at once when its `Last-Modified` is this old.
+    /// ISO 8601. Default `PT10M`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub min_age: Option<String>,
+    /// Remote only: a run whose leads have not all settled is served
+    /// without the missing ones this long after its first file appeared,
+    /// with a WARN naming them. ISO 8601. Default `PT30M`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub run_grace: Option<String>,
+    /// Remote only: variables whose fields of the newest run each poll
+    /// fetches before any request asks, into the compressed-chunk cache.
+    /// A MEPS variable costs about 100 MB per run. Default: none.
+    #[serde(default)]
+    pub prewarm_variables: Vec<String>,
+}
+
+impl NetcdfConfig {
+    /// Whether `data_path` is an `http(s)://` URL, read by HTTP range.
+    pub fn is_remote(&self) -> bool {
+        self.data_path.as_deref().is_some_and(|path| {
+            let lower = path.get(..8).unwrap_or(path).to_ascii_lowercase();
+            lower.starts_with("http://") || lower.starts_with("https://")
+        })
+    }
 }
 
 fn default_netcdf_max_runs() -> usize {
@@ -1777,10 +1825,34 @@ fn default_netcdf_poll_interval_secs() -> u64 {
 pub fn validate_netcdf(id: &str, cfg: &NetcdfConfig) -> Result<(), crate::error::DataServerError> {
     use crate::error::DataServerError::Config;
 
-    if cfg.data_path.as_deref().is_none_or(str::is_empty) {
+    let Some(data_path) = cfg.data_path.as_deref().filter(|path| !path.is_empty()) else {
         return Err(Config(format!(
-            "Collection '{id}': [netcdf] needs a 'data_path' directory"
+            "Collection '{id}': [netcdf] needs a 'data_path' directory or http(s) URL"
         )));
+    };
+    if cfg.is_remote() {
+        validate_netcdf_remote(id, cfg)?;
+    } else {
+        if data_path.contains("://") {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].data_path '{data_path}' is neither a local \
+                 directory nor an http(s) URL"
+            )));
+        }
+        let remote_only = [
+            ("prefix_pattern", cfg.prefix_pattern.is_some()),
+            ("run_hours", cfg.run_hours.is_some()),
+            ("leads", cfg.leads.is_some()),
+            ("time_window", cfg.time_window.is_some()),
+            ("min_age", cfg.min_age.is_some()),
+            ("run_grace", cfg.run_grace.is_some()),
+            ("prewarm_variables", !cfg.prewarm_variables.is_empty()),
+        ];
+        if let Some((field, _)) = remote_only.iter().find(|(_, set)| *set) {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].{field} applies to an http(s) data_path only"
+            )));
+        }
     }
     if cfg.filename_template.as_deref() == Some("") {
         return Err(Config(format!(
@@ -1832,6 +1904,112 @@ pub fn validate_netcdf(id: &str, cfg: &NetcdfConfig) -> Result<(), crate::error:
                 return Err(Config(format!(
                     "Collection '{id}': [netcdf].titles names '{name}', which is not in \
                      [netcdf].variables"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The remote fields of a [`NetcdfConfig`] with an `http(s)://`
+/// `data_path`. The prefix pattern and filename template are checked
+/// against the run hours and leads by engine-netcdf, through ds-storage's
+/// `TemplateProber`.
+fn validate_netcdf_remote(
+    id: &str,
+    cfg: &NetcdfConfig,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    let template = cfg.filename_template.as_deref().unwrap_or_default();
+    if template.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf] with an http(s) data_path needs a filename_template: \
+             the files are found by name, the server cannot be listed"
+        )));
+    }
+    let run_hours = cfg.run_hours.as_deref().unwrap_or_default();
+    if run_hours.is_empty() || run_hours.iter().any(|&hour| hour > 23) {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf].run_hours must list the run hours, each 0-23"
+        )));
+    }
+    if run_hours
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != run_hours.len()
+    {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf].run_hours lists an hour twice"
+        )));
+    }
+    let with_lead = template.contains("{lead}");
+    match &cfg.leads {
+        Some(leads) if !with_lead => {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].leads needs {{lead}} in the filename_template \
+                 (found {} leads)",
+                leads.len()
+            )));
+        }
+        None if with_lead => {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].filename_template names {{lead}}, so leads must \
+                 list them"
+            )));
+        }
+        Some(leads) => {
+            if leads.is_empty() || leads.iter().any(|&lead| lead > 99) {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].leads must list leads of two digits, 0-99"
+                )));
+            }
+            if leads
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != leads.len()
+            {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].leads lists a lead twice"
+                )));
+            }
+        }
+        None => {}
+    }
+    let window = cfg.time_window.as_deref().ok_or_else(|| {
+        Config(format!(
+            "Collection '{id}': [netcdf] with an http(s) data_path needs a time_window, \
+             such as \"-PT12H\""
+        ))
+    })?;
+    let durations = [
+        (
+            "time_window",
+            Some(window.strip_prefix('-').unwrap_or(window)),
+        ),
+        ("min_age", cfg.min_age.as_deref()),
+        ("run_grace", cfg.run_grace.as_deref()),
+    ];
+    for (field, value) in durations {
+        if let Some(value) = value {
+            crate::datetime::parse_iso8601_duration(value)
+                .map_err(|e| Config(format!("Collection '{id}': [netcdf].{field}: {e}")))?;
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for name in &cfg.prewarm_variables {
+        if !seen.insert(name.as_str()) {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].prewarm_variables lists '{name}' twice"
+            )));
+        }
+        if let Some(variables) = &cfg.variables {
+            if !variables.contains(name) {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].prewarm_variables names '{name}', which is \
+                     not in [netcdf].variables"
                 )));
             }
         }
@@ -7949,6 +8127,72 @@ mod netcdf_tests {
         let titled = "data_path = \"d\"\nvariables = [\"t\"]\ntitles = { p = \"P\" }";
         assert!(error(titled).contains("not in"));
         assert!(error("data_path = \"d\"\ntitles = { t = \" \" }").contains("empty"));
+    }
+
+    /// MEPS on thredds.met.no, as the disabled example configures it.
+    const REMOTE: &str = r#"
+        data_path = "https://thredds.met.no/thredds/fileServer/meps25epsarchive/"
+        prefix_pattern = "%Y/%m/%d/{run}/member_00/"
+        filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"
+        run_hours = [0, 3, 6, 9, 12, 15, 18, 21]
+        leads = [0, 1, 2]
+        time_window = "-PT12H"
+        variables = ["air_temperature_2m", "precipitation_amount_acc"]
+        prewarm_variables = ["air_temperature_2m"]
+        "#;
+
+    #[test]
+    fn a_remote_source_takes_its_template_fields() {
+        let cfg = netcdf(REMOTE).unwrap();
+        assert!(cfg.is_remote());
+        validate_netcdf("meps", &cfg).unwrap();
+        let cfg = netcdf(&format!(
+            "{REMOTE}\nmin_age = \"PT5M\"\nrun_grace = \"PT1H\""
+        ))
+        .unwrap();
+        validate_netcdf("meps", &cfg).unwrap();
+        assert!(netcdf("data_path = \"HTTPS://thredds.met.no/x/\"")
+            .unwrap()
+            .is_remote());
+        assert!(!netcdf("data_path = \"testdata/meps-netcdf\"")
+            .unwrap()
+            .is_remote());
+    }
+
+    #[test]
+    fn remote_mistakes_are_load_errors() {
+        let without = |key: &str| {
+            REMOTE
+                .lines()
+                .filter(|line| !line.trim_start().starts_with(key))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let with = |line: &str| format!("{}\n{line}", without(line.split('=').next().unwrap()));
+        assert!(error(&without("filename_template")).contains("filename_template"));
+        assert!(error(&without("run_hours")).contains("run_hours"));
+        assert!(error(&with("run_hours = [24]")).contains("run_hours"));
+        assert!(error(&with("run_hours = [3, 3]")).contains("twice"));
+        assert!(error(&without("leads")).contains("leads"));
+        assert!(error(&with("leads = []")).contains("leads"));
+        assert!(error(&with("leads = [100]")).contains("two digits"));
+        assert!(error(&with("leads = [1, 1]")).contains("twice"));
+        let no_lead = format!(
+            "{}\nfilename_template = \"meps_sfc_%Y%m%dT{{run}}Z.nc\"",
+            without("filename_template")
+        );
+        assert!(error(&no_lead).contains("{lead}"));
+        assert!(error(&without("time_window")).contains("time_window"));
+        assert!(error(&with("time_window = \"12h\"")).contains("time_window"));
+        assert!(error(&with("min_age = \"-PT5M\"")).contains("min_age"));
+        assert!(error(&with("run_grace = \"P1M\"")).contains("run_grace"));
+        assert!(error(&with("prewarm_variables = [\"x_wind_10m\"]")).contains("not in"));
+        let twice = "prewarm_variables = [\"air_temperature_2m\", \"air_temperature_2m\"]";
+        assert!(error(&with(twice)).contains("twice"));
+        // The template fields are remote only, and other schemes are refused.
+        assert!(error("data_path = \"d\"\nrun_hours = [0]").contains("http(s) data_path only"));
+        assert!(error("data_path = \"d\"\nprewarm_variables = [\"t\"]").contains("only"));
+        assert!(error("data_path = \"s3://bucket/meps\"").contains("neither"));
     }
 
     #[test]

@@ -1,10 +1,11 @@
 # engine-netcdf crate — Claude Instructions
 
 CF-NetCDF gridded forecasts and analyses (#1067), first for MET Norway's
-MEPS. Read the root `CLAUDE.md` first — Critical Rules 5, 6, 7 and 10 shape
-this crate. Today: local directories, WMS/Maps/Tiles. Remote files by HTTP
-range (#1067 PR 5), EDR and derived wind (PR 7) and pressure levels (PR 8)
-come later; keep the seams below where they are.
+MEPS. Read the root `CLAUDE.md` first — Critical Rules 5, 6, 7, 9 and 10
+shape this crate. Today: local directories and remote files read in place
+by HTTP range (thredds.met.no), WMS/Maps/Tiles. EDR and derived wind
+(PR 7) and pressure levels (PR 8) come later; keep the seams below where
+they are.
 
 ## Model
 
@@ -50,38 +51,81 @@ followed, temporary names (`ds_core::temp_files`) skipped:
 - without one: every `*.nc`, newest modification first.
 
 The name only selects the file and orders the opening: valid times and the
-run always come from the file. PR 5 adds remote discovery with the same
-`TemplateSpec` vocabulary (`prefix_pattern`, `run_hours`, `leads`,
-`time_window`) next to these fields, without renaming them.
+run always come from the file.
+
+**Remote** (`data_path` = `http(s)://…`, `NetcdfConfig::is_remote`):
+ds-storage's `TemplateProber` over `Schedule::Runs` (`prefix_pattern` with
+`{run}`, `filename_template`, `run_hours`, `leads`, `time_window`, settling
+`Stable { min_age }` default 10 min, `run_grace` default 30 min, not
+`immutable`: published sentinels are re-HEADed every 30 min). The prober
+HEADs through the host's background share. Its published files of the
+newest `max_runs` run slots, newest run first, lead order, are the listing
+(an older run's files would be opened only for the retention to close
+them: ~80 MB a MEPS run); a key is the `Known` map's path. A run is
+published whole (or after its grace), so the engine never sees a run
+half-uploaded. Every HEAD of a probe failing is an `Err` (the catalog stays,
+`/health` degrades after five polls).
 
 The poll (`poll_once`, on `poll_runtime()`, Critical Rule 6) remembers every
-listed file by path and identity (size + modification time):
+listed file by path and identity (`catalog::Identity`, an `ObjectVersion`:
+size, modification time or `Last-Modified`, ETag):
 
 - new or changed files are opened, newest first, at most
   `MAX_OPENS_PER_POLL` (128) per poll (Critical Rule 9);
-- a catalogued file whose identity changes is read again and bumps
-  `content_version` (#1067 decision 7); a new file does not;
+- a catalogued file whose identity changes is read again. Its entry, and
+  its old handle in the catalog, stay until the new version is open
+  (`record`): past the cap, or when the open must be retried, the old
+  version keeps drawing and the next poll finds the change again. Only
+  then does `content_version` move (#1067 decision 7), with the catalog
+  that serves the new version; a new file moves nothing
+  (`scan_tests`, a cap of one);
 - the newest `max_runs` runs are kept, as many as `max_files` holds
   (without runs the `max_files` newest files); files outside are closed
   (`Known::Closed`, run and newest time remembered, never reopened unless
   they come back into the kept set); unservable files are remembered as
   `Skipped` and not opened again until they change.
 
+Opens happen in two phases so remote files open in parallel (Critical
+Rule 9): `open_inspect` (no poll state; `REMOTE_OPEN_CONCURRENCY` = 8
+scoped threads for a remote source, inline for a local one), then `admit`
+in listing order (`fits_layout`). Without an allowlist the first servable
+file is opened alone, since it fixes which variables the rest are read
+for. A remote open that failed on a read (network, deadline, replaced) is
+`Opened::Retry`: forgotten, tried next poll; any other failure is
+`Skipped`. A remote poll may open `max(MAX_OPENS_PER_POLL, leads)` files,
+so at least one whole run.
+
 `NetcdfEngine::new` scans once, synchronously, as engine-grib does, so the
 layers and their styles exist when the server registers the collection; a
-failed scan is a WARN ("initial NetCDF scan failed (will retry on poll)")
-and the poll loop, whose first tick is skipped, retries. Every catalog is
-built by that scan and swapped through `ArcSwap`. PR 5 bounds the remote
-first scan.
+failed scan is a WARN ("initial NetCDF scan failed (will retry on poll)").
+Every catalog is built by a scan and swapped through `ArcSwap`.
+
+- **Local:** the whole directory; the poll loop's first tick is skipped.
+- **Remote, bounded:** up to `INITIAL_PROBE_ROUNDS` (3) probes until a run
+  is published (round 1 finds the sentinels, round 2 HEADs the found runs'
+  other leads, which settle at once when older than `min_age`), then at
+  most one run's leads (the newest run's files) under a deadline of
+  `INITIAL_SCAN_BUDGET` (15 s) from the start, entered on every open
+  thread. Why the bound: `load_collections` builds collections one after
+  another and the server answers nothing until all are built (main.rs
+  "Socket bound — loading collections, not yet serving", and the same on
+  reload, on the poll runtime), so a remote `new()` delays every collection
+  after it and the whole boot. 67 MEPS opens are ~67 MB at the background
+  share of 2: seconds from a server's network, tens of seconds over a slow
+  link. The worst case is the budget plus one wave of HEADs (30 s each).
+  The rest is the poll loop's: its first tick fires at once
+  (`FirstTick::Immediate`), and `netcdf_registration_changed` registers the
+  layers if `new()` found none.
 
 ## Open files and metadata — measured
 
 Each catalogued file keeps its `NcFile` (`catalog::OpenFile`) for as long as
-it is catalogued; request paths never open a file. Files are opened over
-`FileStorage` (positional reads) for NetCDF-4 and classic alike, never
+it is catalogued; request paths never open a file. Local files are opened
+over `FileStorage` (positional reads) for NetCDF-4 and classic alike, never
 `NcFile::open`'s mmap, which a file truncated in place would turn into
-SIGBUS. One descriptor per catalogued file: `max_files` bounds them.
-The reader's chunk cache is off (`chunk_cache_bytes = 0`).
+SIGBUS. One descriptor per catalogued local file: `max_files` bounds them.
+Remote files are opened over `remote::RemoteFile` (below). The reader's
+chunk cache is off (`chunk_cache_bytes = 0`) either way.
 
 - **Metadata trees:** `NcFile::variables()` and `variable(name)` build two
   separate trees. Ingest reads only `variables()`; nothing calls
@@ -108,9 +152,95 @@ The reader's chunk cache is off (`chunk_cache_bytes = 0`).
   handle_memory`): 140 KB per MEPS fixture file serving 8 variables, 100 KB
   serving 1, 61 KB for the global fixture (2 variables). It grows with the
   variables in the file, all of which `variables()` parses, so a real MEPS
-  sfc file (221 variables, 190 MB) holds far more. **Not measured here:**
-  a real file was deliberately not downloaded; PR 5 measures one per-lead
-  sfc handle × 67 leads × `max_runs` and records it here.
+  sfc file (221 variables, 190 MB) holds far more: **820 KB** per kept
+  per-lead sfc handle serving one variable (`tests/live_thredds.rs`,
+  2026-10-17, heap allocated by a second open of the same three files from
+  the block cache). Handles alone hold 820 KB × 67 leads × `max_runs`:
+  **110 MB** at the remote example's `max_runs = 2`, 220 MB at 4.
+
+## Remote files (`remote.rs`, `io.rs`) — #1067 PR 5
+
+Read in place by HTTP range, never downloaded whole (decision 4).
+
+- **Storage:** `RemoteFile` implements `hdf5_reader::Storage` over
+  `DataStore::get_range_if_unmodified_on`. Every GET is conditional on the
+  version the prober listed (`If-Unmodified-Since`, plus the response's
+  size from `Content-Range`, `Last-Modified` and ETag compared:
+  ds-storage's `range_tests::a_conditional_read_over_http_sends_and_checks_the_version`
+  pins that a 206 carries the whole object's size).
+- **Runtime (Critical Rule 7, a tested exception):** the callback is
+  synchronous; `io::blocking` runs the GET on the persistent `netcdf-io`
+  runtime (`Handle::block_on`): `block_in_place` on a multi-thread worker
+  (a render on a request worker, the poll loop), directly on a blocking or
+  plain thread (`RenderJob`, a detached fill, ingest's open threads), a
+  scoped thread on a current-thread runtime. The deadline is the calling
+  thread's (`ds_storage` captures it). Pinned by
+  `io::tests::every_calling_thread_reaches_the_runtime` and
+  `remote::tests::reads_run_on_the_poll_runtime_render_jobs_and_async_workers`.
+  EDR and GetFeatureInfo query workers: PR 7 adds their tests.
+- **Fetch modes** (`io::Mode`, a thread-local like `ds_core::deadline`):
+  `Request` (default: the host's whole limit, `FetchBudget::Request`, the
+  request's deadline), `Detached` (a fill a request handed off: whole
+  limit, `Background` budget, no deadline), `Background` (every read a
+  poll makes, ingest and prewarm: the host's background share,
+  `Background` budget). `scan` and every open/prewarm thread enter it.
+- **Host limit:** `remote::host` → `ds_storage::build_http_store_limited`
+  (`HOST_REQUEST_LIMIT` = 8, one limit per host for the process, over
+  every collection) and a `BACKGROUND_SHARE` (2) stacked on it, also one
+  per host (`with_request_limit`). The prober's HEADs take the share too.
+  A permit wait counts against the deadline. `ds_storage::host_requests`
+  reports in flight and queued per host.
+- **Blocks** (`BLOCKS`, `MC_NETCDF_BLOCK_CACHE_MB`, default 64 MiB, floor
+  8): reads ≤ `Tuning::bypass_over` (256 KiB) come from 64 KiB blocks keyed
+  by `FileId` (URL + version) and index, `approx_entry_bytes` 64 KiB. A
+  read's missing blocks are claimed with zero-timeout guards and fetched
+  in one GET (copied per block, so no block pins a span); blocks another
+  reader is fetching are waited for (single-flight). `prefetch` fetches the
+  first 1 MiB in one GET before the reader parses it (MEPS keeps all its
+  metadata there, measured). Keyed by identity, not ingest: a second open
+  of the same version (reload, a closed file kept again) makes 0 GETs.
+- **Chunks** (`CHUNKS`, `MC_NETCDF_CHUNK_CACHE_MB`, default 512 MiB): reads
+  over 256 KiB, cached whole by (identity, offset, length), single-flight:
+  8 renders of a cold field make one GET. Equivalent to the issue's
+  (identity, variable, time, level) key without passing a field context
+  down to the storage callback; PR 7's EDR series inserts here.
+- **Replaced file** (decision 7): `RangeRead::Changed` (412, 404, or another
+  size/`Last-Modified`/ETag) marks the `RemoteFile` replaced (every later
+  read fails at once), drops its blocks and chunks (`retain` by `FileId`)
+  and its ingest's decoded fields (`field::evict_file`), queues
+  (key, version) on the engine's `Changes`, and, from a request or detached
+  fill, bumps `content_version` at once (`content_version()` =
+  catalog's + `Changes::bumps`). The read is `ReadFailure::Replaced`,
+  which a request gets as `ResourceExhausted` (503). The next poll
+  forgets the file (bumping again if it was open), calls
+  `TemplateProber::recheck(key)` so that poll HEADs it first, and opens the
+  new version once it settles; the same version is opened again. A
+  replacement or removal the prober finds itself (its 30-min sentinel
+  recheck) withdraws a file whose run is still in the window: the poll
+  bumps `content_version` for it too. A run aging out of the window bumps
+  nothing.
+- **Errors:** `ReadFailure` travels through hdf5-reader as an `io::Error`;
+  `ReadFailure::find` walks the error chain (through `Context` and the
+  `io::Error`'s inner value) so a deadline stays `DeadlineExceeded`.
+- **Request counts — measured** on testdata/netcdf-remote (62 KB files,
+  production sizes ÷ 64, `remote::tests::TUNING`): an open is 4 GETs (the
+  first read, which covers all `variables()` metadata, and three block
+  reads: two chunk indexes and the time axis), a cold field 1 GET (its
+  chunk), a repeat 0, a second open of the same identity 0.
+- **MEPS on thredds.met.no — measured 2026-10-17 over a laptop link, debug
+  build** (`tests/live_thredds.rs`, newest sfc run 09Z, leads 00-02, one
+  variable): first scan 4.0 s, 5 HEADs, 13 GETs, 3.71 MB (about 4 GETs
+  and 1.24 MB per file: the 1 MiB first read and three 64 KiB blocks); a
+  second open of the same files 0 GETs, 0.2 s; a cold field 1 GET,
+  1.57 MB, 3.5 s (over the 3 s render deadline: detached fills matter on
+  such a link); the same field again 0 GETs, 34 ms. A 206 for bytes
+  0-1023 named the whole file's size (167 786 505), as HEAD did. A server
+  smoke test (two variables, the same three files) loaded the collection
+  in 1.7-2.0 s with 1.31 MB per file, drew a cold GetMap in about 1 s
+  (384 × 512 EPSG:3857 over Norway; 355 × 600 EPSG:3067 over Finland,
+  every pixel drawn) and map tiles of the same field in 25-30 ms. Not yet measured from a
+  server's network: a follow-up after deploy, which sets the cache and
+  budget defaults.
 
 ## Reads (`field.rs`)
 
@@ -129,9 +259,10 @@ The reader's chunk cache is off (`chunk_cache_bytes = 0`).
   file's fields), variable, time index and level index (0 until PR 8).
   Values are `Arc<[f32]>`, north-up, NaN for nodata: a flipped (south-up)
   grid's rows are reversed once, while decoding.
-- **Single-flight:** `get_or_insert_with_timeout` inside `block_in_place` on
-  a Tokio worker, directly elsewhere, as engine-zarr's store does. Only the
-  fill owner reserves the transient peak from the decode budget
+- **Single-flight:** `get_or_insert_with_timeout` inside `io::blocking`
+  (`block_in_place` on a Tokio worker, directly elsewhere), as engine-zarr's
+  store does. Only the fill owner reserves the transient peak from the
+  decode budget
   (`decode_budget::BUDGET`, `MC_NETCDF_READ_MEMORY_MB`, default 1024):
   3 × decoded + 3 × compressed, where hdf5-reader exposes no chunk's stored
   size before reading it, so the decoded chunk bounds the compressed one
@@ -140,11 +271,33 @@ The reader's chunk cache is off (`chunk_cache_bytes = 0`).
   without one); a fill that completes after it stays cached. The budget is
   a `ds_executor::budget::ByteBudget` (`decode_budget.rs` keeps only the
   static), never a copy of its own.
+- **Detached fills (remote files, the 3 s render deadline):** a remote
+  cold field's fill is claimed with `get_value_or_guard_untracked(ZERO)`
+  and the guard moved into a task on the I/O runtime's blocking pool
+  (`Mode::Detached`: no deadline, `FetchBudget::Background`), which
+  reserves the budget, decodes and inserts. The request waits for the value
+  until its own deadline only. A fetch slower than the deadline fails that
+  request (503) and still fills the cache. A failed detached fill drops
+  the guard: a waiting reader then fills inline and gets the error itself.
+  At most `MAX_DETACHED_FILLS` (16) run at once, over every collection;
+  past that the fill runs inline under the deadline. Local files fill
+  inline. Note for PR 7: derived wind reads u and v one after the other.
+- **Prewarm** (`prewarm_variables`, remote only, off by default): after a
+  poll publishes, the newest run's fields of those variables are read in
+  `Mode::Background` on `BACKGROUND_SHARE` threads, until the next poll is
+  due. `field::prewarm` decodes and drops: the compressed chunk lands in
+  `CHUNKS`, the field cache keeps the frames being drawn. Each (ingest,
+  variable, step) once (`PollState::prewarmed`); the first failure
+  (budget, network) stops it until the next poll. ~100 MB per MEPS
+  variable and run.
 - **Metrics** (server `metrics_handler`, while a NetCDF collection is
-  loaded): `netcdf_field_cache_{hits_total,misses_total,bytes,
-  capacity_bytes}` and `netcdf_read_{reserved_bytes,capacity_bytes,
-  rejected_total}`, with Grafana panels (the cache-family panels, and the
-  two "NetCDF field-read" panels).
+  loaded): `netcdf_{field,block,chunk}_cache_{hits_total,misses_total,
+  bytes,capacity_bytes}`, `netcdf_read_{reserved_bytes,capacity_bytes,
+  rejected_total}`, `netcdf_detached_fills_{pending,total,inline_total}`;
+  and, for every host behind `build_http_store_limited`,
+  `storage_host_{requests_in_flight,requests_queued,request_limit}{host}`.
+  Grafana: the cache-family panels, the two "NetCDF field-read" panels,
+  "Remote requests per host" and "NetCDF detached field fills".
 - **A failed read is an `Err` (`Storage`)**, never a tile of nodata, and is
   not cached.
 - `block_in_place` panics on a current-thread runtime: tests that render
@@ -178,13 +331,16 @@ nearest step, the earlier on a tie. Every variable shares the run's time
 axis (decision 3), so the per-parameter resolvers keep their defaults.
 
 `content_version` starts at the process start's Unix seconds (nonzero, new
-per restart) and moves when a catalogued file is replaced in place.
+per restart) and moves when a catalogued file is replaced in place: found
+by a poll (local identity, or a remote file the prober lists at another
+version), or by a remote read at once (`Changes::bumps`).
 
 ## Server wiring
 
 `engine_type = "netcdf"`, allowlist `["wms", "maps", "tiles"]` (an `edr`
 collection is rejected until PR 7; examples set `apis`). Poll loop in all
-three places (boot spawn, `rotate_poll_loops!`, shutdown). Health: live
+three places (boot spawn, `rotate_poll_loops!`, shutdown); a remote
+source's first tick is immediate. Health: live
 status from `live_health`; data age = the newest run's reference time, or
 the newest valid time without runs. Layer styles resolve at load from
 `raster_info()`, which the initial scan has filled. When it found no files
@@ -202,6 +358,26 @@ Not in `DERIVE_WIND_ENGINES` (PR 7).
   OPeNDAP ASCII subsets, provenance in its README.
 - `testdata/netcdf-global/`: synthetic 5° global grid, north-up, three
   steps, no run; a packed `short` variable with a fill box.
+- `testdata/netcdf-remote/`: two synthetic MEPS-like per-lead files (one
+  run, leads 00 and 01, LCC, south-up, 64 × 96, two variables chunked one
+  field per chunk with shuffle + deflate 3 and noisy values, so a chunk is
+  ~15 KB), written by `make_fixture.py` (needs `ncgen`).
+- `remote::tests` (in the lib test binary): a local HTTP/1.1 server
+  (`test_server.rs`: HEAD without ETag, 206 with `Content-Range`, 412 on
+  `If-Unmodified-Since`, a request log, slow chunk GETs on demand) and the
+  scaled `TUNING`. Pins the request counts above, ranged reads drawing
+  what local reads draw (every GET a 206), one GET for 8 concurrent cold
+  renders, a detached fill outliving its request's deadline and leaving
+  the cache warm, a replaced file (412 → 503, content version, re-probe,
+  new file), prewarm, the bounded first scan opening only the newest run,
+  the runtime contexts, and the shipped thredds example (offline).
+- `tests/live_thredds.rs`: `#[ignore]`, against thredds.met.no: leads
+  00-02 of the newest run, `air_temperature_2m`, one field, ~5 MB, and a
+  1 KiB ranged GET of an archived file. Run by hand only (`cargo test -p
+  engine-netcdf --test live_thredds -- --ignored --nocapture`); it prints
+  requests, bytes, timings and the heap per kept handle
+  (`NetcdfEngine::remote_traffic`).
+- `scan_tests`: a file replaced in place under a cap of one open per poll.
 - `tests/integration.rs`: MET Norway's lat/lon against the grid (measured
   within 6 cm), north-up drawing of south-up rows, run selection and
   fallback with pixel values, `max_runs`/`max_files`, the seam box

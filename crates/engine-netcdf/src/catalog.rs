@@ -4,23 +4,31 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{ParameterInfo, RasterInfo};
 use ds_core::resample::SourceGrid;
+use ds_storage::ObjectVersion;
 use netcdf_reader::NcFile;
 
 use crate::ingest::{FieldRead, FileGrid, Variable};
+use crate::remote::RemoteFile;
 
-/// What a file is on disk: a file whose size or modification time changes
-/// is another file, ingested again (#1067 decision 7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Identity {
-    pub size: u64,
-    pub modified: Option<SystemTime>,
+/// Which version of a file the catalog read: its size and modification
+/// time (a local file's mtime, a remote one's `Last-Modified`), and a
+/// remote ETag where the server sends one. A file whose version changes is
+/// another file, ingested again (#1067 decision 7).
+pub(crate) type Identity = ObjectVersion;
+
+/// The identity of a local file from its metadata.
+pub(crate) fn local_identity(metadata: &std::fs::Metadata) -> Identity {
+    ObjectVersion {
+        size: metadata.len(),
+        last_modified: metadata.modified().ok().map(DateTime::<Utc>::from),
+        e_tag: None,
+    }
 }
 
 /// A catalogued file, open for as long as the catalog keeps it. Requests
@@ -28,9 +36,12 @@ pub(crate) struct Identity {
 pub(crate) struct OpenFile {
     /// Unique in the process: the field cache's key ([`crate::field`]).
     pub id: u64,
+    /// The local path, or the object key of a remote file.
     pub path: PathBuf,
     pub identity: Identity,
     pub nc: NcFile,
+    /// The storage of a remote file, read by HTTP range.
+    pub remote: Option<Arc<RemoteFile>>,
     pub run: Option<DateTime<Utc>>,
     /// Valid time of each index along the time axis.
     pub times: Vec<DateTime<Utc>>,
