@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.13.0](https://github.com/mrauhala/meteocore/compare/v0.12.0...v0.13.0) (2026-10-17)
+
+
+### Features
+
+* **units:** match units in any spelling, and style defaults for MEPS NetCDF ([#1145](https://github.com/mrauhala/meteocore/issues/1145)) ([0f39df9](https://github.com/mrauhala/meteocore/commit/0f39df9c6f6ea0ab3292c8cb7d5cf95a6ccac88a))
+* **engine-netcdf:** EDR position, area and radius, GetFeatureInfo and derived wind speed ([#1153](https://github.com/mrauhala/meteocore/issues/1153)) ([561ca68](https://github.com/mrauhala/meteocore/commit/561ca68b7d861bee194ea33a2117a99c01299f48))
+* **engine-netcdf:** pressure levels as a vertical axis ([#1163](https://github.com/mrauhala/meteocore/issues/1163)) ([bb27a4d](https://github.com/mrauhala/meteocore/commit/bb27a4d8c9b74e369e9ca6b41b5cc13a0293c52a))
+
+
+### Bug Fixes
+
+* **api-common:** JSON 400 for a repeated parameter on landing, conformance and collection routes and EDR queries ([#1124](https://github.com/mrauhala/meteocore/issues/1124)) ([692930a](https://github.com/mrauhala/meteocore/commit/692930ae65c153df9a262932cd1cad99c9afd64c))
+* **discovery:** skip files inside hidden folders below the scanned base ([#1125](https://github.com/mrauhala/meteocore/issues/1125)) ([bf13057](https://github.com/mrauhala/meteocore/commit/bf130579de033b725209fb160a4e34603d829f4e))
+* **core:** end the Transverse Mercator inverse at the poles and 50° from its meridian ([#1154](https://github.com/mrauhala/meteocore/issues/1154)) ([cbd03f5](https://github.com/mrauhala/meteocore/commit/cbd03f58bbae921ad83d643d5ca576cffb28a163))
+* **preview:** phone layout, default parameter, served APIs and no dead switches in the map viewer ([#1157](https://github.com/mrauhala/meteocore/issues/1157)) ([3d0afd0](https://github.com/mrauhala/meteocore/commit/3d0afd0d120f2bd4d19c9cac080cfda4e4140437))
+* **render:** draw a multi-parameter collection's default parameter with its own style on Maps, Tiles and WMS ([#1161](https://github.com/mrauhala/meteocore/issues/1161)) ([b371a61](https://github.com/mrauhala/meteocore/commit/b371a61684c1abc7ecf114281584f8c4da1d7e03))
+* **api-common:** workbench layout for link tables, data tables, run cards and the phone shell ([#1162](https://github.com/mrauhala/meteocore/issues/1162)) ([c7bc53e](https://github.com/mrauhala/meteocore/commit/c7bc53e4f80334ff0e5b437e5810294b1a1fd11d))
+* **api-common:** answer HTML requests' errors with workbench pages ([#1164](https://github.com/mrauhala/meteocore/issues/1164)) ([d17cc77](https://github.com/mrauhala/meteocore/commit/d17cc77026eb3999bfd47ef6760b5e598ca0e646))
+
+
+### Performance Improvements
+
+* **engine-odim:** download PVOL volumes concurrently in EDR datetime walks ([#1128](https://github.com/mrauhala/meteocore/issues/1128)) ([27523ac](https://github.com/mrauhala/meteocore/commit/27523ace03c8089fe9871ba555a2fc83b904220e))
+* **api-features:** simplify the items page map geometry and render the page once ([#1158](https://github.com/mrauhala/meteocore/issues/1158)) ([e45ece7](https://github.com/mrauhala/meteocore/commit/e45ece76da1504313d3ca6d1eafce296c3618a8a))
+
 ## [0.12.0](https://github.com/mrauhala/meteocore/compare/v0.11.0...v0.12.0) (2026-10-17)
 
 
