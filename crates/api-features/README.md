@@ -181,7 +181,11 @@ coordinates against it. Note that WMS here takes EPSG:3035 `BBOX` easting first.
   boxes (lower corner first) become the envelope of densely sampled edge points,
   so a curved edge between corners is covered, widened to a pole the box
   contains. The envelope may also match features just outside the projected
-  rectangle near its corners, never fewer.
+  rectangle near its corners, never fewer. EPSG:3067 points past a pole or
+  more than 50° of longitude from 27°E name no place (#1113). The envelope of
+  a box reaching past them ends at that edge, 23°W or 77°E, though around a
+  pole it still spans every longitude; a box around the whole area matches
+  every feature, and one wholly past them is a 400.
 - **Links:** `self`/`next`/`prev` and each feature's `self` repeat a requested
   `crs`; the bbox is repeated as its CRS84 conversion, without `bbox-crs`. The
   HTML view is CRS84, so the GeoJSON response's `alternate` HTML link drops `crs`.
@@ -281,6 +285,12 @@ layer but has no effect on this engine.
 | ODIM PVOL network | one radar site (Point) — site inventory | site point inside box | sites with a volume inside the interval; each site collection's EDR `/locations?datetime=` lists its site by the same rule (#932) | – (400) | ✓ all site inventory properties (including quantities/elevation_angles lists) | ✓ | – | ✓ (inventory-sensitive) |
 | Nowcast | one tracked storm cell (Point + fact-sheet properties) from one generation | cell centroid inside box | with none: latest generation; with `datetime`: the newest retained generation inside the interval (~4 h history) | ✓ significance, significance_rank, max_dbz, area_km2, track_age, speed_ms, bearing_deg, intensity_trend_dbz_min + lightning / impact / radar extras when those sources are wired | ✓ all base cell properties except `significance_contributions` + wired lightning/impact/radar groups | ✓ | ✓ (retained history span) | ✓ |
 | GeoTIFF, GRIB, QueryData, Zarr, ODIM composite, ODIM PVOL site | — no `FeatureEngine` (EDR / Maps only) — | | | | — | | | |
+
+PostGIS checks timestamp mappings and point/SRID requirements before publishing
+data. A schema mismatch blocks data queries and degrades collection health;
+a successful reachability ping cannot clear it. Generic geometry views remain
+supported with bounded startup checks and validation of returned coordinates.
+See [database validation](../engine-postgis/README.md#column-requirements).
 
 CSV pagination uses an immutable station inventory built at load time, in
 first-observation order. Unfiltered pages slice that inventory directly;

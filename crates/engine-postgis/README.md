@@ -1,710 +1,369 @@
 # engine-postgis
 
-MeteoCore engine that serves observations from PostgreSQL / PostGIS (optionally
-TimescaleDB) through OGC API - EDR and OGC API - Features.
+Publish observations already stored in PostgreSQL/PostGIS through MeteoCore's
+OGC APIs. Clients can discover stations and retrieve measurements by location
+and time without database access or a separate export pipeline.
 
-## Scope (v1)
+The engine maps existing tables to collections and named parameters using
+TOML. It reads measurements in place and refreshes cached station metadata in
+the background. It does not ingest data, create tables, or require a
+MeteoCore-specific database schema.
 
-**In:**
+## Supported data and APIs
 
-- `Engine` trait — `get_locations`, `query_position`, `query_location`, `query_area`.
-- `FeatureEngine` trait — each station is one Feature; properties come from the
-  mapped `property_cols`, and each one not named like an API control such as `limit` or `f` is a
-  property filter (`?territory=FI`) from startup, even before any station row has loaded.
-- Three observation-table shapes:
-  - `long` — EAV (`param_col` + `value_col`)
-  - `wide` — column-per-parameter
-  - `per_parameter` — one table per parameter (typical for hypertables)
+Choose the shape that matches your tables:
 
-**Out (deferred):**
+| `observations.shape` | Layout |
+|---|---|
+| `long` | One measurement per row: `station_id, time, parameter, value` |
+| `wide` | One row per station/time: `station_id, time, temperature, humidity` |
+| `per_parameter` | One table per parameter, each with station, time and value columns |
+| `events` | Independent events with their own time and point geometry, such as lightning strikes |
 
-- No `MapEngine` — no WMS, Maps, or Tiles from this engine in v1. Sparse-point
-  rendering needs interpolation and vector symbolization; that is a separate
-  design.
-- No observations-as-time-aware Features — a Feature is a station. The time
-  series is delivered via EDR coverages.
-- No `events` shape (geometry + time without a station FK, e.g. lightning
-  strikes). Deferred past v0.2.
-- No TimescaleDB code branching — no runtime extension detection, no CAGG
-  selection, no hypertable-aware SQL. TimescaleDB is supported as a deployment
-  choice; the emitted SQL plans well on both.
-- No user-supplied `WHERE` fragments from HTTP. The only filter extension is
-  the load-time constant `stations.where` string.
-- No non-PostgreSQL backends (no MySQL, DuckDB, ODBC).
-- No hot-reload of column renames or DSN changes — those require a restart.
+| API | Station shapes (`long`, `wide`, `per_parameter`) | `events` |
+|---|---|---|
+| EDR | Locations, position, area, radius; time series per station | Area, radius; one point coverage per event |
+| Features | Station inventory and configured properties | Not supported |
+| Tiles | Station vector tiles (MVT) | Raster event-age tiles |
+| WMS / Maps | Not supported | Event-age layer, intended for lightning |
 
-See issue [#99](https://github.com/mrauhala/meteocore/issues/99) (epic) for the
-full design, phased roadmap, and devil's-advocate resolutions.
+Station Features and vector tiles contain metadata, not measurements. Use EDR
+for values. There is no station interpolation, arbitrary measurement-column
+map rendering, trajectory/cube query or forecast-run axis.
 
-## Prerequisites
+Requires PostgreSQL ≥ 13 and PostGIS ≥ 3.0. TimescaleDB hypertables work as
+ordinary observation tables; the engine does not manage compression,
+retention or continuous aggregates.
 
-- **PostgreSQL** ≥ 13
-- **PostGIS** ≥ 3.0
-- **TimescaleDB** — optional. Recommended for large observation tables, but the
-  engine does not branch on it.
+## Database setup
 
-### TLS — not implemented in v1
-
-The engine currently connects with `NoTls`. The `sslmode` field in the DSN is
-parsed and used as part of the pool key, but the connection itself is **never
-actually encrypted**. Real TLS wiring is tracked in
-[#110](https://github.com/mrauhala/meteocore/issues/110).
-
-Until #110 lands, make sure the database is reachable **only** over a private
-network, VPN, loopback, or an SSH tunnel. A startup `WARN` is emitted for any
-non-loopback pool whose DSN does not have `sslmode=require` — treat it as a
-reminder that credentials are moving in plaintext, not as proof that they
-aren't.
-
-## Role SQL
-
-Create a dedicated read-only role and hand MeteoCore a DSN that logs in as this
-role. The engine runs a startup privilege self-check and **warns** (does not
-abort) if the role can `INSERT` on any mapped table, so a misconfigured
-superuser DSN will still start — the warning is your signal.
+Create a dedicated read-only login, adapting the database, password and table
+names. Set role-level limits for normal data queries:
 
 ```sql
--- Replace <db>, <schema>, <password> and the mapped table list as needed.
-
 CREATE ROLE meteocore_ro LOGIN PASSWORD '<password>' NOINHERIT;
-
-GRANT CONNECT ON DATABASE <db> TO meteocore_ro;
-GRANT USAGE   ON SCHEMA  <schema> TO meteocore_ro;
-
--- One GRANT SELECT per mapped table. Do NOT use
--- `GRANT SELECT ON ALL TABLES IN SCHEMA ...` — it re-grants on future tables
--- that you may not want the engine to see.
-GRANT SELECT ON <schema>.stations           TO meteocore_ro;
-GRANT SELECT ON <schema>.obs_t2m            TO meteocore_ro;
-GRANT SELECT ON <schema>.obs_rh2m           TO meteocore_ro;
-GRANT SELECT ON <schema>.obs_pressure       TO meteocore_ro;
-GRANT SELECT ON <schema>.obs_wind_speed     TO meteocore_ro;
-GRANT SELECT ON <schema>.obs_wind_direction TO meteocore_ro;
-GRANT SELECT ON <schema>.obs_precipitation  TO meteocore_ro;
-
--- Enforce server-side resource limits on every session that logs in as
--- this role. THESE ARE NOT OPTIONAL — the engine does NOT set
--- statement_timeout / lock_timeout / default_transaction_read_only
--- itself (session state on a fresh `deadpool-postgres` client with
--- RecyclingMethod::Fast has none applied). A superuser DSN, or a role
--- without these ALTER ROLE statements, will run queries with no cap
--- and no read-only guard — runaway SQL can saturate the pool and
--- Postgres backends.
-ALTER ROLE meteocore_ro SET statement_timeout = '5s';
+GRANT CONNECT ON DATABASE weather TO meteocore_ro;
+GRANT USAGE ON SCHEMA public TO meteocore_ro;
+GRANT SELECT ON public.stations, public.observations TO meteocore_ro;
 ALTER ROLE meteocore_ro SET default_transaction_read_only = on;
+ALTER ROLE meteocore_ro SET statement_timeout = '5s';
 ALTER ROLE meteocore_ro SET lock_timeout = '2s';
+
+CREATE INDEX stations_geom_gix ON public.stations USING GIST (geom);
+CREATE INDEX observations_station_time_idx
+  ON public.observations (station_id, time DESC);
 ```
 
-Hand the engine the DSN via an environment variable — never inline in
-`config.toml`:
+For `per_parameter`, grant and index every observation table. For events,
+start with a B-tree on time and a GiST index on geometry. Check plans for
+queries and metadata refreshes against your data, and adjust timeouts and
+indexes accordingly. With registry-only locations, nearest-station SQL uses
+`geom::geography`; its spatial index needs that expression, whereas area SQL
+uses plain geometry.
+
+At initialization and after a changed mapping is rebuilt, two advisory audits
+use read-only catalog queries, each with a two-second deadline including pool
+acquisition. They never scan data, run query plans, attempt writes or change
+indexes/grants.
+
+The privilege audit warns about superusers and effective `INSERT`, `UPDATE`
+or `DELETE` on mapped relations, including inherited, ownership and column-level
+grants. Extra readable columns are allowed. Keep the role settings above even
+when no write grants are found: this is not a guarantee that the role cannot
+modify the database.
+
+Index diagnostics check station/time B-tree prefixes on every station
+observation table, leading-time indexes for events, and live SQL spatial paths.
+Valid ASC/DESC and longer composite keys are accepted; INCLUDE-only columns and
+invalid indexes do not count. Geometry checks recognize 2D GiST/SP-GiST support.
+Missing paths warn with quoted relation/column names and an index suggestion.
+Views, potentially relevant partial/expression indexes (including geography),
+unfamiliar operator classes, separate/reordered keys and alternative access
+methods log **not assessed** when applicability is uncertain. Partitioned/TimescaleDB parent
+indexes count; independent child/chunk index changes are not verified. Without
+a matching parent index, coverage is not assessed. Materialized views are
+inspected directly. These are bounded heuristics, not a
+query-plan guarantee; investigate plans before adding indexes.
+
+Failed audits log **unchecked** and retry on metadata refresh or a successful
+health ping, without changing collection availability. Completed audits do no
+further work on requests or refreshes. Shared pools deduplicate identical
+findings; logs name the first collection that detected each one. Rebuild a
+collection or restart to recheck changed grants/indexes. Diagnostics stay in
+server logs.
+
+Supply the DSN through the server process's environment:
 
 ```bash
-export FMI_OBS_DSN='postgres://meteocore_ro:<password>@db.example.com:5432/weather?sslmode=verify-full'
+export OBS_DSN='postgres://meteocore_ro:<password>@127.0.0.1:5432/weather?sslmode=disable'
 ```
 
-Inline DSNs in TOML are rejected at config load unless `MC_ALLOW_INLINE_DB_URL=1`
-is set (dev ergonomics only, warns at startup).
+**Native database TLS is not implemented.** Connections use `NoTls`:
+`sslmode=require` fails to connect; the default `prefer` permits plaintext.
+The example assumes a local database or the local end of an encrypted tunnel.
+For remote access, provide a protected connection such as a VPN or SSH tunnel.
+A non-loopback host logs a warning. Inline DSNs in TOML are rejected unless
+`MC_ALLOW_INLINE_DB_URL=1` is set; keep credentials out of committed config.
 
-## Recommended indexes
+## Station configuration
 
-The engine runs a startup index self-check against `pg_index` and logs
-prescriptive `CREATE INDEX` statements if the required indexes are missing. It
-does not abort — you can start an empty database and add the indexes later.
-
-### Always (required for hot-path performance)
-
-```sql
--- Spatial lookups (bbox, nearest-station, ST_Within).
-CREATE INDEX IF NOT EXISTS stations_geom_gix
-  ON stations USING GIST (geom);
-
--- One-station time-slice scans. Compound, with time DESC for "latest N" queries.
--- Create this on EVERY observation table (per_parameter shape = once per table).
-CREATE INDEX IF NOT EXISTS obs_t2m_station_time_idx
-  ON obs_t2m (station_id, time DESC);
--- ... repeat for each obs_<param> table
-```
-
-### Vanilla PostgreSQL only
-
-Add a BRIN index on `time` when observation tables are large (≫ 10M rows) and
-area queries scan wide time windows. BRIN is ~1000× smaller than btree and is a
-good fit for append-only, time-ordered inserts:
-
-```sql
--- Vanilla PG only — DO NOT add this on a TimescaleDB hypertable.
-CREATE INDEX IF NOT EXISTS obs_t2m_time_brin
-  ON obs_t2m USING BRIN (time) WITH (pages_per_range = 32);
-```
-
-### TimescaleDB
-
-**Skip BRIN — per-chunk btree is already optimal.**
-
-Why: TimescaleDB partitions a hypertable by time into chunks. Each chunk gets
-its own local btree on `time`, which is already tight because the chunk covers
-a narrow time interval. A BRIN index on the hypertable parent is ignored by the
-planner, and a per-chunk BRIN is strictly worse than the per-chunk btree. This
-is a known footgun — people who port vanilla-PG index recipes to Timescale
-sometimes add BRIN "for safety" and then wonder why their scans got slower.
-
-If you enable native compression on a hypertable, also consider:
-
-```sql
--- Optional, only if you compress chunks. Lets the planner decompress on demand
--- during index-only plans. The engine does not assert this setting.
-ALTER TABLE obs_t2m
-  SET (timescaledb.enable_transparent_decompression = on);
-```
-
-## Configuration
-
-The example below is the `per_parameter` shape verified against a real
-deployment (TimescaleDB 2.13.1 + PostGIS 3.4.1, six per-parameter weather
-hypertables). All observation tables in that deployment use
-`timestamp without time zone` columns storing UTC, so `time_col_tz = "UTC"` is
-mandatory.
+This collection maps `stations(station_id, name, geom, country)` and
+`observations(station_id, time, parameter, value)`. Save it as
+`collections.d/surface-obs.toml` with
+`[server] collections_dir = "collections.d"` configured:
 
 ```toml
-[[collections]]
-id = "nexus-obs"
-title = "Nexus Weather Observations"
-description = "Finnish surface observations — temperature, humidity, pressure, wind, precipitation"
+id = "surface-obs"
+title = "Surface observations"
+description = "Station air temperature observations"
 engine_type = "postgis"
-apis = ["edr", "features"]
-
-[collections.postgis]
-# DSN resolved from this env var at startup. Inline URLs rejected.
-dsn_env = "NEXUS_DSN"
-# Optional; defaults to max(4, min(cpu_count * 2, 16)), hard-capped at 32.
-# pool_size = 8
-# metadata_refresh_secs = 300
-# Most stations the location list holds; 1..=1000000, default 200000.
-# A list cut at it degrades /health — see "Station-list cap" below.
-# max_locations = 200000
-
-[collections.postgis.stations]
-table         = "public.stations"
-id_col        = "station_id"
-label_col     = "name"
-geom_col      = "geom"                   # geometry(Point, 4326); SRID asserted at startup
-property_cols = ["country", "elevation_m", "wmo_id"]
-where         = "active = true"          # config-time constant, not user input
-
-[collections.postgis.observations]
-shape            = "per_parameter"
-station_fk_col   = "station_id"
-time_col         = "time"
-# Mandatory because the obs tables use `timestamp without time zone`.
-# Forbidden if time_col is `timestamptz`. IANA TZ names also accepted.
-time_col_tz      = "UTC"
-
-# One row per parameter table. Each table must carry station_fk_col and time_col.
-[[collections.postgis.observations.tables]]
-parameter = "t2m"
-table     = "public.obs_t2m"
-value_col = "value"
-
-[[collections.postgis.observations.tables]]
-parameter = "rh2m"
-table     = "public.obs_rh2m"
-value_col = "value"
-
-[[collections.postgis.observations.tables]]
-parameter = "pressure"
-table     = "public.obs_pressure"
-value_col = "value"
-
-[[collections.postgis.observations.tables]]
-parameter = "wind_speed"
-table     = "public.obs_wind_speed"
-value_col = "value"
-
-[[collections.postgis.observations.tables]]
-parameter = "wind_direction"
-table     = "public.obs_wind_direction"
-value_col = "value"
-
-[[collections.postgis.observations.tables]]
-parameter = "precipitation"
-table     = "public.obs_precipitation"
-value_col = "value"
-
-# EDR parameter metadata — one entry per advertised parameter.
-# `name` here must match `parameter` in observations.tables above.
-[[collections.postgis.parameters]]
-name              = "t2m"
-label             = "2 m air temperature"
-unit              = "°C"
-observed_property = "air_temperature"
-
-[[collections.postgis.parameters]]
-name              = "rh2m"
-label             = "2 m relative humidity"
-unit              = "%"
-observed_property = "relative_humidity"
-
-[[collections.postgis.parameters]]
-name              = "pressure"
-label             = "Station pressure"
-unit              = "hPa"
-observed_property = "air_pressure"
-
-[[collections.postgis.parameters]]
-name              = "wind_speed"
-label             = "10 m wind speed"
-unit              = "m/s"
-observed_property = "wind_speed"
-
-[[collections.postgis.parameters]]
-name              = "wind_direction"
-label             = "10 m wind direction"
-unit              = "°"
-observed_property = "wind_from_direction"
-
-[[collections.postgis.parameters]]
-name              = "precipitation"
-label             = "Hourly precipitation"
-unit              = "mm"
-observed_property = "precipitation_amount"
-```
-
-The other two shapes swap the `[collections.postgis.observations]` block:
-
-- **long / EAV:** set `shape = "long"`, drop `[[observations.tables]]`, add
-  `param_col` + `value_col` on `[observations]`, and list each `source_key`
-  under `[[parameters]]`.
-- **wide:** set `shape = "wide"`, drop `[[observations.tables]]`, and add
-  `[[observations.columns]]` mapping `parameter → column`.
-
-If none of the three shapes fit your schema, expose a Postgres `VIEW` that does.
-The DSL deliberately does not support joins, computed expressions, or column
-transforms.
-
-## Events shape (non-station event data)
-
-The fourth shape, `events` (#113), serves tables where each row is an
-independent event with its own time and point geometry — no stations, no
-interval. Reference dataset: a lightning-strike table
-`(id, time, the_geom, multiplicity, peak_current, cloud_indicator, ellipse_major)`.
-
-```toml
-# collections.d/lightning.toml
-id = "lightning"
-title = "Lightning strikes"
-engine_type = "postgis"
-apis = ["edr", "wms", "maps", "tiles"]   # wms/maps/tiles = the #504 age layer
+apis = ["edr", "features", "tiles"]
 
 [postgis]
-dsn_env = "MC_OBS_DSN"
-metadata_refresh_secs = 60   # TIME-less map requests track the latest
-                             # ADVERTISED step, rebuilt on this cadence
+dsn_env = "OBS_DSN"
+
+[postgis.stations]
+table = "public.stations"
+id_col = "station_id"
+label_col = "name"
+geom_col = "geom"
+property_cols = ["country"]
+
+[postgis.observations]
+shape = "long"
+table = "public.observations"
+station_fk_col = "station_id"
+time_col = "time"
+param_col = "parameter"
+value_col = "value"
+
+[[postgis.parameters]]
+name = "t2m"
+source_key = "temperature"
+label = "2 m air temperature"
+unit = "degC"
+observed_property = "air_temperature"
+```
+
+Here, clients request `t2m` and the database stores `temperature` in its
+`parameter` column. Add a `[[postgis.parameters]]` entry for each advertised
+parameter. `source_key` and `observed_property` default to `name`.
+
+For inline configuration, put collection fields under `[[collections]]` and
+prefix the remaining tables with `collections`, for example
+`[collections.postgis]` and `[[collections.postgis.parameters]]`.
+
+### Other station layouts
+
+Keep the station and parameter definitions above and replace the observations
+block with one of these. The mapping's `parameter` key matches `source_key`.
+
+For a **wide** table with a `temperature` column:
+
+```toml
+[postgis.observations]
+shape = "wide"
+table = "public.observations"
+station_fk_col = "station_id"
+time_col = "time"
+columns = [{ parameter = "temperature", column = "temperature" }]
+```
+
+For **one table per parameter**:
+
+```toml
+[postgis.observations]
+shape = "per_parameter"
+station_fk_col = "station_id"
+time_col = "time"
+value_col = "value"
+tables = [{ parameter = "temperature", table = "public.obs_temperature" }]
+```
+
+Each `tables` entry may override the shared `station_fk_col`, `time_col`,
+`time_col_tz`, `value_col` and `geom_col`. The advertised temporal extent comes
+from the first configured table.
+
+### Column requirements
+
+- Use consistent text station keys and a unique registry ID. Non-empty
+  geometry must contain Points with SRID 4326 (X = longitude, Y = latitude); prefer
+  `geometry(Point, 4326)` to enforce this in the database.
+- For `timestamptz`, omit `time_col_tz`. For `timestamp without time zone`,
+  set it to the stored values' timezone, such as `"UTC"` or `"Europe/Helsinki"`.
+  Initialization and metadata refresh check every resolved timestamp mapping
+  and ask PostgreSQL to validate each timezone. Session timezone need not be UTC.
+- Measurements are cast to `double precision`; NULL remains missing. Units
+  describe stored values and do not perform conversion. Station properties
+  support boolean, integer, real/double precision and text types, including
+  NULL. Cast other property types in a view.
+- Table names accept `schema.table` or a bare name in `public`. Identifiers
+  must match `^[A-Za-z_][A-Za-z0-9_]{0,62}$`. Use a SQL view for joins,
+  expressions, type conversions or coordinate transformations.
+
+Database checks cover tables, hypertables, views and materialized views. Known
+non-point geometry declarations or SRIDs other than 4326 are rejected, even on
+empty sources. Generic geometry columns/views are allowed: validation examines
+at most 128 rows per source, including NULL/empty rows, within a five-second
+deadline for the whole collection. This is not a full data audit. Every returned
+geometry is checked before its coordinates are used, including rows outside the
+sample or inserted later. NULL/empty handling is unchanged. Use typed views to
+make the contract explicit; the engine does not transform source geometries.
+
+### Locations without a complete registry
+
+Set `observations.geom_col` when observations carry their own points. For
+`per_parameter`, every table must resolve a geometry column, either inherited
+or set on the table entry.
+
+| Registry | Observation geometry | Locations advertised |
+|---|---|---|
+| Present | Absent | All registry stations, with or without data |
+| Absent | Present | Recent reporting stations; ID as label, no properties |
+| Present | Present | Recent reporting stations, enriched from the registry where available |
+| Absent | Absent | Invalid configuration |
+
+“Recent” means `observations.locations_window`, default `"PT24H"`; use a
+longer ISO 8601 duration or `"all"` for full history. This selects the cached
+station inventory, not the measurement query's time range. Archive queries
+still need their stations in that inventory. Full-history derivation can be
+expensive; a maintained station table or materialized view avoids rescanning.
+
+With observation geometry, position/area selection uses the cached locations
+and exact polygon containment, including boundaries. Registry-only selection
+uses live PostGIS queries; `ST_Within` excludes boundary points.
+
+Optional `where = "active = true"` under `[postgis.stations]` filters the
+registry using a fixed configuration fragment, never HTTP-supplied SQL. In
+combined mode it only filters enrichment: excluded reporters can still appear
+without registry metadata. Filter the observation source to restrict membership.
+
+## Event configuration
+
+For `lightning(id, time, geom, peak_current)`, with UTC values in a timezone-less
+timestamp column, use a separate collection file:
+
+```toml
+id = "lightning"
+title = "Lightning strikes"
+description = "Point events with measured peak current"
+engine_type = "postgis"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[postgis]
+dsn_env = "OBS_DSN"
+metadata_refresh_secs = 60
 
 [postgis.observations]
 shape = "events"
 table = "public.lightning"
+id_col = "id"
 time_col = "time"
-time_col_tz = "UTC"           # mandatory for `timestamp without time zone`
-geom_col = "the_geom"
-id_col = "id"                 # ORDER BY time DESC, id tiebreak
-default_datetime = "PT1H"     # window when the query has no datetime (default PT1H)
-extent_bbox = [4.0, 54.0, 42.0, 72.0]   # REQUIRED: the only spatial-extent source; never ST_Extent
-
-# Optional per-event attributes for the storm-cell join (#616) — see below.
-cloud_indicator_col = "cloud_indicator"   # 0 = cloud-to-ground, 1 = intra-cloud
-peak_current_col = "peak_current"         # signed kA; the SIGN is the polarity
+time_col_tz = "UTC"
+geom_col = "geom"
+default_datetime = "PT1H"
+extent_bbox = [4.0, 54.0, 42.0, 72.0]
 
 [[postgis.parameters]]
-name = "peak_current"         # source_key defaults to name = the column name
+name = "peak_current"
 label = "Peak current"
 unit = "kA"
 
-[[postgis.parameters]]
-name = "multiplicity"
-label = "Multiplicity"
-unit = "1"
-
 [wms]
-colormap = "lightning_age"   # value = strike age in minutes
+colormap = "lightning_age"
 min = 0.0
-max = 60.0                   # match the default_datetime window length
+max = 60.0
 ```
 
-Behaviour:
+`extent_bbox` is required: it supplies the advertised extent as
+`[west, south, east, north]`, without scanning event geometry. Parameter
+`source_key` names the measurement column. Events have no registry or station
+foreign key; `locations_window` and `max_locations` are invalid for this shape.
 
-- **EDR `area` only.** One SQL statement per request (time-range + polygon
-  intersect, `ORDER BY time DESC, id`), no fan-out — the fan-out semaphore is
-  not involved. `position`/`locations` return 400 pointing at the area query.
-- **Response**: a CoverageJSON `CoverageCollection` of `Point` coverages — one
-  per event, each with its own single-value `t` axis and 0-d scalar ranges.
-  An empty window is a valid empty collection, not a 404.
-- **No `datetime`** never means full history: the `default_datetime` window
-  (ending "now") applies.
-- The response-value budget charges `rows × selected parameters`; a breach is
-  an HTTP 400 naming the numbers.
-- Parameter columns are cast `::double precision` in SQL, so `smallint` /
-  `numeric(p,s)` columns work without config.
-- A `[postgis.stations]` block, `station_fk_col`, `locations_window`, or
-  `columns`/`tables` entries are rejected for this shape at config load.
-- Recommended index: `btree (time DESC, geom) INCLUDE (<parameter columns>)`
-  plus the usual gist on the geometry column.
-- **Map layer (#504, `apis` wms/maps/tiles):** each frame renders the
-  strikes of the `default_datetime` window ending at the requested TIME
-  (floored to the minute), splatted as fixed 2 px-radius discs whose value
-  is the strike age in minutes — style them with the `lightning_age`
-  builtin (min 0, max = window minutes). TIME steps advertise the most
-  recent 6 h at 1-minute cadence (361 entries, endpoints inclusive); older frames render via explicit TIME.
-  One whole-extent DB fetch per frame, LRU-cached
-  (`MC_LIGHTNING_STRIKE_CACHE_MB`, default 32; `lightning_strike_cache_*`
-  metrics) and shared by all meta-tile renders of that frame. Explicit-TIME
-  frames are fresh to the minute; TIME-omitted requests track the latest
-  advertised step (metadata refresh cadence) — live clients should pass
-  explicit TIME.
+EDR returns events newest first. Without `datetime`, it queries
+`default_datetime` ending now (default one hour). Event maps use that window
+ending at TIME, floored to the minute, and draw two-pixel-radius discs colored
+by **age in minutes**. Match the style maximum to the window length.
+Advertised steps cover up to the latest six hours at one-minute intervals;
+older frames can be requested explicitly. Omitted TIME follows the latest
+advertised step, updated on metadata refresh; live clients should send TIME.
 
-### Event attributes for the cell join (#616)
+Map windows are cached (`MC_LIGHTNING_STRIKE_CACHE_MB`, default 32 MiB) and
+keep at most the newest 200,000 events, warning on truncation. Increasing cache
+capacity does not raise that limit.
 
-The two optional `*_col` fields above populate `ds_core::events::EventAttrs`
-on every `EventPoint` returned by the `EventSource` trait, which is how
-engine-nowcast derives a cell's IC/CG split and positive-CG fraction. They
-affect **only** that trait — the EDR/WMS paths are unchanged, and a column
-you want in the EDR response still needs its own `[[postgis.parameters]]`
-entry (declaring it in both is fine, and normal: `peak_current` is a useful
-EDR parameter *and* the polarity source).
+For a nowcast `lightning_source`, optional `observations.cloud_indicator_col`
+(0 = cloud-to-ground, 1 = intra-cloud) and `peak_current_col` (signed kA) supply
+flash attributes independently. NULL means unknown; unknown currents do not
+count in the polarity-share denominator. EDR still needs separate parameter
+entries. Set `observations.coverage_bbox` only to a rectangle of guaranteed
+detection, separate from `extent_bbox`; otherwise nowcast counts are null.
+The cell's full footprint and 10 km attribution radius must fit within it.
 
-- Entirely opt-in, and **independently** so. Declaring `cloud_indicator_col`
-  without `peak_current_col` yields the IC/CG split with polarity reported as
-  `null`, not as "no positive flashes"; declaring the reverse yields polarity
-  without the split. Do NOT declare `cloud_indicator_col` pointing at a column
-  whose encoding differs from 0=CG/1=IC — the join would silently invert.
-- **Partial coverage within a column is handled, not assumed away.**
-  Peak-current estimation fails on weak signals, so a NULL current on some
-  rows is normal. Those flashes are excluded from the positive-share
-  denominator rather than counted as non-positive, and the denominator is
-  published as `cg_polarity_known` so the sample size behind the share is
-  visible to a consumer.
-- Identifiers are validated at config load and emitted through
-  `quote_ident` (Critical Rule 8), same as every other column name.
-- Only columns with an actual consumer belong here. Each one is selected and
-  decoded for every event in the window — up to 200k per nowcast generation —
-  so an unread column is pure cost, and a config knob that silently does
-  nothing is worse than an absent one.
-- Cast `::double precision` in SQL (like the EDR parameter columns), so
-  `smallint`, `numeric(p,s)` and `real` source columns all work without
-  config. A NULL row value decodes to `None` — "not reported for this
-  flash", distinct from a reported zero.
-- A name that is valid but wrong (no such column, or a `text` column that
-  won't cast) fails the whole window fetch, loudly, rather than yielding
-  `None` forever. That is deliberate: a silent `None` is indistinguishable
-  from "this network doesn't report polarity", so a misconfiguration would
-  otherwise look exactly like a correct configuration. The nowcast join
-  treats the failed fetch as "join skipped this generation" and the
-  generation itself still succeeds.
+## Queries and limits
 
-## Optional stations / orphan locations
+Discover stations, then request measurements; substitute an ID and dates from
+your data:
 
-The `[collections.postgis.stations]` block is **optional**. When the observation
-tables carry their own point geometry (`observations.geom_col`, e.g. `the_geom`),
-locations can be derived directly from the observations — useful when the
-observed station set is wider than (or entirely absent from) a curated stations
-registry. The mode is derived from what you configure, with no extra flag:
-
-| `[postgis.stations]` | `observations.geom_col` | Mode | Behavior |
-|---|---|---|---|
-| present | absent | stations-only | Original behavior. The **whole registry** is advertised (labels + properties), with or without data. |
-| present | present | **orphan fallback** | **Membership = stations reporting within the window** (same set as observations-only). Registered ones get their label/properties + authoritative geometry; reporters with no `stations` row are bare orphans (`label = id`, no properties). A **registered-but-silent station is not advertised** — use stations-only mode to advertise the full registry. |
-| absent | present | **observations-only** | Every location derived from the obs geometry (windowed reporters). `label = id`, no properties. |
-| absent | absent | — | Hard config error (nothing can be placed on a map). |
-
-**Mode A — no stations table** (everything from the observations geometry):
-
-```toml
-[collections.postgis]
-dsn_env = "OBS_DSN"
-
-[collections.postgis.observations]
-shape          = "per_parameter"
-station_fk_col = "wigos_id"
-time_col       = "time"
-time_col_tz    = "UTC"
-value_col      = "value"
-geom_col       = "the_geom"     # geometry(Point, 4326) on every obs table
-
-[[collections.postgis.observations.tables]]
-parameter = "air_temperature"
-table     = "public.airtemperature"
-# ... more tables ...
-
-[[collections.postgis.parameters]]
-name  = "air_temperature"
-label = "2 m air temperature"
-unit  = "degC"
+```bash
+curl 'http://localhost:8000/edr/collections/surface-obs/locations?limit=100'
+curl --get 'http://localhost:8000/edr/collections/surface-obs/locations/station-1' \
+  --data-urlencode 'datetime=2026-10-16T00:00:00Z/2026-10-17T00:00:00Z' \
+  --data-urlencode 'parameter-name=t2m'
+curl --get 'http://localhost:8000/edr/collections/lightning/area' \
+  --data-urlencode 'coords=POLYGON((24 59,26 59,26 61,24 61,24 59))'
 ```
 
-**Mode B — stations table + orphan fallback** (add `geom_col` to an existing
-stations config; registered stations keep their `name`/properties, the rest fall
-back to the obs geometry):
+A station position query selects the nearest station within **25 km**. An
+instant matches that timestamp, not the nearest observation time. Without
+`datetime`, station queries can read full history. Missing station data gives
+404 for location/position; area/radius queries omit stations without data and
+can return an empty collection. An empty event query is also valid.
 
-```toml
-[collections.postgis.stations]
-table      = "public.stations"
-id_col     = "wigos_id"
-label_col  = "name"
-geom_col   = "the_geom"
-property_cols = ["territory"]
+CoverageJSON is the default. Station queries also support CSV; locations,
+position and radius support EDR GeoJSON. Station Features support bbox,
+paging and property filters, but reject `datetime` because the inventory has
+no time dimension. See the [EDR](../api-edr/README.md) and
+[Features](../api-features/README.md) references for full request/format rules.
 
-[collections.postgis.observations]
-shape          = "per_parameter"
-station_fk_col = "wigos_id"
-time_col       = "time"
-time_col_tz    = "UTC"
-value_col      = "value"
-geom_col       = "the_geom"          # <-- enables orphan fallback
-locations_window = "PT24H"           # optional; default 24h. "all" = full history
-# ... tables / parameters as above ...
-```
-
-**How it performs.** The observation-derived location list is built with one
-`SELECT DISTINCT ON (station_fk)` **per observation table** (deduped by id in
-Rust — NOT a single `UNION`, which would run as one statement and blow a
-read-only role's `statement_timeout`), each fetching `max_locations + 1` rows
-and the merged list stopping at `max_locations` (see
-[Station-list cap](#station-list-cap-max_locations)).
-It runs only in the **background metadata refresh** (`metadata_refresh_secs`),
-never on a request; the per-request observation fetch (`WHERE station_fk = $1`,
-or `= ANY($1)` for a set-based area query) is identical in every mode, so
-request latency is unchanged.
-
-Even one table's *full-history* `DISTINCT ON` can exceed a tight
-`statement_timeout` on a large hypertable (the largest nexus table, ~13 M rows,
-took >5 s). So the derivation is **time-windowed by default**:
-
-- `observations.locations_window` — ISO 8601 duration (**default `"PT24H"`**),
-  adds `AND time_col >= now() - window` so the scan only touches recent
-  hypertable chunks (~0.1 s) and advertises only **currently-reporting**
-  stations. This is the right default for live observations.
-- `locations_window = "all"` — full history (a climate-style collection). Needs a
-  role `statement_timeout` large enough to scan the whole table (the limits come
-  from the role, not the engine), or a pre-materialized distinct-`(id, geom)`
-  table wired as the `stations` block.
-
-In modes A/B, `position` (nearest, by haversine) and `area` (exact
-point-in-polygon, #671) are answered **in-memory** from the cached location
-set; stations-only mode keeps the live `ST_DWithin`/`ST_Within` SQL path.
-
-## Station-list cap (`max_locations`)
-
-Every station shape caches its location list (#110), and `[postgis]
-max_locations` bounds it (#1061): default **200 000**, at most **1 000 000**,
-checked at config load (0, a larger value, or the key on the `events` shape is
-a load error).
-
-- **Detection.** Every location query fetches `max_locations + 1` rows: the
-  stations table read (`ORDER BY id`) and each per-table observations query.
-  A row past the cap means the list does not fit: the first `max_locations`
-  stations are kept in query order and the snapshot is flagged truncated.
-  Exactly `max_locations` stations is a complete list. In mode B either read
-  can be cut. A cut reporter list misses stations, as above. A cut registry
-  matters only when a reporter finds no registry row, since that row may be
-  past the cap: such reporters are served without their label and
-  properties, and the list is flagged as a cut registry. When every reporter
-  found its row, nothing served is missing and nothing is flagged.
-- **Visibility.** A truncated list degrades the collection in `/health`
-  (`"station list truncated at max_locations = N: …"`, or `"station registry
-  truncated at max_locations = N: …"` for a cut mode-B registry) while the
-  database answers; an unreachable database is reported first. The verdict
-  is live: the reload response and the load snapshot keep the collection
-  `ready`, since it still serves. The gauge
-  `postgis_locations_truncated{collection}` is 1, the Grafana overview shows
-  it under PostGIS, and a WARN is logged when a refresh first cuts the list
-  (INFO when it fits again). Stations past the cap are missing from
-  `/locations`, EDR `items` and Features `/items`; in modes A/B also from
-  position and area queries, which run on the cached list. In stations-only
-  mode position and area run in SQL and still find them.
-- **What fixes it.** Raise `max_locations`, or narrow the list:
-  `stations.where`, a view, or a shorter `observations.locations_window`.
-
-**Sizing (measured).** The `metadata::tests::footprint` test counts the heap
-of the cached snapshot for stations with a WIGOS-style id, a 19-character
-name and three properties (text, float, integer). Per station, in requested
-bytes before the allocator's size-class rounding:
-
-| What | Bytes per station | At 200 000 | At 1 000 000 |
-|---|---|---|---|
-| decoded rows (`FeatureStation` + properties) | 446 | 89 MB | 446 MB |
-| whole snapshot (rows + `Location` snapshot + id indexes) | 621 | 124 MB | 621 MB |
-| what an EDR request copies of it (`get_locations` shares the `Location` snapshot) | 0 | 0 | 0 |
-
-A refresh holds the old snapshot until the new one is swapped in, plus the
-query's rows (tokio-postgres buffers the result: about 300–350 B a row for
-this layout, estimated from the row structure). The peak is therefore about
-0.3 GB at 200 000 stations and about 1.5 GB at the ceiling. Memory follows
-the stations actually loaded, not the cap: the cap bounds what a
-misconfigured or unexpectedly large source can cost. The default covers
-national and continental networks (tens of thousands of stations, closed ones
-included) with headroom; the ceiling stops a typo from removing the bound.
-
-**Costs that grow with the list** (checked for #1061):
-
-- **Refresh** (every `metadata_refresh_secs`, on the background poll runtime,
-  never a request worker): `CollectionMeta::build` measured 0.9 µs a station
-  in a debug build, under 0.2 s at 200 000; the query and row decoding come on
-  top. The new snapshot replaces the old through `ArcSwap`; readers never
-  wait, and a request still holding the old one keeps it alive until it
-  finishes.
-- **EDR `/locations`** has a byte budget of its own: the GeoJSON is about
-  610 B a location with six parameters (each feature lists the collection's
-  `parameter-name`s), so the default `MC_EDR_LOCATIONS_MAX_BYTES` of 16 MiB
-  holds about 27 000 locations. A larger unpaged list is a 503 `ResponseLimit`
-  ("page it with `limit`"), as it already was at the old 50 001 cap; pages of
-  up to 10 000 (about 6 MB) fit. A page is a slice of the cached `Location`
-  snapshot, which `get_locations` shares by `Arc` (#1083); a `bbox` or
-  `datetime` filter collects a pointer per kept location (1.6 MB when all
-  200 000 match).
-- **Other EDR paths look stations up by id** in the same shared snapshot
-  (`LocationSnapshot::by_id`, a bisection over an index of 8 B a station):
-  EDR `items` pages and single items, `f=GeoJSON` and CSV queries, and the
-  unknown-id check of a location list. On 200 000 synthetic stations in a
-  release build (`cargo run --release -p ds-core --example
-  location_snapshot_bench`) a lookup takes about 0.2 µs and allocates
-  nothing; the copy of the list each of these requests made before took
-  about 10–25 ms and 20–28 MB. A GeoJSON or CSV position, area or radius
-  query names its coverages through an index of the list's points
-  (`LocationSnapshot::at`), built by the first such query after each refresh
-  and kept with the snapshot until the next one; a result named by its
-  location ids never builds it.
-- **Features `/items`** pages with `limit` ≤ 1000 and `offset`; each page
-  filters the whole cached list in memory, an O(n) scan plus a pointer per
-  match (1.6 MB of pointers when all 200 000 match). Vector tiles do the same
-  per tile, then cache the tile.
-- **Modes A/B in-memory queries:** position scans the list for the nearest
-  station (O(n) haversine per request). Area polygons are bounded at
-  20 million `stations × polygon vertices` edge tests
-  (`ds_core::feature::check_mask_budget`), so at 200 000 stations a polygon
-  may have at most 100 vertices, and 20 at the ceiling, before the 400 that
-  names the numbers; rectangles are exempt.
-
-## Startup behavior: error vs. warning
-
-The engine distinguishes between conditions that make the collection
-unusable (hard error — the whole config load fails) and conditions that are
-suspicious but workable (WARN — the collection still loads).
-
-### Hard errors (config load or collection init fails)
-
-- `engine_type = "postgis"` but no `[postgis]` block present.
-- `[postgis]` contains a literal `postgres://…` URL and `MC_ALLOW_INLINE_DB_URL`
-  is not `1`.
-- `dsn_env` names an env var that does not exist at startup or during reload.
-- Any schema, table, or column identifier fails the regex
-  `^[A-Za-z_][A-Za-z0-9_]{0,62}$`.
-- `pool_size > 32`.
-- `max_locations` of 0 or above 1 000 000, or set on the `events` shape.
-- Two collections share a pool tuple `(host, port, db, user, sslmode)` but
-  specify different passwords.
-- `stations.geom_col` is not `geometry(Point, 4326)` (SRID or geometry type
-  mismatch is checked against `geometry_columns`).
-- `time_col` is `timestamp without time zone` but `time_col_tz` is absent.
-- `time_col` is `timestamptz` but `time_col_tz` is set.
-- A `property_cols` entry has an unsupported type (only `text`, `varchar`,
-  integer types, `real`, `double precision`, and `bool` are accepted).
-- The initial `SELECT 1` ping fails past the 2 s deadline at boot.
-
-### Warnings (collection loads, condition logged)
-
-- Role has `INSERT`, `UPDATE`, or `DELETE` privilege on any mapped table
-  (startup `has_table_privilege` check).
-- Role can `SELECT` a column on a mapped table that is not in the mapping
-  (`has_column_privilege` check) — suggests the DSN is broader than needed.
-- `GIST(geom)` on `stations` is missing.
-- Compound `btree (station_fk_col, time_col DESC)` on an observation table is
-  missing.
-- `MC_ALLOW_INLINE_DB_URL=1` is set (inline DSNs are a dev-only escape hatch).
-- A non-loopback DSN has `sslmode` other than `require` — a reminder that
-  credentials are moving in plaintext (TLS enforcement tracked in #110).
-- Two collections on the same pool tuple specify different `pool_size` —
-  **first-caller wins**, subsequent size mismatches logged at INFO.
+EDR engine queries have a **500,000-value budget**, counting NULLs, and station
+areas may select at most 200,000 stations. Long-window or unbounded area
+queries can also hit the 20,000-statement and 10,000-row-per-statement guards;
+single-station queries do not have that row cap. Observation-derived polygon
+selection is limited to 20 million cached-location × vertex tests (rectangles
+are exempt). Budget breaches return HTTP 400 with narrowing guidance. Database
+statement timeouts apply independently.
 
 ## Operations
 
-- **Health:** `/health` reports per-collection `ready | degraded | failed`.
-  A 30 s background `SELECT 1` ping (2 s deadline) flips a loaded collection
-  between `ready` and `degraded` on DB reachability — live, not boot-time-only.
-  A station list cut at `max_locations` is `degraded` too, with the cap in the
-  message (see [Station-list cap](#station-list-cap-max_locations)).
-  `failed` means the collection never finished loading (config/privilege).
-  The ping and the last successful refresh's cut are the authority: a
-  metadata-refresh failure does NOT degrade health; it keeps the previous
-  snapshot and shows in metrics + logs.
-- **Metrics:** Prometheus series under the `postgis_*` prefix, scraped live —
-  gauges `postgis_up{collection}` (1/0), `postgis_pool_{size,max_size,available,waiting}{pool_key}`
-  (`size` = open connections, `max_size` = capacity, `available` = acquirable now),
-  `postgis_metadata_refresh_seconds{collection}` (last refresh duration),
-  `postgis_locations_truncated{collection}` (1 = station list, or a mode-B
-  station registry, cut at `max_locations`); and
-  counters `postgis_{metadata_refreshes,metadata_refresh_failures,pings,ping_failures}_total{collection}`
-  (process-global, delta-tracked so `rate()` works across reloads). Labels are
-  bounded (collection / pool_key are config-time).
-  Per-query histograms (`postgis_query_duration_seconds` / `rows_returned` /
-  `query_errors_total`) are a follow-up — they need recording at the API layer,
-  which calls engines generically through the trait.
-- **Reload:** `POST /admin/collections/reload` re-reads the config and swaps
-  engines atomically via `ArcSwap`. Shared pools carry over by identity across
-  reloads; dropped URLs' pools close naturally.
-- **Row caps:** every emitted SELECT carries a `LIMIT`. Observation queries
-  are bounded by the response budget (500 000 values a request); past it,
-  the request is an HTTP 400 that names the budget and what to narrow. The
-  area prefilter stops at 200 000 stations, a memory guard far above any
-  station network, also a 400 past it: one value a station still makes a
-  coverage a station, which the value budget does not bound. Location
-  lists fetch `max_locations + 1` rows (see
-  [Station-list cap](#station-list-cap-max_locations)).
-- **Area queries** (#1062) read the stations inside the polygon, each
-  station once, on one of two paths, which answer the same coverages in
-  the same order (two edge cases aside: only the fan-out stops at 10 000
-  rows a station, and only set-based drops rows whose `citext`-like
-  station key spells the id differently):
-  - **set-based**, for a `datetime` window of at most 12 hours (an
-    instant, each instant of a `datetime` list, or up to 72 ten-minute
-    steps): one statement per observation
-    table (`long` and `wide` one, `per_parameter` one per parameter) for
-    every station at once, `station_fk = ANY($1)`, rows streamed in
-    station and time order and charged against the budget as they arrive.
-    Every station's values at 06 UTC over a 30 000-station network is
-    one statement per table, not 30 000 round trips;
-  - **per-station fan-out** for longer windows and without `datetime`: one
-    statement per station (per station and parameter for `per_parameter`),
-    at most 16 in flight per pool, each using the `(station_fk_col,
-    time_col)` index, at most 20 000 statements a request and 10 000 rows
-    a statement. A longer window over more stations than that runs
-    set-based instead, so the value budget decides.
+| Setting under `[postgis]` | Default / behavior |
+|---|---|
+| `metadata_refresh_secs` | 300; refreshes cached locations and extents |
+| `pool_size` | Twice CPU parallelism, bounded to 4–16; explicit values 1–32 |
+| `pool_label` | Optional pool metrics label |
+| `max_locations` | 200,000; valid range 1–1,000,000 for station shapes |
 
-  Neither changes the role's `statement_timeout`: a network-wide instant
-  must finish within it, which on a large table needs the
-  `(station_fk_col, time_col DESC)` index recommended above. That index
-  matters most for a long window over more than 20 000 statements' worth
-  of stations: run set-based, its 400 is cheap only when the database
-  stops reading at the statement's `LIMIT`, and without the index it can
-  read every row in the window and hit the timeout, a 500 instead of the
-  400. The 12-hour threshold comes from the database tests, which print
-  both paths' timings on a TimescaleDB hypertable, each path's time to
-  that 400 for a week over 20 000 stations, and the set-based statement's
-  query plan. In CI set-based was faster at every size measured: 18–25×
-  at one instant and 1.75× at 12 hours of 10-minute steps, for 400 to
-  20 000 stations; the week's 400 took 0.9 s set-based and 2.1 s fanned
-  out, its plan an incremental sort that stops at the `LIMIT`.
+A location list exceeding `max_locations` is served partially, with degraded
+health and `postgis_locations_truncated = 1`. A cut registry in combined mode
+can instead leave reporters without labels/properties. Memory follows actual
+stations and their properties: the representative snapshot test stays below
+1 KiB/station, or about 195 MiB at 200,000 stations. Refreshes hold old and new
+snapshots plus database rows; responses need additional memory. Raising the
+inventory cap does not raise query limits.
 
-## References
+A database outage keeps the previous snapshot; an initial outage registers a
+degraded engine with no loaded stations. Database queries wait for successful
+schema validation and metadata publication. `/health` combines a dedicated
+`SELECT 1` probe every 30 seconds (two-second deadline), schema validation and
+station-list truncation. Confirmed schema mismatches block data access and stay
+degraded even when pings succeed. Pending/failed validation is retried on a
+successful ping and on metadata refresh; recovery requires a successful refresh.
+Detailed database diagnostics are logged, while public health errors stay generic.
+Config resolution or pool construction failures leave the collection failed.
+`/metrics` exposes `postgis_*` pool, reachability and refresh metrics, and
+`lightning_strike_cache_*` for event maps.
 
-- Epic: [#99](https://github.com/mrauhala/meteocore/issues/99)
-- This README: [#112](https://github.com/mrauhala/meteocore/issues/112)
-- Workspace guide: `/CLAUDE.md` (architecture rules, config format, admin
-  endpoints)
-
-For nowcast lightning joins, set `[postgis.observations].coverage_bbox` only to a
-CRS84 rectangle over which the network guarantees detection. This is separate
-from `extent_bbox`, which advertises the data's spatial extent. No coverage
-configuration means unknown coverage and null nowcast flash counts. A cell's
-whole labeled footprint and 10 km attribution radius must fit inside the
-coverage rectangle. Use a conservative rectangle for an irregular network;
-polygonal detection footprints are not yet supported. Do not infer coverage
-from the bounding box of recent strikes or from administrative borders.
+`POST /admin/collections/reload` reuses unchanged engines and rebuilds changed
+mappings. Pools are shared by `(host, port, database, user, sslmode)`; the first
+pool's size wins and conflicting passwords are rejected. Changing an
+environment-supplied DSN or password requires a server restart.

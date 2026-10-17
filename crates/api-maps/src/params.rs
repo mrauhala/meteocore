@@ -1090,6 +1090,103 @@ mod tests {
         );
     }
 
+    /// EPSG:3067's inverse ends at the poles and 50° from 27°E (#1113). A
+    /// box wholly past that has no read window: 400, as for an EPSG:3035
+    /// box past the LAEA disk. A box holding a pole reads up to it, and the
+    /// default map of a global collection, whose frame holds both, reads
+    /// the whole area. A box the meridians 50° out cross reads up to them:
+    /// its edges alone stop at 19.25°W and 73.25°E. Its north is PROJ
+    /// 9.8.1's, `cs2cs -d 9 EPSG:3067 EPSG:4326` of (500 000, 9 900 000):
+    /// 89.122 564 865°N. Such a polar box in `bbox-crs` frames a CRS84 map
+    /// up to the pole, and a Web Mercator one is a 400.
+    #[test]
+    fn projected_frames_past_or_around_the_tm_area() {
+        let in_crs = |crs: &str, bbox: &str| MapQueryParams {
+            bbox: Some(bbox.into()),
+            bbox_crs: Some(crs.into()),
+            ..query_with_crs(crs)
+        };
+        for (crs, bbox) in [
+            ("EPSG:3067", "0,21000000,1000000,22000000"),
+            ("EPSG:3067", "0,15000000,1000000,16000000"),
+            ("EPSG:3067", "5000000,6500000,6000000,7000000"),
+            ("EPSG:3035", "20000000,20000000,21000000,21000000"),
+        ] {
+            let Err(MapsError::BadRequest(message)) = view(in_crs(crs, bbox), &NONE) else {
+                panic!("{crs} {bbox}: no 400");
+            };
+            assert_eq!(
+                message, "bbox is outside the valid area of the requested crs",
+                "{crs} {bbox}"
+            );
+        }
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let polar = view(
+            in_crs("EPSG:3067", "-1000000,6000000,2000000,10500000"),
+            &NONE,
+        )
+        .unwrap();
+        let [w, s, e, n] = polar.bbox;
+        assert!(
+            near(w, -23.0) && near(e, 77.0) && n == 90.0,
+            "{:?}",
+            polar.bbox
+        );
+        assert!((52.0..52.2).contains(&s), "{s}");
+        let crossed = view(
+            in_crs("EPSG:3067", "-1000000,6000000,2000000,9900000"),
+            &NONE,
+        )
+        .unwrap();
+        let [w, s, e, n] = crossed.bbox;
+        assert!(
+            near(w, -23.0) && near(e, 77.0) && (n - 89.122_565).abs() < 0.02,
+            "{:?}",
+            crossed.bbox
+        );
+        assert!((52.0..52.2).contains(&s), "{s}");
+        for (bbox_crs, bbox) in [
+            ("EPSG:3067", "-1000000,6000000,2000000,10500000"),
+            ("EPSG:3035", "6000000,3000000,8500000,5500000"),
+        ] {
+            let from = |crs: &str| MapQueryParams {
+                bbox: Some(bbox.into()),
+                bbox_crs: Some(bbox_crs.into()),
+                ..query_with_crs(crs)
+            };
+            let map = view(from("CRS84"), &NONE).unwrap();
+            assert_eq!(
+                map.frame.rect()[3],
+                90.0,
+                "{bbox_crs}: {:?}",
+                map.frame.rect()
+            );
+            let Err(MapsError::BadRequest(message)) = view(from("EPSG:3857"), &NONE) else {
+                panic!("{bbox_crs}: Web Mercator up to the pole");
+            };
+            assert!(message.contains("strictly between -90 and 90"), "{message}");
+        }
+        let global = RasterInfo {
+            spatial_extent: Some([-180.0, -90.0, 180.0, 90.0]),
+            ..info()
+        };
+        let query = MapQueryParams {
+            bbox: None,
+            ..query_with_crs("EPSG:3067")
+        };
+        let default = query
+            .validate(&NONE)
+            .unwrap()
+            .view(&global, "radar")
+            .unwrap();
+        let [w, s, e, n] = default.bbox;
+        assert!(
+            near(w, -23.0) && near(e, 77.0) && s == -90.0 && n == 90.0,
+            "{:?}",
+            default.bbox
+        );
+    }
+
     #[test]
     fn quality_is_parsed_for_webp_and_jpeg() {
         for (f, q) in [

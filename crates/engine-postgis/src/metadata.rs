@@ -35,6 +35,8 @@ pub enum MetadataError {
     Pool(String),
     #[error("database error: {0}")]
     Db(String),
+    #[error("geometry must be a Point with SRID 4326")]
+    GeometryMismatch,
     #[error("row decode error: {0}")]
     Decode(String),
 }
@@ -413,6 +415,7 @@ async fn fetch_station_rows(
 
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
+        check_geometry_row(row)?;
         let id: String = row
             .try_get("id")
             .map_err(|e| MetadataError::Decode(e.to_string()))?;
@@ -495,12 +498,21 @@ async fn fetch_observation_rows(
     Ok(merged.finish())
 }
 
+fn check_geometry_row(row: &Row) -> Result<(), MetadataError> {
+    if crate::validation::geometry_row_valid(row) {
+        Ok(())
+    } else {
+        Err(MetadataError::GeometryMismatch)
+    }
+}
+
 fn derived_row_id(row: &Row) -> Result<String, MetadataError> {
     row.try_get("id")
         .map_err(|e| MetadataError::Decode(e.to_string()))
 }
 
 fn derived_row_lat_lon(row: &Row) -> Result<(f64, f64), MetadataError> {
+    check_geometry_row(row)?;
     let decode = |col: &str| -> Result<f64, MetadataError> {
         row.try_get(col)
             .map_err(|e| MetadataError::Decode(e.to_string()))

@@ -269,9 +269,12 @@ pub enum FrameError {
     /// The box's edge samples all miss a projection's valid area
     /// (`geo::wgs84_envelope` is `None`): the box lies wholly outside it, or
     /// the area lies inside the box, as in an EPSG:3035 box wider than the
-    /// LAEA disk. Not every box wholly outside gets here: past Transverse
-    /// Mercator's strip the inverse is finite, and such a frame renders
-    /// empty through `get_raster_tile_in_domain` (#1089).
+    /// LAEA disk. Both projected CRSs' inverses are `None` past their area,
+    /// EPSG:3067's past a pole or 50° from its meridian (#1113), so no box
+    /// wholly outside has an envelope, here or in [`Frame::render_target`],
+    /// and Maps answers 400 for it. Every EPSG:3067 box that meets the area
+    /// has one, a box around the whole area too: its poles and the
+    /// meridians 50° out bound it (`geo::area_edge_points`).
     OutsideDomain,
 }
 

@@ -688,16 +688,16 @@ fn parse_bbox(bbox_str: &str, crs: &str) -> Result<([f64; 4], OutputCrs), WmsErr
             // Wholly outside the projection's valid area: WMS 1.3.0 §7.3.3.6
             // empty content (#1089). `OutputCrs::domain_rows` is `None` for
             // this frame, so GetMap serves the empty image without reading
-            // the engine. Asked before the envelope, which is finite but
-            // meaningless past TM's strip.
+            // the engine. Asked before the envelope, which such a box has
+            // none of.
             let wgs84 = if ds_core::geo::outside_projection_domain(&proj_crs, proj_bbox) {
                 NO_READ_WINDOW
             } else {
                 // `None`: every edge sample misses the valid area, which
-                // reaches into the box: an EPSG:3035 box wider than the LAEA
-                // disk, or a tall one whose edges cross it between samples.
-                // The edges give no read window, and a global one would read
-                // whole datasets: reject.
+                // reaches into the box: a box wider than the LAEA disk, or a
+                // tall or wide one whose edges cross the area between
+                // samples. The edges give no read window, and a global one
+                // would read whole datasets: reject.
                 ds_core::geo::wgs84_envelope(&proj_crs, proj_bbox).ok_or_else(|| {
                     WmsError::invalid_parameter(&format!(
                         "BBOX edges miss the valid area of {crs} inside the box: request a \
@@ -912,14 +912,16 @@ mod tests {
 
     /// A projected box wholly outside its projection keeps its metres in the
     /// output CRS, and its read window names no place: NaN, never a real
-    /// position such as 0°, 0°, nor the meaningless envelope TM's inverse
-    /// gives past its strip (#1089).
+    /// position such as 0°, 0° (#1089). EPSG:3067's lie past a pole, and
+    /// past 50° east of its meridian, where its inverse once gave places
+    /// anywhere (#1113).
     #[test]
     fn projected_bbox_wholly_outside_has_no_read_window() {
         for (crs, metres) in [
             ("EPSG:3035", [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
             ("EPSG:3067", [0.0, 2.1e7, 1.0e6, 2.2e7]),
             ("EPSG:3067", [0.0, -2.2e7, 1.0e6, -2.1e7]),
+            ("EPSG:3067", [5.0e6, 6.5e6, 6.0e6, 7.0e6]),
         ] {
             let bbox = metres.map(|v| v.to_string()).join(",");
             let (read, output) = parse_bbox(&bbox, crs).unwrap();

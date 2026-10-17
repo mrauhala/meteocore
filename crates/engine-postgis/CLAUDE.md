@@ -82,6 +82,59 @@ Derivation rules (hard-won from production timeouts):
   each load so rebuilt collections on the same DSN join them — DSN sharing
   is a standing invariant, not load-time-only.
 
+## Advisory privilege audit
+
+`privileges.rs` inspects the effective pool connection role and all mapped
+relations once per engine build. Use PostgreSQL's privilege functions for
+inherited/owner/table/column grants; never probe a write or warn on extra SELECT
+columns. The read-only transaction has a two-second deadline including pool
+acquisition, preserves stricter role timeouts and restores session settings.
+Discard unfinished connections on timeout/error/cancellation.
+
+A failed audit logs unchecked once and retries on refresh or a reachable ping;
+it never changes metadata, readiness or public API errors. Successful audits
+skip subsequent I/O. Warnings are deduplicated by role/relation/privileges within
+the shared pool, including across incremental reloads, but rebuilt engines
+inspect permissions afresh. The weak registry must not retain dead pools.
+
+## Advisory index audit
+
+`indexes.rs` follows the privilege audit lifecycle independently; both run
+concurrently, each bounded to two seconds. `catalog.rs` shares their read-only
+transaction, stricter-timeout preservation and connection-discard rules. Never
+scan source data, run EXPLAIN, or execute suggested DDL in these audits.
+
+Derive access paths from resolved mappings: station/time on every observation
+table (including per-parameter overrides), event time/geometry, and station
+geometry/geography only in stations-only mode. B-tree key prefixes accept either
+sort direction and long-shape parameter equality keys; INCLUDE is not a key.
+Inspect validity and spatial operator-family support. Partial/expression keys,
+custom operator classes/collations and alternative methods are inconclusive,
+not proof that an index is missing. Views are not traced; materialized views
+are direct relations. Accept valid logical parent indexes; do not infer missing
+partition/chunk indexes from a parent's storage or absent matching parent index.
+Bound catalog rows too (4096 index keys per relation). Deduplicate by pool,
+relation, mapped access path and finding; rebuilt engines inspect afresh.
+
+## Database schema validation
+
+`validation.rs` checks every resolved timestamp and used geometry mapping on
+initial/periodic metadata refresh, using a dedicated connection and a five-second
+collection deadline. Preserve stricter role statement timeouts. Timestamp types
+and `time_col_tz` must agree; PostgreSQL validates zone names. Never require a UTC
+session. Catalog typmods reject known incompatible geometry; generic views use a
+128-row sample (limit before filtering) and a boolean appended LAST to every
+geometry-producing query. Check that boolean before using coordinates, including
+EDR, metadata, EventSource and map-cache fill paths. No request-time catalogs.
+
+The engine's pending/valid/invalid schema state is separate from ping reachability.
+Only successful validation AND metadata publication permits live DB queries;
+confirmed mismatches also block cached location/feature access. Initial empty
+config-seeded metadata remains available. Ping success retries pending/invalid
+validation but cannot itself clear it. Transient failures preserve previously
+validated snapshots. Keep server live-health mapping and database recovery tests
+in step when changing this lifecycle.
+
 ## Station-list cap (`[postgis] max_locations`, #1061)
 
 - One cap for every station shape: default
@@ -291,3 +344,8 @@ Derivation rules (hard-won from production timeouts):
   20 000 stations, and that set-based statement's `EXPLAIN ANALYZE`. It
   never fails on a number; without TimescaleDB it prints that it skipped.
   Run with `-- --nocapture --test-threads=1`.
+
+- Advisory audit tests in `tests/support/{privileges,indexes}.rs` share read-only
+  role fixtures and capture lifecycle diagnostics. They use a disposable DB,
+  run serially, and restore temporarily revoked catalog privileges even after
+  assertion failures. Keep the shared pool-wait test covering both audits.
