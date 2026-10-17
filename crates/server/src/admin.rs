@@ -546,6 +546,36 @@ static GEOTIFF_DECODE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
     )
 });
 
+// NetCDF decoded-field cache and field-read admission (#1067), process-global
+// like the GeoTIFF ones.
+static NETCDF_FIELD_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "netcdf_field_cache",
+        "NetCDF decoded-field cache",
+        None,
+        Some("field reads"),
+        false,
+    )
+});
+static NETCDF_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "netcdf_read_reserved_bytes",
+        "Reserved transient NetCDF field-read memory",
+    )
+});
+static NETCDF_READ_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "netcdf_read_capacity_bytes",
+        "Transient NetCDF field-read memory capacity",
+    )
+});
+static NETCDF_READ_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "netcdf_read_rejected_total",
+        "NetCDF field reads rejected by memory admission",
+    )
+});
+
 // Lightning strike-window cache (#504) — process-global, byte-bounded LRU of
 // decoded event windows for the events-shape map layer, so the ~50-190
 // meta-tile renders tiling one frame share ONE DB fetch.
@@ -1498,6 +1528,10 @@ pub struct ServerState {
     pub grib_engines: RwLock<Vec<Arc<engine_grib::GribEngine>>>,
     pub zarr_engines: RwLock<Vec<Arc<engine_zarr::ZarrEngine>>>,
     pub satellite_engines: RwLock<Vec<Arc<engine_satellite::SatelliteEngine>>>,
+    pub netcdf_engines: RwLock<Vec<Arc<engine_netcdf::NetcdfEngine>>>,
+    /// The parameters each NetCDF collection's layer styles were resolved
+    /// for ([`LoadResult::netcdf_parameters`]).
+    pub netcdf_parameters: RwLock<NetcdfParameters>,
     pub odim_engines: RwLock<Vec<Arc<engine_odim::OdimEngine>>>,
     pub odim_volume_engines: RwLock<Vec<Arc<engine_odim::PolarVolumeEngine>>>,
     pub cap_engines: RwLock<Vec<Arc<engine_cap::CapEngine>>>,
@@ -1553,6 +1587,13 @@ pub struct LoadResult {
     pub grib_engines: Vec<Arc<engine_grib::GribEngine>>,
     pub zarr_engines: Vec<Arc<engine_zarr::ZarrEngine>>,
     pub satellite_engines: Vec<Arc<engine_satellite::SatelliteEngine>>,
+    pub netcdf_engines: Vec<Arc<engine_netcdf::NetcdfEngine>>,
+    /// The parameters each NetCDF collection's layer styles were resolved
+    /// for, by collection id. Its layers come from its files, which only
+    /// the poll reads, so a fresh engine has none at load; the recovery loop
+    /// registers the collection again once they differ
+    /// ([`netcdf_registration_changed`]).
+    pub netcdf_parameters: NetcdfParameters,
     pub odim_engines: Vec<Arc<engine_odim::OdimEngine>>,
     pub odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>>,
     pub cap_engines: Vec<Arc<engine_cap::CapEngine>>,
@@ -1570,6 +1611,9 @@ pub struct LoadResult {
 
 /// Derived-wind wrappers by configured collection id, then registered id.
 pub type WindHandles = HashMap<String, HashMap<String, Arc<ds_core::wind::DerivedWind>>>;
+
+/// Parameters by NetCDF collection id ([`LoadResult::netcdf_parameters`]).
+pub type NetcdfParameters = HashMap<String, Vec<ds_core::map_engine::ParameterInfo>>;
 
 impl LoadResult {
     /// Staging a load must not mutate live engines: call only after the reload
@@ -1610,6 +1654,7 @@ pub enum EngineHandle {
     Grib(Arc<engine_grib::GribEngine>),
     Zarr(Arc<engine_zarr::ZarrEngine>),
     Satellite(Arc<engine_satellite::SatelliteEngine>),
+    Netcdf(Arc<engine_netcdf::NetcdfEngine>),
     Odim(Arc<engine_odim::OdimEngine>),
     OdimVolume(Arc<engine_odim::PolarVolumeEngine>),
     Cap(Arc<engine_cap::CapEngine>),
@@ -1641,6 +1686,7 @@ impl EngineHandle {
             | Self::Grib(_)
             | Self::Zarr(_)
             | Self::Satellite(_)
+            | Self::Netcdf(_)
             | Self::Odim(_) => None,
         }
     }
@@ -1681,6 +1727,7 @@ impl EngineReuse {
     reuse_take!(take_grib, Grib, engine_grib::GribEngine);
     reuse_take!(take_zarr, Zarr, engine_zarr::ZarrEngine);
     reuse_take!(take_satellite, Satellite, engine_satellite::SatelliteEngine);
+    reuse_take!(take_netcdf, Netcdf, engine_netcdf::NetcdfEngine);
     reuse_take!(take_odim, Odim, engine_odim::OdimEngine);
     reuse_take!(take_odim_volume, OdimVolume, engine_odim::PolarVolumeEngine);
     reuse_take!(take_cap, Cap, engine_cap::CapEngine);
@@ -1926,6 +1973,8 @@ pub fn load_collections(
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
     let mut zarr_engines: Vec<Arc<engine_zarr::ZarrEngine>> = Vec::new();
     let mut satellite_engines: Vec<Arc<engine_satellite::SatelliteEngine>> = Vec::new();
+    let mut netcdf_engines: Vec<Arc<engine_netcdf::NetcdfEngine>> = Vec::new();
+    let mut netcdf_parameters: NetcdfParameters = HashMap::new();
     let mut odim_engines: Vec<Arc<engine_odim::OdimEngine>> = Vec::new();
     let mut odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>> = Vec::new();
     let mut cap_engines: Vec<Arc<engine_cap::CapEngine>> = Vec::new();
@@ -1984,6 +2033,8 @@ pub fn load_collections(
             "grib" => &["edr", "wms", "maps", "tiles"],
             "zarr" => &["edr", "wms", "maps", "tiles"],
             "satellite" => &["edr", "wms", "maps", "tiles"],
+            // EDR and GetFeatureInfo come with its position queries (#1067).
+            "netcdf" => &["wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
@@ -2905,6 +2956,110 @@ pub fn load_collections(
                 health.push(CollectionHealth {
                     id: collection.id.clone(),
                     engine_type: "satellite".into(),
+                    status,
+                    error,
+                });
+            }
+            "netcdf" => {
+                let netcdf_config = match collection.netcdf.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'netcdf' but missing [collections.netcdf] config, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "netcdf".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing [collections.netcdf] config".into()),
+                        });
+                        continue;
+                    }
+                };
+
+                let engine = match engine_reuse.take_netcdf(&collection.id) {
+                    Some(e) => {
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
+                        );
+                        e
+                    }
+                    None => match engine_netcdf::NetcdfEngine::new(&collection.id, netcdf_config) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to initialize NetCDF engine: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "netcdf".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
+                };
+                engines_by_id.insert(collection.id.clone(), EngineHandle::Netcdf(engine.clone()));
+                netcdf_engines.push(engine.clone());
+
+                // One WMS/Maps/Tiles layer per variable. The layers come from
+                // the files, so a fresh engine has none until the immediate
+                // first tick of its poll loop; the recovery loop then
+                // registers the collection again with their styles.
+                let map_engine = engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>;
+                let raster_params = map_engine.raster_info().parameters;
+                netcdf_parameters.insert(collection.id.clone(), raster_params.clone());
+                if collection.apis.contains(&"wms".to_string()) {
+                    map_engines.insert(collection.id.clone(), map_engine.clone());
+                    map_collections.insert(collection.id.clone(), collection.clone());
+                    map_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to WMS API", collection.id);
+                }
+                if collection.apis.contains(&"maps".to_string()) {
+                    maps_engines.insert(collection.id.clone(), map_engine.clone());
+                    maps_collections.insert(collection.id.clone(), collection.clone());
+                    maps_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to Maps API", collection.id);
+                }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_engines.insert(collection.id.clone(), map_engine.clone());
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    tiles_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to Tiles API", collection.id);
+                }
+
+                // Live status comes from `/health` (`live_health`).
+                let (status, error) = match engine.live_health() {
+                    Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
+                    Some(live) => (CollectionStatus::Degraded, live.degraded_reason()),
+                    None => (CollectionStatus::Degraded, None),
+                };
+                health.push(CollectionHealth {
+                    id: collection.id.clone(),
+                    engine_type: "netcdf".into(),
                     status,
                     error,
                 });
@@ -4217,6 +4372,8 @@ pub fn load_collections(
         grib_engines,
         zarr_engines,
         satellite_engines,
+        netcdf_engines,
+        netcdf_parameters,
         odim_engines,
         odim_volume_engines,
         cap_engines,
@@ -4888,6 +5045,7 @@ pub(crate) fn recover_radar_once(state: &AdminState) -> Result<RecoveryOutcome, 
         &inputs.collections,
         &state.health.read().unwrap_or_else(|e| e.into_inner()),
     ) && !grib_registration_changed(state, &inputs.collections)
+        && !netcdf_registration_changed(state)
     {
         return Ok(RecoveryOutcome::Idle);
     }
@@ -4926,6 +5084,29 @@ fn grib_registration_changed(state: &AdminState, collections: &[CollectionConfig
             .filter(|id| health.iter().any(|h| &h.id == id))
             .collect();
         expected != actual
+    })
+}
+
+/// Polls read a NetCDF collection's variables from its files (#1067): once
+/// they differ from the parameters its layer styles were resolved for (a
+/// fresh engine has none at load), the collection is registered again with
+/// the accepted config, as GRIB level families are.
+fn netcdf_registration_changed(state: &AdminState) -> bool {
+    let engines = state
+        .netcdf_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let registered = state
+        .netcdf_parameters
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    engines.iter().any(|engine| {
+        registered
+            .get(engine.collection_id())
+            .is_some_and(|params| {
+                use ds_core::map_engine::MapEngine;
+                *params != engine.raster_info_shared().parameters
+            })
     })
 }
 
@@ -5145,6 +5326,7 @@ fn apply_load(
     rotate_poll_loops!(grib_engines);
     rotate_poll_loops!(zarr_engines);
     rotate_poll_loops!(satellite_engines);
+    rotate_poll_loops!(netcdf_engines);
     rotate_poll_loops!(odim_engines);
     rotate_poll_loops!(odim_volume_engines);
     rotate_poll_loops!(cap_engines);
@@ -5217,10 +5399,27 @@ fn apply_load(
     // sweep and its completion — the same narrow window the previous
     // drop-everything behavior had; closing it would need config-versioned
     // cache keys.)
+    // A reused NetCDF collection whose layers changed (its first poll found
+    // its variables) has new styles: its tiles drawn before are stale too.
+    let restyled: Vec<String> = {
+        let mut registered = state
+            .netcdf_parameters
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let restyled = result
+            .netcdf_parameters
+            .iter()
+            .filter(|(id, params)| registered.get(*id).is_some_and(|old| old != *params))
+            .map(|(id, _)| id.clone())
+            .collect();
+        *registered = std::mem::take(&mut result.netcdf_parameters);
+        restyled
+    };
     let stale: Vec<&str> = old_collections
         .keys()
         .filter(|id| !reusable.contains(id.as_str()))
         .map(String::as_str)
+        .chain(restyled.iter().map(String::as_str))
         .collect();
     // Batch form: `retain` visits every cache entry, so one combined pass
     // per cache instead of one pass per stale collection.
@@ -5229,7 +5428,7 @@ fn apply_load(
     vector_cache.evict_collections(&stale);
     if !stale.is_empty() {
         info!(
-            "Evicted cached tiles for {} rebuilt/removed collection(s)",
+            "Evicted cached tiles for {} rebuilt, removed or restyled collection(s)",
             stale.len()
         );
     }
@@ -5288,6 +5487,10 @@ fn apply_load(
         .satellite_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.satellite_engines;
+    *state
+        .netcdf_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.netcdf_engines;
     *state
         .odim_engines
         .write()
@@ -5412,8 +5615,21 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
                 live.insert(e.collection_id().to_string(), s);
             }
         }
+        for e in state
+            .netcdf_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if let Some(s) = e.live_health() {
+                live.insert(e.collection_id().to_string(), s);
+            }
+        }
         for h in health.iter_mut().filter(|h| {
-            h.engine_type == "cap" || h.engine_type == "bufr" || h.engine_type == "satellite"
+            matches!(
+                h.engine_type.as_str(),
+                "cap" | "bufr" | "satellite" | "netcdf"
+            )
         }) {
             match live.get(h.id.as_str()) {
                 Some(ds_core::health::LiveStatus::Ready) => {
@@ -5510,6 +5726,8 @@ pub(crate) fn refresh_health_gauges(state: &ServerState) -> HealthCounts {
 /// - QueryData: the newest run's origin (reference) time.
 /// - BUFR: the newest report held.
 /// - Satellite: the newest scan start.
+/// - NetCDF: the newest run's reference time, or the newest valid time of
+///   files without runs.
 /// - Nowcast: the latest generation's anchor frame.
 ///
 /// Other engines, and one with no data yet, are absent. An age is negative
@@ -5550,6 +5768,14 @@ pub(crate) fn collection_data_ages(state: &ServerState) -> Vec<(String, i64)> {
     }
     for e in state
         .satellite_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.data_age());
+    }
+    for e in state
+        .netcdf_engines
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
@@ -5707,6 +5933,18 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     {
         let engines = state
             .satellite_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
+            if let Some(temporal) = temporal_from_times(&engine.times()) {
+                temporal_info.insert(id, temporal);
+            }
+        }
+    }
+    {
+        let engines = state
+            .netcdf_engines
             .read()
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
@@ -5901,6 +6139,18 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         GEOTIFF_DECODE_REJECTED.feed(rejected);
         GEOTIFF_DECODED_CHUNK_CACHE_METRICS
             .update(engine_geotiff::decoded_chunk_cache_metrics(), None);
+    }
+    let has_netcdf = !state
+        .netcdf_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty();
+    if has_netcdf {
+        let (used, limit, rejected) = engine_netcdf::decode_budget::metrics();
+        NETCDF_READ_USED.set(used.min(i64::MAX as u64) as i64);
+        NETCDF_READ_LIMIT.set(limit.min(i64::MAX as u64) as i64);
+        NETCDF_READ_REJECTED.feed(rejected);
+        NETCDF_FIELD_CACHE_METRICS.update(engine_netcdf::field_cache_metrics(), None);
     }
     let satellite_engines = state
         .satellite_engines
@@ -6733,6 +6983,7 @@ mod tests {
             postgis: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             nowcast: source.map(|s| ds_core::config::NowcastConfig {
                 source: s.to_string(),
                 horizon: "PT1H".to_string(),
@@ -7725,6 +7976,53 @@ mod tests {
         drop(second);
         drop(live);
         assert_eq!(rebuilt.frame_window(), held);
+    }
+
+    /// A NetCDF collection serves WMS, Maps and Tiles only until its EDR
+    /// lands; a reload keeping its config keeps its engine and open files,
+    /// a changed config builds a new one.
+    #[test]
+    fn netcdf_is_a_map_engine_reused_across_reloads() {
+        let meps = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/meps-netcdf")
+            .to_string_lossy()
+            .into_owned();
+        let mut collection = nowcast_test_collection("meps-reload", "netcdf", None);
+        collection.apis = vec!["wms".into(), "maps".into(), "tiles".into()];
+        collection.netcdf = Some(
+            toml::from_str(&format!(
+                "data_path = {meps:?}\nvariables = [\"air_temperature_2m\"]"
+            ))
+            .unwrap(),
+        );
+        let mut with_edr = collection.clone();
+        with_edr.id = "meps-edr".into();
+        with_edr.apis = vec!["edr".into(), "wms".into()];
+        let configs = vec![collection, with_edr];
+        let first = load_with_reuse(&configs, super::EngineReuse::default());
+        assert_eq!(first.netcdf_engines.len(), 1, "EDR is not served yet");
+        let failed = first.health.iter().find(|h| h.id == "meps-edr").unwrap();
+        assert_eq!(failed.status, super::CollectionStatus::Failed);
+        assert!(first.wms_state.engines.contains_key("meps-reload"));
+        assert!(first.maps_state.engines.contains_key("meps-reload"));
+        assert!(first.tiles_state.map_engines.contains_key("meps-reload"));
+        let live = first.netcdf_engines[0].clone();
+        live.poll_once();
+        assert_eq!(live.times().len(), 6);
+
+        let second = load_with_reuse(
+            &configs,
+            reuse_pool(&configs, &configs, &first.engines_by_id),
+        );
+        assert!(Arc::ptr_eq(&live, &second.netcdf_engines[0]));
+
+        let mut changed = configs.clone();
+        changed[0].title = "renamed".to_string();
+        let third = load_with_reuse(
+            &changed,
+            reuse_pool(&configs, &changed, &second.engines_by_id),
+        );
+        assert!(!Arc::ptr_eq(&live, &third.netcdf_engines[0]));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

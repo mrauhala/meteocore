@@ -278,24 +278,35 @@ pub struct RegularAxis {
 
 impl RegularAxis {
     /// The axis that coordinate variable `name`'s `values` (CF packing
-    /// applied) describe. The step is the mean spacing end to end, and
-    /// every value must lie within a thousandth of a step of
-    /// `first + i * step`. Fewer than two values, a zero step or an
-    /// irregular axis is an error.
+    /// applied) describe. The origin and step come from the first and last
+    /// values and the count, never from adjacent differences, and every
+    /// value must lie within the larger of a thousandth of a step and the
+    /// f32 allowance of `first + i * step`. Fewer than two values, a zero
+    /// step or an irregular axis is an error.
+    ///
+    /// Float32 coordinates (MEPS's x/y) are rounded to f32 and can carry
+    /// their producer's arithmetic too: x[100] is −810084.06, not −810084.
+    /// The allowance is two f32 epsilons of the axis's magnitude, about
+    /// 0.3 m at 1.3e6 m and 4e-5° at 180°, capped at a tenth of a step. A
+    /// thousandth of a step alone covers MEPS's 2500 m, but not a 0.01° f32
+    /// longitude near ±180, whose ulp is 1.5e-5°.
     pub fn from_values(name: &str, values: &[f64], units: &str) -> Result<Self, String> {
         let len =
             u32::try_from(values.len()).map_err(|_| format!("coordinate '{name}' is too long"))?;
         if len < 2 {
             return Err(format!("coordinate '{name}' has fewer than two values"));
         }
-        let first = values[0];
-        let step = (values[values.len() - 1] - first) / f64::from(len - 1);
+        let (first, last) = (values[0], values[values.len() - 1]);
+        let step = (last - first) / f64::from(len - 1);
+        let f32_noise =
+            (2.0 * f64::from(f32::EPSILON) * first.abs().max(last.abs())).min(step.abs() * 0.1);
+        let tolerance = (step.abs() * 1e-3).max(f32_noise);
         let regular = step != 0.0
             && step.is_finite()
             && values
                 .iter()
                 .enumerate()
-                .all(|(i, v)| (v - (first + i as f64 * step)).abs() <= step.abs() * 1e-3);
+                .all(|(i, v)| (v - (first + i as f64 * step)).abs() <= tolerance);
         if !regular {
             return Err(format!("coordinate '{name}' is not a regular axis"));
         }
@@ -865,5 +876,78 @@ mod tests {
                 "{values:?}"
             );
         }
+    }
+
+    /// A Float32 axis on the lattice `first + i * step`: each value rounded
+    /// to f32, then the `down` ones an ulp below that and every other odd
+    /// one an ulp above, as a producer's own f32 arithmetic leaves them.
+    fn f32_axis(first: f64, step: f64, len: u32, down: &[u32]) -> Vec<f64> {
+        (0..len)
+            .map(|i| {
+                let value = (first + f64::from(i) * step) as f32;
+                let value = if down.contains(&i) {
+                    value.next_down()
+                } else if i % 2 == 1 {
+                    value.next_up()
+                } else {
+                    value
+                };
+                f64::from(value)
+            })
+            .collect()
+    }
+
+    /// MEPS's x/y are Float32, and the file shows them so at every 100th
+    /// index. The axes are regular, and the origin and step come from the
+    /// first and last values and the count.
+    #[test]
+    fn meps_f32_axes_are_regular() {
+        let down: Vec<u32> = (1..=8).map(|k| k * 100).collect();
+        let x = f32_axis(-1060084.0, 2500.0, 949, &down);
+        let y = f32_axis(-1332517.9, 2500.0, 1069, &[500]);
+        for (axis, i, file) in [
+            (&x, 0, -1060084.0_f32),
+            (&x, 100, -810084.06),
+            (&x, 200, -560084.06),
+            (&x, 900, 1189916.0),
+            (&y, 0, -1332517.9),
+            (&y, 100, -1082517.9),
+            (&y, 500, -82517.91),
+            (&y, 600, 167482.1),
+        ] {
+            assert_eq!(axis[i], f64::from(file), "index {i}");
+        }
+        let x_axis = RegularAxis::from_values("x", &x, "m").unwrap();
+        let y_axis = RegularAxis::from_values("y", &y, "m").unwrap();
+        assert!((x_axis.step - 2500.0).abs() < 1e-3, "{x_axis:?}");
+        assert!((y_axis.step - 2500.0).abs() < 1e-3, "{y_axis:?}");
+        let grid = grid(meps_crs(), &x_axis, &y_axis).unwrap();
+        assert!(grid.flipped);
+        let gt = &grid.transform;
+        assert!((gt.origin_x - (-1060084.0 - 1250.0)).abs() < 0.2, "{gt:?}");
+        assert!((gt.origin_y - (1337482.1 + 1250.0)).abs() < 0.2, "{gt:?}");
+        // Every 100th value, as a strided subset reads them: a 250 km step.
+        let every_100th = |values: &[f64]| values.iter().step_by(100).copied().collect::<Vec<_>>();
+        for values in [every_100th(&x), every_100th(&y)] {
+            let axis = RegularAxis::from_values("subset", &values, "m").unwrap();
+            assert!((axis.step - 250000.0).abs() < 1e-3, "{axis:?}");
+        }
+        // A 3 m step out of line is irregular, f32 or not.
+        let mut glitch = x.clone();
+        glitch[474] += 3.0;
+        assert!(RegularAxis::from_values("x", &glitch, "m").is_err());
+    }
+
+    /// Near ±180° an f32 ulp is 1.5e-5°, so one ulp of noise on a 0.01°
+    /// longitude is past a thousandth of its step: the f32 allowance keeps
+    /// the axis regular, and a real misplacement is still rejected.
+    #[test]
+    fn a_fine_f32_axis_near_the_antimeridian_is_regular() {
+        let lon = f32_axis(-179.995, 0.01, 36_000, &[]);
+        let axis = RegularAxis::from_values("lon", &lon, "degrees_east").unwrap();
+        assert!((axis.step - 0.01).abs() < 1e-8, "{axis:?}");
+        let mut glitch = lon.clone();
+        glitch[18_000] += 0.001;
+        assert!(RegularAxis::from_values("lon", &glitch, "degrees_east").is_err());
     }
 }

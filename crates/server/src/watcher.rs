@@ -424,6 +424,8 @@ pub(crate) mod tests {
             grib_engines: RwLock::new(result.grib_engines),
             zarr_engines: RwLock::new(result.zarr_engines),
             satellite_engines: RwLock::new(result.satellite_engines),
+            netcdf_engines: RwLock::new(result.netcdf_engines),
+            netcdf_parameters: RwLock::new(result.netcdf_parameters),
             odim_engines: RwLock::new(result.odim_engines),
             odim_volume_engines: RwLock::new(result.odim_volume_engines),
             cap_engines: RwLock::new(result.cap_engines),
@@ -445,6 +447,105 @@ pub(crate) mod tests {
             engine_handles: RwLock::new(result.engines_by_id),
             wind_handles: RwLock::new(result.wind_by_id),
         })
+    }
+
+    /// A NetCDF collection's layers come from its files (#1067): loaded
+    /// over an empty directory it has none. Once a poll reads the first
+    /// files, the recovery loop registers it again with each layer's style
+    /// (the one configured by name, or the default its unit selects),
+    /// keeping the engine and dropping the tiles drawn meanwhile.
+    #[test]
+    fn netcdf_recovery_registers_layer_styles_once_variables_are_found() {
+        use crate::admin::{recover_radar_once, RecoveryOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/meps-netcdf");
+        let meps = dir.path().join("meps");
+        fs::create_dir(&meps).unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 0
+
+[[collections]]
+id = "meps"
+title = "MEPS"
+description = "test"
+engine_type = "netcdf"
+apis = ["wms", "maps", "tiles"]
+[collections.netcdf]
+data_path = {meps:?}
+variables = ["air_temperature_2m", "air_pressure_at_sea_level"]
+[collections.wms]
+colormap = "temperature"
+[[collections.wms.parameters]]
+name = "air_pressure_at_sea_level"
+colormap = "pressure"
+min = 95000.0
+max = 105000.0
+"#,
+                meps = meps.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let state = build_state(&config_path);
+        let style = |state: &AdminState, layer: &str| {
+            let wms = state.wms.load();
+            let style = wms.styles.get(layer)?.get("default")?;
+            Some((style.palette.name.clone(), style.max))
+        };
+        let (pressure, t2m) = ("meps/air_pressure_at_sea_level", "meps/air_temperature_2m");
+        assert_eq!(style(&state, t2m), None);
+        assert_eq!(recover_radar_once(&state).unwrap(), RecoveryOutcome::Idle);
+
+        let name = "meps_sfc_00_20261015T06Z.nc";
+        fs::copy(fixtures.join(name), meps.join(name)).unwrap();
+        let engine = state.netcdf_engines.read().unwrap()[0].clone();
+        engine.poll_once();
+        // Drawn before the layer had its style.
+        let cache = state.wms.load().rendered_cache.clone();
+        let key = ds_render::CacheKey {
+            layer: t2m.into(),
+            style: "default".into(),
+            format: ds_render::ImageFormat::Png,
+            crs: "EPSG:4326".into(),
+            bbox: [0, 0, 1, 1],
+            width: 1,
+            height: 1,
+            time: None,
+            parameter: None,
+            z: None,
+            reference_time: None,
+            content_version: 1,
+            background: None,
+        };
+        cache.insert(
+            key.clone(),
+            ds_render::CachedRendered::new(axum::body::Bytes::from_static(b"stale")),
+        );
+        assert!(cache.get(&key).is_some());
+        assert_eq!(
+            recover_radar_once(&state).unwrap(),
+            RecoveryOutcome::Recovered
+        );
+        assert_eq!(style(&state, pressure).unwrap().0, "pressure");
+        // The kelvin temperature default, which the file's unit selects.
+        assert_eq!(
+            style(&state, t2m),
+            Some(("temperature".to_string(), 323.15))
+        );
+        assert!(Arc::ptr_eq(
+            &engine,
+            &state.netcdf_engines.read().unwrap()[0]
+        ));
+        assert!(
+            cache.get(&key).is_none(),
+            "tiles of the old styles are dropped"
+        );
+        assert_eq!(recover_radar_once(&state).unwrap(), RecoveryOutcome::Idle);
     }
 
     /// Reuse the loader/registry test harness for the automatic recovery path:

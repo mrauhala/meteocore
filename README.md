@@ -29,6 +29,7 @@ Each engine implements one or more of the core traits.
 | `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
 | `engine-zarr` | `EdrEngine` + `MapEngine` | Zarr V2/V3 multidimensional arrays with CF metadata (local, S3, HTTP); optional Icechunk repositories |
 | `engine-satellite` | `EdrEngine` + `MapEngine` | Geostationary satellite imagery: GOES-R ABI NetCDF-4 scans, Himawari-9 AHI ISatSS tiles and NOAA's hourly GMGSI global mosaic (NOAA open data on AWS, or a local mirror), one parameter per band/product, each with its own time axis |
+| `engine-netcdf` | `MapEngine` | CF-NetCDF gridded forecasts and analyses (MET Norway MEPS per-lead files first) from a local directory: one layer per variable, model runs from `forecast_reference_time` |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
 
 ### OGC API Plugins
@@ -198,6 +199,8 @@ not re-scan the auto roots.
 | `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` | `512` | GeoTIFF decoded-chunk cache for local and remote sources, in MB. `0` disables. |
 | `MC_SATELLITE_FRAME_CACHE_MB` | `1024` | Satellite scans held in memory (the compressed NetCDF file plus its overview, ~30 MB per 2 km full disk), in MB, shared by every satellite collection. Size it above the scans in the `time_window` of **all** satellite collections together (see [Satellite](#satellite)). While they fit, a poll downloads back any in-window scan evicted here; when they do not, it logs a WARN with the sizes and requests download the missing scans themselves. |
 | `MC_SATELLITE_STRIP_CACHE_MB` | `256` | Satellite decoded blocks (GOES-R: strips of 24 full-width rows, ~260 KB each at 2 km; GMGSI: 793 × 1322 chunks, ~2 MB each), in MB. |
+| `MC_NETCDF_FIELD_CACHE_MB` | `256` | NetCDF decoded fields (`f32`, ~4 MB per MEPS field), in MB, shared by every NetCDF collection. Concurrent renders of one field decode it once. `0` disables retention. |
+| `MC_NETCDF_READ_MEMORY_MB` | `1024` | Process-wide admission budget for NetCDF field reads in progress, in MiB: a cold field read reserves three times its decoded chunk plus three times its compressed chunk (~24 MB for MEPS); cache hits and readers waiting for another's read reserve nothing. A read that does not fit fails at once with 503. Restart to change. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool, across all renders. A projected WMS view (EPSG:3857/3067/3035) renders one meta-tile at a time with only a few fetches in flight, so raising this does not shorten its first view; a whole-viewport render (WMS EPSG:4326, a Maps image) fetches all its missing tiles at once and does wait on the pool. Raise it (e.g. 32–64) when cold renders queue on a high-latency object store. Value must be ≥ 1. |
 | `MC_COG_PREWARM_MB` | `32` | Per-frame cap, in MiB of encoded tiles, on the poll-time pre-warm of newly discovered remote COG frames, which reads them into the collection's tile cache so their first view needs no storage round trips. Also at most 1/8 of the collection's `tile_cache_mb`. Levels are taken coarsest first while they fit, so a larger file still gets its overviews. `0` turns the pre-warm off. Restart to change. |
 | `MC_ALLOW_INLINE_DB_URL` | _(unset)_ | Set to `1` to allow a literal `postgres://` URL in TOML instead of `dsn_env` (development only). |
@@ -536,7 +539,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `description` | yes | — | Collection description |
 | `data_path` | yes* | — | Path to data file (CSV, GeoJSON) or directory (GeoTIFF) |
 | `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"`, `"3dtiles"` |
-| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"zarr"`, `"postgis"`, `"satellite"` |
+| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"zarr"`, `"postgis"`, `"satellite"`, `"netcdf"` |
 | `keywords` | no | — | Array of discovery keyword strings, e.g. `["radar", "reflectivity"]`. Surfaced in collection JSON, WMS capabilities, and matched by `/collections?q=`. |
 | `license` | no | — | `[collections.license]` table with `title` (required — SPDX id or human name), optional `url` and optional `type`, the media type `url` serves (default `text/html`; only with `url`). When `url` is omitted and `title` is an SPDX id, the URL is synthesized from `https://spdx.org/licenses/<id>.html`. The `rel="license"` link carries the `type`. |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
@@ -1470,6 +1473,34 @@ max = 255.0
 ```
 
 `collections.d/gmgsi-global.toml` is a runnable example with longwave IR and water vapour.
+
+### NetCDF
+
+Gridded CF-NetCDF data (`engine_type = "netcdf"`, #1067), served through WMS, OGC API Maps and Tiles. One collection is one file family in a local directory, such as MET Norway's MEPS surface files, one per lead time: every file carries the collection's variables on one grid. Each variable is a layer: a WMS child layer `coll/<variable>`, Maps/Tiles `parameter-name=<variable>`.
+
+- **Times come from the files.** Each file's valid times are its `time` axis and its model run its `forecast_reference_time`. Runs are the WMS `reference_time` dimension: a map draws from the newest run whose steps span the requested time, so a newer run still arriving does not hide an older one, and a pinned run draws from that run or fails. Files without `forecast_reference_time` form one timeline without runs. File names only select the files and order the opening (`filename_template`, with `{run}` and `{lead}` as in ds-storage's discovery, default `*.nc`), and global time attributes are never read.
+- **Grids:** 1-D latitude/longitude, or 1-D projected x/y with a CF `grid_mapping` (`lambert_conformal_conic`, as MEPS; `geostationary`). Rows stored south to north are drawn north-up. A projected grid has no `storageCrs`: its native CRS has no OGC URI.
+- **Fields** have one level: any axis other than time and an ensemble must have a single value, identified by its coordinate (2 m, 10 m), never its dimension name. Files with an ensemble axis are read at `member`. Packed values are unpacked, and `_FillValue`, `missing_value` and NaN are transparent. Values keep the files' units (K, Pa, m/s, kg/m², fractions).
+- **The first file fixes the layout:** its variables (the `variables` allowlist, else every variable on its grid) and its grid. A later file missing one, or on another grid, is skipped with a WARN. A file replaced in place is read again, and tiles drawn from it before are not served again.
+- **Files stay open** while the collection keeps them: the newest `max_runs` runs, at most `max_files` files. Requests read one 2-D field per layer and time through a field cache shared by every NetCDF collection (`MC_NETCDF_FIELD_CACHE_MB`), never the whole file.
+
+```toml
+[netcdf]
+data_path = "testdata/meps-netcdf"                    # local directory, not recursive
+filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"  # default: names ending in .nc
+variables = ["air_temperature_2m", "air_pressure_at_sea_level", "precipitation_amount_acc"]
+max_runs = 4                                          # default 4
+# max_files = 1024                                    # default 1024
+# member = 0                                          # ensemble member, default 0
+poll_interval_secs = 60
+
+[netcdf.titles]                                       # layer titles, else each file's long_name
+precipitation_amount_acc = "Precipitation accumulated since run start"
+```
+
+`apis` must be set (`["wms", "maps", "tiles"]`): the default `["edr"]` is rejected until the engine answers EDR queries. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs) with a palette per variable.
+
+Not yet: remote files by HTTP range, EDR, derived wind, pressure levels as a vertical axis, and per-variable file layouts (#1067).
 
 ## OGC 3D Tiles
 

@@ -1094,6 +1094,8 @@ mod tests {
             grib_engines: RwLock::new(Vec::new()),
             zarr_engines: RwLock::new(Vec::new()),
             satellite_engines: RwLock::new(Vec::new()),
+            netcdf_engines: RwLock::new(Vec::new()),
+            netcdf_parameters: RwLock::new(HashMap::new()),
             odim_engines: RwLock::new(Vec::new()),
             odim_volume_engines: RwLock::new(Vec::new()),
             cap_engines: RwLock::new(Vec::new()),
@@ -1130,6 +1132,7 @@ mod tests {
             nowcast: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
             derive_wind: None,
         }

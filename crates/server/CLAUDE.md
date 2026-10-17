@@ -217,8 +217,9 @@ need no reload pruning.
   the newest run's origin time, the header's reference time that keys the
   run and is its instance id. An analysis file's origin time is its analysis
   time, and a forecast's newest valid time lies in the future. BUFR: the
-  newest report. Satellite: the newest scan start. Nowcast: the latest
-  generation's anchor frame. Other engines report none. Negative when the
+  newest report. Satellite: the newest scan start. NetCDF: the newest run's
+  reference time, or the newest valid time of files without runs. Nowcast:
+  the latest generation's anchor frame. Other engines report none. Negative when the
   newest data lies in the future.
 - Never the time since a poll. A stalled feeder leaves its files in place,
   every poll still finds them, and a poll-stamped age stayed near the poll
@@ -370,6 +371,20 @@ permanent endpoint/bucket mistakes, so repeated failed health needs operator
 attention. The all-failed startup exception requires every configured collection to be
 remote radar; mixed local/remote failures still exit. Local missing files and structurally missing source config retain
 startup fail-fast behavior. Runtime scan errors still retain the good catalog.
+
+## NetCDF layer registration (#1067)
+
+A NetCDF collection's layers are its files' variables. `NetcdfEngine::new`
+scans its directory once, as engine-grib does, so they and their styles
+exist at load; a collection whose directory was empty or unreadable then
+loads with none. `LoadResult::netcdf_parameters` records the parameters each
+collection's styles were resolved for; the recovery loop's
+`netcdf_registration_changed`, like `grib_registration_changed`, registers
+the collection again (accepted config, engine reused) once they differ,
+within 30 s of the poll that reads its first files, and `apply_load` evicts
+that collection's rendered and meta-tile entries, drawn meanwhile with the
+collection's style. The layout is fixed for an engine's life, so this
+happens at most once per engine.
 
 ## GRIB level collections
 

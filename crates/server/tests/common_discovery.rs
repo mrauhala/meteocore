@@ -40,6 +40,9 @@ struct Fixture {
     vertical: Option<VerticalDimension>,
     /// Render parameters, each with its own time axis if it has one (#819).
     parameters: Vec<(ParameterInfo, Option<Vec<DateTime<Utc>>>)>,
+    /// `RasterInfo.native_crs`: `"CRS:84"`, or `"projected"` as engine-netcdf
+    /// and engine-querydata label a CF projected grid.
+    native_crs: &'static str,
 }
 
 impl EdrEngine for Fixture {
@@ -127,7 +130,7 @@ impl MapEngine for Fixture {
     }
     fn raster_info(&self) -> RasterInfo {
         RasterInfo {
-            native_crs: "CRS:84".into(),
+            native_crs: self.native_crs.into(),
             spatial_extent: self.bbox,
             times: self.times.clone(),
             parameter: "rain".into(),
@@ -223,6 +226,7 @@ fn catalog() -> Catalog {
             times,
             vertical,
             parameters,
+            native_crs: "CRS:84",
         });
         edr.insert(id.into(), fixture.clone());
         maps.insert(id.into(), fixture.clone());
@@ -1382,6 +1386,7 @@ async fn shared_root_extent_precedence_matches_discovery() {
             times: vec![],
             vertical: None,
             parameters: vec![],
+            native_crs: "CRS:84",
         }),
     );
     // `f-wind` is served by Features alone: no map, no tiles.
@@ -1455,6 +1460,73 @@ async fn shared_root_extent_precedence_matches_discovery() {
         .iter()
         .any(|l| l["rel"] == api_common::rel::MAP));
     assert_eq!(start(&features_only), instant("2024-01-01T00:00:00Z"));
+}
+
+/// A map collection on a projected grid (engine-netcdf's MEPS, #1067:
+/// `native_crs = "projected"`, 949 × 1069 cells) advertises neither a
+/// `storageCrs` nor a `grid` of degrees, which only a CRS84 grid has, and
+/// its description still validates, on every map surface.
+#[tokio::test]
+async fn a_projected_grid_advertises_no_storage_crs_or_degree_grid() {
+    let (mut configs, _, mut maps, features) = catalog();
+    let mut config = configs["c-match"].clone();
+    config.id = "g-projected".into();
+    configs.insert(config.id.clone(), config);
+    maps.insert(
+        "g-projected".into(),
+        Arc::new(Fixture {
+            bbox: Some([-18.1, 49.8, 54.2, 75.2]),
+            time: Some((
+                instant("2024-01-01T00:00:00Z"),
+                instant("2024-01-01T01:00:00Z"),
+            )),
+            times: vec![
+                instant("2024-01-01T00:00:00Z"),
+                instant("2024-01-01T01:00:00Z"),
+            ],
+            vertical: None,
+            parameters: vec![],
+            native_crs: "projected",
+        }),
+    );
+    let surfaces = [
+        (
+            api_maps::router(maps_state(configs.clone(), maps.clone())),
+            "/base/maps",
+        ),
+        (
+            api_tiles::router(tiles_state(
+                configs.clone(),
+                maps.clone(),
+                features.clone(),
+                false,
+            )),
+            "/base/tiles",
+        ),
+        (
+            api_common::shared::router(shared_api_over((configs, HashMap::new(), maps, features))),
+            "/base",
+        ),
+    ];
+    for (router, prefix) in surfaces {
+        let app = Router::new().nest(prefix, router);
+        let url = format!("{prefix}/collections/g-projected");
+        let projected = get_json(&app, &url).await;
+        schema::assert_valid("/collections/{collectionId}", &projected, &url);
+        assert!(projected.get("storageCrs").is_none(), "{url}: {projected}");
+        assert!(
+            projected["extent"]["spatial"].get("grid").is_none(),
+            "{url}: {projected}"
+        );
+        assert!(projected["extent"]["spatial"]["bbox"].is_array(), "{url}");
+        // The same fields on a CRS84 grid, so the absence above means something.
+        let crs84 = get_json(&app, &format!("{prefix}/collections/c-match")).await;
+        assert!(crs84["storageCrs"].is_string(), "{prefix}: {crs84}");
+        assert!(
+            crs84["extent"]["spatial"]["grid"].is_array(),
+            "{prefix}: {crs84}"
+        );
+    }
 }
 
 /// ets-ogcapi-features10 reads the `limit`, `bbox` and `datetime` definitions
