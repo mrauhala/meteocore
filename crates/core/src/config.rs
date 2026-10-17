@@ -285,14 +285,14 @@ pub struct CollectionConfig {
     pub preview: Option<PreviewConfig>,
     /// Wind speed and direction derived from u/v component pairs (#897,
     /// `ds_core::wind`). Unset or `true` derives them for the engines that
-    /// report their components (`grib`, `querydata`, `zarr`); `false` opts
+    /// report their components (`grib`, `querydata`, `zarr`, `netcdf`); `false` opts
     /// the collection out. Any other engine type rejects the key at load.
     #[serde(default)]
     pub derive_wind: Option<bool>,
 }
 
 /// The engine types whose collections derive wind from u/v components.
-pub const DERIVE_WIND_ENGINES: [&str; 3] = ["grib", "querydata", "zarr"];
+pub const DERIVE_WIND_ENGINES: [&str; 4] = ["grib", "querydata", "zarr", "netcdf"];
 
 impl CollectionConfig {
     /// Whether this collection serves wind derived from u/v components:
@@ -5424,11 +5424,19 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         );
         assert!(!off.collections[0].derives_wind());
         assert!(off.validate().is_ok());
+        // NetCDF states its components by CF standard_name (#1067).
+        let netcdf = collection_with(
+            "engine_type = \"netcdf\"\n[collections.netcdf]\ndata_path = \"/data\"\n",
+        );
+        assert!(netcdf.collections[0].derives_wind());
+        assert!(netcdf.validate().is_ok());
         let csv = collection_with("derive_wind = true\n");
         assert!(!csv.collections[0].derives_wind(), "csv has no components");
         let err = csv.validate().unwrap_err().to_string();
         assert!(
-            err.contains("'derive_wind' applies only to engine types grib, querydata, zarr"),
+            err.contains(
+                "'derive_wind' applies only to engine types grib, querydata, zarr, netcdf"
+            ),
             "{err}"
         );
         let toml = "[server]\nhost=\"h\"\nport=1\n[[collections]]\nid=\"c\"\ntitle=\"t\"\n\

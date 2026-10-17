@@ -44,6 +44,18 @@ runtime by `Handle::id()` and the thread name:
 `queries_run_on_the_shared_query_runtime_under_the_edr_deadline`, and the
 server's `edr_and_get_feature_info_share_one_query_runtime`.
 
+`field_jobs::run_field_jobs` is an engine query's bounded field-read
+scheduler (#1067: engine-grib's, shared with engine-netcdf): at most
+`FIELD_CONCURRENCY` (4) jobs per query as tasks on the runtime the query
+runs on (the query runtime), each inside `block_in_place` and re-entering
+the caller's `ds_core::deadline`; on the first error or the deadline no
+job starts, and the running ones drain before it returns. A caller outside
+any runtime passes its fallback runtime (`field_jobs::block_on`); a caller
+on a current-thread runtime, which cannot `block_in_place`, runs on the
+fallback from a scoped thread carrying its deadline, so the future, the
+field iterator and `consume` are `Send`. Pinned by `field_jobs::tests`;
+keep it engine-neutral.
+
 GetFeatureInfo admits with `RenderJob::acquire_feature_info`: the render
 slots and queue, no memory (one point), under its own deadline,
 `MC_FEATURE_INFO_TIMEOUT_MS` (10 000 by default, at most one day), not the

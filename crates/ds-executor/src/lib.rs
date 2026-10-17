@@ -1,5 +1,6 @@
 //! Bounded render admission and blocking execution shared by HTTP APIs.
 pub mod budget;
+pub mod field_jobs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};

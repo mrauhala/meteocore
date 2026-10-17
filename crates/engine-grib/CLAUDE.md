@@ -387,8 +387,11 @@ ones only in the legacy layout.
   output and mask budgets, then sample and release the grid before loading
   remaining fields.
 - Use `runtime::run_field_jobs`, shared with positions, for at most four
-  parameter/level jobs per admitted query. Keep deadline propagation, blocking
-  cache waits and drain-on-error behavior in that scheduler. Area read failures
+  parameter/level jobs per admitted query. It is a thin wrapper over
+  `ds_executor::field_jobs::run_field_jobs` (moved there for engine-netcdf,
+  #1067) with the GRIB I/O runtime as the off-runtime fallback. Keep deadline
+  propagation, blocking cache waits and drain-on-error behavior in that
+  shared scheduler. Area read failures
   are fatal; ordinary position field failures remain null samples.
 - Workers return small masked/converted subsets into fixed
   step/parameter/level slots. Preserve requested level order and missing upper-air nulls regardless

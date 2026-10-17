@@ -1,6 +1,6 @@
-//! MEPS read live from MET Norway's thredds.met.no (#1067 PR 5). Ignored:
-//! it goes to the network. Run it by hand, on a connection that can take
-//! about 5 MB:
+//! MEPS read live from MET Norway's thredds.met.no (#1067 PRs 5 and 7).
+//! Ignored: it goes to the network. Run it by hand, on a connection that can
+//! take about 9 MB:
 //!
 //! ```text
 //! cargo test -p engine-netcdf --test live_thredds -- --ignored --nocapture
@@ -9,8 +9,10 @@
 //! What it reads: a few HEADs for the sentinels and leads of the runs in
 //! a 6 h window; leads 00-02 of the newest published sfc run of the
 //! control member, opened for `air_temperature_2m` (each file's 1 MiB
-//! first read and a few 64 KiB blocks, about 3.5 MB); and one field of it,
-//! one ~1.5 MB chunk. It prints the requests, bytes and time of each step
+//! first read and a few 64 KiB blocks, about 3.5 MB); one field of it,
+//! one ~1.5 MB chunk; and an EDR position series of it over the three
+//! leads, which fetches the other two leads' chunks (~3 MB). It prints the
+//! requests, bytes and time of each step
 //! and the heap a kept per-lead handle holds, for the crate notes'
 //! "handle × 67 × max_runs". `a_ranged_get_names_the_whole_file` is one
 //! HEAD and a 1 KiB GET.
@@ -66,7 +68,7 @@ fn traffic(engine: &NetcdfEngine) -> engine_netcdf::RemoteTraffic {
 }
 
 #[test]
-#[ignore = "reads about 5 MB from thredds.met.no; run by hand"]
+#[ignore = "reads about 9 MB from thredds.met.no; run by hand"]
 fn meps_per_lead_files_from_thredds() {
     let config: NetcdfConfig = toml::from_str(CONFIG).unwrap();
     let started = Instant::now();
@@ -144,6 +146,44 @@ fn meps_per_lead_files_from_thredds() {
         "the same field again: {:.3} s, {} GETs",
         started.elapsed().as_secs_f64(),
         traffic(&engine).gets - field.gets
+    );
+    // EDR: a position series over the three leads, the first one's chunk
+    // cached by the render above.
+    let before = traffic(&engine);
+    let started = Instant::now();
+    let series = {
+        use ds_core::edr_engine::EdrEngine;
+        let _deadline =
+            ds_core::deadline::enter(Some(Instant::now() + std::time::Duration::from_secs(30)));
+        match engine
+            .query_position(
+                "POINT(10.75 59.91)",
+                None,
+                Some(&["air_temperature_2m".to_string()]),
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            ds_core::model::CoverageResponse::Single(result) => {
+                result.ranges["air_temperature_2m"].values.clone()
+            }
+            ds_core::model::CoverageResponse::Collection(_) => panic!("one coverage"),
+        }
+    };
+    let after = traffic(&engine);
+    println!(
+        "EDR position series over 3 leads: {:.1} s, {} GETs, {} bytes, values {series:?}",
+        started.elapsed().as_secs_f64(),
+        after.gets - before.gets,
+        after.bytes - before.bytes
+    );
+    assert_eq!(series.len(), 3);
+    assert!(series.iter().all(Option::is_some));
+    assert_eq!(
+        after.gets - before.gets,
+        2,
+        "the two uncached leads' chunks"
     );
     println!(
         "block cache {:?}\nchunk cache {:?}\ntotal {:?}",

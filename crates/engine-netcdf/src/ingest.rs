@@ -155,6 +155,15 @@ impl FieldRead {
         }
     }
 
+    /// Bytes one read of the field decodes, from the metadata alone: its
+    /// `f32` values, or the whole chunk when a chunk spans several fields.
+    /// 4.06 MB for a MEPS field. The EDR query-shape cap counts it
+    /// ([`crate::edr`]).
+    pub(crate) fn decoded_bytes(&self) -> u64 {
+        let (ny, nx) = self.shape();
+        ((ny * nx) as u64 * 4).max(self.chunk_bytes)
+    }
+
     /// The hyperslab of time step `time`.
     pub(crate) fn selection(&self, time: u32) -> NcSliceInfo {
         let selections = self
@@ -191,6 +200,9 @@ pub(crate) struct Variable {
     pub title: String,
     /// `units` as the file spells it, empty when absent.
     pub units: String,
+    /// CF `standard_name`, when the file states one: EDR's observed
+    /// property, and what identifies wind components (`x_wind`).
+    pub standard_name: Option<String>,
     pub levels: Vec<Level>,
 }
 
@@ -428,6 +440,9 @@ fn field(
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
+            standard_name: text_attr(var, "standard_name")
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty()),
             levels,
         },
         read: FieldRead {

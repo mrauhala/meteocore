@@ -4005,7 +4005,7 @@
       "id": 83,
       "type": "timeseries",
       "title": "NetCDF detached field fills",
-      "description": "Cold remote NetCDF fields are fetched by a task the request hands its fill to, which finishes after the request's 3 s deadline and leaves the field cached (#1067). Pending: running now, at most 16. Inline: fills a request ran itself, under its deadline, because 16 were running. A steady inline rate means fetches cannot keep up with the frames asked for.",
+      "description": "Cold remote NetCDF fields are fetched by a task the request hands its fill to, which finishes after the request's 3 s deadline and leaves the field cached (#1067). Pending: running now, at most 16. Inline: fills a request ran itself, under its deadline, because 16 were running. A steady inline rate means fetches cannot keep up with the frames asked for. EDR and GetFeatureInfo reads detach from a pool of their own, at most 8, and are not counted here.",
       "gridPos": {
         "h": 8,
         "w": 12,

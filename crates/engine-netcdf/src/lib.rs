@@ -1,5 +1,6 @@
 //! CF-NetCDF gridded forecasts and analyses (#1067), served through WMS,
-//! OGC API Maps and Tiles.
+//! OGC API Maps and Tiles, and OGC API EDR position, area and radius
+//! queries ([`edr`]).
 //!
 //! One collection is one file family, such as MEPS's per-lead surface files:
 //! every file carries the collection's variables on one grid, its valid
@@ -15,6 +16,7 @@
 mod catalog;
 pub mod decode_budget;
 mod discover;
+mod edr;
 mod field;
 mod ingest;
 mod io;
@@ -38,7 +40,6 @@ use ds_core::deadline;
 use ds_core::error::DataServerError;
 use ds_core::geo::GeoTransform;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
-use ds_core::resample::SourceGrid;
 use ds_poll::{FirstTick, Shutdown};
 use ds_storage::discovery::{
     FilenameMatcher, Schedule, Settling, TemplateProber, TemplateSpec, TimeWindow,
@@ -1010,15 +1011,14 @@ impl NetcdfEngine {
                     ""
                 }
             );
-            state.layout = Some(Arc::new(Layout {
-                variables: inspected
+            state.layout = Some(Arc::new(Layout::new(
+                inspected
                     .fields
                     .iter()
                     .map(|f| f.variable.clone())
                     .collect(),
-                source: SourceGrid::new(inspected.grid.transform.clone()),
-                grid: inspected.grid.clone(),
-            }));
+                inspected.grid.clone(),
+            )));
             return Ok(());
         };
         if !layout.grid.same(&inspected.grid) {
@@ -1265,6 +1265,18 @@ impl MapEngine for NetcdfEngine {
     /// it.
     fn content_version(&self) -> u64 {
         self.catalog.load().content_version + self.changes.bumps()
+    }
+}
+
+/// The layout's wind facts for `ds_core::wind::DerivedWind` (#897): an `Arc`
+/// built once with the layout, so the plan is built once per engine.
+impl ds_core::wind::WindSource for NetcdfEngine {
+    fn wind_facts(&self) -> Arc<ds_core::wind::WindFacts> {
+        self.catalog
+            .load()
+            .layout
+            .as_ref()
+            .map_or_else(ds_core::wind::WindFacts::none, |layout| layout.wind.clone())
     }
 }
 

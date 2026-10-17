@@ -10,6 +10,7 @@ use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{ParameterInfo, RasterInfo};
 use ds_core::resample::SourceGrid;
+use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 use ds_storage::ObjectVersion;
 use netcdf_reader::NcFile;
 
@@ -56,6 +57,59 @@ pub(crate) struct Layout {
     pub grid: FileGrid,
     /// The sampler over the grid, built once.
     pub source: SourceGrid,
+    /// What the files state about wind components, for
+    /// `ds_core::wind::DerivedWind`: built once with the layout, so the
+    /// snapshot is the same `Arc` for the engine's life (#897).
+    pub wind: Arc<WindFacts>,
+}
+
+impl Layout {
+    pub(crate) fn new(variables: Vec<Variable>, grid: FileGrid) -> Self {
+        let wind = Arc::new(wind_facts(&variables, &grid.transform.crs));
+        Self {
+            source: SourceGrid::new(grid.transform.clone()),
+            variables,
+            grid,
+            wind,
+        }
+    }
+}
+
+/// The wind facts of a layout (#897, #1067 decision 6): each variable's CF
+/// `standard_name` says whether it is a component and in which frame
+/// (`x_wind`/`y_wind`: along the grid's axes; `eastward_wind`/
+/// `northward_wind`: along east and north), its single level is the
+/// pairing level, and the grid's projection says how its axes lie. MEPS's
+/// Lambert grid is `GridAxes::Rotated`, so its grid-relative 10 m wind
+/// gives a speed and no direction until the components are turned by the
+/// convergence angle (a follow-up on #897). Nothing is taken from a name.
+pub(crate) fn wind_facts(variables: &[Variable], crs: &Crs) -> WindFacts {
+    WindFacts {
+        grid: GridAxes::of(crs),
+        parameters: variables
+            .iter()
+            .map(|v| {
+                let level = (!v.levels.is_empty()).then(|| {
+                    v.levels
+                        .iter()
+                        .map(|l| format!("{} {}", l.value, l.units).trim().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                });
+                ParameterFacts {
+                    standard_name: v.standard_name.clone(),
+                    frame: v
+                        .standard_name
+                        .as_deref()
+                        .map_or(VectorFrame::Unknown, VectorFrame::from_standard_name),
+                    level_label: level.clone(),
+                    level,
+                    unit: v.units.clone(),
+                    ..ParameterFacts::new(v.name.to_string())
+                }
+            })
+            .collect(),
+    }
 }
 
 /// A run's key: its reference time, `None` for the timeline of files
@@ -189,6 +243,82 @@ impl Catalog {
             step,
         })
     }
+
+    /// The run an EDR query reads, as engine-grib selects it
+    /// (`/req/core/datetime-response` A and F): a pinned run is exactly
+    /// that run (absent ⇒ [`DataServerError::ReferenceTimeNotFound`], 404).
+    /// Unpinned with a `datetime` window, the newest run with a step inside
+    /// it that also spans the window's start, else the newest with any step
+    /// inside, which is how an open start (`../end`) or a window starting
+    /// before a run finds one; none ⇒ [`no_step_within`] (404), so a
+    /// `datetime` list skips the instant (#968). Without a window, the
+    /// newest run. An instant `(t, t)` needs a step valid at exactly `t`,
+    /// never the nearest: GetFeatureInfo asks for the step its map drew,
+    /// in the run the map drew it from.
+    pub(crate) fn query_run(
+        &self,
+        reference_time: Option<DateTime<Utc>>,
+        window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<&Run, DataServerError> {
+        if self.runs.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "No NetCDF data available yet".into(),
+            ));
+        }
+        if let Some(rt) = reference_time {
+            return self.runs.get(&Some(rt)).ok_or_else(|| {
+                DataServerError::ReferenceTimeNotFound(format!(
+                    "no forecast run for reference time {rt}"
+                ))
+            });
+        }
+        let Some((start, end)) = window else {
+            return Ok(self.runs.values().next_back().expect("runs is not empty"));
+        };
+        let newest_first = || {
+            self.runs
+                .values()
+                .rev()
+                .filter(move |run| run.steps_within(start, end).next().is_some())
+        };
+        newest_first()
+            .find(|run| run.covers(start))
+            .or_else(|| newest_first().next())
+            .ok_or_else(|| no_step_within(start, end))
+    }
+}
+
+impl Run {
+    /// The steps valid inside `[start, end]`, both ends included, ascending.
+    pub(crate) fn steps_within(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> impl Iterator<Item = (DateTime<Utc>, &Step)> + '_ {
+        // `range` panics on a reversed range, which the API refuses (#932).
+        let start = start.min(end);
+        self.steps
+            .range(start..=end)
+            .map(|(&valid, step)| (valid, step))
+    }
+}
+
+/// No step is valid inside the requested `datetime`: the 404 an instant
+/// without data gets, which a `datetime` list skips (#968).
+pub(crate) fn no_step_within(start: DateTime<Utc>, end: DateTime<Utc>) -> DataServerError {
+    let bound = |time: DateTime<Utc>| {
+        if time == DateTime::<Utc>::MIN_UTC || time == DateTime::<Utc>::MAX_UTC {
+            "..".to_string()
+        } else {
+            time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        }
+    };
+    let datetime = if start == end {
+        bound(start)
+    } else {
+        format!("{}/{}", bound(start), bound(end))
+    };
+    DataServerError::LocationNotFound(format!("No forecast step matches datetime {datetime}"))
 }
 
 /// The `RasterInfo` of a catalog, built once per poll (Critical Rule 10).
