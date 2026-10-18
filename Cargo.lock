@@ -1541,6 +1541,7 @@ dependencies = [
  "ds-3dtiles",
  "ds-cache",
  "ds-core",
+ "ds-executor",
  "ds-poll",
  "ds-render",
  "ds-storage",

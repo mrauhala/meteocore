@@ -15,17 +15,28 @@
 //! derived **`CELLS`** WMS/Maps/Tiles layer: footprint outlines, centroid
 //! markers, and track polylines painted into a [`RasterTile`] at the cell's
 //! max dBZ, so the ordinary radar colormap styles the overlay.
+//!
+//! A tile segments every volume of its tracking window. The poll loop builds
+//! those cell sets ahead of the tiles ([`warm_from_bytes`],
+//! [`warm_windows`]), and the tiles of a cold window build its volumes in
+//! parallel, each waiting for the others' builds without a render slot
+//! (#1155).
 
+use crate::pvol::PolarVolume;
 use crate::quantities;
 use crate::volume_engine::{
-    blocking_pixel_handle, pixel_cache_id, PolarVolumeSiteView, DEFAULT_VOXEL_DIMS,
+    blocking_pixel_handle, pixel_cache_id, read_volume_files, voxel_grid_from_bytes, Catalog,
+    PolarVolumeSiteView, Source, VolumeEntry, DEFAULT_VOXEL_DIMS,
 };
-use ds_core::cells::{extract_cells, track_cells, CellSet, MAX_TRACK_SCANS};
+use chrono::{DateTime, Utc};
+use ds_cache::{CacheEntry, CacheFillGuard};
+use ds_core::cells::{extract_cells, track_cells, CellExtractionOptions, CellSet, MAX_TRACK_SCANS};
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{OutputCrs, RasterTile};
 use ds_core::raster_paint::Canvas;
-use ds_core::volume::{CellProduct, CellQuery};
+use ds_core::volume::{CellProduct, CellQuery, VoxelGrid};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Derived map-layer parameter id for the storm-cell overlay. Uppercase like
 /// the bare ODIM quantities it sits alongside in the WMS layer list, but
@@ -38,6 +49,22 @@ pub(crate) const CELLS_PARAMETER_TITLE: &str = "Storm cells";
 /// Scans tracked behind the rendered one for the overlay's trajectories —
 /// half an hour at 5-minute cadence.
 const CELLS_TRACK_SCANS: usize = 6;
+/// The volumes one `CELLS` tile segments: the scan it draws and the scans
+/// it tracks behind it.
+const LAYER_WINDOW: usize = CELLS_TRACK_SCANS + 1;
+const _: () = assert!(CELLS_TRACK_SCANS <= MAX_TRACK_SCANS);
+/// Most cell sets one poll builds for the `CELLS` layer's windows by
+/// downloading their volumes again ([`warm_windows`], #1155): the volumes a
+/// poll itself downloads are segmented from the bytes it holds and are not
+/// counted. A process start or a poll after an outage has every window
+/// cold; the windows fill over the next polls, newest volumes first, while
+/// the poll loop spends at most this many builds on them: about 50 ms of
+/// CPU each for a 25–40 MB volume, plus its download.
+const MAX_WARMS_PER_POLL: usize = 32;
+/// Volume files [`warm_windows`] downloads at once, so a batch holds at most
+/// this many times `MAX_REMOTE_FILE_SIZE` (64 MiB) of bytes (root CLAUDE.md
+/// Critical Rule 9).
+const WARM_DOWNLOADS: usize = 4;
 /// Stroke width (px) for footprint rings.
 const STROKE_PX: u32 = 2;
 /// Stroke width (px) for track trails — one thinner than the outlines so a
@@ -113,12 +140,83 @@ pub fn cell_set_cache_metrics() -> ds_cache::CacheMetrics {
 
 /// The extraction options as an exact key component: two requests share an
 /// entry iff every knob is bit-identical (no hash, no collision).
-fn extraction_key(opts: &ds_core::cells::CellExtractionOptions) -> (u64, u64, u64) {
+fn extraction_key(opts: &CellExtractionOptions) -> (u64, u64, u64) {
     (
         opts.threshold.to_bits(),
         opts.min_volume_km3.to_bits(),
         opts.max_cells as u64,
     )
+}
+
+/// The [`CELL_SET_CACHE`] key of one volume file's segmentation. The one
+/// home for it, so the poll-time warm-up fills the entries tiles read.
+fn cell_set_key(
+    source: &Source,
+    file_id: &str,
+    quantity: &str,
+    dims: [usize; 3],
+    extraction: &CellExtractionOptions,
+) -> CellSetKey {
+    (
+        Arc::from(pixel_cache_id(source, file_id).as_ref()),
+        Arc::from(quantity),
+        dims,
+        extraction_key(extraction),
+    )
+}
+
+/// Segment one volume's resampled `grid`, holding `valid` echo cells.
+fn segment(
+    grid: &VoxelGrid,
+    valid: usize,
+    time: DateTime<Utc>,
+    quantity: &str,
+    extraction: &CellExtractionOptions,
+) -> CellSet {
+    if valid == 0 {
+        // No echo anywhere in the volume: a valid empty scan (tracking sees
+        // the death), cached like any other.
+        CellSet::empty(
+            time,
+            quantity,
+            extraction.threshold,
+            [grid.origin_lon, grid.origin_lat, grid.origin_height],
+        )
+    } else {
+        extract_cells(grid, time, extraction)
+    }
+}
+
+/// The quantity the `CELLS` layer segments, from a site's or a volume's
+/// sorted quantities: corrected reflectivity `DBZH`, then total `TH`, then
+/// any other dBZ-unit moment.
+fn layer_quantity<Q: AsRef<str>>(quantities: &[Q]) -> Option<&str> {
+    let quantities = || quantities.iter().map(AsRef::as_ref);
+    ["DBZH", "TH"]
+        .into_iter()
+        .find_map(|preferred| quantities().find(|q| *q == preferred))
+        .or_else(|| quantities().find(|q| quantities::quantity_unit(q) == "dBZ"))
+}
+
+/// What a `CELLS` tile at `time` asks [`PolarVolumeSiteView::cell_product`]
+/// for: the one home of the layer's grid and extraction options, which the
+/// warm-up keys its entries by.
+fn layer_query(quantity: &str, time: Option<DateTime<Utc>>) -> CellQuery {
+    CellQuery {
+        quantity: Some(quantity.to_string()),
+        time,
+        dims: None, // engine default (low) — cells don't need a fine grid
+        track_scans: CELLS_TRACK_SCANS,
+        ..CellQuery::default()
+    }
+}
+
+/// How long a tile may wait for another caller's build: until its deadline,
+/// or for good without one.
+fn wait_budget() -> Duration {
+    ds_core::deadline::current().map_or(Duration::MAX, |deadline| {
+        deadline.saturating_duration_since(Instant::now())
+    })
 }
 
 impl PolarVolumeSiteView {
@@ -136,6 +234,13 @@ impl PolarVolumeSiteView {
     /// Each scan's segmentation is memoized in the process-global
     /// [`CELL_SET_CACHE`]; in steady state only the newest volume pays the
     /// resample + extraction, so a poll-cadence animation window stays cheap.
+    ///
+    /// A cold window is built in parallel by the callers that need it
+    /// (#1155): each builds the volumes no other caller is building, then
+    /// waits for the rest through [`ds_executor::wait_without_slot`], so the
+    /// tiles of one viewport share one build per volume instead of building
+    /// the window one volume after another, and a tile does not hold a
+    /// render slot while another tile's build runs.
     pub fn cell_product(
         &self,
         query: &CellQuery,
@@ -177,36 +282,87 @@ impl PolarVolumeSiteView {
         // memo, a cold window is one grid resample per scan.
         let start = target_idx.saturating_sub(query.track_scans.min(MAX_TRACK_SCANS));
         let dims = query.dims.unwrap_or(DEFAULT_VOXEL_DIMS);
-        let opts_key = extraction_key(&query.extraction);
+        let window = &volumes[start..=target_idx];
+        let keys: Vec<CellSetKey> = window
+            .iter()
+            .map(|entry| cell_set_key(&self.source, &entry.id, &quantity, dims, &query.extraction))
+            .collect();
 
-        let mut cell_sets = Vec::with_capacity(target_idx - start + 1);
-        for entry in &volumes[start..=target_idx] {
-            let key: CellSetKey = (
-                Arc::from(pixel_cache_id(&self.source, &entry.id).as_ref()),
-                Arc::from(quantity.as_str()),
-                dims,
-                opts_key,
-            );
-            let set = CELL_SET_CACHE.get_or_insert_with(&key, || {
-                let (grid, valid) = self.voxel_grid_cached(entry, &quantity, dims, handle)?;
-                let set = if valid == 0 {
-                    // No echo anywhere in the volume: a valid empty scan
-                    // (tracking sees the death) — cached like any other.
-                    CellSet::empty(
-                        entry.volume.time,
-                        quantity.as_str(),
-                        query.extraction.threshold,
-                        [grid.origin_lon, grid.origin_lat, grid.origin_height],
-                    )
-                } else {
-                    extract_cells(&grid, entry.volume.time, &query.extraction)
-                };
-                Ok::<_, DataServerError>(Arc::new(set))
-            })?;
-            cell_sets.push((entry.volume.time, set));
+        let mut sets: Vec<Option<Arc<CellSet>>> = vec![None; window.len()];
+        loop {
+            // Take what is cached and build what nobody is building; note
+            // the first set another caller is building.
+            let mut building = None;
+            for (i, (entry, key)) in window.iter().zip(&keys).enumerate() {
+                if sets[i].is_some() {
+                    continue;
+                }
+                match CELL_SET_CACHE.get_value_or_guard_untracked(key, Duration::ZERO) {
+                    CacheEntry::Value(set) => {
+                        CELL_SET_CACHE.record_hit();
+                        sets[i] = Some(set);
+                    }
+                    CacheEntry::Vacant(fill) => {
+                        let set =
+                            self.fill_cell_set(fill, entry, &quantity, dims, query, handle)?;
+                        sets[i] = Some(set);
+                    }
+                    CacheEntry::Timeout => {
+                        building.get_or_insert(i);
+                    }
+                }
+            }
+            let Some(i) = building else { break };
+            // The CPU is the builder's: wait for it without the slot. A
+            // builder that fails hands its claim to a waiter; that claim is
+            // let go before the wait for a slot, so no tile holds a claim
+            // the others wait on while it queues, and the next round builds
+            // the set or waits for whoever claimed it first.
+            let budget = wait_budget();
+            let waited = ds_executor::wait_without_slot(|| {
+                match CELL_SET_CACHE.get_value_or_guard_untracked(&keys[i], budget) {
+                    CacheEntry::Value(set) => Ok(Some(set)),
+                    CacheEntry::Vacant(_) => Ok(None),
+                    CacheEntry::Timeout => Err(DataServerError::DeadlineExceeded),
+                }
+            })??;
+            if let Some(set) = waited {
+                CELL_SET_CACHE.record_hit();
+                sets[i] = Some(set);
+            }
         }
+        let cell_sets: Vec<_> = window
+            .iter()
+            .zip(sets)
+            .map(|(entry, set)| (entry.volume.time, set.expect("every set taken or built")))
+            .collect();
         let tracks = track_cells(&cell_sets, &query.tracking);
         Ok(CellProduct { cell_sets, tracks })
+    }
+
+    /// Build the cell set a caller claimed (`fill`) and publish it to the
+    /// callers waiting for it. On an error the claim is dropped, and one of
+    /// them builds the set instead.
+    fn fill_cell_set(
+        &self,
+        fill: CacheFillGuard<'_, CellSetKey, Arc<CellSet>>,
+        entry: &VolumeEntry,
+        quantity: &str,
+        dims: [usize; 3],
+        query: &CellQuery,
+        handle: Option<&tokio::runtime::Handle>,
+    ) -> Result<Arc<CellSet>, DataServerError> {
+        CELL_SET_CACHE.record_miss();
+        let (grid, valid) = self.voxel_grid_cached(entry, quantity, dims, handle)?;
+        let set = Arc::new(segment(
+            &grid,
+            valid,
+            entry.volume.time,
+            quantity,
+            &query.extraction,
+        ));
+        let _ = fill.insert(set.clone());
+        Ok(set)
     }
 
     /// Render the derived **`CELLS`** overlay layer: the selected scan's
@@ -240,16 +396,8 @@ impl PolarVolumeSiteView {
                     self.collection_id, self.nod
                 ))
             })?;
-            ["DBZH", "TH"]
-                .into_iter()
-                .find(|q| meta.quantities.iter().any(|x| x == q))
+            layer_quantity(&meta.quantities)
                 .map(str::to_string)
-                .or_else(|| {
-                    meta.quantities
-                        .iter()
-                        .find(|q| quantities::quantity_unit(q) == "dBZ")
-                        .cloned()
-                })
                 .ok_or_else(|| {
                     DataServerError::LocationNotFound(format!(
                         "[{}] no reflectivity quantity to derive storm cells from",
@@ -257,13 +405,7 @@ impl PolarVolumeSiteView {
                     ))
                 })?
         };
-        let query = CellQuery {
-            quantity: Some(quantity),
-            time,
-            dims: None, // engine default (low) — cells don't need a fine grid
-            track_scans: CELLS_TRACK_SCANS,
-            ..CellQuery::default()
-        };
+        let query = layer_query(&quantity, time);
         let handle = blocking_pixel_handle();
         let product = self.cell_product(&query, handle.as_ref())?;
 
@@ -284,6 +426,138 @@ impl PolarVolumeSiteView {
             values: values.into(),
         })
     }
+}
+
+/// Segment `volume` for the `CELLS` layer from its file's `bytes` and
+/// publish the cell set to `fill`, off the request path (#1155). The
+/// quantity's sweeps are decoded into memory of the build's own, not the
+/// pixel cache, and the grid is not kept: only the cell set, a few KB, is.
+/// Best-effort: a volume that does not decode is left to the tiles.
+fn warm_one(
+    fill: CacheFillGuard<'_, CellSetKey, Arc<CellSet>>,
+    source: &Source,
+    file_id: &str,
+    volume: &PolarVolume,
+    quantity: &str,
+    bytes: &[u8],
+) -> bool {
+    let query = layer_query(quantity, None);
+    let dims = query.dims.unwrap_or(DEFAULT_VOXEL_DIMS);
+    match voxel_grid_from_bytes(source, file_id, volume, quantity, dims, bytes) {
+        Ok((grid, valid)) => {
+            let set = segment(&grid, valid, volume.time, quantity, &query.extraction);
+            let _ = fill.insert(Arc::new(set));
+            true
+        }
+        Err(e) => {
+            tracing::debug!("PVOL cell-set warm-up of `{file_id}` skipped: {e}");
+            false
+        }
+    }
+}
+
+/// The key of `file_id`'s cell set in the `CELLS` layer's tracking windows.
+fn layer_key(source: &Source, file_id: &str, quantity: &str) -> CellSetKey {
+    let query = layer_query(quantity, None);
+    let dims = query.dims.unwrap_or(DEFAULT_VOXEL_DIMS);
+    cell_set_key(source, file_id, quantity, dims, &query.extraction)
+}
+
+/// Build the `CELLS` layer's cell set of a volume the poll loop just
+/// downloaded, from the `bytes` it holds, unless it is cached or a tile is
+/// building it (#1155). On the background poll runtime, never a request
+/// worker. Returns whether it built one.
+pub(crate) fn warm_from_bytes(
+    source: &Source,
+    file_id: &str,
+    volume: &PolarVolume,
+    bytes: &[u8],
+) -> bool {
+    let mut quantities: Vec<&str> = volume
+        .sweeps
+        .iter()
+        .flat_map(|sweep| sweep.moments.iter().map(|m| m.quantity.as_str()))
+        .collect();
+    quantities.sort_unstable();
+    quantities.dedup();
+    let Some(quantity) = layer_quantity(&quantities) else {
+        return false;
+    };
+    let key = layer_key(source, file_id, quantity);
+    match CELL_SET_CACHE.get_value_or_guard_untracked(&key, Duration::ZERO) {
+        CacheEntry::Vacant(fill) => warm_one(fill, source, file_id, volume, quantity, bytes),
+        CacheEntry::Value(_) | CacheEntry::Timeout => false,
+    }
+}
+
+/// Build the cell sets the newest `CELLS` window of each site still lacks
+/// (#1155): every site's newest volume first, then every site's second
+/// newest, and so on, at most [`MAX_WARMS_PER_POLL`] per call, downloading
+/// [`WARM_DOWNLOADS`] volume files at a time. The poll loop runs it on the
+/// background runtime after each scan, and once as it starts, so a viewport
+/// rarely meets a cold window. A volume is claimed only once downloaded, for
+/// its segmentation alone, so no tile waits on a download that has no
+/// deadline; one a tile claimed meanwhile is left to it. Returns the number
+/// of cell sets built.
+pub(crate) fn warm_windows(source: &Source, catalog: &Catalog) -> usize {
+    let windows: Vec<(&str, &[VolumeEntry])> = catalog
+        .sorted_nods
+        .iter()
+        .filter_map(|nod| {
+            let quantity = layer_quantity(&catalog.by_site_meta.get(nod)?.quantities)?;
+            let volumes = catalog.by_site.get(nod)?;
+            Some((
+                quantity,
+                &volumes[volumes.len().saturating_sub(LAYER_WINDOW)..],
+            ))
+        })
+        .collect();
+    let mut cold = Vec::new();
+    'newest_first: for depth in 0..LAYER_WINDOW {
+        for &(quantity, window) in &windows {
+            let Some(entry) = window.iter().rev().nth(depth) else {
+                continue;
+            };
+            let key = layer_key(source, &entry.id, quantity);
+            if CELL_SET_CACHE.contains_key(&key) {
+                continue;
+            }
+            cold.push((quantity, entry, key));
+            if cold.len() == MAX_WARMS_PER_POLL {
+                break 'newest_first;
+            }
+        }
+    }
+    let mut built = 0;
+    for batch in cold.chunks(WARM_DOWNLOADS) {
+        let ids: Vec<&str> = batch
+            .iter()
+            .map(|(_, entry, _)| entry.id.as_str())
+            .collect();
+        let files = read_volume_files(source, &ids);
+        for ((quantity, entry, key), bytes) in batch.iter().zip(files) {
+            let bytes = match bytes {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::debug!("PVOL cell-set warm-up of `{}` skipped: {e}", entry.id);
+                    continue;
+                }
+            };
+            if let CacheEntry::Vacant(fill) =
+                CELL_SET_CACHE.get_value_or_guard_untracked(key, Duration::ZERO)
+            {
+                built += usize::from(warm_one(
+                    fill,
+                    source,
+                    &entry.id,
+                    &entry.volume,
+                    quantity,
+                    &bytes,
+                ));
+            }
+        }
+    }
+    built
 }
 
 /// Paint a [`CellProduct`] into `canvas`: the target scan's footprint
@@ -590,5 +864,211 @@ mod tests {
                 "weight {weight} B under-counts a {allocated} B allocation"
             );
         }
+    }
+
+    /// The cold-batch fixture (two sweeps of `DBZH` and `VRAD`) as a volume
+    /// of site `nod`, four characters, timed 12:`minute` on its date: its
+    /// `/what/source` and `/what/time` attributes are fixed-length strings
+    /// that occur once in the file.
+    fn scan_bytes(nod: &str, minute: usize) -> Vec<u8> {
+        const FIXTURE: &[u8] = include_bytes!("../../../testdata/pvol-cold-batch.h5");
+        let mut bytes = FIXTURE.to_vec();
+        for (from, to) in [
+            ("NOD:test".to_string(), format!("NOD:{nod}")),
+            ("120000".to_string(), format!("12{minute:02}00")),
+        ] {
+            assert_eq!(from.len(), to.len());
+            let at = bytes
+                .windows(from.len())
+                .position(|w| w == from.as_bytes())
+                .unwrap();
+            bytes[at..at + to.len()].copy_from_slice(to.as_bytes());
+        }
+        bytes
+    }
+
+    /// An engine over a fresh in-memory store under a prefix of its own,
+    /// holding `scans` volumes five minutes apart for each site of `nods`,
+    /// plus the store to add volumes to and the engine's view of it.
+    fn remote_engine(
+        nods: &[&str],
+        scans: usize,
+    ) -> (
+        crate::PolarVolumeEngine,
+        Arc<ds_storage::object_store::memory::InMemory>,
+        ds_storage::DataStore,
+        String,
+    ) {
+        remote_engine_with_delay(nods, scans, Duration::ZERO)
+    }
+
+    /// [`remote_engine`] whose store waits `delay` before every GET.
+    fn remote_engine_with_delay(
+        nods: &[&str],
+        scans: usize,
+        delay: Duration,
+    ) -> (
+        crate::PolarVolumeEngine,
+        Arc<ds_storage::object_store::memory::InMemory>,
+        ds_storage::DataStore,
+        String,
+    ) {
+        use ds_storage::object_store::throttle::{ThrottleConfig, ThrottledStore};
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let prefix = format!("warm-{}-{n}/", std::process::id());
+        let inner = Arc::new(ds_storage::object_store::memory::InMemory::new());
+        for nod in nods {
+            for i in 0..scans {
+                put_scan(&inner, &prefix, nod, 5 * i);
+            }
+        }
+        let config = ThrottleConfig {
+            wait_get_per_call: delay,
+            ..ThrottleConfig::default()
+        };
+        let throttled = ThrottledStore::new(inner.clone(), config);
+        let store = ds_storage::DataStore::new(Arc::new(throttled));
+        let engine =
+            crate::PolarVolumeEngine::new_remote_for_test("warm", store.clone(), &prefix).unwrap();
+        (engine, inner, store, prefix)
+    }
+
+    fn put_scan(
+        store: &ds_storage::object_store::memory::InMemory,
+        prefix: &str,
+        nod: &str,
+        minute: usize,
+    ) {
+        use ds_storage::object_store::{ObjectStoreExt, PutPayload};
+        let key = format!("{prefix}2026091612{minute:02}_{nod}_PVOL.h5");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(store.put(
+                &ds_storage::object_store::path::Path::from(key),
+                PutPayload::from(scan_bytes(nod, minute)),
+            ))
+            .unwrap();
+    }
+
+    /// Whether the `CELLS` layer's cell set of each volume of `nod` is
+    /// cached, oldest first.
+    fn warm_by_volume(engine: &crate::PolarVolumeEngine, nod: &str) -> Vec<bool> {
+        engine.catalog.load().by_site[nod]
+            .iter()
+            .map(|e| CELL_SET_CACHE.contains_key(&layer_key(&engine.source, &e.id, "DBZH")))
+            .collect()
+    }
+
+    /// #1155: the poll-time warm-up builds the cell sets of every site's
+    /// newest `CELLS` window, newest volumes first across sites, at most
+    /// `MAX_WARMS_PER_POLL` per call; the next call finishes the windows.
+    /// It reads each file once, keeps nothing in the pixel cache beyond
+    /// the scan's pre-warmed base sweep, and a `CELLS` tile then reads no
+    /// volume file.
+    #[test]
+    fn warm_up_builds_the_newest_windows_first_within_its_bound() {
+        let nods = ["sa01", "sa02", "sa03", "sa04", "sa05"];
+        assert!(nods.len() * LAYER_WINDOW > MAX_WARMS_PER_POLL);
+        let (engine, _, store, _) = remote_engine(&nods, LAYER_WINDOW + 1);
+        let file = scan_bytes("sa01", 0).len() as u64;
+        let read = store.bytes_read();
+        let catalog = engine.catalog.load();
+
+        assert_eq!(warm_windows(&engine.source, &catalog), MAX_WARMS_PER_POLL);
+        assert_eq!(store.bytes_read() - read, MAX_WARMS_PER_POLL as u64 * file);
+        // Volume 0 is outside every window; volume 1 is the oldest in it.
+        // Its build waits for the next call in the sites sorted last.
+        for (i, nod) in nods.iter().enumerate() {
+            let oldest_warm = i < MAX_WARMS_PER_POLL - (LAYER_WINDOW - 1) * nods.len();
+            let mut want = vec![false, oldest_warm];
+            want.extend([true; LAYER_WINDOW - 1]);
+            assert_eq!(warm_by_volume(&engine, nod), want, "{nod}");
+        }
+        assert_eq!(warm_windows(&engine.source, &catalog), 3);
+        assert_eq!(warm_windows(&engine.source, &catalog), 0);
+        for nod in nods {
+            let mut want = vec![true; LAYER_WINDOW + 1];
+            want[0] = false;
+            assert_eq!(warm_by_volume(&engine, nod), want, "{nod}");
+        }
+
+        let volume = &catalog.by_site["sa01"][1];
+        let cache_id = pixel_cache_id(&engine.source, &volume.id);
+        let pixels = crate::volume_engine::pixel_cache();
+        for sweep in &volume.volume.sweeps[1..] {
+            for moment in &sweep.moments {
+                assert!(
+                    !pixels.contains(&cache_id, &moment.dataset_path),
+                    "the warm-up decoded `{}` into the pixel cache",
+                    moment.dataset_path
+                );
+            }
+        }
+
+        let read = store.bytes_read();
+        let view = engine.site_view("sa03", "warm-sa03");
+        let product = view.cell_product(&layer_query("DBZH", None), None).unwrap();
+        assert_eq!(product.cell_sets.len(), LAYER_WINDOW);
+        assert_eq!(store.bytes_read(), read, "a warm window reads no file");
+    }
+
+    /// #1155: a poll that downloads a site's new newest volume segments it
+    /// from the bytes it downloaded: the new window is warm after one GET
+    /// of the new file, not a second one.
+    #[test]
+    fn a_poll_segments_its_new_volume_from_the_bytes_in_hand() {
+        let (engine, inner, store, prefix) = remote_engine(&["sb01"], LAYER_WINDOW);
+        let file = scan_bytes("sb01", 0).len() as u64;
+        assert_eq!(
+            warm_windows(&engine.source, &engine.catalog.load()),
+            LAYER_WINDOW
+        );
+        put_scan(&inner, &prefix, "sb01", 5 * LAYER_WINDOW);
+        let read = store.bytes_read();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(engine.poll_once());
+        assert_eq!(
+            engine.catalog.load().by_site["sb01"].len(),
+            LAYER_WINDOW + 1
+        );
+        assert!(warm_by_volume(&engine, "sb01").iter().all(|&warm| warm));
+        assert_eq!(store.bytes_read() - read, file, "one GET of the new volume");
+    }
+
+    /// #1155: when the tile building a cell set fails, here at its
+    /// deadline, a tile waiting for that build builds the set itself
+    /// instead of failing with it.
+    #[test]
+    fn a_waiting_tile_builds_the_set_when_its_builder_fails() {
+        let get = Duration::from_millis(300);
+        let (engine, ..) = remote_engine_with_delay(&["sc01"], 1, get);
+        let view = Arc::new(engine.site_view("sc01", "warm-sc01"));
+        let query = layer_query("DBZH", None);
+        let builder = {
+            let (view, query) = (view.clone(), query.clone());
+            std::thread::spawn(move || {
+                let _deadline = ds_core::deadline::enter(Some(Instant::now() + get / 3));
+                view.cell_product(&query, None).map(|_| ())
+            })
+        };
+        // The builder holds the claim, its GET under way.
+        std::thread::sleep(get / 10);
+        let started = Instant::now();
+        let product = view.cell_product(&query, None).unwrap();
+        assert!(matches!(
+            builder.join().unwrap(),
+            Err(DataServerError::DeadlineExceeded)
+        ));
+        assert_eq!(product.cell_sets.len(), 1);
+        assert!(
+            started.elapsed() >= get,
+            "the waiter downloaded the volume itself"
+        );
     }
 }
