@@ -28,12 +28,13 @@ use ds_core::geo::geodetic_to_ecef;
 // implementations cannot drift (#499).
 use ds_core::http_cache::etag_of;
 use ds_core::volume::VolumeEngine;
-use ds_render::{BuiltinColormap, ColorMap, ColorStop, LutColorMap};
+use ds_render::{ColorMap, ColorStop, LutColorMap};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::cache::{ContentKey, ContentKind, CONTENT_CACHE};
 use crate::error::Tiles3dError;
+use crate::quantity::{self, QuantityStyles};
 
 /// Default isosurface threshold (dBZ) when a request names none — a light-rain
 /// reflectivity shell.
@@ -42,7 +43,8 @@ const ISOSURFACE_DEFAULT_THRESHOLD: f64 = 20.0;
 /// isosurface threshold and the no-echo-floor guard below, this is
 /// reflectivity-specific: an echo-top request for a non-reflectivity quantity
 /// (e.g. `VRADH`) still validates against the −32 dBZ floor, which is meaningless
-/// for velocity. Per-quantity floors land with per-quantity colormaps (#350).
+/// for velocity. Per-quantity floors are a follow-up (#350); until then the
+/// bundled viewer offers the grid products for reflectivity only (#1137).
 const ECHO_TOP_DEFAULT_THRESHOLD: f64 = 18.0;
 /// Cap on nested isosurface shells per request (#363). Each extra shell is
 /// another full marching pass over the voxel grid (the blur + resample are
@@ -158,70 +160,6 @@ impl Resolution {
     }
 }
 
-/// Reflectivity range (dBZ) sampled for the viewer's colour-scale legend. The
-/// shared point colormap is sampled across this span so the legend reads the
-/// same colours the points show. 0–70 dBZ is the conventional radar display
-/// range — it covers the whole coloured ramp (the radar colormap is ~black
-/// below a few dBZ, so a lower bound just adds an invisible band).
-const LEGEND_MIN_DBZ: f64 = 0.0;
-const LEGEND_MAX_DBZ: f64 = 70.0;
-const LEGEND_STOPS: usize = 24;
-
-/// The shared colour ramp applied to point-cloud values. v1 uses one reflectivity
-/// ramp for every 3D-Tiles collection (per-collection/per-quantity colormaps are
-/// a follow-up — #350). Single source of truth so the points the server encodes
-/// and the legend it advertises can't drift; every `TilesState3d` construction
-/// site uses this.
-pub fn default_point_colormap() -> Arc<dyn ColorMap> {
-    Arc::new(LutColorMap::from_builtin(
-        BuiltinColormap::RadarDbz,
-        -32.0,
-        95.0,
-    ))
-}
-
-/// Sample `colormap` into `(value, "#rrggbb")` stops across `[min, max]` for the
-/// viewer legend. RGB only — `.pnts` colours are opaque, so alpha is dropped.
-fn legend_stops(colormap: &dyn ColorMap, min: f64, max: f64, n: usize) -> Vec<serde_json::Value> {
-    (0..n)
-        .map(|i| {
-            // Guard n == 1: `i/(n-1)` would be `0/0 = NaN`, which serde emits as
-            // `null`. (LEGEND_STOPS is 24 today, but keep the invariant explicit.)
-            let v = min
-                + if n <= 1 {
-                    0.0
-                } else {
-                    (max - min) * (i as f64) / ((n - 1) as f64)
-                };
-            let c = colormap.color(Some(v));
-            json!({
-                "value": (v * 10.0).round() / 10.0,
-                "color": format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]),
-            })
-        })
-        .collect()
-}
-
-/// The point-cloud colour-scale legend, built once. The colormap is fixed for the
-/// process ([`default_point_colormap`]), so we sample it a single time rather than
-/// on every `GET /collections/{id}` (a metadata accessor — keep it O(1), #211).
-/// When per-collection colormaps land (#350) this moves into the per-collection
-/// snapshot.
-static POINT_LEGEND: LazyLock<serde_json::Value> = LazyLock::new(|| {
-    json!({
-        "title": "Reflectivity",
-        "unit": "dBZ",
-        "min": LEGEND_MIN_DBZ,
-        "max": LEGEND_MAX_DBZ,
-        "stops": legend_stops(
-            default_point_colormap().as_ref(),
-            LEGEND_MIN_DBZ,
-            LEGEND_MAX_DBZ,
-            LEGEND_STOPS,
-        ),
-    })
-});
-
 /// The 3D Tiles **content pool**: bounds every cold content compute (`.pnts`,
 /// the `.glb` meshes and voxels) — separate from the raster render slots
 /// (`ds_executor::RENDER_SLOTS`) that WMS/Maps/Tiles share (#380). A mesh or
@@ -265,10 +203,21 @@ pub struct TilesState3d {
     pub volume_engines: HashMap<String, Arc<dyn VolumeEngine>>,
     /// Per-collection config (title/description/etc.), keyed by id.
     pub collections: HashMap<String, CollectionConfig>,
-    /// Colour ramp applied to point values when encoding `.pnts` RGB. v1 uses
-    /// one shared ramp (reflectivity); per-collection/per-quantity colormaps
-    /// from config are a follow-up.
+    /// Fallback colour ramp for a quantity with no entry in
+    /// [`Self::quantity_styles`] (one a poll brought in after load). The
+    /// server passes [`crate::default_point_colormap`].
     pub colormap: Arc<dyn ColorMap>,
+    /// How each quantity is drawn, by collection id then quantity id: the
+    /// default style of its WMS/Maps/Tiles parameter layer, resolved by the
+    /// server at load (#1137). Built with [`crate::quantity_styles`].
+    pub quantity_styles: HashMap<String, QuantityStyles>,
+    /// The HTML page of each collection another API serves, keyed by
+    /// collection id, as a path below the base URL: `/collections/{id}` on
+    /// the shared OGC API root, `/edr/collections/{id}`. The server resolves
+    /// it from the registries the collection entered (#1137); the collection
+    /// document links it (`rel=related`, `text/html`) as the way to the data
+    /// when the 3D view cannot start. No entry, no link.
+    pub collection_pages: HashMap<String, String>,
     /// Bounds concurrent content sampling/encoding. The server passes
     /// [`CONTENT_SLOTS`] — never the raster render slots (#380).
     pub content_semaphore: Arc<tokio::sync::Semaphore>,
@@ -504,11 +453,77 @@ fn content_version(info: &ds_core::volume::VolumeInfo, exact: bool) -> u64 {
 /// The bundled CesiumJS viewer page (collection + quantity + representation
 /// picker), baked into the binary and served at `GET /3dtiles/viewer`.
 const VIEWER_HTML: &str = include_str!("../viewer/index.html");
+/// The viewer's script, served beside the page so the CSP needs no inline
+/// script.
+const VIEWER_JS: &str = include_str!("../viewer/viewer.js");
+
+/// The viewer page's Content-Security-Policy (#1137). Scripts run only from
+/// this origin and the pinned CesiumJS release, whose script, stylesheet,
+/// workers and assets all sit under one CDN prefix: a version bump in
+/// `viewer.js`, which inserts CesiumJS, MUST change it here too (a test pins
+/// the two together). No inline script. `'unsafe-eval'` is CesiumJS's requirement, not the page's:
+/// its bundle evaluates a string while loading (without it `Cesium` is never
+/// defined) and its decoders compile WebAssembly. CesiumJS starts its workers
+/// from `blob:` URLs that import the CDN scripts; a module worker's imports
+/// are checked against `worker-src`, so the prefix is listed there too
+/// (without it no globe tile is meshed). The basemap tiles come from CARTO.
+/// Styles allow `'unsafe-inline'` for the page's own `<style>` block. API
+/// requests stay on this origin (`?base=` is same-origin only).
+const VIEWER_CSP: &str = "default-src 'none'; \
+    script-src 'self' 'unsafe-eval' https://cesium.com/downloads/cesiumjs/releases/1.142/Build/Cesium/; \
+    style-src 'self' 'unsafe-inline' https://cesium.com/downloads/cesiumjs/releases/1.142/Build/Cesium/; \
+    img-src 'self' data: blob: https://cesium.com/downloads/cesiumjs/releases/1.142/Build/Cesium/ https://*.basemaps.cartocdn.com; \
+    connect-src 'self' https://cesium.com/downloads/cesiumjs/releases/1.142/Build/Cesium/ https://*.basemaps.cartocdn.com; \
+    worker-src blob: https://cesium.com/downloads/cesiumjs/releases/1.142/Build/Cesium/; \
+    object-src 'none'; \
+    base-uri 'none'; \
+    form-action 'none'; \
+    frame-ancestors 'none'";
+
+/// Strong ETag of [`VIEWER_JS`], computed once.
+static VIEWER_JS_ETAG: LazyLock<String> = LazyLock::new(|| etag_of(VIEWER_JS.as_bytes()));
 
 /// `GET /viewer` — interactive CesiumJS viewer. It calls this same API
-/// (same-origin by default), so it works on any deployment.
-pub async fn get_viewer() -> axum::response::Html<&'static str> {
-    axum::response::Html(VIEWER_HTML)
+/// (same-origin by default), so it works on any deployment. `no-cache`: the
+/// page and its script change together with the binary.
+pub async fn get_viewer() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONTENT_SECURITY_POLICY, VIEWER_CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        VIEWER_HTML,
+    )
+        .into_response()
+}
+
+/// `GET /viewer.js` (and `/viewer/viewer.js`, where a trailing-slash page URL
+/// resolves the page's relative `viewer.js`) — the viewer's script.
+pub async fn get_viewer_js(headers: HeaderMap) -> Response {
+    let etag = VIEWER_JS_ETAG.as_str();
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|v| ds_core::http_cache::if_none_match_matches(v, etag));
+    if not_modified {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [(header::ETAG, etag), (header::CACHE_CONTROL, "no-cache")],
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        VIEWER_JS,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -692,24 +707,27 @@ pub async fn get_content(
     // to reject them (#536).
     check_quantity(&info, quantity.as_deref(), &id)?;
     let exact = exact_volume_time(&info, time);
+    // Resolve an absent quantity to the default so both forms share one entry
+    // (the engine resolves `None` to the same default).
+    let resolved = quantity
+        .clone()
+        .unwrap_or_else(|| info.default_quantity.clone());
+    // Points are painted with the quantity's own ramp (#1137).
+    let (colormap, style) = quantity::ramp(&state, &id, &resolved);
     let key = ContentKey {
         collection: id,
         kind: ContentKind::Pnts,
-        // Resolve an absent quantity to the default so both forms share one
-        // entry (the engine resolves `None` to the same default).
-        quantity: quantity
-            .clone()
-            .unwrap_or_else(|| info.default_quantity.clone()),
+        quantity: resolved,
         datetime: time,
         param_bits: min_value.map(f64::to_bits),
         dims: [0; 3],
+        style,
         version: content_version(&info, exact),
     };
     let pinned = exact;
 
     let engine = engine.clone();
     let semaphore = state.content_semaphore.clone();
-    let colormap = state.colormap.clone();
     let content = CONTENT_CACHE
         .get_or_compute(key, move || async move {
             // Sample + encode off the request worker: `read_point_cloud` does
@@ -832,28 +850,35 @@ pub async fn get_content_glb(
         .join(", ");
 
     let exact = exact_volume_time(&info, time);
+    let resolved = quantity
+        .clone()
+        .unwrap_or_else(|| info.default_quantity.clone());
+    // Isosurface shells take their colours from the quantity's ramp (#1137);
+    // echo-top columns are coloured by height, whatever the quantity.
+    let (colormap, style) = quantity::ramp(&state, &id, &resolved);
     let key = ContentKey {
         collection: id,
         kind: match representation {
             Representation::EchoTop => ContentKind::EchoTop,
             _ => ContentKind::Isosurface,
         },
-        quantity: quantity
-            .clone()
-            .unwrap_or_else(|| info.default_quantity.clone()),
+        quantity: resolved,
         datetime: time,
         // The *applied* thresholds (default already folded in above, sorted +
         // deduped), so a defaulted and an explicit-default request share one
         // entry whatever the spelling.
         param_bits: Some(thresholds_bits(&thresholds)),
         dims,
+        style: match representation {
+            Representation::EchoTop => 0,
+            _ => style,
+        },
         version: content_version(&info, exact),
     };
     let pinned = exact;
 
     let engine = engine.clone();
     let semaphore = state.content_semaphore.clone();
-    let colormap = state.colormap.clone(); // reflectivity ramp (isosurface)
     let id_for_err = key.collection.clone();
     let content = CONTENT_CACHE
         .get_or_compute(key, move || async move {
@@ -881,8 +906,7 @@ pub async fn get_content_glb(
                             engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
                         // Colour each shell at its threshold, alpha ramped outer-
                         // translucent → inner-opaque (#363; one threshold = one
-                        // opaque shell, the classic look; v1: one colormap for
-                        // all quantities — #350); seal NaN at the no-echo floor
+                        // opaque shell, the classic look); seal NaN at the no-echo floor
                         // so shells close into solid blobs (`floor <
                         // thresholds[0]` guaranteed above).
                         let shells = ds_3dtiles::nested_shells(&thresholds, colormap.as_ref());
@@ -995,8 +1019,10 @@ pub async fn get_voxel_tileset(
         caps.height_m,
         [n_r, n_a, n_h],
         &quantity,
-        LEGEND_MIN_DBZ,
-        LEGEND_MAX_DBZ,
+        // Property statistics: the reflectivity display range (the viewer
+        // offers voxels for reflectivity only, #1137).
+        quantity::REFLECTIVITY_RANGE.0,
+        quantity::REFLECTIVITY_RANGE.1,
         &content_uri,
         "subtrees/{level}/{x}/{y}/{z}.json",
     )
@@ -1124,6 +1150,8 @@ pub async fn get_voxel_content(
         datetime: time,
         param_bits: None,
         dims,
+        // Voxel content is values only; the viewer colours it.
+        style: 0,
         version: content_version(&info, exact),
     };
     let pinned = exact;
@@ -1223,7 +1251,7 @@ pub async fn collections(
     ids.sort();
     let items: Vec<_> = ids
         .iter()
-        .map(|id| collection_doc(&state, id, base))
+        .map(|id| collection_doc(&state, id, base, false))
         .collect();
     Ok(Json(json!({ "collections": items })))
 }
@@ -1241,22 +1269,46 @@ pub async fn collection(
         &state,
         &id,
         &request_base_url(&state, &headers),
+        true,
     )))
 }
 
-fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Value {
+/// One collection's document. `detail` adds each quantity's `legend`: the
+/// collection list leaves them out (each is ~24 stops, ten-odd quantities a
+/// radar site), since a client draws a legend for one collection at a time.
+fn collection_doc(state: &TilesState3d, id: &str, base: &str, detail: bool) -> serde_json::Value {
     let cfg = state.collections.get(id);
     let title = cfg
         .map(|c| c.title.clone())
         .unwrap_or_else(|| id.to_string());
     let description = cfg.map(|c| c.description.clone()).unwrap_or_default();
     let info = state.volume_engines.get(id).map(|e| e.volume_info());
+    // Each quantity with how it is drawn (#1137): its unit, the suggested
+    // point/voxel floor (`null` when the quantity has no weak end to drop)
+    // and, in the collection's own document, the legend of the ramp its
+    // points are painted with. Precomputed per load, so this only clones.
+    let mut default_legend = serde_json::Value::Null;
     let quantities: Vec<_> = info
         .as_ref()
         .map(|i| {
             i.quantities
                 .iter()
-                .map(|(qid, label)| json!({ "id": qid, "label": label }))
+                .map(|(qid, label)| {
+                    let style = quantity::resolve(state, id, i, qid, label);
+                    if *qid == i.default_quantity {
+                        default_legend = style.legend().clone();
+                    }
+                    let mut entry = json!({
+                        "id": qid,
+                        "label": label,
+                        "unit": style.unit(),
+                        "min_value": style.min_value(),
+                    });
+                    if detail {
+                        entry["legend"] = style.legend().clone();
+                    }
+                    entry
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1312,11 +1364,13 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
     if supports_voxels {
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/voxel/tileset.json"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (cylindrical voxels)" }));
     }
-    // Colour-scale legend for the point cloud: the precomputed gradient of the
-    // shared reflectivity colormap, so the viewer's bar matches the point colours
-    // (built once — this is a metadata accessor; v1 uses one ramp for all
-    // quantities — #350).
-    let legend = POINT_LEGEND.clone();
+    // The bundled viewer opened on this collection, and the collection's HTML
+    // page where another API serves it: the way forward when the 3D view
+    // cannot start (#1137).
+    links.push(json!({ "href": format!("{base}/3dtiles/viewer?collection={}", pct_encode(id)), "rel": "alternate", "type": "text/html", "title": "3D viewer" }));
+    if let Some(page) = state.collection_pages.get(id) {
+        links.push(json!({ "href": format!("{base}{page}?f=html"), "rel": "related", "type": "text/html", "title": "Collection page" }));
+    }
     json!({
         "id": id,
         "title": title,
@@ -1324,7 +1378,9 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
         "quantities": quantities,
         "times": times,
         "representations": representations,
-        "legend": legend,
+        // The default quantity's legend, kept for clients that predate the
+        // per-quantity ones.
+        "legend": default_legend,
         "links": links,
     })
 }

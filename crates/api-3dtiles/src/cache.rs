@@ -10,7 +10,7 @@
 //!
 //! The cache stores the final encoded bytes + their strong ETag, keyed by
 //! everything that determines them (collection, product, quantity, time,
-//! product parameters, resolution) **plus a data-version** derived from the
+//! product parameters, resolution, colour ramp) **plus a data-version** derived from the
 //! collection's `VolumeInfo` time axis — when the engine ingests or drops a
 //! volume the version changes, so "latest" requests and nearest-time
 //! selection changes invalidate naturally without duplicating the engine's
@@ -76,6 +76,11 @@ pub struct ContentKey {
     /// Voxel-grid dims for the mesh/voxel products; `[0; 3]` for points
     /// (native resolution, no grid).
     pub dims: [usize; 3],
+    /// Fingerprint of the colour ramp painted into the bytes
+    /// ([`crate::QuantityStyle::fingerprint`]): points and isosurface shells
+    /// are coloured server-side, so a reload that restyles a quantity must
+    /// miss. `0` for the products coloured otherwise (echo top, voxels).
+    pub style: u64,
     /// Data version of the collection — see [`module docs`](self). Computed
     /// by the handler from `VolumeInfo`.
     pub version: u64,
@@ -226,6 +231,7 @@ mod tests {
             datetime: None,
             param_bits: None,
             dims: [0; 3],
+            style: 0,
             version: n,
         }
     }

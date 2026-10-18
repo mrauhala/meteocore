@@ -1977,6 +1977,22 @@ fn state_dir_reload_warning(
     })
 }
 
+/// The HTML page of a 3D Tiles collection in another API, as a path below the
+/// base URL (#1137): on the shared OGC API root (mounted at the server root,
+/// `SharedApi::new("")` in `main.rs`) when Maps or Tiles serve the
+/// collection, else EDR's. `None` when neither does: WMS has no collection
+/// page, and a PVOL site never enters the Features registry.
+fn volume_collection_page(id: &str, shared_root: bool, edr: bool) -> Option<String> {
+    let mount = if shared_root {
+        ""
+    } else if edr {
+        api_common::mounts::EDR
+    } else {
+        return None;
+    };
+    Some(format!("{mount}/collections/{id}"))
+}
+
 #[allow(clippy::too_many_arguments)] // config + style inputs + the two reload reuse pools are all distinct concerns
 pub fn load_collections(
     style_ctx: &ds_render::StyleContext,
@@ -2031,6 +2047,11 @@ pub fn load_collections(
     let mut volume_engines: HashMap<String, Arc<dyn ds_core::volume::VolumeEngine>> =
         HashMap::new();
     let mut volume_collections: HashMap<String, CollectionConfig> = HashMap::new();
+    // How each 3D Tiles quantity is drawn: its parameter layer's default
+    // style, keyed by collection id (#1137).
+    let mut volume_quantity_styles: HashMap<String, api_3dtiles::QuantityStyles> = HashMap::new();
+    // Each 3D Tiles collection's HTML page in another API (#1137).
+    let mut volume_collection_pages: HashMap<String, String> = HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
@@ -3498,6 +3519,31 @@ pub fn load_collections(
                             view.clone() as Arc<dyn ds_core::volume::VolumeEngine>,
                         );
                         volume_collections.insert(site_id.clone(), site_cfg.clone());
+                        // Paint each quantity as its WMS/Maps/Tiles layer does
+                        // (the same cached resolution), so the 3D legend and
+                        // filter speak the quantity's own unit (#1137).
+                        let layer_styles = collection_layer_styles(
+                            style_ctx,
+                            &mut styles_cache,
+                            &site_cfg,
+                            &raster_params,
+                            &bundle_index,
+                        );
+                        volume_quantity_styles.insert(
+                            site_id.clone(),
+                            api_3dtiles::quantity_styles(&site_id, &raster_params, &layer_styles),
+                        );
+                        // From the registries this site entered above, not
+                        // from `apis`: "features" registers the network
+                        // inventory under the source id, never the site.
+                        if let Some(page) = volume_collection_page(
+                            &site_id,
+                            maps_collections.contains_key(&site_id)
+                                || tiles_collections.contains_key(&site_id),
+                            edr_collections.contains_key(&site_id),
+                        ) {
+                            volume_collection_pages.insert(site_id.clone(), page);
+                        }
                     }
 
                     info!(
@@ -4449,10 +4495,11 @@ pub fn load_collections(
         tiles_3d_state: api_3dtiles::TilesState3d {
             volume_engines,
             collections: volume_collections,
-            // v1: one shared reflectivity ramp for all 3D-Tiles collections (the
-            // legend the API advertises samples this same source). Per-collection
-            // /per-quantity colormaps from config are a follow-up (#350).
+            // Only for a quantity a poll brings in after these styles were
+            // resolved (until the next reload, like its WMS layer).
             colormap: api_3dtiles::default_point_colormap(),
+            quantity_styles: volume_quantity_styles,
+            collection_pages: volume_collection_pages,
             // Its own process-lifetime pool, NOT `render_semaphore`: a cold
             // 3D preload must not occupy WMS/Maps/Tiles render slots (#380).
             content_semaphore: api_3dtiles::CONTENT_SLOTS.clone(),
@@ -9370,6 +9417,137 @@ colormap = "radar_dbz"
         assert_eq!(edr.len(), wms.len(), "EDR and WMS share one resolution");
         assert_eq!(edr["default"].min, wms["default"].min);
         assert_eq!(edr["default"].max, wms["default"].max);
+    }
+
+    /// A PVOL site's 3D Tiles document (#1137): each quantity is drawn with
+    /// the default style of its parameter layer, the one `[wms]` gives it,
+    /// and the collection page comes from the registries the site entered.
+    /// A site is in no Features registry, whatever `apis` says (the network
+    /// inventory is, under the source id), so without Maps or Tiles its page
+    /// is EDR's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pvol_sites_draw_each_quantity_in_its_style_and_link_their_page_in_3d_tiles() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        // One volume of site `test` with DBZH and VRAD.
+        std::fs::write(
+            dir.path().join("pvol.h5"),
+            include_bytes!("../../../testdata/pvol-cold-batch.h5"),
+        )
+        .unwrap();
+        let volume = |id: &str, apis: &str| -> CollectionConfig {
+            toml::from_str(&format!(
+                r#"
+id = "{id}"
+title = "Volumes"
+description = "test"
+engine_type = "odim-volume"
+apis = {apis}
+data_path = {path:?}
+
+[odim]
+prewarm_sweeps = 0
+
+[wms]
+colormap = "radar_dbz"
+
+[[wms.parameters]]
+name = "VRAD"
+colormap = "viridis"
+min = -30.0
+max = 30.0
+"#,
+                path = dir.path().to_str().unwrap()
+            ))
+            .unwrap()
+        };
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[
+                volume("pvol-edr", r#"["edr", "features", "3dtiles"]"#),
+                volume("pvol-maps", r#"["edr", "maps", "3dtiles"]"#),
+            ],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        for site in ["pvol-edr-test", "pvol-maps-test"] {
+            assert_eq!(
+                health_of(&result, site).status,
+                super::CollectionStatus::Ready
+            );
+        }
+        let state = &result.tiles_3d_state;
+        let page = |id: &str| state.collection_pages.get(id).map(String::as_str);
+        assert_eq!(
+            page("pvol-edr-test"),
+            Some("/edr/collections/pvol-edr-test")
+        );
+        assert_eq!(page("pvol-maps-test"), Some("/collections/pvol-maps-test"));
+        assert_eq!(state.quantity_styles["pvol-edr-test"]["VRAD"].unit(), "m/s");
+
+        let app = api_3dtiles::router(Arc::new(arc_swap::ArcSwap::from_pointee(
+            result.tiles_3d_state,
+        )));
+        let get = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{uri}");
+                let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        let related = |doc: &serde_json::Value| {
+            doc["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|l| l["rel"] == "related" && l["type"] == "text/html")
+                .map(|l| l["href"].as_str().unwrap().to_string())
+        };
+        let doc = get("/collections/pvol-edr-test").await;
+        assert_eq!(
+            related(&doc).as_deref(),
+            Some("http://x/edr/collections/pvol-edr-test?f=html")
+        );
+        let quantity = |id: &str| {
+            doc["quantities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["id"] == id)
+                .unwrap_or_else(|| panic!("{id} in {doc}"))
+                .clone()
+        };
+        // Velocity in m/s over its configured range, no floor; reflectivity
+        // keeps dBZ and its 5 dBZ floor.
+        let vrad = quantity("VRAD");
+        assert_eq!(vrad["unit"], "m/s");
+        assert!(vrad["min_value"].is_null());
+        assert_eq!(vrad["legend"]["unit"], "m/s");
+        assert_eq!(vrad["legend"]["min"], -30.0);
+        assert_eq!(vrad["legend"]["max"], 30.0);
+        let dbzh = quantity("DBZH");
+        assert_eq!(dbzh["unit"], "dBZ");
+        assert_eq!(dbzh["min_value"], 5.0);
+        let doc = get("/collections/pvol-maps-test").await;
+        assert_eq!(
+            related(&doc).as_deref(),
+            Some("http://x/collections/pvol-maps-test?f=html")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

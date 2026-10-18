@@ -1571,9 +1571,15 @@ Each tileset includes a `times` manifest of all available volume timestamps (RFC
 | `GET /3dtiles/collections/{id}/content.glb` | `representation`, `quantity`, `datetime`, `threshold`, `resolution` |
 | `GET /3dtiles/collections/{id}/voxel/tileset.json` | `quantity`, `datetime`, `resolution` |
 | `GET /3dtiles/`, `GET /3dtiles/collections` | `f`: `json` or `application/json` only; any other value, `html` included, is a 400 naming the supported format |
-| `GET /3dtiles/viewer` | Built-in CesiumJS SPA; `?base=` selects another API path on the same origin (e.g. a proxy prefix) |
+| `GET /3dtiles/viewer` | Built-in CesiumJS SPA; `?base=` selects another API path on the same origin (e.g. a proxy prefix); `collection`, `quantity`, `representation`, `min_value`/`threshold`, `resolution` and `datetime` open a view, and the page keeps them in the URL as the view changes |
 
 `datetime` accepts any RFC 3339 instant and selects the nearest available volume; omitting it selects the latest. `?datetime=` values that exactly match an advertised volume time receive `Cache-Control: max-age=86400, immutable`; others receive `max-age=60`.
+
+### Quantities and the viewer
+
+Each quantity is drawn with the default style of its WMS/Maps/Tiles parameter layer: the collection's `[[wms.parameters]]` entry, a style bundle, the built-in parameter defaults, then its `[wms]` fields, so a moment reads the same in 2D and 3D. Radial velocity has a built-in default, a diverging ramp in m/s. A correlation coefficient reads over 0–1 where a `[[wms.parameters]]` entry sets that range, as the shipped PVOL example configs do; a moment nothing styles takes the collection's `[wms]` palette. The point cloud and isosurface shells are painted with that ramp, and each `quantities[]` entry of `GET /3dtiles/collections/{id}` carries its `unit`, a `legend` (`title`, `unit`, `min`, `max` and sampled `#rrggbb` `stops`) and a suggested `min_value` floor: 5 for dBZ, `null` for every other quantity. `GET /3dtiles/collections` lists the same entries without their legends. The top-level `legend` is the default quantity's. The viewer relabels its filter with the quantity's unit and offers the isosurface, echo-top and voxel views for reflectivity only, since the server seals those grids at the −32 dBZ no-echo floor whatever the quantity.
+
+The viewer page runs under a Content-Security-Policy that allows scripts from the server and the pinned CesiumJS release on cesium.com only. The page's script loads CesiumJS without blocking the page. When CesiumJS fails to load, has not arrived after 12 seconds, or WebGL is off, the page still lists every collection with links to its 3D Tiles document and its collection page in the other APIs; a CesiumJS that arrives late still starts the 3D view.
 
 ### Config
 
@@ -1594,7 +1600,7 @@ poll_interval_secs = 300
 
 Two complementary LRU caches reduce per-request compute:
 
-- **Content cache** (`MC_3DTILES_CONTENT_CACHE_MB`, default 512 MB) — caches encoded `.pnts`/`.glb` bytes keyed by (collection, product, quantity, datetime, params, dims) plus a data-version hash derived from `VolumeInfo.times`. Concurrent identical requests share one compute via single-flight coalescing.
+- **Content cache** (`MC_3DTILES_CONTENT_CACHE_MB`, default 512 MB) — caches encoded `.pnts`/`.glb` bytes keyed by (collection, product, quantity, datetime, params, dims, colour-ramp fingerprint) plus a data-version hash derived from `VolumeInfo.times`. Concurrent identical requests share one compute via single-flight coalescing.
 - **Voxel-grid cache** (`MC_PVOL_VOXEL_GRID_CACHE_MB`, default 512 MB, engine-side) — caches the polar-resampled `VoxelGrid` (keyed by file + quantity + dims) so isosurface, echo-top, and voxels all share one resample pass. Threshold changes re-use the cached grid.
 
 Cache metrics: `tiles3d_content_cache_*` and `pvol_voxel_grid_cache_*` in `/metrics`.
@@ -2389,7 +2395,7 @@ baseline before adding CodeQL to required merge checks. The existing RustSec
 - **libaec-sys** for GRIB CCSDS/AEC decompression
 - **memmap2** for memory-mapped QueryData file access
 - **zarrs** for Zarr V2/V3 array reading and codecs (with optional **icechunk** for versioned repositories)
-- **CesiumJS** for the 3D Tiles viewer SPA, whose page (bundled via `include_str!`) loads it from cesium.com
+- **CesiumJS** for the 3D Tiles viewer SPA, whose page (bundled via `include_str!`) loads it from cesium.com under a CSP that allows only that release
 
 ## License
 

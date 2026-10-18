@@ -1158,6 +1158,8 @@ mod tests {
             volume_engines: HashMap::new(),
             collections: HashMap::new(),
             colormap: api_3dtiles::default_point_colormap(),
+            quantity_styles: HashMap::new(),
+            collection_pages: HashMap::new(),
             content_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             base_url: String::new(),
             trust_proxy_headers: false,
