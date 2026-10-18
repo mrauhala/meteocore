@@ -218,6 +218,15 @@ on the request path. Single-level and legacy views require exact metadata.
   4 B/px instead of a boxed 16. Values are exactly the old f64 ones `as f32`
   (`tests/local_source.rs` pins this on the fixture for all three CRS paths);
   keep `resample` returning f64 for the bench fingerprint.
+- This sampler is not `ds_core::resample::SourceGrid` (#1172), and moving to
+  it changes pixels: EPSG:3857 maps each pixel exactly here, SourceGrid
+  through its projection grid; a regional grid draws nothing west or north
+  of its first node here, half a cell more there; a NaN neighbour falls back
+  to the first valid corner here, the nearest cell there; and the display
+  conversion runs before narrowing here. `cache/sampler_tests.rs` pins the
+  two bit-equal where they agree on the committed global field: CRS84 and
+  projected output, both forms of the seam box, the #323 Arctic tile. A
+  sampler change that breaks it is a drift from the shared rules.
 - Cache weights include allocated value capacity and key/structure overhead.
   Keep the entry-size estimate aligned with the 4 MiB typical global field.
 - Run `cargo run --release -p engine-grib --example bench_grid_cache` for a
