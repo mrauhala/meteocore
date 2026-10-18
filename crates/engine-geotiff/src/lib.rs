@@ -2,6 +2,8 @@ mod cache;
 mod catalog;
 pub mod decode_budget;
 mod decoded_cache;
+#[cfg(test)]
+mod footprint_tests;
 mod gone;
 #[cfg(test)]
 mod gone_object_tests;
@@ -2031,6 +2033,25 @@ fn crs_label(crs: &ds_core::geo::Crs) -> String {
     }
 }
 
+/// A map request's output CRS for a log line: its code, and for a projected
+/// one its request rectangle in metres (the logged `bbox` is the WGS84 read
+/// envelope).
+fn output_crs_label(output_crs: &ds_core::map_engine::OutputCrs) -> String {
+    use ds_core::map_engine::OutputCrs;
+    match output_crs {
+        OutputCrs::Wgs84 => "CRS:84".to_string(),
+        OutputCrs::WebMercator => "EPSG:3857".to_string(),
+        OutputCrs::Projected { crs, bbox } => format!("{} {bbox:?}", crs_label(crs)),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Source-pixel projections made by this thread's map renders, so a
+    /// test can pin what a render costs (#1129).
+    static SOURCE_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl ds_core::map_engine::MapEngine for GeoTiffEngine {
     #[allow(clippy::too_many_arguments)]
     fn get_raster_tile(
@@ -2113,6 +2134,39 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
 
         let [west, south, east, north] = bbox;
         let total_pixels = (width as usize) * (height as usize);
+
+        // Domain guard against "ghost" echoes. The coarse projection grid
+        // only approximates the output→source mapping; at low zoom / extreme
+        // viewports (e.g. a whole-world Web Mercator view whose pixels wrap
+        // past ±180° or reach the poles) it — and the source projection's own
+        // out-of-domain forward — can map a far-away output pixel onto a valid
+        // source pixel, painting the radar far from where it belongs (ghosts
+        // in the Arctic/Antarctic, smear north of the data). An output pixel
+        // may only carry data if its TRUE geography lies within the source's
+        // footprint, so bound, in output-pixel space, the window the footprint
+        // can occupy and treat everything outside it as nodata. Computed once
+        // from the source's WGS84 envelope (no per-pixel projection).
+        //
+        // A footprint wholly off the image leaves nothing to draw, so answer
+        // before choosing a level: no source read and no projection grid
+        // (#1129). Far from its meridian a projected source's forward can
+        // fold back onto the raster (the TM series past ±180°), so such a
+        // tile would otherwise steer `select_overview`, decode that level
+        // and refine a grid to its cell cap, all for pixels the guard then
+        // empties. Every level shares the full-resolution extent, so its
+        // envelope serves whichever level is read.
+        let Some(footprint) = output_crs.footprint_window_in_image(
+            bbox,
+            metadata.geo_transform.bbox(),
+            width,
+            height,
+        ) else {
+            return Ok(ds_core::map_engine::RasterTile {
+                width,
+                height,
+                values: ds_core::map_engine::RasterValues::F64(vec![None; total_pixels]),
+            });
+        };
 
         // Select the best overview level for the output resolution.
         // This avoids reading millions of full-resolution pixels for zoomed-out views.
@@ -2197,28 +2251,36 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             // dominates render CPU for projected sources. The output→world axis
             // mapping (linear lon/lat, Mercator Y, or a projected output CRS) is
             // the shared `OutputCrs::project_node`, so EPSG:3067/3035 output is
-            // handled here without per-engine axis math (#160).
-            let grid = ds_core::resample::ProjectionGrid::build_2d(
+            // handled here without per-engine axis math (#160). Only the
+            // footprint's pixels are read, so only their error counts:
+            // outside it the forward folds and refining for it never
+            // converges (#1110, #1129).
+            let grid = ds_core::resample::ProjectionGrid::build_2d_within_quiet(
                 width,
                 height,
+                footprint,
                 gt.width,
                 gt.height,
                 |fx, fy| output_crs.project_node(bbox, fx, fy),
-                |lon, lat| gt.world_to_pixel_f64(lon, lat),
+                |lon, lat| {
+                    #[cfg(test)]
+                    SOURCE_PROJECTIONS.with(|n| n.set(n.get() + 1));
+                    gt.world_to_pixel_f64(lon, lat)
+                },
             );
-
-            // Domain guard against "ghost" echoes. The coarse projection grid
-            // only approximates the output→source mapping; at low zoom / extreme
-            // viewports (e.g. a whole-world Web Mercator view whose pixels wrap
-            // past ±180° or reach the poles) it — and the source projection's own
-            // out-of-domain forward — can map a far-away output pixel onto a valid
-            // source pixel, painting the radar far from where it belongs (ghosts
-            // in the Arctic/Antarctic, smear north of the data). An output pixel
-            // may only carry data if its TRUE geography lies within the source's
-            // footprint, so bound, in output-pixel space, the window the footprint
-            // can occupy and treat everything outside it as nodata. Computed once
-            // from the source's WGS84 envelope (no per-pixel projection).
-            let footprint = output_crs.footprint_pixel_window(bbox, gt.bbox(), width, height);
+            if let Some(error_px) = grid.capped_error() {
+                tracing::warn!(
+                    collection = %self.collection_id,
+                    ?bbox,
+                    width,
+                    height,
+                    crs = %output_crs_label(output_crs),
+                    source_level = ?(gt.width, gt.height),
+                    error_px,
+                    "Projection grid hit its cell cap over the interpolation budget; \
+                     this render may be slightly misregistered"
+                );
+            }
 
             // Native u8 fast path (#206): keep raw bytes end to end — window
             // read, nearest resample, and (in ds-render) a 256-entry-LUT

@@ -119,6 +119,9 @@ pub struct ProjectionGrid {
     /// Whether `boundary` holds a pole cell — one with four finite corners,
     /// which [`Self::sample`] must still route to its sub-grid.
     pole_cells: bool,
+    /// The estimated interpolation error, in the budget's units, when
+    /// refinement stopped at [`MAX_CELLS`] above [`MAX_INTERP_ERROR_PX`].
+    capped: Option<f64>,
 }
 
 /// A boundary cell's nodes at [`BOUNDARY_STEP_PX`] spacing, row-major.
@@ -307,6 +310,7 @@ impl ProjectionGrid {
             out_to_world,
             world_to_src_px,
         )
+        .warn_if_capped()
     }
 
     /// Like [`build_2d`](Self::build_2d) for a caller that samples only the
@@ -333,6 +337,32 @@ impl ProjectionGrid {
         out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) -> Self {
+        Self::build_2d_within_quiet(
+            out_width,
+            out_height,
+            read,
+            src_cols,
+            src_rows,
+            out_to_world,
+            world_to_src_px,
+        )
+        .warn_if_capped()
+    }
+
+    /// [`Self::build_2d_within`] for a caller that reports a capped grid
+    /// itself: nothing goes to stderr, and [`Self::capped_error`] says
+    /// whether refinement stopped at [`MAX_CELLS`] over budget. ds-core has
+    /// no `tracing`, so an engine logs it with what only it knows, the
+    /// collection and the request (#1129).
+    pub fn build_2d_within_quiet(
+        out_width: u32,
+        out_height: u32,
+        read: (u32, u32, u32, u32),
+        src_cols: u32,
+        src_rows: u32,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
+        world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
+    ) -> Self {
         Self::refined(
             out_width,
             out_height,
@@ -345,9 +375,35 @@ impl ProjectionGrid {
         )
     }
 
+    /// The estimated interpolation error when refinement stopped at
+    /// [`MAX_CELLS`] above the [`MAX_INTERP_ERROR_PX`] budget, `None` when
+    /// the grid met it. In source pixels, or output pixels on a periodic
+    /// column axis ([`Self::build_2d_periodic`]).
+    pub fn capped_error(&self) -> Option<f64> {
+        self.capped
+    }
+
+    /// Report a capped grid on stderr, for every constructor but
+    /// [`Self::build_2d_within_quiet`]. ds-core is framework-free (no
+    /// `tracing`). It's a rare edge (only hit when a single render spans
+    /// tens of degrees) and the consequence is sub-pixel-ish
+    /// misregistration, not a failure.
+    fn warn_if_capped(self) -> Self {
+        if let Some(error) = self.capped {
+            eprintln!(
+                "WARN ds_core::resample: projection grid hit the MAX_CELLS \
+                 cap with interpolation error {error:.3} px > budget \
+                 {MAX_INTERP_ERROR_PX} px; rendered output may be slightly \
+                 misregistered for this viewport"
+            );
+        }
+        self
+    }
+
     /// The adaptive build behind every constructor: `col_period` as
     /// [`Self::build_2d_periodic`] takes it, `read` as
-    /// [`Self::build_2d_within`] does (`None` reads every pixel).
+    /// [`Self::build_2d_within`] does (`None` reads every pixel). A grid
+    /// that stops at the cap records its error ([`Self::capped_error`]).
     #[allow(clippy::too_many_arguments)] // output dims + source dims + period + window + 2 mapping closures are all genuine inputs
     fn refined(
         out_width: u32,
@@ -381,19 +437,12 @@ impl ProjectionGrid {
             }
             if cells_x >= MAX_CELLS && cells_y >= MAX_CELLS {
                 // Extreme viewport: even the densest grid cannot meet the
-                // budget. Accept it, but make the degradation observable
-                // rather than letting it pass silently. ds-core is
-                // framework-free (no `tracing`), so this goes to stderr; it's
-                // a rare edge (only hit when a single render spans tens of
-                // degrees) and the consequence is sub-pixel-ish misregistration,
-                // not a failure.
-                eprintln!(
-                    "WARN ds_core::resample: projection grid hit the MAX_CELLS \
-                     cap with interpolation error {error:.3} px > budget \
-                     {MAX_INTERP_ERROR_PX} px; rendered output may be slightly \
-                     misregistered for this viewport"
-                );
-                break grid;
+                // budget. Accept it, but record the error, so the
+                // degradation is observable rather than passing silently.
+                break Self {
+                    capped: Some(error),
+                    ..grid
+                };
             }
             // Halving the cell size quarters the bilinear error.
             cells_x = (cells_x * 2).min(MAX_CELLS);
@@ -601,6 +650,7 @@ impl ProjectionGrid {
             boundary: Vec::new(),
             col_period,
             pole_cells: false,
+            capped: None,
         }
     }
 
@@ -1167,6 +1217,43 @@ mod tests {
             (grid.cells_x, grid.cells_y, grid.node_count()),
             (16, 16, 289)
         );
+    }
+
+    /// #1129: a grid that stops at `MAX_CELLS` over budget records its
+    /// error, so a caller of the quiet constructor can report it with what
+    /// it knows of the request. Every other constructor caps the same way
+    /// and records the same error.
+    #[test]
+    fn a_capped_grid_records_its_error() {
+        // A jump 37 source columns wide at x = 0.6: no cell size
+        // interpolates across it.
+        let map = |x: f64, y: f64| {
+            let jump = if x < 0.6 { 0.0 } else { 37.0 };
+            (x * 100.0 + jump, y * 100.0)
+        };
+        let size = 256;
+        let node = |x: f64, y: f64| (x, y);
+        let all = (0, size - 1, 0, size - 1);
+        let quiet = ProjectionGrid::build_2d_within_quiet(size, size, all, 100, 100, node, map);
+        let cap = MAX_CELLS as usize;
+        assert_eq!((quiet.cells_x, quiet.cells_y), (cap, cap));
+        let error = quiet.capped_error().expect("the jump caps the grid");
+        assert!(error > MAX_INTERP_ERROR_PX, "capped at {error}");
+        let within = ProjectionGrid::build_2d_within(size, size, all, 100, 100, node, map);
+        let whole = ProjectionGrid::build_2d(size, size, 100, 100, node, map);
+        assert_eq!(within.capped_error(), Some(error));
+        assert_eq!(whole.capped_error(), Some(error));
+        // Read short of the jump, the grid meets the budget.
+        let short = ProjectionGrid::build_2d_within_quiet(
+            size,
+            size,
+            (0, 127, 0, size - 1),
+            100,
+            100,
+            node,
+            map,
+        );
+        assert_eq!(short.capped_error(), None);
     }
 
     /// Great-circle distance in km (sphere) — the ground misregistration
