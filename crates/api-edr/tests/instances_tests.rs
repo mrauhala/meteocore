@@ -814,20 +814,29 @@ async fn collection_and_instance_links_name_their_query_end_points() {
     }
 }
 
-/// The HTML pages list the data queries from `data_queries`; the `rel=data`
-/// links are listed at their own href, never as `?f=html` pages a data
-/// query is not.
+/// The HTML pages list the data queries from `data_queries`, each opening
+/// its HTML view: without coordinates, the query's form (#1138), on the run
+/// a run page names.
 #[tokio::test]
-async fn html_pages_do_not_open_data_queries_as_pages() {
-    for uri in [
-        "/collections/fc?f=html",
-        "/collections/fc/instances?f=html",
-        "/collections/fc/instances/2026-06-07T00:00:00Z?f=html",
+async fn html_pages_open_data_queries_as_their_forms() {
+    for (uri, query) in [
+        ("/collections/fc?f=html", "/edr/collections/fc/position"),
+        (
+            "/collections/fc/instances?f=html",
+            "/edr/collections/fc/instances/2026-06-07T00:00:00Z/position",
+        ),
+        (
+            "/collections/fc/instances/2026-06-07T00:00:00Z?f=html",
+            "/edr/collections/fc/instances/2026-06-07T00:00:00Z/position",
+        ),
     ] {
         let (status, _, body) = get_raw(uri, None).await;
         assert_eq!(status, StatusCode::OK, "{uri}");
-        assert!(body.contains("/position"), "{uri} lists the position query");
-        assert!(!body.contains("/position?f=html"), "{uri}");
+        assert!(body.contains(&format!("{query}?f=html\"")), "{uri}");
+        let path = query.strip_prefix("/edr").unwrap();
+        let (status, _, form) = get_raw(&format!("{path}?f=html"), None).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {form}");
+        assert!(form.contains("data-edr-query"), "{path}");
     }
 }
 

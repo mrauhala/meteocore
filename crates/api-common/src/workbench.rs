@@ -1200,8 +1200,8 @@ pub fn collection_html(
         body.push_str("<section class=\"panel enhanced\"><div class=\"panel-head\"><h2>Map legend</h2></div><div class=\"map-legend\"><span id=\"map-legend-status\">Legend will appear after the map loads.</span><a id=\"map-legend-link\" hidden><img id=\"map-legend-image\" alt=\"Selected map style legend\" hidden></a></div></section>");
     }
     // Each href once on the Overview (#1140): the data query end points are
-    // listed under "Request data" from `data_queries` (as `?f=html` pages
-    // their `rel=data` links would be bare 400s), the tilesets beside the
+    // listed under "Request data" from `data_queries` (each opening its
+    // HTML view, a query's form, #1138), the tilesets beside the
     // map, and a configured license in the details. The metadata tab's
     // link table lists every link at its own href.
     let query_hrefs: Vec<&str> = doc["data_queries"]
@@ -1256,15 +1256,14 @@ pub fn collection_html(
 }
 
 /// Where a `data_queries` link points in HTML (every link an `<a>`, OGC
-/// API - EDR `/req/html/content`): the HTML view of a resource that is
-/// one (instances, locations, items), else the query endpoint itself,
-/// which needs its parameters.
-fn data_query_target(name: &str, href: &str) -> String {
-    if matches!(name, "instances" | "locations" | "items") {
-        with_format(href, "html")
-    } else {
-        href.to_owned()
-    }
+/// API - EDR `/req/html/content`): the end point's HTML view. Instances,
+/// locations and items are lists; a parameterised query (position, area,
+/// radius, trajectory, cube) asked for as HTML without its coordinates
+/// answers with its query form (#1138), so no link from a page ends in a
+/// 400. The one place catalog chips, collection and run pages choose it;
+/// the query type no longer changes the answer, every one has a view.
+fn data_query_target(_name: &str, href: &str) -> String {
+    with_format(href, "html")
 }
 
 /// A document's `data_queries` links as anchors, one per query type.
@@ -2542,7 +2541,8 @@ mod tests {
         // A parameter without a label is listed by its name.
         assert!(parameters.contains("<li>x</li>"));
         assert!(!parameters.contains("title="));
-        assert!(rich.contains("<div class=\"row-line query-chips\"><span class=\"row-label\">Data queries</span><span class=\"chip-row\"><a class=\"chip\" href=\"https://example.test/proxy/edr/collections/rich/position\">position</a>"));
+        // The query chip opens the query's HTML view, its form (#1138).
+        assert!(rich.contains("<div class=\"row-line query-chips\"><span class=\"row-label\">Data queries</span><span class=\"chip-row\"><a class=\"chip\" href=\"https://example.test/proxy/edr/collections/rich/position?f=html\">position</a>"));
         assert!(rich.contains("<span class=\"row-label\">Keywords</span>"));
         // Nothing advertised: five dashes, and the id stands in for a title.
         assert_eq!(bare.matches(EMPTY_SLOT).count(), 5);
@@ -3027,8 +3027,8 @@ mod tests {
 
     #[test]
     /// OGC API - EDR `/req/html/content` A: every `data_queries` link is an
-    /// `<a>` on the collection (and instance) page and in the catalog row;
-    /// a resource with an HTML view links to it.
+    /// `<a>` on the collection (and instance) page and in the catalog row,
+    /// to its HTML view: a list, or a query's form (#1138).
     fn data_query_links_are_anchors() {
         let edr = Surface {
             base: "https://x",
@@ -3043,7 +3043,7 @@ mod tests {
                 "instances": link("https://x/edr/collections/c/instances"),
                 "evil": link("javascript:alert(1)")}});
         let hrefs = [
-            "https://x/edr/collections/c/position\"",
+            "https://x/edr/collections/c/position?f=html\"",
             "https://x/edr/collections/c/locations?f=html\"",
             "https://x/edr/collections/c/instances?f=html\"",
         ];
@@ -3142,9 +3142,10 @@ mod tests {
             assert!(html.contains(text), "{text}");
         }
         assert!(html.contains(&escape(attack)) && !html.contains(attack));
-        // The data link is listed at its own href, not as an HTML page.
+        // The data link is listed at its own href; the query chip opens the
+        // query's HTML view, its form (#1138).
         assert!(html.contains("href=\"https://x/edr/collections/a/position\">"));
-        assert!(!html.contains("position?f=html"));
+        assert!(html.contains("href=\"https://x/edr/collections/a/position?f=html\">"));
 
         let instance = json!({"id":"2026-01-01T00:00:00Z","title":"A — run 2026-01-01T00:00:00Z",
             "description":"One run","extent":{"vertical":{"vrs":"VRS-WKT"}},
@@ -3211,7 +3212,10 @@ mod tests {
         ] {
             assert!(html.contains(text), "{text}");
         }
-        assert!(!html.contains("position?f=html"));
+        // The link table keeps the data link's own href; the query row opens
+        // the query's form (#1138).
+        assert!(html.contains("href=\"https://x/edr/collections/c/position\">"));
+        assert!(html.contains("href=\"https://x/edr/collections/c/position?f=html\">"));
     }
 
     /// The `href` of every `<a>` element of `html`, unescaped.

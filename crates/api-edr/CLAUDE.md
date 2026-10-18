@@ -392,7 +392,21 @@ PNG skips it (it plots the newest section). A malformed `limit` is still a 400
 everywhere, as a malformed `z` is. `/locations` without `limit` or a filter must stay byte-identical to
 the unpaged inventory (clients and ETags rely on it); with `limit` it pages
 through `ds_core::collection_search::page_window`, the `/collections`
-arithmetic, under the same `location_budget` writer.
+arithmetic, under the same `location_budget` writer. That rule is the
+GeoJSON's: the HTML page pages `handlers::LOCATIONS_HTML_PAGE` (100) by
+default (#1138), and its row links carry `location_view_datetime`, never
+the collection's last day on a station series (a station that stopped
+reporting 404s there).
+
+HTML data queries (#1138): `query_form::DATA_QUERIES` is the one list of
+coordinate-placed queries and their placing parameter (`coords`, a cube's
+`bbox`), read by `bare_query_form` (an HTML request without it is a 200
+form, JSON keeps the 400), `error_pages::error_detail` and the breadcrumbs,
+all from the matched route (`routed_query`), never the URL's last segment.
+A new data query route ends in its query name and is added to that list.
+Every field a form submits without JavaScript must parse: a blank `z` or
+`parameter-name` is absent (`parse_z`, `parse_parameter_names`), so parse
+any new form field through a helper that treats blank as absent.
 
 `params::parse_locations_query` is the one `/locations` parser (#932).
 `bbox` (`parse_cube_bbox`, heights dropped), then `datetime`, filter the

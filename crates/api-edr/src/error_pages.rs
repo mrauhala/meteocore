@@ -9,7 +9,7 @@
 //! [`ErrorDetail`]; JSON responses are never touched.
 
 use api_common::errors::{self, ErrorDetail};
-use axum::extract::{FromRequestParts, Query, RawPathParams, Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -30,9 +30,6 @@ pub(crate) fn wrap(router: axum::Router, state: AppState, mount: &'static str) -
     errors::html_errors(router, "edr", mount, pages)
 }
 
-/// The data queries an error detail can describe.
-const DATA_QUERIES: &[&str] = &["position", "area", "radius", "cube", "trajectory"];
-
 /// Attach an [`ErrorDetail`] to a data query's 400 or 404 when the request
 /// asked for HTML. Runs after routing, inside `html_errors`.
 pub(crate) async fn error_detail(
@@ -43,27 +40,13 @@ pub(crate) async fn error_detail(
     if errors::wanted(request.uri().query(), request.headers()) != Wanted::Html {
         return next.run(request).await;
     }
-    let query_type = request
-        .uri()
-        .path()
-        .rsplit('/')
-        .next()
-        .filter(|segment| DATA_QUERIES.contains(segment))
-        .map(str::to_owned);
+    // The data query the route names, from `query_form`'s one list.
+    let query_type = crate::query_form::routed_query(&request).map(|(query, _)| query);
     let pairs = Query::<Vec<(String, String)>>::try_from_uri(request.uri())
         .map(|Query(pairs)| pairs)
         .unwrap_or_default();
-    let (mut parts, body) = request.into_parts();
-    let id = RawPathParams::from_request_parts(&mut parts, &())
-        .await
-        .ok()
-        .and_then(|params| {
-            params
-                .iter()
-                .find(|(key, _)| *key == "id")
-                .map(|(_, id)| id.to_owned())
-        });
-    let mut response = next.run(Request::from_parts(parts, body)).await;
+    let (request, id, _) = crate::query_form::route_ids(request).await;
+    let mut response = next.run(request).await;
     let (Some(query_type), Some(id)) = (query_type, id) else {
         return response;
     };
@@ -84,7 +67,7 @@ pub(crate) async fn error_detail(
             unknown_parameter(engine.as_ref(), value("parameter-name"), &response)
         }
         StatusCode::NOT_FOUND if is_no_data(&response) => {
-            Some(no_data(engine.as_ref(), &query_type, value("datetime")))
+            Some(no_data(engine.as_ref(), query_type, value("datetime")))
         }
         _ => None,
     };
@@ -103,10 +86,7 @@ fn unknown_parameter(
     requested: Option<&str>,
     response: &Response,
 ) -> Option<ErrorDetail> {
-    let requested: Vec<String> = requested?
-        .split(',')
-        .map(|name| name.trim().to_owned())
-        .collect();
+    let requested = crate::params::parse_parameter_names(requested)?;
     let available = engine.get_parameters();
     let names: Vec<&str> = available.iter().map(String::as_str).collect();
     let rejection = match select_parameters(Some(requested.as_slice()), &names) {
