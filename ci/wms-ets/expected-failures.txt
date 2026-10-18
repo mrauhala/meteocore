@@ -9,7 +9,7 @@
 #
 # The list holds the failures of the 2026-10-18 run (ets-wms13 1.34, TEAM
 # Engine 6.0.0-RC2), minus the two that #1182 fixed by defaulting TRANSPARENT
-# to FALSE.
+# to FALSE and getmap:no-version, fixed by requiring VERSION on GetMap.
 
 # One layer per GetMap and GetFeatureInfo: `LayerLimit` 1 (#1014), by
 # decision. Several layers per request are #1181.
@@ -23,10 +23,6 @@ getmap:styles-some-default
 getfeatureinfo:two-query_layers
 getfeatureinfo:three-query_layers
 getfeatureinfo:less-query_layers
-
-# GetMap without VERSION assumes 1.3.0, by decision: clients that leave it
-# out keep working.
-getmap:no-version
 
 # OGC's "Blue Lake" test dataset, the cite:* layers, which the fixtures do
 # not serve.

@@ -26,8 +26,10 @@ injection risk.**
 - An unknown name is ignored. A repeated parameter, in any mix of cases,
   takes its first value; serde's derive used to reject a repeat with a
   plain-text 400 that was no ServiceException.
-- GetMap without `VERSION` assumes 1.3.0. Deliberate, kept although
-  ets-wms13's `getmap:no-version` expects an exception.
+- GetMap and GetFeatureInfo require `VERSION=1.3.0`; without it they are
+  `MissingParameterValue` (#1065), which ets-wms13's `getmap:no-version`
+  checks. Only GetCapabilities negotiates the version and answers any or no
+  `VERSION` with the 1.3.0 document.
 
 ## Exception codes (#1065)
 
