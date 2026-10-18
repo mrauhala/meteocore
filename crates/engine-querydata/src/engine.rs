@@ -16,11 +16,12 @@ use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
     QueryResult,
 };
+use ds_core::resample::ProjectionGrid;
 use ds_core::temp_files;
 use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindRole, WindSource};
 
-use crate::parse::QueryData;
+use crate::parse::{GridInfo, QueryData};
 
 /// One retained model run: a parsed `.sqd` file plus its source path (for
 /// change detection on poll). Keyed in [`RunSet`] by the file's origin time.
@@ -620,9 +621,8 @@ impl MapEngine for QueryDataEngine {
         // output's inverse, the source's forward (LCC `powf`/`atan2` for
         // MEPS), or both — so compose them into a coarse `ProjectionGrid` and
         // bilinearly interpolate the output→source pixel map rather than
-        // projecting per output pixel (Critical Rule 5; #268, #807).
-        // Projected sources are regional, so the grid stays accurate and
-        // needs no antimeridian care.
+        // projecting per output pixel (Critical Rule 5; #268, #807). A
+        // projected source's map is bounded by its footprint ([`GridMap`]).
         let gt = data.grid.geo_transform();
         let per_pixel = matches!(output_crs, OutputCrs::Wgs84 | OutputCrs::WebMercator)
             && matches!(gt.crs, ds_core::geo::Crs::Wgs84);
@@ -658,23 +658,34 @@ impl MapEngine for QueryDataEngine {
                     ));
                 }
             }
-        } else {
-            let grid = ds_core::resample::ProjectionGrid::build_2d(
-                width,
-                height,
-                data.grid.nx,
-                data.grid.ny,
-                |fx, fy| output_crs.project_node(bbox, fx, fy),
-                |lon, lat| world_to_grid_px(gt, lon, lat),
-            );
+        } else if let Some(map) =
+            GridMap::new(&data.grid, bbox, width, height, output_crs, |lon, lat| {
+                world_to_grid_px(gt, lon, lat)
+            })
+        {
+            if let Some(error_px) = map.grid.capped_error() {
+                tracing::warn!(
+                    collection = %self.collection_id,
+                    ?bbox,
+                    width,
+                    height,
+                    ?output_crs,
+                    grid = ?(data.grid.nx, data.grid.ny),
+                    error_px,
+                    "Projection grid hit its cell cap over the interpolation budget; \
+                     this render may be slightly misregistered"
+                );
+            }
             for oy in 0..height {
                 for ox in 0..width {
-                    let (col_f, row_f) = grid.sample(ox, oy);
-                    values.push(sample_grid_bilinear(
-                        &data, col_f, row_f, param_idx, 0, time_idx,
-                    ));
+                    values.push(map.position(ox, oy).and_then(|(col_f, row_f)| {
+                        sample_grid_bilinear(&data, col_f, row_f, param_idx, 0, time_idx)
+                    }));
                 }
             }
+        } else {
+            // The footprint misses the image: nothing to draw.
+            values.resize(width as usize * height as usize, None);
         }
 
         Ok(RasterTile {
@@ -1008,13 +1019,125 @@ fn select_param_indices<'a>(
 /// Map WGS84 (lon, lat) to fractional source-grid pixel `(col_f, row_f)` — the
 /// source `Crs::forward` plus the grid's affine, with the half-pixel centre
 /// offset. This is the (possibly projected) per-node mapping fed to
-/// [`ProjectionGrid::build_2d`] and the front half of [`interpolate`].
+/// [`GridMap`] and the front half of [`interpolate`].
 fn world_to_grid_px(gt: &ds_core::geo::GeoTransform, lon: f64, lat: f64) -> (f64, f64) {
     let (x, y) = gt.crs.forward(lon, lat);
     (
         (x - gt.origin_x) / gt.pixel_width - 0.5,
         (gt.origin_y - y) / gt.pixel_height - 0.5,
     )
+}
+
+/// The output→source pixel map of a map request the engine does not sample
+/// per pixel: a coarse [`ProjectionGrid`] over the output, by the rules of
+/// `ds_core::resample::SourceGrid` (pinned in `engine/sampler_tests.rs`).
+///
+/// A projected grid ([`GridInfo::footprint`]) is projected from a
+/// longitude within half a turn of its own centre: `Lcc::forward` is not
+/// periodic in longitude (θ = n·Δλ), so a pixel a turn away, in a second
+/// world copy of a Web Mercator view, would otherwise land on data that
+/// lies elsewhere. Output outside the footprint window of the grid's
+/// envelope ([`OutputCrs::footprint_window_in_image`]) stays empty (#449),
+/// and the grid is refined for that window alone
+/// ([`ProjectionGrid::build_2d_within_quiet`]): outside it the map need
+/// not be smooth, and refining for it ran polar WMS meta-tiles to
+/// `MAX_CELLS`, about 1.5 million projections each (#1114). A lat/lon
+/// grid's window is the whole output, as before.
+struct GridMap {
+    grid: ProjectionGrid,
+    /// The inclusive output window `(px_lo, px_hi, py_lo, py_hi)` the
+    /// grid's footprint can occupy.
+    window: (u32, u32, u32, u32),
+}
+
+impl GridMap {
+    /// The map of `info` onto a `width`×`height` image of `bbox`, the
+    /// request's WGS84 box, in `output_crs`; `None` when the image is
+    /// empty or the footprint lies wholly off it, so there is nothing to
+    /// draw and no grid is built (#1129). `to_grid` is the grid's
+    /// [`world_to_grid_px`]. A box crossing the antimeridian may come
+    /// either way: `west > east` (170, 10, -170, 20), or unwrapped with
+    /// `east` past 180° (170, 10, 190, 20), as OGC API Maps passes it
+    /// (#828).
+    ///
+    /// A grid stopped at its cell cap is not reported on stderr: the
+    /// caller logs [`ProjectionGrid::capped_error`] with the request.
+    fn new(
+        info: &GridInfo,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        output_crs: &OutputCrs,
+        to_grid: impl Fn(f64, f64) -> (f64, f64),
+    ) -> Option<Self> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let [west, south, mut east, north] = bbox;
+        if west > east {
+            east += 360.0;
+        }
+        let bbox = [west, south, east, north];
+        let (window, centre) = match info.footprint() {
+            Some(envelope) => (
+                output_crs.footprint_window_in_image(
+                    bbox,
+                    envelope_near(envelope, bbox, output_crs),
+                    width,
+                    height,
+                )?,
+                Some((envelope[0] + envelope[2]) / 2.0),
+            ),
+            None => ((0, width - 1, 0, height - 1), None),
+        };
+        let grid = ProjectionGrid::build_2d_within_quiet(
+            width,
+            height,
+            window,
+            info.nx,
+            info.ny,
+            |fx, fy| output_crs.project_node(bbox, fx, fy),
+            |lon, lat| to_grid(centre.map_or(lon, |c| within_half_turn(lon, c)), lat),
+        );
+        Some(GridMap { grid, window })
+    }
+
+    /// The fractional grid position output pixel `(ox, oy)` samples, as
+    /// [`world_to_grid_px`] gives it; `None` outside the footprint.
+    fn position(&self, ox: u32, oy: u32) -> Option<(f64, f64)> {
+        let (x_lo, x_hi, y_lo, y_hi) = self.window;
+        ((x_lo..=x_hi).contains(&ox) && (y_lo..=y_hi).contains(&oy))
+            .then(|| self.grid.sample(ox, oy))
+    }
+}
+
+/// `lon` moved by whole turns into `[centre - 180°, centre + 180°)`. A
+/// longitude already there is returned as is, so it never moves by a
+/// rounding error; NaN stays NaN.
+fn within_half_turn(lon: f64, centre: f64) -> f64 {
+    let start = centre - 180.0;
+    if (start..start + 360.0).contains(&lon) {
+        lon
+    } else {
+        start + (lon - start).rem_euclid(360.0)
+    }
+}
+
+/// The envelope [`OutputCrs::footprint_pixel_window`] needs for `bbox`: on
+/// geographic output, moved by whole turns to the box's longitudes, which
+/// may lie past ±180°; spanning the whole turn, it bounds latitude only.
+/// A projected output places the envelope by its own forward transform.
+fn envelope_near(envelope: [f64; 4], bbox: [f64; 4], output_crs: &OutputCrs) -> [f64; 4] {
+    if matches!(output_crs, OutputCrs::Projected { .. }) {
+        return envelope;
+    }
+    let [w, s, e, n] = envelope;
+    let [west, _, east, _] = bbox;
+    if e - w >= 360.0 {
+        return [west, s, east, n];
+    }
+    let turns = ((west + east - w - e) / 720.0).round() * 360.0;
+    [w + turns, s, e + turns, n]
 }
 
 /// Bilinearly sample the grid at fractional source pixel `(col_f, row_f)`,
@@ -1872,6 +1995,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod footprint_tests;
 #[cfg(test)]
 mod sampler_tests;
 #[cfg(test)]

@@ -1,7 +1,8 @@
 //! The shared sampler, `ds_core::resample::SourceGrid` (#1067), pinned to
 //! this engine's own map render on the MEPS fixture (Lambert conformal
 //! conic, rows stored south first): the same decoded field through both
-//! gives the same pixels, value for value.
+//! gives the same pixels, value for value, footprint and world copies
+//! included (#1114).
 
 use super::*;
 use crate::parse::MISSING_VALUE;
@@ -56,6 +57,22 @@ fn shared_sampler_renders_meps_as_the_engine_does() {
             256,
             OutputCrs::WebMercator,
         ),
+        // World copies: a turn east, a turn west, and three turns wide.
+        ([360.0, 55.0, 390.0, 70.0], 256, 256, OutputCrs::WebMercator),
+        ([-355.0, 57.0, -335.0, 68.0], 300, 200, OutputCrs::Wgs84),
+        (
+            [-540.0, -85.0, 540.0, 85.0],
+            768,
+            256,
+            OutputCrs::WebMercator,
+        ),
+    ];
+    // Views of no data: where the Lambert forward transform alone puts
+    // the grid a turn east, at 58°E + 360°, and the antimeridian seam box.
+    let empty = [
+        ([405.0, 58.0, 430.0, 68.0], OutputCrs::WebMercator),
+        ([170.0, 10.0, -170.0, 20.0], OutputCrs::Wgs84),
+        ([170.0, 10.0, 190.0, 20.0], OutputCrs::WebMercator),
     ];
     for (epsg, wgs84) in [
         ("EPSG:3067", [8.0, 59.0, 21.0, 66.0]),
@@ -70,10 +87,12 @@ fn shared_sampler_renders_meps_as_the_engine_does() {
     let arctic = [2_000_000.0, 3_500_000.0, 7_000_000.0, 8_500_000.0];
     let read = wgs84_envelope(&crs, arctic).unwrap();
     views.push((read, 256, 256, OutputCrs::Projected { crs, bbox: arctic }));
+    let has_data = views.len();
+    views.extend(empty.map(|(bbox, crs)| (bbox, 256, 256, crs)));
     for param in 0..data.params.len() {
         let name = data.params[param].name.clone();
         let values = field(&data, param, time);
-        for (bbox, width, height, crs) in &views {
+        for (view, (bbox, width, height, crs)) in views.iter().enumerate() {
             let ours = engine
                 .get_raster_tile(
                     *bbox,
@@ -97,7 +116,11 @@ fn shared_sampler_renders_meps_as_the_engine_does() {
                 assert_eq!(got, want, "{name} {crs:?} {bbox:?} pixel {i}");
                 filled += usize::from(got.is_some());
             }
-            assert!(filled > 0, "{name} {crs:?} {bbox:?}: no data");
+            assert_eq!(
+                filled > 0,
+                view < has_data,
+                "{name} {crs:?} {bbox:?}: {filled} filled"
+            );
         }
     }
 }
