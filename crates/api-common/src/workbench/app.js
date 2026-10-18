@@ -22,6 +22,9 @@
   document.querySelectorAll('[data-page-size]').forEach(select => select.addEventListener('change', event => {
     const url = new URL(location.href); url.searchParams.set('limit', event.target.value); url.searchParams.delete('offset'); url.searchParams.set('f','html'); location.href = url.href;
   }));
+  document.querySelectorAll('[data-sort]').forEach(select => select.addEventListener('change', event => {
+    const url = new URL(location.href); url.searchParams.set('sortby', event.target.value); url.searchParams.delete('offset'); url.searchParams.set('f','html'); location.href = url.href;
+  }));
   function collectionTab() {
     const active = location.hash === '#metadata' ? 'metadata' : 'overview';
     document.querySelectorAll('[data-collection-view]').forEach(view => { view.hidden = view.id !== active; });

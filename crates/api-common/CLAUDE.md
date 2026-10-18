@@ -11,8 +11,11 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   excluded query terms; phrases never span fields or keyword entries. q and query
   combine with AND. Keep operator encoding (`%2B`) intact through navigation.
   See README.md for explicit tokenizer and malformed-input choices.
-- Apply filters before paging. Navigation preserves supported filters and the
-  negotiated format, including requests that used Accept without an explicit f.
+- Apply filters, then `sortby`, before paging. Navigation preserves supported
+  filters and the negotiated format, including requests that used Accept without
+  an explicit f. JSON and HTML default differently (id and 1,000; title and 24,
+  #1141), so an alternate link must spell out `limit` and `sortby`
+  (`SearchQueryParams::explicit_page`) to name the same page.
 - Adapters supply metadata and extents from their registry snapshot. Time bounds
   and advertised collection metadata must agree. Preserve EDR's distinct extent
   representation. Do not infer a sampling grid from feature interval endpoints.

@@ -2,7 +2,10 @@
 //!
 //! JSON remains the resource contract. Adapters supply the same metadata used
 //! for JSON; this module supplies only presentation and progressive enhancement.
-use ds_core::collection_search::{CollectionParameter, SearchParams, SearchQueryParams};
+use ds_core::collection_search::{
+    sortby_value, CollectionParameter, CollectionSortKey, CollectionSortProperty, SearchParams,
+    SearchQueryParams,
+};
 use ds_core::config::LicenseConfig;
 use ds_core::html::{escape, LinkView, FAVICON};
 use serde_json::{json, Value};
@@ -28,6 +31,21 @@ const APIS: &[(&str, &str, &str)] = &[
 /// Per-API services the shared root supersedes (#789): still routed, but
 /// offered by the switcher only on their own pages.
 const SUPERSEDED: &[&str] = &["features", "maps", "tiles"];
+
+/// Collections on an HTML catalog page whose request gives no `limit`
+/// (#1141): a screenful of compact rows. JSON keeps listing every one.
+pub const HTML_PAGE_SIZE: usize = 24;
+/// The order of an HTML catalog page without `sortby` (#1141): by title,
+/// the name people look for. JSON keeps id order.
+pub const HTML_DEFAULT_SORT: CollectionSortKey =
+    CollectionSortKey::ascending(CollectionSortProperty::Title);
+/// The orders the catalog's sort controls offer, as `(sortby, label)`.
+const SORT_CHOICES: [(&str, &str); 4] = [
+    ("title", "Title A–Z"),
+    ("-title", "Title Z–A"),
+    ("id", "ID A–Z"),
+    ("-id", "ID Z–A"),
+];
 
 /// Where a page's API lives. `base` is the server's external base URL (for
 /// server-wide assets and the API switcher); `root` is the absolute root of the
@@ -712,7 +730,7 @@ pub fn landing_document(
         crate::shared::WORKSPACE => "Open a collection to see every way to access it: map images, map tiles and vector tiles, as the collection offers them. Related services are linked below.",
         _ => "Choose an API and a collection first. Then request features, environmental values, map images or tiles using that collection's supported operations.",
     };
-    body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="radar"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,discovery=escape(discovery),arrow=icon("arrow")));
+    body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="e.g. radar or GFS"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,discovery=escape(discovery),arrow=icon("arrow")));
     body.push_str("<section class=\"section-space\"><div class=\"section-header\"><h2>API definitions &amp; resource links</h2></div>");
     body.push_str(&link_table(&doc["links"]));
     body.push_str("</section>");
@@ -1450,86 +1468,145 @@ fn vertical_coverage(vertical: &Value) -> String {
     html
 }
 
+/// An empty catalog fact slot: a dash, read out as "Not advertised".
+const EMPTY_SLOT: &str =
+    "<span aria-hidden=\"true\">—</span><span class=\"visually-hidden\">Not advertised</span>";
+
+/// The catalog's Cadence slot: the advertised time step and the number of
+/// time steps, either or both; `None` when the collection advertises neither.
+fn cadence(temporal: &Value) -> Option<String> {
+    let step = temporal["grid"]["resolution"]
+        .as_str()
+        .map(metadata::cadence_label);
+    let count = temporal["grid"]["cellsCount"]
+        .as_u64()
+        .or_else(|| {
+            temporal["values"]
+                .as_array()
+                .filter(|v| v.len() > 1)
+                .map(|v| v.len() as u64)
+        })
+        .map(|n| format!("{n} time step{}", if n == 1 { "" } else { "s" }));
+    let text = match (step, count) {
+        (Some(step), Some(count)) => format!("{step} · {count}"),
+        (step, count) => step.or(count)?,
+    };
+    Some(escape(&text))
+}
+
+/// The catalog's Area slot: the first CRS84 bbox, its exact numbers in the
+/// tooltip; `None` without a usable one.
+fn area(bbox: &Value) -> Option<String> {
+    let v = metadata::bbox_xy(bbox)?;
+    Some(format!(
+        "<span title=\"{}\">{}</span>",
+        escape(&bbox.to_string()),
+        escape(&metadata::bbox_label(v))
+    ))
+}
+
+/// What a catalog row calls an entry of `parameter_names`: its `label`,
+/// else its observed property's, each plain text or a language map (English
+/// first); else the name itself.
+fn catalog_parameter_label<'a>(name: &'a str, parameter: &'a Value) -> &'a str {
+    let text = |value: &'a Value| {
+        value
+            .as_str()
+            .or_else(|| value["en"].as_str())
+            .or_else(|| value.as_object()?.values().find_map(Value::as_str))
+            .filter(|text| !text.trim().is_empty())
+    };
+    text(&parameter["label"])
+        .or_else(|| text(&parameter["observedProperty"]["label"]))
+        .unwrap_or(name)
+}
+
+/// `(label, name)` entries as a fact: up to three labels inline; more show
+/// the first three and fold the full list, each label with its name, under
+/// a disclosure (#1141), instead of a tooltip only a mouse can read.
+fn label_list(entries: &[(&str, &str)]) -> String {
+    const SHOWN: usize = 3;
+    let preview = entries
+        .iter()
+        .take(SHOWN)
+        .map(|(label, _)| escape(label))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if entries.len() <= SHOWN {
+        return preview;
+    }
+    let items: String = entries
+        .iter()
+        .map(|(label, name)| {
+            if name.is_empty() || label == name {
+                format!("<li>{}</li>", escape(label))
+            } else {
+                format!("<li>{} <code>{}</code></li>", escape(label), escape(name))
+            }
+        })
+        .collect();
+    format!(
+        "<details class=\"slot-list\"><summary>{preview} <span class=\"slot-more\">+{} more</span></summary><ul>{items}</ul></details>",
+        entries.len() - SHOWN
+    )
+}
+
+/// A catalog row's facts, in fixed slots so they line up from row to row
+/// (#1141): Time, Cadence, Area, Vertical, and Parameters (or Styles), each
+/// a dash when the collection does not advertise it; Items follows for a
+/// feature collection. The data queries come after, as their own line of
+/// action chips.
 fn collection_facts(doc: &Value) -> String {
     let mut facts = String::from("<dl class=\"collection-facts\">");
-    let mut fact = |label: &str, value: String| {
+    let mut slot = |label: &str, value: Option<String>| {
         facts.push_str(&format!(
-            "<div><dt>{}</dt><dd>{value}</dd></div>",
-            escape(label)
+            "<div><dt>{}</dt><dd>{}</dd></div>",
+            escape(label),
+            value.as_deref().unwrap_or(EMPTY_SLOT)
         ))
     };
-    if let Some(summary) = vertical_summary(&doc["extent"]["vertical"]) {
-        fact("Vertical dimension", summary);
-    }
     let temporal = &doc["extent"]["temporal"];
-    fact("Time · UTC", collection_time_html(temporal));
-    if let Some(resolution) = temporal["grid"]["resolution"].as_str() {
-        fact(
-            "Time resolution",
-            escape(&metadata::cadence_label(resolution)),
-        );
-    } else if let Some(count) = temporal["grid"]["cellsCount"].as_u64().or_else(|| {
-        temporal["values"]
-            .as_array()
-            .filter(|v| v.len() > 1)
-            .map(|v| v.len() as u64)
-    }) {
-        fact("Time steps", format!("{count} advertised"));
-    }
-    let bbox = &doc["extent"]["spatial"]["bbox"][0];
-    if let Some(v) = metadata::bbox_xy(bbox) {
-        fact(
-            "Bounds · CRS84",
-            format!(
-                "<span title=\"{}\">{}</span>",
-                escape(&bbox.to_string()),
-                escape(&metadata::bbox_label(v))
-            ),
-        );
-    }
-    if let Some(parameters) = doc["parameter_names"].as_object().filter(|p| !p.is_empty()) {
-        let names: Vec<_> = parameters.keys().map(String::as_str).collect();
-        let mut label = names.iter().take(4).copied().collect::<Vec<_>>().join(", ");
-        if names.len() > 4 {
-            label.push_str(&format!(" +{}", names.len() - 4));
-        }
-        fact(
-            "Parameters",
-            format!(
-                "<span title=\"{}\">{}</span>",
-                escape(&names.join(", ")),
-                escape(&label)
-            ),
-        );
-    } else if let Some(styles) = doc["styles"].as_array().filter(|s| !s.is_empty()) {
-        let names: Vec<_> = styles
-            .iter()
-            .filter_map(|s| s["title"].as_str().or(s["id"].as_str()))
-            .collect();
-        let mut label = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
-        if names.len() > 3 {
-            label.push_str(&format!(" +{}", names.len() - 3));
-        }
-        fact(
-            "Styles",
-            format!(
-                "<span title=\"{}\">{}</span>",
-                escape(&names.join(", ")),
-                escape(&label)
-            ),
-        );
+    slot(
+        "Time · UTC",
+        temporal["interval"][0]
+            .is_array()
+            .then(|| collection_time_html(temporal)),
+    );
+    slot("Cadence", cadence(temporal));
+    slot("Area · CRS84", area(&doc["extent"]["spatial"]["bbox"][0]));
+    slot("Vertical", vertical_summary(&doc["extent"]["vertical"]));
+    let parameters: Vec<(&str, &str)> = doc["parameter_names"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, parameter)| (catalog_parameter_label(name, parameter), name.as_str()))
+        .collect();
+    let styles: Vec<(&str, &str)> = doc["styles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|style| {
+            let id = style["id"].as_str();
+            Some((style["title"].as_str().or(id)?, id.unwrap_or_default()))
+        })
+        .collect();
+    if !parameters.is_empty() {
+        slot("Parameters", Some(label_list(&parameters)));
+    } else if !styles.is_empty() {
+        slot("Styles", Some(label_list(&styles)));
+    } else {
+        slot("Parameters", None);
     }
     if let Some(n) = doc.get("numberItems") {
-        fact("Items", value_html(n));
-    }
-    let queries = data_query_links(doc);
-    if !queries.is_empty() {
-        fact(
-            "Data queries",
-            format!("<span class=\"chip-row\">{queries}</span>"),
-        );
+        slot("Items", Some(value_html(n)));
     }
     facts.push_str("</dl>");
+    let queries = data_query_links(doc);
+    if !queries.is_empty() {
+        facts.push_str(&format!(
+            "<div class=\"row-line query-chips\"><span class=\"row-label\">Data queries</span><span class=\"chip-row\">{queries}</span></div>"
+        ));
+    }
     facts
 }
 
@@ -1583,15 +1660,73 @@ pub fn mark_invalid(field: &str, name: &str, message: &str) -> String {
     }
 }
 
+/// The `<option>`s of a catalog sort control, `current` selected: the
+/// offered orders, and `current` itself first when it is none of them (a
+/// multi-key `sortby`).
+fn sort_options(current: &str) -> String {
+    let mut options = String::new();
+    if !SORT_CHOICES.iter().any(|(value, _)| *value == current) {
+        options.push_str(&format!(
+            "<option value=\"{}\" selected>{}</option>",
+            escape(current),
+            escape(current)
+        ));
+    }
+    for (value, label) in SORT_CHOICES {
+        options.push_str(&format!(
+            "<option value=\"{value}\"{}>{label}</option>",
+            if value == current { " selected" } else { "" }
+        ));
+    }
+    options
+}
+
+/// How a results bar names an order: `Title A–Z`, keys joined by "then".
+fn sort_label(keys: &[CollectionSortKey]) -> String {
+    keys.iter()
+        .map(|key| {
+            let value = key.to_string();
+            SORT_CHOICES
+                .iter()
+                .find(|(choice, _)| *choice == value)
+                .map_or(value.clone(), |(_, label)| (*label).to_owned())
+        })
+        .collect::<Vec<_>>()
+        .join(", then ")
+}
+
+/// The same search with each multi-word alternative of `q` split into
+/// separate words (`radar composite` → `radar,composite`): what a search
+/// that matched nothing as a phrase offers instead (#1141). `None` when no
+/// alternative has more than one word.
+fn comma_alternatives(q: &str) -> Option<String> {
+    let alternatives: Vec<&str> = q.split(',').map(str::trim).collect();
+    if !alternatives
+        .iter()
+        .any(|alternative| alternative.split_whitespace().nth(1).is_some())
+    {
+        return None;
+    }
+    Some(
+        alternatives
+            .iter()
+            .flat_map(|alternative| alternative.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
 /// The catalog search form over the request's decoded `pairs`; `invalid`
 /// is the parameter a rejected request failed on and the message, marked
-/// on its field. `json_url` is the request as JSON.
+/// on its field. `page_url` is the request as HTML, which the applied-filter
+/// chips edit; `sortby` is the order the page uses.
 fn catalog_form(
     url: &str,
-    json_url: &str,
+    page_url: &str,
     pairs: &[(String, String)],
     limit: &str,
     offset: &str,
+    sortby: &str,
     invalid: Option<(Option<&str>, &str)>,
 ) -> String {
     let value = |name: &str| {
@@ -1617,13 +1752,16 @@ fn catalog_form(
         let current = value(name);
         match parameter {
             CollectionParameter::Format=>{},
-            CollectionParameter::Q=>primary=format!("<div class=\"search-row\"><div class=\"search-main\"><label for=\"collection-search\">Search text <code>q</code></label><div class=\"search-input-wrap\">{}{}</div></div><button class=\"btn primary\">Find collections {}</button></div><p id=\"collection-search-help\" class=\"search-hint\">Matches titles, descriptions and keywords. Commas separate alternatives.</p>",icon("search"),mark(format!("<input id=\"collection-search\" name=\"q\" value=\"{}\" placeholder=\"e.g. radar or GFS\" aria-describedby=\"collection-search-help\">",escape(current)),name),icon("arrow")),
+            CollectionParameter::Q=>primary=format!("<div class=\"search-row\"><div class=\"search-main\"><label for=\"collection-search\">Search text <code>q</code></label><div class=\"search-input-wrap\">{}{}</div></div><button class=\"btn primary\">Find collections {}</button></div><p id=\"collection-search-help\" class=\"search-hint\">Searches titles, descriptions and keywords for whole words, not ids. Words match as an exact phrase; separate alternatives with commas.</p>",icon("search"),mark(format!("<input id=\"collection-search\" name=\"q\" value=\"{}\" placeholder=\"e.g. radar or GFS\" aria-describedby=\"collection-search-help\">",escape(current)),name),icon("arrow")),
             CollectionParameter::Limit|CollectionParameter::Offset=>paging.push_str(&mark(input(name,if name=="limit"{limit}else{offset},"integer","number",false),name)),
+            // A rejected order is shown as typed, to be corrected in place.
+            CollectionParameter::Sortby if rejected(name).is_some()=>paging.push_str(&mark(input(name,current,"title or id; - descends","text",false).replace("<span>sortby</span>","<span>Order <code>sortby</code></span>"),name)),
+            CollectionParameter::Sortby=>paging.push_str(&format!("<label class=\"field\"><span>Order <code>sortby</code></span><span class=\"hint\">Title or ID</span><select name=\"sortby\">{}</select></label>",sort_options(sortby))),
             CollectionParameter::Bbox=>{
                 let bounds:Vec<_>=current.split(',').collect();
                 if rejected(name).is_none() && (current.is_empty()||bounds.len()==4) {
                     advanced.push_str(&format!("<div class=\"enhanced\"><label>bbox <span class=\"parameter-type\">number[4] · CRS84</span></label><input type=\"hidden\" data-param=\"bbox\" value=\"{}\"><div class=\"bbox-fields\">",escape(current)));
-                    for (i,(label,hint)) in [("West","18"),("South","58"),("East","32"),("North","71")].iter().enumerate(){
+                    for (i,(label,hint)) in [("West","e.g. 18"),("South","e.g. 58"),("East","e.g. 32"),("North","e.g. 71")].iter().enumerate(){
                         advanced.push_str(&format!("<label>{label}<input data-bbox=\"{i}\" type=\"number\" step=\"any\" value=\"{}\" placeholder=\"{hint}\"></label>",escape(bounds.get(i).copied().unwrap_or_default())));
                     }
                     advanced.push_str("</div><p class=\"field-help\">CRS84 · leave blank for any area</p></div>");
@@ -1645,6 +1783,7 @@ fn catalog_form(
         if !matches!(
             parameter,
             CollectionParameter::Q
+                | CollectionParameter::Sortby
                 | CollectionParameter::Limit
                 | CollectionParameter::Offset
                 | CollectionParameter::Format
@@ -1661,7 +1800,7 @@ fn catalog_form(
         .filter(|(k, v)| ["q", "query", "bbox", "datetime"].contains(&k.as_str()) && !v.is_empty())
         .map(|(k, v)| {
             anchor(
-                &query_edit(json_url, k, None),
+                &query_edit(page_url, k, None),
                 &format!("{k}: {v} ×"),
                 "filter-chip",
             )
@@ -1705,7 +1844,8 @@ pub fn rejected_collections_html(
     for (key, value) in pairs.iter().filter(|(key, _)| key != "f") {
         query.append_pair(key, value);
     }
-    let json_url = with_format(&format!("{url}?{}", query.finish()), "json");
+    let page_url = format!("{url}?{}", query.finish());
+    let json_url = with_format(&page_url, "json");
     let value = |name: &str| {
         pairs
             .iter()
@@ -1714,17 +1854,22 @@ pub fn rejected_collections_html(
     };
     let limit = value("limit").unwrap_or_default().to_owned();
     let limit = if limit.is_empty() {
-        ds_core::collection_search::DEFAULT_LIMIT.to_string()
+        HTML_PAGE_SIZE.to_string()
     } else {
         limit
     };
     let offset = value("offset").filter(|v| !v.is_empty()).unwrap_or("0");
+    let sortby = value("sortby")
+        .map(|v| v.trim().trim_start_matches('+').trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| HTML_DEFAULT_SORT.to_string());
     let form = catalog_form(
         url,
-        &json_url,
+        &page_url,
         pairs,
         &limit,
         offset,
+        &sortby,
         Some((parameter, message)),
     );
     let mut body = page_heading(
@@ -1747,6 +1892,11 @@ pub fn rejected_collections_html(
     .render(&body, "")
 }
 
+/// The HTML catalog page: the search form, one compact row per collection
+/// on the page with every member and link of its description (OGC API -
+/// EDR `/req/html/content`), paging, and the page's links. `search.sortby`
+/// is the order the page lists (title when empty), and the page's JSON
+/// switch spells it out with the page size (#1141).
 pub fn collections_html(
     surface: Surface<'_>,
     query: &SearchQueryParams,
@@ -1758,21 +1908,31 @@ pub fn collections_html(
 ) -> String {
     let api = surface.api;
     let url = &format!("{}/collections", surface.root);
+    let sort = if search.sortby.is_empty() {
+        vec![HTML_DEFAULT_SORT]
+    } else {
+        search.sortby.clone()
+    };
     let json_url = format!(
         "{url}{}",
-        query.query_string_with_format(search.limit, search.offset, "json")
+        query
+            .explicit_page(search.limit, &sort)
+            .query_string_with_format(search.limit, search.offset, "json")
     );
     let query_string = query.query_string_with_format(search.limit, search.offset, "html");
+    let page_url = format!("{url}{query_string}");
     let pairs: Vec<(String, String)> =
         form_urlencoded::parse(query_string.trim_start_matches('?').as_bytes())
             .into_owned()
             .collect();
+    let sort_value = sortby_value(&sort);
     let form = catalog_form(
         url,
-        &json_url,
+        &page_url,
         &pairs,
         &search.limit.to_string(),
         &search.offset.to_string(),
+        &sort_value,
         None,
     );
     let mut body = page_heading(
@@ -1803,8 +1963,9 @@ pub fn collections_html(
     } else {
         "collections"
     };
-    body.push_str(&format!("<div data-results-scope=\"{}\"></div><div class=\"query-workspace\"><aside class=\"query-builder\">{form}</aside><section class=\"query-results\" aria-label=\"Matching collections\"><div class=\"results-bar\"><div><strong>{matched} matching {collection_noun}</strong><small>{range} · Collection ID order</small></div><div class=\"view-switch enhanced\" aria-label=\"Result presentation\"><button data-view=\"list\" class=\"selected\" aria-pressed=\"true\">{}List</button><button data-view=\"cards\" aria-pressed=\"false\">{}Cards</button></div></div><div class=\"collection-list\">",escape(url),icon("list"),icon("grid")));
+    body.push_str(&format!("<div data-results-scope=\"{}\"></div><div class=\"query-workspace\"><aside class=\"query-builder\">{form}</aside><section class=\"query-results\" aria-labelledby=\"results-count\"><div class=\"results-bar\"><div><h2 id=\"results-count\">{matched} matching {collection_noun}</h2><small>{range} · {}</small></div><div class=\"results-tools\"><label class=\"sort-select enhanced\">Sort<select data-sort>{}</select></label><div class=\"view-switch enhanced\" aria-label=\"Result presentation\"><button data-view=\"list\" class=\"selected\" aria-pressed=\"true\">{}List</button><button data-view=\"cards\" aria-pressed=\"false\">{}Cards</button></div></div></div><div class=\"collection-list\">",escape(url),escape(&sort_label(&sort)),sort_options(&sort_value),icon("list"),icon("grid")));
     if docs.is_empty() {
+        let clear = |class| anchor(&with_format(url, "html"), "Clear filters", class);
         if matched > 0 {
             let first_page = format!(
                 "{url}{}",
@@ -1812,8 +1973,26 @@ pub fn collections_html(
             );
             let match_verb = if matched == 1 { "matches" } else { "match" };
             body.push_str(&format!("<div class=\"empty-state\"><h2>This page is outside the results.</h2><p>{matched} {collection_noun} {match_verb}. Return to the first page to keep these filters.</p>{}</div>",anchor(&first_page,"Go to first page","btn primary")));
+        } else if let Some(words) = query.q.as_deref().and_then(comma_alternatives) {
+            // Words match as one phrase: offer the same search for any of
+            // them, the other filters kept (#1141).
+            let any = query_edit(&page_url, "q", Some(&words));
+            body.push_str(&format!("<div class=\"empty-state\"><h2>No collections match these filters.</h2><p>The words of a search match together, as one exact phrase. Search for any of them instead, or clear the filters.</p><div class=\"empty-actions\">{}{}</div></div>",anchor(&any,&format!("Search any of: {}",words.replace(',', ", ")),"btn primary"),clear("btn")));
         } else {
-            body.push_str(&format!("<div class=\"empty-state\"><h2>No collections match these filters.</h2><p>Try a broader search, expand the area or remove a time filter.</p>{}</div>",anchor(&with_format(url,"html"),"Clear filters","btn primary")));
+            // Advice for the filters the request gave: words only when it
+            // searched for some (#1141).
+            let given = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.trim().is_empty());
+            let advice = if given(&query.q) || given(&query.query) {
+                Some("The search matches whole words in titles, descriptions and keywords, not ids. Remove a word or a filter, or clear them all.")
+            } else if given(&query.bbox) || given(&query.datetime) {
+                Some("Widen the area or the time, or clear the filters.")
+            } else {
+                None
+            };
+            match advice {
+                Some(advice) => body.push_str(&format!("<div class=\"empty-state\"><h2>No collections match these filters.</h2><p>{advice}</p><div class=\"empty-actions\">{}</div></div>",clear("btn primary"))),
+                None => body.push_str("<div class=\"empty-state\"><h2>No collections are published here.</h2></div>"),
+            }
         }
     }
     for view in docs {
@@ -1825,8 +2004,13 @@ pub fn collections_html(
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .map(|k| anchor(&query_edit(&json_url, "q", Some(k)), k, "chip"))
+            .map(|k| anchor(&query_edit(&page_url, "q", Some(k)), k, "chip"))
             .collect::<String>();
+        let keywords = if keywords.is_empty() {
+            keywords
+        } else {
+            format!("<div class=\"row-line\"><span class=\"row-label\">Keywords</span><span class=\"chip-row\">{keywords}</span></div>")
+        };
         let symbol = if doc["keywords"]
             .as_array()
             .is_some_and(|ks| ks.iter().any(|k| k == "radar"))
@@ -1839,11 +2023,18 @@ pub fn collections_html(
             .as_str()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(id);
-        body.push_str(&format!("<article class=\"collection-row\"><div class=\"collection-icon\">{}</div><div class=\"collection-main\"><h3>{}</h3><span class=\"mono\">{}</span><p>{}</p>{}<div class=\"chip-row\">{keywords}</div>{}{}</div><a class=\"row-arrow\" href=\"{}\" aria-label=\"Open {}\">{}</a></article>",icon(symbol),anchor(&href,title,""),escape(id),escape(doc["description"].as_str().unwrap_or_default()),collection_facts(doc),license_html(view.license),entry_details(doc),escape(&href),escape(title),icon("arrow")));
+        let description = doc["description"]
+            .as_str()
+            .filter(|d| !d.trim().is_empty())
+            .map(|d| format!("<p>{}</p>", escape(d)))
+            .unwrap_or_default();
+        // The title is the row's only link to the collection page: the
+        // arrow repeats it for pointers and is skipped by the keyboard.
+        body.push_str(&format!("<article class=\"collection-row\"><div class=\"collection-icon\">{}</div><div class=\"collection-main\"><h3>{}</h3><span class=\"mono\">{}</span>{description}{}{keywords}<div class=\"row-foot\">{}{}</div></div><a class=\"row-arrow\" href=\"{}\" tabindex=\"-1\" aria-hidden=\"true\">{}</a></article>",icon(symbol),anchor(&href,title,""),escape(id),collection_facts(doc),license_html(view.license),entry_details(doc),escape(&href),icon("arrow")));
     }
     body.push_str("</div><div class=\"pagination\">");
     body.push_str("<label class=\"per-page enhanced\">Per page<select data-page-size>");
-    let mut sizes = vec![6, 12, 24, search.limit];
+    let mut sizes = vec![12, HTML_PAGE_SIZE, 48, 96, search.limit];
     sizes.sort_unstable();
     sizes.dedup();
     for n in sizes {
@@ -2214,6 +2405,241 @@ mod tests {
         assert!(!empty.contains("Go to first page"));
     }
 
+    /// The empty state's advice names the filters the request gave: words
+    /// only for a text search, the area or time for the others (#1141).
+    #[test]
+    fn catalog_empty_state_advice_follows_the_given_filters() {
+        let empty = |pairs: Vec<(&str, &str)>| {
+            let query = SearchQueryParams::from_pairs(
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect(),
+            )
+            .unwrap();
+            let html = collections_html(
+                MAPS_PROXY,
+                &query,
+                &query.parse().unwrap(),
+                0,
+                &[],
+                &[],
+                &json!([]),
+            );
+            html.split("<div class=\"empty-state\">")
+                .nth(1)
+                .unwrap()
+                .split("</div>")
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        let words = "The search matches whole words";
+        for text in [
+            vec![("q", "radar")],
+            vec![("query", "+radar"), ("bbox", "1,2,3,4")],
+        ] {
+            let state = empty(text);
+            assert!(state.contains(words), "{state}");
+            assert!(state.contains("No collections match these filters."));
+        }
+        for area_or_time in [
+            vec![("bbox", "1,2,3,4")],
+            vec![("datetime", "2026-10-17T00:00:00Z")],
+            vec![("q", " "), ("bbox", "1,2,3,4")],
+        ] {
+            let state = empty(area_or_time);
+            assert!(!state.contains(words), "{state}");
+            assert!(state.contains("Widen the area or the time, or clear the filters."));
+        }
+        let none = empty(vec![("limit", "5")]);
+        assert_eq!(none, "<h2>No collections are published here.</h2>");
+    }
+
+    /// A catalog row (#1141): the facts in fixed slots, a dash where the
+    /// collection advertises nothing; parameter labels, with the full list
+    /// under a disclosure rather than a tooltip; data queries as action
+    /// chips of their own; a labelled keyword row; the title as the row's
+    /// only keyboard link to the collection page; the count as the results'
+    /// heading.
+    #[test]
+    fn catalog_rows_have_fixed_fact_slots_and_one_collection_link() {
+        let observed = |label: &str| json!({"observedProperty": {"label": {"en": label}}});
+        // Keys in name order, as `parameter_names` lists them.
+        let rich = json!({
+            "id": "rich", "title": "Rich", "description": "Every fact", "keywords": ["radar"],
+            "extent": {
+                "temporal": {"interval": [["2026-10-17T00:00:00Z", "2026-10-17T01:00:00Z"]],
+                             "grid": {"resolution": "PT5M", "cellsCount": 13}},
+                "spatial": {"bbox": [[20.0, 60.0, 30.0, 70.0]]}
+            },
+            "parameter_names": {"p": {"label": "Pressure"}, "t": observed("Temperature"),
+                                "u": observed("Wind u"), "v": observed("Wind v"), "x": {}},
+            "data_queries": {"position": {"link": {"href": "https://example.test/proxy/edr/collections/rich/position"}}},
+            "links": []
+        });
+        let bare = json!({"id": "bare", "title": " ", "links": []});
+        let query = SearchQueryParams::default();
+        let search = query.parse().unwrap();
+        let views = [
+            CollectionView {
+                metadata: &rich,
+                license: None,
+            },
+            CollectionView {
+                metadata: &bare,
+                license: None,
+            },
+        ];
+        let html = collections_html(MAPS_PROXY, &query, &search, 2, &views, &[], &json!([]));
+        assert!(html.contains("<h2 id=\"results-count\">2 matching collections</h2>"));
+        assert!(html.contains("<small>1–2 shown · Title A–Z</small>"));
+        assert!(
+            html.contains("<select data-sort><option value=\"title\" selected>Title A–Z</option>")
+        );
+        // The JSON switch names the same page: its order spelled out.
+        let json_link = html.split("id=\"json-link\" href=\"").nth(1).unwrap();
+        assert!(json_link.starts_with(
+            "https://example.test/proxy/maps/collections?limit=1000&amp;f=json&amp;sortby=title\""
+        ));
+        let rows: Vec<&str> = html
+            .split("<article class=\"collection-row\">")
+            .skip(1)
+            .collect();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let slots: Vec<&str> = row
+                .split("<dt>")
+                .skip(1)
+                .map(|dt| dt.split("</dt>").next().unwrap())
+                .collect();
+            assert_eq!(
+                slots,
+                [
+                    "Time · UTC",
+                    "Cadence",
+                    "Area · CRS84",
+                    "Vertical",
+                    "Parameters"
+                ]
+            );
+            // The arrow repeats the title's link for pointers, out of the
+            // tab order.
+            assert_eq!(
+                row.matches("tabindex=\"-1\" aria-hidden=\"true\"").count(),
+                1
+            );
+            assert!(!row.contains("aria-label=\"Open"));
+        }
+        let (rich, bare) = (rows[0], rows[1]);
+        assert!(rich.contains("<dd>Every 5 min · 13 time steps</dd>"));
+        assert!(rich.contains("20.00, 60.00 → 30.00, 70.00"));
+        assert!(rich.contains(&format!("<dt>Vertical</dt><dd>{EMPTY_SLOT}</dd>")));
+        let parameters = rich.split("<dt>Parameters</dt><dd>").nth(1).unwrap();
+        let parameters = parameters.split("</dd>").next().unwrap();
+        assert!(parameters.starts_with("<details class=\"slot-list\"><summary>Pressure, Temperature, Wind u <span class=\"slot-more\">+2 more</span></summary>"), "{parameters}");
+        assert!(parameters.contains("<li>Wind v <code>v</code></li>"));
+        // A parameter without a label is listed by its name.
+        assert!(parameters.contains("<li>x</li>"));
+        assert!(!parameters.contains("title="));
+        assert!(rich.contains("<div class=\"row-line query-chips\"><span class=\"row-label\">Data queries</span><span class=\"chip-row\"><a class=\"chip\" href=\"https://example.test/proxy/edr/collections/rich/position\">position</a>"));
+        assert!(rich.contains("<span class=\"row-label\">Keywords</span>"));
+        // Nothing advertised: five dashes, and the id stands in for a title.
+        assert_eq!(bare.matches(EMPTY_SLOT).count(), 5);
+        assert!(bare.contains("<h3><a class=\"\" href=\"https://example.test/proxy/maps/collections/bare?f=html\">bare</a></h3>"));
+        assert!(!bare.contains("row-label"));
+        // Up to three labels need no disclosure.
+        let few = json!({"parameter_names": {"a": {"label": "Alpha"}, "b": {}}});
+        assert!(collection_facts(&few).contains("<dt>Parameters</dt><dd>Alpha, b</dd>"));
+        // Styles fill the slot when there are no parameters.
+        let styled = json!({"styles": [{"id": "default", "title": "Default"}, {"id": "dbz"}]});
+        assert!(collection_facts(&styled).contains("<dt>Styles</dt><dd>Default, dbz</dd>"));
+    }
+
+    /// The search says what `q` does (#1141): the fields it reads, words as
+    /// one phrase, commas between alternatives. A multi-word search that
+    /// found nothing offers the same search for any of its words, the other
+    /// filters kept; placeholders read as examples.
+    #[test]
+    fn catalog_search_hints_say_what_q_does() {
+        let query = SearchQueryParams::from_pairs(vec![
+            ("q".into(), "radar composite, gfs".into()),
+            ("bbox".into(), "1,2,3,4".into()),
+        ])
+        .unwrap();
+        let search = query.parse().unwrap();
+        let html = collections_html(MAPS_PROXY, &query, &search, 0, &[], &[], &json!([]));
+        assert!(html.contains("Searches titles, descriptions and keywords for whole words, not ids. Words match as an exact phrase; separate alternatives with commas."));
+        assert!(html.contains("<a class=\"btn primary\" href=\"https://example.test/proxy/maps/collections?bbox=1%2C2%2C3%2C4&amp;q=radar%2Ccomposite%2Cgfs&amp;f=html\">Search any of: radar, composite, gfs</a>"), "{html}");
+        assert!(!html.contains("Try a broader search"));
+        for (i, hint) in ["e.g. 18", "e.g. 58", "e.g. 32", "e.g. 71"]
+            .iter()
+            .enumerate()
+        {
+            assert!(html.contains(&format!("data-bbox=\"{i}\" type=\"number\" step=\"any\" value=\"{}\" placeholder=\"{hint}\"", i + 1)), "{hint}");
+        }
+        // One word per alternative: nothing to split, so no offer.
+        let single = SearchQueryParams::from_pairs(vec![("q".into(), "radar,gfs".into())]).unwrap();
+        let html = collections_html(
+            MAPS_PROXY,
+            &single,
+            &single.parse().unwrap(),
+            0,
+            &[],
+            &[],
+            &json!([]),
+        );
+        assert!(!html.contains("Search any of"));
+        assert!(html.contains("not ids"));
+        assert_eq!(
+            comma_alternatives(" radar  composite ,gfs"),
+            Some("radar,composite,gfs".into())
+        );
+        assert_eq!(comma_alternatives("radar, gfs"), None);
+        let landing = landing_document(MAPS_PROXY, "Maps", "", &json!({"links": []}));
+        assert!(landing.contains("placeholder=\"e.g. radar or GFS\""));
+    }
+
+    /// The order controls (#1141): the select offers title and id, either
+    /// way, and keeps an order it does not offer; a rejected order is shown
+    /// as typed, marked; a rejected page keeps the HTML page size.
+    #[test]
+    fn catalog_sort_controls_name_the_order() {
+        let keys = [
+            CollectionSortKey {
+                property: CollectionSortProperty::Title,
+                descending: true,
+            },
+            CollectionSortKey::ascending(CollectionSortProperty::Id),
+        ];
+        assert_eq!(sort_label(&keys), "Title Z–A, then ID A–Z");
+        assert!(sort_options("-title,id").starts_with(
+            "<option value=\"-title,id\" selected>-title,id</option><option value=\"title\">"
+        ));
+        assert!(sort_options("-id").contains("<option value=\"-id\" selected>ID Z–A</option>"));
+        let html = rejected_collections_html(
+            MAPS_PROXY,
+            &[("sortby".into(), "updated".into())],
+            Some("sortby"),
+            "Unknown sortby property 'updated'; sortable: title, id",
+        );
+        assert!(html.contains("<span>Order <code>sortby</code></span>"));
+        assert!(html.contains("aria-errormessage=\"sortby-error\""));
+        assert!(html.contains("value=\"updated\""));
+        assert!(html.contains(&format!(
+            "name=\"limit\" type=\"number\" value=\"{HTML_PAGE_SIZE}\""
+        )));
+        // Without a fault in it, the order is a select holding the request's.
+        let html = rejected_collections_html(
+            MAPS_PROXY,
+            &[("sortby".into(), "+id".into()), ("typo".into(), "1".into())],
+            Some("typo"),
+            "Unknown collection query parameter 'typo'",
+        );
+        assert!(html.contains("<select name=\"sortby\">"));
+        assert!(html.contains("<option value=\"id\" selected>ID A–Z</option>"));
+    }
+
     #[test]
     fn catalog_time_summaries_keep_utc_precision_and_only_advertised_resolution() {
         let temporal =
@@ -2262,7 +2688,13 @@ mod tests {
             let doc = json!({"id":"levels","extent":{"vertical":vertical},"links":[
                 {"rel":"self","href":"https://example.test/maps/collections/levels"},
                 {"rel":rel::MAP,"href":"https://example.test/maps/collections/levels/map"}]});
-            assert!(collection_facts(&doc).contains("Vertical dimension"));
+            let facts = collection_facts(&doc);
+            let slot = facts.split("<dt>Vertical</dt><dd>").nth(1).unwrap();
+            let slot = slot.split("</dd>").next().unwrap();
+            assert!(
+                slot.contains("100–1000 hPa") || slot.contains("Model level: 1–137"),
+                "{facts}"
+            );
             for api in ["edr", "maps", "tiles"] {
                 let html = collection("https://example.test", api, &doc, None);
                 let overview = html.split("id=\"metadata\"").next().unwrap();
@@ -2281,7 +2713,7 @@ mod tests {
         }
         let doc =
             json!({"id":"single","links":[{"rel":rel::MAP,"href":"/maps/collections/single/map"}]});
-        assert!(!collection_facts(&doc).contains("Vertical dimension"));
+        assert!(collection_facts(&doc).contains(&format!("<dt>Vertical</dt><dd>{EMPTY_SLOT}</dd>")));
         // The script contains the selector name, so assert the actual element.
         assert!(!collection("", "maps", &doc, None).contains("id=\"map-level\""));
         let malicious = json!({"interval":[[0,1]],"values":[0,"<script>","NaN",1],"unit":"<img onerror=alert(1)>"});

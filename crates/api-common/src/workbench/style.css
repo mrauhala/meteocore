@@ -1972,6 +1972,9 @@ main {
   --text-title: 2rem;
   --ink: #172e27;
   --muted: #465e53;
+  /* A placeholder is an example, never a value: fainter than --muted and
+     italic, still at least 4.5:1 on an input (5.0:1 here, 5.3:1 dark). */
+  --placeholder: #5f7468;
   --teal: #095c49;
   --teal-dark: #064536;
   --mint: #dceee5;
@@ -2001,6 +2004,7 @@ main {
   color-scheme: dark;
   --ink: #f0f6f2;
   --muted: #bfd1c6;
+  --placeholder: #8a9f92;
   --teal: #9be5c8;
   --teal-dark: #b8f4dc;
   --mint: #254438;
@@ -2237,7 +2241,8 @@ input, select, textarea {
   border-color:var(--control-border);
 }
 input::placeholder, textarea::placeholder {
-  color:var(--muted);
+  color:var(--placeholder);
+  font-style:italic;
   opacity:1;
 }
 p, small, .muted, .mono, .property-table td:first-child, .null-value, .field-help,
@@ -2735,6 +2740,54 @@ a {
   .catalog-page .collection-grid .collection-facts,.collection-facts{grid-template-columns:minmax(0,1fr);gap:10px}
   .catalog-page .results-bar{align-items:center}
   .catalog-page .results-bar small{font-size:14px}
+}
+
+/* Catalog rows (#1141): the facts in fixed slots, one line each for data
+   queries, keywords and the row's license and full metadata. */
+.visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+.catalog-page .results-bar h2{margin:0;font-size:var(--text-body);font-weight:600;line-height:1.4}
+.catalog-page .results-tools{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.sort-select{align-items:center;gap:8px;margin:0;font-size:14px;font-weight:400}
+.js .sort-select.enhanced{display:flex!important}
+.sort-select select{min-height:44px;padding:6px 8px;font-size:14px}
+.catalog-page .paging-fields{max-width:none;display:grid;grid-template-columns:repeat(3,minmax(0,200px));gap:0 16px}
+.catalog-page .paging-fields select{display:block;width:100%;margin-top:5px}
+.catalog-page .query-results .collection-row{padding:16px 20px;gap:8px 14px}
+.catalog-page .collection-main>h3{margin:0;line-height:1.35}
+.catalog-page .collection-main>.mono{margin-top:0}
+.catalog-page .collection-main>p{margin:6px 0 0;max-width:80ch}
+.catalog-page .collection-facts{grid-template-columns:minmax(0,1.15fr) minmax(0,1fr) minmax(0,1.1fr) minmax(0,1fr) minmax(0,1.75fr);gap:8px 20px;margin:12px 0 0}
+.catalog-page .collection-facts dt{margin-bottom:1px}
+/* Two columns (cards, phones): Parameters, the longest slot, takes a row. */
+.catalog-page .collection-grid .collection-facts{grid-template-columns:repeat(2,minmax(0,1fr))}
+.catalog-page .collection-grid .collection-facts>div:nth-child(5){grid-column:1/-1}
+.slot-list>summary{cursor:pointer}
+.slot-more{color:var(--teal);white-space:nowrap}
+.slot-list ul{margin:6px 0 0;padding-left:18px}
+.slot-list li{overflow-wrap:anywhere}
+.row-line{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin-top:10px}
+.row-label{font-size:14px;font-weight:500;color:var(--muted)}
+.catalog-page .row-line .chip-row,.query-results .collection-row .row-line .chip-row{margin:0}
+/* Data queries are actions: outlined, with an arrow. Keywords stay filled. */
+.query-chips .chip{background:transparent;border:1px solid var(--teal);color:var(--teal);font-weight:500}
+.query-chips .chip::after{content:"\2192";content:"\2192" / "";margin-left:2px}
+.query-chips .chip:hover{background:var(--mint)}
+.row-foot{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 18px;margin-top:10px}
+.catalog-page .collection-main .row-foot>.license{margin:0;display:block}
+.row-foot>.entry-details{min-width:0}
+.row-foot>.entry-details>summary{font-size:14px;cursor:pointer;color:var(--teal)}
+.row-foot>.entry-details[open]{flex-basis:100%}
+.catalog-page .empty-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin-top:14px}
+@media(max-width:1250px){
+  .catalog-page .collection-facts{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .catalog-page .collection-facts>div:nth-child(5){grid-column:span 2}
+}
+@media(max-width:560px){
+  .catalog-page .collection-facts,.catalog-page .collection-grid .collection-facts{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px}
+  .catalog-page .collection-facts>div:nth-child(5){grid-column:1/-1}
+  .catalog-page .query-results .collection-main>p{-webkit-line-clamp:2}
+  .catalog-page .paging-fields{grid-template-columns:minmax(0,1fr)}
+  .catalog-page .results-tools{width:100%;justify-content:space-between}
 }
 
 /* Generic feature browser: full response rows and accessible paging. */

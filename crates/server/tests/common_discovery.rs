@@ -242,6 +242,34 @@ fn catalog() -> Catalog {
     (configs, edr, maps, features)
 }
 
+/// `n` collections `c-00`, `c-01`, … titled in the reverse order of their
+/// ids (`c-00` is "Collection 29" of 30), so title and id order differ.
+fn numbered_catalog(n: usize) -> Catalog {
+    let mut catalog: Catalog = Default::default();
+    let (configs, edr, maps, features) = &mut catalog;
+    for i in 0..n {
+        let id = format!("c-{i:02}");
+        let fixture = Arc::new(Fixture {
+            bbox: Some([21.0, 61.0, 29.0, 69.0]),
+            time: None,
+            times: vec![],
+            vertical: None,
+            parameters: vec![],
+            native_crs: "CRS:84",
+        });
+        edr.insert(id.clone(), fixture.clone());
+        maps.insert(id.clone(), fixture.clone());
+        features.insert(id.clone(), fixture);
+        let config: CollectionConfig = serde_json::from_value(json!({
+            "id": id, "title": format!("Collection {:02}", n - 1 - i),
+            "description": "Paging fixture", "apis": ["edr", "maps", "tiles", "features"]
+        }))
+        .unwrap();
+        configs.insert(id, config);
+    }
+    catalog
+}
+
 fn maps_state(
     configs: HashMap<String, CollectionConfig>,
     maps: HashMap<String, Arc<dyn MapEngine>>,
@@ -332,12 +360,21 @@ fn app(surface: &str) -> (Router, String) {
         let router = api_common::shared::router(shared_api());
         return (Router::new().nest("/base", router), "/base".into());
     }
+    app_over(surface, catalog())
+}
+
+/// [`app`] over another catalog.
+fn app_over(surface: &str, catalog: Catalog) -> (Router, String) {
+    if surface == "shared" {
+        let router = api_common::shared::router(shared_api_over(catalog));
+        return (Router::new().nest("/base", router), "/base".into());
+    }
     let api = if surface == "vector-tiles" {
         "tiles"
     } else {
         surface
     };
-    let (configs, edr, maps, features) = catalog();
+    let (configs, edr, maps, features) = catalog;
     let router = match surface {
         "edr" => api_edr::router(Arc::new(ArcSwap::from_pointee(
             api_edr::handlers::EdrState {
@@ -612,7 +649,10 @@ async fn unsupported_duplicate_and_invalid_parameters_return_structured_400() {
         for query in [
             "parent=x",
             "descendants=immediate",
-            "sortby=-id",
+            // `sortby` sorts by title or id only; nothing says when a
+            // collection's data last changed (#1141).
+            "sortby=-updated",
+            "sortby=title,",
             "filter=true",
             "query=radar&query=wind",
             "query=radar&%71uery=wind",
@@ -855,6 +895,132 @@ async fn accept_negotiated_html_has_explicit_format_navigation() {
     }
 }
 
+/// The ids of an HTML catalog page's rows, in order.
+fn row_ids(html: &str) -> Vec<String> {
+    html.split("<article class=\"collection-row\">")
+        .skip(1)
+        .map(|row| {
+            row.split("<span class=\"mono\">")
+                .nth(1)
+                .unwrap()
+                .split('<')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// An HTML catalog without `limit` is a page of 24 collections by title,
+/// with a next link; JSON still lists every collection, by id. The HTML
+/// page's JSON switch spells out its size and order, so it names the same
+/// 24 collections in the same order (#1141).
+#[tokio::test]
+async fn html_catalog_pages_24_by_title_while_json_lists_all_by_id() {
+    for surface in SURFACES {
+        let (app, prefix) = app_over(surface, numbered_catalog(30));
+        let (status, _, html) = get(&app, &format!("{prefix}/collections?f=html"), None).await;
+        assert_eq!(status, StatusCode::OK, "{surface}");
+        let rows = row_ids(&html);
+        // Titles run opposite to ids: "Collection 00" is c-29.
+        let by_title: Vec<String> = (6..30).rev().map(|i| format!("c-{i:02}")).collect();
+        assert_eq!(rows, by_title, "{surface}");
+        assert!(html.contains("<h2 id=\"results-count\">30 matching collections</h2>"));
+        let next = html
+            .split("rel=\"next\" href=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a next link")
+            .replace("&amp;", "&");
+        assert!(next.contains("offset=24"), "{surface}: {next}");
+        assert!(!next.contains("limit="), "{surface}: {next}");
+        assert!(!next.contains("sortby="), "{surface}: {next}");
+        let (_, _, rest) = get(&app, &next, None).await;
+        assert_eq!(
+            row_ids(&rest),
+            ["c-05", "c-04", "c-03", "c-02", "c-01", "c-00"]
+        );
+        // A cleared page-size field is no limit either.
+        let (_, _, cleared) = get(&app, &format!("{prefix}/collections?limit=&f=html"), None).await;
+        assert_eq!(row_ids(&cleared).len(), 24, "{surface}");
+        // A browser negotiates HTML with no `f`: the same defaults, and its
+        // next link adds neither a page size nor an order.
+        let (status, headers, browser) = get(
+            &app,
+            &format!("{prefix}/collections"),
+            Some("text/html,application/xhtml+xml,*/*;q=0.8"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{surface}");
+        assert!(headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        assert_eq!(row_ids(&browser), by_title, "{surface}");
+        let browser_next = browser
+            .split("rel=\"next\" href=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a next link")
+            .replace("&amp;", "&");
+        assert!(
+            browser_next.contains("offset=24"),
+            "{surface}: {browser_next}"
+        );
+        assert!(
+            !browser_next.contains("limit="),
+            "{surface}: {browser_next}"
+        );
+        assert!(
+            !browser_next.contains("sortby="),
+            "{surface}: {browser_next}"
+        );
+
+        let json_link = html
+            .split("id=\"json-link\" href=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap()
+            .replace("&amp;", "&");
+        assert!(json_link.contains("limit=24"), "{surface}: {json_link}");
+        assert!(json_link.contains("sortby=title"), "{surface}: {json_link}");
+        let ids = |doc: &Value| -> Vec<String> {
+            doc["collections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            ids(&get_json(&app, &json_link).await),
+            by_title,
+            "{surface}"
+        );
+
+        let all = get_json(&app, &format!("{prefix}/collections")).await;
+        assert_eq!(all["numberReturned"], 30, "{surface}");
+        let by_id: Vec<String> = (0..30).map(|i| format!("c-{i:02}")).collect();
+        assert_eq!(ids(&all), by_id, "{surface}");
+        // JSON's HTML alternate is the same 30, by id.
+        let (_, _, alternate) = get(&app, link(&all, "alternate"), None).await;
+        assert_eq!(row_ids(&alternate), by_id, "{surface}");
+
+        // sortby orders either representation.
+        let sorted = get_json(&app, &format!("{prefix}/collections?sortby=-title&limit=2")).await;
+        assert_eq!(ids(&sorted), ["c-00", "c-01"], "{surface}");
+        assert!(link(&sorted, "next").contains("sortby=-title"), "{surface}");
+        let (_, _, html) = get(
+            &app,
+            &format!("{prefix}/collections?sortby=id&f=html"),
+            None,
+        )
+        .await;
+        assert_eq!(row_ids(&html), by_id[..24], "{surface}");
+        assert!(html.contains("<option value=\"id\" selected>ID A–Z</option>"));
+    }
+}
+
 #[tokio::test]
 async fn metadata_and_search_use_the_same_temporal_extent() {
     for surface in SURFACES {
@@ -939,11 +1105,11 @@ async fn openapi_and_conformance_are_consistent_across_surfaces() {
         );
         let params = &operation["parameters"];
         let parameters = params.as_array().unwrap();
-        assert_eq!(parameters.len(), 8);
+        assert_eq!(parameters.len(), 9);
         let limit = parameters.iter().find(|p| p["name"] == "limit").unwrap();
         assert_eq!(limit["schema"]["default"], 1000);
         assert_eq!(limit["schema"]["maximum"], 1000);
-        for name in ["bbox", "q", "query"] {
+        for name in ["bbox", "q", "query", "sortby"] {
             let p = parameters.iter().find(|p| p["name"] == name).unwrap();
             assert_eq!(p["schema"]["type"], "array");
             assert_eq!(p["style"], "form");
@@ -1003,14 +1169,16 @@ async fn workbench_exposes_supported_queries_and_same_resource_json_on_every_sur
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        for control in ["q", "query", "bbox", "datetime", "limit", "offset"] {
+        for control in [
+            "q", "query", "bbox", "datetime", "sortby", "limit", "offset",
+        ] {
             assert!(
                 html.contains(&format!("name=\"{control}\""))
                     || html.contains(&format!("data-param=\"{control}\"")),
                 "{surface}: {control}"
             );
         }
-        for unsupported in ["sortby", "sd", "resolution", "parent", "depth"] {
+        for unsupported in ["sd", "resolution", "parent", "depth"] {
             assert!(!html.contains(&format!("name=\"{unsupported}\"")));
             assert!(!html.contains(&format!("data-param=\"{unsupported}\"")));
         }
