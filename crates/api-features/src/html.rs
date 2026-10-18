@@ -612,6 +612,11 @@ fn features_page(
             base,
             &json!({"type":"FeatureCollection","features":map_features}),
             is_list,
+            if is_list {
+                "The features of this page are listed in the table."
+            } else {
+                "The geometry is described below."
+            },
         ));
     } else {
         body.push_str("<div class=\"empty\"><p>No geometry available.</p></div>");

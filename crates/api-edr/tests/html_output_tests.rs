@@ -1466,6 +1466,10 @@ async fn the_html_location_list_pages_by_default() {
         html.contains("id=\"feature-map\""),
         "the page's points are mapped"
     );
+    // Without WebGL the map says where the same points are (#1136).
+    assert!(html.contains(
+        "The map needs JavaScript and WebGL. The locations of this page are listed in the table."
+    ));
     let (_, _, last) = get(
         "/collections/net/locations?f=html&limit=100&offset=200",
         None,
