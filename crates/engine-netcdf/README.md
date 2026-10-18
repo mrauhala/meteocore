@@ -1,52 +1,100 @@
 # engine-netcdf
 
-MeteoCore engine that serves gridded CF-NetCDF forecasts and analyses through
-WMS 1.3.0, OGC API - Maps, OGC API - Tiles and OGC API - EDR
-(`engine_type = "netcdf"`, issue
-[#1067](https://github.com/mrauhala/meteocore/issues/1067)). The first
-target is MET Norway's MEPS, as published per lead time on thredds.met.no.
+Serves gridded CF-NetCDF forecasts and analyses through WMS 1.3.0, OGC API -
+Maps, OGC API - Tiles and OGC API - EDR (`engine_type = "netcdf"`).
 
-## Scope
+## What it solves
 
-**In:**
+Weather models such as MetCoOp MEPS publish each run as a family of
+CF-NetCDF files, often one per lead time, each with many variables and
+over 100 MB. Some publishers expose them only on an HTTP file server that
+cannot be listed. This engine serves such a family as map layers and EDR
+queries in place: a request reads one 2-D field, and no file is converted
+or downloaded whole.
 
-- A local directory of NetCDF-4 (HDF5) or classic CDF-1/2/5 files of one
-  family: every file carries the collection's variables on one grid.
-- Or the same family on an HTTP server that cannot be listed, such as MET
-  Norway's thredds.met.no fileServer: files found by probing the names a
-  template gives for each run and lead, read in place by HTTP range.
-- Grids: 1-D latitude/longitude, or 1-D projected x/y with a CF
-  `grid_mapping` (`lambert_conformal_conic`, `geostationary`,
-  `latitude_longitude`). Rows stored south to north (MEPS) are drawn north-up.
-- Valid times from the fields' `time` axis; model runs from
-  `forecast_reference_time`, each run a WMS `reference_time` value. Files
-  without one form one timeline without runs.
-- Single-level fields (any axis other than time and ensemble has one
-  value), or fields on one pressure axis: a dimension whose coordinate's
-  units are a pressure (`hPa`, `Pa`, `mbar`, …). Its levels, in hPa, are
-  the collection's vertical axis (below). Ensemble files are read at one
-  member.
-- CF packing and masking: `scale_factor`/`add_offset`, `_FillValue`,
-  `missing_value`, NaN.
-- EDR position (one point or several), area and radius, each model run an
-  EDR instance; WMS GetFeatureInfo reads a layer's value through the
-  position query.
-- Wind speed derived from u/v components the CF `standard_name` identifies
-  (`x_wind`/`y_wind`, `eastward_wind`/`northward_wind`), on every API:
-  MEPS's `x_wind_10m`/`y_wind_10m` give `wind_speed_10m`, and on pressure
-  levels `x_wind_pl`/`y_wind_pl` give `wind_speed_pl`, level by level.
-  Grid-relative components on a projected grid give no direction yet.
+## How it works
 
-**Not yet:**
+- **One collection is one file family.** Every file carries the
+  collection's variables on one grid. The first file opened fixes the
+  layout (variables, grid, levels, units); a later file that differs is
+  skipped with a WARN.
+- **Discovery.** A local `data_path` is listed non-recursively: names
+  matching `filename_template`, else every `*.nc`, skipping temporary
+  upload names. An `http(s)://` `data_path` is probed by name: each poll
+  HEADs the first lead (the sentinel) of every run in `time_window` not
+  seen yet, and the other leads once it appears. Each poll opens new and
+  changed files and keeps them open: the newest `max_runs` runs, at most
+  `max_files` files. Requests never open a file.
+- **Time comes from the file, never its name:** valid times from the
+  `time` axis, the model run from `forecast_reference_time`. Files without
+  a run form one timeline without runs.
+- **A request reads one field:** one variable at one step and level, by
+  hyperslab, decoded to `f32` (NaN for nodata, north-up) into a field
+  cache shared by every NetCDF collection, then resampled to the output
+  grid. Concurrent renders of one cold field decode it once.
+- **Remote files are read by HTTP range.** Opening a file reads its first
+  1 MiB plus a few 64 KiB blocks of its chunk indexes; a field is one GET
+  of its compressed chunk. Both are cached. Every GET is conditional on
+  the version opened: a request that finds the file replaced gets a 503,
+  and a later poll opens the new version. At most 8 requests go to one
+  host at once, over every collection on it; polls use at most 2 of them.
+- **Run and time selection.** A pinned run is exactly that run (404 when
+  absent). Otherwise a map draws from the newest run whose steps span the
+  requested time, at the nearest step; without a time, the newest run's
+  last step.
 
-- Height above ground and hybrid model levels (MEPS `hl`, `ml`): their axes
-  are not served (`VerticalKind::Height` is height above mean sea level,
-  and `ModelLevel` expects ordinal levels). EDR trajectory and cube, wind
-  direction from grid-relative components (rotation by the convergence
-  angle, #897).
-- Per-variable file layouts, curvilinear 2-D latitude/longitude grids,
-  `polar_stereographic`/`lambert_azimuthal_equal_area`/`transverse_mercator`
-  mappings, ensemble members as a dimension.
+## What it serves
+
+| Trait | APIs | Notes |
+|---|---|---|
+| `MapEngine` | WMS, Maps, Tiles | One layer per variable (WMS child layers `<collection>/<variable>` when there are several, Maps/Tiles `parameter-name=<variable>`); a request naming no variable draws the first. Runs are WMS `DIM_REFERENCE_TIME` values. |
+| `EdrEngine` | EDR, WMS GetFeatureInfo | `position` (one or several points), `area`, `radius`; each run is an instance. No `locations`, `trajectory` or `cube`. GetFeatureInfo reads the run, step and level the map drew. |
+| `WindSource` | all of the above, through the server's derived-wind wrapper | Facts for the wind speed derived from u/v components (below). |
+
+**Data it reads:** NetCDF-4 (HDF5) and classic CDF-1/2/5 files. A
+variable has `(y, x)` as its last two axes: 1-D latitude/longitude, or
+1-D projected x/y with a CF `grid_mapping` of `lambert_conformal_conic` or
+`geostationary`. It needs a time axis; an ensemble axis is read at
+`member`; every other axis has size 1, except one pressure axis. Rows
+stored south to north are drawn north-up. CF `scale_factor`/`add_offset`,
+`_FillValue`, `missing_value`, NaN, and netCDF's default float fill
+(when no `_FillValue` is set) are applied. Values and units are served as
+stored, never converted; layers without a `[[wms.parameters]]` style take
+the built-in default their name and unit select.
+
+**Pressure levels.** A dimension whose coordinate has pressure units
+(`Pa`, `hPa`, `mbar`, …) and is not a parametric coordinate is the
+collection's vertical axis, in hPa, bottom first. WMS `ELEVATION` and
+Maps/Tiles `elevation` must name a level exactly; a map without one draws
+the bottom level. EDR `z` drops levels the collection lacks (a 400 when
+none remain); without `z` it reads every level. A collection has one
+vertical axis, so a pressure-level family (MEPS `pl`) is a collection
+apart from its surface family (MEPS `sfc`).
+
+**EDR.**
+
+- Without `datetime`, a position query is every step of the newest run,
+  and an area is the step a map without `TIME` draws. With `datetime`,
+  the newest run with a step in the window, preferring one that also
+  spans the window's start; a window without a step is a 404.
+- Points and area cells are projected onto the grid once and sampled as
+  the map draws them. A point off the grid is null; a polygon outside the
+  grid's extent is a 404.
+- An area is a CRS84 grid over the polygon's bounding box at the source's
+  mean cell size, at most 256 cells per axis; cells outside the polygon
+  are null. `radius` is answered as an area.
+- Each field is read once per query for all points, four at a time, and
+  is not added to the field cache.
+
+**Derived wind.** Components are identified by CF `standard_name`
+(`x_wind`/`y_wind` and `grid_eastward_wind`/`grid_northward_wind` are
+grid-relative, `eastward_wind`/`northward_wind` earth-relative), or, on a
+variable without one, by a known name such as `u`/`v` (frame unknown).
+`x_wind_10m` and `y_wind_10m` give `wind_speed_10m`; `x_wind_pl` and
+`y_wind_pl` give `wind_speed_pl` per level. Speed is served on every API.
+Direction is EDR-only and needs earth-relative components, or
+grid-relative ones on a latitude/longitude grid. `derive_wind = false`
+opts out.
 
 ## Configuration
 
@@ -56,149 +104,80 @@ engine_type = "netcdf"
 apis = ["edr", "wms", "maps", "tiles"]   # default ["edr"]
 
 [netcdf]
-data_path = "testdata/meps-netcdf"  # local directory, read non-recursively
-filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"  # default: names ending in .nc
-variables = ["air_temperature_2m", "precipitation_amount_acc"]  # default: every variable on the grid
-max_runs = 4                        # newest runs kept
-max_files = 1024                    # most files kept open, over all runs
-member = 0                          # ensemble member, files with an ensemble axis
-poll_interval_secs = 60
-
-[netcdf.titles]                     # layer titles in place of the files' long_name
-precipitation_amount_acc = "Precipitation accumulated since run start"
-```
-
-`collections.d/meps-netcdf-local.toml` is a runnable example on the
-committed MEPS sample, and `collections.d/meps-netcdf-pl-local.toml` one on
-the committed pressure-level sample (below). Values are served in the files' own units (K, Pa,
-m/s, kg/m², fractions), never converted, and units are reported as the
-files spell them (`kg/m^2`). Layers without a `[[wms.parameters]]` entry
-take the built-in default style their name and unit select, matched in any
-unit spelling (`kg/m^2` is `kg m-2`): temperature in kelvin, MSLP in
-pascals, wind speed and gusts, the grid-relative `x_wind_10m`/`y_wind_10m`
-components (±40 m/s), relative humidity and cloud and fog area fractions in
-unit `1` (0–1), and the run-start `precipitation_amount_acc` (0–200 mm,
-`precipitation_accumulation`).
-
-### Pressure levels
-
-A collection has one vertical axis, so a family on pressure levels, such as
-MEPS's per-lead `pl` files (18 variables on 13 levels, 1000 to 50 hPa), is
-a collection of its own:
-
-```toml
-[netcdf]
-data_path = "testdata/meps-netcdf-pl"
-filename_template = "meps_pl_{lead}_%Y%m%dT{run}Z.nc"
-variables = ["air_temperature_pl", "x_wind_pl", "y_wind_pl", "geopotential_pl",
-             "relative_humidity_pl"]
-```
-
-- **The axis:** `RasterInfo.vertical` and EDR's `extent.vertical` are
-  `VerticalKind::Pressure` in hPa, bottom first (the largest pressure
-  first, as GRIB's pressure views). A file storing Pa (ERA5 and many CF
-  writers) is converted; MEPS stores hPa.
-- **Selecting a level:** WMS `ELEVATION`, Maps/Tiles `elevation` and EDR
-  `z` match a level exactly; a level the collection lacks is a 400 (WMS
-  GetMap: the error image). A map without one draws the first, bottom
-  level (1000 hPa for MEPS), and GetFeatureInfo reports and reads that
-  level.
-- **EDR `z`:** a level, a list, an interval or `Rn/min/step`, the levels
-  kept in request order; without `z` every level. One level is a
-  `PointSeries` with a one-value `z` axis, several a `VerticalProfile` per
-  step; an area puts the levels on a `z` axis, `[t, z, y, x]`.
-- **One level is one field:** fetched (one ~1.4 MB chunk for MEPS),
-  decoded, cached and counted by the query cap on its own, so a query
-  reads steps × levels × variables fields. A position series over a whole
-  MEPS run at all 13 levels (871 fields) is past the cap: name the levels.
-- **One axis per collection:** with `variables`, every listed variable must
-  be on the same levels, else the file is skipped naming the one that is
-  not; without, the largest group of the first file's fields on the same
-  levels wins (single-level fields on a tie) and the rest are skipped with a WARN. Later files must
-  have the same levels.
-- **Styles:** the built-in defaults give `x_wind_pl`/`y_wind_pl` ±80 m/s and
-  the derived `wind_speed_pl` 0–80 m/s, twice the surface scale: one range
-  serves every level, and the jet at 300–250 hPa reaches 60–80 m/s (the
-  committed sample's 300 hPa x component, 72 m/s). Temperature,
-  geopotential and relative humidity keep their all-levels ranges.
-
-`collections.d/meps-netcdf-pl-thredds.toml.disabled` reads the MEPS `pl`
-family, control member, 67 leads, from thredds.met.no, with its traffic
-stated (measured 2026-10-18: 4 GETs and 1.23 MB to open a pl file for one
-variable, 1.42 MB per field).
-
-### EDR
-
-- **Run and steps:** an `/instances/{id}/…` query reads that run; otherwise
-  a `datetime` window reads the newest run with a step inside it that also
-  spans the window's start, else the newest with any step inside it. An
-  instant matches a step valid at exactly that time. No step in the window
-  is a 404, so a `datetime` list skips that instant. Without `datetime`, a
-  position series is every step of the newest run, and an area is the step
-  a map without `TIME` draws (the newest run's last).
-- **Position** projects the point onto the grid once and samples every step
-  bilinearly in the grid's x/y, as the map draws it, so GetFeatureInfo
-  answers what GetMap drew. A point off the grid is null.
-- **Area and radius** are a CRS84 grid over the polygon's bbox at the
-  grid's mean cell size in degrees, at most 256 cells per axis; each cell
-  centre is projected once, and cells outside the polygon are null. A
-  polygon outside the grid's extent is a 404. A `datetime` interval puts
-  its steps on a `t` axis.
-- **Cost:** each field is read once per query for every point, at most four
-  at a time. A field a map has just drawn is reused; any other is decoded
-  for the query and not kept, so a series never evicts the frames being
-  drawn. A remote field's ~1.5 MB chunk is cached, and a read that outlives
-  the 30 s query deadline still lands in that cache, so a retry makes
-  progress. A query may decode at most `MC_NETCDF_EDR_QUERY_MB` (544 MiB):
-  one parameter over one MEPS run of 67 leads as the client sees it,
-  including a derived wind speed; more is a 400 that names the fields and
-  the limit, before anything is read. The cap counts the fields read, steps
-  × levels × variables: a derived wind speed reads both of its components,
-  134 fields over a whole run, and three variables over a run do not fit,
-  nor one variable over a run at all 13 MEPS pressure levels. A query whose
-  points all lie off the grid reads nothing.
-
-### Remote files
-
-```toml
-[netcdf]
-data_path = "https://thredds.met.no/thredds/fileServer/meps25epsarchive/"
-prefix_pattern = "%Y/%m/%d/{run}/member_00/"          # {run}: the run hour
+data_path = "testdata/meps-netcdf"
 filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"
-run_hours = [0, 3, 6, 9, 12, 15, 18, 21]              # required
-leads = [0, 1, 2]                                     # {lead}; the first is the sentinel
-time_window = "-PT12H"                                # required: runs probed
-min_age = "PT10M"                                     # a file this old is used at once
-run_grace = "PT30M"                                   # a run missing leads is served after this
-prewarm_variables = []                                # newest run fetched ahead (bottom level)
+variables = ["air_temperature_2m", "x_wind_10m", "y_wind_10m"]
+max_runs = 4
 ```
 
-A run not yet out costs one HEAD per poll (its first lead's); once it
-appears its other leads are HEADed and, settled, opened: each file's first
-1 MiB in one request plus a few 64 KiB blocks of its chunk indexes. A field
-is one request for its compressed chunk (~1.5 MB for MEPS). Every request
-is conditional on the version opened: a file replaced on the server is a
-503 and is opened again by the next poll. At most 8 requests go to one host
-at once, over every collection on it, and polls take at most 2. A cold field
-slower than a render's 3 s deadline fails that render and still lands in the
-cache for the next. The collection opens the newest run when it loads, for
-at most 15 s; its poll loop opens the rest at once.
+In `config.toml` the table is `[collections.netcdf]`. Unknown keys, and
+URL-only fields on a local `data_path`, are a load error.
 
-`collections.d/meps-netcdf-thredds.toml.disabled` is MEPS surface, control
-member, 67 leads, with its traffic stated (about 125 MB of metadata per run
-serving eight variables; ~1.5 MB per field first drawn; ~100 MB per prewarm
-variable and run) and `max_runs = 2`: each kept file holds about 820 KB of
-parsed metadata, so 67 leads × 2 runs is some 110 MB. Prewarm fetches the
-level a map without `ELEVATION` draws, the bottom one on a pressure family.
-
-| Variable | Default | Meaning |
+| Field | Default | Meaning |
 |---|---|---|
-| `MC_NETCDF_FIELD_CACHE_MB` | `256` | Decoded fields (`f32`, ~4 MB per MEPS field), shared by every NetCDF collection |
+| `data_path` | required | Local directory, or an `http(s)://` URL read by range |
+| `filename_template` | every `*.nc` | strftime name with `{run}` (run hour) and `{lead}` (two-digit lead); required for a URL |
+| `variables` | every variable on the first file's grid | Variables served, in order; the first is the default layer |
+| `titles` | `long_name`, else the name | Layer titles by variable name (a table) |
+| `member` | `0` | Ensemble member read from files with an ensemble axis |
+| `max_runs` | `4` | Newest model runs kept |
+| `max_files` | `1024` | Most files kept open, over all runs |
+| `poll_interval_secs` | `60` | Poll period in seconds |
+| `prefix_pattern` | none | URL only: strftime path of one run's files, with `{run}` |
+| `run_hours` | required | URL only: hours (0–23) runs start at |
+| `leads` | required with `{lead}` | URL only: leads to probe; the first is the sentinel |
+| `time_window` | required | URL only: how far back runs are probed, such as `-PT12H` |
+| `min_age` | `PT10M` | URL only: a file is used once two polls see it unchanged, or at once when this old |
+| `run_grace` | `PT30M` | URL only: a run missing leads is served without them after this |
+| `prewarm_variables` | `[]` | URL only: variables whose newest-run fields each poll fetches ahead (bottom level) |
+
+Runnable examples: `collections.d/meps-netcdf-local.toml` (MEPS surface
+sample) and `collections.d/meps-netcdf-pl-local.toml` (pressure-level
+sample). `meps-netcdf-thredds.toml.disabled` and
+`meps-netcdf-pl-thredds.toml.disabled` in the same directory read these
+families from MET Norway's public thredds.met.no and state their traffic.
+
+Process-wide environment variables, shared by every NetCDF collection:
+
+| Variable | Default | Bounds |
+|---|---|---|
+| `MC_NETCDF_FIELD_CACHE_MB` | `256` | Decoded fields (~4 MB per MEPS field) |
 | `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote files (~1.5 MB per MEPS field) |
 | `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote files; at least 8 |
-| `MC_NETCDF_READ_MEMORY_MB` | `1024` | Transient buffers of field reads in progress; a read that does not fit is a 503 |
-| `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read, counted from the metadata before any read: steps × pressure levels × variables read × one field (4.06 MB for MEPS); over it a 400. The default admits one parameter over one MEPS run, including a derived wind speed, which reads both components |
+| `MC_NETCDF_READ_MEMORY_MB` | `1024` | Buffers of field reads in progress; a read that does not fit is a 503 |
+| `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read (steps × levels × variables read × one field), checked before any read; over it a 400. Fits one variable, or a derived wind speed (both components), over a 67-lead MEPS run |
 
-Each catalogued file stays open with its metadata while the catalog keeps
-it, one file descriptor each for local files. Developer notes, measurements
-and the rules the code follows are in `CLAUDE.md`.
+## Limits
+
+- Only a pressure axis may have more than one level. A variable with
+  several height-above-ground or hybrid model levels is skipped; listed
+  in `variables`, it makes the file unservable.
+- Every file must hold all the collection's variables on its grid; a
+  file missing one is skipped. Other grid mappings, 2-D (curvilinear)
+  latitude/longitude grids, and more than one ensemble member per
+  collection are not supported.
+- Grid-relative wind components on a projected grid give speed only (none
+  on a geostationary grid). `valid_range` is not applied; non-standard
+  calendars are refused.
+- A cold remote field slower than the render deadline fails that render
+  with a 503; the fetch still completes into the cache for the next one.
+- Each kept file holds its parsed metadata in memory (about 820 KB for a
+  221-variable MEPS surface file) and, if local, one file descriptor.
+
+## Testing
+
+```bash
+cargo test -p engine-netcdf
+cargo test -p server --test netcdf_edr   # EDR responses vs. the schemas
+```
+
+Fixtures under `testdata/`, each with a README and the script that built
+it: `meps-netcdf/` and `meps-netcdf-pl/` (real MEPS surface and
+pressure-level files cropped to 11 × 10 points, two runs);
+`netcdf-global/` (synthetic global grid without runs, packed and filled
+values); `netcdf-pressure-pa/` (synthetic Pa pressure axis, earth-relative
+wind); `netcdf-remote/` (synthetic MEPS-like files, served by a local HTTP
+test server for the range-read tests). `tests/live_thredds.rs` reads a few
+MEPS files from thredds.met.no and is ignored by default
+(`cargo test -p engine-netcdf --test live_thredds -- --ignored`).
+Contributor notes are in [CLAUDE.md](CLAUDE.md).

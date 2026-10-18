@@ -1,0 +1,202 @@
+# engine-odim
+
+Serves ODIM_H5 weather-radar data: 2-D composites (`engine_type = "odim"`)
+and native polar volumes (`engine_type = "odim-volume"`).
+
+## What it solves
+
+European radar producers publish ODIM_H5, an HDF5 profile. A composite is
+one projected grid per timestep, usually reflectivity. A polar volume is one
+radar's stack of elevation sweeps, each carrying several moments
+(reflectivity, Doppler velocity, dual-polarisation fields) in range ×
+azimuth cells. This crate reads both directly from a local directory or an
+object store, with the pure-Rust `hdf5-reader` (no `libhdf5`, no GDAL
+preprocessing), and serves them through the map, EDR, Features and 3D Tiles
+APIs. Polar data is resampled per request, so every sweep and moment stays
+available.
+
+## How it works
+
+- **Catalog and poll.** A scan lists the source and builds a catalog of
+  timestamped files. A background poll repeats it every
+  `poll_interval_secs` and swaps the catalog atomically; a failed poll keeps
+  the previous one. Temporary names (`.name.h5`, `*.tmp`, `*.part`) are
+  skipped, and so are remote objects over 64 MiB.
+- **Composites (`OdimEngine`).** The filename template (or regex) gives
+  each file's time. The newest file is decoded at startup for the grid, CRS
+  and extent, so a source with no matching file fails to load. Decoded
+  grids live in one byte-bounded LRU shared by all composite collections
+  (`MC_ODIM_COMPOSITE_CACHE_MB`, default 2048, `0` disables).
+- **Polar volumes (`PolarVolumeEngine`).** One source holds a radar
+  network. The scan parses every `.h5` file's metadata (site, sweeps,
+  moments) and groups volumes by the radar's ODIM node id (`NOD`). The
+  server registers one collection per site, id `{id}-{nod}`, each served by
+  a `PolarVolumeSiteView` over the shared catalog. At startup a remote
+  source parses only the newest volume per radar; the first poll fills in
+  the rest of the window.
+- **Lazy polar pixels.** Pixel arrays are decoded per moment on first use
+  into a shared byte-bounded cache (`MC_PVOL_PIXEL_CACHE_MB`, default
+  1024). Each scan pre-decodes the default quantity of the lowest
+  `prewarm_sweeps` sweeps of every volume it reads, so the first map of a
+  new volume is a cache hit. A request that reads several moments of one
+  file fetches it once.
+- **Read errors.** A missing or undecodable polar volume reads as no data
+  and is remembered as bad; a deadline or storage failure fails the
+  request, so no cache keeps an empty frame. A composite that fails to load
+  is a gap in an EDR series and an error for a map.
+- **Maps** find each output pixel's source cell through a coarse
+  projection grid, never a projection per pixel.
+
+## What it serves
+
+**Composites** (`odim`), one parameter per collection:
+
+| Trait | APIs | Behaviour |
+|---|---|---|
+| `MapEngine` | WMS, Maps, Tiles | One layer, nearest-neighbour. `TIME` picks the nearest timestep; without it, the latest |
+| `EdrEngine` | EDR | `position`: bilinear, one value per timestep. `area`: a bilinear WGS84 grid over the polygon's bbox at about the composite's resolution, at most 256 cells per axis and 1 M values per response (400 beyond), cells outside the polygon null. `radius`: an area over the circle. No locations |
+
+**Polar volumes** (`odim-volume`), per site collection `{id}-{nod}`:
+
+| Trait | APIs | Behaviour |
+|---|---|---|
+| `MapEngine` | WMS, Maps, Tiles | One layer per moment, plus `CELLS`. `TIME` picks the nearest volume. `ELEVATION` / `elevation` draws the sweep nearest the angle, else the lowest, among sweeps carrying the moment |
+| `EdrEngine` | EDR | `locations`, `position`, `area`, `radius`, `trajectory` |
+| `VolumeEngine` | 3D Tiles | Point cloud, voxel grid, storm cells |
+
+- **Parameters** are the bare ODIM quantity codes (`DBZH`, `VRADH`, `ZDR`,
+  …), the union over the newest volume's sweeps. Labels and units come from
+  the table in [`src/quantities.rs`](src/quantities.rs); an unknown code is
+  served without a unit. The default quantity (bare WMS layer, no
+  `parameter-name`, no 3D Tiles `quantity`) is `DBZH`, else `TH`, else the
+  first alphabetically. `[[wms.parameters]]` entries named by the bare
+  quantity on the source style that moment at every site.
+- **Vertical axis**: sweep elevation angles rounded to 0.1°. EDR `z` keeps
+  the sweeps within 0.05° of a requested angle; none matching is a 400.
+- **`position`**: without `z`, one vertical profile (value per sweep angle)
+  per volume; with `z`, one time series per angle. A point beyond the
+  radar's range is a 404. Clear air is a measurement and returns nulls; a
+  point never observed at the requested angles is a 404.
+- **`locations`** lists the antenna (id = `NOD`). **`area`** and
+  **`radius`** return the `position` coverages at the antenna when it lies
+  inside the area, else 404.
+- **`trajectory`**: one vertical cross-section (CoverageJSON `Section`)
+  per volume under a 2-D `LINESTRING`: nodes about 500 m apart (at most
+  1024), heights above the antenna placed with the 4/3-Earth beam model (at
+  most 100 levels, 25 km), and the per-node height of the lowest surveyed
+  beam, which api-edr emits as `meteocore:beamCoverage`.
+- **`CELLS`** (sites with a dBZ moment): storm cells at 35 dBZ, drawn as
+  footprint outlines and centroid markers at each cell's peak dBZ, with
+  tracks over the six previous scans. `ELEVATION` is ignored, and WMS
+  GetFeatureInfo does not query the layer.
+- **3D Tiles**: the point cloud holds at most 8 M points. The voxel grid
+  behind the isosurface, echo-top and voxel products is cylindrical (range
+  × azimuth × height up to 20 km); the caller picks its size, at most 32 M
+  cells. Clear air is filled at −32 dBZ and unobserved cells are NaN. A
+  volume without echoes is a 404. Grids and cell sets are cached
+  (`MC_PVOL_VOXEL_GRID_CACHE_MB`, default 512;
+  `MC_PVOL_CELL_SET_CACHE_MB`, default 64).
+- **Site inventory** (`FeatureEngine`, with `features` in `apis`, under
+  the base id `{id}`): one Point feature per radar at its antenna, id =
+  `NOD`, with `nod`, `name`, `wmo`, `longitude`, `latitude`,
+  `antenna_height_m`, `quantities`, `elevation_angles`, `coverage_radius_m`,
+  `latest_volume_time`, `volume_count` and `collection`. `bbox` matches the
+  antenna; `datetime` keeps sites with a volume in the interval. The same
+  site list feeds a nowcast collection's `radar_source`.
+
+## Configuration
+
+Settings live in `[odim]` (`[collections.odim]` inline). The collection's
+`data_path` is a local directory or, for composites only, an `http(s)://`
+URL.
+
+```toml
+id = "radar-eu-composite"
+title = "OPERA radar composite"
+description = "Pan-European reflectivity composite"
+engine_type = "odim"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[odim]
+endpoint = "https://s3.waw3-1.cloudferro.com"
+bucket = "openradar-24h"
+prefix_pattern = "%Y/%m/%d/OPERA/COMP/"
+filename_template = "OPERA@%Y%m%dT%H%M@0@DBZH.h5"
+parameter = "reflectivity"
+unit = "dBZ"
+time_window = "-PT12H"
+poll_interval_secs = 300
+```
+
+```toml
+id = "radar-fi-volume"
+title = "FMI radar volumes"
+description = "Polar volumes, one collection per radar"
+engine_type = "odim-volume"
+apis = ["edr", "wms", "maps", "tiles", "3dtiles", "features"]
+data_path = "testdata/radar-fmi-pvol"
+
+[odim]
+poll_interval_secs = 300
+max_files = 24
+```
+
+| Field | Default | Used by | Meaning |
+|---|---|---|---|
+| `filename_template` | — | `odim` | strftime file name; the whole name must match. Required unless the next two are set |
+| `filename_pattern`, `timestamp_format` | — | `odim` | Regex with a `(?P<timestamp>…)` group, and its chrono format |
+| `parameter`, `unit` | — | `odim` (required) | Advertised parameter name and unit; no conversion |
+| `gain`, `offset`, `nodata` | from the file | `odim` | Override the file's scaling, `value = raw × gain + offset`, and its nodata value |
+| `poll_interval_secs` | `30` | both | Rescan interval |
+| `max_files` | unbounded | both | Keep the newest N files (`odim-volume`: per site) |
+| `endpoint`, `bucket` | — | both | S3 source; set both or neither |
+| `prefix_pattern` | — | both | Key prefix with strftime codes, expanded per UTC day (per hour for an hourly prefix, which needs a `time_window` of at most 24 h). Required for S3 (`""` lists the bucket root); appended to an HTTP `data_path` |
+| `time_window` | — | both | ISO 8601 duration such as `-PT12H`: bounds the prefixes listed and the times kept. Without it a remote source lists today's and yesterday's prefixes and a local source keeps every file |
+| `discovery` | `"list"` | `odim`, HTTP | `"list"` (WebDAV `PROPFIND`) or `"template"`: HEAD-probe the file name of each `cadence_secs` step back from now over `time_window` (at most 288), never re-probing a found file |
+| `cadence_secs` | — | `odim`, template | Spacing of probed timestamps; required in template mode |
+| `resampling` | `"nearest"` | `odim-volume` | Map render: `"nearest"` or `"bilinear"` (EDR and 3D Tiles always use nearest) |
+| `prewarm_sweeps` | `1` | `odim-volume` | Lowest sweeps pre-decoded per volume; `0` disables |
+
+Example collections in `collections.d/`: `radar-eu-composite-dbzh-s3-h5`
+(public S3 bucket), `radar-de-composite-dbzh-http-h5` (HTTP template
+discovery), `radar-fi-volume-s3-h5` (polar volumes on public S3). The
+`*-local-h5` files read local sample directories that are not in git.
+
+## Limits
+
+- Composites: `/what/object` must be `COMP`, and only `/dataset1/data1` is
+  read. Supported projections are PROJ `stere`, `tmerc`, `laea` and
+  `longlat`; a `+R=` sphere radius other than WGS84's is rejected.
+- Polar sources are a local directory (not recursive) or S3; HTTP is not
+  supported. A volume without a `NOD`, or with a non-alphanumeric one, is
+  skipped.
+- A remote polar scan downloads every volume in the window to read its
+  metadata. Bound it with `time_window`: `max_files` trims the catalog only
+  after the download.
+- The polar map render and EDR point samples treat range as ground range,
+  with no slant-range correction. Rays are assumed evenly spaced from
+  north, so sector scans are not supported.
+- Each radar is its own collection; there is no multi-radar mosaic. A
+  radar that appears after load becomes a collection on the next reload.
+  A remote source that found no radar at load is retried in the background.
+
+## Testing
+
+```bash
+cargo test -p engine-odim
+```
+
+- Unit tests use synthetic volumes, `testdata/pvol-cold-batch.h5` (a small
+  two-sweep volume from `testdata/make_pvol_cold_batch.py`) and
+  `testdata/odim-dmi-fixture.h5` (a DMI composite).
+- `tests/integration.rs` runs composites against the DMI fixture, read
+  locally and through an object-store adapter; template discovery probes
+  stub files. Polar volumes run against FMI and SMHI files in
+  `testdata/radar-fmi-pvol/` and `testdata/radar-smhi-pvol/`, which are not
+  in git; those tests skip when the files are absent.
+- `examples/` holds standalone tools: 3D Tiles point cloud, isosurface and
+  echo-top generators, a volume statistics probe and the voxel sampling
+  check in
+  [`docs/odim-voxel-validation.md`](../../docs/odim-voxel-validation.md).
+
+Contributor notes: [`CLAUDE.md`](CLAUDE.md).
