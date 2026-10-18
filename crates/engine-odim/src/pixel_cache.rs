@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use ds_cache::ByteBoundedCache;
 use ds_storage::bytes::Bytes;
+use ds_storage::PendingGet;
 use quick_cache::sync::Cache;
 
 use crate::reader::RawPixels;
@@ -73,6 +74,45 @@ pub struct PixelCache {
     /// lives only as long as its [`HeldBytes`] guard, and their number is
     /// capped by the caller of [`Self::hold_bytes`].
     held: Mutex<HashMap<String, Bytes>>,
+    /// Remote volume file downloads (#1127), keyed like `loading`, so a
+    /// request that needs a file another request is downloading joins that
+    /// read instead of starting its own. Weak: a read lives only while some
+    /// request holds it, which is until the file's bytes are decoded at
+    /// most, and the last holder dropping it aborts it; the downloaded bytes
+    /// are never kept here. Dead entries are pruned on the next
+    /// registration.
+    reads: Mutex<Reads>,
+}
+
+/// A volume file download from [`PixelCache::join_or_start_read`].
+pub(crate) struct VolumeRead {
+    pub(crate) read: Arc<PendingGet>,
+    /// Another request started the read. Its failure is then that request's,
+    /// and the joiner reads the file again.
+    pub(crate) joined: bool,
+}
+
+type Reads = HashMap<String, Weak<PendingGet>>;
+
+/// The registered read of `file_id` (#1127), unless none is held or it is
+/// known to have failed. Prunes the reads nobody holds any more.
+fn join_read(reads: &mut Reads, file_id: &str) -> Option<VolumeRead> {
+    reads.retain(|_, read| read.strong_count() != 0);
+    let read = reads
+        .get(file_id)
+        .and_then(Weak::upgrade)
+        .filter(|read| !read.failed())?;
+    Some(VolumeRead { read, joined: true })
+}
+
+/// Begin a read of `file_id` with `start`, registered for later callers.
+fn start_read(reads: &mut Reads, file_id: &str, start: impl FnOnce() -> PendingGet) -> VolumeRead {
+    let read = Arc::new(start());
+    reads.insert(file_id.to_owned(), Arc::downgrade(&read));
+    VolumeRead {
+        read,
+        joined: false,
+    }
 }
 
 /// One file's bytes registered in [`PixelCache::held_bytes`] for the life of
@@ -113,7 +153,21 @@ impl PixelCache {
             inserts: AtomicU64::new(0),
             loading: Mutex::new(HashMap::new()),
             held: Mutex::new(HashMap::new()),
+            reads: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Join the download of `file_id` another request holds, or else begin
+    /// one with `start` and register it for the requests that follow
+    /// (#1127). A read known to have failed is not joined, so the next caller
+    /// starts another.
+    pub(crate) fn join_or_start_read(
+        &self,
+        file_id: &str,
+        start: impl FnOnce() -> PendingGet,
+    ) -> VolumeRead {
+        let mut reads = self.reads.lock().unwrap_or_else(|e| e.into_inner());
+        join_read(&mut reads, file_id).unwrap_or_else(|| start_read(&mut reads, file_id, start))
     }
 
     /// The bytes of `file_id` a background sibling decode still holds, if
@@ -351,6 +405,41 @@ mod tests {
         assert_eq!(loads.load(Ordering::Relaxed), 1);
         cache.with_file_load("next-file", || {});
         assert!(cache.loading.lock().unwrap().len() <= 1);
+    }
+
+    /// #1127: a file's read is joined while some caller holds it and
+    /// started anew once none does, and the registry keeps no dead reads.
+    #[test]
+    fn reads_are_joined_while_held_and_dead_ones_pruned() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let store =
+            ds_storage::DataStore::new(Arc::new(ds_storage::object_store::memory::InMemory::new()));
+        let starts = AtomicU64::new(0);
+        let start = || {
+            starts.fetch_add(1, Ordering::Relaxed);
+            let object = ds_storage::object_store::path::Path::from("volume");
+            store.start_get_opt(&object, runtime.handle())
+        };
+        let cache = PixelCache::new(1);
+        let first = cache.join_or_start_read("volume", start);
+        let second = cache.join_or_start_read("volume", start);
+        assert!(!first.joined && second.joined);
+        assert!(Arc::ptr_eq(&first.read, &second.read));
+        assert_eq!(starts.load(Ordering::Relaxed), 1, "one read for both");
+        drop(first);
+        let third = cache.join_or_start_read("volume", start);
+        assert!(third.joined, "joined while any caller holds it");
+        drop((second, third));
+        let fourth = cache.join_or_start_read("volume", start);
+        assert!(!fourth.joined, "a read nobody holds is gone");
+        assert_eq!(starts.load(Ordering::Relaxed), 2);
+        drop(fourth);
+        drop(cache.join_or_start_read("other", start));
+        assert_eq!(cache.reads.lock().unwrap().len(), 1, "dead reads pruned");
     }
 
     #[test]

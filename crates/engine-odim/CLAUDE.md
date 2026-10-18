@@ -138,19 +138,35 @@ around `ds-storage` calls (Critical Rules 6–7).
   the EDR queries admitted at once (`ds_executor::query_workers()`), plus
   about 3.3 MB of section cell geometry per volume (`SectionPlan`: 1024
   nodes × 100 levels × 32 B). The cap is a maintainer decision, pinned by a
-  const assert. Errors map as before: the deadline (checked per
-  volume, carried by every download) or a transient failure ends the walk
-  and aborts the downloads in flight; a missing object is nodata and known
+  const assert. Errors map as before: the deadline (checked per volume,
+  bounding every wait for a download) or a transient failure ends the walk
+  and drops the downloads in flight; a missing object is nodata and known
   bad. A local source, a one-volume walk (GetFeatureInfo, a single
   `datetime`) and a thread without a multi-thread runtime read each file
-  as the walk reaches it, inside the per-file lock. Downloads started ahead
-  do not coalesce with another request's cold read of the same file
-  (#1127). Never
+  as the walk reaches it, inside the per-file lock. Never
   loop `Pixels::prefetch` over remote volumes outside `walk_volumes`.
   Pinned by `walks_download_volumes_concurrently_at_most_four_at_once`
   (wall time ≈ ceil(V/4) GET delays, each file once),
   `read_ahead_walks_answer_as_the_sequential_walk` and
   `read_ahead_walk_stops_at_the_deadline`.
+- **Concurrent requests share a volume file's download (#1127).** Every
+  remote whole-file read of the pixel path, a walk's read ahead and a miss
+  inside the per-file lock alike (`fetch_file_bytes`, on a thread with a
+  multi-thread runtime), is a `RemoteRead`: it joins the download of the
+  file another request holds, registered by source-qualified cache id in
+  `PixelCache` (`join_or_start_read`), or starts one that others join. The
+  registry is weak: a read lives while a request holds it, and each holder
+  keeps it until the file's moments are decoded, so a request arriving
+  meanwhile joins instead of downloading again; the last holder dropping
+  it aborts it, and no bytes outlive their holders. A started read
+  (`DataStore::start_get_opt`) is bounded by `FetchBudget::Request` alone
+  and each wait by its own thread's deadline, so one request's deadline
+  never cuts off a read another waits on. A read that failed is not
+  joined, and a request whose joined read failed reads once more, its own
+  read or one started since: the failure is the starter's (503/504), not
+  the joiner's, and nothing is marked bad. Pinned by
+  `concurrent_cold_walks_download_each_volume_once` (GETs counted at the
+  store) and `a_joined_download_that_fails_is_read_again`.
 - **Cold single-moment misses (#293, #994):** only a map render reads one
   moment at a time. A `Pixels::moment` miss fetches the source-qualified
   file once, decodes **only the requested moment** on the caller's thread

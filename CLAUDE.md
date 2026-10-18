@@ -132,6 +132,9 @@ Violating these has caused production incidents. Never break them.
      To overlap whole-object reads from synchronous code, start them with
      `DataStore::start_get_opt` and collect each with
      `PendingGet::wait(Some(handle))`, bounding how many you start (#999).
+     Several threads may wait for one read behind an `Arc` (#1127): each
+     wait is bounded by its own thread's deadline, and the last holder
+     dropping the read aborts it.
      The plain-Zarr adapter is a tested exception: the same synchronous
      `get_opt`/cache-fill path serves EDR async workers and `RenderJob` blocking
      workers. Its `block_in_place` bridge releases an async worker and runs
