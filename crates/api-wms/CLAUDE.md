@@ -119,8 +119,9 @@ under the request as resolved (`CacheKey`): the style layer and style name
 layer and `coll/<default>`, share entries (#1133); the meta-tile
 `TileKeyPrefix` keys the same pair. Maps keys the same way into the same
 instance, so a WMS view and a Maps request whose keys match (CRS code,
-envelope, size, style, parameter, time) share one entry, whichever render
-path filled it; Tiles keys its TileMatrixSet id as the CRS. Every successful non-empty render is
+envelope, size, style, parameter, time, and no background: a WMS PNG or
+WebP with `TRANSPARENT=TRUE`) share one entry, whichever render path
+filled it; Tiles keys its TileMatrixSet id as the CRS. Every successful non-empty render is
 inserted on its first render, a meta-tiled viewport included; empty and
 error images never are. Measured on a day of a live deployment's GetMaps
 (85 000, every one an EPSG:3857 viewport, none tile-shaped):
@@ -227,13 +228,17 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
 
 ## TRANSPARENT / BGCOLOR (#163)
 
-- `TRANSPARENT` is `TRUE`/`FALSE` (case-insensitive) and defaults to `TRUE`
-  — deliberately not the spec's `FALSE`, which would turn every overlay
-  client that omits it opaque. Any other value is `InvalidParameterValue`.
+- `TRANSPARENT` is `TRUE`/`FALSE` (case-insensitive) and defaults to `FALSE`,
+  as WMS 1.3.0 §7.3.3.9 specifies (#1065): a GetMap that omits it is opaque,
+  nodata in `BGCOLOR`. Overlay clients send `TRUE` (OpenLayers' WMS sources
+  do unless told otherwise), so they keep transparent nodata. Any other
+  value is `InvalidParameterValue`.
 - `BGCOLOR` is strictly `0xRRGGBB` (lower-case `0x`, hex digits of either
   case), default white; anything else is `InvalidParameterValue`.
-- `GetMapParams.background` is `Some(BGCOLOR)` for `TRANSPARENT=FALSE` and
-  for JPEG (no alpha, so its nodata is always background), else `None`.
+- `GetMapParams.background` is `Some(BGCOLOR)` for `TRANSPARENT=FALSE`, the
+  default, and for JPEG (no alpha, so its nodata is always background);
+  `None` only for PNG/WebP with `TRANSPARENT=TRUE`. Every render path reads
+  it: direct, meta-tiled, composites, the empty image and the error tile.
   The image is composited onto it at encode time (`ds_render::flatten_onto`):
   every pixel opaque, PNG8 kept, no `tRNS`.
 - Caching: the background is part of the rendered-image `CacheKey` (the
@@ -244,9 +249,11 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   tile is flattened too.
 - GetCapabilities advertises nothing for these; the layer `opaque` attribute
   is unrelated and unchanged.
-- ets-wms13's `getmap:bbox-outside-crs` fails on the `TRUE` default: it
-  sends no `TRANSPARENT`, reads only the pixels' RGB and wants white, and a
-  transparent pixel is RGBA 0,0,0,0. With `TRANSPARENT=FALSE` it passes.
+- ets-wms13's `getmap:bbox-outside-crs` and `getmap:transparent-default`
+  send no `TRANSPARENT` and want the opaque default: every pixel's RGB
+  white, and no transparent pixel. A `TRUE` default failed both (a
+  transparent pixel is RGBA 0,0,0,0). Tests that read a decoded pixel's
+  alpha to tell drawn from empty must send `TRANSPARENT=TRUE`.
 
 ## EMPTY and ERROR images follow FORMAT (#1091)
 
@@ -258,8 +265,8 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   them. ets-wms13's `getmap:each-format` checks this whenever the layer it
   picks has no data at its test bbox.
 - JPEG has no alpha: the empty image is solid `BGCOLOR` (default white) and
-  the semi-transparent error tile is flattened onto it. WebP keeps alpha like
-  PNG unless `TRANSPARENT=FALSE`.
+  the semi-transparent error tile is flattened onto it. So are PNG and WebP
+  without `TRANSPARENT=TRUE`, which keeps their alpha.
 - Neither is inserted into the rendered cache. Both come from one
   process-wide memo in ds-render (`ds_render::background_tile`,
   `ds_render::error_tile`, #1093), keyed on the image and

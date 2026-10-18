@@ -276,10 +276,12 @@ async fn wms_serves_composite_layers() {
     );
     assert!(ir_grey.contains("<Name>default</Name>"), "{ir_grey}");
 
+    // Transparent, as `expected_png` composes: without TRANSPARENT the image
+    // is opaque over white, WMS 1.3.0's default.
     let map = |layer: &str, crs: &str, bbox: &str| {
         format!(
             "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={ID}/{layer}&STYLES=\
-             &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64"
+             &FORMAT=image/png&TRANSPARENT=TRUE&CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64"
         )
     };
     let [w, s, e, n] = IR_BBOX;

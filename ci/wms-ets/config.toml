@@ -33,9 +33,9 @@
 #   fail on the suite's own request: the first encodes the name twice, the
 #   second sends an empty CRS for a layer that inherits its BoundingBox.
 # - getmap:transparent-default asks for a box around 0°N 0°E without
-#   TRANSPARENT. Over no data it meets the TRANSPARENT=TRUE default (#163)
-#   and fails; over data, such as the global ets-grib-pressure, it passes
-#   whatever the default.
+#   TRANSPARENT. Over no data it tests the default itself, FALSE (#1065):
+#   the empty image is opaque BGCOLOR white. Over data, such as the global
+#   ets-grib-pressure, it passes whatever the default.
 
 [server]
 # The suite's container shares the runner's network (`--network host`), so

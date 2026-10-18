@@ -238,10 +238,11 @@ async fn get(app: &axum::Router, uri: &str) -> (StatusCode, bytes::Bytes) {
     )
 }
 
+/// A transparent GetMap, so nodata decodes with alpha 0.
 fn get_map(layer: &str, crs: &str, bbox: &str) -> String {
     format!(
         "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS={layer}&STYLES=\
-         &CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64&FORMAT=image/png"
+         &CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64&FORMAT=image/png&TRANSPARENT=TRUE"
     )
 }
 

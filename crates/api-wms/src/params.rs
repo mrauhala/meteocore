@@ -242,8 +242,8 @@ pub struct GetMapParams {
     pub height: u32,
     /// Opaque background to composite the image over, from `TRANSPARENT` /
     /// `BGCOLOR` and the format: `None` keeps the alpha channel
-    /// (`TRANSPARENT=TRUE`, the default, for PNG/WebP); `Some(rgb)` for
-    /// `TRANSPARENT=FALSE` and for JPEG, which cannot carry alpha.
+    /// (`TRANSPARENT=TRUE`, for PNG/WebP); `Some(rgb)` for `TRANSPARENT=FALSE`,
+    /// the default, and for JPEG, which cannot carry alpha.
     pub background: Option<[u8; 3]>,
     pub time: Option<DateTime<Utc>>,
     /// Output CRS for pixel-to-coordinate mapping.
@@ -455,10 +455,10 @@ impl WmsQuery {
             .map_err(|msg| WmsError::invalid_parameter(&msg))?;
 
         // TRANSPARENT + BGCOLOR (WMS 1.3.0 §7.3.3.9–10). With TRANSPARENT=FALSE,
-        // or a format without alpha (JPEG), nodata pixels take the BGCOLOR
-        // value (default white) and the image is opaque. TRANSPARENT defaults
-        // to TRUE here — the spec's FALSE would turn every overlay client that
-        // omits it opaque.
+        // the default, or a format without alpha (JPEG), nodata pixels take
+        // the BGCOLOR value (default white) and the image is opaque. An
+        // overlay client sends TRANSPARENT=TRUE, as OpenLayers' WMS sources
+        // do unless told otherwise, and keeps nodata transparent.
         let transparent = parse_transparent(self.transparent.as_deref())?;
         let bgcolor = parse_bgcolor(self.bgcolor.as_deref())?;
         let background = (!transparent
@@ -741,11 +741,12 @@ fn epsg3857_to_wgs84(x: f64, y: f64) -> (f64, f64) {
 const DEFAULT_BGCOLOR: [u8; 3] = [0xFF, 0xFF, 0xFF];
 
 /// Parse `TRANSPARENT`: `TRUE` or `FALSE`, case-insensitive; omitted or empty
-/// ⇒ `TRUE`. Anything else is rejected rather than read as `FALSE`, since
-/// that would silently turn the image opaque.
+/// ⇒ `FALSE`, as WMS 1.3.0 §7.3.3.9 specifies (#1065). Anything else is
+/// rejected rather than read as either, since a typo would silently pick
+/// the opaque or the transparent image.
 fn parse_transparent(raw: Option<&str>) -> Result<bool, WmsError> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
-        None => Ok(true),
+        None => Ok(false),
         Some(s) if s.eq_ignore_ascii_case("true") => Ok(true),
         Some(s) if s.eq_ignore_ascii_case("false") => Ok(false),
         Some(s) => Err(WmsError::invalid_parameter(&format!(
@@ -975,8 +976,10 @@ mod tests {
 
     #[test]
     fn parse_transparent_is_true_false_case_insensitive() {
-        assert!(parse_transparent(None).unwrap());
-        assert!(parse_transparent(Some("")).unwrap());
+        // Omitted or empty: FALSE, WMS 1.3.0 §7.3.3.9's default (#1065).
+        assert!(!parse_transparent(None).unwrap());
+        assert!(!parse_transparent(Some("")).unwrap());
+        assert!(!parse_transparent(Some("  ")).unwrap());
         assert!(parse_transparent(Some("TRUE")).unwrap());
         assert!(parse_transparent(Some("true")).unwrap());
         assert!(!parse_transparent(Some("FALSE")).unwrap());

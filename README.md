@@ -1700,7 +1700,7 @@ For multi-parameter engines, GetCapabilities emits a parent layer with no `<Name
 | `FORMAT` | yes | `image/png`, `image/jpeg`, or `image/webp` |
 | `STYLES` | no | Style name (empty or missing = `default`) |
 | `TIME` | no | ISO 8601 timestamp; defaults to the latest available |
-| `TRANSPARENT` | no | `TRUE` (default) keeps nodata transparent; `FALSE` returns an opaque image with nodata painted in `BGCOLOR` |
+| `TRANSPARENT` | no | `FALSE` (default, as WMS 1.3.0 specifies) returns an opaque image with nodata painted in `BGCOLOR`; `TRUE` keeps nodata transparent. Send `TRUE` for a layer overlaid on others; OpenLayers' WMS sources do unless told otherwise |
 | `BGCOLOR` | no | `0xRRGGBB` background for `TRANSPARENT=FALSE` and JPEG output; default `0xFFFFFF` (white) |
 | `QUALITY` | no | Vendor parameter: encoder quality, an integer from 1 to 100, for `image/webp` and `image/jpeg`. WebP 1–99 is lossy at that quality, 100 lossless; without it WebP uses the collection's `[wms] webp_quality`, else lossless. JPEG defaults to 85. With `image/png`, or out of range, it is `InvalidParameterValue` (400). GetMap only: GetLegendGraphic ignores it and stays lossless. |
 
@@ -1744,7 +1744,7 @@ Errors are returned as `ServiceExceptionReport` XML with WMS 1.3.0 error codes: 
 3. Build a cache key from quantized bbox, layer, style, format, CRS, width, height, time, and parameter.
 4. Check the rendered-image cache (shared LRU). On hit: compare the cached entry's content-derived ETag against `If-None-Match` — match → `304` with `X-Cache: HIT`, otherwise return the cached bytes with `X-Cache: HIT`.
 5. On miss: acquire a render semaphore permit (timed out → 503). Run `MapEngine::get_raster_tile()` on a blocking thread — the engine projects the bbox into the source CRS, picks the best overview, reads source tiles, and resamples (nearest-neighbor).
-6. Empty (all-nodata) tile: serve the empty image in the requested format and quality: transparent, or the background colour for `TRANSPARENT=FALSE` and JPEG. Error: serve the red error tile (WMS only) in the requested format too, flattened onto the background for JPEG. Each is encoded once per size, background and format, on the blocking thread of step 5, and kept in a byte-bounded memo. Neither is inserted into the rendered-image cache.
+6. Empty (all-nodata) tile: serve the empty image in the requested format and quality: `BGCOLOR`, white by default, or transparent with `TRANSPARENT=TRUE` in PNG or WebP. Error: serve the red error tile (WMS only) in the requested format too, flattened onto the background unless `TRANSPARENT=TRUE` keeps its alpha in PNG or WebP. Each is encoded once per size, background and format, on the blocking thread of step 5, and kept in a byte-bounded memo. Neither is inserted into the rendered-image cache.
 7. Populated tile: colorize (LUT for discrete data, linear gradient for continuous), encode to PNG/JPEG/WebP, wrap in `CachedRendered` (which derives the ETag via FNV-1a over the bytes), and insert into the cache.
 8. Compare the freshly-computed ETag against `If-None-Match` — match → `304` carrying the same `X-Cache` label the 200 would have (`MISS`, `EMPTY`, or `ERROR`), otherwise return the body with `X-Cache: MISS | EMPTY | ERROR`. Revalidations stay categorised the same as initial fetches on dashboards.
 

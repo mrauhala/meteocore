@@ -175,8 +175,9 @@ fn assert_magic(content_type: &str, body: &[u8], context: &str) {
 
 /// #1091 (and #162 before it): an all-nodata view is encoded in the
 /// requested FORMAT at its QUALITY, with that Content-Type — on the direct
-/// and the meta-tiled empty path. JPEG has no alpha, so it is the
-/// background (BGCOLOR, default white); WebP keeps the alpha like PNG.
+/// and the meta-tiled empty path. It is the background (BGCOLOR, default
+/// white) for TRANSPARENT=FALSE, the default (#1065), and for JPEG, which
+/// has no alpha; with TRANSPARENT=TRUE WebP keeps the alpha like PNG.
 #[tokio::test]
 async fn empty_image_is_encoded_in_the_requested_format() {
     use ds_render::{encode_jpeg, encode_png, encode_webp};
@@ -194,16 +195,36 @@ async fn empty_image_is_encoded_in_the_requested_format() {
             "&FORMAT=image/jpeg&BGCOLOR=0x336699",
             encode_jpeg(&bg, 64, 64, 85),
         ),
-        ("&FORMAT=image/webp", encode_webp(&transparent, 64, 64, 100)),
         (
-            "&FORMAT=image/webp&QUALITY=60",
+            "&FORMAT=image/jpeg&TRANSPARENT=TRUE",
+            encode_jpeg(&white, 64, 64, 85),
+        ),
+        ("&FORMAT=image/webp", encode_webp(&white, 64, 64, 100)),
+        (
+            "&FORMAT=image/webp&QUALITY=60&BGCOLOR=0x336699",
+            encode_webp(&bg, 64, 64, 60),
+        ),
+        (
+            "&FORMAT=image/webp&TRANSPARENT=TRUE",
+            encode_webp(&transparent, 64, 64, 100),
+        ),
+        (
+            "&FORMAT=image/webp&QUALITY=60&TRANSPARENT=TRUE",
             encode_webp(&transparent, 64, 64, 60),
         ),
         (
             "&FORMAT=image/webp&TRANSPARENT=FALSE&BGCOLOR=0x336699",
             encode_webp(&bg, 64, 64, 100),
         ),
-        ("&FORMAT=image/png", encode_png(&transparent, 64, 64)),
+        ("&FORMAT=image/png", encode_png(&white, 64, 64)),
+        (
+            "&FORMAT=image/png&BGCOLOR=0x336699",
+            encode_png(&bg, 64, 64),
+        ),
+        (
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+            encode_png(&transparent, 64, 64),
+        ),
     ];
     for (crs, bbox) in HALF_VIEWS {
         for (extra, expected) in &cases {
@@ -338,7 +359,8 @@ fn build_failing_router() -> axum::Router {
 
 /// The red error tile follows FORMAT too (#1091): encoded at the request's
 /// QUALITY with the requested Content-Type. JPEG flattens it onto BGCOLOR
-/// (default white); PNG and WebP keep its alpha unless TRANSPARENT=FALSE.
+/// (default white), and so do PNG and WebP unless TRANSPARENT=TRUE, which
+/// keeps its alpha (TRANSPARENT defaults to FALSE, #1065).
 #[tokio::test]
 async fn error_tile_is_encoded_in_the_requested_format() {
     use ds_render::{encode_jpeg, encode_png, encode_webp};
@@ -353,16 +375,24 @@ async fn error_tile_is_encoded_in_the_requested_format() {
             "&FORMAT=image/jpeg&QUALITY=30&BGCOLOR=0x000000",
             encode_jpeg(&on_black, 64, 64, 30),
         ),
-        ("&FORMAT=image/webp", encode_webp(&red, 64, 64, 100)),
         (
-            "&FORMAT=image/webp&QUALITY=70",
+            "&FORMAT=image/webp&TRANSPARENT=TRUE",
+            encode_webp(&red, 64, 64, 100),
+        ),
+        (
+            "&FORMAT=image/webp&QUALITY=70&TRANSPARENT=TRUE",
             encode_webp(&red, 64, 64, 70),
         ),
         (
             "&FORMAT=image/webp&TRANSPARENT=FALSE",
             encode_webp(&on_white, 64, 64, 100),
         ),
-        ("&FORMAT=image/png", encode_png(&red, 64, 64)),
+        ("&FORMAT=image/webp", encode_webp(&on_white, 64, 64, 100)),
+        (
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+            encode_png(&red, 64, 64),
+        ),
+        ("&FORMAT=image/png", encode_png(&on_white, 64, 64)),
     ] {
         let uri = format!(
             "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=broken&STYLES=\
@@ -4619,9 +4649,9 @@ async fn meta_tiled_viewport_is_cached_on_its_first_render() {
     let rendered = calls.load(Ordering::Relaxed);
     assert!(rendered > 0);
 
-    // Meta-tiled: an opaque copy of the view is another rendered-cache key,
-    // yet it is assembled from the meta-tiles cached above.
-    let (x, _) = get(format!("{view}&TRANSPARENT=FALSE")).await;
+    // Meta-tiled: a transparent copy of the view is another rendered-cache
+    // key, yet it is assembled from the meta-tiles cached above.
+    let (x, _) = get(format!("{view}&TRANSPARENT=TRUE")).await;
     assert_eq!(x, "MISS");
     assert_eq!(calls.load(Ordering::Relaxed), rendered, "meta-tiled view");
 
@@ -4631,18 +4661,25 @@ async fn meta_tiled_viewport_is_cached_on_its_first_render() {
 }
 
 /// TRANSPARENT=FALSE paints nodata with BGCOLOR and returns an opaque image;
-/// the default keeps nodata transparent — on both render paths.
+/// TRANSPARENT=TRUE keeps nodata transparent — on both render paths.
 #[tokio::test]
 async fn transparent_false_composites_nodata_over_bgcolor() {
     for (crs, bbox) in HALF_VIEWS {
         let (app, _) = build_half_data_router();
 
-        let (status, _, body) = get_map_with(&app, "radar", crs, bbox, "&FORMAT=image/png").await;
+        let (status, _, body) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let default = png_pixels(&body);
         assert!(
             default.iter().any(|p| p[3] == 0),
-            "{crs}: default output keeps nodata transparent"
+            "{crs}: TRANSPARENT=TRUE keeps nodata transparent"
         );
         assert!(default.iter().any(|p| p[3] == 255), "{crs}: data is drawn");
 
@@ -4686,6 +4723,88 @@ async fn transparent_false_composites_nodata_over_bgcolor() {
     }
 }
 
+/// WMS 1.3.0 §7.3.3.9: TRANSPARENT defaults to FALSE (#1065). A GetMap that
+/// omits it is opaque: nodata takes BGCOLOR, default white, and the data is
+/// drawn over it, pixel for pixel the TRANSPARENT=TRUE image flattened, on
+/// both render paths. It shares the TRANSPARENT=FALSE request's cache entry,
+/// never the transparent one's.
+#[tokio::test]
+async fn getmap_without_transparent_is_opaque_over_bgcolor() {
+    use std::sync::atomic::Ordering;
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+    for (crs, bbox) in HALF_VIEWS {
+        let (app, calls) = build_half_data_router();
+        let (status, x, body) = get_map_with(&app, "radar", crs, bbox, "&FORMAT=image/png").await;
+        assert_eq!(status, StatusCode::OK, "{crs}");
+        assert_eq!(x, "MISS", "{crs}");
+        let opaque = png_pixels(&body);
+        assert!(opaque.iter().all(|p| p[3] == 255), "{crs}: opaque");
+        let rendered = calls.load(Ordering::Relaxed);
+
+        // The transparent image of the same view is another entry.
+        let (_, x, transparent_body) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+        )
+        .await;
+        assert_eq!(x, "MISS", "{crs}: never the opaque image's entry");
+        let transparent = png_pixels(&transparent_body);
+        assert!(transparent.iter().any(|p| p[3] == 0), "{crs}: nodata");
+        assert!(transparent.iter().any(|p| p[3] == 255), "{crs}: data");
+        for (t, o) in transparent.iter().zip(&opaque) {
+            let expected = if t[3] == 0 { WHITE } else { *t };
+            assert_eq!(*o, expected, "{crs}: the data over white");
+        }
+        if crs == "EPSG:3857" {
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                rendered,
+                "meta-tiled: both are assembled from the same RGBA tiles"
+            );
+        }
+
+        // An explicit FALSE is the same request, and so the same entry.
+        let (_, x, explicit) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=FALSE",
+        )
+        .await;
+        assert_eq!(x, "HIT", "{crs}");
+        assert_eq!(explicit, body, "{crs}");
+        let (_, x, again) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+        )
+        .await;
+        assert_eq!(x, "HIT", "{crs}");
+        assert_eq!(again, transparent_body, "{crs}");
+
+        // BGCOLOR alone: the data over BGCOLOR.
+        let (_, x, body) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&BGCOLOR=0x336699",
+        )
+        .await;
+        assert_eq!(x, "MISS", "{crs}");
+        for (t, o) in transparent.iter().zip(&png_pixels(&body)) {
+            let expected = if t[3] == 0 { BG } else { *t };
+            assert_eq!(*o, expected, "{crs}: the data over BGCOLOR");
+        }
+    }
+}
+
 /// The rendered-image cache must never serve a transparent image to an opaque
 /// request (or vice versa), while the meta-tile cache — plain RGBA — is shared
 /// by both.
@@ -4694,7 +4813,7 @@ async fn opaque_request_is_not_served_a_cached_transparent_image() {
     use std::sync::atomic::Ordering;
     for (crs, bbox) in HALF_VIEWS {
         let (app, calls) = build_half_data_router();
-        let png = "&FORMAT=image/png";
+        let png = "&FORMAT=image/png&TRANSPARENT=TRUE";
         let opaque = "&FORMAT=image/png&TRANSPARENT=FALSE&BGCOLOR=0x336699";
 
         let (_, x, transparent_body) = get_map_with(&app, "radar", crs, bbox, png).await;
@@ -4736,7 +4855,8 @@ async fn opaque_request_is_not_served_a_cached_transparent_image() {
 }
 
 /// An all-nodata view with TRANSPARENT=FALSE is a solid BGCOLOR image, on the
-/// direct and the meta-tiled empty path; the default stays transparent.
+/// direct and the meta-tiled empty path, and so is one without TRANSPARENT
+/// (#1065); TRANSPARENT=TRUE stays transparent.
 #[tokio::test]
 async fn all_nodata_opaque_view_is_solid_bgcolor() {
     let app = build_empty_router();
@@ -4755,7 +4875,35 @@ async fn all_nodata_opaque_view_is_solid_bgcolor() {
         assert_eq!(pixels.len(), 64 * 64);
         assert!(pixels.iter().all(|&p| p == BG), "{crs}: solid BGCOLOR");
 
+        let (_, x, body) = get_map_with(
+            &app,
+            "empty",
+            crs,
+            bbox,
+            "&FORMAT=image/png&BGCOLOR=0x336699",
+        )
+        .await;
+        assert_eq!(x, "EMPTY", "{crs}");
+        assert!(
+            png_pixels(&body).iter().all(|&p| p == BG),
+            "{crs}: no TRANSPARENT is TRANSPARENT=FALSE"
+        );
+
         let (_, x, body) = get_map_with(&app, "empty", crs, bbox, "&FORMAT=image/png").await;
+        assert_eq!(x, "EMPTY", "{crs}");
+        assert!(
+            png_pixels(&body).iter().all(|&p| p == [255, 255, 255, 255]),
+            "{crs}: BGCOLOR defaults to white"
+        );
+
+        let (_, x, body) = get_map_with(
+            &app,
+            "empty",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+        )
+        .await;
         assert_eq!(x, "EMPTY", "{crs}");
         assert!(png_pixels(&body).iter().all(|&p| p == [0, 0, 0, 0]));
     }
@@ -4777,8 +4925,20 @@ async fn error_tile_honours_transparent_false() {
     // [255, 0, 0, 100] over white.
     assert!(png_pixels(&body).iter().all(|&p| p == [255, 155, 155, 255]));
 
+    // Without TRANSPARENT, the same: FALSE is the default (#1065).
     let (_, x, body) =
         get_map_with(&app, "broken", "CRS:84", "10,55,30,70", "&FORMAT=image/png").await;
+    assert_eq!(x, "ERROR");
+    assert!(png_pixels(&body).iter().all(|&p| p == [255, 155, 155, 255]));
+
+    let (_, x, body) = get_map_with(
+        &app,
+        "broken",
+        "CRS:84",
+        "10,55,30,70",
+        "&FORMAT=image/png&TRANSPARENT=TRUE",
+    )
+    .await;
     assert_eq!(x, "ERROR");
     assert!(png_pixels(&body).iter().all(|&p| p == [255, 0, 0, 100]));
 }
@@ -4801,6 +4961,18 @@ async fn jpeg_is_composited_over_bgcolor() {
         crs,
         bbox,
         "&FORMAT=image/jpeg&TRANSPARENT=FALSE&BGCOLOR=0xFFFFFF",
+    )
+    .await;
+    assert_eq!(x, "HIT");
+    assert_eq!(body, default);
+    // TRANSPARENT=TRUE changes nothing either: still over white, still
+    // the same entry.
+    let (_, x, body) = get_map_with(
+        &app,
+        "radar",
+        crs,
+        bbox,
+        "&FORMAT=image/jpeg&TRANSPARENT=TRUE",
     )
     .await;
     assert_eq!(x, "HIT");
@@ -5278,7 +5450,9 @@ mod composites {
                 None,
             )
             .unwrap();
-        let expected = ds_render::render_composite_tiles(&tiles, &spec, ImageFormat::Png, None)
+        // TRANSPARENT omitted: FALSE, over the default BGCOLOR (#1065).
+        let white = Some([255, 255, 255]);
+        let expected = ds_render::render_composite_tiles(&tiles, &spec, ImageFormat::Png, white)
             .unwrap()
             .unwrap();
         assert_eq!(reply.body, expected);
@@ -5286,6 +5460,20 @@ mod composites {
         // East of 5°E: red 51 - 21 = 30 over -10..40 → 204, green 21 → 54,
         // blue 51 inverted over 100..0 → 125. West of it `b` is nodata.
         let pixels = png_pixels(&reply.body);
+        assert_eq!(pixels[63], [204, 54, 125, 255]);
+        assert_eq!(pixels[0], [255, 255, 255, 255]);
+
+        let transparent = get(
+            &app,
+            &get_map("sat/rgb", "CRS:84", "0,40,10,50", "&TRANSPARENT=TRUE"),
+        )
+        .await;
+        assert_eq!(transparent.x_cache, "MISS");
+        let expected = ds_render::render_composite_tiles(&tiles, &spec, ImageFormat::Png, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(transparent.body, expected);
+        let pixels = png_pixels(&transparent.body);
         assert_eq!(pixels[63], [204, 54, 125, 255]);
         assert_eq!(pixels[0], [0, 0, 0, 0]);
 
@@ -5353,9 +5541,11 @@ mod composites {
             .all(|(bands, time)| bands == &["a", "b"] && *time == Some(t(T1))));
         let (_, misses) = tile_cache.stats();
         assert_eq!(misses as usize, calls.len());
+        // TRANSPARENT omitted: the nodata west of 5°E is the default
+        // BGCOLOR, white (#1065).
         let pixels = png_pixels(&first.body);
         assert_eq!(pixels[63], [204, 54, 125, 255]);
-        assert_eq!(pixels[0], [0, 0, 0, 0]);
+        assert_eq!(pixels[0], [255, 255, 255, 255]);
 
         // Another format misses the rendered cache but assembles from the
         // same composed tiles, still at T1 after `a` gains T2.
@@ -5504,7 +5694,7 @@ struct QualityResponse {
 async fn get_quality(app: &axum::Router, crs: &str, bbox: &str, extra: &str) -> QualityResponse {
     let uri = format!(
         "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar&STYLES=\
-         &CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64&TIME=2024-01-01T00:00:00Z{extra}"
+         &CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64&TIME=2024-01-01T00:00:00Z&TRANSPARENT=TRUE{extra}"
     );
     let resp = app
         .clone()
@@ -6401,10 +6591,12 @@ fn visible_rows(pixels: &[[u8; 4]], width: usize) -> Vec<bool> {
 async fn geographic_getmap_past_a_pole_is_empty_there() {
     use std::sync::atomic::Ordering;
     let (app, _, calls) = build_counting_router(16);
+    // Transparent, so a decoded pixel's alpha tells whether it was drawn.
     let get_map = |crs: &str, bbox: &str| {
         format!(
             "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=data&STYLES=\
-             &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH=100&HEIGHT=100"
+             &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH=100&HEIGHT=100\
+             &TRANSPARENT=TRUE"
         )
     };
 
@@ -6412,6 +6604,19 @@ async fn geographic_getmap_past_a_pole_is_empty_there() {
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.x_cache, "EMPTY");
     assert!(png_pixels(&reply.body).iter().all(|p| p[3] == 0));
+    // ets-wms13's request, without TRANSPARENT: FALSE, the default (#1065),
+    // so every pixel is the default BGCOLOR, white.
+    let reply = fetch(
+        &app,
+        "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=data&STYLES=\
+         &FORMAT=image/png&CRS=CRS:84&BBOX=-10,90,10,110&WIDTH=100&HEIGHT=100",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.x_cache, "EMPTY");
+    assert!(png_pixels(&reply.body)
+        .iter()
+        .all(|p| *p == [255, 255, 255, 255]));
     assert_eq!(
         calls.load(Ordering::Relaxed),
         0,
@@ -6441,10 +6646,7 @@ async fn geographic_getmap_past_a_pole_is_empty_there() {
     // reaching past it, the others drawn.
     let background = [0x33, 0x66, 0x99, 0xff];
     let opaque = |bbox: &str| {
-        format!(
-            "{}&TRANSPARENT=FALSE&BGCOLOR=0x336699",
-            get_map("CRS:84", bbox)
-        )
+        get_map("CRS:84", bbox).replace("TRANSPARENT=TRUE", "TRANSPARENT=FALSE&BGCOLOR=0x336699")
     };
     let reply = fetch(&app, &opaque("-10,90,10,110")).await;
     assert_eq!(reply.status, StatusCode::OK);
@@ -6505,13 +6707,21 @@ async fn projected_getmap_wholly_outside_its_projection_is_empty() {
     let white = solid(64, 64, [255, 255, 255, 255]);
     let bg = solid(64, 64, BG);
     let cases = [
-        ("&FORMAT=image/png", encode_png(&transparent, 64, 64)),
+        (
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+            encode_png(&transparent, 64, 64),
+        ),
+        ("&FORMAT=image/png", encode_png(&white, 64, 64)),
         (
             "&FORMAT=image/png&TRANSPARENT=FALSE&BGCOLOR=0x336699",
             encode_png(&bg, 64, 64),
         ),
         ("&FORMAT=image/jpeg", encode_jpeg(&white, 64, 64, 85)),
-        ("&FORMAT=image/webp", encode_webp(&transparent, 64, 64, 100)),
+        (
+            "&FORMAT=image/webp&TRANSPARENT=TRUE",
+            encode_webp(&transparent, 64, 64, 100),
+        ),
+        ("&FORMAT=image/webp", encode_webp(&white, 64, 64, 100)),
         (
             "&FORMAT=image/webp&TRANSPARENT=FALSE&BGCOLOR=0x336699",
             encode_webp(&bg, 64, 64, 100),
@@ -6544,7 +6754,11 @@ async fn projected_getmap_wholly_outside_its_projection_is_empty() {
             "16000000,2200000,18000000,4200000",
             "4000000,3000000,4512000,3512000",
         ] {
-            let reply = fetch(&app, &get_map("EPSG:3035", bbox, "&FORMAT=image/png")).await;
+            let reply = fetch(
+                &app,
+                &get_map("EPSG:3035", bbox, "&FORMAT=image/png&TRANSPARENT=TRUE"),
+            )
+            .await;
             assert_eq!(reply.status, StatusCode::OK, "{metatile_mb} MB {bbox}");
             assert_eq!(reply.x_cache, "MISS", "{metatile_mb} MB {bbox}");
             assert!(
