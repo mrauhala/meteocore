@@ -197,6 +197,7 @@ impl PostgisEngine {
         let start = Instant::now();
         let was_cut = self.locations_cut();
         let _refresh = self.refresh_lock.lock().await;
+        let had_future = self.cache.load().future_latest.is_some();
         let result = self.refresh_metadata_checked().await;
         // Advisory and independent of schema/metadata success. Completed audits
         // do no further I/O; unchecked audits retry without changing health.
@@ -217,6 +218,23 @@ impl PostgisEngine {
                     collection = %self.collection_id,
                     max_locations = self.config.max_locations,
                     "postgis: station list fits max_locations again"
+                ),
+            }
+        }
+        let future = self.cache.load().future_latest;
+        if result.is_ok() && future.is_some() != had_future {
+            // Transitions only (#1139), like the cut above: every refresh
+            // meanwhile serves the extent that ends at now.
+            match future {
+                Some(latest) => tracing::warn!(
+                    collection = %self.collection_id,
+                    %latest,
+                    "postgis: observations are dated in the future: the advertised temporal \
+                     extent ends at the latest observation not after now"
+                ),
+                None => tracing::info!(
+                    collection = %self.collection_id,
+                    "postgis: no observations are dated in the future any more"
                 ),
             }
         }
@@ -2102,6 +2120,7 @@ mod tests {
             station_idx: std::sync::Arc::new(station_idx),
             parameters: std::sync::Arc::new(HashMap::new()),
             temporal_extent: None,
+            future_latest: None,
             spatial_extent: None,
             wms_times: std::sync::Arc::new(Vec::new()),
             locations_cut: None,
@@ -2366,7 +2385,7 @@ mod tests {
         let refreshed = CollectionMeta::build(
             engine.config(),
             crate::metadata::LocationSet::default(),
-            None,
+            crate::metadata::TemporalRead::default(),
             1,
         );
         engine.cache().store(refreshed);
@@ -2495,9 +2514,12 @@ mod tests {
 
         let rows = ["a", "b", "c", "d"].map(station).to_vec();
         let set = crate::metadata::LocationSet::of_station_rows(engine.config(), rows);
-        engine
-            .cache()
-            .store(CollectionMeta::build(engine.config(), set, None, 1));
+        engine.cache().store(CollectionMeta::build(
+            engine.config(),
+            set,
+            crate::metadata::TemporalRead::default(),
+            1,
+        ));
         engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
 
         assert!(engine.locations_truncated());
@@ -2526,9 +2548,12 @@ mod tests {
             let rows: Vec<_> = rows.into_iter().map(station).collect();
             let n = rows.len();
             let set = crate::metadata::LocationSet::of_station_rows(engine.config(), rows);
-            engine
-                .cache()
-                .store(CollectionMeta::build(engine.config(), set, None, 1));
+            engine.cache().store(CollectionMeta::build(
+                engine.config(),
+                set,
+                crate::metadata::TemporalRead::default(),
+                1,
+            ));
             engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
             assert!(!engine.locations_truncated());
             assert_eq!(served_ids(&engine).len(), n);
@@ -2571,9 +2596,12 @@ mod tests {
         }
         assert!(stopped, "reading stops at the first station past the cap");
         let set = merged.finish();
-        engine
-            .cache()
-            .store(CollectionMeta::build(engine.config(), set, None, 1));
+        engine.cache().store(CollectionMeta::build(
+            engine.config(),
+            set,
+            crate::metadata::TemporalRead::default(),
+            1,
+        ));
         engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
 
         assert!(engine.locations_truncated());

@@ -806,3 +806,6 @@ mod privileges;
 
 #[path = "support/indexes.rs"]
 mod indexes;
+
+#[path = "support/temporal_extent.rs"]
+mod temporal_extent;
