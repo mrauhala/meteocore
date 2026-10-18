@@ -1293,7 +1293,91 @@ struct CacheCounterState {
     cap: HashMap<String, [u64; 8]>,
     /// BUFR engine counters per collection (`Health::counters` order).
     bufr: HashMap<String, [u64; engine_bufr::health::COUNTERS]>,
+    /// Station-grid per-collection `[analyses, failures]` (#1082).
+    station_grid: HashMap<String, [u64; 2]>,
 }
+
+// Station grids (#1082): the stations behind the latest analysis is the
+// first thing to check when one looks wrong.
+static STATION_GRID_STATIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "station_grid_stations",
+            "Stations the latest analysis of a station-grid parameter was computed from",
+        ),
+        &["collection", "parameter"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static STATION_GRID_ANALYSES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "station_grid_analyses_total",
+            "Station-grid analyses computed (request misses and pre-computes)",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static STATION_GRID_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "station_grid_failures_total",
+            "Station-grid analyses and source reads that failed",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static STATION_GRID_LAST_ANALYSIS_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "station_grid_last_analysis_ms",
+            "Wall-clock duration of the most recent station-grid analysis",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static STATION_GRID_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "station_grid_cache",
+        "station-grid analysis cache",
+        None,
+        None,
+        false,
+    )
+});
+static STATION_GRID_COMPUTE_USED: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "station_grid_compute_reserved_bytes",
+        "Bytes reserved by station-grid analyses being computed",
+    )
+});
+static STATION_GRID_COMPUTE_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "station_grid_compute_capacity_bytes",
+        "Station-grid computation admission capacity",
+    )
+});
+static STATION_GRID_COMPUTE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "station_grid_compute_rejected_total",
+        "Station-grid analyses rejected by computation memory admission",
+    )
+});
 
 static NOWCAST_CELL_BIRTHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -1614,6 +1698,7 @@ pub struct ServerState {
     pub bufr_engines: RwLock<Vec<Arc<engine_bufr::BufrEngine>>>,
     pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
     pub nowcast_engines: RwLock<Vec<Arc<engine_nowcast::NowcastEngine>>>,
+    pub station_grid_engines: RwLock<Vec<Arc<engine_station_grid::StationGridEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
     pub reload_lock: tokio::sync::Mutex<()>,
     /// Bearer token for admin endpoint authentication.
@@ -1677,6 +1762,7 @@ pub struct LoadResult {
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
     pub nowcast_engines: Vec<Arc<engine_nowcast::NowcastEngine>>,
     nowcast_dependency_updates: Vec<engine_nowcast::engine::DependencyUpdate>,
+    pub station_grid_engines: Vec<Arc<engine_station_grid::StationGridEngine>>,
     /// Every successfully built (or reused) poll-loop engine, keyed by
     /// collection id — the reuse pool for the NEXT incremental reload (#574).
     pub engines_by_id: HashMap<String, EngineHandle>,
@@ -1737,9 +1823,22 @@ pub enum EngineHandle {
     Bufr(Arc<engine_bufr::BufrEngine>),
     Postgis(Arc<engine_postgis::PostgisEngine>),
     Nowcast(Arc<engine_nowcast::NowcastEngine>),
+    StationGrid(Arc<engine_station_grid::StationGridEngine>),
 }
 
 impl EngineHandle {
+    /// The station collection a station-grid collection may grid (#1082):
+    /// the `EdrEngine` of a CSV, BUFR or PostGIS stations collection,
+    /// whichever APIs it lists. `None` for every other engine.
+    fn station_source(&self) -> Option<Arc<dyn ds_core::edr_engine::EdrEngine>> {
+        match self {
+            Self::Csv(e) => Some(e.clone()),
+            Self::Bufr(e) => Some(e.clone()),
+            Self::Postgis(e) if e.config().events().is_none() => Some(e.clone()),
+            _ => None,
+        }
+    }
+
     /// The `FeatureEngine` that serves this collection's EDR `items` query
     /// (#928): the engine behind its `EdrEngine`, for the engines that
     /// implement both over one collection. `None` for engines without
@@ -1763,7 +1862,8 @@ impl EngineHandle {
             | Self::Zarr(_)
             | Self::Satellite(_)
             | Self::Netcdf(_)
-            | Self::Odim(_) => None,
+            | Self::Odim(_)
+            | Self::StationGrid(_) => None,
         }
     }
 }
@@ -1810,6 +1910,11 @@ impl EngineReuse {
     reuse_take!(take_bufr, Bufr, engine_bufr::BufrEngine);
     reuse_take!(take_postgis, Postgis, engine_postgis::PostgisEngine);
     reuse_take!(take_nowcast, Nowcast, engine_nowcast::NowcastEngine);
+    reuse_take!(
+        take_station_grid,
+        StationGrid,
+        engine_station_grid::StationGridEngine
+    );
 }
 
 /// Decide which collections of the NEW config may reuse their live engine
@@ -1840,7 +1945,12 @@ pub(crate) fn reusable_collections(
         |c: &CollectionConfig| old.get(&c.id).is_some_and(|o| o == c) && live.contains_key(&c.id);
     let base: std::collections::HashSet<String> = new
         .iter()
-        .filter(|c| !matches!(c.engine_type.as_str(), "nowcast" | "csv" | "geojson"))
+        .filter(|c| {
+            !matches!(
+                c.engine_type.as_str(),
+                "nowcast" | "csv" | "geojson" | "station-grid"
+            )
+        })
         .filter(|c| unchanged(c))
         .map(|c| c.id.clone())
         .collect();
@@ -1855,6 +1965,17 @@ pub(crate) fn reusable_collections(
         // Only raster provenance gates reuse. Auxiliary references are staged
         // after validating ALL named dependencies against the new base registries.
         if base.contains(&nc.source) {
+            out.insert(c.id.clone());
+        }
+    }
+    // A station grid keeps its engine only with its station source's: a
+    // rebuilt source (a CSV always is) is a new `Arc` the grid must read.
+    for c in new.iter().filter(|c| c.engine_type == "station-grid") {
+        if unchanged(c)
+            && c.station_grid
+                .as_ref()
+                .is_some_and(|g| base.contains(&g.source))
+        {
             out.insert(c.id.clone());
         }
     }
@@ -2088,6 +2209,8 @@ pub fn load_collections(
     // Derived collections wire in a second pass, after every base engine
     // exists (#522). Collected here during the main loop.
     let mut nowcast_pending: Vec<&CollectionConfig> = Vec::new();
+    let mut station_grid_pending: Vec<&CollectionConfig> = Vec::new();
+    let mut station_grid_engines: Vec<Arc<engine_station_grid::StationGridEngine>> = Vec::new();
     // Pool registry is local to this load: collections sharing a DSN share a
     // pool via Arc<Pool>. Seed it with the pools of every REUSED postgis
     // engine (#574) so a rebuilt collection on a shared DSN joins the live
@@ -2140,6 +2263,7 @@ pub fn load_collections(
             "bufr" => &["edr", "features"],
             "postgis" => &["edr", "features", "tiles", "wms", "maps"],
             "nowcast" => &["wms", "maps", "tiles", "features", "edr"],
+            "station-grid" => &["wms", "maps", "tiles", "edr"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -4138,6 +4262,9 @@ pub fn load_collections(
             "nowcast" => {
                 nowcast_pending.push(collection);
             }
+            "station-grid" => {
+                station_grid_pending.push(collection);
+            }
             other => {
                 tracing::error!(
                     "Collection '{}': unknown engine type '{}', skipping",
@@ -4423,6 +4550,139 @@ pub fn load_collections(
         );
     }
 
+    // ------------------------------------------------------------------
+    // Third pass: station grids (#1082), over the station collections the
+    // passes above built. Only a CSV, BUFR or PostGIS stations engine is a
+    // source, so a grid never grids a derived collection.
+    // ------------------------------------------------------------------
+    for collection in station_grid_pending {
+        let mut fail = |error: String| {
+            tracing::error!("Collection '{}': {error}, skipping", collection.id);
+            health.push(CollectionHealth {
+                id: collection.id.clone(),
+                engine_type: "station-grid".into(),
+                status: CollectionStatus::Failed,
+                error: Some(error),
+            });
+        };
+        let Some(grid_config) = collection.station_grid.as_ref() else {
+            fail("missing [collections.station_grid] config".into());
+            continue;
+        };
+        let Some(source) = engines_by_id
+            .get(&grid_config.source)
+            .and_then(EngineHandle::station_source)
+        else {
+            fail(format!(
+                "station_grid source '{}' not found or not a station collection (csv, bufr \
+                 or postgis stations defined in the same config)",
+                grid_config.source
+            ));
+            continue;
+        };
+        let engine = match engine_reuse.take_station_grid(&collection.id) {
+            Some(live) => live,
+            None => match engine_station_grid::StationGridEngine::new(
+                &collection.id,
+                &grid_config.source,
+                source,
+                grid_config,
+            ) {
+                Ok(engine) => Arc::new(engine),
+                Err(e) => {
+                    fail(format!("failed to initialize station-grid engine: {e}"));
+                    continue;
+                }
+            },
+        };
+        engines_by_id.insert(
+            collection.id.clone(),
+            EngineHandle::StationGrid(engine.clone()),
+        );
+        station_grid_engines.push(engine.clone());
+
+        // Every API's collection description says how the grids are made.
+        let mut described = collection.clone();
+        described.description = match described.description.trim() {
+            "" => engine.provenance().to_string(),
+            own => format!("{own} {}", engine.provenance()),
+        };
+        let parameters = ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+        let mut styles = || {
+            collection_layer_styles(
+                style_ctx,
+                &mut styles_cache,
+                collection,
+                &parameters,
+                &bundle_index,
+            )
+        };
+        if collection.apis.contains(&"edr".to_string()) {
+            edr_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
+            edr_collections.insert(collection.id.clone(), described.clone());
+            edr_styles.extend(styles());
+            info!("Collection '{}': wired to EDR API", collection.id);
+        }
+        if collection.apis.contains(&"wms".to_string()) {
+            map_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            register_point_engine(
+                &mut wms_point_engines,
+                &collection.id,
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
+            map_collections.insert(collection.id.clone(), described.clone());
+            map_styles.extend(styles());
+            info!("Collection '{}': wired to WMS API", collection.id);
+        }
+        if collection.apis.contains(&"maps".to_string()) {
+            maps_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            maps_collections.insert(collection.id.clone(), described.clone());
+            maps_styles.extend(styles());
+            info!("Collection '{}': wired to Maps API", collection.id);
+        }
+        if collection.apis.contains(&"tiles".to_string()) {
+            tiles_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            tiles_collections.insert(collection.id.clone(), described.clone());
+            tiles_styles.extend(styles());
+            info!("Collection '{}': wired to Tiles API", collection.id);
+        }
+
+        // Without an analysis time yet (a WIS2 source that has heard
+        // nothing) the collection is degraded until the poll finds one.
+        let has_data = engine.has_data();
+        health.push(CollectionHealth {
+            id: collection.id.clone(),
+            engine_type: "station-grid".into(),
+            status: if has_data {
+                CollectionStatus::Ready
+            } else {
+                CollectionStatus::Degraded
+            },
+            error: (!has_data).then(|| {
+                format!(
+                    "waiting for the first observations of '{}'",
+                    grid_config.source
+                )
+            }),
+        });
+        info!(
+            "Collection '{}': station grid over '{}'",
+            collection.id, grid_config.source
+        );
+    }
+
     // Determine rendered cache size from first WMS collection config, or the
     // same default a `[wms]` block without `rendered_cache_mb` gets (#1010).
     let rendered_cache_mb = map_collections
@@ -4569,6 +4829,7 @@ pub fn load_collections(
         postgis_engines,
         nowcast_engines,
         nowcast_dependency_updates,
+        station_grid_engines,
         engines_by_id,
         wind_by_id,
     }
@@ -5605,6 +5866,7 @@ fn apply_load(
     rotate_poll_loops!(bufr_engines);
     rotate_poll_loops!(postgis_engines);
     rotate_poll_loops!(nowcast_engines);
+    rotate_poll_loops!(station_grid_engines);
     info!(
         "Incremental reload: {shut_down} old poll engine(s) shut down, {spawned} new spawned, \
          {} reused",
@@ -5784,6 +6046,10 @@ fn apply_load(
         .nowcast_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.nowcast_engines;
+    *state
+        .station_grid_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.station_grid_engines;
 
     // Recount from the final `result.health` — the vanished-site block above
     // appends `Degraded` entries after the guard's `ready` was computed, so
@@ -5929,6 +6195,28 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
             .map(|e| (e.collection_id(), e.has_data()))
             .collect();
         for h in health.iter_mut().filter(|h| h.engine_type == "nowcast") {
+            if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
+                h.status = CollectionStatus::Ready;
+                h.error = None;
+            }
+        }
+    }
+
+    // Station grid: the boot `Degraded` ("waiting for the first
+    // observations") flips to `Ready` once the source has an analysis time.
+    {
+        let engines = state
+            .station_grid_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let has_data: HashMap<&str, bool> = engines
+            .iter()
+            .map(|e| (e.collection_id(), e.has_data()))
+            .collect();
+        for h in health
+            .iter_mut()
+            .filter(|h| h.engine_type == "station-grid")
+        {
             if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
                 h.status = CollectionStatus::Ready;
                 h.error = None;
@@ -6771,6 +7059,45 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         }
     }
 
+    // Station grids (#1082): per collection and parameter, rebuilt each
+    // scrape so a removed collection's series go; the shared cache and
+    // computation budget once.
+    if let Ok(engines) = state.station_grid_engines.read() {
+        STATION_GRID_STATIONS.reset();
+        for engine in engines.iter() {
+            let collection = engine.collection_id();
+            for (parameter, stations) in engine.station_counts() {
+                if let Some(stations) = stations {
+                    STATION_GRID_STATIONS
+                        .with_label_values(&[collection, &parameter])
+                        .set(stations as i64);
+                }
+            }
+            let (analyses, failures, last_ms) = engine.metrics();
+            let d = delta_counts(
+                &mut counter_state.station_grid,
+                collection,
+                [analyses, failures],
+            );
+            STATION_GRID_ANALYSES_TOTAL
+                .with_label_values(&[collection])
+                .inc_by(d[0]);
+            STATION_GRID_FAILURES_TOTAL
+                .with_label_values(&[collection])
+                .inc_by(d[1]);
+            STATION_GRID_LAST_ANALYSIS_MS
+                .with_label_values(&[collection])
+                .set(last_ms as i64);
+        }
+        if !engines.is_empty() {
+            STATION_GRID_CACHE_METRICS.update(engine_station_grid::cache_metrics(), None);
+            let (used, limit, rejected) = engine_station_grid::budget_metrics();
+            STATION_GRID_COMPUTE_USED.set(used.min(i64::MAX as u64) as i64);
+            STATION_GRID_COMPUTE_LIMIT.set(limit.min(i64::MAX as u64) as i64);
+            STATION_GRID_COMPUTE_REJECTED.feed(rejected);
+        }
+    }
+
     // CAP engines: catalog gauges + supersede counter for every mode, and the
     // WIS2 pipeline / accumulator series for WIS2-mode collections.
     if let Ok(engines) = state.cap_engines.read() {
@@ -7300,6 +7627,7 @@ mod tests {
                 impact_weight_property: None,
                 radar_source: None,
             }),
+            station_grid: None,
             preview: None,
             derive_wind: None,
         }
@@ -7832,6 +8160,143 @@ mod tests {
             h.error
         );
         assert!(!result.wms_state.engines.contains_key("nc"));
+    }
+
+    /// A CSV station collection and a station grid over it (#1082).
+    fn station_grid_collections(source: &str) -> Vec<CollectionConfig> {
+        let mut csv = nowcast_test_collection("weather", "csv", None);
+        csv.data_path = Some("../../testdata/weather.csv".to_string());
+        csv.apis = vec!["features".to_string()];
+        let mut grid = nowcast_test_collection("t2m", "station-grid", None);
+        grid.description = "Analysed temperature.".to_string();
+        grid.apis = ["edr", "wms", "maps", "tiles"].map(String::from).to_vec();
+        grid.station_grid = Some(ds_core::config::StationGridConfig {
+            source: source.to_string(),
+            parameters: vec!["temperature".to_string()],
+            grid: ds_core::config::StationGridGeometry {
+                crs: "EPSG:4326".to_string(),
+                bbox: [19.0, 59.0, 32.0, 71.0],
+                resolution: 0.1,
+            },
+            method: "adw".to_string(),
+            power: None,
+            correlation_length_km: None,
+            max_neighbours: 8,
+            search_radius_km: 150.0,
+            max_age: "PT1H".to_string(),
+            cadence: Some("PT1H".to_string()),
+            poll_interval_secs: 60,
+            precompute: 2,
+        });
+        vec![csv, grid]
+    }
+
+    /// A station grid over a CSV collection that lists no EDR: wired into
+    /// every map API and EDR, with one styled layer per parameter, its
+    /// provenance in every description, and GetFeatureInfo through its
+    /// position query.
+    #[test]
+    fn station_grid_wires_maps_and_edr_over_a_station_source() {
+        let result = load_with_reuse(
+            &station_grid_collections("weather"),
+            super::EngineReuse::default(),
+        );
+        let h = health_of(&result, "t2m");
+        assert_eq!(h.status, super::CollectionStatus::Ready, "{:?}", h.error);
+        assert_eq!(result.station_grid_engines.len(), 1);
+        assert!(matches!(
+            result.engines_by_id.get("t2m"),
+            Some(super::EngineHandle::StationGrid(_))
+        ));
+        assert!(result.edr_state.engines.contains_key("t2m"));
+        assert!(result.wms_state.engines.contains_key("t2m"));
+        assert!(result.wms_state.point_engines.contains_key("t2m"));
+        assert!(result.maps_state.engines.contains_key("t2m"));
+        assert!(result.tiles_state.map_engines.contains_key("t2m"));
+        assert!(result.wms_state.styles.contains_key("t2m/temperature"));
+        let description = &result.edr_state.collections["t2m"].description;
+        assert!(
+            description.starts_with(
+                "Analysed temperature. Gridded on the fly from station \
+                 collection 'weather' (temperature) by angular distance weighting"
+            ),
+            "{description}"
+        );
+        assert_eq!(
+            &result.maps_state.collections["t2m"].description,
+            description
+        );
+    }
+
+    #[test]
+    fn station_grid_needs_a_station_source() {
+        let result = load_with_reuse(
+            &station_grid_collections("no-such"),
+            super::EngineReuse::default(),
+        );
+        let h = health_of(&result, "t2m");
+        assert_eq!(h.status, super::CollectionStatus::Failed);
+        assert!(h.error.as_deref().unwrap_or("").contains("not found"));
+        assert!(!result.wms_state.engines.contains_key("t2m"));
+        // The CSV source itself still loads.
+        assert_eq!(
+            health_of(&result, "weather").status,
+            super::CollectionStatus::Ready
+        );
+    }
+
+    /// A station grid keeps its engine across a reload only with its
+    /// source's: never over a CSV, which every reload rebuilds.
+    #[test]
+    fn station_grid_reuse_follows_its_source() {
+        let collections = station_grid_collections("weather");
+        let built = load_with_reuse(&collections, super::EngineReuse::default());
+        let old: HashMap<String, CollectionConfig> = collections
+            .iter()
+            .map(|c| (c.id.clone(), c.clone()))
+            .collect();
+        let live = built.engines_by_id.clone();
+        let r = super::reusable_collections(&old, &collections, &live);
+        assert!(
+            r.is_empty(),
+            "a CSV source is rebuilt, so is its grid: {r:?}"
+        );
+
+        // Over a source that is itself reused, an unchanged grid is too.
+        let radar = tm35_source_collection("radar");
+        let mut grid = collections[1].clone();
+        grid.station_grid.as_mut().unwrap().source = "radar".to_string();
+        let old: HashMap<String, CollectionConfig> = [
+            ("radar".to_string(), radar.clone()),
+            ("t2m".to_string(), grid.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let new = vec![radar, grid.clone()];
+        let r = super::reusable_collections(&old, &new, &live_of_any(&built, &["radar", "t2m"]));
+        assert!(r.contains("t2m") && r.contains("radar"), "{r:?}");
+        let mut changed = grid;
+        changed.station_grid.as_mut().unwrap().max_neighbours = 4;
+        let new = vec![new[0].clone(), changed];
+        let r = super::reusable_collections(&old, &new, &live_of_any(&built, &["radar", "t2m"]));
+        assert!(!r.contains("t2m"), "a changed grid is rebuilt");
+    }
+
+    /// Live handles for `ids`, all the same engine: `reusable_collections`
+    /// asks only whether one is live.
+    fn live_of_any(
+        built: &super::LoadResult,
+        ids: &[&str],
+    ) -> HashMap<String, super::EngineHandle> {
+        let handle = built
+            .engines_by_id
+            .values()
+            .next()
+            .expect("an engine")
+            .clone();
+        ids.iter()
+            .map(|id| (id.to_string(), handle.clone()))
+            .collect()
     }
 
     #[test]

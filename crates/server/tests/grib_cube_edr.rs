@@ -72,6 +72,7 @@ fn app() -> axum::Router {
         cap: None,
         postgis: None,
         nowcast: None,
+        station_grid: None,
         bufr: None,
         satellite: None,
         netcdf: None,

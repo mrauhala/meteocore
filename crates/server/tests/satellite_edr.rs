@@ -95,6 +95,7 @@ fn router(engine: Arc<SatelliteEngine>, dir: &Path) -> axum::Router {
         cap: None,
         postgis: None,
         nowcast: None,
+        station_grid: None,
         bufr: None,
         satellite: Some(satellite_config(dir)),
         netcdf: None,

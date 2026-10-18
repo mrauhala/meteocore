@@ -1,0 +1,48 @@
+id = "weather-analysis"
+title = "Finnish Weather Analysis (gridded stations)"
+description = "Hourly temperature and wind speed fields gridded on the fly from the Finnish station observations."
+# Derived collection (#1082): interpolates one time slice of a station
+# collection onto a regular CRS84 grid, served as map layers and through EDR.
+engine_type = "station-grid"
+apis = ["wms", "maps", "tiles", "edr"]
+keywords = ["observations", "analysis", "stations", "Finland"]
+
+[station_grid]
+# A csv, bufr or postgis stations collection in the same config.
+source = "weather"
+parameters = ["temperature", "wind_speed"]
+# CRS84 only in phase 1; west > east crosses the antimeridian.
+grid = { crs = "EPSG:4326", bbox = [19.0, 59.0, 32.0, 71.0], resolution = 0.05 }
+# "idw" (power = 2 by default), "adw" (power = the decay exponent, 4 by
+# default, and correlation_length_km, search_radius_km by default) or
+# "nearest" for categorical fields.
+method = "adw"
+max_neighbours = 8
+search_radius_km = 150
+# A station's latest observation not after the analysis time, at most this
+# old.
+max_age = "PT1H"
+# Analysis times every hour across the source's temporal extent. Without
+# it the source must list its own instants; CSV, BUFR and PostGIS do not.
+cadence = "PT1H"
+# The latest analyses computed ahead and re-checked for late reports.
+precompute = 3
+poll_interval_secs = 60
+
+# The collection layer draws the first parameter.
+[wms]
+colormap = "temperature"
+min = -35.0
+max = 5.0
+
+[[wms.parameters]]
+name = "temperature"
+colormap = "temperature"
+min = -35.0
+max = 5.0
+
+[[wms.parameters]]
+name = "wind_speed"
+colormap = "viridis"
+min = 0.0
+max = 15.0

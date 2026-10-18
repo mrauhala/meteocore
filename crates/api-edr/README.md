@@ -575,6 +575,7 @@ to leave it out when it equals `observedProperty.label`, which holds it.
 | PostGIS | config `unit` | – (config `observed_property` is free text) |
 | BUFR | Table B unit after display conversion (`°C`, `hPa`, `mm`, …) | – (built-in `observed_property` values are CF names, except `present_weather`, but not marked as such) |
 | Nowcast | `m/s` (motion); none for `motion_quality` | – |
+| Station grid | the source station collection's unit for each parameter | the source's |
 | Satellite | config product `unit` (`1` for GMGSI's display counts, no QUDT entry) | – (the NetCDF `standard_name` is not read) |
 | NetCDF | CF `units` attribute, as the file spells it (`K`, `Pa`, `kg/m^2`, `1`) | ✓ `standard_name` attribute; ✓ derived wind |
 
@@ -722,6 +723,7 @@ transforms retain serial retrieval.
 | BUFR | ✓, `datetime` by reports | ✓ | ✓ | ✓ | – | – | n/a | ✓ stations | stations whose point is inside the polygon (exact, in memory; ≤ 500 000 values per response → 400 naming the budget, no station ceiling, #1062); position = nearest station within `position_radius_km` (25 km) else 404; one `PointSeries` per station over the in-memory `retention` window; same semantics for the polled-directory and WIS2 (push) sources; units are the BUFR units mechanically converted for display (K → °C, Pa → hPa, kg m-2 → mm) like GRIB |
 | Nowcast | – | – | ✓ (motion field) | ✓ | – | – | ✓ | ✓ tracked cells, each naming a radius query over the motion field | motion blocks over the polygon's bbox plus one block each side; a rectangle keeps the blocks whose footprint meets it, so only the padding is null (#966), any other polygon those centred inside it; reflectivity via EDR = #523 |
 | Satellite | – | ✓ | ✓ | ✓ | – | – | n/a | – | GOES-R, Himawari-9 (ISatSS) and the GMGSI global mosaic, whose values are 8-bit display counts (unit `1`), not brightness temperatures; its grid wraps at 180°, so a position either side of the seam, or an area given west > east across it, reads the pixels there. Each product is a parameter on its own time axis: the time axis of a response is the union of the selected products' scans (null where a product has none), an instant is only a scan at exactly that time, per product, never the scan a map at that time renders (#967), no scan at all → 404, and `parameter_names` carries each product's own `extent.temporal`. RGB composites (`[[satellite.composites]]`) are map layers, not EDR parameters: naming one in `parameter-name` → 400. Position = the pixel under the point per scan; behind the Earth or off the mosaic's 72°S–72°N → 404. Area = grid over the bbox at the nadir pixel size (≤ 256 cells/axis), sampled through a coarse projection grid, masked to the polygon; polygon outside the imagery → 404; `t` axis when several scans. A query may download at most 8 scans the cache evicted and decode at most 1024 image blocks (summed per product grid; a GOES-R block is a strip of 24 full-width rows, a GMGSI block a 793 × 1322 chunk) → 400 |
+| Station grid | – | ✓ | ✓ | ✓ | ✓ (no `z`) | – | n/a | – | Every query samples the cached analysis grid the maps draw (station values interpolated onto a CRS84 grid, #1082), at the cell under each point, so position and GetFeatureInfo answer the value the map shows. Area: a grid over the polygon's bbox at the analysis resolution, ≤ 256 cells/axis, cells outside the polygon null; the bbox may cross the antimeridian; polygon off the grid → 404. Cube: the analysis cells whose centres lie in the bbox, or `resolution-x/-y` positions edge to edge; west-to-east across the antimeridian. Always a `[t, y, x]` grid. Without `datetime` the latest analysis time; an instant must be an analysis time (else 404); an interval every analysis time inside it. At most 96 analyses (times × parameters) per query → 400. An analysis not ready by the 30 s deadline → 503 (its computation continues and serves the retry) |
 | CAP, GeoJSON | — no `EdrEngine` (Features/Maps only) — | | | | | | | | |
 
 PostGIS checks timestamp mappings and point/SRID requirements before publishing
@@ -743,13 +745,14 @@ that implements `FeatureEngine` for its EDR collection (the Features engine
 matrix describes each one's features), a list of location ids by every
 engine that answers locations, one `query_location` per id, and corridor
 does not exist. Cube needs a vertical axis, so only the GRIB pressure and
-model-level views offer it: Zarr exposes no vertical dimension yet (a
+model-level views offer it, and the station grid, whose `[t, y, x]` cube
+leaves `z` out (`resolution-z` is a 400 there): Zarr exposes no vertical dimension yet (a
 variable's extra axes are read at index 0), ODIM PVOL's axis is elevation
 angle, not a grid level, and the other gridded engines have no levels.
 Trajectory is along-path sampling on GRIB, QueryData and Zarr (see
 [Trajectory](#trajectory-926)) and a vertical cross-section on PVOL sites;
-GeoTIFF, ODIM composite, Satellite, NetCDF, Nowcast and the station engines
-do not answer it (404).
+GeoTIFF, ODIM composite, Satellite, NetCDF, Nowcast, the station grid and
+the station engines do not answer it (404).
 
 ### Trajectory (#926)
 

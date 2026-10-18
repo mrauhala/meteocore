@@ -275,6 +275,9 @@ pub struct CollectionConfig {
     /// Nowcast derived-collection configuration. Required when
     /// engine_type = "nowcast".
     pub nowcast: Option<NowcastConfig>,
+    /// Station-grid derived-collection configuration. Required when
+    /// engine_type = "station-grid".
+    pub station_grid: Option<StationGridConfig>,
     /// BUFR surface-observation engine (`engine_type = "bufr"`).
     pub bufr: Option<BufrConfig>,
     /// Geostationary satellite imagery (`engine_type = "satellite"`).
@@ -460,6 +463,101 @@ fn default_nowcast_max_pixels() -> usize {
 
 fn default_nowcast_min_echo() -> f64 {
     10.0
+}
+
+/// Configuration for the station-grid derived collection (#1082): one time
+/// slice of a station collection's observations interpolated onto a regular
+/// CRS84 analysis grid, served through WMS, Maps, Tiles and EDR. The engine
+/// (`engine-station-grid`) checks the values when it is built; a bad value
+/// fails the collection, not the whole config.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StationGridConfig {
+    /// Collection id of the station collection to grid (`csv`, `bufr` or a
+    /// `postgis` stations shape) in the same config.
+    pub source: String,
+    /// The source parameters to grid, each a layer of its own.
+    pub parameters: Vec<String>,
+    /// The analysis grid.
+    pub grid: StationGridGeometry,
+    /// `"idw"` (Shepard inverse-distance weighting, the default), `"adw"`
+    /// (angular distance weighting) or `"nearest"`.
+    #[serde(default = "default_station_grid_method")]
+    pub method: String,
+    /// IDW: the power of the inverse distance (default 2). ADW: the exponent
+    /// of the exponential distance decay (default 4). Not for `nearest`.
+    #[serde(default)]
+    pub power: Option<f64>,
+    /// ADW only: the correlation decay length in km (default
+    /// `search_radius_km`).
+    #[serde(default)]
+    pub correlation_length_km: Option<f64>,
+    /// Stations each cell is interpolated from at most (default 8).
+    #[serde(default = "default_station_grid_neighbours")]
+    pub max_neighbours: usize,
+    /// Stations farther than this from a cell are not used; a cell with
+    /// none is nodata (default 150 km).
+    #[serde(default = "default_station_grid_radius_km")]
+    pub search_radius_km: f64,
+    /// A station's value at an analysis time is its latest observation not
+    /// after that time and at most this old, ISO 8601 (default `PT1H`).
+    #[serde(default = "default_station_grid_max_age")]
+    pub max_age: String,
+    /// Analysis times every `cadence` (ISO 8601, aligned to 00:00 UTC) over
+    /// the source's temporal extent. Unset: the source's own observation
+    /// instants, for a source that lists them.
+    #[serde(default)]
+    pub cadence: Option<String>,
+    /// How often the source is checked for new and revised observations.
+    #[serde(default = "default_station_grid_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// The latest analysis times computed ahead of requests, per parameter,
+    /// and re-checked for late observations on every poll (default 3).
+    #[serde(default = "default_station_grid_precompute")]
+    pub precompute: usize,
+}
+
+/// The analysis grid of a [`StationGridConfig`].
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StationGridGeometry {
+    /// The grid's CRS: CRS84 (`"EPSG:4326"`, `"CRS:84"` or `"OGC:CRS84"`)
+    /// in phase 1.
+    #[serde(default = "default_station_grid_crs")]
+    pub crs: String,
+    /// `[west, south, east, north]` in degrees; `west > east` crosses the
+    /// antimeridian.
+    pub bbox: [f64; 4],
+    /// Cell size in degrees.
+    pub resolution: f64,
+}
+
+fn default_station_grid_method() -> String {
+    "idw".to_string()
+}
+
+fn default_station_grid_neighbours() -> usize {
+    8
+}
+
+fn default_station_grid_radius_km() -> f64 {
+    150.0
+}
+
+fn default_station_grid_max_age() -> String {
+    "PT1H".to_string()
+}
+
+fn default_station_grid_poll_interval() -> u64 {
+    60
+}
+
+fn default_station_grid_precompute() -> usize {
+    3
+}
+
+fn default_station_grid_crs() -> String {
+    "EPSG:4326".to_string()
 }
 
 /// License metadata for a collection's data.
@@ -4273,6 +4371,33 @@ impl ServerConfig {
                 }
             }
 
+            // Station-grid engine requires its config section (and vice versa).
+            if collection.engine_type == "station-grid" && collection.station_grid.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'station-grid' requires a \
+                     [collections.station_grid] config section"
+                )));
+            }
+            if collection.station_grid.is_some() && collection.engine_type != "station-grid" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.station_grid] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(grid) = &collection.station_grid {
+                if grid.source.trim().is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': [collections.station_grid].source must be a \
+                         collection id"
+                    )));
+                }
+                if grid.source == collection.id {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': station_grid source cannot be the collection itself"
+                    )));
+                }
+            }
+
             // Zarr engine requires zarr config section.
             if collection.engine_type == "zarr" && collection.zarr.is_none() {
                 return Err(crate::error::DataServerError::Config(format!(
@@ -5459,6 +5584,55 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             "engine_type = \"nowcast\"\n[collections.nowcast]\nsource = \"radar\"\n",
         );
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_station_grid_config_pairing() {
+        let section = |source: &str| {
+            format!(
+                "[collections.station_grid]\nsource = \"{source}\"\nparameters = [\"t2m\"]\n\
+                 grid = {{ bbox = [19.0, 59.0, 32.0, 71.0], resolution = 0.1 }}\n"
+            )
+        };
+        assert!(collection_with("engine_type = \"station-grid\"\n")
+            .validate()
+            .is_err());
+        let mismatched = collection_with(&format!(
+            "engine_type = \"csv\"\ndata_path = \"x.csv\"\n{}",
+            section("obs")
+        ));
+        assert!(mismatched.validate().is_err());
+        for source in ["c", " "] {
+            let bad = collection_with(&format!(
+                "engine_type = \"station-grid\"\n{}",
+                section(source)
+            ));
+            assert!(bad.validate().is_err(), "{source:?}");
+        }
+        let ok = collection_with(&format!(
+            "engine_type = \"station-grid\"\n{}",
+            section("obs")
+        ));
+        assert!(ok.validate().is_ok());
+        let grid = ok.collections[0].station_grid.as_ref().unwrap();
+        assert_eq!(
+            (
+                grid.method.as_str(),
+                grid.max_neighbours,
+                grid.grid.crs.as_str()
+            ),
+            ("idw", 8, "EPSG:4326")
+        );
+        // A misspelt key is an error, not a silent default.
+        let typo = format!(
+            "engine_type = \"station-grid\"\n{}max_neighbors = 4\n",
+            section("obs")
+        );
+        let parsed: Result<ServerConfig, _> = toml::from_str(&format!(
+            "[server]\nhost=\"127.0.0.1\"\nport=8000\n\n[[collections]]\nid=\"c\"\n\
+             title=\"t\"\ndescription=\"d\"\n{typo}"
+        ));
+        assert!(parsed.is_err());
     }
 
     #[test]

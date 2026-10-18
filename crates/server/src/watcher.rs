@@ -432,6 +432,7 @@ pub(crate) mod tests {
             bufr_engines: RwLock::new(result.bufr_engines),
             postgis_engines: RwLock::new(result.postgis_engines),
             nowcast_engines: RwLock::new(result.nowcast_engines),
+            station_grid_engines: RwLock::new(result.station_grid_engines),
             reload_lock: tokio::sync::Mutex::new(()),
             admin_token: None,
             style_fingerprint: std::sync::atomic::AtomicU64::new(
