@@ -24,12 +24,13 @@ Choose the shape that matches your tables:
 |---|---|---|
 | EDR | Locations, position, area, radius; time series per station | Area, radius; one point coverage per event |
 | Features | Station inventory and configured properties | Not supported |
-| Tiles | Station vector tiles (MVT) | Raster event-age tiles |
-| WMS / Maps | Not supported | Event-age layer, intended for lightning |
+| Tiles | Station vector tiles (MVT); raster station-symbol tiles when the map layers are on | Raster event-age tiles |
+| WMS / Maps | One station-symbol layer per parameter: each station a marker coloured by its value | Event-age layer, intended for lightning |
 
 Station Features and vector tiles contain metadata, not measurements. Use EDR
-for values. There is no station interpolation, arbitrary measurement-column
-map rendering, trajectory/cube query or forecast-run axis.
+for values, or the [station map layers](#station-map-layers) to see them on a
+map. There is no station interpolation, trajectory/cube query or forecast-run
+axis.
 
 Requires PostgreSQL ≥ 13 and PostGIS ≥ 3.0. TimescaleDB hypertables work as
 ordinary observation tables; the engine does not manage compression,
@@ -238,6 +239,74 @@ registry using a fixed configuration fragment, never HTTP-supplied SQL. In
 combined mode it only filters enrichment: excluded reporters can still appear
 without registry metadata. Filter the observation source to restrict membership.
 
+### Station map layers
+
+List `wms` or `maps` in `apis`, or add a `[postgis.map]` section, to show a
+station collection on a map; `tiles` then serves the layers as raster tiles
+too. A collection that lists only `tiles`, without the section, serves its
+station vector tiles alone, as before. Each configured parameter is a layer, `surface-obs/t2m` in WMS and
+`parameter-name=t2m` in Maps and Tiles; the collection layer draws the first
+parameter. A layer draws each cached station as a marker coloured by the
+parameter's style, and its legend is that style's colormap legend, as for
+raster layers. Style the layers like any raster layer, with `[wms]` and
+`[[wms.parameters]]`; a `step` palette gives classes such as threshold
+levels. `tiles` keeps serving the station vector tiles beside the raster
+ones.
+
+```toml
+apis = ["edr", "features", "wms", "maps", "tiles"]
+
+[postgis.map]            # optional; the defaults are shown
+max_age = "PT1H"
+time_step = "PT10M"
+marker_size = 6
+draw_missing = false
+
+[wms]
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "t2m"
+min = -30.0
+max = 30.0
+```
+
+- **Value.** A frame at `TIME` shows each station's latest non-null value
+  between `TIME - max_age` and `TIME`, both included. `max_age` is an ISO
+  8601 duration of at most seven days. A station without one is left out;
+  with `draw_missing = true` it is drawn in the palette's `nodata_color`
+  (set it on a named `[[colormaps]]` palette; without one such markers are
+  transparent). Null, NaN and infinite values count as no value.
+- **Time.** The layers advertise steps of `time_step` over the latest six
+  hours of data, updated on metadata refresh; without `TIME` they draw the
+  latest step. A requested `TIME` floors to its step, counted from
+  1970-01-01T00:00Z, so with the default `PT10M` both 10:00 and 10:07 draw
+  the 10:00 frame. `time_step` is whole seconds from `PT1M` to `PT6H`.
+  Older frames can be requested explicitly.
+- **Markers.** Discs `marker_size` output pixels across (1–64), on a
+  transparent background. Where markers overlap, **the most extreme value
+  is on top**: markers are drawn in ascending distance from the middle of
+  the layer's default style range (its `min` and `max`, else the palette's
+  first and last stops), so the value farthest from it is drawn last.
+  Markers without a value are drawn under every value.
+- **Late data.** Observations for a past time can arrive late or be
+  corrected. With the map layers on, each metadata refresh reads a count and
+  hash sums of the rows the advertised frames read, from the first step's window start on; when they or
+  the station list change, every cached frame of the collection is drawn
+  again. Responses to an explicit `TIME` therefore revalidate instead of
+  being `immutable`. A late row before that range is drawn once the
+  collection's frames are drawn again for another change, or its cached
+  frames are evicted.
+- **Cost.** A frame is one statement per observation table: the set-based
+  area statement over every cached station, the window and the parameter,
+  served by the `(station, time)` index above. It may read 2 000 000 rows
+  (stations × steps in `max_age`); past that the layer answers an error that
+  names `max_age`. Frames are cached (`MC_STATION_FRAME_CACHE_MB`, default
+  32 MiB, about 32 bytes a station), so the tiles of one map share a read.
+- **GetFeatureInfo.** The layers are `queryable="0"`: a marker shows the
+  latest value within `max_age`, which the EDR position query, an exact
+  instant at the nearest station, does not answer.
+
 ## Event configuration
 
 For `lightning(id, time, geom, peak_current)`, with UTC values in a timezone-less
@@ -338,7 +407,7 @@ statement timeouts apply independently.
 
 | Setting under `[postgis]` | Default / behavior |
 |---|---|
-| `metadata_refresh_secs` | 300; refreshes cached locations and extents |
+| `metadata_refresh_secs` | 300; refreshes cached locations and extents, and checks station map frames for late data |
 | `pool_size` | Twice CPU parallelism, bounded to 4–16; explicit values 1–32 |
 | `pool_label` | Optional pool metrics label |
 | `max_locations` | 200,000; valid range 1–1,000,000 for station shapes |
@@ -378,7 +447,8 @@ successful ping and on metadata refresh; recovery requires a successful refresh.
 Detailed database diagnostics are logged, while public health errors stay generic.
 Config resolution or pool construction failures leave the collection failed.
 `/metrics` exposes `postgis_*` pool, reachability and refresh metrics, and
-`lightning_strike_cache_*` for event maps.
+`lightning_strike_cache_*` for event maps and `station_frame_cache_*` for
+station map layers.
 
 `POST /admin/collections/reload` reuses unchanged engines and rebuilds changed
 mappings. Pools are shared by `(host, port, database, user, sslmode)`; the first

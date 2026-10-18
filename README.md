@@ -30,7 +30,7 @@ Each engine implements one or more of the core traits.
 | `engine-zarr` | `EdrEngine` + `MapEngine` | Zarr V2/V3 multidimensional arrays with CF metadata (local, S3, HTTP); optional Icechunk repositories |
 | `engine-satellite` | `EdrEngine` + `MapEngine` | Geostationary satellite imagery: GOES-R ABI NetCDF-4 scans, Himawari-9 AHI ISatSS tiles and NOAA's hourly GMGSI global mosaic (NOAA open data on AWS, or a local mirror), one parameter per band/product, each with its own time axis |
 | `engine-netcdf` | `MapEngine` + `EdrEngine` | CF-NetCDF gridded forecasts and analyses (MET Norway MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server that cannot be listed (thredds.met.no): one layer per variable, pressure levels as the vertical axis, model runs from `forecast_reference_time` as EDR instances, EDR position/area/radius, wind speed derived from u/v |
-| `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
+| `engine-postgis` | `EdrEngine` + `FeatureEngine` + `MapEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible); map layers draw stations as markers coloured by value, and lightning events by age |
 
 ### OGC API Plugins
 
@@ -1645,7 +1645,8 @@ observed_property = "air_temperature"
 
 - Requires PostgreSQL ≥ 13, PostGIS ≥ 3.0; TimescaleDB optional but recommended.
 - TLS is deferred to [#110](https://github.com/mrauhala/meteocore/issues/110); v1 connects with `NoTls` — deploy the DB behind a private network or loopback.
-- Full reference lives in `crates/engine-postgis/README.md` (role SQL, index recipes, startup hard-error vs. WARN list).
+- Add `wms` or `maps` to `apis`, or a `[collections.postgis.map]` section, for one map layer per parameter, each station a marker coloured by its latest value within `max_age` (default `PT1H`), on `time_step` frames (default `PT10M`), the most extreme value on top. With either, `tiles` serves them as raster tiles beside the vector tiles.
+- Full reference lives in `crates/engine-postgis/README.md` (role SQL, index recipes, station map layers, startup hard-error vs. WARN list).
 
 ## OGC API - Features
 
@@ -1670,7 +1671,7 @@ A single `/wms/` endpoint dispatches on the `REQUEST` query parameter:
 
 - **GetCapabilities** — XML capabilities listing layers, CRS, extents, time dimension, and styles. Its `<Service>` advertises the GetMap limits as `<LayerLimit>5</LayerLimit>`, `<MaxWidth>8000</MaxWidth>` and `<MaxHeight>8000</MaxHeight>`, so a client can size its requests.
 - **GetMap** — render a map image as PNG, JPEG, or WebP, of up to five layers drawn over each other in list order (see [Several layers](crates/api-wms/README.md#several-layers))
-- **GetFeatureInfo** — each queried layer's value at a pixel of the map, as `text/plain`, `application/json` (GeoJSON) or `text/html`: the collection's EDR position query at the pixel's centre, at the time, run and level GetMap draws. A layer is `queryable="1"` when its engine answers position queries, whether or not the collection lists `edr`; RGB composites, the ODIM `CELLS` overlay, CAP, PostGIS events and nowcast layers are not queryable. It waits in the render queue under its own 10 s deadline, `MC_FEATURE_INFO_TIMEOUT_MS`. See [GetFeatureInfo](crates/api-wms/README.md#getfeatureinfo)
+- **GetFeatureInfo** — each queried layer's value at a pixel of the map, as `text/plain`, `application/json` (GeoJSON) or `text/html`: the collection's EDR position query at the pixel's centre, at the time, run and level GetMap draws. A layer is `queryable="1"` when its engine answers position queries, whether or not the collection lists `edr`; RGB composites, the ODIM `CELLS` overlay, CAP, PostGIS events, PostGIS station symbols and nowcast layers are not queryable. It waits in the render queue under its own 10 s deadline, `MC_FEATURE_INFO_TIMEOUT_MS`. See [GetFeatureInfo](crates/api-wms/README.md#getfeatureinfo)
 - **GetLegendGraphic** — render a colormap legend strip
 
 WMS, OGC API - Maps, and OGC API - Tiles share the same `MapEngine`, render semaphore, rendered-image cache, and colormaps. Only the HTTP layer is WMS-specific.

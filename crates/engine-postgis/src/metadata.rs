@@ -19,6 +19,7 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, TimeDelta, Utc};
 use deadpool_postgres::Pool;
 use ds_core::feature::{FilterableProperties, PropertyValue};
+use ds_core::map_engine::RasterInfo;
 use ds_core::model::{Location, LocationSnapshot, ParameterDescription};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use thiserror::Error;
@@ -29,7 +30,7 @@ use crate::config::{PostgisEngineConfig, ValidatedParameter};
 use crate::query::{
     build_locations, build_locations_from_observations, build_temporal_extent, BuiltQuery,
 };
-use crate::schema::{LocationSource, ObservationSchema};
+use crate::schema::LocationSource;
 
 #[derive(Debug, Error)]
 pub enum MetadataError {
@@ -161,10 +162,13 @@ pub struct CollectionMeta {
     /// logs a warning.
     pub future_latest: Option<DateTime<Utc>>,
     pub spatial_extent: Option<[f64; 4]>,
-    /// Events shape only (#504): the WMS/Maps/Tiles TIME dimension —
-    /// quantized steps ascending, rebuilt each metadata refresh so
-    /// `raster_info()` stays O(1). Empty for station shapes.
+    /// The WMS/Maps/Tiles TIME dimension of the events layer (#504) and the
+    /// station layers (#1063): quantized steps ascending, rebuilt each
+    /// metadata refresh so `raster_info()` stays O(1).
     pub wms_times: Arc<Vec<DateTime<Utc>>>,
+    /// What `MapEngine::raster_info_shared` hands every map request, built
+    /// with the TIME steps above.
+    pub raster_info: Arc<RasterInfo>,
     /// `Some` when `[postgis] max_locations` cut the refresh's reads
     /// (#1061): stations past it are missing from `/locations`, Features
     /// and, in the observations-derived modes, from position and area
@@ -216,14 +220,11 @@ impl CollectionMeta {
             Some(bbox) => Some(bbox),
             None => spatial_extent_from(&locations),
         };
-        // Events shape (#504): the advertised WMS/Maps/Tiles TIME steps,
-        // quantized and bounded, rebuilt per refresh so raster_info() is a
-        // snapshot clone.
-        let wms_times = if matches!(cfg.observations, ObservationSchema::Events(_)) {
-            crate::maps::build_wms_times(temporal_extent)
-        } else {
-            Vec::new()
-        };
+        // The advertised WMS/Maps/Tiles TIME steps of the events layer (#504)
+        // and the station layers (#1063), quantized and bounded, rebuilt per
+        // refresh so raster_info() is a snapshot clone.
+        let wms_times = crate::maps::build_wms_times(temporal_extent, crate::maps::time_step(cfg));
+        let raster_info = crate::maps::build_raster_info(cfg, spatial_extent, &wms_times);
         Self {
             filterables: station_filterables(cfg, &feature_stations),
             feature_stations: Arc::new(feature_stations),
@@ -234,6 +235,7 @@ impl CollectionMeta {
             future_latest,
             spatial_extent,
             wms_times: Arc::new(wms_times),
+            raster_info: Arc::new(raster_info),
             locations_cut,
             version,
         }
@@ -834,7 +836,7 @@ async fn read_extent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{LongShape, QualifiedTable, StationsMapping};
+    use crate::schema::{LongShape, ObservationSchema, QualifiedTable, StationsMapping};
 
     fn mk_loc(id: &str, lon: f64, lat: f64) -> Location {
         Location {
@@ -905,6 +907,7 @@ mod tests {
             locations_window: None,
             events_default_window: None,
             events_extent_bbox: None,
+            station_map: Default::default(),
         }
     }
 
@@ -999,6 +1002,7 @@ mod tests {
             future_latest: None,
             spatial_extent: Some([1.0, 2.0, 1.0, 2.0]),
             wms_times: Arc::new(Vec::new()),
+            raster_info: m0.raster_info.clone(),
             locations_cut: None,
             version: 1,
         };
@@ -1306,6 +1310,7 @@ mod tests {
                 coverage_bbox: None,
             }),
             events_extent_bbox: Some([20.0, 59.0, 32.0, 70.0]),
+            station_map: Default::default(),
             ..cfg
         };
         let meta = CollectionMeta::build(&events, LocationSet::default(), read, 1);

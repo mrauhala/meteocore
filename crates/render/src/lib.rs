@@ -15,7 +15,7 @@ pub mod style;
 
 pub use colormap::{
     parse_hex_color, BuiltinColormap, ColorMap, ColorStop, IntegerLutColorMap, LinearColorMap,
-    LutColorMap, OverlayColorMap,
+    LutColorMap, OverlayColorMap, SymbolColorMap,
 };
 pub use composite::{
     compose_rgb, compose_tiles, composite_legend_json, composite_units, render_composite,
