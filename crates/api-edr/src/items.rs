@@ -32,7 +32,9 @@ use serde_json::{json, Value};
 use api_common::JsonError;
 use api_features::crs::ResponseCrs;
 use api_features::params::{parse_bbox, parse_datetime};
-use api_features::response::{feature_page_to_geojson, feature_to_geojson, preserved_query};
+use api_features::response::{
+    feature_page_to_geojson, feature_to_geojson, preserved_query, Annotations,
+};
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, DatetimeInterval, Feature, FeatureQuery, Geometry, PropertyValue};
@@ -431,6 +433,7 @@ pub async fn items(
             "",
             &root,
             &ResponseCrs::default(),
+            &labels(features.as_ref()),
         );
         let members =
             EdrMembers::new(edr.as_ref(), &root, &id).map_err(|e| map_query_error(&e, "Items"))?;
@@ -493,7 +496,13 @@ pub async fn item(
         let feature = features
             .get_feature(&item_id)
             .map_err(|e| map_query_error(&e, "Item"))?;
-        let mut doc = feature_to_geojson(&feature, &id, &root, &ResponseCrs::default());
+        let mut doc = feature_to_geojson(
+            &feature,
+            &id,
+            &root,
+            &ResponseCrs::default(),
+            &labels(features.as_ref()),
+        );
         EdrMembers::new(edr.as_ref(), &root, &id)
             .map_err(|e| map_query_error(&e, "Item"))?
             .apply(&feature, &mut doc);
@@ -507,6 +516,16 @@ pub async fn item(
     })
     .await?;
     Ok(with_format_vary(response, format))
+}
+
+/// An item's `title` from its engine's label, as Features gives it (#1143).
+/// No `related` links: `edrqueryendpoint` already leads to each item's
+/// data.
+fn labels(engine: &dyn FeatureEngine) -> Annotations<'_> {
+    Annotations {
+        engine: Some(engine),
+        ..Default::default()
+    }
 }
 
 /// The `data_queries.items` entry of a collection whose engine serves

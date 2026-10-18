@@ -1255,6 +1255,10 @@ pub(crate) struct Catalog {
     /// O(1) snapshot read. Bounds the Feature *points* (what `bbox` filters
     /// on), not the wider radar coverage bboxes.
     features_extent: Option<[f64; 4]>,
+    /// Earliest and latest volume time over all sites — the Features
+    /// collection's temporal extent (#1143), the span its `datetime` filter
+    /// selects within, precomputed for an O(1) `temporal_extent()`.
+    features_time: Option<(DateTime<Utc>, DateTime<Utc>)>,
     /// Precomputed `data_version` content hash of the site inventory — a pure
     /// function of this snapshot, computed once at swap time instead of per
     /// (future) vector-tile render.
@@ -2040,6 +2044,7 @@ fn derive_catalog(
     let mut sorted_nods: Vec<String> = by_site_meta.keys().cloned().collect();
     sorted_nods.sort();
     let features_extent = features_extent_of(&by_site_meta);
+    let features_time = features_time_of(&by_site_meta);
     let feature_version = feature_version_of(&sorted_nods, &by_site_meta);
 
     Catalog {
@@ -2047,6 +2052,7 @@ fn derive_catalog(
         by_site_meta,
         sorted_nods,
         features_extent,
+        features_time,
         feature_version,
     }
 }
@@ -4303,9 +4309,10 @@ impl PolarVolumeEngine {
             "volume_count".into(),
             PropertyValue::Integer(meta.times.len() as i64),
         );
+        let site_collection = format!("{}-{}", self.collection_id, nod);
         props.insert(
             "collection".into(),
-            PropertyValue::String(format!("{}-{}", self.collection_id, nod)),
+            PropertyValue::String(site_collection.clone()),
         );
         Feature {
             id: nod.to_string(),
@@ -4314,6 +4321,11 @@ impl PolarVolumeEngine {
                 y: meta.lat,
             }),
             properties: Arc::new(props),
+            // The site's own collection, its volumes (#1143).
+            related: vec![ds_core::feature::Related {
+                target: ds_core::feature::RelatedTarget::Collection(site_collection),
+                title: "Radar site collection".into(),
+            }],
         }
     }
 }
@@ -4354,6 +4366,19 @@ fn features_extent_of(by_site_meta: &HashMap<String, SiteMeta>) -> Option<[f64; 
         });
     }
     acc
+}
+
+/// Earliest and latest volume time over all sites, or `None` without a
+/// volume. Computed once at catalog-build time.
+fn features_time_of(
+    by_site_meta: &HashMap<String, SiteMeta>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let first = by_site_meta
+        .values()
+        .filter_map(|m| m.times.first())
+        .min()?;
+    let last = by_site_meta.values().filter_map(|m| m.times.last()).max()?;
+    Some((*first, *last))
 }
 
 /// Opaque content hash of the whole site inventory — the FeatureEngine
@@ -4526,6 +4551,18 @@ impl FeatureEngine for PolarVolumeEngine {
     fn spatial_extent(&self) -> Option<[f64; 4]> {
         // O(1) snapshot read — precomputed in `derive_catalog`.
         self.catalog.load().features_extent
+    }
+
+    /// The retained volumes' span, which `datetime` selects sites within
+    /// (#1143). O(1) snapshot read — precomputed in `derive_catalog`.
+    fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.catalog.load().features_time
+    }
+
+    /// The collection's description is the network's, shared with its
+    /// per-site collections of volumes; its items are the sites (#1143).
+    fn items_description(&self) -> Option<&'static str> {
+        Some("Radar site inventory: one point per radar. Each site's volumes are in its own collection.")
     }
 
     fn data_version(&self) -> u64 {
@@ -9598,6 +9635,52 @@ mod tests {
             Some(&PropertyValue::String(
                 "radar-fi-volume-local-h5-fivih".into()
             ))
+        );
+    }
+
+    /// #1143: the inventory's temporal extent spans its volumes, the
+    /// times `datetime` selects sites by; each site links to its own
+    /// collection; the collection says its items are sites.
+    #[test]
+    fn inventory_spans_its_volumes_and_links_each_site() {
+        let at = |t: &str| DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc);
+        let stamped = |lon, lat, t: &str| {
+            let mut volume = synthetic_volume(lon, lat);
+            volume.time = at(t);
+            volume
+        };
+        let mut by_site = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![
+                entry(stamped(24.5, 60.3, "2026-10-16T06:05:00Z"), "span-a"),
+                entry(stamped(24.5, 60.3, "2026-10-16T06:10:00Z"), "span-b"),
+            ],
+        );
+        by_site.insert(
+            "fikor".to_string(),
+            vec![entry(stamped(21.0, 60.0, "2026-10-16T06:00:00Z"), "span-c")],
+        );
+        let engine = engine_for(by_site, "radar");
+        assert_eq!(
+            FeatureEngine::temporal_extent(&engine),
+            Some((at("2026-10-16T06:00:00Z"), at("2026-10-16T06:10:00Z")))
+        );
+        let site = FeatureEngine::get_feature(&engine, "fivih").unwrap();
+        assert_eq!(
+            site.related,
+            [ds_core::feature::Related {
+                target: ds_core::feature::RelatedTarget::Collection("radar-fivih".into()),
+                title: "Radar site collection".into(),
+            }]
+        );
+        assert!(FeatureEngine::items_description(&engine)
+            .unwrap()
+            .starts_with("Radar site inventory: one point per radar."));
+        assert_eq!(
+            features_time_of(&HashMap::new()),
+            None,
+            "no volume, no span"
         );
     }
 

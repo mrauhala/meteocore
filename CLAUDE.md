@@ -457,7 +457,12 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    temporal geometry intersects the interval (an instant is `start == end`,
    ends inclusive) and those without one. Features `/items` and vector tiles
    (Tiles DateTime, #946) both pass it; the vector tile cache keys on it.
-   Without time, return `false` from `has_time_dimension`.
+   Without time, return `false` from `has_time_dimension`: the HTML builder
+   shows its time controls exactly when that is `true` (#1143).
+   **If a `FeatureEngine`'s ids are opaque** (alert identifiers, track
+   numbers), implement `label` from the feature's own values and
+   `summary_properties`; a station whose EDR location has its id, or a site
+   with its own collection, names it in `Feature::related` (#1143).
    **If the engine's parameters can be wind components** (u/v), implement
    `ds_core::wind::WindSource`: an O(1) `Arc<WindFacts>` snapshot, built at
    load/poll refresh, of what the source states per parameter (GRIB triple,

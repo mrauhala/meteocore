@@ -26,7 +26,16 @@ without reading code.
   via `ds_core::feature::sort_features` before `offset`/`limit`; sorting a
   slice returns the wrong rows.
 - **Pagination links carry the caller's filters and sort** (`preserved_query`).
-  A `next` link that drops them serves page 2 unfiltered.
+  A `next` link that drops them serves page 2 unfiltered. Past the end,
+  `prev` is the last page with features, not another empty one (#1143).
+- **Engines name, this crate addresses (#1143).** A feature's label comes
+  from `FeatureEngine::label` (served as the `title` property unless the
+  feature has one), its first HTML columns from `summary_properties`, and
+  where it leads from `Feature::related` targets, which
+  `response::Annotations` resolves below the base URL or drops when no API
+  here serves them (`FeaturesState::collection_pages`, `edr` in `apis`).
+  `html.rs` never interprets weather property names, and an engine never
+  builds a URL.
 - **`/items` precomputes its ETag with `timeStamp` blanked**; the
   `caching.rs` middleware honours a handler-set ETag. It is a near-twin of
   `api-edr/src/caching.rs` — keep the two in sync (ds-core is

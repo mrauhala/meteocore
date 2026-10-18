@@ -44,6 +44,7 @@ fn contribution(
         time: info.times.first().copied().zip(info.times.last().copied()),
         // Maps omits a native CRS with no OGC URI rather than mislabel it.
         claims: &["storageCrs"],
+        items: None,
     })
 }
 

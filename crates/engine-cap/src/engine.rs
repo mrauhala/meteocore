@@ -13,7 +13,7 @@ use futures::stream::{FuturesOrdered, StreamExt};
 use ds_core::config::{CapConfig, Wis2Config, CAP_WIS2_MIN_POLL_INTERVAL_SECS};
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
-use ds_core::feature::{Bbox, Feature, FeaturePage, FeatureQuery};
+use ds_core::feature::{Bbox, Feature, FeaturePage, FeatureQuery, PropertyValue};
 use ds_core::health::{LiveStatus, WarmupCause};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::state::{
@@ -875,6 +875,33 @@ impl ds_core::feature_engine::FeatureEngine for CapEngine {
         self.snapshot().records.len()
     }
 
+    /// `event · areaDesc`, the parts the alert area has (#1143): what and
+    /// where, which an alert's sender-scoped id does not say.
+    fn label(&self, feature: &Feature) -> Option<String> {
+        let part = |key: &str| {
+            feature
+                .properties
+                .get(key)
+                .and_then(PropertyValue::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        };
+        let parts: Vec<&str> = ["event", "areaDesc"].into_iter().filter_map(part).collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// How severe, from when, until when; MeteoAlarm's awareness level, or
+    /// the urgency, where the alerts carry them (#1143).
+    fn summary_properties(&self) -> &[&'static str] {
+        &[
+            "severity",
+            "onset",
+            "active_until",
+            "awareness_level",
+            "urgency",
+        ]
+    }
+
     fn spatial_extent(&self) -> Option<[f64; 4]> {
         self.snapshot().spatial_extent
     }
@@ -895,6 +922,7 @@ fn to_feature(rec: &crate::catalog::AreaRecord) -> Feature {
         id: rec.id.clone(),
         geometry: Arc::clone(&rec.geometry),
         properties: Arc::clone(&rec.properties),
+        related: Vec::new(),
     }
 }
 

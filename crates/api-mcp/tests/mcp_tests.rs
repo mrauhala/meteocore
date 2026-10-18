@@ -58,6 +58,7 @@ impl CellEngine {
             id: id.into(),
             geometry: Arc::new(Geometry::Point { x: 24.9, y: 60.2 }),
             properties: Arc::new(m),
+            related: Vec::new(),
         }
     }
 }

@@ -86,6 +86,7 @@ fn fixture_feature() -> Feature {
             "name".to_owned(),
             ds_core::feature::PropertyValue::String("Fixture".into()),
         )])),
+        related: Vec::new(),
     }
 }
 
@@ -321,6 +322,7 @@ fn features_state(
         engines: features,
         // The Tiles fixture encodes every collection as vector tiles.
         vector_tileset_ids: configs.keys().cloned().collect(),
+        collection_pages: Default::default(),
         collections: configs,
         base_url: BASE.into(),
         trust_proxy_headers: false,

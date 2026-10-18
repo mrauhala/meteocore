@@ -504,6 +504,8 @@ fn station_feature(row: &crate::loader::CsvRow) -> Feature {
             ("latitude".into(), PropertyValue::Float(row.latitude)),
             ("longitude".into(), PropertyValue::Float(row.longitude)),
         ])),
+        // The station is the EDR location of its id (#1143).
+        related: vec![ds_core::feature::Related::edr_location(&row.location)],
     }
 }
 
@@ -766,6 +768,11 @@ mod tests {
         assert_eq!(&feature.id, first_id);
         assert!(feature.properties.contains_key("name"));
         assert!(matches!(*feature.geometry, Geometry::Point { .. }));
+        // The station is the EDR location of its id (#1143).
+        assert_eq!(
+            feature.related,
+            [ds_core::feature::Related::edr_location(first_id)]
+        );
     }
 
     #[test]

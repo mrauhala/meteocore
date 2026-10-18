@@ -20,7 +20,7 @@ use crate::params::{
     parse_bbox_values, parse_datetime, parse_sortby, ItemQueryParams, ItemsQueryParams,
     DEFAULT_LIMIT, MAX_LIMIT,
 };
-use crate::response::{feature_page_to_geojson, feature_to_geojson, preserved_query};
+use crate::response::{feature_page_to_geojson, feature_to_geojson, preserved_query, Annotations};
 
 /// Shared state for the Features API: a registry of collection engines + metadata.
 #[derive(Clone)]
@@ -36,6 +36,11 @@ pub struct FeaturesState {
     /// `tilesets-vector` link is advertised only for these, so it never names
     /// a tileset list that does not exist or holds map tiles (#789).
     pub vector_tileset_ids: HashSet<String>,
+    /// Pages of the collections a feature may link to as related (#1143),
+    /// as paths below the base URL, by collection id: a radar site
+    /// inventory's per-site collections. A collection missing here gets no
+    /// link.
+    pub collection_pages: HashMap<String, String>,
 }
 
 pub type AppState = Arc<ArcSwap<FeaturesState>>;
@@ -812,7 +817,7 @@ pub async fn collection(
     );
     Ok(with_vary(match wanted {
         Wanted::Json => Json(metadata).into_response(),
-        Wanted::Html => Html(api_common::workbench::collection_html(
+        Wanted::Html => Html(api_common::workbench::collection_page(
             api_common::workbench::Surface {
                 base,
                 root,
@@ -820,25 +825,60 @@ pub async fn collection(
             },
             &metadata,
             config.license.as_ref(),
+            Some(&items_overview(engine.as_ref())),
         ))
         .into_response(),
     }))
 }
 
+/// The properties `/items` takes as filters: the engine's, less any name
+/// an API control takes.
+fn filterable_names(engine: &dyn FeatureEngine) -> Vec<String> {
+    engine
+        .filterables()
+        .iter()
+        .filter(|name| !crate::params::is_reserved_parameter(name))
+        .cloned()
+        .collect()
+}
+
+fn owned(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
 fn html_controls(engine: &dyn FeatureEngine) -> crate::html::FeatureControls {
     crate::html::FeatureControls {
-        filterables: engine
-            .filterables()
-            .iter()
-            .filter(|name| !crate::params::is_reserved_parameter(name))
-            .cloned()
-            .collect(),
-        sortables: engine
-            .sortables()
-            .iter()
-            .map(|name| (*name).to_owned())
-            .collect(),
-        temporal: engine.temporal_extent().is_some(),
+        filterables: filterable_names(engine),
+        sortables: owned(engine.sortables()),
+        summary: owned(engine.summary_properties()),
+        // The control `/items` accepts `datetime` with (#1143), not whether
+        // the collection advertises a span.
+        temporal: engine.has_time_dimension(),
+    }
+}
+
+/// What a collection's HTML overview says of its items (#1143).
+pub(crate) fn items_overview(engine: &dyn FeatureEngine) -> api_common::workbench::ItemsOverview {
+    api_common::workbench::ItemsOverview {
+        description: engine.items_description().map(str::to_owned),
+        filterables: filterable_names(engine),
+        sortables: owned(engine.sortables()),
+    }
+}
+
+/// What the features of collection `config` carry beyond the engine's
+/// properties (#1143): their labels and related links.
+fn annotations<'a>(
+    state: &'a FeaturesState,
+    engine: &'a dyn FeatureEngine,
+    config: &CollectionConfig,
+    base: &'a str,
+) -> Annotations<'a> {
+    Annotations {
+        engine: Some(engine),
+        base,
+        collection_pages: Some(&state.collection_pages),
+        edr: config.apis.iter().any(|api| api == "edr"),
     }
 }
 
@@ -917,7 +957,17 @@ pub async fn items(
         &query.sortby,
         &query.property_filters,
     );
-    let mut doc = feature_page_to_geojson(&page, &id, limit, offset, &filters, "", root, &crs);
+    let mut doc = feature_page_to_geojson(
+        &page,
+        &id,
+        limit,
+        offset,
+        &filters,
+        "",
+        root,
+        &crs,
+        &annotations(&state, engine.as_ref(), config, base),
+    );
     crate::html::representation_links(&mut doc, wanted);
     let time_stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     // Hash the selected representation with the volatile timestamp blanked.
@@ -1175,7 +1225,13 @@ pub async fn item(
 
     let base = &request_base_url(&state, &headers);
     let root = &mount.root(base);
-    let mut doc = feature_to_geojson(&feature, &id, root, &crs);
+    let mut doc = feature_to_geojson(
+        &feature,
+        &id,
+        root,
+        &crs,
+        &annotations(&state, engine.as_ref(), config, base),
+    );
     crate::html::representation_links(&mut doc, wanted);
     let resp = match wanted {
         ds_core::html::Wanted::Json => GeoJsonResponse(doc).into_response(),

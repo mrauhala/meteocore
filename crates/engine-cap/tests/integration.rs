@@ -91,6 +91,31 @@ fn feature_geometry_is_lat_lon_swapped_to_finland() {
     assert!((24.0..26.0).contains(&b[0]) && (59.0..62.0).contains(&b[1]));
 }
 
+/// #1143: an alert area is labelled by what and where, from its own
+/// `event` and `areaDesc`, not its sender-scoped id; its first columns say
+/// how severe and when.
+#[test]
+fn features_are_labelled_by_event_and_area() {
+    let eng = engine(None);
+    let mut f = eng.get_feature("urn:test:helsinki-flood-1.0.0").unwrap();
+    assert_eq!(
+        eng.label(&f).as_deref(),
+        Some("Flood Warning · Greater Helsinki")
+    );
+    // Only the parts the area has; none, no label.
+    let mut properties = (*f.properties).clone();
+    properties.remove("areaDesc");
+    f.properties = properties.clone().into();
+    assert_eq!(eng.label(&f).as_deref(), Some("Flood Warning"));
+    properties.remove("event");
+    f.properties = properties.into();
+    assert_eq!(eng.label(&f), None);
+    assert_eq!(
+        &eng.summary_properties()[..3],
+        ["severity", "onset", "active_until"]
+    );
+}
+
 #[test]
 fn feature_properties_carry_cap_metadata() {
     let eng = engine(None);

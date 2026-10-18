@@ -250,6 +250,7 @@ fn station(i: usize) -> Feature {
             "name".to_string(),
             PropertyValue::String(format!("<i>S{i}</i>")),
         )])),
+        related: Vec::new(),
     }
 }
 
