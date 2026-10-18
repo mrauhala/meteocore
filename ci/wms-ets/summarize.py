@@ -12,16 +12,25 @@ files are read instead.
 Writes Markdown (stdout, or --markdown FILE) and, with --json FILE, the counts
 and every failure for later tooling. Standard library only.
 
-Exit status: 0 whenever the suite ran, whatever it found. Test failures are
-reported, never enforced (#1065). 2 when the report is missing or unreadable,
-is not a TEAM Engine log, or no conformance class ran, which is what a
-capabilities document the suite could not read looks like.
+--expected FILE is the list of the tests expected to fail
+(ci/wms-ets/expected-failures.txt, read by load_expected). A failure of a
+test that is not listed fails the run; a listed test that did not fail is a
+warning in the summary, so that the list gets pruned. --annotate also prints
+both as GitHub workflow commands, ::error:: and ::warning::, on stdout.
+
+Exit status: 0 when the suite ran and every failure is listed, or no list
+was given. 1 when a test failed that is not on the list (#1065). 2 when the
+list cannot be read or holds a line that is not a test name, or when the
+report is missing or unreadable, is not a TEAM Engine log, or no conformance
+class ran, which is what a capabilities document the suite could not read
+looks like.
 """
 
 import argparse
 import html
 import json
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -63,6 +72,9 @@ OWN_TESTS = (
 MAX_EXPANDED = 100
 # GitHub drops a step summary over 1 MiB, leaving only an annotation.
 SUMMARY_LIMIT = 900_000
+# A test name as the summary prints it and the expected-failure list holds
+# it: `prefix:local-name`.
+TEST_NAME = re.compile(r"[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+")
 
 
 def squash(text, limit=TEXT_LIMIT):
@@ -219,6 +231,95 @@ def needs_dataset(test, class_log):
     return class_log["name"] in DATASET_CLASSES and test["name"] not in OWN_TESTS
 
 
+def load_expected(path):
+    """The expected-failure list: one test name per line, `prefix:local-name`.
+    `#` starts a comment, and blank lines are skipped. Returns the names in
+    file order. Raises ValueError, naming the line, for a line that is not a
+    test name and for a name listed twice; OSError when the file cannot be
+    read."""
+    names, lines = [], {}
+    with open(path, encoding="utf-8") as fh:
+        for number, line in enumerate(fh, 1):
+            name = line.split("#", 1)[0].strip()
+            if not name:
+                continue
+            if not TEST_NAME.fullmatch(name):
+                raise ValueError(f"{path}:{number}: not a test name: {name!r}")
+            if name in lines:
+                raise ValueError(f"{path}:{number}: {name} is listed already, on line {lines[name]}")
+            lines[name] = number
+            names.append(name)
+    return names
+
+
+def check(class_logs, tests, expected, list_path):
+    """The run's failures against the expected list.
+
+    `class_logs` are the conformance classes' own logs and `tests` every
+    other log of the run (`summarize`), `expected` the listed names. Returns
+    `unexpected`, the failed logs whose name is not listed, in report order;
+    `expected`, the failed logs whose name is, and `expected_classes`, how
+    many of those are a class's own log; and `not_failing`, the listed names
+    that did not fail, each with the outcomes its logs had, none when the
+    run held no log of that name."""
+    listed = set(expected)
+    logs = class_logs + tests
+    failures = [t for t in logs if is_failure(t)]
+    failed = {t["name"] for t in failures}
+    outcomes = {}
+    for test in logs:
+        outcomes.setdefault(test["name"], set()).add(test["outcome"])
+    return {
+        "list": list_path,
+        "unexpected": [t for t in failures if t["name"] not in listed],
+        "expected": [t for t in failures if t["name"] in listed],
+        "expected_classes": sum(1 for t in class_logs if is_failure(t) and t["name"] in listed),
+        "not_failing": [
+            {"name": name, "outcomes": sorted(outcomes.get(name, ()))}
+            for name in expected
+            if name not in failed
+        ],
+    }
+
+
+def outcome_text(entry):
+    """What a listed test that did not fail did instead."""
+    return ", ".join(entry["outcomes"]) or "not run"
+
+
+def workflow_command(level, title, message):
+    """A GitHub workflow command, `::error title=…::message`, escaped."""
+    def escape(text, extra=()):
+        text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        for char, code in extra:
+            text = text.replace(char, code)
+        return text
+
+    return f"::{level} title={escape(title, ((':', '%3A'), (',', '%2C')))}::{escape(message)}"
+
+
+def annotations(checked):
+    """An ::error:: per unexpected failure and a ::warning:: per listed test
+    that did not fail."""
+    lines = []
+    for test in checked["unexpected"]:
+        detail = test["messages"][0] if test["messages"] else test["exception"] or test["assertion"]
+        label = f" ({'; '.join(test['params'])})" if test["params"] else ""
+        lines.append(workflow_command(
+            "error",
+            "ets-wms13 unexpected failure",
+            f"{test['name']}{label} failed and is not on {checked['list']}: {squash(detail, 200)}",
+        ))
+    for entry in checked["not_failing"]:
+        lines.append(workflow_command(
+            "warning",
+            "ets-wms13 expected failure did not fail",
+            f"{entry['name']} is on {checked['list']} but did not fail "
+            f"({outcome_text(entry)}): remove it from the list",
+        ))
+    return lines
+
+
 def count_row(counter, columns):
     return [str(counter.get(c, 0)) for c in columns]
 
@@ -249,10 +350,58 @@ def failure_lines(test):
     return lines
 
 
-def markdown(class_logs, scored, outside, title, expand=MAX_EXPANDED):
+def gate_lines(checked):
+    """The verdict against the expected list (`check`): a line, then the
+    unexpected failures and the listed tests that did not fail. They go
+    right after the totals, so cutting the summary to size (`render`) keeps
+    the verdict line."""
+    listed = md_code(checked["list"], 200)
+    unexpected, not_failing = checked["unexpected"], checked["not_failing"]
+    classes = checked["expected_classes"]
+    tests = len(checked["expected"]) - classes
+    if len(unexpected) == 1:
+        out = [f"**1 unexpected failure fails this job: its test is not on {listed}.**", ""]
+    elif unexpected:
+        out = [f"**{len(unexpected)} unexpected failures fail this job: their tests are not on {listed}.**", ""]
+    elif tests or classes:
+        # Counted as the totals above count them: a class whose own log
+        # fails (data-preconditions) is not one of the tests.
+        parts = [
+            f"{n} failed {word if n == 1 else word + plural}"
+            for n, word, plural in ((tests, "test", "s"), (classes, "class", "es"))
+            if n
+        ]
+        verb = "is" if tests + classes == 1 else "are"
+        out = [f"**Every failure is expected: the {' and '.join(parts)} {verb} on {listed}.**", ""]
+    else:
+        out = ["**No test failed.**", ""]
+    if unexpected:
+        out += [
+            f"### Unexpected failures ({len(unexpected)})",
+            "",
+            f"Fix them or, for a deliberate limit, add them to {listed} under their cause. "
+            "Failed, below, has the details.",
+            "",
+        ]
+        out += [failure_line(test) for test in unexpected]
+        out.append("")
+    if not_failing:
+        out += [
+            f"### Warning: expected failures that did not fail ({len(not_failing)})",
+            "",
+            f"These are on {listed} but did not fail in this run: remove them from the list.",
+            "",
+        ]
+        out += [f"- {md_code(entry['name'], 80)}: {outcome_text(entry)}" for entry in not_failing]
+        out.append("")
+    return out
+
+
+def markdown(class_logs, scored, outside, title, expand=MAX_EXPANDED, checked=None):
     """The job summary. At most `expand` failures and warnings are listed in
     full; the rest, and every failure of a DATASET_CLASSES class outside
-    OWN_TESTS, get one line each."""
+    OWN_TESTS, get one line each. `checked`, the verdict against the
+    expected list (`check`), comes first."""
     budget = [expand]
 
     def entries(tests):
@@ -269,20 +418,28 @@ def markdown(class_logs, scored, outside, title, expand=MAX_EXPANDED):
     out = [f"## {title}", ""]
     if not scored:
         out += ["**The suite did not run: no conformance class holds a test. This fails the job.**", ""]
-    out.append(
+    out += [
         f"**{len(scored)} tests: {totals['passed']} passed, {totals['failed']} failed, "
         f"{totals['inherited failure']} failed through a subtest, {totals['skipped']} skipped, "
-        f"{totals['not tested']} not tested, {totals['warning']} warnings.**"
-    )
+        f"{totals['not tested']} not tested, {totals['warning']} warnings.**",
+        "",
+    ]
+    if scored and checked is not None:
+        out += gate_lines(checked)
+    if checked is None:
+        verdict = "No expected-failure list was given, so failures are reported and not checked."
+    else:
+        verdict = (
+            f"A failed test that is not on {md_code(checked['list'], 200)} fails this job; "
+            "the list gives the cause of each expected failure."
+        )
     # Passed, failed and skipped always; the rarer outcomes when they occur.
     columns = [c for c in COLUMNS if c in ("passed", "failed", "skipped") or totals[c]]
     out += [
-        "",
-        "Test failures do not fail this job. The OGC test suite section of "
-        "`crates/api-wms/README.md` lists the failures expected from MeteoCore's "
-        "deliberate limits. `data-preconditions`, `basic` and `queryable` test OGC's "
+        verdict + " The OGC test suite section of `crates/api-wms/README.md` explains "
+        "the causes. `data-preconditions`, `basic` and `queryable` test OGC's "
         "Blue Lake dataset, which MeteoCore does not serve: their failures are "
-        "expected and listed collapsed, except `basic:gif-or-png`, "
+        "listed collapsed, except `basic:gif-or-png`, "
         "`basic:options-requirements` and `queryable:getfeatureinfo-supported`, which "
         "read MeteoCore's own capabilities and are listed in full. The full report is "
         "the run's `wms-ets-report` artifact.",
@@ -345,13 +502,15 @@ def markdown(class_logs, scored, outside, title, expand=MAX_EXPANDED):
     return "\n".join(out) + "\n"
 
 
-def render(class_logs, scored, outside, title, limit=SUMMARY_LIMIT):
+def render(class_logs, scored, outside, title, limit=SUMMARY_LIMIT, checked=None):
     """markdown() within `limit` bytes: one line per failure when the full
-    form is too long, then cut at a line end with a note."""
-    text = markdown(class_logs, scored, outside, title)
+    form is too long, then cut at a line end with a note. The verdict
+    against the expected list comes right after the totals, so the cut
+    never removes its first line."""
+    text = markdown(class_logs, scored, outside, title, checked=checked)
     if len(text.encode("utf-8")) <= limit:
         return text
-    text = markdown(class_logs, scored, outside, title, expand=0)
+    text = markdown(class_logs, scored, outside, title, expand=0, checked=checked)
     if len(text.encode("utf-8")) <= limit:
         return text
     note = (
@@ -373,11 +532,31 @@ def main():
     parser.add_argument("--markdown", help="write the Markdown here instead of stdout")
     parser.add_argument("--json", help="also write counts and failures as JSON here")
     parser.add_argument("--title", default="OGC WMS 1.3.0 test suite (ets-wms13)")
+    parser.add_argument(
+        "--expected",
+        help="the tests expected to fail, one name per line: any other failure fails the run",
+    )
+    parser.add_argument(
+        "--annotate",
+        action="store_true",
+        help="print the verdict against --expected as GitHub workflow commands on stdout",
+    )
     args = parser.parse_args()
+
+    expected = None
+    if args.expected:
+        try:
+            expected = load_expected(args.expected)
+        except (OSError, ValueError) as err:
+            print(f"cannot use the expected-failure list: {err}", file=sys.stderr)
+            if args.annotate:
+                print(workflow_command("error", "ets-wms13 expected-failure list", str(err)))
+            return 2
 
     tests = load_logs(args.report, args.logs_dir)
     class_logs, scored, outside = summarize(tests)
-    text = render(class_logs, scored, outside, args.title)
+    checked = None if expected is None else check(class_logs, scored + outside, expected, args.expected)
+    text = render(class_logs, scored, outside, args.title, checked=checked)
     if args.markdown:
         with open(args.markdown, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -397,6 +576,13 @@ def main():
             "warnings": [t for t in scored if t["outcome"] == "warning"],
             "skipped": [t["name"] for t in scored if t["outcome"] in ("skipped", "not tested")],
         }
+        if checked is not None:
+            doc["expected_failures"] = {
+                "list": checked["list"],
+                "unexpected": [t["name"] for t in checked["unexpected"]],
+                "expected": [t["name"] for t in checked["expected"]],
+                "not_failing": checked["not_failing"],
+            }
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(doc, fh, indent=2)
 
@@ -412,6 +598,24 @@ def main():
         f"{totals['skipped'] + totals['not tested']} skipped or not tested",
         file=sys.stderr,
     )
+    if checked is None:
+        return 0
+    if args.annotate:
+        for line in annotations(checked):
+            print(line)
+    for entry in checked["not_failing"]:
+        print(
+            f"warning: {entry['name']} is on {checked['list']} but did not fail "
+            f"({outcome_text(entry)}): remove it from the list",
+            file=sys.stderr,
+        )
+    if checked["unexpected"]:
+        n = len(checked["unexpected"])
+        print(f"{n} {'failure' if n == 1 else 'failures'} not on {checked['list']}:", file=sys.stderr)
+        for test in checked["unexpected"]:
+            print(f"  {test['name']}", file=sys.stderr)
+        return 1
+    print(f"every failure is on {checked['list']}", file=sys.stderr)
     return 0
 
 

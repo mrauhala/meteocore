@@ -322,6 +322,9 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   registry's HashMap order, which changes with every process (#1102). The
   OGC test suite tests the first or last named layer; `ci/wms-ets/config.toml`
   picks its ids for that.
+- A change that fixes or deliberately breaks an ets-wms13 test updates
+  `ci/wms-ets/expected-failures.txt` in the same PR. A listed test that
+  passes is only a warning; an unlisted failure fails the WMS ETS job.
 - `<Capability>` is `Request`, `Exception`, then the root `Layer`, the
   schema's sequence. `<Exception>` lists `EXCEPTION_FORMATS`, `XML` only:
   every request error is a ServiceExceptionReport, served as `text/xml`

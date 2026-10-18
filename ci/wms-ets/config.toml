@@ -20,14 +20,19 @@
 # - ets-multi:          a multi-parameter GRIB forecast (ARPEGE 10 m wind):
 #                       a parent layer with one child layer per parameter,
 #                       a model-run axis of one run, and an <Attribution>.
-#
-# No committed fixture has several model runs or several pressure levels.
+# - ets-netcdf-levels:  several pressure levels and model runs (MEPS
+#                       CF-NetCDF): an elevation axis of four levels and a
+#                       model-run axis of two runs, declared on the parent
+#                       layer and inherited by its child layers.
 #
 # The ids decide which layer the suite tests. GetCapabilities lists the
 # layers in collection-id order, ets-geotiff, ets-grib-pressure,
-# ets-multi/<param>, ets-radar, and several tests take the first named layer,
-# so every run tests the same layers (#1102). Keep a top-level layer without
-# data at 0°N 0°E first:
+# ets-multi/<param>, ets-netcdf-levels/<param>, ets-radar, and several tests
+# take the first or the last named layer, so every run tests the same layers
+# (#1102). Give a new collection an id that sorts after ets-multi and before
+# ets-radar, the last. One with child layers must sort after ets-multi,
+# because getmap:bbox-inherited and the multi-style tests take the first
+# child layers. Keep a top-level layer without data at 0°N 0°E first:
 #
 # - On a child layer, getmap:layerlimit and getmap:transparent-opaque-layer
 #   fail on the suite's own request: the first encodes the name twice, the
@@ -116,3 +121,32 @@ poll_interval_secs = 3600
 # direction, components); this is the collection-level fallback.
 [collections.wms]
 colormap = "wind_speed"
+
+[[collections]]
+# Sorts after ets-multi and before ets-radar, the last named layer.
+id = "ets-netcdf-levels"
+title = "Pressure levels and model runs (CF-NetCDF)"
+description = "MEPS air temperature and wind on four pressure levels from two forecast runs"
+engine_type = "netcdf"
+apis = ["wms"]
+
+[collections.license]
+title = "CC-BY-4.0"
+
+# The committed MEPS pressure-level sample (testdata/meps-netcdf-pl/README.md):
+# runs 2026-10-15 06Z (leads 0-2) and 09Z (leads 0-1) at 1000, 850, 500 and
+# 300 hPa. The layers are the variables listed here and the wind speed the
+# server derives from the x/y components, ets-netcdf-levels/wind_speed_pl.
+[collections.netcdf]
+data_path = "testdata/meps-netcdf-pl"
+filename_template = "meps_pl_{lead}_%Y%m%dT{run}Z.nc"
+variables = ["air_temperature_pl", "x_wind_pl", "y_wind_pl"]
+poll_interval_secs = 3600
+
+# Each parameter layer takes its built-in default style (temperature, wind
+# components, wind speed); this is the collection-level fallback, the
+# temperature palette over -90…50 °C in kelvin.
+[collections.wms]
+colormap = "temperature"
+min = 183.15
+max = 323.15
