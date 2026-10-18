@@ -183,6 +183,56 @@ impl OutputCrs {
         width: u32,
         height: u32,
     ) -> (u32, u32, u32, u32) {
+        match self.footprint_fractions(wgs84_bbox, src_env_wgs84) {
+            Some(fractions) => footprint_pixels(fractions, width, height),
+            None => (0, width.saturating_sub(1), 0, height.saturating_sub(1)),
+        }
+    }
+
+    /// [`Self::footprint_pixel_window`], or `None` when the footprint lies
+    /// wholly outside the `width`×`height` image, or the image is empty.
+    ///
+    /// The window clamps to the image, so a footprint off its right edge
+    /// still gives the edge column, and every pixel of that column lies
+    /// outside the footprint and its margin: the guard leaves nothing to
+    /// draw there. A caller can then skip the render entirely, with no
+    /// source read and no [`crate::resample::ProjectionGrid`]. Over a
+    /// projected source whose forward folds far from its meridian (the
+    /// Transverse Mercator series at hundreds of degrees of longitude, in a
+    /// Web Mercator tile past ±180°), refining a grid for such a tile ran
+    /// to its cell cap (#1129). Otherwise the window is
+    /// [`Self::footprint_pixel_window`]'s, with the full image when no
+    /// perimeter sample maps.
+    pub fn footprint_window_in_image(
+        &self,
+        wgs84_bbox: [f64; 4],
+        src_env_wgs84: [f64; 4],
+        width: u32,
+        height: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        match self.footprint_fractions(wgs84_bbox, src_env_wgs84) {
+            Some([x_lo, x_hi, y_lo, y_hi])
+                if x_hi < 0.0 || x_lo >= 1.0 || y_hi < 0.0 || y_lo >= 1.0 =>
+            {
+                None
+            }
+            Some(fractions) => Some(footprint_pixels(fractions, width, height)),
+            None => Some((0, width - 1, 0, height - 1)),
+        }
+    }
+
+    /// The fractional output box `[x_lo, x_hi, y_lo, y_hi]` a source's
+    /// WGS84 envelope occupies, with its margin, unclamped; `None` when no
+    /// perimeter sample maps to a finite position. See
+    /// [`Self::footprint_pixel_window`].
+    fn footprint_fractions(
+        &self,
+        wgs84_bbox: [f64; 4],
+        src_env_wgs84: [f64; 4],
+    ) -> Option<[f64; 4]> {
         let [w, s, e, n] = src_env_wgs84;
         let (mut fx_lo, mut fx_hi, mut fy_lo, mut fy_hi) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
         let mut any = false;
@@ -204,33 +254,14 @@ impl OutputCrs {
             }
         }
         if !any {
-            return (0, width.saturating_sub(1), 0, height.saturating_sub(1));
+            return None;
         }
         // Margin: a fraction of the footprint's own output span, with a small
         // floor, so edge-sampling gaps and sub-pixel rounding never clip boundary
         // data. Far-away ghosts sit far outside, so the margin never readmits them.
         let mx = ((fx_hi - fx_lo) * 0.02).max(0.005);
         let my = ((fy_hi - fy_lo) * 0.02).max(0.005);
-        fx_lo -= mx;
-        fx_hi += mx;
-        fy_lo -= my;
-        fy_hi += my;
-        let to_px = |f: f64, dim: u32| {
-            // If dim == 0, `clamp(0.0, dim as f64 - 1.0)` panics (min > max) in
-            // both debug and release; the assert below fires first in debug with
-            // a clearer message. Callers always pass positive output dimensions.
-            debug_assert!(
-                dim > 0,
-                "footprint_pixel_window: output dimension must be > 0"
-            );
-            (f * dim as f64).floor().clamp(0.0, dim as f64 - 1.0) as u32
-        };
-        (
-            to_px(fx_lo, width),
-            to_px(fx_hi, width),
-            to_px(fy_lo, height),
-            to_px(fy_hi, height),
-        )
+        Some([fx_lo - mx, fx_hi + mx, fy_lo - my, fy_hi + my])
     }
 
     /// The rows of a `height`-row output image over `wgs84_bbox` whose pixel
@@ -304,6 +335,32 @@ impl OutputCrs {
 fn projected_point(bbox: &[f64; 4], fx: f64, fy: f64) -> (f64, f64) {
     let [min_e, min_n, max_e, max_n] = *bbox;
     (min_e + fx * (max_e - min_e), max_n - fy * (max_n - min_n))
+}
+
+/// The inclusive pixels `(px_lo, px_hi, py_lo, py_hi)` of the fractional
+/// footprint box `[x_lo, x_hi, y_lo, y_hi]` in a `width`×`height` image,
+/// clamped to the image.
+fn footprint_pixels(
+    [x_lo, x_hi, y_lo, y_hi]: [f64; 4],
+    width: u32,
+    height: u32,
+) -> (u32, u32, u32, u32) {
+    let to_px = |f: f64, dim: u32| {
+        // If dim == 0, `clamp(0.0, dim as f64 - 1.0)` panics (min > max) in
+        // both debug and release; the assert below fires first in debug with
+        // a clearer message. Callers always pass positive output dimensions.
+        debug_assert!(
+            dim > 0,
+            "footprint_pixel_window: output dimension must be > 0"
+        );
+        (f * dim as f64).floor().clamp(0.0, dim as f64 - 1.0) as u32
+    };
+    (
+        to_px(x_lo, width),
+        to_px(x_hi, width),
+        to_px(y_lo, height),
+        to_px(y_hi, height),
+    )
 }
 
 /// The first of `0..height` for which `pred` holds, `height` when none
@@ -1651,6 +1708,106 @@ mod tests {
         let (w, h) = (256u32, 256u32);
         let (px_lo, px_hi, py_lo, py_hi) = crs.footprint_pixel_window(tight, FINLAND_WGS84, w, h);
         assert_eq!((px_lo, px_hi, py_lo, py_hi), (0, w - 1, 0, h - 1));
+    }
+
+    /// The WGS84 box of a Web Mercator meta-tile on the half-octave ladder,
+    /// `2^(level/2)` tiles a world, with longitudes unwrapped past ±180° as
+    /// the meta-tiling passes them.
+    fn merc_tile(level: i32, col: i64, row: i64) -> [f64; 4] {
+        use crate::web_mercator::{x_to_lon, y_to_lat, EARTH_RADIUS};
+        let origin = std::f64::consts::PI * EARTH_RADIUS;
+        let span = 2.0 * origin / 2f64.powf(f64::from(level) / 2.0);
+        let (x0, top) = (-origin + col as f64 * span, origin - row as f64 * span);
+        [
+            x_to_lon(x0),
+            y_to_lat(top - span),
+            x_to_lon(x0 + span),
+            y_to_lat(top),
+        ]
+    }
+
+    /// `footprint_window_in_image` against `footprint_pixel_window`: the same
+    /// window, or `None` when every pixel of the clamped window lies outside
+    /// the footprint and its margin, so the guard would draw none of them.
+    fn assert_in_image_agrees(crs: &OutputCrs, bbox: [f64; 4], env: [f64; 4], size: u32) -> bool {
+        let window = crs.footprint_pixel_window(bbox, env, size, size);
+        let Some(fractions) = crs.footprint_fractions(bbox, env) else {
+            let full = Some((0, size - 1, 0, size - 1));
+            assert_eq!(crs.footprint_window_in_image(bbox, env, size, size), full);
+            return true;
+        };
+        let [x_lo, x_hi, y_lo, y_hi] = fractions;
+        let s = f64::from(size);
+        let meets = |p: u32, lo: f64, hi: f64| f64::from(p) / s <= hi && f64::from(p + 1) / s > lo;
+        let (px_lo, px_hi, py_lo, py_hi) = window;
+        let drawn = (px_lo..=px_hi).any(|px| meets(px, x_lo, x_hi))
+            && (py_lo..=py_hi).any(|py| meets(py, y_lo, y_hi));
+        assert_eq!(
+            crs.footprint_window_in_image(bbox, env, size, size),
+            drawn.then_some(window),
+            "{crs:?} {bbox:?} over {env:?}"
+        );
+        drawn
+    }
+
+    /// #1129: a footprint wholly off the image has no window, and only then.
+    /// The issue's off-world Web Mercator meta-tiles, either side of the
+    /// world, hold no Finland; nor does the seam, where a source that
+    /// crosses it keeps its window, whether its envelope comes unwrapped or
+    /// spans the turn. Every tile of the ladder's first levels, a turn either
+    /// side of the world, and the EPSG:3035 tiles around Europe agree with
+    /// `footprint_pixel_window`.
+    #[test]
+    fn footprint_window_in_image_is_none_only_off_the_image() {
+        let merc = OutputCrs::WebMercator;
+        let seam = [170.0, 10.0, 190.0, 20.0];
+        for (bbox, env, drawn) in [
+            (merc_tile(3, 3, 2), FINLAND_WGS84, false),
+            (merc_tile(3, -1, 2), FINLAND_WGS84, false),
+            (merc_tile(2, 2, 0), FINLAND_WGS84, false),
+            (merc_tile(4, 5, 3), FINLAND_WGS84, false),
+            (merc_tile(3, 1, 0), FINLAND_WGS84, true),
+            (merc_tile(3, 1, 1), FINLAND_WGS84, false),
+            (seam, FINLAND_WGS84, false),
+            (seam, [175.0, 12.0, 185.0, 18.0], true),
+            (seam, [-180.0, 12.0, 180.0, 18.0], true),
+            (
+                [170.0, 10.0, -170.0, 20.0],
+                [175.0, 12.0, 185.0, 18.0],
+                false,
+            ),
+        ] {
+            assert_eq!(
+                assert_in_image_agrees(&merc, bbox, env, 256),
+                drawn,
+                "{bbox:?} over {env:?}"
+            );
+        }
+        for level in 0..=8 {
+            let n = 2f64.powf(f64::from(level) / 2.0).ceil() as i64;
+            for row in 0..n {
+                for col in -n..2 * n {
+                    assert_in_image_agrees(&merc, merc_tile(level, col, row), FINLAND_WGS84, 256);
+                }
+            }
+        }
+        let laea = projected_output_crs("EPSG:3035").unwrap();
+        let side = 1_024_000.0;
+        for i in 0..8 {
+            for j in 0..8 {
+                let (e, n) = (f64::from(i) * side, f64::from(j) * side);
+                let out = OutputCrs::Projected {
+                    crs: laea.clone(),
+                    bbox: [e, n, e + side, n + side],
+                };
+                assert_in_image_agrees(&out, [0.0; 4], FINLAND_WGS84, 256);
+            }
+        }
+        assert_eq!(
+            merc.footprint_window_in_image(merc_tile(3, 1, 0), FINLAND_WGS84, 0, 256),
+            None,
+            "an empty image has no pixel to draw"
+        );
     }
 
     /// #475: the `F32` boxed view — sentinel and every non-finite sample are
