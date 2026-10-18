@@ -33,7 +33,9 @@ with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
 (OGC 3D Tiles encoder), engines (`engine-csv`, `engine-geojson`,
 `engine-geotiff`, `engine-grib`, `engine-odim`, `engine-querydata`,
 `engine-zarr`, `engine-postgis`, `engine-cap`, `engine-bufr`, `engine-satellite`,
-`engine-netcdf`), API layers (`api-common` shared HTTP plumbing, `api-edr`,
+`engine-netcdf`, `engine-station-grid` — station observations gridded on the
+fly, a derived collection over a station collection), API layers
+(`api-common` shared HTTP plumbing, `api-edr`,
 `api-features`, `api-maps`, `api-tiles`, `api-wms`, `api-3dtiles`,
 `api-mcp` — Model Context Protocol tools over the storm-cell surface), and
 `server` (the binary).
@@ -74,7 +76,8 @@ of these crates, read its file — it holds that crate's rules and gotchas:
   `crates/engine-querydata/CLAUDE.md`, `crates/engine-zarr/CLAUDE.md`,
   `crates/engine-cap/CLAUDE.md`, `crates/engine-postgis/CLAUDE.md`,
   `crates/engine-nowcast/CLAUDE.md`, `crates/engine-satellite/CLAUDE.md`,
-  `crates/engine-netcdf/CLAUDE.md` — one file per engine.
+  `crates/engine-netcdf/CLAUDE.md`, `crates/engine-station-grid/CLAUDE.md` —
+  one file per engine.
 
 This root file holds only workspace-wide rules.
 
@@ -851,6 +854,7 @@ one never implies the other.
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
 | NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields, or fields on one pressure axis (`RasterInfo.vertical`: hPa, bottom first; WMS `ELEVATION`, Maps/Tiles `elevation`, EDR `z`; a map without one draws the bottom level, EDR without `z` reads every level; the MEPS `pl` family is a collection of its own). EDR samples each point or area cell as the map draws it (one projection per point, a CRS84 area grid), runs as instances, GetFeatureInfo through position at the level drawn; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (steps × levels × variables); derived wind speed from CF `x_wind`/`y_wind`, per pressure level (no direction on MEPS's Lambert grid) |
 | BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
+| Station grid | `MapEngine` + `EdrEngine` (derived: wraps a CSV, BUFR or PostGIS stations collection's `EdrEngine`) | WMS, Maps, Tiles (one layer per parameter), EDR (position, area, radius, cube without `z`) — one time slice of the source's observations (latest per station within `max_age`, one area query) interpolated by IDW, ADW or nearest onto a CRS84 analysis grid (#1082); great-circle neighbours via a 3-D k-d tree (seam and poles); grids cached per (parameter, time, content version) in `MC_STATION_GRID_CACHE_MB`, computed on a dedicated pool under the request deadline (503, never partial); `cadence` axis; content_version moves with revised input fingerprints; EDR samples the grid the maps draw |
 
 ## Config Format
 
