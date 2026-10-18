@@ -659,8 +659,8 @@ where
                         if outside_projection_domain(crs, bbox) {
                             // Wholly past the projection's valid area, as a
                             // cover's tiles past a pole, past the LAEA disk
-                            // or 50° from TM's meridian are: no pixel has a
-                            // place to read, all nodata (#1113).
+                            // or past TM's east and west edges are: no pixel
+                            // has a place to read, all nodata (#1113).
                             None
                         } else {
                             let Some(envelope) = wgs84_envelope(crs, bbox) else {
@@ -1993,15 +1993,15 @@ mod tests {
         assert_eq!(cache.stats(), (0, 0));
     }
 
-    /// Zoomed-out EPSG:3067 views of the north have covering tiles past the
-    /// pole or 50° from the meridian, where no pixel has a place (#1113).
+    /// Zoomed-out EPSG:3067 views have covering tiles past the pole or the
+    /// area's east edge, where no pixel has a place (#1113, #1130).
     /// They are all-nodata tiles, never read, and the view stays meta-tiled
     /// instead of falling back to an uncached direct render.
     #[test]
     fn projected_tiles_wholly_outside_the_area_are_empty_without_a_read() {
         let crs = projected_output_crs("EPSG:3067").unwrap();
         for (bbox, width, height) in [
-            ([-2.0e6, 5.0e6, 3.0e6, 9.5e6], 1000, 900),
+            ([7.0e6, 5.0e6, 1.2e7, 9.5e6], 1000, 900),
             ([-1.0e6, 6.0e6, 2.0e6, 1.05e7], 1000, 1500),
         ] {
             let cache = TilePixelCache::new(64);

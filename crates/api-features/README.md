@@ -183,11 +183,13 @@ coordinates against it. Note that WMS here takes EPSG:3035 `BBOX` easting first.
   boxes (lower corner first) become the envelope of densely sampled edge points,
   so a curved edge between corners is covered, widened to a pole the box
   contains. The envelope may also match features just outside the projected
-  rectangle near its corners, never fewer. EPSG:3067 points past a pole or
-  more than 50° of longitude from 27°E name no place (#1113). The envelope of
-  a box reaching past them ends at that edge, 23°W or 77°E, though around a
-  pole it still spans every longitude; a box around the whole area matches
-  every feature, and one wholly past them is a 400.
+  rectangle near its corners, never fewer. EPSG:3067 points past a pole's
+  northing, or with an easting more than 9 997 965 m from 27°E's, name no
+  place (#1113, #1130): there its series stops being exact, on the equator
+  66.3° from 27°E, and from 23.4° of latitude poleward the meridians 90° out,
+  63°W and 117°E. The envelope of a box reaching past them ends at that edge,
+  though around a pole it still spans every longitude; a box around the whole
+  area matches every feature, and one wholly past them is a 400.
 - **Links:** `self`/`next`/`prev` and each feature's `self` repeat a requested
   `crs`; the bbox is repeated as its CRS84 conversion, without `bbox-crs`. The
   HTML view is CRS84, so the GeoJSON response's `alternate` HTML link drops `crs`.

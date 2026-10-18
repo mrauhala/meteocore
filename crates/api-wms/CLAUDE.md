@@ -97,7 +97,7 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   tiles that cross it.
 - `params::parse_bbox` asks `outside_projection_domain` before
   `wgs84_envelope`, which samples the box's edges and adds a pole the box
-  holds and, for EPSG:3067, where the meridians 50° out enter and leave it
+  holds and, for EPSG:3067, where its area's edges enter and leave it
   (`geo::area_edge_points`). Wholly outside is the empty image, with read
   window `NO_READ_WINDOW` (NaN, never read). An envelope of `None` for any
   other box means the edges miss a valid area inside it: an EPSG:3035 box
@@ -106,8 +106,9 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   one would read whole datasets. An EPSG:3067 box that meets the area
   always has an envelope. Malformed boxes are rejected before
   either. Both projections' inverses are `None` past their area: the LAEA
-  disk, and for EPSG:3067 past a pole or more than
-  `ds_core::geo::TM_MAX_LON_OFFSET_DEG` (50°) from 27°E (#1113). In a box
+  disk, and for EPSG:3067 past a pole's northing or an easting
+  9 997 965 m from 27°E's (`ds_core::geo::Crs::TransverseMercator`, #1113,
+  #1130). In a box
   partly outside, `project_node` gives those pixels NaN and they stay
   empty. A meta-tile wholly outside is an all-nodata tile with no engine
   call, so a zoomed-out view of the north stays meta-tiled.
@@ -416,8 +417,9 @@ meta-tiles by nearest neighbour).
   `domain_rows` is `None` (GetMap's empty image without a read, #1089), a
   centre past a pole, and a projected centre outside the projection's
   valid area, where its inverse is `None`: past the LAEA disk, and past a
-  pole or `ds_core::geo::TM_MAX_LON_OFFSET_DEG` (50°) from TM's meridian
-  (#1113). `I`/`J` outside the image, negative or non-integer is
+  pole's northing or the eastings where TM's series stops being exact
+  (`ds_core::geo::Crs::TransverseMercator`, #1113, #1130). `I`/`J` outside
+  the image, negative or non-integer is
   `InvalidPoint`.
 - **Dimensions.** The resolved time as `datetime` `(t, t)`, the resolved run
   as `reference_time`, and as `z` the level GetMap draws:

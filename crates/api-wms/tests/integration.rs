@@ -6689,10 +6689,10 @@ async fn geographic_getmap_past_a_pole_is_empty_there() {
 /// WMS 1.3.0 §7.3.3.6: a projected BBOX wholly outside its projection's
 /// valid area is the empty image, encoded in the requested FORMAT, without
 /// an engine read (#1089). EPSG:3035's boxes lie past the LAEA disk, where
-/// they were a 400. EPSG:3067's lie past a pole, north and south, or past
-/// 50° from TM's meridian, where the engine was asked to read the
-/// meaningless places TM's inverse gave there (#1113), or at eastings so
-/// far out that the inverse has no finite result, a 400 before. The engine
+/// they were a 400. EPSG:3067's lie past a pole, north and south, past the
+/// eastings where TM's series stops being exact (#1113, #1130), or at
+/// eastings so far out that the inverse has no finite result, a 400
+/// before. The engine
 /// draws on every pixel it is asked for, so a read would show. On both
 /// render paths a box reaching into the area still renders, and a
 /// malformed box, or one whose edges miss the area inside it, is still a
@@ -6715,9 +6715,11 @@ async fn projected_getmap_wholly_outside_its_projection_is_empty() {
         // Past TM's poles, 9 997 965 m from the equator.
         ("EPSG:3067", "0,21000000,1000000,22000000"),
         ("EPSG:3067", "0,-22000000,1000000,-21000000"),
-        // Past 50° east of its meridian, the second just past it at 51°N.
-        ("EPSG:3067", "5000000,6500000,6000000,7000000"),
-        ("EPSG:3067", "3900000,7000000,4000000,7100000"),
+        // Past its area's east and west edges, k₀ times a quarter meridian
+        // from 500 000 m: 10 497 964.943 and -9 497 964.943, the second box
+        // just past it.
+        ("EPSG:3067", "11000000,6500000,12000000,7000000"),
+        ("EPSG:3067", "-9600000,7000000,-9500000,7100000"),
         ("EPSG:3067", "1e20,6500000,2e20,7000000"),
     ];
     let transparent = solid(64, 64, [0, 0, 0, 0]);

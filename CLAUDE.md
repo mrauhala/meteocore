@@ -656,12 +656,17 @@ one never implies the other.
   `forward` is NaN on the far side of the Earth and `inverse` `None` off the
   disk, so code mapping many points must skip non-finite results; its
   `GeoTransform::bbox` comes from the limb and may be `west > east` (#819).
-  `Crs::TransverseMercator`'s **inverse** is partial too: `None` past a pole
-  or more than `TM_MAX_LON_OFFSET_DEG` (50°) from its central meridian,
-  where its Snyder series stops naming places (#1113); its `forward` stays
-  total but is that series, km off PROJ that far out. Edge samples miss
-  that edge between them, so `wgs84_envelope` adds `area_edge_points`
-  (where those meridians enter and leave the box) and a pole the box holds
+  `Crs::TransverseMercator` is Krüger's series to sixth order in Karney's
+  2011 form, as PROJ's `tmerc` (#1130). Its **inverse** is partial too:
+  `None` outside a square in projected metres, past a pole's northing or
+  an easting k₀ times a quarter meridian (9 997 965 m for EPSG:3067) from
+  the central meridian, where the series stops being exact (#1113; inside,
+  under 1 mm off the exact projection). That spans the hemisphere within
+  90° of the meridian except near the equator, where it ends 66.3° out.
+  Its `forward` stays total: exact inside the area, unbounded near the
+  equator 90° out. Edge samples miss the area's edge between them, so
+  `wgs84_envelope` adds `area_edge_points` (where those edges enter and
+  leave the box, and the equator or pole between) and a pole the box holds
   (`holds_pole`, projected from the central meridian).
 - **`ds_core::cf`** — CF semantics shared by NetCDF and Zarr readers,
   which pass plain values or an attribute lookup (no reader library here):
