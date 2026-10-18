@@ -112,7 +112,7 @@ of cases, takes its first value: `LAYERS=a&layers=b` requests layer `a`.
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `SERVICE` | yes | Must be `WMS` |
-| `VERSION` | no | Must be `1.3.0`, the default when omitted. Deliberate: ets-wms13's `getmap:no-version` expects an exception |
+| `VERSION` | yes | Must be `1.3.0`. Without it the request is `MissingParameterValue`, as WMS 1.3.0 requires: only GetCapabilities negotiates the version |
 | `REQUEST` | yes | `GetMap` |
 | `LAYERS` | yes | Layer name: a collection ID, or `collection/parameter` for one parameter of a multi-parameter collection. A multi-parameter collection's own layer is not advertised, but `LAYERS=collection` is accepted and draws its default parameter with that parameter's style: the image and legend `collection/<default parameter>` gives. Only one layer per request (`LayerLimit` 1): a list naming a layer or style the server does not serve answers `LayerNotDefined` / `StyleNotDefined`, a list of served layers `InvalidParameterValue` |
 | `CRS` | yes | Coordinate reference system (see below) |
@@ -194,7 +194,7 @@ neighbour, so next to a class edge the pixel can show a neighbour's colour.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| GetMap's | yes | The parameters that define the map: `LAYERS`, `STYLES`, `CRS`, `BBOX`, `WIDTH`, `HEIGHT`, `TIME`, `ELEVATION`, `DIM_REFERENCE_TIME`. Every GetMap parameter sent, `FORMAT`, `TRANSPARENT`, `BGCOLOR` and `QUALITY` included, is validated as GetMap validates it, with GetMap's exceptions: an unsupported `FORMAT` is `InvalidFormat` here too. The image parameters do not change the value |
+| GetMap's | yes | The parameters that define the map: `VERSION`, `LAYERS`, `STYLES`, `CRS`, `BBOX`, `WIDTH`, `HEIGHT`, `TIME`, `ELEVATION`, `DIM_REFERENCE_TIME`. Every GetMap parameter sent, `FORMAT`, `TRANSPARENT`, `BGCOLOR` and `QUALITY` included, is validated as GetMap validates it, with GetMap's exceptions: an unsupported `FORMAT` is `InvalidFormat` here too. The image parameters do not change the value |
 | `QUERY_LAYERS` | yes | The layers of `LAYERS` to read. A layer the server does not serve, or one `LAYERS` does not name, is `LayerNotDefined`; one that is not queryable `LayerNotQueryable` |
 | `I` | yes | The pixel's column, 0 to `WIDTH` − 1. Anything else, a negative or non-integer value included, is `InvalidPoint` |
 | `J` | yes | The pixel's row, 0 (top) to `HEIGHT` − 1; otherwise `InvalidPoint` |
@@ -599,11 +599,10 @@ The run meets these deliberate limits:
 - The basic class's dataset tests and the separate data-preconditions class
   need OGC's "Blue Lake" test dataset (the `cite:*` layers), which MeteoCore
   does not serve. They fail.
-- GetMap accepts only `VERSION=1.3.0`. This costs nothing here: the suite
-  sends 1.3.0, and GetCapabilities answers any `VERSION` with the 1.3.0
-  document, as version negotiation requires. GetMap without `VERSION`
-  assumes 1.3.0, so that clients that leave it out keep working, and
-  `getmap:no-version`, which expects an exception, fails.
+- GetMap and GetFeatureInfo accept only `VERSION=1.3.0`, and refuse a
+  request without it. This costs nothing here: the suite sends 1.3.0, and
+  GetCapabilities answers any `VERSION` with the 1.3.0 document, as version
+  negotiation requires.
 
 The server is a debug build, with overflow checks and debug assertions on, so
 reproduce a 500 or a dropped connection on a release build before filing it.
@@ -617,7 +616,7 @@ passed, 96 failed (72 directly, 24 through a failed subtest). By cause:
 | 7 | `LegendURL` has no `<Format>` child, so the suite cannot compare the legend's MIME type | fixed: `<Format>image/png</Format>` plus the legend's width and height |
 | 1 | The capabilities root has no `xsi:schemaLocation` | fixed: WMS 1.3.0 and SLD 1.1.0 schema locations; `GetLegendGraphic` is written as `sld:GetLegendGraphic` so the document validates |
 | 1 | No `<Exception>` element in `<Capability>` | fixed: `XML` only; honouring `EXCEPTIONS=INIMAGE/BLANK` stays open on #1027 |
-| 1 | `getmap:no-version`: GetMap without `VERSION` renders instead of raising an exception | deliberate: a missing `VERSION` defaults to 1.3.0, so clients that leave it out keep working |
+| 1 | `getmap:no-version`: GetMap without `VERSION` renders instead of raising an exception | fixed: GetMap and GetFeatureInfo without `VERSION` are `MissingParameterValue` (#1065) |
 | 1 + class | `data-preconditions` and most of `basic` need OGC's Blue Lake dataset (`cite:` layers) | expected: MeteoCore serves its own collections |
 
 The mixed-case failures stop most GetMap tests at the first request, so the
@@ -638,7 +637,7 @@ a failed subtest), and the data-preconditions class. By cause:
 | 1 | `getmap:invalid-crs` | An unsupported CRS answered `CRSNotDefined`, not Table E.1's `InvalidCRS` | fixed: `InvalidCRS`. A malformed `ELEVATION`, or one for a layer without one, is now `InvalidDimensionValue`, as a malformed `TIME` was |
 | 1 | `getmap:large-size` | The advertised maximum, 8000 × 8000, is 64 M pixels; the default render memory budget admits 33.5 M, so it was a 503 | fixed in the job: `MC_RENDER_MEMORY_MB=2560`, the render deadline 60 s. Production sizes its own budget |
 | 1 | `getmap:bbox-outside-crs` | The box is wholly north of 90°N. The server returned the empty image, transparent since `TRANSPARENT` defaulted to `TRUE`, and the suite wants every pixel's RGB white | fixed: `TRANSPARENT` defaults to `FALSE`, as WMS 1.3.0 specifies (#1065). The test exposed a real fault next to it: a box reaching past a pole had the engine draw there, a global GRIB grid the rows of its edge cell south of 90°S. Fixed: WMS and Maps ask the engine only for the rows inside ±90° |
-| 1 | `getmap:no-version` | GetMap without `VERSION` renders | expected: deliberate |
+| 1 | `getmap:no-version` | GetMap without `VERSION` renders | fixed: GetMap and GetFeatureInfo without `VERSION` are `MissingParameterValue` (#1065) |
 | 5 + class | `basic:bbox-exponential`, `bbox-pixel-interpretation`, `no-bgcolor`, `blue-bgcolor`, `transparent-true`, and `data-preconditions` | OGC's Blue Lake dataset (`cite:` layers) | expected: MeteoCore serves its own collections |
 | 11 | `getmap:getmap`, `bbox`, `crs`, `layers`, `styles`, `width-and-height`, `version`; `basic:getmap`, `bbox`, `bgcolor`, `transparent` | fail through a subtest above | follow their subtests |
 
@@ -656,7 +655,7 @@ layers and `each-info_format` for all three formats among them. By cause:
 | 7 | `getmap:two-layers`, `three-layers`, `two-styles`, `three-styles`, `styles-default-multiple-layers`, `styles-default-commas`, `styles-some-default` | One layer per GetMap (`LayerLimit` 1, #1014) | expected: deliberate |
 | 3 | `getfeatureinfo:two-query_layers`, `three-query_layers`, `less-query_layers` | The same limit: their `LAYERS` name two or three layers | expected: deliberate |
 | 2 | `getmap:bbox-outside-crs`, `transparent-default` | `TRANSPARENT` defaulted to `TRUE` (#163), where WMS 1.3.0 says `FALSE`; `transparent-default` only when its layer has no data in its box | fixed: `TRANSPARENT` defaults to `FALSE` (#1065). A request without it gets an opaque image over `BGCOLOR`; a client that sends `TRANSPARENT` gets what it got before |
-| 1 | `getmap:no-version` | GetMap without `VERSION` renders | expected: deliberate |
+| 1 | `getmap:no-version` | GetMap without `VERSION` renders | fixed: GetMap and GetFeatureInfo without `VERSION` are `MissingParameterValue` (#1065) |
 | 5 + class | `basic:bbox-exponential`, `bbox-pixel-interpretation`, `no-bgcolor`, `blue-bgcolor`, `transparent-true`, and `data-preconditions` | OGC's Blue Lake dataset (`cite:` layers) | expected: MeteoCore serves its own collections |
 | 3 | `queryable:std-data-queryable`, `feature_count-default`, `feature_count-1` | The same dataset | expected |
 

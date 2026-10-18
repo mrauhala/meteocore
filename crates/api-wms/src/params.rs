@@ -351,8 +351,13 @@ impl WmsQuery {
 
     /// Validate and extract GetMap parameters.
     pub fn validate_get_map(&self) -> Result<GetMapParams, WmsError> {
-        // VERSION must be 1.3.0
-        let version = self.version.as_deref().unwrap_or("1.3.0");
+        // VERSION is mandatory and must be 1.3.0. Only GetCapabilities
+        // negotiates a version (WMS 1.3.0 §6.2.4); GetMap and GetFeatureInfo
+        // without one are refused, as ets-wms13's getmap:no-version expects.
+        let version = self
+            .version
+            .as_deref()
+            .ok_or(WmsError::missing_parameter("VERSION"))?;
         if version != "1.3.0" {
             return Err(WmsError::invalid_parameter(&format!(
                 "Unsupported VERSION '{version}'. Only 1.3.0 is supported."
@@ -1118,6 +1123,7 @@ mod tests {
     fn get_feature_info(pairs: &[(&str, &str)]) -> Result<GetFeatureInfoParams, WmsError> {
         let base = [
             ("REQUEST", "GetFeatureInfo"),
+            ("VERSION", "1.3.0"),
             ("LAYERS", "radar"),
             ("CRS", "CRS:84"),
             ("BBOX", "10,55,30,70"),
@@ -1171,10 +1177,11 @@ mod tests {
                 Ok(_) => panic!("{name}={value}: expected InvalidPoint"),
             }
         }
-        for name in ["I", "J", "QUERY_LAYERS"] {
+        for name in ["VERSION", "I", "J", "QUERY_LAYERS"] {
             let query = WmsQuery::from_pairs(
                 [
                     ("REQUEST", "GetFeatureInfo"),
+                    ("VERSION", "1.3.0"),
                     ("LAYERS", "radar"),
                     ("CRS", "CRS:84"),
                     ("BBOX", "10,55,30,70"),
@@ -1187,14 +1194,34 @@ mod tests {
                 .into_iter()
                 .filter(|(n, _)| *n != name),
             );
+            // The message names the omitted parameter, so another missing
+            // one cannot pass for it.
             assert!(
                 matches!(
                     query.validate_get_feature_info(),
-                    Err(WmsError::MissingParameterValue(_))
+                    Err(WmsError::MissingParameterValue(msg)) if msg.ends_with(name)
                 ),
                 "{name} omitted"
             );
         }
+    }
+
+    #[test]
+    fn get_map_without_version_is_missing_parameter_value() {
+        let mut query = get_map_query("image/png", None);
+        query.version = None;
+        match query.validate_get_map() {
+            Err(WmsError::MissingParameterValue(msg)) => {
+                assert_eq!(msg, "Missing required parameter: VERSION")
+            }
+            Err(other) => panic!("expected MissingParameterValue, got {other:?}"),
+            Ok(_) => panic!("a GetMap without VERSION was accepted"),
+        }
+        query.version = Some("1.1.1".into());
+        assert!(matches!(
+            query.validate_get_map(),
+            Err(WmsError::InvalidParameterValue(_))
+        ));
     }
 
     #[test]
