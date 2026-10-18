@@ -522,20 +522,30 @@ the repository:
 | `ets-radar` | A time axis: five radar frames |
 | `ets-grib-pressure` | An elevation axis (GRIB pressure levels) and a model-run axis (`reference_time`), one value each |
 | `ets-multi/<param>` | A multi-parameter forecast: a parent layer with one child layer per parameter, a model-run axis of one run, and an `<Attribution>` |
-
-No committed fixture holds several model runs or several pressure levels, so
-those axes are tested with a single value.
+| `ets-netcdf-levels/<param>` | Several pressure levels and model runs: MEPS CF-NetCDF (`testdata/meps-netcdf-pl`) with an elevation axis of four levels, 1000 to 300 hPa, and a model-run axis of two runs, declared on the parent layer and inherited by its child layers: air temperature, the x/y wind components and the wind speed derived from them |
 
 GetCapabilities lists the layers in collection-id order, the order of the
 OGC API `/collections` list (#1102). Several tests take the first or the last
 named layer, so the ids decide which layers the suite tests, and every run
-tests the same ones.
+tests the same ones. A new fixture collection takes an id that sorts after
+`ets-multi` and before `ets-radar`, the last named layer. One with child
+layers must sort after `ets-multi`, because `getmap:bbox-inherited` and the
+multi-style tests take the first child layers.
+
+The suite's time and elevation classes, `time`, `raster_elevation` and
+`vector_elevation`, test only Blue Lake layers (`cite:Autos`, `cite:Terrain`,
+`cite:Lakes` and others), so they stay off. The several levels and runs of
+`ets-netcdf-levels` are tested as the other axes are: the capabilities tests
+validate their `<Dimension>` declarations, and `getmap:each-layer` and
+`getfeatureinfo:each-queryable-layer` request every child layer at its
+default level, run and time.
 
 The run requests the basic conformance class and, since GetFeatureInfo
 (#1064), the queryable class; the data-independent tests always run. Every
 fixture layer is advertised `queryable="1"`: each engine answers EDR
 position queries, though no fixture collection lists `edr`. The job summary
-lists the passed, failed and skipped tests, with
+opens with the verdict against the expected-failure list, below, then lists
+the passed, failed and skipped tests, with
 each failure's message and request. Failures in the classes that need OGC's
 test dataset, below, are collapsed to one line each, except
 `basic:gif-or-png`, `basic:options-requirements` and
@@ -545,17 +555,26 @@ the full report: TEAM Engine's CTL log, the session directory with every
 test's log and the EARL report (`teamengine-session.tar.gz`), the server log
 and the capabilities document as the server served it at startup.
 
-Test failures do not fail the job. The job fails only when the suite could
-not run: the server or TEAM Engine did not start, the server died during the
-run, the run returned no report, or no conformance class ran. The run meets
-these deliberate limits:
+`ci/wms-ets/expected-failures.txt` lists the tests expected to fail, one
+name per line, grouped by the causes below. The job fails when a test fails
+that is not on the list, with an error annotation naming it, and when the
+suite could not run: the server or TEAM Engine did not start, the server
+died during the run, the run returned no report, no conformance class ran,
+or the list is missing, repeats a name or holds a line that is not a test
+name. A listed test that did not fail is a warning in the job summary and an
+annotation: remove it from the list. A new failure is fixed, or, when it
+comes from a decision or the test dataset, added to the list under its
+cause. `summarize.py` applies the list, and `test_summarize.py`, which the
+job runs first, tests it.
+
+The run meets these deliberate limits:
 
 - One layer per GetMap (`LayerLimit` 1, #1014): the suite's GetMap requests
   with two or three layers, including its multi-layer `STYLES` tests, get an
   exception and fail, and so do its GetFeatureInfo requests whose `LAYERS`
   name two or three layers (`getfeatureinfo:two-query_layers`,
   `three-query_layers`, `less-query_layers`). Its lists naming an undefined layer or style pass: the
-  names are checked before the length.
+  names are checked before the length. Several layers per request are #1181.
 - The queryable class tests the Blue Lake dataset below, except
   `queryable:getfeatureinfo-supported`, which reads MeteoCore's capabilities
   and passes. `queryable:std-data-queryable` looks for the `BasicPolygons`,
@@ -582,7 +601,9 @@ these deliberate limits:
   does not serve. They fail.
 - GetMap accepts only `VERSION=1.3.0`. This costs nothing here: the suite
   sends 1.3.0, and GetCapabilities answers any `VERSION` with the 1.3.0
-  document, as version negotiation requires.
+  document, as version negotiation requires. GetMap without `VERSION`
+  assumes 1.3.0, so that clients that leave it out keep working, and
+  `getmap:no-version`, which expects an exception, fails.
 
 The server is a debug build, with overflow checks and debug assertions on, so
 reproduce a 500 or a dropped connection on a release build before filing it.
@@ -639,6 +660,9 @@ layers and `each-info_format` for all three formats among them. By cause:
 | 5 + class | `basic:bbox-exponential`, `bbox-pixel-interpretation`, `no-bgcolor`, `blue-bgcolor`, `transparent-true`, and `data-preconditions` | OGC's Blue Lake dataset (`cite:` layers) | expected: MeteoCore serves its own collections |
 | 3 | `queryable:std-data-queryable`, `feature_count-default`, `feature_count-1` | The same dataset | expected |
 
-With `TRANSPARENT` defaulting to `FALSE` (#1065), the next run should pass
-`getmap:bbox-outside-crs` and `transparent-default`, leaving only the
-deliberate and Blue Lake failures above.
+**With `TRANSPARENT` defaulting to `FALSE`, 2026-10-18** (ets-wms13 1.34,
+TEAM Engine 6.0.0-RC2, #1182): 177 tests, 145 passed, 19 failed directly and
+13 through a failed subtest, and the data-preconditions class.
+`getmap:bbox-outside-crs` and `transparent-default` pass. The other failures
+are the deliberate and Blue Lake ones above, and
+`ci/wms-ets/expected-failures.txt` lists them.

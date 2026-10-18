@@ -1,0 +1,41 @@
+# The ets-wms13 tests expected to fail (#1065), one name per line as the job
+# summary prints it, `prefix:local-name`. `#` starts a comment.
+#
+# The WMS ETS job fails when a test that is not listed here fails, and warns
+# in its summary about a listed test that did not fail: remove that line.
+# Add a line only for a failure that is a decision or needs a dataset the
+# fixtures do not serve, under its cause; fix everything else.
+# crates/api-wms/README.md ("OGC test suite") explains each cause.
+#
+# The list holds the failures of the 2026-10-18 run (ets-wms13 1.34, TEAM
+# Engine 6.0.0-RC2), minus the two that #1182 fixed by defaulting TRANSPARENT
+# to FALSE.
+
+# One layer per GetMap and GetFeatureInfo: `LayerLimit` 1 (#1014), by
+# decision. Several layers per request are #1181.
+getmap:two-layers
+getmap:three-layers
+getmap:two-styles
+getmap:three-styles
+getmap:styles-default-multiple-layers
+getmap:styles-default-commas
+getmap:styles-some-default
+getfeatureinfo:two-query_layers
+getfeatureinfo:three-query_layers
+getfeatureinfo:less-query_layers
+
+# GetMap without VERSION assumes 1.3.0, by decision: clients that leave it
+# out keep working.
+getmap:no-version
+
+# OGC's "Blue Lake" test dataset, the cite:* layers, which the fixtures do
+# not serve.
+main:data-preconditions
+basic:bbox-exponential
+basic:bbox-pixel-interpretation
+basic:no-bgcolor
+basic:blue-bgcolor
+basic:transparent-true
+queryable:std-data-queryable
+queryable:feature_count-default
+queryable:feature_count-1
