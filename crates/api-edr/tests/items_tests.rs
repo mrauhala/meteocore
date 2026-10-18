@@ -58,6 +58,7 @@ impl Stations {
                 y: 60.0,
             }),
             properties: Arc::new(properties),
+            related: Vec::new(),
         }
     }
 }

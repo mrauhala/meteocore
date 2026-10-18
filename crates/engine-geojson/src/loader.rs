@@ -166,6 +166,7 @@ impl GeoJsonEngine {
             id: stored.id.clone(),
             geometry: Arc::clone(&stored.geometry),
             properties: Arc::clone(&stored.properties),
+            related: Vec::new(),
         }
     }
 }

@@ -1108,6 +1108,7 @@ mod tests {
             base_url: String::new(),
             trust_proxy_headers: false,
             vector_tileset_ids: Default::default(),
+            collection_pages: Default::default(),
         }
     }
 

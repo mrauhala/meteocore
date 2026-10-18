@@ -1977,11 +1977,12 @@ fn state_dir_reload_warning(
     })
 }
 
-/// The HTML page of a 3D Tiles collection in another API, as a path below the
-/// base URL (#1137): on the shared OGC API root (mounted at the server root,
-/// `SharedApi::new("")` in `main.rs`) when Maps or Tiles serve the
-/// collection, else EDR's. `None` when neither does: WMS has no collection
-/// page, and a PVOL site never enters the Features registry.
+/// The page of a per-site radar collection, as a path below the base URL:
+/// for its 3D Tiles collection (#1137) and for the site's feature in the
+/// network's site inventory (#1143). On the shared OGC API root (mounted at
+/// the server root, `SharedApi::new("")` in `main.rs`) when Maps or Tiles
+/// serve the collection, else EDR's. `None` when neither does: WMS has no
+/// collection page, and a PVOL site never enters the Features registry.
 fn volume_collection_page(id: &str, shared_root: bool, edr: bool) -> Option<String> {
     let mount = if shared_root {
         ""
@@ -2052,6 +2053,8 @@ pub fn load_collections(
     let mut volume_quantity_styles: HashMap<String, api_3dtiles::QuantityStyles> = HashMap::new();
     // Each 3D Tiles collection's HTML page in another API (#1137).
     let mut volume_collection_pages: HashMap<String, String> = HashMap::new();
+    // Pages of the collections a feature links to as related (#1143).
+    let mut feature_collection_pages: HashMap<String, String> = HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
@@ -3513,6 +3516,18 @@ pub fn load_collections(
                             &bundle_index,
                         ));
                     }
+                    // From the registries this site entered above, not from
+                    // `apis`: "features" registers the network inventory
+                    // under the source id, never the site.
+                    let site_page = volume_collection_page(
+                        &site_id,
+                        maps_collections.contains_key(&site_id)
+                            || tiles_collections.contains_key(&site_id),
+                        edr_collections.contains_key(&site_id),
+                    );
+                    if let Some(page) = &site_page {
+                        feature_collection_pages.insert(site_id.clone(), page.clone());
+                    }
                     if collection.apis.contains(&"3dtiles".to_string()) {
                         volume_engines.insert(
                             site_id.clone(),
@@ -3533,15 +3548,7 @@ pub fn load_collections(
                             site_id.clone(),
                             api_3dtiles::quantity_styles(&site_id, &raster_params, &layer_styles),
                         );
-                        // From the registries this site entered above, not
-                        // from `apis`: "features" registers the network
-                        // inventory under the source id, never the site.
-                        if let Some(page) = volume_collection_page(
-                            &site_id,
-                            maps_collections.contains_key(&site_id)
-                                || tiles_collections.contains_key(&site_id),
-                            edr_collections.contains_key(&site_id),
-                        ) {
+                        if let Some(page) = site_page {
                             volume_collection_pages.insert(site_id.clone(), page);
                         }
                     }
@@ -4458,6 +4465,7 @@ pub fn load_collections(
             base_url: base_url.to_string(),
             trust_proxy_headers,
             vector_tileset_ids,
+            collection_pages: feature_collection_pages,
         },
         wms_state: WmsState {
             engines: map_engines,

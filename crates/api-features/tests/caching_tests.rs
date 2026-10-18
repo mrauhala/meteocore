@@ -53,6 +53,7 @@ impl MockFeatureEngine {
                     }
                     m.into()
                 },
+                related: Vec::new(),
             }],
         }
     }
@@ -114,6 +115,7 @@ fn dense_areas() -> Vec<Feature> {
                     PropertyValue::String(format!("Area {i}")),
                 )])
                 .into(),
+                related: Vec::new(),
             }
         })
         .collect()
@@ -170,6 +172,7 @@ fn build_router() -> axum::Router {
         base_url: String::new(),
         trust_proxy_headers: false,
         vector_tileset_ids: Default::default(),
+        collection_pages: Default::default(),
     })))
 }
 

@@ -34,6 +34,7 @@ fn point(id: &str, x: f64, y: f64) -> Feature {
         id: id.into(),
         geometry: Geometry::Point { x, y }.into(),
         properties: HashMap::new().into(),
+        related: Vec::new(),
     }
 }
 
@@ -55,6 +56,7 @@ impl Places {
                 }
                 .into(),
                 properties: HashMap::new().into(),
+                related: Vec::new(),
             },
         ])
     }
@@ -111,6 +113,7 @@ fn router() -> axum::Router {
         base_url: String::new(),
         trust_proxy_headers: false,
         vector_tileset_ids: Default::default(),
+        collection_pages: Default::default(),
     })))
 }
 

@@ -98,3 +98,50 @@ test('other values print as before', () => {
   assert.equal(facts.missing.text, 'Not available');
   assert.equal(facts.flag.text, 'true');
 });
+
+// The view an items page's "Use map view" takes (#1143): the map element's
+// `data-view` after a move, for MapLibre bounds west, south, east, north.
+function viewAfterMove(west, south, east, north) {
+  const status = new Element('p');
+  const element = new Element('div');
+  Object.assign(element.dataset, { quicklook: 'true', land: '', fallback: '' });
+  const data = new Element('div');
+  data.textContent = '{"type":"FeatureCollection","features":[]}';
+  const elements = { 'map-status': status, 'feature-map': element, 'map-data': data };
+  const handlers = {};
+  class MovingMap extends StubMap {
+    on(event, handler) { handlers[event] = handler; }
+    getBounds() {
+      return { getWest: () => west, getSouth: () => south, getEast: () => east, getNorth: () => north };
+    }
+  }
+  const document = {
+    readyState: 'complete',
+    documentElement: new Element('html'),
+    getElementById: id => elements[id] || null,
+    createElement: tag => new Element(tag),
+    querySelectorAll: () => [],
+    addEventListener() {},
+  };
+  const maplibregl = { Map: MovingMap, NavigationControl: class {}, ScaleControl: class {} };
+  const context = vm.createContext({
+    document, maplibregl, URL,
+    location: { href: 'https://x/items', origin: 'https://x' },
+    getComputedStyle: () => ({ getPropertyValue: () => '' }),
+  });
+  vm.runInContext(script, context);
+  handlers.moveend();
+  return element.dataset.view;
+}
+
+test('the map view is a CRS84 box, longitudes within ±180', () => {
+  assert.equal(viewAfterMove(19.123456, 59.5, 31.7, 70.25), '19.1235,59.5,31.7,70.25');
+  // Panned a turn east: the same box.
+  assert.equal(viewAfterMove(379.123456, 59.5, 391.7, 70.25), '19.1235,59.5,31.7,70.25');
+  // Across the antimeridian: west > east, as Features `bbox` takes it.
+  assert.equal(viewAfterMove(170, -20, 190, 10), '170,-20,-170,10');
+  // Wider than the world: all of it.
+  assert.equal(viewAfterMove(-300, -85, 200, 85), '-180,-85,180,85');
+  // An edge on the antimeridian keeps its side.
+  assert.equal(viewAfterMove(100, 0, 180, 10), '100,0,180,10');
+});

@@ -55,6 +55,9 @@ pub struct Contribution {
     /// because it omits a native CRS with no OGC URI rather than mislabel it,
     /// and a later Features block's CRS84 must not stand in for it.
     pub claims: &'static [&'static str],
+    /// What the collection's HTML overview says of its feature items
+    /// (#1143), from the block serving them.
+    pub items: Option<workbench::ItemsOverview>,
 }
 
 /// OpenAPI paths and components a block adds to the shared definition.
@@ -522,6 +525,7 @@ async fn api_docs_asset(Path(asset): Path<String>) -> Response {
 struct Merged {
     config: CollectionConfig,
     metadata: Value,
+    items: Option<workbench::ItemsOverview>,
     bbox: Option<[f64; 4]>,
     time: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
@@ -530,12 +534,13 @@ struct Merged {
 fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
     let mut contributions = contributions.into_iter();
     let first = contributions.next()?;
-    let (config, mut fields, mut links, mut bbox, mut time) = (
+    let (config, mut fields, mut links, mut bbox, mut time, mut items) = (
         first.config,
         first.fields,
         first.links,
         first.bbox,
         first.time,
+        first.items,
     );
     let mut claimed: Vec<&str> = first.claims.to_vec();
     // Discovery bounds follow the advertised extent: they come from the block
@@ -568,6 +573,7 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
         }
         links.extend(contribution.links);
         claimed.extend(contribution.claims);
+        items = items.or(contribution.items);
     }
     let mut all = vec![json!({
         "href": format!("{root}/collections/{}", config.id),
@@ -580,6 +586,7 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
     Some(Merged {
         config,
         metadata,
+        items,
         bbox,
         time,
     })
@@ -700,7 +707,7 @@ async fn collection(
     };
     with_vary(match wanted {
         Wanted::Json => Json(merged.metadata).into_response(),
-        Wanted::Html => Html(workbench::collection_html(
+        Wanted::Html => Html(workbench::collection_page(
             Surface {
                 base,
                 root,
@@ -708,6 +715,7 @@ async fn collection(
             },
             &merged.metadata,
             merged.config.license.as_ref(),
+            merged.items.as_ref(),
         ))
         .into_response(),
     })
@@ -726,6 +734,7 @@ mod tests {
             bbox: None,
             time: None,
             claims: &[],
+            items: None,
         }
     }
 
@@ -772,6 +781,26 @@ mod tests {
             .unwrap()
             .metadata;
         assert_eq!(merged["storageCrs"], crs84);
+    }
+
+    /// The items overview comes from the block that serves the items
+    /// (#1143), whatever its place in block order.
+    #[test]
+    fn merge_keeps_the_items_overview_of_the_block_serving_items() {
+        let overview = workbench::ItemsOverview {
+            filterables: vec!["name".into()],
+            ..Default::default()
+        };
+        let mut features = contribution("a", json!({}), vec![]);
+        features.items = Some(overview.clone());
+        let merged = merge(
+            vec![contribution("a", json!({}), vec![]), features],
+            "https://x",
+        )
+        .unwrap();
+        assert_eq!(merged.items, Some(overview));
+        let merged = merge(vec![contribution("a", json!({}), vec![])], "https://x").unwrap();
+        assert_eq!(merged.items, None);
     }
 
     #[test]

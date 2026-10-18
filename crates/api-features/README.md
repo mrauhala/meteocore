@@ -70,8 +70,8 @@ imply a regular sampling grid.
 | `/features/conformance` | ✓ | JSON + HTML |
 | `/features/collections` | ✓ | JSON + HTML; Common Part 4 search |
 | `/features/collections/{id}` | ✓ | JSON + HTML; `extent.spatial` from `spatial_extent`, `extent.temporal` from `temporal_extent` (omitted when `None`); `keywords`, `license` link (typed `text/html` unless `[collections.license] type` says otherwise, #964); a `tilesets-vector` link when the Tiles service registered the collection for vector tiles (listing `tiles` in `apis` is not enough: a nowcast renders only map tiles) |
-| `/features/collections/{id}/items` | ✓ | GeoJSON `FeatureCollection` or HTML with `numberMatched`, `numberReturned`, `timeStamp`, `self`/`next`/`prev` links that carry the caller's filters and sort |
-| `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links; takes only `f` and `crs` — any other parameter (`bbox-crs`, `properties`, a filter, a duplicate) → 400 (#681) |
+| `/features/collections/{id}/items` | ✓ | GeoJSON `FeatureCollection` or HTML with `numberMatched`, `numberReturned`, `timeStamp`, `self`/`next`/`prev` links that carry the caller's filters and sort; on a page past the end, `prev` is the last page with features, not the empty page before it (#1143) |
+| `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links, and `related` links where the feature leads on (see [Labels, columns and related links](#labels-columns-and-related-links)); takes only `f` and `crs` — any other parameter (`bbox-crs`, `properties`, a filter, a duplicate) → 400 (#681) |
 | `/features/collections/{id}/queryables`, `/schema`, `/sortables` | ✗ | not routed |
 
 On the landing page, `/conformance` and `/collections/{id}`, an `f` given
@@ -301,9 +301,42 @@ layer but has no effect on this engine.
 | PostGIS stations | one station (Point) from the cached location set, at most `[postgis] max_locations` (default 200 000; a list cut there degrades `/health`, #1061) | station point inside box (in memory, not SQL) | – (400: no time dimension) | – (400) | ✓ configured `stations.property_cols`, even with no stations loaded (#1024), + names the loaded rows carry | ✓ | – | ✓ |
 | PostGIS events | — no `FeatureEngine` (EDR area + WMS only; Features items = #503) — | | | | — | | | |
 | BUFR | one station (Point) from the observation store; properties `wigos_station_identifier`, `name`, `elevation`, `first_report`, `last_report`, `report_count` | station point inside box | station has ≥ 1 report inside the interval; EDR `/locations?datetime=` lists the same stations, from the same code (#932) | ✓ last_report, first_report, report_count, name | ✓ name, wigos_station_identifier, elevation, first_report, last_report, report_count | ✓ | ✓ (oldest → newest report held) | ✓ (snapshot version) |
-| ODIM PVOL network | one radar site (Point) — site inventory | site point inside box | sites with a volume inside the interval; each site collection's EDR `/locations?datetime=` lists its site by the same rule (#932) | – (400) | ✓ all site inventory properties (including quantities/elevation_angles lists) | ✓ | – | ✓ (inventory-sensitive) |
+| ODIM PVOL network | one radar site (Point) — site inventory | site point inside box | sites with a volume inside the interval; each site collection's EDR `/locations?datetime=` lists its site by the same rule (#932) | – (400) | ✓ all site inventory properties (including quantities/elevation_angles lists) | ✓ | ✓ (earliest → latest retained volume, #1143) | ✓ (inventory-sensitive) |
 | Nowcast | one tracked storm cell (Point + fact-sheet properties) from one generation | cell centroid inside box | with none: latest generation; with `datetime`: the newest retained generation inside the interval (~4 h history) | ✓ significance, significance_rank, max_dbz, area_km2, track_age, speed_ms, bearing_deg, intensity_trend_dbz_min + lightning / impact / radar extras when those sources are wired | ✓ all base cell properties except `significance_contributions` + wired lightning/impact/radar groups | ✓ | ✓ (retained history span) | ✓ |
 | GeoTIFF, GRIB, QueryData, Zarr, ODIM composite, ODIM PVOL site | — no `FeatureEngine` (EDR / Maps only) — | | | | — | | | |
+
+### Labels, columns and related links
+
+Three `FeatureEngine` hooks and one `Feature` field (#1143) let an engine say
+what a feature is called, which properties a listing shows first, what its
+items are and where a feature leads. Defaults keep the generic behaviour.
+
+- **`label(&Feature)`** — served as the feature's `title` property, in
+  GeoJSON and HTML alike (and EDR `items`), unless the feature has a `title`
+  of its own. The label is built from the feature's own values; it adds none.
+  The HTML label rule below then picks it up; the id stays as secondary text.
+- **`summary_properties()`** — the listing's first columns (up to four, those
+  this page has values for). Empty falls back to `sortables`, then the other
+  properties alphabetically, skipping label keys, `id`, `collection`,
+  `latitude`, `longitude` and any property that only repeats the feature id.
+- **`items_description()`** — one line on the collection's HTML overview,
+  where the collection's description could mislead.
+- **`Feature::related`** — resources a feature leads to, named, not
+  addressed: `RelatedTarget::Collection(id)` or `RelatedTarget::EdrLocation(id)`.
+  The API resolves them to `rel="related"` links below the base URL, and
+  leaves out one it has no route for: a collection page only from the
+  server's `FeaturesState::collection_pages` (per-site radar collections: the
+  shared root when Maps or Tiles serve the site, else EDR), an EDR location
+  only when the feature's collection lists `edr` in `apis`. HTML links them as
+  buttons in the item page's aside, to the HTML view.
+
+| Engine | Label (`title`) | First columns | Overview line | Related |
+|---|---|---|---|---|
+| CAP | `event · areaDesc`, the parts the area has | `severity`, `onset`, `active_until`, then `awareness_level` or `urgency` | – | – |
+| Nowcast | `Rank 2 · very severe · max 52 dBZ` (`significance_rank`, `severity`, `max_dbz`; `· likely clutter` when flagged). The rank orders a heuristic significance and the class is the engine's, neither a warning | `significance`, `severity`, `max_dbz`, `area_km2` | – | – |
+| ODIM PVOL network | its `name` (generic rule) | fallback | "Radar site inventory: one point per radar. Each site's volumes are in its own collection." | the site's own collection |
+| BUFR, CSV, PostGIS stations | `name` (generic rule) | fallback (BUFR: its sortables) | – | the station's EDR location, when the collection serves EDR |
+| GeoJSON | generic rule | fallback | – | – |
 
 PostGIS checks timestamp mappings and point/SRID requirements before publishing
 data. A schema mismatch blocks data queries and degrades collection health;
@@ -389,18 +422,35 @@ remain available. See
 ### HTML workbench
 
 Metadata and items share the `api-common::workbench` navigation, themes and
-current-resource JSON switch. The item query builder offers bbox/paging plus
-temporal, exact property and sort controls advertised by the selected engine.
-Repeated predicates and intentional empty predicates from an existing URL are
-preserved. Collection search uses Common `q`/`query`; item queries keep their
-existing Features semantics.
+current-resource JSON switch. The item data request builder (#1143) is open
+when the request filters or sorts, when it was rejected, or when an Overview
+chip names it in the URL fragment (`#filter=<name>`, `#sort=<name>`; never a
+query parameter, which `/items` would reject). Its groups, in order: an exact
+property predicate (the engine's filterables) with the applied ones; time,
+two UTC `datetime-local` pickers that fill the `datetime` field as
+`start/end`, `..` for an open end, the field taking any other form typed with
+its examples beside it; area, a `bbox` field and **Use map view**, which takes
+the items map's current view as a CRS84 box (west > east across the
+antimeridian); order, a sortable property and a direction joined into
+`sortby` (a multi-key `sortby` stays selected as given); paging; and the
+submit button last. The time group is there whenever `/items` takes
+`datetime` (`has_time_dimension`), whether or not the collection advertises
+a temporal extent. Repeated predicates and intentional empty predicates from
+an existing URL are preserved. Collection search uses Common `q`/`query`;
+item queries keep their existing Features semantics.
+
+The collection Overview, on `/features` and at the shared root, lists the
+properties its items page filters by and sorts by as two chip rows, each chip
+opening that page with the builder at the property, and the engine's
+`items_description` line under the description.
 
 Individual items show every property with its JSON type, distinguishing null,
 empty strings, arrays and nested objects. Flat arrays render as visible wrapping
 chips, including in selected listing columns; empty arrays are labelled explicitly.
 Nested arrays and objects retain expandable JSON views. The renderer does not assign weather
 semantics, units, severity, expiry state or observation times based on property
-names. Display titles use case-insensitive common label keys in priority order:
+names. Display titles use case-insensitive common label keys in priority order (an
+engine's own label arrives as `title`):
 `name`, `label`, `title`, `display_name`, `displayname`, `nimi`, `namn`, `nom`,
 `nombre`, `naam`, `bezeichnung`, then the feature ID. Coordinates are rounded to
 five decimal places in the summary; raw geometry retains full precision.
@@ -412,9 +462,11 @@ nothing. Below 600 px the property table stacks: key and type on one line, the
 value below at full width.
 
 Listings derive selectable columns from response properties and advertised
-filter fields, defaulting to the first four non-null scalar fields other than
-label keys. Up to eight property columns can be selected, with a per-collection
-session preference. Missing properties are shown as **Absent**, separately from
+filter fields, defaulting to the engine's choice (see
+[Labels, columns and related links](#labels-columns-and-related-links)).
+Up to eight property columns can be selected; the choice is kept in this
+browser's `localStorage` by collection id, so `/features/…` and the shared
+root share it, and the page says so. Missing properties are shown as **Absent**, separately from
 JSON null. Stored columns survive pages where those fields are absent. Column
 choices never change API requests or JSON output. Without JavaScript, the default
 columns, paging and item links still work.
@@ -425,7 +477,8 @@ available for wide sets of selected columns. The map sits to the right on wide
 screens; below 1100 px it comes before the table, 240 px tall. Paging and spaced page-size
 controls appear above and below the table. An empty offset with
 matches offers a first-page link that retains filters, repeated/empty predicates
-and sorting. The request builder and applied/draft URL tools are collapsible;
+and sorting, its **Previous** link leads to the last page with features, and
+its map says "No features on this page". The request builder and applied/draft URL tools are collapsible;
 builder and advanced-filter disclosure choices persist per collection;
 applied filters stay visible and the global JSON switch retains the applied URL.
 

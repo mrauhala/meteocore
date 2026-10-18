@@ -316,6 +316,7 @@ mod tests {
                 holes: vec![],
             }),
             properties: Arc::new(props),
+            related: Vec::new(),
         }
     }
 

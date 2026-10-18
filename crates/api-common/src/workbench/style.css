@@ -2991,3 +2991,17 @@ h1{overflow-wrap:anywhere}
   .resource-page #request-context>summary{display:none}
   .resource-page .catalog-request .request-content{padding-top:0}
 }
+
+/* Features items: the guided data request builder, the Overview's filter and
+   sort chips, a feature's next steps (#1143). */
+.builder-group{border:0;padding:0;margin:0 0 18px;min-width:0}
+.builder-group>legend{padding:0;margin-bottom:8px;font-weight:600}
+.builder-group .field{margin-bottom:0}
+.builder-area{display:flex;flex-wrap:wrap;align-items:end;gap:8px 12px}
+.builder-area .field{flex:1;min-width:220px}
+.builder-area>.btn{margin-bottom:6px}
+.builder-actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;margin:18px 0}
+.items-note{font-weight:500}
+.item-fields .chip-row{display:flex;flex-wrap:wrap;gap:6px}
+.related-links{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.related-links .btn{white-space:normal}

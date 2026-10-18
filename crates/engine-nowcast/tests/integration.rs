@@ -1848,6 +1848,7 @@ fn impact_context_lifts_a_populated_cell_above_a_stronger_one() {
                     holes: vec![],
                 }),
                 properties: Arc::new(props),
+                related: Vec::new(),
             };
             Ok(FeaturePage {
                 number_matched: 1,
@@ -2043,6 +2044,7 @@ fn wiring_a_source_adds_exactly_its_sortables() {
                         holes: vec![],
                     }),
                     properties: Arc::new(props),
+                    related: Vec::new(),
                 }],
                 number_matched: 1,
                 number_returned: 1,
@@ -2991,6 +2993,7 @@ impl ds_core::feature_engine::FeatureEngine for ReloadAreas {
                         .into_iter()
                         .collect(),
                 ),
+                related: Vec::new(),
             }],
             number_matched: 1,
             number_returned: 1,
