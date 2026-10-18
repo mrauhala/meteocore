@@ -252,7 +252,9 @@ need no reload pruning.
   It deliberately survives reloads so old and new render tasks share one limit.
   The 32-byte/output-pixel estimate covers output buffers/scratch, not source
   decoding or resident caches. An RGB composite render adds 16 bytes per
-  output pixel for each band past the first (`acquire_raster_planes`). At the
+  output pixel for each band past the first (`acquire_raster_planes`). A WMS
+  GetMap of several layers adds 4 bytes per output pixel for the image of
+  the layers below, once (`acquire_layered_raster`). At the
   default, the 8000×8000 format limit exceeds the memory budget and returns
   503; operators can raise the budget explicitly.
   Temporary memory exhaustion queues within the same deadline instead of failing

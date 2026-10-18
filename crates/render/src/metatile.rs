@@ -319,6 +319,46 @@ pub enum MetaTile {
     Fallback,
 }
 
+/// Outcome of a meta-tiled view before encoding, from [`assemble_metatiled`]
+/// and [`assemble_metatiled_composite`]: what [`MetaTile`] is made of. A WMS
+/// GetMap of several layers draws each layer's assembled pixels over the
+/// last and encodes the result once (#1181).
+pub enum MetaTilePixels {
+    /// The assembled `width × height` RGBA view, with no background, and
+    /// the phase timing (`encode` is 0: nothing is encoded yet).
+    Image { rgba: Vec<u8>, stats: MetaTileStats },
+    /// Every covered pixel is nodata, as [`MetaTile::Empty`].
+    Empty { stats: MetaTileStats },
+    /// Meta-tiling declined, as [`MetaTile::Fallback`].
+    Fallback,
+}
+
+impl MetaTilePixels {
+    /// The view encoded in `format`, first composited over `background`
+    /// when one is given, its encode time in the stats.
+    fn encode(
+        self,
+        width: u32,
+        height: u32,
+        format: ImageFormat,
+        background: Option<[u8; 3]>,
+    ) -> Result<MetaTile, DataServerError> {
+        Ok(match self {
+            MetaTilePixels::Image {
+                mut rgba,
+                mut stats,
+            } => {
+                let t_encode = Instant::now();
+                let bytes = crate::encode_rgba(&mut rgba, width, height, format, background)?;
+                stats.encode = t_encode.elapsed();
+                MetaTile::Image { bytes, stats }
+            }
+            MetaTilePixels::Empty { stats } => MetaTile::Empty { stats },
+            MetaTilePixels::Fallback => MetaTile::Fallback,
+        })
+    }
+}
+
 /// Render a supported projected GetMap as cached 256×256 tiles, assembled
 /// affinely in the requested CRS. Geographic/unknown projections decline.
 ///
@@ -347,14 +387,41 @@ pub fn render_metatiled<F>(
 where
     F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<RasterTile, DataServerError>,
 {
+    assemble_metatiled(
+        bbox_deg,
+        output_crs,
+        width,
+        height,
+        prefix,
+        colormap,
+        cache,
+        render_tile,
+    )?
+    .encode(width, height, format, background)
+}
+
+/// [`render_metatiled`]'s view before encoding: the assembled RGBA pixels,
+/// with no background, from the same cached tiles.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_metatiled<F>(
+    bbox_deg: [f64; 4],
+    output_crs: &OutputCrs,
+    width: u32,
+    height: u32,
+    prefix: &TileKeyPrefix,
+    colormap: &dyn ColorMap,
+    cache: &TilePixelCache,
+    render_tile: F,
+) -> Result<MetaTilePixels, DataServerError>
+where
+    F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<RasterTile, DataServerError>,
+{
     render_metatiled_with(
         bbox_deg,
         output_crs,
         width,
         height,
         prefix,
-        format,
-        background,
         cache,
         |tbbox, tw, th, tile_output, times| {
             let t_engine = Instant::now();
@@ -393,14 +460,41 @@ pub fn render_metatiled_composite<F>(
 where
     F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<Vec<RasterTile>, DataServerError>,
 {
+    assemble_metatiled_composite(
+        bbox_deg,
+        output_crs,
+        width,
+        height,
+        prefix,
+        spec,
+        cache,
+        render_bands,
+    )?
+    .encode(width, height, format, background)
+}
+
+/// [`render_metatiled_composite`]'s view before encoding: the assembled
+/// RGBA pixels, with no background, from the same cached tiles.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_metatiled_composite<F>(
+    bbox_deg: [f64; 4],
+    output_crs: &OutputCrs,
+    width: u32,
+    height: u32,
+    prefix: &TileKeyPrefix,
+    spec: &CompositeSpec,
+    cache: &TilePixelCache,
+    render_bands: F,
+) -> Result<MetaTilePixels, DataServerError>
+where
+    F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<Vec<RasterTile>, DataServerError>,
+{
     render_metatiled_with(
         bbox_deg,
         output_crs,
         width,
         height,
         prefix,
-        format,
-        background,
         cache,
         |tbbox, tw, th, tile_output, times| {
             let t_engine = Instant::now();
@@ -422,22 +516,19 @@ struct TileTimes {
     colorize: Duration,
 }
 
-/// The meta-tiling behind [`render_metatiled`] and
-/// [`render_metatiled_composite`]. `tile_pixels` renders one uncached tile
+/// The meta-tiling behind [`assemble_metatiled`] and
+/// [`assemble_metatiled_composite`]. `tile_pixels` renders one uncached tile
 /// to its `TILE_PX × TILE_PX` RGBA pixels, or `None` when all of them are
 /// nodata, adding its engine and colorize time to the [`TileTimes`].
-#[allow(clippy::too_many_arguments)]
 fn render_metatiled_with<F>(
     bbox_deg: [f64; 4],
     output_crs: &OutputCrs,
     width: u32,
     height: u32,
     prefix: &TileKeyPrefix,
-    format: ImageFormat,
-    background: Option<[u8; 3]>,
     cache: &TilePixelCache,
     tile_pixels: F,
-) -> Result<MetaTile, DataServerError>
+) -> Result<MetaTilePixels, DataServerError>
 where
     F: Fn(
         [f64; 4],
@@ -452,11 +543,11 @@ where
         || height == 0
         || !(w.is_finite() && s.is_finite() && e.is_finite() && n.is_finite())
     {
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
 
     let Some(grid) = Grid::for_output(output_crs) else {
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     };
     let (origin_x, origin_y) = grid.origin();
     // Keep the viewport exact. Only Web Mercator tile selection is clamped
@@ -469,11 +560,11 @@ where
         .iter()
         .all(|v| v.is_finite())
     {
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
     if !(east_m > west_m && north_m > south_m) {
         // Antimeridian crossing or degenerate extent — let the caller render directly.
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
 
     // Snap to the ladder using the finer of the two axis resolutions (so neither
@@ -484,7 +575,7 @@ where
         // Requested resolution is finer than the deepest ladder step (~9 mm/px —
         // an absurd over-zoom). Meta-tiling would have to upscale; render
         // directly at the exact requested resolution instead.
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
     let span = TILE_PX as f64 * grid.level_res(level); // tile edge length in metres
 
@@ -509,14 +600,14 @@ where
         .iter()
         .any(|v| !v.is_finite() || v.abs() > (i64::MAX / (2 * TILE_PX as i64)) as f64)
     {
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
     let [col0, col1, row0, row1] = indices.map(|v| v as i64);
     let ncols = (col1 - col0 + 1).max(1) as usize;
     let nrows = (row1 - row0 + 1).max(1) as usize;
     if ncols.saturating_mul(nrows) > tile_budget(width, height) {
         BUDGET_DECLINES.fetch_add(1, Ordering::Relaxed);
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
 
     // Render or fetch each covering tile's RGBA pixels. `None` = an all-nodata
@@ -576,7 +667,7 @@ where
                                 // The tile's edges miss the valid area
                                 // reaching into it. Preserve the direct
                                 // path's handling.
-                                return Ok(MetaTile::Fallback);
+                                return Ok(MetaTilePixels::Fallback);
                             };
                             let tile_output = OutputCrs::Projected {
                                 crs: crs.clone(),
@@ -631,7 +722,7 @@ where
     let tile_loop = t_loop.elapsed();
 
     if !any_data {
-        return Ok(MetaTile::Empty {
+        return Ok(MetaTilePixels::Empty {
             stats: MetaTileStats {
                 tiles: tiles_count,
                 misses,
@@ -670,11 +761,8 @@ where
     }
     let assemble = t_assemble.elapsed();
 
-    let t_encode = Instant::now();
-    let bytes = crate::encode_rgba(&mut out, width, height, format, background)?;
-    let encode = t_encode.elapsed();
-    Ok(MetaTile::Image {
-        bytes,
+    Ok(MetaTilePixels::Image {
+        rgba: out,
         stats: MetaTileStats {
             tiles: tiles_count,
             misses,
@@ -682,7 +770,7 @@ where
             engine: times.engine,
             colorize: times.colorize,
             assemble,
-            encode,
+            encode: Duration::ZERO,
         },
     })
 }
@@ -991,6 +1079,60 @@ mod tests {
         .unwrap();
         let (hits, _) = cache.stats();
         assert!(hits > 0, "overlapping viewport should hit cached tiles");
+    }
+
+    /// `render_metatiled` is `assemble_metatiled` encoded: the assembled
+    /// pixels, from the same cached tiles, encode to the same bytes, with
+    /// and without a background (#1181).
+    #[test]
+    fn assembled_pixels_encode_to_the_rendered_view() {
+        let cache = TilePixelCache::new(64);
+        let prefix = TileKeyPrefix {
+            layer: "l".into(),
+            parameter: None,
+            style: "default".into(),
+            time: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+        };
+        let bbox = [20.0, 58.0, 30.0, 64.0];
+        for background in [None, Some([0x33, 0x66, 0x99])] {
+            let MetaTile::Image { bytes, .. } = render_metatiled(
+                bbox,
+                &OutputCrs::WebMercator,
+                300,
+                200,
+                &prefix,
+                &SolidRed,
+                ImageFormat::Png,
+                background,
+                &cache,
+                solid_tile,
+            )
+            .unwrap() else {
+                panic!("expected an image");
+            };
+            let MetaTilePixels::Image { mut rgba, stats } = assemble_metatiled(
+                bbox,
+                &OutputCrs::WebMercator,
+                300,
+                200,
+                &prefix,
+                &SolidRed,
+                &cache,
+                |_, _, _, _| panic!("every tile is cached"),
+            )
+            .unwrap() else {
+                panic!("expected pixels");
+            };
+            assert_eq!(rgba.len(), 300 * 200 * 4);
+            assert_eq!(stats.encode, Duration::ZERO, "nothing encoded yet");
+            assert_eq!(
+                crate::encode_rgba(&mut rgba, 300, 200, ImageFormat::Png, background).unwrap(),
+                bytes
+            );
+        }
     }
 
     /// #993: an engine error (a deadline, a transient read) fails the

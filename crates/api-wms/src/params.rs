@@ -26,12 +26,13 @@ pub const MAX_MAP_PIXELS: u64 = 64_000_000;
 /// `<MaxHeight>` (#1012).
 pub const MAX_MAP_DIMENSION: u32 = 8000;
 
-/// Most layers one GetMap may name in `LAYERS`, advertised as the
-/// `<Service>`'s `<LayerLimit>`. GetMap renders exactly one layer — it reads
-/// only the first name — so raise this only together with layer composition.
-/// The handler refuses more only after checking every named layer and
-/// style, so an undefined one is `LayerNotDefined` / `StyleNotDefined`.
-pub const LAYER_LIMIT: usize = 1;
+/// Most layers one GetMap or GetFeatureInfo may name in `LAYERS`, advertised
+/// as the `<Service>`'s `<LayerLimit>` (#1181). GetMap draws them one at a
+/// time, each over the ones listed before it, under one render deadline, so
+/// every layer adds a whole render's time to it. The handler refuses more
+/// only after checking every named layer and style, so an undefined one is
+/// `LayerNotDefined` / `StyleNotDefined`.
+pub const LAYER_LIMIT: usize = 5;
 
 /// Supported CRS identifiers.
 const SUPPORTED_CRS: &[&str] = &["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"];
@@ -221,16 +222,12 @@ impl<'de> Deserialize<'de> for WmsQuery {
 
 /// Validated GetMap parameters.
 pub struct GetMapParams {
-    /// The first `LAYERS` name: the layer GetMap renders.
-    pub layer: String,
-    /// Its style, `default` for an empty `STYLES` value.
-    pub style: String,
-    /// The further `(layer, style)` pairs of a request naming several layers,
-    /// in `LAYERS` order. GetMap renders one layer ([`LAYER_LIMIT`]): the
-    /// handler checks each pair names a layer and style it serves, so an
-    /// undefined one gets its WMS 1.3.0 Table E.1 code, then refuses the
-    /// request.
-    pub other_layers: Vec<(String, String)>,
+    /// The `(layer, style)` pairs of `LAYERS` and `STYLES`, in `LAYERS`
+    /// order, the bottom layer first (WMS 1.3.0 §7.3.3.3); never empty. A
+    /// style is `default` for an empty `STYLES` value. The handler checks
+    /// each pair names a layer and style it serves, so an undefined one gets
+    /// its WMS 1.3.0 Table E.1 code, then refuses more than [`LAYER_LIMIT`].
+    pub layers: Vec<(String, String)>,
     pub crs: String,
     /// Bbox in WGS84 [west, south, east, north], normalized from CRS axis order.
     /// For EPSG:3067/3035 the inverse-projected envelope of the projected box
@@ -269,7 +266,8 @@ pub struct GetFeatureInfoParams {
     /// differently.
     pub map: GetMapParams,
     /// The `QUERY_LAYERS` names, in request order, each once. The handler
-    /// checks each is one of the map's `LAYERS`.
+    /// checks each is one of the map's `LAYERS`, and answers for each in
+    /// this order.
     pub query_layers: Vec<String>,
     /// The queried pixel's column, `0..map.width`.
     pub i: u32,
@@ -379,7 +377,8 @@ impl WmsQuery {
             .unwrap_or("");
         // One layer takes the whole STYLES value as its style, as it always
         // has. Several pair with STYLES' values one to one (WMS 1.3.0
-        // §7.3.3.4); an empty STYLES gives each its default.
+        // §7.3.3.4): `STYLES=a,,b` gives the second layer its default, and
+        // an empty STYLES, or one of commas only, gives each its default.
         let styles: Vec<&str> = if layers.len() == 1 || styles_str.is_empty() {
             vec![styles_str; layers.len()]
         } else {
@@ -394,12 +393,14 @@ impl WmsQuery {
             )));
         }
         // An empty style is the layer's default.
-        let mut pairs = layers.iter().zip(&styles).map(|(&layer, &style)| {
-            let style = if style.is_empty() { "default" } else { style };
-            (layer.to_string(), style.to_string())
-        });
-        let (layer, style) = pairs.next().expect("split yields at least one layer");
-        let other_layers: Vec<(String, String)> = pairs.collect();
+        let layers: Vec<(String, String)> = layers
+            .iter()
+            .zip(&styles)
+            .map(|(&layer, &style)| {
+                let style = if style.is_empty() { "default" } else { style };
+                (layer.to_string(), style.to_string())
+            })
+            .collect();
 
         // CRS
         let crs = self
@@ -474,8 +475,8 @@ impl WmsQuery {
         let time = self.time.as_deref().map(parse_time).transpose()?;
 
         // ELEVATION — a single vertical level. WMS 1.3.0 permits a
-        // comma-separated list, but this server renders one layer per
-        // request, so a list is rejected with an explicit message. Like a
+        // comma-separated list, but this server draws each layer at one
+        // level, so a list is rejected with an explicit message. Like a
         // malformed TIME, a value that is no single level is an invalid
         // sample dimension value: `InvalidDimensionValue` (Table E.1).
         let elevation = match self
@@ -515,9 +516,7 @@ impl WmsQuery {
             .transpose()?;
 
         Ok(GetMapParams {
-            layer,
-            style,
-            other_layers,
+            layers,
             crs,
             bbox,
             width,
@@ -1139,7 +1138,7 @@ mod tests {
     #[test]
     fn get_feature_info_reads_the_map_part_and_its_own_parameters() {
         let p = get_feature_info(&[("QUERY_LAYERS", "radar, radar")]).unwrap();
-        assert_eq!(p.map.layer, "radar");
+        assert_eq!(p.map.layers, [("radar".to_string(), "default".to_string())]);
         assert_eq!((p.map.width, p.map.height), (64, 32));
         assert_eq!(p.query_layers, ["radar"], "named once");
         assert_eq!((p.i, p.j), (63, 31));
@@ -1202,6 +1201,49 @@ mod tests {
                     Err(WmsError::MissingParameterValue(msg)) if msg.ends_with(name)
                 ),
                 "{name} omitted"
+            );
+        }
+    }
+
+    /// WMS 1.3.0 §7.3.3.4: `STYLES` pairs with `LAYERS` by position. An
+    /// empty `STYLES`, or one of commas only, gives every layer its default,
+    /// and an empty value one layer its default; another count of values is
+    /// `InvalidParameterValue`. One layer takes the whole value (#1181).
+    #[test]
+    fn styles_pair_with_layers_by_position() {
+        let pairs = |layers: &str, styles: &str| {
+            let mut query = get_map_query("image/png", None);
+            query.layers = Some(layers.into());
+            query.styles = Some(styles.into());
+            query.validate_get_map().map(|p| {
+                p.layers
+                    .into_iter()
+                    .map(|(layer, style)| format!("{layer}:{style}"))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(pairs("a,b", "").unwrap(), ["a:default", "b:default"]);
+        assert_eq!(
+            pairs("a,b,c,d", ",,,").unwrap(),
+            ["a:default", "b:default", "c:default", "d:default"]
+        );
+        assert_eq!(
+            pairs("a,b,a,c,d", "s,,s,,").unwrap(),
+            ["a:s", "b:default", "a:s", "c:default", "d:default"]
+        );
+        assert_eq!(pairs("a,b", "s,t").unwrap(), ["a:s", "b:t"]);
+        assert_eq!(
+            pairs("a", "s,t").unwrap(),
+            ["a:s,t"],
+            "one layer, one style"
+        );
+        for (layers, styles) in [("a,b", "s"), ("a,b", "s,t,u"), ("a,b,c", ",")] {
+            assert!(
+                matches!(
+                    pairs(layers, styles),
+                    Err(WmsError::InvalidParameterValue(_))
+                ),
+                "LAYERS={layers} STYLES={styles}"
             );
         }
     }

@@ -414,8 +414,10 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    legend. They key every cache on the composite's name and its resolved
    time, pass that same time to `get_raster_tiles`, compose with
    `ds_render::render_composite_tiles` (meta-tiles:
-   `render_metatiled_composite`), and render nothing when it is `None`
-   (no shared scan).
+   `render_metatiled_composite`; WMS draws their RGBA forms,
+   `render_composite_tiles_rgba` and `assemble_metatiled_composite`, and
+   encodes once with the other layers), and render nothing when it is
+   `None` (no shared scan).
    **If the engine retains model runs** (non-empty
    `RasterInfo.reference_times`), it MUST likewise override
    `MapEngine::resolve_reference_time` with the SAME run selection
@@ -597,7 +599,7 @@ one never implies the other.
 |---|---|---|---|
 | `MAX_MAP_DIMENSION` / `MAX_MAP_PIXELS` (api-wms `params.rs`; `api_common::map_frame` for Maps and map tiles) | output px per side / `width × height` | 8000 / 64 M | 400 at validation (WMS `InvalidParameterValue`, Maps/Tiles `BadRequest`): "… must not exceed 8000" |
 | `api_tiles::params::TILE_SIZE` | output, a map tile's default (`width`/`height`/`scale-denominator` resize it within the caps above) | 256 × 256 | never |
-| `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss; an RGB composite adds 16 B per band plane past the first (`acquire_raster_planes`) | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
+| `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss; an RGB composite adds 16 B per band plane past the first (`acquire_raster_planes`); a WMS GetMap of several layers adds 4 B for the image below, once (`acquire_layered_raster`) | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
 | `engine_geotiff::reader::MAX_MAP_PIXELS` | native source px of one full-resolution map read | 64 M | Maps/Tiles 400 "Invalid parameter: Map render source area N pixels exceeds maximum 64000000."; WMS red error tile, HTTP 200 `x-cache: ERROR` |
 | `engine_geotiff::decode_budget::BUDGET` (a `ByteBudget`) | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
 | engine-zarr `read_budget::BUDGET` (over a `ByteBudget`) | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |

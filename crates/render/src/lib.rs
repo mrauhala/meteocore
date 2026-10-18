@@ -19,14 +19,14 @@ pub use colormap::{
 };
 pub use composite::{
     compose_rgb, compose_tiles, composite_legend_json, composite_units, render_composite,
-    render_composite_legend, render_composite_tiles, ChannelSource, ChannelSpec, CompositeSpec,
-    COMPOSITE_STYLE,
+    render_composite_legend, render_composite_tiles, render_composite_tiles_rgba, ChannelSource,
+    ChannelSpec, CompositeSpec, COMPOSITE_STYLE,
 };
-pub use encode::{encode_jpeg, encode_png, encode_webp, flatten_onto};
+pub use encode::{draw_over, encode_jpeg, encode_png, encode_webp, flatten_onto};
 pub use layer_style::{resolve_layer_style, LayerStyle, LayerStyleError};
 pub use metatile::{
-    render_metatiled, render_metatiled_composite, MetaTile, MetaTileStats, TileKeyPrefix,
-    TilePixelCache,
+    assemble_metatiled, assemble_metatiled_composite, render_metatiled, render_metatiled_composite,
+    MetaTile, MetaTilePixels, MetaTileStats, TileKeyPrefix, TilePixelCache,
 };
 pub use palette::{
     builtin_palette, builtin_palette_arc, builtin_palettes, Interpolation, Palette, PaletteInsert,
@@ -684,14 +684,25 @@ pub fn render_tile_with_background(
     format: ImageFormat,
     background: Option<[u8; 3]>,
 ) -> Result<Vec<u8>, DataServerError> {
+    let mut rgba = render_tile_rgba(tile, colormap)?;
+    encode_rgba(&mut rgba, tile.width, tile.height, format, background)
+}
+
+/// The RGBA pixels [`render_tile_with_background`] encodes: the tile
+/// through `colormap`, with no background. A WMS GetMap of several layers
+/// draws each layer's pixels over the last with [`draw_over`] and encodes
+/// the result once (#1181).
+pub fn render_tile_rgba(
+    tile: &RasterTile,
+    colormap: &dyn ColorMap,
+) -> Result<Vec<u8>, DataServerError> {
     ds_core::deadline::check()?;
     // Short-circuit for empty tiles: skip colorization, produce transparent RGBA directly.
-    let mut rgba = if tile.is_empty() {
+    Ok(if tile.is_empty() {
         vec![0u8; (tile.width * tile.height * 4) as usize]
     } else {
         colorize(tile, colormap)
-    };
-    encode_rgba(&mut rgba, tile.width, tile.height, format, background)
+    })
 }
 
 /// Encode a rendered RGBA image in `format` at its quality, first
