@@ -285,6 +285,28 @@ not guarantee monotonic improvement. This baseline does not enable #642.
   the byte-bounded per-volume `CELL_SET_CACHE` (`MC_PVOL_CELL_SET_CACHE_MB`,
   default 64; volumes are immutable ⇒ never stale) and gates to dBZ-unit
   quantities (VIL/linear-Z is reflectivity physics → else 400).
+- **A cold `CELLS` window (#1155).** A tile segments the scan it draws and
+  the `CELLS_TRACK_SCANS` (6) behind it: seven whole volumes, each a GET,
+  an HDF5 decode of every reflectivity sweep (most of the ~50 ms CPU), a
+  voxel grid and a segmentation. `cell_product` claims each volume's
+  `CELL_SET_CACHE` fill with a zero-timeout probe and builds only volumes
+  no other caller is building, so a viewport's tiles build a cold window in
+  parallel, one GET per volume; built in turn, seven 0.5 s GETs outlast the
+  3 s render deadline. It waits for the rest through
+  `ds_executor::wait_without_slot`, so a waiting tile holds no render slot.
+  A claim a failed builder hands over is let go before that wait for a
+  slot and re-probed: never hold a fill claim while queueing for a slot.
+  The poll loop builds cell sets ahead of the tiles, on the background
+  runtime: a downloaded volume newer than the site's newest from the bytes
+  in hand (`warm_from_bytes`, no second GET), and the newest windows newest
+  volume first, at most `MAX_WARMS_PER_POLL` (32) per poll and once as the
+  loop starts (`warm_windows`, four downloads at a time, a volume claimed
+  only after its download so no tile waits on a download without a
+  deadline). Warm builds decode into memory of their own
+  (`voxel_grid_from_bytes`), never `PIXEL_CACHE` or `VOXEL_GRID_CACHE`
+  (#992), key entries as tiles do (`layer_query`, `cell_set_key`), and count
+  no hit or miss. Pinned by `tests/cells_viewport.rs` and the warm-up tests
+  in `cells::tests`.
 - **WMS/Maps/Tiles `CELLS` layer:** each reflectivity-capable site
   advertises a derived `CELLS` parameter (`engine_odim::cells::
   CELLS_PARAMETER`; appended to `SiteMeta.parameters` only — never an EDR

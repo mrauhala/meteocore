@@ -667,6 +667,44 @@ fn classify_remote_read(
     }
 }
 
+/// Read whole volume files for a background build off the request path
+/// (the `CELLS` warm-up, #1155): remote files concurrently, all of
+/// `file_ids` at once under the background fetch budget, local files in
+/// turn. Only on the background poll runtime (root CLAUDE.md Critical Rules
+/// 6–7); the caller bounds how many files it passes.
+pub(crate) fn read_volume_files(
+    source: &Source,
+    file_ids: &[&str],
+) -> Vec<Result<Bytes, DataServerError>> {
+    match source {
+        Source::Local { .. } => file_ids
+            .iter()
+            .map(|id| std::fs::read(id).map(Bytes::from).map_err(Into::into))
+            .collect(),
+        Source::Remote { store, .. } => {
+            let paths: Vec<_> = file_ids
+                .iter()
+                .map(|id| ds_storage::object_store::path::Path::from(*id))
+                .collect();
+            match store.get_many_with_budget(
+                &paths,
+                paths.len().max(1),
+                Some(MAX_REMOTE_FILE_SIZE),
+                ds_storage::FetchBudget::Background,
+            ) {
+                Ok(files) => files,
+                Err(e) => {
+                    let e = e.to_string();
+                    file_ids
+                        .iter()
+                        .map(|_| Err(DataServerError::Storage(e.clone())))
+                        .collect()
+                }
+            }
+        }
+    }
+}
+
 /// Most volume files an EDR walk over several volumes downloads at once,
 /// and so the most volumes it holds fetched or decoded (#999): the volume it
 /// samples plus the reads running ahead of it. A cold hour of 5-minute S3
@@ -1249,7 +1287,7 @@ pub(crate) struct Catalog {
     pub(crate) by_site_meta: HashMap<String, SiteMeta>,
     /// `by_site_meta` keys pre-sorted at build time, so the network-inventory
     /// `FeatureEngine` never sorts per request (CLAUDE.md hot-path rule).
-    sorted_nods: Vec<String>,
+    pub(crate) sorted_nods: Vec<String>,
     /// Antenna-point bounding box `[w,s,e,n]` over all sites — the Features
     /// collection's spatial extent, precomputed so `spatial_extent()` is an
     /// O(1) snapshot read. Bounds the Feature *points* (what `bbox` filters
@@ -1332,6 +1370,10 @@ const FETCH_CONCURRENCY: usize = 12;
 /// reusing already-parsed volumes from `cache` (keyed by file identity)
 /// so a poll cycle doesn't re-download / re-parse unchanged files.
 ///
+/// `cells_after` is the catalog a poll replaces: a downloaded volume newer
+/// than every volume it holds for the site gets its `CELLS` cell set built
+/// from the bytes in hand (#1155). `None` at construction.
+///
 /// Blocking — remote scans bridge async object-store I/O internally.
 fn scan_source(
     collection_id: &str,
@@ -1340,6 +1382,7 @@ fn scan_source(
     max_files: Option<usize>,
     depth: ScanDepth,
     prewarm_sweeps: usize,
+    cells_after: Option<&Catalog>,
 ) -> Result<Catalog, EngineError> {
     match source {
         // A local directory is small and cheap to enumerate; the
@@ -1363,7 +1406,14 @@ fn scan_source(
             // file whose name carries no parseable timestamp falls through
             // to the post-parse volume-time filter.
             pending.retain(|p| within_window_by_name(&p.id, time_filter));
-            let mut by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
+            let mut by_site = build_catalog(
+                collection_id,
+                pending,
+                source,
+                cache,
+                prewarm_sweeps,
+                cells_after,
+            );
             retain_within(&mut by_site, time_filter);
             Ok(derive_catalog(by_site, cache, max_files))
         }
@@ -1375,7 +1425,14 @@ fn scan_source(
         } => {
             let (pending, time_filter) =
                 enumerate_remote(collection_id, store, prefix_pattern, time_window, depth)?;
-            let mut by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
+            let mut by_site = build_catalog(
+                collection_id,
+                pending,
+                source,
+                cache,
+                prewarm_sweeps,
+                cells_after,
+            );
             // A `time_window` also bounds the timestamps kept: the
             // object listing can include volumes just outside the
             // window (the prefix is a whole UTC day).
@@ -1682,6 +1739,7 @@ fn build_catalog(
     source: &Source,
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
     prewarm_sweeps: usize,
+    cells_after: Option<&Catalog>,
 ) -> HashMap<String, Vec<VolumeEntry>> {
     use ds_storage::object_store::path::Path as ObjectPath;
 
@@ -1728,6 +1786,9 @@ fn build_catalog(
                         // cache ids (bare paths) are reload-stable, so the
                         // `contains` skip inside `prewarm_pixels` no-ops it.
                         prewarm_pixels(source, &id, &v, &bytes, prewarm_sweeps);
+                        if newest_of_site(cells_after, &v) {
+                            crate::cells::warm_from_bytes(source, &id, &v, &bytes);
+                        }
                         insert_volume(collection_id, &mut by_site, id, v);
                     }
                 }
@@ -1788,6 +1849,9 @@ fn build_catalog(
                         // of a cold whole-`.h5` S3 re-download on a render
                         // permit (#461; the local arm does the same — #472).
                         prewarm_pixels(source, id, &v, &bytes, prewarm_sweeps);
+                        if newest_of_site(cells_after, &v) {
+                            crate::cells::warm_from_bytes(source, id, &v, &bytes);
+                        }
                         insert_volume(collection_id, &mut by_site, id.clone(), v);
                     }
                 }
@@ -1799,6 +1863,19 @@ fn build_catalog(
     }
 
     by_site
+}
+
+/// Whether a poll's freshly downloaded `volume` is newer than every volume
+/// the catalog it replaces (`previous`) holds for its site: in steady state
+/// the one new scan per site and poll, which the `CELLS` layer's next tiles
+/// all track (#1155). Older downloads (a first poll backfilling history
+/// after the bootstrap scan) and new sites are left to
+/// [`crate::cells::warm_windows`], which goes newest first and is bounded.
+fn newest_of_site(previous: Option<&Catalog>, volume: &PolarVolume) -> bool {
+    previous
+        .zip(volume.site.nod.as_ref())
+        .and_then(|(catalog, nod)| catalog.by_site.get(nod)?.last())
+        .is_some_and(|newest| volume.time > newest.volume.time)
 }
 
 /// Parse `bytes` into a `PolarVolume`, insert into the shared parse cache
@@ -2259,12 +2336,12 @@ pub struct PolarVolumeEngine {
     /// Local directory or S3/HTTP object store, re-scanned by the poll loop.
     /// Behind an `Arc` so per-site views can hold it cheaply for lazy pixel
     /// re-fetches.
-    source: Arc<Source>,
+    pub(crate) source: Arc<Source>,
     /// Per-site cap on retained volumes (`OdimConfig.max_files`) — keeps
     /// an archive source from loading every file into the catalog.
     max_files: Option<usize>,
     /// Lock-free catalog snapshot for `raster_info()` + `get_raster_tile`.
-    catalog: Arc<ArcSwap<Catalog>>,
+    pub(crate) catalog: Arc<ArcSwap<Catalog>>,
     /// Parse cache of **metadata-only** [`PolarVolume`]s keyed by file
     /// identity (local path string or S3 object key — see [`FileId`]) so a
     /// poll doesn't re-parse unchanged files' structure. Tiny now that
@@ -2343,6 +2420,7 @@ impl PolarVolumeEngine {
             config.max_files,
             ScanDepth::Bootstrap,
             config.prewarm_sweeps,
+            None,
         )?;
         if catalog.by_site.is_empty() {
             // With a `time_window`, an empty catalog can also mean every file
@@ -2388,6 +2466,9 @@ impl PolarVolumeEngine {
         // This loop runs on the background runtime: cold pixel misses hand
         // their sibling decodes to it (#994).
         set_sibling_decode_runtime(tokio::runtime::Handle::current());
+        // The construction scan built no cell sets: warm the newest `CELLS`
+        // windows now rather than one poll interval later (#1155).
+        self.warm_cells();
         let mut ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
         while ticker.tick().await {
             self.poll_once().await;
@@ -2427,6 +2508,7 @@ impl PolarVolumeEngine {
             None,
             ScanDepth::Full,
             1,
+            None,
         )?;
         Ok(Self {
             collection_id: collection_id.to_string(),
@@ -2460,11 +2542,12 @@ impl PolarVolumeEngine {
     /// volumes are dropped until an admin reload). Mirrors the GRIB /
     /// GeoTIFF / QueryData poll loops, which also call their blocking scan
     /// directly on the poll runtime.
-    async fn poll_once(&self) {
+    pub(crate) async fn poll_once(&self) {
         // Full scan: the poll runs on the background runtime, so downloading
         // and parsing the whole `time_window` here is off the request path
         // and off the startup path. This is what backfills the history the
         // bootstrap scan in `new` deliberately skipped.
+        let prev = self.catalog.load_full();
         match scan_source(
             &self.collection_id,
             &self.source,
@@ -2472,9 +2555,9 @@ impl PolarVolumeEngine {
             self.max_files,
             ScanDepth::Full,
             self.prewarm_sweeps,
+            Some(&prev),
         ) {
             Ok(catalog) => {
-                let prev = self.catalog.load();
                 // Aggregate signals across sites for change detection: site
                 // count, newest volume time, and total volume count.
                 let latest = |c: &Catalog| {
@@ -2503,6 +2586,22 @@ impl PolarVolumeEngine {
             Err(e) => {
                 tracing::warn!("[{}] PVOL catalog refresh failed: {e}", self.collection_id);
             }
+        }
+        self.warm_cells();
+    }
+
+    /// Build the `CELLS` cell sets the newest windows still lack, bounded
+    /// per call ([`crate::cells::warm_windows`], #1155). Blocking: on the
+    /// background poll runtime worker, like the scan.
+    fn warm_cells(&self) {
+        let started = std::time::Instant::now();
+        let built = crate::cells::warm_windows(&self.source, &self.catalog.load());
+        if built > 0 {
+            tracing::debug!(
+                "[{}] built {built} PVOL cell set(s) ahead of the CELLS layer in {:?}",
+                self.collection_id,
+                started.elapsed()
+            );
         }
     }
 }
@@ -5233,6 +5332,40 @@ impl PolarVolumeSiteView {
         })?;
         Ok(result)
     }
+}
+
+/// [`voxel_grid_from_volume`] for a volume whose file's `bytes` are in hand:
+/// the background `CELLS` warm-up (#1155). Every sweep of `quantity` is
+/// decoded from them into memory of this call's own, never the pixel or
+/// voxel-grid caches, so warming a network's windows evicts no pre-warmed
+/// sweep (#992). A moment that does not decode is sampled as nodata, as a
+/// request's batch read leaves it.
+pub(crate) fn voxel_grid_from_bytes(
+    source: &Source,
+    file_id: &str,
+    volume: &PolarVolume,
+    quantity: &str,
+    dims: [usize; 3],
+    bytes: &[u8],
+) -> Result<(VoxelGrid, usize), DataServerError> {
+    let requests = volume.sweeps.iter().flat_map(|sweep| {
+        sweep
+            .moments
+            .iter()
+            .filter(|m| m.quantity == quantity)
+            .map(move |m| (m.dataset_path.as_str(), sweep.nrays, sweep.nbins))
+    });
+    let moments: MomentPixels = crate::pvol::read_moments_pixels(bytes, requests)
+        .map_err(|e| DataServerError::Engine(format!("open volume `{file_id}`: {e}")))?
+        .into_iter()
+        .map(|(path, pixels)| (path, Arc::new(pixels)))
+        .collect();
+    let pix = Pixels {
+        moments: Some(&moments),
+        source,
+        handle: None,
+    };
+    voxel_grid_from_volume(volume, file_id, pix, quantity, Some(dims))
 }
 
 impl VolumeEngine for PolarVolumeSiteView {
