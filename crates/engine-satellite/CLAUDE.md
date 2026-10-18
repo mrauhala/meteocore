@@ -186,6 +186,10 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   - `CoordinateMaps` builds one `ProjectionGrid` per distinct sampled grid,
     full resolution or overview, compared field by field with its column
     period (a global grid's). Bands of one resolution share it. `render::tests` counts the builds.
+  - Renders never go through `ds_core::resample::SourceGrid` (#1172): it
+    interpolates bilinearly over a whole decoded `&[f32]` field. A scan
+    renders nearest-neighbour from blocks read on demand (`PixelReader`), and
+    a full disk decoded whole would be 118 MB per render.
   - Frames and blocks go through `frame()` and `PixelReader` exactly as in
     a single-band render, so the refetch rules above hold unchanged.
 - **RGB composites are layers, not parameters** (`[[satellite.composites]]`,

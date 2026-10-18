@@ -1037,6 +1037,11 @@ mod tests {
         let page = e.get_features(&query).unwrap();
         assert_eq!(page.number_matched, 1);
         assert_eq!(page.features[0].id, "gap-station");
+        // The station is the EDR location of its id (#1143).
+        assert_eq!(
+            page.features[0].related,
+            [ds_core::feature::Related::edr_location("gap-station")]
+        );
         query.offset = 1;
         assert_eq!(e.get_features(&query).unwrap().number_returned, 0);
         query

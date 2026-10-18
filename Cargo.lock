@@ -1537,13 +1537,16 @@ name = "engine-odim"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "chrono",
  "ds-3dtiles",
  "ds-cache",
  "ds-core",
+ "ds-executor",
  "ds-poll",
  "ds-render",
  "ds-storage",
+ "futures",
  "hdf5-reader",
  "ndarray",
  "quick_cache 0.6.24",

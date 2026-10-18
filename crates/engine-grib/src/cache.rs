@@ -422,7 +422,17 @@ impl DecodedGrid {
     ///   longitude cut or around a pole — both inside any projected view of
     ///   the Arctic — stay registered (#323).
     ///
+    /// This is not the shared [`SourceGrid`] sampler, which would change
+    /// pixels (#1172): it maps EPSG:3857 through a projection grid, not
+    /// exactly per pixel; it draws a regional grid half a cell past its
+    /// first node and row, where this draws nothing; it reads the nearest
+    /// cell where a neighbour is NaN, where this reads the first valid
+    /// corner; and it narrows before [`Self::resample_f32`]'s display
+    /// conversion could run. `cache/sampler_tests.rs` pins the two equal
+    /// where they agree: a global grid on CRS84 and projected output.
+    ///
     /// [`ProjectionGrid`]: ds_core::resample::ProjectionGrid
+    /// [`SourceGrid`]: ds_core::resample::SourceGrid
     pub fn resample(
         &self,
         bbox: [f64; 4],
@@ -581,6 +591,9 @@ impl GridCache {
         self.cache.len() == 0
     }
 }
+
+#[cfg(test)]
+mod sampler_tests;
 
 #[cfg(test)]
 mod tests {

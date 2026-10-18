@@ -59,6 +59,33 @@ pub trait FeatureEngine: Send + Sync {
         &[]
     }
 
+    /// A readable name for `feature` built from its own properties, for
+    /// listings and pages that would otherwise show an opaque id (#1143):
+    /// engine-cap's `event · areaDesc`. The API layer serves it as the
+    /// feature's `title` property unless the feature has one. `None` (the
+    /// default) leaves the generic label rule: a `name`-like property, else
+    /// the id. A label states values the feature carries; it never adds any.
+    fn label(&self, feature: &Feature) -> Option<String> {
+        let _ = feature;
+        None
+    }
+
+    /// The properties a listing shows as its first columns, most telling
+    /// first (#1143): a storm cell's significance before its age. Empty (the
+    /// default) falls back to [`sortables`](Self::sortables), then to the
+    /// remaining properties alphabetically.
+    fn summary_properties(&self) -> &[&'static str] {
+        &[]
+    }
+
+    /// What one feature of this collection is, in one line, where the
+    /// collection's metadata alone could mislead (#1143): a radar network's
+    /// description speaks of volumes, while its items are the sites. Shown
+    /// on the collection's HTML overview.
+    fn items_description(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Properties accepted as Part 1 equality filters. Engines must apply
     /// them before paging and number_matched, using the shared matcher.
     /// Dynamic names belong in a prebuilt snapshot, never a per-request scan.

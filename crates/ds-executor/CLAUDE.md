@@ -24,6 +24,22 @@ the worker returns. A timeout cannot release a running worker's permit. Abort ha
 cancel pending blocking jobs but cannot preempt running CPU work. Keep tests for overload, canceled
 waiters, deadline expiry, and worker permit ownership.
 
+Nor is a CPU slot held while a running job waits for work another job is
+doing: `wait_without_slot` (#1155, a `CELLS` tile waiting for another
+tile's cell-set build). The worker keeps its permit in a thread-local; the
+call drops it, runs the wait, then takes a slot again behind the queued
+renders, polling the semaphore on its own thread (no runtime needed;
+`unconstrained`, or a query-runtime worker's task budget could hold the
+permit back). Meanwhile the job holds a place in its admission queue, so
+the queue still bounds admitted jobs and their blocking threads, and
+`render_queue_depth` counts it; with the queue full it keeps its slot and
+is never shed. Its memory reservation and deadline stay; a slot not retaken
+by the deadline is `DeadlineExceeded`, counted once as `timed_out_render`
+at the join. Call it only around a wait that uses no CPU. Pinned by
+`a_job_waits_for_another_without_its_slot`,
+`retaking_a_slot_ends_at_the_deadline` and
+`a_job_keeps_its_slot_when_the_queue_is_full`.
+
 Two ways to run admitted work, sharing one worker wrapper and one join:
 `RenderJob::run`, a `spawn_blocking` thread of the caller's runtime, for a
 render; and `RenderJob::run_query`, a task on the shared query runtime, for

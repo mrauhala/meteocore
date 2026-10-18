@@ -1675,6 +1675,7 @@ mod mvt {
                         .into_iter()
                         .collect(),
                 ),
+                related: Vec::new(),
             };
             Self {
                 features: vec![
@@ -1883,6 +1884,7 @@ mod mvt {
                 id: "pt".into(),
                 geometry: StdArc::new(Geometry::Point { x: 0.0, y: 0.0 }),
                 properties: StdArc::new(Default::default()),
+                related: Vec::new(),
             };
             let features: Vec<Feature> = std::iter::repeat_with(|| f.clone()).take(take).collect();
             let len = features.len();
@@ -4755,6 +4757,7 @@ mod vector_tile_time {
                         .into_iter()
                         .collect(),
                 ),
+                related: Vec::new(),
             };
             Self {
                 features: vec![

@@ -2938,7 +2938,50 @@ pub struct PostgisConfig {
     pub observations: PostgisObservationsConfig,
     #[serde(default)]
     pub parameters: Vec<PostgisParameterConfig>,
+    /// Station shapes only: the WMS/Maps/Tiles station-symbol layers
+    /// (#1063). Optional; the layers exist whenever `apis` lists a map API,
+    /// with the defaults [`PostgisMapConfig`] documents.
+    #[serde(default)]
+    pub map: Option<PostgisMapConfig>,
 }
+
+/// `[postgis.map]` (#1063): how a station collection's map layers draw each
+/// station as a marker coloured by its latest value.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgisMapConfig {
+    /// ISO 8601 duration: a frame at `TIME` shows each station's latest
+    /// non-null value in `[TIME - max_age, TIME]`. Default `PT1H`, at most
+    /// [`POSTGIS_MAP_MAX_AGE_CEILING`].
+    pub max_age: Option<String>,
+    /// Marker diameter in output pixels. Default 6, at most
+    /// [`POSTGIS_MAP_MAX_MARKER_SIZE`].
+    pub marker_size: Option<u32>,
+    /// Draw the cached stations without a value in the window as markers in
+    /// the palette's `nodata_color`, instead of leaving them out. Default
+    /// `false`.
+    pub draw_missing: Option<bool>,
+    /// ISO 8601 duration: the TIME steps the layers advertise over the last
+    /// [`POSTGIS_MAP_TIME_WINDOW`], and what a requested `TIME` floors to.
+    /// Default `PT10M`; whole seconds, from [`POSTGIS_MAP_MIN_TIME_STEP`] to
+    /// [`POSTGIS_MAP_TIME_WINDOW`].
+    pub time_step: Option<String>,
+}
+
+/// How far back from the latest observation the PostGIS map layers advertise
+/// TIME steps (#504, #1063). Older frames still render on an explicit `TIME`.
+pub const POSTGIS_MAP_TIME_WINDOW: chrono::TimeDelta = chrono::TimeDelta::hours(6);
+
+/// Shortest `[postgis.map] time_step` (#1063).
+pub const POSTGIS_MAP_MIN_TIME_STEP: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
+
+/// Longest `[postgis.map] max_age` (#1063): a typo guard. A frame reads every
+/// row of the window for every station, so a long one on a dense network
+/// meets the frame's row cap first.
+pub const POSTGIS_MAP_MAX_AGE_CEILING: chrono::TimeDelta = chrono::TimeDelta::days(7);
+
+/// Largest `[postgis.map] marker_size`, in output pixels (#1063).
+pub const POSTGIS_MAP_MAX_MARKER_SIZE: u32 = 64;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisStationsConfig {
@@ -3182,6 +3225,51 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
             return Err(Config(format!(
                 "Collection '{id}': [postgis].max_locations {n} exceeds the hard ceiling {POSTGIS_MAX_LOCATIONS_CEILING}"
             )));
+        }
+    }
+
+    // -- map (#1063) --------------------------------------------------------
+    if let Some(map) = &cfg.map {
+        if cfg.observations.shape == "events" {
+            return Err(Config(format!(
+                "Collection '{id}': [postgis.map] is not valid for observations.shape 'events' (its strike layer has fixed settings)"
+            )));
+        }
+        if let Some(raw) = map.max_age.as_deref() {
+            let max_age = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
+                Config(format!(
+                    "Collection '{id}': [postgis.map].max_age '{raw}' is not a valid ISO 8601 duration: {e}"
+                ))
+            })?;
+            if max_age <= chrono::TimeDelta::zero() || max_age > POSTGIS_MAP_MAX_AGE_CEILING {
+                return Err(Config(format!(
+                    "Collection '{id}': [postgis.map].max_age '{raw}' must be positive and at most P{}D",
+                    POSTGIS_MAP_MAX_AGE_CEILING.num_days()
+                )));
+            }
+        }
+        if let Some(size) = map.marker_size {
+            if size == 0 || size > POSTGIS_MAP_MAX_MARKER_SIZE {
+                return Err(Config(format!(
+                    "Collection '{id}': [postgis.map].marker_size {size} is outside 1..={POSTGIS_MAP_MAX_MARKER_SIZE}"
+                )));
+            }
+        }
+        if let Some(raw) = map.time_step.as_deref() {
+            let step = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
+                Config(format!(
+                    "Collection '{id}': [postgis.map].time_step '{raw}' is not a valid ISO 8601 duration: {e}"
+                ))
+            })?;
+            if step.subsec_nanos() != 0
+                || step < POSTGIS_MAP_MIN_TIME_STEP
+                || step > POSTGIS_MAP_TIME_WINDOW
+            {
+                return Err(Config(format!(
+                    "Collection '{id}': [postgis.map].time_step '{raw}' must be whole seconds from PT1M to PT{}H",
+                    POSTGIS_MAP_TIME_WINDOW.num_hours()
+                )));
+            }
         }
     }
 
@@ -4419,9 +4507,9 @@ impl ServerConfig {
                 // age-colored strike layer). Its FeatureEngine surface is
                 // #503 — without this check an `apis = ["features"]` events
                 // collection would load cleanly and silently serve an empty
-                // station inventory. Station shapes conversely have no
-                // raster rendering: wms/maps stay rejected for them via the
-                // engine_type allowlist gate in server admin wiring.
+                // station inventory. Station shapes serve every API: their
+                // map layers draw each station as a marker coloured by its
+                // latest value (#1063).
                 if postgis.observations.shape == "events" {
                     if let Some(api) = collection
                         .apis
@@ -4432,15 +4520,16 @@ impl ServerConfig {
                             "Collection '{id}': apis entry '{api}' is not supported for observations.shape 'events' (edr/wms/maps/tiles; \"features\" arrives with #503)"
                         )));
                     }
-                } else if let Some(api) = collection
-                    .apis
-                    .iter()
-                    .find(|a| matches!(a.as_str(), "wms" | "maps"))
+                } else if postgis.map.is_some()
+                    && !collection
+                        .apis
+                        .iter()
+                        .any(|a| matches!(a.as_str(), "wms" | "maps" | "tiles"))
                 {
-                    // Station shapes have no raster surface — only the events
-                    // shape implements a meaningful MapEngine (#504).
+                    // A map section no map API reads would be silently
+                    // ignored.
                     return Err(crate::error::DataServerError::Config(format!(
-                        "Collection '{id}': apis entry '{api}' requires observations.shape 'events' (station shapes serve edr/features/tiles)"
+                        "Collection '{id}': [postgis.map] needs a map API in apis (wms, maps or tiles)"
                     )));
                 }
             } else if collection.postgis.is_some() {
@@ -7035,20 +7124,108 @@ unit = "1"
         assert!(config.collections[0].apis.contains(&"wms".to_string()));
     }
 
+    /// #1063: station shapes serve the map APIs, with or without a
+    /// `[postgis.map]` section.
     #[test]
-    fn postgis_station_shape_rejects_wms_api() {
+    fn postgis_station_shape_allows_map_apis() {
         let tmp = TempDir::new().unwrap();
         let toml = nexus_postgis_toml().replace(
             "apis = [\"edr\", \"features\"]",
-            "apis = [\"edr\", \"wms\"]",
+            "apis = [\"edr\", \"wms\", \"maps\", \"tiles\"]",
         );
         let path = write_config(tmp.path(), "config.toml", &toml);
-        let err = ServerConfig::from_file(path.to_str().unwrap())
-            .unwrap_err()
-            .to_string();
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert!(config.collections[0].apis.contains(&"wms".to_string()));
+        assert_eq!(config.collections[0].postgis.as_ref().unwrap().map, None);
+
+        let toml = format!(
+            "{toml}\n[collections.postgis.map]\nmax_age = \"PT30M\"\nmarker_size = 8\ndraw_missing = true\ntime_step = \"PT5M\"\n"
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        let map = config.collections[0].postgis.as_ref().unwrap().map.clone();
+        assert_eq!(
+            map,
+            Some(PostgisMapConfig {
+                max_age: Some("PT30M".into()),
+                marker_size: Some(8),
+                draw_missing: Some(true),
+                time_step: Some("PT5M".into()),
+            })
+        );
+    }
+
+    /// #1063: `[postgis.map]` is bounded at load, needs a map API, and is
+    /// not the events shape's.
+    #[test]
+    fn postgis_map_section_validated_at_load() {
+        let load = |toml: &str| {
+            let tmp = TempDir::new().unwrap();
+            let path = write_config(tmp.path(), "config.toml", toml);
+            ServerConfig::from_file(path.to_str().unwrap()).map(|(config, _)| config)
+        };
+        let station = |map: &str| {
+            format!(
+                "{}\n[collections.postgis.map]\n{map}\n",
+                nexus_postgis_toml().replace(
+                    "apis = [\"edr\", \"features\"]",
+                    "apis = [\"edr\", \"wms\"]",
+                )
+            )
+        };
+        assert!(load(&station(
+            "max_age = \"P7D\"\nmarker_size = 64\ntime_step = \"PT6H\""
+        ))
+        .is_ok());
+        assert!(load(&station("time_step = \"PT1M\"")).is_ok());
+        for (map, expected) in [
+            (
+                "max_age = \"soon\"",
+                "max_age 'soon' is not a valid ISO 8601 duration",
+            ),
+            ("max_age = \"P8D\"", "must be positive and at most P7D"),
+            (
+                "max_age = \"PT0S\"",
+                "max_age 'PT0S' is not a valid ISO 8601 duration",
+            ),
+            ("marker_size = 0", "marker_size 0 is outside 1..=64"),
+            ("marker_size = 65", "marker_size 65 is outside 1..=64"),
+            (
+                "time_step = \"PT30S\"",
+                "time_step 'PT30S' must be whole seconds from PT1M to PT6H",
+            ),
+            (
+                "time_step = \"PT7H\"",
+                "time_step 'PT7H' must be whole seconds from PT1M to PT6H",
+            ),
+            (
+                "time_step = \"often\"",
+                "time_step 'often' is not a valid ISO 8601 duration",
+            ),
+        ] {
+            let err = load(&station(map)).unwrap_err().to_string();
+            assert!(err.contains(expected), "{map}: {err}");
+        }
+        // A misspelt key is an error, not a silently ignored setting.
+        assert!(load(&station("maxage = \"PT1H\"")).is_err());
+
+        // No map API reads it.
+        let toml = format!(
+            "{}\n[collections.postgis.map]\nmax_age = \"PT1H\"\n",
+            nexus_postgis_toml()
+        );
+        let err = load(&toml).unwrap_err().to_string();
+        assert!(err.contains("[postgis.map] needs a map API"), "{err}");
+
+        // The events shape's strike layer has fixed settings.
+        let toml = format!(
+            "{}\n[collections.postgis.map]\nmax_age = \"PT1H\"\n",
+            lightning_events_toml().replace("apis = [\"edr\"]", "apis = [\"edr\", \"wms\"]")
+        );
+        let err = load(&toml).unwrap_err().to_string();
         assert!(
-            err.contains("requires observations.shape 'events'"),
-            "got: {err}"
+            err.contains("[postgis.map] is not valid for observations.shape 'events'"),
+            "{err}"
         );
     }
 

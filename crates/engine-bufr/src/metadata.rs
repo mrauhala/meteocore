@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use ds_core::feature::{Feature, Geometry, PropertyValue};
+use ds_core::feature::{Feature, Geometry, PropertyValue, Related};
 use ds_core::model::{Location, LocationSnapshot};
 
 use crate::store::{ObsStore, StationInfo};
@@ -102,6 +102,8 @@ impl Snapshot {
                 id: s.id.to_string(),
                 geometry: Arc::new(Geometry::Point { x: s.lon, y: s.lat }),
                 properties: Arc::new(props),
+                // The station is the EDR location of its id (#1143).
+                related: vec![Related::edr_location(&s.id)],
             });
         }
         Snapshot {

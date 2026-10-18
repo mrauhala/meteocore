@@ -1,6 +1,8 @@
 # engine-postgis crate — Claude Instructions
 
-PostGIS/TimescaleDB observation engine (`EdrEngine` + `FeatureEngine`).
+PostGIS/TimescaleDB observation engine (`EdrEngine` + `FeatureEngine` +
+`MapEngine`: the events shape's strike layer, #504, and the station shapes'
+symbol layers, #1063).
 Read the root `CLAUDE.md` first — Critical Rule 8 (SQL safety) is enforced
 in CI by `scripts/check_sql_safety.sh`: keep `SELECT` keywords in plain
 `String` literals, never inside `format!`; no string concatenation onto SQL
@@ -361,6 +363,10 @@ in step when changing this lifecycle.
   stations-only, `wide` mode B with a naive-UTC column, `per_parameter`
   mode A. 20 000 synthetic stations; nulls, missing rows and stations
   without data in a window are deliberate.
+- `station_map_{long,wide}_shape` (#1063, `mc1063_*` schemas) render the
+  station layer through `MapEngine::get_raster_tile` on a blocking thread:
+  latest value within `max_age`, no marker without one, a late row moving
+  `content_version` and then drawn, `draw_missing` nodata markers.
 - The timing test prints both paths by stations × steps on a TimescaleDB
   hypertable, each path's time to the value-budget 400 for a week over
   20 000 stations, and that set-based statement's `EXPLAIN ANALYZE`. It

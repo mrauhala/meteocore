@@ -621,6 +621,136 @@ pub fn build_area_set(
     )
 }
 
+/// The station map layers' content fingerprint (#1063): per observation table
+/// (`long` and `wide` one statement, `per_parameter` one per configured
+/// parameter), the rows of the stations in `station_ids` from `since` on, as
+/// one row of aggregates. `n` is the row count; every further column, all
+/// `bigint`, is a sum of 32-bit hashes: of each row's station, time (and
+/// `long` parameter), then one per value column. Integer sums are exact and
+/// independent of row order, so the fingerprint moves when a row arrives
+/// late, is deleted or has its time, station or value corrected, and holds
+/// still otherwise. A swap of two rows' values would not move it.
+///
+/// The station predicate is the set-based area path's `<fk> = ANY($1)`, so
+/// the `(<fk>, <time>)` index the README asks for answers it as one range
+/// scan a station. `$2` is the lower time bound; there is no upper one.
+pub fn build_frame_fingerprint(
+    cfg: &PostgisEngineConfig,
+    station_ids: &Arc<Vec<String>>,
+    since: DateTime<Utc>,
+) -> Result<Vec<BuiltQuery>, BuildError> {
+    let keys: Vec<&str> = cfg
+        .parameters
+        .iter()
+        .map(|p| p.source_key.as_str())
+        .collect();
+    let ids = || SqlParam::SharedTextArray(Arc::clone(station_ids));
+    match &cfg.observations {
+        ObservationSchema::Long(l) => {
+            let param = quote_ident(&l.param_col)?;
+            let mut q = fingerprint_query(
+                &l.table,
+                &l.station_fk_col,
+                &l.time_col,
+                l.time_col_tz.as_deref(),
+                Some(&param),
+                &[l.value_col.as_str()],
+            )?;
+            q.sql.push_str(&format!(" AND {param} = ANY($3)"));
+            Ok(vec![BuiltQuery::new(
+                q.sql,
+                vec![
+                    ids(),
+                    SqlParam::Timestamp(since),
+                    SqlParam::TextArray(keys.iter().map(|k| k.to_string()).collect()),
+                ],
+            )])
+        }
+        ObservationSchema::Wide(w) => {
+            let mut columns = Vec::with_capacity(keys.len());
+            for key in &keys {
+                let column = w
+                    .columns
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, c)| c.as_str())
+                    .ok_or_else(|| BuildError::UnknownParameter((*key).to_string()))?;
+                columns.push(column);
+            }
+            let q = fingerprint_query(
+                &w.table,
+                &w.station_fk_col,
+                &w.time_col,
+                w.time_col_tz.as_deref(),
+                None,
+                &columns,
+            )?;
+            Ok(vec![BuiltQuery::new(
+                q.sql,
+                vec![ids(), SqlParam::Timestamp(since)],
+            )])
+        }
+        ObservationSchema::PerParameter(pp) => {
+            let mut queries = Vec::with_capacity(keys.len());
+            for key in &keys {
+                let t = pp
+                    .tables
+                    .iter()
+                    .find(|t| t.parameter == *key)
+                    .ok_or_else(|| BuildError::UnknownParameter((*key).to_string()))?;
+                let q = fingerprint_query(
+                    &t.table,
+                    &t.station_fk_col,
+                    &t.time_col,
+                    t.time_col_tz.as_deref(),
+                    None,
+                    &[t.value_col.as_str()],
+                )?;
+                queries.push(
+                    BuiltQuery::new(q.sql, vec![ids(), SqlParam::Timestamp(since)])
+                        .with_parameter(key.to_string()),
+                );
+            }
+            Ok(queries)
+        }
+        ObservationSchema::Events(_) => Err(BuildError::NoStations),
+    }
+}
+
+/// One table's fingerprint statement up to its `WHERE` station and time
+/// predicates ([`build_frame_fingerprint`]). `param` is the quoted `long`
+/// parameter column, hashed into each row's key.
+fn fingerprint_query(
+    table: &QualifiedTable,
+    station_fk_col: &str,
+    time_col: &str,
+    time_col_tz: Option<&str>,
+    param: Option<&str>,
+    value_cols: &[&str],
+) -> Result<BuiltQuery, BuildError> {
+    let table = fq_table(table)?;
+    let fk = quote_ident(station_fk_col)?;
+    let time = quote_ident(time_col)?;
+    let rhs = time_filter_rhs("$2", time_col_tz);
+    let mut row_key =
+        format!("hashtext({fk}::text) # hashfloat8(extract(epoch from {time})::double precision)");
+    if let Some(param) = param {
+        row_key.push_str(&format!(" # hashtext({param}::text)"));
+    }
+    let mut values = String::new();
+    for column in value_cols {
+        let column = quote_ident(column)?;
+        values.push_str(&format!(", sum(hashfloat8({column}::double precision))"));
+    }
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "count(*), sum({row_key}){values} \
+         FROM {table} \
+         WHERE {fk} = ANY($1) AND {time} >= {rhs}"
+    ));
+    Ok(BuiltQuery::new(sql, vec![]))
+}
+
 fn build_observations(
     cfg: &PostgisEngineConfig,
     stations: StationSelect<'_>,
@@ -1125,6 +1255,7 @@ mod tests {
             locations_window: None,
             events_default_window: None,
             events_extent_bbox: None,
+            station_map: Default::default(),
         }
     }
 
@@ -1143,6 +1274,7 @@ mod tests {
             locations_window: None,
             events_default_window: None,
             events_extent_bbox: None,
+            station_map: Default::default(),
         }
     }
 
@@ -1877,6 +2009,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, BuildError::UnknownParameter(_)));
+    }
+
+    /// #1063: the station map fingerprint is one aggregate row per
+    /// observation table over every configured parameter, on the set-based
+    /// path's `<fk> = ANY($1)` from `$2` on: a count, the row-key hash sum
+    /// and a hash sum per value column, every identifier quoted.
+    #[test]
+    fn frame_fingerprint_aggregates_each_table_from_since() {
+        let since = t(2026, 10, 18, 5);
+        let station_ids = ids(&["a", "b"]);
+
+        let q = build_frame_fingerprint(&long_cfg(), &station_ids, since)
+            .unwrap()
+            .remove(0);
+        assert!(q.sql.starts_with("SELECT count(*), sum("), "{}", q.sql);
+        assert!(
+            q.sql.contains("hashtext(\"fmisid\"::text) # hashfloat8(extract(epoch from \"obstime\")::double precision) # hashtext(\"param_name\"::text)"),
+            "{}",
+            q.sql
+        );
+        assert!(q
+            .sql
+            .contains("sum(hashfloat8(\"value\"::double precision))"));
+        assert!(q.sql.contains(
+            "FROM \"public\".\"observations\" WHERE \"fmisid\" = ANY($1) AND \"obstime\" >= $2 AND \"param_name\" = ANY($3)"
+        ));
+        assert_eq!(
+            q.params,
+            vec![
+                SqlParam::SharedTextArray(Arc::clone(&station_ids)),
+                SqlParam::Timestamp(since),
+                SqlParam::TextArray(vec!["t2m".into()]),
+            ]
+        );
+
+        // `wide`: one value hash per configured parameter's column.
+        let q = build_frame_fingerprint(&wide_cfg(), &station_ids, since)
+            .unwrap()
+            .remove(0);
+        assert!(q.sql.contains(
+            "sum(hashfloat8(\"temp_celsius\"::double precision)), sum(hashfloat8(\"humidity_pct\"::double precision))"
+        ));
+        assert_eq!(q.params.len(), 2);
+
+        // `per_parameter`: one statement per table, a naive time column
+        // compared against the converted bind.
+        let queries =
+            build_frame_fingerprint(&nexus_per_parameter_cfg(), &station_ids, since).unwrap();
+        assert_eq!(queries.len(), 2);
+        assert!(queries[1].sql.contains("FROM \"public\".\"wind_speed\""));
+        assert!(queries[1]
+            .sql
+            .contains("\"time\" >= ($2 AT TIME ZONE 'UTC')"));
+        assert_eq!(queries[1].parameter.as_deref(), Some("wind_speed"));
+        for q in &queries {
+            assert_eq!(q.sql.matches("SELECT").count(), 1);
+        }
+
+        let events = mk_cfg_obs_only(ObservationSchema::Events(lightning_shape()));
+        assert!(matches!(
+            build_frame_fingerprint(&events, &station_ids, since),
+            Err(BuildError::NoStations)
+        ));
     }
 
     #[test]

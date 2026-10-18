@@ -434,7 +434,8 @@ pub(crate) fn raster_info(
             Some(_) => "projected",
         }
         .to_string(),
-        spatial_extent: transform.and_then(|t| ds_core::geo::crs84_extent(t.bbox())),
+        // A polar grid's edges circle its pole: the extent reaches the pole.
+        spatial_extent: transform.and_then(|t| ds_core::geo::crs84_extent(t.bbox_with_poles())),
         times,
         parameter: parameters
             .first()

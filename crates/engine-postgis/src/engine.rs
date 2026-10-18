@@ -8,12 +8,13 @@
 //! entering `block_in_place`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::{StreamExt, TryStreamExt};
 
+use arc_swap::ArcSwapOption;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use ds_core::edr_engine::EdrEngine;
@@ -36,6 +37,7 @@ use crate::query::{
     MAX_STATIONS_IN_POLYGON, SET_BASED_MAX_WINDOW,
 };
 use crate::schema::{EventsShape, ObservationSchema};
+use crate::station_map::StationSymbols;
 
 /// Time-ordered observation values for a single parameter. Exists to
 /// keep the Clippy `type_complexity` lint happy without papering over
@@ -90,7 +92,20 @@ pub struct PostgisEngine {
     /// a `shutdown()` that fires before the spawned loop began (rapid-reload
     /// race) is still observed.
     shutdown: Shutdown,
+    /// Process-unique id of this engine: the station-frame cache keys on it,
+    /// so a rebuilt engine never reads its predecessor's frames (#1063).
+    instance_id: u64,
+    /// The station layers' style facts, set by the server when it wires them
+    /// (#1063); `None` while no map API serves them, which also skips the
+    /// per-refresh frame fingerprint.
+    station_symbols: ArcSwapOption<StationSymbols>,
+    /// The station layers' `content_version` (#1063): odd, so never `0`;
+    /// refreshed with the metadata ([`crate::station_map::frame_version`]).
+    frame_version: AtomicU64,
 }
+
+/// Source of [`PostgisEngine`]'s `instance_id`.
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 impl std::fmt::Debug for PostgisEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -134,6 +149,9 @@ impl PostgisEngine {
             indexes,
             pool_key_label,
             shutdown: Shutdown::new(),
+            instance_id: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            station_symbols: ArcSwapOption::empty(),
+            frame_version: AtomicU64::new(1),
         }
     }
 
@@ -189,6 +207,52 @@ impl PostgisEngine {
         &self.pool_key_label
     }
 
+    /// Hand the station layers their style facts (#1063). The server calls
+    /// this on every load that wires a station collection to a map API,
+    /// whether the engine was built or reused, since a reload can change the
+    /// styles without changing the collection. From the next metadata
+    /// refresh on, each refresh also fingerprints the frames' rows.
+    pub fn set_station_symbols(&self, symbols: StationSymbols) {
+        self.station_symbols.store(Some(Arc::new(symbols)));
+    }
+
+    pub(crate) fn station_symbols(&self) -> Option<Arc<StationSymbols>> {
+        self.station_symbols.load_full()
+    }
+
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// The station layers' content version (#1063): moves when a metadata
+    /// refresh finds the advertised frames' rows or the station list
+    /// changed. Odd, never `0`.
+    pub fn frame_version(&self) -> u64 {
+        self.frame_version.load(Ordering::Acquire)
+    }
+
+    /// Re-fingerprint the station frames after a successful metadata refresh
+    /// (#1063). A failure keeps no stale promise: it moves the version, so
+    /// the frames are read again rather than served from a fingerprint that
+    /// could not be checked.
+    async fn refresh_frame_version(&self) {
+        if self.config.events().is_some() || self.station_symbols.load().is_none() {
+            return;
+        }
+        let meta = self.cache.load();
+        match crate::station_map::frame_version(&self.config, &self.pool, &meta).await {
+            Ok(version) => self.frame_version.store(version, Ordering::Release),
+            Err(e) => {
+                tracing::warn!(
+                    collection = %self.collection_id, error = %e,
+                    "postgis: station map fingerprint failed — station frames will be read again"
+                );
+                let next = self.frame_version().wrapping_add(2) | 1;
+                self.frame_version.store(next, Ordering::Release);
+            }
+        }
+    }
+
     /// Run a one-shot metadata refresh. Used at construction and by the
     /// `/admin/collections/reload` path. Validates the schema before publishing
     /// metadata; transient failures retain the previous snapshot, while a
@@ -199,6 +263,9 @@ impl PostgisEngine {
         let _refresh = self.refresh_lock.lock().await;
         let had_future = self.cache.load().future_latest.is_some();
         let result = self.refresh_metadata_checked().await;
+        if result.is_ok() {
+            self.refresh_frame_version().await;
+        }
         // Advisory and independent of schema/metadata success. Completed audits
         // do no further I/O; unchecked audits retry without changing health.
         self.check_advisories().await;
@@ -988,7 +1055,7 @@ static FANOUT_LIMITERS: std::sync::OnceLock<
     std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
 > = std::sync::OnceLock::new();
 
-fn fanout_limiter(pool_key: &str, width: usize) -> Arc<tokio::sync::Semaphore> {
+pub(crate) fn fanout_limiter(pool_key: &str, width: usize) -> Arc<tokio::sync::Semaphore> {
     let map = FANOUT_LIMITERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     map.lock()
         .expect("fanout limiter mutex poisoned")
@@ -1111,7 +1178,7 @@ fn run_area_fanout(
 
 /// Area connections one pool key may hold at once: the pool size minus a
 /// two-connection headroom, between 1 and 16.
-fn fanout_width(pool: &Pool) -> usize {
+pub(crate) fn fanout_width(pool: &Pool) -> usize {
     (pool.status().max_size.saturating_sub(2)).clamp(1, 16)
 }
 
@@ -1899,6 +1966,7 @@ mod tests {
             locations_window: None,
             events_default_window: None,
             events_extent_bbox: None,
+            station_map: Default::default(),
         };
         let keys = resolve_source_keys(&cfg, None).unwrap();
         assert_eq!(keys, vec!["TEMP", "WIND"]);
@@ -1957,6 +2025,7 @@ mod tests {
             locations_window: None,
             events_default_window: Some(chrono::Duration::hours(1)),
             events_extent_bbox: Some([4.0, 54.0, 42.0, 72.0]),
+            station_map: Default::default(),
         }
     }
 
@@ -1993,6 +2062,7 @@ mod tests {
             locations_window: None,
             events_default_window: None,
             events_extent_bbox: None,
+            station_map: Default::default(),
         };
         assert!(engine_with(stations).serves_station_series());
         assert!(!engine_with(events_engine_config()).serves_station_series());
@@ -2052,6 +2122,7 @@ mod tests {
             locations_window: None,
             events_default_window: Some(chrono::Duration::hours(1)),
             events_extent_bbox: None,
+            station_map: Default::default(),
         };
         let t0: DateTime<Utc> = "2026-07-11T17:00:00Z".parse().unwrap();
         let t1: DateTime<Utc> = "2026-07-11T17:05:00Z".parse().unwrap();
@@ -2123,6 +2194,11 @@ mod tests {
             future_latest: None,
             spatial_extent: None,
             wms_times: std::sync::Arc::new(Vec::new()),
+            raster_info: std::sync::Arc::new(crate::maps::build_raster_info(
+                &stations_engine_config(&[]),
+                None,
+                &[],
+            )),
             locations_cut: None,
             version: 1,
         }
@@ -2332,6 +2408,7 @@ mod tests {
             locations_window: None,
             events_default_window: None,
             events_extent_bbox: None,
+            station_map: Default::default(),
         }
     }
 
@@ -2459,6 +2536,110 @@ mod tests {
             engine.get_parameter_descriptions()["peak_current"].unit,
             "kA"
         );
+    }
+
+    /// #1063: a station collection's map surface — a layer per parameter on
+    /// one time axis, a content version that is never `0`, layers
+    /// GetFeatureInfo does not read — while the events layer keeps its own.
+    #[test]
+    fn station_shapes_serve_a_symbol_layer_per_parameter() {
+        use ds_core::map_engine::MapEngine;
+        let engine = engine_with(crate::station_map::tests::station_config());
+        let info = engine.raster_info_shared();
+        assert_eq!(info.parameter, "t2m");
+        assert_eq!(info.unit, "°C");
+        let layers: Vec<(&str, &str, &str)> = info
+            .parameters
+            .iter()
+            .map(|p| (p.name.as_str(), p.title.as_str(), p.unit.as_str()))
+            .collect();
+        assert_eq!(
+            layers,
+            vec![("t2m", "Air temperature", "°C"), ("rh", "Humidity", "%")]
+        );
+        assert!(!engine.layer_shows_values("t2m"));
+        assert_ne!(engine.content_version(), 0);
+
+        let events = engine_with(events_engine_config());
+        let info = events.raster_info();
+        assert_eq!(info.parameter, crate::maps::LIGHTNING_AGE_PARAMETER);
+        assert!(info.parameters.is_empty());
+        assert_eq!(info.spatial_extent, Some([4.0, 54.0, 42.0, 72.0]));
+        assert_eq!(events.content_version(), 0);
+        assert!(events.layer_shows_values(crate::maps::LIGHTNING_AGE_PARAMETER));
+    }
+
+    /// #1063, #507: a station layer renders the instant `resolve_time` and
+    /// `resolve_parameter_time` key the caches on — the latest advertised
+    /// step without `TIME`, the `[postgis.map] time_step` an explicit one
+    /// falls in — and a frame with no cached station needs no database.
+    #[test]
+    fn station_layers_render_the_instant_they_resolve() {
+        use ds_core::map_engine::{MapEngine, OutputCrs};
+        let at = |s: &str| -> DateTime<Utc> { s.parse().unwrap() };
+        let latest = at("2026-10-18T06:08:40Z");
+        let explicit = at("2026-10-18T05:42:59Z");
+        let engine_stepping = |minutes: i64| {
+            let mut cfg = crate::station_map::tests::station_config();
+            cfg.station_map.time_step = chrono::Duration::minutes(minutes);
+            let engine = engine_with(cfg.clone());
+            engine.cache().store(CollectionMeta::build(
+                &cfg,
+                crate::metadata::LocationSet::default(),
+                crate::metadata::TemporalRead {
+                    extent: Some((latest - chrono::Duration::hours(2), latest)),
+                    future_latest: None,
+                },
+                1,
+            ));
+            engine
+        };
+        // A configured 15-minute step.
+        let quarter = engine_stepping(15);
+        assert_eq!(
+            quarter.resolve_time(None, None),
+            Some(at("2026-10-18T06:00:00Z"))
+        );
+        assert_eq!(
+            quarter.resolve_parameter_time(Some("t2m"), Some(explicit), None),
+            Some(at("2026-10-18T05:30:00Z"))
+        );
+        let times = quarter.raster_info().times;
+        assert!(times
+            .windows(2)
+            .all(|w| w[1] - w[0] == chrono::Duration::minutes(15)));
+
+        // The default 10-minute step, rendered.
+        let engine = engine_stepping(10);
+        let step = at("2026-10-18T06:00:00Z");
+        assert_eq!(engine.resolve_time(None, None), Some(step));
+        assert_eq!(
+            engine.resolve_parameter_time(Some("rh"), Some(explicit), None),
+            Some(at("2026-10-18T05:40:00Z"))
+        );
+        assert_eq!(engine.raster_info().times.last(), Some(&step));
+
+        let render = |parameter: Option<&str>| {
+            engine.get_raster_tile(
+                [0.0, 0.0, 10.0, 10.0],
+                8,
+                8,
+                Some(explicit),
+                &OutputCrs::Wgs84,
+                parameter,
+                None,
+                None,
+            )
+        };
+        // Pending validation blocks the database path, as for EDR.
+        assert!(render(Some("rh")).is_err());
+        engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
+        assert!(render(Some("rh")).unwrap().is_empty());
+        assert!(render(None).unwrap().is_empty());
+        assert!(matches!(
+            render(Some("nope")),
+            Err(DataServerError::InvalidParameter(_))
+        ));
     }
 
     // ---- #1061: a station list cut at max_locations ------------------------

@@ -652,6 +652,19 @@ static LIGHTNING_STRIKE_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(
     )
 });
 
+// Station-frame cache (#1063) — process-global, byte-bounded LRU of the
+// station map layers' decoded frames, so the meta-tiles of one frame share
+// ONE DB fetch.
+static STATION_FRAME_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "station_frame_cache",
+        "Station map frame cache",
+        Some("station map layers"),
+        Some("frame DB fetches"),
+        false,
+    )
+});
+
 // PostGIS engine gauges (#110). All set per-scrape from live engine state — no
 // delta-tracking needed (they're true gauges, not cumulative counters; the
 // per-query duration/rows/error histograms are a follow-up — see the metrics
@@ -2098,11 +2111,12 @@ fn state_dir_reload_warning(
     })
 }
 
-/// The HTML page of a 3D Tiles collection in another API, as a path below the
-/// base URL (#1137): on the shared OGC API root (mounted at the server root,
-/// `SharedApi::new("")` in `main.rs`) when Maps or Tiles serve the
-/// collection, else EDR's. `None` when neither does: WMS has no collection
-/// page, and a PVOL site never enters the Features registry.
+/// The page of a per-site radar collection, as a path below the base URL:
+/// for its 3D Tiles collection (#1137) and for the site's feature in the
+/// network's site inventory (#1143). On the shared OGC API root (mounted at
+/// the server root, `SharedApi::new("")` in `main.rs`) when Maps or Tiles
+/// serve the collection, else EDR's. `None` when neither does: WMS has no
+/// collection page, and a PVOL site never enters the Features registry.
 fn volume_collection_page(id: &str, shared_root: bool, edr: bool) -> Option<String> {
     let mount = if shared_root {
         ""
@@ -2173,6 +2187,8 @@ pub fn load_collections(
     let mut volume_quantity_styles: HashMap<String, api_3dtiles::QuantityStyles> = HashMap::new();
     // Each 3D Tiles collection's HTML page in another API (#1137).
     let mut volume_collection_pages: HashMap<String, String> = HashMap::new();
+    // Pages of the collections a feature links to as related (#1143).
+    let mut feature_collection_pages: HashMap<String, String> = HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
@@ -3637,6 +3653,18 @@ pub fn load_collections(
                             &bundle_index,
                         ));
                     }
+                    // From the registries this site entered above, not from
+                    // `apis`: "features" registers the network inventory
+                    // under the source id, never the site.
+                    let site_page = volume_collection_page(
+                        &site_id,
+                        maps_collections.contains_key(&site_id)
+                            || tiles_collections.contains_key(&site_id),
+                        edr_collections.contains_key(&site_id),
+                    );
+                    if let Some(page) = &site_page {
+                        feature_collection_pages.insert(site_id.clone(), page.clone());
+                    }
                     if collection.apis.contains(&"3dtiles".to_string()) {
                         volume_engines.insert(
                             site_id.clone(),
@@ -3657,15 +3685,7 @@ pub fn load_collections(
                             site_id.clone(),
                             api_3dtiles::quantity_styles(&site_id, &raster_params, &layer_styles),
                         );
-                        // From the registries this site entered above, not
-                        // from `apis`: "features" registers the network
-                        // inventory under the source id, never the site.
-                        if let Some(page) = volume_collection_page(
-                            &site_id,
-                            maps_collections.contains_key(&site_id)
-                                || tiles_collections.contains_key(&site_id),
-                            edr_collections.contains_key(&site_id),
-                        ) {
+                        if let Some(page) = site_page {
                             volume_collection_pages.insert(site_id.clone(), page);
                         }
                     }
@@ -4113,11 +4133,34 @@ pub fn load_collections(
                     );
                 }
 
-                // The events shape has a raster surface (#504: the
-                // age-colored lightning layer) — wire the MapEngine into the
-                // raster APIs. Station shapes keep the MVT feature-tile
-                // path; config validation rejects wms/maps for them.
+                // Raster surfaces: the events shape's age-colored lightning
+                // layer (#504), and a station shape's symbol layers (#1063)
+                // when opted in (`postgis_map_wiring`). Station shapes keep
+                // the MVT feature-tile path.
                 let is_events = engine.config().events().is_some();
+                let wiring = postgis_map_wiring(collection);
+                let layer_params = if wiring.station_layers {
+                    use ds_core::map_engine::MapEngine as _;
+                    engine.raster_info_shared().parameters.clone()
+                } else {
+                    Vec::new()
+                };
+                if wiring.station_layers {
+                    // Every load, built or reused: a reload can change the
+                    // styles without changing the collection.
+                    let styles = collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &layer_params,
+                        &bundle_index,
+                    );
+                    engine.set_station_symbols(postgis_station_symbols(
+                        &styles,
+                        &collection.id,
+                        &layer_params,
+                    ));
+                }
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
@@ -4141,27 +4184,32 @@ pub fn load_collections(
                     );
                     feature_collections.insert(collection.id.clone(), collection.clone());
                 }
-                if collection.apis.contains(&"wms".to_string()) && is_events {
+                if wiring.raster_apis.contains(&"wms") {
                     map_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
-                    register_point_engine(
-                        &mut wms_point_engines,
-                        &collection.id,
-                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
-                    );
+                    // A station marker shows the latest value within
+                    // max_age, which the EDR position query does not
+                    // answer: station layers are not queryable (#1063).
+                    if is_events {
+                        register_point_engine(
+                            &mut wms_point_engines,
+                            &collection.id,
+                            engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                        );
+                    }
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
                         style_ctx,
                         &mut styles_cache,
                         collection,
-                        &[],
+                        &layer_params,
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
-                if collection.apis.contains(&"maps".to_string()) && is_events {
+                if wiring.raster_apis.contains(&"maps") {
                     maps_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
@@ -4171,36 +4219,35 @@ pub fn load_collections(
                         style_ctx,
                         &mut styles_cache,
                         collection,
-                        &[],
+                        &layer_params,
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
-                if collection.apis.contains(&"tiles".to_string()) {
-                    if is_events {
-                        tiles_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                        );
-                        tiles_collections.insert(collection.id.clone(), collection.clone());
-                        tiles_styles.extend(collection_layer_styles(
-                            style_ctx,
-                            &mut styles_cache,
-                            collection,
-                            &[],
-                            &bundle_index,
-                        ));
-                        info!(
-                            "Collection '{}': wired to Tiles API (raster)",
-                            collection.id
-                        );
-                    } else {
-                        tiles_feature_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
-                        );
-                        tiles_feature_collections.insert(collection.id.clone(), collection.clone());
-                    }
+                if wiring.raster_apis.contains(&"tiles") {
+                    tiles_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    tiles_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &layer_params,
+                        &bundle_index,
+                    ));
+                    info!(
+                        "Collection '{}': wired to Tiles API (raster)",
+                        collection.id
+                    );
+                }
+                if wiring.vector_tiles {
+                    tiles_feature_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                    );
+                    tiles_feature_collections.insert(collection.id.clone(), collection.clone());
                 }
                 postgis_engines.push(engine);
                 health.push(CollectionHealth {
@@ -4718,6 +4765,7 @@ pub fn load_collections(
             base_url: base_url.to_string(),
             trust_proxy_headers,
             vector_tileset_ids,
+            collection_pages: feature_collection_pages,
         },
         wms_state: WmsState {
             engines: map_engines,
@@ -4976,8 +5024,92 @@ fn collection_layer_styles(
             ),
         }
     }
+    if is_postgis_station_collection(collection) {
+        // Station symbol layers (#1063): every style of the collection, so
+        // no path draws the transparent ground in an opaque nodata colour
+        // or a nodata marker as a value.
+        for styles in layers.values_mut() {
+            for style in styles.values_mut() {
+                style.colormap = Arc::new(ds_render::SymbolColorMap::new(
+                    style.colormap.clone(),
+                    engine_postgis::NODATA_MARKER,
+                ));
+            }
+        }
+    }
     cache.insert(collection.id.clone(), layers.clone());
     layers
+}
+
+/// Which map surfaces a PostGIS collection is wired to.
+#[derive(Debug, PartialEq, Eq)]
+struct PostgisMapWiring {
+    /// The raster map APIs it is registered with, of `wms`, `maps`, `tiles`.
+    raster_apis: Vec<&'static str>,
+    /// A station shape's symbol layers (#1063): styles resolved, midpoints
+    /// handed to the engine, and the per-refresh frame fingerprint on.
+    station_layers: bool,
+    /// The station inventory as vector tiles (MVT).
+    vector_tiles: bool,
+}
+
+/// The map wiring of a PostGIS collection. The events shape's strike layer
+/// (#504) serves every raster API listed. A station shape's symbol layers
+/// (#1063) are opt-in: a `[postgis.map]` section, or `wms`/`maps` in
+/// `apis`. A station collection listing only `tiles` without the section
+/// keeps its vector tiles alone, as before the layers existed: no raster
+/// tileset, no fingerprint statement per refresh, no style resolution and
+/// so no generic-colormap warning.
+fn postgis_map_wiring(collection: &CollectionConfig) -> PostgisMapWiring {
+    let lists = |api: &str| collection.apis.iter().any(|a| a == api);
+    let events = collection
+        .postgis
+        .as_ref()
+        .is_some_and(|p| p.observations.shape == "events");
+    let station_layers = !events
+        && (collection.postgis.as_ref().is_some_and(|p| p.map.is_some())
+            || lists("wms")
+            || lists("maps"));
+    PostgisMapWiring {
+        raster_apis: ["wms", "maps", "tiles"]
+            .into_iter()
+            .filter(|api| lists(api) && (events || station_layers))
+            .collect(),
+        station_layers,
+        vector_tiles: !events && lists("tiles"),
+    }
+}
+
+/// A PostGIS collection of a station shape: its map layers draw station
+/// symbols (#1063), not a raster.
+fn is_postgis_station_collection(collection: &CollectionConfig) -> bool {
+    collection.engine_type == "postgis"
+        && collection
+            .postgis
+            .as_ref()
+            .is_some_and(|p| p.observations.shape != "events")
+}
+
+/// The station layers' overlap order (#1063): each parameter layer's
+/// midpoint, the middle of its default style's value range. That range is
+/// the style's `min`/`max`, which fall back to the palette's first and last
+/// stops, so markers draw in ascending distance from it and the most
+/// extreme value lands on top.
+fn postgis_station_symbols(
+    layers: &HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+    collection_id: &str,
+    params: &[ds_core::map_engine::ParameterInfo],
+) -> engine_postgis::StationSymbols {
+    let midpoints = params
+        .iter()
+        .filter_map(|p| {
+            let style = layers
+                .get(&format!("{collection_id}/{}", p.name))?
+                .get("default")?;
+            Some((p.name.clone(), (style.min + style.max) / 2.0))
+        })
+        .collect();
+    engine_postgis::StationSymbols::new(midpoints)
 }
 
 /// Resolve a collection's bound bundle; None if unset (validation rejects unresolved refs).
@@ -6628,8 +6760,9 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         }
     }
 
-    // Lightning strike-window cache (#504): only meaningful once a postgis
-    // events collection has rendered, but the family is cheap either way.
+    // Lightning strike-window (#504) and station-frame (#1063) caches: only
+    // meaningful once a postgis map layer has rendered, but the families are
+    // cheap either way.
     if !state
         .postgis_engines
         .read()
@@ -6637,6 +6770,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         .is_empty()
     {
         LIGHTNING_STRIKE_CACHE_METRICS.update(engine_postgis::strike_window_cache_metrics(), None);
+        STATION_FRAME_CACHE_METRICS.update(engine_postgis::station_frame_cache_metrics(), None);
     }
 
     // Tile cache: per-collection
@@ -9650,6 +9784,169 @@ colormap = "radar_fmi"
         assert_eq!(styles["radar_dbz"].title, "MeteoCore Radar");
         assert!(styles.contains_key("radar_fmi"));
         assert_eq!(styles["radar_fmi"].title, "FMI Radar");
+    }
+
+    /// #1063: station symbol layers are opt-in. A station collection that
+    /// lists only `tiles` and has no `[postgis.map]` keeps exactly its vector
+    /// tiles: no raster tileset, no station layers (so no fingerprint
+    /// statement and no style resolution). `wms`/`maps` or the section turn
+    /// them on; the events shape is unchanged.
+    #[test]
+    fn postgis_station_map_layers_are_opt_in() {
+        let station = |apis: &[&str], map: bool| {
+            let mut c = nowcast_test_collection("obs", "postgis", None);
+            c.apis = apis.iter().map(|a| a.to_string()).collect();
+            let mut toml =
+                String::from("dsn_env = \"OBS_DSN\"\n[observations]\nshape = \"long\"\n");
+            if map {
+                toml.push_str("[map]\nmax_age = \"PT1H\"\n");
+            }
+            c.postgis = Some(toml::from_str(&toml).unwrap());
+            c
+        };
+        let wiring = |c: &CollectionConfig| super::postgis_map_wiring(c);
+
+        assert_eq!(
+            wiring(&station(&["edr", "features", "tiles"], false)),
+            super::PostgisMapWiring {
+                raster_apis: vec![],
+                station_layers: false,
+                vector_tiles: true,
+            },
+            "tiles alone: today's vector tiles only"
+        );
+        assert_eq!(
+            wiring(&station(&["edr", "tiles"], true)),
+            super::PostgisMapWiring {
+                raster_apis: vec!["tiles"],
+                station_layers: true,
+                vector_tiles: true,
+            }
+        );
+        assert_eq!(
+            wiring(&station(&["wms", "tiles"], false)),
+            super::PostgisMapWiring {
+                raster_apis: vec!["wms", "tiles"],
+                station_layers: true,
+                vector_tiles: true,
+            }
+        );
+        assert_eq!(wiring(&station(&["maps"], false)).raster_apis, vec!["maps"]);
+        assert!(!wiring(&station(&["edr", "features"], false)).station_layers);
+
+        let mut events = station(&["edr", "wms", "tiles"], false);
+        events.postgis.as_mut().unwrap().observations.shape = "events".into();
+        assert_eq!(
+            wiring(&events),
+            super::PostgisMapWiring {
+                raster_apis: vec!["wms", "tiles"],
+                station_layers: false,
+                vector_tiles: false,
+            }
+        );
+    }
+
+    /// #1063: a PostGIS station collection's styles draw station symbols —
+    /// the ground transparent and the nodata marker in the palette's nodata
+    /// colour, on every layer and style — and each parameter layer's
+    /// midpoint is the middle of its default style's range.
+    #[test]
+    fn postgis_station_styles_draw_symbols_and_carry_midpoints() {
+        let collection: CollectionConfig = toml::from_str(
+            r#"
+id = "surface-obs"
+title = "Surface observations"
+description = "Station observations"
+engine_type = "postgis"
+apis = ["edr", "wms"]
+
+[postgis]
+dsn_env = "OBS_DSN"
+
+[postgis.stations]
+table = "public.stations"
+id_col = "station_id"
+label_col = "name"
+geom_col = "geom"
+
+[postgis.observations]
+shape = "long"
+table = "public.observations"
+station_fk_col = "station_id"
+time_col = "time"
+param_col = "parameter"
+value_col = "value"
+
+[[postgis.parameters]]
+name = "t2m"
+label = "Air temperature"
+unit = "degC"
+
+[[postgis.parameters]]
+name = "rh"
+label = "Relative humidity"
+unit = "%"
+
+[wms]
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "t2m"
+min = -30.0
+max = 20.0
+
+[[wms.styles]]
+name = "grey"
+title = "Grey"
+colormap = "grayscale"
+"#,
+        )
+        .unwrap();
+        let params = vec![
+            ds_core::map_engine::ParameterInfo {
+                name: "t2m".into(),
+                title: "Air temperature".into(),
+                unit: "degC".into(),
+            },
+            ds_core::map_engine::ParameterInfo {
+                name: "rh".into(),
+                title: "Relative humidity".into(),
+                unit: "%".into(),
+            },
+        ];
+        let index: HashMap<&str, &StyleBundle> = HashMap::new();
+        let layers = layer_styles(&collection, &params, &index);
+        for (layer, styles) in &layers {
+            for (name, style) in styles {
+                assert_eq!(style.colormap.color(None), [0, 0, 0, 0], "{layer} {name}");
+                // The palette's nodata colour (transparent here), not the
+                // underflow colour the bare palette gives `f64::MIN`.
+                assert_eq!(
+                    style.colormap.color(Some(engine_postgis::NODATA_MARKER)),
+                    [0, 0, 0, 0],
+                    "{layer} {name}"
+                );
+                assert_ne!(
+                    style.colormap.color(Some(style.min))[3],
+                    0,
+                    "{layer} {name}"
+                );
+            }
+        }
+        let symbols = super::postgis_station_symbols(&layers, "surface-obs", &params);
+        assert_eq!(symbols.midpoint("t2m"), -5.0);
+        let rh = &layers["surface-obs/rh"]["default"];
+        assert_eq!(symbols.midpoint("rh"), (rh.min + rh.max) / 2.0);
+
+        // Without the wrap the same palette paints `f64::MIN` opaque.
+        let mut raster = collection.clone();
+        raster.engine_type = "querydata".into();
+        raster.postgis = None;
+        let style = &layer_styles(&raster, &params, &index)["surface-obs/t2m"]["default"];
+        assert_ne!(
+            style.colormap.color(Some(engine_postgis::NODATA_MARKER))[3],
+            0
+        );
     }
 
     #[test]

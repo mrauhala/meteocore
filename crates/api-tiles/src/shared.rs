@@ -48,6 +48,7 @@ fn contribution(state: &TilesState, sources: &TileSources<'_>, root: &str) -> Co
         } else {
             &[]
         },
+        items: None,
     }
 }
 

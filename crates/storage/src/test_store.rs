@@ -238,14 +238,16 @@ type Metadata = BTreeMap<String, (u64, Option<DateTime<Utc>>)>;
 
 /// Answers HEADs, and GETs with an empty body, from scripted metadata: a
 /// key without an entry in `objects` is NotFound, a key in `failing` fails.
-/// Records every key HEADed, and counts the operations in flight while each
-/// sleeps `delay`.
+/// Records every key HEADed, counts every GET, and counts the operations in
+/// flight while each sleeps `delay`.
 #[derive(Debug, Default)]
 pub(crate) struct MetaStore {
     pub objects: Mutex<Metadata>,
     pub failing: Mutex<HashSet<String>>,
     pub headed: Mutex<Vec<String>>,
     pub delay: Duration,
+    /// GETs (not HEADs) asked for.
+    pub gets: Arc<AtomicUsize>,
     pub active: Arc<AtomicUsize>,
     pub peak: Arc<AtomicUsize>,
 }
@@ -303,6 +305,8 @@ impl ObjectStore for MetaStore {
         let key = path.to_string();
         if options.head {
             self.headed.lock().unwrap().push(key.clone());
+        } else {
+            self.gets.fetch_add(1, Ordering::SeqCst);
         }
         let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);

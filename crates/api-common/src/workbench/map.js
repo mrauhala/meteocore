@@ -31,6 +31,20 @@
       center: [10, 30], zoom: 1
     });
     map.on('load',() => { started = true; });
+    // The view as a CRS84 box, west,south,east,north, for an items page's
+    // "Use map view" (#1143). Longitudes wrap into ±180: a view across the
+    // antimeridian has west > east, as Features `bbox` takes it.
+    function recordView() {
+      const view = map.getBounds();
+      const round = n => Number(n.toFixed(4));
+      const wrap = lon => ((lon + 180) % 360 + 360) % 360 - 180;
+      const whole = view.getEast() - view.getWest() >= 360;
+      const west = whole ? -180 : wrap(view.getWest());
+      const east = whole ? 180 : wrap(view.getEast());
+      const lat = n => Math.max(-90, Math.min(90, n));
+      element.dataset.view = [west, lat(view.getSouth()), east === -180 ? 180 : east, lat(view.getNorth())].map(round).join(',');
+    }
+    map.on('moveend',recordView);
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }));
     map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }));
     const inspector = document.createElement('div');
@@ -619,6 +633,7 @@
       function geometry(g) { if (!g) return; if (g.geometries) g.geometries.forEach(geometry); else extend(g.coordinates); }
       data.features.forEach(feature => geometry(feature.geometry));
       if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: 45, maxZoom: data.mapRequest ? 8 : 5, duration: 0 });
+      recordView();
       status.textContent = element.dataset.quicklook === 'true' ? 'Current page · select a shape for a quick look.' : 'Advertised geometry · general-purpose locator.';
       if (data.mapRequest) installRasterPreview(bounds);
       map.on('click', event => {

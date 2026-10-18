@@ -263,6 +263,7 @@ fn config(
         stations,
         observations,
         parameters: parameters(),
+        map: None,
     }
 }
 
@@ -796,6 +797,193 @@ async fn timing_set_based_and_fan_out_on_a_hypertable() {
         }
     }
     exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
+}
+
+/// The station map layers' fixture (#1063): three stations 2° apart, `t2m`
+/// rows around the 06:00 frame, in a `long` table and a `wide` one with a
+/// naive UTC time column.
+///
+/// - `fresh` reports at 05:30 and 05:50 (its value at 06:00 is 2.0) and at
+///   06:10, after the frame.
+/// - `stale` last reported at 04:30, more than an hour before 06:00.
+/// - `nulls` reported only a NULL `t2m`, at 05:55.
+const STATION_MAP: &str = "
+DROP SCHEMA IF EXISTS __S__ CASCADE;
+CREATE SCHEMA __S__;
+CREATE TABLE __S__.stations (
+    id text PRIMARY KEY,
+    name text NOT NULL,
+    geom geometry(Point, 4326) NOT NULL
+);
+INSERT INTO __S__.stations VALUES
+    ('fresh', 'Fresh', ST_SetSRID(ST_MakePoint(1.05, 1.05), 4326)),
+    ('stale', 'Stale', ST_SetSRID(ST_MakePoint(3.05, 3.05), 4326)),
+    ('nulls', 'Nulls', ST_SetSRID(ST_MakePoint(5.05, 5.05), 4326));
+CREATE TABLE __S__.obs (
+    station_id text NOT NULL,
+    obstime timestamptz NOT NULL,
+    param text NOT NULL,
+    value double precision
+);
+INSERT INTO __S__.obs VALUES
+    ('fresh', '2026-01-01 05:30:00+00', 't2m', 1.0),
+    ('fresh', '2026-01-01 05:50:00+00', 't2m', 2.0),
+    ('fresh', '2026-01-01 06:10:00+00', 't2m', 99.0),
+    ('stale', '2026-01-01 04:30:00+00', 't2m', 7.0),
+    ('nulls', '2026-01-01 05:55:00+00', 't2m', NULL);
+CREATE INDEX ON __S__.obs (station_id, obstime DESC);
+CREATE TABLE __S__.synop (
+    station_id text NOT NULL,
+    valid_time timestamp NOT NULL,
+    temp_c double precision,
+    humidity double precision,
+    geom geometry(Point, 4326)
+);
+INSERT INTO __S__.synop
+SELECT o.station_id, o.obstime AT TIME ZONE 'UTC', o.value, 50, s.geom
+FROM __S__.obs o JOIN __S__.stations s ON s.id = o.station_id;
+CREATE INDEX ON __S__.synop (station_id, valid_time DESC);
+ANALYZE;
+";
+
+/// The `t2m` layer at `at` over 0°–10° in 100 × 100 CRS:84 pixels, on a
+/// blocking thread as the render executor draws it.
+async fn station_frame(engine: &Arc<PostgisEngine>, at: &str) -> ds_core::map_engine::RasterTile {
+    use ds_core::map_engine::{MapEngine, OutputCrs};
+    let engine = Arc::clone(engine);
+    let time: DateTime<Utc> = at.parse().unwrap();
+    tokio::task::spawn_blocking(move || {
+        engine.get_raster_tile(
+            [0.0, 0.0, 10.0, 10.0],
+            100,
+            100,
+            Some(time),
+            &OutputCrs::Wgs84,
+            Some("t2m"),
+            None,
+            None,
+        )
+    })
+    .await
+    .expect("render task")
+    .expect("station frame")
+}
+
+/// The value at the pixel holding a fixture station: (1.05, 1.05) is column
+/// 10, row 89; (3.05, 3.05) column 30, row 69; (5.05, 5.05) column 50, row 49.
+fn at_station(tile: &ds_core::map_engine::RasterTile, station: &str) -> Option<f64> {
+    let (col, row) = match station {
+        "fresh" => (10, 89),
+        "stale" => (30, 69),
+        "nulls" => (50, 49),
+        other => panic!("no fixture station {other}"),
+    };
+    tile.values.value_at(row * 100 + col)
+}
+
+/// What #1063 asks of a station layer, on one shape:
+///
+/// 1. a frame draws each station's latest value within `max_age` before it
+///    (`fresh` 2.0, not its later 99.0), and no marker for a station
+///    without one (`stale`, `nulls`);
+/// 2. the content version holds over a refresh that found nothing new, and
+///    a late row moves it, after which the frame shows that row;
+/// 3. with `draw_missing`, stations without a value are nodata markers.
+async fn check_station_map(schema: &str, cfg: PostgisConfig, late_row: &str) {
+    use ds_core::map_engine::MapEngine;
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let client = connect(&dsn).await;
+    {
+        let _setup = SETUP.lock().await;
+        exec(&client, schema, "CREATE EXTENSION IF NOT EXISTS postgis;").await;
+        exec(&client, schema, STATION_MAP).await;
+    }
+    let symbols = || {
+        engine_postgis::StationSymbols::new(std::collections::HashMap::from([(
+            "t2m".to_string(),
+            0.0,
+        )]))
+    };
+    let layer = engine(schema, &cfg).await;
+    layer.set_station_symbols(symbols());
+    layer.refresh_metadata().await.expect("refresh");
+    assert_eq!(
+        layer.resolve_time(Some("2026-01-01T06:00:30Z".parse().unwrap()), None),
+        Some(t0()),
+        "an explicit TIME resolves to its 10-minute step"
+    );
+
+    // 1. The frame at 06:00.
+    let tile = station_frame(&layer, "2026-01-01T06:00:00Z").await;
+    assert_eq!(at_station(&tile, "fresh"), Some(2.0));
+    assert_eq!(at_station(&tile, "stale"), None, "older than max_age");
+    assert_eq!(at_station(&tile, "nulls"), None, "only a null value");
+    let later = station_frame(&layer, "2026-01-01T06:10:00Z").await;
+    assert_eq!(at_station(&later, "fresh"), Some(99.0));
+
+    // 2. Late data.
+    let version = layer.content_version();
+    assert_ne!(version, 0);
+    layer.refresh_metadata().await.expect("refresh");
+    assert_eq!(
+        layer.content_version(),
+        version,
+        "a refresh that found nothing new keeps the version"
+    );
+    exec(&client, schema, late_row).await;
+    layer.refresh_metadata().await.expect("refresh");
+    assert_ne!(
+        layer.content_version(),
+        version,
+        "a late row moves the version"
+    );
+    let tile = station_frame(&layer, "2026-01-01T06:00:00Z").await;
+    assert_eq!(
+        at_station(&tile, "stale"),
+        Some(8.0),
+        "the late row is drawn"
+    );
+
+    // 3. Nodata markers.
+    let mut cfg = cfg;
+    cfg.map = Some(ds_core::config::PostgisMapConfig {
+        draw_missing: Some(true),
+        ..Default::default()
+    });
+    let with_missing = engine(schema, &cfg).await;
+    with_missing.set_station_symbols(symbols());
+    let tile = station_frame(&with_missing, "2026-01-01T06:00:00Z").await;
+    assert_eq!(at_station(&tile, "fresh"), Some(2.0));
+    assert_eq!(
+        at_station(&tile, "nulls"),
+        Some(engine_postgis::NODATA_MARKER)
+    );
+    exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn station_map_long_shape() {
+    let schema = "mc1063_long";
+    check_station_map(
+        schema,
+        long_config(schema),
+        "INSERT INTO __S__.obs VALUES ('stale', '2026-01-01 05:45:00+00', 't2m', 8.0);",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn station_map_wide_shape() {
+    let schema = "mc1063_wide";
+    check_station_map(
+        schema,
+        wide_config(schema),
+        "INSERT INTO __S__.synop SELECT 'stale', TIMESTAMP '2026-01-01 05:45:00', 8.0, 50, geom \
+         FROM __S__.stations WHERE id = 'stale';",
+    )
+    .await;
 }
 
 #[path = "support/schema_validation.rs"]

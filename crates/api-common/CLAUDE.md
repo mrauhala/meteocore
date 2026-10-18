@@ -51,7 +51,14 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
 - `workbench/map.js` prints a property number by the rule of
   `metadata::number_text` (#1140); change both together. Its tests run the
   shipped script on a stub DOM: `node --test crates/api-common/tests/map.test.cjs`
-  (CI).
+  (CI). It also keeps the map's view as a CRS84 box in the map element's
+  `data-view`, which the items builder's "Use map view" reads (#1143).
+- The Overview's "Filter by" / "Sort by" chips (`ItemsOverview`, carried by
+  `Contribution::items`, rendered by `collection_page`) open the items
+  builder through the URL fragment (`#filter=<name>`, `#sort=<name>`), never
+  a query parameter: `/items` rejects unknown ones (#1143). The stylesheet
+  and scripts are inline, so a page test asserting an element's absence
+  matches its markup, not a bare class name.
 - Update README.md here, affected API READMEs and docs/ogc-api-common-matrix.md.
   Run cross-API contracts (`cargo test -p server --test common_discovery`) and the
   affected API suites. Do not require identical real production catalogs.

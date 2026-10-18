@@ -1418,6 +1418,11 @@
           "legendFormat": "Lightning strike windows (#504)"
         },
         {
+          "expr": "rate(station_frame_cache_hits_total[$__rate_interval]) / clamp_min(rate(station_frame_cache_hits_total[$__rate_interval]) + rate(station_frame_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "SF",
+          "legendFormat": "Station map frames (#1063)"
+        },
+        {
           "expr": "rate(satellite_frame_cache_hits_total[$__rate_interval]) / clamp_min(rate(satellite_frame_cache_hits_total[$__rate_interval]) + rate(satellite_frame_cache_misses_total[$__rate_interval]), 1e-9)",
           "refId": "F",
           "legendFormat": "Satellite scans (#819)"
@@ -1544,6 +1549,11 @@
           "expr": "rate(lightning_strike_cache_misses_total[$__rate_interval])",
           "refId": "A",
           "legendFormat": "Lightning strike windows (#504)"
+        },
+        {
+          "expr": "rate(station_frame_cache_misses_total[$__rate_interval])",
+          "refId": "SF",
+          "legendFormat": "Station map frames (#1063)"
         },
         {
           "expr": "rate(satellite_frame_cache_misses_total[$__rate_interval])",
@@ -1674,6 +1684,11 @@
           "expr": "lightning_strike_cache_bytes / clamp_min(lightning_strike_cache_capacity_bytes, 1)",
           "refId": "B",
           "legendFormat": "Lightning strike windows (#504)"
+        },
+        {
+          "expr": "station_frame_cache_bytes / clamp_min(station_frame_cache_capacity_bytes, 1)",
+          "refId": "SF",
+          "legendFormat": "Station map frames (#1063)"
         },
         {
           "expr": "satellite_frame_cache_bytes / clamp_min(satellite_frame_cache_capacity_bytes, 1)",

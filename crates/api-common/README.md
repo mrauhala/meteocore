@@ -36,7 +36,13 @@ per-style map tilesets to Maps' entries, and `crs` lists union in block order
 requires `/items` to accept exactly its collection's list. A block may *claim* a field it leaves
 out (`Contribution::claims`) so that no later block fills it: a raster block
 claims `storageCrs`, which it omits when the native CRS has no OGC URI, so a
-Features block's CRS84 cannot mislabel a projected radar grid. Common metadata routes get the
+Features block's CRS84 cannot mislabel a projected radar grid. A block serving
+feature items adds `Contribution::items`, an `ItemsOverview` (#1143): what one
+item is and the properties its items page filters and sorts by. It reaches the
+collection's HTML page only (`workbench::collection_page`), as a line under the
+description and "Filter by" / "Sort by" chip rows under Request data, each chip
+opening the items page with its builder at the property (`#filter=<name>`,
+`#sort=<name>`); the JSON description is unchanged. Common metadata routes get the
 conditional-GET middleware (`caching`); data routes keep their own ETags. Each
 block's responses carry an `ApiKind` for request logs and the `api` metrics
 label. Blocks reuse their per-API service's state, so reloads reach both.
