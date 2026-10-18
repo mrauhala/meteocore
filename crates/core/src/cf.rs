@@ -1356,10 +1356,10 @@ mod tests {
         ]
     }
 
-    /// How far `Crs::TransverseMercator`'s forward series lies from PROJ's
-    /// within 7° of the central meridian: 3 mm at 5.5° and 30°S. The 1 mm
-    /// of the other mappings holds on the meridian.
-    const TM_SERIES_METRES: f64 = 1e-2;
+    /// How far `Crs::TransverseMercator` may lie from PROJ's `tmerc`: the
+    /// 1 mm of the other mappings. Both use Krüger's series (#1130), which
+    /// agree to well under a micrometre here.
+    const TM_SERIES_METRES: f64 = 1e-3;
 
     /// UTM zone 33N pinned to `cs2cs +proj=longlat +datum=WGS84 +to
     /// +proj=tmerc +lat_0=0 +lon_0=15 +k=0.9996 +x_0=500000 +y_0=0

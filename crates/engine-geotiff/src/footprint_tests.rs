@@ -163,10 +163,14 @@ fn values(tile: &RasterTile) -> Vec<Option<f64>> {
 }
 
 /// The production meta-tiles past ±180° that logged the cap: no read, no
-/// projection, and as empty as they were. Before, the level-3 tile past
-/// 180°E projected 1 486 134 times, its grid refined to 256 × 256 cells,
-/// and each such tile took about 170 ms. A projected tile far from the
-/// source, an EPSG:3035 one over Iberia, is answered the same way.
+/// projection, and as empty as they were. With the Snyder series, whose
+/// forward transform folds hundreds of degrees from its meridian, the
+/// level-3 tile past 180°E projected 1 486 134 times, its grid refined to
+/// 256 × 256 cells, and each such tile took about 170 ms. Krüger's series
+/// is periodic in longitude and smooth on the far side of the Earth
+/// (#1130), so the whole-tile path now refines that tile in 1105
+/// projections; the footprint path still takes none. A projected tile far
+/// from the source, an EPSG:3035 one over Iberia, is answered the same way.
 #[test]
 fn off_world_meta_tiles_read_and_project_nothing() {
     let engine = engine();
@@ -204,7 +208,7 @@ fn off_world_meta_tiles_read_and_project_nothing() {
         assert!(before.is_empty(), "{name} drew data before");
     }
     let (_, before) = whole_tile_render(&engine, meta_tile(3, 3, 2), 256, &merc);
-    assert_eq!(before, 1_486_134, "the cell cap's projections");
+    assert_eq!(before, 1105, "the whole tile's projections");
 }
 
 /// Tiles the footprint covers, in Web Mercator, CRS:84 and EPSG:3067, draw
