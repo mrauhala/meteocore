@@ -438,6 +438,23 @@ and links, keywords are not truncated, and landing, collection and list pages
 list every link with its relation, title and type at its own href. This is a
 presentation change in all four APIs; discovery and conformance are unchanged.
 
+A collection page holds every member of its JSON as tables and anchors, never
+as JSON text (#1140): styles with a legend thumbnail and each style's map,
+map-tile and legend links as `<a>`; the extent with the catalog's time, cadence,
+step and bounds formatting; `parameter_names` as a parameter table (the name a
+request gives `parameter-name`, label, unit or "unit not provided by source",
+and a parameter's own levels and times where it advertises them: no
+parameter builder sets a per-parameter vertical extent yet, so a collection's
+levels stay in its coverage facts); `data_queries` with formats, CRS and, where
+a query takes them, units; CRS lists as short names (`EPSG:3067`) with the URI
+as the title. A member without a layout of its own is a collapsed nested list,
+in which JSON `null` shows as `null`. Labels are
+plain words with the JSON member or link relation as secondary text, and the
+Overview lists each resource once. The conformance page groups the declared
+classes by standard and version and links each class URI, with a class
+declared in its `http` and `https` forms on one row. The JSON and the
+declared conformance classes are unchanged.
+
 Maps HTML collection overviews additionally preview actual data using the
 advertised map/style endpoints. This is API-specific data access; the page’s
 JSON representation remains collection metadata and Common discovery is unchanged.
@@ -454,7 +471,8 @@ vertical coverage, keywords and license links. Storage CRS is not inferred.
 Collection advanced search starts collapsed and remembers its disclosure state
 per API path for the browser session, including after search submission. Applied
 filters remain visible while collapsed. Resource titles and their URLs form one
-clickable link; map endpoints retain their required-bbox hint. Country boundaries
+clickable link; a map endpoint notes that it covers the whole extent unless
+the request sets a bbox. Country boundaries
 render above map imagery with a contrasting halo, including after pan/zoom.
 
 Catalog presentation now has compact request/search disclosures, persistent

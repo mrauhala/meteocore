@@ -1030,7 +1030,10 @@ JSON switch. The collection builder exposes Common text/spatial/temporal search
 and paging. Collection and instance detail pages retain the complete EDR metadata,
 including parameter descriptions, extents and available query links. Overview and
 metadata tabs separate coverage from the full metadata table; a local geographic
-backdrop locates the advertised extent. See the
+backdrop locates the advertised extent. The metadata tab shows every member as
+tables, chips and anchors, never as JSON text (#1140): parameters, styles,
+extent, `data_queries` and CRS lists. The conformance page groups the declared
+classes by standard and version. See the
 [shared HTML behavior](../api-common/README.md#html-api-workbench).
 
 The HTML overview distinguishes finding a collection from requesting its data.

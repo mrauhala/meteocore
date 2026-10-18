@@ -9,6 +9,10 @@ use serde_json::{json, Value};
 
 use crate::{mounts, rel};
 
+mod conformance;
+mod metadata;
+pub use metadata::{i18n_text, unit_text};
+
 const CSS: &str = include_str!("workbench/style.css");
 const SCRIPT: &str = include_str!("workbench/app.js");
 const THEME: &str = include_str!("workbench/theme.js");
@@ -157,16 +161,12 @@ pub fn workspace_of(path: &str) -> (&'static str, &'static str) {
         })
 }
 
-/// A small badge naming the media type of a link that does not open an
-/// HTML page (#1132), so a JSON document or an image is never a surprise.
-/// Empty for `text/html` and for a link whose type is not known.
-pub fn media_badge(media: &str) -> String {
-    let media = media.trim();
-    let essence = media.split(';').next().unwrap_or_default().trim();
-    if essence.is_empty() || essence.eq_ignore_ascii_case("text/html") {
-        return String::new();
-    }
-    let label = match essence.to_ascii_lowercase().as_str() {
+/// The name a media type is known by (`HTML`, `JSON`, `PNG`), from its
+/// essence, the type without parameters; `None` for any other type. The
+/// one table behind the media badges and the resource cards (#1140).
+fn media_label(essence: &str) -> Option<&'static str> {
+    Some(match essence.trim().to_ascii_lowercase().as_str() {
+        "text/html" => "HTML",
         "application/json" => "JSON",
         "application/geo+json" => "GeoJSON",
         "application/vnd.cov+json" | "application/prs.coverage+json" => "CoverageJSON",
@@ -177,8 +177,20 @@ pub fn media_badge(media: &str) -> String {
         "image/webp" => "WebP",
         "text/csv" => "CSV",
         "application/xml" | "text/xml" => "XML",
-        _ => essence,
-    };
+        _ => return None,
+    })
+}
+
+/// A small badge naming the media type of a link that does not open an
+/// HTML page (#1132), so a JSON document or an image is never a surprise.
+/// Empty for `text/html` and for a link whose type is not known.
+pub fn media_badge(media: &str) -> String {
+    let media = media.trim();
+    let essence = media.split(';').next().unwrap_or_default().trim();
+    if essence.is_empty() || essence.eq_ignore_ascii_case("text/html") {
+        return String::new();
+    }
+    let label = media_label(essence).unwrap_or(essence);
     format!(
         "<span class=\"chip media-type\" title=\"Opens {}\">{}</span>",
         escape(media),
@@ -202,6 +214,15 @@ pub fn anchor(href: &str, label: &str, class: &str) -> String {
     format!(
         "<a class=\"{}\" href=\"{}\">{}</a>",
         escape(class),
+        escape(safe_href(href)),
+        escape(label)
+    )
+}
+
+/// [`anchor`] without a `class` attribute.
+fn plain_anchor(href: &str, label: &str) -> String {
+    format!(
+        "<a href=\"{}\">{}</a>",
         escape(safe_href(href)),
         escape(label)
     )
@@ -307,7 +328,7 @@ impl Page<'_> {
                 ("/", "Overview"),
                 ("/collections", "Collections"),
                 ("/api/docs", "API reference"),
-                ("/conformance", "Standards"),
+                ("/conformance", "Conformance"),
             ] {
                 let path = format!("{workspace_root}{suffix}");
                 if suffix == "/api/docs" {
@@ -489,15 +510,26 @@ pub fn page_heading(title: &str, description: &str) -> String {
 
 /// Render arbitrary metadata without losing types or flattening nested values.
 pub fn value_html(value: &Value) -> String {
+    property_value_html("", value)
+}
+
+/// [`value_html`] of the member or property `key`: an integral float
+/// without its `.0`, and a latitude or longitude to 5 decimals with its
+/// exact value in the `title` (#1140).
+pub fn property_value_html(key: &str, value: &Value) -> String {
     match value {
         Value::Null => "<span class=\"muted\">Not available</span>".into(),
         Value::String(v) => escape(v),
+        Value::Number(n) => metadata::number_html(key, n),
         Value::Array(values) if values.iter().all(|v| !v.is_object() && !v.is_array()) => {
             format!(
                 "<span class=\"chip-row\">{}</span>",
                 values
                     .iter()
-                    .map(|v| format!("<span class=\"chip\">{}</span>", value_html(v)))
+                    .map(|v| format!(
+                        "<span class=\"chip\">{}</span>",
+                        property_value_html(key, v)
+                    ))
                     .collect::<String>()
             )
         }
@@ -517,7 +549,7 @@ pub fn property_table(properties: &Value) -> String {
                 "<tr data-property=\"{}\"><th scope=\"row\"><code>{}</code></th><td>{}</td></tr>",
                 escape(key),
                 escape(key),
-                value_html(value)
+                property_value_html(key, value)
             ));
         }
     }
@@ -589,52 +621,20 @@ fn entry_details(doc: &Value) -> String {
     )
 }
 
+/// A document's links other than `self` and `alternate` as resource cards,
+/// one per resource (#1140): links to one href, or to representations of
+/// one resource that differ only in `f`, share a card, labelled in plain
+/// words from the relation with the relation term as secondary text. A
+/// relation with an HTML view (items, data, conformance, …) opens it; any
+/// other link opens its own media type, named by a badge.
 pub fn document_links(doc: &Value) -> String {
-    let mut body = String::from("<div class=\"endpoint-list resource-links\">");
-    // Relations are often advertised twice (short and registered URI form)
-    // with the same href, type and title; list such a pair once, under the
-    // first relation. Differently titled links to one resource (a tileset
-    // list offered as map and vector tilesets) each stay visible.
-    let mut listed: Vec<(&str, &str, &str)> = Vec::new();
-    if let Some(links) = doc["links"].as_array() {
-        for link in links {
-            let href = link["href"].as_str().unwrap_or_default();
-            let rel = link["rel"].as_str().unwrap_or_default();
-            if matches!(rel, "self" | "alternate") {
-                continue;
-            }
-            let media = link["type"].as_str().unwrap_or_default();
-            let title = link["title"].as_str().unwrap_or_default();
-            if listed.contains(&(href, media, title)) {
-                continue;
-            }
-            listed.push((href, media, title));
-            let label = link["title"].as_str().unwrap_or(rel);
-            let human = matches!(
-                rel,
-                "data" | "child" | "collection" | "conformance" | "up" | "items"
-            );
-            let target = if human {
-                with_format(href, "html")
-            } else {
-                href.to_owned()
-            };
-            body.push_str(&format!(
-                "<div class=\"endpoint\"><div><a class=\"resource-title\" href=\"{}\"><strong>{}</strong>{}<code>{}</code></a><p>{} · {}{}</p></div></div>",
-                escape(safe_href(&target)),
-                escape(label),
-                // The HTML view a human relation opens is a page; any other
-                // link opens its own media type.
-                if human { String::new() } else { media_badge(media) },
-                escape(href),
-                escape(rel),
-                escape(link["type"].as_str().unwrap_or("Linked resource")),
-                if rel == rel::MAP { " · requires bbox; use the map controls to build a request" } else { "" }
-            ));
-        }
-    }
-    body.push_str("</div>");
-    body
+    let links: Vec<&Value> = doc["links"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|l| !matches!(l["rel"].as_str(), Some("self" | "alternate")))
+        .collect();
+    metadata::resource_cards(&links)
 }
 
 pub fn landing_html(
@@ -731,11 +731,8 @@ pub fn conformance_html(surface: Surface<'_>, classes: &[&str], nav: &[LinkView]
         .map(|l| l.href.as_str())
         .unwrap_or("");
     let mut body=page_heading("Conformance classes","Classes declared by this API. Draft work is advertised only when its requirements are implemented.");
-    body.push_str("<ul class=\"panel conformance\">");
-    for class in classes {
-        body.push_str(&format!("<li><code>{}</code></li>", escape(class)));
-    }
-    body.push_str("</ul>");
+    // Grouped by standard and version, each class named and linked (#1140).
+    body.push_str(&conformance::conformance_body(classes));
     Page {
         surface,
         title: "Conformance classes",
@@ -1026,12 +1023,8 @@ pub fn collection_html(
         let modes: Vec<&str> = [map_href.map(|_| "maps"), tiles_href.map(|_| "tiles"), vector_href.map(|_| "vector")].into_iter().flatten().collect();
         json!({"styles":styles,"modes":modes,"vector":vector_href.map(|href| json!({"href":href,"layer":id})),"times":map_times(&doc["extent"]["temporal"]),"vertical":doc["extent"]["vertical"]})
     });
-    let kind = doc["itemType"]
-        .as_str()
-        .or(doc["dataType"].as_str())
-        .unwrap_or("Environmental data");
     // One chip per OGC API the collection is available through. Its kind
-    // (`itemType`/`dataType`) is under "Collection details" as Resource; a
+    // (`dataType`/`itemType`) is under "Collection details" as Data type; a
     // `feature` chip beside a `Features` one only read as a duplicate.
     let chips = api_chips(doc);
     let api_chips = if chips.is_empty() {
@@ -1055,7 +1048,6 @@ pub fn collection_html(
         body = body.replace("<h2>Data coverage</h2>", "<h2>Map data &amp; coverage</h2>");
     }
     let bbox = &doc["extent"]["spatial"]["bbox"][0];
-    let interval = &doc["extent"]["temporal"]["interval"][0];
     let mut head = String::new();
     if let Some(b) = bbox
         .as_array()
@@ -1089,9 +1081,20 @@ pub fn collection_html(
             false,
         ));
     } else {
-        body.push_str("<div class=\"empty-state\"><p>Spatial extent not specified.</p></div>");
+        body.push_str("<div class=\"empty-state\"><p>Spatial extent not advertised.</p></div>");
     }
-    body.push_str(&format!("<div class=\"coverage-facts\"><div class=\"fact\"><small>Start · UTC</small><strong>{}</strong></div><div class=\"fact\"><small>End · UTC</small><strong>{}</strong></div><div class=\"fact wide\"><small>Advertised bounds · CRS84 axis order</small><strong class=\"mono\">{}</strong></div>{}</div></section><section class=\"section-space\"><h2>Request data from this collection</h2>",value_html(&interval[0]),value_html(&interval[1]),value_html(bbox),vertical_coverage(&doc["extent"]["vertical"])));
+    // Time, cadence, steps and bounds with the catalog's formatting (#1140).
+    body.push_str(&metadata::coverage_facts(doc));
+    body.push_str("</section>");
+    // The parameters a request names in `parameter-name`, with their units.
+    if let Some(parameters) = doc["parameter_names"].as_object().filter(|p| !p.is_empty()) {
+        body.push_str(&format!(
+            "<section class=\"panel spaced\" id=\"parameters\"><div class=\"panel-head\"><h2>Parameters</h2><span class=\"chip\">{}</span></div>{}</section>",
+            parameters.len(),
+            metadata::parameter_table(parameters, false)
+        ));
+    }
+    body.push_str("<section class=\"section-space\"><h2>Request data from this collection</h2>");
     if let Some(items) = items {
         body.push_str(&format!("<div class=\"callout spaced\">Filter features within this collection by its supported properties, area and time. Inspect the results or copy the GeoJSON request. These filters select data, not collections.</div><div class=\"action-row spaced\">{}{}</div>",anchor(&with_format(items,"html"),"Build a data request →","btn primary"),anchor(&url,"View metadata JSON","btn")));
     }
@@ -1135,17 +1138,28 @@ pub fn collection_html(
         body.push_str(&document_links(&json!({ "links": tilesets })));
     }
     body.push_str("</section></div><aside class=\"aside-stack\"><section class=\"panel\"><div class=\"panel-head\"><h2>Collection details</h2></div><div class=\"panel-body\"><dl class=\"definition\">");
+    // Plain labels; the JSON terms and CRS URIs are secondary text (#1140).
     body.push_str(&format!(
-        "<dt>Resource</dt><dd>{}</dd><dt>Storage coordinate system</dt><dd>{}</dd>",
-        escape(kind),
-        escape(doc["storageCrs"].as_str().unwrap_or("Not advertised"))
+        "<dt>Data type</dt><dd>{}</dd><dt>Storage coordinate system</dt><dd>{}</dd>",
+        metadata::kind_html(doc),
+        doc["storageCrs"]
+            .as_str()
+            .map_or_else(|| metadata::NOT_ADVERTISED.to_owned(), metadata::crs_chip)
     ));
+    if let Some(list) = doc["crs"].as_array().filter(|l| !l.is_empty()) {
+        let chips: String = list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(metadata::crs_chip)
+            .collect();
+        body.push_str(&format!(
+            "<dt>Coordinate systems</dt><dd><span class=\"chip-row\">{chips}</span></dd>"
+        ));
+    }
     if let Some(n) = doc.get("numberItems") {
         body.push_str(&format!("<dt>Items</dt><dd>{}</dd>", value_html(n)));
     }
-    body.push_str("</dl>");
-    body.push_str(&license_html(license));
-    body.push_str("<div class=\"spaced\"><label>Keywords</label><div class=\"tag-list\">");
+    body.push_str("<dt>Keywords</dt><dd><div class=\"tag-list\">");
     for k in doc["keywords"]
         .as_array()
         .into_iter()
@@ -1158,40 +1172,49 @@ pub fn collection_html(
         .as_array()
         .is_some_and(|ks| ks.iter().any(Value::is_string))
     {
-        body.push_str("<span class=\"muted\">Not advertised</span>");
+        body.push_str(metadata::NOT_ADVERTISED);
     }
-    body.push_str("</div></div></div></section>");
+    body.push_str("</div></dd></dl>");
+    body.push_str(&license_html(license));
+    body.push_str("</div></section>");
     // Maps and map tiles have styled legends; vector tiles do not.
     if map_href.is_some() || tiles_href.is_some() {
         body.push_str("<section class=\"panel enhanced\"><div class=\"panel-head\"><h2>Map legend</h2></div><div class=\"map-legend\"><span id=\"map-legend-status\">Legend will appear after the map loads.</span><a id=\"map-legend-link\" hidden><img id=\"map-legend-image\" alt=\"Selected map style legend\" hidden></a></div></section>");
     }
-    body.push_str("<section class=\"panel\"><div class=\"panel-head\"><h2>Resource links</h2></div><div class=\"panel-body\">");
-    // The data query end points are listed under "Request data" from
-    // `data_queries`, each with its documentation; this list would open
-    // their `rel=data` links bare as `?f=html` pages. The metadata tab's
-    // link table lists them, at their own href.
+    // Each href once on the Overview (#1140): the data query end points are
+    // listed under "Request data" from `data_queries` (as `?f=html` pages
+    // their `rel=data` links would be bare 400s), the tilesets beside the
+    // map, and a configured license in the details. The metadata tab's
+    // link table lists every link at its own href.
     let query_hrefs: Vec<&str> = doc["data_queries"]
         .as_object()
         .into_iter()
         .flatten()
         .filter_map(|(_, query)| query["link"]["href"].as_str())
         .collect();
+    let license_href = license.and_then(|license| license.resolved_url());
     let resource_links: Vec<&Value> = links
         .into_iter()
         .flatten()
         .filter(|l| {
-            !(l["rel"] == "data" && l["href"].as_str().is_some_and(|h| query_hrefs.contains(&h)))
+            let href = l["href"].as_str().unwrap_or_default();
+            !matches!(l["rel"].as_str(), Some("self" | "alternate"))
+                && !(l["rel"] == "data" && query_hrefs.contains(&href))
+                && !tilesets.iter().any(|t| t["href"] == href)
+                && !(l["rel"] == "license" && license_href.as_deref() == Some(href))
         })
         .collect();
-    body.push_str(&document_links(&json!({ "links": resource_links })));
-    body.push_str("</div></section></aside></div></section><section id=\"metadata\" class=\"collection-view metadata-section\" data-collection-view><section class=\"panel\"><div class=\"panel-head\"><h2>Coverage &amp; metadata</h2>");
+    // An empty list gets no panel.
+    if !resource_links.is_empty() {
+        body.push_str("<section class=\"panel\"><div class=\"panel-head\"><h2>Resource links</h2></div><div class=\"panel-body\">");
+        body.push_str(&metadata::resource_cards(&resource_links));
+        body.push_str("</div></section>");
+    }
+    body.push_str("</aside></div></section><section id=\"metadata\" class=\"collection-view metadata-section\" data-collection-view><section class=\"panel\"><div class=\"panel-head\"><h2>Coverage &amp; metadata</h2>");
     body.push_str(&anchor(&url, "View full JSON { }", "quiet"));
     body.push_str("</div>");
-    let mut metadata = doc.clone();
-    if let Some(m) = metadata.as_object_mut() {
-        m.remove("links");
-    }
-    body.push_str(&property_table(&metadata));
+    // Every member but the links, as tables and anchors, never as JSON text.
+    body.push_str(&metadata::metadata_html(doc));
     body.push_str(
         "</section><section class=\"panel spaced\"><div class=\"panel-head\"><h2>Links</h2></div>",
     );
@@ -1441,22 +1464,10 @@ fn collection_facts(doc: &Value) -> String {
     let temporal = &doc["extent"]["temporal"];
     fact("Time · UTC", collection_time_html(temporal));
     if let Some(resolution) = temporal["grid"]["resolution"].as_str() {
-        let label = ds_core::datetime::parse_iso8601_duration(resolution)
-            .ok()
-            .map(|step| {
-                let secs = step.num_seconds();
-                if secs % 86400 == 0 {
-                    format!("Every {} d", secs / 86400)
-                } else if secs % 3600 == 0 {
-                    format!("Every {} h", secs / 3600)
-                } else if secs % 60 == 0 {
-                    format!("Every {} min", secs / 60)
-                } else {
-                    format!("Every {secs} s")
-                }
-            })
-            .unwrap_or_else(|| resolution.to_owned());
-        fact("Time resolution", escape(&label));
+        fact(
+            "Time resolution",
+            escape(&metadata::cadence_label(resolution)),
+        );
     } else if let Some(count) = temporal["grid"]["cellsCount"].as_u64().or_else(|| {
         temporal["values"]
             .as_array()
@@ -1466,31 +1477,15 @@ fn collection_facts(doc: &Value) -> String {
         fact("Time steps", format!("{count} advertised"));
     }
     let bbox = &doc["extent"]["spatial"]["bbox"][0];
-    if let Some(b) = bbox.as_array().filter(|b| matches!(b.len(), 4 | 6)) {
-        let xy = if b.len() == 6 {
-            [0, 1, 3, 4]
-        } else {
-            [0, 1, 2, 3]
-        };
-        let values: Option<Vec<f64>> = xy
-            .iter()
-            .map(|&i| b[i].as_f64().filter(|n| n.is_finite()))
-            .collect();
-        if let Some(v) = values {
-            let label = if v == [-180., -90., 180., 90.] {
-                "Global".into()
-            } else {
-                format!("{:.2}, {:.2} → {:.2}, {:.2}", v[0], v[1], v[2], v[3])
-            };
-            fact(
-                "Bounds · CRS84",
-                format!(
-                    "<span title=\"{}\">{}</span>",
-                    escape(&bbox.to_string()),
-                    escape(&label)
-                ),
-            );
-        }
+    if let Some(v) = metadata::bbox_xy(bbox) {
+        fact(
+            "Bounds · CRS84",
+            format!(
+                "<span title=\"{}\">{}</span>",
+                escape(&bbox.to_string()),
+                escape(&metadata::bbox_label(v))
+            ),
+        );
     }
     if let Some(parameters) = doc["parameter_names"].as_object().filter(|p| !p.is_empty()) {
         let names: Vec<_> = parameters.keys().map(String::as_str).collect();
@@ -2325,7 +2320,9 @@ mod tests {
         ] {
             assert!(html.contains(value), "missing {value}");
         }
-        assert!(html.contains("Storage coordinate system</dt><dd>Not advertised</dd>"));
+        assert!(html.contains(
+            "Storage coordinate system</dt><dd><span class=\"muted\">Not advertised</span></dd>"
+        ));
     }
 
     #[test]
@@ -2428,6 +2425,14 @@ mod tests {
         assert!(!html.contains("value=\"https://example.test/maps/?f=html\""));
         // Map request parameters are documented by the API serving the map.
         assert!(html.contains("href=\"https://example.test/maps/api/docs\">Map request parameters"));
+        // The conformance page is named for what it lists (#1140).
+        let conformance = html
+            .split("href=\"https://example.test/relocated/features/conformance?f=html\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</a>").next())
+            .unwrap_or_else(|| panic!("no conformance nav link: {html}"));
+        assert!(conformance.ends_with("Conformance"), "{conformance}");
+        assert!(!html.contains("Standards</a>"), "{html}");
     }
 
     #[test]
@@ -2517,7 +2522,9 @@ mod tests {
             .nth(1)
             .unwrap();
         assert!(!row.split("</div>").next().unwrap().contains(">feature<"));
-        assert!(html.contains("<dt>Resource</dt><dd>feature</dd>"));
+        assert!(html.contains(
+            "<dt>Data type</dt><dd>Features<small class=\"term\">itemType <code>feature</code></small></dd>"
+        ));
         let edr = json!({"id":"c","links":[],"data_queries":{"position":{}}});
         assert_eq!(chips(&edr), ["EDR"]);
         // Nothing advertised: the serving API still labels the page.
@@ -2631,15 +2638,21 @@ mod tests {
         let html = document_links(&doc);
         assert_eq!(html.matches("maps/conformance?f=html").count(), 1);
         assert!(!html.contains(rel::CONFORMANCE));
-        // Distinct representations of one resource remain separate entries.
-        assert_eq!(html.matches(" · image/").count(), 2);
-        // Differently titled offers of one resource keep their relations.
-        for title in ["Tilesets", "Map tilesets", "Vector tilesets"] {
-            assert!(
-                html.contains(&format!("<strong>{title}</strong>")),
-                "{title}"
-            );
-        }
+        // One card per resource (#1140): its representations are listed
+        // on it, not as cards of their own.
+        assert_eq!(html.matches("class=\"endpoint\"").count(), 3, "{html}");
+        assert_eq!(html.matches("<strong>Map image</strong>").count(), 1);
+        assert!(
+            html.contains("image/png, image/jpeg\">PNG, JPEG</span>"),
+            "{html}"
+        );
+        // A resource offered under several relations keeps every relation
+        // and the titles that say more, under the first relation's label.
+        assert_eq!(html.matches("<strong>Tiles</strong>").count(), 1);
+        assert!(
+            html.contains("<p>Map tilesets · Vector tilesets · <code"),
+            "{html}"
+        );
         assert!(html.contains(rel::TILESETS_VECTOR));
     }
 
@@ -2767,6 +2780,261 @@ mod tests {
             assert!(html.contains(text), "{text}");
         }
         assert!(!html.contains("position?f=html"));
+    }
+
+    /// The `href` of every `<a>` element of `html`, unescaped.
+    fn anchor_hrefs(html: &str) -> Vec<String> {
+        html.split("<a ")
+            .skip(1)
+            .filter_map(|tag| {
+                let tag = tag.split('>').next()?;
+                let href = tag.split("href=\"").nth(1)?.split('"').next()?;
+                Some(href.replace("&amp;", "&"))
+            })
+            .collect()
+    }
+
+    /// Every `href` member anywhere in `value`.
+    fn json_hrefs(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Object(members) => {
+                for (key, member) in members {
+                    match (key.as_str(), member) {
+                        ("href", Value::String(href)) => out.push(href.clone()),
+                        _ => json_hrefs(member, out),
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| json_hrefs(item, out)),
+            _ => {}
+        }
+    }
+
+    /// A shared-root collection with styles, parameters, items and an
+    /// EDR-style query, as the #1140 tests read it.
+    fn rich_collection() -> Value {
+        let style = |id: &str, title: &str| {
+            json!({"id": id, "title": title, "links": [
+                {"href": format!("https://x/collections/r/styles/{id}/map"), "rel": rel::MAP, "type": "image/png"},
+                {"href": format!("https://x/collections/r/styles/{id}/legend"), "rel": rel::LEGEND, "type": "application/json"},
+                {"href": format!("https://x/collections/r/styles/{id}/map/tiles"), "rel": rel::TILESETS_MAP, "type": "application/json", "title": "Map tilesets in this style"}]})
+        };
+        json!({"id": "r", "title": "Radar", "description": "Reflectivity",
+            "links": [
+                {"href": "https://x/collections/r", "rel": "self", "type": "application/json", "title": "This collection"},
+                {"href": "https://x/collections/r?f=html", "rel": "alternate", "type": "text/html", "title": "This collection as HTML"},
+                {"href": "https://x/collections/r/map", "rel": rel::MAP, "type": "image/png", "title": "Map"},
+                {"href": "https://x/collections/r/styles", "rel": rel::STYLES, "type": "application/json", "title": "Styles"},
+                {"href": "https://x/collections/r/map/tiles", "rel": rel::TILESETS_MAP, "type": "application/json", "title": "Map tilesets"},
+                {"href": "https://x/collections/r/items", "rel": "items", "type": "application/geo+json", "title": "Items"},
+                {"href": "https://x/collections/r/items?f=html", "rel": "items", "type": "text/html", "title": "Items as HTML"},
+                {"href": "https://x/licenses/cc-by", "rel": "license", "type": "text/html", "title": "CC-BY-4.0"}],
+            "keywords": ["radar"],
+            "dataType": "map", "itemType": "feature", "numberItems": 3,
+            "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84", "http://www.opengis.net/def/crs/EPSG/0/3067"],
+            "storageCrs": "http://www.opengis.net/def/crs/EPSG/0/3067",
+            "styles": [style("default", "Default"), style("grayscale", "Grayscale")],
+            "parameter_names": {
+                "dbzh": {"type": "Parameter", "label": "Reflectivity", "description": "Reflectivity, in dBZ",
+                    "unit": {"label": {"en": "decibel Z"}, "symbol": {"value": "dBZ", "type": "https://qudt.org/vocab/unit/DeciB_Z"}},
+                    "observedProperty": {"id": "https://example.test/reflectivity", "label": {"en": "Reflectivity"}}},
+                "qind": {"type": "Parameter", "observedProperty": {"label": {"en": "Quality index"}}},
+                "rgb": {"type": "Parameter", "description": "RGB composite: red dbzh, green qind",
+                    "observedProperty": {"label": {"en": "Composite"}},
+                    "extent": {"temporal": {"interval": [["2026-03-24T23:20:00Z", "2026-03-24T23:30:00Z"]], "grid": {"cellsCount": 3}}}}},
+            "data_queries": {"position": {"link": {"href": "https://x/edr/collections/r/position", "rel": "data",
+                "variables": {"title": "Position query", "description": "Data at a point", "query_type": "position",
+                    "output_formats": ["CoverageJSON", "HTML"], "default_output_format": "CoverageJSON",
+                    "crs_details": [{"crs": "CRS84", "wkt": "GEOGCRS[\"WGS 84\"]"}], "within_units": ["km"]}}}},
+            "extent": {"spatial": {"bbox": [[0.4190042054438888, 54.570768841987515, 37.99495803626129, 74.81020226886669]],
+                    "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"},
+                "temporal": {"interval": [["2026-03-24T23:15:00+00:00", "2026-03-24T23:35:00+00:00"]],
+                    "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian",
+                    "grid": {"cellsCount": 5, "resolution": "PT5M", "firstCoordinate": "2026-03-24T23:15:00+00:00"}}},
+            "custom": {"nested": [{"value": 135.0}]}})
+    }
+
+    const SHARED_X: Surface<'static> = Surface {
+        base: "https://x",
+        root: "https://x",
+        api: crate::shared::WORKSPACE,
+    };
+
+    /// #1140, Common Part 1 `/req/html/content`: every `href` of the
+    /// collection JSON, the styles' links and the data queries' included,
+    /// is the `href` of an `<a>` on the page; the metadata tab shows no
+    /// member as JSON text.
+    #[test]
+    fn every_href_of_the_collection_json_is_an_anchor() {
+        let doc = rich_collection();
+        let html = collection_html(SHARED_X, &doc, None);
+        let anchors = anchor_hrefs(&html);
+        let mut hrefs = Vec::new();
+        json_hrefs(&doc, &mut hrefs);
+        assert!(hrefs.len() >= 15, "{hrefs:?}");
+        for href in hrefs {
+            assert!(anchors.contains(&href), "{href} is not an anchor");
+        }
+        let metadata = html.split("id=\"metadata\"").nth(1).unwrap();
+        assert!(!metadata.contains("<pre"), "{metadata}");
+        assert!(!html.contains("<pre"));
+        // Each style is a row with its legend and its map, tile and legend
+        // links as anchors labelled in plain words.
+        let styles = metadata.split("data-property=\"styles\"").nth(1).unwrap();
+        assert!(styles.contains(
+            "<img src=\"https://x/collections/r/styles/grayscale/legend?f=png\" alt=\"Legend of the Grayscale style\" loading=\"lazy\">"
+        ), "{styles}");
+        for label in ["Map image", "Map tiles", "Legend"] {
+            assert_eq!(
+                styles.matches(&format!(">{label}</a>")).count(),
+                2,
+                "{label}"
+            );
+        }
+        // Data queries: formats with the default marked, CRS and units.
+        assert!(metadata.contains("CoverageJSON · default"));
+        assert!(metadata.contains("title=\"GEOGCRS[&quot;WGS 84&quot;]\">CRS84</span>"));
+        assert!(metadata.contains(
+            "<div>Radius: km<small class=\"term\"><code>within_units</code></small></div>"
+        ));
+        // CRS lists as short names, the URI in the title.
+        assert!(metadata.contains(
+            "<span class=\"chip crs\" title=\"http://www.opengis.net/def/crs/EPSG/0/3067\">EPSG:3067</span>"
+        ));
+        // The extent with the catalog's formatting, every member kept.
+        assert!(metadata.contains("<dt>Cadence</dt><dd>Every 5 min</dd>"));
+        assert!(metadata.contains("<dt>Steps</dt><dd>5 steps</dd>"));
+        assert!(metadata.contains("0.42, 54.57 → 37.99, 74.81"));
+        assert!(metadata.contains(">2026-03-24T23:15:00+00:00</span>"));
+        // An unknown member is a collapsed nested list; its float shows
+        // without `.0`.
+        assert!(metadata.contains("<details><summary>1 member</summary>"));
+        assert!(metadata.contains("<dt><code>value</code></dt><dd>135</dd>"));
+        // Members are labelled in plain words, the JSON name secondary.
+        assert!(metadata.contains(
+            "<th scope=\"row\">Storage coordinate system<small class=\"term\"><code>storageCrs</code></small></th>"
+        ));
+    }
+
+    /// #1140: the Overview lists the parameters a request names in
+    /// `parameter-name`, with label and unit, says when the source gives
+    /// no unit, and shows a parameter's own time axis.
+    #[test]
+    fn overview_lists_parameters_with_label_and_unit() {
+        let html = collection_html(SHARED_X, &rich_collection(), None);
+        let overview = html.split("id=\"metadata\"").next().unwrap();
+        let table = overview
+            .split("id=\"parameters\"")
+            .nth(1)
+            .unwrap()
+            .split("</section>")
+            .next()
+            .unwrap();
+        assert!(table.contains("<h2>Parameters</h2><span class=\"chip\">3</span>"));
+        assert!(table.contains(
+            "<tr data-parameter=\"dbzh\"><th scope=\"row\"><code>dbzh</code></th><td>Reflectivity</td><td data-label=\"Unit\"><span title=\"decibel Z\">dBZ</span></td>"
+        ), "{table}");
+        assert!(table.contains(
+            "<td>Quality index</td><td data-label=\"Unit\"><span class=\"muted\">unit not provided by source</span></td>"
+        ));
+        // A description that says more than the label is shown under it.
+        assert!(table
+            .contains("<small class=\"secondary\">RGB composite: red dbzh, green qind</small>"));
+        assert!(!table.contains("Reflectivity, in dBZ"));
+        // The composite's own time axis; the others follow the collection.
+        assert!(table.contains("<th scope=\"col\">Time</th>"));
+        assert!(table.contains("<span>23:20–23:30 UTC</span>"), "{table}");
+        assert!(table.contains("<small class=\"secondary\">3 steps</small>"));
+        // A collection without parameters has no table.
+        let mut none = rich_collection();
+        none.as_object_mut().unwrap().remove("parameter_names");
+        assert!(!collection_html(SHARED_X, &none, None).contains("id=\"parameters\""));
+    }
+
+    /// #1140: the coverage facts use the catalog's formatting: the time
+    /// span, cadence and steps, the bounds to 2 decimals with a Copy bbox
+    /// button holding the exact values, and one wording when missing.
+    #[test]
+    fn coverage_facts_use_the_catalog_formatting() {
+        let doc = rich_collection();
+        let facts = metadata::coverage_facts(&doc);
+        assert!(
+            facts.contains("<span>2026-03-24</span><span>23:15–23:35 UTC</span>"),
+            "{facts}"
+        );
+        assert!(facts.contains("<small>Cadence</small><strong>Every 5 min</strong>"));
+        assert!(facts.contains("<small>Steps</small><strong>5 steps</strong>"));
+        assert!(facts.contains("title=\"0.4190042054438888,54.570768841987515,37.99495803626129,74.81020226886669\">0.42, 54.57 → 37.99, 74.81</strong>"), "{facts}");
+        assert!(facts.contains("data-copy=\"0.4190042054438888,54.570768841987515,37.99495803626129,74.81020226886669\">Copy bbox</button>"));
+        // The catalog row shows the same bounds text.
+        assert!(collection_facts(&doc).contains(">0.42, 54.57 → 37.99, 74.81</span>"));
+        let empty = metadata::coverage_facts(&json!({"id": "e"}));
+        assert_eq!(empty.matches("Not advertised").count(), 2, "{empty}");
+        assert!(!empty.contains("Cadence") && !empty.contains("Steps"));
+        let html = collection_html(SHARED_X, &json!({"id": "e", "links": []}), None);
+        assert!(!html.contains("Not available"), "{html}");
+    }
+
+    /// #1140: the Overview's resource cards are labelled in plain words, one
+    /// per resource; the items JSON and HTML share a card; the map card
+    /// says it covers the whole extent; nothing listed elsewhere on the
+    /// Overview repeats, and an empty list gets no panel. The details give
+    /// the kind from `dataType` and keywords as a term.
+    #[test]
+    fn overview_resource_cards_use_plain_labels_once_per_resource() {
+        let license = LicenseConfig {
+            title: "CC-BY-4.0".into(),
+            url: Some("https://x/licenses/cc-by".into()),
+            media_type: None,
+        };
+        let html = collection_html(SHARED_X, &rich_collection(), Some(&license));
+        let overview = html.split("id=\"metadata\"").next().unwrap();
+        let aside = overview
+            .split("<aside class=\"aside-stack\">")
+            .nth(1)
+            .unwrap();
+        let cards = aside.split("<h2>Resource links</h2>").nth(1).unwrap();
+        assert_eq!(cards.matches("class=\"endpoint\"").count(), 3, "{cards}");
+        for label in ["Map image", "Styles", "Features"] {
+            assert!(
+                cards.contains(&format!("<strong>{label}</strong>")),
+                "{label}"
+            );
+        }
+        // The items card opens the HTML view and keeps the GeoJSON link.
+        assert!(cards.contains(
+            "<a class=\"resource-title\" href=\"https://x/collections/r/items?f=html\"><strong>Features</strong><code>https://x/collections/r/items</code></a>"
+        ), "{cards}");
+        assert!(cards
+            .contains("<a class=\"chip\" href=\"https://x/collections/r/items\">As GeoJSON</a>"));
+        assert!(cards.contains("<code class=\"term\" title=\"items\">items</code>"));
+        assert!(cards.contains(&format!(
+            "<code class=\"term\" title=\"{}\">map</code>",
+            rel::MAP
+        )));
+        assert!(cards.contains("Covers the whole extent unless the request sets a bbox"));
+        // A title that only repeats the label is not shown again.
+        assert!(!cards.contains("Map · "));
+        assert!(!overview.contains("requires bbox"));
+        // Tilesets are listed beside the map, the license in the details.
+        assert!(!cards.contains("map/tiles\""));
+        assert!(!cards.contains("licenses/cc-by"));
+        assert_eq!(
+            overview
+                .matches("href=\"https://x/collections/r/map/tiles\"")
+                .count(),
+            1
+        );
+        assert!(aside.contains(
+            "<dt>Data type</dt><dd>Map layer<small class=\"term\">dataType <code>map</code> · itemType <code>feature</code></small></dd>"
+        ), "{aside}");
+        assert!(aside.contains("<dt>Keywords</dt><dd><div class=\"tag-list\">"));
+        assert!(!aside.contains("<label>Keywords</label>"));
+        assert!(aside.contains("<dt>Storage coordinate system</dt><dd><span class=\"chip crs\" title=\"http://www.opengis.net/def/crs/EPSG/0/3067\">EPSG:3067</span></dd>"));
+        // Nothing left to list: no empty panel.
+        let bare =
+            json!({"id": "b", "links": [{"href": "https://x/collections/b", "rel": "self"}]});
+        assert!(!collection_html(SHARED_X, &bare, None).contains("Resource links"));
     }
 
     /// The stylesheet's rules as (selector list, declarations, inside an

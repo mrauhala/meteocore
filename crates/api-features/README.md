@@ -25,7 +25,7 @@ building block of the shared OGC API root at `/` (see
 | Part 1 `core` | ✓ | landing, `/conformance`, `/collections`, `/collections/{id}`, `/items`, `/items/{featureId}`; optional Part 1 property equality filters implemented (#700) |
 | Part 1 `oas30` | ✓ | `/features/api` (hand-written `api_definition()`, validated against the bundled OpenAPI 3.0 meta-schema in tests), Swagger UI at `/features/api/docs`; `limit`, `bbox` and `datetime` are declared as Part 1 defines them, `style: form` and `explode: false` included (the test suite checks them) |
 | Part 1 `geojson` | ✓ | GeoJSON feature encoding (default) |
-| Part 1 `html` | ✓ | metadata, feature pages and individual features negotiate HTML; property tables, geometry details and a map using the preview’s vendored MapLibre assets |
+| Part 1 `html` | ✓ | metadata, feature pages and individual features negotiate HTML; property tables, geometry details and a map using the preview’s vendored MapLibre assets. Property numbers show an integral float without `.0` and a latitude or longitude property to 5 decimals, its exact value in the `title` (#1140); the collection page shows its metadata as tables and anchors, and the conformance page groups classes by standard |
 | Part 1 `gmlsf0` / `gmlsf2` | ✗ | no GML |
 | Part 2 CRS by reference (`crs`) | ✓ | `crs` on `/items` and `/items/{featureId}`, `bbox-crs` on `/items`, `Content-Crs` on every feature response; collections advertise CRS84, EPSG:4326, EPSG:3857, EPSG:3067 and EPSG:3035 with `storageCrs` CRS84 — see [CRS by reference](#crs-by-reference-part-2) (#685) |
 | Part 3 Filtering / CQL2 (`filter`, `queryables`) | ✗ | `filter` controls return 400; no `/queryables` |
