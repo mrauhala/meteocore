@@ -1,9 +1,9 @@
 //! The shared `f32` map sampler over a regular source grid (#1067).
 //!
-//! A gridded engine decodes a field to a row-major `&[f32]` on its
-//! [`GeoTransform`] and renders it with [`SourceGrid::render_f32`]; it does
-//! not write a sampler of its own. The rules, taken from engine-querydata's
-//! projected render path:
+//! A new gridded engine decodes a field to a row-major `&[f32]` on its
+//! [`GeoTransform`] and renders it with [`SourceGrid::render_f32`] rather
+//! than writing a sampler of its own (the exceptions are below). The
+//! rules, first written for engine-querydata's projected render path:
 //!
 //! - **Output → source** goes through [`OutputCrs::project_node`] and a
 //!   coarse [`ProjectionGrid`], never a projection per output pixel
@@ -27,15 +27,24 @@
 //!   longitude within half a turn of the grid's own centre, so a box past
 //!   ±180° reaches a grid near the antimeridian. Its forward transform can
 //!   alias a far-away output pixel onto valid data at low zoom, so output
-//!   outside [`OutputCrs::footprint_pixel_window`] of the grid's WGS84
+//!   outside [`OutputCrs::footprint_window_in_image`] of the grid's WGS84
 //!   envelope stays empty (#449, #453), and the coordinate map is refined
 //!   for that window alone ([`ProjectionGrid::build_2d_within`], #1110).
-//!   The envelope is the grid's inverse-projected cell edges
+//!   A footprint wholly off the image builds no map at all (#1129). The
+//!   envelope is the grid's inverse-projected cell edges
 //!   ([`GeoTransform::bbox`]), computed once by [`SourceGrid::new`], never
 //!   per request.
 //!
 //! The output is [`RasterValues::F32`]: interpolation runs in `f64` and only
 //! the stored value is narrowed, with NaN for nodata.
+//!
+//! Three engines keep a sampler of their own. engine-querydata cannot
+//! afford a decoded field, since its memory-mapped layout strides one field
+//! by levels × times, so it shares the map alone: [`OutputMap::position`]
+//! is where each output pixel samples, and the engine reads its own
+//! storage there by the rules above (#1190). engine-grib and
+//! engine-satellite keep their own samplers, and their own maps, by design:
+//! moving either onto this one changes their pixels (#1172).
 
 use super::ProjectionGrid;
 use crate::error::DataServerError;
@@ -95,6 +104,21 @@ impl SourceGrid {
         &self.transform
     }
 
+    /// Columns per turn of a grid whose columns fill the turn of longitude
+    /// (a global lat/lon or Web Mercator grid), `None` for any other grid.
+    /// Such a grid's columns repeat every turn, and the column one past its
+    /// last is its first: what an engine sampling its own storage at
+    /// [`OutputMap::position`] wraps.
+    pub fn global_period(&self) -> Option<f64> {
+        match self.layout {
+            Layout::Periodic {
+                period,
+                global: true,
+            } => Some(period),
+            _ => None,
+        }
+    }
+
     /// Render `values`, the grid's row-major field with `nodata` as its
     /// sentinel, onto a `width`×`height` map of `bbox` in `output_crs`:
     /// [`Self::output_map`] then [`OutputMap::sample_f32`].
@@ -120,7 +144,29 @@ impl SourceGrid {
     /// crossing the antimeridian may come either way: `west > east`
     /// (170, 10, -170, 20), or unwrapped with `east` past 180°
     /// (170, 10, 190, 20), as OGC API Maps passes it (#828).
+    ///
+    /// A map whose coarse grid stops at its cell cap over the interpolation
+    /// budget is reported on stderr ([`ProjectionGrid::build_2d`]).
     pub fn output_map(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        output_crs: &OutputCrs,
+    ) -> OutputMap<'_> {
+        let map = self.output_map_quiet(bbox, width, height, output_crs);
+        OutputMap {
+            grid: map.grid.map(ProjectionGrid::warn_if_capped),
+            ..map
+        }
+    }
+
+    /// [`Self::output_map`] for a caller that reports a capped map itself:
+    /// nothing goes to stderr, and [`OutputMap::capped_error`] says whether
+    /// its coarse grid stopped at the cell cap over budget. ds-core has no
+    /// `tracing`, so an engine logs it with what only it knows, the
+    /// collection and the request (#1129).
+    pub fn output_map_quiet(
         &self,
         bbox: [f64; 4],
         width: u32,
@@ -136,15 +182,16 @@ impl SourceGrid {
         let node = |fx: f64, fy: f64| output_crs.project_node(bbox, fx, fy);
         let (grid, window) = match self.layout {
             Layout::Periodic { period, .. } => (
-                ProjectionGrid::build_2d_periodic(
+                Some(ProjectionGrid::refined(
                     width,
                     height,
                     gt.width,
                     gt.height,
                     Some(period),
+                    None,
                     node,
                     |lon, lat| centred(gt.world_to_pixel_f64(lon, lat)),
-                ),
+                )),
                 None,
             ),
             Layout::Projected { envelope } => {
@@ -153,8 +200,11 @@ impl SourceGrid {
                     let lon = centre.map_or(lon, |c| within_half_turn(lon, c));
                     centred(gt.world_to_pixel_f64(lon, lat))
                 };
-                let window = envelope.filter(|_| width > 0 && height > 0).map(|env| {
-                    output_crs.footprint_pixel_window(
+                // Only the footprint is sampled, so only its error counts
+                // (#1110). A footprint off the image, or an empty image,
+                // leaves nothing to sample and builds no grid (#1129).
+                let window = envelope.map(|env| {
+                    output_crs.footprint_window_in_image(
                         bbox,
                         envelope_near(env, bbox, output_crs),
                         width,
@@ -162,16 +212,19 @@ impl SourceGrid {
                     )
                 });
                 let grid = match window {
-                    // Only the footprint is sampled, so only its error
-                    // counts (#1110).
-                    Some(read) => ProjectionGrid::build_2d_within(
-                        width, height, read, gt.width, gt.height, node, to_src,
-                    ),
-                    None => {
-                        ProjectionGrid::build_2d(width, height, gt.width, gt.height, node, to_src)
-                    }
+                    Some(None) => None,
+                    read => Some(ProjectionGrid::refined(
+                        width,
+                        height,
+                        gt.width,
+                        gt.height,
+                        None,
+                        read.flatten(),
+                        node,
+                        to_src,
+                    )),
                 };
-                (grid, window)
+                (grid, window.flatten())
             }
         };
         OutputMap {
@@ -321,7 +374,9 @@ impl SourceGrid {
 /// ([`SourceGrid::output_map`]).
 pub struct OutputMap<'a> {
     source: &'a SourceGrid,
-    grid: ProjectionGrid,
+    /// `None` when a projected grid's footprint lies wholly off the image:
+    /// nothing to draw, and no grid built.
+    grid: Option<ProjectionGrid>,
     width: u32,
     height: u32,
     /// The inclusive output window `(px_lo, px_hi, py_lo, py_hi)` a
@@ -351,20 +406,13 @@ impl OutputMap<'_> {
                 gt.height
             )));
         }
-        let (px, py) = match self.window {
-            Some((x0, x1, y0, y1)) => (x0..=x1, y0..=y1),
-            None => (0..=u32::MAX, 0..=u32::MAX),
-        };
         let mut data = Vec::with_capacity(self.width as usize * self.height as usize);
         for oy in 0..self.height {
             crate::deadline::check()?;
             for ox in 0..self.width {
-                let value = if py.contains(&oy) && px.contains(&ox) {
-                    let (col, row) = self.grid.sample(ox, oy);
-                    self.source.sample(values, nodata, col, row)
-                } else {
-                    None
-                };
+                let value = self
+                    .mapped(ox, oy)
+                    .and_then(|(col, row)| self.source.sample(values, nodata, col, row));
                 data.push(value.map_or(f32::NAN, |v| v as f32));
             }
         }
@@ -373,6 +421,44 @@ impl OutputMap<'_> {
             height: self.height,
             values: RasterValues::F32 { data, nodata: None },
         })
+    }
+
+    /// The fractional source position output pixel `(ox, oy)` samples, as
+    /// [`SourceGrid::position`] measures it, with a longitude-linear grid's
+    /// column moved into the turn the grid is drawn in; `None` where the
+    /// map draws nothing: outside a projected grid's footprint, off the
+    /// grid (beyond the half cell past its edges), or where the mapping is
+    /// undefined.
+    ///
+    /// For an engine that samples its own storage rather than a decoded
+    /// field (engine-querydata, #1190), by [`Self::sample_f32`]'s rules:
+    /// bilinear between the four surrounding cell centres, else the nearest
+    /// cell, and on a global grid ([`SourceGrid::global_period`]) the
+    /// column one past the last is the first. The engine checks the
+    /// request deadline per row, as `sample_f32` does.
+    pub fn position(&self, ox: u32, oy: u32) -> Option<(f64, f64)> {
+        let (col, row) = self.mapped(ox, oy)?;
+        let (col, _) = self.source.locate(col, row)?;
+        Some((col, row))
+    }
+
+    /// The estimated interpolation error of the map's coarse grid when its
+    /// refinement stopped at the cell cap over budget, `None` when it met
+    /// the budget or no grid was built. In source pixels, or output pixels
+    /// on a longitude-linear grid ([`ProjectionGrid::capped_error`]).
+    pub fn capped_error(&self) -> Option<f64> {
+        self.grid.as_ref()?.capped_error()
+    }
+
+    /// Output pixel `(ox, oy)`'s source position as the coarse grid
+    /// interpolates it, before [`SourceGrid::locate`]; `None` outside the
+    /// footprint window or with no grid.
+    fn mapped(&self, ox: u32, oy: u32) -> Option<(f64, f64)> {
+        let grid = self.grid.as_ref()?;
+        match self.window {
+            Some((x0, x1, y0, y1)) if !((x0..=x1).contains(&ox) && (y0..=y1).contains(&oy)) => None,
+            _ => Some(grid.sample(ox, oy)),
+        }
     }
 }
 
