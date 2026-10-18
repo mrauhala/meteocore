@@ -135,7 +135,10 @@ fn value_type(value: &Value) -> &'static str {
     }
 }
 
-fn property_value(value: Option<&Value>) -> String {
+/// A property's value; numbers follow the workbench rule for the property
+/// `key` (an integral float without `.0`, a latitude or longitude to 5
+/// decimals, #1140).
+fn property_value(key: &str, value: Option<&Value>) -> String {
     use api_common::workbench as ui;
     match value {
         None => "<span class=\"muted\">Absent</span>".into(),
@@ -146,11 +149,11 @@ fn property_value(value: Option<&Value>) -> String {
             if values.is_empty() {
                 "<span class=\"muted\">Empty array</span>".into()
             } else {
-                format!("<span class=\"chip-row\">{}</span>",values.iter().map(|v|format!("<span class=\"chip\">{}</span>",property_value(Some(v)))).collect::<String>())
+                format!("<span class=\"chip-row\">{}</span>",values.iter().map(|v|format!("<span class=\"chip\">{}</span>",property_value(key, Some(v)))).collect::<String>())
             }
         },
         Some(v @ (Value::Array(_) | Value::Object(_))) => format!("<details class=\"property-value\"><summary>{} · {} {}</summary><pre>{}</pre></details>",value_type(v),v.as_array().map_or_else(||v.as_object().map_or(0,|o|o.len()),|a|a.len()),if v.is_array(){"values"}else{"keys"},escape(&serde_json::to_string_pretty(v).expect("properties serialize"))),
-        Some(v) => ui::value_html(v),
+        Some(v) => ui::property_value_html(key, v),
     }
 }
 
@@ -565,7 +568,7 @@ fn features_page(
                 for key in &defaults {
                     body.push_str(&format!(
                         "<td data-property-cell>{}</td>",
-                        property_value(feature["properties"].get(key))
+                        property_value(key, feature["properties"].get(key))
                     ));
                 }
                 body.push_str("</tr>");
@@ -597,7 +600,7 @@ fn features_page(
         body.push_str(&format!("<div class=\"panel-head\"><h2>Properties <span class=\"muted\">· {}</span></h2><input class=\"property-filter enhanced\" id=\"property-search\" aria-label=\"Find a property\" placeholder=\"Find a property…\"></div><div class=\"table-scroll\"><table class=\"properties property-table typed-properties\"><thead><tr><th scope=\"col\">Property</th><th scope=\"col\">Type</th><th scope=\"col\">Value</th></tr></thead><tbody>",doc["properties"].as_object().map_or(0,|p|p.len())));
         if let Some(props) = doc["properties"].as_object() {
             for (key, value) in props {
-                body.push_str(&format!("<tr data-property=\"{}\"><th scope=\"row\"><code>{}</code></th><td class=\"value-type\">{}</td><td>{}</td></tr>",escape(key),escape(key),value_type(value),property_value(Some(value))));
+                body.push_str(&format!("<tr data-property=\"{}\"><th scope=\"row\"><code>{}</code></th><td class=\"value-type\">{}</td><td>{}</td></tr>",escape(key),escape(key),value_type(value),property_value(key, Some(value))));
             }
         }
         body.push_str("</tbody></table></div>");
@@ -678,7 +681,7 @@ mod tests {
 
     #[test]
     fn flat_property_arrays_are_visible_chips_and_nested_values_remain_expandable() {
-        let html = property_value(Some(&json!(["DBZH", "<script>&", 0, false, null, ""])));
+        let html = property_value("", Some(&json!(["DBZH", "<script>&", 0, false, null, ""])));
         assert_eq!(html.matches("class=\"chip\"").count(), 6);
         assert!(html.contains("DBZH"));
         assert!(html.contains("&lt;script&gt;&amp;"));
@@ -687,14 +690,30 @@ mod tests {
         assert!(html.contains("<code>null</code>"));
         assert!(html.contains("Empty string"));
         assert!(!html.contains("<details"));
-        assert!(property_value(Some(&json!([]))).contains("Empty array"));
+        assert!(property_value("", Some(&json!([]))).contains("Empty array"));
         for nested in [
             json!([[1, 2]]),
             json!([{"name":"nested"}]),
             json!({"a":[1,2]}),
         ] {
-            assert!(property_value(Some(&nested)).starts_with("<details"));
+            assert!(property_value("", Some(&nested)).starts_with("<details"));
         }
+    }
+
+    /// #1140: an item table prints `135`, as the map popup does, not
+    /// `135.0`; a latitude or longitude property shows 5 decimals and keeps
+    /// its exact value in the `title`.
+    #[test]
+    fn property_numbers_follow_the_workbench_display_rule() {
+        assert_eq!(property_value("direction", Some(&json!(135.0))), "135");
+        assert_eq!(property_value("direction", Some(&json!(2.25))), "2.25");
+        assert_eq!(
+            property_value("latitude", Some(&json!(60.17093333333333))),
+            "<span class=\"rounded\" title=\"60.17093333333333\">60.17093</span>"
+        );
+        assert!(
+            property_value("lon", Some(&json!([24.93333333333333]))).contains(">24.93333</span>")
+        );
     }
 
     #[test]

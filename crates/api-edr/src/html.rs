@@ -23,7 +23,7 @@
 use std::fmt::Write as _;
 use std::io;
 
-use api_common::workbench::{self as ui, Page, Surface};
+use api_common::workbench::{self as ui, i18n_text, unit_text, Page, Surface};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use ds_core::html::escape;
@@ -706,33 +706,6 @@ fn scalars(values: &[Value]) -> String {
         .map(scalar_text)
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// An i18n object's English (else first) text, or a plain string.
-fn i18n_text(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Object(map) => map
-            .get("en")
-            .or_else(|| map.values().next())
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        _ => None,
-    }
-}
-
-/// A parameter's unit: its symbol (a string, or `{value, type}`), else its
-/// label.
-fn unit_text(parameter: &Value) -> Option<String> {
-    let unit = &parameter["unit"];
-    match &unit["symbol"] {
-        Value::String(s) => Some(s.clone()),
-        Value::Object(symbol) => symbol
-            .get("value")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        _ => i18n_text(&unit["label"]),
-    }
 }
 
 fn is_url(s: &str) -> bool {

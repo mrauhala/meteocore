@@ -2841,6 +2841,42 @@ tbody th{padding-top:15px;padding-bottom:15px}
 .data-table a,.data-table .coords{overflow-wrap:anywhere}
 .data-table a.word{overflow-wrap:normal;white-space:nowrap}
 .data-table caption{text-align:left;padding:12px 14px;font-weight:600;caption-side:top}
+/* Collection metadata as tables and anchors (#1140): plain labels with
+   the JSON member or link relation as secondary text. */
+.term{display:block;margin-top:2px;font-size:14px;font-weight:400;color:var(--muted)}
+code.term{display:inline;margin-right:4px}
+.metadata-member h3 .term{display:inline;margin-left:8px}
+.secondary{display:block;margin-top:3px;font-size:14px;font-weight:400;color:var(--muted);overflow-wrap:anywhere}
+.bbox-fact{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px}
+.legend-thumb{display:inline-block}
+.legend-thumb img{display:block;max-width:220px;max-height:160px;background:#fff;border:1px solid var(--line);border-radius:4px}
+.link-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.link-list li{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.link-list a,.query-table th a,.conformance-table a{text-decoration:underline;text-underline-offset:3px}
+.query-table th code,.conformance-table a{overflow-wrap:anywhere}
+.metadata-member{padding:20px;border-top:1px solid var(--line)}
+.metadata-member h3{margin-bottom:12px}
+.structured-list{margin:0;padding-left:20px}
+.structured-list>li{margin-bottom:8px}
+.all-fields{margin-top:14px}
+:is(.parameter-table,.styles-table,.query-table,.conformance-table) .chip-row,.coverage-facts .chip-row{display:flex;flex-wrap:wrap;gap:6px}
+:is(.parameter-table,.styles-table,.query-table,.conformance-table) :is(td,th) details{margin-top:6px}
+:is(.parameter-table,.styles-table,.query-table,.conformance-table) .chip{white-space:nowrap}
+:is(.parameter-table,.styles-table,.query-table,.conformance-table) tbody th{background:transparent;font-weight:400}
+/* Below 600 px each parameter, style or query is a card: its name on
+   its own line, the other cells below it. */
+@media(max-width:600px){
+  :is(.parameter-table,.styles-table,.query-table){display:block;min-width:0}
+  :is(.parameter-table,.styles-table,.query-table) thead{display:none}
+  :is(.parameter-table,.styles-table,.query-table) tbody{display:block}
+  :is(.parameter-table,.styles-table,.query-table) tbody tr{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px;padding:12px 14px;border-bottom:1px solid var(--line)}
+  :is(.parameter-table,.styles-table,.query-table) tbody tr:last-child{border-bottom:0}
+  :is(.parameter-table,.styles-table,.query-table) tbody :is(th[scope=row],td){display:block;min-width:0;padding:0;border:0}
+  :is(.parameter-table,.styles-table,.query-table) tbody th[scope=row]{flex-basis:100%}
+  :is(.parameter-table,.styles-table,.query-table) td[data-label]::before{content:attr(data-label) ": ";color:var(--muted);font-size:14px}
+  .styles-table tbody tr{align-items:flex-start}
+}
+.rounded{text-decoration:underline dotted;text-underline-offset:3px}
 /* A nested member list (CoverageJSON referencing) halves the width at
    every level: below 600 px its keys sit above their values. */
 @media(max-width:600px){

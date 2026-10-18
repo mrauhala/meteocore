@@ -185,6 +185,20 @@ picks among them; a collection advertising only tiles still gets a preview.
 Style, time and level apply to Maps and map tiles; vector tiles are unstyled,
 and a vector-only collection shows no legend panel.
 
+The rest of a collection page shows every member of the collection JSON as
+tables, chips and anchors (#1140, `workbench/metadata.rs`): a Parameters table
+on the Overview, coverage facts formatted as in the catalog (one bbox and
+cadence formatter for both, `bbox_label` and `cadence_label`), and on the
+metadata tab the styles with legends and links, the extent, the parameters,
+the data queries and the CRS lists. Missing metadata reads "Not advertised";
+a JSON `null` in the nested member lists shows as `null`, and a data query
+without unit parameters shows a dash for its units.
+Numbers follow one display rule (`property_value_html`): an integral float
+without `.0`, a latitude or longitude property to 5 decimals with the exact
+value in the `title`. `i18n_text` and `unit_text` are shared with api-edr.
+The conformance page groups classes by standard and version
+(`workbench/conformance.rs`).
+
 The collection builder derives its fields from `CollectionParameter::ALL`.
 Search and paging use ordinary GET requests. Optional advanced controls omit
 empty values; literal `+` operators are form-encoded. Unsupported Common sorting,
@@ -327,8 +341,9 @@ storage CRS is labelled "Not advertised", never guessed from the coverage CRS.
 Collection advanced search starts collapsed and remembers its disclosure state
 per API path for the browser session, including after search submission. Applied
 filters remain visible while collapsed. Resource titles and their URLs form one
-clickable link; map endpoints retain their required-bbox hint. Country boundaries
-render above map imagery with a contrasting halo, including after pan/zoom.
+clickable link; a map endpoint notes that it covers the whole extent unless the
+request sets a bbox. Country boundaries render above map imagery with a
+contrasting halo, including after pan/zoom.
 
 Catalogs use a full-width search panel and result summaries. The applied request
 and draft search URL are separate disclosures; the draft opens on the first edit.
