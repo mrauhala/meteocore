@@ -162,21 +162,11 @@ fn parse_stere(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
             // true-scale is exactly 1. Two cases:
             //
             // Polar (lat_0 = ±90): PROJ's `+proj=stere` uses Snyder
-            // eq. 21-39 `ρ = a·m_c·t/t_c` with lat_ts directly. To
-            // make our case-1 formula `ρ = 2·a·k₀·t/D` match exactly
-            // we need the ellipsoidal-corrected k0:
-            //
-            //   k0 = m_c · D / (2 · t_c)
-            //
-            // where:
-            //   m_c = cos(lat_ts) / √(1 - e²·sin²(lat_ts))
-            //   t_c = tan(π/4 - lat_ts/2) · ((1+e·sin lat_ts)/(1-e·sin lat_ts))^(e/2)
-            //   D   = √((1+e)^(1+e) · (1-e)^(1-e))
-            //
-            // (Snyder, "Map Projections — A Working Manual", USGS
-            // PP 1395, 1987.) The spherical shortcut
-            // `(1 + sin|lat_ts|)/2` is ~0.012% off, which translates
-            // to ~200 m on a 3000 km radius — observable in
+            // eq. 21-39 `ρ = a·m_c·t/t_c` with lat_ts directly, and
+            // `ds_core::geo::polar_stereographic_k0` gives the
+            // ellipsoidal k0 that makes our `ρ = 2·a·k₀·t/D` match it.
+            // The spherical shortcut `(1 + sin|lat_ts|)/2` is ~0.012%
+            // off, ~200 m on a 3000 km radius — observable in
             // `stereographic_inverse_absolute_polar`.
             //
             // Oblique (|lat_0| < π/2): no comparable case-2 formula
@@ -188,20 +178,7 @@ fn parse_stere(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
                 let lat0_rad = lat0.to_radians();
                 let lat_ts_rad = lat_ts.to_radians();
                 if (lat0_rad.abs() - std::f64::consts::FRAC_PI_2).abs() < 1e-10 {
-                    // WGS84: e² = 2f - f² with f = 1/298.257223563.
-                    // Kept local to avoid exporting an internal
-                    // constant from `ds_core::geo` for this one
-                    // call site.
-                    let flat: f64 = 1.0 / 298.257_223_563;
-                    let e2 = 2.0 * flat - flat * flat;
-                    let e: f64 = e2.sqrt();
-                    let sin_lat_ts = lat_ts_rad.sin();
-                    let cos_lat_ts = lat_ts_rad.cos();
-                    let m_c = cos_lat_ts / (1.0 - e2 * sin_lat_ts * sin_lat_ts).sqrt();
-                    let t_c = (std::f64::consts::FRAC_PI_4 - lat_ts_rad / 2.0).tan()
-                        * ((1.0 + e * sin_lat_ts) / (1.0 - e * sin_lat_ts)).powf(e / 2.0);
-                    let d = ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
-                    m_c * d / (2.0 * t_c)
+                    ds_core::geo::polar_stereographic_k0(lat_ts_rad)
                 } else {
                     (1.0 + lat0_rad.sin() * lat_ts_rad.sin() + lat0_rad.cos() * lat_ts_rad.cos())
                         / 2.0

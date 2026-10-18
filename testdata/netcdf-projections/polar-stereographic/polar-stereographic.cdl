@@ -1,0 +1,69 @@
+netcdf polar_stereographic {
+dimensions:
+	time = 1 ;
+	y = 9 ;
+	x = 9 ;
+variables:
+	double time(time) ;
+		time:standard_name = "time" ;
+		time:units = "hours since 2026-01-01 00:00:00" ;
+		time:calendar = "standard" ;
+	double y(y) ;
+		y:standard_name = "projection_y_coordinate" ;
+		y:units = "m" ;
+	double x(x) ;
+		x:standard_name = "projection_x_coordinate" ;
+		x:units = "m" ;
+	int crs ;
+		crs:grid_mapping_name = "polar_stereographic" ;
+		crs:straight_vertical_longitude_from_pole = -45. ;
+		crs:latitude_of_projection_origin = 90. ;
+		crs:standard_parallel = 70. ;
+		crs:false_easting = 0. ;
+		crs:false_northing = 0. ;
+		crs:semi_major_axis = 6378137. ;
+		crs:inverse_flattening = 298.257223563 ;
+	double easting(time, y, x) ;
+		easting:long_name = "Projected x of the cell centre" ;
+		easting:units = "m" ;
+		easting:grid_mapping = "crs" ;
+	double northing(time, y, x) ;
+		northing:long_name = "Projected y of the cell centre" ;
+		northing:units = "m" ;
+		northing:grid_mapping = "crs" ;
+
+// global attributes:
+		:Conventions = "CF-1.8" ;
+		:title = "Synthetic polar-stereographic grid, MeteoCore test fixture" ;
+data:
+
+ time = 0 ;
+
+ y = 1000000, 750000, 500000, 250000, 0, -250000, -500000, -750000, -1000000 ;
+
+ x = -1000000, -750000, -500000, -250000, 0, 250000, 500000, 750000, 1000000 ;
+
+ crs = 0 ;
+
+ easting =
+    -1000000, -750000, -500000, -250000, 0, 250000, 500000, 750000, 1000000,
+    -1000000, -750000, -500000, -250000, 0, 250000, 500000, 750000, 1000000,
+    -1000000, -750000, -500000, -250000, 0, 250000, 500000, 750000, 1000000,
+    -1000000, -750000, -500000, -250000, 0, 250000, 500000, 750000, 1000000,
+    -1000000, -750000, -500000, -250000, 0, 250000, 500000, 750000, 1000000,
+    -1000000, -750000, -500000, -250000, 0, 250000, 500000, 750000, 1000000,
+    -1000000, -750000, -500000, -250000, 0, 250000, 500000, 750000, 1000000,
+    -1000000, -750000, -500000, -250000, 0, 250000, 500000, 750000, 1000000,
+    -1000000, -750000, -500000, -250000, 0, 250000, 500000, 750000, 1000000 ;
+
+ northing =
+    1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000,
+    750000, 750000, 750000, 750000, 750000, 750000, 750000, 750000, 750000,
+    500000, 500000, 500000, 500000, 500000, 500000, 500000, 500000, 500000,
+    250000, 250000, 250000, 250000, 250000, 250000, 250000, 250000, 250000,
+    0, 0, 0, 0, 0, 0, 0, 0, 0,
+    -250000, -250000, -250000, -250000, -250000, -250000, -250000, -250000, -250000,
+    -500000, -500000, -500000, -500000, -500000, -500000, -500000, -500000, -500000,
+    -750000, -750000, -750000, -750000, -750000, -750000, -750000, -750000, -750000,
+    -1000000, -1000000, -1000000, -1000000, -1000000, -1000000, -1000000, -1000000, -1000000 ;
+}

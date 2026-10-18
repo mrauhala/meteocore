@@ -655,7 +655,14 @@ one never implies the other.
   total but is that series, km off PROJ that far out. Edge samples miss
   that edge between them, so `wgs84_envelope` adds `area_edge_points`
   (where those meridians enter and leave the box) and a pole the box holds
-  (`holds_pole`, projected from the central meridian).
+  (`holds_pole`, projected from the central meridian). A source grid's
+  `GeoTransform::bbox` misses a pole its cells hold, such as a polar
+  stereographic Arctic grid's: `bbox_with_poles` adds it at every
+  longitude, for advertised extents and `SourceGrid`'s envelope (#1167).
+  `polar_stereographic_k0` is the one conversion of a polar standard
+  parallel (PROJ `+lat_ts`, CF `standard_parallel`) to the ellipsoidal
+  `k0` of `Crs::Stereographic` (engine-odim, `ds_core::cf`); LAEA's polar
+  aspect (EASE-Grid 2.0) takes its limit `β₀ = ±90°`, `D = 1`.
 - **`ds_core::cf`** — CF semantics shared by NetCDF and Zarr readers,
   which pass plain values or an attribute lookup (no reader library here):
   - time units and `decode_times` (`… since 1970-01-01 00:00:00 +00:00`,
@@ -663,9 +670,14 @@ one never implies the other.
   - `classify_axis` → `AxisRole`, including projected x/y (by
     `standard_name`) and ensemble (`realization` / `ensemble_member`);
   - `crs_from_grid_mapping`: `latitude_longitude`, `geostationary`,
-    `lambert_conformal_conic` (one or two parallels, a sphere or WGS84,
-    pinned to PROJ). Unsupported mappings, ellipsoids, scale factors and
-    missing earth figures are errors, never a WGS84 guess;
+    `lambert_conformal_conic` (one or two parallels, a sphere or WGS84),
+    `polar_stereographic` (`standard_parallel` through
+    `geo::polar_stereographic_k0`, or `scale_factor_at_projection_origin`;
+    both must agree), `lambert_azimuthal_equal_area` and
+    `transverse_mercator` (WGS84 only: their `Crs` variants have no
+    sphere), each pinned to PROJ `cs2cs`. Unsupported mappings, ellipsoids,
+    scale factors and missing earth figures are errors, never a WGS84
+    guess;
   - `CfAttr::Numbers` keeps a multi-element attribute whole, and a
     one-number parameter rejects it rather than reading its first element;
   - `grid(crs, &x, &y)` over `RegularAxis` values: units through

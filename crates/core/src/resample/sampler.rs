@@ -400,23 +400,15 @@ fn within_half_turn(lon: f64, centre: f64) -> f64 {
 ///
 /// The edges miss a pole the grid holds (a polar stereographic grid's
 /// edges stay south of it), so a grid whose forward transform puts a pole
-/// inside its cells reaches that pole, at every longitude.
+/// inside its cells reaches that pole, at every longitude
+/// ([`GeoTransform::bbox_with_poles`]).
 fn wgs84_envelope(transform: &GeoTransform) -> Option<[f64; 4]> {
-    let [mut w, mut s, mut e, mut n] = transform.bbox();
+    let [w, s, mut e, n] = transform.bbox_with_poles();
     if !(w.is_finite() && s.is_finite() && e.is_finite() && n.is_finite()) || s > n {
         return None;
     }
     if w > e {
         e += 360.0;
-    }
-    let (cols, rows) = (f64::from(transform.width), f64::from(transform.height));
-    for pole in [90.0, -90.0] {
-        let (col, row) = transform.world_to_pixel_f64(0.0, pole);
-        if (0.0..cols).contains(&col) && (0.0..rows).contains(&row) {
-            (w, e) = (-180.0, 180.0);
-            s = s.min(pole);
-            n = n.max(pole);
-        }
     }
     Some([w, s, e, n])
 }

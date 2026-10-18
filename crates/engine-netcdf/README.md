@@ -15,9 +15,18 @@ target is MET Norway's MEPS, as published per lead time on thredds.met.no.
 - Or the same family on an HTTP server that cannot be listed, such as MET
   Norway's thredds.met.no fileServer: files found by probing the names a
   template gives for each run and lead, read in place by HTTP range.
-- Grids: 1-D latitude/longitude, or 1-D projected x/y with a CF
-  `grid_mapping` (`lambert_conformal_conic`, `geostationary`,
-  `latitude_longitude`). Rows stored south to north (MEPS) are drawn north-up.
+- Grids: 1-D latitude/longitude, or 1-D projected x/y in metres with a CF
+  `grid_mapping`: `lambert_conformal_conic` (a sphere or WGS84),
+  `geostationary`, `latitude_longitude`, `polar_stereographic` (its scale
+  by `standard_parallel` or `scale_factor_at_projection_origin`; both must
+  agree), `lambert_azimuthal_equal_area` and `transverse_mercator`. The
+  mapping must state its earth figure; the last three are served on WGS84
+  (GRS80 matches it to 0.1 mm) and refused on a sphere or another
+  ellipsoid. A grid around a pole (a polar stereographic Arctic grid)
+  advertises an extent reaching the pole. Each mapping is pinned to PROJ
+  `cs2cs` (`ds_core::cf` tests and `tests/grid_mappings.rs`); transverse
+  Mercator keeps the server's bound of 50° from the central meridian
+  (#1113). Rows stored south to north (MEPS) are drawn north-up.
 - Valid times from the fields' `time` axis; model runs from
   `forecast_reference_time`, each run a WMS `reference_time` value. Files
   without one form one timeline without runs.
@@ -45,8 +54,11 @@ target is MET Norway's MEPS, as published per lead time on thredds.met.no.
   direction from grid-relative components (rotation by the convergence
   angle, #897).
 - Per-variable file layouts, curvilinear 2-D latitude/longitude grids,
-  `polar_stereographic`/`lambert_azimuthal_equal_area`/`transverse_mercator`
-  mappings, ensemble members as a dimension.
+  the oblique `stereographic`, `rotated_latitude_longitude` and other
+  mappings, polar stereographic, azimuthal equal-area and transverse
+  Mercator grids on a sphere or a non-WGS84 ellipsoid (NSIDC's Hughes
+  1980 grids, EPSG:3411), projected x/y in kilometres, ensemble members
+  as a dimension.
 
 ## Configuration
 
