@@ -35,6 +35,23 @@ pub fn raster_bytes(width: u32, height: u32, planes: usize) -> Option<u64> {
         .checked_mul(BYTES_PER_PIXEL.checked_add(extra)?)
 }
 
+/// Extra bytes per output pixel for a render that draws several layers into
+/// one image (a WMS GetMap with several `LAYERS`, #1181): the RGBA image the
+/// layers drawn so far make, held while the next layer renders.
+pub const LAYERED_BYTES_PER_PIXEL: u64 = 4;
+
+/// Bytes a render of several layers charges, which draws them one at a
+/// time: [`raster_bytes`] for its largest layer, `planes` being the most
+/// value planes one layer holds, plus [`LAYERED_BYTES_PER_PIXEL`] for the
+/// image of the layers below. Never a charge per layer: only one layer's
+/// planes and pixels are held at once. `None` when it overflows.
+pub fn layered_raster_bytes(width: u32, height: u32, planes: usize) -> Option<u64> {
+    u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(LAYERED_BYTES_PER_PIXEL)?
+        .checked_add(raster_bytes(width, height, planes)?)
+}
+
 /// An environment setting, like the other process-wide render/cache budgets.
 /// A single instance survives collection reloads and spans all raster APIs.
 ///
@@ -311,6 +328,22 @@ mod tests {
         assert!(budget.try_reserve(raster_bytes(1, 1, 1)).is_none());
         drop(composite);
         assert_eq!(budget.available(), budget.capacity());
+    }
+
+    /// Several layers charge their largest layer once, plus the RGBA image
+    /// of the layers below: five plain layers cost 36 B per pixel, not
+    /// five times 32 (#1181).
+    #[test]
+    fn layers_charge_one_layer_and_the_image_below() {
+        assert_eq!(
+            layered_raster_bytes(10, 10, 1),
+            Some(100 * (BYTES_PER_PIXEL + LAYERED_BYTES_PER_PIXEL))
+        );
+        assert_eq!(
+            layered_raster_bytes(10, 10, 3),
+            Some(raster_bytes(10, 10, 3).unwrap() + 100 * LAYERED_BYTES_PER_PIXEL)
+        );
+        assert_eq!(layered_raster_bytes(u32::MAX, u32::MAX, 1), None);
     }
 
     #[test]

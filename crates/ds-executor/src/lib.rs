@@ -47,6 +47,12 @@ static QUEUE_CAPACITY: LazyLock<usize> = LazyLock::new(|| {
 static WAITING: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(*QUEUE_CAPACITY)));
 static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| env_millis("MC_RENDER_TIMEOUT_MS", 3000));
+
+/// The deadline of a render drawing `layers` layers in turn: the render
+/// deadline once per layer, at least once.
+fn layered_timeout(timeout: Duration, layers: usize) -> Duration {
+    timeout.saturating_mul(u32::try_from(layers.max(1)).unwrap_or(u32::MAX))
+}
 /// WMS GetFeatureInfo's deadline, its own and not the render deadline
 /// (#1103): a cold position query can need longer than a render.
 static FEATURE_INFO_TIMEOUT: LazyLock<Duration> =
@@ -246,6 +252,31 @@ impl RenderJob {
             *TIMEOUT,
             budget::RENDER_MEMORY.clone(),
             budget::raster_bytes(width, height, planes),
+        )
+        .await
+    }
+
+    /// [`Self::acquire_raster_planes`] for a render that draws `layers`
+    /// layers into one image, one at a time (a WMS GetMap with several
+    /// `LAYERS`, #1181): `planes` is the most value planes one layer holds.
+    /// It charges [`budget::layered_raster_bytes`], one layer's charge plus
+    /// the RGBA image of the layers below, against the same memory budget
+    /// and queue, and takes one CPU slot: the layers run in turn on one
+    /// worker. Its deadline is the render deadline once per layer, so a
+    /// list is not shed where each of its layers alone would be served.
+    pub async fn acquire_layered_raster(
+        slots: Arc<Semaphore>,
+        width: u32,
+        height: u32,
+        planes: usize,
+        layers: usize,
+    ) -> Result<(Self, Arc<budget::RenderPermit>), ExecutionError> {
+        Self::acquire_bytes_on(
+            slots,
+            WAITING.clone(),
+            layered_timeout(*TIMEOUT, layers),
+            budget::RENDER_MEMORY.clone(),
+            budget::layered_raster_bytes(width, height, planes),
         )
         .await
     }
@@ -465,6 +496,19 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A render of N layers gets the render deadline N times (#1181).
+    #[test]
+    fn layered_deadline_is_one_render_deadline_per_layer() {
+        let second = Duration::from_secs(1);
+        assert_eq!(layered_timeout(second, 0), second);
+        assert_eq!(layered_timeout(second, 1), second);
+        assert_eq!(layered_timeout(second, 5), 5 * second);
+        assert_eq!(
+            layered_timeout(second, usize::MAX),
+            Duration::from_secs(u64::from(u32::MAX))
+        );
+    }
 
     async fn wait_until_queued(waiting: &Semaphore, available: usize) {
         tokio::time::timeout(Duration::from_secs(2), async {

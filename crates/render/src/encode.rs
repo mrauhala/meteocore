@@ -258,6 +258,57 @@ pub fn flatten_onto(rgba: &mut [u8], background: [u8; 3]) {
     }
 }
 
+/// Draw the RGBA image `above` over `below`, in place: straight-alpha
+/// Porter-Duff "source over", pixel by pixel. A WMS GetMap of several layers
+/// draws each layer over the ones listed before it (WMS 1.3.0 §7.3.3.3,
+/// #1181), then flattens the result onto `BGCOLOR` once, at encode time.
+///
+/// An opaque pixel of `above` replaces the one below and a transparent one
+/// keeps it. Over a transparent pixel the result is `above`'s pixel exactly,
+/// so drawing an image over an empty one leaves the image unchanged; over an
+/// opaque one it is [`flatten_onto`]'s blend. Between the two, the alphas
+/// combine as `a + b·(1 − a)` and the colours weight by their share of it,
+/// rounded. Errors when the buffers differ in length.
+pub fn draw_over(below: &mut [u8], above: &[u8]) -> Result<(), DataServerError> {
+    if below.len() != above.len() || !below.len().is_multiple_of(4) {
+        return Err(DataServerError::Render(format!(
+            "cannot draw {} RGBA bytes over {}",
+            above.len(),
+            below.len()
+        )));
+    }
+    let (below, _) = below.as_chunks_mut::<4>();
+    let (above, _) = above.as_chunks::<4>();
+    for (pixel, &top) in below.iter_mut().zip(above) {
+        let (a, b) = (top[3] as u32, pixel[3] as u32);
+        *pixel = match (a, b) {
+            (255, _) | (_, 0) => top,
+            (0, _) => *pixel,
+            (_, 255) => {
+                let [r, g, bl] = over(top, [pixel[0], pixel[1], pixel[2]]);
+                [r, g, bl, 255]
+            }
+            _ => {
+                // Both weights are scaled by 255: `a·255` for the pixel above,
+                // `b·(255 − a)` for the one below; their sum is the result's
+                // alpha scaled by 255, at most 255².
+                let (top_weight, below_weight) = (a * 255, b * (255 - a));
+                let sum = top_weight + below_weight;
+                let blend = |t: u8, u: u8| {
+                    ((t as u32 * top_weight + u as u32 * below_weight + sum / 2) / sum) as u8
+                };
+                [
+                    blend(top[0], pixel[0]),
+                    blend(top[1], pixel[1]),
+                    blend(top[2], pixel[2]),
+                    ((sum + 127) / 255) as u8,
+                ]
+            }
+        };
+    }
+    Ok(())
+}
+
 /// Encode an RGBA buffer to JPEG bytes at `quality` (1–100).
 ///
 /// Drops the alpha channel (JPEG doesn't support transparency), compositing
@@ -630,6 +681,58 @@ mod tests {
                 131, 62, 93, 255, // (c·100 + bg·155) / 255 per channel
             ]
         );
+    }
+
+    /// `draw_over` is source-over: opaque replaces, transparent keeps, over
+    /// a transparent pixel the pixel above is kept exactly, over an opaque
+    /// one it is `flatten_onto`'s blend, and two translucent pixels combine.
+    #[test]
+    fn draw_over_is_source_over() {
+        let mut below = vec![
+            1, 2, 3, 255, // opaque, under an opaque pixel
+            1, 2, 3, 255, // opaque, under a transparent one with stray RGB
+            0, 0, 0, 0, // transparent, under a translucent one
+            0x33, 0x66, 0x99, 255, // opaque, under a translucent one
+            0, 0, 255, 128, // translucent, under a translucent one
+        ];
+        let above = [
+            9, 8, 7, 255, //
+            200, 100, 50, 0, //
+            255, 0, 0, 100, //
+            255, 0, 0, 100, //
+            255, 0, 0, 100, //
+        ];
+        draw_over(&mut below, &above).unwrap();
+        assert_eq!(
+            below,
+            vec![
+                9, 8, 7, 255, //
+                1, 2, 3, 255, //
+                255, 0, 0, 100, //
+                131, 62, 93, 255, // flatten_onto's blend over 0x336699
+                143, 0, 112, 178, // a + b·(1 − a) ≈ 0.697
+            ]
+        );
+    }
+
+    /// Over an opaque image, `draw_over` is `flatten_onto` onto each pixel
+    /// below, for every alpha: a layer over an opaque one looks the same as
+    /// that layer over BGCOLOR of the same colour.
+    #[test]
+    fn draw_over_an_opaque_pixel_is_flatten_onto() {
+        let bg = [0x33, 0x66, 0x99];
+        let above: Vec<u8> = (0..=255u8).flat_map(|a| [200, 100, 50, a]).collect();
+        let mut below = [bg[0], bg[1], bg[2], 255].repeat(256);
+        draw_over(&mut below, &above).unwrap();
+        let mut flat = above.clone();
+        flatten_onto(&mut flat, bg);
+        assert_eq!(below, flat);
+    }
+
+    #[test]
+    fn draw_over_rejects_buffers_of_other_sizes() {
+        assert!(draw_over(&mut [0; 8], &[0; 4]).is_err());
+        assert!(draw_over(&mut [0; 6], &[0; 6]).is_err());
     }
 
     #[test]

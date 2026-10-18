@@ -9,10 +9,11 @@
 //! of the pixel, which an EPSG:3857/3067/3035 GetMap resamples from
 //! meta-tiles by nearest neighbour.
 //!
-//! The map part resolves through [`resolve_map`], GetMap's own resolution,
-//! so the reported time and run are the ones GetMap draws and keys its
-//! caches on, and the level through [`MapEngine::resolve_elevation`], the
-//! one GetMap draws.
+//! The map part resolves through [`resolve_layers`], GetMap's own
+//! resolution, so each query layer's reported time and run are the ones
+//! GetMap draws it at and keys its caches on, and the level through
+//! [`MapEngine::resolve_elevation`], the one GetMap draws. A request with
+//! several `QUERY_LAYERS` answers for each, in `QUERY_LAYERS` order.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -31,7 +32,7 @@ use ds_core::map_engine::MapEngine;
 use ds_core::model::{CoverageResponse, DomainDescription, QueryResult};
 
 use crate::error::WmsError;
-use crate::handlers::{cache_control_value, resolve_map, Paint, ResolvedMap, WmsState};
+use crate::handlers::{cache_control_value, resolve_layers, Paint, ResolvedLayer, WmsState};
 use crate::params::{InfoFormat, WmsQuery};
 
 /// Whether an EDR engine answers position queries, the capability that
@@ -83,21 +84,32 @@ pub(crate) async fn get_feature_info(
 ) -> Result<Response, WmsError> {
     let params = query.validate_get_feature_info()?;
     let map = &params.map;
-    let resolved = resolve_map(state, map)?;
+    let layers = resolve_layers(state, map)?;
 
     // QUERY_LAYERS names layers of the map: Table E.1's LayerNotDefined is
-    // also "a GetFeatureInfo request for a layer not shown on the map".
+    // also "a GetFeatureInfo request for a layer not shown on the map". A
+    // layer LAYERS lists twice is queried as its first listing draws it.
+    let mut queried = Vec::with_capacity(params.query_layers.len());
     for name in &params.query_layers {
-        let shown = *name == map.layer || map.other_layers.iter().any(|(layer, _)| layer == name);
-        if !shown {
-            return Err(WmsError::LayerNotDefined(format!(
-                "QUERY_LAYERS layer '{name}' is not one of LAYERS"
-            )));
-        }
+        let resolved = layers
+            .iter()
+            .find(|layer| layer.layer == *name)
+            .ok_or_else(|| {
+                WmsError::LayerNotDefined(format!(
+                    "QUERY_LAYERS layer '{name}' is not one of LAYERS"
+                ))
+            })?;
+        queried.push(resolved);
     }
-    // `resolve_map` refuses more than `LAYER_LIMIT` (1) layers, so every
-    // query layer is the map's one layer.
-    let (edr, parameter) = point_engine(state, &resolved, &map.layer)?;
+    // Every query layer is queryable, or the request is refused before any
+    // engine is asked.
+    let queries = queried
+        .into_iter()
+        .map(|resolved| {
+            let (edr, parameter) = point_engine(state, resolved)?;
+            Ok(Query::new(resolved, edr, parameter))
+        })
+        .collect::<Result<Vec<_>, WmsError>>()?;
 
     // The centre of pixel (I, J), through the output CRS mapping every
     // engine renders the map with: EPSG:4326's lat/lon BBOX is already
@@ -122,116 +134,43 @@ pub(crate) async fn get_feature_info(
             .map(|(lon, lat)| (ds_core::geo::wrap_lon(lon), lat))
     };
 
-    let time = resolved.time;
-    let reference_time = resolved.reference_time;
-    // The level GetMap draws for this ELEVATION, or without one, as the
-    // engine selects it (`MapEngine::resolve_elevation`), from the same
-    // parameter, time and run GetMap passes it. It need not be ELEVATION
-    // or the first advertised level: GRIB draws the run's own first
-    // level, a radar volume the nearest sweep carrying the quantity. Only
-    // a layer with an ELEVATION dimension has one.
-    let elevation = resolved.info.vertical.as_ref().and_then(|_| {
-        resolved.engine.resolve_elevation(
-            resolved.parameter.as_deref(),
-            map.elevation,
-            time,
-            reference_time,
-        )
-    });
-
-    let sample = match position {
-        None => Sample::default(),
-        Some((lon, lat)) => {
-            // The render slots and queue of a GetMap render, under
-            // GetFeatureInfo's own deadline (`MC_FEATURE_INFO_TIMEOUT_MS`,
-            // #1103), which covers the slot wait and the query. The query
-            // runs on the shared query runtime, as EDR's do: engines
-            // `block_in_place` and spawn their own tasks there, never on the
-            // runtime serving requests (root CLAUDE.md Critical Rule 7).
-            let job = ds_executor::RenderJob::acquire_feature_info(state.render_semaphore.clone())
-                .await
-                .map_err(WmsError::from)?;
-            let coords = format!("POINT({lon} {lat})");
-            let parameters = parameter.clone().map(|parameter| vec![parameter]);
-            let levels = elevation.map(|z| vec![z]);
-            let queried = job
-                .run_query(move || {
-                    edr.query_position(
-                        &coords,
-                        time.map(|t| (t, t)),
-                        parameters.as_deref(),
-                        levels.as_deref(),
-                        reference_time,
-                    )
-                })
-                .await
-                .map_err(WmsError::from)?;
-            match queried {
-                Ok(response) => {
-                    sample(&response, parameter.as_deref(), time, elevation).unwrap_or_default()
-                }
-                // No data at the point or the time, or no longer any: a run
-                // evicted, or a collection reloaded away, since the map
-                // resolved. An empty answer.
-                Err(
-                    DataServerError::LocationNotFound(_)
-                    | DataServerError::FeatureNotFound(_)
-                    | DataServerError::ReferenceTimeNotFound(_)
-                    | DataServerError::CollectionNotFound(_),
-                ) => Sample::default(),
-                Err(
-                    e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded),
-                ) => return Err(WmsError::ServiceUnavailable(e.to_string())),
-                Err(
-                    e @ (DataServerError::InvalidParameter(_)
-                    | DataServerError::InvalidDatetime(_)
-                    | DataServerError::InvalidBbox(_)
-                    | DataServerError::QueryTooLarge(_)),
-                ) => {
-                    tracing::warn!(
-                        "WMS GetFeatureInfo on layer '{}' refused by the engine: {e}",
-                        map.layer
-                    );
-                    return Err(WmsError::invalid_parameter(&format!(
-                        "Layer '{}' cannot be queried with these dimension values",
-                        map.layer
-                    )));
-                }
-                Err(e) => {
-                    tracing::warn!("WMS GetFeatureInfo error for layer '{}': {e}", map.layer);
-                    return Err(WmsError::Internal(e.to_string()));
-                }
-            }
-        }
+    let samples = match position {
+        None => queries.iter().map(|_| Sample::default()).collect(),
+        Some((lon, lat)) => sample_layers(state, &queries, lon, lat).await?,
     };
 
-    let info = FeatureInfo {
-        layer: map.layer.clone(),
-        unit: sample.unit.or_else(|| {
-            resolved
-                .info
-                .parameter_unit(parameter.as_deref())
-                .filter(|unit| !unit.is_empty())
-                .map(str::to_string)
-        }),
-        parameter,
-        value: sample.value,
-        time: time.or(sample.time),
-        reference_time,
-        // The layer's ELEVATION dimension only: a level the source names on
-        // a layer without one (a 10 m wind's height) is no WMS dimension.
-        elevation,
-        position,
-    };
+    let features: Vec<FeatureInfo> = queries
+        .iter()
+        .zip(samples)
+        .map(|(query, sample)| FeatureInfo {
+            layer: query.layer.clone(),
+            unit: sample.unit.or_else(|| query.unit.clone()),
+            parameter: query.parameter.clone(),
+            value: sample.value,
+            time: query.time.or(sample.time),
+            reference_time: query.reference_time,
+            // The layer's ELEVATION dimension only: a level the source names
+            // on a layer without one (a 10 m wind's height) is no WMS
+            // dimension.
+            elevation: query.elevation,
+            position,
+        })
+        .collect();
     // As GetMap: `immutable` only for an explicit TIME that resolved, over
-    // content the engine never revises in place. A null value always
-    // revalidates: some engines answer a read that failed transiently with
-    // a null sample, and GetMap never pins a failed render either.
-    let cache_control = cache_control_value(
-        map.time.is_some() && time.is_some() && info.value.is_some(),
-        resolved.content_version,
-    );
-    let features = [info];
+    // content the engine never revises in place, here for every queried
+    // layer. A null value always revalidates: some engines answer a read
+    // that failed transiently with a null sample, and GetMap never pins a
+    // failed render either.
+    let pinned = queries
+        .iter()
+        .zip(&features)
+        .all(|(query, info)| query.explicit_time && query.time.is_some() && info.value.is_some());
+    let content_version = queries
+        .iter()
+        .map(|query| query.content_version)
+        .max()
+        .unwrap_or_default();
+    let cache_control = cache_control_value(pinned, content_version);
 
     let mut response = match params.info_format {
         InfoFormat::Text => plain_text(&features).into_response(),
@@ -254,14 +193,169 @@ pub(crate) async fn get_feature_info(
     Ok(response)
 }
 
+/// One query layer's position query: its engine, and the parameter, time,
+/// run and level GetMap draws the layer at.
+#[derive(Clone)]
+struct Query {
+    /// The `QUERY_LAYERS` name.
+    layer: String,
+    edr: Arc<dyn EdrEngine>,
+    parameter: Option<String>,
+    /// The parameter's unit from the layer's metadata, for an answer whose
+    /// coverage names none.
+    unit: Option<String>,
+    explicit_time: bool,
+    time: Option<DateTime<Utc>>,
+    reference_time: Option<DateTime<Utc>>,
+    elevation: Option<f64>,
+    content_version: u64,
+}
+
+impl Query {
+    fn new(resolved: &ResolvedLayer, edr: Arc<dyn EdrEngine>, parameter: Option<String>) -> Self {
+        let (time, reference_time) = (resolved.time, resolved.reference_time);
+        // The level GetMap draws for this layer's ELEVATION, or without one,
+        // as the engine selects it (`MapEngine::resolve_elevation`), from
+        // the same parameter, time and run GetMap passes it. It need not be
+        // ELEVATION or the first advertised level: GRIB draws the run's own
+        // first level, a radar volume the nearest sweep carrying the
+        // quantity. Only a layer with an ELEVATION dimension has one.
+        let elevation = resolved.info.vertical.as_ref().and_then(|_| {
+            resolved.engine.resolve_elevation(
+                resolved.parameter.as_deref(),
+                resolved.elevation,
+                time,
+                reference_time,
+            )
+        });
+        Self {
+            layer: resolved.layer.clone(),
+            unit: resolved
+                .info
+                .parameter_unit(parameter.as_deref())
+                .filter(|unit| !unit.is_empty())
+                .map(str::to_string),
+            edr,
+            parameter,
+            explicit_time: resolved.explicit_time,
+            time,
+            reference_time,
+            elevation,
+            content_version: resolved.content_version,
+        }
+    }
+
+    /// The position query at `coords`, at the layer's time, level and run.
+    fn run(&self, coords: &str) -> Result<CoverageResponse, DataServerError> {
+        let parameters = self.parameter.clone().map(|parameter| vec![parameter]);
+        let levels = self.elevation.map(|z| vec![z]);
+        self.edr.query_position(
+            coords,
+            self.time.map(|t| (t, t)),
+            parameters.as_deref(),
+            levels.as_deref(),
+            self.reference_time,
+        )
+    }
+}
+
+/// Whether a position query's error is an empty answer: no data at the
+/// point or the time, or no longer any: a run evicted, or a collection
+/// reloaded away, since the map resolved.
+fn is_no_data(error: &DataServerError) -> bool {
+    matches!(
+        error,
+        DataServerError::LocationNotFound(_)
+            | DataServerError::FeatureNotFound(_)
+            | DataServerError::ReferenceTimeNotFound(_)
+            | DataServerError::CollectionNotFound(_)
+    )
+}
+
+/// Each query layer's value at `(lon, lat)`, in `queries` order. One
+/// admission for them all: the render slots and queue of a GetMap render,
+/// under GetFeatureInfo's own deadline (`MC_FEATURE_INFO_TIMEOUT_MS`,
+/// #1103), which covers the slot wait and every query. The queries run one
+/// after another on the shared query runtime, as EDR's do: engines
+/// `block_in_place` and spawn their own tasks there, never on the runtime
+/// serving requests (root CLAUDE.md Critical Rule 7). The first query that
+/// fails, other than with no data, fails the request, and the ones after it
+/// are not run.
+async fn sample_layers(
+    state: &WmsState,
+    queries: &[Query],
+    lon: f64,
+    lat: f64,
+) -> Result<Vec<Sample>, WmsError> {
+    let job = ds_executor::RenderJob::acquire_feature_info(state.render_semaphore.clone())
+        .await
+        .map_err(WmsError::from)?;
+    let coords = format!("POINT({lon} {lat})");
+    let runs = queries.to_vec();
+    let answers = job
+        .run_query(move || {
+            let mut answers = Vec::with_capacity(runs.len());
+            for query in &runs {
+                // The deadline covers every query: one that expired while an
+                // earlier layer was read is not started.
+                let answer = ds_core::deadline::check().and_then(|()| query.run(&coords));
+                let failed = answer.as_ref().is_err_and(|e| !is_no_data(e));
+                answers.push(answer);
+                if failed {
+                    break;
+                }
+            }
+            answers
+        })
+        .await
+        .map_err(WmsError::from)?;
+
+    let mut samples = Vec::with_capacity(queries.len());
+    for (query, answer) in queries.iter().zip(answers) {
+        samples.push(match answer {
+            Ok(response) => sample(
+                &response,
+                query.parameter.as_deref(),
+                query.time,
+                query.elevation,
+            )
+            .unwrap_or_default(),
+            Err(e) if is_no_data(&e) => Sample::default(),
+            Err(e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded)) => {
+                return Err(WmsError::ServiceUnavailable(e.to_string()));
+            }
+            Err(
+                e @ (DataServerError::InvalidParameter(_)
+                | DataServerError::InvalidDatetime(_)
+                | DataServerError::InvalidBbox(_)
+                | DataServerError::QueryTooLarge(_)),
+            ) => {
+                tracing::warn!(
+                    "WMS GetFeatureInfo on layer '{}' refused by the engine: {e}",
+                    query.layer
+                );
+                return Err(WmsError::invalid_parameter(&format!(
+                    "Layer '{}' cannot be queried with these dimension values",
+                    query.layer
+                )));
+            }
+            Err(e) => {
+                tracing::warn!("WMS GetFeatureInfo error for layer '{}': {e}", query.layer);
+                return Err(WmsError::Internal(e.to_string()));
+            }
+        });
+    }
+    Ok(samples)
+}
+
 /// The position engine and parameter that answer GetFeatureInfo on a map
 /// layer, or `LayerNotQueryable`.
 fn point_engine(
     state: &WmsState,
-    resolved: &ResolvedMap,
-    layer: &str,
+    resolved: &ResolvedLayer,
 ) -> Result<(Arc<dyn EdrEngine>, Option<String>), WmsError> {
-    let not_queryable = || WmsError::LayerNotQueryable(format!("Layer '{layer}' is not queryable"));
+    let not_queryable =
+        || WmsError::LayerNotQueryable(format!("Layer '{}' is not queryable", resolved.layer));
     // An RGB composite has a value per band, and no position query answers
     // its name.
     if matches!(resolved.paint, Paint::Composite(_)) {

@@ -41,11 +41,11 @@ injection risk.**
   that axis), `OperationNotSupported`, and for GetFeatureInfo
   `LayerNotQueryable` and `InvalidPoint`. `MissingParameterValue` /
   `InvalidParameterValue` are for what the table does not cover.
-- A `LAYERS` list is checked name by name before `LAYER_LIMIT` (1,
-  deliberate) refuses it: `resolve_map_layer` runs on every
-  `(layer, style)` pair (`GetMapParams::other_layers`), so an undefined one
-  is `LayerNotDefined` / `StyleNotDefined`. Several layers pair with
-  `STYLES` values one to one (§7.3.3.4), an empty `STYLES` meaning every
+- A `LAYERS` list is checked name by name before `LAYER_LIMIT` (5)
+  refuses more: `resolve_map_layer` runs on every `(layer, style)` pair
+  (`GetMapParams::layers`), so an undefined one is `LayerNotDefined` /
+  `StyleNotDefined`. Several layers pair with `STYLES` values one to one
+  (§7.3.3.4), an empty `STYLES` or one of commas only meaning every
   default; a single layer takes the whole `STYLES` value, as it always has.
 
 ## BBOX axis order (critical gotcha)
@@ -111,6 +111,12 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   partly outside, `project_node` gives those pixels NaN and they stay
   empty. A meta-tile wholly outside is an all-nodata tile with no engine
   call, so a zoomed-out view of the north stays meta-tiled.
+- Several layers (#1181): each layer takes its own path (`render_layer`):
+  meta-tiled pixels from `ds_render::assemble_metatiled[_composite]`, or
+  the direct path's `render_tile_rgba` / `render_composite_tiles_rgba`,
+  all background-free. `render_layers` draws them bottom up with
+  `ds_render::draw_over` and encodes once with `encode_rgba`; a single
+  layer goes through the same code, so its bytes are unchanged.
 
 ## Rendered-image cache (#1010)
 
@@ -149,6 +155,13 @@ error images never are. Measured on a day of a live deployment's GetMaps
   give spare memory to `metatile_cache_mb`.
 - A hit ratio of a few % with the fill pinned at 100 % is expected with
   viewport clients and is not a sizing signal.
+- **Layer lists are never cached** (#1181): a GetMap of several layers
+  neither looks up nor inserts. Its key would name several collections,
+  and `evict_collections` matches one `CacheKey.layer`, so reloading
+  another listed collection would leave its image stale. Each layer keys
+  its meta-tiles on its single-layer `TileKeyPrefix`, so a repeated list
+  costs assembly, `draw_over` and one encode, no engine read. A single
+  layer keeps its exact `CacheKey`.
 
 ## Dimensions
 
@@ -198,6 +211,17 @@ error images never are. Measured on a day of a live deployment's GetMaps
   `0` for immutable-timestep engines; an engine whose content for a fixed
   instant is revised in place (engine-cap) bumps it, so an explicit
   `TIME=` render can't be served stale forever from the no-TTL caches.
+- **Several layers (#1181).** `handlers::resolve_layers` gives `TIME`,
+  `ELEVATION` and `DIM_REFERENCE_TIME` to the listed layers that have the
+  dimension (`!info.times.is_empty()`, `info.vertical`,
+  `info.reference_times`) and `None` to the others. A run a forecast layer
+  lacks is still its `InvalidDimensionValue`. A dimension no listed layer
+  has stays what it is for one layer: `ELEVATION` / `DIM_REFERENCE_TIME`
+  `InvalidDimensionValue`, `TIME` passed to every layer. Without `TIME`
+  each layer defaults and snaps its own (`resolve_layer`) and keys its own
+  time, run, level and content version. `Cache-Control` is `immutable`
+  only when every layer took an explicit `TIME` that resolved and every
+  content version is 0.
 
 ## RGB composite layers (#819)
 
@@ -219,12 +243,14 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   shared scan) renders the empty image without calling the engine, so
   nothing is cached under a key naming no scan.
 - **Rendering**: the direct path composes with
-  `ds_render::render_composite_tiles`; the meta-tile path with
-  `ds_render::render_metatiled_composite`, which caches the composed RGBA
+  `ds_render::render_composite_tiles_rgba`; the meta-tile path with
+  `ds_render::assemble_metatiled_composite`, which caches the composed RGBA
   256×256 tiles in the same `TilePixelCache` as colormapped ones.
-  `TRANSPARENT`/`BGCOLOR` are applied at encode time on both, as for
-  parameter layers.
-- **Admission**: `RenderJob::acquire_raster_planes` with one plane per band.
+  `TRANSPARENT`/`BGCOLOR` are applied at the one encode, as for parameter
+  layers.
+- **Admission**: `RenderJob::acquire_raster_planes` with one plane per band;
+  in a layer list `acquire_layered_raster` with the most planes one layer
+  holds.
 - **Legend**: the channel list (`composite_legend_json`,
   `render_composite_legend`), with the bands' units; no colour bar.
 
@@ -241,6 +267,8 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   default, and for JPEG (no alpha, so its nodata is always background);
   `None` only for PNG/WebP with `TRANSPARENT=TRUE`. Every render path reads
   it: direct, meta-tiled, composites, the empty image and the error tile.
+  With several layers it applies once, at the one encode in
+  `render_layers`; each layer's pixels stay RGBA until then.
   The image is composited onto it at encode time (`ds_render::flatten_onto`):
   every pixel opaque, PNG8 kept, no `tRNS`.
 - Caching: the background is part of the rendered-image `CacheKey` (the
@@ -305,7 +333,7 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
 - `<Service>` follows the WMS 1.3.0 schema sequence: `Name`, `Title`,
   `Abstract`, the mandatory `OnlineResource` (`{base_url}/wms`), then the
   limits GetMap enforces, read from the constants that enforce them (#1012):
-  `<LayerLimit>` = `params::LAYER_LIMIT` (1: GetMap renders one layer),
+  `<LayerLimit>` = `params::LAYER_LIMIT` (5, #1181),
   `<MaxWidth>`/`<MaxHeight>` = `params::MAX_MAP_DIMENSION`. Change a limit
   there and capabilities follows; never hard-code the numbers in the XML.
 - The root declares `xmlns:xsi`, `xmlns:sld` and an `xsi:schemaLocation`
@@ -369,12 +397,14 @@ meta-tiles by nearest neighbour).
   GetCapabilities and the handler use the same function, so the attribute
   and the answer cannot disagree. Never decide it with a probe query.
 - **Map part.** `validate_get_feature_info` runs `validate_get_map`, and the
-  handler resolves it through `handlers::resolve_map`, GetMap's own layer,
-  style, dimension, time, run and content-version resolution. Never resolve
-  a GetFeatureInfo dimension a second way: the value must belong to the
-  frame GetMap draws and keys its caches on. `QUERY_LAYERS` must be layers
-  of `LAYERS` (`LayerNotDefined`, Table E.1's "a layer not shown on the
-  map"); with `LAYER_LIMIT` 1 that is the map's one layer.
+  handler resolves it through `handlers::resolve_layers`, GetMap's own
+  layer, style, dimension, time, run and content-version resolution. Never
+  resolve a GetFeatureInfo dimension a second way: the value must belong to
+  the frame GetMap draws and keys its caches on. `QUERY_LAYERS` must be
+  layers of `LAYERS` (`LayerNotDefined`, Table E.1's "a layer not shown on
+  the map"), each named once; a layer `LAYERS` lists twice is queried as
+  its first listing draws it. Every query layer is checked queryable before
+  any is read, and the answers come in `QUERY_LAYERS` order (#1181).
 - **Point.** `OutputCrs::position_on_earth` at `((I+0.5)/WIDTH,
   (J+0.5)/HEIGHT)`: `project_node`, the mapping every engine renders with
   (EPSG:4326's BBOX is already lon/lat by then), for a point on the Earth,
@@ -391,7 +421,8 @@ meta-tiles by nearest neighbour).
   `InvalidPoint`.
 - **Dimensions.** The resolved time as `datetime` `(t, t)`, the resolved run
   as `reference_time`, and as `z` the level GetMap draws:
-  `MapEngine::resolve_elevation(parameter, ELEVATION, time, run)`, from the
+  `MapEngine::resolve_elevation(parameter, ELEVATION, time, run)`, with the
+  `ELEVATION` the layer takes (`ResolvedLayer::elevation`), from the
   parameter, time and run GetMap passes `get_raster_tile`. Never pass
   `ELEVATION` or `vertical.levels[0]` as such: GRIB draws the run's own
   first level, and an ODIM volume the nearest sweep carrying the quantity,
@@ -400,7 +431,10 @@ meta-tiles by nearest neighbour).
 - **Execution.** `RenderJob::acquire_feature_info` (the render slots and
   queue GetMap uses, no memory reservation: one point) and `job.run_query`,
   a task on ds-executor's shared query runtime, the one api-edr runs its
-  queries on (#1103). The deadline is GetFeatureInfo's own,
+  queries on (#1103). Several query layers share that one admission and
+  one `run_query`, read in turn under the one deadline; the first failure
+  other than no data fails the request and the rest are not read
+  (#1181). The deadline is GetFeatureInfo's own,
   `MC_FEATURE_INFO_TIMEOUT_MS` (10 s), never the render deadline: a cold
   GRIB position query can need more than GetMap's 3 s. It starts at
   admission, so it bounds the slot wait and the query together; expiry is
@@ -431,13 +465,18 @@ meta-tiles by nearest neighbour).
   server-side cache: one point read is cheaper than a cache entry.
 
 GetMap cache misses use `ds-executor::RenderJob`: a bounded shared queue and
-one absolute deadline across admission/render/encoding. The worker retains
+one absolute deadline across admission/render/encoding. A list of N layers
+is admitted with `acquire_layered_raster`: one slot, one layer's memory plus
+the image below, and N render deadlines (#1181). The worker retains
 CPU and memory permits after HTTP timeout/disconnect. Propagate
 `DeadlineExceeded` as 503 + Retry-After, never a successful transparent/error
 image. Meta-tile fan-out checks the same deadline between tiles.
 
 Every served GetMap carries a `ds_executor::RenderTiming` (timed from the
 rendered-cache lookup): `hit`, `assembled` (meta-tiles all cached) or `cold`.
+A layer list is labelled by its bottom layer's collection and is
+`assembled` only when every layer was; drawing layers over each other
+counts as `assemble`.
 An error tile carries none. Maps and Tiles report `hit`/`cold` the same way.
 Its render phases (#147) reuse the slow-render log's measurements, never a
 second timer: `sem_wait` is `queue`; a meta-tiled view reports

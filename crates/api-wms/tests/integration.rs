@@ -2111,7 +2111,7 @@ fn capabilities_service_advertises_getmap_limits_in_schema_order() {
     );
     assert_eq!(children[0].1, "WMS");
     assert_eq!(children[3].1, "https://wms.example/wms");
-    assert_eq!(service_limit(&children, "LayerLimit"), 1);
+    assert_eq!(service_limit(&children, "LayerLimit"), 5);
     assert_eq!(
         service_limit(&children, "LayerLimit"),
         api_wms::params::LAYER_LIMIT
@@ -6519,22 +6519,28 @@ async fn getmap_with_an_unoffered_crs_is_invalid_crs() {
     }
 }
 
-/// GetMap renders one layer (`LayerLimit` 1), but a list naming a layer or
-/// style the server does not serve is answered with that error, as
-/// ets-wms13's `getmap:first-layer-invalid`, `second-layer-invalid`,
-/// `first-style-invalid` and `second-style-invalid` expect. A list of
-/// served layers is still refused, and STYLES must pair with LAYERS.
+/// A list naming a layer or style the server does not serve is answered
+/// with that error, as ets-wms13's `getmap:first-layer-invalid`,
+/// `second-layer-invalid`, `first-style-invalid` and `second-style-invalid`
+/// expect, also past `LayerLimit` (5). STYLES must pair with LAYERS.
 #[tokio::test]
-async fn layer_lists_report_undefined_layers_and_styles_before_the_layer_limit() {
+async fn layer_lists_report_undefined_layers_and_styles() {
     let app = build_populated_router();
     for (layers, styles, code) in [
         ("NonExistant,radar", "", "LayerNotDefined"),
         ("radar,NonExistant", "", "LayerNotDefined"),
         ("radar,radar", "UndefinedStyle,default", "StyleNotDefined"),
         ("radar,radar", "default,UndefinedStyle", "StyleNotDefined"),
-        ("radar,radar", "", "InvalidParameterValue"),
-        ("radar,radar", ",", "InvalidParameterValue"),
-        ("radar,radar", "default,default", "InvalidParameterValue"),
+        (
+            "radar,radar,radar,radar,radar,NonExistant",
+            "",
+            "LayerNotDefined",
+        ),
+        (
+            "radar,radar,radar,radar,radar,radar",
+            "",
+            "InvalidParameterValue",
+        ),
         ("radar,radar", "default", "InvalidParameterValue"),
         ("radar,NonExistant", "a,b,c", "InvalidParameterValue"),
     ] {
@@ -6546,6 +6552,17 @@ async fn layer_lists_report_undefined_layers_and_styles_before_the_layer_limit()
         let reply = fetch(&app, &uri).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
         assert_eq!(exception_code(&reply.text()), code, "{uri}");
+    }
+    // Served layers with STYLES empty, of commas or named are drawn.
+    for styles in ["", ",", "default,default"] {
+        let uri = format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=radar,radar&STYLES={styles}\
+             &CRS=CRS:84&BBOX=-0.0025,-0.0025,0.0025,0.0025&WIDTH=100&HEIGHT=100\
+             &FORMAT=image/png"
+        );
+        let reply = fetch(&app, &uri).await;
+        assert_eq!(reply.status, StatusCode::OK, "{uri}");
+        assert_eq!(reply.content_type, "image/png", "{uri}");
     }
     // One layer keeps taking the whole STYLES value as its style.
     let reply = fetch(

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use axum::extract::{Query, State};
@@ -24,18 +25,19 @@ use crate::params::{GetMapParams, WmsQuery, WmsRequestType};
 /// vs tile render vs assemble vs encode). Diagnostic for the cold-render tail.
 const SLOW_RENDER_LOG_MS: u64 = 400;
 
-/// Which path a GetMap render took, for the slow-render diagnostic log. Keeps the
-/// four cases distinct (a meta render, an all-nodata meta render, a meta render
-/// that *fell back* to direct, and a genuine non-meta render) rather than
-/// conflating the last three under one "direct" label.
+/// Which path a GetMap layer's render took, for the slow-render diagnostic
+/// log. Keeps the four cases distinct (a meta render, an all-nodata meta
+/// render, a meta render that *fell back* to direct, and a genuine non-meta
+/// render) rather than conflating the last three under one "direct" label.
 enum RenderPath {
-    /// Web Mercator meta-tiling, with per-phase stats.
+    /// Web Mercator meta-tiling, with per-phase stats. Its `encode` is 0: the
+    /// layer's pixels are encoded with the others' ([`MapRender::encode`]).
     Meta(ds_render::MetaTileStats),
     /// Meta-tiling path, every covered pixel nodata — carries the tile-loop
     /// timing (assemble/encode skipped).
     MetaEmpty(ds_render::MetaTileStats),
     /// Meta-tiling declined (degenerate bbox / over tile budget / extreme
-    /// zoom) → direct, with its engine and encode phases.
+    /// zoom) → direct, with its engine and colorize (`encode`) phases.
     Fallback(RenderPhases),
     /// Genuine non-meta path (non-3857 CRS, or meta cache disabled).
     Direct(RenderPhases),
@@ -54,10 +56,10 @@ impl RenderPath {
         }
     }
 
-    /// The worker's render phases (#147), from the same measurements the
+    /// The layer's render phases (#147), from the same measurements the
     /// slow-render log reads. A meta-tiled view's `engine` is the uncached
-    /// tiles' engine reads, and its `encode` also counts colorizing them, as
-    /// the direct path's `render_tile` does. Phases a path skipped stay unset.
+    /// tiles' engine reads, and its `encode` counts colorizing them, as the
+    /// direct path's does. Phases a path skipped stay unset.
     fn phases(&self) -> RenderPhases {
         match self {
             RenderPath::Meta(stats) | RenderPath::MetaEmpty(stats) => {
@@ -74,6 +76,56 @@ impl RenderPath {
             }
             RenderPath::Fallback(phases) | RenderPath::Direct(phases) => *phases,
         }
+    }
+}
+
+/// How a GetMap's layers rendered, bottom first, and what drawing them into
+/// one image and encoding it took: the render's outcome and phases, and the
+/// slow-render log's fields.
+#[derive(Default)]
+struct MapRender {
+    /// One path per layer drawn. Empty for a view wholly outside its CRS,
+    /// which no layer is asked for.
+    layers: Vec<RenderPath>,
+    /// Drawing layers over the ones below them (several layers only).
+    compose: Duration,
+    /// Encoding the image; `None` for an all-nodata view, which is not.
+    encode: Option<Duration>,
+}
+
+impl MapRender {
+    /// The render-latency outcome (#466): `Assembled` when every layer was
+    /// assembled from cached meta-tiles, else `Cold`.
+    fn outcome(&self) -> RenderOutcome {
+        let assembled = !self.layers.is_empty()
+            && self
+                .layers
+                .iter()
+                .all(|path| path.outcome() == RenderOutcome::Assembled);
+        if assembled {
+            RenderOutcome::Assembled
+        } else {
+            RenderOutcome::Cold
+        }
+    }
+
+    /// The render's phases (#147): its layers' phases summed, drawing them
+    /// over each other as `assemble`, and the one encode as `encode`. A
+    /// single layer's are what its path measured, its encode included.
+    fn phases(&self) -> RenderPhases {
+        let mut phases = RenderPhases::default();
+        for path in &self.layers {
+            for (phase, elapsed) in path.phases().iter() {
+                phases.add(phase, elapsed);
+            }
+        }
+        if !self.compose.is_zero() {
+            phases.add(RenderPhase::Assemble, self.compose);
+        }
+        if let Some(encode) = self.encode {
+            phases.add(RenderPhase::Encode, encode);
+        }
+        phases
     }
 }
 
@@ -141,18 +193,23 @@ fn request_base_url(state: &WmsState, headers: &HeaderMap) -> String {
 }
 
 /// A GetMap render's outcome: the encoded image, `None` for an all-nodata
-/// view, and the path it took.
-type Rendered = Result<(Option<Vec<u8>>, RenderPath), DataServerError>;
+/// view, and how its layers rendered.
+type Rendered = Result<(Option<Vec<u8>>, MapRender), DataServerError>;
+
+/// One layer's render: its RGBA pixels, background-free, `None` when every
+/// pixel is nodata, and the path it took.
+type LayerPixels = Result<(Option<Vec<u8>>, RenderPath), DataServerError>;
 
 /// What a GetMap render job hands back: the image to serve, already encoded
 /// on the render worker that held the CPU slot (#1093), never on the async
 /// request worker after it.
 enum Finished {
-    /// A populated image, served `MISS` and inserted in the rendered cache.
-    Image(CachedRendered, RenderPath),
+    /// A populated image, served `MISS` and, for one layer, inserted in the
+    /// rendered cache.
+    Image(CachedRendered, MapRender),
     /// An all-nodata view, served `EMPTY`: its memoized empty image, or the
     /// encoder's error.
-    Empty(Result<CachedRendered, DataServerError>, RenderPath),
+    Empty(Result<CachedRendered, DataServerError>, MapRender),
     /// A failed render, served `ERROR`: the memoized error tile (or the
     /// encoder's error), and the render's error for the handler to log.
     Error(Result<CachedRendered, DataServerError>, DataServerError),
@@ -357,12 +414,14 @@ fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLa
     })
 }
 
-/// The map a GetMap draws, or a GetFeatureInfo queries: its layer and style,
-/// and the parameter, timestep, model run and content version GetMap renders
-/// and keys its caches on. GetFeatureInfo resolves its map part through
-/// [`resolve_map`] too, so the value it reports belongs to the frame the
-/// client shows (#1064).
-pub(crate) struct ResolvedMap {
+/// One layer of the map a GetMap draws, or a GetFeatureInfo queries: its
+/// layer and style, and the parameter, timestep, model run, level and
+/// content version GetMap renders it at and keys its caches on.
+/// GetFeatureInfo resolves its map part through [`resolve_layers`] too, so
+/// the value it reports belongs to the frame the client shows (#1064).
+pub(crate) struct ResolvedLayer {
+    /// The `LAYERS` name, as requested.
+    pub layer: String,
     pub collection_id: String,
     pub engine: Arc<dyn MapEngine>,
     pub paint: Paint,
@@ -379,22 +438,141 @@ pub(crate) struct ResolvedMap {
     /// the style's, else on the root layer the default parameter whose style
     /// it draws with (#1133); for a composite, the composite's name.
     pub parameter: Option<String>,
+    /// Whether the layer takes the request's `TIME` (#1181): a `TIME` was
+    /// sent, and the layer has a time dimension or no listed layer has one.
+    pub explicit_time: bool,
     /// The timestep drawn: `TIME`, or the layer's default, snapped by the
     /// engine (#507). `None` when the engine has nothing to draw.
     pub time: Option<DateTime<Utc>>,
     /// The model run drawn (#521); `None` for an engine without runs.
     pub reference_time: Option<DateTime<Utc>>,
+    /// The `ELEVATION` the layer is drawn at: the request's, for a layer
+    /// with an elevation dimension; `None` for one without, which ignores it
+    /// (#1181), and when none was sent.
+    pub elevation: Option<f64>,
     /// [`MapEngine::content_version`], read right after the time resolved.
     pub content_version: u64,
 }
 
 /// Resolve a GetMap's (or a GetFeatureInfo's map part's) layers, styles and
-/// dimensions: every WMS exception the map part can raise, then the
-/// parameter, timestep and model run the engine draws.
-pub(crate) fn resolve_map(
+/// dimensions, in `LAYERS` order: every WMS exception the map part can
+/// raise, then for each layer the parameter, timestep and model run the
+/// engine draws.
+///
+/// Every `(layer, style)` pair is checked first, so a list naming a layer
+/// or style this server does not serve gets that error, WMS 1.3.0 Table
+/// E.1's `LayerNotDefined` / `StyleNotDefined`, whichever layer of the list
+/// it is (#1065), before more than [`LAYER_LIMIT`](crate::params::LAYER_LIMIT)
+/// layers are refused.
+///
+/// `TIME`, `ELEVATION` and `DIM_REFERENCE_TIME` each apply to the listed
+/// layers that have that dimension, and the others ignore it (#1181). A
+/// value a layer with the dimension cannot take is that layer's error; a
+/// dimension no listed layer has is the request's, as for one layer:
+/// `ELEVATION` and `DIM_REFERENCE_TIME` are `InvalidDimensionValue`, while a
+/// `TIME` goes to every layer, as it always went to a layer without times.
+pub(crate) fn resolve_layers(
     state: &WmsState,
     params: &GetMapParams,
-) -> Result<ResolvedMap, WmsError> {
+) -> Result<Vec<ResolvedLayer>, WmsError> {
+    let layers = params
+        .layers
+        .iter()
+        .map(|(layer, style)| Ok((layer.as_str(), resolve_map_layer(state, layer, style)?)))
+        .collect::<Result<Vec<_>, WmsError>>()?;
+    if layers.len() > crate::params::LAYER_LIMIT {
+        return Err(WmsError::invalid_parameter(&format!(
+            "LAYERS names {} layers; at most {} are drawn in one request",
+            layers.len(),
+            crate::params::LAYER_LIMIT
+        )));
+    }
+
+    // Reject an `ELEVATION` no listed layer has a vertical axis for: a
+    // sample dimension value the map cannot take, Table E.1's
+    // `InvalidDimensionValue`, as a `DIM_REFERENCE_TIME` on layers without
+    // runs is below (#1065).
+    if params.elevation.is_some() && layers.iter().all(|(_, m)| m.info.vertical.is_none()) {
+        return Err(WmsError::InvalidDimensionValue(no_dimension(
+            &layers,
+            "ELEVATION",
+        )));
+    }
+
+    // Validate `DIM_REFERENCE_TIME` against the advertised model runs of
+    // each layer that has them. The engine requires an exact run match
+    // (`select_run` → `ReferenceTimeNotFound`, which the GetMap render path
+    // would turn into a red 200 tile); surfacing `InvalidDimensionValue`
+    // here is the correct WMS response — mirroring the parameter/ELEVATION
+    // checks.
+    if let Some(rt) = params.reference_time {
+        if layers
+            .iter()
+            .all(|(_, m)| m.info.reference_times.is_empty())
+        {
+            return Err(WmsError::InvalidDimensionValue(no_dimension(
+                &layers,
+                "reference_time",
+            )));
+        }
+        for (_, m) in &layers {
+            // Ascending by the `RasterInfo` contract; an archive keeps
+            // thousands of runs (#1006).
+            let runs = &m.info.reference_times;
+            if !runs.is_empty() && runs.binary_search(&rt).is_err() {
+                return Err(WmsError::InvalidDimensionValue(format!(
+                    "reference_time '{}' is not an available model run for layer \
+                     '{}'",
+                    rt.to_rfc3339(),
+                    m.collection_id
+                )));
+            }
+        }
+    }
+
+    // A layer has a time dimension when it has times: the axis capabilities
+    // advertises on it, or on the parent its child layer inherits it from.
+    let has_time = |m: &MapLayer| !m.info.times.is_empty();
+    let any_time = layers.iter().any(|(_, m)| has_time(m));
+    Ok(layers
+        .into_iter()
+        .map(|(layer, m)| {
+            let time = params.time.filter(|_| !any_time || has_time(&m));
+            let elevation = params.elevation.filter(|_| m.info.vertical.is_some());
+            let run = params
+                .reference_time
+                .filter(|_| !m.info.reference_times.is_empty());
+            resolve_layer(layer, m, time, elevation, run)
+        })
+        .collect())
+}
+
+/// The `InvalidDimensionValue` message for a `dimension` no layer of
+/// `layers` has.
+fn no_dimension(layers: &[(&str, MapLayer)], dimension: &str) -> String {
+    match layers {
+        [(_, m)] => format!("Layer '{}' has no {dimension} dimension", m.collection_id),
+        _ => format!(
+            "No layer of LAYERS has a {dimension} dimension: {}",
+            layers
+                .iter()
+                .map(|(layer, _)| format!("'{layer}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The timestep, model run and content version GetMap draws one layer at,
+/// from the `TIME`, `ELEVATION` and `DIM_REFERENCE_TIME` it takes
+/// ([`resolve_layers`]).
+fn resolve_layer(
+    layer: &str,
+    map_layer: MapLayer,
+    requested_time: Option<DateTime<Utc>>,
+    elevation: Option<f64>,
+    requested_reference_time: Option<DateTime<Utc>>,
+) -> ResolvedLayer {
     let MapLayer {
         collection_id,
         style_layer,
@@ -403,52 +581,7 @@ pub(crate) fn resolve_map(
         style_name,
         parameter,
         info,
-    } = resolve_map_layer(state, &params.layer, &params.style)?;
-
-    // GetMap renders one layer (`LayerLimit`), but a request naming
-    // a layer or style this server does not serve gets that error
-    // first: WMS 1.3.0 Table E.1's `LayerNotDefined` /
-    // `StyleNotDefined`, whichever layer of the list it is (#1065).
-    for (layer, style) in &params.other_layers {
-        resolve_map_layer(state, layer, style)?;
-    }
-    if 1 + params.other_layers.len() > crate::params::LAYER_LIMIT {
-        return Err(WmsError::invalid_parameter(
-            "Exactly one LAYERS value is supported",
-        ));
-    }
-
-    // Reject an `ELEVATION` against a layer with no vertical axis:
-    // a sample dimension value the layer cannot take, Table E.1's
-    // `InvalidDimensionValue`, as a `DIM_REFERENCE_TIME` on a
-    // layer without runs is below (#1065).
-    if params.elevation.is_some() && info.vertical.is_none() {
-        return Err(WmsError::InvalidDimensionValue(format!(
-            "Layer '{collection_id}' has no ELEVATION dimension"
-        )));
-    }
-
-    // Validate `DIM_REFERENCE_TIME` against the layer's advertised model
-    // runs. The engine requires an exact run match (`select_run` →
-    // `ReferenceTimeNotFound`, which the GetMap render path would turn
-    // into a red 200 tile); surfacing `InvalidDimensionValue` here is the
-    // correct WMS response — mirroring the parameter/ELEVATION checks.
-    if let Some(rt) = params.reference_time {
-        if info.reference_times.is_empty() {
-            return Err(WmsError::InvalidDimensionValue(format!(
-                "Layer '{collection_id}' has no reference_time dimension"
-            )));
-        }
-        // Ascending by the `RasterInfo` contract; an archive keeps
-        // thousands of runs (#1006).
-        if info.reference_times.binary_search(&rt).is_err() {
-            return Err(WmsError::InvalidDimensionValue(format!(
-                "reference_time '{}' is not an available model run for layer \
-                 '{collection_id}'",
-                rt.to_rfc3339()
-            )));
-        }
-    }
+    } = map_layer;
 
     // WMS picks the parameter via `LAYERS=collection/param`, then
     // `style_info.parameter`, then on the root layer the default parameter
@@ -459,7 +592,7 @@ pub(crate) fn resolve_map(
     // Engine-owned default first (CAP: active now), then the
     // parameter's (else the collection's) latest time. Resolve before
     // keying so an omitted TIME tracks catalog updates.
-    let time = params.time.or_else(|| {
+    let time = requested_time.or_else(|| {
         ds_core::map_engine::default_request_time(engine.as_ref(), &info, parameter.as_deref())
     });
 
@@ -471,9 +604,8 @@ pub(crate) fn resolve_map(
     // run's reference time, which an exact pin would refuse (GRIB's
     // cross-run fallback applies only to `None`). A pin of an
     // *older* run stays explicit/exact — that is user intent.
-    let requested_run = params
-        .reference_time
-        .filter(|&rt| info.reference_times.last().copied() != Some(rt));
+    let requested_run =
+        requested_reference_time.filter(|&rt| info.reference_times.last().copied() != Some(rt));
 
     // #521: resolve the run axis to the CONCRETE run the engine will
     // render — the run-axis mirror of what #508 does for TIME below.
@@ -510,7 +642,8 @@ pub(crate) fn resolve_map(
     // version is part of every rendered/meta-tile key.
     let content_version = engine.content_version();
 
-    Ok(ResolvedMap {
+    ResolvedLayer {
+        layer: layer.to_string(),
         collection_id,
         engine,
         paint,
@@ -518,10 +651,12 @@ pub(crate) fn resolve_map(
         style_name,
         info,
         parameter,
+        explicit_time: requested_time.is_some(),
         time,
         reference_time,
+        elevation,
         content_version,
-    })
+    }
 }
 
 /// Main WMS handler — dispatches on REQUEST parameter. `WmsQuery` keys the
@@ -554,78 +689,90 @@ pub async fn wms_handler(
             )
                 .into_response())
         }
+        // Every layer of `LAYERS` drawn with its style, time, level and run,
+        // bottom first (WMS 1.3.0 §7.3.3.3), into one image encoded once.
         WmsRequestType::GetMap => {
             let params = query.validate_get_map()?;
-
-            let ResolvedMap {
-                collection_id,
-                engine,
-                paint,
-                style_layer,
-                style_name,
-                info: _,
-                parameter,
-                time,
-                reference_time,
-                content_version,
-            } = resolve_map(&state, &params)?;
+            let layers = resolve_layers(&state, &params)?;
+            // The render-latency metric's collection label: the bottom
+            // layer's.
+            let collection_id = layers[0].collection_id.clone();
+            // For the logs: the LAYERS names, as requested.
+            let layer_names = params
+                .layers
+                .iter()
+                .map(|(layer, _)| layer.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
 
             // The format as encoded: an explicit QUALITY, else for WebP the
-            // collection's `[wms] webp_quality`, else the format default
+            // collections' `[wms] webp_quality`, else the format default
             // (JPEG 85, lossless WebP). Resolved before keying, so the
             // rendered cache never serves a lossy image for a lossless
             // request or the reverse.
-            let format = params.format.with_quality(
-                params.quality,
-                state
-                    .collections
-                    .get(&collection_id)
-                    .and_then(CollectionConfig::webp_quality),
-            );
+            let format = params
+                .format
+                .with_quality(params.quality, webp_quality(&state, &layers));
             let content_type = format.content_type();
-            let has_explicit_time = params.time.is_some();
 
-            // Build cache key
-            let cache_key = CacheKey {
-                // The RESOLVED style layer and style, which name the
-                // colormap: the root layer drawing its default parameter
-                // with that parameter's style keys as `collection/<default>`
-                // does, so the two share entries (#1133).
-                layer: style_layer.clone(),
-                style: style_name.clone(),
-                // Quality included; the meta-tile key below needs none, its
-                // tiles are RGBA encoded per request.
-                format,
-                crs: params.crs.clone(),
-                // For a projected output CRS the rendered pixels are laid out
-                // over the projected-metres bbox (carried in `output_crs`), not
-                // the WGS84 envelope in `params.bbox` — two requests with
-                // different projected bboxes can share an envelope, so key on the
-                // metres to avoid serving one's tile for the other (#267 review).
-                bbox: match &params.output_crs {
-                    OutputCrs::Projected { bbox, .. } => ds_render::quantize_bbox(bbox),
-                    _ => ds_render::quantize_bbox(&params.bbox),
-                },
-                width: params.width,
-                height: params.height,
-                time,
-                // The parameter settled above (also folded into
-                // `style_parameter` below), so the rendered cache
-                // distinguishes parameters.
-                parameter: parameter.clone(),
-                z: params.elevation.map(ds_render::quantize_z),
-                // The forecast run pinned via the `reference_time` dimension
-                // (None ⇒ latest), so runs don't collide in the rendered cache.
-                reference_time,
-                content_version,
-                // TRANSPARENT=FALSE / BGCOLOR (and JPEG) change the encoded
-                // bytes; the meta-tile key below stays background-free, so
-                // opaque and transparent views share cached RGBA tiles.
-                background: params.background,
+            // Immutable only when every layer draws an explicit TIME that
+            // resolved, over content no layer's engine revises in place.
+            let pinned_time = layers
+                .iter()
+                .all(|layer| layer.explicit_time && layer.time.is_some());
+            let content_version = layers
+                .iter()
+                .map(|layer| layer.content_version)
+                .max()
+                .unwrap_or_default();
+            let cache_control = cache_control_value(pinned_time, content_version);
+
+            // The rendered cache holds single-layer images only. A layer
+            // list is drawn from each layer's cached meta-tiles but never
+            // cached as a whole: a key naming one collection could not be
+            // evicted when another listed collection reloads (#1181).
+            let cache_key = match layers.as_slice() {
+                [layer] => Some(CacheKey {
+                    // The RESOLVED style layer and style, which name the
+                    // colormap: the root layer drawing its default parameter
+                    // with that parameter's style keys as `collection/<default>`
+                    // does, so the two share entries (#1133).
+                    layer: layer.style_layer.clone(),
+                    style: layer.style_name.clone(),
+                    // Quality included; the meta-tile key needs none, its
+                    // tiles are RGBA encoded per request.
+                    format,
+                    crs: params.crs.clone(),
+                    // For a projected output CRS the rendered pixels are laid
+                    // out over the projected-metres bbox (carried in
+                    // `output_crs`), not the WGS84 envelope in `params.bbox` —
+                    // two requests with different projected bboxes can share an
+                    // envelope, so key on the metres to avoid serving one's
+                    // tile for the other (#267 review).
+                    bbox: match &params.output_crs {
+                        OutputCrs::Projected { bbox, .. } => ds_render::quantize_bbox(bbox),
+                        _ => ds_render::quantize_bbox(&params.bbox),
+                    },
+                    width: params.width,
+                    height: params.height,
+                    time: layer.time,
+                    // The parameter settled by `resolve_layers` (also in the
+                    // meta-tile key), so the rendered cache distinguishes
+                    // parameters.
+                    parameter: layer.parameter.clone(),
+                    z: layer.elevation.map(ds_render::quantize_z),
+                    // The forecast run the engine draws (#521), so runs don't
+                    // collide in the rendered cache.
+                    reference_time: layer.reference_time,
+                    content_version: layer.content_version,
+                    // TRANSPARENT=FALSE / BGCOLOR (and JPEG) change the
+                    // encoded bytes; the meta-tile key stays background-free,
+                    // so opaque and transparent views share cached RGBA tiles.
+                    background: params.background,
+                }),
+                _ => None,
             };
 
-            let cache_control =
-                cache_control_value(has_explicit_time && time.is_some(), content_version);
             // Read If-None-Match into an owned String so it survives the move
             // into spawn_blocking and the cache-hit/miss branches below.
             let if_none_match = headers
@@ -641,8 +788,11 @@ pub async fn wms_handler(
             // `render_vector_tile` (the bug #145 fixed for raster tiles).
             // The render-latency clock (#466) starts at this lookup, so hits,
             // assembled views and cold renders each report their own tail.
-            let render_start = std::time::Instant::now();
-            if let Some(cached) = state.rendered_cache.get(&cache_key) {
+            let render_start = Instant::now();
+            if let Some(cached) = cache_key
+                .as_ref()
+                .and_then(|key| state.rendered_cache.get(key))
+            {
                 if let Some(ref inm) = if_none_match {
                     if ds_render::etag_matches(inm, cached.etag()) {
                         // 304 from the cache-HIT branch. The `x-cache: HIT`
@@ -684,15 +834,35 @@ pub async fn wms_handler(
             }
 
             // Acquire render semaphore (with timeout to shed load under
-            // pressure). A composite holds one value plane per band.
-            let t_sem = std::time::Instant::now();
-            let (job, memory_permit) = ds_executor::RenderJob::acquire_raster_planes(
-                state.render_semaphore.clone(),
-                params.width,
-                params.height,
-                paint.planes(),
-            )
-            .await
+            // pressure). A composite holds one value plane per band. Several
+            // layers render one at a time on one worker, so they hold one
+            // layer's planes plus the image of the layers below, never one
+            // charge each, under the render deadline once per layer (#1181).
+            let t_sem = Instant::now();
+            let planes = layers
+                .iter()
+                .map(|layer| layer.paint.planes())
+                .max()
+                .unwrap_or(1);
+            let slots = state.render_semaphore.clone();
+            let (job, memory_permit) = if layers.len() == 1 {
+                ds_executor::RenderJob::acquire_raster_planes(
+                    slots,
+                    params.width,
+                    params.height,
+                    planes,
+                )
+                .await
+            } else {
+                ds_executor::RenderJob::acquire_layered_raster(
+                    slots,
+                    params.width,
+                    params.height,
+                    planes,
+                    layers.len(),
+                )
+                .await
+            }
             .map_err(WmsError::from)?;
 
             // Admission wait: the `queue` render phase (#147) and the slow
@@ -700,310 +870,88 @@ pub async fn wms_handler(
             let queue_wait = t_sem.elapsed();
             let sem_wait_ms = queue_wait.as_millis() as u64;
 
-            // Render on a blocking thread
-            let engine = engine.clone();
-            let bbox = params.bbox;
-            let width = params.width;
-            let height = params.height;
-            // `time` (latest-resolved above) is `Copy`; it flows into both the
-            // direct and meta-tile render closures below.
-            let output_crs = params.output_crs.clone();
+            let frame = Frame {
+                bbox: params.bbox,
+                output_crs: params.output_crs.clone(),
+                width: params.width,
+                height: params.height,
+            };
             let background = params.background;
-            let elevation = params.elevation;
-            // `reference_time` (resolved to a concrete run above, #521) is
-            // `Copy`; it flows into both the direct and meta-tile render
-            // closures below.
-            let z_q = elevation.map(ds_render::quantize_z);
-            // Key meta-tiles on the *resolved* style layer and style name,
-            // not the raw LAYERS and STYLES: `STYLES=` (empty → default) and
-            // `STYLES=default` resolve to the same StyleInfo, and so do the
-            // root layer and `collection/<default>` (#1133), so they must
-            // share cached tiles.
-            let layer = style_layer;
-            let style = style_name;
+            let renders: Vec<LayerRender> = layers
+                .into_iter()
+                .map(|layer| LayerRender {
+                    // Key meta-tiles on the *resolved* style layer and style
+                    // name, not the raw LAYERS and STYLES: `STYLES=` (empty →
+                    // default) and `STYLES=default` resolve to the same
+                    // StyleInfo, and so do the root layer and
+                    // `collection/<default>` (#1133), so they must share
+                    // cached tiles. The key is the layer's alone, so a layer
+                    // list reuses the tiles its layers' own requests cached.
+                    prefix: ds_render::TileKeyPrefix {
+                        layer: layer.style_layer,
+                        parameter: layer.parameter,
+                        style: layer.style_name,
+                        time: layer.time,
+                        z: layer.elevation.map(ds_render::quantize_z),
+                        reference_time: layer.reference_time,
+                        content_version: layer.content_version,
+                    },
+                    engine: layer.engine,
+                    paint: layer.paint,
+                    elevation: layer.elevation,
+                })
+                .collect();
             let rendered_cache = state.rendered_cache.clone();
             let tile_cache = state.tile_cache.clone();
 
-            // Layer parameter (from "collection/param") takes priority over
-            // style parameter; for a composite it is the composite's name.
-            let style_parameter = parameter;
-
-            // Spans spawn_blocking *dispatch* + execution, so `render_ms` includes
-            // any wait for a free blocking-pool thread (itself a useful signal: if
-            // render_ms greatly exceeds the internal phase sum
-            // tile_render_ms+assemble_ms+encode_ms, the gap is scheduling latency).
-            // The job also finishes the image: an empty view's empty image and a
-            // failed render's error tile are encoded there too (#1093), and the
-            // request worker only reads the result.
-            let t_render = std::time::Instant::now();
+            // Spans spawn_blocking *dispatch* + execution, so `render_ms`
+            // includes any wait for a free blocking-pool thread (itself a
+            // useful signal: if render_ms greatly exceeds the internal phase
+            // sum tile_render_ms+assemble_ms+encode_ms, the gap is scheduling
+            // latency). The job also finishes the image: an empty view's
+            // empty image and a failed render's error tile are encoded there
+            // too (#1093), and the request worker only reads the result.
+            let t_render = Instant::now();
             let finished = job
                 .run(render_job(
                     memory_permit,
-                    width,
-                    height,
+                    frame.width,
+                    frame.height,
                     background,
                     format,
-                    move || -> Rendered {
-                        // A composite's bands, in the plane order its spec reads.
-                        let bands: Vec<&str> = match &paint {
-                            Paint::Composite(spec) => {
-                                spec.parameters.iter().map(String::as_str).collect()
-                            }
-                            Paint::Colormap(_) => Vec::new(),
-                        };
-                        // Bands that share no scan resolve no time (#819):
-                        // nothing to draw, and nothing to cache under a key
-                        // that names no timestep.
-                        if matches!(paint, Paint::Composite(_)) && time.is_none() {
-                            return Ok((None, RenderPath::Direct(RenderPhases::default())));
-                        }
-                        // A view wholly outside its CRS, past a pole or a
-                        // projected box outside the projection, is the empty
-                        // image without an engine read (WMS 1.3.0 §7.3.3.6).
-                        // Checked before either path: the meta-tile path asks
-                        // the engine per tile, not through the domain helpers,
-                        // and its tiles reach past the view (#1089).
-                        if output_crs.domain_rows(bbox, height).is_none() {
-                            return Ok((None, RenderPath::Direct(RenderPhases::default())));
-                        }
-
-                        // Direct single-shot render: one get_raster_tile →
-                        // colorize → encode, or a composite's bands → compose →
-                        // encode. The engine is asked only for the rows
-                        // inside the CRS: rows past a pole of a geographic
-                        // view stay empty, and a view wholly past one is the
-                        // empty image without an engine read (WMS 1.3.0
-                        // §7.3.3.6, #1065).
-                        let direct = || {
-                            let mut phases = RenderPhases::default();
-                            let engine_start = std::time::Instant::now();
-                            let bytes = match &paint {
-                                Paint::Colormap(colormap) => {
-                                    let Some(tile) =
-                                        ds_core::map_engine::get_raster_tile_in_domain(
-                                            engine.as_ref(),
-                                            bbox,
-                                            width,
-                                            height,
-                                            time,
-                                            &output_crs,
-                                            style_parameter.as_deref(),
-                                            elevation,
-                                            reference_time,
-                                        )?
-                                    else {
-                                        return Ok((None, phases));
-                                    };
-                                    phases.add(RenderPhase::Engine, engine_start.elapsed());
-                                    // If every pixel is nodata, skip colorization + encoding entirely.
-                                    if tile.is_empty() {
-                                        return Ok((None, phases));
-                                    }
-                                    let encode_start = std::time::Instant::now();
-                                    let bytes = ds_render::render_tile_with_background(
-                                        &tile,
-                                        colormap.as_ref(),
-                                        format,
-                                        background,
-                                    )?;
-                                    phases.add(RenderPhase::Encode, encode_start.elapsed());
-                                    bytes
-                                }
-                                Paint::Composite(spec) => {
-                                    // Every band from the one timestep the
-                                    // cache key names (#507).
-                                    let Some(tiles) =
-                                        ds_core::map_engine::get_raster_tiles_in_domain(
-                                            engine.as_ref(),
-                                            bbox,
-                                            width,
-                                            height,
-                                            time,
-                                            &output_crs,
-                                            &bands,
-                                            elevation,
-                                            reference_time,
-                                        )?
-                                    else {
-                                        return Ok((None, phases));
-                                    };
-                                    phases.add(RenderPhase::Engine, engine_start.elapsed());
-                                    let encode_start = std::time::Instant::now();
-                                    let Some(bytes) = ds_render::render_composite_tiles(
-                                        &tiles, spec, format, background,
-                                    )?
-                                    else {
-                                        return Ok((None, phases));
-                                    };
-                                    phases.add(RenderPhase::Encode, encode_start.elapsed());
-                                    bytes
-                                }
-                            };
-                            Ok::<_, DataServerError>((Some(bytes), phases))
-                        };
-
-                        // Supported projected CRSs: cache 256×256 meta-tiles and
-                        // resample to the exact viewport (#202). The expensive
-                        // per-tile work is cached and reused across overlapping
-                        // fullscreen views; geographic requests render directly. A zero-byte
-                        // tile cache (`metatile_cache_mb = 0`) is the kill switch:
-                        // it bypasses meta-tiling so an operator can revert to the
-                        // direct path via config reload, no redeploy.
-                        if output_crs != OutputCrs::Wgs84 && tile_cache.capacity() > 0 {
-                            let prefix = ds_render::TileKeyPrefix {
-                                layer,
-                                parameter: style_parameter.clone(),
-                                style,
-                                time,
-                                z: z_q,
-                                reference_time,
-                                content_version,
-                            };
-                            // Projected output retains its exact metre rectangle;
-                            // the helper supplies each tile's own OutputCrs and
-                            // WGS84 source-read envelope to the engine. A
-                            // composite's tiles cache its composed RGBA.
-                            let outcome = match &paint {
-                                Paint::Colormap(colormap) => ds_render::render_metatiled(
-                                    bbox,
-                                    &output_crs,
-                                    width,
-                                    height,
-                                    &prefix,
-                                    colormap.as_ref(),
-                                    format,
-                                    background,
-                                    tile_cache.as_ref(),
-                                    |tbbox, tw, th, tile_output| {
-                                        engine.get_raster_tile(
-                                            tbbox,
-                                            tw,
-                                            th,
-                                            time,
-                                            tile_output,
-                                            style_parameter.as_deref(),
-                                            elevation,
-                                            reference_time,
-                                        )
-                                    },
-                                )?,
-                                Paint::Composite(spec) => ds_render::render_metatiled_composite(
-                                    bbox,
-                                    &output_crs,
-                                    width,
-                                    height,
-                                    &prefix,
-                                    spec,
-                                    format,
-                                    background,
-                                    tile_cache.as_ref(),
-                                    |tbbox, tw, th, tile_output| {
-                                        engine.get_raster_tiles(
-                                            tbbox,
-                                            tw,
-                                            th,
-                                            time,
-                                            tile_output,
-                                            &bands,
-                                            elevation,
-                                            reference_time,
-                                        )
-                                    },
-                                )?,
-                            };
-                            match outcome {
-                                ds_render::MetaTile::Image { bytes, stats } => {
-                                    Ok((Some(bytes), RenderPath::Meta(stats)))
-                                }
-                                ds_render::MetaTile::Empty { stats } => {
-                                    Ok((None, RenderPath::MetaEmpty(stats)))
-                                }
-                                ds_render::MetaTile::Fallback => {
-                                    direct().map(|(o, phases)| (o, RenderPath::Fallback(phases)))
-                                }
-                            }
-                        } else {
-                            direct().map(|(o, phases)| (o, RenderPath::Direct(phases)))
-                        }
-                    },
+                    move || render_layers(&frame, &renders, &tile_cache, format, background),
                 ))
                 .await
                 .map_err(WmsError::from)?;
             let render_ms = t_render.elapsed().as_millis() as u64;
 
-            // The path + timing are logged for slow renders so prod pinpoints
-            // the cost (queue wait vs tile render vs assemble vs encode).
-            // `render_path` is `None` for a failed render (no fabricated
-            // placeholder), so the slow-log never reads one.
-            let render_path = match &finished {
-                Ok(Finished::Image(_, path) | Finished::Empty(_, path)) => Some(path),
+            // How the layers rendered, for the slow log and the render timing:
+            // `None` for a failed render (no fabricated placeholder), so the
+            // slow-log never reads one.
+            let render = match &finished {
+                Ok(Finished::Image(_, render) | Finished::Empty(_, render)) => Some(render),
                 Ok(Finished::Error(..)) | Err(_) => None,
             };
             // `None` exactly for a failed render: an error tile is not a
             // render outcome and records no latency.
-            let outcome = render_path.as_ref().map(|path| {
-                let mut phases = path.phases();
+            let outcome = render.map(|render| {
+                let mut phases = render.phases();
                 phases.add(RenderPhase::Queue, queue_wait);
-                (path.outcome(), phases)
+                (render.outcome(), phases)
             });
             // Only log *successful* slow renders (the 200-status tail we're
             // diagnosing); errors are surfaced by the WmsError render warn arm
-            // below. The arms stay distinct so a meta render that fell back to
-            // direct isn't conflated with a genuine non-meta render.
+            // below.
             if render_ms >= SLOW_RENDER_LOG_MS {
-                match render_path {
-                    Some(RenderPath::Meta(s)) => tracing::info!(
-                        layer = %params.layer,
+                if let Some(render) = render {
+                    log_slow_render(
+                        render,
+                        &layer_names,
                         sem_wait_ms,
                         render_ms,
-                        tiles = s.tiles,
-                        misses = s.misses,
-                        tile_loop_ms = s.tile_loop.as_millis() as u64,
-                        assemble_ms = s.assemble.as_millis() as u64,
-                        encode_ms = s.encode.as_millis() as u64,
-                        width = params.width,
-                        height = params.height,
-                        format = content_type,
-                        quality = ?format.quality(),
-                        "slow WMS meta-tile render"
-                    ),
-                    Some(RenderPath::MetaEmpty(s)) => tracing::info!(
-                        layer = %params.layer,
-                        sem_wait_ms,
-                        render_ms,
-                        tiles = s.tiles,
-                        misses = s.misses,
-                        tile_loop_ms = s.tile_loop.as_millis() as u64,
-                        width = params.width,
-                        height = params.height,
-                        format = content_type,
-                        quality = ?format.quality(),
-                        "slow WMS meta-tile render (all nodata)"
-                    ),
-                    Some(RenderPath::Fallback(_)) => tracing::info!(
-                        layer = %params.layer,
-                        sem_wait_ms,
-                        render_ms,
-                        width = params.width,
-                        height = params.height,
-                        format = content_type,
-                        quality = ?format.quality(),
-                        "slow WMS render (meta-tiling fell back to direct)"
-                    ),
-                    // `Direct` covers geographic output and any request
-                    // with meta-tiling disabled (metatile_cache_mb
-                    // = 0), so the label stays generic rather than claiming a CRS.
-                    Some(RenderPath::Direct(_)) => tracing::info!(
-                        layer = %params.layer,
-                        sem_wait_ms,
-                        render_ms,
-                        width = params.width,
-                        height = params.height,
-                        format = content_type,
-                        quality = ?format.quality(),
-                        "slow WMS direct render"
-                    ),
-                    None => {}
+                        (params.width, params.height),
+                        format,
+                    );
                 }
             }
 
@@ -1015,14 +963,16 @@ pub async fn wms_handler(
             // is FNV-1a over the actual bytes — different pixels, different
             // ETag — regardless of which exit we take (#145). The job
             // finished them all (`finish_render`, #1093); this only labels
-            // them. Only the populated image inserts into the rendered cache;
-            // the EMPTY and ERROR fast-paths intentionally don't (their bytes
-            // are deterministic for fixed dimensions and format and come from
-            // their own memo, and the engine error case shouldn't poison the
-            // cache).
+            // them. Only a single layer's populated image inserts into the
+            // rendered cache; the EMPTY and ERROR fast-paths intentionally
+            // don't (their bytes are deterministic for fixed dimensions and
+            // format and come from their own memo, and the engine error case
+            // shouldn't poison the cache).
             let (cached, x_cache) = match finished {
                 Ok(Finished::Image(cached, _)) => {
-                    rendered_cache.insert(cache_key, cached.clone());
+                    if let Some(cache_key) = cache_key {
+                        rendered_cache.insert(cache_key, cached.clone());
+                    }
                     (cached, "MISS")
                 }
                 Ok(Finished::Empty(tile, _)) => {
@@ -1037,7 +987,7 @@ pub async fn wms_handler(
                     return Err(WmsError::ServiceUnavailable(e.to_string()));
                 }
                 Ok(Finished::Error(tile, e)) => {
-                    tracing::warn!("WMS render error for layer '{}': {e}", params.layer);
+                    tracing::warn!("WMS render error for layer '{layer_names}': {e}");
                     let cached = tile.map_err(|e| {
                         WmsError::Internal(format!("Failed to encode error tile: {e}"))
                     })?;
@@ -1243,6 +1193,350 @@ pub async fn wms_handler(
     }
 }
 
+/// The `[wms] webp_quality` a GetMap of `layers` encodes WebP at without a
+/// `QUALITY`: its one layer's collection's. A list is lossy only when every
+/// layer's collection sets one, at the highest of them, so a layer kept
+/// lossless for its discrete classes (radar) keeps the image lossless.
+fn webp_quality(state: &WmsState, layers: &[ResolvedLayer]) -> Option<u8> {
+    let mut quality: Option<u8> = None;
+    for layer in layers {
+        let own = state
+            .collections
+            .get(&layer.collection_id)
+            .and_then(CollectionConfig::webp_quality)?;
+        quality = Some(quality.map_or(own, |highest| highest.max(own)));
+    }
+    quality
+}
+
+/// The view every layer of a GetMap draws into.
+struct Frame {
+    /// WGS84 `[west, south, east, north]`, the engine's read window.
+    bbox: [f64; 4],
+    output_crs: OutputCrs,
+    width: u32,
+    height: u32,
+}
+
+/// One layer of a GetMap, as its render job draws it.
+struct LayerRender {
+    engine: Arc<dyn MapEngine>,
+    paint: Paint,
+    /// Its meta-tile key, whose parameter, timestep, run and content
+    /// version are the ones the engine draws: the key of the layer drawn
+    /// alone, so a layer list shares its layers' cached tiles.
+    prefix: ds_render::TileKeyPrefix,
+    /// The `ELEVATION` it is drawn at (the prefix holds it quantized).
+    elevation: Option<f64>,
+}
+
+/// Draw every layer of a GetMap, bottom first, each over the image the
+/// layers before it made, and encode the result once: `TRANSPARENT` and
+/// `BGCOLOR` apply to the whole image, at encode time. Runs inside the
+/// render job, which holds the memory for the image of the layers below
+/// plus one layer at a time, under the render deadline once per layer. The
+/// first failing layer fails the render.
+fn render_layers(
+    frame: &Frame,
+    layers: &[LayerRender],
+    tile_cache: &ds_render::TilePixelCache,
+    format: ImageFormat,
+    background: Option<[u8; 3]>,
+) -> Rendered {
+    let mut render = MapRender::default();
+    // A view wholly outside its CRS, past a pole or a projected box outside
+    // the projection, is the empty image without an engine read (WMS 1.3.0
+    // §7.3.3.6). Checked before either path: the meta-tile path asks the
+    // engine per tile, not through the domain helpers, and its tiles reach
+    // past the view (#1089).
+    if frame
+        .output_crs
+        .domain_rows(frame.bbox, frame.height)
+        .is_none()
+    {
+        return Ok((None, render));
+    }
+    let mut image: Option<Vec<u8>> = None;
+    for layer in layers {
+        let (pixels, path) = render_layer(frame, layer, tile_cache)?;
+        render.layers.push(path);
+        let Some(pixels) = pixels else {
+            continue;
+        };
+        match image.as_mut() {
+            None => image = Some(pixels),
+            Some(below) => {
+                let compose_start = Instant::now();
+                ds_render::draw_over(below, &pixels)?;
+                render.compose += compose_start.elapsed();
+            }
+        }
+    }
+    let Some(mut rgba) = image else {
+        return Ok((None, render));
+    };
+    let encode_start = Instant::now();
+    let bytes = ds_render::encode_rgba(&mut rgba, frame.width, frame.height, format, background)?;
+    render.encode = Some(encode_start.elapsed());
+    Ok((Some(bytes), render))
+}
+
+/// One layer's background-free RGBA pixels: meta-tiled for a supported
+/// projected CRS, else (or when meta-tiling declines) one direct engine
+/// read for the whole view.
+fn render_layer(
+    frame: &Frame,
+    layer: &LayerRender,
+    tile_cache: &ds_render::TilePixelCache,
+) -> LayerPixels {
+    let Frame {
+        bbox,
+        ref output_crs,
+        width,
+        height,
+    } = *frame;
+    let engine = layer.engine.as_ref();
+    let prefix = &layer.prefix;
+    let (time, reference_time, elevation) = (prefix.time, prefix.reference_time, layer.elevation);
+    // Layer parameter (from "collection/param") takes priority over style
+    // parameter; for a composite it is the composite's name.
+    let parameter = prefix.parameter.as_deref();
+    // A composite's bands, in the plane order its spec reads.
+    let bands: Vec<&str> = match &layer.paint {
+        Paint::Composite(spec) => spec.parameters.iter().map(String::as_str).collect(),
+        Paint::Colormap(_) => Vec::new(),
+    };
+    // Bands that share no scan resolve no time (#819): nothing to draw,
+    // and nothing to cache under a key that names no timestep.
+    if matches!(layer.paint, Paint::Composite(_)) && time.is_none() {
+        return Ok((None, RenderPath::Direct(RenderPhases::default())));
+    }
+
+    // Direct single-shot render: one get_raster_tile → colorize, or a
+    // composite's bands → compose. The engine is asked only for the rows
+    // inside the CRS: rows past a pole of a geographic view stay empty, and
+    // a view wholly past one is the empty image without an engine read
+    // (WMS 1.3.0 §7.3.3.6, #1065).
+    let direct = || {
+        let mut phases = RenderPhases::default();
+        let engine_start = Instant::now();
+        let rgba = match &layer.paint {
+            Paint::Colormap(colormap) => {
+                let Some(tile) = ds_core::map_engine::get_raster_tile_in_domain(
+                    engine,
+                    bbox,
+                    width,
+                    height,
+                    time,
+                    output_crs,
+                    parameter,
+                    elevation,
+                    reference_time,
+                )?
+                else {
+                    return Ok((None, phases));
+                };
+                phases.add(RenderPhase::Engine, engine_start.elapsed());
+                // If every pixel is nodata, skip colorization entirely.
+                if tile.is_empty() {
+                    return Ok((None, phases));
+                }
+                let colorize_start = Instant::now();
+                let rgba = ds_render::render_tile_rgba(&tile, colormap.as_ref())?;
+                phases.add(RenderPhase::Encode, colorize_start.elapsed());
+                rgba
+            }
+            Paint::Composite(spec) => {
+                // Every band from the one timestep the cache key names
+                // (#507).
+                let Some(tiles) = ds_core::map_engine::get_raster_tiles_in_domain(
+                    engine,
+                    bbox,
+                    width,
+                    height,
+                    time,
+                    output_crs,
+                    &bands,
+                    elevation,
+                    reference_time,
+                )?
+                else {
+                    return Ok((None, phases));
+                };
+                phases.add(RenderPhase::Engine, engine_start.elapsed());
+                let compose_start = Instant::now();
+                let Some(rgba) = ds_render::render_composite_tiles_rgba(&tiles, spec)? else {
+                    return Ok((None, phases));
+                };
+                phases.add(RenderPhase::Encode, compose_start.elapsed());
+                rgba
+            }
+        };
+        Ok::<_, DataServerError>((Some(rgba), phases))
+    };
+
+    // Supported projected CRSs: cache 256×256 meta-tiles and resample to
+    // the exact viewport (#202). The expensive per-tile work is cached and
+    // reused across overlapping fullscreen views; geographic requests
+    // render directly. A zero-byte tile cache (`metatile_cache_mb = 0`) is
+    // the kill switch: it bypasses meta-tiling so an operator can revert to
+    // the direct path via config reload, no redeploy.
+    if *output_crs == OutputCrs::Wgs84 || tile_cache.capacity() == 0 {
+        return direct().map(|(rgba, phases)| (rgba, RenderPath::Direct(phases)));
+    }
+    // Projected output retains its exact metre rectangle; the helper
+    // supplies each tile's own OutputCrs and WGS84 source-read envelope to
+    // the engine. A composite's tiles cache its composed RGBA.
+    let outcome = match &layer.paint {
+        Paint::Colormap(colormap) => ds_render::assemble_metatiled(
+            bbox,
+            output_crs,
+            width,
+            height,
+            prefix,
+            colormap.as_ref(),
+            tile_cache,
+            |tbbox, tw, th, tile_output| {
+                engine.get_raster_tile(
+                    tbbox,
+                    tw,
+                    th,
+                    time,
+                    tile_output,
+                    parameter,
+                    elevation,
+                    reference_time,
+                )
+            },
+        )?,
+        Paint::Composite(spec) => ds_render::assemble_metatiled_composite(
+            bbox,
+            output_crs,
+            width,
+            height,
+            prefix,
+            spec,
+            tile_cache,
+            |tbbox, tw, th, tile_output| {
+                engine.get_raster_tiles(
+                    tbbox,
+                    tw,
+                    th,
+                    time,
+                    tile_output,
+                    &bands,
+                    elevation,
+                    reference_time,
+                )
+            },
+        )?,
+    };
+    match outcome {
+        ds_render::MetaTilePixels::Image { rgba, stats } => {
+            Ok((Some(rgba), RenderPath::Meta(stats)))
+        }
+        ds_render::MetaTilePixels::Empty { stats } => Ok((None, RenderPath::MetaEmpty(stats))),
+        ds_render::MetaTilePixels::Fallback => {
+            direct().map(|(rgba, phases)| (rgba, RenderPath::Fallback(phases)))
+        }
+    }
+}
+
+/// Log a successful GetMap render that took at least
+/// [`SLOW_RENDER_LOG_MS`], so production pinpoints its cost (queue wait vs
+/// tile render vs assemble vs encode). One layer's arms stay distinct so a
+/// meta render that fell back to direct isn't conflated with a genuine
+/// non-meta render; several layers log one line with their totals.
+fn log_slow_render(
+    render: &MapRender,
+    layer: &str,
+    sem_wait_ms: u64,
+    render_ms: u64,
+    (width, height): (u32, u32),
+    format: ImageFormat,
+) {
+    let content_type = format.content_type();
+    let encode_ms = render.encode.unwrap_or_default().as_millis() as u64;
+    match render.layers.as_slice() {
+        [RenderPath::Meta(s)] => tracing::info!(
+            layer,
+            sem_wait_ms,
+            render_ms,
+            tiles = s.tiles,
+            misses = s.misses,
+            tile_loop_ms = s.tile_loop.as_millis() as u64,
+            assemble_ms = s.assemble.as_millis() as u64,
+            encode_ms,
+            width,
+            height,
+            format = content_type,
+            quality = ?format.quality(),
+            "slow WMS meta-tile render"
+        ),
+        [RenderPath::MetaEmpty(s)] => tracing::info!(
+            layer,
+            sem_wait_ms,
+            render_ms,
+            tiles = s.tiles,
+            misses = s.misses,
+            tile_loop_ms = s.tile_loop.as_millis() as u64,
+            width,
+            height,
+            format = content_type,
+            quality = ?format.quality(),
+            "slow WMS meta-tile render (all nodata)"
+        ),
+        [RenderPath::Fallback(_)] => tracing::info!(
+            layer,
+            sem_wait_ms,
+            render_ms,
+            width,
+            height,
+            format = content_type,
+            quality = ?format.quality(),
+            "slow WMS render (meta-tiling fell back to direct)"
+        ),
+        // `Direct` covers geographic output and any request with
+        // meta-tiling disabled (metatile_cache_mb = 0), so the label stays
+        // generic rather than claiming a CRS. No path at all is a view
+        // wholly outside its CRS, which reads nothing.
+        [] | [RenderPath::Direct(_)] => tracing::info!(
+            layer,
+            sem_wait_ms,
+            render_ms,
+            width,
+            height,
+            format = content_type,
+            quality = ?format.quality(),
+            "slow WMS direct render"
+        ),
+        paths => {
+            let meta = paths.iter().filter_map(|path| match path {
+                RenderPath::Meta(s) | RenderPath::MetaEmpty(s) => Some(s),
+                RenderPath::Fallback(_) | RenderPath::Direct(_) => None,
+            });
+            let (tiles, misses) = meta.fold((0, 0), |(tiles, misses), s| {
+                (tiles + s.tiles, misses + s.misses)
+            });
+            tracing::info!(
+                layer,
+                layers = paths.len(),
+                sem_wait_ms,
+                render_ms,
+                tiles,
+                misses,
+                compose_ms = render.compose.as_millis() as u64,
+                encode_ms,
+                width,
+                height,
+                format = content_type,
+                quality = ?format.quality(),
+                "slow WMS multi-layer render"
+            )
+        }
+    }
+}
+
 /// The legend image size a GetLegendGraphic asks for: the one function
 /// capabilities also reads for its LegendURL size, so the advertised size is
 /// the size served.
@@ -1369,9 +1663,22 @@ mod tests {
     #[test]
     fn empty_views_share_one_empty_image_encode() {
         let empty = || {
-            let view = Ok((None, RenderPath::Direct(RenderPhases::default())));
-            match finish_render(view, 59, 31, Some([1, 2, 3]), ImageFormat::JPEG) {
-                Ok(Finished::Empty(tile, RenderPath::Direct(_))) => tile.unwrap(),
+            let render = MapRender {
+                layers: vec![RenderPath::Direct(RenderPhases::default())],
+                ..MapRender::default()
+            };
+            match finish_render(
+                Ok((None, render)),
+                59,
+                31,
+                Some([1, 2, 3]),
+                ImageFormat::JPEG,
+            ) {
+                Ok(Finished::Empty(tile, render))
+                    if matches!(render.layers[..], [RenderPath::Direct(_)]) =>
+                {
+                    tile.unwrap()
+                }
                 _ => panic!("an all-nodata view is served as the empty image"),
             }
         };
@@ -1408,10 +1715,7 @@ mod tests {
     /// A populated render is served as rendered, its ETag over its bytes.
     #[test]
     fn a_populated_render_is_served_as_rendered() {
-        let view = Ok((
-            Some(vec![1, 2, 3]),
-            RenderPath::Direct(RenderPhases::default()),
-        ));
+        let view = Ok((Some(vec![1, 2, 3]), MapRender::default()));
         match finish_render(view, 8, 8, None, ImageFormat::Png) {
             Ok(Finished::Image(image, _)) => {
                 let expected = CachedRendered::new(bytes::Bytes::from_static(&[1, 2, 3]));

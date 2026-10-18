@@ -10,6 +10,12 @@ Raster admission reserves memory before CPU, sharing one absolute deadline.
 `acquire_raster_planes` charges a render holding several value planes (an
 RGB composite's bands) 16 B per output pixel per plane past the first
 (`budget::raster_bytes`); `acquire_raster` is its one-plane case.
+`acquire_layered_raster` admits a render that draws several layers into one
+image (WMS GetMap with several `LAYERS`, #1181): it charges
+`budget::layered_raster_bytes`, one layer's `raster_bytes` for the most
+planes a layer holds plus 4 B per output pixel for the image below, never a
+charge per layer, and its deadline is the render deadline once per layer
+(`layered_timeout`). The layers run in turn in one slot.
 No CPU slot is held while waiting for memory. CPU permits belong to workers,
 never HTTP futures awaiting a running worker. The raster handlers move the
 `Arc<RenderPermit>` into the job, so it survives HTTP cancellation; the job
@@ -70,7 +76,8 @@ Slot count: `render_concurrency()`, fixed by its first read — the server's
 `[server] render_concurrency` via `set_render_concurrency` at boot, else
 `default_render_concurrency()` (2× CPUs, min 8). Nothing may read the slots,
 queue or metrics before the server sets it; tests of it need process isolation.
-Raster default: MC_RENDER_TIMEOUT_MS=3000. Shared 3D points/meshes use 30 s,
+Raster default: MC_RENDER_TIMEOUT_MS=3000, once per layer for a layered
+render. Shared 3D points/meshes use 30 s,
 GetFeatureInfo MC_FEATURE_INFO_TIMEOUT_MS=10000.
 MC_RENDER_QUEUE_CAPACITY defaults to 3× render concurrency; zero permits no
 waiting. Global slots and queue survive reload. Metrics snapshot is exported

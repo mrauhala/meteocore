@@ -81,8 +81,8 @@ new ol.layer.Tile({
 | Operation | Description |
 |-----------|-------------|
 | `GetCapabilities` | Returns XML document listing available layers, CRS, extents, time dimension, and styles with their legends; `<Service>` advertises the GetMap limits (`LayerLimit`, `MaxWidth`, `MaxHeight`) |
-| `GetMap` | Returns a rendered map image (PNG or JPEG) |
-| `GetFeatureInfo` | Returns a layer's value at a pixel of the map, as plain text, GeoJSON or HTML ([GetFeatureInfo](#getfeatureinfo)) |
+| `GetMap` | Returns a rendered map image (PNG, JPEG or WebP) of up to five layers drawn over each other ([Several layers](#several-layers)) |
+| `GetFeatureInfo` | Returns each queried layer's value at a pixel of the map, as plain text, GeoJSON or HTML ([GetFeatureInfo](#getfeatureinfo)) |
 | `GetLegendGraphic` | Returns a legend image showing the colormap scale |
 
 The capabilities document names its schemas and validates against them: the
@@ -114,17 +114,62 @@ of cases, takes its first value: `LAYERS=a&layers=b` requests layer `a`.
 | `SERVICE` | yes | Must be `WMS` |
 | `VERSION` | yes | Must be `1.3.0`. Without it the request is `MissingParameterValue`, as WMS 1.3.0 requires: only GetCapabilities negotiates the version |
 | `REQUEST` | yes | `GetMap` |
-| `LAYERS` | yes | Layer name: a collection ID, or `collection/parameter` for one parameter of a multi-parameter collection. A multi-parameter collection's own layer is not advertised, but `LAYERS=collection` is accepted and draws its default parameter with that parameter's style: the image and legend `collection/<default parameter>` gives. Only one layer per request (`LayerLimit` 1): a list naming a layer or style the server does not serve answers `LayerNotDefined` / `StyleNotDefined`, a list of served layers `InvalidParameterValue` |
+| `LAYERS` | yes | Up to five comma-separated layer names (`LayerLimit` 5), drawn in list order, the first at the bottom ([Several layers](#several-layers)). A layer name is a collection ID, or `collection/parameter` for one parameter of a multi-parameter collection. A multi-parameter collection's own layer is not advertised, but `LAYERS=collection` is accepted and draws its default parameter with that parameter's style: the image and legend `collection/<default parameter>` gives. Every name and style is checked first, so a list naming a layer or style the server does not serve answers `LayerNotDefined` / `StyleNotDefined`, and a list of more than five served layers `InvalidParameterValue` |
 | `CRS` | yes | Coordinate reference system (see below) |
 | `BBOX` | yes | Bounding box (axis order depends on CRS) |
 | `WIDTH` | yes | Output image width in pixels (1–8000) |
 | `HEIGHT` | yes | Output image height in pixels (1–8000) |
 | `FORMAT` | yes | `image/png`, `image/jpeg` or `image/webp` |
-| `TRANSPARENT` | no | `FALSE` (default, as WMS 1.3.0 specifies) or `TRUE`. `FALSE` returns an opaque image with nodata painted in `BGCOLOR`; `TRUE` keeps nodata transparent in PNG and WebP. A map overlaid on others needs `TRUE`, which OpenLayers' WMS sources send unless told otherwise |
+| `TRANSPARENT` | no | `FALSE` (default, as WMS 1.3.0 specifies) or `TRUE`. `FALSE` returns an opaque image with nodata painted in `BGCOLOR`; `TRUE` keeps nodata transparent in PNG and WebP. A map overlaid on others needs `TRUE`, which OpenLayers' WMS sources send unless told otherwise. With several layers it applies once, to the image they make together |
 | `BGCOLOR` | no | `0xRRGGBB` background for `TRANSPARENT=FALSE` and JPEG output (default `0xFFFFFF`) |
 | `QUALITY` | no | Vendor parameter: encoder quality 1–100 for `image/webp` (1–99 lossy, 100 lossless; default the collection's `[wms] webp_quality`, else lossless) and `image/jpeg` (default 85). With `image/png` or out of range: `InvalidParameterValue` |
-| `TIME` | no | ISO 8601 timestamp. Defaults to latest available. |
-| `STYLES` | no | The layer's style; empty for its default. A `LAYERS` list, which `LayerLimit` 1 refuses, is first checked pair by pair: one `STYLES` value per layer (`STYLES=a,,b`), or empty for every default |
+| `TIME` | no | ISO 8601 timestamp. Defaults to latest available, each layer's own. With several layers it applies to the layers with a time dimension ([Several layers](#several-layers)) |
+| `ELEVATION` | no | One vertical level, for a layer with an elevation dimension; `InvalidDimensionValue` when no listed layer has one |
+| `DIM_REFERENCE_TIME` | no | A model run of a forecast layer; defaults to its latest. `InvalidDimensionValue` for a run the layer does not have, or when no listed layer has runs |
+| `STYLES` | no | One style per layer, by position, each empty for that layer's default: `STYLES=a,,b`. An empty `STYLES`, or one of commas only, gives every layer its default; another number of values is `InvalidParameterValue`. A single layer takes the whole value as its style |
+
+### Several layers
+
+A GetMap may name up to five layers, the `<LayerLimit>5</LayerLimit>` its
+capabilities advertise, as `LAYERS=radar,warnings` (#1181). Each layer is
+drawn as a GetMap of that layer alone draws it, with its own style, and the
+layers are drawn over each other in list order, the first at the bottom
+(WMS 1.3.0 §7.3.3.3): a layer's nodata, and its translucent colours, show
+the layers below it. `FORMAT`, `TRANSPARENT` and `BGCOLOR` apply once, to
+the image the layers make together: with `TRANSPARENT=FALSE`, `BGCOLOR`
+fills only what no layer covers. Every layer kind can be listed: parameter
+layers, RGB composites, CAP warnings, nowcast, lightning events and radar
+volumes.
+
+- **Dimensions.** `TIME`, `ELEVATION` and `DIM_REFERENCE_TIME` each apply
+  to the listed layers that have that dimension; the other layers ignore
+  it. A value a layer with the dimension cannot take is that layer's error,
+  as for one layer: a run the layer does not have is
+  `InvalidDimensionValue`. A dimension no listed layer has is the
+  request's, also as for one layer: `ELEVATION` and `DIM_REFERENCE_TIME`
+  are `InvalidDimensionValue`, while a `TIME` goes to every layer, as it
+  goes to a single layer without times. Without `TIME`, each layer draws
+  its own default, the latest of its own axis for a parameter that has one.
+- **Failures.** A layer that fails fails the map: the error tile, or HTTP
+  503 when the server is busy or the render deadline passes.
+- **Rendering.** The layers render one after another, in one render slot,
+  under the render deadline (`MC_RENDER_TIMEOUT_MS`, 3 s) once per layer:
+  15 s for five. The deadline counts from admission, so it covers the wait
+  for memory and a slot too, and a list is not shed where each of its
+  layers alone would be served. The render memory reserved is what one
+  layer holds, 32 B per output pixel and 16 B more per further band of an
+  RGB composite, plus 4 B per pixel for the image of the layers below,
+  whatever the number of layers.
+- **Caching.** In EPSG:3857, 3067 and 3035 each layer reuses its own cached
+  meta-tiles, the ones a GetMap of that layer alone caches, and caches the
+  tiles it renders for those requests too. The image of several layers is
+  never in the rendered-image cache: its key would name several
+  collections, and reloading one of them could not evict it. Its
+  `Cache-Control` is `immutable` only when every layer draws an explicit
+  `TIME`, over content its engine never revises in place.
+- **WebP quality.** Without `QUALITY`, WebP is lossy only when every listed
+  layer's collection sets `[wms] webp_quality`, at the highest of them, so
+  a layer kept lossless for its discrete classes keeps the image lossless.
 
 ## Supported CRS
 
@@ -176,9 +221,9 @@ by up to their spacing. Two boxes stay `InvalidParameterValue`:
 
 ## GetFeatureInfo
 
-GetFeatureInfo returns the value of a layer at a pixel of the map a client
-shows, for QGIS's identify tool, a click in OpenLayers or Leaflet, or any
-WMS client:
+GetFeatureInfo returns the value of each queried layer at a pixel of the
+map a client shows, for QGIS's identify tool, a click in OpenLayers or
+Leaflet, or any WMS client:
 
 ```
 http://localhost:8000/wms/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&LAYERS=radar&QUERY_LAYERS=radar&STYLES=&CRS=CRS:84&BBOX=19,59,32,71&WIDTH=256&HEIGHT=256&I=128&J=100&INFO_FORMAT=application/json
@@ -195,7 +240,7 @@ neighbour, so next to a class edge the pixel can show a neighbour's colour.
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | GetMap's | yes | The parameters that define the map: `VERSION`, `LAYERS`, `STYLES`, `CRS`, `BBOX`, `WIDTH`, `HEIGHT`, `TIME`, `ELEVATION`, `DIM_REFERENCE_TIME`. Every GetMap parameter sent, `FORMAT`, `TRANSPARENT`, `BGCOLOR` and `QUALITY` included, is validated as GetMap validates it, with GetMap's exceptions: an unsupported `FORMAT` is `InvalidFormat` here too. The image parameters do not change the value |
-| `QUERY_LAYERS` | yes | The layers of `LAYERS` to read. A layer the server does not serve, or one `LAYERS` does not name, is `LayerNotDefined`; one that is not queryable `LayerNotQueryable` |
+| `QUERY_LAYERS` | yes | The layers of `LAYERS` to read, answered in this order, a layer named twice once. A layer the server does not serve, or one `LAYERS` does not name, is `LayerNotDefined`; one that is not queryable `LayerNotQueryable`, before any layer is read. Each is read at the time, run and level GetMap draws it at ([Several layers](#several-layers)) |
 | `I` | yes | The pixel's column, 0 to `WIDTH` − 1. Anything else, a negative or non-integer value included, is `InvalidPoint` |
 | `J` | yes | The pixel's row, 0 (top) to `HEIGHT` − 1; otherwise `InvalidPoint` |
 | `INFO_FORMAT` | no | `text/plain` (the default when omitted), `application/json` or `text/html`, in any case. Anything else is `InvalidFormat` |
@@ -275,10 +320,12 @@ GetFeatureInfo runs on the same render slots and queue as GetMap, under a
 deadline of its own, `MC_FEATURE_INFO_TIMEOUT_MS` (10 s by default), not
 GetMap's 3 s render deadline: a cold position query can take longer than a
 render. The deadline counts from admission, so it covers both the wait for a
-render slot and the query. An overloaded or timed-out request is HTTP 503
-with `Retry-After: 1`. The engine call runs on the query runtime EDR queries
-also run on, never on the threads that serve requests. An engine failure is
-a generic exception, its detail only in the server log.
+render slot and the queries: several query layers are read one after
+another, in one slot, under that one deadline. An overloaded or timed-out
+request is HTTP 503 with `Retry-After: 1`. The engine calls run on the query
+runtime EDR queries also run on, never on the threads that serve requests.
+An engine failure is a generic exception, its detail only in the server log,
+and the query layers after it are not read.
 
 ## WMS Configuration
 
@@ -374,7 +421,7 @@ rendered_cache_mb = 256    # Default: 256 MB. Set to 0 to disable.
 metatile_cache_mb = 1024   # Global (server-wide). Default: 1024 MB. 0 disables meta-tiling.
 ```
 
-The rendered image cache stores final PNG/JPEG/WebP bytes keyed by bbox, style, format, dimensions, CRS, and timestamp. No TTL — radar data is immutable once produced. Cache is invalidated on collection reload (`POST /admin/collections/reload`).
+The rendered image cache stores a single layer's final PNG/JPEG/WebP bytes keyed by bbox, style, format, dimensions, CRS, and timestamp; an image of several layers is not cached ([Several layers](#several-layers)). No TTL — radar data is immutable once produced. Cache is invalidated on collection reload (`POST /admin/collections/reload`).
 
 For EPSG:3857 GetMap, the handler additionally uses an internal **meta-tile cache**: each request is decomposed into fixed 256×256 WebMercatorQuad tiles, rendered+cached as decoded RGBA, and resampled to the exact viewport — so overlapping fullscreen views reuse cached tiles instead of re-rendering. This cache is **global** (configured once under `[server] metatile_cache_mb`, not per-collection) and is consumed by WMS today (Maps/Tiles render directly for now). `metatile_cache_mb = 0` disables it and reverts to a direct render (reversible via reload).
 
@@ -404,7 +451,7 @@ All GetMap responses include an `ETag` header derived from the request parameter
 |-------|-------|---------|
 | Max image pixels | 64,000,000 | `WIDTH × HEIGHT` cap (`params::MAX_MAP_PIXELS`); the render memory budget `MC_RENDER_MEMORY_MB` admits fewer at its default |
 | Max dimension | 8,000 px | Limits width and height individually (`params::MAX_MAP_DIMENSION`); advertised in GetCapabilities as `<MaxWidth>`/`<MaxHeight>` |
-| Max layers | 1 | One `LAYERS` name per GetMap (`params::LAYER_LIMIT`); advertised as `<LayerLimit>` |
+| Max layers | 5 | `LAYERS` names per GetMap and GetFeatureInfo (`params::LAYER_LIMIT`); advertised as `<LayerLimit>` |
 | Concurrent renders | `[server] render_concurrency` | Render slots shared by WMS, Maps, Tiles and 3D Tiles (default 2× CPUs, min 8) |
 | CRS whitelist | 5 CRS | Only supported projections accepted |
 | Format whitelist | PNG, JPEG, WebP | No unexpected format handling |
@@ -484,16 +531,15 @@ Client
 
 ## Current Limitations
 
-- Single layer per request (no multi-layer composition)
 - No external SLD/SE style documents; local SLD ColorMap palette import is supported
-- GetFeatureInfo answers one value per layer, from the collection's position query; composites, overlays and collections without a position query are not queryable ([GetFeatureInfo](#getfeatureinfo))
+- GetFeatureInfo answers one value per queried layer, from the collection's position query; composites, overlays and collections without a position query are not queryable ([GetFeatureInfo](#getfeatureinfo))
 - Source sampling depends on the engine (including bilinear for GRIB/QueryData/Zarr/NetCDF); meta-tile assembly uses nearest-neighbor to preserve discrete palettes
 - Collections must implement `MapEngine` and enable `wms`; GeoTIFF, GRIB, ODIM, QueryData, Zarr, nowcast, CAP and PostGIS events are supported
 - CAP limits that can leave a warning off the map, the same in WMS, Maps and Tiles: a WIS2-fed collection holds at most `max_alerts` (default 10 000) alerts, and past it drops still-valid ones from the map and `/items`, not-yet-active and lowest severity first, reporting `degraded` in `/health`; one render draws at most 50 000 active alert areas, and past that leaves out the least severe (#805)
 - JPEG output composites transparency onto white background (no alpha channel)
 
 Uncached GetMap requests have a configurable 3 s queue/render deadline
-(`MC_RENDER_TIMEOUT_MS`) and a bounded waiting queue (`MC_RENDER_QUEUE_CAPACITY`,
+(`MC_RENDER_TIMEOUT_MS`), once per layer of a list, and a bounded waiting queue (`MC_RENDER_QUEUE_CAPACITY`,
 default 3× CPU slots). Overload or expiry returns HTTP 503 with `Retry-After: 1`;
 cached images remain available. GeoTIFF remote reads use the same deadline.
 GetFeatureInfo waits in the same queue under its own 10 s deadline
@@ -569,12 +615,14 @@ job runs first, tests it.
 
 The run meets these deliberate limits:
 
-- One layer per GetMap (`LayerLimit` 1, #1014): the suite's GetMap requests
-  with two or three layers, including its multi-layer `STYLES` tests, get an
-  exception and fail, and so do its GetFeatureInfo requests whose `LAYERS`
-  name two or three layers (`getfeatureinfo:two-query_layers`,
-  `three-query_layers`, `less-query_layers`). Its lists naming an undefined layer or style pass: the
-  names are checked before the length. Several layers per request are #1181.
+- Up to five layers per GetMap and GetFeatureInfo (`LayerLimit` 5, #1181).
+  The suite's requests naming two to five layers are drawn and answered:
+  its multi-layer `STYLES` tests, the five layers of
+  `getmap:styles-some-default` (`STYLES=s,,s,,`) among them, and
+  `getfeatureinfo:two-query_layers`, `three-query_layers` and
+  `less-query_layers`. Its lists naming an undefined layer or style pass:
+  the names are checked before the length. `getmap:layerlimit` sends
+  `LayerLimit` copies of one layer.
 - The queryable class tests the Blue Lake dataset below, except
   `queryable:getfeatureinfo-supported`, which reads MeteoCore's capabilities
   and passes. `queryable:std-data-queryable` looks for the `BasicPolygons`,
@@ -632,7 +680,7 @@ a failed subtest), and the data-preconditions class. By cause:
 
 | Failures | Tests | Cause | Status |
 |---:|---|---|---|
-| 7 | `getmap:two-layers`, `three-layers`, `two-styles`, `three-styles`, `styles-default-multiple-layers`, `styles-default-commas`, `styles-some-default` | GetMap renders one layer (`LayerLimit` 1, #1014) | expected: deliberate |
+| 7 | `getmap:two-layers`, `three-layers`, `two-styles`, `three-styles`, `styles-default-multiple-layers`, `styles-default-commas`, `styles-some-default` | GetMap renders one layer (`LayerLimit` 1, #1014) | fixed: up to five layers (#1181) |
 | 4 | `getmap:first-layer-invalid`, `second-layer-invalid`, `first-style-invalid`, `second-style-invalid` | A `LAYERS` list was refused for its length, `InvalidParameterValue`, before its names were checked | fixed: every named layer and style is checked first, so an undefined one is `LayerNotDefined` / `StyleNotDefined`; a list of served layers is still refused |
 | 1 | `getmap:invalid-crs` | An unsupported CRS answered `CRSNotDefined`, not Table E.1's `InvalidCRS` | fixed: `InvalidCRS`. A malformed `ELEVATION`, or one for a layer without one, is now `InvalidDimensionValue`, as a malformed `TIME` was |
 | 1 | `getmap:large-size` | The advertised maximum, 8000 × 8000, is 64 M pixels; the default render memory budget admits 33.5 M, so it was a 503 | fixed in the job: `MC_RENDER_MEMORY_MB=2560`, the render deadline 60 s. Production sizes its own budget |
@@ -652,8 +700,8 @@ layers and `each-info_format` for all three formats among them. By cause:
 
 | Failures | Tests | Cause | Status |
 |---:|---|---|---|
-| 7 | `getmap:two-layers`, `three-layers`, `two-styles`, `three-styles`, `styles-default-multiple-layers`, `styles-default-commas`, `styles-some-default` | One layer per GetMap (`LayerLimit` 1, #1014) | expected: deliberate |
-| 3 | `getfeatureinfo:two-query_layers`, `three-query_layers`, `less-query_layers` | The same limit: their `LAYERS` name two or three layers | expected: deliberate |
+| 7 | `getmap:two-layers`, `three-layers`, `two-styles`, `three-styles`, `styles-default-multiple-layers`, `styles-default-commas`, `styles-some-default` | One layer per GetMap (`LayerLimit` 1, #1014) | fixed: up to five layers (#1181) |
+| 3 | `getfeatureinfo:two-query_layers`, `three-query_layers`, `less-query_layers` | The same limit: their `LAYERS` name two or three layers | fixed: an answer per query layer (#1181) |
 | 2 | `getmap:bbox-outside-crs`, `transparent-default` | `TRANSPARENT` defaulted to `TRUE` (#163), where WMS 1.3.0 says `FALSE`; `transparent-default` only when its layer has no data in its box | fixed: `TRANSPARENT` defaults to `FALSE` (#1065). A request without it gets an opaque image over `BGCOLOR`; a client that sends `TRANSPARENT` gets what it got before |
 | 1 | `getmap:no-version` | GetMap without `VERSION` renders | fixed: GetMap and GetFeatureInfo without `VERSION` are `MissingParameterValue` (#1065) |
 | 5 + class | `basic:bbox-exponential`, `bbox-pixel-interpretation`, `no-bgcolor`, `blue-bgcolor`, `transparent-true`, and `data-preconditions` | OGC's Blue Lake dataset (`cite:` layers) | expected: MeteoCore serves its own collections |

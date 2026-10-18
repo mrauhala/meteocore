@@ -343,24 +343,41 @@ fn style() -> HashMap<String, StyleInfo> {
 /// A WMS serving `nwp` (`engine`, which answers position queries) and
 /// `plain`, a map-only collection with no position engine.
 fn router(engine: Arc<Nwp>) -> axum::Router {
+    router_with(engine, Nwp::new(Answer::Value(300.0)))
+}
+
+/// [`router`] with `nwp2` too, a second collection whose engine, `nwp2`,
+/// answers position queries.
+fn router_with(engine: Arc<Nwp>, nwp2: Arc<Nwp>) -> axum::Router {
     let plain: Arc<dyn MapEngine> = Nwp::new(Answer::Value(0.0));
     let mut styles = HashMap::new();
-    for layer in ["nwp", "nwp/t2m", "nwp/outline", "plain", "plain/t2m"] {
+    for layer in [
+        "nwp",
+        "nwp/t2m",
+        "nwp/outline",
+        "nwp2",
+        "nwp2/t2m",
+        "plain",
+        "plain/t2m",
+    ] {
         styles.insert(layer.to_string(), style());
     }
-    let point_engines: HashMap<String, Arc<dyn EdrEngine>> = [("nwp", engine.clone())]
-        .into_iter()
-        .filter(|(_, engine)| api_wms::feature_info::answers_position(engine.as_ref()))
-        .map(|(id, engine)| (id.to_string(), engine as Arc<dyn EdrEngine>))
-        .collect();
+    let point_engines: HashMap<String, Arc<dyn EdrEngine>> =
+        [("nwp", engine.clone()), ("nwp2", nwp2.clone())]
+            .into_iter()
+            .filter(|(_, engine)| api_wms::feature_info::answers_position(engine.as_ref()))
+            .map(|(id, engine)| (id.to_string(), engine as Arc<dyn EdrEngine>))
+            .collect();
     api_wms::router(Arc::new(ArcSwap::from_pointee(WmsState {
         engines: HashMap::from([
             ("nwp".to_string(), engine as Arc<dyn MapEngine>),
+            ("nwp2".to_string(), nwp2 as Arc<dyn MapEngine>),
             ("plain".to_string(), plain),
         ]),
         point_engines,
         collections: HashMap::from([
             ("nwp".to_string(), collection("nwp")),
+            ("nwp2".to_string(), collection("nwp2")),
             ("plain".to_string(), collection("plain")),
         ]),
         styles,
@@ -423,6 +440,15 @@ fn gfi(layer: &str, i: u32, j: u32, extra: &str) -> String {
         "SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&LAYERS={layer}&STYLES=\
          &CRS=CRS:84&BBOX=10,50,30,60&WIDTH=20&HEIGHT=10&QUERY_LAYERS={layer}\
          &I={i}&J={j}{extra}"
+    )
+}
+
+/// [`gfi`] on a map of `layers`, reading `query_layers`.
+fn gfi_layers(layers: &str, query_layers: &str, extra: &str) -> String {
+    gfi(layers, 0, 0, extra).replacen(
+        &format!("QUERY_LAYERS={layers}"),
+        &format!("QUERY_LAYERS={query_layers}"),
+        1,
     )
 }
 
@@ -1178,4 +1204,195 @@ fn only_a_position_engine_answers_get_feature_info() {
         Nwp::new(Answer::Nodata).as_ref()
     ));
     assert!(!api_wms::feature_info::answers_position(&AreaOnly));
+}
+
+// ---------------------------------------------------------------------------
+// Several QUERY_LAYERS (#1181)
+// ---------------------------------------------------------------------------
+
+/// One answer per query layer, in `QUERY_LAYERS` order, each at its own
+/// layer's time, run and level: a text block, a feature, an HTML table each.
+#[tokio::test]
+async fn several_query_layers_answer_in_query_layers_order() {
+    let (nwp, nwp2) = (
+        Nwp::new(Answer::Value(271.5)),
+        Nwp::new(Answer::Value(300.0)),
+    );
+    let app = router_with(nwp.clone(), nwp2.clone());
+    let query = |format: &str| {
+        gfi_layers(
+            "nwp/t2m,plain/t2m,nwp2/t2m",
+            "nwp2/t2m,nwp/t2m",
+            &format!("&ELEVATION=500&INFO_FORMAT={format}"),
+        )
+    };
+
+    let reply = get(&app, &query("application/json")).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let features = json(&reply)["features"].clone();
+    let answers: Vec<_> = features
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["properties"]["layer"].as_str().unwrap().to_string(),
+                f["properties"]["value"].as_f64().unwrap(),
+                f["properties"]["elevation"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        [
+            ("nwp2/t2m".to_string(), 300.0, 500.0),
+            ("nwp/t2m".to_string(), 271.5, 500.0)
+        ]
+    );
+    for engine in [&nwp, &nwp2] {
+        let calls = engine.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].z.as_deref(), Some(&[500.0][..]));
+        assert_eq!(calls[0].coords, nwp.calls()[0].coords, "one point");
+    }
+
+    let reply = get(&app, &query("text/plain")).await;
+    assert_eq!(reply.content_type, "text/plain; charset=utf-8");
+    let blocks: Vec<&str> = reply.body.split("\n\n").collect();
+    assert_eq!(blocks.len(), 2, "{}", reply.body);
+    assert!(blocks[0].starts_with("layer: nwp2/t2m\n"), "{}", reply.body);
+    assert!(blocks[0].contains("\nvalue: 300\n"), "{}", reply.body);
+    assert!(blocks[1].starts_with("layer: nwp/t2m\n"), "{}", reply.body);
+    assert!(blocks[1].contains("\nvalue: 271.5\n"), "{}", reply.body);
+
+    let reply = get(&app, &query("text/html")).await;
+    assert_eq!(reply.content_type, "text/html; charset=utf-8");
+    let second = reply.body.find("<caption>nwp/t2m</caption>");
+    let first = reply.body.find("<caption>nwp2/t2m</caption>");
+    assert!(first.is_some() && first < second, "{}", reply.body);
+    assert_eq!(reply.body.matches("<table>").count(), 2, "{}", reply.body);
+}
+
+/// Every query layer must be a layer of the map and queryable, checked
+/// before any engine is asked.
+#[tokio::test]
+async fn every_query_layer_is_shown_and_queryable() {
+    let nwp = Nwp::new(Answer::Value(1.0));
+    let app = router(nwp.clone());
+    for (layers, query_layers, code) in [
+        ("nwp/t2m,plain/t2m", "nwp/t2m,nwp2/t2m", "LayerNotDefined"),
+        (
+            "nwp/t2m,plain/t2m",
+            "nwp/t2m,plain/t2m",
+            "LayerNotQueryable",
+        ),
+        ("nwp/t2m,nwp/rgb", "nwp/t2m,nwp/rgb", "LayerNotQueryable"),
+    ] {
+        let reply = get(&app, &gfi_layers(layers, query_layers, "")).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{query_layers}");
+        assert_eq!(
+            exception_code(&reply.body).as_deref(),
+            Some(code),
+            "{query_layers}: {}",
+            reply.body
+        );
+    }
+    assert!(nwp.calls().is_empty());
+}
+
+/// The request shapes of ets-wms13's `getfeatureinfo:two-query_layers`,
+/// `three-query_layers` and `less-query_layers`: one layer listed two or
+/// three times, all or some of them queried. A layer queried twice is
+/// answered once.
+#[tokio::test]
+async fn ets_multi_layer_get_feature_infos_answer() {
+    let nwp = Nwp::new(Answer::Value(271.5));
+    let app = router(nwp.clone());
+    for (layers, query_layers) in [
+        ("nwp/t2m,nwp/t2m", "nwp/t2m,nwp/t2m"),
+        ("nwp/t2m,nwp/t2m,nwp/t2m", "nwp/t2m,nwp/t2m,nwp/t2m"),
+        ("nwp/t2m,nwp/t2m,nwp/t2m", "nwp/t2m,nwp/t2m"),
+    ] {
+        let reply = get(
+            &app,
+            &gfi_layers(
+                layers,
+                query_layers,
+                "&INFO_FORMAT=text/plain&FORMAT=image/png",
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{layers}: {}", reply.body);
+        assert_eq!(reply.content_type, "text/plain; charset=utf-8");
+        assert_eq!(reply.body.matches("layer: ").count(), 1, "{}", reply.body);
+    }
+}
+
+/// A query layer that fails fails the request, as one layer does, and the
+/// layers after it are not queried; one with no data at the point is an
+/// empty answer among the others. `immutable` needs every value.
+#[tokio::test]
+async fn a_failing_query_layer_fails_the_request() {
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+    let both = |extra: &str| gfi_layers("nwp/t2m,nwp2/t2m", "nwp2/t2m,nwp/t2m", extra);
+
+    let nwp = Nwp::new(Answer::Value(1.0));
+    let app = router_with(nwp.clone(), Nwp::new(Answer::Fails));
+    let reply = get(&app, &both("")).await;
+    assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!reply.body.contains("secret"), "{}", reply.body);
+    assert!(nwp.calls().is_empty(), "the layer after it is not queried");
+
+    let app = router_with(Nwp::new(Answer::Busy), Nwp::new(Answer::Value(1.0)));
+    let reply = get(&app, &both("")).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let app = router_with(Nwp::new(Answer::Value(1.0)), Nwp::new(Answer::NotFound));
+    let pinned = both("&INFO_FORMAT=application/json&TIME=2026-10-01T01:00:00Z");
+    let reply = get(&app, &pinned).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let values: Vec<_> = json(&reply)["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["properties"]["value"].clone())
+        .collect();
+    assert_eq!(values, [serde_json::Value::Null, serde_json::json!(1.0)]);
+    assert_eq!(reply.cache_control, SHORT, "a null value is never pinned");
+
+    let app = router_with(Nwp::new(Answer::Value(1.0)), Nwp::new(Answer::Value(2.0)));
+    assert_eq!(get(&app, &pinned).await.cache_control, IMMUTABLE);
+}
+
+/// GetFeatureInfo's deadline is the whole request's: the query layers are
+/// read one after another under it. With 1 s, one 600 ms query answers and
+/// two are the 503. The deadline is fixed by its first read, so the test
+/// runs in a child process.
+#[test]
+fn several_query_layers_share_one_deadline() {
+    const TEST: &str = "several_query_layers_share_one_deadline";
+    const CHILD: &str = "MC_TEST_FEATURE_INFO_LAYERS_DEADLINE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env("MC_FEATURE_INFO_TIMEOUT_MS", "1000")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{TEST} failed in its child process");
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let slow = || Nwp::slow(Duration::from_millis(600));
+        let app = router_with(slow(), slow());
+        let one = get(&app, &gfi_layers("nwp/t2m,nwp2/t2m", "nwp/t2m", "")).await;
+        assert_eq!(one.status, StatusCode::OK, "{}", one.body);
+        let two = get(
+            &app,
+            &gfi_layers("nwp/t2m,nwp2/t2m", "nwp/t2m,nwp2/t2m", ""),
+        )
+        .await;
+        assert_eq!(two.status, StatusCode::SERVICE_UNAVAILABLE, "{}", two.body);
+    });
 }
