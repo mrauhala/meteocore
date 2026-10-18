@@ -120,7 +120,7 @@ of cases, takes its first value: `LAYERS=a&layers=b` requests layer `a`.
 | `WIDTH` | yes | Output image width in pixels (1–8000) |
 | `HEIGHT` | yes | Output image height in pixels (1–8000) |
 | `FORMAT` | yes | `image/png`, `image/jpeg` or `image/webp` |
-| `TRANSPARENT` | no | `TRUE` (default) or `FALSE`. `FALSE` returns an opaque image with nodata painted in `BGCOLOR` |
+| `TRANSPARENT` | no | `FALSE` (default, as WMS 1.3.0 specifies) or `TRUE`. `FALSE` returns an opaque image with nodata painted in `BGCOLOR`; `TRUE` keeps nodata transparent in PNG and WebP. A map overlaid on others needs `TRUE`, which OpenLayers' WMS sources send unless told otherwise |
 | `BGCOLOR` | no | `0xRRGGBB` background for `TRANSPARENT=FALSE` and JPEG output (default `0xFFFFFF`) |
 | `QUALITY` | no | Vendor parameter: encoder quality 1–100 for `image/webp` (1–99 lossy, 100 lossless; default the collection's `[wms] webp_quality`, else lossless) and `image/jpeg` (default 85). With `image/png` or out of range: `InvalidParameterValue` |
 | `TIME` | no | ISO 8601 timestamp. Defaults to latest available. |
@@ -140,7 +140,7 @@ of cases, takes its first value: `LAYERS=a&layers=b` requests layer `a`.
 
 Any other CRS answers `InvalidCRS`. A CRS:84 or EPSG:4326 BBOX may reach
 past a pole: the rows whose centres lie beyond ±90° have no content
-(transparent, or `BGCOLOR` with `TRANSPARENT=FALSE`), as WMS 1.3.0 §7.3.3.6
+(`BGCOLOR`, white by default, or transparent with `TRANSPARENT=TRUE`), as WMS 1.3.0 §7.3.3.6
 asks, and a BBOX wholly past a pole is the empty image. No engine is asked
 for those rows (#1065).
 
@@ -556,12 +556,6 @@ these deliberate limits:
   name two or three layers (`getfeatureinfo:two-query_layers`,
   `three-query_layers`, `less-query_layers`). Its lists naming an undefined layer or style pass: the
   names are checked before the length.
-- `TRANSPARENT` defaults to `TRUE` (#163), where WMS 1.3.0 says `FALSE`:
-  content outside the data is transparent, a pixel of RGBA 0,0,0,0.
-  `getmap:bbox-outside-crs` asks for a box wholly north of 90°N without
-  `TRANSPARENT`, reads only its pixels' red, green and blue, and wants every
-  pixel white, the spec default's background. The server returns the empty
-  image, transparent, and the test fails.
 - The queryable class tests the Blue Lake dataset below, except
   `queryable:getfeatureinfo-supported`, which reads MeteoCore's capabilities
   and passes. `queryable:std-data-queryable` looks for the `BasicPolygons`,
@@ -570,12 +564,12 @@ these deliberate limits:
   `LAYERS` and `QUERY_LAYERS`. The data-independent GetFeatureInfo tests
   read MeteoCore's own layers.
 - The first named layer is `ets-geotiff`, a top-level layer with no data at
-  0°N 0°E. The results of three tests depend on that choice:
+  0°N 0°E. Three tests take it:
   - `getmap:transparent-default` asks for a box around 0°N 0°E without
-    `TRANSPARENT` and wants no transparent pixel. The empty image is
-    transparent while `TRANSPARENT` defaults to `TRUE` (#163), and the test
-    fails. Over data, as on the global `ets-grib-pressure`, it would pass
-    whatever the default.
+    `TRANSPARENT` and wants no transparent pixel. Over no data it tests the
+    default itself: `FALSE` (#1065), so the empty image is `BGCOLOR` white.
+    Over data, as on the global `ets-grib-pressure`, it would pass whatever
+    the default.
   - `getmap:layerlimit` and `getmap:transparent-opaque-layer` pass. On a
     child layer, such as `ets-multi/10wdir`, both fail on the request
     ets-wms13 1.34 builds: `layerlimit` percent-encodes the name twice, so
@@ -622,7 +616,7 @@ a failed subtest), and the data-preconditions class. By cause:
 | 4 | `getmap:first-layer-invalid`, `second-layer-invalid`, `first-style-invalid`, `second-style-invalid` | A `LAYERS` list was refused for its length, `InvalidParameterValue`, before its names were checked | fixed: every named layer and style is checked first, so an undefined one is `LayerNotDefined` / `StyleNotDefined`; a list of served layers is still refused |
 | 1 | `getmap:invalid-crs` | An unsupported CRS answered `CRSNotDefined`, not Table E.1's `InvalidCRS` | fixed: `InvalidCRS`. A malformed `ELEVATION`, or one for a layer without one, is now `InvalidDimensionValue`, as a malformed `TIME` was |
 | 1 | `getmap:large-size` | The advertised maximum, 8000 × 8000, is 64 M pixels; the default render memory budget admits 33.5 M, so it was a 503 | fixed in the job: `MC_RENDER_MEMORY_MB=2560`, the render deadline 60 s. Production sizes its own budget |
-| 1 | `getmap:bbox-outside-crs` | The box is wholly north of 90°N. The server returned the empty image, transparent since `TRANSPARENT` defaults to `TRUE`, and the suite wants every pixel's RGB white | expected while `TRANSPARENT` defaults to `TRUE` (#163). The test exposed a real fault next to it: a box reaching past a pole had the engine draw there, a global GRIB grid the rows of its edge cell south of 90°S. Fixed: WMS and Maps ask the engine only for the rows inside ±90° |
+| 1 | `getmap:bbox-outside-crs` | The box is wholly north of 90°N. The server returned the empty image, transparent since `TRANSPARENT` defaulted to `TRUE`, and the suite wants every pixel's RGB white | fixed: `TRANSPARENT` defaults to `FALSE`, as WMS 1.3.0 specifies (#1065). The test exposed a real fault next to it: a box reaching past a pole had the engine draw there, a global GRIB grid the rows of its edge cell south of 90°S. Fixed: WMS and Maps ask the engine only for the rows inside ±90° |
 | 1 | `getmap:no-version` | GetMap without `VERSION` renders | expected: deliberate |
 | 5 + class | `basic:bbox-exponential`, `bbox-pixel-interpretation`, `no-bgcolor`, `blue-bgcolor`, `transparent-true`, and `data-preconditions` | OGC's Blue Lake dataset (`cite:` layers) | expected: MeteoCore serves its own collections |
 | 11 | `getmap:getmap`, `bbox`, `crs`, `layers`, `styles`, `width-and-height`, `version`; `basic:getmap`, `bbox`, `bgcolor`, `transparent` | fail through a subtest above | follow their subtests |
@@ -640,7 +634,11 @@ layers and `each-info_format` for all three formats among them. By cause:
 |---:|---|---|---|
 | 7 | `getmap:two-layers`, `three-layers`, `two-styles`, `three-styles`, `styles-default-multiple-layers`, `styles-default-commas`, `styles-some-default` | One layer per GetMap (`LayerLimit` 1, #1014) | expected: deliberate |
 | 3 | `getfeatureinfo:two-query_layers`, `three-query_layers`, `less-query_layers` | The same limit: their `LAYERS` name two or three layers | expected: deliberate |
-| 2 | `getmap:bbox-outside-crs`, `transparent-default` | `TRANSPARENT` defaults to `TRUE` (#163); `transparent-default` only when its random layer has no data in its box | expected |
+| 2 | `getmap:bbox-outside-crs`, `transparent-default` | `TRANSPARENT` defaulted to `TRUE` (#163), where WMS 1.3.0 says `FALSE`; `transparent-default` only when its layer has no data in its box | fixed: `TRANSPARENT` defaults to `FALSE` (#1065). A request without it gets an opaque image over `BGCOLOR`; a client that sends `TRANSPARENT` gets what it got before |
 | 1 | `getmap:no-version` | GetMap without `VERSION` renders | expected: deliberate |
 | 5 + class | `basic:bbox-exponential`, `bbox-pixel-interpretation`, `no-bgcolor`, `blue-bgcolor`, `transparent-true`, and `data-preconditions` | OGC's Blue Lake dataset (`cite:` layers) | expected: MeteoCore serves its own collections |
 | 3 | `queryable:std-data-queryable`, `feature_count-default`, `feature_count-1` | The same dataset | expected |
+
+With `TRANSPARENT` defaulting to `FALSE` (#1065), the next run should pass
+`getmap:bbox-outside-crs` and `transparent-default`, leaving only the
+deliberate and Blue Lake failures above.
