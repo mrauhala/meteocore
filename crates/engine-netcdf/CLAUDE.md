@@ -392,7 +392,10 @@ refuse it first).
 `RasterInfo` is built once per poll (`raster_info_shared` is O(1), Critical
 Rule 10): `native_crs` `CRS:84` only for latitude/longitude axes, else
 `projected` (`geos` for geostationary), so the Common `storageCrs` and
-degree grid are omitted for MEPS; `grid_size` `[nx, ny]`; `reference_times`
+degree grid are omitted for MEPS; `spatial_extent` from
+`GeoTransform::bbox_with_poles`, so a polar grid's reaches the pole it
+holds and an EDR area there is not a 404 (#1167); `grid_size` `[nx, ny]`;
+`reference_times`
 ascending; `times` the union over runs; titles from `titles`, else
 `long_name`; units as the file spells them (`kg/m^2`), never converted
 (#1067 decision: the files' own units). Style defaults and every other
@@ -547,6 +550,16 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
   run, leads 00 and 01, LCC, south-up, 64 × 96, two variables chunked one
   field per chunk with shuffle + deflate 3 and noisy values, so a chunk is
   ~15 KB), written by `make_fixture.py` (needs `ncgen`).
+- `testdata/netcdf-projections/`: one synthetic file per CF mapping of
+  #1167, each its own collection directory (`polar-stereographic/` with
+  EPSG:3413's parameters around the North Pole, `laea/` with EPSG:3035's
+  on GRS80 and rows south-up, `transverse-mercator/` UTM 33N), one step,
+  no run; the fields `easting`/`northing` are each cell centre's own
+  projected x/y, so a read returns where the server puts a point
+  (`make_cdl.py`). `tests/grid_mappings.rs` reads them through EDR
+  position and a one-pixel map at points pinned to PROJ `cs2cs` (forward,
+  and cell centres through `-I`), within the 1 m their `f32` rounding
+  allows, and the polar grid's extent and an EDR area at the pole.
 - `remote::tests` (in the lib test binary): a local HTTP/1.1 server
   (`test_server.rs`: HEAD without ETag, 206 with `Content-Range`, 412 on
   `If-Unmodified-Since`, a request log, slow chunk GETs on demand) and the
