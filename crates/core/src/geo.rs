@@ -1038,6 +1038,32 @@ impl GeoTransform {
         [min_lon, min_lat, max_lon, max_lat]
     }
 
+    /// [`bbox`](Self::bbox) reaching every pole the grid holds, at every
+    /// longitude. A polar stereographic or azimuthal grid's edges circle
+    /// its pole and stay short of it, so the edge samples alone miss the
+    /// pole and the latitudes around it. The sentinel stays the sentinel.
+    pub fn bbox_with_poles(&self) -> [f64; 4] {
+        let [mut w, mut s, mut e, mut n] = self.bbox();
+        if s > n {
+            return [w, s, e, n];
+        }
+        for pole in [90.0, -90.0] {
+            if self.cells_hold_pole(pole) {
+                (w, e) = (-180.0, 180.0);
+                s = s.min(pole);
+                n = n.max(pole);
+            }
+        }
+        [w, s, e, n]
+    }
+
+    /// Whether the grid's forward transform puts the pole at latitude
+    /// `pole` (±90°) inside its cells.
+    pub fn cells_hold_pole(&self, pole: f64) -> bool {
+        let (col, row) = self.world_to_pixel_f64(0.0, pole);
+        (0.0..f64::from(self.width)).contains(&col) && (0.0..f64::from(self.height)).contains(&row)
+    }
+
     /// [`bbox`](Self::bbox) of a geostationary raster.
     ///
     /// Longitude and latitude have no extremum inside the visible part of
@@ -1436,15 +1462,12 @@ fn laea_forward(
     let e = e2.sqrt();
 
     let q_val = q_authalic(lat, e);
-    let q0 = q_authalic(lat0, e);
     let qp = q_authalic(PI / 2.0, e);
 
     let beta = (q_val / qp).clamp(-1.0, 1.0).asin();
-    let beta0 = (q0 / qp).clamp(-1.0, 1.0).asin();
 
     let rq = WGS84_A * (qp / 2.0).sqrt();
-    let m0 = lat0.cos() / (1.0 - e2 * lat0.sin().powi(2)).sqrt();
-    let dd = WGS84_A * m0 / (rq * beta0.cos());
+    let (beta0, dd) = laea_origin(lat0, e, qp, rq);
 
     let dl = lon - lon0;
 
@@ -1474,10 +1497,8 @@ fn laea_inverse(x: f64, y: f64, lat0: f64, lon0: f64, false_e: f64, false_n: f64
     let e2 = WGS84_E2;
     let e = e2.sqrt();
     let qp = q_authalic(PI / 2.0, e);
-    let beta0 = (q_authalic(lat0, e) / qp).clamp(-1.0, 1.0).asin();
     let rq = WGS84_A * (qp / 2.0).sqrt();
-    let m0 = lat0.cos() / (1.0 - e2 * lat0.sin().powi(2)).sqrt();
-    let dd = WGS84_A * m0 / (rq * beta0.cos());
+    let (beta0, dd) = laea_origin(lat0, e, qp, rq);
 
     let (x, y) = (x - false_e, y - false_n);
     let rho = ((x / dd).powi(2) + (dd * y).powi(2)).sqrt();
@@ -1492,12 +1513,33 @@ fn laea_inverse(x: f64, y: f64, lat0: f64, lon0: f64, false_e: f64, false_n: f64
     (authalic_inverse(q, e), lon)
 }
 
+/// The origin's authalic latitude `β₀` and Snyder's `D` (eq. 24-20), how
+/// much the oblique aspect stretches x, and shrinks y, at the origin, for
+/// the origin latitude `lat0`, eccentricity `e`, `qp` and the authalic
+/// radius `rq`. A polar origin (EASE-Grid 2.0, EPSG:6931/6932) is the
+/// limit, `β₀ = ±90°` and `D = 1`: there `D`'s factors `cos φ₀` and
+/// `cos β₀` both vanish, and the ratio of their rounded values is 0.45 %
+/// off it, which put a point 2300 km from the pole 10 km out of place.
+fn laea_origin(lat0: f64, e: f64, qp: f64, rq: f64) -> (f64, f64) {
+    if FRAC_PI_2 - lat0.abs() < 1e-10 {
+        return (FRAC_PI_2.copysign(lat0), 1.0);
+    }
+    let beta0 = (q_authalic(lat0, e) / qp).clamp(-1.0, 1.0).asin();
+    let m0 = lat0.cos() / (1.0 - WGS84_E2 * lat0.sin().powi(2)).sqrt();
+    (beta0, WGS84_A * m0 / (rq * beta0.cos()))
+}
+
+/// Snyder's `q` (eq. 3-12), odd in `lat` to the bit: computed as written
+/// for a southern latitude, the logarithm's quotient rounds differently,
+/// `q(−90°)/q(90°)` misses −1, and `asin` turns that ulp into 20 cm at the
+/// south pole.
 fn q_authalic(lat: f64, e: f64) -> f64 {
-    let sin_lat = lat.sin();
+    let sin_lat = lat.abs().sin();
     let e_sin = e * sin_lat;
-    (1.0 - e * e)
+    let q = (1.0 - e * e)
         * (sin_lat / (1.0 - e_sin * e_sin)
-            - (1.0 / (2.0 * e)) * ((1.0 - e_sin) / (1.0 + e_sin)).ln())
+            - (1.0 / (2.0 * e)) * ((1.0 - e_sin) / (1.0 + e_sin)).ln());
+    q.copysign(lat)
 }
 
 fn authalic_inverse(q: f64, e: f64) -> f64 {
@@ -1645,6 +1687,43 @@ fn lcc_t(lat: f64, e: f64) -> f64 {
 // Reference: EPSG guidance note 7-2, method 9809 (Oblique Stereographic)
 // Uses conformal sphere approach (Gauss conformal latitude)
 // ============================================================================
+
+/// The scale factor at the pole, `k₀` of a polar [`Crs::Stereographic`],
+/// of a projection on WGS84 whose scale is true at latitude `lat_ts`
+/// (radians): the standard parallel of EPSG method 9829, PROJ's `+lat_ts`
+/// and CF's `standard_parallel`. `lat_ts` lies on the pole's side of the
+/// equator, measured toward that pole: a south-polar projection's −71° is
+/// passed as 71°.
+///
+/// PROJ's `+proj=stere +lat_ts` uses Snyder eq. 21-39, `ρ = a·m_c·t/t_c`,
+/// and [`Crs::Stereographic`]'s polar form is eq. 21-33, `ρ = 2·a·k₀·t/D`,
+/// so they agree for
+///
+/// ```text
+/// k₀  = m_c · D / (2 · t_c)
+/// m_c = cos(lat_ts) / √(1 − e²·sin²(lat_ts))
+/// t_c = tan(π/4 − lat_ts/2) · ((1 + e·sin lat_ts)/(1 − e·sin lat_ts))^(e/2)
+/// D   = √((1+e)^(1+e) · (1−e)^(1−e))
+/// ```
+///
+/// (Snyder, "Map Projections — A Working Manual", USGS PP 1395, 1987). The
+/// spherical shortcut `(1 + sin lat_ts)/2` is 0.012 % off at 60°, some
+/// 200 m at 3000 km from the pole. Scale true at the pole itself is
+/// `k₀ = 1`, the limit as `t_c → 0`.
+pub fn polar_stereographic_k0(lat_ts: f64) -> f64 {
+    if FRAC_PI_2 - lat_ts < 1e-10 {
+        return 1.0;
+    }
+    let e2 = WGS84_E2;
+    let e = e2.sqrt();
+    let sin_lat_ts = lat_ts.sin();
+    let cos_lat_ts = lat_ts.cos();
+    let m_c = cos_lat_ts / (1.0 - e2 * sin_lat_ts * sin_lat_ts).sqrt();
+    let t_c = (std::f64::consts::FRAC_PI_4 - lat_ts / 2.0).tan()
+        * ((1.0 + e * sin_lat_ts) / (1.0 - e * sin_lat_ts)).powf(e / 2.0);
+    let d = ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
+    m_c * d / (2.0 * t_c)
+}
 
 /// Oblique stereographic projection on the conformal sphere, EPSG 9809.
 ///
@@ -3474,6 +3553,21 @@ mod tests {
                 "lat mismatch at ({x_proj}, {y_proj}): got {lat}, expected {lat_exp}"
             );
         }
+    }
+
+    /// `polar_stereographic_k0` gives the `k0` above for 60°, which the
+    /// spherical shortcut misses, and 1 for scale true at the pole, the
+    /// limit its formula approaches and cannot evaluate (`t_c = 0`).
+    #[test]
+    fn polar_stereographic_k0_from_the_standard_parallel() {
+        assert_eq!(
+            polar_stereographic_k0(60.0_f64.to_radians()),
+            0.933_069_071_736_356_6
+        );
+        assert!((polar_stereographic_k0(60.0_f64.to_radians()) - 0.933_012_7).abs() > 5e-5);
+        assert_eq!(polar_stereographic_k0(FRAC_PI_2), 1.0);
+        let near_pole = polar_stereographic_k0(89.999_f64.to_radians());
+        assert!((near_pole - 1.0).abs() < 1e-9, "{near_pole}");
     }
 
     // Test at ~1000km from center (edge of typical radar composite)
