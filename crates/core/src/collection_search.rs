@@ -3,15 +3,16 @@
 //! The 2026-09-17 draft also requires `sd` and `resolution`; those are not
 //! implemented, so API layers must not advertise that class yet.
 //!
-//! Filtering and pagination for the `/collections` resource: `bbox` /
-//! `bbox-crs`, `datetime`, `q`, `query`, and `limit` + `offset`. The logic lives here
+//! Filtering, sorting and pagination for the `/collections` resource: `bbox` /
+//! `bbox-crs`, `datetime`, `q`, `query`, `sortby` (§8, by `title` or `id`
+//! only, #1141), and `limit` + `offset`. The logic lives here
 //! (not in the API crates) so EDR, Maps, Tiles, and Features share one
 //! implementation — ds-core never builds `serde_json::Value`; api-common uses
 //! [`SearchQueryParams::parse`] + [`search`] and assembles HTTP responses/links.
 //!
 //! Only CRS84 is supported for `bbox` / `bbox-crs` (every collection bbox is
-//! advertised in CRS84). Sortable / Filterable (CQL2) / Hierarchical classes
-//! are intentionally not implemented.
+//! advertised in CRS84). The Sortable class's sortables resource, and the
+//! Filterable (CQL2) / Hierarchical classes, are intentionally not implemented.
 //!
 //! [25-046]: https://docs.ogc.org/DRAFTS/25-046.html
 
@@ -77,6 +78,8 @@ impl SearchError {
 /// list, then pass the slice to [`search`].
 #[derive(Debug, Clone)]
 pub struct CollectionMatch<'a> {
+    /// The collection id: a `sortby` key, and the tie-break of every order.
+    pub id: &'a str,
     pub title: &'a str,
     pub description: &'a str,
     /// The collection's configured keywords (may be empty). Matched by `q`
@@ -99,6 +102,9 @@ pub struct SearchParams {
     pub q: Vec<String>,
     /// OR alternatives of required/excluded phrases. Empty = no `query`.
     pub query: Vec<TextAlternative>,
+    /// The `sortby` keys, applied in turn, ties by id. Empty = no `sortby`:
+    /// [`search`] keeps the input order, and the caller picks the default.
+    pub sortby: Vec<CollectionSortKey>,
     pub limit: usize,
     pub offset: usize,
 }
@@ -111,13 +117,161 @@ pub struct TextAlternative {
     excluded: Vec<String>,
 }
 
+/// A collection property `sortby` can order the list by (draft 25-046 §8).
+/// Only these two: a collection description has no other member every
+/// collection carries, and none that says when its data last changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionSortProperty {
+    Title,
+    Id,
+}
+
+impl CollectionSortProperty {
+    pub const ALL: &'static [Self] = &[Self::Title, Self::Id];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Id => "id",
+        }
+    }
+}
+
+/// One collection-list `sortby` key: a property, ascending unless
+/// `descending`. Unlike [`crate::feature::SortKey`], which names any
+/// property an engine lists as sortable, it names one of the two
+/// properties every collection description has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionSortKey {
+    pub property: CollectionSortProperty,
+    pub descending: bool,
+}
+
+impl CollectionSortKey {
+    pub const fn ascending(property: CollectionSortProperty) -> Self {
+        Self {
+            property,
+            descending: false,
+        }
+    }
+}
+
+impl std::fmt::Display for CollectionSortKey {
+    /// The key as `sortby` writes it: `title`, or `-title` descending.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sign = if self.descending { "-" } else { "" };
+        write!(f, "{sign}{}", self.property.name())
+    }
+}
+
+/// `keys` as one `sortby` value: `-title,id`.
+pub fn sortby_value(keys: &[CollectionSortKey]) -> String {
+    keys.iter()
+        .map(CollectionSortKey::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Parse a `sortby` value: comma-separated property names, each ascending
+/// or prefixed `+` (ascending) or `-` (descending). Form decoding turns an
+/// unescaped `+` into a space, which is the same ascending order. The edge
+/// cases follow the Features `/items` parser: whitespace around a key and
+/// after its sign is ignored, and a property may be named only once.
+fn parse_sortby(value: &str) -> Result<Vec<CollectionSortKey>, SearchError> {
+    let sortable = || {
+        CollectionSortProperty::ALL
+            .iter()
+            .map(|p| p.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut keys: Vec<CollectionSortKey> = Vec::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        let (descending, name) = match item.strip_prefix('-') {
+            Some(name) => (true, name),
+            None => (false, item.strip_prefix('+').unwrap_or(item)),
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(SearchError::new(format!(
+                "sortby: each comma-separated key must name a property: {}",
+                sortable()
+            )));
+        }
+        let property = CollectionSortProperty::ALL
+            .iter()
+            .copied()
+            .find(|p| p.name() == name)
+            .ok_or_else(|| {
+                SearchError::new(format!(
+                    "Unknown sortby property '{name}'; sortable: {}",
+                    sortable()
+                ))
+            })?;
+        if keys.iter().any(|k| k.property == property) {
+            return Err(SearchError::new(format!(
+                "sortby: property '{name}' listed more than once"
+            )));
+        }
+        keys.push(CollectionSortKey {
+            property,
+            descending,
+        });
+    }
+    Ok(keys)
+}
+
+/// Sort `indices` into `items` by `keys`, then by id. A title compares
+/// case-insensitively, with whitespace normalized; an empty title sorts as
+/// the id, which is what a list shows for it.
+fn sort_matches(items: &[CollectionMatch], indices: &mut [usize], keys: &[CollectionSortKey]) {
+    let titles: Vec<String> = if keys
+        .iter()
+        .any(|k| k.property == CollectionSortProperty::Title)
+    {
+        items
+            .iter()
+            .map(|it| {
+                let shown = if it.title.trim().is_empty() {
+                    it.id
+                } else {
+                    it.title
+                };
+                normalize_text(shown)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    indices.sort_by(|&a, &b| {
+        keys.iter()
+            .map(|key| {
+                let order = match key.property {
+                    CollectionSortProperty::Title => titles[a]
+                        .cmp(&titles[b])
+                        .then_with(|| items[a].title.cmp(items[b].title)),
+                    CollectionSortProperty::Id => items[a].id.cmp(items[b].id),
+                };
+                if key.descending {
+                    order.reverse()
+                } else {
+                    order
+                }
+            })
+            .find(|order| order.is_ne())
+            .unwrap_or_else(|| items[a].id.cmp(items[b].id))
+    });
+}
+
 /// The outcome of a [`search`]: the total match count and the indices of the
 /// items on the requested page, plus pagination cursors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
     /// Total collections matching the filters (before pagination).
     pub number_matched: usize,
-    /// Indices into the `items` slice for this page, in input order.
+    /// Indices into the `items` slice for this page, in `sortby` order, or
+    /// in input order without `sortby`.
     pub page: Vec<usize>,
     pub has_next: bool,
     pub next_offset: usize,
@@ -219,6 +373,7 @@ pub fn parse_search_params(
         datetime,
         q,
         query: Vec::new(),
+        sortby: Vec::new(),
         limit,
         offset,
     })
@@ -263,14 +418,18 @@ fn parse_bbox(s: &str) -> Result<[f64; 4], SearchError> {
     Ok(bbox)
 }
 
-/// Filter `items` by the parameters and apply `offset`/`limit` pagination.
+/// Filter `items` by the parameters, sort the matches by `sortby` and
+/// apply `offset`/`limit` pagination.
 pub fn search(items: &[CollectionMatch], p: &SearchParams) -> SearchResult {
-    let matched: Vec<usize> = items
+    let mut matched: Vec<usize> = items
         .iter()
         .enumerate()
         .filter(|(_, it)| matches(it, p))
         .map(|(i, _)| i)
         .collect();
+    if !p.sortby.is_empty() {
+        sort_matches(items, &mut matched, &p.sortby);
+    }
 
     let window = page_window(matched.len(), p.offset, p.limit);
     SearchResult {
@@ -468,6 +627,7 @@ pub enum CollectionParameter {
     Datetime,
     Q,
     Query,
+    Sortby,
     Limit,
     Offset,
     Format,
@@ -480,6 +640,7 @@ impl CollectionParameter {
         Self::Datetime,
         Self::Q,
         Self::Query,
+        Self::Sortby,
         Self::Limit,
         Self::Offset,
         Self::Format,
@@ -492,6 +653,7 @@ impl CollectionParameter {
             Self::Datetime => "datetime",
             Self::Q => "q",
             Self::Query => "query",
+            Self::Sortby => "sortby",
             Self::Limit => "limit",
             Self::Offset => "offset",
             Self::Format => "f",
@@ -513,6 +675,7 @@ pub struct SearchQueryParams {
     pub datetime: Option<String>,
     pub q: Option<String>,
     pub query: Option<String>,
+    pub sortby: Option<String>,
     pub limit: Option<String>,
     pub offset: Option<String>,
     /// Output-format selector (`json`/`html`) for content negotiation. Not a
@@ -549,6 +712,7 @@ impl SearchQueryParams {
                 CollectionParameter::Datetime => &mut params.datetime,
                 CollectionParameter::Q => &mut params.q,
                 CollectionParameter::Query => &mut params.query,
+                CollectionParameter::Sortby => &mut params.sortby,
                 CollectionParameter::Limit => &mut params.limit,
                 CollectionParameter::Offset => &mut params.offset,
                 CollectionParameter::Format => &mut params.f,
@@ -577,7 +741,35 @@ impl SearchQueryParams {
             params.query =
                 parse_query(query).map_err(|e| e.naming(CollectionParameter::Query.name()))?;
         }
+        if let Some(sortby) = self.sortby.as_deref().filter(|s| !s.trim().is_empty()) {
+            params.sortby =
+                parse_sortby(sortby).map_err(|e| e.naming(CollectionParameter::Sortby.name()))?;
+        }
         Ok(params)
+    }
+
+    /// This request with its page size and order spelled out: `limit` and
+    /// `sortby` set to the values the response used where the request gave
+    /// none. A link to the other representation needs them, because JSON and
+    /// HTML default to different ones (#1141).
+    pub fn explicit_page(&self, limit: usize, sortby: &[CollectionSortKey]) -> Self {
+        let mut explicit = self.clone();
+        if explicit
+            .limit
+            .as_deref()
+            .is_none_or(|l| l.trim().is_empty())
+        {
+            explicit.limit = Some(limit.to_string());
+        }
+        if !sortby.is_empty()
+            && explicit
+                .sortby
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+        {
+            explicit.sortby = Some(sortby_value(sortby));
+        }
+        explicit
     }
 
     /// The query string (leading `?`, or empty) for this request at `offset`,
@@ -614,6 +806,11 @@ impl SearchQueryParams {
             result.push(if result.is_empty() { '?' } else { '&' });
             result.push_str("query=");
             result.push_str(&encode_query_value(query));
+        }
+        if let Some(sortby) = self.sortby.as_deref().filter(|s| !s.trim().is_empty()) {
+            result.push(if result.is_empty() { '?' } else { '&' });
+            result.push_str("sortby=");
+            result.push_str(&encode_query_value(sortby));
         }
         result
     }
@@ -694,6 +891,7 @@ mod tests {
         time: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> CollectionMatch<'a> {
         CollectionMatch {
+            id: "",
             title,
             description,
             keywords: &[],
@@ -709,6 +907,7 @@ mod tests {
         keywords: &'a [String],
     ) -> CollectionMatch<'a> {
         CollectionMatch {
+            id: "",
             title,
             description,
             keywords,
@@ -1285,5 +1484,161 @@ mod tests {
         // Client supplied no limit → links omit it (clean default-page URL).
         let none = SearchQueryParams::default();
         assert_eq!(none.query_string(DEFAULT_LIMIT, 0), "");
+    }
+
+    /// `sortby` (draft 25-046 §8, #1141): title compares case-insensitively,
+    /// an empty title as the id, `-` descends, and ties fall back to the id
+    /// so every page boundary is stable.
+    #[test]
+    fn sortby_orders_by_title_or_id_with_id_tie_break() {
+        let item = |id, title| CollectionMatch {
+            id,
+            title,
+            description: "",
+            keywords: &[],
+            bbox: None,
+            time: None,
+        };
+        let items = [
+            item("z-alerts", "Alerts"),
+            item("a-radar", "radar composite"),
+            item("m-blank", " "),
+            item("b-radar", "Radar composite"),
+            item("c-gfs", "GFS"),
+        ];
+        let order = |sortby: &str| {
+            let params = SearchQueryParams {
+                sortby: Some(sortby.into()),
+                ..Default::default()
+            }
+            .parse()
+            .unwrap();
+            search(&items, &params)
+                .page
+                .iter()
+                .map(|&i| items[i].id)
+                .collect::<Vec<_>>()
+        };
+        // "Radar composite" and "radar composite" fold to one key; the
+        // exact title then orders them (uppercase first), before the id.
+        assert_eq!(
+            order("title"),
+            ["z-alerts", "c-gfs", "m-blank", "b-radar", "a-radar"]
+        );
+        assert_eq!(
+            order(" title"),
+            order("title"),
+            "a decoded '+' is ascending"
+        );
+        assert_eq!(order("+title"), order("title"));
+        assert_eq!(
+            order("-title"),
+            ["a-radar", "b-radar", "m-blank", "c-gfs", "z-alerts"]
+        );
+        assert_eq!(
+            order("id"),
+            ["a-radar", "b-radar", "c-gfs", "m-blank", "z-alerts"]
+        );
+        assert_eq!(
+            order("-id"),
+            ["z-alerts", "m-blank", "c-gfs", "b-radar", "a-radar"]
+        );
+        // Without sortby the input order stands.
+        let unsorted = search(&items, &SearchQueryParams::default().parse().unwrap());
+        assert_eq!(unsorted.page, [0, 1, 2, 3, 4]);
+        // Sorting happens before paging.
+        let page = SearchQueryParams {
+            sortby: Some("id".into()),
+            limit: Some("2".into()),
+            offset: Some("2".into()),
+            ..Default::default()
+        }
+        .parse()
+        .unwrap();
+        let ids: Vec<_> = search(&items, &page)
+            .page
+            .iter()
+            .map(|&i| items[i].id)
+            .collect();
+        assert_eq!(ids, ["c-gfs", "m-blank"]);
+    }
+
+    #[test]
+    fn sortby_rejects_unknown_repeated_and_empty_keys() {
+        for (value, message) in [
+            (
+                "updated",
+                "Unknown sortby property 'updated'; sortable: title, id",
+            ),
+            ("Title", "Unknown sortby property 'Title'"),
+            (
+                "title,",
+                "sortby: each comma-separated key must name a property",
+            ),
+            ("-", "sortby: each comma-separated key must name a property"),
+            (
+                "title,-title",
+                "sortby: property 'title' listed more than once",
+            ),
+            ("id, +id", "sortby: property 'id' listed more than once"),
+        ] {
+            let error = SearchQueryParams::from_pairs(vec![("sortby".into(), value.into())])
+                .and_then(|query| query.parse())
+                .unwrap_err();
+            assert_eq!(error.parameter(), Some("sortby"), "{value}");
+            assert!(error.to_string().starts_with(message), "{value}: {error}");
+        }
+        // An empty value is no sortby, like an empty q.
+        let empty = SearchQueryParams::from_pairs(vec![("sortby".into(), String::new())])
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(empty.sortby.is_empty());
+        let keys = SearchQueryParams::from_pairs(vec![("sortby".into(), "-title,id".into())])
+            .unwrap()
+            .parse()
+            .unwrap()
+            .sortby;
+        assert_eq!(sortby_value(&keys), "-title,id");
+        // Space after the sign is ignored, as in Features `/items`.
+        let spaced = SearchQueryParams::from_pairs(vec![("sortby".into(), "- title, id".into())])
+            .unwrap()
+            .parse()
+            .unwrap()
+            .sortby;
+        assert_eq!(spaced, keys);
+    }
+
+    /// Links keep the request's sortby; an alternate link spells out the
+    /// page size and order the response used (#1141).
+    #[test]
+    fn links_keep_sortby_and_explicit_page_fills_only_what_is_missing() {
+        let sorted = SearchQueryParams {
+            q: Some("radar".into()),
+            sortby: Some("-title".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            sorted.query_string_with_format(24, 24, "html"),
+            "?q=radar&f=html&offset=24&sortby=-title"
+        );
+        let title = [CollectionSortKey::ascending(CollectionSortProperty::Title)];
+        let bare = SearchQueryParams::default();
+        assert_eq!(
+            bare.explicit_page(24, &title)
+                .query_string_with_format(24, 0, "json"),
+            "?limit=24&f=json&sortby=title"
+        );
+        // What the request gave stays as it gave it.
+        let given = SearchQueryParams {
+            limit: Some("5".into()),
+            ..sorted
+        };
+        assert_eq!(
+            given
+                .explicit_page(5, &title)
+                .query_string_with_format(5, 0, "json"),
+            "?q=radar&limit=5&f=json&sortby=-title"
+        );
     }
 }

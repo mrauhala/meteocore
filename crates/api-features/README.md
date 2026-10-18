@@ -38,10 +38,12 @@ Part 2 (collections, json, html). The landing page links `/conformance` and
 `/collections` with both the short `conformance`/`data` relations this standard
 requires and the registered `http://www.opengis.net/def/rel/ogc/1.0/conformance`
 / `…/data` relations Common Part 1 names. Collection discovery supports `bbox`,
-`bbox-crs` (CRS84 only), `datetime`, `q`, `query`, `limit`, `offset` and `f` through
+`bbox-crs` (CRS84 only), `datetime`, `q`, `query`, `sortby` (`title` or `id`),
+`limit`, `offset` and `f` through
 [api-common](../api-common/README.md). Unknown/unsupported or duplicate controls
-return structured HTTP 400 errors. Filters run before paging; JSON/HTML links
-preserve filters and the negotiated format. Collection descriptions expose HTML
+return structured HTTP 400 errors. Filters and sorting run before paging; JSON/HTML links
+preserve filters and the negotiated format. Without `sortby` and `limit`, JSON
+lists every collection by id and the HTML catalog 24 a page by title (#1141). Collection descriptions expose HTML
 alternate links and configured keywords/license metadata through the shared helper.
 
 Text discovery supports whitespace-normalized whole-word phrases in `q`, and

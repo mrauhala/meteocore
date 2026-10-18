@@ -200,7 +200,7 @@ collection.
 | Collection `datetime`: instant, interval, open ends (§7.5) | Yes — engine extent [5] | Yes — raster extent [5] | Yes — raster or feature extent [5] | Yes — feature extent [5] |
 | Collection `q`: case-insensitive terms/phrases in title, description, keywords (§7.6) | Yes [10] | Yes [10] | Yes [10] | Yes [10] |
 | Collection `query`: required/excluded terms (§7.7) | Yes [10] | Yes [10] | Yes [10] | Yes [10] |
-| Collection page size `limit` (§7.8) | Yes — default/max 1,000 | Yes — same | Yes — same | Yes — same |
+| Collection page size `limit` (§7.8) | Yes — default/max 1,000; HTML default 24 [12] | Yes — same | Yes — same | Yes — same |
 | Collection `next` paging links (§7.8) | Yes | Yes | Yes | Yes |
 | Collection `prev` paging links (§7.8, optional) | Yes | Yes | Yes | Yes |
 | `offset` paging mechanism (MeteoCore extension) | Yes | Yes | Yes | Yes |
@@ -208,7 +208,7 @@ collection.
 | Combined filters before paging; links preserve supported filters | Yes | Yes | Yes | Yes |
 | Scale denominator filter `sd` (§7.9) | No — 400 | No — 400 | No — 400 | No — 400 |
 | Cell-size filter `resolution` (§7.9) | No — 400 | No — 400 | No — 400 | No — 400 |
-| Client-selected collection sorting `sortby` (§8) | No — fixed ID order | No — fixed ID order | No — fixed ID order | No — fixed ID order |
+| Client-selected collection sorting `sortby` (§8) | Partial — `title` and `id` [12] | Partial — same [12] | Partial — same [12] | Partial — same [12] |
 | Collection-list sortables discovery (§8) | No | No | No | No |
 | CQL2 collection filtering (§9) | No | No | No | No |
 | Collection-list queryables discovery (§9) | No | No | No | No |
@@ -227,8 +227,8 @@ collection.
 2. The shared extractor rejects unsupported and duplicate collection parameters
    with a JSON `BadRequest` response. Part 1 §8.3 permits some tolerance, but the
    project's stricter policy avoids misleading draft-testing clients. Unsupported
-   controls such as `sd`, `parent` and `sortby` now return 400 rather than
-   silently serving unfiltered results. `offset` and `f` remain supported extensions.
+   controls such as `sd` and `parent`, and a `sortby` property other than `title`
+   or `id`, return 400 rather than silently serving unfiltered or unsorted results. `offset` and `f` remain supported extensions.
    An HTML request's 400 is the catalog page with the field at fault marked, and
    every other error of an HTML request is an HTML page with the same status
    (#1132); JSON requests keep the JSON body.
@@ -280,6 +280,16 @@ collection.
     class assessment are tracked in [#742](https://github.com/mrauhala/meteocore/issues/742);
     Searchable Collections remains undeclared. Sorting, CQL2 and hierarchy are
     separate classes; their absence does not itself invalidate Searchable Collections.
+12. `sortby` takes comma-separated `title` and `id` keys, each ascending or
+    `-` descending; titles compare case-insensitively and ties are ordered by
+    id. No collection description carries a member saying when its data last
+    changed, so there is no `updated` key; any other property, or a property
+    given twice, is a 400, and there is no sortables resource, so the
+    Sortable class stays undeclared.
+    Without `sortby`, JSON lists collections by id and the HTML catalog by
+    title; without `limit`, an HTML page holds 24 collections (#1141). A
+    JSON/HTML alternate link spells out `limit` and `sortby`, so both
+    representations of a page list the same collections in the same order.
 
 **Advertised conformance versus assessed behavior**
 

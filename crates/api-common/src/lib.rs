@@ -17,7 +17,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use ds_core::collection_search::{
-    CollectionMatch, CollectionParameter, SearchParams, SearchQueryParams, DEFAULT_LIMIT, MAX_LIMIT,
+    CollectionMatch, CollectionParameter, CollectionSortKey, CollectionSortProperty, SearchParams,
+    SearchQueryParams, DEFAULT_LIMIT, MAX_LIMIT,
 };
 use ds_core::config::CollectionConfig;
 use ds_core::html::{self, LinkView, Wanted};
@@ -244,23 +245,45 @@ pub struct CollectionEntry<'a> {
     pub time: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
-/// Filter, page and represent a collection list at `{surface.root}/collections`.
-/// The root is the externally resolved absolute API root (including any proxy
-/// prefix and the API mount).
+/// The order of a JSON collection list without `sortby`: by id.
+pub const JSON_DEFAULT_SORT: CollectionSortKey =
+    CollectionSortKey::ascending(CollectionSortProperty::Id);
+
+/// Filter, sort, page and represent a collection list at
+/// `{surface.root}/collections`. The root is the externally resolved absolute
+/// API root (including any proxy prefix and the API mount).
+///
+/// Without `limit` and `sortby`, JSON lists [`DEFAULT_LIMIT`] collections by
+/// id and an HTML page [`workbench::HTML_PAGE_SIZE`] by title (#1141). Links
+/// to the same representation leave them out, as the request did; a link to
+/// the other representation spells out the page size and order used, so it
+/// names the same page.
 pub fn collections_response(
     surface: workbench::Surface<'_>,
     request: CollectionRequest,
-    mut entries: Vec<CollectionEntry<'_>>,
+    entries: Vec<CollectionEntry<'_>>,
 ) -> Response {
     let url = &format!("{}/collections", surface.root);
-    let (query, search) = match request.parsed {
+    let (query, mut search) = match request.parsed {
         Ok(parsed) => parsed,
         Err(rejected) => return rejected_search(surface, rejected),
     };
-    entries.sort_by(|a, b| a.config.id.cmp(&b.config.id));
+    let html = request.wanted == Wanted::Html;
+    // An empty `limit`, as a cleared form field sends it, is no limit.
+    if html && query.limit.as_deref().is_none_or(|l| l.trim().is_empty()) {
+        search.limit = workbench::HTML_PAGE_SIZE;
+    }
+    if search.sortby.is_empty() {
+        search.sortby = vec![if html {
+            workbench::HTML_DEFAULT_SORT
+        } else {
+            JSON_DEFAULT_SORT
+        }];
+    }
     let facets: Vec<_> = entries
         .iter()
         .map(|entry| CollectionMatch {
+            id: &entry.config.id,
             title: &entry.config.title,
             description: &entry.config.description,
             keywords: &entry.config.keywords,
@@ -283,6 +306,7 @@ pub fn collections_response(
             query.query_string_with_format(search.limit, offset, f)
         )
     };
+    let explicit = query.explicit_page(search.limit, &search.sortby);
     let mut nav = vec![LinkView::new(
         href(search.offset, format),
         "self",
@@ -303,7 +327,10 @@ pub fn collections_response(
         ));
     }
     nav.push(LinkView::new(
-        href(search.offset, alternate),
+        format!(
+            "{url}{}",
+            explicit.query_string_with_format(search.limit, search.offset, alternate)
+        ),
         "alternate",
         Some(&format!("This page as {}", alternate.to_uppercase())),
     ));
@@ -599,26 +626,30 @@ pub fn legend_schema() -> Value {
 /// Pure bounds/defaults come from ds-core, not copies in each API crate.
 pub fn collection_parameters() -> Value {
     Value::Array(CollectionParameter::ALL.iter().map(|p| {
-        let (schema, description) = match p {
+        let (schema, description): (Value, String) = match p {
             CollectionParameter::Bbox => (json!({"type": "array", "minItems": 4, "maxItems": 6, "items": {"type": "number"}}),
-                "Filter collections by horizontal CRS84 extent intersection. Four or six comma-separated numbers; vertical bounds are ignored."),
+                "Filter collections by horizontal CRS84 extent intersection. Four or six comma-separated numbers; vertical bounds are ignored.".into()),
             CollectionParameter::BboxCrs => (json!({"type": "string", "default": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"}),
-                "CRS of bbox. Only CRS84 is supported."),
+                "CRS of bbox. Only CRS84 is supported.".into()),
             CollectionParameter::Datetime => (json!({"type": "string"}),
-                "Filter by temporal extent overlap with an RFC 3339 instant or interval (start/end, ../end, start/..). Unknown extents remain eligible."),
+                "Filter by temporal extent overlap with an RFC 3339 instant or interval (start/end, ../end, start/..). Unknown extents remain eligible.".into()),
             CollectionParameter::Q => (json!({"type": "array", "minItems": 1, "items": {"type": "string"}}),
-                "Case-insensitive text search over title, description and keywords. Comma-separated terms are OR; phrases match whole words with normalized whitespace within one property."),
+                "Case-insensitive text search over title, description and keywords. Comma-separated terms are OR; phrases match whole words with normalized whitespace within one property.".into()),
             CollectionParameter::Query => (json!({"type": "array", "minItems": 1, "items": {"type": "string"}}),
-                "Text search with comma-separated OR alternatives. Within each alternative, + requires and - excludes the following term or phrase; required terms may match different properties. Phrases match within one property with normalized whitespace. Operators only apply at the start or after whitespace; internal signs are literal. Encode + as %2B. Empty alternatives or operators without an attached term return 400. Combined with q and other filters using AND."),
+                "Text search with comma-separated OR alternatives. Within each alternative, + requires and - excludes the following term or phrase; required terms may match different properties. Phrases match within one property with normalized whitespace. Operators only apply at the start or after whitespace; internal signs are literal. Encode + as %2B. Empty alternatives or operators without an attached term return 400. Combined with q and other filters using AND.".into()),
+            // OGC API - Common - Part 4 `sortby`, schema verbatim from the
+            // pinned bundle (schemas/ogcapi-common-4.bundled.json).
+            CollectionParameter::Sortby => (json!({"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "[+|-]?[A-Za-z_].*", "example": "title"}}),
+                "Sort the collections by `title` or `id`: comma-separated property names, each ascending unless prefixed with `-` (an unescaped `+` decodes as a space, which is also ascending). Titles compare case-insensitively; ties are ordered by id. Any other property returns 400. Without sortby, JSON lists collections by id and an HTML page by title.".into()),
             CollectionParameter::Limit => (json!({"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": DEFAULT_LIMIT}),
-                "Maximum collections per page. Values above the maximum are clamped."),
+                format!("Maximum collections per page. Values above the maximum are clamped. The default is for JSON; an HTML page without limit shows {}.", workbench::HTML_PAGE_SIZE)),
             CollectionParameter::Offset => (json!({"type": "integer", "minimum": 0, "default": 0}),
-                "Number of matching collections to skip (offset pagination extension)."),
+                "Number of matching collections to skip (offset pagination extension).".into()),
             CollectionParameter::Format => (json!({"type": "string", "enum": ["json", "html"]}),
-                "Output representation; overrides Accept. Without f, Accept is used, defaulting to JSON."),
+                "Output representation; overrides Accept. Without f, Accept is used, defaulting to JSON.".into()),
         };
         let mut definition = json!({"name": p.name(), "in": "query", "required": false, "schema": schema, "description": description});
-        if matches!(p, CollectionParameter::Bbox | CollectionParameter::Q | CollectionParameter::Query) {
+        if matches!(p, CollectionParameter::Bbox | CollectionParameter::Q | CollectionParameter::Query | CollectionParameter::Sortby) {
             definition["style"] = json!("form");
             definition["explode"] = json!(false);
         }

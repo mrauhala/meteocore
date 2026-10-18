@@ -8,9 +8,11 @@ Open `/?f=html` or any of `/edr/`, `/features/`, `/maps/`, `/tiles/` with
 selects the same resource as JSON. These are server-rendered API resources with
 ordinary URLs, not a separate client-side application.
 
-- Collection lists offer Common `q`, `query`, `bbox`, `datetime`, `limit` and
-  `offset`. Existing `bbox-crs` values remain editable. Results and navigation
-  come from the shared server discovery pipeline.
+- Collection lists offer Common `q`, `query`, `bbox`, `datetime`, `sortby`,
+  `limit` and `offset`. Existing `bbox-crs` values remain editable. Results and
+  navigation come from the shared server discovery pipeline. Without `limit`
+  and `sortby`, the HTML catalog lists 24 collections a page by title; JSON
+  keeps up to 1000 by id (#1141).
 - Feature items expose the collection's supported property/sort/time controls,
   response counts, paging, typed properties and geometry. The map contains only
   the returned page over locally bundled Natural Earth outlines; overlapping shapes
@@ -26,8 +28,9 @@ ordinary URLs, not a separate client-side application.
   quality callouts when the corresponding properties exist.
 - Collection details retain full API metadata, keywords and license labels,
   including free-text licenses without a URL. EDR model-run pages share the shell.
-- Common sorting, hierarchy, `sd` and `resolution` remain unsupported and have
-  no active controls.
+- Collection lists sort by `title` or `id`, ascending or descending. Sortables,
+  hierarchy, `sd` and `resolution` remain unsupported and have no active
+  controls.
 - A request that asks for HTML (`f=html`, or no `f` and an `Accept` that ranks
   `text/html` first) gets its errors as workbench pages with the same status:
   the message, the parameter at fault and links back. JSON clients keep the

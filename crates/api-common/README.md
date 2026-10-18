@@ -10,7 +10,7 @@ and API-specific fields.
 |---|---|
 | `CollectionRequest` | Decode controls, reject unsupported/duplicate names, validate values, negotiate representation before consulting engines |
 | `JsonQuery` | axum's `Query` whose rejection, such as a parameter given twice, is the JSON 400 body instead of axum's plain text. Every struct-shaped query of the OGC API routes extracts with it: the `f` of each landing page, `/conformance` and `/collections/{id}` in Maps, Tiles, EDR, Features and the shared root, EDR's instance and data queries, and the Maps and Tiles render and legend routes |
-| `collections_response` | Sort by ID, filter before paging, counts, JSON/HTML, explicit-format self/next/prev and alternate links |
+| `collections_response` | Filter, sort and page (JSON by id and up to 1,000 per page, HTML by title and 24 per page, unless `sortby` or `limit` says otherwise), counts, JSON/HTML, explicit-format self/next/prev links, and alternate links that spell out the page size and order |
 | `collection_metadata`, `collection_card` | Common descriptive fields, keywords, license and HTML alternate links; API fields may override defaults for EDR instances |
 | `collection_operation` | OpenAPI discovery operation, supported parameters, JSON/HTML responses and structured 400 errors |
 | `parameter_names`, `parameter_name_parameter` | Maps/Tiles parameter discovery: a multi-parameter raster's EDR-shaped `parameter_names` member, with label, unit and a parameter's own time axis, and the render routes' `parameter-name` OpenAPI component, one definition for every block. RGB composites (`MapEngine::composites`, #819) are entries too, with no unit and a `description` of their channels |
@@ -78,11 +78,12 @@ the same inventory drives pair validation and OpenAPI generation.
 | `datetime` | RFC 3339 instant or interval overlap; unknown temporal extents remain eligible |
 | `q` | Case-insensitive title/description/keyword search; comma-separated OR; whole words and whitespace-normalized phrases |
 | `query` | The same text matching plus required (`+`) and excluded (`-`) terms/phrases within each OR alternative |
-| `limit` | Default/max 1,000; values above max clamp; invalid values and zero return 400 |
+| `sortby` | Draft §8: comma-separated `title` and `id`, each ascending or `-` descending; titles compare case-insensitively, ties by id. Any other property, or an empty key, returns 400. Without it JSON lists by id and HTML by title. No sortables resource |
+| `limit` | Default/max 1,000 for JSON, default 24 for an HTML page; values above max clamp; invalid values and zero return 400 |
 | `offset` | Nonnegative number of matching collections to skip; default zero |
 | `f` | `json` or `html`, overrides Accept; navigation retains the selected format |
 
-Unsupported controls (`sd`, `resolution`, `sortby`, CQL2 and hierarchy
+Unsupported controls (`sd`, `resolution`, CQL2 and hierarchy
 controls, for example) and repeated controls return JSON `{code, description}`
 with HTTP 400. An HTML request (`f=html`, or `Accept` listing `text/html`
 without `f`) gets that 400 as the catalog page instead: `CollectionRequest`
@@ -129,7 +130,12 @@ space by form query parsing. For example:
 ```
 
 Self/next/prev and JSON/HTML alternate links retain the query with its operators
-percent-encoded. Clients can also use `curl --get --data-urlencode
+percent-encoded. Self, next and prev leave out a `limit` or `sortby` the request
+left out, since following them gets the same defaults. An alternate link spells
+both out, because JSON and HTML default to different ones: an HTML page's JSON
+alternate is `?limit=24&f=json&sortby=title`, the same collections in the same
+order, and a JSON page's HTML alternate is `?limit=1000&f=html&sortby=id`
+(#1141). Clients can also use `curl --get --data-urlencode
 'query=canada +weather -extreme'` to construct the request.
 
 ## Extents and conformance
@@ -200,10 +206,29 @@ The conformance page groups classes by standard and version
 (`workbench/conformance.rs`).
 
 The collection builder derives its fields from `CollectionParameter::ALL`.
-Search and paging use ordinary GET requests. Optional advanced controls omit
-empty values; literal `+` operators are form-encoded. Unsupported Common sorting,
+Search, sorting and paging use ordinary GET requests. Optional advanced controls omit
+empty values; literal `+` operators are form-encoded. Unsupported Common
 `sd`, `resolution` and hierarchy controls are not shown. Adding them requires the
 shared validator, metadata and OpenAPI contract to support them first.
+
+The catalog (#1141) shows 24 collections a page, by title, unless the request
+says otherwise. Its results bar heads the list with the match count (an `h2`)
+and offers the order (`sortby`: title or id, either way) and the page size;
+both are also fields of the search form, so they work without JavaScript. Each
+row's facts sit in fixed slots, so values line up from row to row: Time,
+Cadence, Area, Vertical, and Parameters (or Styles), a dash where the collection
+advertises nothing, then Items for a feature collection. The Parameters slot
+names parameters by label; with more than three it shows the first three and
+folds the full list, each label with its name, under a disclosure. Data
+queries are outlined action chips with an arrow, keywords filled chips under a
+"Keywords" label. The title is the row's only link to the collection page:
+the arrow repeats it for pointers and is skipped by the keyboard. The search hint says what `q` does: titles,
+descriptions and keywords, not ids; words as one exact phrase; commas between
+alternatives. A multi-word search that matches nothing offers the same search
+with its words as comma-separated alternatives. Placeholders are examples
+(`e.g. 18`), lighter and italic, and still at least 4.5:1 against the field.
+Grouping a radar network's per-site collections needs the network parents of
+#301.
 
 Light/dark/system themes persist in the browser. Body text and controls are
 16px; supporting text and code are at least 14px. Navigation, metadata, JSON links
