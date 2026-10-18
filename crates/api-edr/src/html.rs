@@ -1343,7 +1343,8 @@ pub(crate) fn write_locations(
             ui::map_html(
                 page.base,
                 &serde_json::json!({"type": "FeatureCollection", "features": points}),
-                true
+                true,
+                "The locations of this page are listed in the table."
             )
         );
     }

@@ -203,7 +203,8 @@ Numbers follow one display rule (`property_value_html`): an integral float
 without `.0`, a latitude or longitude property to 5 decimals with the exact
 value in the `title`. Both forms come from `ds_core::html`'s formatter
 (`display_number`, `display_coordinate`), which the EDR data pages use too
-(#1138). `i18n_text` and `unit_text` are shared with api-edr.
+(#1138). The map's quick look of a feature prints its numbers by the same
+rule (`map.js`). `i18n_text` and `unit_text` are shared with api-edr.
 The conformance page groups classes by standard and version
 (`workbench/conformance.rs`).
 
@@ -347,28 +348,65 @@ not duplicate them.
 Maps collection overviews render the advertised map endpoint over the locator.
 The browser requests the visible CRS84 bbox as a Web Mercator PNG (at most
 1024 × 768), with advertised style links, an optional datetime instant, and a
-`z` selector when discrete vertical levels are advertised. The selected level is
-included in the rendered-image URL; collection default omits `z`. Pan/zoom
+level select when discrete vertical levels are advertised. The selected level is
+sent as `elevation`, also in the rendered-image URL; Default omits it. Pan/zoom
 requests are debounced and superseded fetches are cancelled. Loading/errors are
 explicit; failed requests hide the previous image. The rendered-image URL is
 separate from the collection metadata JSON link. No rendering occurs while
 assembling metadata on the server.
 
+What the map draws is shown, not left as "default" (#1136):
+
+- A collection with two or more `parameter_names` gets a Parameter select.
+  Its first choice, Default, sends no `parameter-name`; the map, the map
+  tiles, the legend and the rendered-image URL carry the one chosen.
+- After each image the status line names the instant from the response's
+  `Content-Datetime` ("Showing 2026-10-17 17:05 UTC"), the parameter and any
+  style or level chosen. The Default time and parameter options take the
+  resolved values as their text. The time arrows step from the instant
+  drawn, Default standing for the latest time until a map has named one,
+  and each is disabled at its end. A drawn instant newer than every listed
+  time, on a page left open while new frames arrive, stands past the last
+  one, so the previous arrow selects the last listed time.
+- A time axis that runs past the viewer's clock (a forecast, a nowcast)
+  opens at the time nearest now. The collection advertises no default time
+  of its own; Default still asks for the engine's.
+- Without a temporal extent there is no time row. A 404 or 500 for the
+  server's own choices reads "No data available for this collection right
+  now" and hides the time row. A 404 for a parameter, style or level the
+  viewer chose shows the server's description, such as a style that
+  parameter does not have; one for a chosen time only says that time has
+  no data. Map tiles word their 404s the same way.
+- The legend sits under the map: the style's legend JSON drawn as a colour
+  bar in the page's theme, titled with the parameter's label and unit, its
+  minimum and maximum always labelled, the PNG and JSON as links. The JSON
+  is fetched beside the map request, not after the image, and its
+  `parameter` names what Default draws.
+- An extent crossing the antimeridian is one unwrapped polygon, and a view
+  across it is requested in the Maps antimeridian form (west > east). A
+  map tileset for it is given no source bounds, which MapLibre would clamp
+  to ±180°.
+- When MapLibre or WebGL is unavailable the map and its controls are
+  hidden, and the status says where the page lists the same facts.
+
 Map refreshes retain the displayed image until its replacement has loaded in
 MapLibre, then swap the layers. Status, image-link and request-URL areas keep
 fixed dimensions to avoid shifting content during pan/zoom. Map controls use
-equal-height fields and an aligned action button, stacking on narrow screens.
+equal-height fields that wrap at a 170 px minimum column; Update map has its
+own row, and on a phone the time select has its own line with the arrows
+under it.
 
 Breadcrumb labels use available collection/item titles while preserving resource
 IDs in URLs, including parent collections on item and model-run pages. Maps time
 controls expand an advertised regular grid (`cellsCount` + ISO duration) or use
 its explicit irregular coordinates, with previous/next available-time buttons.
 An interval alone does not imply sample availability; absent/oversized grids use
-a native UTC date/time input (expansion is bounded at 10,000 choices). Advertised
-style legends load with the displayed image; unchanged legends stay visible on
-pan/zoom. Full nested metadata and license links remain in Metadata & links,
-with configured licenses and searchable keywords also in the overview. Missing
-storage CRS is labelled "Not advertised", never guessed from the coverage CRS.
+a native UTC date/time input (expansion is bounded at 10,000 choices). The
+selected style's legend JSON is fetched beside the map request, revalidated on
+selection, and kept across pan/zoom. Full nested metadata and license links
+remain in Metadata & links, with configured licenses and searchable keywords
+also in the overview. Missing storage CRS is labelled "Not advertised", never
+guessed from the coverage CRS.
 
 Collection advanced search starts collapsed and remembers its disclosure state
 per API path for the browser session, including after search submission. Applied

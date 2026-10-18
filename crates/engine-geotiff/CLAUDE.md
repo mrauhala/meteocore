@@ -269,6 +269,12 @@ depends on the kind:
   href with that `file:size` adds a stub, which the screen removes; a new
   href or size is a new object. A same-size rewrite under the same key is
   not told apart, as on the scan's reuse path.
+- **Nothing left:** a map or map tile over an empty catalog, before the
+  first file or after every file is gone, has no timestep to select.
+  `get_raster_tile` answers `LocationNotFound("No data available for this
+  collection")`: a 404 with that message in Maps and Tiles, while WMS draws
+  its error tile. Never an `Engine` error, which is an opaque 500 there
+  (#1136, `empty_catalog_map_is_not_found`).
 - **`content_version`:** 0 until a timestep the screen removed holds an
   entry again, then it moves before that catalog is stored. Renders cached
   under the timestep may hold the gap, or the frame the time snapped to.

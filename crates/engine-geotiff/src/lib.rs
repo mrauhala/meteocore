@@ -2080,9 +2080,12 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
 
         // Find the target timestamp first, then ensure it's loaded. The
         // selection lives on Catalog so resolve_time (the cache-key
-        // authority, #507) shares it verbatim.
+        // authority, #507) shares it verbatim. It finds none only in a
+        // catalog without a live file, before the first file or after every
+        // one went gone (#1074): a not-found with its message (404 in Maps
+        // and Tiles), never an opaque engine failure (500, #1136).
         let target_timestamp = self.catalog.load().select_timestamp(time).ok_or_else(|| {
-            DataServerError::Engine("No data available for the requested time".into())
+            DataServerError::LocationNotFound("No data available for this collection".into())
         })?;
 
         // Lazily load STAC stub if needed
@@ -3575,6 +3578,37 @@ mod tests {
         assert_eq!(values.len(), 2 * expected.len());
         assert_eq!(&values[..expected.len()], expected);
         assert!(values[expected.len()..].iter().all(Option::is_none));
+    }
+
+    /// A source with no files yet has nothing to draw: a not-found that
+    /// Maps and Tiles answer with a 404 and its message, not an engine
+    /// failure behind a 500 (#1136).
+    #[test]
+    fn empty_catalog_map_is_not_found() {
+        use ds_core::map_engine::MapEngine;
+        let engine = radar_engine();
+        engine
+            .catalog
+            .store(Arc::new(crate::catalog::Catalog::empty()));
+        for time in [None, Some(Utc::now())] {
+            let result = engine.get_raster_tile(
+                [20.0, 59.0, 32.0, 70.0],
+                64,
+                64,
+                time,
+                &ds_core::map_engine::OutputCrs::Wgs84,
+                None,
+                None,
+                None,
+            );
+            match result {
+                Err(DataServerError::LocationNotFound(message)) => {
+                    assert_eq!(message, "No data available for this collection");
+                }
+                Err(e) => panic!("expected LocationNotFound, got {e:?}"),
+                Ok(_) => panic!("expected LocationNotFound, got a tile"),
+            }
+        }
     }
 
     /// Only a file failure becomes nulls; request errors fail the query.

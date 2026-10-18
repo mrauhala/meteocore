@@ -2620,15 +2620,18 @@ a {
 .detail-layout>div,.detail-layout>aside{min-width:0}
 
 /* Keep map refreshes inside a stable panel: no page reflow during pan/zoom. */
-#feature-map[aria-label="Collection map data"]+#map-status{height:6em;overflow:auto;margin:0}
+#feature-map[aria-label="Collection map data"]:not([hidden])+#map-status{height:6em;overflow:auto;margin:0}
 .map-request code{height:4.5em;line-height:1.5;overflow:auto;overflow-wrap:anywhere}
 #map-image-link[aria-disabled="true"]{cursor:default;color:var(--muted)}
 .map-controls{padding:20px}
-.js .map-controls.enhanced{display:grid!important;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr) auto;align-items:end;gap:16px}
-.js .map-controls.enhanced:has(#map-level){grid-template-columns:minmax(0,1fr) minmax(0,1.35fr) minmax(0,.8fr) auto}
+/* Fields wrap at a 170px minimum; the parameter's long labels and time,
+   with its arrows, take two columns wherever two fit. Update map has its
+   own row. */
+.js .map-controls.enhanced{display:grid!important;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));align-items:end;gap:16px;container-type:inline-size}
+@container (min-width:400px){.map-controls>.map-time-field,.map-controls>label:has(#map-parameter){grid-column:span 2}}
 .map-controls label{display:flex;flex-direction:column;gap:8px;min-width:0;max-width:none;margin:0;line-height:24px}
 .map-controls select,.map-controls input{display:block;width:100%;box-sizing:border-box;height:46px;min-height:46px;margin:0;font-size:16px;line-height:24px}
-.map-controls>.btn{box-sizing:border-box;height:46px;min-height:46px;margin:0;white-space:nowrap}
+.map-controls>.btn{box-sizing:border-box;height:46px;min-height:46px;margin:0;white-space:nowrap;grid-column:1/-1;justify-self:start}
 .map-controls>p{grid-column:1/-1;font-size:14px;color:var(--muted);margin:0}
 /* Maps / map tiles / vector tiles switch: its own full-width row. The
    grid and flex rules above would otherwise override the hidden attribute. */
@@ -2637,19 +2640,37 @@ a {
 .map-mode label{flex-direction:row;align-items:center;gap:6px;line-height:24px}
 .map-mode input{width:auto;height:auto;min-height:0}
 .map-controls [hidden],.js .map-controls.enhanced[hidden]{display:none!important}
-@media(max-width:1000px){.js .map-controls.enhanced,.js .map-controls.enhanced:has(#map-level){grid-template-columns:minmax(0,1fr)}.map-controls>.btn{justify-self:start}}
+/* What the script hides stays hidden: the map without WebGL, its
+   controls, request link and legend. */
+.js .enhanced[hidden]{display:none!important}
 
 /* Keep time navigation and the style/action row aligned at every width. */
 .map-time-field{display:flex;flex-direction:column;gap:8px;min-width:0}
 .map-time-picker{display:flex;align-items:center;gap:6px;min-width:0}
 .map-time-picker select,.map-time-picker input{min-width:0;flex:1}
 .map-time-picker .btn{height:46px;min-width:40px;padding:0 10px;margin:0;flex:none}
+/* One column (a phone): the time on its own line, the arrows under it. */
+@container (max-width:399px){.map-time-picker{flex-wrap:wrap}.map-time-picker select,.map-time-picker input{flex:1 0 100%;order:-1}.map-time-picker .btn{min-width:56px}}
 #breadcrumbs{min-width:0;flex-wrap:wrap}
 #breadcrumbs a{overflow-wrap:anywhere}
 
-.map-legend{height:332px;padding:16px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;overflow:auto;font-size:14px;color:var(--muted)}
-.map-legend img{display:block;max-width:100%;height:auto}
-.map-legend [hidden]{display:none}
+/* The legend under the map: a colour bar in the page's type and theme. */
+.map-legend{padding:14px 18px 18px;border-top:1px solid var(--line);font-size:14px}
+.map-legend [hidden]{display:none!important}
+.map-legend-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 16px}
+.map-legend-head strong{font-size:16px;color:var(--ink);overflow-wrap:anywhere}
+.map-legend-links{display:flex;flex-wrap:wrap;gap:4px 16px}
+.map-legend-links a{text-decoration:underline;text-underline-offset:3px}
+.map-legend-bar{height:18px;margin-top:10px;border:1px solid var(--line);border-radius:3px}
+.map-legend-ticks{position:relative;height:22px;margin-top:4px;color:var(--muted);font-variant-numeric:tabular-nums}
+.map-legend-ticks span{position:absolute;top:0;transform:translateX(-50%);white-space:nowrap}
+.map-legend-ticks span.start{transform:none}
+.map-legend-ticks span.end{transform:translateX(-100%)}
+#map-legend-status{margin:8px 0 0;color:var(--muted)}
+.map-legend-channels{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px}
+.map-legend-channels li{display:flex;align-items:center;gap:8px;color:var(--ink)}
+.channel-swatch{width:14px;height:14px;border-radius:3px;flex:none}
+.channel-swatch.red{background:#e0321e}.channel-swatch.green{background:#2a9d3a}.channel-swatch.blue{background:#2f63d6}
 
 .resource-title{display:block;text-decoration:underline;text-underline-offset:3px}
 .resource-title code{color:inherit}

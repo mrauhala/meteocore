@@ -48,6 +48,10 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   parameters it requires. Tiles DateTime covers map and vector tiles; both
   parse time through `subset`, and vector tiles hand it to the engine as
   `FeatureQuery::datetime`.
+- `workbench/map.js` prints a property number by the rule of
+  `metadata::number_text` (#1140); change both together. Its tests run the
+  shipped script on a stub DOM: `node --test crates/api-common/tests/map.test.cjs`
+  (CI).
 - Update README.md here, affected API READMEs and docs/ogc-api-common-matrix.md.
   Run cross-API contracts (`cargo test -p server --test common_discovery`) and the
   affected API suites. Do not require identical real production catalogs.

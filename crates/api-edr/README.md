@@ -1131,7 +1131,8 @@ data explicitly.
   first (label, id, point to 5 decimals with the exact value in `title`,
   geometry type, `edrqueryendpoint`, and each feature's link with its
   relation, title and type), a filter over the page's rows, the pager from
-  `prev`/`next`, and a map of the page's points; the request, links and
+  `prev`/`next`, and a map of the page's points, which without WebGL says
+  the table lists them (#1136); the request, links and
   document members are folded below. Each label, and the
   `edrqueryendpoint` cell's anchor, opens the location's data page at a
   time it has data (`location_view_datetime`): the page's own `datetime`
