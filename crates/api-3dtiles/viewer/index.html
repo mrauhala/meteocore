@@ -4,43 +4,74 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MeteoCore — 3D Tiles viewer</title>
-<!-- Subresource Integrity on the version-pinned CesiumJS entry point: a CDN
-     compromise/MITM can't silently swap the bundle. (Cesium then loads workers/
-     WASM from the CDN without SRI — full mitigation would self-host CesiumJS.)
-     MANDATORY when bumping the CesiumJS version below: recompute these two
-     sha384 hashes with `scripts/check-cesium-sri.sh` — a stale hash makes
-     browsers silently refuse to load CesiumJS (blank viewer for everyone). -->
-<script src="https://cesium.com/downloads/cesiumjs/releases/1.142/Build/Cesium/Cesium.js"
-        crossorigin="anonymous"
-        integrity="sha384-PCryXL7CqnqM5KijUKfJgy+y9b4vE7GzIHvb5J/MSSnIkFptiGOUrlt4s9uBUdtO"></script>
-<link href="https://cesium.com/downloads/cesiumjs/releases/1.142/Build/Cesium/Widgets/widgets.css" rel="stylesheet"
-      crossorigin="anonymous"
-      integrity="sha384-ghEeMdcWWzRv/BPeUcX835vcKDGrxvROXisl/Btpv3GeekBUXTSPVcFJpI1Tcrgp">
+<!-- No CDN tag here: viewer.js inserts CesiumJS and its stylesheet (#1137).
+     A parser-blocking script or render-blocking stylesheet from a host that
+     silently drops packets would hold the whole page blank until the
+     connection gives up. -->
 <style>
+  /* Dark under everything, so a page whose 3D view never starts is not white. */
+  html, body { background: #05070b; color: #e8eef6; }
   html, body, #cesium { width: 100%; height: 100%; margin: 0; overflow: hidden; }
   #cesium { position: absolute; inset: 0; }
+  #cesium[hidden] { display: none; }
   #bar {
     position: absolute; top: 0; left: 0; right: 0; z-index: 10;
-    display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+    display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
     padding: 9px 14px; box-sizing: border-box;
     background: rgba(10, 13, 20, 0.82); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
     color: #e8eef6; font: 13px/1.3 system-ui, -apple-system, sans-serif;
   }
-  #bar .brand { font-weight: 650; letter-spacing: .2px; margin-right: 4px; }
+  #bar .brand { font-weight: 650; letter-spacing: .2px; margin-right: 4px; white-space: nowrap; }
   #bar .brand span { opacity: .55; font-weight: 400; }
-  #bar .field { display: flex; align-items: center; gap: 6px; }
+  #fields { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; min-width: 0; }
+  #bar .field { display: flex; align-items: center; gap: 6px; min-width: 0; }
   /* `[hidden]` alone loses to the rule above on specificity — force it. */
   #bar .field[hidden] { display: none; }
-  #bar label { opacity: .6; }
+  #bar label { opacity: .6; white-space: nowrap; }
   #bar select, #bar input {
     background: #161b25; color: #e8eef6; border: 1px solid #2a3340;
-    border-radius: 6px; padding: 5px 8px; font: 13px system-ui; max-width: 320px;
+    border-radius: 6px; padding: 5px 8px; font: 13px system-ui; max-width: 320px; min-width: 0;
   }
-  #bar input[type=number] { width: 58px; }
+  #bar input[type=number] { width: 64px; }
   #bar input[type=text] { width: 96px; }
-  #status { margin-left: auto; opacity: .6; font-size: 12px; white-space: nowrap; }
+  #menu {
+    display: none; background: #1b2230; color: #e8eef6; border: 1px solid #2a3340; border-radius: 6px;
+    width: 34px; height: 30px; font-size: 16px; line-height: 1; cursor: pointer;
+  }
+  /* Fills what the fields leave, and ellipsizes there rather than wrapping
+     onto a second row (the full text is its tooltip). */
+  #status {
+    flex: 1 1 0; min-width: 120px; text-align: right; opacity: .6; font-size: 12px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   #status.err { color: #ff8a8a; opacity: .95; }
+  /* Phone: the fields fold into a menu so the bar stays one row. */
+  @media (max-width: 760px) {
+    #menu { display: block; order: 2; }
+    #bar .brand { order: 1; }
+    #status { order: 3; min-width: 0; }
+    #fields { order: 4; display: none; flex: 1 1 100%; flex-direction: column; align-items: stretch; gap: 8px; padding: 4px 0 2px; }
+    #bar.open #fields { display: flex; }
+    #bar .field { justify-content: space-between; }
+    #bar select { flex: 1 1 auto; max-width: 70vw; }
+  }
+  /* When the 3D view cannot start: what happened, and where the data is. */
+  #fallback {
+    position: absolute; top: 64px; left: 50%; transform: translateX(-50%); z-index: 9;
+    width: min(620px, calc(100vw - 24px)); max-height: calc(100vh - 88px); overflow: auto;
+    box-sizing: border-box; padding: 16px 18px; border-radius: 10px;
+    background: rgba(16, 21, 31, 0.96); border: 1px solid rgba(255, 255, 255, 0.1);
+    font: 14px/1.45 system-ui, -apple-system, sans-serif;
+  }
+  #fallback[hidden] { display: none; }
+  #fallback h2 { margin: 0 0 6px; font-size: 17px; color: #ffb4a8; }
+  #fallback p { margin: 0 0 10px; opacity: .85; }
+  #fallback ul { list-style: none; margin: 0 0 12px; padding: 0; }
+  #fallback li { padding: 7px 0; border-top: 1px solid rgba(255, 255, 255, 0.07); }
+  #fallback li .fname { display: block; font-weight: 600; }
+  #fallback li a { margin-right: 14px; font-size: 13px; }
+  #fallback a { color: #8cc4ff; }
   /* Colour-scale legend for the point cloud (value → colour). */
   #legend {
     position: absolute; left: 14px; bottom: 34px; z-index: 10;
@@ -50,885 +81,74 @@
     color: #e8eef6; font: 11px/1.2 system-ui, -apple-system, sans-serif;
   }
   #legend[hidden] { display: none; }
-  #legend .ltitle { opacity: .7; margin-bottom: 6px; font-size: 11px; }
+  #legend .ltitle { opacity: .7; margin-bottom: 6px; font-size: 11px; max-width: 128px; }
   #legend .lwrap { display: flex; height: 132px; }
   #legend .lbar { width: 13px; height: 100%; border: 1px solid rgba(255,255,255,.18); border-radius: 2px; }
-  #legend .lticks { position: relative; width: 30px; margin-left: 5px; }
+  #legend .lticks { position: relative; width: 36px; margin-left: 5px; }
   #legend .tick { position: absolute; left: 0; transform: translateY(50%); white-space: nowrap; opacity: .85; }
   #legend .tick::before { content: "– "; opacity: .5; }
   /* Time scrubber (shown only when the collection has >1 volume). */
   #timebar {
     position: absolute; left: 50%; transform: translateX(-50%); bottom: 22px; z-index: 10;
-    display: flex; align-items: center; gap: 10px;
-    padding: 8px 14px; border-radius: 9px; max-width: 70vw;
+    display: flex; align-items: center; gap: 10px; box-sizing: border-box;
+    padding: 8px 14px; border-radius: 9px; max-width: calc(100vw - 24px);
     background: rgba(10, 13, 20, 0.82); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
     border: 1px solid rgba(255, 255, 255, 0.08);
     color: #e8eef6; font: 12px system-ui, -apple-system, sans-serif;
   }
   #timebar[hidden] { display: none; }
   #timebar button {
-    background: #1b2230; color: #e8eef6; border: 1px solid #2a3340; border-radius: 6px;
+    flex: none; background: #1b2230; color: #e8eef6; border: 1px solid #2a3340; border-radius: 6px;
     width: 30px; height: 26px; cursor: pointer; font-size: 13px; line-height: 1;
   }
   #timebar button:hover { background: #232c3c; }
-  #timebar input[type=range] { width: 320px; accent-color: #4a90d9; }
-  #timeLabel { min-width: 132px; opacity: .85; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #timebar input[type=range] { width: 320px; min-width: 40px; flex: 0 1 auto; accent-color: #4a90d9; }
+  #timeLabel, #timeCount { opacity: .85; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #timeLabel { min-width: 104px; }
+  /* Phone: the time bar spans the width above CesiumJS's credit line (the
+     basemap attribution stays readable), the legend above it. */
+  @media (max-width: 480px) {
+    #timebar { left: 12px; right: 12px; transform: none; bottom: 36px; padding: 7px 10px; gap: 8px; }
+    #timebar input[type=range] { width: auto; flex: 1 1 auto; }
+    #timeCount { display: none; }
+    #legend { left: 12px; bottom: 88px; }
+    #legend .lwrap { height: 104px; }
+  }
 </style>
 </head>
 <body>
 <div id="bar">
   <div class="brand">MeteoCore <span>· 3D Tiles</span></div>
-  <div class="field"><label for="coll">Collection</label><select id="coll"></select></div>
-  <div class="field"><label for="qty">Quantity</label><select id="qty"></select></div>
-  <div class="field"><label for="rep">View</label><select id="rep"></select></div>
-  <div class="field" id="resField" hidden><label for="res">Resolution</label><select id="res">
-    <option value="low">Low</option>
-    <option value="med" selected>Med</option>
-    <option value="high">High</option>
-  </select></div>
-  <div class="field"><label id="numLabel" for="num">min dBZ</label><input id="num" type="number" value="5" step="1"></div>
-  <div id="status"></div>
+  <button id="menu" type="button" aria-expanded="false" aria-controls="fields" title="Controls">☰</button>
+  <div id="fields">
+    <div class="field"><label for="coll">Collection</label><select id="coll"></select></div>
+    <div class="field"><label for="qty">Quantity</label><select id="qty"></select></div>
+    <div class="field"><label for="rep">View</label><select id="rep"></select></div>
+    <div class="field" id="resField" hidden><label for="res">Resolution</label><select id="res">
+      <option value="low">Low</option>
+      <option value="med" selected>Med</option>
+      <option value="high">High</option>
+    </select></div>
+    <div class="field"><label id="numLabel" for="num">min dBZ</label><input id="num" type="number" value="5" step="any"></div>
+  </div>
+  <div id="status" role="status"></div>
 </div>
 <div id="cesium"></div>
+<div id="fallback" hidden>
+  <h2 id="fallbackTitle"></h2>
+  <p id="fallbackText"></p>
+  <ul id="fallbackList"></ul>
+  <p><a id="retry" href="">Try again</a></p>
+</div>
 <div id="legend" hidden>
   <div class="ltitle"></div>
   <div class="lwrap"><div class="lbar"></div><div class="lticks"></div></div>
 </div>
 <div id="timebar" hidden>
-  <button id="play" title="Play / pause">▶</button>
-  <input id="time" type="range" min="0" max="0" step="1" value="0">
-  <span id="timeLabel"></span>
+  <button id="play" type="button" title="Play / pause">▶</button>
+  <input id="time" type="range" min="0" max="0" step="1" value="0" aria-label="Volume time">
+  <span id="timeLabel"></span><span id="timeCount"></span>
 </div>
-<script>
-"use strict";
-
-// API base, in priority order:
-//   1. ?base=…              a path on THIS origin (e.g. a proxy-prefixed
-//                           mount). Another origin is ignored: a crafted link
-//                           must not make a served viewer fetch and render some
-//                           other server's "radar volumes" as ours (CodeQL
-//                           js/client-side-request-forgery). The host part is
-//                           always location.origin, never taken from the query.
-//   2. same origin          when served at /3dtiles/viewer (the normal path) —
-//                           so it works on any deployment with no config.
-//   3. the public instance  last resort, e.g. when this file is opened directly
-//                           from disk (origin "null": no override applies).
-//                           Intentional (the page targets the public API by
-//                           default); it is a fixed constant, never user input.
-const params = new URLSearchParams(location.search);
-const here = location.pathname.replace(/\/+$/, "");
-const sameOrigin = here.endsWith("/viewer")
-  ? location.origin + here.slice(0, -"/viewer".length)
-  : null;
-const rawBase = params.get("base");
-let override = null;
-if (rawBase && location.origin !== "null") {
-  try {
-    // Resolve against this origin (normalises `..`, throws on malformed
-    // input) and keep only its path.
-    const u = new URL(rawBase, location.origin);
-    if (u.origin === location.origin) {
-      override = location.origin + u.pathname.replace(/\/+$/, "");
-    } else {
-      console.warn(`ignoring ?base=${rawBase}: the viewer only reads its own origin`);
-    }
-  } catch { /* ignore a malformed ?base override */ }
-}
-const BASE = override || sameOrigin || "https://meteocore.app.meteo.fi/3dtiles";
-
-const $coll = document.getElementById("coll");
-const $qty = document.getElementById("qty");
-const $rep = document.getElementById("rep");
-const $res = document.getElementById("res");
-const $resField = document.getElementById("resField");
-const $num = document.getElementById("num");
-const $numLabel = document.getElementById("numLabel");
-const $status = document.getElementById("status");
-const $legend = document.getElementById("legend");
-const $legendTitle = $legend.querySelector(".ltitle");
-const $legendBar = $legend.querySelector(".lbar");
-const $legendTicks = $legend.querySelector(".lticks");
-const $timebar = document.getElementById("timebar");
-const $play = document.getElementById("play");
-const $time = document.getElementById("time");
-const $timeLabel = document.getElementById("timeLabel");
-const setStatus = (msg, err) => { $status.textContent = msg; $status.className = err ? "err" : ""; };
-
-// Each representation's label for the numeric field + its default value:
-// point clouds drop echoes below `min_value`; isosurfaces draw nested shells AT
-// the comma-separated `threshold` list (#363 — translucent envelopes around an
-// opaque core; a single value is one opaque shell); echo-top columns rise to
-// where reflectivity drops below `threshold`. All dBZ, so one input serves
-// them, relabelled — `multi` switches it to a free-text field accepting the
-// comma list. `grid` products (isosurface/echotop/voxels) are resampled to a
-// voxel grid, so they take the low/med/high Resolution selector; the point
-// cloud is native-res and hides it. `voxels` is the CesiumJS VoxelPrimitive
-// ray-march (its own load path, not a tileset of tiles).
-// `legend` = coloured by the reflectivity ramp (points + voxels show the colour
-// scale; isosurface is coloured per-shell threshold, echo-top a height ramp →
-// no reflectivity legend).
-const REP_META = {
-  points:     { label: "Point cloud", numLabel: "min dBZ",        numDefault: "5",        mesh: false, voxel: false, legend: true  },
-  isosurface: { label: "Isosurface",  numLabel: "shells dBZ",     numDefault: "20,35,50", mesh: true,  voxel: false, legend: false, multi: true },
-  echotop:    { label: "Echo top",    numLabel: "threshold dBZ",  numDefault: "18",       mesh: true,  voxel: false, legend: false },
-  voxels:     { label: "Voxels",      numLabel: "min dBZ",        numDefault: "5",        mesh: true,  voxel: true,  legend: true  },
-};
-
-// Token-free CesiumJS: CARTO Dark Matter basemap, no Cesium Ion.
-const viewer = new Cesium.Viewer("cesium", {
-  baseLayer: new Cesium.ImageryLayer(new Cesium.UrlTemplateImageryProvider({
-    url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-    subdomains: "abcd", maximumLevel: 19,
-    credit: "© OpenStreetMap contributors © CARTO",
-  })),
-  baseLayerPicker: false, timeline: false, animation: false, geocoder: false,
-  homeButton: false, sceneModePicker: false, navigationHelpButton: false, infoBox: false, selectionIndicator: false,
-});
-viewer.scene.backgroundColor = Cesium.Color.BLACK;
-viewer.scene.globe.depthTestAgainstTerrain = false;
-
-// Time-dynamic playback: one preloaded tileset per available volume timestamp
-// (#350). All frames are kept hidden except the active one, so scrubbing/playing
-// just toggles `.show` — no per-frame network/reload stall. A non-time-dynamic
-// collection is just the degenerate 1-frame case. Frames load progressively
-// (active frame first, then newest→oldest, bounded concurrency) and every loaded
-// tileset is kept in an LRU cache keyed by its tileset URL, so toggling a
-// control and back is a pure visibility flip, not a refetch (#379).
-let frames = [];          // Cesium3DTileset per animated timestamp (parallel to `frameTimes`; null = failed/not yet loaded)
-let times = [];           // full volume-time manifest (ISO Z) from the collection doc
-let frameTimes = [];      // the timestamps actually animated = most-recent MAX_FRAMES of `times`
-let frameIdx = 0;         // active index into `frameTimes`
-let playbackIntent = 0; // user play/pause/seek changes invalidate deferred auto-resume
-let playing = false;      // animation running?
-let playTimer = null;     // setInterval handle while playing
-const FRAME_MS = 600;     // per-frame dwell when playing
-// Safety cap on preloaded frames: a source with `max_files` unset (the default)
-// can retain hundreds of volumes (a day ≈ 288 at 5-min cadence), and preloading
-// all of them would mean hundreds of concurrent fetches + GPU-resident tilesets.
-// Animate the most-recent MAX_FRAMES; a true sliding window for longer runs is a
-// follow-up. Operators bound the source itself with `[odim] max_files`/`time_window`.
-const MAX_FRAMES = 48;
-let loadToken = 0;        // guards against out-of-order async (re)builds
-let currentRep = null;    // representation of the active frames
-let pointsFetchFloor = null; // the min_value (dBZ) the point-cloud frames were fetched at
-let pointsStyleMin = null;   // the min currently applied to point styles (client-side filter)
-let legendData = null;    // colour-scale legend {title,unit,min,max,stops} from the collection doc
-let voxelPrimitive = null; // active Cesium VoxelPrimitive (the `voxels` representation)
-let metadataToken = 0;
-let metadataController = null;
-let metaCollection = null;
-let frameController = null;
-let refreshingTimes = false;
-
-async function loadCollections() {
-  setStatus("loading collections…");
-  try {
-    const data = await (await fetch(`${BASE}/collections`)).json();
-    const cols = data.collections || [];
-    $coll.innerHTML = "";
-    for (const c of cols) {
-      const o = document.createElement("option");
-      o.value = c.id; o.textContent = c.title || c.id;
-      $coll.appendChild(o);
-    }
-    if (!cols.length) { setStatus("no 3D-Tiles collections at " + BASE, true); return; }
-    await loadCollectionMeta(true); // first view → frame the volume
-  } catch (e) {
-    setStatus("can't reach " + BASE + " — " + e, true);
-  }
-}
-
-// `reframe` controls whether the camera is moved to frame the volume. Frame on a
-// collection switch (the volume may be elsewhere); preserve the camera for
-// in-place changes (quantity/representation/threshold/resolution) so adjusting a
-// filter doesn't yank the view.
-async function loadCollectionMeta(reframe) {
-  const id = $coll.value;
-  if (!id) return;
-  const token = ++metadataToken;
-  metadataController?.abort();
-  metadataController = new AbortController();
-  ++loadToken;
-  frameController?.abort();
-  stopPlaying();
-  try {
-    const response = await fetch(`${BASE}/collections/${encodeURIComponent(id)}`, { signal: metadataController.signal });
-    if (!response.ok) throw new Error(`collection request failed (${response.status})`);
-    const data = await response.json();
-    if (token !== metadataToken || id !== $coll.value) return;
-    metaCollection = id;
-    legendData = data.legend || null;
-    buildLegend();
-    // The volume time axis (ascending). Default to the latest frame so the static
-    // initial view matches the no-`datetime` default (latest volume); play loops.
-    times = Array.isArray(data.times) ? data.times : [];
-    frameIdx = times.length ? times.length - 1 : 0;
-    const qs = data.quantities || [];
-    $qty.innerHTML = "";
-    for (const q of qs) {
-      const o = document.createElement("option");
-      o.value = q.id; o.textContent = q.label || q.id;
-      $qty.appendChild(o);
-    }
-    // Prefer a reflectivity quantity for the default view.
-    for (const pref of ["DBZH", "TH"]) {
-      const i = [...$qty.options].findIndex(o => o.value === pref);
-      if (i >= 0) { $qty.selectedIndex = i; break; }
-    }
-    // Representations the collection actually serves (always at least points).
-    const reps = (data.representations && data.representations.length) ? data.representations : ["points"];
-    $rep.innerHTML = "";
-    for (const r of reps) {
-      const o = document.createElement("option");
-      o.value = r; o.textContent = (REP_META[r] && REP_META[r].label) || r;
-      $rep.appendChild(o);
-    }
-    syncNumField();
-    // Drop the previous collection's cached frames only now that the new
-    // collection's metadata is in hand — if the fetch above failed, the old
-    // collection stays on screen instead of going blank. (On the initial load
-    // the cache is empty and this is a no-op.)
-    clearFrameCache();
-    await loadFrames(reframe);
-  } catch (e) {
-    if (token === metadataToken && e.name !== "AbortError") setStatus("error loading collection — " + e, true);
-  }
-}
-
-// Refresh only the manifest: retain controls, camera, and ready frame objects.
-// Follow newly arriving volumes when viewing latest; preserve a historical seek.
-async function refreshCollectionTimes() {
-  const id = metaCollection, token = metadataToken;
-  if (!id || id !== $coll.value || refreshingTimes || document.hidden) return;
-  refreshingTimes = true;
-  try {
-    const response = await fetch(`${BASE}/collections/${encodeURIComponent(id)}`, { cache: "no-cache" });
-    if (!response.ok) throw new Error(`collection request failed (${response.status})`);
-    const data = await response.json();
-    if (token !== metadataToken || id !== $coll.value) return;
-    const updated = Array.isArray(data.times) ? data.times : [];
-    if (updated.length === times.length && updated.every((t, i) => t === times[i])) return;
-    const selected = frameTimes[frameIdx];
-    const followLatest = currentRep === "voxels" || !selected || selected === times[times.length - 1];
-    const resumePlayback = playing;
-    times = updated;
-    const window = times.slice(-MAX_FRAMES);
-    frameIdx = followLatest ? Math.max(0, window.length - 1) : Math.max(0, window.indexOf(selected));
-    await loadFrames(false, resumePlayback, true);
-  } catch (e) {
-    console.warn("volume manifest refresh", e);
-  } finally {
-    refreshingTimes = false;
-  }
-}
-
-// Relabel + default the numeric field for the active representation, show the
-// Resolution selector only for the (resampled) mesh products, and show the
-// colour legend only for the point cloud (whose points are coloured by value;
-// the mesh products colour by threshold / height instead).
-function syncNumField() {
-  const meta = REP_META[$rep.value] || REP_META.points;
-  $numLabel.textContent = meta.numLabel;
-  // A multi-value field (isosurface shell list, e.g. "20,35,50") needs a text
-  // input — type=number silently rejects commas.
-  $num.type = meta.multi ? "text" : "number";
-  $num.value = meta.numDefault;
-  $resField.hidden = !meta.mesh;
-  $legend.hidden = !meta.legend || !legendData;
-}
-
-// Build the colour-scale legend from the collection doc's `legend` (a sampled
-// gradient of the point colormap). A vertical bar, low value at the bottom, with
-// tick labels at round values across the range.
-function buildLegend() {
-  const lg = legendData;
-  if (!lg || !lg.stops || !lg.stops.length) { $legend.hidden = true; return; }
-  $legendTitle.textContent = (lg.title || "") + (lg.unit ? ` (${lg.unit})` : "");
-  const span = (lg.max - lg.min) || 1;
-  const frac = (v) => Math.max(0, Math.min(1, (v - lg.min) / span));
-  // CSS gradient bottom→top, each stop placed at its value's fraction.
-  const css = lg.stops.map(s => `${s.color} ${(frac(s.value) * 100).toFixed(1)}%`).join(", ");
-  $legendBar.style.background = `linear-gradient(to top, ${css})`;
-  // ~5 tick labels at round values within the range.
-  const step = span > 80 ? 25 : span > 40 ? 10 : 5;
-  $legendTicks.innerHTML = "";
-  for (let val = Math.ceil(lg.min / step) * step; val <= lg.max + 1e-6; val += step) {
-    const el = document.createElement("div");
-    el.className = "tick";
-    el.style.bottom = (frac(val) * 100) + "%";
-    el.textContent = val;
-    $legendTicks.appendChild(el);
-  }
-}
-
-// The tileset.json URL for the active params at a given volume timestamp
-// (`time` = null → the server's latest-volume default, no `datetime`).
-function tilesetUrl(time, pointFloor = null) {
-  const id = $coll.value, q = $qty.value, rep = $rep.value || "points";
-  const num = rep === "points" && pointFloor !== null
-    ? (Number.isFinite(pointFloor) ? String(pointFloor) : "") : $num.value.trim();
-  let url = `${BASE}/collections/${encodeURIComponent(id)}/tileset.json?quantity=${encodeURIComponent(q)}`;
-  if (rep === "isosurface" || rep === "echotop") {
-    url += `&representation=${rep}`;
-    if (num !== "") url += `&threshold=${encodeURIComponent(num)}`;
-    url += `&resolution=${encodeURIComponent($res.value)}`;
-  } else if (num !== "") {
-    url += `&min_value=${encodeURIComponent(num)}`;
-  }
-  if (time) url += `&datetime=${encodeURIComponent(time)}`;
-  return url;
-}
-
-// Frame cache (#379): every loaded tileset is keyed by its full tileset URL —
-// which encodes collection, quantity, representation, threshold/min_value,
-// resolution AND datetime — and kept in the scene hidden, so toggling a control
-// and back reuses the already-downloaded tileset instead of refetching every
-// frame. LRU-capped at the active frame set plus one full previous set; eviction
-// removes the tileset from the scene (the primitive collection's
-// destroyPrimitives:true destroys its GPU buffers on remove()).
-const readyFrames = new WeakSet();
-function isFrameReady(ts) { return !!ts && !ts.isDestroyed() && readyFrames.has(ts); }
-const tileCache = new Map(); // tileset URL → Cesium3DTileset (in scene.primitives, hidden)
-const TILE_CACHE_MAX = 2 * MAX_FRAMES;
-
-// Remove a tileset from the scene AND make sure its GPU buffers are freed.
-// remove() destroys only when the primitive collection has
-// destroyPrimitives:true (the CesiumJS default, but nothing asserts it) — the
-// explicit destroy() makes eviction leak-proof regardless of the flag.
-function dropTileset(ts) {
-  viewer.scene.primitives.remove(ts);
-  if (!ts.isDestroyed()) ts.destroy();
-}
-
-function cacheGet(url) {
-  const ts = tileCache.get(url);
-  if (!ts) return null;
-  if (!isFrameReady(ts)) {
-    tileCache.delete(url);
-    if (!ts.isDestroyed()) dropTileset(ts);
-    return null;
-  }
-  tileCache.delete(url); tileCache.set(url, ts); // LRU bump
-  return ts;
-}
-function cachePut(url, ts) {
-  // Pinned = the active frames plus the entry being inserted (`frames[i] = ts`
-  // only happens after cachePut returns, so `ts` isn't in `frames` yet).
-  // Deliberately reads the LIVE `frames`, not a per-build snapshot — a stale
-  // worker must see the NEWER build's frames to detect the A→B→A dup below;
-  // threading a snapshot through loadFrames would break that guard.
-  const pinned = new Set(frames);
-  pinned.add(ts);
-  // Two overlapping builds can both fetch the same URL (the first superseded
-  // mid-flight), so the slower one finds the winner already in the map. If the
-  // existing entry is hidden, it's the orphan — drop it and overwrite. But a
-  // stale worker can also land AFTER a newer build cached and displayed the
-  // same URL (rapid A→B→A toggling): then `prev` is the live, pinned frame and
-  // the incoming `ts` is the stale duplicate — destroy `ts` (it was added to
-  // the scene just before this call), keep the map pointing at `prev`, and
-  // return false so the caller drops its now-dead reference; overwriting would
-  // orphan the live tileset out of the cache, beyond the reach of both LRU
-  // eviction and clearFrameCache.
-  const prev = tileCache.get(url);
-  if (prev && prev !== ts) {
-    if (pinned.has(prev)) { dropTileset(ts); return false; }
-    dropTileset(prev);
-  }
-  tileCache.set(url, ts);
-  // Soft cap: pinned entries are skipped, not evicted, so the size can sit
-  // above TILE_CACHE_MAX until frames unpin (harmless — pins ≤ MAX_FRAMES + 1,
-  // and the cap is 2× that).
-  for (const [u, old] of tileCache) {
-    if (tileCache.size <= TILE_CACHE_MAX) break;
-    if (pinned.has(old)) continue; // never evict a frame in active use
-    tileCache.delete(u);
-    dropTileset(old);
-  }
-  return true;
-}
-// Collection switch: the cached frames belong to another volume entirely —
-// destroy them all rather than letting them age out of the LRU. Bumping
-// `cacheGen` makes in-flight workers from the old build discard what they
-// fetched instead of repopulating the just-cleared cache + scene (each build
-// captures the generation it started under).
-let cacheGen = 0;
-function clearFrameCache() {
-  frameController?.abort();
-  stopPlaying(); // don't leave the play timer ticking over an emptied `frames`
-  cacheGen++;
-  frames = [];
-  for (const ts of tileCache.values()) dropTileset(ts);
-  tileCache.clear();
-}
-
-// Hide the current frame set. The tilesets stay in the scene + cache, so coming
-// back to the same params is a visibility flip; only LRU eviction or a
-// collection switch (clearFrameCache) actually destroys them.
-function hideFrames() {
-  for (const ts of frames) if (ts) ts.show = false;
-  frames = [];
-}
-function clearVoxel() {
-  if (voxelPrimitive) { viewer.scene.primitives.remove(voxelPrimitive); voxelPrimitive = null; }
-}
-
-// (Re)build the frame set for the current params: one hidden tileset per
-// timestamp (or a single latest-volume frame when the collection has no time
-// axis). Cached frames appear instantly; missing ones load progressively — the
-// active frame first (shown + reframed as soon as it's ready), then the rest
-// newest→oldest with bounded concurrency — instead of one unthrottled
-// Promise.all over all 48 (#379).
-const PRELOAD_CONCURRENCY = 6;
-const FRAME_LOAD_TIMEOUT_MS = 120000;
-const frameLoadQueue = [];
-let activeFrameLoads = 0;
-const frameAbort = () => new DOMException("Frame load superseded", "AbortError");
-
-// Resource clones retain an abortable JSON loader; content URLs still resolve
-// against the original tileset URL and use Cesium's normal binary loaders.
-class FrameResource extends Cesium.Resource {
-  constructor(options, signal) { super(options); this.frameSignal = signal; }
-  clone(result) {
-    const copy = super.clone(result || new FrameResource({ url: this.url }, this.frameSignal));
-    copy.frameSignal = this.frameSignal;
-    return copy;
-  }
-  async fetchJson() {
-    const response = await fetch(this.url, {
-      signal: this.frameSignal, headers: { Accept: "application/json", ...this.headers },
-    });
-    if (!response.ok) throw new Error(`Tileset metadata HTTP ${response.status}`);
-    return response.json();
-  }
-}
-async function loadFrameMetadata(url, options, signal) {
-  if (signal.aborted) throw frameAbort();
-  const controller = new AbortController();
-  const abort = () => controller.abort(frameAbort());
-  signal.addEventListener("abort", abort, { once: true });
-  const timer = setTimeout(() => controller.abort(new Error("Tileset metadata load timed out")), FRAME_LOAD_TIMEOUT_MS);
-  try {
-    return await Cesium.Cesium3DTileset.fromUrl(new FrameResource({ url }, controller.signal), options);
-  } finally {
-    clearTimeout(timer);
-    signal.removeEventListener("abort", abort);
-  }
-}
-
-// One queue across ALL builds. Cancellation aborts metadata fetches before
-// releasing their slots; a control change cannot multiply active requests.
-function queueFrameLoad(signal, load) {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) { reject(frameAbort()); return; }
-    const job = { signal, load, resolve, reject, cancel: null };
-    job.cancel = () => {
-      const index = frameLoadQueue.indexOf(job);
-      if (index >= 0) { frameLoadQueue.splice(index, 1); reject(frameAbort()); }
-    };
-    signal.addEventListener("abort", job.cancel, { once: true });
-    frameLoadQueue.push(job);
-    drainFrameLoads();
-  });
-}
-function drainFrameLoads() {
-  while (activeFrameLoads < PRELOAD_CONCURRENCY && frameLoadQueue.length) {
-    const job = frameLoadQueue.shift();
-    job.signal.removeEventListener("abort", job.cancel);
-    if (job.signal.aborted) { job.reject(frameAbort()); continue; }
-    activeFrameLoads++;
-    Promise.resolve().then(job.load).then(job.resolve, job.reject).finally(() => {
-      activeFrameLoads--;
-      drainFrameLoads();
-    });
-  }
-}
-
-// These API tilesets have one root content tile. `tilesLoaded` / metadata
-// readiness can be true when offscreen with NO content, so wait for tileLoad.
-// Resolve only from the event; scene/cache mutations happen after traversal.
-function waitForFrameContent(ts, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) { reject(frameAbort()); return; }
-    if (isFrameReady(ts)) { resolve(); return; }
-    let timer;
-    const cleanup = () => {
-      removeLoaded(); removeFailed();
-      signal.removeEventListener("abort", aborted);
-      clearTimeout(timer);
-    };
-    const loaded = (tile) => { if (tile === ts.root) { cleanup(); resolve(); } };
-    const failed = (error) => { cleanup(); reject(new Error(error.message || "Tile content failed")); };
-    const aborted = () => { cleanup(); reject(frameAbort()); };
-    const removeLoaded = ts.tileLoad.addEventListener(loaded);
-    const removeFailed = ts.tileFailed.addEventListener(failed);
-    signal.addEventListener("abort", aborted, { once: true });
-    timer = setTimeout(() => failed({ message: "Tile content load timed out" }), FRAME_LOAD_TIMEOUT_MS);
-  });
-}
-
-async function loadFrames(reframe = false, resumePlayback = false, refresh = false) {
-  const id = $coll.value, q = $qty.value, rep = $rep.value || "points";
-  const num = $num.value.trim();
-  if (!id || !q || id !== metaCollection) return;
-  frameController?.abort();
-  frameController = new AbortController();
-  const signal = frameController.signal;
-  const token = ++loadToken;
-  const playIntent = playbackIntent;
-  const gen = cacheGen; // cache generation this build belongs to
-  stopPlaying();
-  hideFrames();
-  clearVoxel();
-  const retainedFloor = refresh && currentRep === "points" ? pointsFetchFloor : null;
-  currentRep = rep;
-  pointsFetchFloor = rep === "points" ? (retainedFloor ?? (num === "" ? -Infinity : parseFloat(num))) : null;
-
-  // Voxels use one ray-marched primitive, without animation. Pin the latest
-  // advertised time so the periodic manifest refresh advances this view too.
-  if (rep === "voxels") {
-    frameTimes = [times[times.length - 1] || null];
-    frameIdx = 0;
-    syncTimeBar();
-    await loadVoxel(token);
-    return;
-  }
-
-  // Animate the most-recent MAX_FRAMES of the manifest ([null] = the single
-  // latest-volume frame when there's no time axis).
-  frameTimes = times.length ? times.slice(-MAX_FRAMES) : [null];
-  if (frameIdx >= frameTimes.length) frameIdx = frameTimes.length - 1;
-  if (frameIdx < 0) frameIdx = 0;
-  const capped = times.length > frameTimes.length ? ` (latest ${frameTimes.length} of ${times.length})` : "";
-
-  // Satisfy what we can from the frame cache, then show it immediately — a
-  // control toggled back to cached params renders with zero network.
-  const urls = frameTimes.map((t) => tilesetUrl(t, pointsFetchFloor));
-  frames = urls.map((u) => cacheGet(u));
-  if (rep === "points") applyPointStyle(num === "" ? -Infinity : parseFloat(num));
-  syncTimeBar();
-  showFrame(frameIdx);
-  if (resumePlayback) startPlaying();
-
-  // Load order for the misses: the active frame first (it's what's on screen),
-  // then the rest newest→oldest so recent frames fill in first.
-  const pending = [];
-  if (!frames[frameIdx]) pending.push(frameIdx);
-  for (let i = frames.length - 1; i >= 0; i--) if (i !== frameIdx && !frames[i]) pending.push(i);
-  const progress = () => {
-    const done = frames.filter(isFrameReady).length;
-    setStatus(`loading ${id} · ${q} · ${rep} · frame ${done}/${frameTimes.length}${capped}…`);
-  };
-  if (pending.length) progress();
-
-  // Reframe the camera as soon as the active frame exists (cached, or first to
-  // load) — don't hold the view hostage to the background fill.
-  let needReframe = reframe;
-  const maybeReframe = async (ts = frames[frameIdx]) => {
-    if (!needReframe || !ts) return;
-    needReframe = false;
-    try {
-      await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
-        Cesium.Math.toRadians(45), Cesium.Math.toRadians(-28), 300000));
-    } catch (_) {
-      // A second collection switch during the ~1 s flight destroys `ts` via
-      // clearFrameCache and zoomTo throws on it — a superseded build, not an
-      // error to surface (the token check after each maybeReframe call exits).
-    }
-  };
-  await maybeReframe();
-  if (token !== loadToken) return; // superseded during the zoomTo animation
-
-  // Only content-ready tilesets enter frames/cache. Failed or aborted loads
-  // are destroyed, so playback never mistakes successful JSON for a frame.
-  let next = 0;
-  const worker = async () => {
-    while (next < pending.length && token === loadToken) {
-      const i = pending[next++];
-      let ts = null;
-      try {
-        ts = await queueFrameLoad(signal, async () => {
-          if (signal.aborted) throw frameAbort();
-          const tile = await loadFrameMetadata(urls[i],
-            { maximumScreenSpaceError: 1, show: false, preloadWhenHidden: true }, signal);
-          try {
-            if (signal.aborted) throw frameAbort();
-            // Track readiness through public content events, including eviction.
-            tile.tileLoad.addEventListener(root => { if (root === tile.root) readyFrames.add(tile); });
-            tile.tileUnload.addEventListener(root => { if (root === tile.root) readyFrames.delete(tile); });
-            const ready = waitForFrameContent(tile, signal);
-            viewer.scene.primitives.add(tile);
-            // The initial camera must see the radar before Cesium will request
-            // content. Reframe from metadata, without advertising it as playable.
-            await Promise.all([ready, i === frameIdx ? maybeReframe(tile) : Promise.resolve()]);
-            if (signal.aborted) throw frameAbort();
-            tile.preloadWhenHidden = false;
-            return tile;
-          } catch (e) {
-            dropTileset(tile);
-            throw e;
-          }
-        });
-      } catch (e) {
-        if (e.name !== "AbortError") console.error("frame", urls[i], e);
-      }
-      if (token !== loadToken || gen !== cacheGen) {
-        if (ts) dropTileset(ts);
-        return;
-      }
-      if (ts && !cachePut(urls[i], ts)) ts = cacheGet(urls[i]);
-      frames[i] = ts;
-      if (ts) {
-        if (currentRep === "points") stylePointFrame(ts, pointsStyleMin);
-        syncTimeBar();
-        if (i === frameIdx) showFrame(frameIdx);
-        if (resumePlayback && playIntent === playbackIntent) startPlaying();
-      }
-      progress();
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(PRELOAD_CONCURRENCY, pending.length) }, () => worker()));
-  if (token !== loadToken) return;
-
-  if (!frames.some(isFrameReady)) setStatus("no data for this selection", true);
-  else {
-    updateStatus();
-    if (resumePlayback && playIntent === playbackIntent) startPlaying();
-  }
-}
-
-// Load the cylindrical voxel volume for the active time as a CesiumJS
-// VoxelPrimitive (ray-marched), styled by a reflectivity transfer-function
-// custom shader. EXT_primitive_voxels is CesiumGS-only + draft, so this whole
-// path is best-effort — a load failure just reports, leaving the other
-// representations untouched.
-async function loadVoxel(token) {
-  const id = $coll.value, q = $qty.value;
-  setStatus(`loading ${id} · ${q} · voxels…`);
-  let url = `${BASE}/collections/${encodeURIComponent(id)}/voxel/tileset.json?quantity=${encodeURIComponent(q)}`;
-  const time = frameTimes.length ? frameTimes[frameIdx] : null;
-  if (time) url += `&datetime=${encodeURIComponent(time)}`;
-  url += `&resolution=${encodeURIComponent($res.value)}`;
-  try {
-    if (typeof Cesium.Cesium3DTilesVoxelProvider !== "function") {
-      throw new Error("this CesiumJS build has no voxel support");
-    }
-    const provider = await Cesium.Cesium3DTilesVoxelProvider.fromUrl(url);
-    if (token !== loadToken) return; // superseded
-    voxelPrimitive = viewer.scene.primitives.add(new Cesium.VoxelPrimitive({
-      provider,
-      customShader: voxelShader(q, legendData, voxelMin()),
-    }));
-    // Default ray-march step (1 sample/cell). Finer stepping was tried (0.4,
-    // 0.12) to smooth the cell lattice but made no visible difference — the
-    // lattice is a property of the DATA, now dissolved by the encoder's
-    // multi-pass blur, not of the step size — so it was pure cost (a smaller
-    // multiplier means proportionally more samples per ray). Left at the
-    // default for ~2.5× faster ray-marching with no quality loss.
-    voxelPrimitive.stepSizeMultiplier = 1.0;
-    viewer.scene.requestRender();
-    updateStatus(voxelMinLabel());
-  } catch (e) {
-    if (token === loadToken) setStatus("voxels unavailable — " + e.message, true);
-    console.error("voxel load", e);
-  }
-}
-
-// The `min dBZ` field value for voxels (cells below it are fully transparent).
-function voxelMin() { const m = parseFloat($num.value); return Number.isFinite(m) ? m : parseFloat(REP_META.voxels.numDefault); }
-function voxelMinLabel() { const m = parseFloat($num.value); return Number.isFinite(m) ? `≥ ${m} dBZ` : ""; }
-
-// #rrggbb → "vec3(r,g,b)" (0..1) for GLSL.
-function hexToGlslVec3(hex) {
-  const r = parseInt(hex.slice(1, 3), 16) / 255;
-  const g = parseInt(hex.slice(3, 5), 16) / 255;
-  const b = parseInt(hex.slice(5, 7), 16) / 255;
-  return `vec3(${r.toFixed(4)},${g.toFixed(4)},${b.toFixed(4)})`;
-}
-
-// Reflectivity transfer function for the voxel ray-march: the per-cell metadata
-// value (dBZ, property = the quantity) → colour + alpha. The colour ramp is built
-// from the SAME legend stops the colour-scale bar shows, so the voxels match the
-// legend exactly; `min` (the `min dBZ` field) makes weaker cells (and the nodata
-// sentinel) transparent; denser echo grows more opaque.
-function voxelShader(quantity, legend, min) {
-  // `quantity` is interpolated into GLSL source — guard the property name even
-  // though it comes from server metadata (ODIM quantities are A-Z0-9_). Sandboxed
-  // to our own GPU context, but cheap defence-in-depth.
-  if (!/^[A-Z][A-Z0-9_]*$/.test(quantity)) throw new Error("invalid quantity: " + quantity);
-  // Also guard non-finite min/max: `(NaN|Infinity).toFixed(2)` emits the
-  // literal "NaN"/"Infinity" into the GLSL below → the shader fails to compile
-  // and the volume goes dark. (serde can emit those for IEEE-754 specials.)
-  const lg = (legend && legend.stops && legend.stops.length >= 2
-              && Number.isFinite(legend.min) && Number.isFinite(legend.max))
-    ? legend
-    : { min: 0, max: 70, stops: [{ color: "#0000ff" }, { color: "#ff0000" }] };
-  const n = lg.stops.length;
-  const ramp = lg.stops.map(s => hexToGlslVec3(s.color)).join(",");
-  const span = (lg.max - lg.min) || 1;
-  const fs = [
-    `vec3 voxRamp(float v){`,
-    `  vec3 ramp[${n}]=vec3[${n}](${ramp});`,
-    `  float t=clamp((v-(${lg.min.toFixed(2)}))/${span.toFixed(2)},0.0,1.0)*float(${n - 1});`,
-    `  int i=int(floor(t));`,
-    `  return mix(ramp[i],ramp[min(i+1,${n - 1})],fract(t));`,
-    `}`,
-    `void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material){`,
-    `  float v=fsInput.metadata.${quantity};`,
-    `  material.diffuse=voxRamp(v);`,
-    // Opacity: a dead-band then a quadratic ramp to near-opaque (#383). The
-    // encoder fills unmeasured cells with the −32 dBZ no-echo floor, so the
-    // whole cylinder is a dense low-value field — the old slow linear ramp
-    // (0.022/dBZ from `min`, capped at 0.55) let weak echo + interpolated floor
-    // accumulate along every ray into a uniform milky haze while storm cores
-    // never read solid. Instead: fully transparent until 3 dBZ above `min`
-    // (kills the haze; still no hard alpha step — the quadratic rises smoothly
-    // from 0, so no shell/"walls and floors" at the min isovalue), then
-    // t² over the next 20 dBZ up to 0.95 so cores approach opacity.
-    `  float t=clamp((v-(${(min + 3.0).toFixed(2)}))/20.0,0.0,1.0);`,
-    `  material.alpha=t*t*0.95;`,
-    `}`,
-  ].join("\n");
-  return new Cesium.CustomShader({ fragmentShaderText: fs });
-}
-
-// `min dBZ` for voxels updates the transfer-function shader live (no reload):
-// rebuild the customShader with the new threshold and reassign it.
-function voxelClientFilter() {
-  if (($rep.value || "points") !== "voxels" || currentRep !== "voxels" || !voxelPrimitive) return false;
-  try { voxelPrimitive.customShader = voxelShader($qty.value, legendData, voxelMin()); } catch (e) { console.error(e); return false; }
-  viewer.scene.requestRender();
-  updateStatus(voxelMinLabel());
-  return true;
-}
-
-// Reveal frame `i` (wrapping), hide the rest — a pure visibility toggle, the
-// no-stall core of playback.
-function showFrame(i) {
-  if (!frames.length) return;
-  frameIdx = ((i % frames.length) + frames.length) % frames.length;
-  for (let j = 0; j < frames.length; j++) if (frames[j]) frames[j].show = (j === frameIdx);
-  $time.value = String(frameIdx);
-  updateTimeLabel();
-  updateStatus();
-  viewer.scene.requestRender();
-}
-
-// Point-cloud style applied to EVERY frame so the whole animation filters/sizes
-// consistently: drop points below `min` and scale each dot by its reflectivity
-// (the per-point `value` batch property). Both read `${value}` (a mesh ignores
-// both). `pointsStyleMin` remembers the applied min so frames still arriving
-// from the progressive preload get the same style.
-function stylePointFrame(ts, min) {
-  const cond = Number.isFinite(min) ? "${value} >= " + min : "true";
-  ts.style = new Cesium.Cesium3DTileStyle({
-    show: cond,
-    // Steep ramp so weak vs strong reads clearly: ~1 px at 5 dBZ up to 16 px at
-    // 55 dBZ (slope 0.3). Weak clutter stays a speck; storm cores are fat dots.
-    pointSize: "clamp((${value} - 5.0) * 0.3 + 1.0, 1.0, 16.0)",
-  });
-}
-function applyPointStyle(min) {
-  pointsStyleMin = min;
-  for (const ts of frames) if (ts) stylePointFrame(ts, min);
-}
-
-// The `min dBZ` field for a point cloud filters CLIENT-SIDE across all frames (no
-// re-fetch) by restyling `show` — instant, since every point carries its value.
-// We can only hide points we already have, so dropping below the fetched floor
-// re-fetches the (larger) set; raising the threshold is always client-side.
-function pointsClientFilter() {
-  if (($rep.value || "points") !== "points" || currentRep !== "points" || !frames.some(isFrameReady)) return false;
-  const min = parseFloat($num.value);
-  if (!Number.isFinite(min) || pointsFetchFloor === null || min < pointsFetchFloor) return false;
-  applyPointStyle(min);
-  viewer.scene.requestRender();
-  updateStatus(`≥ ${min} dBZ`);
-  return true;
-}
-
-function onNumCommit() {
-  // Points (client restyle) and voxels (shader rebuild) handle the field live →
-  // nothing to fetch; everything else (mesh threshold/resolution) re-fetches.
-  if (pointsClientFilter() || voxelClientFilter()) return;
-  loadFrames(false);
-}
-
-// ── Time scrubber ──────────────────────────────────────────────────────────
-// Show the bar only for a genuine time axis (>1 volume); size the slider to the
-// frames and seek to the active one.
-function syncTimeBar() {
-  const n = frameTimes.length;
-  // Hide for a single frame, and also when every frame failed to load (the
-  // manifest had >1 time but nothing rendered) — no point showing a dead slider.
-  $timebar.hidden = n <= 1 || !frames.some(isFrameReady);
-  $time.max = String(Math.max(0, n - 1));
-  $time.value = String(frameIdx);
-  updateTimeLabel();
-}
-
-// Compact label for the active timestamp, e.g. `2026-05-15 00:05Z  (1/3)`
-// (`2026-05-15T00:05:00Z` → drop the `T` and the trailing `:00` seconds).
-function updateTimeLabel() {
-  const t = frameTimes[frameIdx];
-  if (!t) { $timeLabel.textContent = ""; return; }
-  const pretty = t.replace("T", " ").replace(/:\d{2}Z$/, "Z");
-  $timeLabel.textContent = `${pretty}  (${frameIdx + 1}/${frameTimes.length})`;
-}
-
-function updateStatus(extra) {
-  const base = `${$coll.value} · ${$qty.value} · ${$rep.value || "points"}`;
-  setStatus(extra ? `${base} · ${extra}` : base);
-}
-
-// Next loaded frame at-or-after `from` (wrapping): playback can start while the
-// progressive preload is still filling, so skip slots that are null (failed or
-// not yet loaded) rather than flashing empty frames.
-function nextLoadedFrame(from) {
-  for (let k = 0; k < frames.length; k++) {
-    const i = (((from + k) % frames.length) + frames.length) % frames.length;
-    if (isFrameReady(frames[i])) return i;
-  }
-  return from;
-}
-
-function startPlaying() {
-  // Need >1 frame AND at least one that actually loaded — otherwise play would
-  // loop forever showing nothing (every frame's fromUrl can fail → all null).
-  if (playing || frames.length <= 1 || !frames.some(isFrameReady)) return;
-  playing = true;
-  $play.textContent = "⏸";
-  playTimer = setInterval(() => showFrame(nextLoadedFrame(frameIdx + 1)), FRAME_MS);
-}
-
-function stopPlaying() {
-  playing = false;
-  $play.textContent = "▶";
-  if (playTimer) { clearInterval(playTimer); playTimer = null; }
-}
-
-// Collection switch → drop the frame cache (inside loadCollectionMeta, once the
-// new metadata fetch succeeds) and reframe. Every other control is an in-place
-// change → preserve the camera AND the cache, so toggling back is instant.
-// (Arrow wrappers are load-bearing: passing the handler bare would feed the DOM
-// Event as `reframe`, which is truthy and would reframe on every filter tweak.)
-$coll.addEventListener("change", () => loadCollectionMeta(true));
-$qty.addEventListener("change", () => loadFrames(false));
-// Switching representation relabels + re-defaults the numeric field, toggles the
-// Resolution selector, then rebuilds the frames (camera preserved).
-$rep.addEventListener("change", () => { syncNumField(); loadFrames(false); });
-$res.addEventListener("change", () => loadFrames(false));
-// Live: a point cloud re-filters client-side as you drag the field. Commit
-// (`change`): re-fetch for meshes, or for points that need values below their
-// fetched floor.
-$num.addEventListener("input", () => { pointsClientFilter() || voxelClientFilter(); });
-$num.addEventListener("change", onNumCommit);
-// Time scrubber: play/pause toggles the loop; dragging the slider seeks (and
-// pauses, so the frame you drag to stays put).
-$play.addEventListener("click", () => { ++playbackIntent; playing ? stopPlaying() : startPlaying(); });
-$time.addEventListener("input", () => { ++playbackIntent; stopPlaying(); showFrame(parseInt($time.value, 10) || 0); });
-setInterval(refreshCollectionTimes, 60000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshCollectionTimes(); });
-loadCollections();
-</script>
+<script src="viewer.js"></script>
 </body>
 </html>

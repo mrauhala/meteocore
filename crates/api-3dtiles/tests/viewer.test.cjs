@@ -6,8 +6,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const html = fs.readFileSync(`${__dirname}/../viewer/index.html`, 'utf8');
-const script = html.slice(html.lastIndexOf('<script>') + 8, html.lastIndexOf('</script>'))
-  .replace(/loadCollections\(\);\s*$/, '');
+// The script without its two start calls; each harness starts CesiumJS itself.
+const shipped = fs.readFileSync(`${__dirname}/../viewer/viewer.js`, 'utf8');
+const script = shipped.replace(/loadCesium\(\);\s*loadCollections\(\);\s*$/, '');
+assert.notEqual(script, shipped, 'viewer.js no longer ends with its start calls');
 
 class Event {
   listeners = new Set();
@@ -35,30 +37,44 @@ class Element {
   options = [];
   listeners = new Map();
   style = {};
+  attributes = {};
+  classes = new Set();
+  classList = { contains: c => this.classes.has(c), toggle: (c, on) => on ? this.classes.add(c) : this.classes.delete(c) };
+  selectors = new Map();
   _value = '';
   set innerHTML(_) { this.options = []; this._value = ''; }
+  set textContent(v) { this._text = v; if (v === '') this.options = []; }
+  get textContent() { return this._text; }
   set value(v) { this._value = v; }
   get value() { return this._value; }
   set selectedIndex(i) { this._value = this.options[i].value; }
+  get children() { return this.options; }
   appendChild(o) { this.options.push(o); if (!this._value) this._value = o.value || ''; }
+  insertBefore(o) { this.options.push(o); }
   addEventListener(name, fn) { this.listeners.set(name, fn); }
-  querySelector() { return new Element(); }
+  setAttribute(name, value) { this.attributes[name] = value; }
+  querySelector(selector) {
+    if (!this.selectors.has(selector)) this.selectors.set(selector, new Element());
+    return this.selectors.get(selector);
+  }
 }
 const tick = () => new Promise(resolve => setImmediate(resolve));
 async function until(predicate) {
   for (let i = 0; i < 100; i++) { if (predicate()) return; await tick(); }
   assert.fail('asynchronous state did not settle');
 }
-function harness(t, metadataTimeout = null) {
-  const elements = new Map(), created = [], primitives = new Set(), timers = new Set(), intervals = [];
-  const document = { hidden: false, addEventListener() {}, createElement: () => new Element(),
+function harness(t, metadataTimeout = null, { search = '', cesium = true, cesiumTimeout = null } = {}) {
+  const elements = new Map(), created = [], primitives = new Set(), timers = new Set(), intervals = [], urls = [];
+  const head = new Element();
+  const document = { hidden: false, head, addEventListener() {}, createElement: () => new Element(),
     getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); } };
   const viewer = { scene: { globe: {}, requestRender() {}, primitives: {
     add(ts) { primitives.add(ts); return ts; },
     remove(ts) { const found = primitives.delete(ts); if (found) ts.destroy(); return found; },
   } }, zoomTo: async () => true };
   const context = vm.createContext({ document, URLSearchParams, URL, AbortController, DOMException,
-    location: { search: '', pathname: '/3dtiles/viewer', origin: 'https://test' },
+    location: { search, pathname: '/3dtiles/viewer', origin: 'https://test', href: `https://test/3dtiles/viewer${search}` },
+    history: { state: null, replaceState(state, title, url) { urls.push(url); } },
     console: { error() {}, warn() {} },
     setTimeout(fn, ms) { const id = setTimeout(fn, ms); timers.add(id); return id; },
     clearTimeout(id) { clearTimeout(id); timers.delete(id); },
@@ -73,11 +89,18 @@ function harness(t, metadataTimeout = null) {
         const ts = new Tileset(copy.url, options); created.push(ts); return ts;
       } } },
   });
-  vm.runInContext(metadataTimeout === null ? script : script.replace('const FRAME_LOAD_TIMEOUT_MS = 120000;', `const FRAME_LOAD_TIMEOUT_MS = ${metadataTimeout};`), context);
+  const Cesium = context.Cesium;
+  if (!cesium) delete context.Cesium;
+  let source = script;
+  if (metadataTimeout !== null) source = source.replace('const FRAME_LOAD_TIMEOUT_MS = 120000;', `const FRAME_LOAD_TIMEOUT_MS = ${metadataTimeout};`);
+  if (cesiumTimeout !== null) source = source.replace('const CESIUM_TIMEOUT_MS = 12000;', `const CESIUM_TIMEOUT_MS = ${cesiumTimeout};`);
+  vm.runInContext(source + '\nloadCesium();', context);
   const run = code => vm.runInContext(code, context);
   run(`$coll.value = 'A'; metaCollection = 'A'; $qty.value = 'DBZH'; $rep.value = 'points'; $num.value = '5'; $res.value = 'med';`);
   t.after(() => { run('frameController?.abort()'); for (const timer of timers) clearTimeout(timer); });
-  return { context, run, created, primitives, elements, intervals };
+  // The CesiumJS tag the page inserts (`cesium: false` leaves it pending).
+  const cesiumScript = () => head.options.find(e => typeof e.src === 'string' && e.src.endsWith('/Cesium.js'));
+  return { context, run, created, primitives, elements, intervals, urls, head, Cesium, cesiumScript };
 }
 async function finishFrames(h, promise) {
   let done = false;
@@ -300,4 +323,195 @@ test('?base selects a path on the viewer origin only', () => {
     resolve('?base=https://attacker.example', 'null', '/Users/x/viewer/index.html'),
     'https://meteocore.app.meteo.fi/3dtiles'
   );
+});
+
+// #1137: the collection documents the viewer reads, with a unit, a legend and a
+// suggested floor per quantity.
+const stops = (min, max) => [{ value: min, color: '#000000' }, { value: max, color: '#ffffff' }];
+const reflectivity = { id: 'DBZH', label: 'Reflectivity', unit: 'dBZ', min_value: 5,
+  legend: { title: 'Reflectivity', unit: 'dBZ', min: 0, max: 70, stops: stops(0, 70) } };
+const reflectivityTH = { ...reflectivity, id: 'TH', label: 'Total reflectivity' };
+const velocity = { id: 'VRADH', label: 'Radial velocity', unit: 'm/s', min_value: null,
+  legend: { title: 'Radial velocity', unit: 'm/s', min: -48, max: 48, stops: stops(-48, 48) } };
+const correlation = { id: 'RHOHV', label: 'Correlation coefficient', unit: '', min_value: null,
+  legend: { title: 'Correlation coefficient', unit: '', min: 0, max: 1, stops: stops(0, 1) } };
+const volumeTimes = ['2026-05-15T00:00:00Z', '2026-05-15T00:05:00Z', '2026-05-15T00:10:00Z'];
+function serve(h, docs) {
+  h.context.fetch = async url => {
+    const path = new URL(url).pathname;
+    const body = docs[path];
+    return body ? { ok: true, json: async () => body } : { ok: true, json: async () => ({}) };
+  };
+}
+const optionTexts = element => element.options.map(o => o.textContent);
+const legendTicks = h => h.elements.get('legend').querySelector('.lticks').children.map(c => c.textContent);
+
+// #1137: a CDN host that silently drops packets must not hold the page blank.
+// Nothing in the page blocks on CesiumJS: the page's own styles come first, and
+// the CDN script and stylesheet are inserted by viewer.js, with their SRI.
+test('the page never blocks on the CesiumJS CDN', async t => {
+  const head = html.slice(0, html.indexOf('</head>'));
+  assert.ok(!/<script[^>]*src=/i.test(head), 'no parser-blocking script in <head>');
+  assert.ok(!/<link[^>]*stylesheet/i.test(html), 'no render-blocking CDN stylesheet tag');
+  assert.match(html, /<script src="viewer\.js"><\/script>\s*<\/body>/, 'viewer.js runs after the body is parsed');
+  const h = harness(t, null, { cesium: false });
+  const script = h.cesiumScript();
+  assert.ok(script, 'CesiumJS inserted');
+  assert.match(script.integrity, /^sha384-/);
+  assert.equal(script.crossOrigin, 'anonymous');
+  const style = h.head.options.find(e => e.rel === 'stylesheet');
+  assert.match(style.href, /^https:\/\/cesium\.com\/.*\/widgets\.css$/);
+  assert.match(style.integrity, /^sha384-/);
+  assert.equal(style.crossOrigin, 'anonymous');
+});
+
+test('without CesiumJS the page still fills the selects and links every collection', async t => {
+  const h = harness(t, null, { cesium: false });
+  serve(h, {
+    '/3dtiles/collections': { collections: [
+      { id: 'A', title: 'Radar A', links: [
+        { rel: 'related', type: 'text/html', href: 'https://test/collections/A?f=html', title: 'Collection page' }] },
+      { id: 'B', title: 'Radar B', links: [
+        { rel: 'related', type: 'text/html', href: 'javascript:alert(1)', title: 'Collection page' }] },
+    ] },
+    '/3dtiles/collections/A': { quantities: [reflectivity, velocity], representations: ['points'], times: volumeTimes },
+  });
+  await h.run('loadCollections()');
+  assert.deepEqual(optionTexts(h.elements.get('coll')), ['Radar A', 'Radar B']);
+  assert.deepEqual(optionTexts(h.elements.get('qty')), ['Reflectivity', 'Radial velocity']);
+  // Still within its time: no panel yet, the status line says what is pending.
+  assert.notEqual(h.elements.get('fallback').hidden, false);
+  assert.equal(h.elements.get('status').textContent, 'loading the 3D library…');
+  // The CDN refuses (or the SRI check fails): the panel, at once.
+  h.cesiumScript().listeners.get('error')();
+  assert.equal(h.elements.get('fallback').hidden, false);
+  assert.equal(h.elements.get('fallbackTitle').textContent, '3D library could not be loaded');
+  assert.equal(h.elements.get('status').className, 'err');
+  const [a, b] = h.elements.get('fallbackList').children;
+  assert.equal(a.children[0].textContent, 'Radar A');
+  assert.deepEqual(a.children.slice(1).map(l => [l.textContent, l.href]), [
+    ['3D Tiles JSON', 'https://test/3dtiles/collections/A'],
+    ['Collection page', 'https://test/collections/A?f=html'],
+  ]);
+  // A link that is not http(s) is shown but never made clickable.
+  assert.equal(b.children[2].href, undefined);
+  assert.equal(h.elements.get('legend').hidden, true);
+  assert.equal(h.run('FrameResource'), null);
+});
+
+test('a CDN that never answers shows the fallback after the timeout; a late CesiumJS still starts the view', async t => {
+  const h = harness(t, null, { cesium: false, cesiumTimeout: 20 });
+  serve(h, {
+    '/3dtiles/collections': { collections: [{ id: 'A', title: 'Radar A', links: [] }] },
+    '/3dtiles/collections/A': { quantities: [reflectivity], representations: ['points'], times: volumeTimes },
+  });
+  await h.run('loadCollections()');
+  const fallback = h.elements.get('fallback');
+  assert.notEqual(fallback.hidden, false);
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(fallback.hidden, false);
+  assert.equal(h.elements.get('fallbackTitle').textContent, '3D library has not loaded');
+  assert.equal(h.elements.get('status').textContent, '3D library has not loaded');
+  assert.deepEqual(h.elements.get('fallbackList').children.map(li => li.children[0].textContent), ['Radar A']);
+  assert.deepEqual(optionTexts(h.elements.get('coll')), ['Radar A']);
+  assert.equal(h.created.length, 0);
+  // CesiumJS arrives after all: the panel goes and the selected volume loads.
+  h.context.Cesium = h.Cesium;
+  h.cesiumScript().listeners.get('load')();
+  assert.equal(fallback.hidden, true);
+  assert.notEqual(h.run('FrameResource'), null);
+  await until(() => {
+    for (const ts of h.created) if (h.primitives.has(ts) && !ts.dead && !ts.root.contentReady) ts.complete();
+    return h.run('frames.filter(isFrameReady).length') === volumeTimes.length;
+  });
+  assert.ok(h.created.every(ts => /collections\/A\/tileset\.json\?quantity=DBZH&min_value=5/.test(ts.url)));
+  assert.equal(h.elements.get('status').textContent, 'Reflectivity · Point cloud · ≥ 5 dBZ · Radar A');
+});
+
+test('a quantity relabels the filter in its own unit and rebuilds the legend', async t => {
+  const h = harness(t);
+  serve(h, { '/3dtiles/collections/A': { legend: reflectivity.legend, times: volumeTimes,
+    quantities: [reflectivity, reflectivityTH, velocity, correlation], representations: ['points', 'isosurface', 'echotop', 'voxels'] } });
+  h.run('loadFrames = async () => {}');
+  await h.run('loadCollectionMeta(true)');
+  const label = h.elements.get('numLabel'), num = h.elements.get('num'), rep = h.elements.get('rep');
+  const legendTitle = h.elements.get('legend').querySelector('.ltitle');
+  assert.equal(label.textContent, 'min dBZ');
+  assert.equal(num.value, '5');
+  assert.equal(legendTitle.textContent, 'Reflectivity (dBZ)');
+  assert.deepEqual(legendTicks(h), ['0', '10', '20', '30', '40', '50', '60', '70']);
+  assert.ok(rep.options.every(o => !o.disabled));
+
+  // Another quantity in the same unit keeps the filter typed.
+  num.value = '30';
+  h.elements.get('qty').value = 'TH';
+  h.elements.get('qty').listeners.get('change')();
+  assert.equal(label.textContent, 'min dBZ');
+  assert.equal(num.value, '30');
+
+  rep.value = 'isosurface';
+  h.elements.get('qty').value = 'VRADH';
+  h.elements.get('qty').listeners.get('change')();
+  assert.equal(label.textContent, 'min m/s');
+  assert.equal(num.value, '', 'no dBZ floor for a velocity');
+  assert.equal(legendTitle.textContent, 'Radial velocity (m/s)');
+  assert.deepEqual(legendTicks(h), ['-40', '-20', '0', '20', '40']);
+  // The grid products are reflectivity products: the view falls back to points.
+  assert.equal(rep.value, 'points');
+  assert.deepEqual(rep.options.filter(o => o.disabled).map(o => o.value), ['isosurface', 'echotop', 'voxels']);
+
+  h.elements.get('qty').value = 'RHOHV';
+  h.elements.get('qty').listeners.get('change')();
+  assert.equal(label.textContent, 'min value');
+  assert.equal(legendTitle.textContent, 'Correlation coefficient');
+  assert.deepEqual(legendTicks(h), ['0', '0.2', '0.4', '0.6', '0.8', '1']);
+
+  h.elements.get('qty').value = 'DBZH';
+  h.elements.get('qty').listeners.get('change')();
+  assert.equal(num.value, '5');
+  assert.ok(rep.options.every(o => !o.disabled));
+});
+
+// Quantity, view and filter first, the collection last: a narrow bar's
+// ellipsis cuts the collection, which its select names.
+test('the status line names the quantity, view and collection by title', async t => {
+  const h = harness(t);
+  h.run(`$coll.innerHTML = ''; $coll.appendChild({ value: 'A', textContent: 'Radar A' });
+    $qty.innerHTML = ''; $qty.appendChild({ value: 'DBZH', textContent: 'Reflectivity' });
+    $rep.innerHTML = ''; $rep.appendChild({ value: 'points', textContent: 'Point cloud' });
+    $num.value = '5'; updateStatus(filterLabel());`);
+  assert.equal(h.elements.get('status').textContent, 'Reflectivity · Point cloud · ≥ 5 dBZ · Radar A');
+});
+
+test('the view round-trips through the URL, and ?collection= opens a volume', async t => {
+  const h = harness(t, null, { search: '?base=/3dtiles&collection=B&quantity=VRADH&representation=points&min_value=-10&datetime=2026-05-15T00%3A05%3A00Z' });
+  serve(h, {
+    '/3dtiles/collections': { collections: [{ id: 'A', title: 'Radar A' }, { id: 'B', title: 'Radar B' }] },
+    '/3dtiles/collections/B': { times: volumeTimes, quantities: [reflectivity, velocity], representations: ['points'] },
+  });
+  await finishFrames(h, h.run('loadCollections()'));
+  assert.equal(h.run('$coll.value'), 'B');
+  assert.equal(h.run('$qty.value'), 'VRADH');
+  assert.equal(h.run('$num.value'), '-10');
+  assert.equal(h.run('frameTimes[frameIdx]'), '2026-05-15T00:05:00Z');
+  assert.ok(h.created.every(ts => /quantity=VRADH&min_value=-10/.test(ts.url)));
+  const written = new URL(h.urls.at(-1), 'https://test');
+  assert.equal(written.pathname, '/3dtiles/viewer');
+  assert.deepEqual(Object.fromEntries(written.searchParams), { base: '/3dtiles', collection: 'B', quantity: 'VRADH',
+    representation: 'points', min_value: '-10', datetime: '2026-05-15T00:05:00Z' });
+  // Dragging the slider seeks without writing the URL per step (Safari throws
+  // after 100 replaceState calls in 30 s); releasing it writes the frame. The
+  // latest frame is written as no time at all, so the link follows new volumes.
+  const writes = h.urls.length;
+  h.elements.get('time').value = '2';
+  h.elements.get('time').listeners.get('input')();
+  h.elements.get('time').value = '1';
+  h.elements.get('time').listeners.get('input')();
+  h.elements.get('time').value = '2';
+  h.elements.get('time').listeners.get('input')();
+  assert.equal(h.urls.length, writes);
+  assert.equal(h.run('frameIdx'), 2);
+  h.elements.get('time').listeners.get('change')();
+  assert.equal(h.urls.length, writes + 1);
+  assert.equal(new URL(h.urls.at(-1), 'https://test').searchParams.has('datetime'), false);
 });
