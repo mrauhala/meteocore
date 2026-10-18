@@ -351,6 +351,23 @@ stations and their properties: the representative snapshot test stays below
 snapshots plus database rows; responses need additional memory. Raising the
 inventory cap does not raise query limits.
 
+The advertised temporal extent, of the collection and of each location, runs
+from the earliest observation to the latest one not after the metadata
+refresh. Rows dated after the refresh are left out of it. When the latest of
+them is more than 10 minutes ahead, the refresh that first finds them logs a
+warning with its time, and the refresh that no longer finds them logs that
+too. While such rows exist, and not every row is among them, a refresh runs
+a second extent query, bounded at its own time. Both extent queries read
+`MIN` and `MAX` of the bare time column, which an index led by that column
+answers without scanning the table.
+
+A `timestamp without time zone` column in a zone with daylight saving time
+is bounded in its own local time. In the repeated autumn hour PostgreSQL
+reads an ambiguous local time as standard time, so the rows of that hour's
+first pass read back an hour late: the extent can then end up to an hour
+after the refresh, and the warning can appear and clear once around the
+change. A `timestamptz` column, or one holding UTC, avoids this.
+
 A database outage keeps the previous snapshot; an initial outage registers a
 degraded engine with no loaded stations. Database queries wait for successful
 schema validation and metadata publication. `/health` combines a dedicated

@@ -724,6 +724,13 @@ a successful reachability ping cannot clear it. Generic geometry views remain
 supported with bounded startup checks and validation of returned coordinates.
 See [database validation](../engine-postgis/README.md#column-requirements).
 
+A PostGIS collection's temporal extent, which each of its locations advertises
+too, ends at the latest observation not after the metadata refresh: rows dated
+after it are left out, and logged when more than 10 minutes ahead (#1139).
+During the repeated autumn hour, a naive local-time column can end it up to an
+hour after the refresh; see the
+[engine README](../engine-postgis/README.md#operations).
+
 Radius, corridor, items and location lists have no engine-specific code:
 radius is answered by every engine that answers area, items by every engine
 that implements `FeatureEngine` for its EDR collection (the Features engine

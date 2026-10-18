@@ -952,6 +952,71 @@ fn build_location_per_parameter(
     Ok(queries)
 }
 
+// ─── temporal extent ───────────────────────────────────────────────────────
+
+/// The advertised temporal extent's read: `MIN` and `MAX` of the time column
+/// as `timestamptz`, named `lo` and `hi`, over the single observation table,
+/// the first `per_parameter` table or the events table.
+///
+/// With `not_after`, only rows at or before it count (#1139). The metadata
+/// refresh reads without a bound first, and again bounded at its own `now`
+/// when that `hi` lies after it, so the extent ends at the latest row the
+/// bound admits.
+///
+/// Both reads leave the column bare, so PostgreSQL can answer each aggregate
+/// from a btree index led by the time column instead of a scan. A naive
+/// `time_col_tz` column converts the aggregate's result, not every row:
+/// `(MAX(col) AT TIME ZONE tz)`. The two agree because the conversion never
+/// reorders the local times real instants produce. The bound compares the
+/// column against the converted bind ([`time_filter_rhs`]) in the column's
+/// own local time, so in a zone's repeated autumn hour it admits rows that
+/// read back up to an hour after `not_after`.
+///
+/// `None` for a `per_parameter` mapping without tables, which config
+/// validation rejects.
+pub fn build_temporal_extent(
+    cfg: &PostgisEngineConfig,
+    not_after: Option<DateTime<Utc>>,
+) -> Result<Option<BuiltQuery>, BuildError> {
+    let (table, time_col, tz) = match &cfg.observations {
+        ObservationSchema::Long(l) => (&l.table, l.time_col.as_str(), l.time_col_tz.as_deref()),
+        ObservationSchema::Wide(w) => (&w.table, w.time_col.as_str(), w.time_col_tz.as_deref()),
+        ObservationSchema::PerParameter(pp) => {
+            let Some(first) = pp.tables.first() else {
+                return Ok(None);
+            };
+            (
+                &first.table,
+                first.time_col.as_str(),
+                first.time_col_tz.as_deref(),
+            )
+        }
+        // MIN/MAX over the event time column: index-only on any table with
+        // a leading-time btree, the documented deployment shape.
+        ObservationSchema::Events(ev) => {
+            (&ev.table, ev.time_col.as_str(), ev.time_col_tz.as_deref())
+        }
+    };
+    let table_fq = fq_table(table)?;
+    let time = quote_ident(time_col)?;
+    // The aggregate over the bare column, converted afterwards.
+    let lo = time_select_expr(&format!("MIN({time})"), tz);
+    let hi = time_select_expr(&format!("MAX({time})"), tz);
+    let mut params = Vec::new();
+    // SELECT kept in a plain literal; the format! templates below interpolate
+    // only already-quoted identifiers and contain no flagged SQL verb.
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{lo}::timestamptz AS lo, {hi}::timestamptz AS hi FROM {table_fq}"
+    ));
+    if let Some(bound) = not_after {
+        let rhs = time_filter_rhs("$1", tz);
+        sql.push_str(&format!(" WHERE {time} <= {rhs}"));
+        params.push(SqlParam::Timestamp(bound));
+    }
+    Ok(Some(BuiltQuery::new(sql, params)))
+}
+
 // ─── helpers ───────────────────────────────────────────────────────────────
 
 fn fq_table(t: &QualifiedTable) -> Result<String, BuildError> {
@@ -2001,5 +2066,69 @@ mod tests {
         );
         // The statement still ends at the single LIMIT bind — nothing escaped.
         assert_eq!(q.sql.matches("SELECT").count(), 1);
+    }
+
+    // ---- temporal extent ---------------------------------------------------
+
+    /// #1139: the unbounded read is the extent statement as it always was;
+    /// the bounded one adds the `now` bind against the bare column.
+    #[test]
+    fn temporal_extent_sql_unbounded_and_bounded_at_now() {
+        let now = t(2026, 10, 18, 12);
+        let cfg = long_cfg(); // timestamptz column
+        let all = build_temporal_extent(&cfg, None).unwrap().unwrap();
+        assert_eq!(
+            all.sql,
+            "SELECT MIN(\"obstime\")::timestamptz AS lo, MAX(\"obstime\")::timestamptz AS hi \
+             FROM \"public\".\"observations\""
+        );
+        assert!(all.params.is_empty());
+
+        let bounded = build_temporal_extent(&cfg, Some(now)).unwrap().unwrap();
+        assert_eq!(bounded.sql, format!("{} WHERE \"obstime\" <= $1", all.sql));
+        assert_eq!(bounded.params, vec![SqlParam::Timestamp(now)]);
+    }
+
+    /// A naive column (`time_col_tz`) aggregates the bare column and converts
+    /// the result to `timestamptz`, and bounds the bare column with the
+    /// converted bind, as every observation window does: a time index serves
+    /// both reads. `per_parameter` reads its first table.
+    #[test]
+    fn temporal_extent_sql_naive_column_aggregates_the_bare_column() {
+        let now = t(2026, 10, 18, 12);
+        let cfg = nexus_per_parameter_cfg(); // time_col_tz = "UTC"
+        let all = build_temporal_extent(&cfg, None).unwrap().unwrap();
+        assert_eq!(
+            all.sql,
+            "SELECT (MIN(\"time\") AT TIME ZONE 'UTC')::timestamptz AS lo, \
+             (MAX(\"time\") AT TIME ZONE 'UTC')::timestamptz AS hi \
+             FROM \"public\".\"airtemperature\""
+        );
+        let bounded = build_temporal_extent(&cfg, Some(now)).unwrap().unwrap();
+        assert_eq!(
+            bounded.sql,
+            format!("{} WHERE \"time\" <= ($1 AT TIME ZONE 'UTC')", all.sql)
+        );
+        assert_eq!(bounded.params, vec![SqlParam::Timestamp(now)]);
+    }
+
+    #[test]
+    fn temporal_extent_sql_events_table_and_no_table() {
+        let now = t(2026, 10, 18, 12);
+        let events = mk_cfg_obs_only(ObservationSchema::Events(lightning_shape()));
+        let bounded = build_temporal_extent(&events, Some(now)).unwrap().unwrap();
+        assert!(bounded
+            .sql
+            .starts_with("SELECT (MIN(\"time\") AT TIME ZONE 'UTC')::timestamptz AS lo"));
+        assert!(bounded.sql.contains("FROM \"public\".\"lightning\""));
+        assert!(bounded
+            .sql
+            .ends_with("WHERE \"time\" <= ($1 AT TIME ZONE 'UTC')"));
+
+        let no_tables = mk_cfg_obs_only(ObservationSchema::PerParameter(PerParameterShape {
+            tables: vec![],
+        }));
+        assert_eq!(build_temporal_extent(&no_tables, None).unwrap(), None);
+        assert_eq!(build_temporal_extent(&no_tables, Some(now)).unwrap(), None);
     }
 }

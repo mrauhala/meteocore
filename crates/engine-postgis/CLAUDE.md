@@ -201,6 +201,28 @@ in step when changing this lifecycle.
   matches registered stations only. Snapshot assembly is
   `CollectionMeta::build`, pure and unit-tested without a database; keep new
   per-refresh derivations there, not in `refresh`.
+- **The temporal extent ends at now (#1139).** `fetch_temporal_extent`
+  reads `MIN`/`MAX` unbounded, one statement as before, and takes `now`
+  after the pool checkout. Only when that `MAX` is after `now` and the `MIN`
+  is not does it read again bounded at `now`
+  (`build_temporal_extent(cfg, Some(now))`); a `MIN` after `now` leaves no
+  extent without a second statement. Both statements aggregate the bare
+  column and convert the result (`(MAX(col) AT TIME ZONE tz)` for a naive
+  column), and the bound compares the bare column against the converted
+  bind, so a btree led by the time column answers both as index probes;
+  converting inside the aggregate scans the table. Do not fold the bound
+  into one statement with `FILTER` either: PostgreSQL's `MIN`/`MAX` index
+  optimisation skips filtered aggregates. `CollectionMeta::future_latest`
+  keeps the `MAX` only when it is more than `FUTURE_LOG_GRACE` (10 min)
+  after `now`, so a slightly fast ingest clock does not toggle the log;
+  `refresh_metadata` logs its transitions only (WARN when it appears, INFO
+  when it clears). Every location advertises the collection's extent.
+  Known limitation: a naive column in a zone with daylight saving time is
+  bounded in its own local time but judged in UTC. In the repeated autumn
+  hour PostgreSQL reads an ambiguous local time as standard time, so rows
+  from the hour's first pass read back an hour late: the extent can end up
+  to an hour after `now`, and the WARN/INFO pair can fire once around the
+  change. `timestamptz`, or a naive column holding UTC, has no such hour.
 - **Live ping:** `poll_loop` runs `SELECT 1` every 30 s (2 s deadline) on a
   **dedicated** connection (not the shared pool — a busy pool must not
   masquerade as DB-unreachable), flipping the collection ready⇄degraded.

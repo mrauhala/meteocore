@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use deadpool_postgres::Pool;
 use ds_core::feature::{FilterableProperties, PropertyValue};
 use ds_core::model::{Location, LocationSnapshot, ParameterDescription};
@@ -26,7 +26,9 @@ use tokio_postgres::types::Type;
 use tokio_postgres::Row;
 
 use crate::config::{PostgisEngineConfig, ValidatedParameter};
-use crate::query::{build_locations, build_locations_from_observations, SqlParam};
+use crate::query::{
+    build_locations, build_locations_from_observations, build_temporal_extent, BuiltQuery,
+};
 use crate::schema::{LocationSource, ObservationSchema};
 
 #[derive(Debug, Error)]
@@ -150,7 +152,14 @@ pub struct CollectionMeta {
     /// `iter().find()` was 12 M string compares per area request.
     pub station_idx: Arc<HashMap<String, usize>>,
     pub parameters: Arc<HashMap<String, ParameterDescription>>,
+    /// The advertised temporal extent: the first observation to the latest
+    /// one not after the refresh's `now` (#1139).
     pub temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// The latest observation time when the refresh found it more than
+    /// `FUTURE_LOG_GRACE` after its `now`: rows dated in the future, left
+    /// out of `temporal_extent` (#1139). The refresh that first finds them
+    /// logs a warning.
+    pub future_latest: Option<DateTime<Utc>>,
     pub spatial_extent: Option<[f64; 4]>,
     /// Events shape only (#504): the WMS/Maps/Tiles TIME dimension —
     /// quantized steps ascending, rebuilt each metadata refresh so
@@ -174,7 +183,7 @@ impl CollectionMeta {
     /// descriptions (#1072), the configured property columns as filterables
     /// (#1024) and the events shape's `extent_bbox`.
     fn empty(cfg: &PostgisEngineConfig) -> Self {
-        Self::build(cfg, LocationSet::default(), None, 0)
+        Self::build(cfg, LocationSet::default(), TemporalRead::default(), 0)
     }
 
     /// Assemble a refreshed snapshot from what [`MetadataCache::refresh`]
@@ -183,13 +192,17 @@ impl CollectionMeta {
     pub(crate) fn build(
         cfg: &PostgisEngineConfig,
         locations: LocationSet,
-        temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        temporal: TemporalRead,
         version: u64,
     ) -> Self {
         let LocationSet {
             stations: feature_stations,
             cut: locations_cut,
         } = locations;
+        let TemporalRead {
+            extent: temporal_extent,
+            future_latest,
+        } = temporal;
         let locations: Vec<Location> = feature_stations
             .iter()
             .map(FeatureStation::to_location)
@@ -218,11 +231,61 @@ impl CollectionMeta {
             station_idx: Arc::new(station_idx),
             parameters: Arc::new(parameters),
             temporal_extent,
+            future_latest,
             spatial_extent,
             wms_times: Arc::new(wms_times),
             locations_cut,
             version,
         }
+    }
+}
+
+/// How far past the refresh's `now` the latest observation must lie before
+/// the refresh reports rows dated in the future (#1139). The extent is bounded
+/// at `now` all the same; the grace keeps a slightly fast ingest clock, or a
+/// row committed while the refresh runs, from toggling the WARN/INFO pair.
+const FUTURE_LOG_GRACE: TimeDelta = TimeDelta::minutes(10);
+
+/// The temporal extent one refresh read (#1139).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TemporalRead {
+    /// The first observation to the latest one not after the refresh's
+    /// `now`: what the collection and each of its locations advertise.
+    pub(crate) extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// The latest observation time, when it is more than
+    /// [`FUTURE_LOG_GRACE`] after `now`.
+    pub(crate) future_latest: Option<DateTime<Utc>>,
+}
+
+/// What the unbounded extent read leaves to do (#1139).
+#[derive(Debug, PartialEq, Eq)]
+enum ExtentNext {
+    /// The read is final: no row after `now`, or every row after it.
+    Done(TemporalRead),
+    /// Rows on both sides of `now`: read the extent again, bounded at it.
+    Bound {
+        future_latest: Option<DateTime<Utc>>,
+    },
+}
+
+/// Judge the unbounded read `all` at the refresh's `now` (#1139). A row at
+/// exactly `now` is not after it. When even the first row is after `now`,
+/// nothing is left to advertise and no bounded read is needed.
+fn judge_extent(all: Option<(DateTime<Utc>, DateTime<Utc>)>, now: DateTime<Utc>) -> ExtentNext {
+    let Some((first, latest)) = all.filter(|&(_, latest)| latest > now) else {
+        return ExtentNext::Done(TemporalRead {
+            extent: all,
+            future_latest: None,
+        });
+    };
+    let future_latest = (latest > now + FUTURE_LOG_GRACE).then_some(latest);
+    if first > now {
+        ExtentNext::Done(TemporalRead {
+            extent: None,
+            future_latest,
+        })
+    } else {
+        ExtentNext::Bound { future_latest }
     }
 }
 
@@ -709,67 +772,56 @@ fn decode_property(row: &Row, col_idx: usize) -> Result<PropertyValue, MetadataE
     )))
 }
 
+/// The advertised temporal extent (#1139): `MIN`/`MAX` of the time column
+/// ([`build_temporal_extent`]), ending at the latest observation not after
+/// `now`. One unbounded read, as before; only when its `MAX` lies after
+/// `now` and its `MIN` does not is the extent read again over the rows at or
+/// before `now`, so a table without future rows costs no extra statement.
+/// Every row after `now` leaves no extent at all.
 async fn fetch_temporal_extent(
     cfg: &PostgisEngineConfig,
     pool: &Pool,
-) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>, MetadataError> {
-    // Pick the first observation table to probe. For per_parameter we use
-    // the first declared table; for long/wide it's the single table.
-    let (table, time_col, tz) = match &cfg.observations {
-        ObservationSchema::Long(l) => (&l.table, l.time_col.as_str(), l.time_col_tz.as_deref()),
-        ObservationSchema::Wide(w) => (&w.table, w.time_col.as_str(), w.time_col_tz.as_deref()),
-        ObservationSchema::PerParameter(pp) => {
-            let Some(first) = pp.tables.first() else {
-                return Ok(None);
-            };
-            (
-                &first.table,
-                first.time_col.as_str(),
-                first.time_col_tz.as_deref(),
-            )
-        }
-        ObservationSchema::Events(ev) => {
-            // MIN/MAX over the event time column — index-only on any table
-            // with a leading-time btree (the documented deployment shape).
-            (&ev.table, ev.time_col.as_str(), ev.time_col_tz.as_deref())
-        }
+) -> Result<TemporalRead, MetadataError> {
+    let build = |not_after| {
+        build_temporal_extent(cfg, not_after).map_err(|e| MetadataError::Decode(e.to_string()))
     };
-
-    // Use quote_ident for every identifier — defense-in-depth even though
-    // schema/table/column have already passed the whitelist regex at
-    // config load.
-    let time_col_quoted =
-        crate::security::quote_ident(time_col).map_err(|e| MetadataError::Decode(e.to_string()))?;
-    let schema_quoted = crate::security::quote_ident(&table.schema)
-        .map_err(|e| MetadataError::Decode(e.to_string()))?;
-    let table_quoted = crate::security::quote_ident(&table.table)
-        .map_err(|e| MetadataError::Decode(e.to_string()))?;
-    let time_expr = match tz {
-        None => time_col_quoted.clone(),
-        Some(tz) => format!(
-            "({time_col_quoted} AT TIME ZONE '{}')",
-            tz.replace('\'', "''")
-        ),
+    // `None` only for a `per_parameter` mapping without tables.
+    let Some(unbounded) = build(None)? else {
+        return Ok(TemporalRead::default());
     };
-    // Compose the statement with the SELECT keyword in a plain string
-    // literal (not in a format macro) so the check_sql_safety tripwire
-    // stays meaningful.
-    let mut sql = String::from("SELECT ");
-    sql.push_str(&format!("MIN({time_expr})::timestamptz AS lo, "));
-    sql.push_str(&format!("MAX({time_expr})::timestamptz AS hi "));
-    sql.push_str(&format!("FROM {schema_quoted}.{table_quoted}"));
-
     let client = pool
         .get()
         .await
         .map_err(|e| MetadataError::Pool(e.to_string()))?;
-    let empty_params: Vec<SqlParam> = vec![];
-    let param_refs = crate::query::params_as_refs(&empty_params);
+    // Taken after the checkout, so rows written during a slow pool wait are
+    // not after `now`.
+    let now = Utc::now();
+    match judge_extent(read_extent(&client, &unbounded).await?, now) {
+        ExtentNext::Done(read) => Ok(read),
+        ExtentNext::Bound { future_latest } => {
+            let extent = match build(Some(now))? {
+                Some(bounded) => read_extent(&client, &bounded).await?,
+                None => None,
+            };
+            Ok(TemporalRead {
+                extent,
+                future_latest,
+            })
+        }
+    }
+}
+
+/// Run one [`build_temporal_extent`] statement: `(lo, hi)`, or `None` when
+/// it matched no row.
+async fn read_extent(
+    client: &tokio_postgres::Client,
+    built: &BuiltQuery,
+) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>, MetadataError> {
+    let param_refs = crate::query::params_as_refs(&built.params);
     let row = client
-        .query_one(&sql, &param_refs)
+        .query_one(&built.sql, &param_refs)
         .await
         .map_err(|e| MetadataError::Db(e.to_string()))?;
-
     let lo: Option<DateTime<Utc>> = row
         .try_get("lo")
         .map_err(|e| MetadataError::Decode(e.to_string()))?;
@@ -876,7 +928,8 @@ mod tests {
             assert!(fresh.feature_stations.is_empty());
             assert_eq!(fresh.version, 0);
 
-            let empty_table = CollectionMeta::build(&cfg, LocationSet::default(), None, 1);
+            let empty_table =
+                CollectionMeta::build(&cfg, LocationSet::default(), TemporalRead::default(), 1);
             assert_eq!(names(&empty_table.filterables), ["elevation", "territory"]);
             assert!(empty_table.feature_stations.is_empty());
         }
@@ -890,7 +943,12 @@ mod tests {
             let cfg = cfg_with(source);
             assert!(MetadataCache::new(&cfg).load().filterables.is_empty());
             let bare = mk_fs("0-246-0-101004", 24.9, 60.2, "0-246-0-101004", &[]);
-            let meta = CollectionMeta::build(&cfg, LocationSet::complete(vec![bare]), None, 1);
+            let meta = CollectionMeta::build(
+                &cfg,
+                LocationSet::complete(vec![bare]),
+                TemporalRead::default(),
+                1,
+            );
             assert!(meta.filterables.is_empty());
         }
     }
@@ -908,7 +966,12 @@ mod tests {
             mk_fs("other", 18.0, 59.3, "Stockholm", &[("network", "synop")]),
             mk_fs("orphan", 18.9, 12.1, "orphan", &[]),
         ];
-        let meta = CollectionMeta::build(&cfg, LocationSet::complete(rows), None, 7);
+        let meta = CollectionMeta::build(
+            &cfg,
+            LocationSet::complete(rows),
+            TemporalRead::default(),
+            7,
+        );
         assert_eq!(
             names(&meta.filterables),
             ["elevation", "network", "territory"]
@@ -933,6 +996,7 @@ mod tests {
             station_idx: Arc::new(HashMap::from([("s".to_string(), 0)])),
             parameters: Arc::new(HashMap::new()),
             temporal_extent: None,
+            future_latest: None,
             spatial_extent: Some([1.0, 2.0, 1.0, 2.0]),
             wms_times: Arc::new(Vec::new()),
             locations_cut: None,
@@ -1162,9 +1226,91 @@ mod tests {
             stations: vec![mk_fs("a", 25.0, 60.0, "a", &[])],
             cut: Some(LocationsCut::Registry),
         };
-        let meta = CollectionMeta::build(&cfg, set, None, 1);
+        let meta = CollectionMeta::build(&cfg, set, TemporalRead::default(), 1);
         assert_eq!(meta.locations_cut, Some(LocationsCut::Registry));
         assert_eq!(meta.locations.len(), 1);
+    }
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// #1139: a `MAX` after `now` asks for the bounded read, a `MIN` after it
+    /// leaves no extent without one, and only a `MAX` past the grace is
+    /// reported. A row at `now` is not after it; an empty table has none.
+    #[test]
+    fn extent_judged_at_now_reports_past_the_grace() {
+        let now = utc("2026-10-18T12:00:00Z");
+        let past = utc("2026-10-18T11:50:00Z");
+        let soon = now + TimeDelta::minutes(2);
+        let ahead = utc("2026-10-31T12:00:00Z");
+        let done = |extent, future_latest| {
+            ExtentNext::Done(TemporalRead {
+                extent,
+                future_latest,
+            })
+        };
+        let bound = |future_latest| ExtentNext::Bound { future_latest };
+        assert_eq!(judge_extent(None, now), done(None, None));
+        for all in [(past, past), (past, now)] {
+            assert_eq!(judge_extent(Some(all), now), done(Some(all), None));
+        }
+        assert_eq!(judge_extent(Some((past, soon)), now), bound(None));
+        let at_grace = now + FUTURE_LOG_GRACE;
+        assert_eq!(judge_extent(Some((past, at_grace)), now), bound(None));
+        let past_grace = at_grace + TimeDelta::seconds(1);
+        assert_eq!(
+            judge_extent(Some((past, past_grace)), now),
+            bound(Some(past_grace))
+        );
+        assert_eq!(judge_extent(Some((past, ahead)), now), bound(Some(ahead)));
+        // Every row after `now`: no extent, and no second statement.
+        assert_eq!(judge_extent(Some((soon, soon)), now), done(None, None));
+        assert_eq!(
+            judge_extent(Some((soon, ahead)), now),
+            done(None, Some(ahead))
+        );
+    }
+
+    /// #1139: the snapshot advertises the bounded extent and keeps the
+    /// future time only for the log; an events collection's TIME steps end
+    /// at the bounded extent, not in the future.
+    #[test]
+    fn snapshot_advertises_the_extent_bounded_at_now() {
+        let first = utc("2026-10-18T06:00:00Z");
+        let last = utc("2026-10-18T11:50:00Z");
+        let ahead = utc("2026-10-31T12:00:00Z");
+        let read = TemporalRead {
+            extent: Some((first, last)),
+            future_latest: Some(ahead),
+        };
+        let cfg = cfg_with(LocationSource::Observations);
+        let meta = CollectionMeta::build(&cfg, LocationSet::default(), read, 1);
+        assert_eq!(meta.temporal_extent, Some((first, last)));
+        assert_eq!(meta.future_latest, Some(ahead));
+        assert_eq!(MetadataCache::new(&cfg).load().future_latest, None);
+
+        let events = PostgisEngineConfig {
+            location_source: LocationSource::None,
+            observations: ObservationSchema::Events(crate::schema::EventsShape {
+                table: QualifiedTable {
+                    schema: "public".into(),
+                    table: "lightning".into(),
+                },
+                time_col: "time".into(),
+                time_col_tz: None,
+                geom_col: "geom".into(),
+                id_col: "id".into(),
+                cloud_indicator_col: None,
+                peak_current_col: None,
+                coverage_bbox: None,
+            }),
+            events_extent_bbox: Some([20.0, 59.0, 32.0, 70.0]),
+            ..cfg
+        };
+        let meta = CollectionMeta::build(&events, LocationSet::default(), read, 1);
+        assert_eq!(meta.wms_times.last(), Some(&last));
+        assert_eq!(meta.temporal_extent, Some((first, last)));
     }
 
     /// The `/health` reasons name the cap and what is missing.
@@ -1315,7 +1461,12 @@ mod tests {
             let rows_bytes = live() - before;
 
             let started = std::time::Instant::now();
-            let meta = CollectionMeta::build(&cfg, LocationSet::complete(rows), None, 1);
+            let meta = CollectionMeta::build(
+                &cfg,
+                LocationSet::complete(rows),
+                TemporalRead::default(),
+                1,
+            );
             let build_time = started.elapsed();
             let snapshot_bytes = live() - before;
 
