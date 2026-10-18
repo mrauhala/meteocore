@@ -1610,6 +1610,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-station-grid"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "chrono",
+ "ds-cache",
+ "ds-core",
+ "ds-executor",
+ "ds-poll",
+ "engine-csv",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "engine-zarr"
 version = "0.1.0"
 dependencies = [
@@ -4768,6 +4783,7 @@ dependencies = [
  "engine-postgis",
  "engine-querydata",
  "engine-satellite",
+ "engine-station-grid",
  "engine-zarr",
  "http-body",
  "http-body-util",

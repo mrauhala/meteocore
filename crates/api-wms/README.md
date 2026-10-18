@@ -534,7 +534,7 @@ Client
 - No external SLD/SE style documents; local SLD ColorMap palette import is supported
 - GetFeatureInfo answers one value per queried layer, from the collection's position query; composites, overlays and collections without a position query are not queryable ([GetFeatureInfo](#getfeatureinfo))
 - Source sampling depends on the engine (including bilinear for GRIB/QueryData/Zarr/NetCDF); meta-tile assembly uses nearest-neighbor to preserve discrete palettes
-- Collections must implement `MapEngine` and enable `wms`; GeoTIFF, GRIB, ODIM, QueryData, Zarr, nowcast, CAP and PostGIS events are supported
+- Collections must implement `MapEngine` and enable `wms`; GeoTIFF, GRIB, ODIM, QueryData, Zarr, nowcast, CAP, PostGIS events and station grids (station observations gridded on the fly, #1082) are supported
 - CAP limits that can leave a warning off the map, the same in WMS, Maps and Tiles: a WIS2-fed collection holds at most `max_alerts` (default 10 000) alerts, and past it drops still-valid ones from the map and `/items`, not-yet-active and lowest severity first, reporting `degraded` in `/health`; one render draws at most 50 000 active alert areas, and past that leaves out the least severe (#805)
 - JPEG output composites transparency onto white background (no alpha channel)
 

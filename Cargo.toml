@@ -15,6 +15,7 @@ members = [
     "crates/engine-zarr",
     "crates/engine-satellite",
     "crates/engine-netcdf",
+    "crates/engine-station-grid",
     "crates/storage",
     "crates/render",
     "crates/ds-cache",
