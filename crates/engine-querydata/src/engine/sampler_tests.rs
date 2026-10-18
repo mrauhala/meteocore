@@ -124,3 +124,34 @@ fn shared_sampler_renders_meps_as_the_engine_does() {
         }
     }
 }
+
+/// The render checks the request deadline per row, as the shared sampler
+/// does (#1190): a deadline already passed fails the render with
+/// `DeadlineExceeded`, on the shared map's path (MEPS) and on the per-pixel
+/// path of a lat/lon grid under geographic output (Kenya).
+#[test]
+fn a_passed_deadline_stops_the_render() {
+    let (meps, _) = meps();
+    let kenya = QueryDataEngine::new(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/ecmwf-kenya"),
+        "test",
+        None,
+        30,
+        4,
+    )
+    .unwrap();
+    let (read, laea) = projected("EPSG:3035", [8.0, 59.0, 21.0, 66.0]);
+    for (engine, bbox, crs) in [
+        (&meps, [10.0, 60.5, 19.0, 64.5], OutputCrs::WebMercator),
+        (&meps, read, laea),
+        (&kenya, [34.0, -5.0, 41.0, 4.0], OutputCrs::Wgs84),
+    ] {
+        let render = || engine.get_raster_tile(bbox, 64, 64, None, &crs, None, None, None);
+        assert!(render().is_ok(), "{crs:?}");
+        let _deadline = ds_core::deadline::enter(Some(std::time::Instant::now()));
+        assert!(
+            matches!(render(), Err(DataServerError::DeadlineExceeded)),
+            "{crs:?}"
+        );
+    }
+}

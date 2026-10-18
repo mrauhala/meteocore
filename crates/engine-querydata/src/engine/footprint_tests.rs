@@ -1,15 +1,16 @@
-//! The projected map path's footprint (#1114): [`GridMap`] refines its
-//! coarse grid for, and samples, only the output its grid's footprint can
-//! occupy, and projects a pixel from the longitude it shows within half a
-//! turn of the grid. On a full-size MEPS grid built here from its
-//! definition (no fixture is that large), on a Lambert grid centred on the
-//! antimeridian, and on the cropped MEPS fixture.
-
-use std::cell::Cell;
+//! The projected map path's footprint (#1114): the shared map
+//! (`SourceGrid::output_map_quiet`, #1190) refines its coarse grid for, and
+//! samples, only the output its grid's footprint can occupy, and projects a
+//! pixel from the longitude it shows within half a turn of the grid. On a
+//! full-size MEPS grid built here from its definition (no fixture is that
+//! large), on a Lambert grid centred on the antimeridian, and on the
+//! cropped MEPS fixture. What the map costs, its projections, is pinned
+//! where it is built, in ds-core's `resample/sampler/tests.rs`.
 
 use super::*;
-use crate::parse::GridArea;
+use crate::parse::{GridArea, GridInfo};
 use ds_core::geo::{projected_envelope, projected_output_crs, wgs84_envelope, Crs};
+use ds_core::resample::{OutputMap, ProjectionGrid};
 
 /// A Lambert conformal conic grid tangent at `lat0`° on a sphere of
 /// `radius` metres: `nx` × `ny` cells `step` metres apart, the north-west
@@ -62,21 +63,28 @@ fn meps_fixture() -> QueryDataEngine {
     QueryDataEngine::new(&dir, "test", None, 30, 4).unwrap()
 }
 
-/// [`GridMap::new`] over `info`, with the number of grid projections its
-/// build made: nodes, error probes and boundary sub-grids.
-fn counted(
-    info: &GridInfo,
+/// The map the engine samples `info` through for a `width`×`height` image
+/// of `bbox` in `crs`.
+fn shared_map<'a>(
+    info: &'a GridInfo,
     bbox: [f64; 4],
     (width, height): (u32, u32),
     crs: &OutputCrs,
-) -> (Option<GridMap>, usize) {
-    let gt = info.geo_transform();
-    let calls = Cell::new(0);
-    let map = GridMap::new(info, bbox, width, height, crs, |lon, lat| {
-        calls.set(calls.get() + 1);
-        world_to_grid_px(gt, lon, lat)
-    });
-    (map, calls.get())
+) -> OutputMap<'a> {
+    info.source().output_map_quiet(bbox, width, height, crs)
+}
+
+/// The middle longitude of a projected grid's WGS84 envelope: the
+/// shared map projects a pixel from its longitude within half a turn of it.
+fn centre_lon(info: &GridInfo) -> f64 {
+    let [w, _, e, _] = info.bbox();
+    (w + e) / 2.0
+}
+
+/// `lon` moved by whole turns into `[centre - 180°, centre + 180°)`.
+fn within_half_turn(lon: f64, centre: f64) -> f64 {
+    let start = centre - 180.0;
+    start + (lon - start).rem_euclid(360.0)
 }
 
 /// Whether grid position `(col, row)` is where [`sample_grid_bilinear`]
@@ -85,8 +93,16 @@ fn on_grid(info: &GridInfo, (col, row): (f64, f64)) -> bool {
     (-1.0..f64::from(info.nx)).contains(&col) && (-1.0..f64::from(info.ny)).contains(&row)
 }
 
+/// Whether grid position `(col, row)` lies on the grid at least half a
+/// pixel in from where [`on_grid`] ends: where a map position within the
+/// half pixel nearest-neighbour resolves is on the grid too.
+fn well_on_grid(info: &GridInfo, (col, row): (f64, f64)) -> bool {
+    (-0.5..f64::from(info.nx) - 0.5).contains(&col)
+        && (-0.5..f64::from(info.ny) - 0.5).contains(&row)
+}
+
 /// The fractional position of output pixel `(ox, oy)`'s centre.
-fn centre(ox: u32, oy: u32, (width, height): (u32, u32)) -> (f64, f64) {
+fn pixel_centre(ox: u32, oy: u32, (width, height): (u32, u32)) -> (f64, f64) {
     (
         (f64::from(ox) + 0.5) / f64::from(width),
         (f64::from(oy) + 0.5) / f64::from(height),
@@ -98,17 +114,16 @@ fn centre(ox: u32, oy: u32, (width, height): (u32, u32)) -> (f64, f64) {
 /// footprint, the EPSG:3035 tile's map jumps where the Lambert forward
 /// transform crosses the cone's gap, half a turn from the grid. Refined
 /// for the whole tile, that never converged: the build ran to the 256 ×
-/// 256 cell cap, 1 486 134 projections and a stderr warning per render.
-/// Refined for the footprint it takes 1394. Since #1113 bounded the
-/// EPSG:3067 inverse, that tile no longer reaches the cap: 3796
-/// projections for the whole tile, 3060 for the footprint. No pixel
-/// outside the footprint has a place on the grid, and inside it the coarse
-/// map holds the half pixel nearest-neighbour resolves.
+/// 256 cell cap, 1 486 134 projections and a warning per render. Refined
+/// for the footprint, the map meets its budget, with a few hundred nodes
+/// (pinned in ds-core on the same grid). No pixel outside the footprint
+/// has a place on the grid, and inside it the coarse map holds the half
+/// pixel nearest-neighbour resolves.
 #[test]
 fn polar_meta_tiles_refine_only_the_footprint() {
     let info = meps();
     let gt = info.geo_transform();
-    let [w, _, e, _] = info.footprint().unwrap();
+    let centre = centre_lon(&info);
     let size = (256, 256);
     let tiles = [
         (
@@ -125,7 +140,6 @@ fn polar_meta_tiles_refine_only_the_footprint() {
                 168.97855020194945,
                 143.55146987202554,
             ],
-            4_000,
             0,
         ),
         (
@@ -142,28 +156,26 @@ fn polar_meta_tiles_refine_only_the_footprint() {
                 189.14274294709074,
                 77.91855602096956,
             ],
-            2_000,
             400,
         ),
     ];
-    for (epsg, projected, bbox, budget, min_on_grid) in tiles {
+    for (epsg, projected, bbox, min_on_grid) in tiles {
         let crs = OutputCrs::Projected {
             crs: projected_output_crs(epsg).unwrap(),
             bbox: projected,
         };
-        let (map, projections) = counted(&info, bbox, size, &crs);
-        let map = map.expect("the footprint meets the tile");
-        assert!(projections <= budget, "{epsg}: {projections} projections");
+        let map = shared_map(&info, bbox, size, &crs);
+        assert_eq!(map.capped_error(), None, "{epsg}");
         let mut seen = 0;
         for oy in 0..size.1 {
             for ox in 0..size.0 {
-                let (fx, fy) = centre(ox, oy, size);
+                let (fx, fy) = pixel_centre(ox, oy, size);
                 let (lon, lat) = crs.project_node(bbox, fx, fy);
-                let exact = world_to_grid_px(gt, within_half_turn(lon, (w + e) / 2.0), lat);
+                let exact = world_to_grid_px(gt, within_half_turn(lon, centre), lat);
                 let Some(at) = map.position(ox, oy) else {
                     assert!(
-                        !on_grid(&info, exact),
-                        "{epsg}: ({ox}, {oy}) at {exact:?}, outside the footprint"
+                        !well_on_grid(&info, exact),
+                        "{epsg}: ({ox}, {oy}) at {exact:?} drawn nothing"
                     );
                     continue;
                 };
@@ -182,7 +194,9 @@ fn polar_meta_tiles_refine_only_the_footprint() {
 
 /// A tile inside the grid's footprint is mapped as before #1114, bit for
 /// bit: its window is the whole tile, its longitudes lie within half a
-/// turn of the grid's centre, and its grid is the whole-tile build's.
+/// turn of the grid's centre, and its grid is the whole-tile build's. The
+/// map gives no position where that build's lies off the grid, where
+/// nothing is drawn.
 #[test]
 fn an_in_footprint_tile_maps_as_the_whole_tile_build() {
     let info = meps();
@@ -206,8 +220,7 @@ fn an_in_footprint_tile_maps_as_the_whole_tile_build() {
         ),
     ];
     for (bbox, crs) in tiles {
-        let map = counted(&info, bbox, size, &crs).0.unwrap();
-        assert_eq!(map.window, (0, 255, 0, 255), "{crs:?}");
+        let map = shared_map(&info, bbox, size, &crs);
         let whole = ProjectionGrid::build_2d(
             size.0,
             size.1,
@@ -216,15 +229,19 @@ fn an_in_footprint_tile_maps_as_the_whole_tile_build() {
             |fx, fy| crs.project_node(bbox, fx, fy),
             |lon, lat| world_to_grid_px(gt, lon, lat),
         );
+        let mut drawn = 0;
         for oy in 0..size.1 {
             for ox in 0..size.0 {
+                let before = whole.sample(ox, oy);
                 assert_eq!(
                     map.position(ox, oy),
-                    Some(whole.sample(ox, oy)),
+                    on_grid(&info, before).then_some(before),
                     "{crs:?}: ({ox}, {oy})"
                 );
+                drawn += usize::from(on_grid(&info, before));
             }
         }
+        assert!(drawn > 50_000, "{crs:?}: {drawn} on the grid");
     }
 }
 
@@ -290,7 +307,7 @@ fn a_lambert_grid_is_drawn_where_it_lies_in_every_world_copy() {
     let engine = meps_fixture();
     let data = engine.latest_data().unwrap();
     let gt = data.grid.geo_transform();
-    let [w, _, e, _] = data.grid.footprint().unwrap();
+    let half = centre_lon(&data.grid);
     let render = |bbox: [f64; 4], (width, height): (u32, u32)| {
         engine
             .get_raster_tile(
@@ -337,9 +354,8 @@ fn a_lambert_grid_is_drawn_where_it_lies_in_every_world_copy() {
         }
         drawn += 1;
         let (ox, oy) = (i as u32 % size.0, i as u32 / size.0);
-        let (fx, fy) = centre(ox, oy, size);
+        let (fx, fy) = pixel_centre(ox, oy, size);
         let (lon, lat) = OutputCrs::WebMercator.project_node(bbox, fx, fy);
-        let half = (w + e) / 2.0;
         assert!(
             (half - 180.0..half + 180.0).contains(&lon),
             "({ox}, {oy}) drawn at {lon}°, a turn from the grid"
@@ -378,12 +394,13 @@ fn the_seam_box_draws_nothing_of_meps() {
     }
 }
 
-/// A tile the footprint misses builds no grid and makes no projection
-/// (#1129): on the full MEPS grid, a view a turn east of the grid's east
-/// edge, one south of it, and the seam box in each form, geographic and
-/// Web Mercator. The engine answers such a tile with every pixel empty.
+/// A tile the footprint misses draws nothing (#1129): on the full MEPS
+/// grid, a view a turn east of the grid's east edge, one south of it, and
+/// the seam box in each form, geographic and Web Mercator. Its map gives
+/// no pixel a position, builds no grid and makes no projection (pinned in
+/// ds-core), and the engine answers such a tile with every pixel empty.
 #[test]
-fn a_tile_the_footprint_misses_builds_no_grid() {
+fn a_tile_the_footprint_misses_draws_nothing() {
     let info = meps();
     let mut views = vec![
         ([430.0, 58.0, 460.0, 68.0], OutputCrs::WebMercator),
@@ -393,11 +410,11 @@ fn a_tile_the_footprint_misses_builds_no_grid() {
         views.extend(SEAM.map(|bbox| (bbox, crs.clone())));
     }
     for (bbox, crs) in views {
-        let (map, projections) = counted(&info, bbox, (256, 256), &crs);
-        assert!(
-            map.is_none() && projections == 0,
-            "{crs:?} {bbox:?}: {projections} projections"
-        );
+        let map = shared_map(&info, bbox, (256, 256), &crs);
+        let drawn = (0..256 * 256)
+            .filter(|i| map.position(i % 256, i / 256).is_some())
+            .count();
+        assert_eq!(drawn, 0, "{crs:?} {bbox:?}");
     }
     let tile = meps_fixture()
         .get_raster_tile(
@@ -431,11 +448,11 @@ fn a_grid_on_the_antimeridian_is_mapped_across_the_seam() {
     let size = (64, 32);
     for crs in [OutputCrs::Wgs84, OutputCrs::WebMercator] {
         for bbox in SEAM {
-            let map = counted(&info, bbox, size, &crs).0.unwrap();
+            let map = shared_map(&info, bbox, size, &crs);
             let unwrapped = [170.0, 10.0, 190.0, 20.0];
             for oy in 0..size.1 {
                 for ox in 0..size.0 {
-                    let (fx, fy) = centre(ox, oy, size);
+                    let (fx, fy) = pixel_centre(ox, oy, size);
                     let (lon, lat) = crs.project_node(unwrapped, fx, fy);
                     let exact = world_to_grid_px(gt, lon, lat);
                     let at = map.position(ox, oy);

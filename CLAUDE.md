@@ -564,7 +564,8 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   `ProjectionGrid::build_2d_periodic` (its column period) and wraps the
   sampled column: EPSG:3035's inverse cuts longitude at 170°W and every
   longitude meets at the pole, so plain `build_2d` interpolates straight
-  through both in any Arctic view (#323; engine-grib does this).
+  through both in any Arctic view (#323; engine-grib does this, and
+  `SourceGrid` does it for engine-netcdf and engine-querydata, #1188).
 - **A new gridded engine renders through `ds_core::resample::SourceGrid`**
   (#1067), not a sampler of its own: decode the field to a row-major
   `&[f32]`, north row first, on its `GeoTransform`, and call `render_f32`
@@ -573,13 +574,19 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   (`engine-querydata/src/engine/sampler_tests.rs`): half-pixel convention,
   bilinear with a nearest fallback, `RasterValues::F32`. Lat/lon and Web
   Mercator sources get the periodic map; any other gets the longitude
-  within half a turn of the grid's centre and the `footprint_pixel_window`
-  guard (#449/#453). Build the `SourceGrid` once per grid, not per request:
-  `new` inverse-projects the envelope. Its point queries (an EDR position, an
-  area's cell centre) project each point once with `position` and sample
-  every field there with `value_at`, the map's own sampling, so
-  GetFeatureInfo answers what GetMap drew (engine-netcdf). querydata, grib
-  and satellite keep their own samplers for now.
+  within half a turn of the grid's centre and the
+  `footprint_window_in_image` guard (#449/#453), and a footprint wholly
+  off the image builds no grid at all (#1129). Build the `SourceGrid` once
+  per grid, not per request: `new` inverse-projects the envelope. Its point
+  queries (an EDR position, an area's cell centre) project each point once
+  with `position` and sample every field there with `value_at`, the map's
+  own sampling, so GetFeatureInfo answers what GetMap drew (engine-netcdf).
+  An engine that cannot afford a decoded field shares the map alone:
+  `output_map_quiet` (it logs `OutputMap::capped_error` itself), then
+  `OutputMap::position` per pixel and its own read of its storage by the
+  same rules, wrapping a global grid's columns (`global_period`) and
+  checking the deadline per row (engine-querydata, #1190). grib and
+  satellite keep their own samplers (#1172).
 - **Before blaming a mechanism for a latency spike, check the magnitude adds
   up.** A 2.3 MB local read from page cache is tens of ms, not seconds.
   Multi-second stalls at low load almost always mean blocking/contention
