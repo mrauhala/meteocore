@@ -75,6 +75,8 @@ pub struct GridInfo {
     bbox: [f64; 4],
     /// [`Self::lonlat_extent`], computed once by [`Self::new`].
     lonlat_extent: [f64; 4],
+    /// [`Self::footprint`], computed once by [`Self::new`].
+    footprint: Option<[f64; 4]>,
 }
 
 impl GridInfo {
@@ -135,6 +137,10 @@ impl GridInfo {
             ],
             _ => bbox,
         };
+        let footprint = match area.crs {
+            Crs::Wgs84 => None,
+            _ => footprint_envelope(&transform, bbox),
+        };
         Self {
             nx,
             ny,
@@ -142,6 +148,7 @@ impl GridInfo {
             transform,
             bbox,
             lonlat_extent,
+            footprint,
         }
     }
 
@@ -173,6 +180,45 @@ impl GridInfo {
     pub fn bbox(&self) -> [f64; 4] {
         self.bbox
     }
+
+    /// The WGS84 envelope `[w, s, e, n]` a projected grid's map footprint
+    /// lies in, computed once by [`Self::new`]: [`Self::bbox`] with `w <= e`
+    /// (`e` past 180° when the grid crosses the antimeridian), reaching a
+    /// pole the grid's cells hold at every longitude. `None` for a lat/lon
+    /// grid, and for a grid none of whose edge points inverse-projects.
+    ///
+    /// It is the envelope `ds_core::resample::SourceGrid` bounds a
+    /// projected grid's map by, so the two draw the same pixels
+    /// (`engine/sampler_tests.rs`).
+    pub fn footprint(&self) -> Option<[f64; 4]> {
+        self.footprint
+    }
+}
+
+/// [`GridInfo::footprint`] of a projected grid with the transform
+/// `transform`, whose edges inverse-project to `bbox`.
+///
+/// The edges miss a pole the grid holds (a polar stereographic grid's
+/// edges stay south of it), so a grid whose forward transform puts a pole
+/// inside its cells reaches that pole, at every longitude.
+fn footprint_envelope(transform: &GeoTransform, bbox: [f64; 4]) -> Option<[f64; 4]> {
+    let [mut w, mut s, mut e, mut n] = bbox;
+    if !(w.is_finite() && s.is_finite() && e.is_finite() && n.is_finite()) || s > n {
+        return None;
+    }
+    if w > e {
+        e += 360.0;
+    }
+    let (cols, rows) = (f64::from(transform.width), f64::from(transform.height));
+    for pole in [90.0, -90.0] {
+        let (col, row) = transform.world_to_pixel_f64(0.0, pole);
+        if (0.0..cols).contains(&col) && (0.0..rows).contains(&row) {
+            (w, e) = (-180.0, 180.0);
+            s = s.min(pole);
+            n = n.max(pole);
+        }
+    }
+    Some([w, s, e, n])
 }
 
 /// Parsed querydata file providing access to metadata and float data.

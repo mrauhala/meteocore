@@ -35,11 +35,23 @@ runtime).
   stored corners have only six significant digits, so corner anchoring lands
   within ~5 m of the file's world rect — pinned in `parse_meps_lcc`. The
   stereographic record carries no radius line and still projects on WGS84.
-- The shared map sampler `ds_core::resample::SourceGrid` (#1067) is this
-  engine's projected render path, pinned value for value on the MEPS
-  fixture (`engine/sampler_tests.rs`). A change to the map sampling here
-  (`world_to_grid_px`, `sample_grid_bilinear`) breaks that test: change
-  both, or move this engine onto the shared sampler.
+- The projected render path (every source but a lat/lon grid under
+  CRS:84 / Web Mercator) maps output to source through `GridMap`
+  (`engine.rs`), which follows `ds_core::resample::SourceGrid`'s map rules
+  (#1114): the window is `OutputCrs::footprint_window_in_image` over
+  `GridInfo::footprint` (computed once at load); a footprint off the image
+  returns the empty tile with no grid; the grid is
+  `ProjectionGrid::build_2d_within_quiet` over the window, and a capped
+  grid is logged through `tracing`; longitudes are taken within half a
+  turn of the grid's centre, because `Lcc::forward` is not periodic
+  (θ = n·Δλ) and a second Web Mercator world copy otherwise drew MEPS data
+  ~43° east of where it lies; a west > east box is unwrapped.
+  `engine/sampler_tests.rs` pins the engine's render to SourceGrid value
+  for value, world copies and the seam box included: change a rule in
+  both, or move this engine onto the shared sampler. It does not render
+  through SourceGrid because QueryData's param → location → level → time
+  layout strides one field by levels × times, so SourceGrid's decoded
+  `&[f32]` field would cost a full-field strided read per tile.
 - EDR position queries and map rendering use bilinear interpolation. EDR area (and radius via the shared default) returns a
   CRS84 `Grid` over the polygon bbox at native resolution (≤ 256 cells per
   axis, 1M-value budget across time × cells × parameters), every cell
