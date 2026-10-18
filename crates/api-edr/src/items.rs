@@ -206,6 +206,7 @@ fn html_page<'a>(
         raw_query,
         json_url,
         links,
+        ..Default::default()
     }
 }
 

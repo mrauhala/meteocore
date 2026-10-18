@@ -143,7 +143,7 @@ No executable documentation assets or validation requests use a CDN (#587).
 
 | Query type | Route | Status | Notes |
 |---|---|---|---|
-| `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list, each feature's data link and `edrqueryendpoint` carrying its id percent-encoded (#970), complete without `limit` and paged with it, `bbox` and `datetime` filtering it before paging (see below), + CoverageJSON/PNG series per location, and EDR GeoJSON and CSV on station collections; `{locId}` may be a comma-delimited list of up to 64 ids, answered in request order as one CoverageCollection or, on station collections, one EDR GeoJSON FeatureCollection or one CSV table (no PNG), and with a `datetime` list at most 256 ids × instants (see [Location lists](#location-lists)) |
+| `locations` | `/collections/{id}/locations`, `/locations/{locId}` | ✓ | GeoJSON list, each feature's data link and `edrqueryendpoint` carrying its id percent-encoded (#970), complete without `limit` and paged with it (its HTML page lists 100 a page without `limit`, #1138), `bbox` and `datetime` filtering it before paging (see below), + CoverageJSON/PNG series per location, and EDR GeoJSON and CSV on station collections; `{locId}` may be a comma-delimited list of up to 64 ids, answered in request order as one CoverageCollection or, on station collections, one EDR GeoJSON FeatureCollection or one CSV table (no PNG), and with a `datetime` list at most 256 ids × instants (see [Location lists](#location-lists)) |
 | `position` | `/collections/{id}/position` | ✓ | `POINT` or `MULTIPOINT` (fanned out, flattened into one CoverageCollection — per-point grouping not preserved; at most 64 points, 16 KiB decoded coordinates, 1 million values combined, and with a `datetime` list at most 256 points × instants; all coordinates finite and within CRS84 bounds); EDR GeoJSON too on station collections, one feature per point, and CSV |
 | `area` | `/collections/{id}/area` | ✓ | WKT `POLYGON` (holes allowed) or `west,south,east,north`; PNG and GeoJSON rejected; CSV on station collections |
 | `radius` | `/collections/{id}/radius` | ✓ | `coords=POINT`, `within`, `within-units=km\|m\|mi`; default trait impl = 64-vertex geodesic polygon → `query_area`; capped at 1000 km; pole/antimeridian circles are 400 (#667); PNG rejected; EDR GeoJSON and CSV too on station collections |
@@ -358,13 +358,13 @@ collection's extent describes the latest run.
 | `coords` | ✓ | WKT per query type (see above) |
 | `bbox` | ✓ | `items` (CRS84), cube and `/locations`: four or six comma-separated numbers (EDR 1.2 `bbox`/`cube-bbox`, `style: form`, `explode: false`), `west > east` crossing the antimeridian; `/collections` discovery also takes one. On `/locations` (#932) it keeps the locations whose point lies inside the box, edges included, before `limit` pages the list; a six-number box's heights must be numbers and are otherwise ignored, since a location is a point without a height, as `items` ignores them. A malformed or repeated `bbox` is a 400 |
 | `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..`, and EDR 1.2's list of instants `T1,T2,T3` and repeating interval `Rn/date-time/duration` (`/req/core/datetime-response` D). A list names at most 16 instants (`params::MAX_DATETIME_INSTANTS`), since each is a sequential engine query and no intervals; repeats collapse. Each instant is its own engine query with the window `(t, t)`, so it is matched exactly as a request for that instant alone; the answers merge (`src/datetime_list.rs`): series and `t`-axis grids at the same place join into one coverage with every instant's steps, ascending and each once, and other coverages are listed. A grid without `t`, the one-step answer of a gridded area or radius, first gets a one-step `t` axis at the listed instant it answered, so a list joins its instants along `t` as cube does, instead of keeping only the first (#968); a single `datetime` keeps the engine's grid as it is. An instant with no data (the engine's 404) contributes nothing; none with data is that 404, and any other engine error fails the request. QueryData, Zarr, NetCDF and the along-path trajectory plan answer an instant or window without a step with that 404 (#968; it was a 400, which failed the whole list). The merged response is bounded to 1 million values; the deadline is checked before every instant. A repeating interval (#933) is the list of its `n` instants, the start and then one duration apart, queried exactly as that list: `R4/2026-10-01T00:00:00Z/PT6H` is 00, 06, 12 and 18 UTC. `n` counts instants, as `z=R20/100/50` counts levels; the informative collection-response annex reads `R4/100/5` as five values instead, but the `z` parameter's example, the OpenAPI temporal extent example and ISO 8601 parsers all count `n` items. `n` is 1 to 16, a list's cap: `R0`, an unbounded `R/…` or `R-1/…`, and `R17` up are 400s. The duration is a positive ISO 8601 duration (`ds_core::datetime::parse_iso8601_duration`) in weeks or days, hours, minutes and whole seconds, added as a fixed length to the UTC start; calendar years and months (`P1M`, `P1Y`) are a 400, since their length varies, and so are a zero or signed duration, a fractional component and any other shape (`Rn/duration/end`, `Rn/start/end`). On an along-path trajectory a 2-D or Z path takes each listed instant (one coverage per instant), and any `datetime`, a list included, with a `LINESTRING M`/`ZM` is a 400: that path carries its own times. An interval that ends before it starts is a 400 on every route, as in Features, Maps and Tiles (#932; it used to reach the engines, and CSV and BUFR panicked on it). On `/locations` (#932) it keeps the locations with at least one observation in the interval, each instant of a list matched exactly, before `limit` pages the list: the rule of the station engines' Features `datetime` (#682), from the same engine code (`EdrEngine::location_time_filter`). A collection whose engine cannot tell when a location has data answers it with a 400 naming the collection, not the unfiltered list; see the engine matrix |
-| `parameter-name` | ✓ | comma-separated, case-insensitive, repeats collapse; any unknown name (or an empty list) is a 400 listing the valid names — one rule in `ds_core::edr_engine::select_parameters` for GeoTIFF, ODIM, Zarr, QueryData, NetCDF and Nowcast (#666) and for CSV and BUFR (#966); GRIB keeps its own equivalent check. Absent, every parameter of the collection is returned, on GRIB area and radius too (#966) |
+| `parameter-name` | ✓ | comma-separated, case-insensitive, repeats collapse; any unknown name (or an empty list) is a 400 listing the valid names — one rule in `ds_core::edr_engine::select_parameters` for GeoTIFF, ODIM, Zarr, QueryData, NetCDF and Nowcast (#666) and for CSV and BUFR (#966); GRIB keeps its own equivalent check. Absent, every parameter of the collection is returned, on GRIB area and radius too (#966). A blank value (`parameter-name=`) is the same as leaving it out, as a blank `z` is (`params::parse_parameter_names`, #1138): it is what a query form submitted without JavaScript sends. An empty name inside a list (`a,,b`) is still an unknown parameter |
 | `z` | ✓ | EDR 1.2 grammar (`/req/edr/z-response`): a level, a list, a closed `min/max` interval, the open intervals `../max` and `min/..` (an open end reaches the lowest or highest advertised level), and the recurring interval `Rn/min/step` (`n` levels from `min`, `step` apart, as in the standard's `R20/100/50` = 20 levels; non-zero step). A list or a recurring interval names at most 1000 levels (`params::MAX_Z_LEVELS`, #940); more is a 400 naming the cap, raised while parsing, before any engine work. An interval selects the advertised levels inside it (none is a 400). A level, a list and a recurring interval go to the engine as a list, which keeps only the levels it has (clause B), in request order and each once, and answers 400 when it keeps none, as for an interval (#969): GRIB keeps the run's exact levels, NetCDF the collection's exact pressure levels in hPa (#1067); an ODIM PVOL site keeps the sweep within 0.05° of each requested angle, half the 0.1° step its sweep angles are advertised at, so `z=50` on a 0.3–9° volume is a 400, not the 9° sweep. A pinned PVOL angle samples each volume's own sweep at that angle; a volume in the window without one has no value there. The PVOL cross-section trajectory applies the same rule (#983): `z` names sweeps within 0.05°, a `z` matching none is the same 400, and the section keeps only the cells whose nearest sweep is a selected one, so `z=0.7` shows the 0.7° sweep and nothing of 0.4° or 1.5°. It used to read `z` as an angle band widened by 1° and sample whichever sweep was nearest, so a `z` between sweeps answered 200 with its neighbours' data. A cube without `z` returns every level (clause F and `/req/edr/cube-z-response` E), not the 400 that `/req/edr/rc-cube` E recommends: those SHOULDs conflict. A collection with no vertical extent **ignores** a well-formed `z` on every query route, instance routes included (clause A, a SHALL in 1.2); a malformed `z` is still a 400 everywhere. Cube also takes the interval from a six-number `bbox` when `z` is absent, ignored the same way without a vertical extent. On an along-path trajectory: the levels a 2-D or M path is sampled on; `z` with a `LINESTRING Z`/`ZM` is a 400 on every collection, since that path carries its own levels |
 | `f` | partial | `CoverageJSON` (default), `GeoJSON` (locations/position/radius on station collections; never area or cube), `PNG` (position/locations plots, one location, not a list; radar cross-section trajectories) and `CSV` (locations, id lists included, position, radius and area on station collections, #1066; see [CSV output](#csv-output)), case-insensitively, also as media types: `application/vnd.cov+json`, `application/prs.coverage+json` (EDR 1.1's type, still accepted), `application/geo+json`, `image/png` (encode `+` as `%2B`; a bare `+` read as a space is accepted), `text/csv` (also with its parameters `;header=present` and `;charset=utf-8`; another `header` or `charset` is a 400, other parameters are ignored, and no other media type takes parameters), and `HTML` / `text/html` on every data query (#971). CoverageJSON is always sent as `application/vnd.cov+json`, the EDR 1.2 type (#920), whichever `f` spelling or `Accept` header asked for it; `/api` and the `/locations` data links name the same type. A format the query does not offer is a 400 naming the ones it does; each query's offer is its `data_queries` `output_formats`. Without `f`, the `Accept` header chooses among the offered media types by q-value (ties go to the order CoverageJSON, GeoJSON, PNG, CSV, HTML, so a browser's `Accept: text/html,…,*/*` gets the HTML page and a client naming a data type beside `text/html` gets the data; wildcards, `text/*` and `application/json` keep CoverageJSON, nothing acceptable falls back to it rather than 406), and the response carries `Vary: Accept` when the query offers more than one format, which with HTML is every query. The `/locations` list offers `GeoJSON` (also as `json`) and `HTML`; any other `f` is a 400 naming them (#605). Metadata resources take `json`/`html` or `application/json`/`text/html` (#510). No CSV for gridded collections, no NetCDF |
 | `crs` | partial | every data query reads it (`/req/edr/REQ_rc-crs-definition`, #965): position, area, radius, cube, trajectory, `/locations/{locId}` and the instance routes. The CRS84 URI, `CRS84` or `OGC:CRS84` are accepted, anything else is a 400 naming the CRS served (`/req/edr/REQ_rc-crs-response` C); before #965 only cube read it and the others ignored any value. Data are served in CRS84 only, which every `data_queries` link advertises in `crs_details` (#918); other CRSs are #84. The `/locations` list takes no `crs`, as the 1.2 OpenAPI defines none, so there it is an unknown parameter, a 400. `bbox-crs` on `/collections` is CRS84 only |
 | `within`, `within-units` | ✓ | radius only |
 | `resolution-x`/`-y`/`-z` | partial | cube only: `n` evenly spaced positions from the bbox's west/south edge to its east/north edge (for `z`, from the lowest to the highest selected level), both ends included, each taking the nearest native value; a position more than half a cell off the grid is null. `0` or absent is the native resolution; a whole number up to 1 000 000, else 400 stating that range. Area does not take `resolution-x`/`-y` |
-| `limit` | ✓ | EDR 1.2 `/req/edr/rc-limit-definition`: an integer from 1 to 10000; a larger value is clamped to 10000, not an error; `0`, a sign, a fraction, an exponent or a non-number is a 400. Absent means no limit, not the spec's suggested default of 10. On position, area, radius, `/locations/{locId}` and the instance position/area/radius routes it caps the top-level coverages of a CoverageCollection, in engine order; the rest are dropped, since CoverageJSON has no paging links. A single Coverage is one object and is unchanged. A MULTIPOINT keeps the first coverages in point order, then each point's own order, so a vertical profile per step counts once per step, and the points past the limit are never queried. A list of location ids does the same in id order; the ids past the limit are not queried, but an unknown one is still a 404. On `/locations` it pages the list, below. Trajectory and cube accept it too (#983, `/req/edr/rc-core-query-parameters` L: a data query may carry `limit`, and a format that cannot page ignores it; both used to answer 400): a trajectory's CoverageCollection, one coverage per timestep, is capped like the others, while a single Section, Trajectory or cube Grid coverage is returned unchanged. `limit` applies to CoverageJSON and GeoJSON only (#988), and to CSV, whose rows are those coverages' (#1066): a PNG plot is one image and an HTML page has no paging links, so on every data query `f=PNG` and `f=HTML` ignore it (validated, then unused) and render every point and coverage, bounded by the values caps; a MULTIPOINT plot with `limit=1` is byte-identical to the one without. `/api` declares `limit` on both, instance cube included. `items` (#928) pages with the Features default of 10. `/collections` pages with Common's default and maximum of 1000, and an HTML catalog page holds 24 by default (#1141). `/instances` pages its runs with `limit` + `offset`, at most 500 a page and 100 by default once the run axis is longer than 500 (#1006, see [Long run axes](#long-run-axes)) |
+| `limit` | ✓ | EDR 1.2 `/req/edr/rc-limit-definition`: an integer from 1 to 10000; a larger value is clamped to 10000, not an error; `0`, a sign, a fraction, an exponent or a non-number is a 400. Absent means no limit, not the spec's suggested default of 10. On position, area, radius, `/locations/{locId}` and the instance position/area/radius routes it caps the top-level coverages of a CoverageCollection, in engine order; the rest are dropped, since CoverageJSON has no paging links. A single Coverage is one object and is unchanged. A MULTIPOINT keeps the first coverages in point order, then each point's own order, so a vertical profile per step counts once per step, and the points past the limit are never queried. A list of location ids does the same in id order; the ids past the limit are not queried, but an unknown one is still a 404. On `/locations` it pages the list, below; the list's HTML page pages 100 at a time when `limit` is absent (#1138). Trajectory and cube accept it too (#983, `/req/edr/rc-core-query-parameters` L: a data query may carry `limit`, and a format that cannot page ignores it; both used to answer 400): a trajectory's CoverageCollection, one coverage per timestep, is capped like the others, while a single Section, Trajectory or cube Grid coverage is returned unchanged. `limit` applies to CoverageJSON and GeoJSON only (#988), and to CSV, whose rows are those coverages' (#1066): a PNG plot is one image and an HTML page has no paging links, so on every data query `f=PNG` and `f=HTML` ignore it (validated, then unused) and render every point and coverage, bounded by the values caps; a MULTIPOINT plot with `limit=1` is byte-identical to the one without. `/api` declares `limit` on both, instance cube included. `items` (#928) pages with the Features default of 10. `/collections` pages with Common's default and maximum of 1000, and an HTML catalog page holds 24 by default (#1141). `/instances` pages its runs with `limit` + `offset`, at most 500 a page and 100 by default once the run axis is longer than 500 (#1006, see [Long run axes](#long-run-axes)) |
 | `offset` | ✓ | `/locations` with `limit`, as on `/collections`: the offset pagination extension. `offset` without `limit` on `/locations` is a 400. `/locations` takes only `limit`, `offset`, `bbox`, `datetime` and `f`; any other parameter is a 400 naming them. Its `f` names GeoJSON (`GeoJSON`, `application/geo+json`, `json` or `application/json`) or its HTML page (`HTML`, `text/html`, #971), case-insensitively, the one list `params::LOCATIONS_FORMATS` that `items` and `/api` share; any other value is a 400 (#965; it used to be ignored). `bbox` and `datetime` filter before paging (#932). `/instances` takes `offset` the same way, and only `limit`, `offset` and `f` (#1006) |
 
 Data queries execute on a dedicated, bounded runtime, including radius and
@@ -378,7 +378,11 @@ concurrency without claiming that synchronous engine I/O is preemptible.
 For `/locations`, the same permit covers retrieval, metadata, direct JSON
 serialization and ETag hashing (#533). Without `limit` the response is the
 complete inventory, byte for byte what it was before paging existed: no
-counts, one `self` link, no implicit pagination. With `limit` (EDR 1.2,
+counts, one `self` link, no implicit pagination. Its HTML page alone pages
+by default (#1138): without `limit` it lists the first 100 locations
+(`handlers::LOCATIONS_HTML_PAGE`) with `numberMatched` and a pager, since a
+station network's whole inventory was a page of several megabytes; its links
+carry `limit=100`. With `limit` (EDR 1.2,
 #922) it is one page of the inventory in the engine's order, which is stable
 within one inventory snapshot: CSV first-seen order, PostGIS and BUFR by
 station id. `bbox` and `datetime` (#932) filter the inventory first, in
@@ -1039,17 +1043,23 @@ classes by standard and version. See the
 [shared HTML behavior](../api-common/README.md#html-api-workbench).
 
 The HTML overview distinguishes finding a collection from requesting its data.
-Collection pages list advertised EDR operations and link to the API reference
-for required data-query inputs; collection search is not an EDR data builder.
-Every `data_queries` link is an anchor (`/req/html/content`): instances,
-locations and items open their HTML view, the parameterised queries their
-endpoint. Catalog rows and model-run lists anchor them too.
+Collection pages list advertised EDR operations and link to the API reference;
+collection search is not an EDR data builder.
+Every `data_queries` link is an anchor (`/req/html/content`) to the end
+point's HTML view (#1138): instances, locations and items open their lists,
+and position, area, radius, trajectory and cube their query form (see
+[Query forms](#query-forms)), so no link on a catalog, collection, run or data
+page ends in a 400 (`tests/html_output_tests.rs`
+`no_link_on_a_page_ends_in_a_400` follows every one). Catalog rows and
+model-run lists anchor them too, through the one workbench helper
+(`data_query_target`).
 
 `/req/html/content` A asks for all of a response's information in the body
 (#984). The landing, collection and instance pages list every link in a table
 with its relation, title and type, `self` and `alternate` included; each link
-is an `<a>` to its own href, so a `rel=data` query end point is never opened
-as a bare `?f=html` page. The landing page's `self` is the HTML page, the JSON
+is an `<a>` to its own href, a `rel=data` query end point at its bare href
+(a browser following it negotiates HTML and gets the query's form). The
+landing page's `self` is the HTML page, the JSON
 its `alternate`. The `/collections` and `/instances` lists keep their summary
 cards and add each entry in full under "All metadata & links": every member as
 the detail pages' property table (crs, output_formats, the whole extent,
@@ -1071,15 +1081,31 @@ and any client naming a data type are unchanged
 data explicitly.
 
 - **CoverageJSON queries** (position, area, radius, trajectory, cube, their
-  instance routes, `/locations/{id}` and id lists): the request's parameters;
-  the page's links (`self`, an `alternate` per data format, the collection),
-  in the workbench's link table;
-  every parameter (label, unit, observed property, and all its fields); and
-  per coverage the domain axes with every value, the referencing, any foreign
-  member (`meteocore:beamCoverage`), and every range value. A grid range is
-  one y × x matrix per parameter and leading `t`/`z` index; any other range
-  (series, profile, composite trajectory or section axis) one row per domain
-  position, a column per parameter. Null values are empty cells.
+  instance routes, `/locations/{id}` and id lists): the data first (#1138).
+  The heading and tab title say what and where the page answers, with the
+  collection (`Position at 60.16667° N, 24.93333° E · …`, `Area 59° N to
+  61° N, …`, `Location …`); a summary names the model run (the path's;
+  without one, that the collection's default answered), the requested time,
+  the values' time span (each time once) and each parameter with its unit;
+  on a query offering PNG whose result plots (a series, a profile, a
+  cross-section) the same query's `f=PNG` image follows; then every range
+  value, each of several coverages headed by what tells it apart (its point
+  among an area's stations, its time among a series of profiles). A grid range is one y × x matrix per parameter and
+  leading `t`/`z` index; any other range (series, profile, composite
+  trajectory or section axis) one row per domain position, a column per
+  parameter headed by its label and unit (`unit not provided` when the
+  source gives none). Null values are empty cells. Numbers display through
+  `ds_core::html` (`display_value`: at most 3 decimals, three significant
+  digits below 1; `display_coordinate`: x and y to 5 decimals), the exact
+  JSON number in the cell's `title` when rounding changed it. Below the
+  values: the request as its form, and folded in a `<details>` the request's
+  parameters, the page's links (`self`, an `alternate` per data format, the
+  collection) in the workbench's link table, every parameter (label, unit,
+  observed property, and all its fields) and the document's members. Each
+  coverage folds its domain: the axes (an axis over 8 values shows its count
+  and ends, every value exactly in a nested `<details>`), the referencing,
+  any foreign member (`meteocore:beamCoverage`) and each range's own
+  members.
 - **Station identity** (#988): on a station collection, where the same
   position, radius or `/locations/{id}` response is also offered as EDR
   GeoJSON, the page names each coverage's location as that GeoJSON does: a
@@ -1095,16 +1121,29 @@ data explicitly.
 - **Size.** `/req/html/content` asks for all the response's information, so
   nothing is truncated and there is no HTML-only cap: the CoverageJSON caps
   (`MAX_AREA_VALUES`, `MAX_POSITION_VALUES`, `MAX_LOCATION_VALUES`, the cube
-  budget, all 1M values) bound the page, at about twice the JSON's bytes
-  plus the ~80 KB workbench shell. Like the CoverageJSON body, it is built
+  budget, all 1M values) bound the page, at about two to three times the
+  JSON's bytes (a rounded value's cell also carries its exact form) plus the
+  ~80 KB workbench shell. Like the CoverageJSON body, it is built
   from the response's JSON value with no admission of its own; it is written
   into one buffer reserved from the value count, so it never holds a second
   copy of the page or regrows by doubling.
-- **`/locations`**: the list as a table (id, label, geometry type, point,
-  `edrqueryendpoint`, and each feature's link with its relation, title and
-  type),
-  written into the GeoJSON's budgeted writer, so the same byte limit and
-  memory admission apply (over it: the same 503, page with `limit`).
+- **`/locations`**: 100 locations a page without `limit` (#1138), the table
+  first (label, id, point to 5 decimals with the exact value in `title`,
+  geometry type, `edrqueryendpoint`, and each feature's link with its
+  relation, title and type), a filter over the page's rows, the pager from
+  `prev`/`next`, and a map of the page's points; the request, links and
+  document members are folded below. Each label, and the
+  `edrqueryendpoint` cell's anchor, opens the location's data page at a
+  time it has data (`location_view_datetime`): the page's own `datetime`
+  filter when it has one, in which every listed location has data;
+  otherwise a station series' whole series, since the collection's last
+  day is not a station's and the CSV, BUFR and PostGIS engines answer a
+  window without a station's data with a 404; a forecast's latest run
+  whole; else the latest advertised time, so a radar volume site reads one
+  volume rather than every one it retains. Only the HTML links carry it,
+  never the GeoJSON's, and the cell's text stays the bare end point. Written into the
+  GeoJSON's budgeted writer, so the same byte limit and memory admission
+  apply (over it: the same 503, page with a smaller `limit`).
   `self`/`next`/`prev` link to their HTML pages.
 - **`items`**: a feature table (id, geometry, every property, every link
   with its relation, title and type),
@@ -1118,7 +1157,44 @@ data explicitly.
   anchors.
 
 HTML breadcrumbs use collection titles, including parent collection links on
-model-run lists and individual run metadata pages. IDs remain unchanged in URLs.
+model-run lists and individual run metadata pages, and name a data page's
+query (`Position query`, which opens its form) and run (`Run …`). IDs remain
+unchanged in URLs.
+
+### Query forms
+
+A position, area, radius, trajectory or cube request that asked for HTML
+(`f=html`, or an `Accept` ranking `text/html` first) and gives no
+coordinates (`coords`, a cube's `bbox`; empty counts as none) is answered
+with the query's form, status 200, instead of the 400 a JSON client still
+gets (#1138, `src/query_form.rs`, the `bare_query_form` middleware). The
+form is a GET form: coordinates prefilled with an example inside the
+collection's extent (its centre, the nearest station on a station
+collection, preferring one with data in the default window where the engine
+can tell from memory, `location_time_filter`; a point, a small square, a
+short path or a bbox), the advertised
+times as a select (the 500 newest, "All times" as the extent's `start/end`
+interval, never an empty `datetime`) or a text field when only an extent is
+known, `z` from the vertical extent, a checkbox per parameter (the first
+checked), `within`/`within-units` on radius, the formats the query offers
+(HTML first) and the URL it runs with a Copy button. Defaults keep the
+example cheap: one time (the advertised time nearest now) and the first
+level, except a position on a station collection, which reads the last
+24 hours of the extent (an observation table can hold years of one station,
+more than one response may carry), a position on a forecast run, which reads
+the run's whole series, and a position, cube or cross-section, which read
+every level. A run's form (`/instances/{id}/…`) offers that run's valid
+times. Without JavaScript the form still submits (the parameters as one
+comma-separated field; its empty `z` and `parameter-name` mean every level
+and every parameter); with it, empty fields are left out and the preview
+follows every change. A data page's form offers the formats its request
+does (a location list no PNG) and checks the parameters its request names,
+in any case, as the query matches them. Which requests get a form is read
+from the matched route, so a location or item whose id is `area` is that
+location or item. Its JSON switch opens the example as CoverageJSON. A
+request that names its coordinates, an unknown collection or run, or a query
+the collection does not offer goes to the handler as before. Every data page
+repeats its request as the same form, filled from the request.
 
 Collection advanced search starts closed and retains the user's open/closed
 choice across searches in the browser session. Resource URLs are clickable.

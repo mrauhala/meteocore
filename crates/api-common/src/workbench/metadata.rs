@@ -8,7 +8,7 @@
 //! secondary text. A member the page has no layout for is a collapsed
 //! nested list, still in full.
 
-use ds_core::html::escape;
+use ds_core::html::{display_coordinate, display_number, escape};
 use serde_json::{Map, Number, Value};
 
 use super::{
@@ -59,24 +59,12 @@ fn is_coordinate_key(key: &str) -> bool {
         .any(|suffix| key.ends_with(suffix))
 }
 
-/// A number's decimal text without trailing zeros (and `-0` as `0`).
-fn trim_decimals(text: String) -> String {
-    let text = if text.contains('.') {
-        text.trim_end_matches('0').trim_end_matches('.').to_owned()
-    } else {
-        text
-    };
-    if text == "-0" {
-        "0".into()
-    } else {
-        text
-    }
-}
-
 /// A JSON number as the workbench shows it: an integral float without its
 /// `.0` (`135`, not `135.0`), and the value of a latitude or longitude
 /// member (`key`) to at most 5 decimals, about a metre. The second value
-/// says whether the text is rounded.
+/// says whether the text is rounded. Both forms are ds-core's display rule
+/// (`display_number`, `display_coordinate`), which the EDR data pages use
+/// too (#1138), so a number has one form on every page.
 pub(super) fn number_text(key: &str, n: &Number) -> (String, bool) {
     if n.is_i64() || n.is_u64() {
         return (n.to_string(), false);
@@ -85,12 +73,12 @@ pub(super) fn number_text(key: &str, n: &Number) -> (String, bool) {
         return (n.to_string(), false);
     };
     if is_coordinate_key(key) {
-        let text = trim_decimals(format!("{f:.5}"));
+        let text = display_coordinate(f);
         let rounded = text.parse::<f64>().ok() != Some(f);
         return (text, rounded);
     }
     if f.fract() == 0.0 && f.abs() < 1e15 {
-        return (trim_decimals(format!("{f:.0}")), false);
+        return (display_number(f, 0), false);
     }
     (n.to_string(), false)
 }
@@ -739,8 +727,9 @@ fn takes_units(query_type: &str) -> bool {
 }
 
 /// A collection's `data_queries` as a table: each query's title and
-/// description with an anchor to it, its output formats (the default
-/// marked), CRS and units. The Units column is there only when a query
+/// description, the title an anchor to its HTML view (a query's form,
+/// #1138) and its own href an anchor beneath it, its output formats (the
+/// default marked), CRS and units. The Units column is there only when a query
 /// lists units or takes them; a query without unit parameters shows a dash
 /// in it, never "Not advertised".
 pub(super) fn data_queries_table(queries: &Map<String, Value>) -> String {
@@ -772,8 +761,9 @@ pub(super) fn data_queries_table(queries: &Map<String, Value>) -> String {
             .unwrap_or(name);
         let heading = match link["href"].as_str() {
             Some(href) => format!(
-                "{}<small class=\"secondary\"><code>{}</code></small>",
+                "{}<small class=\"secondary\"><a href=\"{}\"><code>{}</code></a></small>",
                 plain_anchor(&data_query_target(name, href), title),
+                escape(safe_href(href)),
                 escape(href)
             ),
             None => escape(title),

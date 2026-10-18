@@ -10,6 +10,7 @@ pub mod items;
 mod location_budget;
 pub mod params;
 pub(crate) mod plot_convert;
+mod query_form;
 pub mod response;
 
 use axum::routing::get;
@@ -65,6 +66,12 @@ pub fn router(state: AppState) -> Router {
             "/collections/{id}/instances/{instanceId}/cube",
             get(handlers::instance_cube_query),
         )
+        // A data query asked for as HTML without its coordinates is
+        // answered with its form (#1138), cached like any page.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            query_form::bare_query_form,
+        ))
         // Cache-Control + ETag/If-None-Match on every 200 (#499).
         .layer(axum::middleware::from_fn(caching::conditional_get))
         // What an HTML error page adds for a data query (#1132).

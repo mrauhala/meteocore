@@ -1186,6 +1186,17 @@ fn parse_z_value(part: &str) -> Result<f64, DataServerError> {
         })
 }
 
+/// The names a data query's `parameter-name` asks for, trimmed, in request
+/// order. An absent or blank value is `None`, every parameter, as a blank
+/// `z` is every level ([`parse_z`]): a browser submitting an EDR HTML form
+/// without JavaScript sends the empty field (#1138). Any other value is
+/// split as it is, so an empty name inside a list stays an unknown
+/// parameter.
+pub fn parse_parameter_names(raw: Option<&str>) -> Option<Vec<String>> {
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(raw.split(',').map(|name| name.trim().to_owned()).collect())
+}
+
 /// Parse the EDR `z` query parameter (EDR 1.2 `/req/edr/z-response`):
 ///
 /// - a level or a comma-separated list: `z=0.5`, `z=850,700,500`;
@@ -1883,6 +1894,24 @@ mod tests {
     fn parse_z_none_and_blank() {
         assert_eq!(parse_z(None).unwrap(), None);
         assert_eq!(parse_z(Some("   ")).unwrap(), None);
+    }
+
+    /// #1138: a blank `parameter-name`, what a form submitted without
+    /// JavaScript sends, is every parameter; a list keeps its names.
+    #[test]
+    fn a_blank_parameter_name_is_every_parameter() {
+        assert_eq!(parse_parameter_names(None), None);
+        assert_eq!(parse_parameter_names(Some("")), None);
+        assert_eq!(parse_parameter_names(Some("  ")), None);
+        assert_eq!(
+            parse_parameter_names(Some(" t2m , ws")),
+            Some(vec!["t2m".to_owned(), "ws".to_owned()])
+        );
+        // An empty name inside a list is still a name nobody advertises.
+        assert_eq!(
+            parse_parameter_names(Some("t2m,,ws")),
+            Some(vec!["t2m".to_owned(), String::new(), "ws".to_owned()])
+        );
     }
 
     #[test]

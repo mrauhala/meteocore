@@ -151,19 +151,62 @@ impl GeoJsonRequest {
     }
 
     /// This query's HTML page context (#971): its links as HTML, the
-    /// default format as the page's JSON switch.
-    fn html_page(&self) -> crate::html::DataPage<'_> {
+    /// default format as the page's JSON switch. The page says what and
+    /// where it answers, plots the result when the query offers a PNG of
+    /// it, and repeats the request as its form (#1138). Reads the engine,
+    /// so it is built on the query executor, after the query.
+    fn html_page(&self, result: &CoverageResponse) -> crate::html::DataPage<'_> {
         let segment = self.path.rsplit('/').next().unwrap_or_default();
-        let title = if self.path.contains("/locations/") {
+        let pairs = crate::query_form::query_pairs(self.raw_query.as_deref());
+        let location = self.path.contains("/locations/");
+        let query_type = if location { "locations" } else { segment };
+        let title = if location {
             let ids = percent_encoding::percent_decode_str(segment).decode_utf8_lossy();
-            format!("Location data: {ids}")
+            format!("Location {}", ids.replace(',', ", "))
         } else {
-            let mut query = segment.to_owned();
-            if let Some(first) = query.get_mut(..1) {
-                first.make_ascii_uppercase();
-            }
-            format!("{query} query")
+            crate::query_form::page_title(query_type, &pairs)
         };
+        // The model run the path names, if any.
+        let run = self
+            .path
+            .split_once("/instances/")
+            .and_then(|(_, rest)| rest.split('/').next())
+            .and_then(ds_core::instances::parse_instance_id)
+            .and_then(|rt| self.engine.find_instance(rt));
+        // Without one in the path the engine chooses (the latest run, or
+        // its own fallback across runs): the page does not guess which.
+        let mut facts = Vec::new();
+        match &run {
+            Some(run) => facts.push(("Model run".to_owned(), run.instance_id())),
+            None if self.engine.has_instances() => facts.push((
+                "Model run".to_owned(),
+                "The collection's default; choose one under Model runs".to_owned(),
+            )),
+            None => {}
+        }
+        if let Some((_, datetime)) = pairs
+            .iter()
+            .find(|(k, v)| k == "datetime" && !v.trim().is_empty())
+        {
+            facts.push(("Requested time".to_owned(), datetime.clone()));
+        }
+        // The query's PNG: a cross-section's heatmap, or a series or
+        // profile plot where the result has one.
+        let chart = (self.offered.contains(&EdrFormat::Png)
+            && (query_type == "trajectory" || crate::plot_convert::is_plottable(result)))
+        .then(|| crate::html::Chart {
+            src: self.url(EdrFormat::Png),
+            alt: format!("Plot of {}: {title}", plotted_parameters(result)),
+        });
+        let action = format!("{}/edr{}", self.base, self.path);
+        let form = crate::query_form::QueryForm::new(
+            self.engine.as_ref(),
+            query_type,
+            action,
+            run.as_ref(),
+        )
+        .offering(&self.offered)
+        .html(&pairs, false, "Change the request");
         crate::html::DataPage {
             base: &self.base,
             collection_id: &self.collection_id,
@@ -186,7 +229,30 @@ impl GeoJsonRequest {
                     title: l.title,
                 })
                 .collect(),
+            form: Some(form),
+            chart,
+            facts,
         }
+    }
+}
+
+/// The labels of a result's parameters, for a plot's alt text.
+fn plotted_parameters(result: &CoverageResponse) -> String {
+    let coverages = match result {
+        CoverageResponse::Single(q) => std::slice::from_ref(q),
+        CoverageResponse::Collection(v) => v.as_slice(),
+    };
+    let mut labels: Vec<&str> = coverages
+        .iter()
+        .flat_map(|q| q.parameters.values().map(|p| p.label.as_str()))
+        .filter(|label| !label.is_empty())
+        .collect();
+    labels.sort_unstable();
+    labels.dedup();
+    if labels.is_empty() {
+        "the parameters".to_owned()
+    } else {
+        labels.join(", ")
     }
 }
 
@@ -401,7 +467,7 @@ fn render_coverage_response(
             let locations = geojson.html_locations(&result, number_matched)?;
             Ok(crate::html::response(crate::html::coverage_page(
                 &result,
-                &geojson.html_page(),
+                &geojson.html_page(&result),
                 locations.as_ref(),
             )))
         }
@@ -552,7 +618,7 @@ fn negotiate(f: Option<&str>, headers: &HeaderMap) -> Result<ds_core::html::Want
 /// don't serve the JSON body to a client that asked for HTML (or vice versa).
 /// Uses `append` (not `insert`) so it never clobbers a `Vary` an upstream layer
 /// may have set (e.g. compression's `Vary: Accept-Encoding`).
-fn with_vary(mut resp: Response) -> Response {
+pub(crate) fn with_vary(mut resp: Response) -> Response {
     resp.headers_mut()
         .append(header::VARY, axum::http::HeaderValue::from_static("accept"));
     resp
@@ -1016,7 +1082,11 @@ fn data_format_parameter(formats: &[EdrFormat]) -> serde_json::Value {
                  or ' at its start, and before those or \" right after a ; in it, the quotes a \
                  client drops to read the data; a body over 64 MiB is a 400)"
             }
-            EdrFormat::Html => "HTML (a page of the response)",
+            EdrFormat::Html => {
+                "HTML (a page of the response; a position, area, radius, trajectory or cube \
+                 request for it without coords, or a cube's bbox, is answered with the \
+                 query's form)"
+            }
         })
         .collect();
     let names: Vec<&str> = formats.iter().map(|f| f.name()).collect();
@@ -1599,7 +1669,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "string"},
                     "style": "form",
                     "explode": false,
-                    "description": "Comma-separated list of parameter names to include"
+                    "description": "Comma-separated list of parameter names to include, matched ignoring case. Absent or empty: every parameter."
                 },
                 "z": {
                     "name": "z",
@@ -1752,7 +1822,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT},
                     "style": "form",
                     "explode": false,
-                    "description": format!("Page size of the location list, in the collection's inventory order. With limit the response carries numberMatched, numberReturned and self, next and prev links that repeat the other query parameters. Values above {MAX_LIMIT} are clamped to {MAX_LIMIT}; zero, negative and non-integer values are 400. Absent: the complete inventory in one response, without paging members.")
+                    "description": format!("Page size of the location list, in the collection's inventory order. With limit the response carries numberMatched, numberReturned and self, next and prev links that repeat the other query parameters. Values above {MAX_LIMIT} are clamped to {MAX_LIMIT}; zero, negative and non-integer values are 400. Absent: the complete inventory in one response, without paging members; the HTML page (f=html) lists {LOCATIONS_HTML_PAGE} locations a page instead.")
                 },
                 // The instances list's paging (#1006). EDR 1.2 gives
                 // `/instances` only `f`; these are the `/locations` pair.
@@ -2395,7 +2465,7 @@ pub async fn locations(
     let (engine, config) = lookup_collection(&state, &id)?;
     require_query_type(engine, &id, "locations", "location")?;
     let Query(pairs) = query.map_err(|_| bad_request_msg("Invalid query string"))?;
-    let request = parse_locations_query(pairs).map_err(|e| bad_request(&e))?;
+    let mut request = parse_locations_query(pairs).map_err(|e| bad_request(&e))?;
     let f = request
         .preserved
         .iter()
@@ -2404,6 +2474,15 @@ pub async fn locations(
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let format =
         negotiate_list_format(f, accept, "the location list").map_err(|e| bad_request(&e))?;
+    // The HTML page lists one page by default (#1138): a station network's
+    // whole inventory was a page of several megabytes. Its links carry the
+    // limit; the GeoJSON keeps its complete unpaged inventory.
+    if format.format == EdrFormat::Html && request.paging.is_none() {
+        request.paging = Some(crate::params::LocationsPaging {
+            limit: LOCATIONS_HTML_PAGE,
+            offset: 0,
+        });
+    }
     let collection_title = config.title.clone();
 
     let base_url = request_base_url(&state, &headers);
@@ -2523,7 +2602,22 @@ pub async fn locations(
                 &collection_title,
             );
             let counts = number_matched.map(|matched| (matched, page_locs.len()));
-            crate::html::write_locations(page_locs, &ctx, &page, counts, &mut writer)
+            // The filter as the request spelled it: the data query reads
+            // the same grammar (`parse_datetime`).
+            let filter = request
+                .datetime
+                .as_ref()
+                .and_then(|_| request.preserved.iter().find(|(name, _)| name == "datetime"))
+                .map(|(_, value)| value.as_str());
+            let view = location_view_datetime(query_engine.as_ref(), filter);
+            crate::html::write_locations(
+                page_locs,
+                &ctx,
+                &page,
+                counts,
+                view.as_deref(),
+                &mut writer,
+            )
         } else {
             let page = (!links.is_empty()).then_some(LocationsPage {
                 number_matched,
@@ -2567,6 +2661,33 @@ pub async fn locations(
     ))
 }
 
+/// The locations an HTML `/locations` page lists when the request gives no
+/// `limit` (#1138).
+pub(crate) const LOCATIONS_HTML_PAGE: usize = 100;
+
+/// The `datetime` an HTML `/locations` row's data page opens at (#1138).
+/// The JSON links carry none.
+///
+/// - The page's own `datetime` filter (#932), verbatim: each listed
+///   location has data in it, so its page does too, and a station series
+///   answers a window without data with a 404.
+/// - Else none on a forecast (the latest run's whole series) and on a
+///   station series: the collection's last day is not a station's, which
+///   may have stopped reporting long before. Its whole series is bounded
+///   by the engine's response budget, as it was before #1138.
+/// - Else the latest advertised time, so a radar volume site reads one
+///   volume instead of every one it retains.
+fn location_view_datetime(engine: &dyn EdrEngine, filter: Option<&str>) -> Option<String> {
+    if let Some(filter) = filter {
+        return Some(filter.to_owned());
+    }
+    if engine.has_instances() || engine.serves_station_series() {
+        return None;
+    }
+    let (_, end) = engine.get_temporal_extent()?;
+    Some(end.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+}
+
 /// The `/locations` HTML page's context (#971): the GeoJSON's `self`,
 /// `next` and `prev` links as HTML pages, the GeoJSON as `alternate`.
 fn locations_html_page<'a>(
@@ -2608,6 +2729,7 @@ fn locations_html_page<'a>(
         raw_query,
         json_url,
         links: page_links,
+        ..Default::default()
     }
 }
 
@@ -2675,10 +2797,7 @@ pub async fn location_query(
         }
     }
 
-    let param_names: Option<Vec<String>> = params
-        .parameter_name
-        .as_deref()
-        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+    let param_names = crate::params::parse_parameter_names(params.parameter_name.as_deref());
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
     let limit = request_limit(params.limit.as_deref(), format.format)?;
@@ -2991,10 +3110,7 @@ async fn run_position_query(
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
 
-    let param_names: Option<Vec<String>> = params
-        .parameter_name
-        .as_deref()
-        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+    let param_names = crate::params::parse_parameter_names(params.parameter_name.as_deref());
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
 
@@ -3194,10 +3310,7 @@ async fn run_area_query(
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
 
-    let param_names: Option<Vec<String>> = params
-        .parameter_name
-        .as_deref()
-        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+    let param_names = crate::params::parse_parameter_names(params.parameter_name.as_deref());
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
     let limit = request_limit(params.limit.as_deref(), format.format)?;
@@ -3307,10 +3420,7 @@ async fn run_radius_query(
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
 
-    let param_names: Option<Vec<String>> = params
-        .parameter_name
-        .as_deref()
-        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+    let param_names = crate::params::parse_parameter_names(params.parameter_name.as_deref());
 
     let z = resolve_request_z(engine, params.z.as_deref())?;
     let limit = request_limit(params.limit.as_deref(), format.format)?;
@@ -3446,10 +3556,7 @@ async fn run_cube_query(
     // L): a cube is one Grid coverage, which it leaves unchanged.
     let limit = request_limit(params.limit.as_deref(), format.format)?;
 
-    let param_names: Option<Vec<String>> = params
-        .parameter_name
-        .as_deref()
-        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+    let param_names = crate::params::parse_parameter_names(params.parameter_name.as_deref());
 
     // An explicit `z` overrides the vertical pair of a six-number bbox; on
     // a collection without a vertical dimension both are ignored, as `z`
@@ -3536,10 +3643,7 @@ pub async fn trajectory_query(
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
 
-    let param_names: Option<Vec<String>> = params
-        .parameter_name
-        .as_deref()
-        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+    let param_names = crate::params::parse_parameter_names(params.parameter_name.as_deref());
 
     // `z` selects levels from the collection's advertised vertical extent:
     // elevation angles bounding a radar cross-section's sweeps, or the
@@ -3605,7 +3709,8 @@ pub async fn trajectory_query(
         )
         .map_err(|e| map_query_error(&e, "Trajectory"))?;
         let result = limit_coverages(result, limit);
-        let html = page.map(|page| crate::html::coverage_page(&result, &page.html_page(), None));
+        let html =
+            page.map(|page| crate::html::coverage_page(&result, &page.html_page(&result), None));
         Ok((result, html))
     })
     .await?;
@@ -3703,7 +3808,7 @@ fn temporal_extent_json(
 /// collection add GeoJSON (#929), those and its area add CSV (#1066), and
 /// only a radar cross-section trajectory renders as a PNG — an along-path
 /// one (#926) is CoverageJSON only.
-fn data_query_variables(
+pub(crate) fn data_query_variables(
     query_type: &str,
     station_series: bool,
     trajectory: TrajectoryShape,

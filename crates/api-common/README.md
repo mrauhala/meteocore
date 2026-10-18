@@ -201,7 +201,9 @@ a JSON `null` in the nested member lists shows as `null`, and a data query
 without unit parameters shows a dash for its units.
 Numbers follow one display rule (`property_value_html`): an integral float
 without `.0`, a latitude or longitude property to 5 decimals with the exact
-value in the `title`. `i18n_text` and `unit_text` are shared with api-edr.
+value in the `title`. Both forms come from `ds_core::html`'s formatter
+(`display_number`, `display_coordinate`), which the EDR data pages use too
+(#1138). `i18n_text` and `unit_text` are shared with api-edr.
 The conformance page groups classes by standard and version
 (`workbench/conformance.rs`).
 
@@ -277,8 +279,13 @@ from the query response and wrapped in this shell (`Page`).
 
 Every EDR `data_queries` link is an anchor (`data_query_links`): on the
 collection and instance pages, in catalog rows and under each model run.
-Instances, locations and items link to their HTML view; parameterised queries
-link to their endpoint, next to the API reference button.
+Each links to its end point's HTML view (`data_query_target`, the one place
+that chooses it): instances, locations and items their lists, parameterised
+queries their query form, which api-edr answers when the request gives no
+coordinates (#1138); the API reference button stays beside them. In the
+collection page's data-queries table the title opens that view and the
+query's href, printed beneath it, is an anchor to itself, so every href of
+the collection JSON stays an anchor (#1140).
 
 Links are rendered in full (`link_table`, OGC API - EDR `/req/html/content`,
 #984): the landing page's "API definitions & resource links" and the collection
