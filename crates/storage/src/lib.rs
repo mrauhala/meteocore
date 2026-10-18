@@ -497,15 +497,20 @@ impl DataStore {
     /// CLAUDE.md Critical Rule 9, #999). The caller bounds how many it
     /// starts, and with them how many objects it holds.
     ///
-    /// The read is limited like [`Self::get_opt`]: by the request deadline
-    /// in scope on the calling thread, which the task carries, else by
-    /// [`FetchBudget::Request`]. A deadline that has already passed fails
-    /// the read without sending it.
+    /// Several threads can wait for one read (#1127): share the
+    /// [`PendingGet`] behind an `Arc`, and the read runs until it finishes
+    /// or the last holder drops it. So the read is limited by
+    /// [`FetchBudget::Request`] alone, and each [`PendingGet::wait`] by the
+    /// request deadline in scope on the waiting thread: one request's
+    /// deadline ends its own wait, never the read another request waits on.
+    /// A deadline that has already passed when the read is asked for fails
+    /// it without sending it.
     ///
     /// `handle` must be a multi-thread runtime: a current-thread runtime
     /// runs the task only while something drives it, so the reads would not
     /// progress while the caller works.
     pub fn start_get_opt(&self, path: &ObjectPath, handle: &tokio::runtime::Handle) -> PendingGet {
+        use futures::FutureExt;
         debug_assert_eq!(
             handle.runtime_flavor(),
             tokio::runtime::RuntimeFlavor::MultiThread,
@@ -517,11 +522,10 @@ impl DataStore {
                 read: PendingRead::Expired,
             };
         }
-        let deadline = ds_core::deadline::current();
         let store = self.clone();
         let object = path.clone();
         let task = handle.spawn(async move {
-            let result = within(FetchBudget::Request, deadline, async {
+            let result = within(FetchBudget::Request, None, async {
                 store
                     .whole_opt(&object)
                     .await
@@ -535,9 +539,21 @@ impl DataStore {
             }
             Ok(result)
         });
+        let abort = task.abort_handle();
+        let result = async move {
+            match task.await {
+                Ok(Ok(bytes)) => Ok(bytes),
+                Ok(Err(DataServerError::Storage(e))) => Err(e),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("read task failed: {e}")),
+            }
+        };
         PendingGet {
             path: path.clone(),
-            read: PendingRead::Running(task),
+            read: PendingRead::Running {
+                result: result.boxed().shared(),
+                abort,
+            },
         }
     }
 
@@ -931,24 +947,36 @@ fn block_on_ambient<F: std::future::Future>(future: F) -> Result<F::Output, Data
 
 /// A whole-object read running on a runtime ahead of the synchronous code
 /// that needs its bytes, from [`DataStore::start_get_opt`]. Collect it with
-/// [`Self::wait`]; dropping it unread aborts the read.
+/// [`Self::wait`], from as many threads as hold it (#1127); dropping it
+/// aborts the read, so its last holder going away unread stops it.
 #[must_use = "dropping a PendingGet aborts its read"]
 pub struct PendingGet {
     path: ObjectPath,
     read: PendingRead,
 }
 
+/// What a started read ends with, cloned to each waiter: the bytes, `None`
+/// for a missing object, or the failure's message. Every failure of the
+/// read itself is a [`DataServerError::Storage`], which is not `Clone`.
+type ReadOutcome = Result<Option<Bytes>, String>;
+
 enum PendingRead {
     /// The request deadline had passed when the read was asked for, so it
     /// was never sent.
     Expired,
-    Running(tokio::task::JoinHandle<Result<Option<Bytes>, DataServerError>>),
+    Running {
+        /// The task's outcome, which every waiter polls.
+        result: futures::future::Shared<futures::future::BoxFuture<'static, ReadOutcome>>,
+        abort: tokio::task::AbortHandle,
+    },
 }
 
 impl PendingGet {
     /// Wait for the read and return what [`DataStore::get_opt`] would have:
-    /// `Ok(None)` for a missing object, and `Err` for every other failure,
-    /// the request deadline as `DeadlineExceeded`.
+    /// `Ok(None)` for a missing object, and `Err` for every other failure.
+    /// The wait is limited by the request deadline in scope on this thread,
+    /// `DeadlineExceeded` when it passes; the read goes on for any other
+    /// holder.
     ///
     /// `handle` picks the bridge by the caller's context, as
     /// [`DataStore::get_opt_on`] and [`DataStore::get_opt`] do: `Some` drives
@@ -956,25 +984,44 @@ impl PendingGet {
     /// foreign thread; `None` uses `block_in_place` around the ambient
     /// runtime, for a multi-thread runtime worker.
     pub fn wait(
-        mut self,
+        &self,
         handle: Option<&tokio::runtime::Handle>,
     ) -> Result<Option<Bytes>, DataServerError> {
-        let task = match &mut self.read {
+        let result = match &self.read {
             PendingRead::Expired => return Err(DataServerError::DeadlineExceeded),
-            PendingRead::Running(task) => task,
+            PendingRead::Running { result, .. } => result.clone(),
         };
-        let joined = match handle {
-            Some(handle) => handle.block_on(task),
-            None => block_on_ambient(task)?,
+        let deadline = ds_core::deadline::current();
+        let waited = async move {
+            match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline.into(), result)
+                    .await
+                    .map_err(|_| DataServerError::DeadlineExceeded),
+                None => Ok(result.await),
+            }
         };
-        joined.unwrap_or_else(|e| Err(DataServerError::Storage(format!("read task failed: {e}"))))
+        let outcome = match handle {
+            Some(handle) => handle.block_on(waited),
+            None => block_on_ambient(waited)?,
+        }?;
+        outcome.map_err(DataServerError::Storage)
+    }
+
+    /// Whether the read is known to have failed: it ended with an error a
+    /// waiter has seen, or it was never sent. A caller that wants the object
+    /// starts another read rather than waiting for this one.
+    pub fn failed(&self) -> bool {
+        match &self.read {
+            PendingRead::Expired => true,
+            PendingRead::Running { result, .. } => matches!(result.peek(), Some(Err(_))),
+        }
     }
 }
 
 impl Drop for PendingGet {
     fn drop(&mut self) {
-        if let PendingRead::Running(task) = &self.read {
-            task.abort();
+        if let PendingRead::Running { abort, .. } = &self.read {
+            abort.abort();
         }
     }
 }
@@ -1638,10 +1685,12 @@ mod deadline_tests {
 
     /// #999: reads started with `start_get_opt` run concurrently on the
     /// runtime and are collected in any order; a missing object stays
-    /// `Ok(None)`, apart from a failed read; and each read carries the request
-    /// deadline of the thread that started it, one already past never sent.
+    /// `Ok(None)`, apart from a failed read, which `failed` reports. #1127:
+    /// threads holding one read share its GET; a waiter's deadline ends its
+    /// own wait, not the read; and a read asked for past the deadline is
+    /// never sent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn started_reads_overlap_and_carry_the_starting_deadline() {
+    async fn started_reads_overlap_are_shared_and_waits_keep_their_own_deadline() {
         use crate::test_store::MetaStore;
         use std::time::{Duration, Instant};
         let meta = Arc::new(MetaStore {
@@ -1662,7 +1711,7 @@ mod deadline_tests {
                 .map(start)
                 .collect();
             let mut results: Vec<_> = reads
-                .into_iter()
+                .iter()
                 .rev()
                 .map(|read| read.wait(Some(&handle)))
                 .collect();
@@ -1681,22 +1730,48 @@ mod deadline_tests {
                 "a failed read is an error, not a missing object: {:?}",
                 results[4]
             );
+            let failed: Vec<_> = reads.iter().map(PendingGet::failed).collect();
+            assert_eq!(failed, [false, false, false, false, true]);
+            drop(reads);
 
-            let _scope = ds_core::deadline::enter(Some(Instant::now() + Duration::from_millis(50)));
+            meta.gets.store(0, Ordering::SeqCst);
             let read = start("a");
+            std::thread::scope(|scope| {
+                for _ in 0..3 {
+                    scope.spawn(|| {
+                        assert_eq!(read.wait(Some(&handle)).unwrap().as_deref(), Some(&b""[..]));
+                    });
+                }
+            });
+            assert_eq!(
+                meta.gets.load(Ordering::SeqCst),
+                1,
+                "three waiters, one GET"
+            );
+
+            let read = start("b");
+            let scope = ds_core::deadline::enter(Some(Instant::now() + Duration::from_millis(50)));
             assert!(matches!(
                 read.wait(Some(&handle)),
                 Err(DataServerError::DeadlineExceeded)
             ));
-            meta.peak.store(0, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(60));
+            drop(scope);
+            assert_eq!(
+                read.wait(Some(&handle)).unwrap().as_deref(),
+                Some(&b""[..]),
+                "the read went on past the first waiter's deadline"
+            );
+
+            meta.gets.store(0, Ordering::SeqCst);
+            let _scope = ds_core::deadline::enter(Some(Instant::now()));
             let read = start("a");
+            assert!(read.failed(), "an expired read is not joined");
             assert!(matches!(
                 read.wait(Some(&handle)),
                 Err(DataServerError::DeadlineExceeded)
             ));
             assert_eq!(
-                meta.peak.load(Ordering::SeqCst),
+                meta.gets.load(Ordering::SeqCst),
                 0,
                 "an expired read is not sent"
             );

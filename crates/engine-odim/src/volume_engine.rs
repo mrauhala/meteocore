@@ -560,10 +560,11 @@ impl PixelReadError {
     }
 }
 
-/// Per-file count of volume file downloads, [`fetch_file_bytes`] calls and
-/// the reads a walk starts ahead (`Pixels::start_read`), so tests can pin
-/// how many times one request downloads a volume file (#994) and that a
-/// walk read it ahead (#999).
+/// Per-file count of volume file downloads started: [`fetch_file_bytes`]
+/// reads of its own, and the shared remote reads a request starts rather
+/// than joins ([`RemoteRead::start`]); and of those a walk started ahead
+/// (`Pixels::start_read`). Tests pin with them how many times a volume file
+/// is downloaded (#994, #1127) and that a walk read it ahead (#999).
 #[cfg(test)]
 mod file_fetches {
     use std::collections::HashMap;
@@ -595,10 +596,9 @@ mod file_fetches {
         bump(&FETCHES, file_id);
     }
 
-    /// A download a walk started ahead of reaching the file: counted as a
-    /// fetch, and as read ahead.
+    /// A download a walk started ahead of reaching the file, already
+    /// counted as a fetch.
     pub(super) fn record_ahead(file_id: &str) {
-        bump(&FETCHES, file_id);
         bump(&AHEAD, file_id);
     }
 
@@ -614,46 +614,144 @@ mod file_fetches {
 /// Re-fetch one volume file's raw bytes by its [`FileId`] — a local path
 /// read or an S3 `get`. Used by the lazy pixel reader on a cache miss.
 ///
-/// `handle` picks the async→sync bridge for a remote fetch by the caller's
-/// runtime context (see [`Pixels::handle`]): `Some(handle)` drives the fetch
-/// via `handle.block_on` (valid on a `spawn_blocking` pool thread, where
+/// A remote file is read as a [`RemoteRead`] on the runtime
+/// [`shared_read_runtime`] picks, so the miss joins another request's
+/// download of the file, or registers its own for others to join (#1127).
+/// On a thread with no multi-thread runtime it is read in place, unshared,
+/// and `handle` picks the async→sync bridge by the caller's runtime context
+/// (see [`Pixels::handle`]): `Some(handle)` drives the fetch via
+/// `handle.block_on` (valid on a `spawn_blocking` pool thread, where
 /// `block_in_place` *panics*); `None` uses the plain `DataStore::get_opt`,
-/// whose `block_in_place` is valid on a multi-thread runtime worker. A local read
-/// never touches a runtime, so the handle is irrelevant there.
+/// whose `block_in_place` is valid on a multi-thread runtime worker. A local
+/// read never touches a runtime, so the handle is irrelevant there.
 ///
 /// A missing file or object is [`PixelReadError::Bad`]; a deadline or any
 /// other storage failure is [`PixelReadError::Abort`] (#993).
-fn fetch_file_bytes(
-    source: &Source,
-    file_id: &str,
+///
+/// The shared read comes back with the bytes: hold it until they are
+/// decoded, so that a request needing the file meanwhile joins it.
+fn fetch_file_bytes<'a>(
+    source: &'a Source,
+    file_id: &'a str,
     handle: Option<&tokio::runtime::Handle>,
-) -> Result<Bytes, PixelReadError> {
-    #[cfg(test)]
-    file_fetches::record(file_id);
+) -> Result<(Bytes, Option<RemoteRead<'a>>), PixelReadError> {
     match source {
-        Source::Local { .. } => std::fs::read(file_id).map(Bytes::from).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                PixelReadError::Bad(format!("read `{file_id}`: {e}"))
-            } else {
-                PixelReadError::from_storage(file_id, DataServerError::Io(e))
-            }
-        }),
+        Source::Local { .. } => {
+            #[cfg(test)]
+            file_fetches::record(file_id);
+            let bytes = std::fs::read(file_id).map(Bytes::from).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    PixelReadError::Bad(format!("read `{file_id}`: {e}"))
+                } else {
+                    PixelReadError::from_storage(file_id, DataServerError::Io(e))
+                }
+            })?;
+            Ok((bytes, None))
+        }
         Source::Remote { store, .. } => {
+            if let Some(runtime) = shared_read_runtime(handle) {
+                let cache_id = pixel_cache_id(source, file_id).into_owned();
+                let mut read = RemoteRead::start(store, cache_id, file_id, runtime);
+                return Ok((read.wait(handle)?, Some(read)));
+            }
+            #[cfg(test)]
+            file_fetches::record(file_id);
             use ds_storage::object_store::path::Path as ObjectPath;
             let object = ObjectPath::from(file_id);
             let bytes = match handle {
                 Some(h) => store.get_opt_on(&object, h),
                 None => store.get_opt(&object),
             };
-            classify_remote_read(file_id, bytes)
+            Ok((classify_remote_read(file_id, bytes)?, None))
         }
     }
 }
 
+/// The runtime a remote volume read runs on as a task, so that other
+/// requests can join it (#1127): the explicit handle on a blocking-pool
+/// worker, else the runtime whose worker runs the caller (the query
+/// runtime for EDR). `None` on a thread with no multi-thread runtime: a
+/// current-thread runtime would not drive the read while its requests wait.
+fn shared_read_runtime(handle: Option<&tokio::runtime::Handle>) -> Option<tokio::runtime::Handle> {
+    handle
+        .cloned()
+        .or_else(|| tokio::runtime::Handle::try_current().ok())
+        .filter(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+}
+
+/// A remote volume file download that a request waits on (#1127): one it
+/// started, or another request's that it joined through [`PixelCache`]'s
+/// registry, so requests that need one file at once share one GET: walks
+/// reading ahead ([`walk_volumes`]) and misses inside the per-file lock
+/// ([`fetch_file_bytes`]) alike. Holding it keeps the read joinable, so
+/// each holds it until the file's moments are decoded.
+struct RemoteRead<'a> {
+    store: &'a ds_storage::DataStore,
+    file_id: &'a str,
+    cache_id: String,
+    runtime: tokio::runtime::Handle,
+    read: crate::pixel_cache::VolumeRead,
+}
+
+impl<'a> RemoteRead<'a> {
+    /// Join the download of `file_id` another request holds, or start one
+    /// on `runtime` that later requests join. `cache_id` is the file's
+    /// [`pixel_cache_id`], which keys the registry.
+    fn start(
+        store: &'a ds_storage::DataStore,
+        cache_id: String,
+        file_id: &'a str,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        let read =
+            PIXEL_CACHE.join_or_start_read(&cache_id, || start_get(store, file_id, &runtime));
+        RemoteRead {
+            store,
+            file_id,
+            cache_id,
+            runtime,
+            read,
+        }
+    }
+
+    /// Wait for the download, within this thread's request deadline, and
+    /// classify it as [`fetch_file_bytes`] classifies its own (#993). A
+    /// joined read that failed is the failure of the request that started
+    /// it: this one reads once more, starting its own read or joining one
+    /// started since, as a miss inside the per-file lock reads again after
+    /// another's failed load.
+    fn wait(&mut self, handle: Option<&tokio::runtime::Handle>) -> Result<Bytes, PixelReadError> {
+        let mut bytes = self.read.read.wait(handle);
+        if self.read.joined && matches!(bytes, Err(DataServerError::Storage(_))) {
+            tracing::debug!(
+                "PVOL download of `{}` this request joined failed; reading again",
+                self.file_id
+            );
+            let (store, file_id, runtime) = (self.store, self.file_id, &self.runtime);
+            self.read = PIXEL_CACHE
+                .join_or_start_read(&self.cache_id, || start_get(store, file_id, runtime));
+            bytes = self.read.read.wait(handle);
+        }
+        classify_remote_read(self.file_id, bytes)
+    }
+}
+
+/// Start downloading the remote `file_id` on `runtime` for a [`RemoteRead`].
+fn start_get(
+    store: &ds_storage::DataStore,
+    file_id: &str,
+    runtime: &tokio::runtime::Handle,
+) -> ds_storage::PendingGet {
+    #[cfg(test)]
+    file_fetches::record(file_id);
+    let object = ds_storage::object_store::path::Path::from(file_id);
+    store.start_get_opt(&object, runtime)
+}
+
 /// A remote whole-file read as the pixel reader sees it (#993): a missing
 /// object is unusable data, any other failure the request's. Shared by
-/// [`fetch_file_bytes`] and a walk's read-ahead ([`Pixels::finish_read`]),
-/// so both classify alike.
+/// [`fetch_file_bytes`]'s unshared read and [`RemoteRead::wait`], so both
+/// classify alike.
 fn classify_remote_read(
     file_id: &str,
     read: Result<Option<Bytes>, DataServerError>,
@@ -966,10 +1064,17 @@ impl<'a> Pixels<'a> {
             return Ok(MomentPixels::new());
         }
         let (pixels, failures) = PIXEL_CACHE.load_many(&cache_id, &requests, |missing, held| {
+            // Held until the moments are decoded (#1127).
+            let mut download = None;
             let bytes = match (held, fetched) {
                 (Some(bytes), _) => Ok(bytes),
                 (None, Some(fetched)) => fetched,
-                (None, None) => fetch_file_bytes(self.source, file_id, self.handle),
+                (None, None) => {
+                    fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
+                        download = read;
+                        bytes
+                    })
+                }
             };
             let decoded = bytes.and_then(|bytes| {
                 crate::pvol::read_moments_pixels(&bytes, missing.iter().copied())
@@ -999,7 +1104,7 @@ impl<'a> Pixels<'a> {
     /// Sample through [`Self::batched`] with the result.
     ///
     /// `fetched` is the file's download when the walk started it ahead
-    /// ([`Self::start_read`], collected by [`Self::finish_read`]; #999), else
+    /// ([`Self::start_read`], collected by [`RemoteRead::wait`]; #999), else
     /// `None` and the batch downloads it if it needs it.
     fn prefetch<'v>(
         &self,
@@ -1028,22 +1133,23 @@ impl<'a> Pixels<'a> {
         if volumes < 2 || self.moments.is_some() || !matches!(self.source, Source::Remote { .. }) {
             return None;
         }
-        self.handle
-            .cloned()
-            .or_else(|| tokio::runtime::Handle::try_current().ok())
-            .filter(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        shared_read_runtime(self.handle)
     }
 
-    /// Start downloading the remote `file_id` on `runtime` when the batch
-    /// for `targets` will read it: some target is neither resident nor known
-    /// bad, and no background sibling decode holds the file's bytes. `None`
-    /// when nothing needs downloading, and for a local source.
-    fn start_read(
+    /// Download the remote `file_id` on `runtime` when the batch for
+    /// `targets` will read it: some target is neither resident nor known
+    /// bad, and no background sibling decode holds the file's bytes. Another
+    /// request's download of the file is joined, not repeated (#1127).
+    /// `None` when nothing needs downloading, and for a local source.
+    fn start_read<'r>(
         &self,
-        file_id: &str,
+        file_id: &'r str,
         targets: &[(&Sweep, &PolarMoment)],
         runtime: &tokio::runtime::Handle,
-    ) -> Option<ds_storage::PendingGet> {
+    ) -> Option<RemoteRead<'r>>
+    where
+        'a: 'r,
+    {
         let Source::Remote { store, .. } = self.source else {
             return None;
         };
@@ -1055,20 +1161,12 @@ impl<'a> Pixels<'a> {
         if !cold || PIXEL_CACHE.held_bytes(&cache_id).is_some() {
             return None;
         }
+        let read = RemoteRead::start(store, cache_id.into_owned(), file_id, runtime.clone());
         #[cfg(test)]
-        file_fetches::record_ahead(file_id);
-        let object = ds_storage::object_store::path::Path::from(file_id);
-        Some(store.start_get_opt(&object, runtime))
-    }
-
-    /// Wait for a download [`Self::start_read`] started, classified exactly
-    /// as [`fetch_file_bytes`] classifies its own (#993).
-    fn finish_read(
-        &self,
-        file_id: &str,
-        read: ds_storage::PendingGet,
-    ) -> Result<Bytes, PixelReadError> {
-        classify_remote_read(file_id, read.wait(self.handle))
+        if !read.read.joined {
+            file_fetches::record_ahead(file_id);
+        }
+        Some(read)
     }
 
     /// This context reading from `batch` (a [`Self::prefetch`] result) when
@@ -1156,9 +1254,14 @@ impl<'a> Pixels<'a> {
                 return Ok(None);
             }
             PIXEL_CACHE.record_miss();
+            // Held until the moment is decoded and cached (#1127).
+            let mut download = None;
             let bytes = match held {
                 Some(bytes) => Ok(bytes),
-                None => fetch_file_bytes(self.source, file_id, self.handle),
+                None => fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
+                    download = read;
+                    bytes
+                }),
             };
             let decoded = bytes.and_then(|bytes| {
                 let path = moment.dataset_path.as_str();
@@ -3152,17 +3255,19 @@ fn level_target<'v>(
 /// remote files among them that the batch will read are downloaded
 /// concurrently on the runtime ([`Pixels::read_ahead_runtime`]) through
 /// `ds_storage`'s started reads — async tasks, never a thread per file
-/// (root CLAUDE.md Critical Rules 7 and 9). Each volume is still decoded and
-/// sampled on the caller's thread, in order, from the same batch as a
-/// sequential walk reads, and dropped before the next download starts, so
-/// the results are the sequential walk's and at most that many volumes are
-/// fetched or decoded at once.
+/// (root CLAUDE.md Critical Rules 7 and 9). A file another request is
+/// downloading is joined instead ([`RemoteRead`], #1127). Each volume is
+/// still decoded and sampled on the caller's thread, in order, from the same
+/// batch as a sequential walk reads, and dropped before the next download
+/// starts, so the results are the sequential walk's and at most that many
+/// volumes are fetched or decoded at once.
 ///
 /// The first error ends the walk and is its result, as before (#993): the
-/// request deadline, checked before each volume and carried by every
-/// download, or a transient read failure. Downloads still running are
-/// aborted, and no volume after the failing one is decoded or marked bad. A
-/// missing object stays unusable data: nodata, negatively cached (#996).
+/// request deadline, checked before each volume and bounding every wait for
+/// a download, or a transient read failure. Downloads still running are
+/// dropped, which aborts those no other request holds, and no volume after
+/// the failing one is decoded or marked bad. A missing object stays
+/// unusable data: nodata, negatively cached (#996).
 fn walk_volumes<'v, S, T>(
     pix: Pixels,
     entries: &[&'v VolumeEntry],
@@ -3189,11 +3294,15 @@ fn walk_volumes<'v, S, T>(
                 .and_then(|runtime| pix.start_read(&entry.id, &targets, runtime));
             ahead.push_back((entry, targets, state, read));
         }
-        let Some((entry, targets, state, read)) = ahead.pop_front() else {
+        let Some((entry, targets, state, mut read)) = ahead.pop_front() else {
             break;
         };
-        let fetched = read.map(|read| pix.finish_read(&entry.id, read));
+        // The download stays joinable until its moments are decoded, so a
+        // request that needs the file meanwhile does not download it again
+        // (#1127).
+        let fetched = read.as_mut().map(|read| read.wait(pix.handle));
         let batch = pix.prefetch(&entry.id, targets, fetched)?;
+        drop(read);
         out.push(sample(entry, state, pix.batched(&batch))?);
     }
     Ok(out)
@@ -7408,15 +7517,133 @@ mod tests {
     /// VRAD; every gate a value out to 8 km).
     const COLD_BATCH: &[u8] = include_bytes!("../../../testdata/pvol-cold-batch.h5");
 
-    /// A remote source whose every GET first waits `delay` (object_store's
-    /// `ThrottledStore` over an in-memory store), and `n` catalog entries
-    /// five minutes apart, each the cold-batch fixture under a key of its
-    /// own. The entry at `missing` is catalogued but absent from the store.
+    /// [`counted_remote_volumes`] without the store's counts.
     fn throttled_remote_volumes(
         n: usize,
         delay: Duration,
         missing: Option<usize>,
     ) -> (Arc<Source>, Arc<Vec<VolumeEntry>>) {
+        let (source, volumes, _) = counted_remote_volumes(n, delay, missing);
+        (source, volumes)
+    }
+
+    /// An object store that counts the GETs of each key it is asked for
+    /// (#1127), and fails the first GET of each key in `fail_first` once
+    /// the store under it has answered: the read then takes its full time.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: Arc<dyn ds_storage::object_store::ObjectStore>,
+        gets: Mutex<HashMap<String, usize>>,
+        fail_first: Mutex<std::collections::HashSet<String>>,
+    }
+
+    impl CountingStore {
+        /// The GETs of the volume file `file_id` so far.
+        fn gets(&self, file_id: &str) -> usize {
+            let key = ds_storage::object_store::path::Path::from(file_id).to_string();
+            self.gets.lock().unwrap().get(&key).copied().unwrap_or(0)
+        }
+
+        /// Fail the next GET of the volume file `file_id`.
+        fn fail_next(&self, file_id: &str) {
+            let key = ds_storage::object_store::path::Path::from(file_id).to_string();
+            self.fail_first.lock().unwrap().insert(key);
+        }
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ds_storage::object_store::ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &ds_storage::object_store::path::Path,
+            payload: ds_storage::object_store::PutPayload,
+            options: ds_storage::object_store::PutOptions,
+        ) -> ds_storage::object_store::Result<ds_storage::object_store::PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ds_storage::object_store::path::Path,
+            options: ds_storage::object_store::PutMultipartOptions,
+        ) -> ds_storage::object_store::Result<Box<dyn ds_storage::object_store::MultipartUpload>>
+        {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ds_storage::object_store::path::Path,
+            options: ds_storage::object_store::GetOptions,
+        ) -> ds_storage::object_store::Result<ds_storage::object_store::GetResult> {
+            let key = location.to_string();
+            *self.gets.lock().unwrap().entry(key.clone()).or_default() += 1;
+            let result = self.inner.get_opts(location, options).await;
+            if self.fail_first.lock().unwrap().remove(&key) {
+                return Err(ds_storage::object_store::Error::Generic {
+                    store: "CountingStore",
+                    source: "server unavailable".into(),
+                });
+            }
+            result
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                ds_storage::object_store::Result<ds_storage::object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<
+            'static,
+            ds_storage::object_store::Result<ds_storage::object_store::path::Path>,
+        > {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ds_storage::object_store::path::Path>,
+        ) -> futures::stream::BoxStream<
+            'static,
+            ds_storage::object_store::Result<ds_storage::object_store::ObjectMeta>,
+        > {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ds_storage::object_store::path::Path>,
+        ) -> ds_storage::object_store::Result<ds_storage::object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ds_storage::object_store::path::Path,
+            to: &ds_storage::object_store::path::Path,
+            options: ds_storage::object_store::CopyOptions,
+        ) -> ds_storage::object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A remote source whose every GET first waits `delay` (object_store's
+    /// `ThrottledStore` over an in-memory store) and is counted above that
+    /// ([`CountingStore`]), and `n` catalog entries five minutes apart, each
+    /// the cold-batch fixture under a key of its own. The entry at `missing`
+    /// is catalogued but absent from the store.
+    fn counted_remote_volumes(
+        n: usize,
+        delay: Duration,
+        missing: Option<usize>,
+    ) -> (Arc<Source>, Arc<Vec<VolumeEntry>>, Arc<CountingStore>) {
         use ds_storage::object_store::throttle::{ThrottleConfig, ThrottledStore};
         use ds_storage::object_store::{ObjectStoreExt, PutPayload};
         let volume = crate::pvol::read_polar_volume(COLD_BATCH).unwrap();
@@ -7444,14 +7671,19 @@ mod tests {
             wait_get_per_call: delay,
             ..ThrottleConfig::default()
         };
+        let counted = Arc::new(CountingStore {
+            inner: Arc::new(ThrottledStore::new(inner, config)),
+            gets: Mutex::default(),
+            fail_first: Mutex::default(),
+        });
         let source = Source::Remote {
-            store: ds_storage::DataStore::new(Arc::new(ThrottledStore::new(inner, config))),
+            store: ds_storage::DataStore::new(counted.clone()),
             endpoint: "https://s3.example.com".to_string(),
             bucket: "read-ahead-test".to_string(),
             prefix_pattern: "%Y/".to_string(),
             time_window: None,
         };
-        (Arc::new(source), Arc::new(volumes))
+        (Arc::new(source), Arc::new(volumes), counted)
     }
 
     /// A multi-thread runtime standing in for the query runtime (#1103).
@@ -7675,6 +7907,100 @@ mod tests {
             }
             assert_none_marked_bad(&source, &volumes);
         }
+    }
+
+    /// #1127: concurrent cold walks over the same remote volumes download
+    /// each file once at the store: two walks reading ahead, which join each
+    /// other's downloads, and a one-volume walk, whose miss inside the
+    /// per-file lock joins theirs or is joined. For level series and
+    /// profiles on query runtime workers and cross-sections on the blocking
+    /// pool. Both full walks answer as a sequential walk alone.
+    #[test]
+    fn concurrent_cold_walks_download_each_volume_once() {
+        let n = 6;
+        for walk in [Walk::Series, Walk::Profiles, Walk::Section] {
+            let (source, volumes) = throttled_remote_volumes(n, Duration::ZERO, None);
+            let alone = run_walk(walk, source, volumes, None, None)
+                .unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+
+            let (source, volumes, store) = counted_remote_volumes(n, READ_DELAY, None);
+            let first = Arc::new(vec![volumes[0].clone()]);
+            let start = std::sync::Barrier::new(3);
+            let [a, b, single] = std::thread::scope(|scope| {
+                [volumes.clone(), volumes.clone(), first]
+                    .map(|volumes| {
+                        let (source, start) = (source.clone(), &start);
+                        scope.spawn(move || {
+                            start.wait();
+                            run_walk(walk, source, volumes, Some(query_runtime()), None)
+                        })
+                    })
+                    .map(|walk| walk.join().unwrap())
+            });
+            for result in [&a, &b] {
+                let result = result.as_ref().unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+                assert_eq!(fingerprint(result), fingerprint(&alone), "{walk:?}");
+            }
+            single.unwrap_or_else(|e| panic!("{walk:?}, one volume: {e}"));
+            for e in volumes.iter() {
+                assert_eq!(store.gets(&e.id), 1, "{walk:?}: GETs of `{}`", e.id);
+                assert_eq!(file_fetches::count(&e.id), 1, "{walk:?}: `{}`", e.id);
+            }
+            let Source::Remote { store, .. } = &*source else {
+                unreachable!("a remote source")
+            };
+            assert_eq!(
+                store.bytes_read(),
+                (n * COLD_BATCH.len()) as u64,
+                "{walk:?}: one whole-file GET per volume at the store"
+            );
+        }
+    }
+
+    /// #1127: a download that fails is the failure of the request that
+    /// started it. A walk that joined it reads the file once more and
+    /// answers in full, starting a read of its own, since a failed read is
+    /// not joined; the request that started it gets its error; and nothing
+    /// is marked bad.
+    #[test]
+    fn a_joined_download_that_fails_is_read_again() {
+        let n = 2;
+        let (source, volumes) = throttled_remote_volumes(n, Duration::ZERO, None);
+        let alone = run_walk(Walk::Profiles, source, volumes, None, None).unwrap();
+
+        let (source, volumes, counted) = counted_remote_volumes(n, READ_DELAY, None);
+        let Source::Remote { store, .. } = &*source else {
+            unreachable!("a remote source")
+        };
+        let failing = &volumes[0].id;
+        counted.fail_next(failing);
+        let runtime = query_runtime().handle();
+        let cache_id = pixel_cache_id(&source, failing).into_owned();
+        let mut other = RemoteRead::start(store, cache_id, failing, runtime.clone());
+        assert!(!other.read.joined);
+
+        let results = run_walk(
+            Walk::Profiles,
+            source.clone(),
+            volumes.clone(),
+            Some(query_runtime()),
+            None,
+        )
+        .expect("the joiner reads again");
+        assert_eq!(fingerprint(&results), fingerprint(&alone));
+        assert_eq!(file_fetches::ahead(failing), 0, "the walk joined the read");
+        assert_eq!(
+            counted.gets(failing),
+            2,
+            "the failed GET and the walk's own"
+        );
+        assert_eq!(file_fetches::count(failing), 2);
+        assert_eq!(counted.gets(&volumes[1].id), 1);
+        assert!(matches!(
+            other.wait(Some(runtime)),
+            Err(PixelReadError::Abort(DataServerError::ResourceExhausted))
+        ));
+        assert_none_marked_bad(&source, &volumes);
     }
 
     /// A dummy file source for the lazy-pixel context; never actually read,
