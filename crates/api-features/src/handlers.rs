@@ -826,7 +826,7 @@ pub async fn collection(
             &metadata,
             config.license.as_ref(),
             Some(&items_overview(engine.as_ref())),
-            None,
+            &api_common::workbench::Services::default(),
         ))
         .into_response(),
     }))

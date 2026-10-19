@@ -115,6 +115,32 @@ pub struct RelatedLink {
     pub title: String,
 }
 
+/// What the services outside the shared root serve of one collection
+/// (#1228): EDR with the query types it offers, WMS as the layer named by
+/// the collection's id, and 3D Tiles. The collection document names none
+/// of them; its HTML page links each and builds example requests for it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServedBy {
+    /// EDR's query types for the collection, `None` when EDR does not serve
+    /// it.
+    pub edr: Option<Vec<String>>,
+    pub wms: bool,
+    pub tiles_3d: bool,
+}
+
+/// [`ServedBy`] per collection id, built once per load from the server's
+/// registries.
+pub type ServedByMap = std::collections::HashMap<String, Arc<ServedBy>>;
+
+/// Where a collection page reads [`ServedBy`]: the server's snapshot of its
+/// registries, swapped on reload. A lookup, never a computation: the page
+/// is rendered per request (root CLAUDE.md rule 10).
+pub trait CollectionServices: Send + Sync + 'static {
+    /// The services outside the shared root serving collection `id`;
+    /// `None` when none does.
+    fn served_by(&self, id: &str) -> Option<Arc<ServedBy>>;
+}
+
 /// The shared root: its mount below the external base URL, its blocks in
 /// precedence order, and related services for the landing page.
 pub struct SharedApi {
@@ -124,6 +150,9 @@ pub struct SharedApi {
     /// Common classes plus every block's (its per-API classes, then its
     /// shared-root ones), de-duplicated once.
     conformance: Vec<&'static str>,
+    /// What the services outside the shared root serve of each collection;
+    /// without it a page reads them from the collection's `apis`.
+    services: Option<Arc<dyn CollectionServices>>,
 }
 
 impl SharedApi {
@@ -147,7 +176,17 @@ impl SharedApi {
             blocks,
             related,
             conformance,
+            services: None,
         }
+    }
+
+    /// Read what EDR, WMS and 3D Tiles serve of a collection from
+    /// `services`, the server's registries, rather than from the
+    /// collection's `apis` (#1228): an EDR query type, or a service the
+    /// collection's id does not reach, is then never offered.
+    pub fn with_services(mut self, services: Arc<dyn CollectionServices>) -> Self {
+        self.services = Some(services);
+        self
     }
 
     fn base(&self, headers: &HeaderMap) -> String {
@@ -692,6 +731,49 @@ fn wms_endpoint(config: &CollectionConfig, base: &str) -> Option<String> {
         .then(|| format!("{base}{}", crate::mounts::WMS))
 }
 
+/// The services outside the shared root that a collection's `apis` wire it
+/// to (#1228), as [`wms_endpoint`] reads WMS: the page's fallback when the
+/// server gives no [`CollectionServices`]. The EDR query types are not
+/// known from them, so the page offers no EDR example.
+fn services_from_apis<'a>(config: &CollectionConfig, base: &str) -> workbench::Services<'a> {
+    let lists = |name: &str| config.apis.iter().any(|api| api == name);
+    workbench::Services {
+        edr: lists("edr").then(|| workbench::EdrService {
+            href: collection_url(base, crate::mounts::EDR, &config.id),
+            queries: &[],
+        }),
+        wms: wms_endpoint(config, base),
+        tiles_3d: lists("3dtiles")
+            .then(|| collection_url(base, crate::mounts::TILES_3D, &config.id)),
+    }
+}
+
+/// The services [`ServedBy`] names, at their mounts below `base`.
+fn services_served<'a>(
+    served: Option<&'a ServedBy>,
+    id: &str,
+    base: &str,
+) -> workbench::Services<'a> {
+    let Some(served) = served else {
+        return workbench::Services::default();
+    };
+    workbench::Services {
+        edr: served.edr.as_deref().map(|queries| workbench::EdrService {
+            href: collection_url(base, crate::mounts::EDR, id),
+            queries,
+        }),
+        wms: served.wms.then(|| format!("{base}{}", crate::mounts::WMS)),
+        tiles_3d: served
+            .tiles_3d
+            .then(|| collection_url(base, crate::mounts::TILES_3D, id)),
+    }
+}
+
+/// A collection's URL in the API mounted at `mount` below `base`.
+fn collection_url(base: &str, mount: &str, id: &str) -> String {
+    format!("{base}{mount}/collections/{}", workbench::path_segment(id))
+}
+
 /// GET {mount}/collections/{id} — one collection, merged from every block
 async fn collection(
     Path(id): Path<String>,
@@ -717,21 +799,29 @@ async fn collection(
             &format!("Collection '{id}' not found"),
         );
     };
-    let wms = wms_endpoint(&merged.config, base);
     with_vary(match wanted {
         Wanted::Json => Json(merged.metadata).into_response(),
-        Wanted::Html => Html(workbench::collection_page(
-            Surface {
-                base,
-                root,
-                api: WORKSPACE,
-            },
-            &merged.metadata,
-            merged.config.license.as_ref(),
-            merged.items.as_ref(),
-            wms.as_deref(),
-        ))
-        .into_response(),
+        Wanted::Html => {
+            // The services outside the shared root, from the server's
+            // registries when it gives them (#1228).
+            let served = api.services.as_ref().map(|s| s.served_by(&id));
+            let services = match &served {
+                Some(served) => services_served(served.as_deref(), &id, base),
+                None => services_from_apis(&merged.config, base),
+            };
+            Html(workbench::collection_page(
+                Surface {
+                    base,
+                    root,
+                    api: WORKSPACE,
+                },
+                &merged.metadata,
+                merged.config.license.as_ref(),
+                merged.items.as_ref(),
+                &services,
+            ))
+            .into_response()
+        }
     })
 }
 
@@ -767,6 +857,65 @@ mod tests {
         assert_eq!(
             wms_endpoint(&config(json!(["maps", "tiles"])), "https://x"),
             None
+        );
+    }
+
+    /// #1228: the services outside the shared root come from the server's
+    /// registries when it gives them: EDR with its query types, WMS and 3D
+    /// Tiles at their mounts, and nothing for an id none serves (a radar
+    /// volume's network inventory, though its config lists them all).
+    /// Without them, from the collection's `apis`, as the WMS draw mode
+    /// was (#1220), with EDR's queries unknown.
+    #[test]
+    fn page_services_follow_the_registries_else_the_apis() {
+        let config = |apis: Value| -> CollectionConfig {
+            serde_json::from_value(
+                json!({"id": "r d", "title": "c", "description": "", "apis": apis}),
+            )
+            .unwrap()
+        };
+        let every = config(json!([
+            "edr", "wms", "maps", "tiles", "3dtiles", "features"
+        ]));
+        let fallback = services_from_apis(&every, "https://x/base");
+        assert_eq!(
+            fallback,
+            workbench::Services {
+                edr: Some(workbench::EdrService {
+                    href: "https://x/base/edr/collections/r%20d".into(),
+                    queries: &[],
+                }),
+                wms: Some("https://x/base/wms".into()),
+                tiles_3d: Some("https://x/base/3dtiles/collections/r%20d".into()),
+            }
+        );
+        assert_eq!(
+            services_from_apis(&config(json!(["maps", "tiles"])), "https://x"),
+            workbench::Services::default()
+        );
+        let served = ServedBy {
+            edr: Some(vec!["area".into(), "radius".into()]),
+            wms: true,
+            tiles_3d: false,
+        };
+        let services = services_served(Some(&served), "r d", "https://x");
+        assert_eq!(
+            services
+                .edr
+                .as_ref()
+                .map(|edr| (edr.href.as_str(), edr.queries)),
+            Some((
+                "https://x/edr/collections/r%20d",
+                &["area".to_owned(), "radius".to_owned()][..]
+            ))
+        );
+        assert_eq!(services.wms.as_deref(), Some("https://x/wms"));
+        assert_eq!(services.tiles_3d, None);
+        // The network inventory: served by none of them, whatever its
+        // `apis` say.
+        assert_eq!(
+            services_served(None, "r d", "https://x"),
+            workbench::Services::default()
         );
     }
 
