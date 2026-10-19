@@ -4691,6 +4691,7 @@ pub fn load_collections(
             (&maps_engines, &maps_collections, &mut maps_styles),
             (&tiles_engines, &tiles_collections, &mut tiles_styles),
         ],
+        &mut edr_styles,
     );
 
     // Determine rendered cache size from first WMS collection config, or the
@@ -4997,12 +4998,15 @@ type MapRegistry<'a> = (
 /// on the collection's own style layer draws the engine's default
 /// parameter, which only the engine names, so it takes that parameter's
 /// built-in default ([`ds_render::StyleContext::base_layer_default`]) in
-/// every map API: the events shape's strike-age layer is one. A root
-/// layer still generic after that is warned.
+/// every map API, and in EDR's styles too, so EDR and the map APIs keep
+/// one resolution (the `f=png` plot draws the collection's default): the
+/// events shape's strike-age layer is one. A root layer still generic
+/// after that is warned.
 fn default_generic_root_layers(
     ctx: &ds_render::StyleContext,
     bundles: &HashMap<&str, &StyleBundle>,
     registries: [MapRegistry<'_>; 3],
+    edr_styles: &mut HashMap<String, HashMap<String, ds_render::StyleInfo>>,
 ) {
     let mut decided: HashMap<String, Option<ds_render::StyleInfo>> = HashMap::new();
     for (engines, collections, styles) in registries {
@@ -5019,6 +5023,11 @@ fn default_generic_root_layers(
             if let (Some(Some(default)), Some(layer)) = (decided.get(id), styles.get_mut(id)) {
                 layer.insert("default".to_string(), default.clone());
             }
+        }
+    }
+    for (id, default) in decided {
+        if let (Some(default), Some(layer)) = (default, edr_styles.get_mut(&id)) {
+            layer.insert("default".to_string(), default);
         }
     }
 }
@@ -8059,7 +8068,7 @@ mod tests {
 
     /// The root layer of a collection whose engine draws one parameter takes
     /// that parameter's built-in default when nothing configured a palette,
-    /// in every map API, instead of the generic palette the #320 warning
+    /// in every map API and EDR, instead of the generic palette the #320 warning
     /// names: here the committed GeoTIFF radar, unstyled, draws `radar_dbz`,
     /// and its styled twin keeps its deliberate viridis.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8067,7 +8076,7 @@ mod tests {
         let collection = |id: &str, wms: Option<serde_json::Value>| -> CollectionConfig {
             let mut c = serde_json::json!({
                 "id": id, "title": "Radar", "description": "GeoTIFF",
-                "engine_type": "geotiff", "apis": ["wms", "maps", "tiles"],
+                "engine_type": "geotiff", "apis": ["edr", "wms", "maps", "tiles"],
                 "data_path": "../../testdata/radar",
                 "geotiff": {
                     "filename_template": "radar_%Y%m%dT%H%MZ.tif",
@@ -8097,6 +8106,7 @@ mod tests {
             &result.wms_state.styles,
             &result.maps_state.styles,
             &result.tiles_state.styles,
+            &result.edr_state.styles,
         ] {
             assert_eq!(styles["radar"]["default"].palette.name, "radar_dbz");
             assert_eq!(styles["styled"]["default"].palette.name, "viridis");
