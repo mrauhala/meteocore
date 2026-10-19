@@ -98,9 +98,9 @@ data filters remain independent, and JSON always represents the current resource
 ## Maps collection data preview
 
 Maps collection overviews fetch actual rendered PNG data for the visible area
-over the geographic backdrop. Pan/zoom updates the request; advertised styles
-and a metadata-driven time selector can be applied with **Update map**. Default time uses
-the collection default. The exact image URL is visible below the map and opens
+over the geographic backdrop. Pan/zoom updates the request; advertised styles,
+parameters, levels and a metadata-driven time selector apply as soon as they
+change (#1220). Default time uses the collection default. The exact image URL is visible below the map and opens
 through **Open rendered image**. The global JSON switch remains the collection
 metadata representation. Loading failures and timeouts stay in the map panel.
 
