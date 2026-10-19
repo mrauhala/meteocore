@@ -3,7 +3,8 @@
 WMO BUFR surface-observation engine (`engine_type = "bufr"`): SYNOP / SHIP
 station reports → an in-memory, time-windowed store → `EdrEngine`
 (`locations`, `position`, `area`, `radius`) + `FeatureEngine` (one Point
-feature per station). Source: a polled directory / object-store prefix of
+feature per station) + `MapEngine` (station symbol layers, `src/map.rs`,
+#1204). Source: a polled directory / object-store prefix of
 BUFR files (`data_path`) or a WIS2 Global Broker subscription
 (`[bufr.wis2]`, `src/wis2.rs`). Real fixtures: `testdata/bufr-synop/` (8
 reports captured from the WIS2 Global Broker, values cross-checked with
@@ -152,7 +153,8 @@ no opt-out, as for GRIB; a client wanting kelvin converts back.
   `poll_runtime()`: scan every `poll_interval_secs`, prune every 60 s,
   snapshot every 10 s when dirty. `live_health()` degrades after 3
   consecutive failed scans. Wired in `server/src/admin.rs` (`"bufr" =>
-  ["edr", "features"]`, built by `new_with_state(…, state_store())`), boot
+  ["edr", "features", "wms", "maps", "tiles"]`, built by
+  `new_with_state(…, state_store())`, map layers by `wire_station_layers!`), boot
   spawn + shutdown in `main.rs` (`shutdown()` flushes the WIS2 state
   snapshot), `rotate_poll_loops!` on reload.
 - `source.rs` uses `ds-storage` (`list` + `get_many`, bounded concurrency,
@@ -299,6 +301,23 @@ at boot and ignores the state store.
   its final state, which the new engine overwrites at its next write, so
   the reports the replaced engine received since its last periodic write
   are lost (as for CAP).
+
+## Station symbol layers (`src/map.rs`, #1204)
+
+- Drawn through `ds_render::station_symbols`/`ds_core::station_map`, shared
+  with CSV and PostGIS; never re-implement marker order, discs or the time
+  axis here. One layer per table parameter with its display unit.
+- A frame iterates the SNAPSHOT's stations (sorted by id, its positions)
+  and reads each station's rows under the store read lock: reverse range
+  walk from `TIME`, first finite value wins (`round_stored`, as EDR),
+  `MAX_FRAME_ROWS` scanned rows at most (`QueryTooLarge` naming
+  `[bufr.map] max_age`).
+- `content_version` = the snapshot `version` (`.max(1)`): it moves at the
+  rebuild after any store change (late report, correction, deletion,
+  prune), at most every 10 s, so a frame lags the store by at most that.
+  Do not bump it per ingest: under a WIS2 feed that would re-key every
+  cache on every notification. Pinned by
+  `map::tests::a_late_report_moves_the_content_version`.
 
 ## Smoke test
 

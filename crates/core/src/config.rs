@@ -280,6 +280,10 @@ pub struct CollectionConfig {
     pub station_grid: Option<StationGridConfig>,
     /// BUFR surface-observation engine (`engine_type = "bufr"`).
     pub bufr: Option<BufrConfig>,
+    /// CSV engine options (`engine_type = "csv"`, #1204): its station-symbol
+    /// map layers' `[csv.map]`. Optional.
+    #[serde(default)]
+    pub csv: Option<CsvConfig>,
     /// Geostationary satellite imagery (`engine_type = "satellite"`).
     pub satellite: Option<SatelliteConfig>,
     /// CF-NetCDF gridded data (`engine_type = "netcdf"`).
@@ -1214,6 +1218,11 @@ pub struct BufrConfig {
     /// table (same name ⇒ replaces the built-in entry).
     #[serde(default)]
     pub parameters: Vec<BufrParameterConfig>,
+    /// The WMS/Maps/Tiles station-symbol layers (#1204). Optional; the
+    /// layers exist whenever `apis` lists a map API, with the defaults
+    /// [`StationMapConfig`] documents.
+    #[serde(default)]
+    pub map: Option<StationMapConfig>,
 }
 
 /// One parameter of a BUFR collection: which Table B element (and, for
@@ -1281,6 +1290,9 @@ pub fn validate_bufr(id: &str, cfg: &BufrConfig) -> Result<(), crate::error::Dat
         return Err(Config(format!(
             "Collection '{id}': [bufr].max_stations must be > 0"
         )));
+    }
+    if let Some(map) = &cfg.map {
+        validate_station_map(id, "bufr.map", map)?;
     }
     if !(cfg.position_radius_km > 0.0 && cfg.position_radius_km.is_finite()) {
         return Err(Config(format!(
@@ -3099,6 +3111,19 @@ fn require_map_api(
     )))
 }
 
+/// `[csv]` (#1204): options of a CSV collection. It holds only the
+/// station-symbol layers' `[csv.map]` for now; any other key is a load
+/// error.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CsvConfig {
+    /// The WMS/Maps/Tiles station-symbol layers (#1204). Optional; the
+    /// layers exist whenever `apis` lists a map API, with the defaults
+    /// [`StationMapConfig`] documents.
+    #[serde(default)]
+    pub map: Option<StationMapConfig>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisStationsConfig {
     /// Qualified table name (`schema.table` or bare `table`).
@@ -4823,6 +4848,22 @@ impl ServerConfig {
             }
             if let Some(bufr) = &collection.bufr {
                 validate_bufr(id, bufr)?;
+                if bufr.map.is_some() {
+                    require_map_api(id, "bufr.map", &collection.apis)?;
+                }
+            }
+
+            // CSV options (#1204): only on a CSV collection, and a `[csv.map]`
+            // needs a map API to read it.
+            if collection.csv.is_some() && collection.engine_type != "csv" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.csv] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(map) = collection.csv.as_ref().and_then(|c| c.map.as_ref()) {
+                validate_station_map(id, "csv.map", map)?;
+                require_map_api(id, "csv.map", &collection.apis)?;
             }
 
             // Satellite engine requires its config section, and vice versa.
@@ -7435,6 +7476,110 @@ unit = "1"
         assert!(
             err.contains("[postgis.map] is not valid for observations.shape 'events'"),
             "{err}"
+        );
+    }
+
+    /// #1204: `[bufr.map]` and `[csv.map]` are `[postgis.map]`'s shape with
+    /// its checks, each message naming its own section. A section needs a
+    /// map API, `[csv]` belongs to a CSV collection, and a misspelt key is an
+    /// error. CSV collections without `[csv]` parse as before.
+    #[test]
+    fn bufr_and_csv_map_sections_validated_at_load() {
+        let full = StationMapConfig {
+            max_age: Some("PT30M".into()),
+            marker_size: Some(8),
+            draw_missing: Some(true),
+            time_step: Some("PT5M".into()),
+        };
+        let full_toml =
+            "max_age = \"PT30M\"\nmarker_size = 8\ndraw_missing = true\ntime_step = \"PT5M\"";
+        // CSV: `engine_type` omitted is csv.
+        let csv = |apis: &str, map: &str| {
+            collection_with(&format!(
+                "data_path = \"w.csv\"\napis = {apis}\n[collections.csv.map]\n{map}\n"
+            ))
+        };
+        let ok = csv("[\"edr\", \"wms\"]", full_toml);
+        assert!(ok.validate().is_ok(), "{:?}", ok.validate());
+        assert_eq!(
+            ok.collections[0].csv,
+            Some(CsvConfig {
+                map: Some(full.clone())
+            })
+        );
+        let plain = collection_with("data_path = \"w.csv\"\napis = [\"edr\", \"features\"]\n");
+        assert!(plain.validate().is_ok(), "{:?}", plain.validate());
+        assert_eq!(plain.collections[0].csv, None);
+        for (apis, map, expected) in [
+            (
+                "[\"tiles\"]",
+                "marker_size = 0",
+                "[csv.map].marker_size 0 is outside 1..=64",
+            ),
+            (
+                "[\"maps\"]",
+                "max_age = \"P8D\"",
+                "[csv.map].max_age 'P8D' must be positive and at most P7D",
+            ),
+            (
+                "[\"edr\", \"features\"]",
+                "max_age = \"PT1H\"",
+                "[csv.map] needs a map API in apis (wms, maps or tiles)",
+            ),
+        ] {
+            let err = csv(apis, map).validate().unwrap_err().to_string();
+            assert!(err.contains(expected), "{map}: {err}");
+        }
+        let err = collection_with(
+            "engine_type = \"bufr\"\napis = [\"edr\"]\n[collections.bufr]\ndata_path = \"x\"\n\
+             [collections.csv]\n",
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("[collections.csv] is set but engine_type is 'bufr'"),
+            "{err}"
+        );
+        assert!(toml::from_str::<CsvConfig>("mapp = 1").is_err());
+        assert!(toml::from_str::<CsvConfig>("[map]\nmaxage = \"PT1H\"").is_err());
+
+        // BUFR.
+        let bufr = |apis: &str, map: &str| {
+            collection_with(&format!(
+                "engine_type = \"bufr\"\napis = {apis}\n[collections.bufr]\ndata_path = \"x\"\n\
+                 [collections.bufr.map]\n{map}\n"
+            ))
+        };
+        let ok = bufr("[\"edr\", \"tiles\"]", full_toml);
+        assert!(ok.validate().is_ok(), "{:?}", ok.validate());
+        assert_eq!(ok.collections[0].bufr.as_ref().unwrap().map, Some(full));
+        for (apis, map, expected) in [
+            (
+                "[\"wms\"]",
+                "time_step = \"PT30S\"",
+                "[bufr.map].time_step 'PT30S' must be whole seconds from PT1M to PT6H",
+            ),
+            (
+                "[\"wms\"]",
+                "max_age = \"soon\"",
+                "[bufr.map].max_age 'soon' is not a valid ISO 8601 duration",
+            ),
+            (
+                "[\"edr\", \"features\"]",
+                "marker_size = 4",
+                "[bufr.map] needs a map API in apis (wms, maps or tiles)",
+            ),
+        ] {
+            let err = bufr(apis, map).validate().unwrap_err().to_string();
+            assert!(err.contains(expected), "{map}: {err}");
+        }
+        assert!(toml::from_str::<BufrConfig>("data_path = \"x\"\n[map]\nsize = 4\n").is_err());
+        assert_eq!(
+            toml::from_str::<BufrConfig>("data_path = \"x\"\n")
+                .unwrap()
+                .map,
+            None
         );
     }
 

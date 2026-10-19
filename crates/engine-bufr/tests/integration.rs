@@ -32,6 +32,7 @@ fn config() -> BufrConfig {
         position_radius_km: 25.0,
         builtin_parameters: true,
         parameters: Vec::new(),
+        map: None,
     }
 }
 
@@ -746,4 +747,255 @@ fn failures_are_counted_by_kind() {
     assert_eq!(e.health.decode_failures_total(), 3);
     let counters = e.health.counters();
     assert_eq!(counters[7..], [1, 1, 1, 0, 0]);
+}
+
+// ---------------------------------------------------------------------------
+// Station-symbol map layers (#1204). Positions as decoded (ecCodes agrees):
+// SMHI 18.98391°E 57.44075°N, 16.97 °C, no MSL pressure; Hong Kong
+// 113.92194°E 22.30944°N, 34.2 °C; Indonesia 122.85125°E 0.63907°N, 30.5 °C;
+// Rwanda 29.73202°E 2.59444°S reports at 08:20Z, every other station at
+// 08:00Z. Reference projections from PROJ (`cs2cs EPSG:4326 EPSG:3857` /
+// `EPSG:3035`).
+// ---------------------------------------------------------------------------
+
+mod station_map {
+    use super::*;
+    use ds_core::config::StationMapConfig;
+    use ds_core::map_engine::{MapEngine, OutputCrs, RasterTile};
+    use ds_render::station_symbols::{StationSymbols, NODATA_MARKER};
+    use std::collections::HashMap;
+
+    fn map_engine(map: StationMapConfig) -> BufrEngine {
+        let cfg = BufrConfig {
+            map: Some(map),
+            ..config()
+        };
+        BufrEngine::new(&cfg, "bufr-map-test").unwrap()
+    }
+
+    fn one_pixel() -> StationMapConfig {
+        StationMapConfig {
+            marker_size: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn render(
+        e: &BufrEngine,
+        bbox: [f64; 4],
+        size: (u32, u32),
+        time: DateTime<Utc>,
+        crs: &OutputCrs,
+        parameter: &str,
+    ) -> RasterTile {
+        e.get_raster_tile(
+            bbox,
+            size.0,
+            size.1,
+            Some(time),
+            crs,
+            Some(parameter),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn painted(tile: &RasterTile) -> HashMap<(u32, u32), f64> {
+        (0..tile.height)
+            .flat_map(|row| (0..tile.width).map(move |col| (col, row)))
+            .filter_map(|(col, row)| {
+                tile.values
+                    .value_at((row * tile.width + col) as usize)
+                    .map(|v| ((col, row), v))
+            })
+            .collect()
+    }
+
+    /// One layer per parameter in table order with its display unit, frames
+    /// every 10 minutes from the first report (08:00Z) to the newest
+    /// (08:20Z), the render's selection for `resolve_time` and
+    /// `resolve_parameter_time`, a non-zero content version (the store
+    /// revises in place) and no GetFeatureInfo.
+    #[test]
+    fn layers_advertise_each_parameter_on_ten_minute_frames() {
+        let e = map_engine(StationMapConfig::default());
+        let info = e.raster_info_shared();
+        assert_eq!(info.parameter, "air_temperature");
+        assert_eq!(info.unit, "°C");
+        assert_eq!(
+            info.parameters
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+            e.get_parameters()
+        );
+        let msl = info
+            .parameters
+            .iter()
+            .find(|p| p.name == "pressure_msl")
+            .unwrap();
+        assert_eq!(msl.unit, "hPa");
+        let at = |hh: u32, mm: u32| Utc.with_ymd_and_hms(2026, 9, 12, hh, mm, 0).unwrap();
+        assert_eq!(info.times, vec![at(8, 0), at(8, 10), at(8, 20)]);
+        assert_eq!(e.resolve_time(None, None), Some(at(8, 20)));
+        assert_eq!(
+            e.resolve_parameter_time(Some("pressure_msl"), Some(at(8, 19)), None),
+            Some(at(8, 10))
+        );
+        assert_ne!(e.content_version(), 0);
+        assert!(!e.layer_shows_values("air_temperature"));
+    }
+
+    /// CRS:84, 1° a pixel over the world: each station at its pixel with
+    /// its 08:00Z value. Rwanda's 08:20Z report is after the frame; at
+    /// 08:20Z it is drawn too.
+    #[test]
+    fn markers_land_on_their_pixels_in_crs84() {
+        let e = map_engine(one_pixel());
+        let world = [-180.0, -90.0, 180.0, 90.0];
+        let tile = render(
+            &e,
+            world,
+            (360, 180),
+            t0800(),
+            &OutputCrs::Wgs84,
+            "air_temperature",
+        );
+        let pixels = painted(&tile);
+        assert_eq!(pixels.len(), 7, "{pixels:?}");
+        assert_eq!(pixels[&(198, 32)], 16.97, "SMHI");
+        assert_eq!(pixels[&(293, 67)], 34.2, "Hong Kong");
+        assert_eq!(pixels[&(121, 124)], 11.4, "Morón");
+        assert!(!pixels.contains_key(&(209, 92)), "Rwanda reports at 08:20Z");
+        let later = t0800() + chrono::Duration::minutes(20);
+        let tile = render(
+            &e,
+            world,
+            (360, 180),
+            later,
+            &OutputCrs::Wgs84,
+            "air_temperature",
+        );
+        assert_eq!(painted(&tile)[&(209, 92)], 24.1, "Rwanda");
+    }
+
+    /// EPSG:3857 over 10°–30°E, 50°–60°N in 200 × 100 pixels: SMHI is row 28
+    /// in Web Mercator but row 25 in CRS:84. PROJ northings: 60°N
+    /// 8 399 737.8898 m, 57.44075°N 7 850 742.8523 m, 50°N 6 446 275.8410 m.
+    #[test]
+    fn markers_land_on_their_pixels_in_epsg3857() {
+        let (north, station, south): (f64, f64, f64) =
+            (8_399_737.889_818, 7_850_742.852_275, 6_446_275.841_017);
+        let row = ((north - station) / (north - south) * 100.0).floor() as u32;
+        assert_eq!(row, 28, "the reference itself");
+        let e = map_engine(one_pixel());
+        let bbox = [10.0, 50.0, 30.0, 60.0];
+        let mercator = render(
+            &e,
+            bbox,
+            (200, 100),
+            t0800(),
+            &OutputCrs::WebMercator,
+            "air_temperature",
+        );
+        assert_eq!(painted(&mercator), HashMap::from([((89, row), 16.97)]));
+        let linear = render(
+            &e,
+            bbox,
+            (200, 100),
+            t0800(),
+            &OutputCrs::Wgs84,
+            "air_temperature",
+        );
+        assert_eq!(painted(&linear), HashMap::from([((89, 25), 16.97)]));
+    }
+
+    /// EPSG:3035: SMHI is (4 859 507.0774 E, 3 849 268.3648 N). 100 m pixels
+    /// with the station at the centre of pixel (30, 70).
+    #[test]
+    fn markers_land_on_their_pixels_in_epsg3035() {
+        let crs = ds_core::geo::projected_output_crs("EPSG:3035").unwrap();
+        let (east, north) = (4_859_507.077_4, 3_849_268.364_8);
+        let west = east - 3_050.0;
+        let top = north + 7_050.0;
+        let projected = [west, top - 10_000.0, west + 10_000.0, top];
+        let output = OutputCrs::Projected {
+            crs: crs.clone(),
+            bbox: projected,
+        };
+        let envelope = ds_core::geo::wgs84_envelope(&crs, projected).unwrap();
+        let e = map_engine(one_pixel());
+        let tile = render(
+            &e,
+            envelope,
+            (100, 100),
+            t0800(),
+            &output,
+            "air_temperature",
+        );
+        assert_eq!(painted(&tile), HashMap::from([((30, 70), 16.97)]));
+    }
+
+    /// The overlap rule: at 10° a pixel, the 6-pixel markers of Hong Kong
+    /// (34.2 °C) and Indonesia (30.5 °C) each cover the other's pixel; the
+    /// one farther from the layer's midpoint is on top of both.
+    #[test]
+    fn the_most_extreme_value_is_on_top() {
+        let e = map_engine(StationMapConfig::default());
+        let frame = |midpoint: f64| {
+            e.set_station_symbols(StationSymbols::new(HashMap::from([(
+                "air_temperature".to_string(),
+                midpoint,
+            )])));
+            let tile = render(
+                &e,
+                [-180.0, -90.0, 180.0, 90.0],
+                (36, 18),
+                t0800(),
+                &OutputCrs::Wgs84,
+                "air_temperature",
+            );
+            let pixels = painted(&tile);
+            (pixels[&(29, 6)], pixels[&(30, 8)])
+        };
+        // |34.2 - 32| = 2.2 > |30.5 - 32| = 1.5: Hong Kong on top.
+        assert_eq!(frame(32.0), (34.2, 34.2));
+        // |34.2 - 33| = 1.2 < |30.5 - 33| = 2.5: Indonesia on top.
+        assert_eq!(frame(33.0), (30.5, 30.5));
+    }
+
+    /// No marker without a value: SMHI reports no MSL pressure, so the
+    /// pressure layer leaves it out, or draws a nodata marker with
+    /// `draw_missing`.
+    #[test]
+    fn a_station_without_a_value_has_no_marker() {
+        let world = [-180.0, -90.0, 180.0, 90.0];
+        let e = map_engine(one_pixel());
+        let tile = render(
+            &e,
+            world,
+            (360, 180),
+            t0800(),
+            &OutputCrs::Wgs84,
+            "pressure_msl",
+        );
+        let pixels = painted(&tile);
+        assert!(!pixels.contains_key(&(198, 32)), "{pixels:?}");
+        // The stored f32 widened as EDR serves it.
+        assert_eq!(pixels[&(293, 67)], 1011.59998, "Hong Kong");
+        let e = map_engine(StationMapConfig {
+            draw_missing: Some(true),
+            ..one_pixel()
+        });
+        let tile = render(
+            &e,
+            world,
+            (360, 180),
+            t0800(),
+            &OutputCrs::Wgs84,
+            "pressure_msl",
+        );
+        assert_eq!(painted(&tile)[&(198, 32)], NODATA_MARKER);
+    }
 }

@@ -11,6 +11,9 @@ ds-poll = { path = "../ds-poll" }
 ds-storage = { path = "../storage" }
 ds-wis2 = { path = "../ds-wis2" }
 ds-bufr = { path = "../ds-bufr" }
+# Station-symbol map layers (#1204): the shared marker drawing and frame
+# cache. Vector MapEngines may depend on ds-render (the CAP precedent).
+ds-render = { path = "../render" }
 arc-swap = "1"
 chrono = { version = "0.4", features = ["serde"] }
 # The WIS2 store snapshot (#1002, `src/persist.rs`): gzip-compressed JSON.

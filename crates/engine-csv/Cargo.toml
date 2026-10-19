@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 ds-core = { path = "../core" }
+# Station-symbol map layers (#1204): the shared marker drawing and frame
+# cache. Vector MapEngines may depend on ds-render (the CAP precedent).
+ds-render = { path = "../render" }
 csv = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"

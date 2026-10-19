@@ -178,6 +178,7 @@ fn router() -> axum::Router {
             bufr: None,
             satellite: None,
             netcdf: None,
+            csv: None,
             preview: None,
             derive_wind: None,
         },

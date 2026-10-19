@@ -2,4 +2,22 @@ id = "weather"
 title = "Finnish Weather Observations"
 description = "Hourly weather observations from Finnish weather stations"
 data_path = "testdata/weather.csv"
-apis = ["edr", "features"]
+apis = ["edr", "features", "wms", "maps", "tiles"]
+
+# Station symbol layers (#1204): one map layer per column, each station a
+# marker coloured by its latest value within max_age. The map APIs in `apis`
+# turn them on; the section is optional (the defaults are shown).
+[csv.map]
+max_age = "PT1H"
+time_step = "PT10M"
+marker_size = 6
+draw_missing = false
+
+# A January range for temperature; humidity and wind_speed take the built-in
+# default their name and unit select. The collection layer draws the first
+# column, temperature.
+[[wms.parameters]]
+name = "temperature"
+colormap = "temperature"
+min = -35.0
+max = 5.0

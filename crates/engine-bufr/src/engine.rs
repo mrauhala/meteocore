@@ -36,6 +36,8 @@ use crate::persist;
 use crate::source::LocalSource;
 use crate::store::{Ingest, ObsStore, StationInfo};
 use crate::wis2::{WarmupClock, Wis2Source};
+use ds_core::station_map::StationMapSettings;
+use ds_render::station_symbols::{StationLayers, StationSymbols};
 
 /// Values (stations × parameters × timesteps) one response may carry. The
 /// only bound on an `area` query's size (#1062): the stations it may touch
@@ -79,10 +81,10 @@ pub struct IngestOutcome {
 
 pub struct BufrEngine {
     collection_id: String,
-    table: Arc<ParameterTable>,
+    pub(crate) table: Arc<ParameterTable>,
     decoder: Decoder,
-    store: RwLock<ObsStore>,
-    snapshot: ArcSwap<Snapshot>,
+    pub(crate) store: RwLock<ObsStore>,
+    pub(crate) snapshot: ArcSwap<Snapshot>,
     dirty: AtomicBool,
     version: AtomicU64,
     source: Source,
@@ -94,6 +96,8 @@ pub struct BufrEngine {
     /// policy (#1002). `None` = no persistence (`data_path` mode re-reads
     /// its files instead).
     state: Option<Mutex<StateWriter>>,
+    /// The station-symbol map layers (`[bufr.map]`, #1204).
+    pub(crate) map: StationLayers,
 }
 
 impl BufrEngine {
@@ -118,6 +122,13 @@ impl BufrEngine {
         state: Option<Arc<dyn StateStore>>,
     ) -> Result<Self, DataServerError> {
         let retention = parse_iso8601_duration(&config.retention)?;
+        let map = StationLayers::new(StationMapSettings::resolve(config.map.as_ref()).map_err(
+            |e| {
+                DataServerError::Config(format!(
+                    "Collection '{collection_id}': invalid [bufr.map] {e}"
+                ))
+            },
+        )?);
         let table = Arc::new(ParameterTable::build(
             config.builtin_parameters,
             &config.parameters,
@@ -135,12 +146,13 @@ impl BufrEngine {
                 )))
             }
         };
+        let snapshot = ArcSwap::from_pointee(Snapshot::empty(&table, &map));
         let mut engine = BufrEngine {
             collection_id: collection_id.to_string(),
             table,
             decoder: Decoder::new(),
             store: RwLock::new(ObsStore::new(retention, config.max_stations)),
-            snapshot: ArcSwap::from_pointee(Snapshot::empty()),
+            snapshot,
             dirty: AtomicBool::new(false),
             version: AtomicU64::new(0),
             source,
@@ -149,6 +161,7 @@ impl BufrEngine {
             shutdown: Shutdown::new(),
             health: Health::new(),
             state: None,
+            map,
         };
         // Local mode: best-effort initial scan so fixtures serve at once.
         // WIS2 mode: nothing to load until the broker delivers — the
@@ -322,6 +335,14 @@ impl BufrEngine {
                 self.collection_id
             ),
         }
+    }
+
+    /// Hand the station map layers their style facts (#1204): each
+    /// parameter layer's midpoint, which the overlap order measures from.
+    /// The server calls this whenever it wires the collection to a map API,
+    /// built or reused, since a reload can change the styles alone.
+    pub fn set_station_symbols(&self, symbols: StationSymbols) {
+        self.map.set_symbols(symbols);
     }
 
     /// Whether this collection is fed by a WIS2 subscription.
@@ -515,7 +536,7 @@ impl BufrEngine {
         let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
         let snap = {
             let store = self.store.read().unwrap_or_else(|e| e.into_inner());
-            Snapshot::build(&store, version)
+            Snapshot::build(&store, version, &self.table, &self.map)
         };
         self.snapshot.store(Arc::new(snap));
     }
@@ -740,7 +761,7 @@ fn has_report_in(store: &ObsStore, station: &StationInfo, interval: &DatetimeInt
 /// Rows are `f32` (BUFR values carry at most ~7 significant digits); widen
 /// back to the decimal the producer encoded rather than the binary
 /// expansion (`290.12`, not `290.1199951171875`).
-fn round_stored(v: f32) -> f64 {
+pub(crate) fn round_stored(v: f32) -> f64 {
     ((v as f64) * 1e5).round() / 1e5
 }
 
@@ -1019,6 +1040,7 @@ mod tests {
             position_radius_km: 25.0,
             builtin_parameters: true,
             parameters: Vec::new(),
+            map: None,
         };
         let e = BufrEngine::new(&cfg, "bufr-gap").unwrap();
         // One station reporting at 08:00 and 09:00 only.
@@ -1089,6 +1111,7 @@ mod tests {
             position_radius_km: 25.0,
             builtin_parameters: true,
             parameters: Vec::new(),
+            map: None,
         };
         let e = BufrEngine::new(&cfg, "bufr-network").unwrap();
         {
@@ -1194,6 +1217,7 @@ mod tests {
             position_radius_km: 25.0,
             builtin_parameters: true,
             parameters: Vec::new(),
+            map: None,
         }
     }
 
