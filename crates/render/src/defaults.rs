@@ -4,7 +4,9 @@
 //! the resolver consults this table (config `[[parameter_defaults]]` rules
 //! first, then the embedded rules) so temperature renders as temperature and
 //! pressure as pressure instead of everything getting one collection-wide
-//! colormap — or viridis 0..1.
+//! colormap — or viridis 0..1. A single-parameter collection's layer with
+//! no palette configured consults it too, for the parameter its engine
+//! draws (`StyleContext::base_layer_default`).
 //!
 //! Matching is **display styling only** — never unit conversion or semantic
 //! interpretation. It is best-effort by normalized parameter name/title plus
@@ -63,6 +65,17 @@ static RULES: &[DefaultRule] = &[
         contains: &["dbz"],
         palette: "radar_dbz",
         unit_ranges: &[],
+        fallback_range: None,
+    },
+    // The lightning strike-age layer (engine-postgis events shape, #504):
+    // the value is the strike's age in minutes, on the data-valued
+    // `lightning_age` palette (0–60 min, the default one-hour window).
+    // Unit-gated: a `lightning_age` in other units says nothing about age.
+    DefaultRule {
+        names: &["lightningage"],
+        contains: &[],
+        palette: "lightning_age",
+        unit_ranges: &[(&["min"], 0.0, 60.0)],
         fallback_range: None,
     },
     // Doppler radial velocity — diverging about zero.
@@ -686,6 +699,19 @@ mod tests {
             d.match_default("ws", "", Some("kt")).unwrap().range,
             Some((0.0, 80.0))
         );
+    }
+
+    /// The events shape's strike-age layer (#504): age in minutes on the
+    /// `lightning_age` palette over its one-hour stops; other units say
+    /// nothing about age.
+    #[test]
+    fn lightning_age_in_minutes_takes_its_palette() {
+        let d = builtin();
+        let m = d.match_default("lightning_age", "", Some("min")).unwrap();
+        assert_eq!(m.palette, "lightning_age");
+        assert_eq!(m.range, Some((0.0, 60.0)));
+        assert_eq!(d.match_default("lightning_age", "", None), None);
+        assert_eq!(d.match_default("lightning_age", "", Some("s")), None);
     }
 
     #[test]
