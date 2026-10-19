@@ -37,6 +37,12 @@ target is MET Norway's MEPS, as published per lead time on thredds.met.no.
   member.
 - CF packing and masking: `scale_factor`/`add_offset`, `_FillValue`,
   `missing_value`, NaN.
+- Display units, as GRIB and BUFR serve them (#1209): each variable's CF
+  `units`, in any spelling, through `ds_core::units::display_conversion`:
+  K as °C, Pa as hPa, kg m⁻² as mm, m² s⁻² as gpm. Values are sampled from
+  the stored field and converted after, in `f64`, on every API, so a map
+  pixel, an EDR value and GetFeatureInfo agree. A unit without a rule,
+  such as CF's `1` or m/s, is served as stored.
 - EDR position (one point or several), area and radius, each model run an
   EDR instance; WMS GetFeatureInfo reads a layer's value through the
   position query.
@@ -82,15 +88,18 @@ precipitation_amount_acc = "Precipitation accumulated since run start"
 
 `collections.d/meps-netcdf-local.toml` is a runnable example on the
 committed MEPS sample, and `collections.d/meps-netcdf-pl-local.toml` one on
-the committed pressure-level sample (below). Values are served in the files' own units (K, Pa,
-m/s, kg/m², fractions), never converted, and units are reported as the
-files spell them (`kg/m^2`). Layers without a `[[wms.parameters]]` entry
-take the built-in default style their name and unit select, matched in any
-unit spelling (`kg/m^2` is `kg m-2`): temperature in kelvin, MSLP in
-pascals, wind speed and gusts, the grid-relative `x_wind_10m`/`y_wind_10m`
-components (±40 m/s), relative humidity and cloud and fog area fractions in
-unit `1` (0–1), and the run-start `precipitation_amount_acc` (0–200 mm,
-`precipitation_accumulation`).
+the committed pressure-level sample (below). Values and their reported
+units are in display units: MEPS's temperatures in °C (stored in K), MSLP
+in hPa (Pa), the accumulated precipitation in mm (`kg/m^2`) and
+geopotential in gpm (`m^2/s^2`); wind in m/s and the fractions in unit `1`
+as stored. Layers without a `[[wms.parameters]]` entry take the built-in
+default style their name and served unit select: temperature over
+−90…50 °C, MSLP over 950–1050 hPa, wind speed and gusts, the grid-relative
+`x_wind_10m`/`y_wind_10m` components (±40 m/s), relative humidity and cloud
+and fog area fractions in unit `1` on the fraction palettes (0–1), the
+run-start `precipitation_amount_acc` (0–200 mm,
+`precipitation_accumulation`) and geopotential (0–21 000 gpm). The surface
+examples keep one override, the 10 m wind components at ±20 m/s.
 
 ### Pressure levels
 
@@ -131,8 +140,9 @@ variables = ["air_temperature_pl", "x_wind_pl", "y_wind_pl", "geopotential_pl",
 - **Styles:** the built-in defaults give `x_wind_pl`/`y_wind_pl` ±80 m/s and
   the derived `wind_speed_pl` 0–80 m/s, twice the surface scale: one range
   serves every level, and the jet at 300–250 hPa reaches 60–80 m/s (the
-  committed sample's 300 hPa x component, 72 m/s). Temperature,
-  geopotential and relative humidity keep their all-levels ranges.
+  committed sample's 300 hPa x component, 72 m/s). Temperature
+  (−90…50 °C), geopotential (0–21 000 gpm) and relative humidity (0–1)
+  keep their all-levels ranges.
 
 `collections.d/meps-netcdf-pl-thredds.toml.disabled` reads the MEPS `pl`
 family, control member, 67 leads, from thredds.met.no, with its traffic
@@ -149,8 +159,9 @@ variable, 1.42 MB per field).
   position series is every step of the newest run, and an area is the step
   a map without `TIME` draws (the newest run's last).
 - **Position** projects the point onto the grid once and samples every step
-  bilinearly in the grid's x/y, as the map draws it, so GetFeatureInfo
-  answers what GetMap drew. A point off the grid is null.
+  bilinearly in the grid's x/y, then converts to the display unit, as the
+  map draws it, so GetFeatureInfo answers what GetMap drew. A point off the
+  grid is null.
 - **Area and radius** are a CRS84 grid over the polygon's bbox at the
   grid's mean cell size in degrees, at most 256 cells per axis; each cell
   centre is projected once, and cells outside the polygon are null. A

@@ -10,6 +10,7 @@ use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{ParameterInfo, RasterInfo};
 use ds_core::resample::SourceGrid;
+use ds_core::units::{display_conversion, DisplayConversion};
 use ds_core::vertical::{VerticalDimension, VerticalKind};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 use ds_storage::ObjectVersion;
@@ -55,6 +56,14 @@ pub(crate) struct OpenFile {
 /// every later file must carry the same variables on the same grid.
 pub(crate) struct Layout {
     pub variables: Vec<Variable>,
+    /// Each variable's display conversion (#1209), in `variables` order,
+    /// from its CF `units` through `ds_core::units::display_conversion`,
+    /// as engine-bufr's and engine-grib's: K to °C, Pa to hPa, kg m-2 to
+    /// mm, m2 s-2 to gpm, in any spelling. `None` for a unit without a rule
+    /// (CF's `1`, m/s), served as stored. Every value the engine serves is
+    /// sampled from the stored field first and converted after, in `f64`
+    /// ([`Self::to_display`]), so a map pixel and an EDR value agree.
+    pub display: Vec<Option<DisplayConversion>>,
     pub grid: FileGrid,
     /// The sampler over the grid, built once.
     pub source: SourceGrid,
@@ -71,7 +80,11 @@ pub(crate) struct Layout {
 
 impl Layout {
     pub(crate) fn new(variables: Vec<Variable>, grid: FileGrid) -> Self {
-        let wind = Arc::new(wind_facts(&variables, &grid.transform.crs));
+        let display: Vec<Option<DisplayConversion>> = variables
+            .iter()
+            .map(|v| display_conversion(&v.units))
+            .collect();
+        let wind = Arc::new(wind_facts(&variables, &display, &grid.transform.crs));
         // Every variable of a layout is on the same levels, or none is
         // (`ingest::one_vertical_axis`).
         let vertical = variables
@@ -81,10 +94,23 @@ impl Layout {
         Self {
             source: SourceGrid::new(grid.transform.clone()),
             variables,
+            display,
             grid,
             wind,
             vertical,
         }
+    }
+
+    /// The unit variable `index` is served in: its display unit (`°C`,
+    /// `hPa`, `mm`, `gpm`), else its `units` as the file spells them.
+    pub(crate) fn unit(&self, index: usize) -> &str {
+        served_unit(&self.variables[index], self.display[index])
+    }
+
+    /// `raw`, sampled from variable `index`'s stored field, in the unit it
+    /// is served in ([`Self::unit`]).
+    pub(crate) fn to_display(&self, index: usize, raw: f64) -> f64 {
+        self.display[index].map_or(raw, |display| display.convert(raw))
     }
 
     /// The level a map draws, as an index into the vertical axis's levels:
@@ -157,12 +183,19 @@ impl Layout {
 /// Lambert grid is `GridAxes::Rotated`, so its grid-relative 10 m wind
 /// gives a speed and no direction until the components are turned by the
 /// convergence angle (a follow-up on #897). Nothing is taken from a name.
-pub(crate) fn wind_facts(variables: &[Variable], crs: &Crs) -> WindFacts {
+/// The unit is the one served ([`Layout::unit`]): `DerivedWind` combines
+/// the values the engine serves.
+pub(crate) fn wind_facts(
+    variables: &[Variable],
+    display: &[Option<DisplayConversion>],
+    crs: &Crs,
+) -> WindFacts {
     WindFacts {
         grid: GridAxes::of(crs),
         parameters: variables
             .iter()
-            .map(|v| {
+            .zip(display)
+            .map(|(v, &display)| {
                 let level = (!v.levels.is_empty()).then(|| {
                     v.levels
                         .iter()
@@ -178,12 +211,18 @@ pub(crate) fn wind_facts(variables: &[Variable], crs: &Crs) -> WindFacts {
                         .map_or(VectorFrame::Unknown, VectorFrame::from_standard_name),
                     level_label: level.clone(),
                     level,
-                    unit: v.units.clone(),
+                    unit: served_unit(v, display).to_string(),
                     ..ParameterFacts::new(v.name.to_string())
                 }
             })
             .collect(),
     }
+}
+
+/// The unit `variable` is served in under `display`: the display unit,
+/// else its `units` as the file spells them.
+fn served_unit(variable: &Variable, display: Option<DisplayConversion>) -> &str {
+    display.map_or(variable.units.as_str(), |display| display.unit)
 }
 
 /// A run's key: its reference time, `None` for the timeline of files
@@ -412,13 +451,14 @@ pub(crate) fn raster_info(
             layout
                 .variables
                 .iter()
-                .map(|v| ParameterInfo {
+                .enumerate()
+                .map(|(index, v)| ParameterInfo {
                     name: v.name.to_string(),
                     title: titles
                         .get(&*v.name)
                         .cloned()
                         .unwrap_or_else(|| v.title.clone()),
-                    unit: v.units.clone(),
+                    unit: layout.unit(index).to_string(),
                 })
                 .collect()
         })

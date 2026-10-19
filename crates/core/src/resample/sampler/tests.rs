@@ -239,6 +239,34 @@ fn renders_f32_with_nan_for_nodata() {
     assert!(data.iter().any(|v| v.is_nan()) && data.iter().any(|v| v.is_finite()));
 }
 
+/// A converting render (#1209) converts each sampled value in `f64` before
+/// narrowing it: every pixel is the value a point query reads at its
+/// position, converted, and nodata stays NaN.
+#[test]
+fn a_converting_render_converts_each_sample_before_narrowing() {
+    let gt = meps_shaped();
+    let grid = SourceGrid::new(gt.clone());
+    let kelvin: Vec<f32> = field_of(&gt).iter().map(|v| v + 273.15).collect();
+    let celsius = |k: f64| k - 273.15;
+    let (width, height) = (64, 32);
+    let map = grid.output_map([-30.0, 40.0, 60.0, 85.0], width, height, &OutputCrs::Wgs84);
+    let converted = pixels(&map.sample_f32_with(&kelvin, None, celsius).unwrap());
+    assert!(converted.iter().any(Option::is_none) && converted.iter().any(Option::is_some));
+    for oy in 0..height {
+        for ox in 0..width {
+            let expected = map
+                .position(ox, oy)
+                .and_then(|position| grid.value_at(&kelvin, None, position))
+                .map(|k| f64::from(celsius(k) as f32));
+            assert_eq!(
+                converted[(oy * width + ox) as usize],
+                expected,
+                "({ox}, {oy})"
+            );
+        }
+    }
+}
+
 /// A point query projects the point once and samples it as a map does:
 /// the geography's value inside the grid, nothing off it or from a field of
 /// the wrong length, and on a global lat/lon grid the same value a turn

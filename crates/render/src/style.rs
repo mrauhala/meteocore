@@ -1298,8 +1298,9 @@ mod tests {
     }
 
     /// #1067 PR 6: a NetCDF MEPS collection's layers, with the names,
-    /// titles and units engine-netcdf reports from testdata/meps-netcdf and
-    /// only a collection-level colormap, as the shipped example has. Every
+    /// titles and units engine-netcdf reports from testdata/meps-netcdf (the
+    /// display units of #1209: °C, hPa, mm) and only a collection-level
+    /// colormap, as the shipped example has. Every
     /// layer gets its own default, and representative values render
     /// distinct colours: the fraction palettes span 0..1 rather than sitting
     /// in the percent palettes' bottom 1 % (#872), and the run-start
@@ -1307,9 +1308,9 @@ mod tests {
     #[test]
     fn meps_netcdf_parameters_render_their_defaults() {
         let ctx = StyleContext::with_builtins();
-        let c = coll("colormap = \"temperature\"\nmin = 183.15\nmax = 323.15\n");
+        let c = coll("colormap = \"temperature\"\n");
         let params = [
-            ("air_temperature_2m", "Screen level temperature (T2M)", "K"),
+            ("air_temperature_2m", "Screen level temperature (T2M)", "°C"),
             (
                 "relative_humidity_2m",
                 "Screen level relative humidity (RH2M)",
@@ -1321,12 +1322,12 @@ mod tests {
             (
                 "air_pressure_at_sea_level",
                 "Mean Sea Level Pressure (MSLP)",
-                "Pa",
+                "hPa",
             ),
             (
                 "precipitation_amount_acc",
                 "Precipitation accumulated since run start",
-                "kg/m^2",
+                "mm",
             ),
             ("cloud_area_fraction", "Total cloud cover (TCC)", "1"),
         ]
@@ -1344,8 +1345,8 @@ mod tests {
             (
                 "air_temperature_2m",
                 "temperature",
-                (183.15, 323.15),
-                &[253.15, 272.15, 274.15, 293.15],
+                (-90.0, 50.0),
+                &[-20.0, -1.0, 1.0, 20.0],
             ),
             (
                 "relative_humidity_2m",
@@ -1374,8 +1375,8 @@ mod tests {
             (
                 "air_pressure_at_sea_level",
                 "pressure",
-                (95_000.0, 105_000.0),
-                &[97_000.0, 101_300.0, 104_000.0],
+                (950.0, 1050.0),
+                &[970.0, 1013.0, 1040.0],
             ),
             (
                 "precipitation_amount_acc",
@@ -1424,13 +1425,14 @@ mod tests {
     }
 
     /// #1067 PR 8: MEPS's pressure-level layers, as engine-netcdf reports
-    /// them with the speed `DerivedWind` adds: the jet's 50–70 m/s
-    /// components and speeds draw colours of their own, which the surface
-    /// scale's ±40 / 0–40 m/s would merge into its end colour.
+    /// them with the speed `DerivedWind` adds (geopotential in gpm, #1209):
+    /// the jet's 50–70 m/s components and speeds draw colours of their own,
+    /// which the surface scale's ±40 / 0–40 m/s would merge into its end
+    /// colour.
     #[test]
     fn meps_pressure_level_winds_resolve_the_jet() {
         let ctx = StyleContext::with_builtins();
-        let c = coll("colormap = \"temperature\"\nmin = 183.15\nmax = 323.15\n");
+        let c = coll("colormap = \"temperature\"\n");
         let params = [
             (
                 "x_wind_pl",
@@ -1443,7 +1445,7 @@ mod tests {
                 "m/s",
             ),
             ("wind_speed_pl", "Wind speed", "m/s"),
-            ("geopotential_pl", "Geopotential pressure levels", "m^2/s^2"),
+            ("geopotential_pl", "Geopotential pressure levels", "gpm"),
         ]
         .map(|(name, title, unit)| ds_core::map_engine::ParameterInfo {
             name: name.into(),
@@ -1477,8 +1479,8 @@ mod tests {
             (
                 "geopotential_pl",
                 "viridis",
-                (0.0, 206_000.0),
-                &[1_000.0, 14_000.0, 90_000.0],
+                (0.0, 21_000.0),
+                &[100.0, 1_500.0, 5_500.0, 9_200.0],
             ),
         ];
         for (name, palette, (min, max), values) in cases {

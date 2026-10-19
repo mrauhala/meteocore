@@ -154,10 +154,11 @@ fn json(reply: &Reply) -> Value {
     serde_json::from_str(&reply.body).unwrap_or_else(|e| panic!("{e}: {}", reply.body))
 }
 
-/// A GetFeatureInfo answer: the value, the reported time and run, and the
-/// sampled point.
+/// A GetFeatureInfo answer: the value and its unit, the reported time and
+/// run, and the sampled point.
 struct Info {
     value: Value,
+    unit: Value,
     time: Value,
     reference_time: Value,
     lon: f64,
@@ -192,6 +193,7 @@ async fn feature_info(
     let coordinates = &feature["geometry"]["coordinates"];
     Info {
         value: properties["value"].clone(),
+        unit: properties["unit"].clone(),
         time: properties["time"].clone(),
         reference_time: properties
             .get("reference_time")
@@ -403,7 +405,9 @@ fn meps() -> Apis {
     let config = serde_json::from_value(serde_json::json!({
         "data_path": testdata("meps-netcdf").to_str().unwrap(),
         "filename_template": "meps_sfc_{lead}_%Y%m%dT{run}Z.nc",
-        "variables": ["air_temperature_2m", "x_wind_10m", "y_wind_10m"],
+        "variables": ["air_temperature_2m", "x_wind_10m", "y_wind_10m",
+                      "air_pressure_at_sea_level", "precipitation_amount_acc",
+                      "relative_humidity_2m"],
     }))
     .unwrap();
     let netcdf = Arc::new(NetcdfEngine::new("meps", &config).unwrap());
@@ -420,6 +424,9 @@ fn meps() -> Apis {
             "air_temperature_2m",
             "x_wind_10m",
             "y_wind_10m",
+            "air_pressure_at_sea_level",
+            "precipitation_amount_acc",
+            "relative_humidity_2m",
             "wind_speed_10m",
         ],
     )
@@ -427,18 +434,30 @@ fn meps() -> Apis {
 
 /// Fixture cell (row 5 from the south, column 4) of
 /// `testdata/meps-netcdf`: MET Norway's latitude and longitude of it, and
-/// its 11Z values in `meps_sfc_02_20261015T09Z` (2 m temperature in K, 10 m
-/// wind along the grid's x and y in m/s), as the CDL holds them.
+/// its 11Z 10 m wind along the grid's x and y in m/s in
+/// `meps_sfc_02_20261015T09Z`, as the CDL holds them.
 const MEPS_CELL: (f64, f64) = (13.827_727_538_778_511, 62.552_981_178_508_49);
-const MEPS_CELL_11Z: (f64, f64, f64) = (278.38034, 1.137_076_4, 5.762_552_3);
+const MEPS_CELL_11Z: (f64, f64) = (1.137_076_4, 5.762_552_3);
+
+/// [`MEPS_CELL`]'s other 11Z values, as the CDL holds them in the file's
+/// unit, converted to what GetFeatureInfo serves and named in the unit it
+/// reports (#1209): 2 m temperature from K to °C, MSLP from Pa to hPa, the
+/// accumulated precipitation's kg/m^2 as mm; relative humidity, a fraction
+/// in unit 1, as stored.
+const MEPS_CELL_11Z_DISPLAY: [(&str, f64, &str); 4] = [
+    ("air_temperature_2m", 278.38034 - 273.15, "°C"),
+    ("air_pressure_at_sea_level", 100_751.086 / 100.0, "hPa"),
+    ("precipitation_amount_acc", 0.021_972_656, "mm"),
+    ("relative_humidity_2m", 1.000_006, "1"),
+];
 
 /// NetCDF (#1067): MEPS on its Lambert grid, south-up rows. The pixel over
-/// a grid cell's centre reads the cell's stored value; every pixel reads
-/// the EDR position value at its centre, from the step and run GetMap
-/// draws: the newest run without `TIME`, the run that has a time the
-/// newest lacks. The derived speed is the wrapper's in both. Served by a
-/// current-thread runtime, as GRIB's above: the field jobs run on the
-/// query runtime.
+/// a grid cell's centre reads the cell's stored value in its display unit
+/// (#1209); every pixel reads the EDR position value at its centre, from
+/// the step and run GetMap draws: the newest run without `TIME`, the run
+/// that has a time the newest lacks. The derived speed is the wrapper's in
+/// both. Served by a current-thread runtime, as GRIB's above: the field
+/// jobs run on the query runtime.
 #[test]
 fn a_netcdf_pixel_reads_the_edr_position_value() {
     let Apis { wms, edr } = meps();
@@ -453,17 +472,19 @@ async fn netcdf_pixels_read_the_edr_position_value(wms: axum::Router, edr: axum:
     let (lon, lat) = MEPS_CELL;
     let d = 0.01;
     let bbox = format!("{},{},{},{}", lon - d, lat - d, lon + d, lat + d);
-    let (t2m, u, v) = MEPS_CELL_11Z;
-    for (parameter, stored) in [("air_temperature_2m", t2m), ("wind_speed_10m", u.hypot(v))] {
+    let (u, v) = MEPS_CELL_11Z;
+    let speed = ("wind_speed_10m", u.hypot(v), "m/s");
+    for (parameter, served, unit) in MEPS_CELL_11Z_DISPLAY.into_iter().chain([speed]) {
         let layer = format!("meps/{parameter}");
         let info = feature_info(&wms, &layer, "CRS:84", &bbox, (3, 3), (1, 1), "").await;
         assert_eq!(info.time, "2026-10-15T11:00:00Z", "{parameter}");
         assert_eq!(info.reference_time, "2026-10-15T09:00:00Z", "{parameter}");
         let value = info.value.as_f64().unwrap();
         assert!(
-            (value - stored).abs() < 1e-3,
-            "{parameter}: {value} {stored}"
+            (value - served).abs() < 1e-3,
+            "{parameter}: {value} {served}"
         );
+        assert_eq!(info.unit, unit, "{parameter}");
         let position = edr_position(
             &edr,
             "meps",
@@ -535,8 +556,8 @@ fn meps_pl() -> Apis {
 
 /// `testdata/meps-netcdf-pl` at [`MEPS_CELL`] in `meps_pl_01_20261015T09Z`
 /// (10Z, the default step), as the CDL holds them: per level (1000, 850,
-/// 500, 300 hPa) the temperature in K and the wind along the grid's x and
-/// y in m/s.
+/// 500, 300 hPa) the temperature in K, served in °C (#1209), and the wind
+/// along the grid's x and y in m/s.
 const MEPS_PL_CELL_10Z: [(f64, f64, f64, f64); 4] = [
     (1000.0, 281.9298, 0.607_873_9, 5.187_544),
     (850.0, 277.650_57, 20.274_448, 14.588_396),
@@ -622,7 +643,9 @@ async fn netcdf_pressure_level_pixels(wms: axum::Router, edr: axum::Router) {
         };
         let info = feature_info(&wms, layer, "CRS:84", &bbox, (3, 3), (1, 1), &extra).await;
         let value = info.value.as_f64().unwrap();
-        assert!((value - t).abs() < 1e-3, "{hpa}: {value} {t}");
+        let celsius = t - 273.15;
+        assert!((value - celsius).abs() < 1e-3, "{hpa}: {value} {celsius}");
+        assert_eq!(info.unit, "°C", "{hpa}");
         let speed = feature_info(
             &wms,
             "meps-pl/wind_speed_pl",

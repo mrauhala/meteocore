@@ -1516,7 +1516,7 @@ poll_interval_secs = 60
 precipitation_amount_acc = "Precipitation accumulated since run start"
 ```
 
-`apis` defaults to `["edr"]`; the examples serve all four, `["edr", "wms", "maps", "tiles"]`. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs). Values are served in the files' own units, never converted; layers the example does not style take the per-parameter default their name and unit select, in any unit spelling (see [Styling](#styling-shared-with-maps-and-tiles)).
+`apis` defaults to `["edr"]`; the examples serve all four, `["edr", "wms", "maps", "tiles"]`. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs). Values are served in display units, as GRIB's and BUFR's are: each variable's CF `units`, in any spelling, converted after sampling on every API (K as °C, Pa as hPa, kg m⁻² as mm, m² s⁻² as gpm), and reported in the converted unit; a unit without a rule, such as CF's `1` or m/s, is served as stored. Layers the example does not style take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
 
 **Remote files.** An `http(s)://` `data_path` is a server whose files are found by name and read in place by HTTP range, never downloaded whole: MEPS on thredds.met.no's fileServer, which cannot be listed.
 
@@ -1926,7 +1926,7 @@ parameter, a WMS `LAYERS=<collection>` or a Maps or Tiles request without
 too (#1133).
 
 For multi-parameter rasters, defaults and legend labels use each selected
-parameter's own unit: GRIB display units, Zarr and NetCDF CF units as the
+parameter's own unit: GRIB and NetCDF display units, Zarr CF units as the
 files spell them, or ODIM quantity units.
 Temperature, pressure and the signed, geopotential, specific-humidity,
 column-water, snowfall, run-start accumulation and CF area-fraction defaults

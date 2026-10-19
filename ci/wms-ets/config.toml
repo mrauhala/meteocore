@@ -143,10 +143,8 @@ filename_template = "meps_pl_{lead}_%Y%m%dT{run}Z.nc"
 variables = ["air_temperature_pl", "x_wind_pl", "y_wind_pl"]
 poll_interval_secs = 3600
 
-# Each parameter layer takes its built-in default style (temperature, wind
-# components, wind speed); this is the collection-level fallback, the
-# temperature palette over -90…50 °C in kelvin.
+# Each parameter layer takes its built-in default style (temperature in °C,
+# served from the files' K, wind components, wind speed); this is the
+# collection-level fallback, the temperature palette over its own -90…50 °C.
 [collections.wms]
 colormap = "temperature"
-min = 183.15
-max = 323.15
