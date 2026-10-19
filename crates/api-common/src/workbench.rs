@@ -12,12 +12,16 @@ use serde_json::{json, Value};
 
 use crate::{mounts, rel};
 
+pub mod assets;
 mod conformance;
 mod metadata;
 pub use metadata::{i18n_text, unit_text};
 
+/// The stylesheet, for the tests that read its rules; pages link it as a
+/// static asset (`assets`).
+#[cfg(test)]
 const CSS: &str = include_str!("workbench/style.css");
-const SCRIPT: &str = include_str!("workbench/app.js");
+/// Sets the theme before the first paint, so it stays inline.
 const THEME: &str = include_str!("workbench/theme.js");
 /// API workspaces offered by the switcher: (kind, label, mount path). The
 /// shared OGC API root (#789) is mounted at the server root.
@@ -246,6 +250,9 @@ fn plain_anchor(href: &str, label: &str) -> String {
     )
 }
 
+/// An inline SVG icon: a 24-unit `viewBox` stroked in `currentColor`, no
+/// icon font. The map's controls (#1220) draw theirs at 20 px with a 1.75
+/// stroke (`map.css`); `layers` is also the fallback.
 pub fn icon(name: &str) -> String {
     let path = match name {
         "home" => "m3 10 9-7 9 7v11h-6v-7H9v7H3Z",
@@ -256,6 +263,21 @@ pub fn icon(name: &str) -> String {
         "radar" => "M12 2a10 10 0 1 0 10 10 M12 6a6 6 0 1 0 6 6 M12 12 22 2",
         "list" => "M8 5h13 M8 12h13 M8 19h13 M3 5h1 M3 12h1 M3 19h1",
         "grid" => "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
+        "play" => "M8 5.5v13l10-6.5Z",
+        "pause" => "M8 5h2.5v14H8Z M13.5 5H16v14h-2.5Z",
+        "step-back" => "m15 6-6 6 6 6",
+        "step-forward" => "m9 6 6 6-6 6",
+        "to-start" => "M6 5v14 M18 6l-8.5 6 8.5 6Z",
+        "to-end" => "M18 5v14 M6 6l8.5 6L6 18Z",
+        "loop" => "m17 2 3 3-3 3 M4 11V9a4 4 0 0 1 4-4h12 M7 22l-3-3 3-3 M20 13v2a4 4 0 0 1-4 4H4",
+        "bounce" => "m7 8-4 4 4 4 M17 8l4 4-4 4 M3 12h18",
+        "once" => "M3 12h13 m-4-4 4 4-4 4 M20 5v14",
+        "expand" => "M15 3h6v6 M9 21H3v-6 M21 3l-7 7 M3 21l7-7",
+        "collapse" => "M4 14h6v6 M20 10h-6V4 M14 10l7-7 M3 21l7-7",
+        "help" => "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18 M9.2 9a2.9 2.9 0 0 1 5.6 1c0 2-2.8 2.6-2.8 2.6 M12 17h.01",
+        "basemap" => "M9 4 3 6.5v13.5l6-2.5 6 2.5 6-2.5V4l-6 2.5Z M9 4v13.5 M15 6.5V20",
+        "chevron" => "m6 9 6 6 6-6",
+        "close" => "M6 6l12 12 M18 6 6 18",
         _ => "m12 3 10 5-10 5L2 8Z M2 12l10 5 10-5 M2 16l10 5 10-5",
     };
     format!(
@@ -448,15 +470,17 @@ impl Page<'_> {
             if catalog || items { "" } else { REQUEST_FOLD }
         );
         format!(
-            r##"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{document_title}</title><link rel="icon" href="{FAVICON}"><link rel="alternate" type="{json_type}" href="{json_url}"><style>{CSS}</style><script>{THEME}</script>{head}</head>
+            r##"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{document_title}</title><link rel="icon" href="{FAVICON}"><link rel="alternate" type="{json_type}" href="{json_url}"><link rel="stylesheet" href="{stylesheet}"><script>{THEME}</script>{head}</head>
 <body class="{page_class}"><a class="skip" href="#main">Skip to content</a><div class="shell"><aside class="sidebar" aria-label="API navigation"><a class="brand" href="{base}/?f=html"><span class="brand-mark"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><circle cx="16" cy="16" r="11"/><circle cx="16" cy="16" r="6"/><path d="M16 16 27 5M16 3v3M3 16h3M16 26v3M26 16h3"/></svg></span><span>MeteoCore<small>API WORKBENCH</small></span></a><div class="api-switch enhanced"><label for="api-select">API workspace</label><select id="api-select">{options}</select></div><noscript><nav aria-label="APIs">{api_nav}</nav></noscript><nav id="primary-nav" aria-label="Workspace">{nav}</nav><div class="sidebar-note"><span class="eyebrow">OPEN STANDARDS</span><p>One data platform.<br>Different ways to explore.</p></div><div class="sidebar-footer">MeteoCore<small>OGC API · Developer workspace</small></div></aside>
 <div class="workspace"><header class="topbar"><nav id="breadcrumbs" aria-label="Breadcrumb">{crumbs}</nav><div class="topbar-actions"><button class="quiet enhanced" id="help-button">Help</button><label class="theme-label enhanced" for="theme">Theme<select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label><nav class="representation-switch" aria-label="Representation"><a aria-current="page" href="{html_url}">HTML</a><a rel="alternate" id="json-link" href="{json_url}">JSON</a></nav></div></header>
 {request_context}
-<main id="main" tabindex="-1">{body}</main><footer class="page-footer"><span>MeteoCore · Open weather data</span><span>HTML representation · Times in UTC</span></footer></div></div><dialog id="help-dialog"><div class="dialog-head"><h2>Find a collection, then request data</h2><button class="icon-button" id="close-help" aria-label="Close help">×</button></div><div class="panel-body"><p><strong>1. Find a collection.</strong> Collection search matches titles, descriptions and keywords. Commas separate alternatives; words form a phrase.</p><p>Advanced search adds required (+) and excluded (-) terms. Area and time narrow coverage; unknown extents remain eligible.</p><p><strong>2. Request data.</strong> Open a collection to see its data operations. Feature filters select items within that collection; discovery filters are not copied into the data request. The JSON switch always opens the current resource with its applied filters and paging.</p></div></dialog><div id="toast" role="status" aria-live="polite"></div><script>{SCRIPT}</script></body></html>"##,
+<main id="main" tabindex="-1">{body}</main><footer class="page-footer"><span>MeteoCore · Open weather data</span><span>HTML representation · Times in UTC</span></footer></div></div><dialog id="help-dialog"><div class="dialog-head"><h2>Find a collection, then request data</h2><button class="icon-button" id="close-help" aria-label="Close help">×</button></div><div class="panel-body"><p><strong>1. Find a collection.</strong> Collection search matches titles, descriptions and keywords. Commas separate alternatives; words form a phrase.</p><p>Advanced search adds required (+) and excluded (-) terms. Area and time narrow coverage; unknown extents remain eligible.</p><p><strong>2. Request data.</strong> Open a collection to see its data operations. Feature filters select items within that collection; discovery filters are not copied into the data request. The JSON switch always opens the current resource with its applied filters and paging.</p></div></dialog><div id="toast" role="status" aria-live="polite"></div><script src="{script}"></script></body></html>"##,
             document_title = escape(document_title),
             json_url = escape(safe_href(json_url)),
             html_url = escape(safe_href(&html_url)),
             base = escape(base),
+            stylesheet = escape(&assets::href(base, "style.css")),
+            script = escape(&assets::href(base, "app.js")),
             page_class = if items {
                 "items-page"
             } else if catalog {
@@ -840,10 +864,13 @@ const MAP_EXTENT_FALLBACK: &str = "The advertised extent is listed below.";
 const MAP_REQUEST_FALLBACK: &str =
     "Map requests are listed below, under Request data from this collection.";
 
+/// What a page with a map links in its head: MapLibre's stylesheet and the
+/// map's own (`map.css`, a static asset).
 pub fn map_head(base: &str) -> String {
     format!(
-        "<link rel=\"stylesheet\" href=\"{}/preview/vendor/maplibre-gl.css\">",
-        escape(base)
+        "<link rel=\"stylesheet\" href=\"{}/preview/vendor/maplibre-gl.css\"><link rel=\"stylesheet\" href=\"{}\">",
+        escape(base),
+        escape(&assets::href(base, "map.css"))
     )
 }
 
@@ -979,274 +1006,439 @@ fn map_parameters(parameters: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// An icon button of the map's floating panels: 44 px, its name for
+/// assistive technology in `aria-label`, its keys in the title.
+fn map_button(id: &str, label: &str, title: &str, inner: &str, attrs: &str) -> String {
+    format!("<button type=\"button\" class=\"map-icon-button\" id=\"{id}\" aria-label=\"{label}\" title=\"{title}\"{attrs}>{inner}</button>")
+}
+
 /// The map's time bar (#1220), the script's alone: hidden until the script
-/// binds a time axis to it. The track is laid out by time; its range input
-/// is the playhead, and the marks over it are drawn by the script.
-const MAP_TIME_BAR: &str = concat!(
-    "<div id=\"map-timebar\" class=\"map-timebar enhanced\" role=\"group\" aria-label=\"Time\" hidden>",
-    "<div class=\"map-timebar-row\">",
-    "<button type=\"button\" class=\"btn\" id=\"map-first\" aria-label=\"First frame of the loop\" title=\"First frame of the loop; with Shift, of all\">⇤</button>",
-    "<button type=\"button\" class=\"btn\" id=\"map-prev\" aria-label=\"Previous frame\" title=\"Previous frame (,); with Shift, 10 frames\">‹</button>",
-    "<button type=\"button\" class=\"btn primary\" id=\"map-play\" aria-label=\"Play\" title=\"Play or pause (Space or K)\">▶\u{fe0e}</button>",
-    "<button type=\"button\" class=\"btn\" id=\"map-next\" aria-label=\"Next frame\" title=\"Next frame (.); with Shift, 10 frames\">›</button>",
-    "<button type=\"button\" class=\"btn\" id=\"map-last\" aria-label=\"Last frame of the loop\" title=\"Last frame of the loop; with Shift, of all\">⇥</button>",
-    "<p class=\"map-time-label\"><span id=\"map-time-drawn\">–</span> <span id=\"map-time-relative\"></span> <span id=\"map-time-seek\" hidden></span></p>",
-    "<label>Speed<select id=\"map-speed\"><option value=\"1\">1 fps</option><option value=\"2\">2 fps</option><option value=\"4\">4 fps</option><option value=\"8\">8 fps</option></select></label>",
-    "<label>Repeat<select id=\"map-repeat\"><option value=\"loop\">Loop</option><option value=\"bounce\">Bounce</option><option value=\"once\">Once</option></select></label>",
-    "<details id=\"map-time-menu\" class=\"map-time-menu\"><summary aria-label=\"More time options\">…</summary><div class=\"map-time-menu-body\">",
-    "<label>Jump to · UTC<input id=\"map-jump\" type=\"datetime-local\" step=\"1\"></label>",
-    "<button type=\"button\" class=\"btn small\" id=\"map-window-start\">Start the loop here</button>",
-    "<button type=\"button\" class=\"btn small\" id=\"map-window-end\">End the loop here</button>",
-    "<button type=\"button\" class=\"btn small\" id=\"map-window-reset\">Default loop</button>",
-    "</div></details>",
-    "<button type=\"button\" class=\"btn\" id=\"map-keys\" aria-expanded=\"false\" aria-controls=\"map-keys-help\" aria-label=\"Keyboard shortcuts\">?</button>",
-    "</div>",
-    "<div id=\"map-track\" class=\"map-track\">",
-    "<div id=\"map-track-marks\" class=\"map-track-marks\" aria-hidden=\"true\"></div>",
-    "<div id=\"map-track-buffer\" class=\"map-track-buffer\" aria-hidden=\"true\"></div>",
-    "<div id=\"map-window\" class=\"map-window\" aria-hidden=\"true\"><span id=\"map-window-lo\" class=\"map-window-handle\"></span><span id=\"map-window-hi\" class=\"map-window-handle\"></span></div>",
-    "<span id=\"map-playhead-mark\" class=\"map-playhead-mark\" aria-hidden=\"true\"></span>",
-    "<input id=\"map-playhead\" type=\"range\" min=\"0\" max=\"0\" value=\"0\" step=\"any\" aria-label=\"Time · UTC\">",
-    "</div>",
-    "<p id=\"map-window-text\" class=\"map-window-text\"></p>",
-    "<div id=\"map-keys-help\" class=\"map-keys-help\" hidden><p>With focus on the map or its time bar:</p><dl>",
-    "<dt>Space or K</dt><dd>Play or pause</dd>",
-    "<dt>, and .</dt><dd>Previous or next frame; with Shift, 10 frames</dd>",
-    "<dt>← and → on the time slider</dt><dd>Previous or next frame; with Shift, 10 frames</dd>",
-    "<dt>Page Up and Page Down</dt><dd>One day earlier or later</dd>",
-    "<dt>Home and End</dt><dd>First or last frame</dd>",
-    "<dt>[ and ]</dt><dd>Start or end the loop at this frame</dd>",
-    "<dt>&lt; and &gt;</dt><dd>Slower or faster</dd>",
-    "<dt>N</dt><dd>The frame nearest now</dd>",
-    "<dt>?</dt><dd>This list</dd>",
-    "</dl></div></div>"
-);
+/// binds a time axis to it, docked across the bottom of the map. The track
+/// is laid out by time; its range input is the playhead, and the marks over
+/// it are drawn by the script. Repeat is a radio group outside the form.
+fn map_time_bar(help: &str) -> String {
+    let mut bar = String::from("<div id=\"map-timebar\" class=\"map-timebar map-card enhanced\" role=\"group\" aria-label=\"Time\" hidden><div class=\"map-timebar-row\"><div class=\"map-transport\">");
+    bar.push_str(&map_button(
+        "map-first",
+        "First frame of the loop",
+        "First frame of the loop; with Shift, of all",
+        &icon("to-start"),
+        "",
+    ));
+    bar.push_str(&map_button(
+        "map-prev",
+        "Previous frame",
+        "Previous frame (,); with Shift, 10 frames",
+        &icon("step-back"),
+        "",
+    ));
+    bar.push_str(&map_button(
+        "map-play",
+        "Play",
+        "Play or pause (Space or K)",
+        &format!(
+            "<span class=\"when-paused\">{}</span><span class=\"when-playing\">{}</span>",
+            icon("play"),
+            icon("pause")
+        ),
+        "",
+    ));
+    bar.push_str(&map_button(
+        "map-next",
+        "Next frame",
+        "Next frame (.); with Shift, 10 frames",
+        &icon("step-forward"),
+        "",
+    ));
+    bar.push_str(&map_button(
+        "map-last",
+        "Last frame of the loop",
+        "Last frame of the loop; with Shift, of all",
+        &icon("to-end"),
+        "",
+    ));
+    bar.push_str("</div><div class=\"map-time-text\"><p class=\"map-time-label\"><span id=\"map-time-drawn\">–</span> <span id=\"map-time-relative\"></span> <span id=\"map-time-seek\" hidden></span></p><p id=\"map-window-text\" class=\"map-window-text\"></p></div><div class=\"map-time-options\">");
+    bar.push_str("<label class=\"map-speed\"><span class=\"visually-hidden\">Speed</span><select id=\"map-speed\"><option value=\"1\">1 fps</option><option value=\"2\">2 fps</option><option value=\"4\">4 fps</option><option value=\"8\">8 fps</option></select></label>");
+    bar.push_str("<fieldset id=\"map-repeat\" class=\"map-repeat\"><legend class=\"visually-hidden\">Repeat</legend>");
+    for (value, label, checked) in [
+        ("loop", "Loop", " checked"),
+        ("bounce", "Bounce", ""),
+        ("once", "Once", ""),
+    ] {
+        bar.push_str(&format!(
+            "<label title=\"{label}\"><input type=\"radio\" name=\"map-repeat\" value=\"{value}\"{checked}><span>{}<span class=\"visually-hidden\">{label}</span></span></label>",
+            icon(value)
+        ));
+    }
+    bar.push_str("</fieldset>");
+    bar.push_str("<details id=\"map-time-menu\" class=\"map-time-menu\"><summary aria-label=\"More time options\" title=\"More time options\">…</summary><div class=\"map-time-menu-body map-card\"><label>Jump to · UTC<input id=\"map-jump\" type=\"datetime-local\" step=\"1\"></label><button type=\"button\" class=\"btn small\" id=\"map-window-start\">Start the loop here</button><button type=\"button\" class=\"btn small\" id=\"map-window-end\">End the loop here</button><button type=\"button\" class=\"btn small\" id=\"map-window-reset\">Default loop</button></div></details>");
+    bar.push_str(&map_button(
+        "map-keys",
+        "Help and keyboard shortcuts",
+        "Help and keyboard shortcuts (?)",
+        &icon("help"),
+        " aria-expanded=\"false\" aria-controls=\"map-keys-help\"",
+    ));
+    bar.push_str("</div></div>");
+    bar.push_str(&format!(
+        "<div id=\"map-keys-help\" class=\"map-keys-help map-card\" hidden>{help}"
+    ));
+    bar.push_str(concat!(
+        "<p>With focus on the map or its time bar:</p><dl>",
+
+        "<dt>Space or K</dt><dd>Play or pause</dd>",
+        "<dt>, and .</dt><dd>Previous or next frame; with Shift, 10 frames</dd>",
+        "<dt>← and → on the time slider</dt><dd>Previous or next frame; with Shift, 10 frames</dd>",
+        "<dt>Page Up and Page Down</dt><dd>One day earlier or later</dd>",
+        "<dt>Home and End</dt><dd>First or last frame</dd>",
+        "<dt>[ and ]</dt><dd>Start or end the loop at this frame</dd>",
+        "<dt>&lt; and &gt;</dt><dd>Slower or faster</dd>",
+        "<dt>N</dt><dd>The frame nearest now</dd>",
+        "<dt>?</dt><dd>This list</dd>",
+        "<dt>Esc</dt><dd>Close a panel, or leave the full window</dd>",
+        "</dl></div>",
+        "<div id=\"map-track\" class=\"map-track\">",
+        "<div id=\"map-track-marks\" class=\"map-track-marks\" aria-hidden=\"true\"></div>",
+        "<div id=\"map-track-buffer\" class=\"map-track-buffer\" aria-hidden=\"true\"></div>",
+        "<div id=\"map-window\" class=\"map-window\" aria-hidden=\"true\"><span id=\"map-window-lo\" class=\"map-window-handle\"></span><span id=\"map-window-hi\" class=\"map-window-handle\"></span></div>",
+        "<span id=\"map-playhead-mark\" class=\"map-playhead-mark\" aria-hidden=\"true\"></span>",
+        "<input id=\"map-playhead\" type=\"range\" min=\"0\" max=\"0\" value=\"0\" step=\"any\" aria-label=\"Time · UTC\">",
+        "</div></div>"
+    ));
+    bar
+}
+
+/// The most levels the map offers as a ladder on its right edge (#1220);
+/// more stay in the layer card's select alone.
+const MAX_LADDER_LEVELS: usize = 12;
+
+/// The map's level ladder: one button per level, the highest in the
+/// atmosphere on top. Pressure and model levels count down as they rise;
+/// heights, angles and isentropes count up; any other axis keeps its order.
+fn map_ladder(vertical: &Value, levels: &[String]) -> String {
+    use ds_core::vertical::VerticalKind;
+    if levels.is_empty() || levels.len() > MAX_LADDER_LEVELS {
+        return String::new();
+    }
+    let (label, unit) = vertical_axis(vertical);
+    let vrs = vertical["vrs"].as_str();
+    let rising = |kind: VerticalKind| vrs == Some(kind.vrs());
+    let mut ordered: Vec<&String> = levels.iter().collect();
+    let value = |level: &&String| level.parse::<f64>().unwrap_or(0.0);
+    if rising(VerticalKind::Pressure) || rising(VerticalKind::ModelLevel) {
+        ordered.sort_by(|a, b| value(a).total_cmp(&value(b)));
+    } else if [
+        VerticalKind::Height,
+        VerticalKind::ElevationAngle,
+        VerticalKind::HeightAboveAntenna,
+        VerticalKind::Isentropic,
+    ]
+    .into_iter()
+    .any(rising)
+    {
+        ordered.sort_by(|a, b| value(b).total_cmp(&value(a)));
+    }
+    let name = if unit.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{label} · {unit}")
+    };
+    let mut ladder = format!(
+        "<div id=\"map-ladder\" class=\"map-ladder map-card enhanced\" role=\"group\" aria-label=\"{}\"><span class=\"map-ladder-unit\" aria-hidden=\"true\">{}</span>",
+        escape(&name),
+        escape(if unit.is_empty() { label } else { unit })
+    );
+    for level in ordered {
+        ladder.push_str(&format!(
+            "<button type=\"button\" data-level=\"{0}\" aria-pressed=\"false\">{0}</button>",
+            escape(level)
+        ));
+    }
+    ladder.push_str("</div>");
+    ladder
+}
+
+/// The top-right tools: the full window and the basemap with the data's
+/// opacity, a popover. The basemap is the bundled Natural Earth only.
+fn map_tools() -> String {
+    let mut tools = String::from("<div id=\"map-tools\" class=\"map-tools enhanced\">");
+    tools.push_str(&map_button(
+        "map-expand",
+        "Full window",
+        "Fill the window with the map; Esc leaves",
+        &format!(
+            "<span class=\"when-normal\">{}</span><span class=\"when-expanded\">{}</span>",
+            icon("expand"),
+            icon("collapse")
+        ),
+        " aria-pressed=\"false\"",
+    ));
+    tools.push_str(&map_button(
+        "map-basemap-button",
+        "Basemap and data opacity",
+        "Basemap and data opacity",
+        &icon("basemap"),
+        " aria-expanded=\"false\" aria-controls=\"map-basemap\"",
+    ));
+    tools.push_str("<div id=\"map-basemap\" class=\"map-basemap map-card\" role=\"group\" aria-label=\"Basemap and data opacity\" hidden><fieldset class=\"map-choice\"><legend>Basemap</legend><div class=\"map-segmented\">");
+    for (value, label, title, checked) in [
+        ("land", "Land", "Land and borders", " checked"),
+        ("borders", "Borders", "Borders only", ""),
+        ("none", "None", "No basemap", ""),
+    ] {
+        tools.push_str(&format!(
+            "<label title=\"{title}\"><input type=\"radio\" name=\"map-basemap\" value=\"{value}\"{checked}><span>{label}</span></label>"
+        ));
+    }
+    tools.push_str("</div></fieldset><label class=\"map-check\"><input type=\"checkbox\" id=\"map-labels\" checked><span>Country labels</span></label><div class=\"map-opacity\"><label for=\"map-opacity\">Data opacity</label><output id=\"map-opacity-value\" for=\"map-opacity\">85 %</output><input type=\"range\" id=\"map-opacity\" min=\"0\" max=\"100\" step=\"5\" value=\"85\"></div></div></div>");
+    tools
+}
 
 /// The map panel: the map, its status line, and for a collection with a
-/// `mapRequest` the controls, the rendered-request link and the legend.
-/// `fallback` finishes the sentence shown when the browser cannot draw the
-/// map: where the same facts are on this page.
+/// `mapRequest` the controls, the legend, the time bar and the frame's
+/// request. `fallback` finishes the sentence shown when the browser cannot
+/// draw the map: where the same facts are on this page.
 ///
-/// The controls are a real form (#1220): a `GET` to the default style's
-/// Maps endpoint whose only named fields are Maps parameters
-/// (`parameter-name`, `datetime`, `elevation`), so without JavaScript it
-/// opens the image the choices describe. The draw-mode switch sits outside
-/// the form and the style select has no name: neither is a Maps parameter.
-/// With JavaScript every control applies on `change`; there is no submit.
+/// A collection's map (#1220) opens the Overview at the content width.
+/// Its panels float over it: the layer card top left, which folds into a
+/// pill (a bottom sheet on a phone); the full-window and basemap tools top
+/// right; a level ladder on the right edge for 12 levels or fewer; the
+/// legend bottom left; the time bar docked across the bottom; a status chip
+/// top centre, whose text the visually hidden status line also carries.
+/// Below the map, "This frame as an API request" holds the request drawn.
+///
+/// The controls are a real form: a `GET` to the default style's Maps
+/// endpoint whose only named fields are Maps parameters (`parameter-name`,
+/// `datetime`, `elevation`), so without JavaScript it opens the image the
+/// choices describe. The draw-mode switch sits outside the form and the
+/// style select has no name: neither is a Maps parameter. With JavaScript
+/// every control applies on `change`; there is no submit.
+///
+/// The script and stylesheets are static assets (`assets`), not inlined.
 pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -> String {
-    let raster = features.get("mapRequest");
-    let mut controls = String::new();
-    let mut legend = "";
-    let mut time_bar = "";
-    if let Some(request) = raster {
-        // A time axis, the collection's or a parameter's own: the time bar.
-        let has_axis = |value: &Value| value.get("axis").is_some_and(|axis| !axis.is_null());
-        if has_axis(request)
-            || request["parameter_names"]
-                .as_array()
-                .is_some_and(|parameters| parameters.iter().any(has_axis))
-        {
-            time_bar = MAP_TIME_BAR;
-        }
-        let modes: Vec<&str> = request["modes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        // Map tiles where advertised, else Maps (#1220): pans keep the
-        // tiles, and the server's tile cache is shared between viewers.
-        let default_mode = ["tiles", "maps", "wms", "vector"]
-            .into_iter()
-            .find(|mode| modes.contains(mode))
-            .unwrap_or("maps");
-        // Vector tiles alone have nothing to choose: the controls stay
-        // hidden, also before the script runs.
-        let vector_only = modes == ["vector"];
-        controls.push_str(&format!(
-            "<div id=\"map-controls\" class=\"map-controls-block\"{}>",
-            if vector_only { " hidden" } else { "" }
-        ));
-        if modes.iter().any(|mode| *mode != "vector") {
-            legend = "<div id=\"map-legend\" class=\"map-legend enhanced\" aria-live=\"polite\"><div class=\"map-legend-head\"><strong id=\"map-legend-title\">Legend</strong><span class=\"map-legend-links\"><a id=\"map-legend-image\" hidden>Legend image ↗</a><a id=\"map-legend-link\" hidden>Legend JSON ↗</a></span></div><div id=\"map-legend-scale\" hidden></div><p id=\"map-legend-status\">Loading legend…</p></div>";
-        }
-        // More than one mechanism draws this collection: let the viewer
-        // choose. The switch is the script's, so it is no form field.
-        if modes.len() > 1 {
-            controls.push_str("<fieldset class=\"map-mode enhanced\"><legend>Draw with</legend>");
-            for (mode, label) in [
-                ("tiles", "Map tiles"),
-                ("maps", "Maps · one image per view"),
-                ("wms", "WMS GetMap · one image per view"),
-                ("vector", "Vector tiles"),
-            ]
-            .into_iter()
-            .filter(|(mode, _)| modes.contains(mode))
-            {
-                controls.push_str(&format!(
-                    "<label><input type=\"radio\" name=\"map-mode\" value=\"{mode}\"{}> {label}</label>",
-                    if mode == default_mode { " checked" } else { "" }
-                ));
-            }
-            controls.push_str("</fieldset>");
-        }
-        let styles = request["styles"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        fn maps_href(style: &Value) -> Option<&str> {
-            style["href"]
-                .as_str()
-                .map(safe_href)
-                .filter(|href| *href != "#")
-        }
-        // Without a Maps endpoint there is nothing to GET: the form is the
-        // script's alone.
-        let action = styles.first().and_then(maps_href);
-        match action {
-            Some(href) => controls.push_str(&format!(
-                "<form id=\"map-form\" class=\"map-controls\" method=\"get\" action=\"{}\">",
-                escape(href)
-            )),
-            None => controls.push_str("<form id=\"map-form\" class=\"map-controls enhanced\">"),
-        }
-        // A multi-parameter collection: choose what to draw. "Default" sends
-        // no `parameter-name`; the script names what the server drew.
-        let parameters = request["parameter_names"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        if parameters.len() > 1 {
-            controls.push_str(
-                "<label>Parameter<select id=\"map-parameter\" name=\"parameter-name\"><option value=\"\">Default</option>",
-            );
-            let label = |p: &Value| p["label"].as_str().unwrap_or_default().to_owned();
-            for parameter in parameters {
-                let name = parameter["name"].as_str().unwrap_or_default();
-                let unit = parameter["unit"].as_str().unwrap_or_default();
-                let mut text = label(parameter);
-                if !unit.is_empty() {
-                    text.push_str(&format!(" ({unit})"));
-                }
-                // Two parameters with one label stay apart by name.
-                if parameters
-                    .iter()
-                    .filter(|p| label(p) == label(parameter))
-                    .count()
-                    > 1
-                {
-                    text.push_str(&format!(" · {name}"));
-                }
-                controls.push_str(&format!(
-                    "<option value=\"{}\" data-label=\"{}\" data-unit=\"{}\">{}</option>",
-                    escape(name),
-                    escape(&label(parameter)),
-                    escape(unit),
-                    escape(&text)
-                ));
-            }
-            controls.push_str("</select></label>");
-        }
-        // The style picks the endpoint, not a query parameter: no name, and
-        // shown only with the script. One style is no choice at all.
-        controls.push_str(&format!(
-            "<label class=\"enhanced\"{}>Style<select id=\"map-style\" data-mode=\"{}\">",
-            if styles.len() < 2 { " hidden" } else { "" },
-            escape(default_mode)
-        ));
-        for style in styles {
-            controls.push_str(&format!(
-                "<option value=\"{}\" data-id=\"{}\" data-tiles=\"{}\" data-legend=\"{}\">{}</option>",
-                escape(maps_href(style).unwrap_or_default()),
-                escape(style["id"].as_str().unwrap_or_default()),
-                escape(style["tiles"].as_str().map(safe_href).unwrap_or_default()),
-                escape(style["legend"].as_str().map(safe_href).unwrap_or_default()),
-                escape(style["title"].as_str().unwrap_or("Default"))
-            ));
-        }
-        controls.push_str("</select></label>");
-        let axis = request.get("axis").filter(|axis| !axis.is_null());
-        // No temporal extent (a static source, or one with no data yet):
-        // there is no time to choose, so no time row. Otherwise a date and
-        // time without a zone, which `datetime` reads as UTC, bounded by
-        // the axis and stepping by a regular one's step. The script hides
-        // it for the time bar under the map, or applies it on `change`
-        // when there is no axis to bind.
-        if axis.is_some() || request["temporal"] == true {
-            let bounds = match axis.and_then(axis_ends) {
-                Some((first, last, step)) => {
-                    let local = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S");
-                    format!(
-                        " min=\"{}\" max=\"{}\" step=\"{}\"",
-                        local(first),
-                        local(last),
-                        step.unwrap_or(1)
-                    )
-                }
-                None => " step=\"1\"".to_owned(),
-            };
-            controls.push_str(&format!("<div class=\"map-time-field\"><label for=\"map-time\">Time · UTC</label><input id=\"map-time\" name=\"datetime\" type=\"datetime-local\"{bounds} aria-describedby=\"map-help\"></div>"));
-        }
-        let vertical = &request["vertical"];
-        let levels = vertical_values(vertical);
-        if !levels.is_empty() {
-            let (label, unit) = vertical_axis(vertical);
-            controls.push_str(&format!(
-                "<label>{}<select id=\"map-level\" name=\"elevation\"><option value=\"\">Default</option>",
-                escape(label)
-            ));
-            for level in levels {
-                controls.push_str(&format!(
-                    "<option value=\"{}\">{} {}</option>",
-                    escape(&level),
-                    escape(&level),
-                    escape(unit)
-                ));
-            }
-            controls.push_str("</select></label>");
-        }
-        controls.push_str("<p id=\"map-help\" class=\"enhanced\">Every choice applies at once. Pan or zoom to draw the visible area. ");
-        if let Some(axis) = axis {
-            controls.push_str(&format!(
-                "The time bar under the map steps through and plays the {} advertised times; ? on it lists its keys. ",
-                axis_len(axis)
-            ));
-        }
-        controls.push_str("Default leaves the choice to the server; the line under the map names what it drew.</p>");
-        // Without the script: one Maps image of the collection's extent per
-        // style, each its own endpoint.
-        if action.is_some() {
-            controls.push_str("<noscript><p>Without JavaScript, these choices open one Maps image of the whole collection.</p>");
-            for (i, style) in styles.iter().enumerate() {
-                let Some(href) = maps_href(style) else {
-                    continue;
-                };
-                if i == 0 {
-                    controls.push_str("<button class=\"btn primary\">Open map image</button>");
-                } else {
-                    controls.push_str(&format!(
-                        "<button class=\"btn\" formaction=\"{}\">Open map image · {}</button>",
-                        escape(href),
-                        escape(style["title"].as_str().unwrap_or("Style"))
-                    ));
-                }
-            }
-            controls.push_str("</noscript>");
-        }
-        controls.push_str("</form></div>");
-    }
-    let label = if raster.is_some() {
-        "Collection map data"
-    } else {
-        "Feature geometry map"
-    };
-    let request_link = if raster.is_some() {
-        "<div id=\"map-request\" class=\"map-request panel-body enhanced\"><a id=\"map-image-link\" class=\"btn small\" aria-disabled=\"true\">Open rendered image ↗</a><code id=\"map-image-request\"></code></div>"
-    } else {
-        ""
-    };
     let fallback = escape(fallback);
-    format!("{controls}<div class=\"map-panel\"><div id=\"feature-map\" data-land=\"{base}/preview/vendor/workbench-land.json\" data-quicklook=\"{quicklook}\" data-fallback=\"{fallback}\" role=\"region\" aria-label=\"{label}\"></div>{time_bar}<p id=\"map-status\" role=\"status\">The map needs JavaScript and WebGL. {fallback}</p>{legend}{request_link}<div id=\"map-data\" hidden>{}</div></div><script src=\"{base}/preview/vendor/maplibre-gl.js\"></script><script>{}</script>",escape(&features.to_string()),include_str!("workbench/map.js"),base=escape(base))
+    let scripts = format!(
+        "<script src=\"{}/preview/vendor/maplibre-gl.js\" defer></script><script src=\"{}\" defer></script>",
+        escape(base),
+        escape(&assets::href(base, "map.js"))
+    );
+    let land = format!("{}/preview/vendor/workbench-land.json", escape(base));
+    let data = escape(&features.to_string());
+    let Some(request) = features.get("mapRequest") else {
+        // A locator: the page's own geometry, with a quick look on an
+        // items page.
+        return format!("<div class=\"map-panel\"><div id=\"feature-map\" data-land=\"{land}\" data-quicklook=\"{quicklook}\" data-fallback=\"{fallback}\" role=\"region\" aria-label=\"Feature geometry map\"></div><p id=\"map-status\" role=\"status\">The map needs JavaScript and WebGL. {fallback}</p><div id=\"map-data\" hidden>{data}</div></div>{scripts}");
+    };
+    // A time axis, the collection's or a parameter's own: the time bar.
+    let has_axis = |value: &Value| value.get("axis").is_some_and(|axis| !axis.is_null());
+    let has_time_bar = has_axis(request)
+        || request["parameter_names"]
+            .as_array()
+            .is_some_and(|parameters| parameters.iter().any(has_axis));
+    let modes: Vec<&str> = request["modes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    // Map tiles where advertised, else Maps (#1220): pans keep the
+    // tiles, and the server's tile cache is shared between viewers.
+    let default_mode = ["tiles", "maps", "wms", "vector"]
+        .into_iter()
+        .find(|mode| modes.contains(mode))
+        .unwrap_or("maps");
+    // Vector tiles alone have nothing to choose: the layer card stays
+    // hidden, also before the script runs. They have no legend either.
+    let vector_only = modes == ["vector"];
+    let legend = if modes.iter().any(|mode| *mode != "vector") {
+        format!("<div id=\"map-legend\" class=\"map-legend map-card enhanced\"><div class=\"map-legend-head\"><strong id=\"map-legend-title\">Legend</strong><button type=\"button\" id=\"map-legend-toggle\" class=\"map-icon-button map-fold\" aria-expanded=\"true\" aria-controls=\"map-legend-more\" aria-label=\"Legend scale and links\" title=\"Show or hide the scale and links\">{}</button></div><div id=\"map-legend-scale\" hidden></div><p id=\"map-legend-status\">Loading legend…</p><div id=\"map-legend-more\" class=\"map-legend-links\"><a id=\"map-legend-image\" hidden>Legend image ↗</a><a id=\"map-legend-link\" hidden>Legend JSON ↗</a></div></div>", icon("chevron"))
+    } else {
+        String::new()
+    };
+    let mut card = format!(
+        "<div id=\"map-controls\" class=\"map-card map-layer open\"{}><button type=\"button\" id=\"map-layer-pill\" class=\"map-pill enhanced\" aria-expanded=\"true\" aria-controls=\"map-layer-body\">{}<span id=\"map-layer-text\">Map layer</span><span class=\"map-fold\">{}</span></button><div id=\"map-layer-body\" class=\"map-layer-body\"><div class=\"map-sheet-head enhanced\"><strong>Map layer</strong>{}</div>",
+        if vector_only { " hidden" } else { "" },
+        icon("layers"),
+        icon("chevron"),
+        map_button("map-sheet-close", "Close", "Close", &icon("close"), "")
+    );
+    let styles = request["styles"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    fn maps_href(style: &Value) -> Option<&str> {
+        style["href"]
+            .as_str()
+            .map(safe_href)
+            .filter(|href| *href != "#")
+    }
+    // Without a Maps endpoint there is nothing to GET: the form is the
+    // script's alone.
+    let action = styles.first().and_then(maps_href);
+    match action {
+        Some(href) => card.push_str(&format!(
+            "<form id=\"map-form\" class=\"map-controls\" method=\"get\" action=\"{}\">",
+            escape(href)
+        )),
+        None => card.push_str("<form id=\"map-form\" class=\"map-controls enhanced\">"),
+    }
+    // A multi-parameter collection: choose what to draw. "Default" sends
+    // no `parameter-name`; the script names what the server drew.
+    let parameters = request["parameter_names"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if parameters.len() > 1 {
+        card.push_str(
+            "<label>Parameter<select id=\"map-parameter\" name=\"parameter-name\"><option value=\"\">Default</option>",
+        );
+        let label = |p: &Value| p["label"].as_str().unwrap_or_default().to_owned();
+        for parameter in parameters {
+            let name = parameter["name"].as_str().unwrap_or_default();
+            let unit = parameter["unit"].as_str().unwrap_or_default();
+            let mut text = label(parameter);
+            if !unit.is_empty() {
+                text.push_str(&format!(" ({unit})"));
+            }
+            // Two parameters with one label stay apart by name.
+            if parameters
+                .iter()
+                .filter(|p| label(p) == label(parameter))
+                .count()
+                > 1
+            {
+                text.push_str(&format!(" · {name}"));
+            }
+            card.push_str(&format!(
+                "<option value=\"{}\" data-label=\"{}\" data-unit=\"{}\">{}</option>",
+                escape(name),
+                escape(&label(parameter)),
+                escape(unit),
+                escape(&text)
+            ));
+        }
+        card.push_str("</select></label>");
+    }
+    // The style picks the endpoint, not a query parameter: no name, and
+    // shown only with the script. One style is no choice at all.
+    card.push_str(&format!(
+        "<label class=\"enhanced\"{}>Style<select id=\"map-style\" data-mode=\"{}\">",
+        if styles.len() < 2 { " hidden" } else { "" },
+        escape(default_mode)
+    ));
+    for style in styles {
+        card.push_str(&format!(
+            "<option value=\"{}\" data-id=\"{}\" data-tiles=\"{}\" data-legend=\"{}\">{}</option>",
+            escape(maps_href(style).unwrap_or_default()),
+            escape(style["id"].as_str().unwrap_or_default()),
+            escape(style["tiles"].as_str().map(safe_href).unwrap_or_default()),
+            escape(style["legend"].as_str().map(safe_href).unwrap_or_default()),
+            escape(style["title"].as_str().unwrap_or("Default"))
+        ));
+    }
+    card.push_str("</select></label>");
+    let axis = request.get("axis").filter(|axis| !axis.is_null());
+    // No temporal extent (a static source, or one with no data yet):
+    // there is no time to choose, so no time row. Otherwise a date and
+    // time without a zone, which `datetime` reads as UTC, bounded by the
+    // axis and stepping by a regular one's step. The script hides it for
+    // the time bar, or applies it on `change` when there is no axis to
+    // bind.
+    if axis.is_some() || request["temporal"] == true {
+        let bounds = match axis.and_then(axis_ends) {
+            Some((first, last, step)) => {
+                let local = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S");
+                format!(
+                    " min=\"{}\" max=\"{}\" step=\"{}\"",
+                    local(first),
+                    local(last),
+                    step.unwrap_or(1)
+                )
+            }
+            None => " step=\"1\"".to_owned(),
+        };
+        card.push_str(&format!("<div class=\"map-time-field\"><label for=\"map-time\">Time · UTC</label><input id=\"map-time\" name=\"datetime\" type=\"datetime-local\"{bounds} aria-describedby=\"map-help\"></div>"));
+    }
+    let vertical = &request["vertical"];
+    let levels = vertical_values(vertical);
+    if !levels.is_empty() {
+        let (label, unit) = vertical_axis(vertical);
+        card.push_str(&format!(
+            "<label>{}<select id=\"map-level\" name=\"elevation\"><option value=\"\">Default</option>",
+            escape(label)
+        ));
+        for level in &levels {
+            card.push_str(&format!(
+                "<option value=\"{}\">{} {}</option>",
+                escape(level),
+                escape(level),
+                escape(unit)
+            ));
+        }
+        card.push_str("</select></label>");
+    }
+    // The help: in the time bar's help popover where there is one, else
+    // under the choices.
+    let mut help = String::from("<p id=\"map-help\" class=\"map-help\">Every choice applies at once; Default leaves it to the server.");
+    if let Some(axis) = axis {
+        help.push_str(&format!(
+            " The time bar plays the {} advertised times.",
+            axis_len(axis)
+        ));
+    }
+    help.push_str("</p>");
+    let time_bar = if has_time_bar {
+        map_time_bar(&help)
+    } else {
+        card.push_str(&help.replacen("class=\"map-help\"", "class=\"map-help enhanced\"", 1));
+        String::new()
+    };
+    // Without the script: one Maps image of the collection's extent per
+    // style, each its own endpoint.
+    if action.is_some() {
+        card.push_str("<noscript><p>Without JavaScript, these choices open one Maps image of the whole collection.</p>");
+        for (i, style) in styles.iter().enumerate() {
+            let Some(href) = maps_href(style) else {
+                continue;
+            };
+            if i == 0 {
+                card.push_str("<button class=\"btn primary\">Open map image</button>");
+            } else {
+                card.push_str(&format!(
+                    "<button class=\"btn\" formaction=\"{}\">Open map image · {}</button>",
+                    escape(href),
+                    escape(style["title"].as_str().unwrap_or("Style"))
+                ));
+            }
+        }
+        card.push_str("</noscript>");
+    }
+    card.push_str("</form>");
+    // More than one mechanism draws this collection: let the viewer
+    // choose. The switch is the script's, so it is no form field.
+    if modes.len() > 1 {
+        card.push_str("<fieldset class=\"map-mode map-choice enhanced\"><legend>Draw with</legend><div class=\"map-segmented\">");
+        for (mode, label, title) in [
+            ("tiles", "Tiles", "Map tiles (OGC API - Tiles)"),
+            ("maps", "Image", "One image per view (OGC API - Maps)"),
+            ("wms", "WMS", "WMS GetMap · one image per view"),
+            ("vector", "Vector", "Vector tiles"),
+        ]
+        .into_iter()
+        .filter(|(mode, _, _)| modes.contains(mode))
+        {
+            card.push_str(&format!(
+                "<label title=\"{title}\"><input type=\"radio\" name=\"map-mode\" value=\"{mode}\"{}><span>{label}</span></label>",
+                if mode == default_mode { " checked" } else { "" }
+            ));
+        }
+        card.push_str("</div></fieldset>");
+    }
+    card.push_str("</div></div>");
+    let ladder = map_ladder(vertical, &levels);
+    let tools = map_tools();
+    let request_disclosure = "<details id=\"map-request\" class=\"map-request enhanced\"><summary>This frame as an API request</summary><div class=\"map-request-body\"><div class=\"request-identity\"><span class=\"method\">GET</span><code id=\"map-image-request\"></code></div><div class=\"map-request-actions\"><button type=\"button\" class=\"btn small\" id=\"map-request-copy\" data-copy=\"\" disabled>Copy</button><a id=\"map-image-link\" class=\"btn small\" aria-disabled=\"true\">Open ↗</a></div></div></details>";
+    format!("<div class=\"map-panel map-raster\"><div id=\"map-stage\" class=\"map-stage\"><div class=\"map-view\">{card}<div id=\"feature-map\" data-land=\"{land}\" data-quicklook=\"{quicklook}\" data-fallback=\"{fallback}\" role=\"region\" aria-label=\"Collection map data\"></div><p id=\"map-chip\" class=\"map-chip enhanced\" aria-hidden=\"true\" hidden></p>{tools}{ladder}{legend}</div>{time_bar}</div><p id=\"map-status\" role=\"status\">The map needs JavaScript and WebGL. {fallback}</p>{request_disclosure}<div id=\"map-data\" hidden>{data}</div></div>{scripts}")
 }
 
 /// What a collection's Overview says of its feature items beyond the
@@ -1353,7 +1545,9 @@ pub fn collection_page(
         let modes: Vec<&str> = [tiles_href.map(|_| "tiles"), map_href.map(|_| "maps"), wms.map(|_| "wms"), vector_href.map(|_| "vector")].into_iter().flatten().collect();
         // A time axis to choose from: an interval with at least one bound.
         let temporal = doc["extent"]["temporal"]["interval"][0].as_array().is_some_and(|bounds| bounds.iter().any(Value::is_string));
-        json!({"styles":styles,"modes":modes,"vector":vector_href.map(|href| json!({"href":href,"layer":id})),"wms":wms.map(|href| json!({"href":href,"layer":id})),"parameter_names":map_parameters(&doc["parameter_names"]),"axis":map_axis(&doc["extent"]["temporal"]),"temporal":temporal,"vertical":doc["extent"]["vertical"]})
+        // The map's attribution names the collection's licence (#1220).
+        let license = license.map(|license| json!({"title":license.title,"href":license.resolved_url()}));
+        json!({"styles":styles,"modes":modes,"vector":vector_href.map(|href| json!({"href":href,"layer":id})),"wms":wms.map(|href| json!({"href":href,"layer":id})),"parameter_names":map_parameters(&doc["parameter_names"]),"axis":map_axis(&doc["extent"]["temporal"]),"temporal":temporal,"vertical":doc["extent"]["vertical"],"license":license})
     });
     // One chip per OGC API the collection is available through. Its kind
     // (`dataType`/`itemType`) is under "Collection details" as Data type; a
@@ -1380,46 +1574,61 @@ pub fn collection_page(
     if let Some(items) = items {
         body.push_str(&anchor(&with_format(items, "html"), "Request data", ""));
     }
-    body.push_str("<a data-collection-tab=\"metadata\" href=\"#metadata\">Metadata &amp; links</a></nav><section id=\"overview\" class=\"collection-view\" data-collection-view><div class=\"detail-layout\"><div><section class=\"panel\"><div class=\"panel-head\"><h2>Data coverage</h2><span class=\"chip\">CRS84</span></div>");
-    if map_request.is_some() {
-        body = body.replace("<h2>Data coverage</h2>", "<h2>Map data &amp; coverage</h2>");
-    }
+    body.push_str("<a data-collection-tab=\"metadata\" href=\"#metadata\">Metadata &amp; links</a></nav><section id=\"overview\" class=\"collection-view\" data-collection-view>");
     let bbox = &doc["extent"]["spatial"]["bbox"][0];
-    let mut head = String::new();
-    if let Some(b) = bbox
+    // The advertised extent as a polygon, which the map frames and outlines.
+    let extent = bbox
         .as_array()
         .filter(|b| matches!(b.len(), 4 | 6) && b.iter().all(Value::is_number))
-    {
-        let east = if b.len() == 6 { 3 } else { 2 };
-        let north = east + 1;
-        let (w, s, e, n) = (
-            b[0].as_f64().unwrap(),
-            b[1].as_f64().unwrap(),
-            b[east].as_f64().unwrap(),
-            b[north].as_f64().unwrap(),
-        );
-        // A box crossing the antimeridian (west > east) is one region: one
-        // polygon in unwrapped longitudes, east + 360, so the map frames
-        // and draws it whole instead of as two halves at the world's edges.
-        let e = if w > e { e + 360. } else { e };
-        let geometry =
-            json!({"type":"Polygon","coordinates":[[[w, s], [e, s], [e, n], [w, n], [w, s]]]});
+        .map(|b| {
+            let east = if b.len() == 6 { 3 } else { 2 };
+            let north = east + 1;
+            let (w, s, e, n) = (
+                b[0].as_f64().unwrap(),
+                b[1].as_f64().unwrap(),
+                b[east].as_f64().unwrap(),
+                b[north].as_f64().unwrap(),
+            );
+            // A box crossing the antimeridian (west > east) is one region:
+            // one polygon in unwrapped longitudes, east + 360, so the map
+            // frames and draws it whole instead of as two halves at the
+            // world's edges.
+            let e = if w > e { e + 360. } else { e };
+            json!({"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[w, s], [e, s], [e, n], [w, n], [w, s]]]},"properties":{"label":"Advertised collection extent"}})
+        });
+    let mut head = String::new();
+    // A collection with a map opens on it (#1220): the full content width,
+    // its controls on it, the metadata below.
+    if let Some(request) = &map_request {
         head = map_head(base);
-        let mut map_data = json!({"type":"FeatureCollection","features":[{"type":"Feature","geometry":geometry,"properties":{"label":"Advertised collection extent"}}]});
-        if let Some(request) = &map_request {
-            map_data["mapRequest"] = request.clone();
-        }
-        body.push_str(&map_html(base, &map_data, false, MAP_EXTENT_FALLBACK));
-    } else if let Some(request) = &map_request {
-        head = map_head(base);
+        let features: Vec<&Value> = extent.iter().collect();
+        body.push_str("<div class=\"map-section\"><h2 class=\"visually-hidden\">Map</h2>");
         body.push_str(&map_html(
             base,
-            &json!({"type":"FeatureCollection","features":[],"mapRequest":request}),
+            &json!({"type":"FeatureCollection","features":features,"mapRequest":request}),
             false,
-            MAP_REQUEST_FALLBACK,
+            if extent.is_some() {
+                MAP_EXTENT_FALLBACK
+            } else {
+                MAP_REQUEST_FALLBACK
+            },
         ));
-    } else {
-        body.push_str("<div class=\"empty-state\"><p>Spatial extent not advertised.</p></div>");
+        body.push_str("</div>");
+    }
+    body.push_str("<div class=\"detail-layout\"><div><section class=\"panel\"><div class=\"panel-head\"><h2>Data coverage</h2><span class=\"chip\">CRS84</span></div>");
+    if map_request.is_none() {
+        // A locator of the advertised extent.
+        if let Some(extent) = &extent {
+            head = map_head(base);
+            body.push_str(&map_html(
+                base,
+                &json!({"type":"FeatureCollection","features":[extent]}),
+                false,
+                MAP_EXTENT_FALLBACK,
+            ));
+        } else {
+            body.push_str("<div class=\"empty-state\"><p>Spatial extent not advertised.</p></div>");
+        }
     }
     // Time, cadence, steps and bounds with the catalog's formatting (#1140).
     body.push_str(&metadata::coverage_facts(doc));
@@ -1465,7 +1674,7 @@ pub fn collection_page(
         body.push_str("</div>");
     }
     if let Some(map_href) = map_href.filter(|_| map_request.is_some()) {
-        body.push_str("<p class=\"spaced\">Use the map controls above to build an image request for the visible area. The image URL includes the selected style, time, vertical level, bounds and output size. The JSON switch opens this collection’s metadata.</p>");
+        body.push_str("<p class=\"spaced\">With JavaScript, “This frame as an API request” under the map holds the exact request of the frame drawn: its style, time, vertical level, bounds and output size. The JSON switch opens this collection’s metadata.</p>");
         // Document the map request at the API serving the map link, which
         // need not be the API rendering this page.
         let map_api = map_href.split("/collections/").next().unwrap_or(root);
@@ -3374,7 +3583,7 @@ mod tests {
                 {"rel":rel::TILESETS_MAP,"href":"https://x/collections/cap/styles/severity/map/tiles"}]}]});
         let html = collection_html(shared, &doc, None);
         let switch = html
-            .split("<fieldset class=\"map-mode enhanced\">")
+            .split("<fieldset class=\"map-mode map-choice enhanced\">")
             .nth(1)
             .unwrap()
             .split("</fieldset>")
@@ -3415,7 +3624,6 @@ mod tests {
         let html = collection_html(shared, &maps_only, None);
         assert!(html.contains("id=\"map-controls\""));
         assert!(html.contains("data-mode=\"maps\""));
-        // (The inlined map script names the input too; check the switch itself.)
         assert!(!html.contains("<fieldset class=\"map-mode"));
         let mut tiles_only = doc.clone();
         tiles_only["links"].as_array_mut().unwrap().remove(1);
@@ -3424,7 +3632,6 @@ mod tests {
         let html = collection_html(shared, &tiles_only, None);
         assert!(html.contains("id=\"map-controls\""));
         assert!(html.contains("data-mode=\"tiles\""));
-        // (The inlined map script names the input too; check the switch itself.)
         assert!(!html.contains("<fieldset class=\"map-mode"));
         // No Maps endpoint: nothing to GET, so the form is the script's.
         assert!(
@@ -3449,11 +3656,11 @@ mod tests {
         serde_json::from_str(&data).unwrap()
     }
 
-    /// The map controls: the draw-mode switch and the form (the inlined
-    /// script and the stylesheet name every control too).
+    /// The layer card: the pill, the form and the draw-mode switch after
+    /// it; the map itself follows the card.
     fn map_controls(html: &str) -> &str {
         let start = html.find("<div id=\"map-controls\"").unwrap();
-        let end = start + html[start..].find("</form></div>").unwrap();
+        let end = start + html[start..].find("<div id=\"feature-map\"").unwrap();
         &html[start..end]
     }
 
@@ -3562,8 +3769,11 @@ mod tests {
             map_data(&html)["mapRequest"]["axis"],
             json!({"times":["2026-10-17T17:00:00Z","2026-10-17T17:10:30Z"]})
         );
-        let panel = html.split("<div class=\"map-panel\">").nth(1).unwrap();
-        assert!(panel.contains("<div id=\"map-timebar\" class=\"map-timebar enhanced\" role=\"group\" aria-label=\"Time\" hidden>"));
+        let panel = html
+            .split("<div class=\"map-panel map-raster\">")
+            .nth(1)
+            .unwrap();
+        assert!(panel.contains("<div id=\"map-timebar\" class=\"map-timebar map-card enhanced\" role=\"group\" aria-label=\"Time\" hidden>"));
         assert!(panel.contains("<input id=\"map-playhead\" type=\"range\""));
         // A regular grid steps the input by its step.
         doc["extent"]["temporal"] = json!({"interval":[["2026-10-17T00:00:00Z","2026-10-17T23:55:00Z"]],
@@ -3571,7 +3781,7 @@ mod tests {
         let html = collection_html(shared, &doc, None);
         assert!(map_controls(&html)
             .contains(" min=\"2026-10-17T00:00:00\" max=\"2026-10-17T23:55:00\" step=\"300\""));
-        assert!(map_controls(&html).contains("the 288 advertised times"));
+        assert!(html.contains("The time bar plays the 288 advertised times."));
         assert_eq!(
             map_controls(&html).matches("<option value=\"2026").count(),
             0
@@ -3606,13 +3816,20 @@ mod tests {
         assert!(bare_html.contains(&format!("data-fallback=\"{MAP_REQUEST_FALLBACK}\"")));
         assert!(!bare_html.contains(MAP_EXTENT_FALLBACK));
         assert!(bare_html.contains("<h2>Request data from this collection</h2>"));
-        let panel = html.split("<div class=\"map-panel\">").nth(1).unwrap();
+        let panel = html
+            .split("<div class=\"map-panel map-raster\">")
+            .nth(1)
+            .unwrap();
         let panel = panel.split("<script").next().unwrap();
-        assert!(panel.contains("<div id=\"map-legend\" class=\"map-legend enhanced\""));
+        assert!(panel.contains("<div id=\"map-legend\" class=\"map-legend map-card enhanced\">"));
         assert_eq!(html.matches("id=\"map-legend\"").count(), 1);
         assert!(!html.contains("<h2>Map legend</h2>"));
-        assert!(map_controls(&html).starts_with(
-            "<div id=\"map-controls\" class=\"map-controls-block\"><form id=\"map-form\" class=\"map-controls\" method=\"get\" action=\"https://x/collections/radar/map\">"
+        let card = map_controls(&html);
+        assert!(card.starts_with(
+            "<div id=\"map-controls\" class=\"map-card map-layer open\"><button type=\"button\" id=\"map-layer-pill\" class=\"map-pill enhanced\" aria-expanded=\"true\" aria-controls=\"map-layer-body\">"
+        ));
+        assert!(card.contains(
+            "<form id=\"map-form\" class=\"map-controls\" method=\"get\" action=\"https://x/collections/radar/map\">"
         ));
 
         let vector = json!({"id":"regions","extent":{"spatial":{"bbox":[[20,60,30,70]]}},
@@ -3620,7 +3837,7 @@ mod tests {
                 {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/regions/tiles"}]});
         let html = collection_html(shared, &vector, None);
         assert!(map_controls(&html)
-            .starts_with("<div id=\"map-controls\" class=\"map-controls-block\" hidden>"));
+            .starts_with("<div id=\"map-controls\" class=\"map-card map-layer open\" hidden>"));
         // Vector tiles have no legend.
         assert!(!html.contains("id=\"map-legend\""));
 
@@ -3663,7 +3880,8 @@ mod tests {
         let html = collection_html(shared, &doc, None);
         assert!(!html.contains("Update map"));
         let controls = map_controls(&html);
-        let (switch, form) = controls.split_once("<form").unwrap();
+        let (form, switch) = controls.split_once("</form>").unwrap();
+        let form = form.split_once("<form").unwrap().1;
         assert!(
             form.starts_with(" id=\"map-form\" class=\"map-controls\" method=\"get\" action=\"https://x/collections/nwp/map\">"),
             "{form}"
@@ -3687,10 +3905,11 @@ mod tests {
         assert!(noscript.contains(
             "<button class=\"btn\" formaction=\"https://x/collections/nwp/styles/warm/map\">Open map image · Warm</button>"
         ));
-        // The help is the script's; it names no button.
-        assert!(
-            form.contains("<p id=\"map-help\" class=\"enhanced\">Every choice applies at once.")
-        );
+        // The help is the script's, in the time bar's help; it names no
+        // button.
+        assert!(html.contains(
+            "<div id=\"map-keys-help\" class=\"map-keys-help map-card\" hidden><p id=\"map-help\" class=\"map-help\">Every choice applies at once; Default leaves it to the server. The time bar plays the 2 advertised times.</p>"
+        ));
         // A label ending in its own name drops it before the unit.
         assert!(
             form.contains(">2 Metre Temperature (°C)</option>"),
@@ -3760,8 +3979,8 @@ mod tests {
         )));
         assert!(axes.contains(&("vis", &Value::Null)));
         let controls = map_controls(&html);
-        let (switch, form) = controls.split_once("<form").unwrap();
-        assert!(switch.contains("<label><input type=\"radio\" name=\"map-mode\" value=\"wms\"> WMS GetMap · one image per view</label>"));
+        let (form, switch) = controls.split_once("</form>").unwrap();
+        assert!(switch.contains("<label title=\"WMS GetMap · one image per view\"><input type=\"radio\" name=\"map-mode\" value=\"wms\"><span>WMS</span></label>"));
         assert!(!form.contains("wms"));
         // Map tiles stay the default.
         assert!(switch.contains("value=\"tiles\" checked"));
@@ -3777,6 +3996,209 @@ mod tests {
             {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/regions/tiles"}]});
         let html = collection_page(shared, &vector, None, None, Some("https://x/wms"));
         assert_eq!(map_data(&html)["mapRequest"]["modes"], json!(["vector"]));
+    }
+
+    /// #1220: the workbench's stylesheets and scripts are static assets at
+    /// versioned URLs below the base URL, the same on every API mount, so a
+    /// browser caches one copy. A page links them and inlines neither: its
+    /// only inline scripts set the theme and fold the request bar before
+    /// the first paint.
+    #[test]
+    fn pages_link_the_versioned_assets_and_inline_none() {
+        let base = "https://example.test/prefix";
+        let doc = json!({"id":"a","extent":{"spatial":{"bbox":[[20,60,30,70]]}},"links":[
+            {"rel":"self","href":format!("{base}/collections/a")},
+            {"rel":rel::MAP,"href":format!("{base}/collections/a/map")}]});
+        let shared = collection_html(
+            Surface {
+                base,
+                root: base,
+                api: crate::shared::WORKSPACE,
+            },
+            &doc,
+            None,
+        );
+        let pages: Vec<String> = ["edr", "features", "maps", "tiles"]
+            .into_iter()
+            .map(|api| collection(base, api, &doc, None))
+            .chain([shared])
+            .collect();
+        for html in &pages {
+            for name in ["style.css", "map.css"] {
+                assert!(html.contains(&format!(
+                    "<link rel=\"stylesheet\" href=\"{}\">",
+                    assets::href(base, name)
+                )));
+            }
+            assert!(html.contains(&format!(
+                "<script src=\"{}\" defer></script>",
+                assets::href(base, "map.js")
+            )));
+            assert!(html.contains(&format!(
+                "<script src=\"{}\"></script>",
+                assets::href(base, "app.js")
+            )));
+            assert!(!html.contains("<style>"));
+            assert!(!html.contains("function installRasterPreview"));
+            assert!(!html.contains("Progressive enhancement only"));
+            assert!(!html.contains(".js .map-stage{"));
+            assert_eq!(html.matches("<script>").count(), 2, "{html}");
+        }
+        assert!(assets::href(base, "map.js").starts_with("https://example.test/prefix/workbench/"));
+    }
+
+    /// #1220: a collection's map opens its Overview at the content width,
+    /// before the coverage facts. Its panels are the script's: the layer
+    /// card's pill, the status chip, the full-window and basemap tools with
+    /// the data's opacity at 85 %, icons drawn inline. The attribution names
+    /// the collection's licence, and the frame's request sits under the map
+    /// with Copy and Open. A collection without a map keeps the extent
+    /// locator in the coverage panel.
+    #[test]
+    fn the_overview_opens_on_the_map_and_names_the_licence() {
+        let shared = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let doc = json!({"id":"nwp","extent":{"spatial":{"bbox":[[20,60,30,70]]},
+                "temporal":{"interval":[["2026-10-17T00:00:00Z","2026-10-17T01:00:00Z"]],
+                    "grid":{"cellsCount":2,"resolution":"PT1H"}}},
+            "links":[{"rel":"self","href":"https://x/collections/nwp"},
+                {"rel":rel::MAP,"href":"https://x/collections/nwp/map"}]});
+        let license = LicenseConfig {
+            title: "CC-BY-4.0".into(),
+            url: None,
+            media_type: None,
+        };
+        let html = collection_page(shared, &doc, Some(&license), None, None);
+        let overview = html.split("<section id=\"overview\"").nth(1).unwrap();
+        let map = overview.find("<div class=\"map-section\">").unwrap();
+        assert!(map < overview.find("<h2>Data coverage</h2>").unwrap());
+        assert!(map < overview.find("<div class=\"detail-layout\">").unwrap());
+        assert_eq!(
+            map_data(&html)["mapRequest"]["license"],
+            json!({"title":"CC-BY-4.0","href":"https://spdx.org/licenses/CC-BY-4.0.html"})
+        );
+        assert!(html.contains("<details id=\"map-request\" class=\"map-request enhanced\"><summary>This frame as an API request</summary>"));
+        assert!(html.contains(
+            "<button type=\"button\" class=\"btn small\" id=\"map-request-copy\" data-copy=\"\" disabled>Copy</button><a id=\"map-image-link\" class=\"btn small\" aria-disabled=\"true\">Open ↗</a>"
+        ));
+        assert!(html.contains(
+            "<p id=\"map-chip\" class=\"map-chip enhanced\" aria-hidden=\"true\" hidden></p>"
+        ));
+        assert!(html.contains("id=\"map-expand\" aria-label=\"Full window\""));
+        assert!(html.contains("<input type=\"radio\" name=\"map-basemap\" value=\"land\" checked>"));
+        assert!(html.contains("<input type=\"checkbox\" id=\"map-labels\" checked>"));
+        assert!(html.contains(
+            "<input type=\"range\" id=\"map-opacity\" min=\"0\" max=\"100\" step=\"5\" value=\"85\">"
+        ));
+        // The basemap and the repeat mode are no Maps parameters: neither
+        // is in the form.
+        let form = html.split("<form id=\"map-form\"").nth(1).unwrap();
+        let form = form.split("</form>").next().unwrap();
+        assert!(!form.contains("map-basemap") && !form.contains("map-repeat"));
+        // Icons are inline SVG in the page's own markup, no icon font.
+        assert!(html.contains(&format!(
+            "<span class=\"when-paused\">{}</span><span class=\"when-playing\">{}</span>",
+            icon("play"),
+            icon("pause")
+        )));
+        for name in [
+            "to-start",
+            "step-back",
+            "step-forward",
+            "to-end",
+            "loop",
+            "bounce",
+            "expand",
+            "collapse",
+            "help",
+            "layers",
+        ] {
+            assert!(html.contains(&icon(name)), "{name}");
+        }
+
+        let mut no_map = doc.clone();
+        no_map["links"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|l| l["rel"] != rel::MAP);
+        let html = collection_page(shared, &no_map, None, None, None);
+        assert!(!html.contains("map-section"));
+        let coverage = html.split("<h2>Data coverage</h2>").nth(1).unwrap();
+        assert!(coverage
+            .split("</section>")
+            .next()
+            .unwrap()
+            .contains("<div class=\"map-panel\"><div id=\"feature-map\""));
+        assert!(map_data(&html).get("mapRequest").is_none());
+    }
+
+    /// #1220: 12 levels or fewer also get a ladder on the map's right edge,
+    /// the highest in the atmosphere on top: pressure counts down as it
+    /// rises, height and elevation angle count up. More levels stay in the
+    /// layer card's select alone.
+    #[test]
+    fn the_level_ladder_holds_up_to_twelve_levels_highest_on_top() {
+        use ds_core::vertical::VerticalKind;
+        let shared = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let ladder = |vertical: Value| -> Option<(String, Vec<String>)> {
+            let doc = json!({"id":"nwp","extent":{"spatial":{"bbox":[[20,60,30,70]]},"vertical":vertical},
+                "links":[{"rel":"self","href":"https://x/collections/nwp"},
+                    {"rel":rel::MAP,"href":"https://x/collections/nwp/map"}]});
+            let html = collection_html(shared, &doc, None);
+            let rest = html.split("<div id=\"map-ladder\"").nth(1)?;
+            let rest = rest.split("</div>").next().unwrap();
+            let label = rest
+                .split("aria-label=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            let levels = rest
+                .split("data-level=\"")
+                .skip(1)
+                .map(|value| value.split('"').next().unwrap().to_owned())
+                .collect();
+            Some((label.to_owned(), levels))
+        };
+        let pressure = ladder(
+            json!({"interval":[[300,1000]],"values":[1000,850,500,300],"unit":"hPa",
+            "vrs":VerticalKind::Pressure.vrs()}),
+        )
+        .unwrap();
+        assert_eq!(pressure.1, ["300", "500", "850", "1000"]);
+        assert_eq!(
+            pressure.0,
+            format!("{} · hPa", VerticalKind::Pressure.default_label())
+        );
+        let angles = ladder(
+            json!({"interval":[[0.5,5]],"values":[0.5,1.5,5],"unit":"deg",
+            "vrs":VerticalKind::ElevationAngle.vrs()}),
+        )
+        .unwrap();
+        assert_eq!(angles.1, ["5", "1.5", "0.5"]);
+        // An axis of unknown kind keeps the order it is given in.
+        let unknown = ladder(json!({"interval":[[1,3]],"values":[2,1,3]})).unwrap();
+        assert_eq!(unknown.1, ["2", "1", "3"]);
+        let twelve: Vec<u32> = (1..=12).map(|level| level * 100).collect();
+        assert_eq!(
+            ladder(json!({"interval":[[100,1200]],"values":twelve,"unit":"hPa","vrs":VerticalKind::Pressure.vrs()}))
+                .unwrap()
+                .1
+                .len(),
+            12
+        );
+        let thirteen: Vec<u32> = (1..=13).map(|level| level * 75).collect();
+        assert!(ladder(json!({"interval":[[75,975]],"values":thirteen,"unit":"hPa","vrs":VerticalKind::Pressure.vrs()})).is_none());
+        // No levels: no ladder.
+        assert!(ladder(json!({"interval":[[0,0]]})).is_none());
     }
 
     /// The map panel of `tests/fixtures/map-panel.html`, which the map
@@ -3811,8 +4233,13 @@ mod tests {
                     {"rel":rel::MAP,"href":"https://x/collections/nwp/styles/warm/map"},
                     {"rel":rel::TILESETS_MAP,"href":"https://x/collections/nwp/styles/warm/map/tiles"},
                     legend("warm")]}]});
-        let html = collection_page(shared, &doc, None, None, Some("https://x/wms"));
-        let start = html.find("<div id=\"map-controls\"").unwrap();
+        let license = LicenseConfig {
+            title: "CC-BY-4.0".into(),
+            url: None,
+            media_type: None,
+        };
+        let html = collection_page(shared, &doc, Some(&license), None, Some("https://x/wms"));
+        let start = html.find("<div class=\"map-panel map-raster\">").unwrap();
         let end = start + html[start..].find("<script").unwrap();
         format!("{}\n", &html[start..end])
     }

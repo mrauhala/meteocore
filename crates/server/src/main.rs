@@ -872,7 +872,11 @@ async fn main() {
         // `/preview` before the router runs, so a single literal route
         // handles both forms.
         .route("/preview", get(preview::index_handler))
-        .route("/preview/{*path}", get(preview::asset_handler));
+        .route("/preview/{*path}", get(preview::asset_handler))
+        // The HTML workbench's stylesheets and scripts at versioned,
+        // immutable URLs below the base URL, which every API mount's pages
+        // link (#1220).
+        .merge(api_common::workbench::assets::router());
 
     // Admin routes (protected by bearer token auth, not CORS)
     // /mcp last and conditionally: `api_mcp::router` wraps the transport in

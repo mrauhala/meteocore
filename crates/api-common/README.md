@@ -252,8 +252,63 @@ resource as currently filtered and paged.
   engine gives one) and "Filter by" and "Sort by" chips. Each chip opens the
   items page with its request builder set to that property, named in the
   URL fragment (`#filter=<name>`, `#sort=<name>`).
+- **Static assets.** The stylesheets (`style.css`, and `map.css` on pages
+  with a map) and scripts (`app.js`, `map.js`) are not inlined. The server
+  mounts `workbench::assets::router()` at its root and serves them at
+  `{base}/workbench/{hash}/{file}`, where the hash is the FNV-1a hash of
+  the file's bytes. That URL is answered `public, max-age=31536000,
+  immutable` with a strong ETag, and `If-None-Match` gets a 304. Another
+  build's hash still gets the current bytes, but `no-cache`. Pages on
+  every API mount and on the shared root link the same URLs, so the
+  browser keeps one copy. Only `theme.js`, which sets the theme before the
+  first paint, and the request bar's fold stay inline.
 - **Map preview.** Drawn with MapLibre over Natural Earth outlines, which
   the server serves under `/preview/vendor/`.
+  - **Layout.** A collection with a map opens its Overview on it: the
+    content width, `clamp(420px, 70vh, 820px)` tall, with the coverage
+    facts, parameters and details below. Its panels float over it:
+    - top left, the layer card: parameter, style (hidden with one style),
+      level and draw mode (Tiles, Image or WMS). It folds into a pill that
+      names the layer, such as "Temperature · 850 hPa";
+    - top right, MapLibre's zoom beside the full-window and basemap
+      buttons. The basemap popover offers land and borders, borders only
+      or none, country names on or off, and the data's opacity, 0 to
+      100 %, 85 % by default. The basemap is the bundled Natural Earth
+      only, with borders over the data;
+    - on the right edge, a level ladder for 12 levels or fewer, the
+      highest in the atmosphere on top;
+    - bottom left, the legend card, which folds to its title and bar;
+    - across the bottom, the time bar; bottom right, the scale and a
+      compact attribution naming Natural Earth and the collection's
+      licence;
+    - top centre, a status chip for a load, a retry or a frame without
+      data. The status line, visually hidden once the map runs, is the
+      live region that says the same.
+  - **Full window.** The expand button fixes the map over the page
+    (`position: fixed; inset: 0`); Esc closes an open panel first, then
+    leaves. In the full window the wheel and one finger are the map's.
+  - **This frame as an API request**, a disclosure under the map, shows
+    the request of the frame drawn with Copy and Open.
+  - **Phone.** Below 600 px the map is `60svh` tall, the time bar docks
+    under it and the legend is a strip above the time bar. The pill opens
+    a bottom sheet with the layer controls, the basemap and the opacity.
+    In the full window the map and the time bar fit the screen.
+  - **Theme.** Every map colour is a token next to the workbench's
+    `:root` and `[data-theme=dark]` blocks in `style.css`: `--map-water`,
+    `--map-land`, `--map-border`, `--map-border-halo`, `--map-ink`,
+    `--map-panel-bg`, `--map-track`, `--map-buffer`, `--map-playhead`,
+    `--map-window`, `--map-now` and `--map-error`. `map.js` reads the
+    basemap's and the outline's with `getComputedStyle`, holds no hex
+    colour, and reads them again on the `workbench-theme` event.
+    MapLibre's zoom, scale and attribution take the panels' surface and
+    ink. Panels are the surface at 92 % with `backdrop-filter: blur(10px)`,
+    opaque without backdrop-filter or `color-mix` and under
+    `prefers-reduced-transparency: reduce`.
+  - **Accessibility.** Text is at least 4.5:1 and controls and the focus
+    ring 3:1 in both themes. Focus is a 3 px outline 2 px out, between
+    rings of the surface. Every target is at least 44 × 44 px, the
+    playhead thumb included. Times, ticks and the legend use tabular
+    figures. Icons are inline SVG from `icon()`, no icon font.
   - It draws with whatever the collection advertises: map tiles, Maps
     images (Web Mercator PNG) or vector tiles. On the shared root, a
     collection the WMS serves (its `apis` lists `wms`) can also be drawn with
@@ -351,12 +406,14 @@ resource as currently filtered and paged.
     another fragment such as `#metadata`.
   - On a collection page the wheel and a one-finger drag scroll the page.
     The map zooms with Ctrl or ⌘ and the wheel, and pans with two fingers.
+    The locator maps of items, EDR and Features pages keep their size and
+    behaviour and take the panels' styling.
   - On an items page, the request builder's **Use map view** copies the
     map's current view into `bbox` as a CRS84 box, west > east across the
     antimeridian.
 - **Without JavaScript.** Navigation, metadata, JSON links, paging and basic
-  text search all work. The map controls are a `GET` form to the
-  collection's Maps endpoint. Its only fields are Maps parameters
+  text search all work. The map is not drawn; its layer card is a `GET`
+  form to the collection's Maps endpoint, in the page's flow. Its only fields are Maps parameters
   (`parameter-name`, `datetime`, `elevation`), and each style has its own
   "Open map image" button. The time is a date and time input bounded by
   the axis and stepping by a regular grid's step. JavaScript adds the optional search fields, the
@@ -381,9 +438,9 @@ node --test crates/api-common/tests/map.test.cjs  # map script, stub DOM and Map
 cargo test -p server --test common_discovery      # cross-API contracts
 ```
 
-The map tests run the shipped `workbench/map.js` on
-[`tests/fixtures/map-panel.html`](tests/fixtures/map-panel.html), the map
-panel as `workbench` renders it. A unit test fails when the fixture is
+The map tests run the shipped `workbench/map.js`, the file the asset route
+serves, on [`tests/fixtures/map-panel.html`](tests/fixtures/map-panel.html),
+the map panel as `workbench` renders it. A unit test fails when the fixture is
 stale; `UPDATE_MAP_FIXTURE=1 cargo test -p api-common map_panel_fixture`
 regenerates it. api-maps submits the panel's no-JavaScript form to its own
 router (`workbench_form` in its integration tests).

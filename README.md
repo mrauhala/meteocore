@@ -393,11 +393,12 @@ the shared root serves all three):
 /preview                                       Built-in MapLibre SPA (cards + map for every collection)
 /preview/manifest.json                         Aggregated discovery JSON consumed by the SPA
 /preview/{*path}                               Embedded SPA assets (HTML, JS, CSS, vendored MapLibre)
+/workbench/{hash}/{file}                       The HTML pages' stylesheets and scripts, at immutable content-hashed URLs
 
 /admin/collections/reload                      POST: reload config and swap engines
 /health                                        Per-collection health status
 /metrics                                       Prometheus metrics (text format)
-/robots.txt                                    Crawler rules: landing pages, API, conformance, collection lists and collection pages only
+/robots.txt                                    Crawler rules: landing pages, API, conformance, collection lists and collection pages only, plus the pages' styles and scripts
 ```
 
 ### Map requests (OGC API - Maps)
