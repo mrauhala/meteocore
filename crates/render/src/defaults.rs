@@ -314,9 +314,12 @@ static RULES: &[DefaultRule] = &[
         unit_ranges: &[(&["mm", "kgm2"], 0.0, 70.0)],
         fallback_range: None,
     },
-    // Relative humidity as a fraction (CF's unit 1, MEPS
-    // `relative_humidity_2m`): the fraction-valued twin of the percent
-    // palette. The percent palette over 0..1 would overlap its stops, so
+    // Relative humidity as a fraction, in unit 1 as a source serves it
+    // unconverted (engine-netcdf and engine-zarr serve CF's
+    // `relative_humidity` in %, `ds_core::units::cf_display_conversion`,
+    // so MEPS `relative_humidity_2m` takes the percent rule below): the
+    // fraction-valued twin of the percent palette. The percent palette
+    // over 0..1 would overlap its stops, so
     // #823 clips instead of rescaling and the field sits in its bottom 1 %
     // (#872). `contains` names relative humidity explicitly: "Specific
     // humidity" must not reach these ranges.
@@ -337,8 +340,8 @@ static RULES: &[DefaultRule] = &[
         fallback_range: Some((0.0, 100.0)),
     },
     // Cloud and fog cover as a fraction, on the fraction-valued twin of the
-    // percent palette (as for relative humidity above), including the CF
-    // area fractions MEPS publishes in unit 1.
+    // percent palette (as for relative humidity above), including a CF area
+    // fraction in unit 1 that a source serves unconverted.
     DefaultRule {
         names: CLOUD_NAMES,
         contains: &[
@@ -352,10 +355,12 @@ static RULES: &[DefaultRule] = &[
         unit_ranges: &[(FRACTION, 0.0, 1.0)],
         fallback_range: None,
     },
-    // The CF area fractions in percent. Unit-gated: CF's unit for them is
-    // 1, so without a known unit their names guess nothing (unlike the cover
-    // names below, whose percent fallback serves a source without units). A
-    // title naming cloud cover still reaches that fallback.
+    // The CF area fractions in percent, as engine-netcdf and engine-zarr
+    // serve them from their standard name (MEPS `cloud_area_fraction`).
+    // Unit-gated: CF's unit for them is 1, so without a known unit their
+    // names guess nothing (unlike the cover names below, whose percent
+    // fallback serves a source without units). A title naming cloud cover
+    // still reaches that fallback.
     DefaultRule {
         names: &[],
         contains: CF_CLOUD_CONTAINS,
@@ -1100,8 +1105,10 @@ mod tests {
     /// units engine-netcdf reports for them (`long_name` as in
     /// testdata/meps-netcdf, or the example's `[netcdf.titles]`; the files'
     /// `units` in their display unit, #1209: K as °C, Pa as hPa, kg/m^2 as
-    /// mm), and the files' own spellings, as a CF store that serves them
-    /// unconverted would.
+    /// mm, and unit 1 as % for relative humidity and the cloud and fog area
+    /// fractions, whose standard names say they are fractions), and the
+    /// files' own spellings, as a CF store that serves them unconverted
+    /// would.
     #[test]
     fn meps_names_get_their_defaults() {
         let d = builtin();
@@ -1119,6 +1126,13 @@ mod tests {
                 "K",
                 "temperature",
                 Some((183.15, 323.15)),
+            ),
+            (
+                "relative_humidity_2m",
+                "Screen level relative humidity (RH2M)",
+                "%",
+                "humidity",
+                Some((0.0, 100.0)),
             ),
             (
                 "relative_humidity_2m",
@@ -1200,6 +1214,13 @@ mod tests {
             (
                 "cloud_area_fraction",
                 "Total cloud cover (TCC)",
+                "%",
+                "cloud_cover",
+                Some((0.0, 100.0)),
+            ),
+            (
+                "cloud_area_fraction",
+                "Total cloud cover (TCC)",
                 "1",
                 "cloud_cover_fraction",
                 Some((0.0, 1.0)),
@@ -1207,9 +1228,23 @@ mod tests {
             (
                 "low_type_cloud_area_fraction",
                 "Low cloud cover (LCC)",
+                "%",
+                "cloud_cover",
+                Some((0.0, 100.0)),
+            ),
+            (
+                "low_type_cloud_area_fraction",
+                "Low cloud cover (LCC)",
                 "1",
                 "cloud_cover_fraction",
                 Some((0.0, 1.0)),
+            ),
+            (
+                "fog_area_fraction",
+                "Fog",
+                "%",
+                "cloud_cover",
+                Some((0.0, 100.0)),
             ),
             (
                 "fog_area_fraction",
@@ -1229,8 +1264,8 @@ mod tests {
 
     /// #1067 PR 8: MEPS's pressure-level variables, with the titles and units
     /// engine-netcdf reports for them (testdata/meps-netcdf-pl; temperature
-    /// in °C and geopotential in gpm, #1209, and in the files' K and
-    /// m^2/s^2). Their wind
+    /// in °C, geopotential in gpm and relative humidity in %, #1209, and in
+    /// the files' K, m^2/s^2 and 1). Their wind
     /// components and the speed derived from them span ±80 / 0–80 m/s, twice
     /// the surface scale, for the jet; temperature, geopotential and
     /// relative humidity keep their all-levels ranges. The surface
@@ -1287,6 +1322,13 @@ mod tests {
                 "m^2/s^2",
                 "viridis",
                 Some((0.0, 206_000.0)),
+            ),
+            (
+                "relative_humidity_pl",
+                "Relative humidity pressure levels",
+                "%",
+                "humidity",
+                Some((0.0, 100.0)),
             ),
             (
                 "relative_humidity_pl",

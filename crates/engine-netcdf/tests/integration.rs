@@ -69,13 +69,15 @@ fn stored(file: &str, variable: &str) -> Vec<Vec<f64>> {
 /// A stored value of `variable` in the committed MEPS fixtures as the
 /// engine serves it (#1209), each conversion written out here rather than
 /// taken from `ds_core::units`: temperatures from K to °C, MSLP from Pa to
-/// hPa, geopotential from m^2/s^2 to gpm. The precipitation's kg/m^2 is mm
-/// unchanged, and fractions (unit 1) and m/s have no rule.
+/// hPa, geopotential from m^2/s^2 to gpm, and the fractions in unit 1 whose
+/// standard name is `relative_humidity` or `cloud_area_fraction` to %. The
+/// precipitation's kg/m^2 is mm unchanged, and m/s has no rule.
 fn served(variable: &str, stored: f64) -> f64 {
     match variable {
         "air_temperature_2m" | "air_temperature_pl" => stored - 273.15,
         "air_pressure_at_sea_level" => stored / 100.0,
         "geopotential_pl" => stored / 9.80665,
+        "relative_humidity_2m" | "relative_humidity_pl" | "cloud_area_fraction" => stored * 100.0,
         _ => stored,
     }
 }
@@ -866,11 +868,13 @@ fn stored_unit(file: &str, variable: &str) -> String {
 }
 
 /// #1209: every value is served in its display unit, converted from the
-/// variable's CF `units` after sampling: K as °C, Pa as hPa, kg/m^2 as mm.
-/// At a cell centre the map pixel, the EDR position value and the query
-/// GetFeatureInfo makes (the step and run the map resolved) agree, and are
-/// the stored value converted; every unit reported is the converted one. A
-/// unit without a rule, CF's `1` or m/s, is served as stored.
+/// variable's CF `units` after sampling: K as °C, Pa as hPa, kg/m^2 as mm,
+/// and CF's `1` as % where the standard name is a fraction
+/// (`relative_humidity`, `cloud_area_fraction`). At a cell centre the map
+/// pixel, the EDR position value and the query GetFeatureInfo makes (the
+/// step and run the map resolved) agree, and are the stored value
+/// converted; every unit reported is the converted one. A unit without a
+/// rule, m/s, is served as stored.
 #[test]
 fn values_are_served_in_display_units() {
     let engine = meps();
@@ -894,7 +898,8 @@ fn values_are_served_in_display_units() {
         ("air_temperature_2m", "K", "°C", 278.38034 - 273.15),
         ("air_pressure_at_sea_level", "Pa", "hPa", 1007.51086),
         ("precipitation_amount_acc", "kg/m^2", "mm", 0.021972656),
-        ("relative_humidity_2m", "1", "1", 1.000006),
+        ("relative_humidity_2m", "1", "%", 100.0006),
+        ("cloud_area_fraction", "1", "%", 100.0),
         ("wind_speed_of_gust", "m/s", "m/s", 12.461373),
     ] {
         assert_eq!(stored_unit(file, name), unit, "{name}: the fixture's unit");
@@ -955,6 +960,43 @@ fn values_are_served_in_display_units() {
     assert!((5000.0..6000.0).contains(&drawn), "500 hPa near 5.5 km");
     let unit = &pl.get_parameter_descriptions()["geopotential_pl"].unit;
     assert_eq!(unit, "gpm");
+
+    // Relative humidity in unit 1 as %, on a pressure level.
+    assert_eq!(stored_unit(pl_file, "relative_humidity_pl"), "1");
+    let stored = stored_pl("meps_pl_01_20261015T09Z.nc", "relative_humidity_pl", 850.0)[j][i];
+    let drawn = value_at_level(&pl, cell, "relative_humidity_pl", ten, Some(850.0))
+        .unwrap()
+        .unwrap();
+    assert!(
+        (drawn - stored * 100.0).abs() < 1e-3,
+        "{drawn} %, stored {stored}"
+    );
+    let unit = &pl.get_parameter_descriptions()["relative_humidity_pl"].unit;
+    assert_eq!(unit, "%");
+
+    // An EDR area of the fractions: every cell in %, the field's
+    // 0.48 to 1.0 relative humidity as 48 to 100.
+    let area = single(
+        engine
+            .query_area(
+                "POLYGON((5 55, 30 55, 30 70, 5 70, 5 55))",
+                Some((time, time)),
+                Some(&names(&["relative_humidity_2m", "cloud_area_fraction"])),
+                None,
+                run,
+            )
+            .unwrap(),
+    );
+    for name in ["relative_humidity_2m", "cloud_area_fraction"] {
+        assert_eq!(area.parameters[name].unit, "%", "{name}");
+        let cells: Vec<f64> = area.ranges[name].values.iter().flatten().copied().collect();
+        assert!(!cells.is_empty(), "{name}");
+        assert!(
+            cells.iter().all(|v| (0.0..=100.001).contains(v)),
+            "{name}: {cells:?}"
+        );
+        assert!(cells.iter().any(|&v| v > 1.0), "{name}: {cells:?}");
+    }
 }
 
 /// Several points share every field read; a query decodes each field it
@@ -1649,7 +1691,10 @@ fn edr_z_selects_the_levels_a_query_reads() {
     };
     assert_eq!(t.len(), 2);
     assert_eq!(z.as_ref().map(|z| z.values.clone()), Some(vec![300.0]));
-    let stored = stored_pl(file, "relative_humidity_pl", 300.0)[j][i];
+    let stored = served(
+        "relative_humidity_pl",
+        stored_pl(file, "relative_humidity_pl", 300.0)[j][i],
+    );
     let value = series.ranges["relative_humidity_pl"].values[1].unwrap();
     assert!((value - stored).abs() < 1e-3, "{value} {stored}");
 

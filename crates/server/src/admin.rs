@@ -9087,7 +9087,8 @@ mod tests {
     /// committed sample. Every layer has its style at load: the layers the
     /// example does not configure take the built-in default their name and
     /// served unit select (the temperature in °C, MSLP in hPa, the
-    /// run-start accumulation in mm, the fractions in unit `1`, the gusts),
+    /// run-start accumulation in mm, relative humidity and cloud cover in %
+    /// from the files' unit `1` and fraction standard names, the gusts),
     /// the wind components keep their narrower entries, and the
     /// collection's own style is the temperature palette over its own
     /// range.
@@ -9117,8 +9118,8 @@ mod tests {
                 "precipitation_amount_acc",
                 ("precipitation_accumulation", 0.0, 200.0),
             ),
-            ("relative_humidity_2m", ("humidity_fraction", 0.0, 1.0)),
-            ("cloud_area_fraction", ("cloud_cover_fraction", 0.0, 1.0)),
+            ("relative_humidity_2m", ("humidity", 0.0, 100.0)),
+            ("cloud_area_fraction", ("cloud_cover", 0.0, 100.0)),
             // Configured by the example.
             ("x_wind_10m", ("diverging", -20.0, 20.0)),
             ("y_wind_10m", ("diverging", -20.0, 20.0)),
@@ -9140,7 +9141,8 @@ mod tests {
             ("air_temperature_2m", "°C"),
             ("air_pressure_at_sea_level", "hPa"),
             ("precipitation_amount_acc", "mm"),
-            ("relative_humidity_2m", "1"),
+            ("relative_humidity_2m", "%"),
+            ("cloud_area_fraction", "%"),
             ("wind_speed_10m", "m/s"),
         ] {
             assert_eq!(units[name], unit, "{name}");
@@ -9151,8 +9153,9 @@ mod tests {
     /// loaded over its committed sample. The layers advertise the pressure
     /// axis (WMS ELEVATION, EDR `z`), and every layer, the derived
     /// `wind_speed_pl` included, takes the built-in default its name and
-    /// served unit select: the temperature in °C, geopotential in gpm, the
-    /// wind on twice the surface scale, for the jet.
+    /// served unit select: the temperature in °C, geopotential in gpm,
+    /// relative humidity in %, the wind on twice the surface scale, for the
+    /// jet.
     #[test]
     fn meps_netcdf_pressure_level_example_serves_its_levels_and_styles() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -9187,7 +9190,7 @@ mod tests {
             ("y_wind_pl", ("diverging", -80.0, 80.0)),
             ("wind_speed_pl", ("wind_speed", 0.0, 80.0)),
             ("geopotential_pl", ("viridis", 0.0, 21_000.0)),
-            ("relative_humidity_pl", ("humidity_fraction", 0.0, 1.0)),
+            ("relative_humidity_pl", ("humidity", 0.0, 100.0)),
         ] {
             assert_eq!(style(name), expected, "{name}");
         }

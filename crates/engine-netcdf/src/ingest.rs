@@ -208,11 +208,12 @@ pub(crate) struct Variable {
     pub title: String,
     /// `units` as the file spells it, empty when absent: the stored
     /// values' unit. The layer is served in its display unit where
-    /// `ds_core::units::display_conversion` has a rule (`Layout::display`,
-    /// #1209).
+    /// `ds_core::units::cf_display_conversion` has a rule for it and the
+    /// standard name (`Layout::display`, #1209).
     pub units: String,
     /// CF `standard_name`, when the file states one: EDR's observed
-    /// property, and what identifies wind components (`x_wind`).
+    /// property, what identifies wind components (`x_wind`), and whether a
+    /// value in unit `1` is a fraction served in % (`relative_humidity`).
     pub standard_name: Option<String>,
     /// The identity of a field with one level ([`Level`]): every size-1
     /// axis that is not time, run, lead or ensemble.

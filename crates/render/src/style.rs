@@ -1299,12 +1299,13 @@ mod tests {
 
     /// #1067 PR 6: a NetCDF MEPS collection's layers, with the names,
     /// titles and units engine-netcdf reports from testdata/meps-netcdf (the
-    /// display units of #1209: °C, hPa, mm) and only a collection-level
-    /// colormap, as the shipped example has. Every
-    /// layer gets its own default, and representative values render
-    /// distinct colours: the fraction palettes span 0..1 rather than sitting
-    /// in the percent palettes' bottom 1 % (#872), and the run-start
-    /// accumulation still separates 100 from 200 mm.
+    /// display units of #1209: °C, hPa, mm, and % for the CF fractions
+    /// whose standard name is `relative_humidity` or `cloud_area_fraction`)
+    /// and only a collection-level colormap, as the shipped example has.
+    /// Every layer gets its own default, and representative values render
+    /// distinct colours: relative humidity and cloud cover on the percent
+    /// palettes over 0..100, and the run-start accumulation still separates
+    /// 100 from 200 mm.
     #[test]
     fn meps_netcdf_parameters_render_their_defaults() {
         let ctx = StyleContext::with_builtins();
@@ -1314,7 +1315,7 @@ mod tests {
             (
                 "relative_humidity_2m",
                 "Screen level relative humidity (RH2M)",
-                "1",
+                "%",
             ),
             ("x_wind_10m", "10 m wind along the grid's x axis", "m/s"),
             ("y_wind_10m", "10 m wind along the grid's y axis", "m/s"),
@@ -1329,7 +1330,7 @@ mod tests {
                 "Precipitation accumulated since run start",
                 "mm",
             ),
-            ("cloud_area_fraction", "Total cloud cover (TCC)", "1"),
+            ("cloud_area_fraction", "Total cloud cover (TCC)", "%"),
         ]
         .map(|(name, title, unit)| ds_core::map_engine::ParameterInfo {
             name: name.into(),
@@ -1350,9 +1351,9 @@ mod tests {
             ),
             (
                 "relative_humidity_2m",
-                "humidity_fraction",
-                (0.0, 1.0),
-                &[0.1, 0.5, 0.9],
+                "humidity",
+                (0.0, 100.0),
+                &[10.0, 50.0, 90.0],
             ),
             (
                 "x_wind_10m",
@@ -1386,9 +1387,9 @@ mod tests {
             ),
             (
                 "cloud_area_fraction",
-                "cloud_cover_fraction",
-                (0.0, 1.0),
-                &[0.0, 0.25, 0.5, 1.0],
+                "cloud_cover",
+                (0.0, 100.0),
+                &[0.0, 25.0, 50.0, 100.0],
             ),
         ];
         for (name, palette, (min, max), values) in cases {
@@ -1402,11 +1403,12 @@ mod tests {
                 }
             }
         }
-        // A fraction draws the colour its percentage draws on the percent
-        // palette, and clear sky stays transparent.
-        let percent = ctx
+        // A percentage draws the colour its fraction draws on the fraction
+        // palette, which a CF fraction without a fraction standard name
+        // still takes, and clear sky stays transparent.
+        let fraction = ctx
             .build_colormap(&StyleSpec {
-                colormap: Some("cloud_cover"),
+                colormap: Some("cloud_cover_fraction"),
                 ..StyleSpec::default()
             })
             .unwrap();
@@ -1414,14 +1416,14 @@ mod tests {
         for f in [0.1, 0.4, 0.8] {
             assert!(
                 close(
-                    cloud.colormap.color(Some(f)),
-                    percent.colormap.color(Some(f * 100.0))
+                    cloud.colormap.color(Some(f * 100.0)),
+                    fraction.colormap.color(Some(f))
                 ),
                 "{f}"
             );
         }
         assert_eq!(cloud.colormap.color(Some(0.0))[3], 0);
-        assert_eq!(cloud.colormap.color(Some(1.0))[3], 255);
+        assert_eq!(cloud.colormap.color(Some(100.0))[3], 255);
     }
 
     /// #1067 PR 8: MEPS's pressure-level layers, as engine-netcdf reports
