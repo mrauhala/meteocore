@@ -851,6 +851,17 @@ one never implies the other.
   `MapEngine`s (engine-cap today) may depend on ds-render for it — an
   approved exception; engines still return `RasterTile` domain types and
   colorization stays in the API layer.
+- **Station symbol layers** (#1063, #1204) — every station collection's
+  marker layers share one implementation: `ds_core::station_map` (resolved
+  `[<engine>.map]` settings, the `time_step` frame axis and
+  `resolve_frame_end` that `get_raster_tile`/`resolve_time` share, the
+  frame window, `LatestValues`, `MAX_FRAME_ROWS`) and
+  `ds_render::station_symbols` (overlap order around the server-handed
+  midpoint, `draw_markers` projecting per station, `NODATA_MARKER` for
+  `SymbolColorMap`, the shared `MC_STATION_FRAME_CACHE_MB` frame cache keyed
+  by a `next_frame_source()` id, `StationLayers` for in-memory engines).
+  The server wires them with `admin::station_map_wiring`. Never fork it per
+  engine.
 - **`ds_render::resolve_layer_style`** — the one style lookup for WMS GetMap
   and GetLegendGraphic, and the Maps and Tiles map, tile and legend routes
   (#1133). A named parameter styles from `"{collection}/{param}"`, else the

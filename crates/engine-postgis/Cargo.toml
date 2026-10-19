@@ -13,6 +13,10 @@ ds-poll = { path = "../ds-poll" }
 # Strike-window LRU for the events map layer (#504) — byte-bounded caches go
 # through ds-cache (#480).
 ds-cache = { path = "../ds-cache" }
+# The station-symbol drawing shared with the CSV and BUFR engines (#1204):
+# marker order, discs, the nodata marker and the station-frame cache. Vector
+# MapEngines may depend on ds-render (the CAP `fill_polygon` precedent).
+ds-render = { path = "../render" }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }

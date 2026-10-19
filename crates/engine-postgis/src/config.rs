@@ -9,11 +9,12 @@
 
 use chrono::Duration;
 use ds_core::config::{
-    PostgisConfig, PostgisMapConfig, POSTGIS_DEFAULT_MAX_LOCATIONS, POSTGIS_MAP_MAX_AGE_CEILING,
-    POSTGIS_MAP_MAX_MARKER_SIZE, POSTGIS_MAP_MIN_TIME_STEP, POSTGIS_MAP_TIME_WINDOW,
-    POSTGIS_MAX_LOCATIONS_CEILING,
+    PostgisConfig, POSTGIS_DEFAULT_MAX_LOCATIONS, POSTGIS_MAX_LOCATIONS_CEILING,
 };
 use ds_core::datetime::parse_iso8601_duration;
+/// `[postgis.map]` resolved (#1063): the shared station-layer settings
+/// (#1204).
+pub use ds_core::station_map::StationMapSettings;
 use thiserror::Error;
 
 use crate::schema::{
@@ -111,74 +112,6 @@ pub struct PostgisEngineConfig {
     /// Station shapes: how the map layers draw the stations (`[postgis.map]`,
     /// #1063). The defaults for the events shape, which never reads it.
     pub station_map: StationMapSettings,
-}
-
-/// `[postgis.map]` resolved (#1063): the station-symbol layers' frame window,
-/// marker size and handling of stations without a value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StationMapSettings {
-    /// A frame at `TIME` shows each station's latest non-null value in
-    /// `[TIME - max_age, TIME]`.
-    pub max_age: Duration,
-    /// Marker diameter in output pixels.
-    pub marker_size: u32,
-    /// Draw cached stations without a value in the window as nodata markers.
-    pub draw_missing: bool,
-    /// The layers' TIME step: the advertised steps over the last 6 h, and
-    /// what a requested TIME floors to. Whole seconds, at least a minute.
-    pub time_step: Duration,
-}
-
-impl Default for StationMapSettings {
-    fn default() -> Self {
-        Self {
-            max_age: Duration::hours(1),
-            marker_size: 6,
-            draw_missing: false,
-            time_step: Duration::minutes(10),
-        }
-    }
-}
-
-impl StationMapSettings {
-    /// Lower `[postgis.map]`; absent fields take the defaults. Defense in
-    /// depth: `ds-core`'s `validate_postgis` already bounds every field.
-    fn resolve(raw: Option<&PostgisMapConfig>) -> Result<Self, PostgisConfigError> {
-        let defaults = Self::default();
-        let Some(raw) = raw else {
-            return Ok(defaults);
-        };
-        let max_age = match raw.max_age.as_deref() {
-            None => defaults.max_age,
-            Some(s) => parse_iso8601_duration(s)
-                .ok()
-                .filter(|d| *d > Duration::zero() && *d <= POSTGIS_MAP_MAX_AGE_CEILING)
-                .ok_or_else(|| PostgisConfigError::InvalidMap(format!("max_age '{s}'")))?,
-        };
-        let marker_size = raw.marker_size.unwrap_or(defaults.marker_size);
-        if marker_size == 0 || marker_size > POSTGIS_MAP_MAX_MARKER_SIZE {
-            return Err(PostgisConfigError::InvalidMap(format!(
-                "marker_size {marker_size}"
-            )));
-        }
-        let time_step = match raw.time_step.as_deref() {
-            None => defaults.time_step,
-            Some(s) => parse_iso8601_duration(s)
-                .ok()
-                .filter(|d| {
-                    d.subsec_nanos() == 0
-                        && *d >= POSTGIS_MAP_MIN_TIME_STEP
-                        && *d <= POSTGIS_MAP_TIME_WINDOW
-                })
-                .ok_or_else(|| PostgisConfigError::InvalidMap(format!("time_step '{s}'")))?,
-        };
-        Ok(Self {
-            max_age,
-            marker_size,
-            draw_missing: raw.draw_missing.unwrap_or(defaults.draw_missing),
-            time_step,
-        })
-    }
 }
 
 /// Parameter descriptor after cross-checking against the observation shape.
@@ -321,7 +254,8 @@ impl PostgisEngineConfig {
         if max_locations == 0 || max_locations > POSTGIS_MAX_LOCATIONS_CEILING {
             return Err(PostgisConfigError::InvalidMaxLocations(max_locations));
         }
-        let station_map = StationMapSettings::resolve(cfg.map.as_ref())?;
+        let station_map = StationMapSettings::resolve(cfg.map.as_ref())
+            .map_err(PostgisConfigError::InvalidMap)?;
 
         Ok(Self {
             dsn,
@@ -400,7 +334,7 @@ mod tests {
     use super::*;
     use ds_core::config::{
         PostgisObservationColumn, PostgisObservationTable, PostgisObservationsConfig,
-        PostgisParameterConfig, PostgisStationsConfig,
+        PostgisParameterConfig, PostgisStationsConfig, StationMapConfig,
     };
 
     // Guard around MC_ALLOW_INLINE_DB_URL + dsn env vars to serialize process-wide
@@ -852,7 +786,7 @@ mod tests {
             }
         );
         let mut cfg = nexus_config();
-        cfg.map = Some(PostgisMapConfig {
+        cfg.map = Some(StationMapConfig {
             max_age: Some("PT30M".into()),
             marker_size: None,
             draw_missing: Some(true),
@@ -864,19 +798,19 @@ mod tests {
         assert!(resolved.station_map.draw_missing);
         assert_eq!(resolved.station_map.time_step, Duration::minutes(5));
         for bad in [
-            PostgisMapConfig {
+            StationMapConfig {
                 max_age: Some("P8D".into()),
                 ..Default::default()
             },
-            PostgisMapConfig {
+            StationMapConfig {
                 marker_size: Some(0),
                 ..Default::default()
             },
-            PostgisMapConfig {
+            StationMapConfig {
                 time_step: Some("PT30S".into()),
                 ..Default::default()
             },
-            PostgisMapConfig {
+            StationMapConfig {
                 time_step: Some("PT7H".into()),
                 ..Default::default()
             },

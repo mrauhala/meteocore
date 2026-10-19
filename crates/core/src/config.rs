@@ -2987,48 +2987,117 @@ pub struct PostgisConfig {
     pub parameters: Vec<PostgisParameterConfig>,
     /// Station shapes only: the WMS/Maps/Tiles station-symbol layers
     /// (#1063). Optional; the layers exist whenever `apis` lists a map API,
-    /// with the defaults [`PostgisMapConfig`] documents.
+    /// with the defaults [`StationMapConfig`] documents.
     #[serde(default)]
-    pub map: Option<PostgisMapConfig>,
+    pub map: Option<StationMapConfig>,
 }
 
-/// `[postgis.map]` (#1063): how a station collection's map layers draw each
-/// station as a marker coloured by its latest value.
+/// `[postgis.map]`, `[bufr.map]` and `[csv.map]` (#1063, #1204): how a
+/// station collection's map layers draw each station as a marker coloured by
+/// its latest value. One shape for every station engine, checked at load by
+/// [`validate_station_map`] (its messages name the section) and resolved by
+/// [`crate::station_map::StationMapSettings::resolve`].
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct PostgisMapConfig {
+pub struct StationMapConfig {
     /// ISO 8601 duration: a frame at `TIME` shows each station's latest
     /// non-null value in `[TIME - max_age, TIME]`. Default `PT1H`, at most
-    /// [`POSTGIS_MAP_MAX_AGE_CEILING`].
+    /// [`STATION_MAP_MAX_AGE_CEILING`].
     pub max_age: Option<String>,
     /// Marker diameter in output pixels. Default 6, at most
-    /// [`POSTGIS_MAP_MAX_MARKER_SIZE`].
+    /// [`STATION_MAP_MAX_MARKER_SIZE`].
     pub marker_size: Option<u32>,
-    /// Draw the cached stations without a value in the window as markers in
-    /// the palette's `nodata_color`, instead of leaving them out. Default
+    /// Draw the stations without a value in the window as markers in the
+    /// palette's `nodata_color`, instead of leaving them out. Default
     /// `false`.
     pub draw_missing: Option<bool>,
     /// ISO 8601 duration: the TIME steps the layers advertise over the last
-    /// [`POSTGIS_MAP_TIME_WINDOW`], and what a requested `TIME` floors to.
-    /// Default `PT10M`; whole seconds, from [`POSTGIS_MAP_MIN_TIME_STEP`] to
-    /// [`POSTGIS_MAP_TIME_WINDOW`].
+    /// [`STATION_MAP_TIME_WINDOW`], and what a requested `TIME` floors to.
+    /// Default `PT10M`; whole seconds, from [`STATION_MAP_MIN_TIME_STEP`] to
+    /// [`STATION_MAP_TIME_WINDOW`].
     pub time_step: Option<String>,
 }
 
-/// How far back from the latest observation the PostGIS map layers advertise
-/// TIME steps (#504, #1063). Older frames still render on an explicit `TIME`.
-pub const POSTGIS_MAP_TIME_WINDOW: chrono::TimeDelta = chrono::TimeDelta::hours(6);
+/// How far back from the latest observation the station map layers, and the
+/// PostGIS events layer, advertise TIME steps (#504, #1063). Older frames
+/// still render on an explicit `TIME`.
+pub const STATION_MAP_TIME_WINDOW: chrono::TimeDelta = chrono::TimeDelta::hours(6);
 
-/// Shortest `[postgis.map] time_step` (#1063).
-pub const POSTGIS_MAP_MIN_TIME_STEP: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
+/// Shortest `[<engine>.map] time_step` (#1063).
+pub const STATION_MAP_MIN_TIME_STEP: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
 
-/// Longest `[postgis.map] max_age` (#1063): a typo guard. A frame reads every
-/// row of the window for every station, so a long one on a dense network
-/// meets the frame's row cap first.
-pub const POSTGIS_MAP_MAX_AGE_CEILING: chrono::TimeDelta = chrono::TimeDelta::days(7);
+/// Longest `[<engine>.map] max_age` (#1063): a typo guard. A frame reads
+/// every row of the window for every station, so a long one on a dense
+/// network meets the frame's row cap first.
+pub const STATION_MAP_MAX_AGE_CEILING: chrono::TimeDelta = chrono::TimeDelta::days(7);
 
-/// Largest `[postgis.map] marker_size`, in output pixels (#1063).
-pub const POSTGIS_MAP_MAX_MARKER_SIZE: u32 = 64;
+/// Largest `[<engine>.map] marker_size`, in output pixels (#1063).
+pub const STATION_MAP_MAX_MARKER_SIZE: u32 = 64;
+
+/// Hard-fail validation of a [`StationMapConfig`]; `section` names it in the
+/// messages: `postgis.map`, `bufr.map` or `csv.map`.
+pub fn validate_station_map(
+    id: &str,
+    section: &str,
+    map: &StationMapConfig,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+    if let Some(raw) = map.max_age.as_deref() {
+        let max_age = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
+            Config(format!(
+                "Collection '{id}': [{section}].max_age '{raw}' is not a valid ISO 8601 duration: {e}"
+            ))
+        })?;
+        if max_age <= chrono::TimeDelta::zero() || max_age > STATION_MAP_MAX_AGE_CEILING {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].max_age '{raw}' must be positive and at most P{}D",
+                STATION_MAP_MAX_AGE_CEILING.num_days()
+            )));
+        }
+    }
+    if let Some(size) = map.marker_size {
+        if size == 0 || size > STATION_MAP_MAX_MARKER_SIZE {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].marker_size {size} is outside 1..={STATION_MAP_MAX_MARKER_SIZE}"
+            )));
+        }
+    }
+    if let Some(raw) = map.time_step.as_deref() {
+        let step = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
+            Config(format!(
+                "Collection '{id}': [{section}].time_step '{raw}' is not a valid ISO 8601 duration: {e}"
+            ))
+        })?;
+        if step.subsec_nanos() != 0
+            || step < STATION_MAP_MIN_TIME_STEP
+            || step > STATION_MAP_TIME_WINDOW
+        {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].time_step '{raw}' must be whole seconds from PT1M to PT{}H",
+                STATION_MAP_TIME_WINDOW.num_hours()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A `[<engine>.map]` section no map API reads would be silently ignored:
+/// reject one without `wms`, `maps` or `tiles` in `apis`.
+fn require_map_api(
+    id: &str,
+    section: &str,
+    apis: &[String],
+) -> Result<(), crate::error::DataServerError> {
+    if apis
+        .iter()
+        .any(|a| matches!(a.as_str(), "wms" | "maps" | "tiles"))
+    {
+        return Ok(());
+    }
+    Err(crate::error::DataServerError::Config(format!(
+        "Collection '{id}': [{section}] needs a map API in apis (wms, maps or tiles)"
+    )))
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisStationsConfig {
@@ -3334,42 +3403,7 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
                 "Collection '{id}': [postgis.map] is not valid for observations.shape 'events' (its strike layer has fixed settings)"
             )));
         }
-        if let Some(raw) = map.max_age.as_deref() {
-            let max_age = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
-                Config(format!(
-                    "Collection '{id}': [postgis.map].max_age '{raw}' is not a valid ISO 8601 duration: {e}"
-                ))
-            })?;
-            if max_age <= chrono::TimeDelta::zero() || max_age > POSTGIS_MAP_MAX_AGE_CEILING {
-                return Err(Config(format!(
-                    "Collection '{id}': [postgis.map].max_age '{raw}' must be positive and at most P{}D",
-                    POSTGIS_MAP_MAX_AGE_CEILING.num_days()
-                )));
-            }
-        }
-        if let Some(size) = map.marker_size {
-            if size == 0 || size > POSTGIS_MAP_MAX_MARKER_SIZE {
-                return Err(Config(format!(
-                    "Collection '{id}': [postgis.map].marker_size {size} is outside 1..={POSTGIS_MAP_MAX_MARKER_SIZE}"
-                )));
-            }
-        }
-        if let Some(raw) = map.time_step.as_deref() {
-            let step = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
-                Config(format!(
-                    "Collection '{id}': [postgis.map].time_step '{raw}' is not a valid ISO 8601 duration: {e}"
-                ))
-            })?;
-            if step.subsec_nanos() != 0
-                || step < POSTGIS_MAP_MIN_TIME_STEP
-                || step > POSTGIS_MAP_TIME_WINDOW
-            {
-                return Err(Config(format!(
-                    "Collection '{id}': [postgis.map].time_step '{raw}' must be whole seconds from PT1M to PT{}H",
-                    POSTGIS_MAP_TIME_WINDOW.num_hours()
-                )));
-            }
-        }
+        validate_station_map(id, "postgis.map", map)?;
     }
 
     // -- parameters list --------------------------------------------------
@@ -4621,17 +4655,8 @@ impl ServerConfig {
                             "Collection '{id}': apis entry '{api}' is not supported for observations.shape 'events' (edr/wms/maps/tiles; \"features\" arrives with #503)"
                         )));
                     }
-                } else if postgis.map.is_some()
-                    && !collection
-                        .apis
-                        .iter()
-                        .any(|a| matches!(a.as_str(), "wms" | "maps" | "tiles"))
-                {
-                    // A map section no map API reads would be silently
-                    // ignored.
-                    return Err(crate::error::DataServerError::Config(format!(
-                        "Collection '{id}': [postgis.map] needs a map API in apis (wms, maps or tiles)"
-                    )));
+                } else if postgis.map.is_some() {
+                    require_map_api(id, "postgis.map", &collection.apis)?;
                 }
             } else if collection.postgis.is_some() {
                 return Err(crate::error::DataServerError::Config(format!(
@@ -7330,7 +7355,7 @@ unit = "1"
         let map = config.collections[0].postgis.as_ref().unwrap().map.clone();
         assert_eq!(
             map,
-            Some(PostgisMapConfig {
+            Some(StationMapConfig {
                 max_age: Some("PT30M".into()),
                 marker_size: Some(8),
                 draw_missing: Some(true),
