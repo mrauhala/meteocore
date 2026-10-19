@@ -5,7 +5,9 @@
 //! runs, maps and tiles are generated per request, and an archive store's run
 //! list alone links thousands of them. So is every other path, including the
 //! per-API services the landing page no longer advertises, WMS, 3D Tiles,
-//! `/preview`, `/health` and `/metrics`.
+//! `/preview`, `/health` and `/metrics`. The HTML pages' own stylesheets
+//! and scripts under `/workbench/` (#1220) are crawlable, so a crawler that
+//! renders a page sees it as a browser does.
 //!
 //! The paths assume the server answers at the host root, as robots.txt
 //! itself must. When adding a crawlable root or catalog, add its rules here
@@ -21,7 +23,7 @@ use axum::response::{IntoResponse, Response};
 pub const ROBOTS_TXT: &str = "\
 # MeteoCore: crawl the landing pages, API definitions, conformance, the
 # collection lists and each collection's own page, nothing below a
-# collection and nothing else.
+# collection and nothing else, and the pages' own styles and scripts.
 User-agent: *
 Disallow: /collections/*/
 Disallow: /edr/collections/*/
@@ -41,6 +43,7 @@ Allow: /edr/conformance
 Allow: /edr/collections$
 Allow: /edr/collections?
 Allow: /edr/collections/
+Allow: /workbench/
 Disallow: /
 ";
 
@@ -94,6 +97,10 @@ mod tests {
             "/edr/collections?f=json",
             "/edr/collections/dwd-icon-eu",
             "/edr/collections/dwd-icon-eu?f=html",
+            // The pages' stylesheets and scripts, for a crawler that
+            // renders them.
+            "/workbench/0123456789abcdef/style.css",
+            "/workbench/0123456789abcdef/map.js",
         ] {
             assert!(allowed(path), "{path} should be crawlable");
         }
@@ -138,6 +145,7 @@ mod tests {
             "/3dtiles/collections/fivih",
             "/preview",
             "/preview/manifest.json",
+            "/workbenchx",
             "/health",
             "/metrics",
             "/mcp",

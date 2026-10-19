@@ -102,9 +102,26 @@ over the geographic backdrop. Pan/zoom updates the request; advertised styles,
 parameters and levels apply as soon as they change, and a time bar steps
 through and plays the advertised time axis (#1220). The map opens on the
 latest observation or a forecast's step nearest now, and every frame names its
-time. The exact image URL is visible below the map and opens
-through **Open rendered image**. The global JSON switch remains the collection
-metadata representation. Loading failures and timeouts stay in the map panel.
+time. The exact request of the frame drawn is in the disclosure **This frame
+as an API request** under the map, with Copy and Open. The global JSON switch
+remains the collection metadata representation. Loading failures and timeouts
+stay on the map, in its status chip.
+
+The map comes first (#1220): it opens the collection's Overview at the content
+width, `clamp(420px, 70vh, 820px)` tall, and the coverage facts and details
+follow. Its controls float over it as translucent panels: the layer card top
+left (parameter, style, level and Tiles, Image or WMS), which folds into a pill
+such as "Temperature · 850 hPa"; zoom, full window and a basemap popover (land
+and borders, borders only or none, country names, data opacity at 85 % by
+default) top right; a level ladder on the right edge for 12 levels or fewer;
+the legend card bottom left; the time bar docked across the bottom; the scale
+and an attribution naming Natural Earth and the collection's licence bottom
+right; a status chip top centre. The expand button fills the window, and Esc
+leaves it. At 390 px the pill opens a bottom sheet with the layer, basemap and
+opacity, the legend is a strip above the time bar, and the map is `60svh` tall
+with no horizontal scroll. Every map colour is a theme token in `style.css`;
+the stylesheets and scripts are versioned, immutable static assets under
+`/workbench/`, linked rather than inlined.
 
 [Maps collection with radar data](screenshots/map-data-light.png)
 

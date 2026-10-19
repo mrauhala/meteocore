@@ -29,7 +29,17 @@ class Element {
     this.className = ''; this.title = ''; this.textContent = ''; this.hidden = false; this.style = {};
     this.classList = new ClassList(); this.listeners = {}; this.parent = null; this.id = '';
   }
-  append(...nodes) { nodes.forEach(node => { if (node instanceof Element) node.parent = this; }); this.children.push(...nodes); }
+  append(...nodes) {
+    nodes.forEach(node => {
+      // Appending moves a node, as in the DOM.
+      if (node instanceof Element && node.parent) node.parent.children = node.parent.children.filter(child => child !== node);
+      if (node instanceof Element) node.parent = this;
+    });
+    this.children.push(...nodes);
+  }
+  get parentNode() { return this.parent; }
+  contains(node) { for (let at = node; at; at = at.parent) if (at === this) return true; return false; }
+  focus() { Element.focused = this; }
   replaceChildren(...nodes) { this.children = []; this.append(...nodes); }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   removeAttribute(name) { delete this.attributes[name]; if (name === 'href') delete this.href; }
@@ -84,7 +94,7 @@ function parse(html) {
     const element = tag === 'select' ? new Select() : new Element(tag.toLowerCase());
     for (const [, name, , value = ''] of attrs.matchAll(/([a-z][a-z0-9-]*)(="([^"]*)")?/gi)) {
       const v = decode(value);
-      if (name === 'class') element.className = v;
+      if (name === 'class') { element.className = v; v.split(/\s+/).filter(Boolean).forEach(c => element.classList.add(c)); }
       else if (name === 'id') element.id = v;
       else if (name === 'hidden') element.hidden = true;
       else if (name === 'checked') element.checked = true;
@@ -93,7 +103,8 @@ function parse(html) {
       element.attributes[name] = v;
     }
     node.append(element);
-    if (!VOID.has(element.tag)) node = element;
+    // A void element, or a self-closing one such as an icon's `<path/>`.
+    if (!VOID.has(element.tag) && !attrs.trim().endsWith('/')) node = element;
   }
   // Text content as the DOM reads it, fixed at load.
   const text = element => element.children.map(child => typeof child === 'string' ? child : text(child)).join('');
@@ -109,8 +120,12 @@ function parse(html) {
 // `render()` stands for one frame: MapLibre draws, then fires `render`.
 class StubMap {
   constructor(options) {
-    this.options = options; this.handlers = {}; this.sources = new Map(); this.layers = [];
-    this.loadedSources = new Set(); this.log = []; this.added = [];
+    // The style's own layers (the background) come first.
+    this.options = options; this.handlers = {}; this.sources = new Map();
+    this.layers = Array.from(options.style?.layers || [], layer => ({ ...layer, paint: { ...layer.paint } }));
+    this.loadedSources = new Set(); this.log = []; this.added = []; this.controls = [];
+    // MapLibre's cooperative gestures handler.
+    this.cooperativeGestures = { on: Boolean(options.cooperativeGestures), enable() { this.on = true; }, disable() { this.on = false; } };
     this.view = { west: 20, south: 55, east: 30, north: 65 }; this.zoom = 5; this.center = { lng: 25, lat: 60 };
     StubMap.last = this;
   }
@@ -118,7 +133,7 @@ class StubMap {
   off(type, listener) { this.handlers[type] = (this.handlers[type] || []).filter(l => l !== listener); return this; }
   once(type, listener) { const once = event => { this.off(type, once); listener(event); }; return this.on(type, once); }
   fire(type, event = {}) { [...(this.handlers[type] || [])].forEach(listener => listener(event)); }
-  addControl() {}
+  addControl(control, position) { this.controls.push([control, position]); }
   addSource(id, source) {
     assert.ok(!this.sources.has(id), `source ${id} added twice`);
     this.sources.set(id, { ...source, setTiles: () => this.log.push(['setTiles', id]) });
@@ -142,6 +157,11 @@ class StubMap {
     const layer = this.getLayer(id);
     assert.ok(layer, `paint on missing layer ${id}`);
     layer.paint[name] = value; this.log.push(['paint', id, name, value]);
+  }
+  setLayoutProperty(id, name, value) {
+    const layer = this.getLayer(id);
+    assert.ok(layer, `layout on missing layer ${id}`);
+    (layer.layout ||= {})[name] = value; this.log.push(['layout', id, name, value]);
   }
   isSourceLoaded(id) { return this.loadedSources.has(id); }
   triggerRepaint() {}
@@ -182,8 +202,17 @@ const image = drawn => respond(200, { headers: { 'Content-Type': 'image/png', 'C
 // MapLibre's style loaded. `maps` and `wms` answer each Maps image and WMS
 // GetMap request; `mapData` edits the panel's `mapRequest` first; `now` is
 // the viewer's clock; `connection` is `navigator.connection`.
+// The map's colour tokens per theme, as style.css defines them for
+// `getComputedStyle` to read (custom properties come back as written).
+const TOKENS = {
+  light: { '--map-water': '#e4eee8', '--map-land': '#f0f5ef', '--map-border': '#29434b', '--map-border-halo': '#ffffffbf', '--map-ink': '#095c49' },
+  dark: { '--map-water': '#192e23', '--map-land': '#293e32', '--map-border': '#c5d3ca', '--map-border-halo': '#101b15bf', '--map-ink': '#9be5c8' },
+};
+
+// `land` serves the Natural Earth backdrop; `narrow` is a phone-width
+// viewport (`matchMedia('(max-width: 600px)')`).
 async function page({ hash = '', dpr = 1, mode, maps = url => image(url.searchParams.get('datetime') || '2024-01-01T02:00:00Z'), wms = () => image(), edit, mapData,
-  now = '2026-10-19T00:00:00Z', connection, size = [800, 480] } = {}) {
+  now = '2026-10-19T00:00:00Z', connection, size = [800, 480], land = false, narrow = false } = {}) {
   const root = parse(panel);
   if (edit) edit(root);
   const byId = id => { for (const element of root.walk()) if (element.id === id) return element; return null; };
@@ -215,6 +244,7 @@ async function page({ hash = '', dpr = 1, mode, maps = url => image(url.searchPa
         links: [{ rel: 'self', href: `${base}/tiles/WebMercatorQuad` }, { rel: 'item', href: `${base}/tiles/WebMercatorQuad/{tileMatrix}/{tileRow}/{tileCol}` }] }] } });
     }
     if (url.includes('/legend')) return respond(200, { json: { stops: [{ value: 0, color: '#000000' }, { value: 1, color: '#ffffff' }], min: 0, max: 1, parameter: 't', unit: 'K' } });
+    if (land && url.endsWith('/workbench-land.json')) return respond(200, { json: { type: 'FeatureCollection', features: [] } });
     if (/\/(map|wms)\?/.test(url)) {
       const signal = init?.signal;
       if (signal?.aborted) throw aborted();
@@ -251,9 +281,11 @@ async function page({ hash = '', dpr = 1, mode, maps = url => image(url.searchPa
     document, location, history, fetch, URL, URLSearchParams, AbortController, Date: PageDate,
     AbortSignal: { timeout: () => new AbortController().signal },
     maplibregl: { Map: StubMap, NavigationControl: class {}, ScaleControl: class {}, LngLatBounds, Marker: class {},
+      AttributionControl: class { constructor(options) { this.options = options; } },
       // MapLibre's Web Mercator: x and y in [0, 1] over the world.
       MercatorCoordinate: { fromLngLat: ([lng, lat]) => ({ x: (180 + lng) / 360, y: (180 - 180 / Math.PI * Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360))) / 360 }) } },
-    getComputedStyle: () => ({ getPropertyValue: () => '' }),
+    getComputedStyle: () => ({ getPropertyValue: name => TOKENS[document.documentElement.dataset.theme]?.[name] ?? '' }),
+    matchMedia: () => ({ matches: narrow, addEventListener() {} }),
     ResizeObserver: class { observe() {} },
     IntersectionObserver: class { constructor(callback) { intersection = callback; } observe() {} },
     navigator: { connection },
@@ -323,7 +355,11 @@ async function page({ hash = '', dpr = 1, mode, maps = url => image(url.searchPa
   const playing = () => byId('map-play').getAttribute('aria-label') === 'Pause';
   return { root, map: stub, byId, change, click, key, wait, run, requests, mapRequests, wmsRequests, tileFrames, shownTime, sourceTime, held, playing,
     writes, writeTimes, location, document, signals, inFlight: () => inFlight, status: byId('map-status'), legend: byId('map-legend'),
-    fireDocument: type => (documentListeners[type] || []).forEach(listener => listener({ type })),
+    fireDocument: (type, props = {}) => {
+      const event = { type, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...props };
+      (documentListeners[type] || []).forEach(listener => listener(event));
+      return event;
+    },
     intersect: visible => intersection?.([{ isIntersecting: visible }]),
     clock: () => clock };
 }
@@ -1066,7 +1102,7 @@ test('shortcuts work only with focus in the map or its time bar', async () => {
   const last = () => { const text = at().slice(4, 20); return `${text.replace(' ', 'T')}:00Z`; };
   // Outside the map region: nothing.
   await p.key('.', {}, p.byId('map-legend'));
-  await p.key(',', {}, p.byId('map-help'));
+  await p.key(',', {}, p.byId('map-layer-pill'));
   assert.equal(p.tileFrames().length, 1);
   // On the map: `,` steps back, with Shift ten frames.
   await p.key(',');
@@ -1220,4 +1256,266 @@ test('no autoplay; a hidden tab or a map scrolled away pauses playback and buffe
   const away = p.mapRequests().length;
   await p.run(5000);
   assert.equal(p.mapRequests().length, away);
+});
+
+// #1220 phase 3: the map's floating panels.
+
+test('every map colour is a theme token, read again on a theme change; no hex in the script', async () => {
+  // A quoted hex colour anywhere in the shipped script fails this.
+  assert.ok(!/['"`]#[0-9a-f]{3,8}['"`]/i.test(script), 'map.js holds a hex colour');
+  const p = await page({ land: true });
+  assert.equal(p.map.options.style.layers[0].paint['background-color'], TOKENS.light['--map-water']);
+  const paint = id => p.map.getLayer(id).paint;
+  assert.equal(paint('land')['fill-color'], TOKENS.light['--map-land']);
+  assert.equal(paint('borders')['line-color'], TOKENS.light['--map-border']);
+  assert.equal(paint('border-halo')['line-color'], TOKENS.light['--map-border-halo']);
+  assert.equal(paint('outlines')['line-color'], TOKENS.light['--map-ink']);
+  // The halo is the token's own colour and transparency, never white in
+  // the dark theme.
+  p.document.documentElement.dataset.theme = 'dark';
+  p.fireDocument('workbench-theme');
+  const background = p.map.log.filter(entry => entry[0] === 'paint' && entry[1] === 'background').at(-1);
+  assert.deepEqual(background.slice(2), ['background-color', TOKENS.dark['--map-water']]);
+  assert.equal(paint('land')['fill-color'], TOKENS.dark['--map-land']);
+  assert.equal(paint('borders')['line-color'], TOKENS.dark['--map-border']);
+  assert.equal(paint('border-halo')['line-color'], '#101b15bf');
+  assert.equal(paint('outlines')['line-color'], TOKENS.dark['--map-ink']);
+  assert.equal(paint('points')['circle-stroke-color'], TOKENS.dark['--map-land']);
+});
+
+test('the basemap: land and borders, borders only or none, country names, and the data opacity', async () => {
+  const p = await page({ land: true });
+  const first = showFirst(p);
+  const visibility = id => p.map.getLayer(id).layout?.visibility;
+  assert.deepEqual(['land', 'border-halo', 'borders'].map(visibility), ['visible', 'visible', 'visible']);
+  // A popover from the tools, closed until asked for.
+  const button = p.byId('map-basemap-button'), popover = p.byId('map-basemap');
+  assert.equal(popover.hidden, true);
+  await p.click('map-basemap-button');
+  assert.equal(popover.hidden, false);
+  assert.equal(button.getAttribute('aria-expanded'), 'true');
+  const choose = async value => {
+    const radio = [...p.root.walk()].find(e => e.name === 'map-basemap' && e.value === value);
+    [...p.root.walk()].filter(e => e.name === 'map-basemap').forEach(e => { e.checked = e === radio; });
+    radio.dispatch('change'); await settle();
+  };
+  await choose('borders');
+  assert.deepEqual(['land', 'border-halo', 'borders'].map(visibility), ['none', 'visible', 'visible']);
+  await choose('none');
+  assert.deepEqual(['land', 'border-halo', 'borders'].map(visibility), ['none', 'none', 'none']);
+  await choose('land');
+  assert.deepEqual(['land', 'border-halo', 'borders'].map(visibility), ['visible', 'visible', 'visible']);
+  // Country names off and on.
+  const labels = p.byId('map-labels');
+  labels.checked = false; labels.dispatch('change');
+  assert.ok(p.byId('feature-map').classList.contains('map-no-labels'));
+  labels.checked = true; labels.dispatch('change');
+  assert.ok(!p.byId('feature-map').classList.contains('map-no-labels'));
+  // 85 % by default; a new opacity applies to the frame drawn, every later
+  // frame and the legend.
+  const opacity = p.byId('map-opacity');
+  assert.equal(opacity.value, '85');
+  assert.equal(p.byId('map-opacity-value').textContent, '85 %');
+  opacity.value = '50'; opacity.dispatch('input');
+  assert.equal(p.map.getLayer(first).paint['raster-opacity'], 0.5);
+  assert.equal(p.byId('map-opacity-value').textContent, '50 %');
+  assert.equal(p.byId('map-legend-scale').children[0].style.opacity, '0.5');
+  await p.click('map-prev');
+  const next = p.map.rasters().find(layer => layer.id !== first).id;
+  p.map.tilesLoaded(next); p.map.render();
+  assert.equal(p.map.getLayer(next).paint['raster-opacity'], 0.5);
+  // A tap elsewhere closes the popover; it holds no Maps parameter.
+  p.fireDocument('pointerdown', { target: p.byId('feature-map') });
+  assert.equal(popover.hidden, true);
+  assert.ok(!popover.closest('form'));
+});
+
+test('the layer card folds into a pill naming the layer; a narrow screen opens it as a bottom sheet', async () => {
+  const p = await page();
+  showFirst(p);
+  const card = p.byId('map-controls'), pill = p.byId('map-layer-pill');
+  // Open on a wide screen, the pill its header, named by the legend's
+  // default parameter until one is chosen.
+  assert.ok(card.classList.contains('open'));
+  assert.equal(p.byId('map-layer-text').textContent, 'Temperature');
+  await p.change('map-level', '850');
+  assert.equal(p.byId('map-layer-text').textContent, 'Temperature · 850 hPa');
+  await p.change('map-style', 'https://x/collections/nwp/styles/warm/map');
+  await p.change('map-parameter', 'r');
+  assert.equal(p.byId('map-layer-text').textContent, 'Relative humidity · Warm · 850 hPa');
+  await p.click('map-layer-pill');
+  assert.ok(!card.classList.contains('open'));
+  assert.equal(pill.getAttribute('aria-expanded'), 'false');
+  await p.click('map-layer-pill');
+  assert.ok(card.classList.contains('open'));
+
+  // A phone: the pill first; it opens the sheet, which also holds the
+  // basemap and the opacity, and the legend is a folded strip.
+  const phone = await page({ narrow: true });
+  const sheet = phone.byId('map-controls');
+  assert.ok(!sheet.classList.contains('open'));
+  assert.equal(phone.byId('map-layer-pill').getAttribute('aria-expanded'), 'false');
+  assert.equal(phone.byId('map-basemap').parent, phone.byId('map-layer-body'));
+  assert.equal(phone.byId('map-basemap').hidden, false);
+  assert.ok(phone.byId('map-legend').classList.contains('folded'));
+  assert.equal(phone.byId('map-legend-toggle').getAttribute('aria-expanded'), 'false');
+  await phone.click('map-layer-pill');
+  assert.ok(sheet.classList.contains('open'));
+  // Esc closes it and gives focus back to the pill; so does the close
+  // button, and a tap outside closes it too.
+  const escape = phone.fireDocument('keydown', { key: 'Escape' });
+  assert.ok(escape.defaultPrevented);
+  assert.ok(!sheet.classList.contains('open'));
+  await phone.click('map-layer-pill');
+  await phone.click('map-sheet-close');
+  assert.ok(!sheet.classList.contains('open'));
+  await phone.click('map-layer-pill');
+  phone.fireDocument('pointerdown', { target: phone.byId('feature-map') });
+  assert.ok(!sheet.classList.contains('open'));
+  // The basemap still applies from the sheet; none of it is a form field.
+  assert.ok(![...phone.byId('map-form').walk()].some(e => e.name === 'map-basemap'));
+});
+
+test('the full window: Expand fills it, Esc closes a panel first and then leaves', async () => {
+  const p = await page();
+  showFirst(p);
+  const stage = p.byId('map-stage'), button = p.byId('map-expand');
+  assert.equal(p.map.cooperativeGestures.on, true);
+  await p.click('map-expand');
+  assert.ok(stage.classList.contains('expanded'));
+  assert.ok(p.document.documentElement.classList.contains('map-expanded'));
+  assert.equal(button.getAttribute('aria-pressed'), 'true');
+  // The wheel and one finger are the map's in the full window.
+  assert.equal(p.map.cooperativeGestures.on, false);
+  await p.click('map-basemap-button');
+  p.fireDocument('keydown', { key: 'Escape' });
+  assert.equal(p.byId('map-basemap').hidden, true);
+  assert.ok(stage.classList.contains('expanded'), 'Esc left the window before closing the popover');
+  const escape = p.fireDocument('keydown', { key: 'Escape' });
+  assert.ok(escape.defaultPrevented);
+  assert.ok(!stage.classList.contains('expanded'));
+  assert.ok(!p.document.documentElement.classList.contains('map-expanded'));
+  assert.equal(button.getAttribute('aria-pressed'), 'false');
+  assert.equal(p.map.cooperativeGestures.on, true);
+  // Outside the full window, Esc is not the map's.
+  assert.equal(p.fireDocument('keydown', { key: 'Escape' }).defaultPrevented, false);
+  // The button leaves it too.
+  await p.click('map-expand');
+  await p.click('map-expand');
+  assert.ok(!stage.classList.contains('expanded'));
+});
+
+test('the frame as an API request: Copy and Open name the frame drawn', async () => {
+  const p = await page();
+  const copy = p.byId('map-request-copy'), open = p.byId('map-image-link');
+  assert.equal(copy.attributes['data-copy'], '');
+  showFirst(p);
+  const template = 'https://x/collections/nwp/map/tiles/WebMercatorQuad/{z}/{y}/{x}?datetime=2024-01-01T02%3A00%3A00Z';
+  assert.equal(p.byId('map-image-request').textContent, template);
+  assert.equal(copy.dataset.copy, template);
+  assert.equal(copy.disabled, false);
+  assert.equal(open.href, 'https://x/collections/nwp/map/tiles/WebMercatorQuad');
+  assert.equal(open.textContent, 'Open tileset ↗');
+  const maps = await page({ mode: 'maps' });
+  showFirst(maps);
+  const image = maps.mapRequests().at(-1).href;
+  assert.equal(maps.byId('map-request-copy').dataset.copy, image);
+  assert.equal(maps.byId('map-image-link').href, image);
+  assert.equal(maps.byId('map-image-link').textContent, 'Open ↗');
+});
+
+test('the level ladder sets the level and shows the one drawn', async () => {
+  const p = await page();
+  showFirst(p);
+  const rungs = [...p.byId('map-ladder').children].filter(node => node.tagName === 'BUTTON');
+  assert.deepEqual(rungs.map(button => button.dataset.level), ['1000', '850']);
+  // Default draws the server's level: no rung is pressed.
+  assert.deepEqual(rungs.map(button => button.getAttribute('aria-pressed')), ['false', 'false']);
+  rungs[1].dispatch('click'); await settle();
+  assert.equal(p.byId('map-level').value, '850');
+  assert.equal(p.tileFrames().at(-1).searchParams.get('elevation'), '850');
+  assert.deepEqual(rungs.map(button => button.getAttribute('aria-pressed')), ['false', 'true']);
+  // The select and the ladder are one choice.
+  await p.change('map-level', '1000');
+  assert.deepEqual(rungs.map(button => button.getAttribute('aria-pressed')), ['true', 'false']);
+  assert.ok(!p.byId('map-ladder').closest('form'));
+});
+
+test('the status chip shows a load or a failure and the live region says the same; a frame drawn clears it', async () => {
+  const p = await page();
+  assert.ok(p.byId('map-stage').parent.classList.contains('map-live'), 'the status line stays a visible paragraph');
+  const chip = p.byId('map-chip');
+  assert.equal(chip.hidden, false);
+  assert.equal(chip.textContent, 'Loading map tiles…');
+  assert.equal(p.status.textContent, 'Loading map tiles…');
+  showFirst(p);
+  assert.equal(chip.hidden, true);
+  assert.match(p.status.textContent, /^Map tiles · Showing/);
+  // A frame without data: the chip says why and is marked stale.
+  await p.click('map-first');
+  const staged = p.map.rasters().find(layer => !p.map.loadedSources.has(layer.id));
+  p.map.loadedSources.add(staged.id); p.map.render();
+  assert.equal(chip.textContent, 'No data at 2024-01-01 00:00 UTC. Choose another time.');
+  assert.ok(chip.classList.contains('stale'));
+  assert.match(p.status.textContent, /^No data at 2024-01-01 00:00 UTC\. Choose another time\. Still showing/);
+  // A notice fades by itself.
+  await p.key('>');
+  assert.equal(chip.textContent, '4 frames a second.');
+  await p.wait(4000);
+  assert.equal(chip.hidden, true);
+  // While playback waits for frames, the chip counts them in; the live
+  // region does not.
+  const q = await page();
+  await q.run();
+  q.held.add('2024-01-01T00:00:00Z');
+  await q.click('map-play');
+  await q.run(1000);
+  assert.equal(q.byId('map-chip').textContent, 'Loading 1/3');
+  assert.equal(q.status.textContent, 'Playing 3 frames · 2 h, 2 frames a second.');
+  q.held.clear();
+  await q.run();
+  assert.equal(q.byId('map-chip').hidden, true);
+});
+
+test('the attribution names Natural Earth and the collection licence, escaped; the legend folds without losing its scale', async () => {
+  const p = await page();
+  const [attribution, position] = p.map.controls.find(([control]) => control.options?.customAttribution);
+  assert.equal(position, 'bottom-right');
+  assert.equal(attribution.options.compact, true);
+  assert.equal(JSON.stringify(attribution.options.customAttribution), JSON.stringify(['Data: <a href="https://spdx.org/licenses/CC-BY-4.0.html">CC-BY-4.0</a>']));
+  assert.equal(p.map.options.attributionControl, false);
+  const odd = await page({ mapData: r => { r.license = { title: '<b>Own & "terms"</b>', href: 'javascript:alert(1)' }; } });
+  const [[{ options }]] = odd.map.controls.filter(([control]) => control.options?.customAttribution);
+  assert.equal(JSON.stringify(options.customAttribution), JSON.stringify(['Data: &lt;b&gt;Own &amp; &quot;terms&quot;&lt;/b&gt;']));
+  // The legend folds to its title and bar, and opens again.
+  showFirst(p);
+  await p.click('map-legend-toggle');
+  assert.ok(p.legend.classList.contains('folded'));
+  assert.equal(p.byId('map-legend-toggle').getAttribute('aria-expanded'), 'false');
+  assert.equal(p.byId('map-legend-scale').hidden, false);
+  await p.click('map-legend-toggle');
+  assert.ok(!p.legend.classList.contains('folded'));
+});
+
+test('play and pause swap their icons; repeat is a radio group outside the form', async () => {
+  const p = await page();
+  await p.run();
+  const play = p.byId('map-play');
+  assert.ok(!play.classList.contains('playing'));
+  await p.click('map-play');
+  assert.ok(play.classList.contains('playing'));
+  assert.equal(play.getAttribute('aria-label'), 'Pause');
+  const repeats = [...p.root.walk()].filter(e => e.name === 'map-repeat');
+  assert.deepEqual(repeats.map(e => e.value), ['loop', 'bounce', 'once']);
+  assert.ok(repeats.every(e => !e.closest('form')));
+  // A radio keeps its own keys: Space and Home are not the map's.
+  assert.equal((await p.key(' ', {}, repeats[1])).defaultPrevented, false);
+  assert.equal((await p.key('Home', {}, repeats[1])).defaultPrevented, false);
+  assert.ok(p.playing());
+  // Once: played to the loop's end, it stops there.
+  repeats.forEach(e => { e.checked = e.value === 'once'; });
+  repeats[2].dispatch('change');
+  await p.run(5000);
+  assert.ok(!p.playing());
+  assert.match(p.status.textContent, /^Played once to Mon 2024-01-01 02:00 UTC; paused\.$/);
 });

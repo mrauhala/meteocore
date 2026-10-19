@@ -9,27 +9,35 @@
   }
   const status = document.getElementById('map-status');
   const element = document.getElementById('feature-map');
+  // A collection's map (#1220): its panel, and the stage the map and its
+  // floating panels fill.
+  const panel = element.closest('.map-raster');
+  const stage = document.getElementById('map-stage');
   // Without MapLibre or WebGL nothing on the panel works: hide the map with
   // every control, and say where this page lists the same facts.
   function unavailable() {
-    ['map-controls','map-request','map-legend'].forEach(id => { const node = document.getElementById(id); if (node) node.hidden = true; });
+    ['map-stage','map-controls','map-request','map-legend'].forEach(id => { const node = document.getElementById(id); if (node) node.hidden = true; });
     element.hidden = true;
+    panel?.classList.remove('map-live');
     status.textContent = `This browser cannot draw the map. ${element.dataset.fallback || ''}`.trim();
   }
   if (typeof maplibregl === 'undefined') { unavailable(); return; }
   let started = false;
   try {
     const data = JSON.parse(document.getElementById('map-data').textContent);
-    // The data layer's opacity over the basemap; the legend is drawn at it
-    // too, so its colours match the map's.
+    // The data layer's opacity over the basemap by default; the legend is
+    // drawn at it too, so its colours match the map's.
     const DATA_OPACITY = 0.85;
+    // The map's colours are the theme's tokens (style.css `--map-*`), read
+    // when drawn and again on every theme change: water, land, borders over
+    // the data on a halo of the theme's background, and the outline of the
+    // extent and of vector features.
+    const TOKENS = { water: '--map-water', land: '--map-land', border: '--map-border', halo: '--map-border-halo', ink: '--map-ink' };
     const palette = () => {
       const css = getComputedStyle(document.documentElement);
-      const dark = document.documentElement.dataset.theme === 'dark';
-      // Borders over the data: a line in the theme's text colour on a halo
-      // of its background, so neither glares in the dark theme.
-      return { water: dark ? '#192e23' : '#e4eee8', land: dark ? '#293e32' : '#f0f5ef',
-        border: dark ? '#c5d3ca' : '#29434b', halo: dark ? '#101b15' : '#ffffff', ink: css.getPropertyValue('--teal').trim() };
+      const colors = {};
+      Object.entries(TOKENS).forEach(([key, token]) => { colors[key] = css.getPropertyValue(token).trim() || 'transparent'; });
+      return colors;
     };
     // A collection page's map keeps its view and choices in the URL
     // fragment (#1220), under the API's own parameter names:
@@ -53,15 +61,21 @@
       return saved;
     }
     const saved = data.mapRequest ? readFragment() : undefined;
-    const map = new maplibregl.Map({
+    const options = {
       container: element,
       style: { version: 8, sources: {}, layers: [{ id: 'background', type: 'background', paint: { 'background-color': palette().water } }] },
       center: [10, 30], zoom: 1,
       // A collection page's map sits on a long page: the wheel and one
       // finger scroll it, and the map pans with a modifier or two fingers.
       cooperativeGestures: element.dataset.quicklook !== 'true'
-    });
+    };
+    // A collection's map adds its own attribution, which names the data's
+    // licence beside Natural Earth.
+    if (data.mapRequest) options.attributionControl = false;
+    const map = new maplibregl.Map(options);
     map.on('load',() => { started = true; });
+    // Once the map runs, its status line is the chip's live region.
+    panel?.classList.add('map-live');
     // The view as a CRS84 box, west,south,east,north, for an items page's
     // "Use map view" (#1143). Longitudes wrap into ±180: a view across the
     // antimeridian has west > east, as Features `bbox` takes it.
@@ -76,8 +90,37 @@
       element.dataset.view = [west, lat(view.getSouth()), east === -180 ? 180 : east, lat(view.getNorth())].map(round).join(',');
     }
     map.on('moveend',recordView);
-    map.addControl(new maplibregl.NavigationControl({ showCompass: false }));
-    map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }));
+    // The basemap is the bundled Natural Earth only (#1220): land and
+    // borders, borders only, or none, with country names on or off.
+    const basemap = { mode: 'land', labels: true };
+    function applyBasemap() {
+      const show = (id, on) => { if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none'); };
+      show('land', basemap.mode === 'land');
+      show('border-halo', basemap.mode !== 'none');
+      show('borders', basemap.mode !== 'none');
+      element.classList.toggle('map-no-labels', !basemap.labels);
+    }
+    if (data.mapRequest) {
+      // Top right: the full window and the basemap beside the zoom; bottom
+      // right: the scale over a compact attribution that also names the
+      // collection's licence.
+      const tools = document.getElementById('map-tools');
+      if (tools) map.addControl({ onAdd: () => { tools.classList.add('maplibregl-ctrl', 'maplibregl-ctrl-group'); return tools; }, onRemove: () => tools.remove() }, 'top-right');
+      map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
+      const escapeHtml = text => String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+      const license = data.mapRequest.license;
+      let licenseHtml = [];
+      if (license?.title) {
+        let href;
+        try { href = license.href && ['http:','https:'].includes(new URL(license.href, location.href).protocol) ? license.href : undefined; } catch (_) {}
+        licenseHtml = [`Data: ${href ? `<a href="${escapeHtml(href)}">${escapeHtml(license.title)}</a>` : escapeHtml(license.title)}`];
+      }
+      map.addControl(new maplibregl.AttributionControl({ compact: true, customAttribution: licenseHtml }), 'bottom-right');
+      map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right');
+    } else {
+      map.addControl(new maplibregl.NavigationControl({ showCompass: false }));
+      map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }));
+    }
     const inspector = document.createElement('div');
     inspector.className = 'mini-inspector';
     inspector.setAttribute('aria-live', 'polite');
@@ -278,8 +321,154 @@
         // Another layer: nothing buffered or failed for the old one counts.
         if (changed.some(key => LAYER_KEYS.includes(key))) resetFrames();
         if (changed.includes('parameter-name')) rebind();
+        syncLayer();
         render();
         saveFragment();
+      }
+
+      // The floating panels (#1220). Narrow screens get a bottom sheet for
+      // the layer card, which then also holds the basemap and opacity, and
+      // a folded legend strip.
+      const narrow = typeof matchMedia === 'function' ? matchMedia('(max-width: 600px)') : undefined;
+      const isNarrow = () => Boolean(narrow?.matches);
+      const layerBody = byId('map-layer-body');
+      const pill = byId('map-layer-pill');
+      const pillText = byId('map-layer-text');
+      const levelText = value => [...(level?.options || [])].find(option => option.value === value)?.textContent || value;
+      // The pill names what is drawn: "Temperature · 850 hPa".
+      function layerSummary() {
+        if (state.mode === 'vector') return 'Vector tiles';
+        const name = state['parameter-name'] || defaultParameter || (parameters.length === 1 ? parameters[0].name : '');
+        const parts = [name ? findParameter(name)?.label || name : 'Map layer'];
+        if (state.style > 0) parts.push(style.options[state.style]?.textContent);
+        if (state.elevation) parts.push(levelText(state.elevation));
+        return parts.filter(Boolean).join(' · ');
+      }
+      // The layer card open or folded into its pill; on a narrow screen,
+      // open is the bottom sheet, which takes focus and gives it back.
+      function setCard(open, refocus) {
+        if (!block) return;
+        block.classList.toggle('open', open);
+        pill?.setAttribute('aria-expanded', String(open));
+        if (!isNarrow()) return;
+        if (open) [...(layerBody?.querySelectorAll?.('select,input,button') || [])].find(node => !node.disabled && node.offsetParent !== null)?.focus();
+        else if (refocus) pill?.focus();
+      }
+      pill?.addEventListener('click',() => setCard(!block.classList.contains('open')));
+      byId('map-sheet-close')?.addEventListener('click',() => setCard(false, true));
+      // The level ladder: one button per level, pressed for the level drawn.
+      const ladder = byId('map-ladder');
+      const ladderButtons = ladder ? [...ladder.children].filter(node => node.tagName === 'BUTTON') : [];
+      ladderButtons.forEach(button => button.addEventListener('click',() => {
+        if (choose(level, option => option.value !== '' && Number(option.value) === Number(button.dataset.level))) apply({ elevation: level.value });
+      }));
+      function syncLayer() {
+        if (pillText) pillText.textContent = layerSummary();
+        ladderButtons.forEach(button => button.setAttribute('aria-pressed', String(state.elevation !== '' && Number(button.dataset.level) === Number(state.elevation))));
+      }
+      // Top right: the basemap and the data's opacity in a popover, or in
+      // the sheet on a narrow screen.
+      const tools = byId('map-tools');
+      const basemapButton = byId('map-basemap-button');
+      const basemapPanel = byId('map-basemap');
+      const opacityInput = byId('map-opacity');
+      const opacityText = byId('map-opacity-value');
+      let dataOpacity = DATA_OPACITY;
+      function setPopover(open) {
+        if (!basemapPanel || isNarrow()) return;
+        basemapPanel.hidden = !open;
+        basemapButton?.setAttribute('aria-expanded', String(open));
+      }
+      function placeBasemap() {
+        if (!basemapPanel) return;
+        if (isNarrow()) { layerBody?.append(basemapPanel); basemapPanel.hidden = false; basemapButton?.setAttribute('aria-expanded', 'false'); }
+        else if (tools && basemapPanel.parentNode !== tools) { tools.append(basemapPanel); basemapPanel.hidden = true; }
+      }
+      basemapButton?.addEventListener('click',() => setPopover(basemapPanel.hidden));
+      document.querySelectorAll('input[name="map-basemap"]').forEach(input => input.addEventListener('change',() => {
+        if (!input.checked) return;
+        basemap.mode = input.value; applyBasemap();
+      }));
+      const labelsInput = byId('map-labels');
+      labelsInput?.addEventListener('change',() => { basemap.labels = labelsInput.checked; applyBasemap(); });
+      // The data's opacity, 0–100 %: the frame drawn now and every later
+      // one, and the legend with them.
+      function setOpacity(value) {
+        dataOpacity = Math.max(0, Math.min(1, value));
+        if (front?.id && map.getLayer(front.id)) map.setPaintProperty(front.id,'raster-opacity',dataOpacity);
+        if (opacityText) opacityText.textContent = `${Math.round(dataOpacity * 100)} %`;
+        if (legendBar) legendBar.style.opacity = String(dataOpacity);
+      }
+      opacityInput?.addEventListener('input',() => setOpacity(Number(opacityInput.value) / 100));
+      // The full window: the map over the page, the wheel and one finger
+      // its own; Esc or the button leaves it.
+      const expandButton = byId('map-expand');
+      const expanded = () => Boolean(stage?.classList.contains('expanded'));
+      function setExpanded(on) {
+        if (!stage || expanded() === on) return;
+        stage.classList.toggle('expanded', on);
+        document.documentElement.classList.toggle('map-expanded', on);
+        expandButton?.setAttribute('aria-pressed', String(on));
+        if (on) map.cooperativeGestures?.disable?.(); else if (element.dataset.quicklook !== 'true') map.cooperativeGestures?.enable?.();
+        map.resize();
+        measureDock();
+      }
+      expandButton?.addEventListener('click',() => setExpanded(!expanded()));
+      // The legend folds to its title and bar; a narrow screen starts with
+      // the strip.
+      const legendToggle = byId('map-legend-toggle');
+      let legendBar;
+      function foldLegend(folded) {
+        legendBox?.classList.toggle('folded', folded);
+        legendToggle?.setAttribute('aria-expanded', String(!folded));
+      }
+      legendToggle?.addEventListener('click',() => foldLegend(!legendBox.classList.contains('folded')));
+      // The status chip, top centre: what is loading, retrying or missing.
+      // It is hidden from assistive technology, which hears the status
+      // line; a notice fades after 4 s, a load or a failure stays.
+      const chip = byId('map-chip');
+      let chipTimer, chipBuffering = false;
+      function showChip(text, kind) {
+        if (!chip) return;
+        clearTimeout(chipTimer);
+        chipBuffering = false;
+        chip.textContent = text || '';
+        chip.hidden = !text;
+        chip.classList.toggle('stale', kind === 'stale');
+        if (text && !kind) chipTimer = setTimeout(() => { chip.hidden = true; }, 4000);
+      }
+      // Narrow screens: the sheet and strip; wide ones: the card and popover.
+      function placePanels() {
+        placeBasemap();
+        if (isNarrow()) { setCard(false); foldLegend(true); }
+      }
+      narrow?.addEventListener?.('change',() => { placePanels(); if (!isNarrow()) { setCard(true); foldLegend(false); } });
+      // A tap outside closes the sheet or the popover.
+      document.addEventListener('pointerdown',event => {
+        const inside = node => Boolean(node && event.target && (node === event.target || node.contains?.(event.target)));
+        if (isNarrow() && block?.classList.contains('open') && !inside(block)) setCard(false);
+        if (!isNarrow() && basemapPanel && !basemapPanel.hidden && !inside(basemapPanel) && !inside(basemapButton)) setPopover(false);
+      });
+      // Esc closes the innermost open panel, else leaves the full window.
+      document.addEventListener('keydown',event => {
+        if (event.key !== 'Escape' || event.defaultPrevented) return;
+        if (isNarrow() && block?.classList.contains('open')) setCard(false, true);
+        else if (basemapPanel && !basemapPanel.hidden && !isNarrow()) { setPopover(false); basemapButton?.focus(); }
+        else if (byId('map-time-menu')?.open) byId('map-time-menu').open = false;
+        else if (keysHelp && !keysHelp.hidden) toggleHelp(false);
+        else if (expanded()) { setExpanded(false); expandButton?.focus(); }
+        else return;
+        event.preventDefault();
+      });
+      // How far the docked time bar reaches up the map: the legend, the
+      // scale and the attribution sit above it.
+      function measureDock() {
+        if (!stage?.style?.setProperty) return;
+        const docked = bar && !bar.hidden && getComputedStyle(bar).position === 'absolute';
+        let dock = docked ? bar.offsetHeight : 0;
+        // A narrow screen's legend is a strip along the map's bottom.
+        if (isNarrow() && legendBox && !legendBox.hidden) dock += legendBox.offsetHeight;
+        stage.style.setProperty('--map-dock', `${dock}px`);
       }
       parameter?.addEventListener('change',() => apply({ 'parameter-name': parameter.value }));
       style.addEventListener('change',() => apply({ style: Math.max(0, style.selectedIndex) }));
@@ -304,7 +493,7 @@
       const playheadMark = byId('map-playhead-mark');
       const playButton = byId('map-play');
       const speedSelect = byId('map-speed');
-      const repeatSelect = byId('map-repeat');
+      const repeatInputs = [...document.querySelectorAll('input[name="map-repeat"]')];
       const drawnLabel = byId('map-time-drawn');
       const relativeLabel = byId('map-time-relative');
       const seekLabel = byId('map-time-seek');
@@ -388,6 +577,7 @@
       function bindAxis(times, keep, keepWindow) {
         axis = times;
         if (bar) bar.hidden = !axis.length;
+        measureDock();
         if (timeField) timeField.hidden = axis.length > 0;
         if (!axis.length) { head = -1; return; }
         head = Number.isFinite(keep) ? nearestIndex(keep) : openingIndex();
@@ -459,8 +649,17 @@
         }
         if (total > 0) {
           const step = TICK_STEPS.find(s => width * s / total >= 72) || TICK_STEPS[TICK_STEPS.length - 1];
+          let previous = -Infinity;
           for (let t = Math.ceil(first / step) * step, k = 0; t <= last && k < 200; t += step, k++) {
-            nodes.push(spanAt(t % DAY === 0 ? 'map-tick day' : 'map-tick', t, tickText(t, step)));
+            const tick = spanAt(t % DAY === 0 ? 'map-tick day' : 'map-tick', t, tickText(t, step));
+            // A label near the track's end reads leftward, never cut, and
+            // is left out where it would meet the one before.
+            if ((last - t) * width / total < 48) {
+              if ((t - previous) * width / total < 100) continue;
+              tick.dataset.edge = 'end';
+            }
+            previous = t;
+            nodes.push(tick);
           }
           const now = Date.now();
           if (now >= first && now <= last) { const node = spanAt('map-now', now); node.title = 'Now'; nodes.push(node); }
@@ -506,6 +705,7 @@
         });
         bufferBox.replaceChildren(...nodes);
         drawWindowText();
+        if (chipBuffering) bufferChip();
       }
       // The playhead mark sits at the frame drawn, moved in the paint that
       // shows it.
@@ -546,7 +746,7 @@
       // Playback. The next frame is shown once it has fully loaded; until
       // then the current one holds. Failed frames are skipped. There is no
       // autoplay: only the viewer starts it.
-      const repeat = () => repeatSelect?.value || 'loop';
+      const repeat = () => repeatInputs.find(input => input.checked)?.value || 'loop';
       const speed = () => Number(speedSelect?.value) || 4;
       const interval = () => 1000 / speed();
       // The frame after `index` in playback order, and the direction then:
@@ -581,9 +781,20 @@
       }
       function updatePlay() {
         if (!playButton) return;
-        playButton.textContent = playing ? '❚❚' : '▶︎';
+        playButton.classList.toggle('playing', playing);
         playButton.setAttribute('aria-label', playing ? 'Pause' : 'Play');
         playButton.classList.toggle('buffering', playing && holding);
+        bufferChip();
+      }
+      // While playback waits for a frame, the chip counts the loop's frames
+      // in, "Loading 6/24"; the live region says nothing per frame.
+      function bufferChip() {
+        if (playing && holding && axis.length) {
+          let ready = 0;
+          for (let i = win.lo; i <= win.hi; i++) if (readyAt(i)) ready++;
+          showChip(`Loading ${ready}/${win.hi - win.lo + 1}`, 'loading');
+          chipBuffering = true;
+        } else if (chipBuffering) showChip('');
       }
       function play() {
         if (playing || axis.length < 2) return;
@@ -672,7 +883,7 @@
       byId('map-first')?.addEventListener('click',event => { halt(); goTo(event.shiftKey ? 0 : win.lo); });
       byId('map-last')?.addEventListener('click',event => { halt(); goTo(event.shiftKey ? axis.length - 1 : win.hi); });
       speedSelect?.addEventListener('change',() => { speedChosen = true; });
-      repeatSelect?.addEventListener('change',() => { direction = 1; trimPool(); prefetch(); });
+      repeatInputs.forEach(input => input.addEventListener('change',() => { direction = 1; trimPool(); prefetch(); }));
       keysButton?.addEventListener('click',() => toggleHelp());
       const closeMenu = () => { if (menu) menu.open = false; };
       byId('map-window-start')?.addEventListener('click',() => { setWindowEnd('lo', head); closeMenu(); });
@@ -727,11 +938,12 @@
       // Keyboard shortcuts, only while focus is in the map or its time bar
       // (WCAG 2.1.4). Arrow keys on the map keep MapLibre's pan; on the
       // slider they step frames.
-      const TYPING = /^(text|search|number|email|url|tel|password|date|time|datetime-local|month|week)$/;
       function onKey(event) {
         if (!axis.length || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
         const target = event.target, tag = target?.tagName;
-        if (tag === 'SELECT' || tag === 'TEXTAREA' || (tag === 'INPUT' && TYPING.test(target.type || 'text'))) return;
+        // A field keeps its own keys: text, a select, and the basemap's
+        // radios and opacity slider. Only the playhead takes the map's.
+        if (tag === 'SELECT' || tag === 'TEXTAREA' || (tag === 'INPUT' && target !== slider)) return;
         const key = event.key, count = event.shiftKey ? 10 : 1;
         const onSlider = target === slider;
         if (key === ' ' || key === 'k' || key === 'K') {
@@ -849,7 +1061,8 @@
           colourBar.style.background = legend.interpolation === 'step'
             ? `linear-gradient(to right, ${stops.map((stop,i) => `${stop.color} ${at(stop.value)}% ${at(stops[i + 1]?.value ?? max)}%`).join(', ')})`
             : `linear-gradient(to right, ${stops.map(stop => `${stop.color} ${at(stop.value)}%`).join(', ')})`;
-          colourBar.style.opacity = String(DATA_OPACITY);
+          colourBar.style.opacity = String(dataOpacity);
+          legendBar = colourBar;
           const scale = document.createElement('div'); scale.className = 'map-legend-ticks';
           const width = legendBox.clientWidth || 300;
           ticks(min, max, Math.max(2, Math.floor(width / 90))).forEach(value => {
@@ -868,6 +1081,7 @@
         const known = findParameter(name);
         defaultParameter = known?.name || name;
         if (parameter) parameter.options[0].textContent = `Default · ${known?.label || name}`;
+        syncLayer();
         if (shown && statusShowsFrame) showing(shown);
         // The default parameter on its own axis: the time bar follows it.
         if (!state['parameter-name']) {
@@ -953,6 +1167,7 @@
         status.textContent = still ? `${text} Still showing ${frameText(shown)}.` : text;
         status.classList.toggle('stale', Boolean(still && kind === 'stale'));
         statusShowsFrame = false;
+        showChip(text, kind);
       }
       function disableImageLink() {
         link.removeAttribute('href'); link.setAttribute('aria-disabled','true');
@@ -963,16 +1178,27 @@
       function showing(frame) {
         shown = frame;
         link.href = frame.href; link.removeAttribute('aria-disabled');
-        requestText.textContent = frame.text;
+        showRequest(frame.text);
         labelFrame(frame);
         if (playing) return;
         report(`${frame.kind === 'tiles' ? 'Map tiles · ' : ''}Showing ${frameText(frame)}${frame.note ? `. ${frame.note}` : ''}`);
         statusShowsFrame = true;
+        // The time bar and the pill name a frame drawn; the chip only says
+        // what went wrong with it.
+        showChip(frame.note ? `${frame.note}.` : '', frame.note ? 'stale' : undefined);
+      }
+      // The frame's request, under the map: the text to read and copy.
+      const copyButton = byId('map-request-copy');
+      function showRequest(text) {
+        requestText.textContent = text;
+        if (!copyButton) return;
+        copyButton.dataset.copy = text;
+        copyButton.disabled = !text;
       }
       // A request that drew nothing new. The frame on the map stays; the
       // failed request is listed only while there is none.
       function failed(error, requested) {
-        if (!shown && requested) { requestText.textContent = requested; disableImageLink(); }
+        if (!shown && requested) { showRequest(requested); disableImageLink(); }
         const text = error.noData ? 'No data available for this collection right now.'
           : error.name === 'AbortError' || error.name === 'TimeoutError' ? 'Map request timed out. Pan, zoom or change a choice to try again.'
           : error.message || 'Map data unavailable.';
@@ -1113,7 +1339,7 @@
         const old = front;
         if (pool.get(frame.key) === frame) pool.delete(frame.key);
         front = frame;
-        map.setPaintProperty(frame.id,'raster-opacity',DATA_OPACITY);
+        map.setPaintProperty(frame.id,'raster-opacity',dataOpacity);
         if (!old || old === frame) return;
         map.setPaintProperty(old.id,'raster-opacity',0);
         if (old.key !== frame.key && !pool.has(old.key) && wantedKeys().has(old.key)) pool.set(old.key, old);
@@ -1314,7 +1540,9 @@
         state.style = Math.max(0, style.selectedIndex);
         // One style is no choice.
         styleField.hidden = vector || usable < 2;
-        link.textContent = mode === 'maps' || mode === 'wms' ? 'Open rendered image ↗' : 'Open tileset metadata ↗';
+        link.textContent = mode === 'maps' || mode === 'wms' ? 'Open ↗' : 'Open tileset ↗';
+        if (ladder) ladder.hidden = vector;
+        measureDock();
         if (help) help.textContent = vector ? 'Vector tiles load as you pan and zoom: feature geometry in one outline color.' : generalHelp;
       }
       // The request a render makes, fixed when it starts.
@@ -1502,7 +1730,7 @@
         try {
           const url = wms ? wmsUrl(want, view) : mapsUrl(want, view);
           frame.href = frame.text = url.href;
-          if (pendingFront === frame && !shown) requestText.textContent = url.href;
+          if (pendingFront === frame && !shown) showRequest(url.href);
           const response = await fetch(url,{signal:controller.signal});
           const type = response.headers.get('content-type') || '';
           if (wms) {
@@ -1559,7 +1787,7 @@
           map.addLayer({id:'map-vector-line',type:'line',source:'map-vector','source-layer':layer,filter:['!',kind(['Point','MultiPoint'])],paint:{'line-color':colors.ink,'line-width':1.5}},before);
           map.addLayer({id:'map-vector-points',type:'circle',source:'map-vector','source-layer':layer,filter:kind(['Point','MultiPoint']),paint:{'circle-color':colors.ink,'circle-radius':4,'circle-stroke-color':colors.land,'circle-stroke-width':1}},before);
           link.href = tileset.self; link.removeAttribute('aria-disabled');
-          requestText.textContent = tileset.template;
+          showRequest(tileset.template);
           report('Vector tiles · loading as you pan and zoom');
         } catch (error) {
           if (current !== vectorGeneration || state.mode !== 'vector') return;
@@ -1606,7 +1834,13 @@
         savedWindow.length === 2 && savedWindow.every(Number.isFinite) ? savedWindow : undefined);
       if (!axis.length) state.datetime = selectedTimeValue();
       applyMode();
+      placePanels();
+      syncLayer();
       updatePlay();
+      if (typeof ResizeObserver === 'function') {
+        const docks = new ResizeObserver(measureDock);
+        [bar, legendBox].forEach(node => { if (node) docks.observe(node); });
+      }
       render();
     }
     map.on('style.load', async () => {
@@ -1627,7 +1861,18 @@
       // A fragment's view wins over the extent: a reload or a shared link
       // reopens where the viewer was.
       if (saved?.view) map.jumpTo(saved.view);
-      else if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: 45, maxZoom: data.mapRequest ? 8 : 5, duration: 0 });
+      else if (!bounds.isEmpty()) {
+        // A collection's map frames the extent clear of its panels: the
+        // layer card on the left and the time bar along the bottom of a
+        // wide map. Padding never takes more than a third of a side.
+        const width = element.clientWidth || 0, height = element.clientHeight || 0;
+        const wide = width > 900 && Boolean(data.mapRequest);
+        const padding = wide
+          ? { top: 60, right: 80, bottom: document.getElementById('map-timebar') ? 150 : 60, left: 350 }
+          : { top: 45, right: 45, bottom: 45, left: 45 };
+        Object.keys(padding).forEach(side => { padding[side] = Math.min(padding[side], Math.floor((side === 'top' || side === 'bottom' ? height : width) / 3)); });
+        map.fitBounds(bounds, { padding, maxZoom: data.mapRequest ? 8 : 5, duration: 0 });
+      }
       recordView();
       status.textContent = element.dataset.quicklook === 'true' ? 'Current page · select a shape for a quick look.' : 'Advertised geometry · general-purpose locator.';
       if (data.mapRequest) installRasterPreview(bounds);
@@ -1647,14 +1892,19 @@
           if (unique.size === 1) inspect(feature);
         });
       });
+      // A theme change re-reads the tokens and repaints every layer that
+      // takes one.
       document.addEventListener('workbench-theme', () => {
         const colors = palette();
-        map.setPaintProperty('background','background-color',colors.water);
-        if (map.getLayer('land')) map.setPaintProperty('land','fill-color',colors.land);
-        if (map.getLayer('border-halo')) map.setPaintProperty('border-halo','line-color',colors.halo);
-        if (map.getLayer('borders')) map.setPaintProperty('borders','line-color',colors.border);
-        map.setPaintProperty('areas','fill-color',colors.ink); map.setPaintProperty('outlines','line-color',colors.ink);
-        map.setPaintProperty('points','circle-color',colors.ink); map.setPaintProperty('points','circle-stroke-color',colors.land);
+        const paint = (id, property, value) => { if (map.getLayer(id)) map.setPaintProperty(id, property, value); };
+        paint('background','background-color',colors.water);
+        paint('land','fill-color',colors.land);
+        paint('border-halo','line-color',colors.halo);
+        paint('borders','line-color',colors.border);
+        paint('areas','fill-color',colors.ink); paint('outlines','line-color',colors.ink);
+        paint('points','circle-color',colors.ink); paint('points','circle-stroke-color',colors.land);
+        paint('map-vector-fill','fill-color',colors.ink); paint('map-vector-line','line-color',colors.ink);
+        paint('map-vector-points','circle-color',colors.ink); paint('map-vector-points','circle-stroke-color',colors.land);
       });
       try {
         const response = await fetch(element.dataset.land);
@@ -1664,9 +1914,11 @@
         const colors = palette();
         map.addLayer({id:'land',type:'fill',source:'land',paint:{'fill-color':colors.land}},'areas');
         // Keep borders above every replacement raster, with a halo so
-        // boundaries remain visible over both dark and bright weather colors.
-        map.addLayer({id:'border-halo',type:'line',source:'land',paint:{'line-color':colors.halo,'line-width':3,'line-opacity':0.75}},'outlines');
+        // boundaries remain visible over both dark and bright weather
+        // colors; the halo token carries its own transparency.
+        map.addLayer({id:'border-halo',type:'line',source:'land',paint:{'line-color':colors.halo,'line-width':3}},'outlines');
         map.addLayer({id:'borders',type:'line',source:'land',paint:{'line-color':colors.border,'line-width':1}},'outlines');
+        applyBasemap();
         // Country names, largest country first. Markers have no collision
         // detection (a symbol layer would need a glyph server), so a name
         // whose box overlaps one already placed, or the map's edge, is

@@ -1,0 +1,299 @@
+/* The workbench maps (#1220): a collection's map, map-first on its
+   Overview, and the locator maps of items, EDR and Features pages. Every
+   colour is a token from style.css's :root and [data-theme=dark] blocks.
+   Pages with a map link this file after style.css. */
+
+/* ---- Every map: the locator and MapLibre's own controls ---- */
+.map-panel{position:relative}
+#feature-map{height:340px}
+#map-status{padding:10px 18px;font-size:14px}
+#map-status.stale{color:var(--amber)}
+.map-selection{padding:18px;display:flex;flex-wrap:wrap;gap:8px}
+.map-selection p{flex-basis:100%}
+.map-selection:empty{display:none}
+.map-selection .btn{white-space:normal}
+.country-label{font:600 14px var(--font-ui);color:var(--ink);text-shadow:0 1px 2px var(--white),1px 0 2px var(--white),0 0 4px var(--white);pointer-events:none}
+.map-no-labels .country-label{display:none}
+
+/* Floating panels: the surface at 92 % over the map, blurred, where the
+   browser blends and blurs; opaque otherwise, and for a viewer who asks
+   for less transparency. MapLibre's controls take the same surface. */
+.map-card,.map-panel .maplibregl-ctrl-group,.map-panel .maplibregl-ctrl-attrib,.map-panel .maplibregl-ctrl-scale{background:var(--white);color:var(--ink);border:1px solid var(--line);box-shadow:var(--shadow)}
+.map-card{border-radius:12px}
+@supports ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) and (background:color-mix(in srgb,red 50%,transparent)){
+  .map-card,.map-panel .maplibregl-ctrl-group,.map-panel .maplibregl-ctrl-attrib,.map-panel .maplibregl-ctrl-scale{background:var(--map-panel-bg);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+}
+@media(prefers-reduced-transparency:reduce){
+  .map-card,.map-panel .maplibregl-ctrl-group,.map-panel .maplibregl-ctrl-attrib,.map-panel .maplibregl-ctrl-scale{background:var(--white);-webkit-backdrop-filter:none;backdrop-filter:none}
+}
+.map-panel .maplibregl-ctrl-group{border-radius:10px;overflow:hidden}
+.map-panel .maplibregl-ctrl-group:not(:empty){box-shadow:var(--shadow)}
+.map-panel .maplibregl-ctrl-group button{width:44px;height:44px;color:var(--ink);background:transparent}
+.map-panel .maplibregl-ctrl-group button+button{border-top:1px solid var(--line)}
+.map-panel .maplibregl-ctrl-group button:not(:disabled):hover{background:var(--mint)}
+/* MapLibre's icons are dark-only images: masks in the theme's ink. */
+.map-panel .maplibregl-ctrl button .maplibregl-ctrl-icon{background:currentColor;-webkit-mask:var(--map-icon) center/22px no-repeat;mask:var(--map-icon) center/22px no-repeat}
+.map-panel .maplibregl-ctrl button.maplibregl-ctrl-zoom-in{--map-icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M12 5v14M5 12h14'/%3E%3C/svg%3E")}
+.map-panel .maplibregl-ctrl button.maplibregl-ctrl-zoom-out{--map-icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M5 12h14'/%3E%3C/svg%3E")}
+.map-panel .maplibregl-ctrl-attrib,.map-panel .maplibregl-ctrl-scale{font:14px/1.5 var(--font-ui)}
+.map-panel .maplibregl-ctrl-attrib{border-radius:10px;margin:0 10px 10px 0}
+.map-panel .maplibregl-ctrl-attrib a{color:var(--ink);text-decoration:underline;text-underline-offset:2px}
+.map-panel .maplibregl-ctrl-attrib.maplibregl-compact{min-height:44px;padding:9px 44px 9px 12px;display:flex;align-items:center}
+.map-panel .maplibregl-ctrl-attrib.maplibregl-compact:not(.maplibregl-compact-show){padding:0;width:44px}
+.map-panel .maplibregl-ctrl-attrib .maplibregl-ctrl-attrib-button{top:0;right:0;width:44px;height:44px;border-radius:10px;background:currentColor;-webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.75' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 11v6M12 7.5h.01'/%3E%3C/svg%3E") center/22px no-repeat;mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.75' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 11v6M12 7.5h.01'/%3E%3C/svg%3E") center/22px no-repeat}
+.map-panel .maplibregl-ctrl-scale{border:2px solid var(--ink);border-top:0;border-radius:0 0 4px 4px;padding:0 6px;color:var(--ink);box-shadow:none;font-variant-numeric:tabular-nums}
+.map-panel .maplibregl-ctrl-bottom-left .maplibregl-ctrl-scale{margin:0 0 10px 10px}
+
+/* Focus over any data colour: the focus colour between two rings of the
+   surface. */
+.map-panel :is(button,a,select,input,summary,canvas):focus-visible,.map-panel .map-choice input:focus-visible+span,.map-panel .map-repeat input:focus-visible+span{outline:3px solid var(--focus);outline-offset:2px;box-shadow:0 0 0 7px var(--white)}
+.map-panel .map-choice input:focus-visible,.map-panel .map-repeat input:focus-visible{outline:0;box-shadow:none}
+
+/* ---- The collection map ---- */
+.map-section{margin:0 0 24px}
+.map-raster{font-variant-numeric:tabular-nums}
+html:not(.js) .map-raster #feature-map{display:none}
+/* With the script the map fills the content width; its panels float over
+   it, the time bar docked across its bottom (--map-dock, set by the
+   script, is how high it reaches). */
+.js .map-stage{--map-gap:12px;position:relative;height:clamp(420px,70vh,820px);border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--map-water);box-shadow:var(--shadow)}
+.js .map-view{position:absolute;inset:0;container:map/inline-size}
+.js .map-raster #feature-map{position:absolute;inset:0;height:auto}
+.map-raster .maplibregl-ctrl-bottom-left,.map-raster .maplibregl-ctrl-bottom-right{bottom:var(--map-dock,0px)}
+/* The status line is the live region the chip mirrors; once the map runs
+   it is read, not shown. Without WebGL it says so on the page. */
+.map-raster.map-live #map-status{position:absolute;width:1px;height:1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+
+/* Icon buttons: 20 px icons in 44 px targets. */
+.map-icon-button{display:inline-grid;place-items:center;flex:none;width:44px;height:44px;min-height:44px;padding:0;border:1px solid transparent;border-radius:10px;color:var(--ink);background:transparent;cursor:pointer}
+.map-icon-button:not(:disabled):hover,.map-pill:hover{background:var(--mint)}
+.map-raster svg.icon{width:20px;height:20px;stroke-width:1.75}
+.map-raster .when-playing,.map-raster .when-expanded,.map-raster .playing .when-paused,.map-raster .expanded .when-normal{display:none}
+.map-raster .playing .when-playing,.map-raster .expanded .when-expanded{display:contents}
+.map-fold svg{transition:transform .15s}
+[aria-expanded=false]>.map-fold svg,.map-fold[aria-expanded=false] svg{transform:rotate(-90deg)}
+
+/* The layer card, top left: parameter, style, level and draw mode. Its
+   header is the pill it folds into ("Temperature · 850 hPa"). Without the
+   script it is the no-JS Maps form, in the page's flow. */
+.map-layer{position:relative;margin:0 0 16px}
+.js .map-layer{position:absolute;top:var(--map-gap);left:var(--map-gap);z-index:3;width:min(356px,calc(100% - 140px));max-height:calc(100% - var(--map-dock,0px) - 2 * var(--map-gap));margin:0;overflow:auto;overscroll-behavior:contain}
+.js .map-layer:not(.open){width:auto;max-width:calc(100% - 140px)}
+.js .map-layer:not(.open) .map-layer-body{display:none}
+.map-pill{display:flex;align-items:center;gap:10px;width:100%;min-height:44px;margin:0;padding:6px 8px 6px 12px;border:0;border-radius:11px;font:600 16px/1.3 var(--font-ui);color:var(--ink);background:transparent;text-align:left;cursor:pointer}
+.js .map-pill.enhanced{display:flex!important}
+#map-layer-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.map-pill .map-fold{display:inline-grid;place-items:center;width:28px;height:28px;color:var(--muted)}
+.map-layer-body{display:grid;gap:10px;padding:2px 12px 12px}
+.map-sheet-head,.js .map-sheet-head.enhanced{display:none!important}
+.map-controls{display:grid;gap:12px;margin:0;padding:0}
+.js .map-controls.enhanced{display:grid!important}
+.map-controls label,.map-time-field{display:grid;gap:4px;min-width:0;margin:0;font-size:14px;font-weight:600;line-height:1.4;color:var(--ink)}
+/* On the map: a label column and a control column, so the card stays
+   short over the map. */
+.js .map-layer :is(.map-controls label,.map-time-field,.map-choice){grid-template-columns:92px minmax(0,1fr);align-items:center;column-gap:10px}
+.js .map-layer .map-choice legend{float:left;margin:0}
+.js .map-layer .map-opacity{grid-template-columns:92px minmax(0,1fr) auto;column-gap:10px}
+.js .map-layer .map-opacity input{grid-column:2;grid-row:1}
+.js .map-layer .map-opacity output{grid-column:3;grid-row:1}
+.js .map-controls label.enhanced:not([hidden]){display:grid!important}
+.map-controls [hidden],.js .map-controls .enhanced[hidden]{display:none!important}
+.map-controls select,.map-controls input{display:block;width:100%;height:44px;min-height:44px;margin:0;padding:8px 10px;font-size:16px;font-weight:400;line-height:24px}
+.map-controls>noscript{display:flex;flex-wrap:wrap;align-items:center;gap:12px}
+.map-controls>noscript p{flex-basis:100%;margin:0;font-size:14px;color:var(--muted)}
+.map-help{margin:0;font-size:14px;line-height:1.5;color:var(--muted)}
+.map-keys-help .map-help{margin:0 0 10px;padding-bottom:10px;border-bottom:1px solid var(--line);color:var(--ink)}
+html:not(.js) .map-layer{padding:16px}
+
+/* Segmented choices: draw mode, basemap. Native radios under the labels. */
+.map-choice{display:grid;min-width:0;margin:0;padding:0;border:0}
+.js .map-choice.enhanced:not([hidden]){display:grid!important}
+.map-choice legend{margin:0 0 4px;padding:0;font-size:14px;font-weight:600;color:var(--ink)}
+.map-segmented{display:flex;gap:2px;padding:2px;border:1px solid var(--control-border);border-radius:10px}
+.map-segmented label{position:relative;flex:1 1 0;min-width:0;margin:0}
+.map-segmented input,.map-repeat input{position:absolute;inset:0;width:100%;height:100%;min-height:0;margin:0;padding:0;opacity:0;cursor:pointer}
+.map-segmented span{display:flex;align-items:center;justify-content:center;min-height:44px;padding:0 8px;border-radius:8px;font-size:15px;font-weight:600;line-height:1.2;text-align:center;color:var(--ink)}
+.map-segmented input:checked+span,.map-repeat input:checked+span{background:var(--teal);color:var(--on-accent)}
+.map-segmented label:hover input:not(:checked)+span,.map-repeat label:hover input:not(:checked)+span{background:var(--mint)}
+
+/* The status chip, top centre: loading, retrying, a frame without data.
+   The status line reads the same text out. */
+.map-chip{position:absolute;top:var(--map-gap);left:50%;z-index:4;max-width:min(440px,calc(100% - 760px));margin:0;padding:10px 16px;border:1px solid var(--line);border-radius:22px;background:var(--white);color:var(--ink);box-shadow:var(--shadow);font-size:14px;line-height:1.4;transform:translateX(-50%);overflow-wrap:anywhere}
+.js .map-chip.enhanced:not([hidden]){display:block!important}
+.map-chip.stale{border-color:var(--amber);color:var(--amber)}
+@container map (max-width:1100px){
+  .map-chip{left:calc(var(--map-gap) + min(356px,100% - 140px) + var(--map-gap));right:120px;width:fit-content;max-width:none;margin:0 auto;transform:none}
+}
+
+/* Top right: the full window and the basemap, beside MapLibre's zoom. */
+.map-raster .maplibregl-ctrl-top-right{top:var(--map-gap);right:var(--map-gap);z-index:4;display:flex;flex-direction:row-reverse;align-items:flex-start;gap:8px}
+.map-raster .maplibregl-ctrl-top-right .maplibregl-ctrl{float:none;clear:none;margin:0}
+.map-tools{position:relative;display:flex;flex-direction:column;overflow:visible!important}
+.js .map-tools.enhanced:not([hidden]){display:flex!important}
+.map-tools .map-icon-button{border-radius:0}
+.map-tools .map-icon-button:first-of-type{border-radius:9px 9px 0 0}
+.map-tools .map-icon-button:last-of-type{border-radius:0 0 9px 9px}
+.map-tools .map-icon-button+.map-icon-button{border-top:1px solid var(--line)}
+.map-tools .map-icon-button[aria-pressed=true],.map-tools .map-icon-button[aria-expanded=true]{background:var(--mint)}
+.map-basemap{position:absolute;top:calc(100% + 8px);right:0;display:grid;gap:14px;width:268px;padding:14px;text-align:left}
+.map-check{display:flex;align-items:center;gap:10px;min-height:44px;margin:0;font-size:15px;font-weight:600;cursor:pointer}
+.map-check input{width:22px;height:22px;min-height:0;margin:0;accent-color:var(--teal)}
+.map-opacity{display:grid;grid-template-columns:1fr auto;align-items:center;gap:2px 8px}
+.map-opacity label{margin:0;font-size:14px;font-weight:600}
+.map-opacity output{font-size:14px;font-variant-numeric:tabular-nums;color:var(--muted)}
+.map-opacity input{grid-column:1/-1;width:100%;height:44px;min-height:44px;margin:0;padding:0;border:0;background:transparent;accent-color:var(--teal)}
+
+/* The level ladder, right edge, under the tools: the highest level on
+   top. It scrolls when the map is too short for every level. */
+.map-ladder{position:absolute;right:var(--map-gap);top:calc(var(--map-gap) + 104px);z-index:3;display:flex;flex-direction:column;max-height:calc(100% - var(--map-dock,0px) - 104px - 84px);overflow-y:auto;overscroll-behavior:contain;border-radius:10px}
+.js .map-ladder.enhanced:not([hidden]){display:flex!important}
+.map-ladder-unit{padding:6px 4px 4px;font-size:13px;font-weight:600;text-align:center;color:var(--muted)}
+.map-ladder button{flex:none;min-width:60px;min-height:44px;margin:0;padding:0 10px;border:0;border-top:1px solid var(--line);background:transparent;color:var(--ink);font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;cursor:pointer}
+.map-ladder button:hover{background:var(--mint)}
+.map-ladder button[aria-pressed=true]{background:var(--teal);color:var(--on-accent)}
+
+/* The legend card, bottom left: a 12 px colour bar at the data's opacity,
+   ticks in tabular figures. It folds to its title and bar; while the next
+   legend loads the last stays, dimmed, never collapsed. */
+.map-legend{font-size:14px}
+.js .map-legend{position:absolute;left:var(--map-gap);bottom:calc(var(--map-dock,0px) + var(--map-gap));z-index:3;width:min(340px,calc(100% - 200px));padding:6px 6px 12px 14px}
+.map-legend-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.map-legend-head strong{min-width:0;font-size:15px;line-height:1.3;color:var(--ink);overflow-wrap:anywhere}
+.map-legend [hidden]{display:none!important}
+#map-legend-scale{margin-right:8px}
+.map-legend-bar{height:12px;margin-top:4px;border-radius:2px;box-shadow:inset 0 0 0 1px var(--line)}
+.map-legend-ticks{position:relative;height:20px;margin-top:4px;color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}
+.map-legend-ticks span{position:absolute;top:0;transform:translateX(-50%);white-space:nowrap}
+.map-legend-ticks span.start{transform:none}
+.map-legend-ticks span.end{transform:translateX(-100%)}
+#map-legend-status{margin:4px 8px 0 0;color:var(--muted)}
+.map-legend-links{display:flex;flex-wrap:wrap;gap:0 16px;margin:2px 0 -10px}
+.map-legend-links a{display:inline-flex;align-items:center;min-height:44px;font-size:14px;text-decoration:underline;text-underline-offset:3px}
+.map-legend.stale #map-legend-scale{opacity:.5}
+.map-legend.folded .map-legend-ticks,.map-legend.folded .map-legend-links,.map-legend.folded .map-legend-channels{display:none}
+.map-legend-channels{list-style:none;margin:6px 0 0;padding:0;display:grid;gap:6px}
+.map-legend-channels li{display:flex;align-items:center;gap:8px;color:var(--ink)}
+.channel-swatch{width:14px;height:14px;border-radius:3px;flex:none}
+.channel-swatch.red{background:#e0321e}.channel-swatch.green{background:#2a9d3a}.channel-swatch.blue{background:#2f63d6}
+
+/* The time bar, docked across the bottom: transport, the time drawn
+   (18 px, tabular), speed, repeat and more; then the track laid out by
+   time. */
+.map-timebar{display:flex;flex-direction:column;gap:2px;padding:8px 14px 6px;border-radius:0;font-variant-numeric:tabular-nums}
+.js .map-timebar{position:absolute;left:0;right:0;bottom:0;z-index:3;border-width:1px 0 0;box-shadow:none}
+.js .map-timebar.enhanced:not([hidden]){display:flex!important}
+/* A popover of the time bar opens over the map's other panels. */
+.js .map-timebar:has(.map-keys-help:not([hidden]),.map-time-menu[open]){z-index:5}
+.map-timebar-row{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px}
+.map-transport,.map-time-options{display:flex;align-items:center;gap:4px}
+.map-time-options{margin-left:auto}
+#map-play{border-color:var(--teal);background:var(--teal);color:var(--on-accent)}
+#map-play:hover{background:var(--teal-dark);border-color:var(--teal-dark)}
+#map-play svg{fill:currentColor}
+#map-play.buffering{box-shadow:0 0 0 3px var(--map-buffer)}
+.map-time-text{flex:1 1 260px;min-width:0}
+.map-time-label{margin:0;font-size:14px;line-height:1.35;color:var(--muted)}
+#map-time-drawn{font-size:18px;font-weight:600;color:var(--ink);white-space:nowrap}
+#map-time-relative,#map-time-seek{margin-left:6px;white-space:nowrap}
+.map-speed{margin:0}
+.map-speed select{height:44px;min-height:44px;padding:6px 8px;font-size:16px}
+.map-repeat{display:flex;margin:0;padding:0;border:1px solid var(--control-border);border-radius:10px}
+.map-repeat label{position:relative;margin:0}
+.map-repeat span{display:grid;place-items:center;width:44px;height:44px;border-radius:9px;color:var(--ink)}
+.map-time-menu{position:relative}
+.map-time-menu summary{display:grid;place-items:center;width:44px;height:44px;padding-bottom:6px;border-radius:10px;font-size:20px;font-weight:700;line-height:1;color:var(--ink);list-style:none;cursor:pointer}
+.map-time-menu summary::-webkit-details-marker{display:none}
+.map-time-menu summary:hover,.map-time-menu[open] summary{background:var(--mint)}
+.map-time-menu-body{position:absolute;right:0;bottom:calc(100% + 8px);z-index:5;display:grid;gap:8px;width:260px;padding:12px}
+.map-time-menu-body label{display:grid;gap:4px;margin:0;font-size:14px}
+.map-time-menu-body input{height:44px;font-size:16px}
+.map-time-menu-body .btn{min-height:44px}
+#map-keys[aria-expanded=true]{background:var(--mint)}
+.map-track{position:relative;height:44px;margin:2px 8px 0}
+.map-track-marks,.map-track-buffer{position:absolute;inset:0;pointer-events:none}
+.map-track-marks::before{content:"";position:absolute;left:0;right:0;top:12px;height:4px;border-radius:2px;background:var(--map-track)}
+.map-notch{position:absolute;top:9px;width:1px;height:10px;background:var(--muted)}
+.map-strip{position:absolute;top:12px;height:4px;background:var(--muted)}
+.map-tick{position:absolute;top:24px;padding-left:4px;border-left:1px solid var(--map-track);font-size:13px;line-height:18px;color:var(--muted);white-space:nowrap}
+.map-tick.day{color:var(--ink);font-weight:600}
+.map-tick[data-edge=end]{padding:0 4px 0 0;border-left:0;border-right:1px solid var(--map-track);transform:translateX(-100%)}
+.map-now{position:absolute;top:2px;width:2px;height:22px;margin-left:-1px;background:var(--map-now)}
+.map-buffered{position:absolute;top:19px;height:3px;border-radius:2px;background:var(--map-buffer)}
+.map-errored{position:absolute;top:6px;width:3px;height:16px;margin-left:-1px;background:var(--map-error)}
+.map-window{position:absolute;top:6px;height:16px;background:var(--map-window);pointer-events:none}
+/* Handles: an 8 × 24 px grip in a 44 px target. */
+.map-window-handle{position:absolute;top:-14px;width:44px;height:44px;margin-left:-22px;cursor:ew-resize;pointer-events:auto;touch-action:none}
+.map-window-handle::before{content:"";position:absolute;left:18px;top:10px;width:8px;height:24px;border-radius:3px;background:var(--map-playhead);box-shadow:0 0 0 2px var(--white)}
+#map-window-lo{left:0}#map-window-hi{left:100%}
+/* The playhead: a line and a knob on the track; the native range over it,
+   transparent, is the 44 px thumb for pointers, keyboards and assistive
+   technology. */
+.map-playhead-mark{position:absolute;top:0;width:3px;height:28px;margin-left:-1px;border-radius:2px;background:var(--map-playhead);pointer-events:none}
+.map-playhead-mark::after{content:"";position:absolute;left:50%;top:7px;width:14px;height:14px;margin-left:-7px;border-radius:50%;background:var(--map-playhead);box-shadow:0 0 0 2px var(--white)}
+#map-playhead{position:absolute;left:0;right:0;top:-8px;width:100%;height:44px;min-height:44px;margin:0;padding:0;border:0;opacity:0;cursor:pointer}
+#map-playhead::-webkit-slider-thumb{width:44px;height:44px}
+#map-playhead::-moz-range-thumb{width:44px;height:44px}
+.map-track:focus-within{outline:3px solid var(--focus);outline-offset:4px;border-radius:4px;box-shadow:0 0 0 9px var(--white)}
+.map-window-text{margin:0;font-size:13px;line-height:1.35;color:var(--muted)}
+.map-keys-help{position:absolute;right:var(--map-gap);bottom:calc(100% + 8px);z-index:5;width:min(440px,calc(100% - 2 * var(--map-gap)));max-height:min(60vh,460px);overflow:auto;padding:12px 16px;font-size:14px}
+.map-keys-help p{margin:0 0 6px}
+.map-keys-help dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px;margin:0}
+.map-keys-help dt{font-weight:600}
+.map-keys-help dd{margin:0}
+
+/* The frame as an API request, under the map. */
+.map-request{margin-top:12px;border:1px solid var(--line);border-radius:12px;background:var(--white)}
+.map-request>summary{display:flex;align-items:center;min-height:44px;padding:8px 16px;font-weight:600;cursor:pointer}
+.map-request-body{display:grid;gap:10px;padding:0 16px 14px}
+.map-request-body code{overflow-wrap:anywhere}
+.map-request-actions{display:flex;flex-wrap:wrap;gap:8px}
+.map-request-actions .btn{min-height:44px}
+#map-image-link[aria-disabled=true]{cursor:default;color:var(--muted)}
+
+/* Forced colours: a chosen segment or rung is outlined, and the masked
+   MapLibre icons keep the system's text colour. */
+@media(forced-colors:active){
+  .map-segmented input:checked+span,.map-repeat input:checked+span,.map-ladder button[aria-pressed=true]{outline:3px solid Highlight;outline-offset:-3px}
+  .map-panel .maplibregl-ctrl button .maplibregl-ctrl-icon,.map-panel .maplibregl-ctrl-attrib .maplibregl-ctrl-attrib-button{forced-color-adjust:none}
+}
+
+/* Full window: the map over the page, Esc or the button to leave. */
+.js .map-stage.expanded{position:fixed;inset:0;z-index:40;height:auto;border:0;border-radius:0}
+html.map-expanded,html.map-expanded body{overflow:hidden}
+
+/* ---- Phone: the pill opens a bottom sheet with the layer, basemap and
+   opacity; the legend is a strip above the time bar, which docks under
+   the map; the map is 60 % of the viewport, or all of it with the time
+   bar when expanded. ---- */
+@media(max-width:600px){
+  .js .map-stage{height:auto;display:flex;flex-direction:column;background:var(--white)}
+  .js .map-view{position:relative;inset:auto;height:60svh;min-height:300px;flex:none}
+  .js .map-stage.expanded .map-view{flex:1 1 auto;height:auto;min-height:0}
+  .js .map-timebar{position:relative;left:auto;right:auto;bottom:auto}
+  .js .map-layer{width:auto;max-width:calc(100% - 80px);overflow:visible}
+  .js .map-layer.open{position:fixed;inset:auto 0 0 0;z-index:45;width:auto;max-width:none;max-height:min(80svh,560px);overflow:auto;border-radius:16px 16px 0 0;border-width:1px 0 0}
+  .js .map-layer.open .map-pill{display:none!important}
+  .js .map-layer.open .map-sheet-head.enhanced{display:flex!important;align-items:center;justify-content:space-between;margin:0 -6px 0 0}
+  .js .map-layer.open .map-sheet-head::before{content:"";position:absolute;left:50%;top:6px;width:40px;height:4px;margin-left:-20px;border-radius:2px;background:var(--control-border)}
+  .js .map-layer.open .map-layer-body{padding:14px 16px 20px}
+  .map-raster .maplibregl-ctrl-top-right{flex-direction:column;align-items:flex-end}
+  #map-basemap-button{display:none}
+  .js .map-layer .map-basemap{position:static;width:auto;padding:0;border:0;border-radius:0;background:none;box-shadow:none;-webkit-backdrop-filter:none;backdrop-filter:none}
+  /* The right edge holds the tools and the scale: the ladder takes the
+     left one, under the pill. */
+  .map-ladder{left:var(--map-gap);right:auto;top:calc(var(--map-gap) + 58px);max-height:calc(100% - 58px - var(--map-dock,0px) - 2 * var(--map-gap))}
+  .js .map-legend{left:0;right:0;bottom:0;width:auto;padding:4px 4px 6px 12px;border-radius:0;border-width:1px 0 0;box-shadow:none}
+  /* Folded, the strip is one row: the bar, the title, the toggle. */
+  .js .map-legend.folded:not([hidden]){display:grid!important;grid-template-columns:minmax(0,1fr) auto;align-items:center;column-gap:10px;padding:0 0 0 12px}
+  .map-legend.folded .map-legend-head{order:2}
+  .map-legend.folded .map-legend-head strong{max-width:42vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
+  .map-legend.folded #map-legend-scale,.map-legend.folded #map-legend-status{order:1;margin:0}
+  .map-legend.folded .map-legend-bar{margin:0}
+  .js .map-chip{top:calc(var(--map-gap) + 58px);left:calc(2 * var(--map-gap) + 62px);right:64px;width:fit-content;max-width:none;margin:0 auto;transform:none}
+  .map-timebar{padding:6px 8px}
+  .map-timebar-row{gap:2px 4px}
+  .map-time-text{order:-1;flex-basis:100%;padding:0 6px}
+  .map-transport .map-icon-button{width:48px;height:48px}
+  .map-time-options{margin-left:auto}
+  .map-time-menu-body{right:-8px}
+}

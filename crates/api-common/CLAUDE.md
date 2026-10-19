@@ -81,9 +81,19 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
 - The Overview's "Filter by" / "Sort by" chips (`ItemsOverview`, carried by
   `Contribution::items`, rendered by `collection_page`) open the items
   builder through the URL fragment (`#filter=<name>`, `#sort=<name>`), never
-  a query parameter: `/items` rejects unknown ones (#1143). The stylesheet
-  and scripts are inline, so a page test asserting an element's absence
-  matches its markup, not a bare class name.
+  a query parameter: `/items` rejects unknown ones (#1143).
+- Static assets (#1220): `style.css`, `map.css`, `app.js` and `map.js` are
+  served by `workbench::assets::router()` (server root) at
+  `{base}/workbench/{fnv-hash}/{file}`, immutable with a strong ETag. Pages
+  link them via `assets::href(base, name)` from the base URL, never a mount;
+  never inline them. Only `theme.js` and the request-bar fold stay inline.
+- The map's look (#1220): every map colour is a `--map-*` token in
+  style.css's `:root`/`[data-theme=dark]` blocks; `map.js` reads them with
+  `getComputedStyle`, holds no hex colour (map.test.cjs checks) and re-reads
+  them on `workbench-theme`. Floating panels are `enhanced`; a display
+  override on an enhanced element needs `:not([hidden])` (the `.js
+  .enhanced` rules are `!important`). The fixture starts at
+  `<div class="map-panel map-raster">`.
 - Update README.md here, affected API READMEs and docs/ogc-api-common-matrix.md.
   Run cross-API contracts (`cargo test -p server --test common_discovery`) and the
   affected API suites. Do not require identical real production catalogs.
