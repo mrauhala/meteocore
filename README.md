@@ -1886,9 +1886,11 @@ palette's title keeps its original unit. The same rule applies to inline
 `color_stops`.
 
 **Per-parameter default styles** (#320) — parameters of multi-parameter
-collections (GRIB, QueryData, Zarr, NetCDF, radar volumes) with no explicit style
-are matched against a built-in defaults table by normalized name/title plus
-each parameter's unit: temperature and dew point such as `t`/`t2m`/`2t`/`TMP`/`2d`
+collections (GRIB, QueryData, Zarr, NetCDF, radar volumes) with no explicit style,
+and the one parameter a single-parameter collection with no configured palette
+draws, are matched against a built-in defaults table by normalized name/title plus
+each parameter's unit: the lightning strike-age layer `lightning_age` (min) →
+`lightning_age` over 0–60 min, temperature and dew point such as `t`/`t2m`/`2t`/`TMP`/`2d`
 (unit K or C) → `temperature` over one range for every level, −90…50 °C or
 183.15…323.15 K, so a colour means the same temperature from the surface to
 the stratosphere,

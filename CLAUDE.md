@@ -975,8 +975,9 @@ color_stops = [
 ]
 
 # Optional per-parameter default-style override rules, checked before the
-# EMBEDDED defaults table (#320: parameters of multi-parameter collections
-# with no explicit style match built-in defaults — temperature palette for
+# EMBEDDED defaults table (#320: parameters of multi-parameter collections,
+# and a single-parameter collection's one layer, with no explicit style
+# match built-in defaults — temperature palette for
 # t2m/2t/TMP/dew point by unit K|C over one all-levels range, −90…50 °C =
 # 183.15…323.15 K, pressure for msl by unit Pa|hPa, radar_dbz for
 # DBZH, fraction twins of the humidity/cloud palettes for unit 1, etc. —

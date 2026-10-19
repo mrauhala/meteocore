@@ -4683,14 +4683,15 @@ pub fn load_collections(
         );
     }
 
-    warn_generic_root_layers(
+    default_generic_root_layers(
         style_ctx,
         &bundle_index,
         [
-            (&map_engines, &map_collections, &map_styles),
-            (&maps_engines, &maps_collections, &maps_styles),
-            (&tiles_engines, &tiles_collections, &tiles_styles),
+            (&map_engines, &map_collections, &mut map_styles),
+            (&maps_engines, &maps_collections, &mut maps_styles),
+            (&tiles_engines, &tiles_collections, &mut tiles_styles),
         ],
+        &mut edr_styles,
     );
 
     // Determine rendered cache size from first WMS collection config, or the
@@ -4989,54 +4990,102 @@ fn generic_root_layer<'a>(
 type MapRegistry<'a> = (
     &'a HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>>,
     &'a HashMap<String, CollectionConfig>,
-    &'a HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+    &'a mut HashMap<String, HashMap<String, ds_render::StyleInfo>>,
 );
 
-/// The #320 warning, once per map collection of a load: its root layer
-/// draws the generic palette ([`generic_root_layer`]).
-fn warn_generic_root_layers(
+/// The #320 fallback, once per map collection of a load, for a root layer
+/// that draws the generic palette ([`generic_root_layer`]). A root layer
+/// on the collection's own style layer draws the engine's default
+/// parameter, which only the engine names, so it takes that parameter's
+/// built-in default ([`ds_render::StyleContext::base_layer_default`]) in
+/// every map API, and in EDR's styles too, so EDR and the map APIs keep
+/// one resolution (the `f=png` plot draws the collection's default): the
+/// events shape's strike-age layer is one. A root layer still generic
+/// after that is warned.
+fn default_generic_root_layers(
     ctx: &ds_render::StyleContext,
     bundles: &HashMap<&str, &StyleBundle>,
     registries: [MapRegistry<'_>; 3],
+    edr_styles: &mut HashMap<String, HashMap<String, ds_render::StyleInfo>>,
 ) {
-    let mut checked = std::collections::HashSet::new();
+    let mut decided: HashMap<String, Option<ds_render::StyleInfo>> = HashMap::new();
     for (engines, collections, styles) in registries {
         for (id, engine) in engines {
             let Some(collection) = collections.get(id) else {
                 continue;
             };
-            if !checked.insert(id.as_str()) {
-                continue;
+            if !decided.contains_key(id) {
+                let info = engine.raster_info_shared();
+                let default = generic_root_layer(ctx, collection, bundles, styles, id, &info)
+                    .and_then(|root| root_layer_default(ctx, collection, id, &info, root));
+                decided.insert(id.clone(), default);
             }
-            let info = engine.raster_info_shared();
-            let Some(root) = generic_root_layer(ctx, collection, bundles, styles, id, &info) else {
-                continue;
-            };
-            let style = root.style;
-            match root.parameter.filter(|_| root.layer != id) {
-                Some(parameter) => tracing::warn!(
-                    "Collection '{id}': no colormap configured and no built-in default for \
-                     its default parameter '{parameter}' — collection layer renders generic \
-                     {} {:.0}..{:.0}",
-                    style.palette.name,
-                    style.min,
-                    style.max
-                ),
-                None => tracing::warn!(
-                    "Collection '{id}': no colormap configured — collection layer renders \
-                     generic {} {:.0}..{:.0}{}",
-                    style.palette.name,
-                    style.min,
-                    style.max,
-                    if info.parameters.len() > 1 {
-                        " (parameter layers keep their own styles)"
-                    } else {
-                        ""
-                    }
-                ),
+            if let (Some(Some(default)), Some(layer)) = (decided.get(id), styles.get_mut(id)) {
+                layer.insert("default".to_string(), default.clone());
             }
         }
     }
+    for (id, default) in decided {
+        if let (Some(default), Some(layer)) = (default, edr_styles.get_mut(&id)) {
+            layer.insert("default".to_string(), default);
+        }
+    }
+}
+
+/// [`default_generic_root_layers`] for one collection whose root layer
+/// draws the generic palette: the built-in default its own style layer
+/// takes, else `None` after the #320 warning.
+fn root_layer_default(
+    ctx: &ds_render::StyleContext,
+    collection: &CollectionConfig,
+    id: &str,
+    info: &ds_core::map_engine::RasterInfo,
+    root: ds_render::LayerStyle<'_>,
+) -> Option<ds_render::StyleInfo> {
+    if root.layer == id {
+        match ctx.base_layer_default(collection, None, &info.parameter, Some(&info.unit)) {
+            Ok(Some(mut default)) => {
+                if is_postgis_station_collection(collection) {
+                    wrap_station_symbols(&mut default);
+                }
+                info!(
+                    "Collection '{id}': no colormap configured — collection layer renders \
+                     the built-in default for '{}', {} {}..{}",
+                    info.parameter, default.palette.name, default.min, default.max
+                );
+                return Some(default);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::error!(
+                "Collection '{id}': built-in default style for '{}' failed ({e})",
+                info.parameter
+            ),
+        }
+    }
+    let style = root.style;
+    match root.parameter.filter(|_| root.layer != id) {
+        Some(parameter) => tracing::warn!(
+            "Collection '{id}': no colormap configured and no built-in default for \
+             its default parameter '{parameter}' — collection layer renders generic \
+             {} {:.0}..{:.0}",
+            style.palette.name,
+            style.min,
+            style.max
+        ),
+        None => tracing::warn!(
+            "Collection '{id}': no colormap configured — collection layer renders \
+             generic {} {:.0}..{:.0}{}",
+            style.palette.name,
+            style.min,
+            style.max,
+            if info.parameters.len() > 1 {
+                " (parameter layers keep their own styles)"
+            } else {
+                ""
+            }
+        ),
+    }
+    None
 }
 
 /// Compute (once per collection) the full style-layer map: the collection
@@ -5103,16 +5152,20 @@ fn collection_layer_styles(
         // no path draws the transparent ground in an opaque nodata colour
         // or a nodata marker as a value.
         for styles in layers.values_mut() {
-            for style in styles.values_mut() {
-                style.colormap = Arc::new(ds_render::SymbolColorMap::new(
-                    style.colormap.clone(),
-                    engine_postgis::NODATA_MARKER,
-                ));
-            }
+            styles.values_mut().for_each(wrap_station_symbols);
         }
     }
     cache.insert(collection.id.clone(), layers.clone());
     layers
+}
+
+/// A station symbol layer's colormap (#1063): the transparent ground and
+/// the nodata marker drawn as symbols, never as values.
+fn wrap_station_symbols(style: &mut ds_render::StyleInfo) {
+    style.colormap = Arc::new(ds_render::SymbolColorMap::new(
+        style.colormap.clone(),
+        engine_postgis::NODATA_MARKER,
+    ));
 }
 
 /// Which map surfaces a PostGIS collection is wired to.
@@ -8011,6 +8064,91 @@ mod tests {
         let other_viridis =
             collection("[[wms.parameters]]\nname = \"foo\"\ncolormap = \"viridis\"\n");
         assert_eq!(warned(&other_viridis, &unitless), some("c/t", Some("t")));
+    }
+
+    /// The root layer of a collection whose engine draws one parameter takes
+    /// that parameter's built-in default when nothing configured a palette,
+    /// in every map API and EDR, instead of the generic palette the #320 warning
+    /// names: here the committed GeoTIFF radar, unstyled, draws `radar_dbz`,
+    /// and its styled twin keeps its deliberate viridis.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unstyled_single_parameter_root_layers_take_the_builtin_default() {
+        let collection = |id: &str, wms: Option<serde_json::Value>| -> CollectionConfig {
+            let mut c = serde_json::json!({
+                "id": id, "title": "Radar", "description": "GeoTIFF",
+                "engine_type": "geotiff", "apis": ["edr", "wms", "maps", "tiles"],
+                "data_path": "../../testdata/radar",
+                "geotiff": {
+                    "filename_template": "radar_%Y%m%dT%H%MZ.tif",
+                    "parameter": "reflectivity", "unit": "dBZ",
+                },
+            });
+            if let Some(wms) = wms {
+                c["wms"] = wms;
+            }
+            serde_json::from_value(c).unwrap()
+        };
+        let collections = [
+            collection("radar", None),
+            collection("styled", Some(serde_json::json!({"colormap": "viridis"}))),
+        ];
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &collections,
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        for styles in [
+            &result.wms_state.styles,
+            &result.maps_state.styles,
+            &result.tiles_state.styles,
+            &result.edr_state.styles,
+        ] {
+            assert_eq!(styles["radar"]["default"].palette.name, "radar_dbz");
+            assert_eq!(styles["styled"]["default"].palette.name, "viridis");
+        }
+    }
+
+    /// The events shape's strike-age layer (#504) has no `[wms]` palette in
+    /// a bare config; its root layer takes the `lightning_age` default from
+    /// the engine's parameter and unit. A parameter with no default is
+    /// still the warned generic fallback.
+    #[test]
+    fn root_layer_default_styles_the_strike_age_layer() {
+        use ds_core::map_engine::RasterInfo;
+        let collection: CollectionConfig = toml::from_str(
+            "id = \"c\"\ntitle = \"C\"\ndescription = \"C\"\nengine_type = \"postgis\"\n",
+        )
+        .unwrap();
+        let info = |parameter: &str, unit: &str| RasterInfo {
+            native_crs: "CRS:84".to_string(),
+            spatial_extent: None,
+            times: Vec::new(),
+            parameter: parameter.to_string(),
+            unit: unit.to_string(),
+            parameters: Vec::new(),
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+        };
+        let ctx = ds_render::StyleContext::with_builtins();
+        let bundles = HashMap::new();
+        let styles = layer_styles(&collection, &[], &bundles);
+        let default = |info: &RasterInfo| {
+            let root = super::generic_root_layer(&ctx, &collection, &bundles, &styles, "c", info)
+                .expect("the unconfigured root layer is the generic fallback");
+            super::root_layer_default(&ctx, &collection, "c", info, root)
+        };
+
+        let age = default(&info("lightning_age", "min")).expect("lightning_age default");
+        assert_eq!(age.palette.name, "lightning_age");
+        assert_eq!((age.min, age.max), (0.0, 60.0));
+        assert!(default(&info("foo", "min")).is_none());
     }
 
     /// WMS GetFeatureInfo (#1064): a WMS collection whose engine answers
