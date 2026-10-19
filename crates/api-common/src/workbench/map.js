@@ -524,7 +524,10 @@
       // Frames that have loaded at least once, by frame key. The pool keeps
       // only the frames ahead, so a frame shown and dropped is still in: its
       // explicit-time response is in the browser cache for the next loop.
+      // Keys of other layers and views never match again, so the set is
+      // cleared when it reaches LOADED_LIMIT, far above any loop window.
       const loaded = new Set();
+      const LOADED_LIMIT = 2048;
       // A hold shorter than this shows no chip: a frame a moment late on
       // every step would otherwise flash the chip once a frame.
       const HOLD_CHIP_DELAY = 400;
@@ -1434,6 +1437,7 @@
       // waits, and buffering goes on.
       function frameReady(frame) {
         frame.state = 'ready';
+        if (loaded.size >= LOADED_LIMIT) loaded.clear();
         loaded.add(frame.key);
         busyStreak = 0;
         if (marks.delete(frame.ms)) drawBuffer();
