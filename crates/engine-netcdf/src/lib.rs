@@ -43,6 +43,8 @@ use ds_core::deadline;
 use ds_core::error::DataServerError;
 use ds_core::geo::GeoTransform;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
+use ds_core::resample::OutputMap;
+use ds_core::units::DisplayConversion;
 use ds_poll::{FirstTick, Shutdown};
 use ds_storage::discovery::{
     FilenameMatcher, Schedule, Settling, TemplateProber, TemplateSpec, TimeWindow,
@@ -1009,6 +1011,11 @@ impl NetcdfEngine {
                     ds_core::geo::Crs::Wgs84 => "latitude/longitude",
                     ds_core::geo::Crs::LambertConformalConic { .. } => "Lambert conformal conic",
                     ds_core::geo::Crs::Geostationary { .. } => "geostationary",
+                    ds_core::geo::Crs::Stereographic { .. } => "polar stereographic",
+                    ds_core::geo::Crs::LambertAzimuthalEqualArea { .. } => {
+                        "Lambert azimuthal equal-area"
+                    }
+                    ds_core::geo::Crs::TransverseMercator { .. } => "transverse Mercator",
                     _ => "projected",
                 },
                 if inspected.grid.flipped {
@@ -1206,9 +1213,8 @@ impl MapEngine for NetcdfEngine {
         let index = Self::variable_index(layout, parameter)?;
         let level = layout.map_level(z)?;
         let values = self.field(layout, selected.step, index, level)?;
-        layout
-            .source
-            .render_f32(&values, None, bbox, width, height, output_crs)
+        let map = layout.source.output_map(bbox, width, height, output_crs);
+        sample_display(&map, layout, index, &values)
     }
 
     /// Every band from the one step `select` picks and the one level
@@ -1243,7 +1249,10 @@ impl MapEngine for NetcdfEngine {
         let map = layout.source.output_map(bbox, width, height, output_crs);
         indices
             .into_iter()
-            .map(|index| map.sample_f32(&self.field(layout, selected.step, index, level)?, None))
+            .map(|index| {
+                let values = self.field(layout, selected.step, index, level)?;
+                sample_display(&map, layout, index, &values)
+            })
             .collect()
     }
 
@@ -1300,6 +1309,22 @@ impl ds_core::wind::WindSource for NetcdfEngine {
             .layout
             .as_ref()
             .map_or_else(ds_core::wind::WindFacts::none, |layout| layout.wind.clone())
+    }
+}
+
+/// Variable `index`'s stored field `values` sampled onto `map` in the unit
+/// it is served in (#1209): each value is sampled in `f64` and converted
+/// before it is narrowed, as engine-grib's map path converts, so a pixel is
+/// what an EDR position query reads there ([`Layout::to_display`]).
+fn sample_display(
+    map: &OutputMap<'_>,
+    layout: &Layout,
+    index: usize,
+    values: &[f32],
+) -> Result<RasterTile, DataServerError> {
+    match layout.display[index].filter(DisplayConversion::has_conversion) {
+        Some(display) => map.sample_f32_with(values, None, |v| display.convert(v)),
+        None => map.sample_f32(values, None),
     }
 }
 

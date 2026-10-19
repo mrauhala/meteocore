@@ -1,6 +1,6 @@
-//! Geostationary satellite imagery (#819): GOES-R ABI and Himawari ISatSS
-//! NetCDF-4 scans, and NOAA's GMGSI global mosaic, served through WMS, OGC
-//! API Maps, Tiles and EDR.
+//! Geostationary satellite imagery (#819): GOES-R ABI, Himawari ISatSS and
+//! GK2A AMI NetCDF-4 scans, and NOAA's GMGSI global mosaic, served through
+//! WMS, OGC API Maps, Tiles and EDR.
 //!
 //! One collection is one satellite and sector (or one mosaic); each
 //! configured product (an ABI band, or an L2 field such as cloud top
@@ -10,6 +10,7 @@
 //! decode only the blocks they touch ([`cache::STRIPS`]) or, zoomed out,
 //! sample the overview built at ingest.
 
+mod ami;
 mod cache;
 mod frame;
 mod mercator;
@@ -46,7 +47,7 @@ use ds_storage::FetchBudget;
 pub use cache::{frame_metrics, frame_reingests, strip_metrics};
 
 use cache::{BlockKey, FrameKey, FRAMES, STRIPS};
-use frame::{Frame, FrameOptions};
+use frame::{Format, Frame, FrameOptions};
 use naming::Naming;
 use source::Source;
 
@@ -62,11 +63,12 @@ const MAX_INGEST_PER_POLL: usize = 4;
 /// (Critical Rule 9).
 const MAX_QUERY_FETCHES: usize = 8;
 
-/// Blocks one EDR query may decode, over all its products and scans (~0.7 ms
-/// and ~260 KB each for a 2 km full-width GOES-R strip). A position reads one
+/// Pixels of image blocks one EDR query may decode, over all its products
+/// and scans: 1024 full-width 2 km GOES-R strips (24 × 5424 pixels, ~0.7 ms
+/// and ~260 KB each), or 70 GK2A 1375 × 1375 chunks. A position reads one
 /// block per scan; an area the blocks its polygon's bbox covers, per product
 /// grid.
-const MAX_QUERY_BLOCKS: usize = 1024;
+const MAX_QUERY_PIXELS: u64 = 1024 * 24 * 5424;
 
 /// The files of one scan: one, or a mosaic's tiles.
 type Scan = Arc<[ObjectPath]>;
@@ -112,6 +114,7 @@ fn tiled_scan_ready(
 struct Product {
     parameter: Arc<str>,
     variable: String,
+    format: Format,
     naming: Naming,
     /// Packed validity for files that declare none (ISatSS).
     valid_fallback: Option<(i32, i32)>,
@@ -174,12 +177,22 @@ impl SatelliteEngine {
             .map(|p| Product {
                 parameter: p.parameter.as_str().into(),
                 variable: p.variable.clone(),
+                format: match config.provider.as_str() {
+                    "gk2a" => Format::AmiL1b,
+                    _ => Format::Cf,
+                },
                 naming: match config.provider.as_str() {
                     "isatss" => Naming::isatss(
                         &p.product,
                         p.band.expect("validate_satellite requires an ISatSS band"),
                     ),
                     "gmgsi" => Naming::gmgsi(&p.product),
+                    "gk2a" => {
+                        let channel = p.band.and_then(ami::channel).expect(
+                            "validate_satellite admits only GK2A_BANDS, each in ami::CHANNELS",
+                        );
+                        Naming::gk2a(&p.product, channel.file_channel, channel.file_resolution)
+                    }
                     _ => Naming::goes_r(&p.product, p.band),
                 },
                 // ISatSS writes space as ~0 K and declares no fill or range:
@@ -616,6 +629,7 @@ impl SatelliteEngine {
     ) -> Result<Frame, DataServerError> {
         let product = &self.products[index];
         let options = FrameOptions {
+            format: product.format,
             variable: &product.variable,
             valid_fallback: product.valid_fallback,
         };
@@ -785,11 +799,13 @@ impl SatelliteEngine {
         Ok(())
     }
 
-    fn check_block_budget(blocks: usize) -> Result<(), DataServerError> {
-        if blocks > MAX_QUERY_BLOCKS {
+    fn check_decode_budget(pixels: u64) -> Result<(), DataServerError> {
+        if pixels > MAX_QUERY_PIXELS {
             return Err(DataServerError::QueryTooLarge(format!(
-                "The query would decode {blocks} image blocks; at most {MAX_QUERY_BLOCKS} per \
-                 request — narrow the datetime window, the polygon or the parameters"
+                "The query would decode {} million pixels of image blocks; at most {} million \
+                 per request — narrow the datetime window, the polygon or the parameters",
+                pixels.div_ceil(1_000_000),
+                MAX_QUERY_PIXELS / 1_000_000
             )));
         }
         Ok(())
@@ -1034,7 +1050,16 @@ impl EdrEngine for SatelliteEngine {
         let catalog = self.catalog.load();
         let (plan, times) = self.query_plan(&catalog, parameters, datetime)?;
         self.check_fetch_budget(&plan)?;
-        Self::check_block_budget(plan.iter().map(|(_, own)| own.len()).sum())?;
+        // One block per scan, of each product's own block size.
+        let mut pixels = 0u64;
+        for (index, own) in &plan {
+            let Some(&first) = own.first() else {
+                continue;
+            };
+            let probe = self.frame(*index, first, &catalog.frames[*index][&first].paths)?;
+            pixels = pixels.saturating_add(probe.block_pixels().saturating_mul(own.len() as u64));
+        }
+        Self::check_decode_budget(pixels)?;
         let mut on_disk = false;
         let mut descriptions = HashMap::new();
         let mut ranges = HashMap::new();
@@ -1106,25 +1131,27 @@ impl EdrEngine for SatelliteEngine {
 
         self.check_fetch_budget(&plan)?;
         // Each product has its own grid (ABI bands are 0.5, 1 or 2 km): the
-        // decode budget sums the blocks its polygon's bbox covers on each
-        // grid, and the output grid samples at the finest nadir pixel size.
+        // decode budget sums the block pixels its polygon's bbox covers on
+        // each grid, and the output grid samples at the finest nadir pixel
+        // size.
         let b = &polygon.bbox;
         let mut resolution = f64::INFINITY;
-        let mut blocks = 0usize;
+        let mut pixels = 0u64;
         for (index, own) in &plan {
             let Some(&first) = own.first() else {
                 continue;
             };
             let probe = self.frame(*index, first, &catalog.frames[*index][&first].paths)?;
             resolution = resolution.min(probe.gt.pixel_width / 111_320.0);
-            let per_scan: usize = probe
+            let blocks: u64 = probe
                 .windows([b.west, b.south, b.east, b.north])
                 .iter()
-                .map(|&[c0, r0, c1, r1]| probe.blocks_in(c0, r0, c1, r1))
+                .map(|&[c0, r0, c1, r1]| probe.blocks_in(c0, r0, c1, r1) as u64)
                 .sum();
-            blocks = blocks.saturating_add(per_scan.saturating_mul(own.len()));
+            let per_scan = blocks.saturating_mul(probe.block_pixels());
+            pixels = pixels.saturating_add(per_scan.saturating_mul(own.len() as u64));
         }
-        Self::check_block_budget(blocks)?;
+        Self::check_decode_budget(pixels)?;
         let axes = polygon.sample_grid(resolution, resolution, MAX_AREA_DIM);
         let (nx, ny) = axes.dims();
         check_area_budget(times.len(), ny, nx, plan.len())?;
@@ -1334,6 +1361,18 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
+    /// Every GK2A band the config admits has a calibrated channel.
+    #[test]
+    fn gk2a_bands_are_calibrated_channels() {
+        for band in ds_core::config::GK2A_BANDS {
+            assert!(super::ami::channel(band).is_some(), "band {band}");
+        }
+        assert_eq!(
+            super::ami::CHANNELS.len(),
+            ds_core::config::GK2A_BANDS.len()
+        );
+    }
+
     #[test]
     fn tiled_scans_wait_for_their_tiles() {
         let at = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
@@ -1351,10 +1390,14 @@ mod tests {
     }
 
     #[test]
-    fn block_budget_caps_decode_work() {
-        assert!(super::SatelliteEngine::check_block_budget(super::MAX_QUERY_BLOCKS).is_ok());
+    fn decode_budget_caps_decode_work() {
+        use super::{SatelliteEngine, MAX_QUERY_PIXELS};
+        // 1024 GOES-R 2 km strips; 70 GK2A 2 km chunks, not 71.
+        assert!(SatelliteEngine::check_decode_budget(1024 * 24 * 5424).is_ok());
+        assert!(SatelliteEngine::check_decode_budget(70 * 1375 * 1375).is_ok());
+        assert!(SatelliteEngine::check_decode_budget(71 * 1375 * 1375).is_err());
         assert!(matches!(
-            super::SatelliteEngine::check_block_budget(super::MAX_QUERY_BLOCKS + 1),
+            SatelliteEngine::check_decode_budget(MAX_QUERY_PIXELS + 1),
             Err(ds_core::error::DataServerError::QueryTooLarge(_))
         ));
     }

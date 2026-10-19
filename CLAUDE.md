@@ -33,7 +33,9 @@ with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
 (OGC 3D Tiles encoder), engines (`engine-csv`, `engine-geojson`,
 `engine-geotiff`, `engine-grib`, `engine-odim`, `engine-querydata`,
 `engine-zarr`, `engine-postgis`, `engine-cap`, `engine-bufr`, `engine-satellite`,
-`engine-netcdf`), API layers (`api-common` shared HTTP plumbing, `api-edr`,
+`engine-netcdf`, `engine-station-grid` — station observations gridded on the
+fly, a derived collection over a station collection), API layers
+(`api-common` shared HTTP plumbing, `api-edr`,
 `api-features`, `api-maps`, `api-tiles`, `api-wms`, `api-3dtiles`,
 `api-mcp` — Model Context Protocol tools over the storm-cell surface), and
 `server` (the binary).
@@ -74,7 +76,8 @@ of these crates, read its file — it holds that crate's rules and gotchas:
   `crates/engine-querydata/CLAUDE.md`, `crates/engine-zarr/CLAUDE.md`,
   `crates/engine-cap/CLAUDE.md`, `crates/engine-postgis/CLAUDE.md`,
   `crates/engine-nowcast/CLAUDE.md`, `crates/engine-satellite/CLAUDE.md`,
-  `crates/engine-netcdf/CLAUDE.md` — one file per engine.
+  `crates/engine-netcdf/CLAUDE.md`, `crates/engine-station-grid/CLAUDE.md` —
+  one file per engine.
 
 This root file holds only workspace-wide rules.
 
@@ -132,6 +135,9 @@ Violating these has caused production incidents. Never break them.
      To overlap whole-object reads from synchronous code, start them with
      `DataStore::start_get_opt` and collect each with
      `PendingGet::wait(Some(handle))`, bounding how many you start (#999).
+     Several threads may wait for one read behind an `Arc` (#1127): each
+     wait is bounded by its own thread's deadline, and the last holder
+     dropping the read aborts it.
      The plain-Zarr adapter is a tested exception: the same synchronous
      `get_opt`/cache-fill path serves EDR async workers and `RenderJob` blocking
      workers. Its `block_in_place` bridge releases an async worker and runs
@@ -166,6 +172,14 @@ Violating these has caused production incidents. Never break them.
      Anything a request can wait on, a single-flight cache fill included,
      keeps `FetchBudget::Request` (30 s or the render deadline). See
      `crates/storage/README.md` (#1011).
+   - Never wait on a runtime worker for work that needs that runtime: a
+     `std` lock or condvar, or a single-flight cache wait (`quick_cache`
+     placeholders park the thread), whose holder downloads through this
+     bridge or a task on the same runtime. Waiters parked on every worker
+     leave nothing to run that task or drive its I/O and the deadline
+     timers, and the runtime stalls for good (#1200). Take the lock if it is
+     free, else wait inside `block_in_place`, until the request deadline:
+     engine-odim's `PixelCache::with_file_load`, GRIB's field jobs.
 8. **SQL safety:** every identifier goes through `quote_ident`, every value
    is a `$N` bind, no SQL text inside `format!()`.
    `scripts/check_sql_safety.sh` enforces this in CI.
@@ -457,7 +471,12 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    temporal geometry intersects the interval (an instant is `start == end`,
    ends inclusive) and those without one. Features `/items` and vector tiles
    (Tiles DateTime, #946) both pass it; the vector tile cache keys on it.
-   Without time, return `false` from `has_time_dimension`.
+   Without time, return `false` from `has_time_dimension`: the HTML builder
+   shows its time controls exactly when that is `true` (#1143).
+   **If a `FeatureEngine`'s ids are opaque** (alert identifiers, track
+   numbers), implement `label` from the feature's own values and
+   `summary_properties`; a station whose EDR location has its id, or a site
+   with its own collection, names it in `Feature::related` (#1143).
    **If the engine's parameters can be wind components** (u/v), implement
    `ds_core::wind::WindSource`: an O(1) `Arc<WindFacts>` snapshot, built at
    load/poll refresh, of what the source states per parameter (GRIB triple,
@@ -564,22 +583,32 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   `ProjectionGrid::build_2d_periodic` (its column period) and wraps the
   sampled column: EPSG:3035's inverse cuts longitude at 170°W and every
   longitude meets at the pole, so plain `build_2d` interpolates straight
-  through both in any Arctic view (#323; engine-grib does this).
+  through both in any Arctic view (#323; engine-grib does this, and
+  `SourceGrid` does it for engine-netcdf and engine-querydata, #1188).
 - **A new gridded engine renders through `ds_core::resample::SourceGrid`**
   (#1067), not a sampler of its own: decode the field to a row-major
   `&[f32]`, north row first, on its `GeoTransform`, and call `render_f32`
-  (or `output_map` once, then `sample_f32` per field). It is querydata's
+  (or `output_map` once, then `sample_f32` per field). An engine serving
+  display units passes its conversion to `sample_f32_with`, applied in
+  `f64` before the pixel is narrowed, and converts `value_at`'s result the
+  same way, so a pixel and a point query agree (engine-netcdf, #1209). It is querydata's
   projected path, pinned to it on the MEPS fixture
   (`engine-querydata/src/engine/sampler_tests.rs`): half-pixel convention,
   bilinear with a nearest fallback, `RasterValues::F32`. Lat/lon and Web
   Mercator sources get the periodic map; any other gets the longitude
-  within half a turn of the grid's centre and the `footprint_pixel_window`
-  guard (#449/#453). Build the `SourceGrid` once per grid, not per request:
-  `new` inverse-projects the envelope. Its point queries (an EDR position, an
-  area's cell centre) project each point once with `position` and sample
-  every field there with `value_at`, the map's own sampling, so
-  GetFeatureInfo answers what GetMap drew (engine-netcdf). querydata, grib
-  and satellite keep their own samplers for now.
+  within half a turn of the grid's centre and the
+  `footprint_window_in_image` guard (#449/#453), and a footprint wholly
+  off the image builds no grid at all (#1129). Build the `SourceGrid` once
+  per grid, not per request: `new` inverse-projects the envelope. Its point
+  queries (an EDR position, an area's cell centre) project each point once
+  with `position` and sample every field there with `value_at`, the map's
+  own sampling, so GetFeatureInfo answers what GetMap drew (engine-netcdf).
+  An engine that cannot afford a decoded field shares the map alone:
+  `output_map_quiet` (it logs `OutputMap::capped_error` itself), then
+  `OutputMap::position` per pixel and its own read of its storage by the
+  same rules, wrapping a global grid's columns (`global_period`) and
+  checking the deadline per row (engine-querydata, #1190). grib and
+  satellite keep their own samplers (#1172).
 - **Before blaming a mechanism for a latency spike, check the magnitude adds
   up.** A 2.3 MB local read from page cache is tens of ms, not seconds.
   Multi-second stalls at low load almost always mean blocking/contention
@@ -649,13 +678,25 @@ one never implies the other.
   `forward` is NaN on the far side of the Earth and `inverse` `None` off the
   disk, so code mapping many points must skip non-finite results; its
   `GeoTransform::bbox` comes from the limb and may be `west > east` (#819).
-  `Crs::TransverseMercator`'s **inverse** is partial too: `None` past a pole
-  or more than `TM_MAX_LON_OFFSET_DEG` (50°) from its central meridian,
-  where its Snyder series stops naming places (#1113); its `forward` stays
-  total but is that series, km off PROJ that far out. Edge samples miss
-  that edge between them, so `wgs84_envelope` adds `area_edge_points`
-  (where those meridians enter and leave the box) and a pole the box holds
-  (`holds_pole`, projected from the central meridian).
+  `Crs::TransverseMercator` is Krüger's series to sixth order in Karney's
+  2011 form, as PROJ's `tmerc` (#1130). Its **inverse** is partial too:
+  `None` outside a square in projected metres, past a pole's northing or
+  an easting k₀ times a quarter meridian (9 997 965 m for EPSG:3067) from
+  the central meridian, where the series stops being exact (#1113; inside,
+  under 1 mm off the exact projection). That spans the hemisphere within
+  90° of the meridian except near the equator, where it ends 66.3° out.
+  Its `forward` stays total: exact inside the area, unbounded near the
+  equator 90° out. Edge samples miss the area's edge between them, so
+  `wgs84_envelope` adds `area_edge_points` (where those edges enter and
+  leave the box, and the equator or pole between) and a pole the box holds
+  (`holds_pole`, projected from the central meridian). A source grid's
+  `GeoTransform::bbox` misses a pole its cells hold, such as a polar
+  stereographic Arctic grid's: `bbox_with_poles` adds it at every
+  longitude, for advertised extents and `SourceGrid`'s envelope (#1167).
+  `polar_stereographic_k0` is the one conversion of a polar standard
+  parallel (PROJ `+lat_ts`, CF `standard_parallel`) to the ellipsoidal
+  `k0` of `Crs::Stereographic` (engine-odim, `ds_core::cf`); LAEA's polar
+  aspect (EASE-Grid 2.0) takes its limit `β₀ = ±90°`, `D = 1`.
 - **`ds_core::cf`** — CF semantics shared by NetCDF and Zarr readers,
   which pass plain values or an attribute lookup (no reader library here):
   - time units and `decode_times` (`… since 1970-01-01 00:00:00 +00:00`,
@@ -663,9 +704,14 @@ one never implies the other.
   - `classify_axis` → `AxisRole`, including projected x/y (by
     `standard_name`) and ensemble (`realization` / `ensemble_member`);
   - `crs_from_grid_mapping`: `latitude_longitude`, `geostationary`,
-    `lambert_conformal_conic` (one or two parallels, a sphere or WGS84,
-    pinned to PROJ). Unsupported mappings, ellipsoids, scale factors and
-    missing earth figures are errors, never a WGS84 guess;
+    `lambert_conformal_conic` (one or two parallels, a sphere or WGS84),
+    `polar_stereographic` (`standard_parallel` through
+    `geo::polar_stereographic_k0`, or `scale_factor_at_projection_origin`;
+    both must agree), `lambert_azimuthal_equal_area` and
+    `transverse_mercator` (WGS84 only: their `Crs` variants have no
+    sphere), each pinned to PROJ `cs2cs`. Unsupported mappings, ellipsoids,
+    scale factors and missing earth figures are errors, never a WGS84
+    guess;
   - `CfAttr::Numbers` keeps a multi-element attribute whole, and a
     one-number parameter rejects it rather than reading its first element;
   - `grid(crs, &x, &y)` over `RegularAxis` values: units through
@@ -681,8 +727,10 @@ one never implies the other.
   (#1067 PR 6). `canonical_unit` reduces every spelling of a product of
   powers to one (`kg/m^2`, `kg m**-2`, `kg.m-2` → `kg m-2`; `m/s` → `m s-1`;
   `degC` → `°C`); a scale factor or free text stays as written. Every
-  unit-keyed match goes through it — `display_conversion` (engine-bufr;
-  engine-grib's enum-keyed `default_display` is its twin, rule for rule),
+  unit-keyed match goes through it — `display_conversion` (engine-bufr,
+  engine-netcdf #1209 and engine-zarr #1213; engine-grib's enum-keyed
+  `default_display` is its twin, rule for rule: K → °C, Pa → hPa,
+  kg m-2 → mm, kg m-2 s-1 → mm/h × 3600, m2 s-2 → gpm, proportion → %),
   `qudt_unit` (EDR), ds-render's defaults table and `[[parameter_defaults]]`
   unit ranges, `same_unit` (wind u/v pairing, engine-netcdf's per-file
   check, the satellite recipes' K check) — never a raw string compare. The
@@ -845,12 +893,13 @@ one never implies the other.
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; derived wind speed from u/v, direction on lat/lon areas (newbase's grid-relative convention) |
-| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP; derived wind speed + direction from CF-identified u/v |
+| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP; derived wind speed + direction from CF-identified u/v; values and units in display units from CF `units` through `ds_core::units::display_conversion` (°C, hPa, mm, mm/h, gpm; plain Zarr and Icechunk, #1213) |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
-| PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
-| Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
-| NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields, or fields on one pressure axis (`RasterInfo.vertical`: hPa, bottom first; WMS `ELEVATION`, Maps/Tiles `elevation`, EDR `z`; a map without one draws the bottom level, EDR without `z` reads every level; the MEPS `pl` family is a collection of its own). EDR samples each point or area cell as the map draws it (one projection per point, a CRS84 area grid), runs as instances, GetFeatureInfo through position at the level drawn; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (steps × levels × variables); derived wind speed from CF `x_wind`/`y_wind`, per pressure level (no direction on MEPS's Lambert grid) |
+| PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (position, locations, area), Features; station shapes also WMS/Maps/Tiles when opted in (`[postgis.map]`, or `wms`/`maps` in `apis`): one symbol layer per parameter, each station a marker coloured by its latest value within `max_age` on `time_step` frames, most extreme on top (#1063); events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
+| Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles, GK2A AMI L1B and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
+| NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields, or fields on one pressure axis (`RasterInfo.vertical`: hPa, bottom first; WMS `ELEVATION`, Maps/Tiles `elevation`, EDR `z`; a map without one draws the bottom level, EDR without `z` reads every level; the MEPS `pl` family is a collection of its own). EDR samples each point or area cell as the map draws it (one projection per point, a CRS84 area grid), runs as instances, GetFeatureInfo through position at the level drawn; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (steps × levels × variables); derived wind speed from CF `x_wind`/`y_wind`, per pressure level (no direction on MEPS's Lambert grid); values and units in display units from CF `units` through `ds_core::units::display_conversion` (°C, hPa, mm, gpm; #1209) |
 | BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
+| Station grid | `MapEngine` + `EdrEngine` (derived: wraps a CSV, BUFR or PostGIS stations collection's `EdrEngine`) | WMS, Maps, Tiles (one layer per parameter), EDR (position, area, radius, cube without `z`) — one time slice of the source's observations (latest per station within `max_age`, one area query) interpolated by IDW, ADW or nearest onto a CRS84 analysis grid (#1082); great-circle neighbours via a 3-D k-d tree (seam and poles); grids cached per (parameter, time, content version) in `MC_STATION_GRID_CACHE_MB`, computed on a dedicated pool under the request deadline (503, never partial); `cadence` axis; content_version moves with revised input fingerprints; EDR samples the grid the maps draw |
 
 ## Config Format
 

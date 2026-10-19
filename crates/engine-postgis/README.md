@@ -26,9 +26,9 @@ reads them in place.
 
 | `observations.shape` | Layout | EDR | Features | Tiles | WMS, Maps |
 |---|---|---|---|---|---|
-| `long` | Row per value: station, time, parameter, value | `locations`, `position`, `area`, `radius` | Station inventory | Vector (MVT) | – |
-| `wide` | Row per station and time, column per parameter | same | same | same | – |
-| `per_parameter` | Table per parameter: station, time, value | same | same | same | – |
+| `long` | Row per value: station, time, parameter, value | `locations`, `position`, `area`, `radius` | Station inventory | Vector (MVT); raster with the map layers | [Station layer](#station-map-layers) per parameter |
+| `wide` | Row per station and time, column per parameter | same | same | same | same |
+| `per_parameter` | Table per parameter: station, time, value | same | same | same | same |
 | `events` | Point events with own time and geometry (lightning) | `area`, `radius` | – | Raster | Age layer `lightning_age`, unit `min` |
 
 ## Configuration
@@ -98,6 +98,8 @@ source_key = "temperature"   # value in param_col; default: name
 label = "2 m air temperature"
 unit = "degC"                # a label; no conversion
 observed_property = "air_temperature"   # default: name
+valid_range = [-80.0, 60.0]  # optional, inclusive [min, max]
+missing_values = [-32766]    # optional, at most 16 codes
 ```
 
 | `[postgis.observations]` field | Shapes | Meaning |
@@ -121,6 +123,27 @@ the ID as label; with a registry too, registered reporters take its label,
 properties and geometry, and `where` filters only that metadata. For
 `per_parameter`, observation geometry counts only when every table has one.
 
+### Missing values and valid ranges
+
+Some sources store a code such as `-32766` instead of NULL. A value outside
+a parameter's `valid_range`, or equal to one of its `missing_values`, reads
+as NULL. Config load requires finite numbers, `min <= max` and at most 16
+codes.
+
+- EDR series keep the row's time with a null value; an event keeps its
+  place with a null value.
+- The station map layers and a
+  [`station-grid`](../engine-station-grid/README.md) collection over this
+  one use each station's latest valid value.
+- The location list, the temporal extent and the value budget still count
+  the row. Features properties come from the stations table and are not
+  filtered, nor are the event attributes a nowcast reads.
+
+The test runs in SQL on the value cast to `double precision`. A `real`
+column's `-999.9` is therefore not the TOML `-999.9`: list the code as it
+reads back in `double precision`, or exclude it with `valid_range`. NaN
+falls outside every range.
+
 ### Column requirements
 
 - Geometry is a Point with SRID 4326 (X = longitude); prefer
@@ -140,6 +163,60 @@ sampled (128 rows per source), and every geometry a query returns is checked
 before use. A mismatch blocks data queries and degrades `/health` until a
 refresh succeeds. A registry row or property column that breaks the rules
 above fails the refresh, which keeps the previous snapshot.
+
+### Station map layers
+
+A station collection that lists `wms` or `maps` in `apis`, or has a
+`[postgis.map]` section, draws each parameter as a map layer: every cached
+station is a disc coloured by its latest value. In WMS, a collection of
+several parameters has a layer `<collection>/<parameter>` each, such as
+`surface-obs/t2m`, and `<collection>` draws the first; a single parameter
+is the layer `<collection>`. Maps and Tiles select one with
+`parameter-name`, by default the first. Listed with `tiles`, the layers are
+raster tiles beside the station vector tiles. A collection that lists only
+`tiles` and has no `[postgis.map]` serves vector tiles alone.
+
+```toml
+[postgis.map]            # optional; the defaults are shown
+max_age = "PT1H"         # ISO 8601, at most P7D
+time_step = "PT10M"      # whole seconds, PT1M to PT6H
+marker_size = 6          # disc diameter in pixels, 1 to 64
+draw_missing = false
+
+[wms]                    # styled like any raster layer
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "t2m"
+min = -30.0
+max = 30.0
+```
+
+`[postgis.map]` needs `wms`, `maps` or `tiles` in `apis` and is rejected
+on the events shape. An unknown key in it is a load error.
+
+- A frame at `TIME` shows each station's latest valid value in
+  `[TIME - max_age, TIME]`. A station without one is left out, or with
+  `draw_missing = true` drawn in the palette's `nodata_color` (transparent
+  unless the palette sets one).
+- The layers advertise `time_step` steps over the newest six hours of data,
+  updated on refresh; without `TIME` they draw the newest step. A `TIME`
+  floors to its step, counted from 1970-01-01T00:00Z.
+- Where discs overlap, the value farthest from the middle of the layer's
+  default style range (its `min` and `max`, else the palette's end stops)
+  is on top. Stations without a value lie under the rest.
+- Rows can arrive late or be corrected. With the layers on, each metadata
+  refresh fingerprints the station list and the rows the advertised frames
+  read, and a change redraws the collection's cached frames. Responses to
+  an explicit `TIME` therefore revalidate rather than being `immutable`.
+  A late row older than the advertised frames' windows is not detected.
+- A frame is one set-based read over every cached station, cached
+  (`MC_STATION_FRAME_CACHE_MB`, default 32) so the tiles of one map share
+  it. A frame that would read over 2 000 000 rows (every station's rows
+  within `max_age`) fails with an error that names `max_age`.
+- WMS GetFeatureInfo does not answer these layers (`queryable="0"`): a
+  marker's latest value within `max_age` is not what an EDR position query
+  returns.
 
 ### Event collection
 
@@ -187,13 +264,16 @@ A nowcast `lightning_source` reads the same table. Optional
 - Registry-only areas use `ST_Within` (boundary excluded); observation-derived
   ones test the cached locations (boundary included).
 - Features: `bbox`, paging and property filters; `datetime`/`sortby` are 400.
+  With `edr` in `apis`, each station links (`rel="related"`) to its EDR
+  location.
 
-A response holds at most 500 000 values (NULLs included) and an area at most
-200 000 stations. Windows up to 12 hours run one statement per observation
-table. Longer windows and no `datetime` run one per station (and parameter,
-for `per_parameter`), each at most 10 000 rows; past 20 000 statements a
-window runs per table again and no `datetime` is refused. Each breach is a
-400 saying what to narrow. Formats: [api-edr](../api-edr/README.md),
+A response holds at most 500 000 values (NULLs and filtered values
+included) and an area at most 200 000 stations. Windows up to 12 hours run
+one statement per observation table. Longer windows and no `datetime` run
+one per station (and parameter, for `per_parameter`), each at most 10 000
+rows; past 20 000 statements a window runs per table again and no
+`datetime` is refused. Each breach is a 400 saying what to narrow.
+Formats: [api-edr](../api-edr/README.md),
 [api-features](../api-features/README.md).
 
 ## Operations
@@ -222,14 +302,17 @@ window runs per table again and no `datetime` is refused. Each breach is a
   pool's size wins, and a second password for the same pool fails that
   collection.
 - `/metrics`: `postgis_up`, `postgis_locations_truncated`, `postgis_pool_*`,
-  refresh and ping counters, `lightning_strike_cache_*`.
+  refresh and ping counters, `lightning_strike_cache_*` (event maps) and
+  `station_frame_cache_*` (station map layers).
 
 ## Limits
 
 - No native TLS: connections are plaintext and `sslmode=require` fails. Use
   loopback, a private network, a VPN or an SSH tunnel.
-- No interpolation between stations, no station map layers, no trajectory,
-  cube or corridor, no vertical axis, no forecast instances.
+- No interpolation between stations (a
+  [`station-grid`](../engine-station-grid/README.md) collection over this
+  one grids them), no trajectory, cube or corridor, no vertical axis, no
+  forecast instances.
 - No DDL: the engine creates no tables or indexes. TimescaleDB hypertables
   are read as ordinary tables.
 

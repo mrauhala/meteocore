@@ -1108,6 +1108,7 @@ mod tests {
             base_url: String::new(),
             trust_proxy_headers: false,
             vector_tileset_ids: Default::default(),
+            collection_pages: Default::default(),
         }
     }
 
@@ -1209,6 +1210,7 @@ mod tests {
             bufr_engines: RwLock::new(Vec::new()),
             postgis_engines: RwLock::new(Vec::new()),
             nowcast_engines: RwLock::new(Vec::new()),
+            station_grid_engines: RwLock::new(Vec::new()),
             reload_lock: tokio::sync::Mutex::new(()),
             admin_token: None,
             style_fingerprint: std::sync::atomic::AtomicU64::new(0),
@@ -1237,6 +1239,7 @@ mod tests {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
             netcdf: None,

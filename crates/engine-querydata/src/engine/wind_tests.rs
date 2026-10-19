@@ -13,7 +13,7 @@ use super::*;
 use ds_core::map_engine::OutputCrs;
 use ds_core::wind::{DerivedWind, OutcomeLog, PairOutcome};
 
-const KENYA: (&str, &str) = (
+pub(super) const KENYA: (&str, &str) = (
     "ecmwf-kenya",
     "202604042019_202604040600_ecmwf_kenya_surface.sqd",
 );
@@ -29,10 +29,10 @@ const FMI_V: &[u8] = b"\n24\n7 WindVMS\n";
 
 /// A copy of a fixture with descriptors replaced, in a fresh directory
 /// (removed on drop).
-struct Fixture(PathBuf);
+pub(super) struct Fixture(pub(super) PathBuf);
 
 impl Fixture {
-    fn new((dir, file): (&str, &str), renames: &[(&[u8], &[u8])]) -> Self {
+    pub(super) fn new((dir, file): (&str, &str), renames: &[(&[u8], &[u8])]) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../testdata")
@@ -169,11 +169,12 @@ fn fmi_components_on_lat_lon_give_speed_and_direction() {
         let from = derived.ranges["WindDirection"].values[i].unwrap();
         assert!((from - (-u).atan2(-v).to_degrees().rem_euclid(360.0)).abs() < 1e-9);
     }
-    assert_eq!(
-        derived.parameters["WindSpeedMS"].unit, "",
-        "QueryData has no units"
-    );
+    // The components' unit, from their FMI numbers (#1211).
+    assert_eq!(derived.parameters["WindSpeedMS"].unit, "m s-1");
     assert_eq!(derived.parameters["WindDirection"].unit, "°");
+    let info = wind.raster_info_shared();
+    let speed = info.parameters.iter().find(|p| p.name == "WindSpeedMS");
+    assert_eq!(speed.map(|p| p.unit.as_str()), Some("m s-1"));
     assert_speed_tile(&engine, &wind, [35.0, -4.0, 40.0, 3.0], "WindSpeedMS");
 }
 

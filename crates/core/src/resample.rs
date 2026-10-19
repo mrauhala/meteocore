@@ -470,9 +470,8 @@ impl ProjectionGrid {
     /// many pixels instead of blanking the whole cell. A cell is on it when
     /// some corner nodes are finite and some not, or when the domain
     /// reaches in between corners that all miss it. The domain's edge does
-    /// that where it has a corner, as Transverse Mercator's area does at a
-    /// pole (#1113): low in a 32 px cell, the pole and the tip of the area
-    /// below it miss every corner. The domain then reaches the cell across
+    /// that where it has a corner, such as a wedge's tip (#1113): low in a
+    /// 32 px cell, the tip misses every corner. The domain then reaches the cell across
     /// a side, from a neighbour whose sub-grid has a finite node along it,
     /// or from past the grid or the cells `read` holds, where the cell's
     /// own side is probed at the sub-grid spacing. A cell bracketing a
@@ -1338,59 +1337,51 @@ mod tests {
         }
     }
 
-    /// EPSG:3067's area narrows to a point at the North Pole between the
-    /// meridians 50° either side of 27°E (#1113): below the pole, a wedge
-    /// about 100° wide. In a 256 px tile at 5 km a pixel, a pole 6 px above
-    /// a 32 px cell's bottom side lies 16 px from that side's corners, and
-    /// the tip of the wedge misses all four. Once with the cell below in
-    /// the tile, whose sub-grid reaches the tip along their shared side, and
-    /// once with the cell's bottom side the tile's own, where no node is on
-    /// the Earth and only the side's probes find the tip. The source is the
-    /// tile's own grid, so the map is the identity and the grid stays at
-    /// its 32 px cells. Every pixel whose 2 px surroundings, a sub-grid step,
-    /// lie in the area is drawn where it lies, and no pixel past the area.
-    /// The pole is (500 000, 9 997 964.943), PROJ 9.8.1's `cs2cs -d 3
-    /// EPSG:4326 EPSG:3067` of 90°N 27°E.
+    /// A domain whose edge has a corner reaches into a cell between its
+    /// corner nodes: here a wedge 100° wide below its tip, the shape of
+    /// EPSG:3067's area at the North Pole under the meridians 50° either
+    /// side of 27°E that bounded it (#1113). In a 256 px tile, a tip 6 px
+    /// above a 32 px cell's bottom side lies 16 px from that side's
+    /// corners, and misses all four. Once with the cell below in the tile,
+    /// whose sub-grid reaches the tip along their shared side, and once with
+    /// the cell's bottom side the tile's own, where no node is in the domain
+    /// and only the side's probes find the tip. The map is the identity, so
+    /// the grid stays at its 32 px cells. Every pixel whose 2 px
+    /// surroundings, a sub-grid step, lie in the domain is drawn where it
+    /// lies, and no pixel past the domain.
     #[test]
-    fn the_tip_of_a_tm_area_at_its_pole_is_drawn() {
-        let tm = crate::geo::projected_output_crs("EPSG:3067").unwrap();
-        let (pole_e, pole_n, px, size) = (500_000.0, 9_997_964.943, 5_000.0, 256_u32);
-        let side = f64::from(size) * px;
+    fn the_tip_of_a_domain_between_cell_corners_is_drawn() {
+        let size = 256_u32;
+        let half_angle = 50.0_f64.to_radians().tan();
         for (col, row) in [(80.0, 26.0), (80.0, 250.0)] {
-            let (west, north) = (pole_e - col * px, pole_n + row * px);
-            let bbox = [west, north - side, west + side, north];
-            let output = crate::map_engine::OutputCrs::Projected {
-                crs: tm.clone(),
-                bbox,
-            };
-            let place = |x: f64, y: f64| {
-                let (fx, fy) = (x / f64::from(size), y / f64::from(size));
-                output.position_on_earth([f64::NAN; 4], fx, fy).is_some()
-            };
-            let to_src = |lon: f64, lat: f64| {
-                let (x, y) = tm.forward(lon, lat);
-                ((x - west) / px, (north - y) / px)
-            };
+            let place = |x: f64, y: f64| y >= row && (x - col).abs() <= (y - row) * half_angle;
             let grid = ProjectionGrid::build_2d(
                 size,
                 size,
                 size,
                 size,
-                |fx, fy| output.project_node([f64::NAN; 4], fx, fy),
-                to_src,
+                |fx, fy| {
+                    let (x, y) = (fx * f64::from(size), fy * f64::from(size));
+                    if place(x, y) {
+                        (x, y)
+                    } else {
+                        (f64::NAN, f64::NAN)
+                    }
+                },
+                |x, y| (x, y),
             );
             assert_eq!(
                 (grid.cells_x, grid.cells_y),
                 (8, 8),
-                "pole at ({col}, {row})"
+                "tip at ({col}, {row})"
             );
-            // The pole's cell, from 64 px across and its row down.
+            // The tip's cell, from 64 px across and its row down.
             let (cx, cy) = (2, (row / 32.0) as usize);
             let n = cy * grid.stride + cx;
             let corners = [n, n + 1, n + grid.stride, n + grid.stride + 1];
             assert!(
                 corners.iter().all(|&k| !grid.nodes[k].0.is_finite()),
-                "pole at ({col}, {row}): a corner of its cell is on the Earth"
+                "tip at ({col}, {row}): a corner of its cell is in the domain"
             );
             let mut drawn = 0;
             for oy in 0..size {
@@ -1398,26 +1389,26 @@ mod tests {
                     let (x, y) = (f64::from(ox) + 0.5, f64::from(oy) + 0.5);
                     let (c, r) = grid.sample(ox, oy);
                     if !place(x, y) {
-                        assert!(c.is_nan() || r.is_nan(), "({ox}, {oy}) off the Earth");
+                        assert!(c.is_nan() || r.is_nan(), "({ox}, {oy}) past the domain");
                     } else if [(-2.0, -2.0), (2.0, -2.0), (-2.0, 2.0), (2.0, 2.0)]
                         .iter()
                         .all(|&(dx, dy)| place(x + dx, y + dy))
                     {
                         assert!(
                             (c - x).abs() < 0.5 && (r - y).abs() < 0.5,
-                            "pole at ({col}, {row}): ({ox}, {oy}) drawn at ({c}, {r})"
+                            "tip at ({col}, {row}): ({ox}, {oy}) drawn at ({c}, {r})"
                         );
                         drawn += usize::from(oy < 32 * (cy as u32 + 1));
                     }
                 }
             }
-            // The tip inside the pole's own cell row, 4 px below the pole.
+            // Inside the tip's own cell row, 4 px below the tip.
             let (c, r) = grid.sample(80, row as u32 + 4);
             assert!(
                 c.is_finite() && r.is_finite(),
-                "pole at ({col}, {row}): the tip is empty"
+                "tip at ({col}, {row}): the tip is empty"
             );
-            assert!(drawn > 0, "pole at ({col}, {row})");
+            assert!(drawn > 0, "tip at ({col}, {row})");
         }
     }
 

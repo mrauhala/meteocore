@@ -11,6 +11,10 @@
 //! - GMGSI (`gmgsi`), NOAA's hourly global mosaic:
 //!   `GMGSI_<product>/<year>/<month>/<day>/<hour>/GLOBCOMP<band>_v<v>r<r>_blend_s<start>_e<end>_c<created>.nc`,
 //!   one file per hour, each time stamp `%Y%m%d%H%M%S` plus a tenths digit.
+//! - GK2A AMI L1B (`gk2a`), as NOAA republishes KMA's files:
+//!   `AMI/L1B/<sector>/<year><month>/<day>/<hour>/gk2a_ami_le1b_<channel>_<sector><res>ge_<slot>.nc`,
+//!   one file per channel and scan, `<slot>` the nominal `%Y%m%d%H%M` (the
+//!   scan itself starts ~30 s later).
 
 use chrono::{DateTime, Duration, DurationRound, NaiveDateTime, Utc};
 use ds_core::error::DataServerError;
@@ -51,7 +55,7 @@ pub(crate) struct Naming {
 enum Stamp {
     /// `%Y%j%H%M` (GOES-R, ISatSS: day of year).
     DayOfYear,
-    /// `%Y%m%d%H%M` (GMGSI).
+    /// `%Y%m%d%H%M` (GMGSI, GK2A).
     Calendar,
 }
 
@@ -114,6 +118,23 @@ impl Naming {
         .expect("config validation restricts the product to GMGSI_PRODUCTS");
         Naming {
             layout: Layout::Hourly(format!("GMGSI_{product}/%Y/%m/%d/%H/")),
+            file,
+            stamp: Stamp::Calendar,
+        }
+    }
+
+    /// The GK2A AMI L1B files of one `sector` (`FD`, the full disk) and
+    /// `channel` (`ir105`) at its resolution code (`020`, 2 km).
+    pub fn gk2a(sector: &str, channel: &str, resolution: &str) -> Self {
+        let file = Regex::new(&format!(
+            r"^gk2a_ami_le1b_{}_{}{}ge_(?P<start>\d{{12}})\.nc$",
+            regex::escape(channel),
+            regex::escape(&sector.to_ascii_lowercase()),
+            regex::escape(resolution),
+        ))
+        .expect("the channel table and config validation restrict the parts");
+        Naming {
+            layout: Layout::Hourly(format!("AMI/L1B/{sector}/%Y%m/%d/%H/")),
             file,
             stamp: Stamp::Calendar,
         }
@@ -281,6 +302,37 @@ mod tests {
             ),
             Some(at("2026-09-28T12:00:00Z"))
         );
+    }
+
+    #[test]
+    fn gk2a_names_select_sector_channel_and_slot() {
+        let ir105 = Naming::gk2a("FD", "ir105", "020");
+        assert!(!ir105.tiled());
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            ir105
+                .prefixes(
+                    at("2026-09-28T23:30:00Z"),
+                    at("2026-09-29T00:10:00Z"),
+                    |_| false
+                )
+                .unwrap(),
+            ["AMI/L1B/FD/202609/28/23", "AMI/L1B/FD/202609/29/00"]
+        );
+        let name = "gk2a_ami_le1b_ir105_fd020ge_202609281200.nc";
+        assert_eq!(ir105.scan_start(name), Some(at("2026-09-28T12:00:00Z")));
+        for other in [
+            // Another channel, resolution, sector; a partial upload; a
+            // malformed stamp.
+            "gk2a_ami_le1b_ir112_fd020ge_202609281200.nc",
+            "gk2a_ami_le1b_ir105_fd010ge_202609281200.nc",
+            "gk2a_ami_le1b_ir105_la020ge_202609281200.nc",
+            "gk2a_ami_le1b_ir105_fd020ge_202609281200.nc.tmp",
+            "gk2a_ami_le1b_ir105_fd020ge_20260928120.nc",
+            "gk2a_ami_le1b_ir105_fd020ge_202613281200.nc",
+        ] {
+            assert_eq!(ir105.scan_start(other), None, "{other}");
+        }
     }
 
     #[test]

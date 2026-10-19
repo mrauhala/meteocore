@@ -2184,6 +2184,7 @@ fn cell_feature(
             id: t.id.to_string(),
             geometry: Arc::new(Geometry::Point { x: lon, y: lat }),
             properties: Arc::new(props),
+            related: Vec::new(),
         },
     )
 }
@@ -2526,6 +2527,25 @@ impl NowcastEngine {
     }
 }
 
+/// A tracked cell's label from its feature properties (see
+/// [`FeatureEngine::label`]); `None` when it carries none of them.
+fn cell_label(properties: &HashMap<String, PropertyValue>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(PropertyValue::Integer(rank)) = properties.get("significance_rank") {
+        parts.push(format!("Rank {rank}"));
+    }
+    if let Some(severity) = properties.get("severity").and_then(PropertyValue::as_str) {
+        parts.push(severity.replace('_', " "));
+    }
+    if let Some(dbz) = properties.get("max_dbz").and_then(PropertyValue::as_f64) {
+        parts.push(format!("max {} dBZ", ds_core::html::display_number(dbz, 1)));
+    }
+    if properties.get("likely_clutter") == Some(&PropertyValue::Bool(true)) {
+        parts.push("likely clutter".into());
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 impl FeatureEngine for NowcastEngine {
     fn filterables(&self) -> ds_core::feature::FilterableProperties {
         self.filterables.clone()
@@ -2598,6 +2618,19 @@ impl FeatureEngine for NowcastEngine {
     /// puts the weakest cells last. `significance` already incorporates it.
     fn sortables(&self) -> &[&'static str] {
         &self.sortables
+    }
+
+    /// The cell's rank, severity class and peak reflectivity, from its own
+    /// properties (#1143): `Rank 2 · very severe · max 52 dBZ`. Each part is
+    /// a value the cell carries, worded as data: the rank orders a heuristic
+    /// significance and the class is this engine's, neither a warning.
+    fn label(&self, feature: &Feature) -> Option<String> {
+        cell_label(&feature.properties)
+    }
+
+    /// Significance first, then what it rests on (#1143).
+    fn summary_properties(&self) -> &[&'static str] {
+        &["significance", "severity", "max_dbz", "area_km2"]
     }
 
     /// O(1) from the snapshot — the default would build every feature just
@@ -2713,6 +2746,25 @@ mod tests {
         };
         let (_, _, feature) = cell_feature(&cell, wired.0, wired.1, wired.2);
         feature.properties.as_ref().clone()
+    }
+
+    /// #1143: a cell is labelled by its rank, severity class and peak
+    /// reflectivity, the values it carries; a likely-clutter echo says so.
+    #[test]
+    fn cells_are_labelled_from_their_own_values() {
+        let mut f = facts();
+        f.max_dbz = 52.0;
+        f.severity = Severity::VerySevere;
+        assert_eq!(
+            cell_label(&served(f, (false, false, false))).as_deref(),
+            Some("Rank 1 · very severe · max 52 dBZ")
+        );
+        let mut clutter = facts();
+        clutter.max_dbz = 41.5;
+        clutter.likely_clutter = true;
+        let label = cell_label(&served(clutter, (false, false, false))).unwrap();
+        assert!(label.ends_with("max 41.5 dBZ · likely clutter"), "{label}");
+        assert_eq!(cell_label(&HashMap::new()), None);
     }
 
     #[test]

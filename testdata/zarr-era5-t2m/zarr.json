@@ -3,6 +3,6 @@
   "node_type": "group",
   "attributes": {
     "Conventions": "CF-1.8",
-    "title": "Synthetic ERA5-like 2 m temperature"
+    "title": "Synthetic ERA5-like surface fields"
   }
 }

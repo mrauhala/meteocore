@@ -33,10 +33,17 @@ while the engines stay free of HTTP and JSON.
 - This crate encodes the response: GeoJSON, or an HTML page built from the
   same GeoJSON document. For the Part 2 `crs` parameter it reprojects
   geometry per vertex with `ds_core::web_mercator` and `ds_core::geo`.
+- An engine can also say how to present its features: `label` names a
+  feature, `summary_properties` picks a listing's first columns,
+  `items_description` says in one line what an item is, and
+  `Feature::related` names resources a feature leads to. The engine names
+  them; this crate builds the URLs and drops a link that no API here
+  serves. See
+  [Labels, columns and related links](#labels-columns-and-related-links).
 - State is `FeaturesState`: engines and collection configs keyed by
-  collection id, the base URL and proxy setting, and the ids that api-tiles
-  serves as vector tiles. It sits behind an `ArcSwap`, so a reload swaps it
-  in one step.
+  collection id, the base URL and proxy setting, the ids that api-tiles
+  serves as vector tiles, and the pages of the collections a feature may
+  link to. It sits behind an `ArcSwap`, so a reload swaps it in one step.
 - [api-common](../api-common/README.md) supplies collection discovery, Common
   metadata, the HTML workbench pages, HTML error pages and conditional GET.
 - The `/items` and `/items/{featureId}` handlers serve two mounts: the
@@ -155,8 +162,13 @@ renders with. A collection's `crs` list is exactly what `/items` accepts.
 
 - `/items` is a GeoJSON `FeatureCollection` with `numberMatched`,
   `numberReturned`, `timeStamp` and `self`, `next` (when more remain), `prev`
-  (when `offset` > 0) and `alternate` links. Each feature has `self` and
-  `collection` links.
+  (when `offset` > 0) and `alternate` links. Past the end, `prev` is the last
+  page that has features.
+- Each feature has `self` and `collection` links, plus a `related` link for
+  each resource its engine names and an API here serves.
+- A feature's `title` property is its engine's label, unless the feature
+  has a `title` of its own. EDR `items` carries the same `title`, without
+  the `related` links.
 - Paging links carry `offset`, `limit`, the explicit format and the parsed
   `bbox`, `datetime`, `sortby`, property filters and `crs`. Following `next`
   keeps the same query.
@@ -180,15 +192,28 @@ Metadata, item listings and single features render as pages of the shared
 workbench (see [HTML API workbench](../api-common/README.md#html-api-workbench)).
 An item listing has:
 
-- a request builder for the `bbox`, time, property filter and sort controls
-  that the engine advertises;
-- a property table with selectable columns;
+- a request builder, open when the request filters, sorts or was rejected.
+  Its groups follow what the engine advertises: property equality, time
+  (two UTC pickers that fill `datetime`, `..` for an open end), area
+  (`bbox`, or **Use map view** for the map's current view), order (a
+  sortable property and a direction) and paging;
+- a property table of up to eight selectable columns. By default it shows up
+  to four that have values on the page: the engine's `summary_properties`,
+  else its sortables and then the other properties alphabetically, without
+  labels, ids and coordinates. The browser's `localStorage` keeps a choice
+  per collection id;
 - a MapLibre locator map of the page.
 
 The map draws only the returned page, simplified for display, over locally
 bundled Natural Earth outlines. It makes no extra feature or tile requests.
-A feature page lists every property with its JSON type. Feature titles come
-from a `name`-like property, else the id.
+A feature page lists every property with its JSON type, and shows its
+`related` links as buttons. Feature titles come from a `name`-like property
+(an engine's label arrives as `title`), else the id.
+
+A collection's overview page adds the engine's `items_description` and two
+chip rows: the properties its items page filters and sorts by. A chip opens
+the items page with the builder set to that property, through the URL
+fragment (`#filter=<name>`, `#sort=<name>`), never a query parameter.
 
 ## Shared OGC API root
 
@@ -221,7 +246,7 @@ api-tiles vector-tile cache key.
 | CAP | one alert area (Polygon, MultiPolygon or null) | area's bounding box intersects the box; null geometry excluded | alert active window intersects the interval | 400 | the standard CAP alert, info and area properties and derived ones (always), plus producer parameter and `eventCode:` names from loaded alerts | yes / earliest window start to latest window end, extended to the catalog time; none when every window is open | changes with the alert set |
 | PostGIS stations | one station (Point) from the cached station list | point inside the box | 400: no time dimension | 400 | configured `stations.property_cols` (always), plus names the loaded rows carry | yes / – | changes per metadata refresh |
 | BUFR | one station (Point) | point inside the box | stations with a report in the interval | `last_report`, `first_report`, `report_count`, `name` | `name`, `wigos_station_identifier`, `elevation`, `first_report`, `last_report`, `report_count` | yes / oldest to newest report | changes per snapshot |
-| ODIM PVOL network | one radar site (Point), the site inventory | point inside the box | sites with a retained volume in the interval | 400 | site properties (below) | yes / – | changes with the inventory |
+| ODIM PVOL network | one radar site (Point), the site inventory | point inside the box | sites with a retained volume in the interval | 400 | site properties (below) | yes / earliest to latest retained volume | changes with the inventory |
 | Nowcast | one tracked storm cell (Point) of one generation | cell point inside the box | the newest retained generation inside the interval; none inside: no features. Without `datetime`: the latest | cell facts (below) | every cell property except `significance_contributions`, including the groups of wired sources | yes / retained history | changes every generation |
 
 - Every `bbox` test above handles a box that crosses the antimeridian.
@@ -240,8 +265,32 @@ api-tiles vector-tile cache key.
 - An ODIM volume source with `features` in `apis` serves the site inventory
   under its own id. The per-site radar collections are not feature
   collections.
-- GeoTIFF, GRIB, QueryData, Zarr, NetCDF, Satellite and ODIM composite
-  collections have no `FeatureEngine`.
+- GeoTIFF, GRIB, QueryData, Zarr, NetCDF, Satellite, ODIM composite and
+  station-grid collections have no `FeatureEngine`.
+
+### Labels, columns and related links
+
+| Engine | Label (`title`) | First columns | `related` link |
+|---|---|---|---|
+| CSV | – | default | the station's EDR location |
+| GeoJSON | – | default | – |
+| CAP | `event · areaDesc`, the parts the area has | `severity`, `onset`, `active_until`, then `awareness_level` or `urgency` | – |
+| PostGIS stations | – | default | the station's EDR location |
+| BUFR | – | default | the station's EDR location |
+| ODIM PVOL network | – | default | the site's own collection |
+| Nowcast | `Rank 2 · very severe · max 52 dBZ` from `significance_rank`, `severity` and `max_dbz`, plus `· likely clutter` when flagged | `significance`, `severity`, `max_dbz`, `area_km2` | – |
+
+- Without a label, a page titles a feature by its `name`-like property, else
+  its id. "Default" columns are the sortables, then the other properties
+  alphabetically.
+- An EDR location link needs `edr` in the collection's `apis`. A radar
+  site's collection link goes to the shared root when Maps or Tiles serve
+  the site, else to EDR, else it is left out.
+- The ODIM PVOL network's overview says what an item is: "Radar site
+  inventory: one point per radar. Each site's volumes are in its own
+  collection." No other engine sets `items_description`.
+- The nowcast label's rank orders a heuristic significance, and the
+  severity class is the engine's own. Neither is a warning.
 
 ## Configuration
 
@@ -288,7 +337,8 @@ The tests run the router against in-memory mock engines; they need no data
 files.
 
 - `ogc_features_api_tests.rs`: routes, links, paging, `bbox`, `datetime`,
-  `f` and `Accept` negotiation, errors, and the vector-tileset link.
+  `f` and `Accept` negotiation, errors, the vector-tileset link, and engine
+  labels, columns and overview in HTML.
 - `sorting_tests.rs`: `sortby` validation and order. It also validates
   `/api` against `schemas/openapi-3.0.json`.
 - `crs_tests.rs`: Part 2, with expected coordinates taken from PROJ `cs2cs`.

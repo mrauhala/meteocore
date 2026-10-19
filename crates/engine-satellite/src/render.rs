@@ -5,6 +5,12 @@
 //! from one scan time and builds the coordinate map once per distinct
 //! source grid it samples: ABI bands of one resolution share a grid, so a
 //! three-band composite projects once, not three times.
+//!
+//! Sampling stays here by design, not in the shared
+//! `ds_core::resample::SourceGrid` (#1172). A scan renders nearest-neighbour
+//! from the blocks a request touches, read on demand through `PixelReader`.
+//! SourceGrid interpolates bilinearly over a whole decoded `&[f32]` field: a
+//! full disk is 118 MB of it and ~160 ms to decode per render.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use ds_core::error::DataServerError;

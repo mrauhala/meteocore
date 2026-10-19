@@ -560,10 +560,11 @@ impl PixelReadError {
     }
 }
 
-/// Per-file count of volume file downloads, [`fetch_file_bytes`] calls and
-/// the reads a walk starts ahead (`Pixels::start_read`), so tests can pin
-/// how many times one request downloads a volume file (#994) and that a
-/// walk read it ahead (#999).
+/// Per-file count of volume file downloads started: [`fetch_file_bytes`]
+/// reads of its own, and the shared remote reads a request starts rather
+/// than joins ([`RemoteRead::start`]); and of those a walk started ahead
+/// (`Pixels::start_read`). Tests pin with them how many times a volume file
+/// is downloaded (#994, #1127) and that a walk read it ahead (#999).
 #[cfg(test)]
 mod file_fetches {
     use std::collections::HashMap;
@@ -595,10 +596,9 @@ mod file_fetches {
         bump(&FETCHES, file_id);
     }
 
-    /// A download a walk started ahead of reaching the file: counted as a
-    /// fetch, and as read ahead.
+    /// A download a walk started ahead of reaching the file, already
+    /// counted as a fetch.
     pub(super) fn record_ahead(file_id: &str) {
-        bump(&FETCHES, file_id);
         bump(&AHEAD, file_id);
     }
 
@@ -614,46 +614,144 @@ mod file_fetches {
 /// Re-fetch one volume file's raw bytes by its [`FileId`] — a local path
 /// read or an S3 `get`. Used by the lazy pixel reader on a cache miss.
 ///
-/// `handle` picks the async→sync bridge for a remote fetch by the caller's
-/// runtime context (see [`Pixels::handle`]): `Some(handle)` drives the fetch
-/// via `handle.block_on` (valid on a `spawn_blocking` pool thread, where
+/// A remote file is read as a [`RemoteRead`] on the runtime
+/// [`shared_read_runtime`] picks, so the miss joins another request's
+/// download of the file, or registers its own for others to join (#1127).
+/// On a thread with no multi-thread runtime it is read in place, unshared,
+/// and `handle` picks the async→sync bridge by the caller's runtime context
+/// (see [`Pixels::handle`]): `Some(handle)` drives the fetch via
+/// `handle.block_on` (valid on a `spawn_blocking` pool thread, where
 /// `block_in_place` *panics*); `None` uses the plain `DataStore::get_opt`,
-/// whose `block_in_place` is valid on a multi-thread runtime worker. A local read
-/// never touches a runtime, so the handle is irrelevant there.
+/// whose `block_in_place` is valid on a multi-thread runtime worker. A local
+/// read never touches a runtime, so the handle is irrelevant there.
 ///
 /// A missing file or object is [`PixelReadError::Bad`]; a deadline or any
 /// other storage failure is [`PixelReadError::Abort`] (#993).
-fn fetch_file_bytes(
-    source: &Source,
-    file_id: &str,
+///
+/// The shared read comes back with the bytes: hold it until they are
+/// decoded, so that a request needing the file meanwhile joins it.
+fn fetch_file_bytes<'a>(
+    source: &'a Source,
+    file_id: &'a str,
     handle: Option<&tokio::runtime::Handle>,
-) -> Result<Bytes, PixelReadError> {
-    #[cfg(test)]
-    file_fetches::record(file_id);
+) -> Result<(Bytes, Option<RemoteRead<'a>>), PixelReadError> {
     match source {
-        Source::Local { .. } => std::fs::read(file_id).map(Bytes::from).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                PixelReadError::Bad(format!("read `{file_id}`: {e}"))
-            } else {
-                PixelReadError::from_storage(file_id, DataServerError::Io(e))
-            }
-        }),
+        Source::Local { .. } => {
+            #[cfg(test)]
+            file_fetches::record(file_id);
+            let bytes = std::fs::read(file_id).map(Bytes::from).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    PixelReadError::Bad(format!("read `{file_id}`: {e}"))
+                } else {
+                    PixelReadError::from_storage(file_id, DataServerError::Io(e))
+                }
+            })?;
+            Ok((bytes, None))
+        }
         Source::Remote { store, .. } => {
+            if let Some(runtime) = shared_read_runtime(handle) {
+                let cache_id = pixel_cache_id(source, file_id).into_owned();
+                let mut read = RemoteRead::start(store, cache_id, file_id, runtime);
+                return Ok((read.wait(handle)?, Some(read)));
+            }
+            #[cfg(test)]
+            file_fetches::record(file_id);
             use ds_storage::object_store::path::Path as ObjectPath;
             let object = ObjectPath::from(file_id);
             let bytes = match handle {
                 Some(h) => store.get_opt_on(&object, h),
                 None => store.get_opt(&object),
             };
-            classify_remote_read(file_id, bytes)
+            Ok((classify_remote_read(file_id, bytes)?, None))
         }
     }
 }
 
+/// The runtime a remote volume read runs on as a task, so that other
+/// requests can join it (#1127): the explicit handle on a blocking-pool
+/// worker, else the runtime whose worker runs the caller (the query
+/// runtime for EDR). `None` on a thread with no multi-thread runtime: a
+/// current-thread runtime would not drive the read while its requests wait.
+fn shared_read_runtime(handle: Option<&tokio::runtime::Handle>) -> Option<tokio::runtime::Handle> {
+    handle
+        .cloned()
+        .or_else(|| tokio::runtime::Handle::try_current().ok())
+        .filter(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+}
+
+/// A remote volume file download that a request waits on (#1127): one it
+/// started, or another request's that it joined through [`PixelCache`]'s
+/// registry, so requests that need one file at once share one GET: walks
+/// reading ahead ([`walk_volumes`]) and misses inside the per-file lock
+/// ([`fetch_file_bytes`]) alike. Holding it keeps the read joinable, so
+/// each holds it until the file's moments are decoded.
+struct RemoteRead<'a> {
+    store: &'a ds_storage::DataStore,
+    file_id: &'a str,
+    cache_id: String,
+    runtime: tokio::runtime::Handle,
+    read: crate::pixel_cache::VolumeRead,
+}
+
+impl<'a> RemoteRead<'a> {
+    /// Join the download of `file_id` another request holds, or start one
+    /// on `runtime` that later requests join. `cache_id` is the file's
+    /// [`pixel_cache_id`], which keys the registry.
+    fn start(
+        store: &'a ds_storage::DataStore,
+        cache_id: String,
+        file_id: &'a str,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        let read =
+            PIXEL_CACHE.join_or_start_read(&cache_id, || start_get(store, file_id, &runtime));
+        RemoteRead {
+            store,
+            file_id,
+            cache_id,
+            runtime,
+            read,
+        }
+    }
+
+    /// Wait for the download, within this thread's request deadline, and
+    /// classify it as [`fetch_file_bytes`] classifies its own (#993). A
+    /// joined read that failed is the failure of the request that started
+    /// it: this one reads once more, starting its own read or joining one
+    /// started since, as a miss inside the per-file lock reads again after
+    /// another's failed load.
+    fn wait(&mut self, handle: Option<&tokio::runtime::Handle>) -> Result<Bytes, PixelReadError> {
+        let mut bytes = self.read.read.wait(handle);
+        if self.read.joined && matches!(bytes, Err(DataServerError::Storage(_))) {
+            tracing::debug!(
+                "PVOL download of `{}` this request joined failed; reading again",
+                self.file_id
+            );
+            let (store, file_id, runtime) = (self.store, self.file_id, &self.runtime);
+            self.read = PIXEL_CACHE
+                .join_or_start_read(&self.cache_id, || start_get(store, file_id, runtime));
+            bytes = self.read.read.wait(handle);
+        }
+        classify_remote_read(self.file_id, bytes)
+    }
+}
+
+/// Start downloading the remote `file_id` on `runtime` for a [`RemoteRead`].
+fn start_get(
+    store: &ds_storage::DataStore,
+    file_id: &str,
+    runtime: &tokio::runtime::Handle,
+) -> ds_storage::PendingGet {
+    #[cfg(test)]
+    file_fetches::record(file_id);
+    let object = ds_storage::object_store::path::Path::from(file_id);
+    store.start_get_opt(&object, runtime)
+}
+
 /// A remote whole-file read as the pixel reader sees it (#993): a missing
 /// object is unusable data, any other failure the request's. Shared by
-/// [`fetch_file_bytes`] and a walk's read-ahead ([`Pixels::finish_read`]),
-/// so both classify alike.
+/// [`fetch_file_bytes`]'s unshared read and [`RemoteRead::wait`], so both
+/// classify alike.
 fn classify_remote_read(
     file_id: &str,
     read: Result<Option<Bytes>, DataServerError>,
@@ -664,6 +762,44 @@ fn classify_remote_read(
             "get `{file_id}`: object not found"
         ))),
         Err(e) => Err(PixelReadError::from_storage(file_id, e)),
+    }
+}
+
+/// Read whole volume files for a background build off the request path
+/// (the `CELLS` warm-up, #1155): remote files concurrently, all of
+/// `file_ids` at once under the background fetch budget, local files in
+/// turn. Only on the background poll runtime (root CLAUDE.md Critical Rules
+/// 6–7); the caller bounds how many files it passes.
+pub(crate) fn read_volume_files(
+    source: &Source,
+    file_ids: &[&str],
+) -> Vec<Result<Bytes, DataServerError>> {
+    match source {
+        Source::Local { .. } => file_ids
+            .iter()
+            .map(|id| std::fs::read(id).map(Bytes::from).map_err(Into::into))
+            .collect(),
+        Source::Remote { store, .. } => {
+            let paths: Vec<_> = file_ids
+                .iter()
+                .map(|id| ds_storage::object_store::path::Path::from(*id))
+                .collect();
+            match store.get_many_with_budget(
+                &paths,
+                paths.len().max(1),
+                Some(MAX_REMOTE_FILE_SIZE),
+                ds_storage::FetchBudget::Background,
+            ) {
+                Ok(files) => files,
+                Err(e) => {
+                    let e = e.to_string();
+                    file_ids
+                        .iter()
+                        .map(|_| Err(DataServerError::Storage(e.clone())))
+                        .collect()
+                }
+            }
+        }
     }
 }
 
@@ -928,10 +1064,17 @@ impl<'a> Pixels<'a> {
             return Ok(MomentPixels::new());
         }
         let (pixels, failures) = PIXEL_CACHE.load_many(&cache_id, &requests, |missing, held| {
+            // Held until the moments are decoded (#1127).
+            let mut download = None;
             let bytes = match (held, fetched) {
                 (Some(bytes), _) => Ok(bytes),
                 (None, Some(fetched)) => fetched,
-                (None, None) => fetch_file_bytes(self.source, file_id, self.handle),
+                (None, None) => {
+                    fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
+                        download = read;
+                        bytes
+                    })
+                }
             };
             let decoded = bytes.and_then(|bytes| {
                 crate::pvol::read_moments_pixels(&bytes, missing.iter().copied())
@@ -961,7 +1104,7 @@ impl<'a> Pixels<'a> {
     /// Sample through [`Self::batched`] with the result.
     ///
     /// `fetched` is the file's download when the walk started it ahead
-    /// ([`Self::start_read`], collected by [`Self::finish_read`]; #999), else
+    /// ([`Self::start_read`], collected by [`RemoteRead::wait`]; #999), else
     /// `None` and the batch downloads it if it needs it.
     fn prefetch<'v>(
         &self,
@@ -990,22 +1133,23 @@ impl<'a> Pixels<'a> {
         if volumes < 2 || self.moments.is_some() || !matches!(self.source, Source::Remote { .. }) {
             return None;
         }
-        self.handle
-            .cloned()
-            .or_else(|| tokio::runtime::Handle::try_current().ok())
-            .filter(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        shared_read_runtime(self.handle)
     }
 
-    /// Start downloading the remote `file_id` on `runtime` when the batch
-    /// for `targets` will read it: some target is neither resident nor known
-    /// bad, and no background sibling decode holds the file's bytes. `None`
-    /// when nothing needs downloading, and for a local source.
-    fn start_read(
+    /// Download the remote `file_id` on `runtime` when the batch for
+    /// `targets` will read it: some target is neither resident nor known
+    /// bad, and no background sibling decode holds the file's bytes. Another
+    /// request's download of the file is joined, not repeated (#1127).
+    /// `None` when nothing needs downloading, and for a local source.
+    fn start_read<'r>(
         &self,
-        file_id: &str,
+        file_id: &'r str,
         targets: &[(&Sweep, &PolarMoment)],
         runtime: &tokio::runtime::Handle,
-    ) -> Option<ds_storage::PendingGet> {
+    ) -> Option<RemoteRead<'r>>
+    where
+        'a: 'r,
+    {
         let Source::Remote { store, .. } = self.source else {
             return None;
         };
@@ -1017,20 +1161,12 @@ impl<'a> Pixels<'a> {
         if !cold || PIXEL_CACHE.held_bytes(&cache_id).is_some() {
             return None;
         }
+        let read = RemoteRead::start(store, cache_id.into_owned(), file_id, runtime.clone());
         #[cfg(test)]
-        file_fetches::record_ahead(file_id);
-        let object = ds_storage::object_store::path::Path::from(file_id);
-        Some(store.start_get_opt(&object, runtime))
-    }
-
-    /// Wait for a download [`Self::start_read`] started, classified exactly
-    /// as [`fetch_file_bytes`] classifies its own (#993).
-    fn finish_read(
-        &self,
-        file_id: &str,
-        read: ds_storage::PendingGet,
-    ) -> Result<Bytes, PixelReadError> {
-        classify_remote_read(file_id, read.wait(self.handle))
+        if !read.read.joined {
+            file_fetches::record_ahead(file_id);
+        }
+        Some(read)
     }
 
     /// This context reading from `batch` (a [`Self::prefetch`] result) when
@@ -1118,9 +1254,14 @@ impl<'a> Pixels<'a> {
                 return Ok(None);
             }
             PIXEL_CACHE.record_miss();
+            // Held until the moment is decoded and cached (#1127).
+            let mut download = None;
             let bytes = match held {
                 Some(bytes) => Ok(bytes),
-                None => fetch_file_bytes(self.source, file_id, self.handle),
+                None => fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
+                    download = read;
+                    bytes
+                }),
             };
             let decoded = bytes.and_then(|bytes| {
                 let path = moment.dataset_path.as_str();
@@ -1156,7 +1297,7 @@ impl<'a> Pixels<'a> {
                     Ok(None)
                 }
             }
-        })
+        })?
     }
 }
 
@@ -1249,12 +1390,16 @@ pub(crate) struct Catalog {
     pub(crate) by_site_meta: HashMap<String, SiteMeta>,
     /// `by_site_meta` keys pre-sorted at build time, so the network-inventory
     /// `FeatureEngine` never sorts per request (CLAUDE.md hot-path rule).
-    sorted_nods: Vec<String>,
+    pub(crate) sorted_nods: Vec<String>,
     /// Antenna-point bounding box `[w,s,e,n]` over all sites — the Features
     /// collection's spatial extent, precomputed so `spatial_extent()` is an
     /// O(1) snapshot read. Bounds the Feature *points* (what `bbox` filters
     /// on), not the wider radar coverage bboxes.
     features_extent: Option<[f64; 4]>,
+    /// Earliest and latest volume time over all sites — the Features
+    /// collection's temporal extent (#1143), the span its `datetime` filter
+    /// selects within, precomputed for an O(1) `temporal_extent()`.
+    features_time: Option<(DateTime<Utc>, DateTime<Utc>)>,
     /// Precomputed `data_version` content hash of the site inventory — a pure
     /// function of this snapshot, computed once at swap time instead of per
     /// (future) vector-tile render.
@@ -1332,6 +1477,10 @@ const FETCH_CONCURRENCY: usize = 12;
 /// reusing already-parsed volumes from `cache` (keyed by file identity)
 /// so a poll cycle doesn't re-download / re-parse unchanged files.
 ///
+/// `cells_after` is the catalog a poll replaces: a downloaded volume newer
+/// than every volume it holds for the site gets its `CELLS` cell set built
+/// from the bytes in hand (#1155). `None` at construction.
+///
 /// Blocking — remote scans bridge async object-store I/O internally.
 fn scan_source(
     collection_id: &str,
@@ -1340,6 +1489,7 @@ fn scan_source(
     max_files: Option<usize>,
     depth: ScanDepth,
     prewarm_sweeps: usize,
+    cells_after: Option<&Catalog>,
 ) -> Result<Catalog, EngineError> {
     match source {
         // A local directory is small and cheap to enumerate; the
@@ -1363,7 +1513,14 @@ fn scan_source(
             // file whose name carries no parseable timestamp falls through
             // to the post-parse volume-time filter.
             pending.retain(|p| within_window_by_name(&p.id, time_filter));
-            let mut by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
+            let mut by_site = build_catalog(
+                collection_id,
+                pending,
+                source,
+                cache,
+                prewarm_sweeps,
+                cells_after,
+            );
             retain_within(&mut by_site, time_filter);
             Ok(derive_catalog(by_site, cache, max_files))
         }
@@ -1375,7 +1532,14 @@ fn scan_source(
         } => {
             let (pending, time_filter) =
                 enumerate_remote(collection_id, store, prefix_pattern, time_window, depth)?;
-            let mut by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
+            let mut by_site = build_catalog(
+                collection_id,
+                pending,
+                source,
+                cache,
+                prewarm_sweeps,
+                cells_after,
+            );
             // A `time_window` also bounds the timestamps kept: the
             // object listing can include volumes just outside the
             // window (the prefix is a whole UTC day).
@@ -1682,6 +1846,7 @@ fn build_catalog(
     source: &Source,
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
     prewarm_sweeps: usize,
+    cells_after: Option<&Catalog>,
 ) -> HashMap<String, Vec<VolumeEntry>> {
     use ds_storage::object_store::path::Path as ObjectPath;
 
@@ -1728,6 +1893,9 @@ fn build_catalog(
                         // cache ids (bare paths) are reload-stable, so the
                         // `contains` skip inside `prewarm_pixels` no-ops it.
                         prewarm_pixels(source, &id, &v, &bytes, prewarm_sweeps);
+                        if newest_of_site(cells_after, &v) {
+                            crate::cells::warm_from_bytes(source, &id, &v, &bytes);
+                        }
                         insert_volume(collection_id, &mut by_site, id, v);
                     }
                 }
@@ -1788,6 +1956,9 @@ fn build_catalog(
                         // of a cold whole-`.h5` S3 re-download on a render
                         // permit (#461; the local arm does the same — #472).
                         prewarm_pixels(source, id, &v, &bytes, prewarm_sweeps);
+                        if newest_of_site(cells_after, &v) {
+                            crate::cells::warm_from_bytes(source, id, &v, &bytes);
+                        }
                         insert_volume(collection_id, &mut by_site, id.clone(), v);
                     }
                 }
@@ -1799,6 +1970,19 @@ fn build_catalog(
     }
 
     by_site
+}
+
+/// Whether a poll's freshly downloaded `volume` is newer than every volume
+/// the catalog it replaces (`previous`) holds for its site: in steady state
+/// the one new scan per site and poll, which the `CELLS` layer's next tiles
+/// all track (#1155). Older downloads (a first poll backfilling history
+/// after the bootstrap scan) and new sites are left to
+/// [`crate::cells::warm_windows`], which goes newest first and is bounded.
+fn newest_of_site(previous: Option<&Catalog>, volume: &PolarVolume) -> bool {
+    previous
+        .zip(volume.site.nod.as_ref())
+        .and_then(|(catalog, nod)| catalog.by_site.get(nod)?.last())
+        .is_some_and(|newest| volume.time > newest.volume.time)
 }
 
 /// Parse `bytes` into a `PolarVolume`, insert into the shared parse cache
@@ -2040,6 +2224,7 @@ fn derive_catalog(
     let mut sorted_nods: Vec<String> = by_site_meta.keys().cloned().collect();
     sorted_nods.sort();
     let features_extent = features_extent_of(&by_site_meta);
+    let features_time = features_time_of(&by_site_meta);
     let feature_version = feature_version_of(&sorted_nods, &by_site_meta);
 
     Catalog {
@@ -2047,6 +2232,7 @@ fn derive_catalog(
         by_site_meta,
         sorted_nods,
         features_extent,
+        features_time,
         feature_version,
     }
 }
@@ -2259,12 +2445,12 @@ pub struct PolarVolumeEngine {
     /// Local directory or S3/HTTP object store, re-scanned by the poll loop.
     /// Behind an `Arc` so per-site views can hold it cheaply for lazy pixel
     /// re-fetches.
-    source: Arc<Source>,
+    pub(crate) source: Arc<Source>,
     /// Per-site cap on retained volumes (`OdimConfig.max_files`) — keeps
     /// an archive source from loading every file into the catalog.
     max_files: Option<usize>,
     /// Lock-free catalog snapshot for `raster_info()` + `get_raster_tile`.
-    catalog: Arc<ArcSwap<Catalog>>,
+    pub(crate) catalog: Arc<ArcSwap<Catalog>>,
     /// Parse cache of **metadata-only** [`PolarVolume`]s keyed by file
     /// identity (local path string or S3 object key — see [`FileId`]) so a
     /// poll doesn't re-parse unchanged files' structure. Tiny now that
@@ -2343,6 +2529,7 @@ impl PolarVolumeEngine {
             config.max_files,
             ScanDepth::Bootstrap,
             config.prewarm_sweeps,
+            None,
         )?;
         if catalog.by_site.is_empty() {
             // With a `time_window`, an empty catalog can also mean every file
@@ -2388,6 +2575,9 @@ impl PolarVolumeEngine {
         // This loop runs on the background runtime: cold pixel misses hand
         // their sibling decodes to it (#994).
         set_sibling_decode_runtime(tokio::runtime::Handle::current());
+        // The construction scan built no cell sets: warm the newest `CELLS`
+        // windows now rather than one poll interval later (#1155).
+        self.warm_cells();
         let mut ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
         while ticker.tick().await {
             self.poll_once().await;
@@ -2427,6 +2617,7 @@ impl PolarVolumeEngine {
             None,
             ScanDepth::Full,
             1,
+            None,
         )?;
         Ok(Self {
             collection_id: collection_id.to_string(),
@@ -2460,11 +2651,12 @@ impl PolarVolumeEngine {
     /// volumes are dropped until an admin reload). Mirrors the GRIB /
     /// GeoTIFF / QueryData poll loops, which also call their blocking scan
     /// directly on the poll runtime.
-    async fn poll_once(&self) {
+    pub(crate) async fn poll_once(&self) {
         // Full scan: the poll runs on the background runtime, so downloading
         // and parsing the whole `time_window` here is off the request path
         // and off the startup path. This is what backfills the history the
         // bootstrap scan in `new` deliberately skipped.
+        let prev = self.catalog.load_full();
         match scan_source(
             &self.collection_id,
             &self.source,
@@ -2472,9 +2664,9 @@ impl PolarVolumeEngine {
             self.max_files,
             ScanDepth::Full,
             self.prewarm_sweeps,
+            Some(&prev),
         ) {
             Ok(catalog) => {
-                let prev = self.catalog.load();
                 // Aggregate signals across sites for change detection: site
                 // count, newest volume time, and total volume count.
                 let latest = |c: &Catalog| {
@@ -2503,6 +2695,22 @@ impl PolarVolumeEngine {
             Err(e) => {
                 tracing::warn!("[{}] PVOL catalog refresh failed: {e}", self.collection_id);
             }
+        }
+        self.warm_cells();
+    }
+
+    /// Build the `CELLS` cell sets the newest windows still lack, bounded
+    /// per call ([`crate::cells::warm_windows`], #1155). Blocking: on the
+    /// background poll runtime worker, like the scan.
+    fn warm_cells(&self) {
+        let started = std::time::Instant::now();
+        let built = crate::cells::warm_windows(&self.source, &self.catalog.load());
+        if built > 0 {
+            tracing::debug!(
+                "[{}] built {built} PVOL cell set(s) ahead of the CELLS layer in {:?}",
+                self.collection_id,
+                started.elapsed()
+            );
         }
     }
 }
@@ -3047,17 +3255,19 @@ fn level_target<'v>(
 /// remote files among them that the batch will read are downloaded
 /// concurrently on the runtime ([`Pixels::read_ahead_runtime`]) through
 /// `ds_storage`'s started reads — async tasks, never a thread per file
-/// (root CLAUDE.md Critical Rules 7 and 9). Each volume is still decoded and
-/// sampled on the caller's thread, in order, from the same batch as a
-/// sequential walk reads, and dropped before the next download starts, so
-/// the results are the sequential walk's and at most that many volumes are
-/// fetched or decoded at once.
+/// (root CLAUDE.md Critical Rules 7 and 9). A file another request is
+/// downloading is joined instead ([`RemoteRead`], #1127). Each volume is
+/// still decoded and sampled on the caller's thread, in order, from the same
+/// batch as a sequential walk reads, and dropped before the next download
+/// starts, so the results are the sequential walk's and at most that many
+/// volumes are fetched or decoded at once.
 ///
 /// The first error ends the walk and is its result, as before (#993): the
-/// request deadline, checked before each volume and carried by every
-/// download, or a transient read failure. Downloads still running are
-/// aborted, and no volume after the failing one is decoded or marked bad. A
-/// missing object stays unusable data: nodata, negatively cached (#996).
+/// request deadline, checked before each volume and bounding every wait for
+/// a download, or a transient read failure. Downloads still running are
+/// dropped, which aborts those no other request holds, and no volume after
+/// the failing one is decoded or marked bad. A missing object stays
+/// unusable data: nodata, negatively cached (#996).
 fn walk_volumes<'v, S, T>(
     pix: Pixels,
     entries: &[&'v VolumeEntry],
@@ -3084,11 +3294,15 @@ fn walk_volumes<'v, S, T>(
                 .and_then(|runtime| pix.start_read(&entry.id, &targets, runtime));
             ahead.push_back((entry, targets, state, read));
         }
-        let Some((entry, targets, state, read)) = ahead.pop_front() else {
+        let Some((entry, targets, state, mut read)) = ahead.pop_front() else {
             break;
         };
-        let fetched = read.map(|read| pix.finish_read(&entry.id, read));
+        // The download stays joinable until its moments are decoded, so a
+        // request that needs the file meanwhile does not download it again
+        // (#1127).
+        let fetched = read.as_mut().map(|read| read.wait(pix.handle));
         let batch = pix.prefetch(&entry.id, targets, fetched)?;
+        drop(read);
         out.push(sample(entry, state, pix.batched(&batch))?);
     }
     Ok(out)
@@ -4303,9 +4517,10 @@ impl PolarVolumeEngine {
             "volume_count".into(),
             PropertyValue::Integer(meta.times.len() as i64),
         );
+        let site_collection = format!("{}-{}", self.collection_id, nod);
         props.insert(
             "collection".into(),
-            PropertyValue::String(format!("{}-{}", self.collection_id, nod)),
+            PropertyValue::String(site_collection.clone()),
         );
         Feature {
             id: nod.to_string(),
@@ -4314,6 +4529,11 @@ impl PolarVolumeEngine {
                 y: meta.lat,
             }),
             properties: Arc::new(props),
+            // The site's own collection, its volumes (#1143).
+            related: vec![ds_core::feature::Related {
+                target: ds_core::feature::RelatedTarget::Collection(site_collection),
+                title: "Radar site collection".into(),
+            }],
         }
     }
 }
@@ -4354,6 +4574,19 @@ fn features_extent_of(by_site_meta: &HashMap<String, SiteMeta>) -> Option<[f64; 
         });
     }
     acc
+}
+
+/// Earliest and latest volume time over all sites, or `None` without a
+/// volume. Computed once at catalog-build time.
+fn features_time_of(
+    by_site_meta: &HashMap<String, SiteMeta>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let first = by_site_meta
+        .values()
+        .filter_map(|m| m.times.first())
+        .min()?;
+    let last = by_site_meta.values().filter_map(|m| m.times.last()).max()?;
+    Some((*first, *last))
 }
 
 /// Opaque content hash of the whole site inventory — the FeatureEngine
@@ -4526,6 +4759,18 @@ impl FeatureEngine for PolarVolumeEngine {
     fn spatial_extent(&self) -> Option<[f64; 4]> {
         // O(1) snapshot read — precomputed in `derive_catalog`.
         self.catalog.load().features_extent
+    }
+
+    /// The retained volumes' span, which `datetime` selects sites within
+    /// (#1143). O(1) snapshot read — precomputed in `derive_catalog`.
+    fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.catalog.load().features_time
+    }
+
+    /// The collection's description is the network's, shared with its
+    /// per-site collections of volumes; its items are the sites (#1143).
+    fn items_description(&self) -> Option<&'static str> {
+        Some("Radar site inventory: one point per radar. Each site's volumes are in its own collection.")
     }
 
     fn data_version(&self) -> u64 {
@@ -5233,6 +5478,40 @@ impl PolarVolumeSiteView {
         })?;
         Ok(result)
     }
+}
+
+/// [`voxel_grid_from_volume`] for a volume whose file's `bytes` are in hand:
+/// the background `CELLS` warm-up (#1155). Every sweep of `quantity` is
+/// decoded from them into memory of this call's own, never the pixel or
+/// voxel-grid caches, so warming a network's windows evicts no pre-warmed
+/// sweep (#992). A moment that does not decode is sampled as nodata, as a
+/// request's batch read leaves it.
+pub(crate) fn voxel_grid_from_bytes(
+    source: &Source,
+    file_id: &str,
+    volume: &PolarVolume,
+    quantity: &str,
+    dims: [usize; 3],
+    bytes: &[u8],
+) -> Result<(VoxelGrid, usize), DataServerError> {
+    let requests = volume.sweeps.iter().flat_map(|sweep| {
+        sweep
+            .moments
+            .iter()
+            .filter(|m| m.quantity == quantity)
+            .map(move |m| (m.dataset_path.as_str(), sweep.nrays, sweep.nbins))
+    });
+    let moments: MomentPixels = crate::pvol::read_moments_pixels(bytes, requests)
+        .map_err(|e| DataServerError::Engine(format!("open volume `{file_id}`: {e}")))?
+        .into_iter()
+        .map(|(path, pixels)| (path, Arc::new(pixels)))
+        .collect();
+    let pix = Pixels {
+        moments: Some(&moments),
+        source,
+        handle: None,
+    };
+    voxel_grid_from_volume(volume, file_id, pix, quantity, Some(dims))
 }
 
 impl VolumeEngine for PolarVolumeSiteView {
@@ -7238,15 +7517,133 @@ mod tests {
     /// VRAD; every gate a value out to 8 km).
     const COLD_BATCH: &[u8] = include_bytes!("../../../testdata/pvol-cold-batch.h5");
 
-    /// A remote source whose every GET first waits `delay` (object_store's
-    /// `ThrottledStore` over an in-memory store), and `n` catalog entries
-    /// five minutes apart, each the cold-batch fixture under a key of its
-    /// own. The entry at `missing` is catalogued but absent from the store.
+    /// [`counted_remote_volumes`] without the store's counts.
     fn throttled_remote_volumes(
         n: usize,
         delay: Duration,
         missing: Option<usize>,
     ) -> (Arc<Source>, Arc<Vec<VolumeEntry>>) {
+        let (source, volumes, _) = counted_remote_volumes(n, delay, missing);
+        (source, volumes)
+    }
+
+    /// An object store that counts the GETs of each key it is asked for
+    /// (#1127), and fails the first GET of each key in `fail_first` once
+    /// the store under it has answered: the read then takes its full time.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: Arc<dyn ds_storage::object_store::ObjectStore>,
+        gets: Mutex<HashMap<String, usize>>,
+        fail_first: Mutex<std::collections::HashSet<String>>,
+    }
+
+    impl CountingStore {
+        /// The GETs of the volume file `file_id` so far.
+        fn gets(&self, file_id: &str) -> usize {
+            let key = ds_storage::object_store::path::Path::from(file_id).to_string();
+            self.gets.lock().unwrap().get(&key).copied().unwrap_or(0)
+        }
+
+        /// Fail the next GET of the volume file `file_id`.
+        fn fail_next(&self, file_id: &str) {
+            let key = ds_storage::object_store::path::Path::from(file_id).to_string();
+            self.fail_first.lock().unwrap().insert(key);
+        }
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ds_storage::object_store::ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &ds_storage::object_store::path::Path,
+            payload: ds_storage::object_store::PutPayload,
+            options: ds_storage::object_store::PutOptions,
+        ) -> ds_storage::object_store::Result<ds_storage::object_store::PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ds_storage::object_store::path::Path,
+            options: ds_storage::object_store::PutMultipartOptions,
+        ) -> ds_storage::object_store::Result<Box<dyn ds_storage::object_store::MultipartUpload>>
+        {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ds_storage::object_store::path::Path,
+            options: ds_storage::object_store::GetOptions,
+        ) -> ds_storage::object_store::Result<ds_storage::object_store::GetResult> {
+            let key = location.to_string();
+            *self.gets.lock().unwrap().entry(key.clone()).or_default() += 1;
+            let result = self.inner.get_opts(location, options).await;
+            if self.fail_first.lock().unwrap().remove(&key) {
+                return Err(ds_storage::object_store::Error::Generic {
+                    store: "CountingStore",
+                    source: "server unavailable".into(),
+                });
+            }
+            result
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                ds_storage::object_store::Result<ds_storage::object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<
+            'static,
+            ds_storage::object_store::Result<ds_storage::object_store::path::Path>,
+        > {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ds_storage::object_store::path::Path>,
+        ) -> futures::stream::BoxStream<
+            'static,
+            ds_storage::object_store::Result<ds_storage::object_store::ObjectMeta>,
+        > {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ds_storage::object_store::path::Path>,
+        ) -> ds_storage::object_store::Result<ds_storage::object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ds_storage::object_store::path::Path,
+            to: &ds_storage::object_store::path::Path,
+            options: ds_storage::object_store::CopyOptions,
+        ) -> ds_storage::object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A remote source whose every GET first waits `delay` (object_store's
+    /// `ThrottledStore` over an in-memory store) and is counted above that
+    /// ([`CountingStore`]), and `n` catalog entries five minutes apart, each
+    /// the cold-batch fixture under a key of its own. The entry at `missing`
+    /// is catalogued but absent from the store.
+    fn counted_remote_volumes(
+        n: usize,
+        delay: Duration,
+        missing: Option<usize>,
+    ) -> (Arc<Source>, Arc<Vec<VolumeEntry>>, Arc<CountingStore>) {
         use ds_storage::object_store::throttle::{ThrottleConfig, ThrottledStore};
         use ds_storage::object_store::{ObjectStoreExt, PutPayload};
         let volume = crate::pvol::read_polar_volume(COLD_BATCH).unwrap();
@@ -7274,14 +7671,19 @@ mod tests {
             wait_get_per_call: delay,
             ..ThrottleConfig::default()
         };
+        let counted = Arc::new(CountingStore {
+            inner: Arc::new(ThrottledStore::new(inner, config)),
+            gets: Mutex::default(),
+            fail_first: Mutex::default(),
+        });
         let source = Source::Remote {
-            store: ds_storage::DataStore::new(Arc::new(ThrottledStore::new(inner, config))),
+            store: ds_storage::DataStore::new(counted.clone()),
             endpoint: "https://s3.example.com".to_string(),
             bucket: "read-ahead-test".to_string(),
             prefix_pattern: "%Y/".to_string(),
             time_window: None,
         };
-        (Arc::new(source), Arc::new(volumes))
+        (Arc::new(source), Arc::new(volumes), counted)
     }
 
     /// A multi-thread runtime standing in for the query runtime (#1103).
@@ -7505,6 +7907,220 @@ mod tests {
             }
             assert_none_marked_bad(&source, &volumes);
         }
+    }
+
+    /// #1127: concurrent cold walks over the same remote volumes download
+    /// each file once at the store: two walks reading ahead, which join each
+    /// other's downloads, and a one-volume walk, whose miss inside the
+    /// per-file lock joins theirs or is joined. For level series and
+    /// profiles on query runtime workers and cross-sections on the blocking
+    /// pool. Both full walks answer as a sequential walk alone.
+    #[test]
+    fn concurrent_cold_walks_download_each_volume_once() {
+        let n = 6;
+        for walk in [Walk::Series, Walk::Profiles, Walk::Section] {
+            let (source, volumes) = throttled_remote_volumes(n, Duration::ZERO, None);
+            let alone = run_walk(walk, source, volumes, None, None)
+                .unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+
+            let (source, volumes, store) = counted_remote_volumes(n, READ_DELAY, None);
+            let first = Arc::new(vec![volumes[0].clone()]);
+            let start = std::sync::Barrier::new(3);
+            let [a, b, single] = std::thread::scope(|scope| {
+                [volumes.clone(), volumes.clone(), first]
+                    .map(|volumes| {
+                        let (source, start) = (source.clone(), &start);
+                        scope.spawn(move || {
+                            start.wait();
+                            run_walk(walk, source, volumes, Some(query_runtime()), None)
+                        })
+                    })
+                    .map(|walk| walk.join().unwrap())
+            });
+            for result in [&a, &b] {
+                let result = result.as_ref().unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+                assert_eq!(fingerprint(result), fingerprint(&alone), "{walk:?}");
+            }
+            single.unwrap_or_else(|e| panic!("{walk:?}, one volume: {e}"));
+            for e in volumes.iter() {
+                assert_eq!(store.gets(&e.id), 1, "{walk:?}: GETs of `{}`", e.id);
+                assert_eq!(file_fetches::count(&e.id), 1, "{walk:?}: `{}`", e.id);
+            }
+            let Source::Remote { store, .. } = &*source else {
+                unreachable!("a remote source")
+            };
+            assert_eq!(
+                store.bytes_read(),
+                (n * COLD_BATCH.len()) as u64,
+                "{walk:?}: one whole-file GET per volume at the store"
+            );
+        }
+    }
+
+    /// #1127: a download that fails is the failure of the request that
+    /// started it. A walk that joined it reads the file once more and
+    /// answers in full, starting a read of its own, since a failed read is
+    /// not joined; the request that started it gets its error; and nothing
+    /// is marked bad.
+    #[test]
+    fn a_joined_download_that_fails_is_read_again() {
+        let n = 2;
+        let (source, volumes) = throttled_remote_volumes(n, Duration::ZERO, None);
+        let alone = run_walk(Walk::Profiles, source, volumes, None, None).unwrap();
+
+        let (source, volumes, counted) = counted_remote_volumes(n, READ_DELAY, None);
+        let Source::Remote { store, .. } = &*source else {
+            unreachable!("a remote source")
+        };
+        let failing = &volumes[0].id;
+        counted.fail_next(failing);
+        let runtime = query_runtime().handle();
+        let cache_id = pixel_cache_id(&source, failing).into_owned();
+        let mut other = RemoteRead::start(store, cache_id, failing, runtime.clone());
+        assert!(!other.read.joined);
+
+        let results = run_walk(
+            Walk::Profiles,
+            source.clone(),
+            volumes.clone(),
+            Some(query_runtime()),
+            None,
+        )
+        .expect("the joiner reads again");
+        assert_eq!(fingerprint(&results), fingerprint(&alone));
+        assert_eq!(file_fetches::ahead(failing), 0, "the walk joined the read");
+        assert_eq!(
+            counted.gets(failing),
+            2,
+            "the failed GET and the walk's own"
+        );
+        assert_eq!(file_fetches::count(failing), 2);
+        assert_eq!(counted.gets(&volumes[1].id), 1);
+        assert!(matches!(
+            other.wait(Some(runtime)),
+            Err(PixelReadError::Abort(DataServerError::ResourceExhausted))
+        ));
+        assert_none_marked_bad(&source, &volumes);
+    }
+
+    /// A runtime of `workers` workers that is never dropped (#1200): a test
+    /// whose tasks stall it then fails at its watchdog, where dropping it
+    /// would wait on them for good.
+    fn leaked_runtime(workers: usize) -> &'static tokio::runtime::Runtime {
+        Box::leak(Box::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .enable_all()
+                .build()
+                .unwrap(),
+        ))
+    }
+
+    /// Run `walk` over `volumes` on `runtime` under `deadline` on a thread of
+    /// its own, sending its result and wall time to `done`.
+    fn spawn_walk(
+        runtime: &'static tokio::runtime::Runtime,
+        source: &Arc<Source>,
+        volumes: &Arc<Vec<VolumeEntry>>,
+        deadline: Option<Duration>,
+        start: Option<Arc<std::sync::Barrier>>,
+        done: &std::sync::mpsc::Sender<(Result<Vec<QueryResult>, DataServerError>, Duration)>,
+    ) {
+        let (source, volumes, done) = (source.clone(), volumes.clone(), done.clone());
+        std::thread::spawn(move || {
+            if let Some(start) = start {
+                start.wait();
+            }
+            let started = std::time::Instant::now();
+            let deadline = deadline.map(|deadline| started + deadline);
+            let result = run_walk(Walk::Profiles, source, volumes, Some(runtime), deadline);
+            let _ = done.send((result, started.elapsed()));
+        });
+    }
+
+    /// How long a #1200 test waits for a walk before it calls the runtime
+    /// stalled.
+    const STALL_WATCHDOG: Duration = Duration::from_secs(20);
+
+    /// #1200: more concurrent one-volume walks on one cold remote file than
+    /// the runtime has workers all answer, and the file is downloaded once.
+    /// The first takes the per-file lock and downloads the file as a task on
+    /// the runtime; the rest wait for the lock without holding a worker, so
+    /// that task runs. Waiting on the workers would park both of them and
+    /// stall the runtime for good, every deadline timer with it.
+    #[test]
+    fn one_volume_walks_waiting_on_a_cold_file_leave_the_runtime_running() {
+        let workers = 2;
+        let walks = workers + 2;
+        let (source, volumes) = throttled_remote_volumes(1, Duration::ZERO, None);
+        let alone = run_walk(Walk::Profiles, source, volumes, None, None).unwrap();
+
+        let runtime = leaked_runtime(workers);
+        let (source, volumes, store) = counted_remote_volumes(1, READ_DELAY, None);
+        let start = Arc::new(std::sync::Barrier::new(walks));
+        let (done, finished) = std::sync::mpsc::channel();
+        for _ in 0..walks {
+            let deadline = Some(Duration::from_secs(10));
+            spawn_walk(
+                runtime,
+                &source,
+                &volumes,
+                deadline,
+                Some(start.clone()),
+                &done,
+            );
+        }
+        for _ in 0..walks {
+            let (result, _) = finished
+                .recv_timeout(STALL_WATCHDOG)
+                .expect("the runtime stalled");
+            assert_eq!(fingerprint(&result.unwrap()), fingerprint(&alone));
+        }
+        assert_eq!(store.gets(&volumes[0].id), 1, "one download, read by all");
+    }
+
+    /// #1200: walks waiting for another request's load of a cold file give
+    /// up at their own deadline, not when that load ends, and download
+    /// nothing. More of them than the runtime has workers.
+    #[test]
+    fn walks_waiting_on_a_cold_file_stop_at_their_deadline() {
+        let workers = 2;
+        let download = Duration::from_secs(2);
+        let deadline = Duration::from_millis(300);
+        let runtime = leaked_runtime(workers);
+        let (source, volumes, store) = counted_remote_volumes(1, download, None);
+        let (done, finished) = std::sync::mpsc::channel();
+        spawn_walk(runtime, &source, &volumes, None, None, &done);
+        // The walk takes the lock before it asks the store for the file.
+        let asked = std::time::Instant::now();
+        while store.gets(&volumes[0].id) == 0 {
+            assert!(
+                asked.elapsed() < STALL_WATCHDOG,
+                "the first walk never read"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (waited, waits) = std::sync::mpsc::channel();
+        for _ in 0..workers + 1 {
+            spawn_walk(runtime, &source, &volumes, Some(deadline), None, &waited);
+        }
+        for _ in 0..workers + 1 {
+            let (result, took) = waits
+                .recv_timeout(STALL_WATCHDOG)
+                .expect("the runtime stalled");
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "got {:?}",
+                result.map(|r| r.len())
+            );
+            assert!(took < download / 2, "a waiter took {took:?}");
+        }
+        let (first, _) = finished
+            .recv_timeout(STALL_WATCHDOG)
+            .expect("the runtime stalled");
+        first.expect("the first walk downloads and answers");
+        assert_eq!(store.gets(&volumes[0].id), 1);
+        assert_none_marked_bad(&source, &volumes);
     }
 
     /// A dummy file source for the lazy-pixel context; never actually read,
@@ -9598,6 +10214,52 @@ mod tests {
             Some(&PropertyValue::String(
                 "radar-fi-volume-local-h5-fivih".into()
             ))
+        );
+    }
+
+    /// #1143: the inventory's temporal extent spans its volumes, the
+    /// times `datetime` selects sites by; each site links to its own
+    /// collection; the collection says its items are sites.
+    #[test]
+    fn inventory_spans_its_volumes_and_links_each_site() {
+        let at = |t: &str| DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc);
+        let stamped = |lon, lat, t: &str| {
+            let mut volume = synthetic_volume(lon, lat);
+            volume.time = at(t);
+            volume
+        };
+        let mut by_site = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![
+                entry(stamped(24.5, 60.3, "2026-10-16T06:05:00Z"), "span-a"),
+                entry(stamped(24.5, 60.3, "2026-10-16T06:10:00Z"), "span-b"),
+            ],
+        );
+        by_site.insert(
+            "fikor".to_string(),
+            vec![entry(stamped(21.0, 60.0, "2026-10-16T06:00:00Z"), "span-c")],
+        );
+        let engine = engine_for(by_site, "radar");
+        assert_eq!(
+            FeatureEngine::temporal_extent(&engine),
+            Some((at("2026-10-16T06:00:00Z"), at("2026-10-16T06:10:00Z")))
+        );
+        let site = FeatureEngine::get_feature(&engine, "fivih").unwrap();
+        assert_eq!(
+            site.related,
+            [ds_core::feature::Related {
+                target: ds_core::feature::RelatedTarget::Collection("radar-fivih".into()),
+                title: "Radar site collection".into(),
+            }]
+        );
+        assert!(FeatureEngine::items_description(&engine)
+            .unwrap()
+            .starts_with("Radar site inventory: one point per radar."));
+        assert_eq!(
+            features_time_of(&HashMap::new()),
+            None,
+            "no volume, no span"
         );
     }
 

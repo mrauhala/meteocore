@@ -160,6 +160,10 @@ conformance classes. For each collection it serves, a block also adds a
 - `styles` merge by id. `crs` lists are combined in block order, without
   duplicates.
 - Discovery uses the bbox and time span of the block whose `extent` is kept.
+- A block that serves feature items adds an `ItemsOverview`
+  (`Contribution::items`): what one item is, and the properties its items
+  page filters and sorts by. The first block to add one keeps it. Only the
+  collection's HTML page shows it; it adds nothing to the JSON.
 - In OpenAPI, the earlier block wins a name clash. Blocks keep shared
   components identical or prefix them (`features-bbox`).
 
@@ -243,7 +247,11 @@ resource as currently filtered and paged.
   chip per OGC API that the collection's links advertise. The metadata tab
   shows every member of the collection JSON as tables and links, including
   every link with its relation and media type. A missing member reads "Not
-  advertised", and nothing is inferred.
+  advertised", and nothing is inferred. When the Features API serves the
+  collection's items, the Overview adds a line on what one item is (when the
+  engine gives one) and "Filter by" and "Sort by" chips. Each chip opens the
+  items page with its request builder set to that property, named in the
+  URL fragment (`#filter=<name>`, `#sort=<name>`).
 - **Map preview.** Drawn with MapLibre over Natural Earth outlines, which
   the server serves under `/preview/vendor/`.
   - It draws with whatever the collection advertises: Maps images (Web
@@ -253,6 +261,9 @@ resource as currently filtered and paged.
     when the collection advertises them. Vector tiles take none.
   - For a Maps image, the status line names the instant drawn, taken from
     `Content-Datetime`.
+  - On an items page, the request builder's **Use map view** copies the
+    map's current view into `bbox` as a CRS84 box, west > east across the
+    antimeridian.
 - **Without JavaScript.** Navigation, metadata, JSON links, paging and basic
   text search all work. JavaScript adds the optional search fields, the
   map, clipboard buttons and view switching.

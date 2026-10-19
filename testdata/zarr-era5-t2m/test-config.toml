@@ -5,7 +5,9 @@
 #
 #   CONFIG_PATH=testdata/zarr-era5-t2m/test-config.toml cargo run -p server
 #
-# Then try (the fixture's field is 273.15 + 0.1*lat + 0.01*lon + 0.5*t):
+# Then try. Values are served in display units (#1213): `t2m`, stored as
+# 273.15 + 0.1*lat + 0.01*lon + 0.5*t K, reads 0.1*lat + 0.01*lon + 0.5*t °C;
+# `msl` (Pa) reads in hPa and `mtpr` (kg m**-2 s**-1) in mm/h.
 #
 #   curl 'http://127.0.0.1:8097/edr/collections/era5-t2m'
 #   curl 'http://127.0.0.1:8097/edr/collections/era5-t2m/position?coords=POINT(5.5%2054.5)'
@@ -21,24 +23,27 @@ port = 8097
 
 [[collections]]
 id = "era5-t2m"
-title = "ERA5-like 2 m Temperature (Zarr V3)"
-description = "Synthetic CF-conventions Zarr V3 store: 2 m temperature over a small lat/lon window, served from a local directory."
+title = "ERA5-like Surface Fields (Zarr V3)"
+description = "Synthetic CF-conventions Zarr V3 store: 2 m temperature, mean sea level pressure and precipitation rate over a small lat/lon window, served from a local directory."
 engine_type = "zarr"
 apis = ["edr", "wms", "maps", "tiles"]
-keywords = ["temperature", "reanalysis", "zarr"]
+keywords = ["temperature", "pressure", "precipitation", "reanalysis", "zarr"]
 
 [collections.zarr]
 # Local Zarr store root (relative to the working directory).
 data_path = "testdata/zarr-era5-t2m"
 zarr_version = 3
-# Optional: expose only some variables. The fixture has `t2m` (float32) and
-# `t2m_packed` (int16 with scale_factor/add_offset). Default = all.
+# Optional: expose only some variables. The fixture has `msl` (Pa), `mtpr`
+# (kg m**-2 s**-1), `t2m` (float32) and `t2m_packed` (int16 with
+# scale_factor/add_offset). Default = all.
 # parameters = ["t2m"]
 poll_interval_secs = 300
 
-# WMS/Maps/Tiles rendering needs a colormap (one layer per variable).
+# One WMS/Maps/Tiles layer per variable, each on the built-in default for
+# its name and served unit. The collection's own layer draws the first
+# variable, `msl`, in hPa.
 [collections.wms]
-colormap = "temperature"
+colormap = "pressure"
 
 # ---------------------------------------------------------------------------
 # Remote S3/HTTP backend (Phase 2, #125). A geographic (1-D lat/lon) Zarr on a

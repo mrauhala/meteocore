@@ -275,6 +275,9 @@ pub struct CollectionConfig {
     /// Nowcast derived-collection configuration. Required when
     /// engine_type = "nowcast".
     pub nowcast: Option<NowcastConfig>,
+    /// Station-grid derived-collection configuration. Required when
+    /// engine_type = "station-grid".
+    pub station_grid: Option<StationGridConfig>,
     /// BUFR surface-observation engine (`engine_type = "bufr"`).
     pub bufr: Option<BufrConfig>,
     /// Geostationary satellite imagery (`engine_type = "satellite"`).
@@ -460,6 +463,101 @@ fn default_nowcast_max_pixels() -> usize {
 
 fn default_nowcast_min_echo() -> f64 {
     10.0
+}
+
+/// Configuration for the station-grid derived collection (#1082): one time
+/// slice of a station collection's observations interpolated onto a regular
+/// CRS84 analysis grid, served through WMS, Maps, Tiles and EDR. The engine
+/// (`engine-station-grid`) checks the values when it is built; a bad value
+/// fails the collection, not the whole config.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StationGridConfig {
+    /// Collection id of the station collection to grid (`csv`, `bufr` or a
+    /// `postgis` stations shape) in the same config.
+    pub source: String,
+    /// The source parameters to grid, each a layer of its own.
+    pub parameters: Vec<String>,
+    /// The analysis grid.
+    pub grid: StationGridGeometry,
+    /// `"idw"` (Shepard inverse-distance weighting, the default), `"adw"`
+    /// (angular distance weighting) or `"nearest"`.
+    #[serde(default = "default_station_grid_method")]
+    pub method: String,
+    /// IDW: the power of the inverse distance (default 2). ADW: the exponent
+    /// of the exponential distance decay (default 4). Not for `nearest`.
+    #[serde(default)]
+    pub power: Option<f64>,
+    /// ADW only: the correlation decay length in km (default
+    /// `search_radius_km`).
+    #[serde(default)]
+    pub correlation_length_km: Option<f64>,
+    /// Stations each cell is interpolated from at most (default 8).
+    #[serde(default = "default_station_grid_neighbours")]
+    pub max_neighbours: usize,
+    /// Stations farther than this from a cell are not used; a cell with
+    /// none is nodata (default 150 km).
+    #[serde(default = "default_station_grid_radius_km")]
+    pub search_radius_km: f64,
+    /// A station's value at an analysis time is its latest observation not
+    /// after that time and at most this old, ISO 8601 (default `PT1H`).
+    #[serde(default = "default_station_grid_max_age")]
+    pub max_age: String,
+    /// Analysis times every `cadence` (ISO 8601, aligned to 00:00 UTC) over
+    /// the source's temporal extent. Unset: the source's own observation
+    /// instants, for a source that lists them.
+    #[serde(default)]
+    pub cadence: Option<String>,
+    /// How often the source is checked for new and revised observations.
+    #[serde(default = "default_station_grid_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// The latest analysis times computed ahead of requests, per parameter,
+    /// and re-checked for late observations on every poll (default 3).
+    #[serde(default = "default_station_grid_precompute")]
+    pub precompute: usize,
+}
+
+/// The analysis grid of a [`StationGridConfig`].
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StationGridGeometry {
+    /// The grid's CRS: CRS84 (`"EPSG:4326"`, `"CRS:84"` or `"OGC:CRS84"`)
+    /// in phase 1.
+    #[serde(default = "default_station_grid_crs")]
+    pub crs: String,
+    /// `[west, south, east, north]` in degrees; `west > east` crosses the
+    /// antimeridian.
+    pub bbox: [f64; 4],
+    /// Cell size in degrees.
+    pub resolution: f64,
+}
+
+fn default_station_grid_method() -> String {
+    "idw".to_string()
+}
+
+fn default_station_grid_neighbours() -> usize {
+    8
+}
+
+fn default_station_grid_radius_km() -> f64 {
+    150.0
+}
+
+fn default_station_grid_max_age() -> String {
+    "PT1H".to_string()
+}
+
+fn default_station_grid_poll_interval() -> u64 {
+    60
+}
+
+fn default_station_grid_precompute() -> usize {
+    3
+}
+
+fn default_station_grid_crs() -> String {
+    "EPSG:4326".to_string()
 }
 
 /// License metadata for a collection's data.
@@ -1130,7 +1228,8 @@ pub struct BufrParameterConfig {
     pub descriptors: Vec<String>,
     /// Unit as encoded in BUFR (Table B), e.g. `"K"`. The engine applies the
     /// mechanical display conversion of `ds_core::units` on top (K → °C,
-    /// Pa → hPa, kg m-2 → mm; anything else served as-is), as engine-grib
+    /// Pa → hPa, kg m-2 → mm, kg m-2 s-1 → mm/h; anything else served
+    /// as-is), as engine-grib
     /// does — so name the source unit here, not the wanted one.
     pub unit: String,
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
@@ -1258,6 +1357,9 @@ pub struct SatelliteConfig {
     /// Imagery, `GMGSI_<product>/%Y/%m/%d/%H/GLOBCOMP…_s<start>_…nc`, one
     /// global spherical-Mercator file per hour. Its values are 8-bit display
     /// counts, not physical units.
+    /// `"gk2a"`: KMA GK2A AMI L1B NetCDF-4 as NOAA publishes it,
+    /// `AMI/L1B/<sector>/%Y%m/%d/%H/gk2a_ami_le1b_<channel>_…_<%Y%m%d%H%M>.nc`,
+    /// counts calibrated to brightness temperature on ingest.
     #[serde(default = "default_satellite_provider")]
     pub provider: String,
     /// Local directory holding the files (listed recursively). Mutually
@@ -1351,10 +1453,12 @@ pub struct SatelliteProductConfig {
     /// GOES-R product, e.g. `"ABI-L2-CMIPF"` (full-disk cloud and moisture
     /// imagery) or `"ABI-L2-ACHTF"` (full-disk cloud top temperature); for
     /// ISatSS the sector, `"HFD"` (full disk); for GMGSI the mosaic, one of
-    /// [`GMGSI_PRODUCTS`] (`"LW"` is longwave IR).
+    /// [`GMGSI_PRODUCTS`] (`"LW"` is longwave IR); for GK2A the observation
+    /// mode, one of [`GK2A_SECTORS`] (`"FD"` is the full disk).
     pub product: String,
-    /// ABI or AHI band (1–16), for per-band products such as CMIP; required
-    /// for ISatSS; not taken by GMGSI, whose product is the band.
+    /// ABI, AHI or AMI band (1–16), for per-band products such as CMIP;
+    /// required for ISatSS and GK2A (one of [`GK2A_BANDS`]); not taken by
+    /// GMGSI, whose product is the band.
     #[serde(default)]
     pub band: Option<u8>,
     /// NetCDF variable holding the values, e.g. `"CMI"` or `"TEMP"`.
@@ -1371,6 +1475,15 @@ fn default_satellite_provider() -> String {
 /// differently.
 pub const GMGSI_PRODUCTS: [&str; 4] = ["LW", "SW", "WV", "VIS"];
 
+/// The GK2A AMI observation modes served (#819): the full disk. The local
+/// area (`LA`) sector is a different grid and cadence, not yet tested.
+pub const GK2A_SECTORS: [&str; 1] = ["FD"];
+
+/// The GK2A AMI bands served (#819): band 13, IR105. Brightness temperature
+/// needs each channel's central wavenumber, which the files do not carry;
+/// only IR105's is sourced so far (engine-satellite `ami.rs`, `CHANNELS`).
+pub const GK2A_BANDS: [u8; 1] = [13];
+
 fn default_satellite_poll_interval_secs() -> u64 {
     60
 }
@@ -1382,10 +1495,13 @@ pub fn validate_satellite(
 ) -> Result<(), crate::error::DataServerError> {
     use crate::error::DataServerError::Config;
 
-    if !matches!(cfg.provider.as_str(), "goes-r" | "isatss" | "gmgsi") {
+    if !matches!(
+        cfg.provider.as_str(),
+        "goes-r" | "isatss" | "gmgsi" | "gk2a"
+    ) {
         return Err(Config(format!(
             "Collection '{id}': [satellite].provider '{}' is not supported \
-             (supported: goes-r, isatss, gmgsi)",
+             (supported: goes-r, isatss, gmgsi, gk2a)",
             cfg.provider
         )));
     }
@@ -1467,6 +1583,9 @@ pub fn validate_satellite(
         if cfg.provider == "gmgsi" {
             validate_gmgsi_product(id, product)?;
         }
+        if cfg.provider == "gk2a" {
+            validate_gk2a_product(id, product)?;
+        }
     }
     validate_satellite_composites(id, cfg)
 }
@@ -1490,6 +1609,32 @@ fn validate_gmgsi_product(
         )));
     }
     Ok(())
+}
+
+/// A GK2A product names its sector (`FD`) and one of the calibrated bands.
+fn validate_gk2a_product(
+    id: &str,
+    product: &SatelliteProductConfig,
+) -> Result<(), crate::error::DataServerError> {
+    let name = &product.parameter;
+    if !GK2A_SECTORS.contains(&product.product.as_str()) {
+        return Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GK2A product '{}' is not one of {}",
+            product.product,
+            GK2A_SECTORS.join(", ")
+        )));
+    }
+    match product.band {
+        Some(band) if GK2A_BANDS.contains(&band) => Ok(()),
+        Some(band) => Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GK2A parameter '{name}' band {band} is not served: brightness \
+             temperature needs the channel's central wavenumber, which the files do not carry, \
+             and only band 13 (IR105) has a sourced one"
+        ))),
+        None => Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GK2A parameter '{name}' needs a 'band' (13, IR105)"
+        ))),
+    }
 }
 
 /// A satellite parameter or composite name: `^[a-z0-9_]+$`.
@@ -2840,7 +2985,50 @@ pub struct PostgisConfig {
     pub observations: PostgisObservationsConfig,
     #[serde(default)]
     pub parameters: Vec<PostgisParameterConfig>,
+    /// Station shapes only: the WMS/Maps/Tiles station-symbol layers
+    /// (#1063). Optional; the layers exist whenever `apis` lists a map API,
+    /// with the defaults [`PostgisMapConfig`] documents.
+    #[serde(default)]
+    pub map: Option<PostgisMapConfig>,
 }
+
+/// `[postgis.map]` (#1063): how a station collection's map layers draw each
+/// station as a marker coloured by its latest value.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgisMapConfig {
+    /// ISO 8601 duration: a frame at `TIME` shows each station's latest
+    /// non-null value in `[TIME - max_age, TIME]`. Default `PT1H`, at most
+    /// [`POSTGIS_MAP_MAX_AGE_CEILING`].
+    pub max_age: Option<String>,
+    /// Marker diameter in output pixels. Default 6, at most
+    /// [`POSTGIS_MAP_MAX_MARKER_SIZE`].
+    pub marker_size: Option<u32>,
+    /// Draw the cached stations without a value in the window as markers in
+    /// the palette's `nodata_color`, instead of leaving them out. Default
+    /// `false`.
+    pub draw_missing: Option<bool>,
+    /// ISO 8601 duration: the TIME steps the layers advertise over the last
+    /// [`POSTGIS_MAP_TIME_WINDOW`], and what a requested `TIME` floors to.
+    /// Default `PT10M`; whole seconds, from [`POSTGIS_MAP_MIN_TIME_STEP`] to
+    /// [`POSTGIS_MAP_TIME_WINDOW`].
+    pub time_step: Option<String>,
+}
+
+/// How far back from the latest observation the PostGIS map layers advertise
+/// TIME steps (#504, #1063). Older frames still render on an explicit `TIME`.
+pub const POSTGIS_MAP_TIME_WINDOW: chrono::TimeDelta = chrono::TimeDelta::hours(6);
+
+/// Shortest `[postgis.map] time_step` (#1063).
+pub const POSTGIS_MAP_MIN_TIME_STEP: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
+
+/// Longest `[postgis.map] max_age` (#1063): a typo guard. A frame reads every
+/// row of the window for every station, so a long one on a dense network
+/// meets the frame's row cap first.
+pub const POSTGIS_MAP_MAX_AGE_CEILING: chrono::TimeDelta = chrono::TimeDelta::days(7);
+
+/// Largest `[postgis.map] marker_size`, in output pixels (#1063).
+pub const POSTGIS_MAP_MAX_MARKER_SIZE: u32 = 64;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisStationsConfig {
@@ -2968,6 +3156,58 @@ pub struct PostgisParameterConfig {
     /// For `long`: the string literal stored in `param_col`.
     /// For `wide`/`per_parameter`: column/table key. Defaults to `name`.
     pub source_key: Option<String>,
+    /// Inclusive `[min, max]` of the values that are observations (#1210).
+    /// A value outside it is served as null, so a series keeps its time and
+    /// the latest-value reads (station map layers, a station grid over the
+    /// collection) skip it. Optional. A list rather than `[f64; 2]`, whose
+    /// TOML parse ignores a third number: the check below wants exactly two.
+    #[serde(default)]
+    pub valid_range: Option<Vec<f64>>,
+    /// Values a source stores for "missing" instead of NULL (#1210), such as
+    /// `[-32766]`: served as null, like a value outside `valid_range`. At most
+    /// [`POSTGIS_MAX_MISSING_VALUES`]. Optional.
+    #[serde(default)]
+    pub missing_values: Vec<f64>,
+}
+
+/// Most `missing_values` one `[[postgis.parameters]]` entry lists (#1210):
+/// sentinels are a handful of codes, and each statement binds them all.
+pub const POSTGIS_MAX_MISSING_VALUES: usize = 16;
+
+impl PostgisParameterConfig {
+    /// Check `valid_range` and `missing_values` (#1210): finite numbers,
+    /// `min <= max`, at most [`POSTGIS_MAX_MISSING_VALUES`] sentinels. Config
+    /// load and engine-postgis's resolve both run it.
+    pub fn check_value_filter(&self) -> Result<(), String> {
+        if let Some(range) = &self.valid_range {
+            let &[min, max] = range.as_slice() else {
+                return Err(format!(
+                    "valid_range must be two numbers [min, max], got {}",
+                    range.len()
+                ));
+            };
+            if !(min.is_finite() && max.is_finite()) {
+                return Err(format!(
+                    "valid_range [{min}, {max}] must be two finite numbers"
+                ));
+            }
+            if min > max {
+                return Err(format!(
+                    "valid_range [{min}, {max}] has its minimum above its maximum"
+                ));
+            }
+        }
+        if self.missing_values.len() > POSTGIS_MAX_MISSING_VALUES {
+            return Err(format!(
+                "missing_values lists {} values, at most {POSTGIS_MAX_MISSING_VALUES}",
+                self.missing_values.len()
+            ));
+        }
+        if let Some(v) = self.missing_values.iter().find(|v| !v.is_finite()) {
+            return Err(format!("missing_values entry {v} is not a finite number"));
+        }
+        Ok(())
+    }
 }
 
 /// Byte-level check for `^[A-Za-z_][A-Za-z0-9_]{0,62}$` — no regex dep.
@@ -3087,6 +3327,51 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
         }
     }
 
+    // -- map (#1063) --------------------------------------------------------
+    if let Some(map) = &cfg.map {
+        if cfg.observations.shape == "events" {
+            return Err(Config(format!(
+                "Collection '{id}': [postgis.map] is not valid for observations.shape 'events' (its strike layer has fixed settings)"
+            )));
+        }
+        if let Some(raw) = map.max_age.as_deref() {
+            let max_age = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
+                Config(format!(
+                    "Collection '{id}': [postgis.map].max_age '{raw}' is not a valid ISO 8601 duration: {e}"
+                ))
+            })?;
+            if max_age <= chrono::TimeDelta::zero() || max_age > POSTGIS_MAP_MAX_AGE_CEILING {
+                return Err(Config(format!(
+                    "Collection '{id}': [postgis.map].max_age '{raw}' must be positive and at most P{}D",
+                    POSTGIS_MAP_MAX_AGE_CEILING.num_days()
+                )));
+            }
+        }
+        if let Some(size) = map.marker_size {
+            if size == 0 || size > POSTGIS_MAP_MAX_MARKER_SIZE {
+                return Err(Config(format!(
+                    "Collection '{id}': [postgis.map].marker_size {size} is outside 1..={POSTGIS_MAP_MAX_MARKER_SIZE}"
+                )));
+            }
+        }
+        if let Some(raw) = map.time_step.as_deref() {
+            let step = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
+                Config(format!(
+                    "Collection '{id}': [postgis.map].time_step '{raw}' is not a valid ISO 8601 duration: {e}"
+                ))
+            })?;
+            if step.subsec_nanos() != 0
+                || step < POSTGIS_MAP_MIN_TIME_STEP
+                || step > POSTGIS_MAP_TIME_WINDOW
+            {
+                return Err(Config(format!(
+                    "Collection '{id}': [postgis.map].time_step '{raw}' must be whole seconds from PT1M to PT{}H",
+                    POSTGIS_MAP_TIME_WINDOW.num_hours()
+                )));
+            }
+        }
+    }
+
     // -- parameters list --------------------------------------------------
     if cfg.parameters.is_empty() {
         return Err(Config(format!(
@@ -3118,6 +3403,8 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
                 p.name
             )));
         }
+        p.check_value_filter()
+            .map_err(|e| Config(format!("Collection '{id}': parameter '{}' {e}", p.name)))?;
     }
 
     // -- stations (optional) ----------------------------------------------
@@ -4185,6 +4472,33 @@ impl ServerConfig {
                 }
             }
 
+            // Station-grid engine requires its config section (and vice versa).
+            if collection.engine_type == "station-grid" && collection.station_grid.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'station-grid' requires a \
+                     [collections.station_grid] config section"
+                )));
+            }
+            if collection.station_grid.is_some() && collection.engine_type != "station-grid" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.station_grid] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(grid) = &collection.station_grid {
+                if grid.source.trim().is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': [collections.station_grid].source must be a \
+                         collection id"
+                    )));
+                }
+                if grid.source == collection.id {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': station_grid source cannot be the collection itself"
+                    )));
+                }
+            }
+
             // Zarr engine requires zarr config section.
             if collection.engine_type == "zarr" && collection.zarr.is_none() {
                 return Err(crate::error::DataServerError::Config(format!(
@@ -4294,9 +4608,9 @@ impl ServerConfig {
                 // age-colored strike layer). Its FeatureEngine surface is
                 // #503 — without this check an `apis = ["features"]` events
                 // collection would load cleanly and silently serve an empty
-                // station inventory. Station shapes conversely have no
-                // raster rendering: wms/maps stay rejected for them via the
-                // engine_type allowlist gate in server admin wiring.
+                // station inventory. Station shapes serve every API: their
+                // map layers draw each station as a marker coloured by its
+                // latest value (#1063).
                 if postgis.observations.shape == "events" {
                     if let Some(api) = collection
                         .apis
@@ -4307,15 +4621,16 @@ impl ServerConfig {
                             "Collection '{id}': apis entry '{api}' is not supported for observations.shape 'events' (edr/wms/maps/tiles; \"features\" arrives with #503)"
                         )));
                     }
-                } else if let Some(api) = collection
-                    .apis
-                    .iter()
-                    .find(|a| matches!(a.as_str(), "wms" | "maps"))
+                } else if postgis.map.is_some()
+                    && !collection
+                        .apis
+                        .iter()
+                        .any(|a| matches!(a.as_str(), "wms" | "maps" | "tiles"))
                 {
-                    // Station shapes have no raster surface — only the events
-                    // shape implements a meaningful MapEngine (#504).
+                    // A map section no map API reads would be silently
+                    // ignored.
                     return Err(crate::error::DataServerError::Config(format!(
-                        "Collection '{id}': apis entry '{api}' requires observations.shape 'events' (station shapes serve edr/features/tiles)"
+                        "Collection '{id}': [postgis.map] needs a map API in apis (wms, maps or tiles)"
                     )));
                 }
             } else if collection.postgis.is_some() {
@@ -5370,6 +5685,55 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             "engine_type = \"nowcast\"\n[collections.nowcast]\nsource = \"radar\"\n",
         );
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_station_grid_config_pairing() {
+        let section = |source: &str| {
+            format!(
+                "[collections.station_grid]\nsource = \"{source}\"\nparameters = [\"t2m\"]\n\
+                 grid = {{ bbox = [19.0, 59.0, 32.0, 71.0], resolution = 0.1 }}\n"
+            )
+        };
+        assert!(collection_with("engine_type = \"station-grid\"\n")
+            .validate()
+            .is_err());
+        let mismatched = collection_with(&format!(
+            "engine_type = \"csv\"\ndata_path = \"x.csv\"\n{}",
+            section("obs")
+        ));
+        assert!(mismatched.validate().is_err());
+        for source in ["c", " "] {
+            let bad = collection_with(&format!(
+                "engine_type = \"station-grid\"\n{}",
+                section(source)
+            ));
+            assert!(bad.validate().is_err(), "{source:?}");
+        }
+        let ok = collection_with(&format!(
+            "engine_type = \"station-grid\"\n{}",
+            section("obs")
+        ));
+        assert!(ok.validate().is_ok());
+        let grid = ok.collections[0].station_grid.as_ref().unwrap();
+        assert_eq!(
+            (
+                grid.method.as_str(),
+                grid.max_neighbours,
+                grid.grid.crs.as_str()
+            ),
+            ("idw", 8, "EPSG:4326")
+        );
+        // A misspelt key is an error, not a silent default.
+        let typo = format!(
+            "engine_type = \"station-grid\"\n{}max_neighbors = 4\n",
+            section("obs")
+        );
+        let parsed: Result<ServerConfig, _> = toml::from_str(&format!(
+            "[server]\nhost=\"127.0.0.1\"\nport=8000\n\n[[collections]]\nid=\"c\"\n\
+             title=\"t\"\ndescription=\"d\"\n{typo}"
+        ));
+        assert!(parsed.is_err());
     }
 
     #[test]
@@ -6640,6 +7004,89 @@ observed_property = "wind_speed"
         assert!(load(&with("-5")).is_err());
     }
 
+    /// #1210: `valid_range` and `missing_values` are optional, read as
+    /// numbers (TOML integers included) and bounded at load: two finite
+    /// numbers with `min <= max`, at most 16 finite sentinels.
+    #[test]
+    fn postgis_parameter_value_filter_validated_at_load() {
+        let with = |lines: &str| {
+            nexus_postgis_toml().replace(
+                "observed_property = \"air_temperature\"",
+                &format!("observed_property = \"air_temperature\"\n{lines}"),
+            )
+        };
+        let load = |toml: &str| {
+            let tmp = TempDir::new().unwrap();
+            let path = write_config(tmp.path(), "config.toml", toml);
+            ServerConfig::from_file(path.to_str().unwrap()).map(|(config, _)| config)
+        };
+
+        let config = load(nexus_postgis_toml()).unwrap();
+        let p = &config.collections[0].postgis.as_ref().unwrap().parameters[0];
+        assert_eq!(p.valid_range, None);
+        assert!(p.missing_values.is_empty());
+
+        let config = load(&with(
+            "valid_range = [-80, 60.5]\nmissing_values = [-32766, -9999.5]",
+        ))
+        .unwrap();
+        let pg = config.collections[0].postgis.as_ref().unwrap();
+        assert_eq!(pg.parameters[0].valid_range, Some(vec![-80.0, 60.5]));
+        assert_eq!(pg.parameters[0].missing_values, vec![-32766.0, -9999.5]);
+        // The other parameter is untouched.
+        assert_eq!(pg.parameters[1].valid_range, None);
+        // A single-value range is valid.
+        assert!(load(&with("valid_range = [0, 0]")).is_ok());
+        let sixteen = vec!["-1"; POSTGIS_MAX_MISSING_VALUES].join(", ");
+        assert!(load(&with(&format!("missing_values = [{sixteen}]"))).is_ok());
+
+        let seventeen = vec!["-1"; POSTGIS_MAX_MISSING_VALUES + 1].join(", ");
+        for (lines, expected) in [
+            (
+                "valid_range = [60, -80]".to_string(),
+                "parameter 't2m' valid_range [60, -80] has its minimum above its maximum",
+            ),
+            (
+                "valid_range = [nan, 1]".to_string(),
+                "parameter 't2m' valid_range [NaN, 1] must be two finite numbers",
+            ),
+            (
+                "valid_range = [-inf, 1]".to_string(),
+                "valid_range [-inf, 1] must be two finite numbers",
+            ),
+            (
+                format!("missing_values = [{seventeen}]"),
+                "parameter 't2m' missing_values lists 17 values, at most 16",
+            ),
+            (
+                "missing_values = [-32766, inf]".to_string(),
+                "missing_values entry inf is not a finite number",
+            ),
+        ] {
+            let err = load(&with(&lines)).unwrap_err().to_string();
+            assert!(err.contains(expected), "{lines}: {err}");
+        }
+        // Not a pair.
+        for (lines, expected) in [
+            (
+                "valid_range = [1]",
+                "valid_range must be two numbers [min, max], got 1",
+            ),
+            (
+                "valid_range = [1, 2, 3]",
+                "valid_range must be two numbers [min, max], got 3",
+            ),
+            (
+                "valid_range = []",
+                "valid_range must be two numbers [min, max], got 0",
+            ),
+        ] {
+            let err = load(&with(lines)).unwrap_err().to_string();
+            assert!(err.contains(expected), "{lines}: {err}");
+        }
+        assert!(load(&with("valid_range = [\"0\", 1]")).is_err());
+    }
+
     /// #1061: the events shape has no location list, so the knob would do
     /// nothing there — rejected rather than silently ignored.
     #[test]
@@ -6861,20 +7308,108 @@ unit = "1"
         assert!(config.collections[0].apis.contains(&"wms".to_string()));
     }
 
+    /// #1063: station shapes serve the map APIs, with or without a
+    /// `[postgis.map]` section.
     #[test]
-    fn postgis_station_shape_rejects_wms_api() {
+    fn postgis_station_shape_allows_map_apis() {
         let tmp = TempDir::new().unwrap();
         let toml = nexus_postgis_toml().replace(
             "apis = [\"edr\", \"features\"]",
-            "apis = [\"edr\", \"wms\"]",
+            "apis = [\"edr\", \"wms\", \"maps\", \"tiles\"]",
         );
         let path = write_config(tmp.path(), "config.toml", &toml);
-        let err = ServerConfig::from_file(path.to_str().unwrap())
-            .unwrap_err()
-            .to_string();
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert!(config.collections[0].apis.contains(&"wms".to_string()));
+        assert_eq!(config.collections[0].postgis.as_ref().unwrap().map, None);
+
+        let toml = format!(
+            "{toml}\n[collections.postgis.map]\nmax_age = \"PT30M\"\nmarker_size = 8\ndraw_missing = true\ntime_step = \"PT5M\"\n"
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        let map = config.collections[0].postgis.as_ref().unwrap().map.clone();
+        assert_eq!(
+            map,
+            Some(PostgisMapConfig {
+                max_age: Some("PT30M".into()),
+                marker_size: Some(8),
+                draw_missing: Some(true),
+                time_step: Some("PT5M".into()),
+            })
+        );
+    }
+
+    /// #1063: `[postgis.map]` is bounded at load, needs a map API, and is
+    /// not the events shape's.
+    #[test]
+    fn postgis_map_section_validated_at_load() {
+        let load = |toml: &str| {
+            let tmp = TempDir::new().unwrap();
+            let path = write_config(tmp.path(), "config.toml", toml);
+            ServerConfig::from_file(path.to_str().unwrap()).map(|(config, _)| config)
+        };
+        let station = |map: &str| {
+            format!(
+                "{}\n[collections.postgis.map]\n{map}\n",
+                nexus_postgis_toml().replace(
+                    "apis = [\"edr\", \"features\"]",
+                    "apis = [\"edr\", \"wms\"]",
+                )
+            )
+        };
+        assert!(load(&station(
+            "max_age = \"P7D\"\nmarker_size = 64\ntime_step = \"PT6H\""
+        ))
+        .is_ok());
+        assert!(load(&station("time_step = \"PT1M\"")).is_ok());
+        for (map, expected) in [
+            (
+                "max_age = \"soon\"",
+                "max_age 'soon' is not a valid ISO 8601 duration",
+            ),
+            ("max_age = \"P8D\"", "must be positive and at most P7D"),
+            (
+                "max_age = \"PT0S\"",
+                "max_age 'PT0S' is not a valid ISO 8601 duration",
+            ),
+            ("marker_size = 0", "marker_size 0 is outside 1..=64"),
+            ("marker_size = 65", "marker_size 65 is outside 1..=64"),
+            (
+                "time_step = \"PT30S\"",
+                "time_step 'PT30S' must be whole seconds from PT1M to PT6H",
+            ),
+            (
+                "time_step = \"PT7H\"",
+                "time_step 'PT7H' must be whole seconds from PT1M to PT6H",
+            ),
+            (
+                "time_step = \"often\"",
+                "time_step 'often' is not a valid ISO 8601 duration",
+            ),
+        ] {
+            let err = load(&station(map)).unwrap_err().to_string();
+            assert!(err.contains(expected), "{map}: {err}");
+        }
+        // A misspelt key is an error, not a silently ignored setting.
+        assert!(load(&station("maxage = \"PT1H\"")).is_err());
+
+        // No map API reads it.
+        let toml = format!(
+            "{}\n[collections.postgis.map]\nmax_age = \"PT1H\"\n",
+            nexus_postgis_toml()
+        );
+        let err = load(&toml).unwrap_err().to_string();
+        assert!(err.contains("[postgis.map] needs a map API"), "{err}");
+
+        // The events shape's strike layer has fixed settings.
+        let toml = format!(
+            "{}\n[collections.postgis.map]\nmax_age = \"PT1H\"\n",
+            lightning_events_toml().replace("apis = [\"edr\"]", "apis = [\"edr\", \"wms\"]")
+        );
+        let err = load(&toml).unwrap_err().to_string();
         assert!(
-            err.contains("requires observations.shape 'events'"),
-            "got: {err}"
+            err.contains("[postgis.map] is not valid for observations.shape 'events'"),
+            "{err}"
         );
     }
 
@@ -7656,6 +8191,45 @@ unit = "C"
             .unwrap_err()
             .to_string()
             .contains("gmgsi"));
+    }
+
+    /// A GK2A product names the full disk and a calibrated band; any other
+    /// band is refused at load, naming why.
+    #[test]
+    fn validate_satellite_gk2a_products() {
+        let config = |product: &str, band: Option<u8>| SatelliteConfig {
+            provider: "gk2a".into(),
+            data_path: Some("testdata/gk2a-ami".into()),
+            endpoint: None,
+            bucket: None,
+            time_window: None,
+            poll_interval_secs: 60,
+            composites: Vec::new(),
+            products: vec![SatelliteProductConfig {
+                parameter: "ir_10_5".into(),
+                title: "IR 10.5 µm brightness temperature".into(),
+                unit: "K".into(),
+                product: product.into(),
+                band,
+                variable: "image_pixel_values".into(),
+            }],
+        };
+        assert!(validate_satellite("g", &config("FD", Some(13))).is_ok());
+        let err = |product: &str, band| {
+            validate_satellite("g", &config(product, band))
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err("FD", Some(14)).contains("only band 13 (IR105)"));
+        assert!(err("FD", Some(7)).contains("central wavenumber"));
+        assert!(err("FD", None).contains("needs a 'band'"));
+        assert!(err("LA", Some(13)).contains("not one of FD"));
+        let mut other = config("FD", Some(13));
+        other.provider = "gk2b".into();
+        assert!(validate_satellite("g", &other)
+            .unwrap_err()
+            .to_string()
+            .contains("gk2a"));
     }
 }
 

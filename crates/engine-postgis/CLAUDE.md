@@ -1,6 +1,8 @@
 # engine-postgis crate — Claude Instructions
 
-PostGIS/TimescaleDB observation engine (`EdrEngine` + `FeatureEngine`).
+PostGIS/TimescaleDB observation engine (`EdrEngine` + `FeatureEngine` +
+`MapEngine`: the events shape's strike layer, #504, and the station shapes'
+symbol layers, #1063).
 Read the root `CLAUDE.md` first — Critical Rule 8 (SQL safety) is enforced
 in CI by `scripts/check_sql_safety.sh`: keep `SELECT` keywords in plain
 `String` literals, never inside `format!`; no string concatenation onto SQL
@@ -335,6 +337,29 @@ in step when changing this lifecycle.
 - Supported `pg_type`s for `property_cols`: `bool`, `int2/4/8`, `float4/8`,
   `text`/`varchar`/`bpchar`/`name`, NULL. Others (arrays, json, enums,
   numeric, timestamp-typed properties) are rejected at refresh time.
+- **Value filters (#1210):** `[[postgis.parameters]]` `valid_range =
+  [min, max]` (inclusive) and `missing_values` (at most
+  `POSTGIS_MAX_MISSING_VALUES` = 16), both optional, checked by
+  `PostgisParameterConfig::check_value_filter` at config load and again in
+  `resolve` (`ValidatedParameter::filter`). `valid_range` is a `Vec<f64>`
+  checked for exactly two numbers: a TOML parse into `[f64; 2]` silently
+  drops a third. The builders select a rejected value as NULL in SQL,
+  `CASE WHEN <v> >= $a AND <v> <= $b AND <v> <> ALL($c) THEN <v> END` with
+  `<v>` the `::double precision` cast and every bound and the sentinel array
+  a bind, so every consumer treats the row as a NULL row: EDR series keep
+  the time, the station map's `LatestValues` and a station grid's `latest`
+  pass over it. Do not move the test to `WHERE` (it would drop the time from
+  a series) or into Rust after decoding (the decoders and the frame
+  reduction would each need it). Station statements put the filter binds
+  after the `WHERE` clause's and before the `LIMIT` (`limit_param_idx`
+  follows); `build_events_area` puts them after its fixed `LIMIT $4`. `long`
+  branches per filtered key on the parameter column (`CASE WHEN <param> =
+  $k THEN … ELSE <v> END`). Without a filter the SQL is unchanged. Not
+  filtered: the station map fingerprint (it hashes raw values, so a late
+  sentinel row redraws an unchanged frame), the temporal extent and the
+  derived location list (they count filtered rows), and the events
+  attributes `cloud_indicator_col`/`peak_current_col`. Sentinels compare as
+  `double precision`: a `real` -999.9 is not the TOML -999.9.
 - Do not `map_err(|_| …)` away the underlying Postgres error — surfacing
   the real error is tracked in #436; swallowing it hid a production
   misconfiguration.
@@ -353,14 +378,27 @@ in step when changing this lifecycle.
   CI's `.github/workflows/postgis-db.yml` runs them against a
   `timescale/timescaledb-ha:pg17` service container with both set, on PRs
   touching engine-postgis, its path dependencies (ds-core, ds-poll,
-  ds-cache), api-edr, `Cargo.toml`, `Cargo.lock` or the workflow, and on
-  every main push. `cargo test` elsewhere skips them.
+  ds-cache), api-edr, engine-station-grid and ds-executor (a dev-dependency
+  and its executor, #1210), `Cargo.toml`, `Cargo.lock` or the workflow, and
+  on every main push. `cargo test` elsewhere skips them.
 - They go through the public load path (`PostgisEngineConfig::resolve`,
   `PoolRegistry`, `PostgisEngine::new`, `refresh_metadata`) and the area
   query (`query_area_on` forces a path), one shape per test: `long`
   stations-only, `wide` mode B with a naive-UTC column, `per_parameter`
   mode A. 20 000 synthetic stations; nulls, missing rows and stations
   without data in a window are deliberate.
+- `station_map_{long,wide}_shape` (#1063, `mc1063_*` schemas) render the
+  station layer through `MapEngine::get_raster_tile` on a blocking thread:
+  latest value within `max_age`, no marker without one, a late row moving
+  `content_version` and then drawn, `draw_missing` nodata markers.
+- `value_filters_{long,wide,per_parameter}_shape` (#1210, `mc1210_*`
+  schemas): a sentinel inside the range, an out-of-range value and NaN are
+  null in the location query's and both area paths' series with their times
+  kept; the station map frame and a `StationGridEngine` built over the
+  engine, as the server wires one, use the latest valid value and leave out
+  the station without one; without filters the same rows read back as
+  stored. `value_filters_events_shape`: a `real` peak current, out of range
+  or the sentinel, is null on its event.
 - The timing test prints both paths by stations × steps on a TimescaleDB
   hypertable, each path's time to the value-budget 400 for a week over
   20 000 stations, and that set-based statement's `EXPLAIN ANALYZE`. It

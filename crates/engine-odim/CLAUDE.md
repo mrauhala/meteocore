@@ -138,19 +138,47 @@ around `ds-storage` calls (Critical Rules 6–7).
   the EDR queries admitted at once (`ds_executor::query_workers()`), plus
   about 3.3 MB of section cell geometry per volume (`SectionPlan`: 1024
   nodes × 100 levels × 32 B). The cap is a maintainer decision, pinned by a
-  const assert. Errors map as before: the deadline (checked per
-  volume, carried by every download) or a transient failure ends the walk
-  and aborts the downloads in flight; a missing object is nodata and known
+  const assert. Errors map as before: the deadline (checked per volume,
+  bounding every wait for a download) or a transient failure ends the walk
+  and drops the downloads in flight; a missing object is nodata and known
   bad. A local source, a one-volume walk (GetFeatureInfo, a single
   `datetime`) and a thread without a multi-thread runtime read each file
-  as the walk reaches it, inside the per-file lock. Downloads started ahead
-  do not coalesce with another request's cold read of the same file
-  (#1127). Never
+  as the walk reaches it, inside the per-file lock. Never
   loop `Pixels::prefetch` over remote volumes outside `walk_volumes`.
   Pinned by `walks_download_volumes_concurrently_at_most_four_at_once`
   (wall time ≈ ceil(V/4) GET delays, each file once),
   `read_ahead_walks_answer_as_the_sequential_walk` and
   `read_ahead_walk_stops_at_the_deadline`.
+- **Concurrent requests share a volume file's download (#1127).** Every
+  remote whole-file read of the pixel path, a walk's read ahead and a miss
+  inside the per-file lock alike (`fetch_file_bytes`, on a thread with a
+  multi-thread runtime), is a `RemoteRead`: it joins the download of the
+  file another request holds, registered by source-qualified cache id in
+  `PixelCache` (`join_or_start_read`), or starts one that others join. The
+  registry is weak: a read lives while a request holds it, and each holder
+  keeps it until the file's moments are decoded, so a request arriving
+  meanwhile joins instead of downloading again; the last holder dropping
+  it aborts it, and no bytes outlive their holders. A started read
+  (`DataStore::start_get_opt`) is bounded by `FetchBudget::Request` alone
+  and each wait by its own thread's deadline, so one request's deadline
+  never cuts off a read another waits on. A read that failed is not
+  joined, and a request whose joined read failed reads once more, its own
+  read or one started since: the failure is the starter's (503/504), not
+  the joiner's, and nothing is marked bad. Pinned by
+  `concurrent_cold_walks_download_each_volume_once` (GETs counted at the
+  store) and `a_joined_download_that_fails_is_read_again`.
+- **A request waiting for the per-file lock leaves its runtime running
+  (#1200).** `PixelCache::with_file_load` takes a free lock at once. A
+  request that finds another's load of the file in flight waits inside
+  `block_in_place` on a multi-thread runtime (`off_core`), because that load
+  may be downloading the file as a task on the same runtime: requests
+  parked on every query-runtime worker left nothing to run the download or
+  the deadline timers, and the runtime stalled for good. The wait ends at
+  the request deadline with `DeadlineExceeded`: its load never runs and
+  nothing is marked bad. The lock's mutex guards a flag, never the load.
+  Pinned by `one_volume_walks_waiting_on_a_cold_file_leave_the_runtime_running`
+  (more walks than workers), `walks_waiting_on_a_cold_file_stop_at_their_deadline`
+  and `file_load_waiter_gives_up_at_its_deadline`.
 - **Cold single-moment misses (#293, #994):** only a map render reads one
   moment at a time. A `Pixels::moment` miss fetches the source-qualified
   file once, decodes **only the requested moment** on the caller's thread
@@ -285,6 +313,28 @@ not guarantee monotonic improvement. This baseline does not enable #642.
   the byte-bounded per-volume `CELL_SET_CACHE` (`MC_PVOL_CELL_SET_CACHE_MB`,
   default 64; volumes are immutable ⇒ never stale) and gates to dBZ-unit
   quantities (VIL/linear-Z is reflectivity physics → else 400).
+- **A cold `CELLS` window (#1155).** A tile segments the scan it draws and
+  the `CELLS_TRACK_SCANS` (6) behind it: seven whole volumes, each a GET,
+  an HDF5 decode of every reflectivity sweep (most of the ~50 ms CPU), a
+  voxel grid and a segmentation. `cell_product` claims each volume's
+  `CELL_SET_CACHE` fill with a zero-timeout probe and builds only volumes
+  no other caller is building, so a viewport's tiles build a cold window in
+  parallel, one GET per volume; built in turn, seven 0.5 s GETs outlast the
+  3 s render deadline. It waits for the rest through
+  `ds_executor::wait_without_slot`, so a waiting tile holds no render slot.
+  A claim a failed builder hands over is let go before that wait for a
+  slot and re-probed: never hold a fill claim while queueing for a slot.
+  The poll loop builds cell sets ahead of the tiles, on the background
+  runtime: a downloaded volume newer than the site's newest from the bytes
+  in hand (`warm_from_bytes`, no second GET), and the newest windows newest
+  volume first, at most `MAX_WARMS_PER_POLL` (32) per poll and once as the
+  loop starts (`warm_windows`, four downloads at a time, a volume claimed
+  only after its download so no tile waits on a download without a
+  deadline). Warm builds decode into memory of their own
+  (`voxel_grid_from_bytes`), never `PIXEL_CACHE` or `VOXEL_GRID_CACHE`
+  (#992), key entries as tiles do (`layer_query`, `cell_set_key`), and count
+  no hit or miss. Pinned by `tests/cells_viewport.rs` and the warm-up tests
+  in `cells::tests`.
 - **WMS/Maps/Tiles `CELLS` layer:** each reflectivity-capable site
   advertises a derived `CELLS` parameter (`engine_odim::cells::
   CELLS_PARAMETER`; appended to `SiteMeta.parameters` only — never an EDR

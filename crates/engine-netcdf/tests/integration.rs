@@ -66,6 +66,20 @@ fn stored(file: &str, variable: &str) -> Vec<Vec<f64>> {
     flat.chunks(nx).map(<[f64]>::to_vec).collect()
 }
 
+/// A stored value of `variable` in the committed MEPS fixtures as the
+/// engine serves it (#1209), each conversion written out here rather than
+/// taken from `ds_core::units`: temperatures from K to °C, MSLP from Pa to
+/// hPa, geopotential from m^2/s^2 to gpm. The precipitation's kg/m^2 is mm
+/// unchanged, and fractions (unit 1) and m/s have no rule.
+fn served(variable: &str, stored: f64) -> f64 {
+    match variable {
+        "air_temperature_2m" | "air_temperature_pl" => stored - 273.15,
+        "air_pressure_at_sea_level" => stored / 100.0,
+        "geopotential_pl" => stored / 9.80665,
+        _ => stored,
+    }
+}
+
 /// Every value of a tile, row-major from the north-west.
 fn values(tile: &RasterTile) -> Vec<Option<f64>> {
     (0..(tile.width * tile.height) as usize)
@@ -124,11 +138,12 @@ fn meps_runs_and_variables_are_advertised() {
     assert_eq!(names[..2], ["air_temperature_2m", "relative_humidity_2m"]);
     assert_eq!(names.len(), 8);
     assert_eq!(info.parameter, "air_temperature_2m");
-    assert_eq!(info.unit, "K");
+    // Display units (#1209): the file's K and kg/m^2 as °C and mm.
+    assert_eq!(info.unit, "°C");
     let precipitation = &info.parameters[6];
     assert_eq!(
         (precipitation.title.as_str(), precipitation.unit.as_str()),
-        ("Precipitation accumulated since run start", "kg/m^2")
+        ("Precipitation accumulated since run start", "mm")
     );
     assert_eq!(info.parameters[0].title, "Screen level temperature (T2M)");
     // The domain, from the grid's inverse-projected edges.
@@ -159,7 +174,7 @@ fn new_scans_and_polls_pick_up_new_files() {
     let engine = NetcdfEngine::new("meps", &meps_config(dir.path())).unwrap();
     let info = engine.raster_info();
     assert_eq!(info.parameters.len(), 8);
-    assert_eq!(info.parameters[0].unit, "K");
+    assert_eq!(info.parameters[0].unit, "°C");
     assert_eq!(info.times.len(), 1);
     assert!(matches!(
         engine.live_health(),
@@ -220,10 +235,10 @@ fn south_up_rows_are_drawn_north_up() {
         let drawn = value_at(&engine, lon[j][i], lat[j][i], None, six, None)
             .unwrap()
             .unwrap();
+        let expected = served("air_temperature_2m", t2m[j][i]);
         assert!(
-            (drawn - t2m[j][i]).abs() < 1e-3,
-            "cell ({j}, {i}): drawn {drawn}, stored {}",
-            t2m[j][i]
+            (drawn - expected).abs() < 1e-3,
+            "cell ({j}, {i}): drawn {drawn}, served {expected}"
         );
     }
     // Over the whole domain: the southern half is warmer.
@@ -247,7 +262,7 @@ fn south_up_rows_are_drawn_north_up() {
         v.iter().sum::<f64>() / v.len() as f64
     };
     let (north, south) = (mean(0..18), mean(18..36));
-    assert!(south > north + 1.0, "south {south} K, north {north} K");
+    assert!(south > north + 1.0, "south {south} °C, north {north} °C");
 }
 
 /// 09Z is valid in both runs: unpinned it comes from the newest run, an
@@ -268,7 +283,10 @@ fn the_newest_covering_run_is_drawn_and_older_runs_fill_in() {
             run.map(at),
         )
     };
-    let stored_at = |file: &str| stored(&format!("meps-netcdf/{file}"), "air_temperature_2m")[j][i];
+    let stored_at = |file: &str| {
+        let t2m = stored(&format!("meps-netcdf/{file}"), "air_temperature_2m")[j][i];
+        served("air_temperature_2m", t2m)
+    };
     let from_09z = stored_at("meps_sfc_00_20261015T09Z.nc");
     let from_06z = stored_at("meps_sfc_03_20261015T06Z.nc");
     assert!((from_09z - from_06z).abs() > 0.05, "the runs differ there");
@@ -498,10 +516,11 @@ fn a_replaced_file_moves_the_content_version() {
             .unwrap()
     };
     let lead = |n: u32| {
-        stored(
+        let t2m = stored(
             &format!("meps-netcdf/meps_sfc_0{n}_20261015T06Z.nc"),
             "air_temperature_2m",
-        )[0][0]
+        )[0][0];
+        served("air_temperature_2m", t2m)
     };
     assert!((draw() - lead(1)).abs() < 1e-3);
 
@@ -654,8 +673,10 @@ fn position(
 fn edr_position_reads_the_stored_values_of_the_selected_run() {
     let engine = meps();
     let cell = (2, 7);
-    let stored_at =
-        |file: &str| stored(&format!("meps-netcdf/{file}"), "air_temperature_2m")[cell.0][cell.1];
+    let stored_at = |file: &str| {
+        let t2m = stored(&format!("meps-netcdf/{file}"), "air_temperature_2m")[cell.0][cell.1];
+        served("air_temperature_2m", t2m)
+    };
     let close = |got: &[Option<f64>], want: &[f64]| {
         got.len() == want.len()
             && got
@@ -738,7 +759,7 @@ fn edr_position_reads_the_stored_values_of_the_selected_run() {
     let result = position(&engine, cell, "air_temperature_2m", Some(nine), None).unwrap();
     let description = &result.parameters["air_temperature_2m"];
     assert_eq!(description.label, "Screen level temperature (T2M)");
-    assert_eq!(description.unit, "K");
+    assert_eq!(description.unit, "°C");
     assert_eq!(
         description.standard_name.as_deref(),
         Some("air_temperature")
@@ -833,6 +854,107 @@ fn edr_position_samples_what_the_map_draws() {
             "({lon}, {lat}): {value} {drawn}"
         );
     }
+}
+
+/// The `units` attribute of `variable` in a fixture file.
+fn stored_unit(file: &str, variable: &str) -> String {
+    let nc = netcdf_reader::NcFile::open(testdata(file)).unwrap();
+    let var = nc.variable(variable).unwrap();
+    var.attribute("units")
+        .and_then(|a| a.value.as_string())
+        .unwrap()
+}
+
+/// #1209: every value is served in its display unit, converted from the
+/// variable's CF `units` after sampling: K as °C, Pa as hPa, kg/m^2 as mm.
+/// At a cell centre the map pixel, the EDR position value and the query
+/// GetFeatureInfo makes (the step and run the map resolved) agree, and are
+/// the stored value converted; every unit reported is the converted one. A
+/// unit without a rule, CF's `1` or m/s, is served as stored.
+#[test]
+fn values_are_served_in_display_units() {
+    let engine = meps();
+    let (j, i) = (5, 4);
+    let (lat, lon) = met_latlon();
+    let (x, y) = (lon[j][i], lat[j][i]);
+    // A map without TIME draws the newest run's last step, 11Z of the 09Z run.
+    let file = "meps-netcdf/meps_sfc_02_20261015T09Z.nc";
+    let (time, run) = (
+        engine.resolve_time(None, None).unwrap(),
+        engine.resolve_reference_time(None, None),
+    );
+    assert_eq!(
+        (time, run),
+        (at("2026-10-15T11:00:00Z"), Some(at("2026-10-15T09:00:00Z")))
+    );
+    let info = engine.raster_info();
+    let descriptions = engine.get_parameter_descriptions();
+    let wind = ds_core::wind::WindSource::wind_facts(&engine);
+    for (name, unit, display, expected) in [
+        ("air_temperature_2m", "K", "°C", 278.38034 - 273.15),
+        ("air_pressure_at_sea_level", "Pa", "hPa", 1007.51086),
+        ("precipitation_amount_acc", "kg/m^2", "mm", 0.021972656),
+        ("relative_humidity_2m", "1", "1", 1.000006),
+        ("wind_speed_of_gust", "m/s", "m/s", 12.461373),
+    ] {
+        assert_eq!(stored_unit(file, name), unit, "{name}: the fixture's unit");
+        let stored = stored(file, name)[j][i];
+        // The CDL's value, converted as written above.
+        assert!((served(name, stored) - expected).abs() < 1e-4, "{name}");
+        let drawn = value_at(&engine, x, y, Some(name), None, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            (drawn - expected).abs() < 1e-3,
+            "{name}: drawn {drawn}, expected {expected}"
+        );
+        let feature_info = single(
+            engine
+                .query_position(
+                    &format!("POINT({x} {y})"),
+                    Some((time, time)),
+                    Some(&names(&[name])),
+                    None,
+                    run,
+                )
+                .unwrap(),
+        );
+        let queried = feature_info.ranges[name].values[0].unwrap();
+        assert!(
+            (queried - drawn).abs() < 1e-3,
+            "{name}: queried {queried}, drawn {drawn}"
+        );
+        let series = position(&engine, (j, i), name, None, None).unwrap();
+        assert_eq!(series_hours(&series), [9, 10, 11]);
+        assert_eq!(series.ranges[name].values[2], Some(queried), "{name}");
+
+        let advertised = info.parameters.iter().find(|p| p.name == name).unwrap();
+        assert_eq!(advertised.unit, display, "{name}: RasterInfo");
+        assert_eq!(descriptions[name].unit, display, "{name}: EDR metadata");
+        assert_eq!(series.parameters[name].unit, display, "{name}: coverage");
+    }
+    assert_eq!(info.unit, "°C", "the default parameter's");
+    // The derived wind combines the components as served: m/s, no rule.
+    let u = wind.parameters.iter().find(|p| p.name == "x_wind_10m");
+    assert_eq!(u.map(|p| p.unit.as_str()), Some("m/s"));
+
+    // Geopotential in m^2/s^2 as gpm, on a pressure level.
+    let pl = meps_pl();
+    let ten = at("2026-10-15T10:00:00Z");
+    let cell = met_cell((j, i));
+    let pl_file = "meps-netcdf-pl/meps_pl_01_20261015T09Z.nc";
+    assert_eq!(stored_unit(pl_file, "geopotential_pl"), "m^2/s^2");
+    let stored = stored_pl("meps_pl_01_20261015T09Z.nc", "geopotential_pl", 500.0)[j][i];
+    let drawn = value_at_level(&pl, cell, "geopotential_pl", ten, Some(500.0))
+        .unwrap()
+        .unwrap();
+    assert!(
+        (drawn - stored / 9.80665).abs() < 1e-2,
+        "{drawn} gpm, stored {stored} m^2/s^2"
+    );
+    assert!((5000.0..6000.0).contains(&drawn), "500 hPa near 5.5 km");
+    let unit = &pl.get_parameter_descriptions()["geopotential_pl"].unit;
+    assert_eq!(unit, "gpm");
 }
 
 /// Several points share every field read; a query decodes each field it
@@ -1311,7 +1433,7 @@ fn pressure_levels_are_the_vertical_axis() {
             "relative_humidity_pl"
         ]
     );
-    assert_eq!(info.parameters[3].unit, "m^2/s^2");
+    assert_eq!(info.parameters[3].unit, "gpm");
     assert_eq!(
         info.reference_times,
         [at("2026-10-15T06:00:00Z"), at("2026-10-15T09:00:00Z")]
@@ -1341,6 +1463,7 @@ fn each_pressure_level_draws_its_own_field() {
             .unwrap()
             .unwrap();
         let stored = stored_pl("meps_pl_01_20261015T09Z.nc", "air_temperature_pl", hpa)[j][i];
+        let stored = served("air_temperature_pl", stored);
         assert!((value - stored).abs() < 1e-3, "{hpa}: {value} {stored}");
         drawn.push(value);
     }
@@ -1492,7 +1615,7 @@ fn edr_z_selects_the_levels_a_query_reads() {
             (&[2][..], &["z".to_string()][..])
         );
         for (value, hpa) in range.values.iter().zip([850.0, 500.0]) {
-            let stored = stored_pl(file, parameter, hpa)[j][i];
+            let stored = served(parameter, stored_pl(file, parameter, hpa)[j][i]);
             assert!((value.unwrap() - stored).abs() < 1e-3, "{parameter} {hpa}");
         }
     }
@@ -1513,7 +1636,11 @@ fn edr_z_selects_the_levels_a_query_reads() {
         .collect();
     assert_eq!(steps, [Some(at("2026-10-15T09:00:00Z")), Some(ten)]);
     let at_850 = profiles[1].ranges["air_temperature_pl"].values[1].unwrap();
-    assert!((at_850 - stored_pl(file, "air_temperature_pl", 850.0)[j][i]).abs() < 1e-3);
+    let stored = served(
+        "air_temperature_pl",
+        stored_pl(file, "air_temperature_pl", 850.0)[j][i],
+    );
+    assert!((at_850 - stored).abs() < 1e-3);
 
     // One level: a series over the run's steps with a one-value `z` axis.
     let series = single(query(None, Some(&[300.0])).unwrap());
@@ -1669,16 +1796,20 @@ fn pressure_in_pa_is_served_in_hpa_with_wind_direction_per_level() {
     );
     assert!(info.reference_times.is_empty());
     let six = at("2026-01-01T06:00:00Z");
-    // Column 2 (22°E), row 1 (61°N), step 1: t = 300 - 0.05 hPa + 1 + 0.2 - 0.2.
+    // Column 2 (22°E), row 1 (61°N), step 1: t = 300 - 0.05 hPa + 1 + 0.2 - 0.2
+    // K, served in °C (#1209).
     let cell = (22.0, 61.0);
     let t850 = value_at_level(engine.as_ref(), cell, "t", six, Some(850.0))
         .unwrap()
         .unwrap();
-    assert!((t850 - 258.5).abs() < 1e-4, "{t850}");
+    assert!((t850 - (258.5 - 273.15)).abs() < 1e-4, "{t850}");
     let t_default = value_at_level(engine.as_ref(), cell, "t", six, None)
         .unwrap()
         .unwrap();
-    assert!((t_default - 251.0).abs() < 1e-4, "1000 hPa: {t_default}");
+    assert!(
+        (t_default - (251.0 - 273.15)).abs() < 1e-4,
+        "1000 hPa: {t_default}"
+    );
     assert!(value_at_level(engine.as_ref(), cell, "t", six, Some(85000.0)).is_err());
 
     let wind = DerivedWind::new(

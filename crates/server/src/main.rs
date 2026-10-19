@@ -607,6 +607,15 @@ async fn main() {
             poller.poll_loop().await;
         });
     }
+    // Station-grid loop — re-reads the latest analysis times for late
+    // observations and computes them ahead (source I/O; background runtime
+    // only).
+    for engine in &result.station_grid_engines {
+        let poller = engine.clone();
+        poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
 
     // Set initial health gauges
     admin::update_health_gauges(&result.health);
@@ -740,6 +749,7 @@ async fn main() {
         bufr_engines: RwLock::new(result.bufr_engines),
         postgis_engines: RwLock::new(result.postgis_engines),
         nowcast_engines: RwLock::new(result.nowcast_engines),
+        station_grid_engines: RwLock::new(result.station_grid_engines),
         reload_lock: tokio::sync::Mutex::new(()),
         admin_token,
         style_fingerprint: std::sync::atomic::AtomicU64::new(colormaps::style_config_fingerprint(
@@ -996,6 +1006,13 @@ async fn main() {
         .read()
         .unwrap_or_else(|e| e.into_inner());
     for engine in nowcast.iter() {
+        engine.shutdown();
+    }
+    let station_grid = server_state
+        .station_grid_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    for engine in station_grid.iter() {
         engine.shutdown();
     }
     info!("Server shut down gracefully");

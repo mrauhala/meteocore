@@ -114,10 +114,12 @@ unlike GeoTIFF's one band per collection.
   short-name tables. Source units come from WMO Code Table 4.2
   (`src/units.rs`) plus per-center overlays for local parameter numbers
   192–254.
-- Display conversions are mechanical: K→°C, Pa→hPa, kg m⁻²→mm, m² s⁻²→gpm,
+- Display conversions are mechanical: K→°C, Pa→hPa, kg m⁻²→mm,
+  kg m⁻² s⁻¹→mm/h (× 3600, PRATE / ECMWF `tprate`, #1213), m² s⁻²→gpm,
   proportion→%. Colormap ranges use display units. The string-keyed twin
   of this table lives in `ds_core::units::display_conversion` (used by
-  engine-bufr); keep the two rule for rule. The units test
+  engine-bufr, engine-netcdf and engine-zarr); keep the two rule for rule.
+  The units test
   `every_spelled_variant_has_ds_core_rule` checks each `SourceUnit` through
   its WMO spelling, and `display_rules_agree_with_ds_core_for_every_spelling`
   each spelling `parse_source_unit` reads (through
@@ -125,7 +127,7 @@ unlike GeoTIFF's one band per collection.
   rules are GRIB-only, since no unit string identifies them: the code
   tables assign `KelvinDifference` (stays K) and ECMWF's `MetresOfWater`
   (× 1000 to mm) from the parameter. Served units come from the code table,
-  already canonical (`m s-1`, `kg m-2 s-1`, `J kg-1`), so unit
+  already canonical (`m s-1`, `J kg-1`, `W m-2`), so unit
   normalisation (#1067 PR 6) changes no GRIB output.
 - Distinguish absolute temperature from temperature differences using the
   WMO parameter semantics: dewpoint depression uses `KelvinDifference` and
@@ -218,6 +220,15 @@ on the request path. Single-level and legacy views require exact metadata.
   4 B/px instead of a boxed 16. Values are exactly the old f64 ones `as f32`
   (`tests/local_source.rs` pins this on the fixture for all three CRS paths);
   keep `resample` returning f64 for the bench fingerprint.
+- This sampler is not `ds_core::resample::SourceGrid` (#1172), and moving to
+  it changes pixels: EPSG:3857 maps each pixel exactly here, SourceGrid
+  through its projection grid; a regional grid draws nothing west or north
+  of its first node here, half a cell more there; a NaN neighbour falls back
+  to the first valid corner here, the nearest cell there; and the display
+  conversion runs before narrowing here. `cache/sampler_tests.rs` pins the
+  two bit-equal where they agree on the committed global field: CRS84 and
+  projected output, both forms of the seam box, the #323 Arctic tile. A
+  sampler change that breaks it is a drift from the shared rules.
 - Cache weights include allocated value capacity and key/structure overhead.
   Keep the entry-size estimate aligned with the 4 MiB typical global field.
 - Run `cargo run --release -p engine-grib --example bench_grid_cache` for a

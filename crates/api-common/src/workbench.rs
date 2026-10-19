@@ -1094,10 +1094,53 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
     format!("{controls}<div class=\"map-panel\"><div id=\"feature-map\" data-land=\"{base}/preview/vendor/workbench-land.json\" data-quicklook=\"{quicklook}\" data-fallback=\"{fallback}\" role=\"region\" aria-label=\"{label}\"></div><p id=\"map-status\" role=\"status\">The map needs JavaScript and WebGL. {fallback}</p>{legend}{request_link}<div id=\"map-data\" hidden>{}</div></div><script src=\"{base}/preview/vendor/maplibre-gl.js\"></script><script>{}</script>",escape(&features.to_string()),include_str!("workbench/map.js"),base=escape(base))
 }
 
+/// What a collection's Overview says of its feature items beyond the
+/// metadata document (#1143), from the Features API: what one item is, and
+/// the properties its items page filters and sorts by.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ItemsOverview {
+    pub description: Option<String>,
+    pub filterables: Vec<String>,
+    pub sortables: Vec<String>,
+}
+
 pub fn collection_html(
     surface: Surface<'_>,
     doc: &Value,
     license: Option<&LicenseConfig>,
+) -> String {
+    collection_page(surface, doc, license, None)
+}
+
+/// A chip row of item properties on the Overview, each opening the items
+/// page with its data request builder open at that property (#1143): the
+/// fragment `#{kind}={name}` names it, and no query parameter, which
+/// `/items` would reject.
+fn item_field_chips(items: &str, label: &str, kind: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    let page = with_format(items, "html");
+    let chips: String = names
+        .iter()
+        .map(|name| {
+            anchor(
+                &format!("{page}#{kind}={}", path_segment(name)),
+                name,
+                "chip",
+            )
+        })
+        .collect();
+    format!("<div class=\"row-line item-fields\"><span class=\"row-label\">{label}</span><span class=\"chip-row\">{chips}</span></div>")
+}
+
+/// [`collection_html`] with what the Features API says of the collection's
+/// items, when it serves them.
+pub fn collection_page(
+    surface: Surface<'_>,
+    doc: &Value,
+    license: Option<&LicenseConfig>,
+    overview: Option<&ItemsOverview>,
 ) -> String {
     let Surface { base, root, api } = surface;
     let title = doc["title"]
@@ -1166,7 +1209,12 @@ pub fn collection_html(
             })
             .collect()
     };
-    let mut body=format!("<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← Back to collections</a><div class=\"detail-heading\"><div class=\"chip-row\" aria-label=\"Available through\">{api_chips}</div><h1>{}</h1><div class=\"mono\">{}</div><p>{}</p></div><nav class=\"detail-tabs\" aria-label=\"Collection views\"><a data-collection-tab=\"overview\" class=\"active\" href=\"#overview\">Overview</a>",escape(&catalog),escape(&with_format(&catalog,"html")),escape(title),escape(id),escape(doc["description"].as_str().unwrap_or_default()));
+    // What one item is, where the description alone could mislead (#1143).
+    let items_note = overview
+        .and_then(|o| o.description.as_deref())
+        .map(|note| format!("<p class=\"items-note\">{}</p>", escape(note)))
+        .unwrap_or_default();
+    let mut body=format!("<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← Back to collections</a><div class=\"detail-heading\"><div class=\"chip-row\" aria-label=\"Available through\">{api_chips}</div><h1>{}</h1><div class=\"mono\">{}</div><p>{}</p>{items_note}</div><nav class=\"detail-tabs\" aria-label=\"Collection views\"><a data-collection-tab=\"overview\" class=\"active\" href=\"#overview\">Overview</a>",escape(&catalog),escape(&with_format(&catalog,"html")),escape(title),escape(id),escape(doc["description"].as_str().unwrap_or_default()));
     if let Some(items) = items {
         body.push_str(&anchor(&with_format(items, "html"), "Request data", ""));
     }
@@ -1225,6 +1273,20 @@ pub fn collection_html(
     body.push_str("<section class=\"section-space\"><h2>Request data from this collection</h2>");
     if let Some(items) = items {
         body.push_str(&format!("<div class=\"callout spaced\">Filter features within this collection by its supported properties, area and time. Inspect the results or copy the GeoJSON request. These filters select data, not collections.</div><div class=\"action-row spaced\">{}{}</div>",anchor(&with_format(items,"html"),"Build a data request →","btn primary"),anchor(&url,"View metadata JSON","btn")));
+        if let Some(overview) = overview {
+            body.push_str(&item_field_chips(
+                items,
+                "Filter by",
+                "filter",
+                &overview.filterables,
+            ));
+            body.push_str(&item_field_chips(
+                items,
+                "Sort by",
+                "sort",
+                &overview.sortables,
+            ));
+        }
     }
     if let Some(queries) = doc["data_queries"].as_object() {
         body.push_str("<div class=\"endpoint-list spaced\">");
@@ -3606,6 +3668,38 @@ mod tests {
         root: "https://x",
         api: crate::shared::WORKSPACE,
     };
+
+    /// #1143: the Overview says what an item is and lists the properties
+    /// the items page filters and sorts by, each chip opening the builder
+    /// at its property through the fragment, never a query parameter.
+    #[test]
+    fn overview_lists_item_filters_and_sorts() {
+        let doc = json!({"id": "b", "title": "Radar sites", "description": "Polar volumes", "links": [
+            {"rel": "items", "href": "https://x/collections/b/items", "type": "application/geo+json"}]});
+        let overview = ItemsOverview {
+            description: Some("Radar site inventory: one point per radar.".into()),
+            filterables: vec!["name".into(), "a b/c".into()],
+            sortables: vec!["volume_count".into()],
+        };
+        let html = collection_page(SHARED_X, &doc, None, Some(&overview));
+        assert!(html.contains("<p>Polar volumes</p><p class=\"items-note\">Radar site inventory: one point per radar.</p>"));
+        assert!(html.contains("<span class=\"row-label\">Filter by</span><span class=\"chip-row\"><a class=\"chip\" href=\"https://x/collections/b/items?f=html#filter=name\">name</a><a class=\"chip\" href=\"https://x/collections/b/items?f=html#filter=a%20b%2Fc\">a b/c</a></span>"), "{html}");
+        assert!(html.contains("<a class=\"chip\" href=\"https://x/collections/b/items?f=html#sort=volume_count\">volume_count</a>"));
+        // Nothing to say, no rows; no items link, no chips.
+        let html = collection_page(SHARED_X, &doc, None, Some(&ItemsOverview::default()));
+        // The stylesheet is inline: look for the elements.
+        assert!(
+            !html.contains("class=\"row-line item-fields\"")
+                && !html.contains("class=\"items-note\"")
+        );
+        let no_items = json!({"id": "b", "links": []});
+        assert!(!collection_page(SHARED_X, &no_items, None, Some(&overview))
+            .contains("class=\"row-line item-fields\""));
+        assert_eq!(
+            collection_html(SHARED_X, &doc, None),
+            collection_page(SHARED_X, &doc, None, None)
+        );
+    }
 
     /// #1140, Common Part 1 `/req/html/content`: every `href` of the
     /// collection JSON, the styles' links and the data queries' included,

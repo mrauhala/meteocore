@@ -9,7 +9,9 @@
 
 use chrono::Duration;
 use ds_core::config::{
-    PostgisConfig, POSTGIS_DEFAULT_MAX_LOCATIONS, POSTGIS_MAX_LOCATIONS_CEILING,
+    PostgisConfig, PostgisMapConfig, POSTGIS_DEFAULT_MAX_LOCATIONS, POSTGIS_MAP_MAX_AGE_CEILING,
+    POSTGIS_MAP_MAX_MARKER_SIZE, POSTGIS_MAP_MIN_TIME_STEP, POSTGIS_MAP_TIME_WINDOW,
+    POSTGIS_MAX_LOCATIONS_CEILING,
 };
 use ds_core::datetime::parse_iso8601_duration;
 use thiserror::Error;
@@ -61,12 +63,16 @@ pub enum PostgisConfigError {
     InvalidDefaultDatetime(String),
     #[error("max_locations {0} is outside 1..={POSTGIS_MAX_LOCATIONS_CEILING}")]
     InvalidMaxLocations(usize),
+    #[error("invalid [postgis.map] {0}")]
+    InvalidMap(String),
     #[error("parameter '{name}' (source_key '{key}') is not mapped in observations.{where_}")]
     ParameterNotMapped {
         name: String,
         key: String,
         where_: &'static str,
     },
+    #[error("parameter '{name}' {reason}")]
+    InvalidValueFilter { name: String, reason: String },
 }
 
 /// Validated, engine-ready view of [`ds_core::config::PostgisConfig`]. All
@@ -102,6 +108,77 @@ pub struct PostgisEngineConfig {
     /// `events` shape: advertised spatial extent from config
     /// (`observations.extent_bbox`) — never computed via `ST_Extent`.
     pub events_extent_bbox: Option<[f64; 4]>,
+    /// Station shapes: how the map layers draw the stations (`[postgis.map]`,
+    /// #1063). The defaults for the events shape, which never reads it.
+    pub station_map: StationMapSettings,
+}
+
+/// `[postgis.map]` resolved (#1063): the station-symbol layers' frame window,
+/// marker size and handling of stations without a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StationMapSettings {
+    /// A frame at `TIME` shows each station's latest non-null value in
+    /// `[TIME - max_age, TIME]`.
+    pub max_age: Duration,
+    /// Marker diameter in output pixels.
+    pub marker_size: u32,
+    /// Draw cached stations without a value in the window as nodata markers.
+    pub draw_missing: bool,
+    /// The layers' TIME step: the advertised steps over the last 6 h, and
+    /// what a requested TIME floors to. Whole seconds, at least a minute.
+    pub time_step: Duration,
+}
+
+impl Default for StationMapSettings {
+    fn default() -> Self {
+        Self {
+            max_age: Duration::hours(1),
+            marker_size: 6,
+            draw_missing: false,
+            time_step: Duration::minutes(10),
+        }
+    }
+}
+
+impl StationMapSettings {
+    /// Lower `[postgis.map]`; absent fields take the defaults. Defense in
+    /// depth: `ds-core`'s `validate_postgis` already bounds every field.
+    fn resolve(raw: Option<&PostgisMapConfig>) -> Result<Self, PostgisConfigError> {
+        let defaults = Self::default();
+        let Some(raw) = raw else {
+            return Ok(defaults);
+        };
+        let max_age = match raw.max_age.as_deref() {
+            None => defaults.max_age,
+            Some(s) => parse_iso8601_duration(s)
+                .ok()
+                .filter(|d| *d > Duration::zero() && *d <= POSTGIS_MAP_MAX_AGE_CEILING)
+                .ok_or_else(|| PostgisConfigError::InvalidMap(format!("max_age '{s}'")))?,
+        };
+        let marker_size = raw.marker_size.unwrap_or(defaults.marker_size);
+        if marker_size == 0 || marker_size > POSTGIS_MAP_MAX_MARKER_SIZE {
+            return Err(PostgisConfigError::InvalidMap(format!(
+                "marker_size {marker_size}"
+            )));
+        }
+        let time_step = match raw.time_step.as_deref() {
+            None => defaults.time_step,
+            Some(s) => parse_iso8601_duration(s)
+                .ok()
+                .filter(|d| {
+                    d.subsec_nanos() == 0
+                        && *d >= POSTGIS_MAP_MIN_TIME_STEP
+                        && *d <= POSTGIS_MAP_TIME_WINDOW
+                })
+                .ok_or_else(|| PostgisConfigError::InvalidMap(format!("time_step '{s}'")))?,
+        };
+        Ok(Self {
+            max_age,
+            marker_size,
+            draw_missing: raw.draw_missing.unwrap_or(defaults.draw_missing),
+            time_step,
+        })
+    }
 }
 
 /// Parameter descriptor after cross-checking against the observation shape.
@@ -113,6 +190,24 @@ pub struct ValidatedParameter {
     pub unit: String,
     pub observed_property: String,
     pub source_key: String,
+    /// `valid_range` and `missing_values` (#1210).
+    pub filter: ValueFilter,
+}
+
+/// Which values of a parameter are observations (#1210): those inside the
+/// inclusive `range` and equal to none of the `missing` sentinels. The query
+/// builders select every other value as NULL, so a series keeps its time and
+/// every latest-value read skips it. Empty: every value is one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ValueFilter {
+    pub range: Option<(f64, f64)>,
+    pub missing: Vec<f64>,
+}
+
+impl ValueFilter {
+    pub fn is_empty(&self) -> bool {
+        self.range.is_none() && self.missing.is_empty()
+    }
 }
 
 impl PostgisEngineConfig {
@@ -196,6 +291,11 @@ impl PostgisEngineConfig {
                     check_identifier(&source_key, "parameters[].source_key (events column)")?;
                 }
             }
+            p.check_value_filter()
+                .map_err(|reason| PostgisConfigError::InvalidValueFilter {
+                    name: p.name.clone(),
+                    reason,
+                })?;
             parameters.push(ValidatedParameter {
                 name: check_identifier(&p.name, "parameters[].name")?,
                 label: p.label.clone(),
@@ -205,6 +305,13 @@ impl PostgisEngineConfig {
                     .clone()
                     .unwrap_or_else(|| p.name.clone()),
                 source_key,
+                filter: ValueFilter {
+                    range: match p.valid_range.as_deref() {
+                        Some(&[min, max]) => Some((min, max)),
+                        _ => None,
+                    },
+                    missing: p.missing_values.clone(),
+                },
             });
         }
 
@@ -214,6 +321,7 @@ impl PostgisEngineConfig {
         if max_locations == 0 || max_locations > POSTGIS_MAX_LOCATIONS_CEILING {
             return Err(PostgisConfigError::InvalidMaxLocations(max_locations));
         }
+        let station_map = StationMapSettings::resolve(cfg.map.as_ref())?;
 
         Ok(Self {
             dsn,
@@ -230,6 +338,7 @@ impl PostgisEngineConfig {
             locations_window,
             events_default_window,
             events_extent_bbox,
+            station_map,
         })
     }
 
@@ -389,6 +498,8 @@ mod tests {
                     unit: "°C".into(),
                     observed_property: Some("air_temperature".into()),
                     source_key: None,
+                    valid_range: None,
+                    missing_values: vec![],
                 },
                 PostgisParameterConfig {
                     name: "ws_10m".into(),
@@ -396,8 +507,11 @@ mod tests {
                     unit: "m/s".into(),
                     observed_property: Some("wind_speed".into()),
                     source_key: None,
+                    valid_range: None,
+                    missing_values: vec![],
                 },
             ],
+            map: None,
         }
     }
 
@@ -673,7 +787,10 @@ mod tests {
                 unit: "kA".into(),
                 observed_property: None,
                 source_key: None,
+                valid_range: None,
+                missing_values: vec![],
             }],
+            map: None,
         }
     }
 
@@ -716,5 +833,97 @@ mod tests {
         let resolved = PostgisEngineConfig::resolve(&nexus_config()).unwrap();
         assert_eq!(resolved.events_default_window, None);
         assert_eq!(resolved.events_extent_bbox, None);
+    }
+
+    /// #1063: `[postgis.map]` resolves field by field over the defaults
+    /// (PT1H, 6 px, stations without a value left out).
+    #[test]
+    fn resolve_station_map_settings() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let resolved = PostgisEngineConfig::resolve(&nexus_config()).unwrap();
+        assert_eq!(
+            resolved.station_map,
+            StationMapSettings {
+                max_age: Duration::hours(1),
+                marker_size: 6,
+                draw_missing: false,
+                time_step: Duration::minutes(10),
+            }
+        );
+        let mut cfg = nexus_config();
+        cfg.map = Some(PostgisMapConfig {
+            max_age: Some("PT30M".into()),
+            marker_size: None,
+            draw_missing: Some(true),
+            time_step: Some("PT5M".into()),
+        });
+        let resolved = PostgisEngineConfig::resolve(&cfg).unwrap();
+        assert_eq!(resolved.station_map.max_age, Duration::minutes(30));
+        assert_eq!(resolved.station_map.marker_size, 6);
+        assert!(resolved.station_map.draw_missing);
+        assert_eq!(resolved.station_map.time_step, Duration::minutes(5));
+        for bad in [
+            PostgisMapConfig {
+                max_age: Some("P8D".into()),
+                ..Default::default()
+            },
+            PostgisMapConfig {
+                marker_size: Some(0),
+                ..Default::default()
+            },
+            PostgisMapConfig {
+                time_step: Some("PT30S".into()),
+                ..Default::default()
+            },
+            PostgisMapConfig {
+                time_step: Some("PT7H".into()),
+                ..Default::default()
+            },
+        ] {
+            cfg.map = Some(bad);
+            assert!(matches!(
+                PostgisEngineConfig::resolve(&cfg),
+                Err(PostgisConfigError::InvalidMap(_))
+            ));
+        }
+    }
+
+    /// #1210: `valid_range` and `missing_values` lower into the parameter's
+    /// `ValueFilter`; without them it is empty. A bad one is an error even if
+    /// config validation was bypassed.
+    #[test]
+    fn resolve_value_filters() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let mut cfg = nexus_config();
+        cfg.parameters[0].valid_range = Some(vec![-80.0, 60.0]);
+        cfg.parameters[0].missing_values = vec![-32766.0, -9999.0];
+        let resolved = PostgisEngineConfig::resolve(&cfg).unwrap();
+        assert_eq!(
+            resolved.parameters[0].filter,
+            ValueFilter {
+                range: Some((-80.0, 60.0)),
+                missing: vec![-32766.0, -9999.0],
+            }
+        );
+        assert!(!resolved.parameters[0].filter.is_empty());
+        assert!(resolved.parameters[1].filter.is_empty());
+
+        for (range, missing) in [
+            (Some(vec![60.0, -80.0]), vec![]),
+            (Some(vec![f64::NAN, 1.0]), vec![]),
+            (Some(vec![1.0]), vec![]),
+            (None, vec![f64::INFINITY]),
+            (None, vec![0.0; 17]),
+        ] {
+            cfg.parameters[0].valid_range = range;
+            cfg.parameters[0].missing_values = missing;
+            let err = PostgisEngineConfig::resolve(&cfg).unwrap_err();
+            assert!(
+                matches!(err, PostgisConfigError::InvalidValueFilter { ref name, .. } if name == "t2m"),
+                "got: {err:?}"
+            );
+        }
     }
 }

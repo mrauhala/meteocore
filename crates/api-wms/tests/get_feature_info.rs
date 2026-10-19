@@ -853,9 +853,9 @@ async fn no_data_at_the_point_is_an_empty_answer() {
 /// A projected map never queries a point that is not on the Earth (#1089).
 /// A BBOX wholly outside its projection, which GetMap draws as the empty
 /// image, has no position at any pixel, and so has a pixel centre past a
-/// pole or 50° from Transverse Mercator's meridian, where its inverse names
-/// no place (#1113): the empty answer, without an engine call. A point on
-/// the Earth still answers.
+/// pole or past the eastings where Transverse Mercator's series stops being
+/// exact, where its inverse names no place (#1113, #1130): the empty
+/// answer, without an engine call. A point on the Earth still answers.
 #[tokio::test]
 async fn a_projected_pixel_off_the_earth_is_an_empty_answer() {
     let engine = Nwp::new(Answer::Value(280.0));
@@ -884,13 +884,13 @@ async fn a_projected_pixel_off_the_earth_is_an_empty_answer() {
         );
     };
 
-    // Wholly outside: past TM's poles, north and south, past 50° east of its
-    // meridian, and past the LAEA disk. Every pixel is empty, the corners
+    // Wholly outside: past TM's poles, north and south, past its area's
+    // east edge, and past the LAEA disk. Every pixel is empty, the corners
     // and the centre alike.
     for (crs, bbox) in [
         ("EPSG:3067", "0,21000000,1000000,22000000"),
         ("EPSG:3067", "0,-22000000,1000000,-21000000"),
-        ("EPSG:3067", "5000000,6500000,6000000,7000000"),
+        ("EPSG:3067", "11000000,6500000,12000000,7000000"),
         ("EPSG:3035", "20000000,20000000,21000000,21000000"),
     ] {
         let reply = get(
@@ -919,13 +919,11 @@ async fn a_projected_pixel_off_the_earth_is_an_empty_answer() {
             &format!("row {j}"),
         );
     }
-    // The #1110 meta-tile's top row runs from 36° to 62° east of the
-    // meridian. Its columns 14 to 19 of 20 lie past 50°, where TM's inverse
-    // once gave centres anywhere (ds-core's
-    // `position_on_earth_is_none_off_the_earth` pins it, #1113): none is
-    // asked.
-    let far_east = "1448154.7,7240773.4,2896309.4,8688928.1";
-    for i in 14..20 {
+    // A TM map across its area's east edge on the equator, easting
+    // 10 497 964.943, 20 columns of 50 km: columns 10 to 19 are centred
+    // past it, where the series stops being exact (#1130): none is asked.
+    let far_east = "10000000,-1000000,11000000,1000000";
+    for i in 10..20 {
         assert_empty(
             &get(&app, &info_at("EPSG:3067", far_east, 4, (i, 0))).await,
             &format!("far east ({i}, 0)"),

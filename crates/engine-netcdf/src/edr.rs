@@ -9,9 +9,11 @@
 //! query's deadline) and samples it at every point the query asks for:
 //! each point, or each cell centre of an area's CRS84 grid, is projected
 //! onto the source grid once ([`SourceGrid::position`]) and sampled as a
-//! map draws it ([`SourceGrid::value_at`]), so GetFeatureInfo answers what
-//! GetMap drew. Field reads go through [`field::read_uncached`]: a decoded field
-//! the render cache holds is used, any other is decoded for the query alone.
+//! map draws it ([`SourceGrid::value_at`]) and converted to the unit served
+//! as the map converts it ([`Layout::to_display`], #1209), so
+//! GetFeatureInfo answers what GetMap drew. Field reads go through
+//! [`field::read_uncached`]: a decoded field the render cache holds is used,
+//! any other is decoded for the query alone.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -197,9 +199,15 @@ impl NetcdfEngine {
             move |(v, f, step, index, level)| {
                 let values =
                     field::read_uncached(&step.file, index, step.index, level, flipped, &decodes)?;
+                // Sampled from the stored field, then converted to the
+                // unit served, as the map converts each pixel (#1209).
                 let samples = positions
                     .iter()
-                    .map(|position| position.and_then(|p| layout.source.value_at(&values, None, p)))
+                    .map(|position| {
+                        position
+                            .and_then(|p| layout.source.value_at(&values, None, p))
+                            .map(|raw| layout.to_display(index, raw))
+                    })
                     .collect::<Vec<_>>();
                 Ok((v, f, samples))
             },
@@ -212,7 +220,8 @@ impl NetcdfEngine {
     }
 
     /// Label, unit and CF standard name of each variable a query returns,
-    /// as the collection describes them.
+    /// as the collection describes them: the unit served, after the
+    /// display conversion ([`Layout::unit`]), as the map layers report it.
     fn descriptions(
         catalog: &Catalog,
         layout: &Layout,
@@ -227,7 +236,7 @@ impl NetcdfEngine {
                     variable.name.to_string(),
                     ParameterDescription {
                         label: info.map_or_else(|| variable.title.clone(), |p| p.title.clone()),
-                        unit: variable.units.clone(),
+                        unit: layout.unit(index).to_string(),
                         observed_property: variable.name.to_string(),
                         standard_name: variable.standard_name.clone(),
                     },

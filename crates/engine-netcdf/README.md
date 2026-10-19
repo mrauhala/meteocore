@@ -53,14 +53,30 @@ or downloaded whole.
 
 **Data it reads:** NetCDF-4 (HDF5) and classic CDF-1/2/5 files. A
 variable has `(y, x)` as its last two axes: 1-D latitude/longitude, or
-1-D projected x/y with a CF `grid_mapping` of `lambert_conformal_conic` or
-`geostationary`. It needs a time axis; an ensemble axis is read at
-`member`; every other axis has size 1, except one pressure axis. Rows
-stored south to north are drawn north-up. CF `scale_factor`/`add_offset`,
-`_FillValue`, `missing_value`, NaN, and netCDF's default float fill
-(when no `_FillValue` is set) are applied. Values and units are served as
-stored, never converted; layers without a `[[wms.parameters]]` style take
-the built-in default their name and unit select.
+1-D projected x/y in metres with a CF `grid_mapping` (below). It needs a
+time axis; an ensemble axis is read at `member`; every other axis has
+size 1, except one pressure axis. Rows stored south to north are drawn
+north-up. CF `scale_factor`/`add_offset`, `_FillValue`, `missing_value`,
+NaN, and netCDF's default float fill (when no `_FillValue` is set) are
+applied.
+
+**Grid mappings.** `lambert_conformal_conic` (one or two standard
+parallels, on a sphere or WGS84), `geostationary` (x/y may also be a scan
+angle in radians or microradians), `polar_stereographic` (scaled by
+`standard_parallel` or `scale_factor_at_projection_origin`; given both,
+they must agree), `lambert_azimuthal_equal_area` and
+`transverse_mercator`. The mapping must state its earth figure. The last
+three take WGS84 only, or GRS80, which matches it to 0.1 mm. A grid that
+holds a pole, such as an Arctic polar stereographic grid, advertises an
+extent reaching the pole.
+
+**Display units.** Each variable's CF `units`, in any spelling, picks
+the unit it is served in: K as °C, Pa as hPa, kg m-2 as mm, kg m-2 s-1 as
+mm/h, m2 s-2 as gpm. A unit without a rule, such as CF's `1` or m/s, is
+served as stored. Values are sampled from the stored field and converted
+after, so a map pixel, an EDR value and GetFeatureInfo at one point
+agree. Layers without a `[[wms.parameters]]` style take the built-in
+default their name and served unit select.
 
 **Pressure levels.** A dimension whose coordinate has pressure units
 (`Pa`, `hPa`, `mbar`, …) and is not a parametric coordinate is the
@@ -77,9 +93,9 @@ apart from its surface family (MEPS `sfc`).
   and an area is the step a map without `TIME` draws. With `datetime`,
   the newest run with a step in the window, preferring one that also
   spans the window's start; a window without a step is a 404.
-- Points and area cells are projected onto the grid once and sampled as
-  the map draws them. A point off the grid is null; a polygon outside the
-  grid's extent is a 404.
+- Points and area cells are projected onto the grid once, and sampled and
+  converted as the map draws them. A point off the grid is null; a polygon
+  outside the grid's extent is a 404.
 - An area is a CRS84 grid over the polygon's bounding box at the source's
   mean cell size, at most 256 cells per axis; cells outside the polygon
   are null. `radius` is answered as an area.
@@ -153,11 +169,16 @@ Process-wide environment variables, shared by every NetCDF collection:
   several height-above-ground or hybrid model levels is skipped; listed
   in `variables`, it makes the file unservable.
 - Every file must hold all the collection's variables on its grid; a
-  file missing one is skipped. Other grid mappings, 2-D (curvilinear)
-  latitude/longitude grids, and more than one ensemble member per
-  collection are not supported.
-- Grid-relative wind components on a projected grid give speed only (none
-  on a geostationary grid). `valid_range` is not applied; non-standard
+  file missing one is skipped. More than one ensemble member per
+  collection is not supported.
+- Not supported grids: other mappings (such as the oblique
+  `stereographic` and `rotated_latitude_longitude`), polar stereographic,
+  azimuthal equal-area and transverse Mercator on a sphere or another
+  ellipsoid, projected x/y in kilometres, and 2-D (curvilinear)
+  latitude/longitude grids.
+- Grid-relative wind components on a projected grid give speed only, and
+  nothing on a geostationary or azimuthal equal-area grid, whose axes are
+  not orthogonal on the ground. `valid_range` is not applied; non-standard
   calendars are refused.
 - A cold remote field slower than the render deadline fails that render
   with a 503; the fetch still completes into the cache for the next one.
@@ -177,7 +198,10 @@ pressure-level files cropped to 11 × 10 points, two runs);
 `netcdf-global/` (synthetic global grid without runs, packed and filled
 values); `netcdf-pressure-pa/` (synthetic Pa pressure axis, earth-relative
 wind); `netcdf-remote/` (synthetic MEPS-like files, served by a local HTTP
-test server for the range-read tests). `tests/live_thredds.rs` reads a few
+test server for the range-read tests); `netcdf-projections/` (synthetic
+polar stereographic, LAEA and transverse Mercator grids whose fields are
+each cell's own projected x/y, which `tests/grid_mappings.rs` checks
+against PROJ's `cs2cs`). `tests/live_thredds.rs` reads a few
 MEPS files from thredds.met.no and is ignored by default
 (`cargo test -p engine-netcdf --test live_thredds -- --ignored`).
 Contributor notes are in [CLAUDE.md](CLAUDE.md).

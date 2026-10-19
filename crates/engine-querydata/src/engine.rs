@@ -16,12 +16,12 @@ use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
     QueryResult,
 };
-use ds_core::resample::ProjectionGrid;
 use ds_core::temp_files;
 use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindRole, WindSource};
 
-use crate::parse::{GridInfo, QueryData};
+use crate::parse::{ParamInfo, QueryData};
+use crate::units;
 
 /// One retained model run: a parsed `.sqd` file plus its source path (for
 /// change detection on poll). Keyed in [`RunSet`] by the file's origin time.
@@ -270,17 +270,7 @@ impl EdrEngine for QueryDataEngine {
         };
         data.params
             .iter()
-            .map(|p| {
-                (
-                    p.name.clone(),
-                    ParameterDescription {
-                        label: p.name.clone(),
-                        unit: String::new(),
-                        observed_property: p.name.clone(),
-                        standard_name: None,
-                    },
-                )
-            })
+            .map(|p| (p.name.clone(), description(p)))
             .collect()
     }
 
@@ -372,17 +362,7 @@ impl EdrEngine for QueryDataEngine {
             .collect();
         let descriptions: Vec<(String, ParameterDescription)> = param_indices
             .iter()
-            .map(|(_, param)| {
-                (
-                    param.name.clone(),
-                    ParameterDescription {
-                        label: param.name.clone(),
-                        unit: String::new(),
-                        observed_property: param.name.clone(),
-                        standard_name: None,
-                    },
-                )
-            })
+            .map(|(_, param)| (param.name.clone(), description(param)))
             .collect();
         plan.into_response(&descriptions, &values)
     }
@@ -463,15 +443,7 @@ impl EdrEngine for QueryDataEngine {
                     })
                 }));
             }
-            params_map.insert(
-                param.name.clone(),
-                ParameterDescription {
-                    label: param.name.clone(),
-                    unit: String::new(),
-                    observed_property: param.name.clone(),
-                    standard_name: None,
-                },
-            );
+            params_map.insert(param.name.clone(), description(param));
             let (shape, axis_names) = if has_time {
                 (
                     vec![times.len(), ny, nx],
@@ -542,15 +514,7 @@ impl EdrEngine for QueryDataEngine {
                 .map(|(ti, _)| interpolate(&data, lon, lat, *pi, 0, *ti))
                 .collect();
 
-            params_map.insert(
-                param.name.clone(),
-                ParameterDescription {
-                    label: param.name.clone(),
-                    unit: String::new(),
-                    observed_property: param.name.clone(),
-                    standard_name: None,
-                },
-            );
+            params_map.insert(param.name.clone(), description(param));
 
             ranges.insert(
                 param.name.clone(),
@@ -613,16 +577,18 @@ impl MapEngine for QueryDataEngine {
         // Each output pixel's WGS84 lon/lat comes from the shared
         // `OutputCrs::project_node` (linear lon/lat, Mercator-Y, or a projected
         // output CRS; #160), and the source grid — itself possibly projected
-        // (LCC, stereographic, rotated lat-lon) — is sampled by
-        // `world_to_grid_px` (`Crs::forward` + affine) then bilinear.
+        // (LCC, stereographic, rotated lat-lon) — is sampled at its grid
+        // position (`Crs::forward` + affine) by `sample_grid_bilinear`.
         // A lat/lon source (`Crs::Wgs84`, forward = identity) under lat/lon
         // or Web Mercator output needs no projection at all: sample per
         // pixel. Every other pairing runs a projection per node — the
         // output's inverse, the source's forward (LCC `powf`/`atan2` for
-        // MEPS), or both — so compose them into a coarse `ProjectionGrid` and
-        // bilinearly interpolate the output→source pixel map rather than
-        // projecting per output pixel (Critical Rule 5; #268, #807). A
-        // projected source's map is bounded by its footprint ([`GridMap`]).
+        // MEPS), or both — so it takes the shared sampler's coarse
+        // output→source map (`SourceGrid::output_map_quiet`) rather than
+        // projecting per output pixel (Critical Rule 5; #268, #807, #1190):
+        // a lat/lon grid's is periodic in longitude, so the pole and the
+        // EPSG:3035 cut stay registered (#323, #1188), and a projected
+        // grid's is bounded by its footprint (#1114).
         let gt = data.grid.geo_transform();
         let per_pixel = matches!(output_crs, OutputCrs::Wgs84 | OutputCrs::WebMercator)
             && matches!(gt.crs, ds_core::geo::Crs::Wgs84);
@@ -632,7 +598,14 @@ impl MapEngine for QueryDataEngine {
             // `sample_grid_bilinear` reaches). A viewport may reach past
             // ±180° (OGC API Maps unwraps a bbox crossing the antimeridian,
             // #828), and such a pixel shows the meridian a turn away: 185°
-            // is 175°W. A longitude already in the frame is used as is.
+            // is 175°W. A longitude already in the frame is used as is. A
+            // box given `west > east` (170, 10, -170, 20) is unwrapped
+            // first, as the shared map unwraps it.
+            let [west, south, mut east, north] = bbox;
+            if west > east {
+                east += 360.0;
+            }
+            let bbox = [west, south, east, north];
             let frame = (gt.pixel_width > 0.0).then(|| {
                 let west = gt.origin_x - 0.5 * gt.pixel_width;
                 west..west + 360.0
@@ -644,6 +617,7 @@ impl MapEngine for QueryDataEngine {
                 _ => lon,
             };
             for row in 0..height {
+                ds_core::deadline::check()?;
                 let fy = (row as f64 + 0.5) / height as f64;
                 for col in 0..width {
                     let fx = (col as f64 + 0.5) / width as f64;
@@ -658,12 +632,12 @@ impl MapEngine for QueryDataEngine {
                     ));
                 }
             }
-        } else if let Some(map) =
-            GridMap::new(&data.grid, bbox, width, height, output_crs, |lon, lat| {
-                world_to_grid_px(gt, lon, lat)
-            })
-        {
-            if let Some(error_px) = map.grid.capped_error() {
+        } else {
+            let map = data
+                .grid
+                .source()
+                .output_map_quiet(bbox, width, height, output_crs);
+            if let Some(error_px) = map.capped_error() {
                 tracing::warn!(
                     collection = %self.collection_id,
                     ?bbox,
@@ -677,15 +651,13 @@ impl MapEngine for QueryDataEngine {
                 );
             }
             for oy in 0..height {
+                ds_core::deadline::check()?;
                 for ox in 0..width {
                     values.push(map.position(ox, oy).and_then(|(col_f, row_f)| {
                         sample_grid_bilinear(&data, col_f, row_f, param_idx, 0, time_idx)
                     }));
                 }
             }
-        } else {
-            // The footprint misses the image: nothing to draw.
-            values.resize(width as usize * height as usize, None);
         }
 
         Ok(RasterTile {
@@ -753,10 +725,10 @@ impl MapEngine for QueryDataEngine {
         drop(set);
         let param_idx = self.resolve_map_param_idx(&data);
 
-        let param_name = data
+        let (param_name, param_unit) = data
             .params
             .get(param_idx)
-            .map(|p| p.name.clone())
+            .map(|p| (p.name.clone(), units::unit(p.id).to_string()))
             .unwrap_or_default();
 
         let gt = data.grid.geo_transform();
@@ -773,8 +745,8 @@ impl MapEngine for QueryDataEngine {
             _ => "projected".to_string(),
         };
 
-        // QueryData descriptors carry no trustworthy unit metadata. Keep units
-        // unknown instead of inferring physical units from names.
+        // Each unit is its FMI parameter number's (`units`), never one
+        // inferred from a name: the style defaults key on it (#1211).
         let parameters: Vec<ds_core::map_engine::ParameterInfo> = data
             .params
             .iter()
@@ -784,7 +756,7 @@ impl MapEngine for QueryDataEngine {
                 ds_core::map_engine::ParameterInfo {
                     name: short,
                     title: p.name.clone(),
-                    unit: String::new(),
+                    unit: units::unit(p.id).to_string(),
                 }
             })
             .collect();
@@ -794,7 +766,7 @@ impl MapEngine for QueryDataEngine {
             spatial_extent: Some(bbox),
             times: data.times.clone(),
             parameter: param_name,
-            unit: String::new(),
+            unit: param_unit,
             parameters,
             vertical: None,
             grid_size: Some([gt.width, gt.height]),
@@ -904,7 +876,8 @@ fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id
 }
 
 /// What a run states about its wind components (#897): each parameter's
-/// FMI number and its map and EDR names, and the frame of its u/v.
+/// FMI number, the unit that number fixes (#1211), its map and EDR names,
+/// and the frame of its u/v.
 ///
 /// The format has no u/v frame flag (neither the header, a parameter
 /// descriptor nor an area class carries one), so the frame is FMI newbase's
@@ -934,6 +907,7 @@ fn wind_facts(data: &QueryData) -> WindFacts {
                     fmi_param: WindRole::from_fmi_param(p.id).map(|_| p.id),
                     // newbase's convention, see above.
                     frame: VectorFrame::Grid,
+                    unit: units::unit(p.id).to_string(),
                     ..ParameterFacts::new(name)
                 }
             })
@@ -948,6 +922,17 @@ fn map_name(name: &str) -> &str {
     name.rfind('(')
         .and_then(|start| name[start + 1..].strip_suffix(')'))
         .unwrap_or(name)
+}
+
+/// A parameter's EDR description: its full descriptor, and the unit its
+/// FMI parameter number fixes (`units`, #1211), empty when unsourced.
+fn description(param: &ParamInfo) -> ParameterDescription {
+    ParameterDescription {
+        label: param.name.clone(),
+        unit: units::unit(param.id).to_string(),
+        observed_property: param.name.clone(),
+        standard_name: None,
+    }
 }
 
 fn load_file(path: &Path, collection_id: &str) -> Result<QueryData, DataServerError> {
@@ -975,8 +960,9 @@ fn log_loaded(collection_id: &str, path: &Path, data: &QueryData) {
 /// Bilinear interpolation at (lon, lat) for a given parameter and time.
 ///
 /// Used by EDR position queries and the `Wgs84`/`WebMercator` map path. The
-/// projected map path instead drives [`sample_grid_bilinear`] through a coarse
-/// [`ProjectionGrid`] to avoid per-pixel projection (#268).
+/// projected map path instead drives [`sample_grid_bilinear`] through the
+/// shared coarse map (`OutputMap::position`) to avoid per-pixel projection
+/// (#268, #1190).
 fn interpolate(
     data: &QueryData,
     lon: f64,
@@ -1002,7 +988,7 @@ fn interpolate(
 fn select_param_indices<'a>(
     data: &'a QueryData,
     parameters: Option<&[String]>,
-) -> Result<Vec<(usize, &'a crate::parse::ParamInfo)>, DataServerError> {
+) -> Result<Vec<(usize, &'a ParamInfo)>, DataServerError> {
     let names: Vec<&str> = data.params.iter().map(|p| p.name.as_str()).collect();
     let selected = ds_core::edr_engine::select_parameters(parameters, &names)?;
     if selected.is_empty() {
@@ -1018,126 +1004,15 @@ fn select_param_indices<'a>(
 
 /// Map WGS84 (lon, lat) to fractional source-grid pixel `(col_f, row_f)` — the
 /// source `Crs::forward` plus the grid's affine, with the half-pixel centre
-/// offset. This is the (possibly projected) per-node mapping fed to
-/// [`GridMap`] and the front half of [`interpolate`].
+/// offset: the position `ds_core::resample::SourceGrid` measures, and the
+/// front half of [`interpolate`]. A map render projected per node takes its
+/// positions from the shared map instead (`OutputMap::position`).
 fn world_to_grid_px(gt: &ds_core::geo::GeoTransform, lon: f64, lat: f64) -> (f64, f64) {
     let (x, y) = gt.crs.forward(lon, lat);
     (
         (x - gt.origin_x) / gt.pixel_width - 0.5,
         (gt.origin_y - y) / gt.pixel_height - 0.5,
     )
-}
-
-/// The output→source pixel map of a map request the engine does not sample
-/// per pixel: a coarse [`ProjectionGrid`] over the output, by the rules of
-/// `ds_core::resample::SourceGrid` (pinned in `engine/sampler_tests.rs`).
-///
-/// A projected grid ([`GridInfo::footprint`]) is projected from a
-/// longitude within half a turn of its own centre: `Lcc::forward` is not
-/// periodic in longitude (θ = n·Δλ), so a pixel a turn away, in a second
-/// world copy of a Web Mercator view, would otherwise land on data that
-/// lies elsewhere. Output outside the footprint window of the grid's
-/// envelope ([`OutputCrs::footprint_window_in_image`]) stays empty (#449),
-/// and the grid is refined for that window alone
-/// ([`ProjectionGrid::build_2d_within_quiet`]): outside it the map need
-/// not be smooth, and refining for it ran polar WMS meta-tiles to
-/// `MAX_CELLS`, about 1.5 million projections each (#1114). A lat/lon
-/// grid's window is the whole output, as before.
-struct GridMap {
-    grid: ProjectionGrid,
-    /// The inclusive output window `(px_lo, px_hi, py_lo, py_hi)` the
-    /// grid's footprint can occupy.
-    window: (u32, u32, u32, u32),
-}
-
-impl GridMap {
-    /// The map of `info` onto a `width`×`height` image of `bbox`, the
-    /// request's WGS84 box, in `output_crs`; `None` when the image is
-    /// empty or the footprint lies wholly off it, so there is nothing to
-    /// draw and no grid is built (#1129). `to_grid` is the grid's
-    /// [`world_to_grid_px`]. A box crossing the antimeridian may come
-    /// either way: `west > east` (170, 10, -170, 20), or unwrapped with
-    /// `east` past 180° (170, 10, 190, 20), as OGC API Maps passes it
-    /// (#828).
-    ///
-    /// A grid stopped at its cell cap is not reported on stderr: the
-    /// caller logs [`ProjectionGrid::capped_error`] with the request.
-    fn new(
-        info: &GridInfo,
-        bbox: [f64; 4],
-        width: u32,
-        height: u32,
-        output_crs: &OutputCrs,
-        to_grid: impl Fn(f64, f64) -> (f64, f64),
-    ) -> Option<Self> {
-        if width == 0 || height == 0 {
-            return None;
-        }
-        let [west, south, mut east, north] = bbox;
-        if west > east {
-            east += 360.0;
-        }
-        let bbox = [west, south, east, north];
-        let (window, centre) = match info.footprint() {
-            Some(envelope) => (
-                output_crs.footprint_window_in_image(
-                    bbox,
-                    envelope_near(envelope, bbox, output_crs),
-                    width,
-                    height,
-                )?,
-                Some((envelope[0] + envelope[2]) / 2.0),
-            ),
-            None => ((0, width - 1, 0, height - 1), None),
-        };
-        let grid = ProjectionGrid::build_2d_within_quiet(
-            width,
-            height,
-            window,
-            info.nx,
-            info.ny,
-            |fx, fy| output_crs.project_node(bbox, fx, fy),
-            |lon, lat| to_grid(centre.map_or(lon, |c| within_half_turn(lon, c)), lat),
-        );
-        Some(GridMap { grid, window })
-    }
-
-    /// The fractional grid position output pixel `(ox, oy)` samples, as
-    /// [`world_to_grid_px`] gives it; `None` outside the footprint.
-    fn position(&self, ox: u32, oy: u32) -> Option<(f64, f64)> {
-        let (x_lo, x_hi, y_lo, y_hi) = self.window;
-        ((x_lo..=x_hi).contains(&ox) && (y_lo..=y_hi).contains(&oy))
-            .then(|| self.grid.sample(ox, oy))
-    }
-}
-
-/// `lon` moved by whole turns into `[centre - 180°, centre + 180°)`. A
-/// longitude already there is returned as is, so it never moves by a
-/// rounding error; NaN stays NaN.
-fn within_half_turn(lon: f64, centre: f64) -> f64 {
-    let start = centre - 180.0;
-    if (start..start + 360.0).contains(&lon) {
-        lon
-    } else {
-        start + (lon - start).rem_euclid(360.0)
-    }
-}
-
-/// The envelope [`OutputCrs::footprint_pixel_window`] needs for `bbox`: on
-/// geographic output, moved by whole turns to the box's longitudes, which
-/// may lie past ±180°; spanning the whole turn, it bounds latitude only.
-/// A projected output places the envelope by its own forward transform.
-fn envelope_near(envelope: [f64; 4], bbox: [f64; 4], output_crs: &OutputCrs) -> [f64; 4] {
-    if matches!(output_crs, OutputCrs::Projected { .. }) {
-        return envelope;
-    }
-    let [w, s, e, n] = envelope;
-    let [west, _, east, _] = bbox;
-    if e - w >= 360.0 {
-        return [west, s, east, n];
-    }
-    let turns = ((west + east - w - e) / 720.0).round() * 360.0;
-    [w + turns, s, e + turns, n]
 }
 
 /// Bilinearly sample the grid at fractional source pixel `(col_f, row_f)`,
@@ -1148,6 +1023,14 @@ fn envelope_near(envelope: [f64; 4], bbox: [f64; 4], output_crs: &OutputCrs) -> 
 /// rejected up front because NaN comparisons are false and `NaN as i64/usize`
 /// saturates to 0, so the bounds guards would otherwise pass and return
 /// grid-origin data.
+///
+/// A global lat/lon grid's columns repeat every turn
+/// (`SourceGrid::global_period`, #1188): the column is taken within the
+/// turn from the first, and the column one past the last is the first, so
+/// a pixel or point across the grid's seam interpolates between its last
+/// and first columns. These are the shared sampler's rules
+/// (`ds_core::resample::SourceGrid`), read from the memory map instead of a
+/// decoded field.
 fn sample_grid_bilinear(
     data: &QueryData,
     col_f: f64,
@@ -1160,42 +1043,60 @@ fn sample_grid_bilinear(
         return None;
     }
 
+    let nx = data.grid.nx as i64;
+    let ny = data.grid.ny as i64;
+    let period = data.grid.source().global_period();
+    let col_f = period.map_or(col_f, |p| col_f.rem_euclid(p));
+
     let col0 = col_f.floor() as i64;
     let row0 = row_f.floor() as i64;
 
-    let nx = data.grid.nx as i64;
-    let ny = data.grid.ny as i64;
-
-    if col0 < -1 || col0 >= nx || row0 < -1 || row0 >= ny {
+    if row0 < -1 || row0 >= ny || (period.is_none() && (col0 < -1 || col0 >= nx)) {
         return None;
     }
 
+    // The stored column of grid column `c`: on a global grid, one past the
+    // last is the first.
+    let column = |c: i64| {
+        if period.is_some() && c >= nx {
+            Some(0)
+        } else {
+            (0..nx).contains(&c).then_some(c)
+        }
+    };
+    let at = |c: Option<i64>, r: i64| {
+        let c = c.filter(|_| (0..ny).contains(&r))?;
+        let qd_row = (ny - 1 - r) as usize;
+        data.value(
+            param_idx,
+            qd_row * nx as usize + c as usize,
+            level_idx,
+            time_idx,
+        )
+    };
+
     let dx = col_f - col0 as f64;
     let dy = row_f - row0 as f64;
+    let (c0, c1) = (column(col0), column(col0 + 1));
 
-    let mut vals = [None; 4];
-    for (i, (dr, dc)) in [(0, 0), (0, 1), (1, 0), (1, 1)].iter().enumerate() {
-        let c = col0 + dc;
-        let r = row0 + dr;
-        if c >= 0 && c < nx && r >= 0 && r < ny {
-            let qd_row = (ny - 1 - r) as usize;
-            let grid_idx = qd_row * nx as usize + c as usize;
-            vals[i] = data.value(param_idx, grid_idx, level_idx, time_idx);
-        }
-    }
-
-    match (vals[0], vals[1], vals[2], vals[3]) {
+    match (
+        at(c0, row0),
+        at(c1, row0),
+        at(c0, row0 + 1),
+        at(c1, row0 + 1),
+    ) {
         (Some(tl), Some(tr), Some(bl), Some(br)) => {
             let top = tl + (tr - tl) * dx;
             let bot = bl + (br - bl) * dx;
             Some(top + (bot - top) * dy)
         }
         _ => {
-            let nc = (col_f + 0.5).floor().clamp(0.0, (nx - 1) as f64) as usize;
-            let nr = (row_f + 0.5).floor().clamp(0.0, (ny - 1) as f64) as usize;
-            let qd_row = (ny as usize - 1) - nr;
-            let grid_idx = qd_row * nx as usize + nc;
-            data.value(param_idx, grid_idx, level_idx, time_idx)
+            let nearest = |f: f64, n: i64| ((f + 0.5).floor() as i64).clamp(0, n - 1);
+            let nc = match period {
+                Some(_) => column((col_f + 0.5).floor() as i64),
+                None => Some(nearest(col_f, nx)),
+            };
+            at(nc, nearest(row_f, ny))
         }
     }
 }
@@ -1998,6 +1899,10 @@ mod tests {
 #[cfg(test)]
 mod footprint_tests;
 #[cfg(test)]
+mod global_tests;
+#[cfg(test)]
 mod sampler_tests;
+#[cfg(test)]
+mod units_tests;
 #[cfg(test)]
 mod wind_tests;

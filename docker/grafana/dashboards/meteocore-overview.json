@@ -1418,6 +1418,11 @@
           "legendFormat": "Lightning strike windows (#504)"
         },
         {
+          "expr": "rate(station_frame_cache_hits_total[$__rate_interval]) / clamp_min(rate(station_frame_cache_hits_total[$__rate_interval]) + rate(station_frame_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "SF",
+          "legendFormat": "Station map frames (#1063)"
+        },
+        {
           "expr": "rate(satellite_frame_cache_hits_total[$__rate_interval]) / clamp_min(rate(satellite_frame_cache_hits_total[$__rate_interval]) + rate(satellite_frame_cache_misses_total[$__rate_interval]), 1e-9)",
           "refId": "F",
           "legendFormat": "Satellite scans (#819)"
@@ -1544,6 +1549,11 @@
           "expr": "rate(lightning_strike_cache_misses_total[$__rate_interval])",
           "refId": "A",
           "legendFormat": "Lightning strike windows (#504)"
+        },
+        {
+          "expr": "rate(station_frame_cache_misses_total[$__rate_interval])",
+          "refId": "SF",
+          "legendFormat": "Station map frames (#1063)"
         },
         {
           "expr": "rate(satellite_frame_cache_misses_total[$__rate_interval])",
@@ -1674,6 +1684,11 @@
           "expr": "lightning_strike_cache_bytes / clamp_min(lightning_strike_cache_capacity_bytes, 1)",
           "refId": "B",
           "legendFormat": "Lightning strike windows (#504)"
+        },
+        {
+          "expr": "station_frame_cache_bytes / clamp_min(station_frame_cache_capacity_bytes, 1)",
+          "refId": "SF",
+          "legendFormat": "Station map frames (#1063)"
         },
         {
           "expr": "satellite_frame_cache_bytes / clamp_min(satellite_frame_cache_capacity_bytes, 1)",
@@ -4049,6 +4064,232 @@
           "mode": "multi"
         }
       }
+    },
+    {
+      "type": "row",
+      "title": "Station grids (derived collections, #1082)",
+      "id": 84,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 270
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Stations behind the latest analysis",
+      "description": "Stations the latest analysis of each station-grid parameter was computed from: the first thing to check when an analysis looks wrong. A drop means the source lost stations (a feed outage, a filtered window) and the field is interpolated from fewer, farther stations; 0 draws an empty map.",
+      "id": 85,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 271
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "none",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "station_grid_stations",
+          "refId": "A",
+          "legendFormat": "{{collection}} {{parameter}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Analyses, failures and last duration",
+      "description": "Analyses computed per hour (request misses plus the poll's pre-compute and revisions), failed analyses and source reads per hour, and the last analysis's wall-clock duration. A duration near the 3 s render deadline means cold map requests answer 503 until the pre-compute catches up: coarsen the grid or raise MC_STATION_GRID_WORKERS. Rejected/h counts analyses turned away (503) because MC_STATION_GRID_MEMORY_MB was full.",
+      "id": 86,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 271
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(station_grid_analyses_total[$__rate_interval]) * 3600",
+          "refId": "A",
+          "legendFormat": "{{collection}} analyses/h"
+        },
+        {
+          "expr": "rate(station_grid_failures_total[$__rate_interval]) * 3600",
+          "refId": "B",
+          "legendFormat": "{{collection}} failures/h"
+        },
+        {
+          "expr": "station_grid_last_analysis_ms / 1000",
+          "refId": "C",
+          "legendFormat": "{{collection}} last analysis (s)"
+        },
+        {
+          "expr": "rate(station_grid_compute_rejected_total[$__rate_interval]) * 3600",
+          "refId": "D",
+          "legendFormat": "rejected/h"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Station-grid cache — hit ratio and fill",
+      "description": "Hit ratio of the shared analysis cache and its fill against MC_STATION_GRID_CACHE_MB. Every revision of the observations re-keys a collection's grids, so a burst of misses after a late report is expected; a low ratio otherwise means the cache holds fewer grids than the maps animate over.",
+      "id": 87,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 279
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "percentunit",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(station_grid_cache_hits_total[$__rate_interval]) / clamp_min(rate(station_grid_cache_hits_total[$__rate_interval]) + rate(station_grid_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "A",
+          "legendFormat": "hit ratio"
+        },
+        {
+          "expr": "station_grid_cache_bytes / clamp_min(station_grid_cache_capacity_bytes, 1)",
+          "refId": "B",
+          "legendFormat": "fill"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Station-grid computation admission",
+      "description": "Bytes reserved by analyses being computed against MC_STATION_GRID_MEMORY_MB. Analyses it turned away (503) are under “Analyses, failures and last duration”.",
+      "id": 88,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 279
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "station_grid_compute_reserved_bytes",
+          "refId": "A",
+          "legendFormat": "reserved"
+        },
+        {
+          "expr": "station_grid_compute_capacity_bytes",
+          "refId": "B",
+          "legendFormat": "capacity"
+        }
+      ]
     }
   ]
 }

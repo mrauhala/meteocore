@@ -918,15 +918,15 @@ mod tests {
     /// A projected box wholly outside its projection keeps its metres in the
     /// output CRS, and its read window names no place: NaN, never a real
     /// position such as 0°, 0° (#1089). EPSG:3067's lie past a pole, and
-    /// past 50° east of its meridian, where its inverse once gave places
-    /// anywhere (#1113).
+    /// past its area's east edge, where its series stops being exact
+    /// (#1113, #1130).
     #[test]
     fn projected_bbox_wholly_outside_has_no_read_window() {
         for (crs, metres) in [
             ("EPSG:3035", [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
             ("EPSG:3067", [0.0, 2.1e7, 1.0e6, 2.2e7]),
             ("EPSG:3067", [0.0, -2.2e7, 1.0e6, -2.1e7]),
-            ("EPSG:3067", [5.0e6, 6.5e6, 6.0e6, 7.0e6]),
+            ("EPSG:3067", [1.1e7, 6.5e6, 1.2e7, 7.0e6]),
         ] {
             let bbox = metres.map(|v| v.to_string()).join(",");
             let (read, output) = parse_bbox(&bbox, crs).unwrap();

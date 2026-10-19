@@ -62,6 +62,7 @@ async fn geojson_source_arrays_survive_item_and_listing_responses() {
             base_url: "https://example.test".into(),
             trust_proxy_headers: false,
             vector_tileset_ids: Default::default(),
+            collection_pages: Default::default(),
         },
     )));
 

@@ -27,6 +27,7 @@ engine-cap = { path = "../engine-cap" }
 engine-bufr = { path = "../engine-bufr" }
 engine-postgis = { path = "../engine-postgis" }
 engine-nowcast = { path = "../engine-nowcast" }
+engine-station-grid = { path = "../engine-station-grid" }
 api-common = { path = "../api-common" }
 api-edr = { path = "../api-edr" }
 api-features = { path = "../api-features" }

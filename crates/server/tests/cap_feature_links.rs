@@ -98,6 +98,7 @@ fn features_app(dir: &std::path::Path) -> (Router, Arc<dyn FeatureEngine>) {
                 base_url: BASE.into(),
                 trust_proxy_headers: false,
                 vector_tileset_ids: Default::default(),
+                collection_pages: Default::default(),
             },
         ))),
     );

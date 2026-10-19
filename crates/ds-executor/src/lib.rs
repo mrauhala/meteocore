@@ -1,6 +1,9 @@
 //! Bounded render admission and blocking execution shared by HTTP APIs.
 pub mod budget;
 pub mod field_jobs;
+use ds_core::error::DataServerError;
+use std::cell::RefCell;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
@@ -221,6 +224,9 @@ pub enum ExecutionError {
 pub struct RenderJob {
     permit: OwnedSemaphorePermit,
     deadline: Instant,
+    /// The queue it was admitted through, which it rejoins while it waits
+    /// without its slot ([`wait_without_slot`]).
+    waiting: Arc<Semaphore>,
 }
 
 impl RenderJob {
@@ -317,10 +323,15 @@ impl RenderJob {
         }
         if let Some(reservation) = memory.try_reserve(bytes) {
             if let Ok(permit) = slots.clone().try_acquire_owned() {
-                return Ok((Self { permit, deadline }, Arc::new(reservation)));
+                let job = Self {
+                    permit,
+                    deadline,
+                    waiting,
+                };
+                return Ok((job, Arc::new(reservation)));
             }
         }
-        let _queued = waiting.try_acquire_owned().map_err(|_| {
+        let _queued = waiting.clone().try_acquire_owned().map_err(|_| {
             REJECTED.fetch_add(1, Ordering::Relaxed);
             ExecutionError::Busy
         })?;
@@ -334,7 +345,12 @@ impl RenderJob {
             .await
             .map_err(|_| timeout_error(&TIMED_OUT_QUEUE))?
             .map_err(|_| ExecutionError::Busy)?;
-        Ok((Self { permit, deadline }, Arc::new(reservation)))
+        let job = Self {
+            permit,
+            deadline,
+            waiting,
+        };
+        Ok((job, Arc::new(reservation)))
     }
 
     pub async fn acquire(slots: Arc<Semaphore>) -> Result<Self, ExecutionError> {
@@ -367,7 +383,7 @@ impl RenderJob {
             Err(_) => {
                 // Only actual waiters count; zero queue capacity still allows
                 // immediately available CPU slots. RAII releases on disconnect.
-                let _queued = waiting.try_acquire_owned().map_err(|_| {
+                let _queued = waiting.clone().try_acquire_owned().map_err(|_| {
                     REJECTED.fetch_add(1, Ordering::Relaxed);
                     ExecutionError::Busy
                 })?;
@@ -377,7 +393,11 @@ impl RenderJob {
                     .map_err(|_| ExecutionError::Busy)?
             }
         };
-        Ok(Self { permit, deadline })
+        Ok(Self {
+            permit,
+            deadline,
+            waiting,
+        })
     }
 
     /// Run `work` on a blocking-pool thread of the calling runtime, as a
@@ -410,20 +430,129 @@ impl RenderJob {
     }
 
     /// `work` as a worker: it owns the slot until it returns, runs under the
-    /// absolute deadline, and never starts once that has passed.
+    /// absolute deadline, and never starts once that has passed. The slot
+    /// sits where [`wait_without_slot`] finds it while `work` runs.
     fn worker<T>(
         self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> impl FnOnce() -> Result<T, ExecutionError> + Send + 'static {
-        let Self { permit, deadline } = self;
+        let Self {
+            permit,
+            deadline,
+            waiting,
+        } = self;
         move || {
-            let _permit = permit;
+            let _slot = RunningScope::enter(Running {
+                permit,
+                deadline,
+                waiting,
+            });
             let _scope = ds_core::deadline::enter(Some(deadline));
             if Instant::now() >= deadline {
                 return Err(ExecutionError::Timeout);
             }
             Ok(work())
         }
+    }
+}
+
+thread_local! {
+    /// The slot of the job whose worker runs on this thread, from the
+    /// worker's start to its return, for [`wait_without_slot`].
+    static RUNNING: RefCell<Option<Running>> = const { RefCell::new(None) };
+}
+
+/// A running job's slot, and what it needs to take one again.
+struct Running {
+    permit: OwnedSemaphorePermit,
+    deadline: Instant,
+    waiting: Arc<Semaphore>,
+}
+
+/// Keeps a running job's slot in [`RUNNING`] and releases it, or the slot
+/// taken in its place, when the worker returns or unwinds.
+struct RunningScope(Option<Running>);
+
+impl RunningScope {
+    fn enter(running: Running) -> Self {
+        Self(RUNNING.replace(Some(running)))
+    }
+}
+
+impl Drop for RunningScope {
+    fn drop(&mut self) {
+        drop(RUNNING.replace(self.0.take()));
+    }
+}
+
+/// Run `wait`, a blocking wait for work another job is doing, such as
+/// another tile's build of a value both need (#1155), without holding this
+/// job's render slot, so that work and other renders can use it meanwhile.
+/// The job then takes a slot again, behind the renders already queued for
+/// one, before this returns. Call it only around a wait that uses no CPU:
+/// the slots bound the CPU renders use.
+///
+/// While it waits the job counts as a queued render, so the queue still
+/// bounds the renders admitted at once. It keeps its memory reservation and
+/// its deadline. With the queue full it keeps its slot and waits in it, as
+/// it would without this call: a running job is never shed. Outside a
+/// job's worker `wait` just runs.
+///
+/// `Err(DeadlineExceeded)` when the job's deadline passes before a slot
+/// frees; `wait`'s result is dropped then.
+pub fn wait_without_slot<T>(wait: impl FnOnce() -> T) -> Result<T, DataServerError> {
+    let Some(running) = RUNNING.with_borrow_mut(Option::take) else {
+        return Ok(wait());
+    };
+    let Ok(queued) = running.waiting.clone().try_acquire_owned() else {
+        RUNNING.set(Some(running));
+        return Ok(wait());
+    };
+    let Running {
+        permit,
+        deadline,
+        waiting,
+    } = running;
+    let slots = permit.semaphore().clone();
+    drop(permit);
+    let output = wait();
+    // The slots are never closed: a closed semaphore would end the job as
+    // its deadline does.
+    let permit = block_until(slots.acquire_owned(), deadline)
+        .and_then(Result::ok)
+        .ok_or(DataServerError::DeadlineExceeded)?;
+    drop(queued);
+    RUNNING.set(Some(Running {
+        permit,
+        deadline,
+        waiting,
+    }));
+    Ok(output)
+}
+
+/// Poll `future` on this thread until it is ready or `deadline` passes,
+/// parking between polls. Tokio's semaphore needs no runtime, only a waker;
+/// `unconstrained` keeps a query-runtime worker's task budget from holding
+/// the permit back.
+fn block_until<F: Future>(future: F, deadline: Instant) -> Option<F::Output> {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(tokio::task::coop::unconstrained(future));
+    loop {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return Some(output);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        std::thread::park_timeout(deadline - now);
     }
 }
 
@@ -925,6 +1054,97 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(memory.available(), memory.capacity());
+    }
+
+    /// #1155: a job waiting for another job's work stands aside from its
+    /// slot, so that work can run in it, then takes a slot again. Holding
+    /// it, the one slot would leave the other job queued until the
+    /// deadline. While it waits it counts as queued.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_waits_for_another_without_its_slot() {
+        let slots = Arc::new(Semaphore::new(1));
+        let waiting = Arc::new(Semaphore::new(2));
+        let timeout = Duration::from_secs(2);
+        let first = RenderJob::acquire_on(slots.clone(), waiting.clone(), timeout)
+            .await
+            .unwrap();
+        let (built, wait) = std::sync::mpsc::channel();
+        let first = tokio::spawn(first.run(move || {
+            let value = wait_without_slot(|| wait.recv().unwrap());
+            (value, ds_core::deadline::check())
+        }));
+        let second = RenderJob::acquire_on(slots.clone(), waiting.clone(), timeout)
+            .await
+            .unwrap();
+        let queued = waiting.clone();
+        let queued_while_building = second
+            .run(move || {
+                built.send(7).unwrap();
+                queued.available_permits()
+            })
+            .await
+            .unwrap();
+        assert_eq!(queued_while_building, 1, "the waiting job counts as queued");
+        let (value, deadline) = first.await.unwrap().unwrap();
+        assert_eq!(value.unwrap(), 7);
+        assert!(deadline.is_ok(), "the job keeps its deadline");
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "the slot taken again is freed"
+        );
+        assert_eq!(waiting.available_permits(), 2);
+    }
+
+    /// #1155: a job that cannot take a slot again by its deadline fails
+    /// with the deadline, and releases the queue place it waited in. Here
+    /// the wait itself takes the freed slot and keeps it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retaking_a_slot_ends_at_the_deadline() {
+        let slots = Arc::new(Semaphore::new(1));
+        let waiting = Arc::new(Semaphore::new(1));
+        let timeout = Duration::from_millis(300);
+        let job = RenderJob::acquire_on(slots.clone(), waiting.clone(), timeout)
+            .await
+            .unwrap();
+        let taken = slots.clone();
+        let (sent, result) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let outcome = job
+            .run(move || {
+                let result = wait_without_slot(|| taken.try_acquire_owned().expect("a free slot"));
+                sent.send(result.map(drop)).unwrap();
+            })
+            .await;
+        // The job ends past its deadline, which the join reports.
+        assert!(matches!(outcome, Err(ExecutionError::Timeout)));
+        let result = result.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
+        assert!(started.elapsed() >= timeout);
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(waiting.available_permits(), 1);
+    }
+
+    /// #1155: with the queue full a job keeps its slot while it waits and is
+    /// never shed; outside a job the wait just runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_keeps_its_slot_when_the_queue_is_full() {
+        let slots = Arc::new(Semaphore::new(1));
+        let job = RenderJob::acquire_on(
+            slots.clone(),
+            Arc::new(Semaphore::new(0)),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let held = slots.clone();
+        let free_while_waiting = job
+            .run(move || wait_without_slot(|| held.available_permits()))
+            .await
+            .unwrap();
+        assert_eq!(free_while_waiting.unwrap(), 0);
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(wait_without_slot(|| 5).unwrap(), 5);
     }
 
     /// A query runs on the query runtime, never on the caller's. On a

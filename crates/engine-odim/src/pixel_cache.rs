@@ -8,10 +8,13 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
+use std::time::Instant;
 
 use ds_cache::ByteBoundedCache;
+use ds_core::error::DataServerError;
 use ds_storage::bytes::Bytes;
+use ds_storage::PendingGet;
 use quick_cache::sync::Cache;
 
 use crate::reader::RawPixels;
@@ -66,13 +69,121 @@ pub struct PixelCache {
     inserts: AtomicU64,
     /// Only active file loads own locks; expired weak entries are pruned on
     /// the next miss. No raw file bytes or decoded arrays are retained here.
-    loading: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    loading: Mutex<HashMap<String, Weak<FileLoad>>>,
     /// Downloaded volume files a background sibling decode is still working
     /// through (#994), keyed like `loading`. A cold miss on such a file
     /// decodes from these bytes instead of downloading it again. Each entry
     /// lives only as long as its [`HeldBytes`] guard, and their number is
     /// capped by the caller of [`Self::hold_bytes`].
     held: Mutex<HashMap<String, Bytes>>,
+    /// Remote volume file downloads (#1127), keyed like `loading`, so a
+    /// request that needs a file another request is downloading joins that
+    /// read instead of starting its own. Weak: a read lives only while some
+    /// request holds it, which is until the file's bytes are decoded at
+    /// most, and the last holder dropping it aborts it; the downloaded bytes
+    /// are never kept here. Dead entries are pruned on the next
+    /// registration.
+    reads: Mutex<Reads>,
+}
+
+/// A volume file download from [`PixelCache::join_or_start_read`].
+pub(crate) struct VolumeRead {
+    pub(crate) read: Arc<PendingGet>,
+    /// Another request started the read. Its failure is then that request's,
+    /// and the joiner reads the file again.
+    pub(crate) joined: bool,
+}
+
+type Reads = HashMap<String, Weak<PendingGet>>;
+
+/// The lock [`PixelCache::with_file_load`] holds over one file's cold load.
+/// Its mutex guards only the flag, never the load: a load can download the
+/// file through the runtime a waiter runs on, so a waiter must not hold that
+/// runtime's core while it waits (#1200), and gives up at its deadline.
+#[derive(Default)]
+struct FileLoad {
+    busy: Mutex<bool>,
+    freed: Condvar,
+}
+
+impl FileLoad {
+    /// Take the lock: at once when no load is in flight, else after waiting
+    /// for it off this thread's runtime core ([`off_core`]). `false`, with
+    /// the lock not taken, when `deadline` passes first.
+    fn acquire(&self, deadline: Option<Instant>) -> bool {
+        {
+            let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+            if !*busy {
+                *busy = true;
+                return true;
+            }
+        }
+        off_core(|| {
+            let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+            while *busy {
+                busy = match deadline {
+                    None => self
+                        .freed
+                        .wait(busy)
+                        .unwrap_or_else(PoisonError::into_inner),
+                    Some(deadline) => {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            return false;
+                        }
+                        let waited = self.freed.wait_timeout(busy, left);
+                        waited.unwrap_or_else(PoisonError::into_inner).0
+                    }
+                };
+            }
+            *busy = true;
+            true
+        })
+    }
+}
+
+/// A taken [`FileLoad`], released when dropped, unwinding included.
+struct FileLoadGuard<'a>(&'a FileLoad);
+
+impl Drop for FileLoadGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.busy.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        self.0.freed.notify_all();
+    }
+}
+
+/// Run `wait`, a wait for work another thread does, without holding this
+/// thread's runtime core: inside `block_in_place` on a multi-thread runtime,
+/// so its other workers keep running tasks and driving I/O and timers, the
+/// download the other thread waits on included (#1200); directly elsewhere.
+fn off_core<T>(wait: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
+    }
+}
+
+/// The registered read of `file_id` (#1127), unless none is held or it is
+/// known to have failed. Prunes the reads nobody holds any more.
+fn join_read(reads: &mut Reads, file_id: &str) -> Option<VolumeRead> {
+    reads.retain(|_, read| read.strong_count() != 0);
+    let read = reads
+        .get(file_id)
+        .and_then(Weak::upgrade)
+        .filter(|read| !read.failed())?;
+    Some(VolumeRead { read, joined: true })
+}
+
+/// Begin a read of `file_id` with `start`, registered for later callers.
+fn start_read(reads: &mut Reads, file_id: &str, start: impl FnOnce() -> PendingGet) -> VolumeRead {
+    let read = Arc::new(start());
+    reads.insert(file_id.to_owned(), Arc::downgrade(&read));
+    VolumeRead {
+        read,
+        joined: false,
+    }
 }
 
 /// One file's bytes registered in [`PixelCache::held_bytes`] for the life of
@@ -113,7 +224,21 @@ impl PixelCache {
             inserts: AtomicU64::new(0),
             loading: Mutex::new(HashMap::new()),
             held: Mutex::new(HashMap::new()),
+            reads: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Join the download of `file_id` another request holds, or else begin
+    /// one with `start` and register it for the requests that follow
+    /// (#1127). A read known to have failed is not joined, so the next caller
+    /// starts another.
+    pub(crate) fn join_or_start_read(
+        &self,
+        file_id: &str,
+        start: impl FnOnce() -> PendingGet,
+    ) -> VolumeRead {
+        let mut reads = self.reads.lock().unwrap_or_else(|e| e.into_inner());
+        join_read(&mut reads, file_id).unwrap_or_else(|| start_read(&mut reads, file_id, start))
     }
 
     /// The bytes of `file_id` a background sibling decode still holds, if
@@ -172,19 +297,24 @@ impl PixelCache {
     /// LRU eviction (or a disabled cache) must not cause rereads mid-volume.
     /// Returns the number of newly recorded read/decode failures as well.
     /// A `load` error (a deadline or transient fetch failure, #993) is
-    /// returned as is and marks nothing bad, so the next request retries.
+    /// returned as is and marks nothing bad, so the next request retries,
+    /// as is a deadline that passes while another request loads the file
+    /// ([`Self::with_file_load`]).
     ///
     /// `load` receives the file's [held bytes](Self::held_bytes), if any,
     /// snapshotted **before** the cache recheck (#994): a background sibling
     /// decode drops its bytes only after its last insert, so with `None` the
     /// recheck has already seen every array it decoded, and with `Some` the
     /// loader decodes from them instead of downloading the file again.
-    pub(crate) fn load_many<E>(
+    pub(crate) fn load_many(
         &self,
         file_id: &str,
         requests: &[MomentRequest<'_>],
-        load: impl FnOnce(&[MomentRequest<'_>], Option<Bytes>) -> Result<Vec<(String, RawPixels)>, E>,
-    ) -> Result<(MomentPixels, usize), E> {
+        load: impl FnOnce(
+            &[MomentRequest<'_>],
+            Option<Bytes>,
+        ) -> Result<Vec<(String, RawPixels)>, DataServerError>,
+    ) -> Result<(MomentPixels, usize), DataServerError> {
         self.with_file_load(file_id, || {
             let held = self.held_bytes(file_id);
             let mut pixels = HashMap::new();
@@ -214,7 +344,7 @@ impl PixelCache {
                 }
             }
             Ok((pixels, failures))
-        })
+        })?
     }
 
     /// Count one genuine positive-cache miss — i.e. a key that is neither
@@ -225,20 +355,35 @@ impl PixelCache {
 
     /// Serialize cold loads of sibling datasets in a source-qualified file.
     /// The caller rechecks the pixel/negative caches inside the lock.
-    pub fn with_file_load<T>(&self, file_id: &str, load: impl FnOnce() -> T) -> T {
+    ///
+    /// A caller that finds another's load of the file in flight waits for
+    /// it without holding its runtime core (#1200): that load may be
+    /// downloading the file through the same runtime, and callers parked on
+    /// every worker would leave nothing to drive the download or the
+    /// deadline timers. It waits until the request deadline in scope at
+    /// most: `Err(DeadlineExceeded)`, without running `load`, once that
+    /// passes first.
+    pub fn with_file_load<T>(
+        &self,
+        file_id: &str,
+        load: impl FnOnce() -> T,
+    ) -> Result<T, DataServerError> {
         let lock = {
             let mut loading = self.loading.lock().unwrap_or_else(|e| e.into_inner());
             loading.retain(|_, lock| lock.strong_count() != 0);
             if let Some(lock) = loading.get(file_id).and_then(Weak::upgrade) {
                 lock
             } else {
-                let lock = Arc::new(Mutex::new(()));
+                let lock = Arc::new(FileLoad::default());
                 loading.insert(file_id.to_owned(), Arc::downgrade(&lock));
                 lock
             }
         };
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        load()
+        if !lock.acquire(ds_core::deadline::current()) {
+            return Err(DataServerError::DeadlineExceeded);
+        }
+        let _guard = FileLoadGuard(&lock);
+        Ok(load())
     }
 
     /// Whether `(file_id, dataset_path)` is already resident — a presence
@@ -338,19 +483,89 @@ mod tests {
             for _ in 0..8 {
                 scope.spawn(|| {
                     start.wait();
-                    cache.with_file_load("same-source/file", || {
-                        if cache.is_known_bad("same-source/file", "moment") {
-                            return;
-                        }
-                        loads.fetch_add(1, Ordering::Relaxed);
-                        cache.mark_bad("same-source/file", "moment");
-                    });
+                    cache
+                        .with_file_load("same-source/file", || {
+                            if cache.is_known_bad("same-source/file", "moment") {
+                                return;
+                            }
+                            loads.fetch_add(1, Ordering::Relaxed);
+                            cache.mark_bad("same-source/file", "moment");
+                        })
+                        .unwrap();
                 });
             }
         });
         assert_eq!(loads.load(Ordering::Relaxed), 1);
-        cache.with_file_load("next-file", || {});
+        cache.with_file_load("next-file", || {}).unwrap();
         assert!(cache.loading.lock().unwrap().len() <= 1);
+    }
+
+    /// #1200: a caller that finds the file's load in flight waits for it
+    /// until its own deadline at most, and then fails without running its
+    /// load. A free lock is taken at once, a passed deadline or not: the
+    /// load inside it checks the deadline before any read.
+    #[test]
+    fn file_load_waiter_gives_up_at_its_deadline() {
+        use std::time::Duration;
+        let cache = PixelCache::new(1);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (held, holding) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let cache = &cache;
+            scope.spawn(move || {
+                cache
+                    .with_file_load("file", || {
+                        held.send(()).unwrap();
+                        released.recv().unwrap();
+                    })
+                    .unwrap();
+            });
+            holding.recv().unwrap();
+            let wait = Duration::from_millis(50);
+            let started = Instant::now();
+            let _deadline = ds_core::deadline::enter(Some(started + wait));
+            let waited = cache.with_file_load("file", || panic!("the lock is held"));
+            assert!(matches!(waited, Err(DataServerError::DeadlineExceeded)));
+            assert!(started.elapsed() >= wait);
+            release.send(()).unwrap();
+        });
+        let _passed = ds_core::deadline::enter(Some(Instant::now()));
+        assert!(matches!(cache.with_file_load("file", || 7), Ok(7)));
+    }
+
+    /// #1127: a file's read is joined while some caller holds it and
+    /// started anew once none does, and the registry keeps no dead reads.
+    #[test]
+    fn reads_are_joined_while_held_and_dead_ones_pruned() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let store =
+            ds_storage::DataStore::new(Arc::new(ds_storage::object_store::memory::InMemory::new()));
+        let starts = AtomicU64::new(0);
+        let start = || {
+            starts.fetch_add(1, Ordering::Relaxed);
+            let object = ds_storage::object_store::path::Path::from("volume");
+            store.start_get_opt(&object, runtime.handle())
+        };
+        let cache = PixelCache::new(1);
+        let first = cache.join_or_start_read("volume", start);
+        let second = cache.join_or_start_read("volume", start);
+        assert!(!first.joined && second.joined);
+        assert!(Arc::ptr_eq(&first.read, &second.read));
+        assert_eq!(starts.load(Ordering::Relaxed), 1, "one read for both");
+        drop(first);
+        let third = cache.join_or_start_read("volume", start);
+        assert!(third.joined, "joined while any caller holds it");
+        drop((second, third));
+        let fourth = cache.join_or_start_read("volume", start);
+        assert!(!fourth.joined, "a read nobody holds is gone");
+        assert_eq!(starts.load(Ordering::Relaxed), 2);
+        drop(fourth);
+        drop(cache.join_or_start_read("other", start));
+        assert_eq!(cache.reads.lock().unwrap().len(), 1, "dead reads pruned");
     }
 
     #[test]
@@ -540,7 +755,7 @@ mod tests {
             .load_many("volume", &requests, |missing, _| {
                 reads += 1;
                 assert_eq!(missing.len(), 2);
-                Ok::<_, ()>(
+                Ok::<_, DataServerError>(
                     missing
                         .iter()
                         .map(|(path, _, _)| (path.to_string(), raw()))
@@ -570,7 +785,7 @@ mod tests {
                     let (pixels, failures) = cache
                         .load_many("volume", &[("/a", 2, 2), ("/b", 2, 2)], |missing, _| {
                             reads.fetch_add(1, Ordering::Relaxed);
-                            Ok::<_, ()>(
+                            Ok::<_, DataServerError>(
                                 missing
                                     .iter()
                                     .map(|(path, _, _)| (path.to_string(), raw()))
@@ -593,13 +808,13 @@ mod tests {
         let requests = [("/good", 2, 2), ("/bad", 2, 2)];
         let (pixels, failures) = cache
             .load_many("volume", &requests, |_, _| {
-                Ok::<_, ()>(vec![("/good".into(), raw())])
+                Ok::<_, DataServerError>(vec![("/good".into(), raw())])
             })
             .unwrap();
         assert_eq!(pixels.len(), 1);
         assert_eq!(failures, 1);
         let (pixels, failures) = cache
-            .load_many("volume", &requests, |_, _| -> Result<_, ()> {
+            .load_many("volume", &requests, |_, _| -> Result<_, DataServerError> {
                 panic!("cached or known bad")
             })
             .unwrap();
@@ -617,7 +832,7 @@ mod tests {
             cache
                 .load_many(file, &[("/a", 2, 2)], |missing, held| {
                     seen.push(held);
-                    Ok::<_, ()>(
+                    Ok::<_, DataServerError>(
                         missing
                             .iter()
                             .map(|(path, _, _)| (path.to_string(), raw()))
@@ -642,14 +857,16 @@ mod tests {
     fn failed_load_marks_nothing_bad_and_retries() {
         let cache = PixelCache::new(1);
         let requests = [("/a", 2, 2), ("/b", 2, 2)];
-        let result = cache.load_many("volume", &requests, |_, _| Err("deadline"));
-        assert_eq!(result.err(), Some("deadline"));
+        let result = cache.load_many("volume", &requests, |_, _| {
+            Err(DataServerError::DeadlineExceeded)
+        });
+        assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
         assert!(!cache.is_known_bad("volume", "/a"));
         assert!(!cache.is_known_bad("volume", "/b"));
         let (pixels, failures) = cache
             .load_many("volume", &requests, |missing, _| {
                 assert_eq!(missing.len(), 2, "both moments are retried");
-                Ok::<_, &str>(
+                Ok::<_, DataServerError>(
                     missing
                         .iter()
                         .map(|(path, _, _)| (path.to_string(), raw()))

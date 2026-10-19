@@ -1081,6 +1081,41 @@ pub struct Feature {
     pub id: String,
     pub geometry: Arc<Geometry>,
     pub properties: Arc<HashMap<String, PropertyValue>>,
+    /// Where the feature leads beyond its own item and collection (#1143),
+    /// e.g. a radar site's own collection. Usually empty.
+    pub related: Vec<Related>,
+}
+
+/// A resource a feature leads to (#1143). Named, not addressed: an engine
+/// knows neither the external base URL nor which API serves the resource,
+/// so the API layer builds the URL, and leaves out a link it has no route
+/// for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Related {
+    pub target: RelatedTarget,
+    /// What a person reads on the link, e.g. "Radar site collection".
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelatedTarget {
+    /// The collection with this id, such as the per-site collection of a
+    /// radar in a site inventory.
+    Collection(String),
+    /// The OGC API - EDR location with this id in the feature's own
+    /// collection: a station is the location of the same id. Linked only
+    /// when the collection is served by EDR.
+    EdrLocation(String),
+}
+
+impl Related {
+    /// A station's link to its own EDR location, the one of the same id.
+    pub fn edr_location(id: &str) -> Self {
+        Self {
+            target: RelatedTarget::EdrLocation(id.to_owned()),
+            title: "Station data (EDR location)".to_owned(),
+        }
+    }
 }
 
 /// Cached property-name catalog. Clone the Arc from an engine snapshot; do
@@ -1954,6 +1989,7 @@ mod tests {
             id: id.into(),
             geometry: Arc::new(Geometry::Null),
             properties: Arc::new(props.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
+            related: Vec::new(),
         }
     }
 

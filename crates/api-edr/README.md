@@ -88,7 +88,7 @@ route answers 404 and `/api` omits the path.
 | `area` | WKT `POLYGON` (holes allowed) or `west,south,east,north` | a grid over the polygon's bbox with cells outside it null, or the stations inside it |
 | `radius` | `POINT` + `within` + `within-units` (`km`, `m`, `mi`; at most 1000 km) | the area query over a 64-vertex geodesic circle; a circle containing a pole or crossing the antimeridian is a 400 |
 | `trajectory` | WKT `LINESTRING`, `LINESTRING Z`, `M` or `ZM` | values along the path, or a radar cross-section; see [Trajectory](#trajectory) |
-| `cube` | `bbox` (required) and optional `z` | a grid with `t`, `z`, `y`, `x` axes; see [Cube](#cube) |
+| `cube` | `bbox` (required) and optional `z` | a grid with `t`, `z`, `y`, `x` axes (no `z` on a station grid); see [Cube](#cube) |
 | `items` | `bbox`, `datetime`, `limit`, `offset` | GeoJSON features; see [Items](#items) |
 | `instances` | none | model runs; see [Instances](#instances) |
 
@@ -168,16 +168,16 @@ contributes nothing, and a list where no id has data is a 204.
 
 ### Cube
 
-Only collections with vertical levels offer `cube`: GRIB pressure and
-model-level views. Parameters: `bbox` (four numbers, or six whose vertical
-pair is a `z` interval that an explicit `z` overrides), `z`, `datetime`,
-`parameter-name`, `resolution-x`/`-y`/`-z`, `crs`, `f` and `limit`; any
-other or repeated parameter is a 400. Without `z` every level is returned.
-`resolution-*` is a count of evenly spaced positions from edge to edge, each
-taking the nearest native value (0 or absent is native; at most
-1 000 000). `resolution-z` on a collection without levels is a 400. A
-`datetime` list joins one cube per instant along `t`. The response is capped
-at 1 million values.
+GRIB pressure and model-level views offer `cube`, and so do station grids,
+whose cube is a `t`, `y`, `x` grid without levels. Parameters: `bbox` (four
+numbers, or six whose vertical pair is a `z` interval that an explicit `z`
+overrides), `z`, `datetime`, `parameter-name`, `resolution-x`/`-y`/`-z`,
+`crs`, `f` and `limit`; any other or repeated parameter is a 400. Without
+`z` every level is returned. `resolution-*` is a count of evenly spaced
+positions from edge to edge, each taking the nearest native value (0 or
+absent is native; at most 1 000 000). `resolution-z` on a collection
+without levels is a 400. A `datetime` list joins one cube per instant along
+`t`. The response is capped at 1 million values.
 
 ### Items
 
@@ -191,7 +191,11 @@ or interval, a 400 on features without time; see the
 `bbox`, `datetime`, `limit`, `offset` and `f` are accepted, and
 `/items/{itemId}` takes only `f`. Every feature gains the `edrProperties`
 members: a station item points at its `/locations/{locId}` query, a nowcast
-cell at a radius query over the motion field sized to the cell.
+cell at a radius query over the motion field sized to the cell. As in the
+Features API, a feature without a `title` property gets its engine's label
+as one, such as a nowcast cell's `Rank 2 · very severe · max 52 dBZ`.
+Features' `related` links are left out: `edrqueryendpoint` already names
+the item's data.
 
 ### Instances
 
@@ -269,6 +273,13 @@ set of builders and follow Requirement 7 of the Metocean EDR profile:
   ellipsis; CoverageJSON parameters leave `label` out and carry the full
   label as `observedProperty.label`. `description` is the full label plus
   its unit.
+- The unit is the unit of the values served. GRIB, BUFR, Zarr and NetCDF
+  convert values and unit from the source's: K → °C, Pa → hPa,
+  kg m⁻² → mm, kg m⁻² s⁻¹ → mm/h, m² s⁻² → gpm, a proportion → %. Other
+  units are served as the source spells them. GRIB, Zarr and NetCDF maps
+  draw the same converted values. QueryData takes each unit from the FMI
+  parameter number, and gives none where the number has no known unit. A
+  station grid takes its source's units.
 - `unit.symbol` is the QUDT unit when `ds_core::units` knows one, else
   UCUM-typed for a UCUM unit, else a plain string (`dBZ`, `gpm`).
 - `observedProperty.id` is the NERC CF standard-name URI when the engine
@@ -277,9 +288,9 @@ set of builders and follow Requirement 7 of the Metocean EDR profile:
 - A parameter with its own time axis (satellite products, GRIB windows that
   some steps lack) carries its own `extent.temporal`.
 
-Not covered: CF standard names on the other engines and units on QueryData.
-Labels taken from config or source files are served as given, tagged `en`,
-and are not checked to be English.
+Not covered: CF standard names on the other engines. Labels taken from
+config or source files are served as given, tagged `en`, and are not
+checked to be English.
 
 ### Derived wind
 
@@ -308,6 +319,7 @@ value budget. `derive_wind = false` turns this off for a collection.
 | BUFR | ✓ | ✓ | ✓ | ✓ | – | – | n/a | ✓ |
 | Nowcast | – | – | ✓ | ✓ | – | – | ✓ | ✓ |
 | Satellite | – | ✓ | ✓ | ✓ | – | – | n/a | – |
+| Station grid | – | ✓ | ✓ | ✓ | ✓ no `z` | – | n/a | – |
 
 CAP and GeoJSON collections have no `EdrEngine`. Radius and location lists
 need no engine code of their own; items serve the engine's own
@@ -318,13 +330,14 @@ need no engine code of their own; items serve the engine's own
 | CSV | stations inside the polygon with a row in the window; more than 500 stations is a 400 |
 | GeoTIFF | grid at native resolution; on a STAC source, a window of more than 400 items whose metadata is not loaded yet is a 400 |
 | GRIB | native grid nodes over the bbox; `datetime` matches steps exactly; without `datetime`, the last step of the latest run that has every named parameter. Cube on the `<id>-pressure` and `<id>-model` views that `[grib] level_types` creates |
-| QueryData, Zarr, ODIM composite, Satellite | grid over the bbox, at most 256 cells per axis, cells outside the polygon null. Zarr reads at most 8 variables per area query. Satellite: each product has its own time axis, an instant matches only a scan at exactly that time, RGB composites are not EDR parameters, and a query fetches at most 8 evicted scans and decodes at most 1024 image blocks |
-| NetCDF | CRS84 grid at the source's mean cell size, at most 256 cells per axis; pressure levels through `z`; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (default 544 MiB) |
+| QueryData, Zarr, ODIM composite, Satellite | grid over the bbox, at most 256 cells per axis, cells outside the polygon null. Zarr reads at most 8 variables per area query. Satellite: each product has its own time axis, an instant matches only a scan at exactly that time, RGB composites are not EDR parameters, and a query fetches at most 8 evicted scans and decodes at most 133 million pixels of image blocks (1024 GOES-R 2 km strips or 70 GK2A chunks) |
+| NetCDF | CRS84 grid at the source's mean cell size, at most 256 cells per axis, over lat/lon or CF Lambert conformal conic, geostationary, polar stereographic, Lambert azimuthal equal-area and transverse Mercator grids (a polar grid's extent reaches its pole); pressure levels through `z`; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (default 544 MiB) |
 | ODIM PVOL site | polar sampling of each volume; `/locations` lists the site; trajectory is a vertical cross-section |
-| PostGIS stations | stations inside the polygon, one series each; `/locations` holds at most `max_locations` stations (default 200 000); see [engine-postgis](../engine-postgis/README.md) |
-| PostGIS events | events inside the polygon as `Point` coverages |
+| PostGIS stations | stations inside the polygon, one series each; `/locations` holds at most `max_locations` stations (default 200 000); a value outside its parameter's `valid_range` or equal to one of its `missing_values` is a null, its time kept; see [engine-postgis](../engine-postgis/README.md) |
+| PostGIS events | events inside the polygon as `Point` coverages, with the same `valid_range` and `missing_values` nulls |
 | BUFR | stations inside the polygon over the in-memory retention window; position is the nearest station within `position_radius_km` (default 25 km) |
 | Nowcast | the motion field (`motion_u`, `motion_v` in m/s, `motion_quality`) over the polygon's bbox; generations are instances; items are tracked cells |
+| Station grid | the analysis grid the map draws (each station's latest valid value within `[station_grid] max_age`, interpolated onto a CRS84 grid), read at the cell under each point; without `datetime` the latest analysis; an instant must be an analysis time; at most 96 analyses (times × parameters) per query; an analysis still computing at the deadline is a 503, and its computation goes on for a retry |
 
 Each engine crate documents its own query details.
 
@@ -348,10 +361,10 @@ Each engine crate documents its own query details.
 This crate has no config section of its own. A collection is served when its
 `apis` contains `"edr"` (the default when `apis` is omitted) and its engine
 type supports EDR: `csv`, `geotiff`, `grib`, `querydata`, `zarr`, `netcdf`,
-`odim`, `odim-volume`, `postgis`, `bufr`, `nowcast` or `satellite`. The
-runnable `collections.d/weather.toml` is a CSV station collection
-(`engine_type` defaults to `csv`; `id`, `title` and `description` are
-required):
+`odim`, `odim-volume`, `postgis`, `bufr`, `nowcast`, `satellite` or
+`station-grid`. The runnable `collections.d/weather.toml` is a CSV station
+collection (`engine_type` defaults to `csv`; `id`, `title` and
+`description` are required):
 
 ```toml
 id = "weather"
@@ -360,6 +373,9 @@ description = "Hourly weather observations from Finnish weather stations"
 data_path = "testdata/weather.csv"
 apis = ["edr", "features"]
 ```
+
+`collections.d/weather-analysis.toml` grids that collection's temperature
+and wind speed as a station grid.
 
 Environment variables: `MC_EDR_LOCATIONS_MAX_BYTES` (bytes, default
 16 MiB) and `MC_EDR_LOCATIONS_MEMORY_MB` (default 128); see
@@ -374,7 +390,7 @@ Environment variables: `MC_EDR_LOCATIONS_MAX_BYTES` (bytes, default
 - GeoJSON and CSV only on station collections; no GeoJSON for area; no
   NetCDF output.
 - Along-path trajectory only on GRIB, QueryData and Zarr; cube only on GRIB
-  level views.
+  level views and station grids.
 - `parameter_names` entries carry no `dataType`, and every CoverageJSON
   range is encoded as `float`.
 - `position`, `area`, `radius`, `trajectory` and `/locations/{locId}` ignore

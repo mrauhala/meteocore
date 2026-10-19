@@ -22,7 +22,7 @@ use std::sync::Arc;
 use chrono::{DateTime, TimeDelta, Utc};
 use thiserror::Error;
 
-use crate::config::PostgisEngineConfig;
+use crate::config::{PostgisEngineConfig, ValidatedParameter, ValueFilter};
 use crate::schema::{
     EventsShape, LongShape, ObservationSchema, PerParameterShape, QualifiedTable, WideShape,
 };
@@ -126,6 +126,8 @@ pub enum SqlParam {
     /// A text array shared between statements: the set-based area path binds
     /// one station id list to every per-table statement (#1062).
     SharedTextArray(Arc<Vec<String>>),
+    /// A parameter's `missing_values` (#1210), compared as `double precision`.
+    FloatArray(Vec<f64>),
 }
 
 impl SqlParam {
@@ -140,6 +142,7 @@ impl SqlParam {
             SqlParam::Timestamp(t) => t,
             SqlParam::TextArray(v) => v,
             SqlParam::SharedTextArray(v) => &**v,
+            SqlParam::FloatArray(v) => v,
         }
     }
 }
@@ -621,6 +624,136 @@ pub fn build_area_set(
     )
 }
 
+/// The station map layers' content fingerprint (#1063): per observation table
+/// (`long` and `wide` one statement, `per_parameter` one per configured
+/// parameter), the rows of the stations in `station_ids` from `since` on, as
+/// one row of aggregates. `n` is the row count; every further column, all
+/// `bigint`, is a sum of 32-bit hashes: of each row's station, time (and
+/// `long` parameter), then one per value column. Integer sums are exact and
+/// independent of row order, so the fingerprint moves when a row arrives
+/// late, is deleted or has its time, station or value corrected, and holds
+/// still otherwise. A swap of two rows' values would not move it.
+///
+/// The station predicate is the set-based area path's `<fk> = ANY($1)`, so
+/// the `(<fk>, <time>)` index the README asks for answers it as one range
+/// scan a station. `$2` is the lower time bound; there is no upper one.
+pub fn build_frame_fingerprint(
+    cfg: &PostgisEngineConfig,
+    station_ids: &Arc<Vec<String>>,
+    since: DateTime<Utc>,
+) -> Result<Vec<BuiltQuery>, BuildError> {
+    let keys: Vec<&str> = cfg
+        .parameters
+        .iter()
+        .map(|p| p.source_key.as_str())
+        .collect();
+    let ids = || SqlParam::SharedTextArray(Arc::clone(station_ids));
+    match &cfg.observations {
+        ObservationSchema::Long(l) => {
+            let param = quote_ident(&l.param_col)?;
+            let mut q = fingerprint_query(
+                &l.table,
+                &l.station_fk_col,
+                &l.time_col,
+                l.time_col_tz.as_deref(),
+                Some(&param),
+                &[l.value_col.as_str()],
+            )?;
+            q.sql.push_str(&format!(" AND {param} = ANY($3)"));
+            Ok(vec![BuiltQuery::new(
+                q.sql,
+                vec![
+                    ids(),
+                    SqlParam::Timestamp(since),
+                    SqlParam::TextArray(keys.iter().map(|k| k.to_string()).collect()),
+                ],
+            )])
+        }
+        ObservationSchema::Wide(w) => {
+            let mut columns = Vec::with_capacity(keys.len());
+            for key in &keys {
+                let column = w
+                    .columns
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, c)| c.as_str())
+                    .ok_or_else(|| BuildError::UnknownParameter((*key).to_string()))?;
+                columns.push(column);
+            }
+            let q = fingerprint_query(
+                &w.table,
+                &w.station_fk_col,
+                &w.time_col,
+                w.time_col_tz.as_deref(),
+                None,
+                &columns,
+            )?;
+            Ok(vec![BuiltQuery::new(
+                q.sql,
+                vec![ids(), SqlParam::Timestamp(since)],
+            )])
+        }
+        ObservationSchema::PerParameter(pp) => {
+            let mut queries = Vec::with_capacity(keys.len());
+            for key in &keys {
+                let t = pp
+                    .tables
+                    .iter()
+                    .find(|t| t.parameter == *key)
+                    .ok_or_else(|| BuildError::UnknownParameter((*key).to_string()))?;
+                let q = fingerprint_query(
+                    &t.table,
+                    &t.station_fk_col,
+                    &t.time_col,
+                    t.time_col_tz.as_deref(),
+                    None,
+                    &[t.value_col.as_str()],
+                )?;
+                queries.push(
+                    BuiltQuery::new(q.sql, vec![ids(), SqlParam::Timestamp(since)])
+                        .with_parameter(key.to_string()),
+                );
+            }
+            Ok(queries)
+        }
+        ObservationSchema::Events(_) => Err(BuildError::NoStations),
+    }
+}
+
+/// One table's fingerprint statement up to its `WHERE` station and time
+/// predicates ([`build_frame_fingerprint`]). `param` is the quoted `long`
+/// parameter column, hashed into each row's key.
+fn fingerprint_query(
+    table: &QualifiedTable,
+    station_fk_col: &str,
+    time_col: &str,
+    time_col_tz: Option<&str>,
+    param: Option<&str>,
+    value_cols: &[&str],
+) -> Result<BuiltQuery, BuildError> {
+    let table = fq_table(table)?;
+    let fk = quote_ident(station_fk_col)?;
+    let time = quote_ident(time_col)?;
+    let rhs = time_filter_rhs("$2", time_col_tz);
+    let mut row_key =
+        format!("hashtext({fk}::text) # hashfloat8(extract(epoch from {time})::double precision)");
+    if let Some(param) = param {
+        row_key.push_str(&format!(" # hashtext({param}::text)"));
+    }
+    let mut values = String::new();
+    for column in value_cols {
+        let column = quote_ident(column)?;
+        values.push_str(&format!(", sum(hashfloat8({column}::double precision))"));
+    }
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "count(*), sum({row_key}){values} \
+         FROM {table} \
+         WHERE {fk} = ANY($1) AND {time} >= {rhs}"
+    ));
+    Ok(BuiltQuery::new(sql, vec![]))
+}
+
 fn build_observations(
     cfg: &PostgisEngineConfig,
     stations: StationSelect<'_>,
@@ -637,18 +770,21 @@ fn build_observations(
         source_keys.to_vec()
     };
 
+    let parameters = &cfg.parameters;
     match &cfg.observations {
         ObservationSchema::Long(l) => {
-            let q = build_location_long(l, stations, time_range, &effective, row_limit)?;
+            let q =
+                build_location_long(l, parameters, stations, time_range, &effective, row_limit)?;
             Ok(vec![q])
         }
         ObservationSchema::Wide(w) => {
-            let q = build_location_wide(w, stations, time_range, &effective, row_limit)?;
+            let q =
+                build_location_wide(w, parameters, stations, time_range, &effective, row_limit)?;
             Ok(vec![q])
         }
-        ObservationSchema::PerParameter(pp) => {
-            build_location_per_parameter(pp, stations, time_range, &effective, row_limit)
-        }
+        ObservationSchema::PerParameter(pp) => build_location_per_parameter(
+            pp, parameters, stations, time_range, &effective, row_limit,
+        ),
         // Events have no stations; the engine layer rejects station-keyed
         // queries before reaching the builder.
         ObservationSchema::Events(_) => Err(BuildError::NoStations),
@@ -666,9 +802,11 @@ fn build_observations(
 ///
 /// The `::double precision` cast on every parameter column also normalises
 /// `numeric`-typed columns (e.g. a `numeric(3,1)` accuracy radius) to `f64`
-/// at the SQL layer.
+/// at the SQL layer. A value a parameter's [`ValueFilter`] rejects is NULL
+/// (#1210); the filters' binds follow the `LIMIT`'s.
 pub fn build_events_area(
     shape: &EventsShape,
+    parameters: &[ValidatedParameter],
     polygon_wkt: &str,
     time_range: (DateTime<Utc>, DateTime<Utc>),
     source_keys: &[&str],
@@ -685,13 +823,20 @@ pub fn build_events_area(
     let id = quote_ident(&shape.id_col)?;
     let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
     let tz = shape.time_col_tz.as_deref();
+    let mut params = vec![
+        SqlParam::Timestamp(time_range.0),
+        SqlParam::Timestamp(time_range.1),
+        SqlParam::Text(polygon_wkt.to_string()),
+        SqlParam::Int(row_limit as i64),
+    ];
 
     let mut projection = format!("{time_select} AS time, {coordinates}");
     for key in source_keys {
         // source_key == column name == row alias (identifier-validated at
         // config load and at engine resolve).
         let col = quote_ident(key)?;
-        projection.push_str(&format!(", {col}::double precision AS {col}"));
+        let value = filtered_value(&col, value_filter(parameters, key), &mut params);
+        projection.push_str(&format!(", {value} AS {col}"));
     }
 
     projection.push_str(&format!(", {geometry_check} AS mc_geometry_valid"));
@@ -706,12 +851,6 @@ pub fn build_events_area(
          AND ST_Intersects({geom}, ST_GeomFromText($3, 4326)) \
          ORDER BY {time_col} DESC, {id} LIMIT $4"
     ));
-    let params = vec![
-        SqlParam::Timestamp(time_range.0),
-        SqlParam::Timestamp(time_range.1),
-        SqlParam::Text(polygon_wkt.to_string()),
-        SqlParam::Int(row_limit as i64),
-    ];
     Ok(BuiltQuery::new(sql, params).with_row_limit(3, source_keys.len().max(1)))
 }
 
@@ -792,6 +931,7 @@ pub fn build_events_window(
 
 fn build_location_long(
     shape: &LongShape,
+    parameters: &[ValidatedParameter],
     stations: StationSelect<'_>,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
@@ -808,40 +948,43 @@ fn build_location_long(
     let station_pred = stations.predicate(&station_fk);
 
     let mut params: Vec<SqlParam> = vec![stations.bind()];
-    let mut sql = String::from("SELECT ");
-    sql.push_str(&format!(
-        "{lead}{time_select} AS time, \
-         {param_col} AS parameter, \
-         {value_col}::double precision AS value \
-         FROM {table} \
-         WHERE {station_pred}"
-    ));
-
+    let mut conditions = String::new();
     if let Some((t0, t1)) = time_range {
         let rhs_lo = time_filter_rhs("$2", tz);
         let rhs_hi = time_filter_rhs("$3", tz);
-        sql.push_str(&format!(
+        conditions.push_str(&format!(
             " AND {time_col} >= {rhs_lo} AND {time_col} <= {rhs_hi}"
         ));
         params.push(SqlParam::Timestamp(t0));
         params.push(SqlParam::Timestamp(t1));
     }
 
-    sql.push_str(&format!(" AND {param_col} = ANY(${})", params.len() + 1));
+    conditions.push_str(&format!(" AND {param_col} = ANY(${})", params.len() + 1));
     params.push(SqlParam::TextArray(
         source_keys.iter().map(|s| s.to_string()).collect(),
     ));
+    // The value filters' binds follow the WHERE clause's (#1210).
+    let value = long_value(&param_col, &value_col, parameters, source_keys, &mut params);
 
     let order = stations.order_by(&station_fk, &time_col);
-    sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", params.len() + 1));
     params.push(SqlParam::Int(row_limit as i64));
     let limit_idx = params.len() - 1;
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{lead}{time_select} AS time, \
+         {param_col} AS parameter, \
+         {value} AS value \
+         FROM {table} \
+         WHERE {station_pred}{conditions} ORDER BY {order} LIMIT ${}",
+        limit_idx + 1
+    ));
 
     Ok(BuiltQuery::new(sql, params).with_row_limit(limit_idx, 1))
 }
 
 fn build_location_wide(
     shape: &WideShape,
+    parameters: &[ValidatedParameter],
     stations: StationSelect<'_>,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
@@ -855,7 +998,20 @@ fn build_location_wide(
     let lead = stations.lead_column(&station_fk);
     let station_pred = stations.predicate(&station_fk);
 
-    // Build the projection list from source_keys by looking up columns.
+    let mut params: Vec<SqlParam> = vec![stations.bind()];
+    let mut conditions = String::new();
+    if let Some((t0, t1)) = time_range {
+        let rhs_lo = time_filter_rhs("$2", tz);
+        let rhs_hi = time_filter_rhs("$3", tz);
+        conditions.push_str(&format!(
+            " AND {time_col} >= {rhs_lo} AND {time_col} <= {rhs_hi}"
+        ));
+        params.push(SqlParam::Timestamp(t0));
+        params.push(SqlParam::Timestamp(t1));
+    }
+
+    // Build the projection list from source_keys by looking up columns; the
+    // value filters' binds follow the WHERE clause's (#1210).
     let mut projection = format!("{lead}{time_select} AS time");
     for key in source_keys {
         let column = shape
@@ -866,30 +1022,20 @@ fn build_location_wide(
             .ok_or_else(|| BuildError::UnknownParameter((*key).to_string()))?;
         let col_quoted = quote_ident(column)?;
         let alias = quote_ident(key)?;
-        projection.push_str(&format!(", {col_quoted}::double precision AS {alias}"));
+        let value = filtered_value(&col_quoted, value_filter(parameters, key), &mut params);
+        projection.push_str(&format!(", {value} AS {alias}"));
     }
 
-    let mut params: Vec<SqlParam> = vec![stations.bind()];
+    let order = stations.order_by(&station_fk, &time_col);
+    params.push(SqlParam::Int(row_limit as i64));
+    let limit_idx = params.len() - 1;
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
         "{projection} \
          FROM {table} \
-         WHERE {station_pred}"
+         WHERE {station_pred}{conditions} ORDER BY {order} LIMIT ${}",
+        limit_idx + 1
     ));
-    if let Some((t0, t1)) = time_range {
-        let rhs_lo = time_filter_rhs("$2", tz);
-        let rhs_hi = time_filter_rhs("$3", tz);
-        sql.push_str(&format!(
-            " AND {time_col} >= {rhs_lo} AND {time_col} <= {rhs_hi}"
-        ));
-        params.push(SqlParam::Timestamp(t0));
-        params.push(SqlParam::Timestamp(t1));
-    }
-
-    let order = stations.order_by(&station_fk, &time_col);
-    sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", params.len() + 1));
-    params.push(SqlParam::Int(row_limit as i64));
-    let limit_idx = params.len() - 1;
 
     // One wide row carries a value per selected column — weigh it so
     // against the response budget.
@@ -898,6 +1044,7 @@ fn build_location_wide(
 
 fn build_location_per_parameter(
     shape: &PerParameterShape,
+    parameters: &[ValidatedParameter],
     stations: StationSelect<'_>,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
@@ -922,26 +1069,29 @@ fn build_location_per_parameter(
         let station_pred = stations.predicate(&station_fk);
 
         let mut params: Vec<SqlParam> = vec![stations.bind()];
-        let mut sql = String::from("SELECT ");
-        sql.push_str(&format!(
-            "{lead}{time_select} AS time, \
-             {value_col}::double precision AS value \
-             FROM {table_fq} \
-             WHERE {station_pred}"
-        ));
+        let mut conditions = String::new();
         if let Some((t0, t1)) = time_range {
             let rhs_lo = time_filter_rhs("$2", tz);
             let rhs_hi = time_filter_rhs("$3", tz);
-            sql.push_str(&format!(
+            conditions.push_str(&format!(
                 " AND {time_col} >= {rhs_lo} AND {time_col} <= {rhs_hi}"
             ));
             params.push(SqlParam::Timestamp(t0));
             params.push(SqlParam::Timestamp(t1));
         }
+        // The value filter's binds follow the WHERE clause's (#1210).
+        let value = filtered_value(&value_col, value_filter(parameters, key), &mut params);
         let order = stations.order_by(&station_fk, &time_col);
-        sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", params.len() + 1));
         params.push(SqlParam::Int(row_limit as i64));
         let limit_idx = params.len() - 1;
+        let mut sql = String::from("SELECT ");
+        sql.push_str(&format!(
+            "{lead}{time_select} AS time, \
+             {value} AS value \
+             FROM {table_fq} \
+             WHERE {station_pred}{conditions} ORDER BY {order} LIMIT ${}",
+            limit_idx + 1
+        ));
         queries.push(
             BuiltQuery::new(sql, params)
                 .with_parameter(key.to_string())
@@ -950,6 +1100,96 @@ fn build_location_per_parameter(
     }
 
     Ok(queries)
+}
+
+// ─── value filters (#1210) ─────────────────────────────────────────────────
+
+/// The value filter of the parameter mapped to `source_key`, unless it is
+/// empty. The first parameter with that key, the one its coverage range is
+/// named after.
+fn value_filter<'a>(
+    parameters: &'a [ValidatedParameter],
+    source_key: &str,
+) -> Option<&'a ValueFilter> {
+    parameters
+        .iter()
+        .find(|p| p.source_key == source_key)
+        .map(|p| &p.filter)
+        .filter(|f| !f.is_empty())
+}
+
+/// The test a non-empty `filter` puts to `value`, a `double precision`
+/// expression: inside the range, both ends included, and none of the missing
+/// values (`<> ALL`). Every bound and the sentinel array are binds appended
+/// to `params`. NULL fails it, so a NULL stays NULL, and so does NaN against
+/// a range: PostgreSQL orders NaN above every number.
+fn observation_test(value: &str, filter: &ValueFilter, params: &mut Vec<SqlParam>) -> String {
+    let mut test = String::new();
+    if let Some((min, max)) = filter.range {
+        params.push(SqlParam::Float(min));
+        params.push(SqlParam::Float(max));
+        let max_bind = params.len();
+        test.push_str(&format!(
+            "{value} >= ${} AND {value} <= ${max_bind}",
+            max_bind - 1
+        ));
+    }
+    if !filter.missing.is_empty() {
+        params.push(SqlParam::FloatArray(filter.missing.clone()));
+        let and = if test.is_empty() { "" } else { " AND " };
+        test.push_str(&format!("{and}{value} <> ALL(${})", params.len()));
+    }
+    test
+}
+
+/// `column` (quoted) as `double precision`, NULL where `filter` rejects it:
+/// a series keeps the row's time with a null, as for a NULL value, and every
+/// latest-value read passes over it. Without a filter the plain cast, so the
+/// statement is the one it was before #1210.
+fn filtered_value(
+    column: &str,
+    filter: Option<&ValueFilter>,
+    params: &mut Vec<SqlParam>,
+) -> String {
+    let value = format!("{column}::double precision");
+    match filter {
+        None => value,
+        Some(filter) => {
+            let test = observation_test(&value, filter, params);
+            format!("CASE WHEN {test} THEN {value} END")
+        }
+    }
+}
+
+/// `long`: one value column holds every parameter, so each requested key
+/// with a filter gets a branch on the parameter column
+/// (`WHEN <param> = $k THEN CASE WHEN <test> THEN <value> END`), and every
+/// other key keeps its value. `param_col` and `value_col` are quoted.
+fn long_value(
+    param_col: &str,
+    value_col: &str,
+    parameters: &[ValidatedParameter],
+    source_keys: &[&str],
+    params: &mut Vec<SqlParam>,
+) -> String {
+    let value = format!("{value_col}::double precision");
+    let mut branches = String::new();
+    for key in source_keys {
+        let Some(filter) = value_filter(parameters, key) else {
+            continue;
+        };
+        params.push(SqlParam::Text((*key).to_string()));
+        let key_bind = params.len();
+        let test = observation_test(&value, filter, params);
+        branches.push_str(&format!(
+            " WHEN {param_col} = ${key_bind} THEN CASE WHEN {test} THEN {value} END"
+        ));
+    }
+    if branches.is_empty() {
+        value
+    } else {
+        format!("CASE{branches} ELSE {value} END")
+    }
 }
 
 // ─── temporal extent ───────────────────────────────────────────────────────
@@ -1104,6 +1344,7 @@ mod tests {
             unit: unit.into(),
             observed_property: observed.into(),
             source_key: source.into(),
+            filter: Default::default(),
         }
     }
 
@@ -1125,6 +1366,7 @@ mod tests {
             locations_window: None,
             events_default_window: None,
             events_extent_bbox: None,
+            station_map: Default::default(),
         }
     }
 
@@ -1143,6 +1385,7 @@ mod tests {
             locations_window: None,
             events_default_window: None,
             events_extent_bbox: None,
+            station_map: Default::default(),
         }
     }
 
@@ -1879,6 +2122,69 @@ mod tests {
         assert!(matches!(err, BuildError::UnknownParameter(_)));
     }
 
+    /// #1063: the station map fingerprint is one aggregate row per
+    /// observation table over every configured parameter, on the set-based
+    /// path's `<fk> = ANY($1)` from `$2` on: a count, the row-key hash sum
+    /// and a hash sum per value column, every identifier quoted.
+    #[test]
+    fn frame_fingerprint_aggregates_each_table_from_since() {
+        let since = t(2026, 10, 18, 5);
+        let station_ids = ids(&["a", "b"]);
+
+        let q = build_frame_fingerprint(&long_cfg(), &station_ids, since)
+            .unwrap()
+            .remove(0);
+        assert!(q.sql.starts_with("SELECT count(*), sum("), "{}", q.sql);
+        assert!(
+            q.sql.contains("hashtext(\"fmisid\"::text) # hashfloat8(extract(epoch from \"obstime\")::double precision) # hashtext(\"param_name\"::text)"),
+            "{}",
+            q.sql
+        );
+        assert!(q
+            .sql
+            .contains("sum(hashfloat8(\"value\"::double precision))"));
+        assert!(q.sql.contains(
+            "FROM \"public\".\"observations\" WHERE \"fmisid\" = ANY($1) AND \"obstime\" >= $2 AND \"param_name\" = ANY($3)"
+        ));
+        assert_eq!(
+            q.params,
+            vec![
+                SqlParam::SharedTextArray(Arc::clone(&station_ids)),
+                SqlParam::Timestamp(since),
+                SqlParam::TextArray(vec!["t2m".into()]),
+            ]
+        );
+
+        // `wide`: one value hash per configured parameter's column.
+        let q = build_frame_fingerprint(&wide_cfg(), &station_ids, since)
+            .unwrap()
+            .remove(0);
+        assert!(q.sql.contains(
+            "sum(hashfloat8(\"temp_celsius\"::double precision)), sum(hashfloat8(\"humidity_pct\"::double precision))"
+        ));
+        assert_eq!(q.params.len(), 2);
+
+        // `per_parameter`: one statement per table, a naive time column
+        // compared against the converted bind.
+        let queries =
+            build_frame_fingerprint(&nexus_per_parameter_cfg(), &station_ids, since).unwrap();
+        assert_eq!(queries.len(), 2);
+        assert!(queries[1].sql.contains("FROM \"public\".\"wind_speed\""));
+        assert!(queries[1]
+            .sql
+            .contains("\"time\" >= ($2 AT TIME ZONE 'UTC')"));
+        assert_eq!(queries[1].parameter.as_deref(), Some("wind_speed"));
+        for q in &queries {
+            assert_eq!(q.sql.matches("SELECT").count(), 1);
+        }
+
+        let events = mk_cfg_obs_only(ObservationSchema::Events(lightning_shape()));
+        assert!(matches!(
+            build_frame_fingerprint(&events, &station_ids, since),
+            Err(BuildError::NoStations)
+        ));
+    }
+
     #[test]
     fn stations_in_polygon_fetches_one_past_the_memory_guard() {
         // #1062: the prefilter is a memory guard at 200 000 stations, far
@@ -1886,6 +2192,258 @@ mod tests {
         assert_eq!(MAX_STATIONS_IN_POLYGON, 200_001);
         let q = build_stations_in_polygon(&long_cfg(), "POLYGON((0 0,1 0,1 1,0 1,0 0))").unwrap();
         assert!(q.sql.ends_with(" LIMIT 200001"), "{}", q.sql);
+    }
+
+    // ---- value filters (#1210) ---------------------------------------------
+
+    /// `t2m`/`air_temperature` keep `[-80, 60]` without `-32766`;
+    /// `rh`/`wind_speed` drop `999` only; anything else has no filter.
+    fn with_filters(mut cfg: PostgisEngineConfig) -> PostgisEngineConfig {
+        for p in &mut cfg.parameters {
+            p.filter = match p.source_key.as_str() {
+                "t2m" | "air_temperature" => ValueFilter {
+                    range: Some((-80.0, 60.0)),
+                    missing: vec![-32766.0],
+                },
+                "rh" | "wind_speed" => ValueFilter {
+                    range: None,
+                    missing: vec![999.0],
+                },
+                _ => ValueFilter::default(),
+            };
+        }
+        cfg
+    }
+
+    /// `long`: one branch per requested key with a filter, on the parameter
+    /// column, every bound and sentinel a bind after the WHERE clause's and
+    /// before the LIMIT; a key without a filter keeps its value.
+    #[test]
+    fn long_value_filters_branch_on_the_parameter_with_binds() {
+        let mut cfg = with_filters(long_cfg());
+        cfg.parameters
+            .push(param("ws", "wind", "m/s", "wind_speed", "ws"));
+        let window = Some((t(2026, 4, 1, 0), t(2026, 4, 1, 12)));
+        let q = build_location(&cfg, "1001", window, &["t2m", "ws"], 77)
+            .unwrap()
+            .remove(0);
+        let v = "\"value\"::double precision";
+        assert!(
+            q.sql.contains(&format!(
+                "\"param_name\" AS parameter, CASE WHEN \"param_name\" = $5 THEN CASE WHEN \
+                 {v} >= $6 AND {v} <= $7 AND {v} <> ALL($8) THEN {v} END ELSE {v} END AS value \
+                 FROM"
+            )),
+            "{}",
+            q.sql
+        );
+        assert!(q.sql.contains("\"param_name\" = ANY($4)"), "{}", q.sql);
+        assert!(
+            q.sql.ends_with("ORDER BY \"obstime\" LIMIT $9"),
+            "{}",
+            q.sql
+        );
+        assert_eq!(
+            q.params,
+            vec![
+                SqlParam::Text("1001".into()),
+                SqlParam::Timestamp(t(2026, 4, 1, 0)),
+                SqlParam::Timestamp(t(2026, 4, 1, 12)),
+                SqlParam::TextArray(vec!["t2m".into(), "ws".into()]),
+                SqlParam::Text("t2m".into()),
+                SqlParam::Float(-80.0),
+                SqlParam::Float(60.0),
+                SqlParam::FloatArray(vec![-32766.0]),
+                SqlParam::Int(77),
+            ]
+        );
+        assert_eq!(q.limit_param_idx, Some(8));
+        assert_eq!(q.row_limit(), Some(77));
+        // No bound or sentinel is inlined.
+        assert!(
+            !q.sql.contains("32766") && !q.sql.contains("80"),
+            "{}",
+            q.sql
+        );
+
+        // A sentinel-only filter is one `<> ALL` test, and only the requested
+        // keys get a branch: without a window the binds start at $3.
+        let q = build_location(&cfg, "1001", None, &["ws", "t2m"], 5)
+            .unwrap()
+            .remove(0);
+        assert!(q.sql.contains("\"param_name\" = $3 THEN"), "{}", q.sql);
+        assert_eq!(q.params[2], SqlParam::Text("t2m".into()));
+        let mut rh = with_filters(wide_cfg());
+        rh.observations = long_cfg().observations;
+        let q = build_location(&rh, "1001", None, &["rh"], 5)
+            .unwrap()
+            .remove(0);
+        assert!(
+            q.sql.contains(&format!(
+                "CASE WHEN \"param_name\" = $3 THEN CASE WHEN {v} <> ALL($4) THEN {v} END \
+                 ELSE {v} END AS value"
+            )),
+            "{}",
+            q.sql
+        );
+        assert_eq!(
+            q.params[1..],
+            [
+                SqlParam::TextArray(vec!["rh".into()]),
+                SqlParam::Text("rh".into()),
+                SqlParam::FloatArray(vec![999.0]),
+                SqlParam::Int(5),
+            ]
+        );
+        assert!(q.sql.ends_with("LIMIT $5"), "{}", q.sql);
+        assert_eq!(q.limit_param_idx, Some(4));
+    }
+
+    /// Without any filter a statement is the one it was before #1210.
+    #[test]
+    fn value_filters_leave_unfiltered_statements_unchanged() {
+        for cfg in [long_cfg(), wide_cfg(), nexus_per_parameter_cfg()] {
+            let keys: Vec<&str> = cfg
+                .parameters
+                .iter()
+                .map(|p| p.source_key.as_str())
+                .collect();
+            for q in build_location(&cfg, "s", None, &keys, 3).unwrap() {
+                assert!(!q.sql.contains("CASE WHEN"), "{}", q.sql);
+                assert!(
+                    q.params
+                        .iter()
+                        .all(|p| !matches!(p, SqlParam::Float(_) | SqlParam::FloatArray(_))),
+                    "{:?}",
+                    q.params
+                );
+            }
+        }
+    }
+
+    /// `wide`: a filtered column's value is a CASE in the projection, its
+    /// binds after the window's; each column has its own parameter's filter.
+    #[test]
+    fn wide_value_filters_wrap_each_column() {
+        let cfg = with_filters(wide_cfg());
+        let window = Some((t(2026, 4, 1, 0), t(2026, 4, 1, 12)));
+        let q = build_area_set(&cfg, &ids(&["a", "b"]), window, &["t2m", "rh"], 11)
+            .unwrap()
+            .remove(0);
+        let t2m = "\"temp_celsius\"::double precision";
+        let rh = "\"humidity_pct\"::double precision";
+        assert!(
+            q.sql.contains(&format!(
+                "CASE WHEN {t2m} >= $4 AND {t2m} <= $5 AND {t2m} <> ALL($6) THEN {t2m} END AS \"t2m\", \
+                 CASE WHEN {rh} <> ALL($7) THEN {rh} END AS \"rh\" FROM"
+            )),
+            "{}",
+            q.sql
+        );
+        assert!(
+            q.sql
+                .ends_with("ORDER BY \"station_id\", \"valid_time\" LIMIT $8"),
+            "{}",
+            q.sql
+        );
+        assert_eq!(
+            q.params[3..],
+            [
+                SqlParam::Float(-80.0),
+                SqlParam::Float(60.0),
+                SqlParam::FloatArray(vec![-32766.0]),
+                SqlParam::FloatArray(vec![999.0]),
+                SqlParam::Int(11),
+            ]
+        );
+        assert_eq!(q.limit_param_idx, Some(7));
+        assert_eq!(q.values_per_row, 2);
+    }
+
+    /// `per_parameter`: each table's statement carries its own parameter's
+    /// filter, numbered after its own window binds.
+    #[test]
+    fn per_parameter_value_filters_are_per_table() {
+        let cfg = with_filters(nexus_per_parameter_cfg());
+        let window = Some((t(2026, 6, 15, 0), t(2026, 6, 15, 1)));
+        let qs = build_location(&cfg, "s", window, &["air_temperature", "wind_speed"], 9).unwrap();
+        let v = "\"value\"::double precision";
+        assert!(
+            qs[0].sql.contains(&format!(
+                "CASE WHEN {v} >= $4 AND {v} <= $5 AND {v} <> ALL($6) THEN {v} END AS value FROM"
+            )),
+            "{}",
+            qs[0].sql
+        );
+        assert_eq!(
+            qs[0].params[3..],
+            [
+                SqlParam::Float(-80.0),
+                SqlParam::Float(60.0),
+                SqlParam::FloatArray(vec![-32766.0]),
+                SqlParam::Int(9),
+            ]
+        );
+        assert!(qs[0].sql.ends_with("LIMIT $7"), "{}", qs[0].sql);
+        assert!(
+            qs[1].sql.contains(&format!(
+                "CASE WHEN {v} <> ALL($4) THEN {v} END AS value FROM"
+            )),
+            "{}",
+            qs[1].sql
+        );
+        assert_eq!(
+            qs[1].params[3..],
+            [SqlParam::FloatArray(vec![999.0]), SqlParam::Int(9)]
+        );
+        assert_eq!(qs[1].limit_param_idx, Some(4));
+    }
+
+    /// With filters the set-based statement is still the single-station one
+    /// behind the station id: same value expressions, every bind but the
+    /// station one identical.
+    #[test]
+    fn value_filters_read_the_same_on_every_path() {
+        for cfg in [
+            with_filters(long_cfg()),
+            with_filters(wide_cfg()),
+            with_filters(nexus_per_parameter_cfg()),
+        ] {
+            let keys: Vec<&str> = cfg
+                .parameters
+                .iter()
+                .map(|p| p.source_key.as_str())
+                .collect();
+            let window = Some((t(2026, 4, 1, 0), t(2026, 4, 1, 12)));
+            let one = build_location(&cfg, "s1", window, &keys, 7).unwrap();
+            let set = build_area_set(&cfg, &ids(&["s1", "s2"]), window, &keys, 7).unwrap();
+            assert_eq!(one.len(), set.len());
+            for (o, s) in one.iter().zip(&set) {
+                assert!(o.sql.contains("CASE WHEN"), "{}", o.sql);
+                let (o_cols, _) = o.sql.split_once(" FROM ").unwrap();
+                let (s_cols, _) = s.sql.split_once(" FROM ").unwrap();
+                let o_list = o_cols.split_once(' ').unwrap().1;
+                assert!(
+                    s_cols.ends_with(&format!(" AS mc_station, {o_list}")),
+                    "{s_cols}"
+                );
+                assert_eq!(s.params[1..], o.params[1..]);
+                assert_eq!(s.limit_param_idx, o.limit_param_idx);
+            }
+        }
+    }
+
+    /// The filter of the first parameter mapped to a source key; an empty
+    /// filter or an unknown key is none.
+    #[test]
+    fn value_filter_lookup_by_source_key() {
+        let cfg = with_filters(wide_cfg());
+        assert_eq!(
+            value_filter(&cfg.parameters, "rh").map(|f| f.missing.clone()),
+            Some(vec![999.0])
+        );
+        assert!(value_filter(&cfg.parameters, "nope").is_none());
+        assert!(value_filter(&wide_cfg().parameters, "t2m").is_none());
     }
 
     // ---- events ------------------------------------------------------------
@@ -1916,6 +2474,7 @@ mod tests {
     fn events_area_sql_shape_and_binds() {
         let q = build_events_area(
             &lightning_shape(),
+            &[],
             "POLYGON((21 59,29 59,29 66,21 66,21 59))",
             (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
             &["peak_current", "multiplicity"],
@@ -1954,12 +2513,58 @@ mod tests {
         assert_eq!(q.values_per_row, 2);
     }
 
+    /// #1210: an event's filtered value is a CASE whose binds follow the
+    /// `LIMIT $4`, which keeps its index; an unfiltered key is the plain cast.
+    #[test]
+    fn events_area_value_filter_binds_follow_the_limit() {
+        let mut current = param("peak_current", "Peak current", "kA", "pc", "peak_current");
+        current.filter = ValueFilter {
+            range: Some((-300.0, 300.0)),
+            missing: vec![-999.0, 0.0],
+        };
+        let parameters = vec![
+            param("multiplicity", "Multiplicity", "1", "m", "multiplicity"),
+            current,
+        ];
+        let q = build_events_area(
+            &lightning_shape(),
+            &parameters,
+            "POLYGON((0 0,1 0,1 1,0 1,0 0))",
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            &["multiplicity", "peak_current"],
+            10,
+        )
+        .unwrap();
+        let v = "\"peak_current\"::double precision";
+        assert!(
+            q.sql.contains(&format!(
+                ", \"multiplicity\"::double precision AS \"multiplicity\", \
+                 CASE WHEN {v} >= $5 AND {v} <= $6 AND {v} <> ALL($7) THEN {v} END \
+                 AS \"peak_current\","
+            )),
+            "{}",
+            q.sql
+        );
+        assert!(q.sql.ends_with("LIMIT $4"), "{}", q.sql);
+        assert_eq!(q.limit_param_idx, Some(3));
+        assert_eq!(q.row_limit(), Some(10));
+        assert_eq!(
+            q.params[4..],
+            [
+                SqlParam::Float(-300.0),
+                SqlParam::Float(300.0),
+                SqlParam::FloatArray(vec![-999.0, 0.0]),
+            ]
+        );
+    }
+
     #[test]
     fn events_area_without_tz_uses_bare_binds() {
         let mut shape = lightning_shape();
         shape.time_col_tz = None;
         let q = build_events_area(
             &shape,
+            &[],
             "POLYGON((0 0,1 0,1 1,0 1,0 0))",
             (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
             &["peak_current"],
@@ -1975,6 +2580,7 @@ mod tests {
     fn events_area_rejects_empty_wkt() {
         let err = build_events_area(
             &lightning_shape(),
+            &[],
             "  ",
             (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
             &["peak_current"],

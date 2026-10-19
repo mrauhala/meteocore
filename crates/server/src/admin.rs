@@ -652,6 +652,19 @@ static LIGHTNING_STRIKE_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(
     )
 });
 
+// Station-frame cache (#1063) — process-global, byte-bounded LRU of the
+// station map layers' decoded frames, so the meta-tiles of one frame share
+// ONE DB fetch.
+static STATION_FRAME_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "station_frame_cache",
+        "Station map frame cache",
+        Some("station map layers"),
+        Some("frame DB fetches"),
+        false,
+    )
+});
+
 // PostGIS engine gauges (#110). All set per-scrape from live engine state — no
 // delta-tracking needed (they're true gauges, not cumulative counters; the
 // per-query duration/rows/error histograms are a follow-up — see the metrics
@@ -1280,7 +1293,91 @@ struct CacheCounterState {
     cap: HashMap<String, [u64; 8]>,
     /// BUFR engine counters per collection (`Health::counters` order).
     bufr: HashMap<String, [u64; engine_bufr::health::COUNTERS]>,
+    /// Station-grid per-collection `[analyses, failures]` (#1082).
+    station_grid: HashMap<String, [u64; 2]>,
 }
+
+// Station grids (#1082): the stations behind the latest analysis is the
+// first thing to check when one looks wrong.
+static STATION_GRID_STATIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "station_grid_stations",
+            "Stations the latest analysis of a station-grid parameter was computed from",
+        ),
+        &["collection", "parameter"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static STATION_GRID_ANALYSES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "station_grid_analyses_total",
+            "Station-grid analyses computed (request misses and pre-computes)",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static STATION_GRID_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "station_grid_failures_total",
+            "Station-grid analyses and source reads that failed",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static STATION_GRID_LAST_ANALYSIS_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "station_grid_last_analysis_ms",
+            "Wall-clock duration of the most recent station-grid analysis",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static STATION_GRID_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "station_grid_cache",
+        "station-grid analysis cache",
+        None,
+        None,
+        false,
+    )
+});
+static STATION_GRID_COMPUTE_USED: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "station_grid_compute_reserved_bytes",
+        "Bytes reserved by station-grid analyses being computed",
+    )
+});
+static STATION_GRID_COMPUTE_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "station_grid_compute_capacity_bytes",
+        "Station-grid computation admission capacity",
+    )
+});
+static STATION_GRID_COMPUTE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "station_grid_compute_rejected_total",
+        "Station-grid analyses rejected by computation memory admission",
+    )
+});
 
 static NOWCAST_CELL_BIRTHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -1601,6 +1698,7 @@ pub struct ServerState {
     pub bufr_engines: RwLock<Vec<Arc<engine_bufr::BufrEngine>>>,
     pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
     pub nowcast_engines: RwLock<Vec<Arc<engine_nowcast::NowcastEngine>>>,
+    pub station_grid_engines: RwLock<Vec<Arc<engine_station_grid::StationGridEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
     pub reload_lock: tokio::sync::Mutex<()>,
     /// Bearer token for admin endpoint authentication.
@@ -1664,6 +1762,7 @@ pub struct LoadResult {
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
     pub nowcast_engines: Vec<Arc<engine_nowcast::NowcastEngine>>,
     nowcast_dependency_updates: Vec<engine_nowcast::engine::DependencyUpdate>,
+    pub station_grid_engines: Vec<Arc<engine_station_grid::StationGridEngine>>,
     /// Every successfully built (or reused) poll-loop engine, keyed by
     /// collection id — the reuse pool for the NEXT incremental reload (#574).
     pub engines_by_id: HashMap<String, EngineHandle>,
@@ -1724,9 +1823,22 @@ pub enum EngineHandle {
     Bufr(Arc<engine_bufr::BufrEngine>),
     Postgis(Arc<engine_postgis::PostgisEngine>),
     Nowcast(Arc<engine_nowcast::NowcastEngine>),
+    StationGrid(Arc<engine_station_grid::StationGridEngine>),
 }
 
 impl EngineHandle {
+    /// The station collection a station-grid collection may grid (#1082):
+    /// the `EdrEngine` of a CSV, BUFR or PostGIS stations collection,
+    /// whichever APIs it lists. `None` for every other engine.
+    fn station_source(&self) -> Option<Arc<dyn ds_core::edr_engine::EdrEngine>> {
+        match self {
+            Self::Csv(e) => Some(e.clone()),
+            Self::Bufr(e) => Some(e.clone()),
+            Self::Postgis(e) if e.config().events().is_none() => Some(e.clone()),
+            _ => None,
+        }
+    }
+
     /// The `FeatureEngine` that serves this collection's EDR `items` query
     /// (#928): the engine behind its `EdrEngine`, for the engines that
     /// implement both over one collection. `None` for engines without
@@ -1750,7 +1862,8 @@ impl EngineHandle {
             | Self::Zarr(_)
             | Self::Satellite(_)
             | Self::Netcdf(_)
-            | Self::Odim(_) => None,
+            | Self::Odim(_)
+            | Self::StationGrid(_) => None,
         }
     }
 }
@@ -1797,6 +1910,11 @@ impl EngineReuse {
     reuse_take!(take_bufr, Bufr, engine_bufr::BufrEngine);
     reuse_take!(take_postgis, Postgis, engine_postgis::PostgisEngine);
     reuse_take!(take_nowcast, Nowcast, engine_nowcast::NowcastEngine);
+    reuse_take!(
+        take_station_grid,
+        StationGrid,
+        engine_station_grid::StationGridEngine
+    );
 }
 
 /// Decide which collections of the NEW config may reuse their live engine
@@ -1827,7 +1945,12 @@ pub(crate) fn reusable_collections(
         |c: &CollectionConfig| old.get(&c.id).is_some_and(|o| o == c) && live.contains_key(&c.id);
     let base: std::collections::HashSet<String> = new
         .iter()
-        .filter(|c| !matches!(c.engine_type.as_str(), "nowcast" | "csv" | "geojson"))
+        .filter(|c| {
+            !matches!(
+                c.engine_type.as_str(),
+                "nowcast" | "csv" | "geojson" | "station-grid"
+            )
+        })
         .filter(|c| unchanged(c))
         .map(|c| c.id.clone())
         .collect();
@@ -1842,6 +1965,17 @@ pub(crate) fn reusable_collections(
         // Only raster provenance gates reuse. Auxiliary references are staged
         // after validating ALL named dependencies against the new base registries.
         if base.contains(&nc.source) {
+            out.insert(c.id.clone());
+        }
+    }
+    // A station grid keeps its engine only with its station source's: a
+    // rebuilt source (a CSV always is) is a new `Arc` the grid must read.
+    for c in new.iter().filter(|c| c.engine_type == "station-grid") {
+        if unchanged(c)
+            && c.station_grid
+                .as_ref()
+                .is_some_and(|g| base.contains(&g.source))
+        {
             out.insert(c.id.clone());
         }
     }
@@ -1977,11 +2111,12 @@ fn state_dir_reload_warning(
     })
 }
 
-/// The HTML page of a 3D Tiles collection in another API, as a path below the
-/// base URL (#1137): on the shared OGC API root (mounted at the server root,
-/// `SharedApi::new("")` in `main.rs`) when Maps or Tiles serve the
-/// collection, else EDR's. `None` when neither does: WMS has no collection
-/// page, and a PVOL site never enters the Features registry.
+/// The page of a per-site radar collection, as a path below the base URL:
+/// for its 3D Tiles collection (#1137) and for the site's feature in the
+/// network's site inventory (#1143). On the shared OGC API root (mounted at
+/// the server root, `SharedApi::new("")` in `main.rs`) when Maps or Tiles
+/// serve the collection, else EDR's. `None` when neither does: WMS has no
+/// collection page, and a PVOL site never enters the Features registry.
 fn volume_collection_page(id: &str, shared_root: bool, edr: bool) -> Option<String> {
     let mount = if shared_root {
         ""
@@ -2052,6 +2187,8 @@ pub fn load_collections(
     let mut volume_quantity_styles: HashMap<String, api_3dtiles::QuantityStyles> = HashMap::new();
     // Each 3D Tiles collection's HTML page in another API (#1137).
     let mut volume_collection_pages: HashMap<String, String> = HashMap::new();
+    // Pages of the collections a feature links to as related (#1143).
+    let mut feature_collection_pages: HashMap<String, String> = HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
@@ -2072,6 +2209,8 @@ pub fn load_collections(
     // Derived collections wire in a second pass, after every base engine
     // exists (#522). Collected here during the main loop.
     let mut nowcast_pending: Vec<&CollectionConfig> = Vec::new();
+    let mut station_grid_pending: Vec<&CollectionConfig> = Vec::new();
+    let mut station_grid_engines: Vec<Arc<engine_station_grid::StationGridEngine>> = Vec::new();
     // Pool registry is local to this load: collections sharing a DSN share a
     // pool via Arc<Pool>. Seed it with the pools of every REUSED postgis
     // engine (#574) so a rebuilt collection on a shared DSN joins the live
@@ -2124,6 +2263,7 @@ pub fn load_collections(
             "bufr" => &["edr", "features"],
             "postgis" => &["edr", "features", "tiles", "wms", "maps"],
             "nowcast" => &["wms", "maps", "tiles", "features", "edr"],
+            "station-grid" => &["wms", "maps", "tiles", "edr"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -3513,6 +3653,18 @@ pub fn load_collections(
                             &bundle_index,
                         ));
                     }
+                    // From the registries this site entered above, not from
+                    // `apis`: "features" registers the network inventory
+                    // under the source id, never the site.
+                    let site_page = volume_collection_page(
+                        &site_id,
+                        maps_collections.contains_key(&site_id)
+                            || tiles_collections.contains_key(&site_id),
+                        edr_collections.contains_key(&site_id),
+                    );
+                    if let Some(page) = &site_page {
+                        feature_collection_pages.insert(site_id.clone(), page.clone());
+                    }
                     if collection.apis.contains(&"3dtiles".to_string()) {
                         volume_engines.insert(
                             site_id.clone(),
@@ -3533,15 +3685,7 @@ pub fn load_collections(
                             site_id.clone(),
                             api_3dtiles::quantity_styles(&site_id, &raster_params, &layer_styles),
                         );
-                        // From the registries this site entered above, not
-                        // from `apis`: "features" registers the network
-                        // inventory under the source id, never the site.
-                        if let Some(page) = volume_collection_page(
-                            &site_id,
-                            maps_collections.contains_key(&site_id)
-                                || tiles_collections.contains_key(&site_id),
-                            edr_collections.contains_key(&site_id),
-                        ) {
+                        if let Some(page) = site_page {
                             volume_collection_pages.insert(site_id.clone(), page);
                         }
                     }
@@ -3989,11 +4133,34 @@ pub fn load_collections(
                     );
                 }
 
-                // The events shape has a raster surface (#504: the
-                // age-colored lightning layer) — wire the MapEngine into the
-                // raster APIs. Station shapes keep the MVT feature-tile
-                // path; config validation rejects wms/maps for them.
+                // Raster surfaces: the events shape's age-colored lightning
+                // layer (#504), and a station shape's symbol layers (#1063)
+                // when opted in (`postgis_map_wiring`). Station shapes keep
+                // the MVT feature-tile path.
                 let is_events = engine.config().events().is_some();
+                let wiring = postgis_map_wiring(collection);
+                let layer_params = if wiring.station_layers {
+                    use ds_core::map_engine::MapEngine as _;
+                    engine.raster_info_shared().parameters.clone()
+                } else {
+                    Vec::new()
+                };
+                if wiring.station_layers {
+                    // Every load, built or reused: a reload can change the
+                    // styles without changing the collection.
+                    let styles = collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &layer_params,
+                        &bundle_index,
+                    );
+                    engine.set_station_symbols(postgis_station_symbols(
+                        &styles,
+                        &collection.id,
+                        &layer_params,
+                    ));
+                }
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
@@ -4017,27 +4184,32 @@ pub fn load_collections(
                     );
                     feature_collections.insert(collection.id.clone(), collection.clone());
                 }
-                if collection.apis.contains(&"wms".to_string()) && is_events {
+                if wiring.raster_apis.contains(&"wms") {
                     map_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
-                    register_point_engine(
-                        &mut wms_point_engines,
-                        &collection.id,
-                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
-                    );
+                    // A station marker shows the latest value within
+                    // max_age, which the EDR position query does not
+                    // answer: station layers are not queryable (#1063).
+                    if is_events {
+                        register_point_engine(
+                            &mut wms_point_engines,
+                            &collection.id,
+                            engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                        );
+                    }
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
                         style_ctx,
                         &mut styles_cache,
                         collection,
-                        &[],
+                        &layer_params,
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
-                if collection.apis.contains(&"maps".to_string()) && is_events {
+                if wiring.raster_apis.contains(&"maps") {
                     maps_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
@@ -4047,36 +4219,35 @@ pub fn load_collections(
                         style_ctx,
                         &mut styles_cache,
                         collection,
-                        &[],
+                        &layer_params,
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
-                if collection.apis.contains(&"tiles".to_string()) {
-                    if is_events {
-                        tiles_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                        );
-                        tiles_collections.insert(collection.id.clone(), collection.clone());
-                        tiles_styles.extend(collection_layer_styles(
-                            style_ctx,
-                            &mut styles_cache,
-                            collection,
-                            &[],
-                            &bundle_index,
-                        ));
-                        info!(
-                            "Collection '{}': wired to Tiles API (raster)",
-                            collection.id
-                        );
-                    } else {
-                        tiles_feature_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
-                        );
-                        tiles_feature_collections.insert(collection.id.clone(), collection.clone());
-                    }
+                if wiring.raster_apis.contains(&"tiles") {
+                    tiles_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    tiles_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &layer_params,
+                        &bundle_index,
+                    ));
+                    info!(
+                        "Collection '{}': wired to Tiles API (raster)",
+                        collection.id
+                    );
+                }
+                if wiring.vector_tiles {
+                    tiles_feature_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                    );
+                    tiles_feature_collections.insert(collection.id.clone(), collection.clone());
                 }
                 postgis_engines.push(engine);
                 health.push(CollectionHealth {
@@ -4090,6 +4261,9 @@ pub fn load_collections(
             // base engines exist (#522).
             "nowcast" => {
                 nowcast_pending.push(collection);
+            }
+            "station-grid" => {
+                station_grid_pending.push(collection);
             }
             other => {
                 tracing::error!(
@@ -4376,6 +4550,149 @@ pub fn load_collections(
         );
     }
 
+    // ------------------------------------------------------------------
+    // Third pass: station grids (#1082), over the station collections the
+    // passes above built. Only a CSV, BUFR or PostGIS stations engine is a
+    // source, so a grid never grids a derived collection.
+    // ------------------------------------------------------------------
+    for collection in station_grid_pending {
+        let mut fail = |error: String| {
+            tracing::error!("Collection '{}': {error}, skipping", collection.id);
+            health.push(CollectionHealth {
+                id: collection.id.clone(),
+                engine_type: "station-grid".into(),
+                status: CollectionStatus::Failed,
+                error: Some(error),
+            });
+        };
+        let Some(grid_config) = collection.station_grid.as_ref() else {
+            fail("missing [collections.station_grid] config".into());
+            continue;
+        };
+        let Some(source) = engines_by_id
+            .get(&grid_config.source)
+            .and_then(EngineHandle::station_source)
+        else {
+            fail(format!(
+                "station_grid source '{}' not found or not a station collection (csv, bufr \
+                 or postgis stations defined in the same config)",
+                grid_config.source
+            ));
+            continue;
+        };
+        let engine = match engine_reuse.take_station_grid(&collection.id) {
+            Some(live) => live,
+            None => match engine_station_grid::StationGridEngine::new(
+                &collection.id,
+                &grid_config.source,
+                source,
+                grid_config,
+            ) {
+                Ok(engine) => Arc::new(engine),
+                Err(e) => {
+                    fail(format!("failed to initialize station-grid engine: {e}"));
+                    continue;
+                }
+            },
+        };
+        engines_by_id.insert(
+            collection.id.clone(),
+            EngineHandle::StationGrid(engine.clone()),
+        );
+        station_grid_engines.push(engine.clone());
+
+        // Every API's collection description says how the grids are made.
+        let mut described = collection.clone();
+        described.description = match described.description.trim() {
+            "" => engine.provenance().to_string(),
+            own => format!("{own} {}", engine.provenance()),
+        };
+        let parameters = ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+        let mut styles = || {
+            collection_layer_styles(
+                style_ctx,
+                &mut styles_cache,
+                collection,
+                &parameters,
+                &bundle_index,
+            )
+        };
+        if collection.apis.contains(&"edr".to_string()) {
+            edr_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
+            edr_collections.insert(collection.id.clone(), described.clone());
+            edr_styles.extend(styles());
+            info!("Collection '{}': wired to EDR API", collection.id);
+        }
+        if collection.apis.contains(&"wms".to_string()) {
+            map_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            register_point_engine(
+                &mut wms_point_engines,
+                &collection.id,
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
+            map_collections.insert(collection.id.clone(), described.clone());
+            map_styles.extend(styles());
+            info!("Collection '{}': wired to WMS API", collection.id);
+        }
+        if collection.apis.contains(&"maps".to_string()) {
+            maps_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            maps_collections.insert(collection.id.clone(), described.clone());
+            maps_styles.extend(styles());
+            info!("Collection '{}': wired to Maps API", collection.id);
+        }
+        if collection.apis.contains(&"tiles".to_string()) {
+            tiles_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            tiles_collections.insert(collection.id.clone(), described.clone());
+            tiles_styles.extend(styles());
+            info!("Collection '{}': wired to Tiles API", collection.id);
+        }
+
+        // Without an analysis time yet (a WIS2 source that has heard
+        // nothing) the collection is degraded until the poll finds one.
+        let has_data = engine.has_data();
+        health.push(CollectionHealth {
+            id: collection.id.clone(),
+            engine_type: "station-grid".into(),
+            status: if has_data {
+                CollectionStatus::Ready
+            } else {
+                CollectionStatus::Degraded
+            },
+            error: (!has_data).then(|| {
+                format!(
+                    "waiting for the first observations of '{}'",
+                    grid_config.source
+                )
+            }),
+        });
+        info!(
+            "Collection '{}': station grid over '{}'",
+            collection.id, grid_config.source
+        );
+    }
+
+    warn_generic_root_layers(
+        style_ctx,
+        &bundle_index,
+        [
+            (&map_engines, &map_collections, &map_styles),
+            (&maps_engines, &maps_collections, &maps_styles),
+            (&tiles_engines, &tiles_collections, &tiles_styles),
+        ],
+    );
+
     // Determine rendered cache size from first WMS collection config, or the
     // same default a `[wms]` block without `rendered_cache_mb` gets (#1010).
     let rendered_cache_mb = map_collections
@@ -4458,6 +4775,7 @@ pub fn load_collections(
             base_url: base_url.to_string(),
             trust_proxy_headers,
             vector_tileset_ids,
+            collection_pages: feature_collection_pages,
         },
         wms_state: WmsState {
             engines: map_engines,
@@ -4521,6 +4839,7 @@ pub fn load_collections(
         postgis_engines,
         nowcast_engines,
         nowcast_dependency_updates,
+        station_grid_engines,
         engines_by_id,
         wind_by_id,
     }
@@ -4633,6 +4952,93 @@ fn is_generic_fallback(ctx: &ds_render::StyleContext, palette: &ds_render::Palet
         .is_some_and(|p| p.normalized)
 }
 
+/// The root map layer's style, WMS `LAYERS=<collection>` or a Maps or
+/// Tiles request without `parameter-name`, when it draws the generic
+/// normalized palette that nothing configured chose: the #320 warning's
+/// condition. Resolved as those requests resolve it
+/// ([`ds_render::resolve_layer_style`]), so a multi-parameter collection's
+/// root layer is its default parameter's layer (#1161), which a built-in
+/// parameter default may style. A configured palette is never warned, a
+/// deliberate viridis included: a style bundle, the `[wms]` colormap or
+/// stops, or the drawn parameter's own `[[wms.parameters]]` palette.
+fn generic_root_layer<'a>(
+    ctx: &ds_render::StyleContext,
+    collection: &CollectionConfig,
+    bundles: &HashMap<&str, &StyleBundle>,
+    styles: &'a HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+    id: &str,
+    info: &'a ds_core::map_engine::RasterInfo,
+) -> Option<ds_render::LayerStyle<'a>> {
+    if resolve_bundle(collection, bundles).is_some() {
+        return None;
+    }
+    let root = ds_render::resolve_layer_style(styles, id, None, Some(info), "default").ok()?;
+    let configured = collection.wms.as_ref().is_some_and(|w| {
+        w.colormap.is_some()
+            || !w.color_stops.is_empty()
+            || root.parameter.is_some_and(|drawn| {
+                w.parameters
+                    .iter()
+                    .any(|p| p.name == drawn && (p.colormap.is_some() || !p.color_stops.is_empty()))
+            })
+    });
+    (!configured && is_generic_fallback(ctx, &root.style.palette)).then_some(root)
+}
+
+/// One map API's registries: its engines, collections and style layers.
+type MapRegistry<'a> = (
+    &'a HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>>,
+    &'a HashMap<String, CollectionConfig>,
+    &'a HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+);
+
+/// The #320 warning, once per map collection of a load: its root layer
+/// draws the generic palette ([`generic_root_layer`]).
+fn warn_generic_root_layers(
+    ctx: &ds_render::StyleContext,
+    bundles: &HashMap<&str, &StyleBundle>,
+    registries: [MapRegistry<'_>; 3],
+) {
+    let mut checked = std::collections::HashSet::new();
+    for (engines, collections, styles) in registries {
+        for (id, engine) in engines {
+            let Some(collection) = collections.get(id) else {
+                continue;
+            };
+            if !checked.insert(id.as_str()) {
+                continue;
+            }
+            let info = engine.raster_info_shared();
+            let Some(root) = generic_root_layer(ctx, collection, bundles, styles, id, &info) else {
+                continue;
+            };
+            let style = root.style;
+            match root.parameter.filter(|_| root.layer != id) {
+                Some(parameter) => tracing::warn!(
+                    "Collection '{id}': no colormap configured and no built-in default for \
+                     its default parameter '{parameter}' — collection layer renders generic \
+                     {} {:.0}..{:.0}",
+                    style.palette.name,
+                    style.min,
+                    style.max
+                ),
+                None => tracing::warn!(
+                    "Collection '{id}': no colormap configured — collection layer renders \
+                     generic {} {:.0}..{:.0}{}",
+                    style.palette.name,
+                    style.min,
+                    style.max,
+                    if info.parameters.len() > 1 {
+                        " (parameter layers keep their own styles)"
+                    } else {
+                        ""
+                    }
+                ),
+            }
+        }
+    }
+}
+
 /// Compute (once per collection) the full style-layer map: the collection
 /// key plus one "{id}/{param}" key per parameter, resolved through the
 /// shared StyleContext. Cached so the WMS, Maps and Tiles registries (and
@@ -4670,29 +5076,6 @@ fn collection_layer_styles(
     let mut layers = HashMap::new();
     match ctx.collection_styles(collection, bundle) {
         Ok(styles) => {
-            // #320: make the generic fallback visible. Only when the
-            // collection genuinely configures nothing (no inline colormap/
-            // stops and no bundle) — a deliberate viridis is not warned.
-            let unstyled = bundle.is_none()
-                && collection
-                    .wms
-                    .as_ref()
-                    .is_none_or(|w| w.colormap.is_none() && w.color_stops.is_empty());
-            if unstyled {
-                if let Some(d) = styles.get("default") {
-                    if is_generic_fallback(ctx, &d.palette) {
-                        tracing::warn!(
-                            "Collection '{}': no colormap configured — collection layer \
-                             renders generic {} {:.0}..{:.0} (parameter layers may still \
-                             match built-in defaults)",
-                            collection.id,
-                            d.palette.name,
-                            d.min,
-                            d.max
-                        );
-                    }
-                }
-            }
             layers.insert(collection.id.clone(), styles);
         }
         Err(e) => {
@@ -4715,8 +5098,92 @@ fn collection_layer_styles(
             ),
         }
     }
+    if is_postgis_station_collection(collection) {
+        // Station symbol layers (#1063): every style of the collection, so
+        // no path draws the transparent ground in an opaque nodata colour
+        // or a nodata marker as a value.
+        for styles in layers.values_mut() {
+            for style in styles.values_mut() {
+                style.colormap = Arc::new(ds_render::SymbolColorMap::new(
+                    style.colormap.clone(),
+                    engine_postgis::NODATA_MARKER,
+                ));
+            }
+        }
+    }
     cache.insert(collection.id.clone(), layers.clone());
     layers
+}
+
+/// Which map surfaces a PostGIS collection is wired to.
+#[derive(Debug, PartialEq, Eq)]
+struct PostgisMapWiring {
+    /// The raster map APIs it is registered with, of `wms`, `maps`, `tiles`.
+    raster_apis: Vec<&'static str>,
+    /// A station shape's symbol layers (#1063): styles resolved, midpoints
+    /// handed to the engine, and the per-refresh frame fingerprint on.
+    station_layers: bool,
+    /// The station inventory as vector tiles (MVT).
+    vector_tiles: bool,
+}
+
+/// The map wiring of a PostGIS collection. The events shape's strike layer
+/// (#504) serves every raster API listed. A station shape's symbol layers
+/// (#1063) are opt-in: a `[postgis.map]` section, or `wms`/`maps` in
+/// `apis`. A station collection listing only `tiles` without the section
+/// keeps its vector tiles alone, as before the layers existed: no raster
+/// tileset, no fingerprint statement per refresh, no style resolution and
+/// so no generic-colormap warning.
+fn postgis_map_wiring(collection: &CollectionConfig) -> PostgisMapWiring {
+    let lists = |api: &str| collection.apis.iter().any(|a| a == api);
+    let events = collection
+        .postgis
+        .as_ref()
+        .is_some_and(|p| p.observations.shape == "events");
+    let station_layers = !events
+        && (collection.postgis.as_ref().is_some_and(|p| p.map.is_some())
+            || lists("wms")
+            || lists("maps"));
+    PostgisMapWiring {
+        raster_apis: ["wms", "maps", "tiles"]
+            .into_iter()
+            .filter(|api| lists(api) && (events || station_layers))
+            .collect(),
+        station_layers,
+        vector_tiles: !events && lists("tiles"),
+    }
+}
+
+/// A PostGIS collection of a station shape: its map layers draw station
+/// symbols (#1063), not a raster.
+fn is_postgis_station_collection(collection: &CollectionConfig) -> bool {
+    collection.engine_type == "postgis"
+        && collection
+            .postgis
+            .as_ref()
+            .is_some_and(|p| p.observations.shape != "events")
+}
+
+/// The station layers' overlap order (#1063): each parameter layer's
+/// midpoint, the middle of its default style's value range. That range is
+/// the style's `min`/`max`, which fall back to the palette's first and last
+/// stops, so markers draw in ascending distance from it and the most
+/// extreme value lands on top.
+fn postgis_station_symbols(
+    layers: &HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+    collection_id: &str,
+    params: &[ds_core::map_engine::ParameterInfo],
+) -> engine_postgis::StationSymbols {
+    let midpoints = params
+        .iter()
+        .filter_map(|p| {
+            let style = layers
+                .get(&format!("{collection_id}/{}", p.name))?
+                .get("default")?;
+            Some((p.name.clone(), (style.min + style.max) / 2.0))
+        })
+        .collect();
+    engine_postgis::StationSymbols::new(midpoints)
 }
 
 /// Resolve a collection's bound bundle; None if unset (validation rejects unresolved refs).
@@ -5473,6 +5940,7 @@ fn apply_load(
     rotate_poll_loops!(bufr_engines);
     rotate_poll_loops!(postgis_engines);
     rotate_poll_loops!(nowcast_engines);
+    rotate_poll_loops!(station_grid_engines);
     info!(
         "Incremental reload: {shut_down} old poll engine(s) shut down, {spawned} new spawned, \
          {} reused",
@@ -5652,6 +6120,10 @@ fn apply_load(
         .nowcast_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.nowcast_engines;
+    *state
+        .station_grid_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.station_grid_engines;
 
     // Recount from the final `result.health` — the vanished-site block above
     // appends `Degraded` entries after the guard's `ready` was computed, so
@@ -5797,6 +6269,28 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
             .map(|e| (e.collection_id(), e.has_data()))
             .collect();
         for h in health.iter_mut().filter(|h| h.engine_type == "nowcast") {
+            if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
+                h.status = CollectionStatus::Ready;
+                h.error = None;
+            }
+        }
+    }
+
+    // Station grid: the boot `Degraded` ("waiting for the first
+    // observations") flips to `Ready` once the source has an analysis time.
+    {
+        let engines = state
+            .station_grid_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let has_data: HashMap<&str, bool> = engines
+            .iter()
+            .map(|e| (e.collection_id(), e.has_data()))
+            .collect();
+        for h in health
+            .iter_mut()
+            .filter(|h| h.engine_type == "station-grid")
+        {
             if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
                 h.status = CollectionStatus::Ready;
                 h.error = None;
@@ -6340,8 +6834,9 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         }
     }
 
-    // Lightning strike-window cache (#504): only meaningful once a postgis
-    // events collection has rendered, but the family is cheap either way.
+    // Lightning strike-window (#504) and station-frame (#1063) caches: only
+    // meaningful once a postgis map layer has rendered, but the families are
+    // cheap either way.
     if !state
         .postgis_engines
         .read()
@@ -6349,6 +6844,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         .is_empty()
     {
         LIGHTNING_STRIKE_CACHE_METRICS.update(engine_postgis::strike_window_cache_metrics(), None);
+        STATION_FRAME_CACHE_METRICS.update(engine_postgis::station_frame_cache_metrics(), None);
     }
 
     // Tile cache: per-collection
@@ -6634,6 +7130,45 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
                     .with_label_values(&[collection])
                     .set(persistence as i64);
             }
+        }
+    }
+
+    // Station grids (#1082): per collection and parameter, rebuilt each
+    // scrape so a removed collection's series go; the shared cache and
+    // computation budget once.
+    if let Ok(engines) = state.station_grid_engines.read() {
+        STATION_GRID_STATIONS.reset();
+        for engine in engines.iter() {
+            let collection = engine.collection_id();
+            for (parameter, stations) in engine.station_counts() {
+                if let Some(stations) = stations {
+                    STATION_GRID_STATIONS
+                        .with_label_values(&[collection, &parameter])
+                        .set(stations as i64);
+                }
+            }
+            let (analyses, failures, last_ms) = engine.metrics();
+            let d = delta_counts(
+                &mut counter_state.station_grid,
+                collection,
+                [analyses, failures],
+            );
+            STATION_GRID_ANALYSES_TOTAL
+                .with_label_values(&[collection])
+                .inc_by(d[0]);
+            STATION_GRID_FAILURES_TOTAL
+                .with_label_values(&[collection])
+                .inc_by(d[1]);
+            STATION_GRID_LAST_ANALYSIS_MS
+                .with_label_values(&[collection])
+                .set(last_ms as i64);
+        }
+        if !engines.is_empty() {
+            STATION_GRID_CACHE_METRICS.update(engine_station_grid::cache_metrics(), None);
+            let (used, limit, rejected) = engine_station_grid::budget_metrics();
+            STATION_GRID_COMPUTE_USED.set(used.min(i64::MAX as u64) as i64);
+            STATION_GRID_COMPUTE_LIMIT.set(limit.min(i64::MAX as u64) as i64);
+            STATION_GRID_COMPUTE_REJECTED.feed(rejected);
         }
     }
 
@@ -7166,6 +7701,7 @@ mod tests {
                 impact_weight_property: None,
                 radar_source: None,
             }),
+            station_grid: None,
             preview: None,
             derive_wind: None,
         }
@@ -7341,6 +7877,140 @@ mod tests {
             .contains(&"WindSpeedMS".to_string()));
         assert!(!off.wms_state.styles.contains_key("kenya/WindSpeedMS"));
         assert!(off.wind_by_id.is_empty());
+    }
+
+    /// #1211: QueryData reports each parameter's unit from its FMI number,
+    /// so the unit-gated built-in defaults style the committed fixtures'
+    /// temperature and pressure layers with no `[wms]` configured, and the
+    /// MEPS root layer draws its default `Temperature` with its own style
+    /// (#1161), so it is not the generic palette the #320 warning names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn querydata_fixtures_take_the_unit_gated_defaults() {
+        let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
+        let collection = |id: &str, dir: &str| -> CollectionConfig {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "title": id, "description": "QueryData",
+                "engine_type": "querydata", "apis": ["wms", "maps", "tiles"],
+                "data_path": format!("{testdata}/{dir}"),
+            }))
+            .unwrap()
+        };
+        let collections = [
+            collection("kenya", "ecmwf-kenya"),
+            collection("meps", "meps"),
+        ];
+        assert!(collections.iter().all(|c| c.wms.is_none()));
+        let ctx = ds_render::StyleContext::with_builtins();
+        let result = super::load_collections(
+            &ctx,
+            &collections,
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let styles = &result.wms_state.styles;
+        for (layer, palette, range) in [
+            ("kenya/2t", "temperature", (-90.0, 50.0)),
+            ("kenya/msl", "pressure", (950.0, 1050.0)),
+            ("kenya/rr1h", "precipitation", (0.0, 50.0)),
+            ("meps/Temperature", "temperature", (-90.0, 50.0)),
+            ("meps/Mean Sea Level Pressure", "pressure", (950.0, 1050.0)),
+        ] {
+            let style = &styles[layer]["default"];
+            assert_eq!(style.palette.name, palette, "{layer}");
+            assert_eq!((style.min, style.max), range, "{layer}");
+        }
+
+        let info = result.wms_state.engines["meps"].raster_info_shared();
+        let root =
+            ds_render::resolve_layer_style(styles, "meps", None, Some(&info), "default").unwrap();
+        assert_eq!(root.layer, "meps/Temperature");
+        let no_bundles = HashMap::new();
+        assert!(super::generic_root_layer(
+            &ctx,
+            &collections[1],
+            &no_bundles,
+            styles,
+            "meps",
+            &info
+        )
+        .is_none());
+    }
+
+    /// #320 / #1161: the generic-palette warning fires only when the root
+    /// map layer really draws the generic palette, as WMS, Maps and Tiles
+    /// resolve it, and nothing configured chose it.
+    #[test]
+    fn generic_root_layer_warns_only_on_a_real_fallback() {
+        use ds_core::map_engine::{ParameterInfo, RasterInfo};
+        let collection = |wms: &str| -> CollectionConfig {
+            toml::from_str(&format!(
+                "id = \"c\"\ntitle = \"C\"\ndescription = \"C\"\n\
+                 engine_type = \"querydata\"\n[querydata]\n{wms}"
+            ))
+            .unwrap()
+        };
+        let parameter = |name: &str, unit: &str| ParameterInfo {
+            name: name.to_string(),
+            title: name.to_string(),
+            unit: unit.to_string(),
+        };
+        let info = |default: &str, parameters: Vec<ParameterInfo>| RasterInfo {
+            native_crs: "CRS:84".to_string(),
+            spatial_extent: None,
+            times: Vec::new(),
+            parameter: default.to_string(),
+            unit: String::new(),
+            parameters,
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+        };
+        let bundles = HashMap::new();
+        // The resolved root layer and its drawn parameter, when warned.
+        let warned = |collection: &CollectionConfig, info: &RasterInfo| {
+            let ctx = ds_render::StyleContext::with_builtins();
+            let styles = layer_styles(collection, &info.parameters, &bundles);
+            super::generic_root_layer(&ctx, collection, &bundles, &styles, "c", info)
+                .map(|root| (root.layer.to_string(), root.parameter.map(str::to_string)))
+        };
+        let unstyled = collection("");
+        let some = |layer: &str, parameter: Option<&str>| {
+            Some((layer.to_string(), parameter.map(str::to_string)))
+        };
+
+        // A multi-parameter collection whose default takes a built-in
+        // default draws it: no warning, where the collection layer alone
+        // is viridis 0..1.
+        let celsius = info("t", vec![parameter("t", "°C"), parameter("foo", "")]);
+        assert_eq!(warned(&unstyled, &celsius), None);
+        // Without a unit the temperature default does not apply: the
+        // default parameter's layer is the generic fallback.
+        let unitless = info("t", vec![parameter("t", ""), parameter("foo", "")]);
+        assert_eq!(warned(&unstyled, &unitless), some("c/t", Some("t")));
+        // A default no parameter layer is named for leaves the root layer
+        // on the collection's style.
+        let unnamed = info("Temp (t)", celsius.parameters.clone());
+        assert_eq!(warned(&unstyled, &unnamed), some("c", None));
+        // A single-parameter collection keeps the collection's style.
+        assert_eq!(warned(&unstyled, &info("t", Vec::new())), some("c", None));
+
+        // Configured palettes are never warned, a deliberate viridis
+        // included: the collection's, or the drawn parameter's own.
+        let collection_viridis = collection("[wms]\ncolormap = \"viridis\"\n");
+        assert_eq!(warned(&collection_viridis, &unitless), None);
+        assert_eq!(warned(&collection_viridis, &info("t", Vec::new())), None);
+        let parameter_viridis =
+            collection("[[wms.parameters]]\nname = \"t\"\ncolormap = \"viridis\"\n");
+        assert_eq!(warned(&parameter_viridis, &unitless), None);
+        // Another parameter's palette is not the drawn one's.
+        let other_viridis =
+            collection("[[wms.parameters]]\nname = \"foo\"\ncolormap = \"viridis\"\n");
+        assert_eq!(warned(&other_viridis, &unitless), some("c/t", Some("t")));
     }
 
     /// WMS GetFeatureInfo (#1064): a WMS collection whose engine answers
@@ -7698,6 +8368,143 @@ mod tests {
             h.error
         );
         assert!(!result.wms_state.engines.contains_key("nc"));
+    }
+
+    /// A CSV station collection and a station grid over it (#1082).
+    fn station_grid_collections(source: &str) -> Vec<CollectionConfig> {
+        let mut csv = nowcast_test_collection("weather", "csv", None);
+        csv.data_path = Some("../../testdata/weather.csv".to_string());
+        csv.apis = vec!["features".to_string()];
+        let mut grid = nowcast_test_collection("t2m", "station-grid", None);
+        grid.description = "Analysed temperature.".to_string();
+        grid.apis = ["edr", "wms", "maps", "tiles"].map(String::from).to_vec();
+        grid.station_grid = Some(ds_core::config::StationGridConfig {
+            source: source.to_string(),
+            parameters: vec!["temperature".to_string()],
+            grid: ds_core::config::StationGridGeometry {
+                crs: "EPSG:4326".to_string(),
+                bbox: [19.0, 59.0, 32.0, 71.0],
+                resolution: 0.1,
+            },
+            method: "adw".to_string(),
+            power: None,
+            correlation_length_km: None,
+            max_neighbours: 8,
+            search_radius_km: 150.0,
+            max_age: "PT1H".to_string(),
+            cadence: Some("PT1H".to_string()),
+            poll_interval_secs: 60,
+            precompute: 2,
+        });
+        vec![csv, grid]
+    }
+
+    /// A station grid over a CSV collection that lists no EDR: wired into
+    /// every map API and EDR, with one styled layer per parameter, its
+    /// provenance in every description, and GetFeatureInfo through its
+    /// position query.
+    #[test]
+    fn station_grid_wires_maps_and_edr_over_a_station_source() {
+        let result = load_with_reuse(
+            &station_grid_collections("weather"),
+            super::EngineReuse::default(),
+        );
+        let h = health_of(&result, "t2m");
+        assert_eq!(h.status, super::CollectionStatus::Ready, "{:?}", h.error);
+        assert_eq!(result.station_grid_engines.len(), 1);
+        assert!(matches!(
+            result.engines_by_id.get("t2m"),
+            Some(super::EngineHandle::StationGrid(_))
+        ));
+        assert!(result.edr_state.engines.contains_key("t2m"));
+        assert!(result.wms_state.engines.contains_key("t2m"));
+        assert!(result.wms_state.point_engines.contains_key("t2m"));
+        assert!(result.maps_state.engines.contains_key("t2m"));
+        assert!(result.tiles_state.map_engines.contains_key("t2m"));
+        assert!(result.wms_state.styles.contains_key("t2m/temperature"));
+        let description = &result.edr_state.collections["t2m"].description;
+        assert!(
+            description.starts_with(
+                "Analysed temperature. Gridded on the fly from station \
+                 collection 'weather' (temperature) by angular distance weighting"
+            ),
+            "{description}"
+        );
+        assert_eq!(
+            &result.maps_state.collections["t2m"].description,
+            description
+        );
+    }
+
+    #[test]
+    fn station_grid_needs_a_station_source() {
+        let result = load_with_reuse(
+            &station_grid_collections("no-such"),
+            super::EngineReuse::default(),
+        );
+        let h = health_of(&result, "t2m");
+        assert_eq!(h.status, super::CollectionStatus::Failed);
+        assert!(h.error.as_deref().unwrap_or("").contains("not found"));
+        assert!(!result.wms_state.engines.contains_key("t2m"));
+        // The CSV source itself still loads.
+        assert_eq!(
+            health_of(&result, "weather").status,
+            super::CollectionStatus::Ready
+        );
+    }
+
+    /// A station grid keeps its engine across a reload only with its
+    /// source's: never over a CSV, which every reload rebuilds.
+    #[test]
+    fn station_grid_reuse_follows_its_source() {
+        let collections = station_grid_collections("weather");
+        let built = load_with_reuse(&collections, super::EngineReuse::default());
+        let old: HashMap<String, CollectionConfig> = collections
+            .iter()
+            .map(|c| (c.id.clone(), c.clone()))
+            .collect();
+        let live = built.engines_by_id.clone();
+        let r = super::reusable_collections(&old, &collections, &live);
+        assert!(
+            r.is_empty(),
+            "a CSV source is rebuilt, so is its grid: {r:?}"
+        );
+
+        // Over a source that is itself reused, an unchanged grid is too.
+        let radar = tm35_source_collection("radar");
+        let mut grid = collections[1].clone();
+        grid.station_grid.as_mut().unwrap().source = "radar".to_string();
+        let old: HashMap<String, CollectionConfig> = [
+            ("radar".to_string(), radar.clone()),
+            ("t2m".to_string(), grid.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let new = vec![radar, grid.clone()];
+        let r = super::reusable_collections(&old, &new, &live_of_any(&built, &["radar", "t2m"]));
+        assert!(r.contains("t2m") && r.contains("radar"), "{r:?}");
+        let mut changed = grid;
+        changed.station_grid.as_mut().unwrap().max_neighbours = 4;
+        let new = vec![new[0].clone(), changed];
+        let r = super::reusable_collections(&old, &new, &live_of_any(&built, &["radar", "t2m"]));
+        assert!(!r.contains("t2m"), "a changed grid is rebuilt");
+    }
+
+    /// Live handles for `ids`, all the same engine: `reusable_collections`
+    /// asks only whether one is live.
+    fn live_of_any(
+        built: &super::LoadResult,
+        ids: &[&str],
+    ) -> HashMap<String, super::EngineHandle> {
+        let handle = built
+            .engines_by_id
+            .values()
+            .next()
+            .expect("an engine")
+            .clone();
+        ids.iter()
+            .map(|id| (id.to_string(), handle.clone()))
+            .collect()
     }
 
     #[test]
@@ -8215,11 +9022,75 @@ mod tests {
         assert!(!Arc::ptr_eq(&live, &third.netcdf_engines[0]));
     }
 
-    /// #1067 PR 6: the shipped local MEPS example, loaded over its
+    /// #1213: the shipped local Zarr example, loaded over its committed
+    /// fixture. The engine serves each variable in the display unit of its
+    /// CF `units` (K as °C, Pa as hPa, `kg m**-2 s**-1` as mm/h), so every
+    /// layer takes the built-in default its name and served unit select,
+    /// with no style in the example; the collection's own style is the
+    /// pressure palette over its own range, for `msl`, the first variable.
+    #[test]
+    fn zarr_example_layers_get_default_styles() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text =
+            std::fs::read_to_string(root.join("collections.d/zarr-era5-t2m-local.toml")).unwrap();
+        let mut collection: CollectionConfig = toml::from_str(&text).unwrap();
+        let wms = collection.wms.as_ref().unwrap();
+        assert!(wms.parameters.is_empty() && wms.styles.is_empty());
+        collection.zarr.as_mut().unwrap().data_path = Some(
+            root.join("testdata/zarr-era5-t2m")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let id = "zarr-era5-t2m-local";
+        let loaded = load_with_reuse(&[collection], super::EngineReuse::default());
+        let styles = &loaded.wms_state.styles;
+        let style = |name: &str| {
+            let s = &styles[&format!("{id}/{name}")]["default"];
+            (s.palette.name.as_str(), s.min, s.max)
+        };
+        for (name, expected) in [
+            ("t2m", ("temperature", -90.0, 50.0)),
+            ("t2m_packed", ("temperature", -90.0, 50.0)),
+            ("msl", ("pressure", 950.0, 1050.0)),
+            ("mtpr", ("precipitation_rate", 0.0, 30.0)),
+        ] {
+            assert_eq!(style(name), expected, "{name}");
+        }
+        let parent = &styles[id]["default"];
+        assert_eq!(
+            (parent.palette.name.as_str(), parent.min, parent.max),
+            ("pressure", 950.0, 1050.0)
+        );
+        let info = loaded.wms_state.engines[id].raster_info();
+        assert_eq!(
+            (info.parameter.as_str(), info.unit.as_str()),
+            ("msl", "hPa")
+        );
+        let units: HashMap<String, String> = info
+            .parameters
+            .into_iter()
+            .map(|p| (p.name, p.unit))
+            .collect();
+        for (name, unit) in [
+            ("t2m", "°C"),
+            ("t2m_packed", "°C"),
+            ("msl", "hPa"),
+            ("mtpr", "mm/h"),
+        ] {
+            assert_eq!(units[name], unit, "{name}");
+        }
+        let descriptions = loaded.edr_state.engines[id].get_parameter_descriptions();
+        assert_eq!(descriptions["mtpr"].unit, "mm/h");
+    }
+
+    /// #1067 PR 6, #1209: the shipped local MEPS example, loaded over its
     /// committed sample. Every layer has its style at load: the layers the
-    /// example no longer configures take the built-in default their name
-    /// and the file's unit select (the gusts, MSLP in pascals, the run-start
-    /// accumulation in `kg/m^2`), the rest keep their entries.
+    /// example does not configure take the built-in default their name and
+    /// served unit select (the temperature in °C, MSLP in hPa, the
+    /// run-start accumulation in mm, the fractions in unit `1`, the gusts),
+    /// the wind components keep their narrower entries, and the
+    /// collection's own style is the temperature palette over its own
+    /// range.
     #[test]
     fn meps_netcdf_example_layers_get_default_styles() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -8238,31 +9109,50 @@ mod tests {
             (s.palette.name.as_str(), s.min, s.max)
         };
         for (name, expected) in [
-            ("air_temperature_2m", ("temperature", 183.15, 323.15)),
+            ("air_temperature_2m", ("temperature", -90.0, 50.0)),
             ("wind_speed_of_gust", ("wind_speed", 0.0, 40.0)),
-            (
-                "air_pressure_at_sea_level",
-                ("pressure", 95_000.0, 105_000.0),
-            ),
+            ("wind_speed_10m", ("wind_speed", 0.0, 40.0)),
+            ("air_pressure_at_sea_level", ("pressure", 950.0, 1050.0)),
             (
                 "precipitation_amount_acc",
                 ("precipitation_accumulation", 0.0, 200.0),
             ),
+            ("relative_humidity_2m", ("humidity_fraction", 0.0, 1.0)),
+            ("cloud_area_fraction", ("cloud_cover_fraction", 0.0, 1.0)),
             // Configured by the example.
-            ("relative_humidity_2m", ("viridis", 0.0, 1.0)),
             ("x_wind_10m", ("diverging", -20.0, 20.0)),
             ("y_wind_10m", ("diverging", -20.0, 20.0)),
-            ("cloud_area_fraction", ("grayscale", 0.0, 1.0)),
         ] {
             assert_eq!(style(name), expected, "{name}");
         }
+        let parent = &styles["meps-netcdf-local"]["default"];
+        assert_eq!(
+            (parent.palette.name.as_str(), parent.min, parent.max),
+            ("temperature", -90.0, 50.0)
+        );
+        let units: HashMap<String, String> = loaded.wms_state.engines["meps-netcdf-local"]
+            .raster_info()
+            .parameters
+            .into_iter()
+            .map(|p| (p.name, p.unit))
+            .collect();
+        for (name, unit) in [
+            ("air_temperature_2m", "°C"),
+            ("air_pressure_at_sea_level", "hPa"),
+            ("precipitation_amount_acc", "mm"),
+            ("relative_humidity_2m", "1"),
+            ("wind_speed_10m", "m/s"),
+        ] {
+            assert_eq!(units[name], unit, "{name}");
+        }
     }
 
-    /// #1067 PR 8: the shipped local MEPS pressure-level example, loaded
-    /// over its committed sample. The layers advertise the pressure axis
-    /// (WMS ELEVATION, EDR `z`), and every layer, the derived
+    /// #1067 PR 8, #1209: the shipped local MEPS pressure-level example,
+    /// loaded over its committed sample. The layers advertise the pressure
+    /// axis (WMS ELEVATION, EDR `z`), and every layer, the derived
     /// `wind_speed_pl` included, takes the built-in default its name and
-    /// unit select: the wind on twice the surface scale, for the jet.
+    /// served unit select: the temperature in °C, geopotential in gpm, the
+    /// wind on twice the surface scale, for the jet.
     #[test]
     fn meps_netcdf_pressure_level_example_serves_its_levels_and_styles() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -8292,15 +9182,20 @@ mod tests {
             (s.palette.name.as_str(), s.min, s.max)
         };
         for (name, expected) in [
-            ("air_temperature_pl", ("temperature", 183.15, 323.15)),
+            ("air_temperature_pl", ("temperature", -90.0, 50.0)),
             ("x_wind_pl", ("diverging", -80.0, 80.0)),
             ("y_wind_pl", ("diverging", -80.0, 80.0)),
             ("wind_speed_pl", ("wind_speed", 0.0, 80.0)),
-            ("geopotential_pl", ("viridis", 0.0, 206_000.0)),
+            ("geopotential_pl", ("viridis", 0.0, 21_000.0)),
             ("relative_humidity_pl", ("humidity_fraction", 0.0, 1.0)),
         ] {
             assert_eq!(style(name), expected, "{name}");
         }
+        let parent = &styles[id]["default"];
+        assert_eq!(
+            (parent.palette.name.as_str(), parent.min, parent.max),
+            ("temperature", -90.0, 50.0)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9185,6 +10080,169 @@ colormap = "radar_fmi"
         assert_eq!(styles["radar_dbz"].title, "MeteoCore Radar");
         assert!(styles.contains_key("radar_fmi"));
         assert_eq!(styles["radar_fmi"].title, "FMI Radar");
+    }
+
+    /// #1063: station symbol layers are opt-in. A station collection that
+    /// lists only `tiles` and has no `[postgis.map]` keeps exactly its vector
+    /// tiles: no raster tileset, no station layers (so no fingerprint
+    /// statement and no style resolution). `wms`/`maps` or the section turn
+    /// them on; the events shape is unchanged.
+    #[test]
+    fn postgis_station_map_layers_are_opt_in() {
+        let station = |apis: &[&str], map: bool| {
+            let mut c = nowcast_test_collection("obs", "postgis", None);
+            c.apis = apis.iter().map(|a| a.to_string()).collect();
+            let mut toml =
+                String::from("dsn_env = \"OBS_DSN\"\n[observations]\nshape = \"long\"\n");
+            if map {
+                toml.push_str("[map]\nmax_age = \"PT1H\"\n");
+            }
+            c.postgis = Some(toml::from_str(&toml).unwrap());
+            c
+        };
+        let wiring = |c: &CollectionConfig| super::postgis_map_wiring(c);
+
+        assert_eq!(
+            wiring(&station(&["edr", "features", "tiles"], false)),
+            super::PostgisMapWiring {
+                raster_apis: vec![],
+                station_layers: false,
+                vector_tiles: true,
+            },
+            "tiles alone: today's vector tiles only"
+        );
+        assert_eq!(
+            wiring(&station(&["edr", "tiles"], true)),
+            super::PostgisMapWiring {
+                raster_apis: vec!["tiles"],
+                station_layers: true,
+                vector_tiles: true,
+            }
+        );
+        assert_eq!(
+            wiring(&station(&["wms", "tiles"], false)),
+            super::PostgisMapWiring {
+                raster_apis: vec!["wms", "tiles"],
+                station_layers: true,
+                vector_tiles: true,
+            }
+        );
+        assert_eq!(wiring(&station(&["maps"], false)).raster_apis, vec!["maps"]);
+        assert!(!wiring(&station(&["edr", "features"], false)).station_layers);
+
+        let mut events = station(&["edr", "wms", "tiles"], false);
+        events.postgis.as_mut().unwrap().observations.shape = "events".into();
+        assert_eq!(
+            wiring(&events),
+            super::PostgisMapWiring {
+                raster_apis: vec!["wms", "tiles"],
+                station_layers: false,
+                vector_tiles: false,
+            }
+        );
+    }
+
+    /// #1063: a PostGIS station collection's styles draw station symbols —
+    /// the ground transparent and the nodata marker in the palette's nodata
+    /// colour, on every layer and style — and each parameter layer's
+    /// midpoint is the middle of its default style's range.
+    #[test]
+    fn postgis_station_styles_draw_symbols_and_carry_midpoints() {
+        let collection: CollectionConfig = toml::from_str(
+            r#"
+id = "surface-obs"
+title = "Surface observations"
+description = "Station observations"
+engine_type = "postgis"
+apis = ["edr", "wms"]
+
+[postgis]
+dsn_env = "OBS_DSN"
+
+[postgis.stations]
+table = "public.stations"
+id_col = "station_id"
+label_col = "name"
+geom_col = "geom"
+
+[postgis.observations]
+shape = "long"
+table = "public.observations"
+station_fk_col = "station_id"
+time_col = "time"
+param_col = "parameter"
+value_col = "value"
+
+[[postgis.parameters]]
+name = "t2m"
+label = "Air temperature"
+unit = "degC"
+
+[[postgis.parameters]]
+name = "rh"
+label = "Relative humidity"
+unit = "%"
+
+[wms]
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "t2m"
+min = -30.0
+max = 20.0
+
+[[wms.styles]]
+name = "grey"
+title = "Grey"
+colormap = "grayscale"
+"#,
+        )
+        .unwrap();
+        let params = vec![
+            ds_core::map_engine::ParameterInfo {
+                name: "t2m".into(),
+                title: "Air temperature".into(),
+                unit: "degC".into(),
+            },
+            ds_core::map_engine::ParameterInfo {
+                name: "rh".into(),
+                title: "Relative humidity".into(),
+                unit: "%".into(),
+            },
+        ];
+        let index: HashMap<&str, &StyleBundle> = HashMap::new();
+        let layers = layer_styles(&collection, &params, &index);
+        for (layer, styles) in &layers {
+            for (name, style) in styles {
+                assert_eq!(style.colormap.color(None), [0, 0, 0, 0], "{layer} {name}");
+                // The palette's nodata colour (transparent here), not the
+                // underflow colour the bare palette gives `f64::MIN`.
+                assert_eq!(
+                    style.colormap.color(Some(engine_postgis::NODATA_MARKER)),
+                    [0, 0, 0, 0],
+                    "{layer} {name}"
+                );
+                assert_ne!(
+                    style.colormap.color(Some(style.min))[3],
+                    0,
+                    "{layer} {name}"
+                );
+            }
+        }
+        let symbols = super::postgis_station_symbols(&layers, "surface-obs", &params);
+        assert_eq!(symbols.midpoint("t2m"), -5.0);
+        let rh = &layers["surface-obs/rh"]["default"];
+        assert_eq!(symbols.midpoint("rh"), (rh.min + rh.max) / 2.0);
+
+        // Without the wrap the same palette paints `f64::MIN` opaque.
+        let mut raster = collection.clone();
+        raster.engine_type = "querydata".into();
+        raster.postgis = None;
+        let style = &layer_styles(&raster, &params, &index)["surface-obs/t2m"]["default"];
+        assert_ne!(
+            style.colormap.color(Some(engine_postgis::NODATA_MARKER))[3],
+            0
+        );
     }
 
     #[test]

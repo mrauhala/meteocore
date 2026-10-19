@@ -88,8 +88,8 @@ impl OutputCrs {
     /// point outside its projection's valid area
     /// ([`crate::geo::outside_projection_domain`], #1089), where its inverse
     /// is `None` and `project_node` NaN: past the LAEA disk, and past a pole
-    /// or [`crate::geo::TM_MAX_LON_OFFSET_DEG`] from Transverse Mercator's
-    /// meridian, where its series names no place (#1113). Every point of a
+    /// or Transverse Mercator's eastings where its series stops being exact
+    /// ([`crate::geo::Crs::TransverseMercator`], #1113). Every point of a
     /// projected box wholly outside its projection is outside. The
     /// `Projected` variant ignores `wgs84_bbox`, as `project_node` does, so
     /// a box with no WGS84 envelope may pass NaN.
@@ -283,8 +283,8 @@ impl OutputCrs {
     /// Earth, and the answer is `None` (#1089). That test reads the projected
     /// box only, so `wgs84_bbox` may be anything for such a box, which has no
     /// meaningful WGS84 envelope. In a box partly outside, the pixels past
-    /// the LAEA disk, and past TM's poles or 50° from its meridian (#1113),
-    /// are non-finite in [`Self::project_node`] and stay empty.
+    /// the LAEA disk, and past TM's poles or its area's east and west edges
+    /// (#1113), are non-finite in [`Self::project_node`] and stay empty.
     ///
     /// The box is the request box cut at the outer edges of the first and
     /// last row, so a render of it at `rows.len()` rows samples the full
@@ -1951,9 +1951,10 @@ mod tests {
 
     /// A projected box wholly outside its projection's valid area has no row
     /// inside (#1089): an EPSG:3035 box past the LAEA disk, an EPSG:3067 one
-    /// past a pole, more than 50° from its meridian (#1113), or so far east
-    /// that the TM inverse has no finite result. A box reaching into the
-    /// area, or enclosing it, keeps every row.
+    /// past a pole, past the eastings where its series stops being exact
+    /// (#1113, #1130), or so far east that the TM inverse has no finite
+    /// result. A box reaching into the area, or enclosing it, keeps every
+    /// row.
     #[test]
     fn domain_rows_of_a_projected_box_outside_its_projection_are_none() {
         let laea = projected_output_crs("EPSG:3035").unwrap();
@@ -1969,7 +1970,7 @@ mod tests {
             (&tm, [0.0, 1.5e7, 1.0e6, 1.6e7]),
             (&tm, [0.0, 2.1e7, 1.0e6, 2.2e7]),
             (&tm, [0.0, -2.2e7, 1.0e6, -2.1e7]),
-            (&tm, [5.0e6, 6.5e6, 6.0e6, 7.0e6]),
+            (&tm, [1.1e7, 6.5e6, 1.2e7, 7.0e6]),
             (&tm, [1.0e20, 6.5e6, 2.0e20, 7.0e6]),
         ] {
             assert_eq!(
@@ -1985,9 +1986,12 @@ mod tests {
             // Wider than the disk.
             (&laea, [-3.0e7, -3.0e7, 3.0e7, 3.0e7]),
             (&tm, [-1.2e5, 6.3e6, 8.8e5, 7.9e6]),
-            // Across the North Pole, and across 50° east of the meridian.
+            // Across the North Pole, past the Snyder series' 50° east of the
+            // meridian (#1113), and across the area's east edge.
             (&tm, [0.0, 9.0e6, 1.0e6, 1.1e7]),
             (&tm, [1_448_154.7, 7_240_773.4, 2_896_309.4, 8_688_928.1]),
+            (&tm, [5.0e6, 6.5e6, 6.0e6, 7.0e6]),
+            (&tm, [1.0e7, -1.0e6, 1.1e7, 1.0e6]),
             // Wider than the TM area.
             (&tm, [-3.0e7, -3.0e7, 3.0e7, 3.0e7]),
         ] {
@@ -2004,9 +2008,9 @@ mod tests {
 
     /// A point's position is `project_node`'s when the point lies on the
     /// Earth, and `None` past a pole of a geographic box, past the LAEA
-    /// disk, and past a pole or 50° from Transverse Mercator's meridian
-    /// (#1064, #1089, #1113). A projected output reads its own metres, so a
-    /// NaN WGS84 box does not matter.
+    /// disk, and past a pole or Transverse Mercator's eastings where its
+    /// series stops being exact (#1064, #1089, #1113, #1130). A projected
+    /// output reads its own metres, so a NaN WGS84 box does not matter.
     #[test]
     fn position_on_earth_is_none_off_the_earth() {
         let laea = projected_output_crs("EPSG:3035").unwrap();
@@ -2036,14 +2040,14 @@ mod tests {
             None
         );
         // Every point of a box wholly outside its projection: past the LAEA
-        // disk, past TM's poles, north and south, and past 50° east of its
-        // meridian.
+        // disk, past TM's poles, north and south, and past its area's east
+        // edge.
         for (crs, bbox) in [
             (&laea, [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
             (&tm, [0.0, 1.5e7, 1.0e6, 1.6e7]),
             (&tm, [0.0, 2.1e7, 1.0e6, 2.2e7]),
             (&tm, [0.0, -2.2e7, 1.0e6, -2.1e7]),
-            (&tm, [5.0e6, 6.5e6, 6.0e6, 7.0e6]),
+            (&tm, [1.1e7, 6.5e6, 1.2e7, 7.0e6]),
         ] {
             let out = projected(crs, bbox);
             for (fx, fy) in [(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)] {
@@ -2063,21 +2067,31 @@ mod tests {
         assert!((80.0..90.0).contains(&lat), "{lat}");
 
         // The top row of the #1110 meta-tile, 256 px, runs from 36° to 62°
-        // east of the meridian. Past about 56° the series answered with a
-        // place anywhere, (296.1°, 84.5°) at column 195 with macOS's libm,
-        // and this passed it on (#1113). Now each column is either a place
-        // within 50° or none.
+        // east of the meridian. Past about 56° the Snyder series answered
+        // with a place anywhere, (296.1°, 84.5°) at column 195 with macOS's
+        // libm, and this passed it on (#1113). Krüger's names every column's
+        // place (#1130), eastward and southward column by column, from
+        // PROJ's 63.230 520 390°E 75.537 891 261°N at column 0 to
+        // 88.996 950 258°E 66.092 962 685°N at column 255 (`cs2cs -f %.9f
+        // +proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0
+        // +datum=WGS84 +to +proj=longlat +datum=WGS84` of their centres).
         let tile = projected(&tm, [1_448_154.7, 7_240_773.4, 2_896_309.4, 8_688_928.1]);
         let top = |i: u32| tile.position_on_earth(nan, (f64::from(i) + 0.5) / 256.0, 0.5 / 256.0);
-        for i in 0..=100 {
+        let mut last = (f64::MIN, f64::MAX);
+        for i in 0..256 {
             let (lon, lat) = top(i).unwrap_or_else(|| panic!("column {i}"));
-            assert!(
-                (36.0..50.0).contains(&(lon - 27.0)) && (72.0..76.0).contains(&lat),
-                "column {i}: {lon}, {lat}"
-            );
+            assert!(lon > last.0 && lat < last.1, "column {i}: {lon}, {lat}");
+            last = (lon, lat);
         }
-        for i in 107..256 {
-            assert_eq!(top(i), None, "column {i}");
+        for (i, lon, lat) in [
+            (0, 63.230_520_390, 75.537_891_261),
+            (255, 88.996_950_258, 66.092_962_685),
+        ] {
+            let (got_lon, got_lat) = top(i).unwrap();
+            assert!(
+                (got_lon - lon).abs() < 1e-8 && (got_lat - lat).abs() < 1e-8,
+                "column {i}: {got_lon}, {got_lat}"
+            );
         }
     }
 
@@ -2188,12 +2202,12 @@ mod tests {
         assert!(render([-10.0, 90.0, 10.0, 110.0]).is_none());
         assert!(engine.0.lock().unwrap().is_empty(), "engine called");
         // Nor for a projected box wholly outside its projection (#1089): past
-        // the LAEA disk, or past TM's pole or 50° from its meridian (#1113).
-        // None of them has a read window.
+        // the LAEA disk, or past TM's pole or its area's east edge (#1113,
+        // #1130). None of them has a read window.
         for (code, bbox) in [
             ("EPSG:3035", [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
             ("EPSG:3067", [0.0, 2.1e7, 1.0e6, 2.2e7]),
-            ("EPSG:3067", [5.0e6, 6.5e6, 6.0e6, 7.0e6]),
+            ("EPSG:3067", [1.1e7, 6.5e6, 1.2e7, 7.0e6]),
         ] {
             let crs = projected_output_crs(code).unwrap();
             let read = crate::geo::wgs84_envelope(&crs, bbox).unwrap_or([0.0; 4]);

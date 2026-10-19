@@ -1090,15 +1090,20 @@ mod tests {
         );
     }
 
-    /// EPSG:3067's inverse ends at the poles and 50° from 27°E (#1113). A
-    /// box wholly past that has no read window: 400, as for an EPSG:3035
-    /// box past the LAEA disk. A box holding a pole reads up to it, and the
-    /// default map of a global collection, whose frame holds both, reads
-    /// the whole area. A box the meridians 50° out cross reads up to them:
-    /// its edges alone stop at 19.25°W and 73.25°E. Its north is PROJ
-    /// 9.8.1's, `cs2cs -d 9 EPSG:3067 EPSG:4326` of (500 000, 9 900 000):
-    /// 89.122 564 865°N. Such a polar box in `bbox-crs` frames a CRS84 map
-    /// up to the pole, and a Web Mercator one is a 400.
+    /// EPSG:3067's inverse ends at the poles' northings and at eastings
+    /// 9 997 964.943 m from 27°E's 500 000 m (#1113, #1130). A box wholly
+    /// past that has no read window: 400, as for an EPSG:3035 box past the
+    /// LAEA disk. A box holding a pole reads up to it and 90° either side of
+    /// 27°E, and the default map of a global collection, whose frame holds
+    /// both and the area's east and west edges, reads the whole area. A box
+    /// the area's east edge crosses reads up to it. Its bounds are PROJ
+    /// 9.8.1's, `cs2cs -f %.9f +proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996
+    /// +x_0=500000 +y_0=0 +datum=WGS84 +to +proj=longlat +datum=WGS84`:
+    /// (9 000 000, 0) is 87.355 016 295°E, (9 000 000, -2 000 000)
+    /// 8.744 819 763°S, (9 000 000, 3 000 000) 12.906 601 967°N, and the edge
+    /// at (10 497 964.943, 3 000 000) 95.638 859 216°E. Such a polar box in
+    /// `bbox-crs` frames a CRS84 map up to the pole, and a Web Mercator one
+    /// is a 400.
     #[test]
     fn projected_frames_past_or_around_the_tm_area() {
         let in_crs = |crs: &str, bbox: &str| MapQueryParams {
@@ -1109,7 +1114,7 @@ mod tests {
         for (crs, bbox) in [
             ("EPSG:3067", "0,21000000,1000000,22000000"),
             ("EPSG:3067", "0,15000000,1000000,16000000"),
-            ("EPSG:3067", "5000000,6500000,6000000,7000000"),
+            ("EPSG:3067", "11000000,6500000,12000000,7000000"),
             ("EPSG:3035", "20000000,20000000,21000000,21000000"),
         ] {
             let Err(MapsError::BadRequest(message)) = view(in_crs(crs, bbox), &NONE) else {
@@ -1128,23 +1133,26 @@ mod tests {
         .unwrap();
         let [w, s, e, n] = polar.bbox;
         assert!(
-            near(w, -23.0) && near(e, 77.0) && n == 90.0,
+            near(w, -63.0) && near(e, 117.0) && n == 90.0,
             "{:?}",
             polar.bbox
         );
         assert!((52.0..52.2).contains(&s), "{s}");
         let crossed = view(
-            in_crs("EPSG:3067", "-1000000,6000000,2000000,9900000"),
+            in_crs("EPSG:3067", "9000000,-2000000,12000000,3000000"),
             &NONE,
         )
         .unwrap();
         let [w, s, e, n] = crossed.bbox;
+        let pinned = |a: f64, b: f64| (a - b).abs() < 1e-8;
         assert!(
-            near(w, -23.0) && near(e, 77.0) && (n - 89.122_565).abs() < 0.02,
+            pinned(w, 87.355_016_295)
+                && pinned(s, -8.744_819_763)
+                && pinned(e, 95.638_859_216)
+                && pinned(n, 12.906_601_967),
             "{:?}",
             crossed.bbox
         );
-        assert!((52.0..52.2).contains(&s), "{s}");
         for (bbox_crs, bbox) in [
             ("EPSG:3067", "-1000000,6000000,2000000,10500000"),
             ("EPSG:3035", "6000000,3000000,8500000,5500000"),
@@ -1181,9 +1189,17 @@ mod tests {
             .unwrap();
         let [w, s, e, n] = default.bbox;
         assert!(
-            near(w, -23.0) && near(e, 77.0) && s == -90.0 && n == 90.0,
+            near(w, -63.0) && near(e, 117.0) && s == -90.0 && n == 90.0,
             "{:?}",
             default.bbox
+        );
+        // Its frame holds the area's east and west edges, 500 000 m ± k₀
+        // times a quarter meridian.
+        let [min_e, _, max_e, _] = default.frame.rect();
+        assert!(
+            (min_e + 9_497_964.943).abs() < 0.01 && (max_e - 10_497_964.943).abs() < 0.01,
+            "{:?}",
+            default.frame.rect()
         );
     }
 

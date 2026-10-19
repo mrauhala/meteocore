@@ -16,8 +16,9 @@ pressure axis as the collection's vertical axis (PR 8, the last of the
   grid); a later file missing a variable, on another grid, or with another
   level or units is skipped with a WARN. Units, and level units, compare in
   any spelling (`Variable::same_quantity`, `ds_core::units::same_unit`):
-  `kg m-2` in a later file is the first file's `kg/m^2`, whose spelling
-  stays the served one. The layout lives as long as the
+  `kg m-2` in a later file is the first file's `kg/m^2`. The first file's
+  unit decides the display conversion (see "Display units"), and its
+  spelling is served where none applies. The layout lives as long as the
   engine.
 - **Time from the file, never its name:** valid times from the fields'
   `time` axis (`ds_core::cf::decode_times`, which reads MEPS's
@@ -382,7 +383,8 @@ Read in place by HTTP range, never downloaded whole (decision 4).
 ## Rendering
 
 `get_raster_tile` → `Catalog::select` → `field::read` →
-`ds_core::resample::SourceGrid::render_f32` → `RasterValues::F32`. The
+`SourceGrid::output_map` → `OutputMap::sample_f32_with` (the variable's
+display conversion, #1209) → `RasterValues::F32`. The
 `SourceGrid` is built once per layout (its WGS84 envelope is
 inverse-projected once). `get_raster_tiles` builds the output map once and
 samples every band from it, all at one level. `z` selects the level through
@@ -392,13 +394,53 @@ refuse it first).
 `RasterInfo` is built once per poll (`raster_info_shared` is O(1), Critical
 Rule 10): `native_crs` `CRS:84` only for latitude/longitude axes, else
 `projected` (`geos` for geostationary), so the Common `storageCrs` and
-degree grid are omitted for MEPS; `grid_size` `[nx, ny]`; `reference_times`
+degree grid are omitted for MEPS; `spatial_extent` from
+`GeoTransform::bbox_with_poles`, so a polar grid's reaches the pole it
+holds and an EDR area there is not a 404 (#1167); `grid_size` `[nx, ny]`;
+`reference_times`
 ascending; `times` the union over runs; titles from `titles`, else
-`long_name`; units as the file spells them (`kg/m^2`), never converted
-(#1067 decision: the files' own units). Style defaults and every other
-unit-keyed match read them through `ds_core::units::canonical_unit`
-(`kg/m^2` is `kg m-2`), so the layers need no `[[wms.parameters]]` for the
-defaults ds-render's table gives MEPS names (PR 6).
+`long_name`; units the served ones (`Layout::unit`, below). Style defaults
+and every other unit-keyed match read them through
+`ds_core::units::canonical_unit`, so the layers need no
+`[[wms.parameters]]` for the defaults ds-render's table gives MEPS names
+(PR 6).
+
+## Display units (#1209)
+
+- **One rule per variable:** `Layout::display`, built once with the layout
+  from each variable's CF `units` through
+  `ds_core::units::display_conversion`, the rules engine-bufr uses and
+  engine-grib's `default_display` twins: K → °C, Pa → hPa, kg m-2 → mm
+  (identity), kg m-2 s-1 → mm/h (× 3600, #1213), m2 s-2 → gpm, in any
+  spelling. A unit without a rule (CF's
+  `1`, m/s, `%`) is `None` and served as stored. Never a name table.
+- **Sample, then convert, in `f64`:** maps through
+  `OutputMap::sample_f32_with` (`lib.rs` `sample_display`; an identity rule
+  takes plain `sample_f32`), EDR position/area/radius and GetFeatureInfo by
+  `Layout::to_display` on `SourceGrid::value_at`'s result. A map pixel and
+  an EDR value at the same point are the same number before the pixel is
+  narrowed to `f32`. The field cache holds the stored values; nothing is
+  converted before sampling.
+- **Units reported converted everywhere:** `Layout::unit` feeds
+  `RasterInfo.parameters` (styles, legends, `parameter_names`), EDR
+  `ParameterDescription.unit` (CoverageJSON, GetFeatureInfo's `unit`), and
+  `WindFacts` (the derived speed takes the components' served unit).
+  `Variable::units` stays the file's spelling: `fits_layout` and
+  `same_quantity` compare stored units.
+- **Not converted:** the pressure axis, already hPa from the coordinate
+  (`PressureUnit::to_hpa`): a variable's unit and a level's unit are
+  separate.
+- **Styles:** MEPS takes the defaults by served unit: temperature
+  `temperature` −90…50 °C, MSLP `pressure` 950–1050 hPa, the run-start
+  accumulation `precipitation_accumulation` 0–200 mm, geopotential
+  `viridis` 0–21 000 gpm, relative humidity and cloud cover the fraction
+  palettes 0–1 (unit `1`). The shipped examples keep only the ±20 m/s
+  surface wind components and a collection-level `temperature` palette with
+  no range.
+- Pinned by `tests/integration.rs` `values_are_served_in_display_units`,
+  ds-core's `a_converting_render_converts_each_sample_before_narrowing`,
+  the server's `wms_get_feature_info` (values and `unit` per variable),
+  `netcdf_edr` (QUDT `DEG_C`/`HectoPA`) and the admin example-style tests.
 
 ## EDR (`edr.rs`) — #1067 PR 7
 
@@ -420,7 +462,8 @@ locations, trajectory or cube.
 - **Sampling:** `ds_core::resample::SourceGrid::position` projects a point,
   or an area cell centre, once (Critical Rule 5); `value_at` samples it as
   the map does (bilinear in x/y, nearest at a nodata neighbour, the half
-  cell past the edges). A point off the grid is null, not an error. An
+  cell past the edges), and `Layout::to_display` converts it as the map
+  converts a pixel (#1209). A point off the grid is null, not an error. An
   area is a CRS84 grid over the polygon's bbox at the extent's mean degree
   size per cell (`crs84_bbox_spans` ÷ cells), ≤ `MAX_AREA_DIM`, masked by
   `cell_mask`, as engine-querydata's; a polygon missing the extent is 404.
@@ -466,7 +509,8 @@ locations, trajectory or cube.
   build, `tests/live_thredds.rs`): a 3-lead series whose first field a map
   had drawn, 2 GETs, 3.1 MB, 3.6 s.
 - **Metadata:** parameters from the layout and the catalog's `RasterInfo`
-  (titles, units as spelled), CF `standard_name` → `observedProperty.id`;
+  (titles, served units: `Layout::unit`), CF `standard_name` →
+  `observedProperty.id`;
   temporal extent and available times are the union over runs; instances
   from the run map (`get_instances`, O(1) `has_instances`,
   `instance_reference_times` from its keys, `find_instance` one run); a
@@ -477,7 +521,8 @@ locations, trajectory or cube.
 `WindSource::wind_facts` is the layout's `Arc<WindFacts>`, built once with
 the layout (`catalog::wind_facts`): per variable its CF `standard_name`,
 the frame `VectorFrame::from_standard_name` gives (`x_wind`/`y_wind` ⇒
-`Grid`), the unit, and the level (`"10 m"`: the single level's value and
+`Grid`), the served unit (`Layout::unit`: `DerivedWind` combines served
+values), and the level (`"10 m"`: the single level's value and
 units) as the pairing level; the grid's `GridAxes::of(crs)`. MEPS's Lambert
 grid is `Rotated`, so `x_wind_10m`/`y_wind_10m` give `wind_speed_10m` and no
 direction (decision 6; rotation by the convergence angle is a follow-up on
@@ -547,6 +592,16 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
   run, leads 00 and 01, LCC, south-up, 64 × 96, two variables chunked one
   field per chunk with shuffle + deflate 3 and noisy values, so a chunk is
   ~15 KB), written by `make_fixture.py` (needs `ncgen`).
+- `testdata/netcdf-projections/`: one synthetic file per CF mapping of
+  #1167, each its own collection directory (`polar-stereographic/` with
+  EPSG:3413's parameters around the North Pole, `laea/` with EPSG:3035's
+  on GRS80 and rows south-up, `transverse-mercator/` UTM 33N), one step,
+  no run; the fields `easting`/`northing` are each cell centre's own
+  projected x/y, so a read returns where the server puts a point
+  (`make_cdl.py`). `tests/grid_mappings.rs` reads them through EDR
+  position and a one-pixel map at points pinned to PROJ `cs2cs` (forward,
+  and cell centres through `-I`), within the 1 m their `f32` rounding
+  allows, and the polar grid's extent and an EDR area at the pole.
 - `remote::tests` (in the lib test binary): a local HTTP/1.1 server
   (`test_server.rs`: HEAD without ETag, 206 with `Content-Range`, 412 on
   `If-Unmodified-Since`, a request log, slow chunk GETs on demand) and the

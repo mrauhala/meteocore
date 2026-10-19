@@ -99,12 +99,15 @@ static RULES: &[DefaultRule] = &[
         ],
         fallback_range: None,
     },
-    // Precipitation rate / intensity.
+    // Precipitation rate / intensity, in mm/h. A rate stored in
+    // kg m-2 s-1 is served in mm/h by every engine that converts units
+    // (`ds_core::units::display_conversion` and engine-grib's twin, #1213),
+    // so that unit has no range here: 0–30 kg m-2 s-1 would be 108 000 mm/h.
     DefaultRule {
         names: &["prate", "rr", "rri", "prr"],
         contains: &["precipitationrate", "rainrate", "rainintensity"],
         palette: "precipitation_rate",
-        unit_ranges: &[(&["mmh", "mmhr", "mmh1", "mmhr1", "kgm2s1"], 0.0, 30.0)],
+        unit_ranges: &[(&["mmh", "mmhr", "mmh1", "mmhr1"], 0.0, 30.0)],
         fallback_range: Some((0.0, 30.0)),
     },
     // Precipitation accumulated from the run's start (#1067): MET Norway's
@@ -248,7 +251,7 @@ static RULES: &[DefaultRule] = &[
     // up to 50 hPa (~20.6 km), and 206 000 m2 s-2 is the same height as
     // geopotential. Names only: a "Geopotential height anomaly" title is
     // signed and must not match. MEPS's `geopotential_pl` (#1067 PR 8) is
-    // in m^2/s^2.
+    // stored in m^2/s^2 and served in gpm (#1209).
     DefaultRule {
         names: &[
             "z",
@@ -324,8 +327,8 @@ static RULES: &[DefaultRule] = &[
         unit_ranges: &[(FRACTION, 0.0, 1.0)],
         fallback_range: None,
     },
-    // Relative humidity in percent. A bare `Humidity` short name (FMI
-    // QueryData, no unit metadata) still matches.
+    // Relative humidity in percent. A bare `Humidity` short name with no
+    // known unit still matches.
     DefaultRule {
         names: RH_NAMES,
         contains: RH_CONTAINS,
@@ -351,8 +354,8 @@ static RULES: &[DefaultRule] = &[
     },
     // The CF area fractions in percent. Unit-gated: CF's unit for them is
     // 1, so without a known unit their names guess nothing (unlike the cover
-    // names below, whose percent fallback serves QueryData). A title naming
-    // cloud cover still reaches that fallback.
+    // names below, whose percent fallback serves a source without units). A
+    // title naming cloud cover still reaches that fallback.
     DefaultRule {
         names: &[],
         contains: CF_CLOUD_CONTAINS,
@@ -652,7 +655,8 @@ mod tests {
             // A native GFS speed before its header has been probed.
             ("WIND", "WIND", None),
             ("si10", "Wind speed", Some("m s**-1")),
-            // QueryData publishes no units.
+            // FMI's name, with its number's unit and with none.
+            ("WindSpeedMS", "Wind speed", Some("m s-1")),
             ("WindSpeedMS", "Wind speed", None),
             ("wind_speed_10m", "Wind speed", Some("m s-1")),
             ("10m_wind_speed", "Wind speed", Some("m/s")),
@@ -845,8 +849,8 @@ mod tests {
         );
     }
 
-    /// Relative humidity keeps its percent and fraction ranges, and the
-    /// unit-less FMI QueryData `Humidity` its percent fallback; MSLP keeps
+    /// Relative humidity keeps its percent and fraction ranges, and a
+    /// unit-less FMI `Humidity` its percent fallback; MSLP keeps
     /// 950–1050 hPa.
     #[test]
     fn relative_humidity_and_mslp_keep_their_defaults() {
@@ -908,6 +912,37 @@ mod tests {
         );
     }
 
+    /// #1213: a precipitation rate stored in kg m-2 s-1, in any spelling,
+    /// is served in mm/h (`ds_core::units::display_conversion`, engine-grib's
+    /// twin), whose range the rate rule keys on; the stored unit has none.
+    #[test]
+    fn a_served_precipitation_rate_is_ranged_in_mm_per_hour() {
+        let rule = RULES
+            .iter()
+            .find(|r| r.palette == "precipitation_rate")
+            .unwrap();
+        for spelling in ["kg m-2 s-1", "kg m**-2 s**-1", "kg/m^2/s", "kg/(m2 s)"] {
+            let served = ds_core::units::display_conversion(spelling).unwrap().unit;
+            assert_eq!(served, "mm/h", "{spelling}");
+            let key = unit_key(served);
+            assert!(
+                rule.unit_ranges
+                    .iter()
+                    .any(|(aliases, min, max)| aliases.contains(&key.as_str())
+                        && (*min, *max) == (0.0, 30.0)),
+                "{key}"
+            );
+            let stored = unit_key(spelling);
+            assert!(
+                !rule
+                    .unit_ranges
+                    .iter()
+                    .any(|(aliases, ..)| aliases.contains(&stored.as_str())),
+                "{stored}"
+            );
+        }
+    }
+
     /// #1067 PR 6: a unit matches in every spelling (`unit_key`), in the
     /// embedded table and in config unit ranges alike.
     #[test]
@@ -941,13 +976,6 @@ mod tests {
                 &["m s-1", "m/s", "m s^-1"][..],
                 "diverging",
                 (-40.0, 40.0),
-            ),
-            (
-                "prate",
-                "",
-                &["kg m-2 s-1", "kg/m2/s", "kg/(m2 s)", "kg m**-2 s**-1"][..],
-                "precipitation_rate",
-                (0.0, 30.0),
             ),
             (
                 "prate",
@@ -1069,12 +1097,22 @@ mod tests {
     }
 
     /// #1067 PR 6: MET Norway's MEPS sfc variables, with the titles and
-    /// units engine-netcdf reports for them (`long_name` and `units` as in
-    /// testdata/meps-netcdf, or the example's `[netcdf.titles]`).
+    /// units engine-netcdf reports for them (`long_name` as in
+    /// testdata/meps-netcdf, or the example's `[netcdf.titles]`; the files'
+    /// `units` in their display unit, #1209: K as °C, Pa as hPa, kg/m^2 as
+    /// mm), and the files' own spellings, as a CF store that serves them
+    /// unconverted would.
     #[test]
     fn meps_names_get_their_defaults() {
         let d = builtin();
         for (name, title, unit, palette, range) in [
+            (
+                "air_temperature_2m",
+                "Screen level temperature (T2M)",
+                "°C",
+                "temperature",
+                Some((-90.0, 50.0)),
+            ),
             (
                 "air_temperature_2m",
                 "Screen level temperature (T2M)",
@@ -1120,9 +1158,23 @@ mod tests {
             (
                 "air_pressure_at_sea_level",
                 "Mean Sea Level Pressure (MSLP)",
+                "hPa",
+                "pressure",
+                Some((950.0, 1050.0)),
+            ),
+            (
+                "air_pressure_at_sea_level",
+                "Mean Sea Level Pressure (MSLP)",
                 "Pa",
                 "pressure",
                 Some((95_000.0, 105_000.0)),
+            ),
+            (
+                "precipitation_amount_acc",
+                "Accumulated total precipitation",
+                "mm",
+                "precipitation_accumulation",
+                Some((0.0, 200.0)),
             ),
             (
                 "precipitation_amount_acc",
@@ -1176,7 +1228,9 @@ mod tests {
     }
 
     /// #1067 PR 8: MEPS's pressure-level variables, with the titles and units
-    /// engine-netcdf reports for them (testdata/meps-netcdf-pl). Their wind
+    /// engine-netcdf reports for them (testdata/meps-netcdf-pl; temperature
+    /// in °C and geopotential in gpm, #1209, and in the files' K and
+    /// m^2/s^2). Their wind
     /// components and the speed derived from them span ±80 / 0–80 m/s, twice
     /// the surface scale, for the jet; temperature, geopotential and
     /// relative humidity keep their all-levels ranges. The surface
@@ -1209,9 +1263,23 @@ mod tests {
             (
                 "air_temperature_pl",
                 "Air temperature pressure levels",
+                "°C",
+                "temperature",
+                Some((-90.0, 50.0)),
+            ),
+            (
+                "air_temperature_pl",
+                "Air temperature pressure levels",
                 "K",
                 "temperature",
                 Some((183.15, 323.15)),
+            ),
+            (
+                "geopotential_pl",
+                "Geopotential pressure levels",
+                "gpm",
+                "viridis",
+                Some((0.0, 21_000.0)),
             ),
             (
                 "geopotential_pl",
@@ -1270,7 +1338,7 @@ mod tests {
     /// CF's unit for them being 1, their names guess nothing without a known
     /// unit, nor in a unit with no letters (`-` is not `%`). A title that
     /// names cloud cover still takes the cover rule's percent fallback, as
-    /// for any cloud-cover title (QueryData's have no units).
+    /// does any cloud-cover title without a unit.
     #[test]
     fn cloud_and_fog_fractions_follow_their_unit() {
         let d = builtin();
@@ -1376,10 +1444,12 @@ mod tests {
         assert_eq!(d.match_default("snowfall_amount_acc", "", Some("m")), None);
     }
 
-    /// GRIB (display units), Zarr (CF units as stored) and QueryData (no
-    /// units) parameters keep the defaults they had before units were
-    /// normalised, apart from fractions, which leave the percent palettes'
-    /// bottom 1 % for their fraction twins (#872).
+    /// GRIB (display units), Zarr (CF units as stored) and QueryData (its
+    /// FMI parameter numbers' units, #1211) parameters keep the defaults
+    /// they had before units were normalised, apart from fractions, which
+    /// leave the percent palettes' bottom 1 % for their fraction twins
+    /// (#872). QueryData's unit-gated temperature and pressure match now
+    /// that it reports units.
     #[test]
     fn engine_parameters_keep_their_defaults() {
         let d = builtin();
@@ -1430,7 +1500,7 @@ mod tests {
             (
                 "PRATE",
                 "Precipitation rate",
-                Some("kg m-2 s-1"),
+                Some("mm/h"),
                 "precipitation_rate",
                 Some((0.0, 30.0)),
             ),
@@ -1519,26 +1589,60 @@ mod tests {
                 "viridis",
                 Some((0.0, 206_000.0)),
             ),
-            // QueryData: no units.
-            ("Humidity", "Humidity", None, "humidity", Some((0.0, 100.0))),
+            // QueryData: FMI names, their numbers' units.
+            (
+                "Temperature",
+                "Temperature",
+                Some("°C"),
+                "temperature",
+                Some((-90.0, 50.0)),
+            ),
+            (
+                "DewPoint",
+                "DewPoint",
+                Some("°C"),
+                "temperature",
+                Some((-90.0, 50.0)),
+            ),
+            (
+                "Pressure",
+                "Pressure",
+                Some("hPa"),
+                "pressure",
+                Some((950.0, 1050.0)),
+            ),
+            (
+                "Humidity",
+                "Humidity",
+                Some("%"),
+                "humidity",
+                Some((0.0, 100.0)),
+            ),
             (
                 "TotalCloudCover",
                 "TotalCloudCover",
-                None,
+                Some("%"),
                 "cloud_cover",
                 Some((0.0, 100.0)),
             ),
             (
                 "WindSpeedMS",
-                "Wind speed",
-                None,
+                "WindSpeedMS",
+                Some("m s-1"),
+                "wind_speed",
+                Some((0.0, 40.0)),
+            ),
+            (
+                "WindGust",
+                "WindGust",
+                Some("m s-1"),
                 "wind_speed",
                 Some((0.0, 40.0)),
             ),
             (
                 "Precipitation1h",
                 "Precipitation1h",
-                None,
+                Some("mm"),
                 "precipitation",
                 Some((0.0, 50.0)),
             ),

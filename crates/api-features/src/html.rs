@@ -56,7 +56,9 @@ pub(crate) fn representation_links(doc: &mut Value, wanted: Wanted) {
             if matches!(link["rel"].as_str(), Some("self" | "next" | "prev")) {
                 link["href"] = json!(with_format(&href, format));
                 link["type"] = json!(media);
-            } else if wanted == Wanted::Html && link["rel"] == "collection" {
+            } else if wanted == Wanted::Html
+                && matches!(link["rel"].as_str(), Some("collection" | "related"))
+            {
                 link["href"] = json!(with_format(&href, "html"));
                 link["type"] = json!("text/html");
             }
@@ -74,6 +76,9 @@ pub(crate) fn representation_links(doc: &mut Value, wanted: Wanted) {
 pub(crate) struct FeatureControls {
     pub filterables: Vec<String>,
     pub sortables: Vec<String>,
+    /// The engine's first columns (`FeatureEngine::summary_properties`).
+    pub summary: Vec<String>,
+    /// Whether `/items` takes `datetime` (`FeatureEngine::has_time_dimension`).
     pub temporal: bool,
 }
 
@@ -98,6 +103,19 @@ const LABEL_KEYS: &[&str] = &[
     "naam",
     "bezeichnung",
 ];
+
+fn is_label_key(key: &str) -> bool {
+    LABEL_KEYS
+        .iter()
+        .any(|label| key.eq_ignore_ascii_case(label))
+}
+
+/// Never a default column (#1143): the id again, the owning collection,
+/// and the point's coordinates, which the geometry and map already show.
+const NOT_DEFAULT_COLUMNS: &[&str] = &["id", "collection", "latitude", "longitude"];
+
+/// Property columns a listing shows before the reader chooses.
+const DEFAULT_COLUMNS: usize = 4;
 
 fn feature_id(feature: &Value) -> String {
     match &feature["id"] {
@@ -157,6 +175,29 @@ fn property_value(key: &str, value: Option<&Value>) -> String {
     }
 }
 
+/// Whether property `key` only repeats its feature's id wherever it is set,
+/// as a radar site's `nod` or a station's identifier does.
+fn repeats_id(features: &[Value], key: &str) -> bool {
+    let mut set = false;
+    for feature in features {
+        let text = match feature["properties"].get(key) {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            Some(_) => return false,
+        };
+        if text != feature_id(feature) {
+            return false;
+        }
+        set = true;
+    }
+    set
+}
+
+/// Every property column a listing offers, and the ones it shows first
+/// (#1143): the engine's summary properties, else what it sorts on, then
+/// the rest alphabetically, leaving out labels, the id, the collection and
+/// coordinates. A default column has a value on this page.
 fn property_columns(features: &[Value], controls: &FeatureControls) -> (Vec<String>, Vec<String>) {
     let mut columns: std::collections::BTreeSet<String> =
         controls.filterables.iter().cloned().collect();
@@ -165,23 +206,35 @@ fn property_columns(features: &[Value], controls: &FeatureControls) -> (Vec<Stri
             columns.extend(p.keys().cloned());
         }
     }
-    let defaults = columns
+    let shown = |key: &str| {
+        features.iter().any(|f| {
+            f["properties"]
+                .get(key)
+                .is_some_and(|v| !v.is_null() && !v.is_array() && !v.is_object())
+        })
+    };
+    let mut defaults: Vec<String> = controls
+        .summary
         .iter()
-        .filter(|key| {
-            !LABEL_KEYS
-                .iter()
-                .any(|label| key.eq_ignore_ascii_case(label))
-        })
-        .filter(|key| {
-            features.iter().any(|f| {
-                f["properties"]
-                    .get(*key)
-                    .is_some_and(|v| !v.is_null() && !v.is_array() && !v.is_object())
-            })
-        })
-        .take(4)
+        .filter(|key| shown(key))
+        .take(DEFAULT_COLUMNS)
         .cloned()
         .collect();
+    if defaults.is_empty() {
+        for key in controls.sortables.iter().chain(&columns) {
+            if defaults.len() == DEFAULT_COLUMNS {
+                break;
+            }
+            let skipped = is_label_key(key)
+                || NOT_DEFAULT_COLUMNS
+                    .iter()
+                    .any(|name| key.eq_ignore_ascii_case(name))
+                || repeats_id(features, key);
+            if !skipped && shown(key) && !defaults.contains(key) {
+                defaults.push(key.clone());
+            }
+        }
+    }
     (columns.into_iter().collect(), defaults)
 }
 
@@ -236,6 +289,27 @@ fn item_paging(doc: &Value, count: usize) -> String {
     format!("<div class=\"item-paging\"><span>{range} · {} matched</span><label class=\"per-page enhanced\">Per page<select data-page-size>{options}</select></label>{}</div>",matched.map_or("Unknown".into(),|n|n.to_string()),ui::pagination(&links))
 }
 
+/// A feature's `related` links as buttons (#1143): where it leads next,
+/// such as a radar site's own collection or a station's EDR location.
+fn related_links(feature: &Value) -> String {
+    use api_common::workbench as ui;
+    let buttons: String = feature["links"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|link| link["rel"] == "related")
+        .filter_map(|link| {
+            let href = link["href"].as_str()?;
+            let title = link["title"].as_str().unwrap_or("Related resource");
+            Some(ui::anchor(href, &format!("{title} →"), "btn"))
+        })
+        .collect();
+    if buttons.is_empty() {
+        return String::new();
+    }
+    format!("<section class=\"panel panel-body\"><span class=\"eyebrow\">NEXT STEPS</span><div class=\"action-row related-links\">{buttons}</div></section>")
+}
+
 fn coordinate(value: &Value) -> String {
     value
         .as_f64()
@@ -256,6 +330,60 @@ pub(crate) struct Invalid<'a> {
     pub message: &'a str,
 }
 
+/// `datetime`'s bounds as `datetime-local` values in UTC, for the
+/// builder's pickers: empty for an open or absent bound, or for a value
+/// that does not parse.
+fn picker_bounds(datetime: &str) -> (String, String) {
+    let Ok(interval) = crate::params::parse_datetime(datetime) else {
+        return Default::default();
+    };
+    let local = |t: Option<chrono::DateTime<chrono::Utc>>| {
+        t.map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string())
+            .unwrap_or_default()
+    };
+    (local(interval.start), local(interval.end))
+}
+
+/// The builder's order (#1143): a sortable property and a direction, which
+/// the script joins into `sortby`. A `sortby` they cannot show, several
+/// keys or a rejected one, stays selected as it was given. Returns the
+/// property field, which carries a rejection, and the rest.
+fn sort_fields(current: &str, sortables: &[String]) -> (String, String) {
+    let (descending, key) = match current.strip_prefix('-') {
+        Some(key) => (true, key),
+        None => (false, current.trim_start_matches(['+', ' '])),
+    };
+    let single = sortables.iter().any(|name| name == key);
+    let mut options = String::from("<option value=\"\">Default order</option>");
+    if !current.is_empty() && !single {
+        options.push_str(&format!(
+            "<option value=\"{0}\" data-raw selected>As requested: {0}</option>",
+            escape(current)
+        ));
+    }
+    for name in sortables {
+        options.push_str(&format!(
+            "<option value=\"{0}\"{1}>{0}</option>",
+            escape(name),
+            if single && name == key {
+                " selected"
+            } else {
+                ""
+            }
+        ));
+    }
+    let property = format!("<label class=\"field\"><span>Sort by</span><span class=\"hint\" id=\"sortby-hint\">Properties this collection sorts on</span><select data-sort-property aria-describedby=\"sortby-hint\">{options}</select></label>");
+    let rest = format!(
+        "<label class=\"field\"><span>Direction</span><span class=\"hint\">Ascending or descending</span><select data-sort-direction><option value=\"\"{}>Ascending</option><option value=\"-\"{}>Descending</option></select></label><input type=\"hidden\" data-param=\"sortby\" data-sortby value=\"{}\">",
+        if descending { "" } else { " selected" },
+        if descending { " selected" } else { "" },
+        escape(current)
+    );
+    (property, rest)
+}
+
+/// The data request builder (#1143): property predicates, time, area,
+/// order and paging, each a guided control, and the submit button last.
 fn query_form(doc: &Value, controls: &FeatureControls, invalid: Option<Invalid<'_>>) -> String {
     use api_common::workbench as ui;
     // The field the request was rejected for carries the message.
@@ -280,25 +408,7 @@ fn query_form(doc: &Value, controls: &FeatureControls, invalid: Option<Invalid<'
             .map(|(_, v)| v.as_ref())
             .unwrap_or("")
     };
-    let mut out=format!("<form class=\"query-form item-query items-controls panel enhanced\" action=\"{}\" method=\"get\"><input type=\"hidden\" name=\"f\" value=\"html\"><div class=\"item-primary-fields\">",escape(action));
-    if !controls.filterables.is_empty() {
-        out.push_str("<div class=\"equal-fields\"><label>Property<select data-new-property><option value=\"\">Choose a property</option>");
-        for name in &controls.filterables {
-            out.push_str(&format!(
-                "<option value=\"{}\">{}</option>",
-                escape(name),
-                escape(name)
-            ));
-        }
-        out.push_str("</select></label><label>Equals<input data-new-value data-param=\"\" placeholder=\"Exact value\"></label></div>");
-    }
-    if controls.temporal || !value("datetime").is_empty() {
-        out.push_str(&mark(
-            ui::datetime_input(value("datetime"), true),
-            "datetime",
-        ));
-    }
-    out.push_str("<button class=\"btn primary\">Request features</button></div><p class=\"search-hint\">Filter features within this selected collection. Use Collections to find a different dataset.</p>");
+    let mut out = format!("<form class=\"query-form item-query items-controls panel enhanced\" action=\"{}\" method=\"get\"><input type=\"hidden\" name=\"f\" value=\"html\"><p class=\"search-hint\">Filter features within this selected collection. Use Collections to find a different dataset.</p>",escape(action));
     let mut applied = String::new();
     for name in &controls.filterables {
         for (_, value) in pairs.iter().filter(|(k, _)| k == name) {
@@ -310,25 +420,52 @@ fn query_form(doc: &Value, controls: &FeatureControls, invalid: Option<Invalid<'
             applied.push_str(&format!("<div data-predicate>{input}<button class=\"btn small\" type=\"button\" data-clear-predicate>Clear {}</button></div>",escape(name)));
         }
     }
-    if !applied.is_empty() {
-        out.push_str(&format!("<div class=\"fields spaced\">{applied}</div><p class=\"field-help\">Applied predicates are combined with AND. Numeric fields also accept comma-separated alternatives.</p>"));
+    if !controls.filterables.is_empty() {
+        out.push_str("<fieldset class=\"builder-group\"><legend>Property equals</legend><div class=\"equal-fields\"><label>Property<select data-new-property><option value=\"\">Choose a property</option>");
+        for name in &controls.filterables {
+            out.push_str(&format!(
+                "<option value=\"{}\">{}</option>",
+                escape(name),
+                escape(name)
+            ));
+        }
+        out.push_str("</select></label><label>Equals<input data-new-value data-param=\"\" placeholder=\"Exact value\"></label></div>");
+        if !applied.is_empty() {
+            out.push_str(&format!("<div class=\"fields spaced\">{applied}</div><p class=\"field-help\">Applied predicates are combined with AND. Numeric fields also accept comma-separated alternatives.</p>"));
+        }
+        out.push_str("</fieldset>");
+    }
+    let datetime = value("datetime");
+    if controls.temporal || !datetime.is_empty() {
+        let (start, end) = picker_bounds(datetime);
+        out.push_str(&format!("<fieldset class=\"builder-group\"><legend>Time · UTC</legend><div class=\"fields\"><label class=\"field\"><span>From</span><span class=\"hint\">Start, UTC</span><input type=\"datetime-local\" step=\"1\" data-datetime-start value=\"{}\"></label><label class=\"field\"><span>To</span><span class=\"hint\">End, UTC; empty for an open end (..)</span><input type=\"datetime-local\" step=\"1\" data-datetime-end value=\"{}\"></label>{}</div></fieldset>",escape(&start),escape(&end),mark(ui::datetime_input(datetime, true), "datetime")));
+    }
+    let bbox = mark(
+        ui::input(
+            "bbox",
+            value("bbox"),
+            "CRS84 · west,south,east,north",
+            "text",
+            true,
+        ),
+        "bbox",
+    );
+    out.push_str(&format!("<fieldset class=\"builder-group\"><legend>Area</legend><div class=\"builder-area\">{bbox}<button class=\"btn small\" type=\"button\" data-use-map-view hidden>Use map view</button><span class=\"field-help\" data-map-view-status role=\"status\"></span></div></fieldset>"));
+    if !controls.sortables.is_empty() || !value("sortby").is_empty() {
+        let (property, rest) = sort_fields(value("sortby"), &controls.sortables);
+        out.push_str(&format!(
+            "<fieldset class=\"builder-group\"><legend>Order</legend><div class=\"fields\">{}{rest}</div></fieldset>",
+            mark(property, "sortby")
+        ));
     }
     let open = match invalid {
         Some(Invalid {
-            parameter: Some("bbox" | "limit" | "offset" | "sortby"),
+            parameter: Some("limit" | "offset"),
             ..
         }) => " open",
         _ => "",
     };
-    out.push_str(&format!("<details class=\"filters\" data-disclosure=\"item-filters\"{open}><summary>Area, ordering &amp; paging</summary><div class=\"fields\">"));
-    let field = ui::input(
-        "bbox",
-        value("bbox"),
-        "CRS84 · west,south,east,north",
-        "text",
-        true,
-    );
-    out.push_str(&mark(field, "bbox"));
+    out.push_str(&format!("<details class=\"filters\" data-disclosure=\"item-filters\"{open}><summary>Paging</summary><div class=\"fields\">"));
     for (key, default) in [("limit", "100"), ("offset", "0")] {
         let field = ui::input(
             key,
@@ -343,36 +480,19 @@ fn query_form(doc: &Value, controls: &FeatureControls, invalid: Option<Invalid<'
         );
         out.push_str(&mark(field, key));
     }
-    if !controls.sortables.is_empty() || !value("sortby").is_empty() {
-        let field = ui::input(
-            "sortby",
-            value("sortby"),
-            &format!(
-                "Comma-separated; - for descending. Available: {}",
-                if controls.sortables.is_empty() {
-                    "none".to_owned()
-                } else {
-                    controls.sortables.join(", ")
-                }
-            ),
-            "text",
-            true,
-        );
-        out.push_str(&mark(field, "sortby"));
-    }
+    out.push_str("</div></details>");
     // A rejection with no field of its own (an unknown parameter, a
     // repeated one) is named above the fields.
-    let summary = match invalid {
-        Some(Invalid { message, .. }) if !marked => format!(
+    if let Some(Invalid { message, .. }) = invalid.filter(|_| !marked) {
+        let summary = format!(
             "<p class=\"error-text field-error\" role=\"alert\">{}</p>",
             escape(message)
-        ),
-        _ => String::new(),
-    };
-    if let Some(at) = out.find("<div class=\"item-primary-fields\">") {
-        out.insert_str(at, &summary);
+        );
+        if let Some(at) = out.find("<p class=\"search-hint\">") {
+            out.insert_str(at, &summary);
+        }
     }
-    out.push_str(&format!("</div></details><div class=\"filter-controls\">{}</div><details class=\"draft-request\" data-draft-disclosure><summary>Preview data request</summary><small>Draft · submit to update features</small><code data-draft></code></details></form><noscript><p class=\"callout\">Paging, item links and JSON work without JavaScript. Enable JavaScript to edit item-query parameters.</p></noscript>",ui::anchor(&ui::with_format(action,"html"),"Clear item filters","quiet")));
+    out.push_str(&format!("<div class=\"filter-controls builder-actions\"><button class=\"btn primary\">Request features</button>{}</div><details class=\"draft-request\" data-draft-disclosure><summary>Preview data request</summary><small>Draft · submit to update features</small><code data-draft></code></details></form><noscript><p class=\"callout\">Paging, item links and JSON work without JavaScript. Enable JavaScript to edit item-query parameters.</p></noscript>",ui::anchor(&ui::with_format(action,"html"),"Clear item filters","quiet")));
     out
 }
 
@@ -471,7 +591,6 @@ fn features_page(
             "<div data-results-scope=\"{}\"></div>",
             escape(&items_url)
         ));
-        body.push_str(&format!("<details class=\"item-builder enhanced\" data-disclosure=\"item-builder\"{}><summary>Build a data request</summary>{}</details>",if invalid.is_some() {" open"} else {""},query_form(doc, controls, invalid)));
         let applied: String = form_urlencoded::parse(
             href_for(doc, "self")
                 .split_once('?')
@@ -487,6 +606,10 @@ fn features_page(
             )
         })
         .collect();
+        // Open on a request that filters or sorts, so what was applied is
+        // in view (#1143), and on a rejected one.
+        let open = invalid.is_some() || !applied.is_empty();
+        body.push_str(&format!("<details class=\"item-builder enhanced\" id=\"item-builder\" data-disclosure=\"item-builder\"{}><summary>Build a data request</summary>{}</details>",if open {" open"} else {""},query_form(doc, controls, invalid)));
         if !applied.is_empty() {
             body.push_str(&format!("<div class=\"chip-row applied-item-filters\" aria-label=\"Applied item filters\">{applied}</div>"));
         }
@@ -525,7 +648,7 @@ fn features_page(
             body.push_str(&item_paging(doc, features.len()));
         }
         if !features.is_empty() {
-            body.push_str("<details class=\"column-picker enhanced\"><summary>Choose property columns</summary><p>Showing properties from this response and advertised filter fields. Choose up to eight; your choice is remembered for this collection.</p><div class=\"column-options\">");
+            body.push_str("<details class=\"column-picker enhanced\"><summary>Choose property columns</summary><p>Showing properties from this response and advertised filter fields. Choose up to eight; this browser remembers your choice for this collection.</p><div class=\"column-options\">");
             for key in &columns {
                 body.push_str(&format!(
                     "<label><input type=\"checkbox\" data-item-column value=\"{}\" {}>{}</label>",
@@ -575,8 +698,11 @@ fn features_page(
             }
             body.push_str("</tbody></table></div>");
             let properties: Vec<_> = features.iter().map(|f| &f["properties"]).collect();
+            // The column choice is stored by collection id (#1143), the same
+            // on every API root serving the collection.
             body.push_str(&format!(
-                "<div id=\"item-properties\" hidden>{}</div>",
+                "<div id=\"item-properties\" data-collection=\"{}\" hidden>{}</div>",
+                escape(collection_id),
                 escape(&serde_json::to_string(&properties).expect("properties serialize"))
             ));
             body.push_str(&item_paging(doc, features.len()));
@@ -618,6 +744,8 @@ fn features_page(
                 "The geometry is described below."
             },
         ));
+    } else if is_list && features.is_empty() {
+        body.push_str("<div class=\"empty\"><p>No features on this page.</p></div>");
     } else {
         body.push_str("<div class=\"empty\"><p>No geometry available.</p></div>");
     }
@@ -649,6 +777,7 @@ fn features_page(
     body.push_str("</section>");
     if !is_list {
         body.push_str(&format!("<section class=\"panel panel-body\"><span class=\"eyebrow\">PART OF THIS COLLECTION</span><h3>{}</h3>{}</section>",escape(title),ui::anchor(&ui::with_format(&collection_url,"html"),"Collection overview →","quiet")));
+        body.push_str(&related_links(doc));
     }
     body.push_str("</aside></div>");
     // Tabs and history tell pages apart (#1131): an items page by its
@@ -721,6 +850,44 @@ mod tests {
         );
     }
 
+    /// An engine labelling its features `event · areaDesc`, as engine-cap
+    /// does.
+    struct Labelled;
+
+    impl ds_core::feature_engine::FeatureEngine for Labelled {
+        fn get_features(
+            &self,
+            _: &ds_core::feature::FeatureQuery,
+        ) -> Result<FeaturePage, ds_core::error::DataServerError> {
+            unreachable!("only labels")
+        }
+
+        fn get_feature(&self, _: &str) -> Result<Feature, ds_core::error::DataServerError> {
+            unreachable!("only labels")
+        }
+
+        fn label(&self, feature: &Feature) -> Option<String> {
+            let text = |key: &str| feature.properties.get(key)?.as_str();
+            Some(format!("{} · {}", text("event")?, text("areaDesc")?))
+        }
+    }
+
+    fn alert(properties: &[(&str, &str)]) -> Feature {
+        Feature {
+            id: "2.49.0.0.246.0.FI.260617/1 0".into(),
+            geometry: Geometry::Null.into(),
+            properties: properties
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), PropertyValue::String((*v).to_owned())))
+                .collect::<std::collections::HashMap<_, _>>()
+                .into(),
+            related: Vec::new(),
+        }
+    }
+
+    /// The renderer reads no weather field: labels are the generic keys,
+    /// else the id. An engine's own label arrives as the `title` property
+    /// (#1143) and names the row, the page and the map, the id beside it.
     #[test]
     fn labels_are_generic_and_never_interpret_weather_fields() {
         assert_eq!(
@@ -738,6 +905,60 @@ mod tests {
             "42"
         );
         assert_eq!(coordinate(&json!(51.88055000000001)), "51.88055");
+
+        let labelled = crate::response::Annotations {
+            engine: Some(&Labelled),
+            ..Default::default()
+        };
+        let wind = alert(&[("event", "Wind"), ("areaDesc", "Coast")]);
+        let encode = |feature: &Feature, annotations| {
+            let mut doc = feature_to_geojson(
+                feature,
+                "cap",
+                "/features",
+                &crate::crs::ResponseCrs::default(),
+                annotations,
+            );
+            representation_links(&mut doc, Wanted::Html);
+            doc
+        };
+        let doc = encode(&wind, &labelled);
+        assert_eq!(doc["properties"]["title"], "Wind · Coast");
+        assert_eq!(feature_title(&doc), "Wind · Coast");
+        let page = features_html(
+            &doc,
+            "Alerts",
+            "cap",
+            "",
+            "/features",
+            &FeatureControls::default(),
+        );
+        assert!(
+            page.contains(
+                "<h1>Wind · Coast</h1><p class=\"mono\">2.49.0.0.246.0.FI.260617/1 0</p>"
+            ),
+            "{page}"
+        );
+        let list = json!({"features": [doc], "numberMatched": 1,
+            "links": [{"rel": "self", "href": "/features/collections/cap/items?f=html"}]});
+        let page = features_html(
+            &list,
+            "Alerts",
+            "cap",
+            "",
+            "/features",
+            &FeatureControls::default(),
+        );
+        assert!(
+            page.contains(">Wind · Coast<small>2.49.0.0.246.0.FI.260617/1 0</small></a>"),
+            "{page}"
+        );
+        // A title of the feature's own stays; no engine, no title.
+        let titled = alert(&[("event", "Wind"), ("areaDesc", "Coast"), ("title", "Own")]);
+        assert_eq!(encode(&titled, &labelled)["properties"]["title"], "Own");
+        assert!(encode(&wind, &Default::default())["properties"]
+            .get("title")
+            .is_none());
     }
 
     /// #1131: an items page's tab title names its item range, whether it
@@ -866,14 +1087,14 @@ mod tests {
             filterables: vec!["name".into()],
             sortables: vec!["score".into()],
             temporal: true,
+            ..Default::default()
         };
         let html = query_form(&doc, &controls, None);
         assert_eq!(html.matches("data-param=\"name\"").count(), 2);
         assert!(html.contains("value=\"a&amp;b\""));
         assert!(html.contains("data-keep-empty=\"true\""));
         assert!(html.contains("data-clear-predicate"));
-        assert!(html.contains("data-param=\"sortby\""));
-        assert!(html.contains("value=\"-score\""));
+        assert!(html.contains("data-param=\"sortby\" data-sortby value=\"-score\""));
         assert!(html.contains("data-param=\"datetime\""));
         let plain = query_form(
             &json!({"links":[{"rel":"self","href":"/features/collections/a/items"}]}),
@@ -885,16 +1106,92 @@ mod tests {
         assert!(!plain.contains("data-param=\"name\""));
     }
 
+    /// #1143: the builder guides each control. Sort is a property and a
+    /// direction, time two pickers beside the `datetime` they fill, the box
+    /// can take the map's view, and the submit button comes last.
+    #[test]
+    fn query_builder_guides_sort_time_and_area_and_submits_last() {
+        let controls = FeatureControls {
+            filterables: vec!["name".into()],
+            sortables: vec!["score".into(), "name".into()],
+            temporal: true,
+            ..Default::default()
+        };
+        let form = |query: &str| {
+            query_form(
+                &json!({"links":[{"rel":"self","href":format!("/features/collections/a/items?{query}")}]}),
+                &controls,
+                None,
+            )
+        };
+        let html = form("sortby=-score&datetime=2026-10-16T06:30:00Z/..&f=html");
+        assert!(html.contains("<select data-sort-property aria-describedby=\"sortby-hint\"><option value=\"\">Default order</option><option value=\"score\" selected>score</option><option value=\"name\">name</option></select>"), "{html}");
+        assert!(html.contains("<option value=\"-\" selected>Descending</option>"));
+        assert!(html.contains(
+            "<input type=\"datetime-local\" step=\"1\" data-datetime-start value=\"2026-10-16T06:30:00\">"
+        ));
+        assert!(html.contains("data-datetime-end value=\"\""));
+        assert!(html.contains("empty for an open end (..)"));
+        assert!(html.contains("e.g. 2026-10-17T00:00:00Z/.."));
+        assert!(html.contains("data-use-map-view"));
+        // Nothing comes after the submit button but the clear link and the
+        // draft preview.
+        let submit = html.find("Request features</button>").unwrap();
+        for field in [
+            "data-sort-property",
+            "data-param=\"bbox\"",
+            "name=\"limit\"",
+            "data-new-property",
+        ] {
+            assert!(html.find(field).unwrap() < submit, "{field}");
+        }
+        // Several keys stay as they were given.
+        let html = form("sortby=name,-score&f=html");
+        assert!(html.contains(
+            "<option value=\"name,-score\" data-raw selected>As requested: name,-score</option>"
+        ));
+        assert!(html.contains("<option value=\"name\">name</option>"));
+        // An instant fills both pickers; text the pickers cannot show
+        // leaves them empty.
+        let html = form("datetime=2026-10-16T06:30:00Z&f=html");
+        assert!(html.contains("data-datetime-end value=\"2026-10-16T06:30:00\""));
+        let html = form("datetime=yesterday&f=html");
+        assert!(html.contains("data-datetime-start value=\"\""));
+        assert!(html.contains("value=\"yesterday\""));
+    }
+
+    /// The datetime control follows whether `/items` takes `datetime`
+    /// (`has_time_dimension`), not whether the collection advertises a
+    /// span (#1143).
+    #[test]
+    fn datetime_control_follows_the_time_dimension() {
+        let doc = json!({"links":[{"rel":"self","href":"/features/collections/a/items?f=html"}]});
+        let with = |temporal| {
+            query_form(
+                &doc,
+                &FeatureControls {
+                    temporal,
+                    ..Default::default()
+                },
+                None,
+            )
+        };
+        assert!(with(true).contains("data-datetime-start"));
+        assert!(with(true).contains("data-param=\"datetime\""));
+        assert!(!with(false).contains("data-datetime-start"));
+        assert!(!with(false).contains("data-param=\"datetime\""));
+    }
+
     /// A rejected request's form marks the field at fault and opens the
     /// filters holding it; a parameter with no field is named above them
     /// (#1132).
     #[test]
     fn rejected_requests_mark_the_field_at_fault() {
-        let doc = json!({"links":[{"rel":"self","href":"/features/collections/a/items?sortby=nope&datetime=x&f=html"}]});
+        let doc = json!({"links":[{"rel":"self","href":"/features/collections/a/items?sortby=nope&datetime=x&limit=x&f=html"}]});
         let controls = FeatureControls {
-            filterables: vec![],
             sortables: vec!["score".into()],
             temporal: true,
+            ..Default::default()
         };
         let invalid = |parameter, message| {
             Some(Invalid {
@@ -907,28 +1204,32 @@ mod tests {
             &controls,
             invalid("sortby", "property 'nope' <is> not sortable"),
         );
-        assert!(
-            html.contains("data-disclosure=\"item-filters\" open"),
-            "{html}"
-        );
-        assert!(html.contains("<input aria-invalid=\"true\" aria-errormessage=\"sortby-error\" aria-describedby=\"sortby-error\" data-param=\"sortby\""), "{html}");
+        assert!(html.contains("<select data-sort-property aria-invalid=\"true\" aria-errormessage=\"sortby-error\" aria-describedby=\"sortby-error sortby-hint\">"), "{html}");
         assert!(html.contains(
             "class=\"error-text field-error\">property &#39;nope&#39; &lt;is&gt; not sortable</span></label>"
         ));
+        assert!(
+            html.contains("<option value=\"nope\" data-raw selected>As requested: nope</option>")
+        );
         assert_eq!(html.matches("aria-invalid").count(), 1);
+        assert!(!html.contains("data-disclosure=\"item-filters\" open"));
         // The datetime field shows the forms it takes.
         assert!(html
             .contains("e.g. 2026-10-17T00:00:00Z/.. or 2026-10-16T00:00:00Z/2026-10-17T00:00:00Z"));
         let html = query_form(&doc, &controls, invalid("datetime", "bad"));
         assert!(html.contains("aria-errormessage=\"datetime-error\""));
-        assert!(!html.contains("data-disclosure=\"item-filters\" open"));
+        let html = query_form(&doc, &controls, invalid("limit", "bad"));
+        assert!(
+            html.contains("data-disclosure=\"item-filters\" open"),
+            "{html}"
+        );
         let html = query_form(
             &doc,
             &controls,
             invalid("typo", "unsupported parameter 'typo'"),
         );
         assert!(!html.contains("aria-invalid"));
-        assert!(html.contains("<p class=\"error-text field-error\" role=\"alert\">unsupported parameter &#39;typo&#39;</p><div class=\"item-primary-fields\">"), "{html}");
+        assert!(html.contains("<p class=\"error-text field-error\" role=\"alert\">unsupported parameter &#39;typo&#39;</p><p class=\"search-hint\">"), "{html}");
     }
 
     #[test]
@@ -953,12 +1254,14 @@ mod tests {
             .into_iter()
             .collect::<std::collections::HashMap<_, _>>()
             .into(),
+            related: Vec::new(),
         };
         let mut doc = feature_to_geojson(
             &feature,
             "test",
             "https://example.com/prefix/features",
             &crate::crs::ResponseCrs::default(),
+            &Default::default(),
         );
         representation_links(&mut doc, Wanted::Html);
         let html = features_html(
@@ -1031,6 +1334,7 @@ mod tests {
             "",
             "",
             &crate::crs::ResponseCrs::default(),
+            &Default::default(),
         );
         representation_links(&mut doc, Wanted::Html);
         for link in doc["links"].as_array().unwrap() {
@@ -1050,5 +1354,157 @@ mod tests {
             };
             assert!(pairs.iter().any(|(k, v)| k == "f" && v == format));
         }
+    }
+
+    /// #1143: default columns are the engine's choice, else its sortables,
+    /// else the rest alphabetically; never the id again, the collection or
+    /// coordinates, and only properties this page has values for.
+    #[test]
+    fn default_columns_follow_engine_intent_then_sortables() {
+        let features = [
+            json!({"id": "fivih", "properties": {"nod": "fivih", "id": 7, "collection": "r-fivih",
+                "latitude": 60.5, "longitude": 24.4, "name": "Vihti", "wmo": "02975",
+                "volume_count": 12, "antenna_height_m": 181.0, "quantities": ["DBZH"], "empty": null}}),
+            json!({"id": "fikor", "properties": {"nod": "fikor", "id": 8, "collection": "r-fikor",
+                "latitude": 60.1, "longitude": 21.6, "name": "Korpo", "wmo": "02933",
+                "volume_count": 10, "antenna_height_m": 61.0, "quantities": ["DBZH"], "empty": null}}),
+        ];
+        let defaults = |controls: FeatureControls| property_columns(&features, &controls).1;
+        assert_eq!(
+            defaults(FeatureControls::default()),
+            ["antenna_height_m", "volume_count", "wmo"]
+        );
+        assert_eq!(
+            defaults(FeatureControls {
+                sortables: vec!["volume_count".into(), "name".into()],
+                ..Default::default()
+            }),
+            ["volume_count", "antenna_height_m", "wmo"]
+        );
+        assert_eq!(
+            defaults(FeatureControls {
+                sortables: vec!["volume_count".into()],
+                summary: vec![
+                    "wmo".into(),
+                    "absent".into(),
+                    "empty".into(),
+                    "collection".into()
+                ],
+                ..Default::default()
+            }),
+            ["wmo", "collection"]
+        );
+        // Every property stays choosable.
+        let (columns, _) = property_columns(&features, &FeatureControls::default());
+        assert!(columns.iter().any(|c| c == "nod"));
+        assert!(columns.iter().any(|c| c == "latitude"));
+    }
+
+    /// The column choice is stored by collection id, and the page says it
+    /// is kept in this browser (#1143).
+    #[test]
+    fn column_choice_is_kept_per_collection() {
+        let doc = json!({"features": [{"id": "a", "geometry": null, "properties": {"x": 1}, "links": []}],
+            "numberMatched": 1, "links": [{"rel": "self", "href": "/collections/radar/items?f=html"}]});
+        let html = features_html(&doc, "Radar", "radar", "", "", &FeatureControls::default());
+        assert!(html.contains("<div id=\"item-properties\" data-collection=\"radar\" hidden>"));
+        assert!(html.contains("this browser remembers your choice for this collection"));
+    }
+
+    /// #1143: a request that filters or sorts opens the builder with what
+    /// it applied; a plain one leaves it closed.
+    #[test]
+    fn builder_opens_when_the_request_filters() {
+        let page = |query: &str| {
+            let doc = json!({"features": [], "numberMatched": 0,
+                "links": [{"rel": "self", "href": format!("/collections/a/items?{query}")}]});
+            features_html(&doc, "A", "a", "", "", &FeatureControls::default())
+        };
+        let open = "id=\"item-builder\" data-disclosure=\"item-builder\" open>";
+        assert!(page("limit=10&offset=20&f=html")
+            .contains("id=\"item-builder\" data-disclosure=\"item-builder\">"));
+        assert!(page("bbox=1,2,3,4&f=html").contains(open));
+        assert!(page("sortby=-score&f=html").contains(open));
+        assert!(page("name=x&f=html").contains(open));
+    }
+
+    /// #1143: past the end, `prev` leads to the last page with features,
+    /// and the map says the page has none.
+    #[test]
+    fn a_page_past_the_end_leads_back_to_the_last_page() {
+        let page = FeaturePage {
+            features: vec![],
+            number_returned: 0,
+            number_matched: 23,
+            next_offset: None,
+        };
+        let mut doc = feature_page_to_geojson(
+            &page,
+            "a",
+            10,
+            90,
+            "&name=x",
+            "",
+            "/features",
+            &crate::crs::ResponseCrs::default(),
+            &Default::default(),
+        );
+        representation_links(&mut doc, Wanted::Html);
+        let html = features_html(&doc, "A", "a", "", "/features", &FeatureControls::default());
+        assert!(
+            html.contains("href=\"/features/collections/a/items?offset=20&amp;limit=10&amp;name=x&amp;f=html\""),
+            "{html}"
+        );
+        assert!(html.contains("No features on this page."));
+        assert!(!html.contains("No geometry available."));
+    }
+
+    /// #1143: a feature's related links are buttons in the aside, in HTML
+    /// leading to the HTML view.
+    #[test]
+    fn related_links_are_next_steps() {
+        let pages = std::collections::HashMap::from([(
+            "radar-fivih".to_owned(),
+            "/collections/radar-fivih".to_owned(),
+        )]);
+        let site = Feature {
+            id: "fivih".into(),
+            geometry: Geometry::Point { x: 24.4, y: 60.5 }.into(),
+            properties: std::collections::HashMap::new().into(),
+            related: vec![
+                ds_core::feature::Related {
+                    target: ds_core::feature::RelatedTarget::Collection("radar-fivih".into()),
+                    title: "Radar site collection".into(),
+                },
+                ds_core::feature::Related {
+                    target: ds_core::feature::RelatedTarget::Collection("unknown".into()),
+                    title: "Nowhere".into(),
+                },
+                ds_core::feature::Related::edr_location("fivih"),
+            ],
+        };
+        let mut doc = feature_to_geojson(
+            &site,
+            "radar",
+            "https://x.test/features",
+            &crate::crs::ResponseCrs::default(),
+            &crate::response::Annotations {
+                base: "https://x.test",
+                collection_pages: Some(&pages),
+                edr: true,
+                ..Default::default()
+            },
+        );
+        representation_links(&mut doc, Wanted::Html);
+        let html = features_html(
+            &doc,
+            "Radar",
+            "radar",
+            "",
+            "https://x.test/features",
+            &FeatureControls::default(),
+        );
+        assert!(html.contains("<span class=\"eyebrow\">NEXT STEPS</span><div class=\"action-row related-links\"><a class=\"btn\" href=\"https://x.test/collections/radar-fivih?f=html\">Radar site collection →</a><a class=\"btn\" href=\"https://x.test/edr/collections/radar/locations/fivih?f=html\">Station data (EDR location) →</a></div>"), "{html}");
+        assert!(!html.contains("Nowhere"));
     }
 }

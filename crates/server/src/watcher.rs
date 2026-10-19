@@ -432,6 +432,7 @@ pub(crate) mod tests {
             bufr_engines: RwLock::new(result.bufr_engines),
             postgis_engines: RwLock::new(result.postgis_engines),
             nowcast_engines: RwLock::new(result.nowcast_engines),
+            station_grid_engines: RwLock::new(result.station_grid_engines),
             reload_lock: tokio::sync::Mutex::new(()),
             admin_token: None,
             style_fingerprint: std::sync::atomic::AtomicU64::new(
@@ -484,8 +485,8 @@ colormap = "temperature"
 [[collections.wms.parameters]]
 name = "air_pressure_at_sea_level"
 colormap = "pressure"
-min = 95000.0
-max = 105000.0
+min = 950.0
+max = 1050.0
 "#,
                 meps = meps.to_string_lossy()
             ),
@@ -532,11 +533,9 @@ max = 105000.0
             RecoveryOutcome::Recovered
         );
         assert_eq!(style(&state, pressure).unwrap().0, "pressure");
-        // The kelvin temperature default, which the file's unit selects.
-        assert_eq!(
-            style(&state, t2m),
-            Some(("temperature".to_string(), 323.15))
-        );
+        // The °C temperature default, which the served unit selects: the
+        // file's K converted (#1209).
+        assert_eq!(style(&state, t2m), Some(("temperature".to_string(), 50.0)));
         assert!(Arc::ptr_eq(
             &engine,
             &state.netcdf_engines.read().unwrap()[0]

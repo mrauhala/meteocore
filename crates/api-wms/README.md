@@ -16,9 +16,10 @@ names.
 
 - One route, `GET /wms` (`/wms/` works too), dispatching on `REQUEST`.
 - The server registers each `wms` collection's `MapEngine` in `WmsState`,
-  and its `EdrEngine` when the engine answers EDR position queries (for
-  GetFeatureInfo). A reload swaps the state atomically. The crate depends on
-  `ds-core`, `ds-render` and `ds-executor`, never on an engine crate.
+  and its `EdrEngine` when EDR position queries answer the values its
+  layers show (for GetFeatureInfo). A reload swaps the state atomically.
+  The crate depends on `ds-core`, `ds-render` and `ds-executor`, never on
+  an engine crate.
 - GetMap resolves each layer's style, timestep, model run and level before
   it builds a cache key, so the key names the frame the engine draws. Then:
   rendered-image cache lookup, admission (a render slot and output memory
@@ -142,7 +143,7 @@ are drawn over each other in list order, the first at the bottom: a layer's
 nodata and translucent colours show the layers below. `FORMAT`,
 `TRANSPARENT` and `BGCOLOR` apply once, to the combined image. Any layer
 kind can be listed: parameters, RGB composites, CAP warnings, nowcast,
-lightning events, radar volumes.
+lightning events, station symbols, radar volumes.
 
 - **Checks.** Every name and style is checked first, so an unknown one is
   `LayerNotDefined` / `StyleNotDefined`; a list of more than five served
@@ -185,10 +186,13 @@ latitude-first. When in doubt, use `CRS:84`.
 - An `EPSG:3067` or `EPSG:3035` box wholly outside the projection's valid
   area is the empty image, and no engine is asked. For `EPSG:3035` that
   area is the LAEA disk, about 12 742 km in radius around
-  (4 321 000, 3 210 000). For `EPSG:3067` it reaches the poles but only
-  50° of longitude either side of the central meridian, 27°E: the
-  Transverse Mercator series MeteoCore uses is not reliable further out.
-  `EPSG:3067` maps therefore show nothing west of 23°W or east of 77°E.
+  (4 321 000, 3 210 000). For `EPSG:3067` it is the square of eastings and
+  northings within 9 997 965 m of (500 000, 0), where the Transverse
+  Mercator series MeteoCore uses matches the exact projection to under a
+  millimetre. North and south it reaches the poles. East and west it
+  reaches 90° of longitude from the central meridian, 27°E, poleward of
+  23.4° of latitude, and 66.3° on the equator. `EPSG:3067` maps therefore
+  show nothing west of 63°W or east of 117°E.
 - A box partly outside renders what lies inside; its pixels past the area
   stay empty.
 - An `EPSG:3035` box whose edges miss the disk inside it (wider than the
@@ -208,8 +212,10 @@ The value is the collection's EDR position query at the centre of pixel
 (`I`, `J`), so GetFeatureInfo and `/edr/collections/{id}/position` answer
 the same value at the same point, time, run and level. It is the source
 value as the engine samples it (bilinear for GRIB, QueryData, Zarr and
-NetCDF), not the pixel's colour: a projected GetMap is assembled by nearest
-neighbour.
+NetCDF; a station grid's analysis cell under the point), not the pixel's
+colour: a projected GetMap is assembled by nearest neighbour. The answer
+names the value's unit, the one EDR serves: GRIB, Zarr and NetCDF convert
+a temperature stored in K to °C and a pressure in Pa to hPa.
 
 | Parameter | Required | Values |
 |---|---|---|
@@ -256,10 +262,13 @@ them. `text/plain` writes `layer:` and then one `name: value` line per field,
   is not on the Earth (past a pole, or outside an `EPSG:3067` / `EPSG:3035`
   valid area) also has a null `geometry`, and no engine is asked.
 - **Queryable layers.** A layer is `queryable="1"` when its collection's
-  engine answers EDR position queries for its parameter, whether or not the
-  collection lists `edr`. RGB composites, the ODIM per-site `CELLS`
-  overlay, CAP, PostGIS events (lightning) and nowcast layers are
-  `queryable="0"` and answer `LayerNotQueryable`.
+  engine answers EDR position queries for the values the layer shows,
+  whether or not the collection lists `edr`. RGB composites, the ODIM
+  per-site `CELLS` overlay, CAP, PostGIS events (lightning), PostGIS
+  station symbols and nowcast layers are `queryable="0"` and answer
+  `LayerNotQueryable`. A station marker shows the station's latest value
+  within `max_age`, which a position query, an exact instant at the
+  nearest station, does not answer.
 - **Execution.** The queries wait in GetMap's render queue and run on the
   query runtime EDR uses, one layer after another, under one deadline of
   their own, `MC_FEATURE_INFO_TIMEOUT_MS` (10 s), which also covers the
@@ -322,7 +331,8 @@ only in the server log.
   with HTTP 200, not an exception.
 - `TIME` and `ELEVATION` take one value: no lists, intervals or `current`.
 - Styles come from the server's configuration only: no `SLD` or `SLD_BODY`.
-- `EPSG:3067` covers only 50° of longitude either side of 27°E.
+- `EPSG:3067` covers only the hemisphere within 90° of longitude of 27°E,
+  narrowing to 66.3° at the equator.
 - Vendor additions: `QUALITY`, the `reference_time` dimension
   (`DIM_REFERENCE_TIME`) and GetLegendGraphic `FORMAT=application/json`.
 
@@ -347,7 +357,7 @@ only in the server log.
 | Response | `Cache-Control` |
 |---|---|
 | GetMap with a `TIME` that resolved, on content never revised in place | `public, max-age=86400, immutable` |
-| GetMap otherwise (no `TIME`, CAP alerts, the error image) | `public, max-age=60, must-revalidate` |
+| GetMap otherwise (no `TIME`, CAP alerts, station symbols, station grids, the error image) | `public, max-age=60, must-revalidate` |
 | GetFeatureInfo | As GetMap, and a null value always revalidates |
 | GetLegendGraphic | `public, max-age=86400` |
 
@@ -373,7 +383,9 @@ on every retry; see
 
 A collection is served when its engine draws maps and `apis` lists `wms`:
 `geotiff`, `grib`, `querydata`, `zarr`, `netcdf`, `satellite`, `odim`,
-`odim-volume`, `cap`, `nowcast`, and `postgis` with the events shape.
+`odim-volume`, `cap`, `nowcast`, `station-grid` and `postgis`. A PostGIS
+events collection draws its strikes; a station collection draws a layer
+per parameter, each station a marker coloured by its value.
 
 ```toml
 [[collections]]
@@ -430,8 +442,10 @@ The crate's tests run the router against mock engines: parameter parsing,
 capabilities, exceptions, `TRANSPARENT`/`BGCOLOR` pixels, caching and
 meta-tiling, model runs, legends, several layers, GetFeatureInfo and derived
 wind speed. The server test checks GetFeatureInfo against EDR position
-answers on committed fixtures: GeoTIFF radar frames, a GRIB wind forecast
-and two CF-NetCDF forecast samples, one of them on pressure levels.
+answers on committed fixtures: GeoTIFF radar frames, a GRIB wind forecast,
+two CF-NetCDF forecast samples, one of them on pressure levels, and a Zarr
+store. The NetCDF and Zarr answers carry values and units converted for
+display.
 
 ## OGC test suite
 

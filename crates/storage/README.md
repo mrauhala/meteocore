@@ -38,7 +38,10 @@ decides whether that retry gets to run, so a whole-object fetch names its
 `get_range`, `get_range_on`, `get_range_or_refusal` and `get_many` are the request budget. Don't pass the background budget where a
 request can wait on the result, directly or through a single-flight cache
 fill. `start_get_opt` is a `FetchBudget::Request` read too: it runs ahead on
-the runtime carrying the deadline of the thread that started it (#999).
+the runtime (#999), and several threads can wait for it behind an `Arc`
+(#1127). Each `PendingGet::wait` is limited by its own thread's request
+deadline, so one request's deadline never cuts off a read another waits on;
+the read is aborted when its last holder drops it.
 
 # Catalog discovery
 

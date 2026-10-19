@@ -148,6 +148,7 @@ fn build_state_with_wms(wms: Option<ds_core::config::WmsConfig>) -> api_tiles::A
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
             netcdf: None,
@@ -233,6 +234,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
             netcdf: None,
@@ -1148,6 +1150,7 @@ fn build_empty_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
             netcdf: None,
@@ -1283,6 +1286,7 @@ fn build_multi_param_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
             netcdf: None,
@@ -1671,6 +1675,7 @@ mod mvt {
                         .into_iter()
                         .collect(),
                 ),
+                related: Vec::new(),
             };
             Self {
                 features: vec![
@@ -1835,6 +1840,7 @@ mod mvt {
                 cap: None,
                 postgis: None,
                 nowcast: None,
+                station_grid: None,
                 bufr: None,
                 satellite: None,
                 netcdf: None,
@@ -1878,6 +1884,7 @@ mod mvt {
                 id: "pt".into(),
                 geometry: StdArc::new(Geometry::Point { x: 0.0, y: 0.0 }),
                 properties: StdArc::new(Default::default()),
+                related: Vec::new(),
             };
             let features: Vec<Feature> = std::iter::repeat_with(|| f.clone()).take(take).collect();
             let len = features.len();
@@ -1927,6 +1934,7 @@ mod mvt {
                 cap: None,
                 postgis: None,
                 nowcast: None,
+                station_grid: None,
                 bufr: None,
                 satellite: None,
                 netcdf: None,
@@ -2315,6 +2323,7 @@ mod temporal_grid_jitter {
                 cap: None,
                 postgis: None,
                 nowcast: None,
+                station_grid: None,
                 bufr: None,
                 satellite: None,
                 netcdf: None,
@@ -2491,6 +2500,7 @@ mod metadata_extras {
                 cap: None,
                 postgis: None,
                 nowcast: None,
+                station_grid: None,
                 bufr: None,
                 satellite: None,
                 netcdf: None,
@@ -2840,6 +2850,7 @@ fn build_param_layer_router_with(
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
             netcdf: None,
@@ -3892,6 +3903,7 @@ mod composites {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
             netcdf: None,
@@ -4745,6 +4757,7 @@ mod vector_tile_time {
                         .into_iter()
                         .collect(),
                 ),
+                related: Vec::new(),
             };
             Self {
                 features: vec![

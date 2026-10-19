@@ -90,29 +90,26 @@ poll_interval_secs = 300
 # prewarm_variables = ["air_temperature_2m"]
 
 [netcdf.titles]
-# Accumulated from the run's start, served as it is stored.
+# Accumulated from the run's start, not per step.
 precipitation_amount_acc = "Precipitation accumulated since run start"
 x_wind_10m = "10 m wind along the grid's x axis"
 y_wind_10m = "10 m wind along the grid's y axis"
 
-# Values are served in the files' own units: K, Pa, m/s, kg/m^2 and
-# fractions (units "1"). Each layer without an entry below takes the
-# built-in default its name and unit select: temperature over -90…50 °C in
-# kelvin, pressure over 950…1050 hPa in pascals, wind speed for the gusts,
-# 0-200 mm for the accumulated precipitation.
+# Values are served in display units, converted from each variable's CF
+# units: temperature in °C (the files' K), MSLP in hPa (Pa) and the
+# accumulated precipitation in mm (kg/m^2); wind in m/s and the fractions
+# (unit "1") as stored. Each layer without an entry below takes the
+# built-in default its name and unit select: temperature over -90…50 °C,
+# pressure over 950…1050 hPa, wind speed for the gusts, 0-200 mm for the
+# accumulated precipitation, and relative humidity and cloud cover on the
+# fraction palettes over 0-1.
 [wms]
-# The °C temperature palette over -90…50 °C in kelvin.
+# The collection's own palette, for a variable no default matches: the
+# temperature palette over its own -90…50 °C, the first variable's.
 colormap = "temperature"
-min = 183.15
-max = 323.15
 
-[[wms.parameters]]
-name = "relative_humidity_2m"
-colormap = "viridis"
-min = 0.0
-max = 1.0
-
-# Narrower than the default's ±40 m/s for wind components.
+# Deliberately narrower than the default's ±40 m/s for wind components,
+# so common 10 m winds span the whole palette.
 [[wms.parameters]]
 name = "x_wind_10m"
 colormap = "diverging"
@@ -124,9 +121,3 @@ name = "y_wind_10m"
 colormap = "diverging"
 min = -20.0
 max = 20.0
-
-[[wms.parameters]]
-name = "cloud_area_fraction"
-colormap = "grayscale"
-min = 0.0
-max = 1.0

@@ -4,7 +4,9 @@
 //! **Scope** (issue #125, Phases 1-3): a local **or** remote (S3/HTTP) Zarr
 //! store on a WGS84/geographic lat-lon grid, multi-variable EDR position/area
 //! queries with bilinear interpolation, CF time-axis decoding, CF packing
-//! (`scale_factor`/`add_offset`/`_FillValue`), byte-range chunk reads with an
+//! (`scale_factor`/`add_offset`/`_FillValue`), values served in the display
+//! unit of each array's CF `units` (`ds_core::units::display_conversion`:
+//! °C, hPa, mm, mm/h, gpm; #1213), byte-range chunk reads with an
 //! LRU cache, Map/Tiles/WMS rendering, and chunk-shape diagnostics. Projected
 //! source grids / per-item-CRS sources (Phase 4) are not implemented yet.
 //!
