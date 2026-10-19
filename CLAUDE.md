@@ -1297,10 +1297,18 @@ no `url` are rejected.
   patterns, never raw URLs (cardinality explosion).
 - **Grafana dashboards live in this repo:**
   `docker/grafana/dashboards/meteocore-overview.json`, provisioned via
-  `docker/grafana/provisioning/`. **When adding a new `/metrics` family,
-  update the dashboard too** (same PR or a follow-up issue). Cache families
-  follow the established panel pattern: hit ratio, bytes vs capacity, miss
-  rate.
+  `docker/grafana/provisioning/`: classic JSON that Grafana 12.3 loads
+  with default toggles. An open Summary row, then collapsed rows by
+  question and one row per engine. Every PromQL query carries
+  `job=~"$job"`; per-collection metrics also `collection=~"$collection"`.
+  **When adding a new `/metrics` family, update the dashboard too** (same
+  PR or a follow-up issue), in the row its question belongs to. A cache
+  named `<name>_cache_{hits_total,misses_total,bytes,capacity_bytes}`
+  needs no panel: the `cache` variable feeds it to the cache table and
+  the repeated card of hit ratio, fill and miss rate. Add a per-collection
+  cache to the Gridded sources regex, and a memory budget
+  `<name>_{reserved_bytes,capacity_bytes,rejected_total}` to the
+  admission-budget panels in Memory & process.
 - **State:** API state wrapped in `ArcSwap` for lock-free reads. Render
   semaphore (`[server] render_concurrency`, default 2× CPU cores, min 8;
   fixed at boot, so restart to change) shared across Maps/Tiles/WMS. Engine
