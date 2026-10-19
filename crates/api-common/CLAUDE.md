@@ -57,16 +57,27 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   keeps the map's view as a CRS84 box in the map element's `data-view`,
   which the items builder's "Use map view" reads (#1143).
 - The collection map (#1220): every request reads one drawn-state object that
-  the controls write on `change`; never read a control in a render path. Only
-  `stageFrame` adds data layers: a new raster source at opacity 0 with zero
-  `raster-opacity-transition` and `raster-fade-duration`, swapped in one paint
-  once `isSourceLoaded`, the old removed after that paint. Never remove or
-  `setTiles` the visible source. A 404 tile fires no MapLibre `error`: no tile
+  the controls and the time bar write (`apply`, `goTo`); never read a control
+  in a render path. Only `stageFrame` adds data layers: a new raster source at
+  opacity 0 with zero `raster-opacity-transition` and `raster-fade-duration`.
+  `swapTo` shows a loaded frame in one paint; the old stays hidden in the pool
+  while it is one of the frames ahead, else it is removed after that paint.
+  Never remove or `setTiles` the visible source. A 404 tile fires no MapLibre `error`: no tile
   loaded and none failed means no data. The controls form is a no-JS GET to the
   Maps endpoint whose only named fields are Maps parameters (api-maps
-  `workbench_form` submits it); script-only controls stay unnamed or outside
-  it. The fragment is the map's only when empty, `#overview` or its own keys;
+  `workbench_form` submits it); script-only controls, the time bar and the WMS mode
+  stay unnamed or outside it. The fragment is the map's only when empty, `#overview` or its own keys;
   never overwrite `#metadata`.
+- The time bar (#1220): `mapRequest.axis` is `{start, step, count}` (step in
+  seconds) or `{times}`, never an option per step; a parameter's own axis is
+  on its `parameter_names` entry. Every frame names its time from the axis.
+  Nothing is buffered until the viewer uses the bar; a frame not yet asked for
+  goes before prefetch; tiles stage one prefetch frame at a time, images fetch
+  at most two. The status line announces steps, pauses and errors, never a
+  played frame; the slider moves only on a viewer's move or a pause. No
+  autoplay. WMS mode comes from the collection's `apis`
+  (`shared::wms_endpoint`): the collection document names no WMS, so this is
+  the one map control gated on config rather than an advertised link.
 - The Overview's "Filter by" / "Sort by" chips (`ItemsOverview`, carried by
   `Contribution::items`, rendered by `collection_page`) open the items
   builder through the URL fragment (`#filter=<name>`, `#sort=<name>`), never

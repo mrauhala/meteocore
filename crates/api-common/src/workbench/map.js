@@ -33,9 +33,10 @@
     };
     // A collection page's map keeps its view and choices in the URL
     // fragment (#1220), under the API's own parameter names:
-    // `#map=<zoom>/<lat>/<lon>&parameter-name=t&style=…&datetime=…&elevation=…&mode=tiles`.
-    // Any other fragment, such as the `#metadata` tab, is not the map's.
-    const FRAGMENT_KEYS = ['map','parameter-name','style','datetime','elevation','mode'];
+    // `#map=<zoom>/<lat>/<lon>&parameter-name=t&style=…&datetime=…&elevation=…&mode=tiles`,
+    // and the time bar's loop as `window=<start>/<end>`. Any other
+    // fragment, such as the `#metadata` tab, is not the map's.
+    const FRAGMENT_KEYS = ['map','parameter-name','style','datetime','elevation','mode','window'];
     function readFragment() {
       const text = location.hash.replace(/^#/,'');
       if (!text.includes('=')) return undefined;
@@ -137,36 +138,38 @@
     if (element.dataset.quicklook === 'true' && data.features.length) inspect(data.features[0]);
     // Render the viewport in Web Mercator so image pixels align with MapLibre.
     // Bounds come from the map; projection math remains in the existing API.
-    // Draw the collection with Maps (one image per view), its map tiles, or
-    // its vector tiles, whichever it advertises; a switch picks among several.
+    // Draw the collection with its map tiles, Maps (one image per view), WMS
+    // GetMap or its vector tiles, whichever it offers; a switch picks among
+    // several. A time bar under the map steps through and plays its axis.
     function installRasterPreview(extentBounds) {
       const request = data.mapRequest;
       const modes = request.modes || ['maps'];
-      const block = document.getElementById('map-controls');
-      const form = document.getElementById('map-form');
+      const byId = id => document.getElementById(id);
+      const block = byId('map-controls');
+      const form = byId('map-form');
       const modeInputs = [...document.querySelectorAll('input[name="map-mode"]')];
-      const parameter = document.getElementById('map-parameter');
-      const style = document.getElementById('map-style');
-      const time = document.getElementById('map-time');
-      const level = document.getElementById('map-level');
-      const previous = document.getElementById('map-time-prev');
-      const next = document.getElementById('map-time-next');
-      const help = document.getElementById('map-help');
+      const parameter = byId('map-parameter');
+      const style = byId('map-style');
+      // The form's date and time: the no-JS request's, and the script's only
+      // for a collection whose time has no axis to bind the time bar to.
+      const time = byId('map-time');
+      const level = byId('map-level');
+      const help = byId('map-help');
       const generalHelp = help?.textContent;
       const parameterField = parameter?.closest('label');
       const styleField = style.closest('label');
       const timeField = time?.closest('.map-time-field');
       const levelField = level?.closest('label');
-      const timeList = time?.tagName === 'SELECT';
       const parameters = request.parameter_names || [];
       // A collection crossing the antimeridian comes as one unwrapped
       // polygon (east > 180). Tile sources clamp their bounds to ±180, so
       // such a tileset is given none.
       const tileBounds = extentBounds && !extentBounds.isEmpty() && extentBounds.getWest() >= -180 && extentBounds.getEast() <= 180
         ? extentBounds.toArray().flat() : undefined;
-      // What the server drew when the choice was left to it: the instant
-      // from the map's Content-Datetime, the parameter from the legend.
-      let drawnDefault, defaultParameter, nearNow = false;
+      // The parameter the server draws when the choice is left to it, named
+      // by its legend.
+      let defaultParameter;
+      const MINUTE = 6e4, HOUR = 36e5, DAY = 864e5;
       // UTC to the minute, seconds only when present, as the options read.
       function formatTime(date) {
         const iso = date.toISOString();
@@ -177,6 +180,24 @@
       function instant(ms) {
         const iso = new Date(ms).toISOString();
         return iso.endsWith('.000Z') ? `${iso.slice(0,19)}Z` : iso;
+      }
+      const WEEKDAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+      const weekday = ms => WEEKDAYS[new Date(ms).getUTCDay()];
+      // The time bar's label: `Sun 2026-04-05 21:00 UTC`, UTC only (#1220).
+      const timeText = ms => `${weekday(ms)} ${formatTime(new Date(ms))} UTC`;
+      // A length of time in words, rounded: `45 min`, `3 h`, `2 d`; to a
+      // tenth of an hour or a day when `exact`.
+      function lengthText(ms, exact) {
+        const round = n => exact ? Number(n.toFixed(1)) : Math.round(n);
+        if (ms < 59.5 * MINUTE) return `${Math.round(ms / MINUTE)} min`;
+        if (ms < 48 * HOUR) return `${round(ms / HOUR)} h`;
+        return `${round(ms / DAY)} d`;
+      }
+      // How far an instant is from the viewer's clock: `25 min ago`, `in 3 h`.
+      function relativeText(ms) {
+        const delta = ms - Date.now();
+        if (Math.abs(delta) < MINUTE) return 'now';
+        return delta < 0 ? `${lengthText(-delta)} ago` : `in ${lengthText(delta)}`;
       }
       function findParameter(name) {
         return parameters.find(p => p.name === name) || parameters.find(p => p.label === name);
@@ -192,6 +213,34 @@
         if (index >= 0) select.selectedIndex = index;
         return index >= 0;
       }
+
+      // The time axes `mapRequest` carries (#1220): `{start, step, count}`
+      // for a regular grid, `step` in seconds, or `{times: [...]}`. Decoded
+      // to milliseconds, ascending, each instant once.
+      function decodeAxis(axis) {
+        if (!axis || typeof axis !== 'object') return undefined;
+        let times;
+        if (Array.isArray(axis.times)) times = axis.times.map(t => Date.parse(t)).filter(Number.isFinite);
+        else {
+          const start = Date.parse(axis.start), step = Number(axis.step) * 1000, count = Number(axis.count);
+          if (!Number.isFinite(start) || !(step > 0) || !Number.isInteger(count) || count < 1 || count > 1e6) return undefined;
+          times = Array.from({ length: count }, (_, i) => start + i * step);
+        }
+        times.sort((a, b) => a - b);
+        times = times.filter((t, i) => i === 0 || t !== times[i - 1]);
+        return times.length ? times : undefined;
+      }
+      const collectionAxis = decodeAxis(request.axis) || [];
+      const parameterAxes = new Map();
+      // The axis a parameter is drawn on: its own when it has one (#819),
+      // else the collection's.
+      function axisOf(name) {
+        const known = findParameter(name);
+        if (!known?.axis) return collectionAxis;
+        if (!parameterAxes.has(known.name)) parameterAxes.set(known.name, decodeAxis(known.axis) || collectionAxis);
+        return parameterAxes.get(known.name);
+      }
+
       // The fragment's choices, where this page offers them. A value it
       // does not offer keeps the control's default.
       function restore(saved) {
@@ -201,56 +250,14 @@
         if (saved.style) choose(style, option => option.dataset.id === saved.style);
         if (saved.elevation) choose(level, option => option.value !== '' && Number(option.value) === Number(saved.elevation));
         const ms = Date.parse(saved.datetime || '');
-        if (time && Number.isFinite(ms)) {
-          if (timeList) choose(time, option => option.value !== '' && Date.parse(option.value) === ms);
-          else time.value = instant(ms).slice(0,19);
-        }
-      }
-      // The option nearest an instant (milliseconds), skipping Default.
-      function nearestOption(ms) {
-        let best = -1, distance = Infinity;
-        for (let i = 1; i < time.options.length; i++) {
-          const d = Math.abs(Date.parse(time.options[i].value) - ms);
-          if (d < distance) { best = i; distance = d; }
-        }
-        return best;
-      }
-      // Default (index 0) stands for the instant the server drew for it, or
-      // the latest time before a map has named one. An instant past either
-      // end of the listed times (a page left open while new frames arrive)
-      // stands one place beyond that end, so one step lands on the end.
-      function timeIndex() {
-        if (time.selectedIndex > 0) return time.selectedIndex;
-        const last = time.options.length - 1;
-        if (!drawnDefault || last < 1) return last;
-        const ms = drawnDefault.getTime();
-        if (ms > Date.parse(time.options[last].value)) return last + 1;
-        if (ms < Date.parse(time.options[1].value)) return 0;
-        return nearestOption(ms);
-      }
-      function updateTimeButtons() {
-        if (!timeList || !previous || !next) return;
-        const index = timeIndex();
-        previous.disabled = index <= 1;
-        next.disabled = index >= time.options.length - 1;
+        if (time && Number.isFinite(ms)) time.value = instant(ms).slice(0,19);
       }
       function selectedTimeValue() {
         if (!time?.value) return '';
-        const ms = Date.parse(time.type === 'datetime-local' ? `${time.value}Z` : time.value);
+        const ms = Date.parse(`${time.value}Z`);
         return Number.isFinite(ms) ? instant(ms) : '';
       }
       restore(saved);
-      // A forecast whose axis runs past now opens at the valid time nearest
-      // the viewer's clock, not at the server's default (its last step).
-      // The collection advertises no default time of its own. The margin
-      // keeps a radar whose newest frame is a little ahead of a slow clock
-      // on Default, which follows new frames.
-      if (timeList && time.options.length > 1 && !saved?.datetime) {
-        const now = Date.now();
-        if (Date.parse(time.options[time.options.length - 1].value) > now + 10 * 60 * 1000) {
-          time.selectedIndex = nearestOption(now); nearNow = true;
-        }
-      }
       // What the map draws: one object, which every request reads. A
       // control writes its own key on `change`, so a pan, a step or a retry
       // never picks up an edit the viewer has not made, and nothing waits
@@ -259,40 +266,503 @@
         mode: modeInputs.find(input => input.checked)?.value || modes[0],
         'parameter-name': parameter?.value || '',
         style: Math.max(0, style.selectedIndex),
-        datetime: selectedTimeValue(),
+        datetime: '',
         elevation: level?.value || ''
       };
+      const LAYER_KEYS = ['mode','parameter-name','style','elevation'];
       function apply(change) {
-        const changed = Object.keys(change).some(key => state[key] !== change[key]);
+        const changed = Object.keys(change).filter(key => state[key] !== change[key]);
         Object.assign(state, change);
-        if (!changed) return;
-        if ('mode' in change) applyMode();
-        updateTimeButtons();
+        if (!changed.length) return;
+        if (changed.includes('mode')) applyMode();
+        // Another layer: nothing buffered or failed for the old one counts.
+        if (changed.some(key => LAYER_KEYS.includes(key))) resetFrames();
+        if (changed.includes('parameter-name')) rebind();
         render();
         saveFragment();
       }
-      function stepTime(direction) {
-        const index = timeIndex() + direction;
-        if (index < 1 || index >= time.options.length) return;
-        time.selectedIndex = index; nearNow = false;
-        apply({ datetime: selectedTimeValue() });
-      }
-      previous?.addEventListener('click',() => stepTime(-1));
-      next?.addEventListener('click',() => stepTime(1));
       parameter?.addEventListener('change',() => apply({ 'parameter-name': parameter.value }));
       style.addEventListener('change',() => apply({ style: Math.max(0, style.selectedIndex) }));
       level?.addEventListener('change',() => apply({ elevation: level.value }));
-      time?.addEventListener('change',() => { nearNow = false; apply({ datetime: selectedTimeValue() }); });
+      time?.addEventListener('change',() => { if (!axis.length) apply({ datetime: selectedTimeValue() }); });
       modeInputs.forEach(input => input.addEventListener('change',() => { if (input.checked) apply({ mode: input.value }); }));
       // Without the script the form opens the Maps image. With it, Enter in
       // the date and time field applies that time, and the page stays.
       form?.addEventListener('submit',event => {
         event.preventDefault();
-        if (time && !timeList) { nearNow = false; apply({ datetime: selectedTimeValue() }); }
+        if (time && !axis.length) apply({ datetime: selectedTimeValue() });
       });
+
+      // The time bar (#1220): the axis of the parameter drawn, the playhead
+      // (`head`, an index into it) and the loop window (`win`, indices).
+      const bar = byId('map-timebar');
+      const track = byId('map-track');
+      const marksBox = byId('map-track-marks');
+      const bufferBox = byId('map-track-buffer');
+      const band = byId('map-window');
+      const slider = byId('map-playhead');
+      const playheadMark = byId('map-playhead-mark');
+      const playButton = byId('map-play');
+      const speedSelect = byId('map-speed');
+      const repeatSelect = byId('map-repeat');
+      const drawnLabel = byId('map-time-drawn');
+      const relativeLabel = byId('map-time-relative');
+      const seekLabel = byId('map-time-seek');
+      const windowText = byId('map-window-text');
+      const menu = byId('map-time-menu');
+      const jump = byId('map-jump');
+      const keysButton = byId('map-keys');
+      const keysHelp = byId('map-keys-help');
+      // Observations end no later than about now; a forecast reaches on.
+      // The margin keeps a radar whose newest frame is a little ahead of a
+      // slow clock an observation.
+      const NOW_MARGIN = 10 * MINUTE;
+      // The loop window: 24 frames by default, at most 96.
+      const WINDOW_FRAMES = 24, WINDOW_CAP = 96;
+      const SPEEDS = [1, 2, 4, 8];
+      // The last frame of a loop is held this long before it repeats.
+      const LAST_HOLD = 1200;
+      // A drag requests the frame under the pointer once it rests this long.
+      const DRAG_REST = 150;
+      let axis = [], cadence = Infinity, head = -1, win = { lo: 0, hi: -1 }, userWindow = false;
+      let playing = false, holding = false, direction = 1, playTimer, speedChosen = false;
+      // The viewer has used the time bar: only then are frames buffered
+      // ahead, so a page that is only looked at costs one frame.
+      let engaged = false, playedOnce = false;
+      // Frames of the current layer that failed or had no data, by instant:
+      // marked on the track and skipped in playback.
+      const marks = new Map();
+      const connection = typeof navigator === 'object' ? navigator.connection : undefined;
+      const saveData = Boolean(connection?.saveData);
+      const metered = saveData || /^(slow-2g|2g|3g)$/.test(connection?.effectiveType || '') || connection?.type === 'cellular';
+      function nearestIndex(ms) {
+        let lo = 0, hi = axis.length - 1;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (axis[mid] < ms) lo = mid + 1; else hi = mid; }
+        return lo > 0 && ms - axis[lo - 1] <= axis[lo] - ms ? lo - 1 : lo;
+      }
+      const isForecast = () => axis.length > 0 && axis[axis.length - 1] > Date.now() + NOW_MARGIN;
+      // The time shown first: the latest frame of observations, and for a
+      // forecast the step nearest the viewer's clock. A request always names
+      // it, so even the first frame is cacheable and labelled with its time.
+      // The collection document names no default time of its own.
+      const openingIndex = () => isForecast() ? nearestIndex(Date.now()) : axis.length - 1;
+      // The default loop: the last 24 frames of observations, a forecast's
+      // 24 from the step nearest now, and every frame when there are fewer.
+      function defaultWindow() {
+        const size = Math.min(WINDOW_FRAMES, axis.length);
+        const lo = isForecast() ? Math.min(nearestIndex(Date.now()), axis.length - size) : axis.length - size;
+        win = { lo, hi: lo + size - 1 };
+      }
+      function setWindow(lo, hi) {
+        const last = axis.length - 1;
+        lo = Math.max(0, Math.min(last, lo)); hi = Math.max(0, Math.min(last, hi));
+        if (hi < lo) [lo, hi] = [hi, lo];
+        win = { lo, hi: Math.min(hi, lo + WINDOW_CAP - 1) };
+      }
+      // One end of the loop at `index`; the other stays where it can.
+      function setWindowEnd(end, index, quiet) {
+        if (!axis.length) return;
+        let { lo, hi } = win;
+        if (end === 'lo') {
+          lo = index;
+          if (hi < lo) hi = Math.min(axis.length - 1, lo + WINDOW_FRAMES - 1);
+          hi = Math.min(hi, lo + WINDOW_CAP - 1);
+        } else {
+          hi = index;
+          if (lo > hi) lo = Math.max(0, hi - WINDOW_FRAMES + 1);
+          lo = Math.max(lo, hi - WINDOW_CAP + 1);
+        }
+        win = { lo, hi }; userWindow = true;
+        drawWindow();
+        if (quiet) return;
+        trimPool(); prefetch(); saveFragment();
+        report(`Loop: ${windowSummary()}, ${timeText(axis[lo])} to ${timeText(axis[hi])}.`);
+      }
+      function windowSummary() {
+        const count = win.hi - win.lo + 1;
+        return `${count} frame${count === 1 ? '' : 's'} · ${lengthText(axis[win.hi] - axis[win.lo], true)}`;
+      }
+      // Bind the time bar to `times`, at the instant nearest `keep` (the
+      // fragment's, or the one shown before a parameter change), with the
+      // loop window nearest `keepWindow` when the viewer set one.
+      function bindAxis(times, keep, keepWindow) {
+        axis = times;
+        if (bar) bar.hidden = !axis.length;
+        if (timeField) timeField.hidden = axis.length > 0;
+        if (!axis.length) { head = -1; return; }
+        head = Number.isFinite(keep) ? nearestIndex(keep) : openingIndex();
+        const gaps = [];
+        for (let i = 1; i < axis.length; i++) gaps.push(axis[i] - axis[i - 1]);
+        gaps.sort((a, b) => a - b);
+        cadence = gaps.length ? gaps[gaps.length >> 1] : Infinity;
+        userWindow = Boolean(keepWindow);
+        if (keepWindow) setWindow(nearestIndex(keepWindow[0]), nearestIndex(keepWindow[1])); else defaultWindow();
+        state.datetime = instant(axis[head]);
+        if (!bar) return;
+        slider.min = '0';
+        slider.max = String((axis[axis.length - 1] - axis[0]) / 1000);
+        if (jump) { jump.min = instant(axis[0]).slice(0,19); jump.max = instant(axis[axis.length - 1]).slice(0,19); }
+        // Four frames a second at radar cadences, two at model steps.
+        if (!speedChosen && speedSelect) speedSelect.value = String(cadence <= 15 * MINUTE ? 4 : 2);
+        drawTrack(); syncSlider();
+      }
+      // A parameter on its own axis rebinds the time bar to it, at the
+      // instant nearest the one shown, as /preview does.
+      function rebind() {
+        const next = axisOf(state['parameter-name'] || defaultParameter || '');
+        if (next === axis) return;
+        const keep = head >= 0 ? axis[head] : undefined;
+        const keepWindow = userWindow && axis.length ? [axis[win.lo], axis[win.hi]] : undefined;
+        bindAxis(next, keep, keepWindow);
+      }
+
+      // The track, laid out by time: frame notches where they are at least
+      // 4 px apart (else a strip that breaks at gaps), day and hour ticks,
+      // the viewer's clock, the loop window and the buffered frames.
+      const TICK_STEPS = [10 * MINUTE, 15 * MINUTE, 30 * MINUTE, HOUR, 2 * HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR,
+        DAY, 2 * DAY, 7 * DAY, 14 * DAY, 28 * DAY, 91 * DAY, 364 * DAY];
+      const percent = ms => {
+        const total = axis[axis.length - 1] - axis[0];
+        return total > 0 ? (ms - axis[0]) / total * 100 : 50;
+      };
+      function spanAt(className, ms, text) {
+        const node = document.createElement('span');
+        node.className = className; node.style.left = `${percent(ms)}%`;
+        if (text) node.textContent = text;
+        return node;
+      }
+      function tickText(ms, step) {
+        const iso = new Date(ms).toISOString();
+        if (step >= 28 * DAY) return iso.slice(0,10);
+        if (ms % DAY === 0) return `${weekday(ms)} ${iso.slice(5,10)}`;
+        return iso.slice(11,16);
+      }
+      function drawTrack() {
+        if (!bar || !axis.length) return;
+        const width = track.clientWidth || 600;
+        const first = axis[0], last = axis[axis.length - 1], total = last - first;
+        const nodes = [];
+        let gap = Infinity;
+        for (let i = 1; i < axis.length; i++) gap = Math.min(gap, axis[i] - axis[i - 1]);
+        if (axis.length === 1 || width * gap / total >= 4) axis.forEach(ms => nodes.push(spanAt('map-notch', ms)));
+        else {
+          // Too dense for notches: where frames are, broken at gaps of more
+          // than three steps.
+          let start = first;
+          for (let i = 1; i <= axis.length && nodes.length < 400; i++) {
+            if (i < axis.length && axis[i] - axis[i - 1] <= 3 * cadence) continue;
+            const strip = spanAt('map-strip', start);
+            strip.style.width = `${Math.max(0.2, percent(axis[i - 1]) - percent(start))}%`;
+            nodes.push(strip);
+            if (i < axis.length) start = axis[i];
+          }
+        }
+        if (total > 0) {
+          const step = TICK_STEPS.find(s => width * s / total >= 72) || TICK_STEPS[TICK_STEPS.length - 1];
+          for (let t = Math.ceil(first / step) * step, k = 0; t <= last && k < 200; t += step, k++) {
+            nodes.push(spanAt(t % DAY === 0 ? 'map-tick day' : 'map-tick', t, tickText(t, step)));
+          }
+          const now = Date.now();
+          if (now >= first && now <= last) { const node = spanAt('map-now', now); node.title = 'Now'; nodes.push(node); }
+        }
+        marksBox.replaceChildren(...nodes);
+        drawWindow(); drawBuffer(); moveMark();
+      }
+      function drawWindow() {
+        if (!bar || !axis.length) return;
+        band.style.left = `${percent(axis[win.lo])}%`;
+        band.style.width = `${percent(axis[win.hi]) - percent(axis[win.lo])}%`;
+        drawWindowText();
+      }
+      function drawWindowText() {
+        if (!windowText || !axis.length) return;
+        let text = `Loop: ${windowSummary()}`;
+        // Before the first play on a metered connection: what it will cost.
+        if (metered && !playedOnce) {
+          const view = state.mode === 'tiles' ? undefined : imageView();
+          let missing = 0;
+          for (let i = win.lo; i <= win.hi; i++) if (!readyAt(i, view)) missing++;
+          text += ` · about ${missing} frame${missing === 1 ? '' : 's'} to load on this metered connection`;
+        }
+        windowText.textContent = text;
+      }
+      // The frames ready to show, and the ones that failed.
+      function drawBuffer() {
+        if (!bar || !axis.length) return;
+        const total = axis[axis.length - 1] - axis[0];
+        const width = total > 0 && Number.isFinite(cadence) ? Math.max(0.3, cadence / total * 100) : 2;
+        const layer = layerKey(state);
+        const nodes = [];
+        for (const frame of [front, ...pool.values()]) {
+          if (!frame || frame.state !== 'ready' || layerKey(frame.want) !== layer || !Number.isFinite(frame.ms)) continue;
+          const node = spanAt('map-buffered', frame.ms);
+          node.style.left = `${percent(frame.ms) - width / 2}%`; node.style.width = `${width}%`;
+          nodes.push(node);
+        }
+        marks.forEach((kind, ms) => {
+          const node = spanAt(`map-errored ${kind}`, ms);
+          node.title = `${kind === 'nodata' ? 'No data' : 'Failed'} at ${timeText(ms)}`;
+          nodes.push(node);
+        });
+        bufferBox.replaceChildren(...nodes);
+        drawWindowText();
+      }
+      // The playhead mark sits at the frame drawn, moved in the paint that
+      // shows it.
+      function moveMark() {
+        if (!bar || !axis.length) return;
+        const ms = Number.isFinite(front?.ms) ? front.ms : axis[head];
+        playheadMark.style.left = `${percent(ms)}%`;
+      }
+      // The slider is the playhead for assistive technology: it is moved by
+      // the viewer, on a pause and on a step, never once per played frame.
+      function syncSlider() {
+        if (!bar || head < 0) return;
+        slider.value = String((axis[head] - axis[0]) / 1000);
+        slider.setAttribute('aria-valuetext', timeText(axis[head]));
+      }
+      // The label names the time drawn, changed in the paint that shows it:
+      // a Maps image's `Content-Datetime`, else the time requested.
+      function labelFrame(frame) {
+        if (!bar || !frame.drawn) return;
+        const ms = frame.drawn.getTime();
+        const snapped = Number.isFinite(frame.ms) && frame.ms !== ms;
+        drawnLabel.textContent = `${timeText(ms)}${snapped ? ' · nearest available' : ''}`;
+        relativeLabel.textContent = relativeText(ms);
+        seekLabel.hidden = true;
+        moveMark();
+      }
+      // The track and the relative time follow the viewer's clock.
+      if (bar) {
+        (function refreshClock() {
+          setTimeout(() => {
+            if (document.visibilityState !== 'hidden') { drawTrack(); if (shown?.drawn) relativeLabel.textContent = relativeText(shown.drawn.getTime()); }
+            refreshClock();
+          }, 60000);
+        })();
+        new ResizeObserver(() => drawTrack()).observe(track);
+      }
+
+      // Playback. The next frame is shown once it has fully loaded; until
+      // then the current one holds. Failed frames are skipped. There is no
+      // autoplay: only the viewer starts it.
+      const repeat = () => repeatSelect?.value || 'loop';
+      const speed = () => Number(speedSelect?.value) || 4;
+      const interval = () => 1000 / speed();
+      // The frame after `index` in playback order, and the direction then:
+      // in the loop window when `inside`, else on to the axis end.
+      // Undefined at the end of a loop played once.
+      function following(index, dir, inside) {
+        if (!inside) return index + 1 < axis.length ? { index: index + 1, dir: 1 } : undefined;
+        const { lo, hi } = win;
+        if (index < lo || index > hi) return { index: lo, dir: 1 };
+        if (repeat() === 'bounce') {
+          if (lo === hi) return { index: lo, dir };
+          let next = index + dir;
+          if (next > hi || next < lo) { dir = -dir; next = index + dir; }
+          return { index: next, dir };
+        }
+        if (index < hi) return { index: index + 1, dir: 1 };
+        return repeat() === 'loop' ? { index: lo, dir: 1 } : undefined;
+      }
+      // The next `count` frames to show after the playhead, failed ones
+      // skipped: in the loop window while playing or in it, else onward.
+      function upcoming(count) {
+        const out = [];
+        if (head < 0) return out;
+        const inside = playing || (head >= win.lo && head <= win.hi);
+        let at = { index: head, dir: direction };
+        for (let guard = 0; out.length < count && guard <= axis.length; guard++) {
+          at = following(at.index, at.dir, inside);
+          if (!at || at.index === head) break;
+          if (!marks.has(axis[at.index]) && !out.includes(at.index)) out.push(at.index);
+        }
+        return out;
+      }
+      function updatePlay() {
+        if (!playButton) return;
+        playButton.textContent = playing ? '❚❚' : '▶︎';
+        playButton.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+        playButton.classList.toggle('buffering', playing && holding);
+      }
+      function play() {
+        if (playing || axis.length < 2) return;
+        playing = true; engaged = true; playedOnce = true; direction = 1;
+        updatePlay(); drawWindowText();
+        report(`Playing ${windowSummary()}, ${speed()} frame${speed() === 1 ? '' : 's'} a second.`);
+        // From the loop's end or outside it, play starts at the loop's start.
+        if (head < win.lo || head >= win.hi) goTo(win.lo, true);
+        else if (!pendingFront) shownNext();
+        prefetch();
+      }
+      // Stop playing. A pause is announced; `quiet` leaves that to what
+      // follows, such as a step.
+      function pause(text, quiet) {
+        if (!playing) return;
+        playing = false; holding = false;
+        clearTimeout(playTimer); playTimer = undefined;
+        updatePlay(); syncSlider(); saveFragment();
+        if (!quiet) report(text || `Paused at ${shown?.drawn ? frameText(shown) : timeText(axis[head])}.`);
+      }
+      const halt = () => pause(undefined, true);
+      function tick() {
+        playTimer = undefined;
+        if (!playing) return;
+        let at = { index: head, dir: direction };
+        for (let guard = 0; guard <= win.hi - win.lo + 1; guard++) {
+          at = following(at.index, at.dir, true);
+          if (!at || !marks.has(axis[at.index])) break;
+        }
+        if (!at || marks.has(axis[at.index])) {
+          pause(at ? 'No frame of the loop could be drawn; paused.' : `Played once to ${timeText(axis[head])}; paused.`);
+          return;
+        }
+        direction = at.dir;
+        goTo(at.index, true);
+      }
+      // A frame has been shown: while playing, the next follows after the
+      // frame interval, or after 1.2 s on the last frame of the loop.
+      function shownNext() {
+        if (!playing) return;
+        holding = false; updatePlay();
+        clearTimeout(playTimer);
+        const last = head === win.hi && repeat() !== 'once';
+        playTimer = setTimeout(tick, last ? Math.max(LAST_HOLD, interval()) : interval());
+      }
+      // Show frame `index`. During playback (`played`) nothing is announced
+      // and the slider stays; a viewer's move is announced when drawn.
+      function goTo(index, played, dragging) {
+        if (!axis.length) return;
+        head = Math.max(0, Math.min(axis.length - 1, index));
+        state.datetime = instant(axis[head]);
+        if (!played) {
+          engaged = true;
+          if (!dragging) { syncSlider(); if (seekLabel) seekLabel.hidden = true; }
+          saveFragment();
+        }
+        render();
+      }
+      function step(delta) { if (!axis.length) return; halt(); goTo(head + delta); }
+      function byDay(sign) {
+        if (!axis.length) return;
+        halt();
+        let index = nearestIndex(axis[head] + sign * DAY);
+        if (index === head) index += sign;
+        goTo(index);
+      }
+      function speedBy(delta) {
+        if (!speedSelect) return;
+        const index = Math.max(0, Math.min(SPEEDS.length - 1, SPEEDS.indexOf(speed()) + delta));
+        speedSelect.value = String(SPEEDS[index]); speedChosen = true;
+        report(`${SPEEDS[index]} frame${SPEEDS[index] === 1 ? '' : 's'} a second.`);
+      }
+      function toggleHelp(open) {
+        if (!keysHelp) return;
+        const show = open ?? keysHelp.hidden;
+        keysHelp.hidden = !show;
+        keysButton?.setAttribute('aria-expanded', String(show));
+      }
+      const readyAt = (index, view = state.mode === 'tiles' ? undefined : imageView()) => {
+        const key = frameKey({ ...state, datetime: instant(axis[index]) }, view);
+        return front?.key === key || pool.get(key)?.state === 'ready';
+      };
+      playButton?.addEventListener('click',() => { if (playing) pause(); else play(); });
+      byId('map-prev')?.addEventListener('click',event => step(event.shiftKey ? -10 : -1));
+      byId('map-next')?.addEventListener('click',event => step(event.shiftKey ? 10 : 1));
+      byId('map-first')?.addEventListener('click',event => { halt(); goTo(event.shiftKey ? 0 : win.lo); });
+      byId('map-last')?.addEventListener('click',event => { halt(); goTo(event.shiftKey ? axis.length - 1 : win.hi); });
+      speedSelect?.addEventListener('change',() => { speedChosen = true; });
+      repeatSelect?.addEventListener('change',() => { direction = 1; trimPool(); prefetch(); });
+      keysButton?.addEventListener('click',() => toggleHelp());
+      const closeMenu = () => { if (menu) menu.open = false; };
+      byId('map-window-start')?.addEventListener('click',() => { setWindowEnd('lo', head); closeMenu(); });
+      byId('map-window-end')?.addEventListener('click',() => { setWindowEnd('hi', head); closeMenu(); });
+      byId('map-window-reset')?.addEventListener('click',() => {
+        if (!axis.length) return;
+        userWindow = false; defaultWindow(); drawWindow(); trimPool(); prefetch(); saveFragment(); closeMenu();
+        report(`Loop: ${windowSummary()}.`);
+      });
+      // Jump to a date and time, read as UTC: the frame nearest it.
+      jump?.addEventListener('change',() => {
+        const ms = Date.parse(`${jump.value}Z`);
+        if (!Number.isFinite(ms) || !axis.length) return;
+        halt(); goTo(nearestIndex(ms)); closeMenu();
+      });
+      // Dragging shows buffered frames at once; any other is requested once
+      // the pointer rests, or on release, never once per pixel.
+      let dragTimer;
+      const sliderIndex = () => nearestIndex(axis[0] + Number(slider.value) * 1000);
+      slider?.addEventListener('input',() => {
+        if (!axis.length) return;
+        const index = sliderIndex();
+        halt(); engaged = true; clearTimeout(dragTimer);
+        slider.setAttribute('aria-valuetext', timeText(axis[index]));
+        if (index === head) { seekLabel.hidden = true; return; }
+        seekLabel.textContent = `→ ${timeText(axis[index])}`; seekLabel.hidden = false;
+        if (readyAt(index)) goTo(index, false, true);
+        else dragTimer = setTimeout(() => goTo(index, false, true), DRAG_REST);
+      });
+      slider?.addEventListener('change',() => { if (!axis.length) return; clearTimeout(dragTimer); goTo(sliderIndex()); });
+      // The loop window's handles.
+      [['lo', byId('map-window-lo')], ['hi', byId('map-window-hi')]].forEach(([end, handle]) => {
+        handle?.addEventListener('pointerdown',event => {
+          if (!axis.length) return;
+          event.preventDefault();
+          handle.setPointerCapture?.(event.pointerId);
+          const move = e => {
+            const rect = track.getBoundingClientRect();
+            if (!rect.width) return;
+            const share = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+            setWindowEnd(end, nearestIndex(axis[0] + share * (axis[axis.length - 1] - axis[0])), true);
+          };
+          const up = () => {
+            ['pointermove','pointerup','pointercancel'].forEach((type, i) => handle.removeEventListener(type, i ? up : move));
+            setWindowEnd(end, end === 'lo' ? win.lo : win.hi);
+          };
+          handle.addEventListener('pointermove',move);
+          handle.addEventListener('pointerup',up);
+          handle.addEventListener('pointercancel',up);
+        });
+      });
+      // Keyboard shortcuts, only while focus is in the map or its time bar
+      // (WCAG 2.1.4). Arrow keys on the map keep MapLibre's pan; on the
+      // slider they step frames.
+      const TYPING = /^(text|search|number|email|url|tel|password|date|time|datetime-local|month|week)$/;
+      function onKey(event) {
+        if (!axis.length || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+        const target = event.target, tag = target?.tagName;
+        if (tag === 'SELECT' || tag === 'TEXTAREA' || (tag === 'INPUT' && TYPING.test(target.type || 'text'))) return;
+        const key = event.key, count = event.shiftKey ? 10 : 1;
+        const onSlider = target === slider;
+        if (key === ' ' || key === 'k' || key === 'K') {
+          // Space on a button or link is its own click.
+          if (key === ' ' && ['BUTTON','SUMMARY','A'].includes(tag)) return;
+          if (playing) pause(); else play();
+        } else if (key === '<') speedBy(-1);
+        else if (key === '>') speedBy(1);
+        else if (key === ',' || event.code === 'Comma') step(-count);
+        else if (key === '.' || event.code === 'Period') step(count);
+        else if (onSlider && (key === 'ArrowLeft' || key === 'ArrowDown')) step(-count);
+        else if (onSlider && (key === 'ArrowRight' || key === 'ArrowUp')) step(count);
+        else if (key === 'PageUp') byDay(-1);
+        else if (key === 'PageDown') byDay(1);
+        else if (key === 'Home') { halt(); goTo(0); }
+        else if (key === 'End') { halt(); goTo(axis.length - 1); }
+        else if (key === '[') setWindowEnd('lo', head);
+        else if (key === ']') setWindowEnd('hi', head);
+        else if (key === 'n' || key === 'N') { halt(); goTo(nearestIndex(Date.now())); }
+        else if (key === '?') toggleHelp();
+        else if (key === 'Escape' && keysHelp && !keysHelp.hidden) toggleHelp(false);
+        else return;
+        event.preventDefault();
+      }
+      element.addEventListener('keydown',onKey);
+      bar?.addEventListener('keydown',onKey);
+
       // The fragment follows the view and the choices, replaced rather than
       // pushed so history stays clean, and at most about once a second:
-      // Safari allows 100 replaceState calls per 30 s.
+      // Safari allows 100 replaceState calls per 30 s. It is not written per
+      // played frame, only when playback stops.
       let fragmentTimer, lastFragment = 0;
       function fragmentText() {
         const center = map.getCenter();
@@ -306,6 +776,8 @@
         add('datetime', state.datetime);
         add('elevation', state.elevation);
         add('mode', state.mode);
+        // The loop window the viewer set, as an interval of its two ends.
+        if (userWindow && axis.length) add('window', `${instant(axis[win.lo])}/${instant(axis[win.hi])}`);
         return parts.join('&');
       }
       // A write already due takes the state as it is then.
@@ -319,14 +791,14 @@
           history.replaceState(history.state, '', `#${fragmentText()}`);
         }, Math.max(250, lastFragment + 1000 - Date.now()));
       }
-      const link = document.getElementById('map-image-link');
-      const requestText = document.getElementById('map-image-request');
-      const legendBox = document.getElementById('map-legend');
-      const legendTitle = document.getElementById('map-legend-title');
-      const legendScale = document.getElementById('map-legend-scale');
-      const legendStatus = document.getElementById('map-legend-status');
-      const legendImage = document.getElementById('map-legend-image');
-      const legendJson = document.getElementById('map-legend-link');
+      const link = byId('map-image-link');
+      const requestText = byId('map-image-request');
+      const legendBox = byId('map-legend');
+      const legendTitle = byId('map-legend-title');
+      const legendScale = byId('map-legend-scale');
+      const legendStatus = byId('map-legend-status');
+      const legendImage = byId('map-legend-image');
+      const legendJson = byId('map-legend-link');
       let legendGeneration = 0, activeLegend;
       function legendMessage(text) {
         legendScale.hidden = true; legendImage.hidden = true; legendJson.hidden = true;
@@ -373,11 +845,11 @@
           const min = Number.isFinite(legend.min) ? legend.min : stops[0].value;
           const max = Number.isFinite(legend.max) ? legend.max : stops[stops.length - 1].value;
           const at = value => max > min ? Math.min(100,Math.max(0,(value - min) / (max - min) * 100)) : 0;
-          const bar = document.createElement('div'); bar.className = 'map-legend-bar';
-          bar.style.background = legend.interpolation === 'step'
+          const colourBar = document.createElement('div'); colourBar.className = 'map-legend-bar';
+          colourBar.style.background = legend.interpolation === 'step'
             ? `linear-gradient(to right, ${stops.map((stop,i) => `${stop.color} ${at(stop.value)}% ${at(stops[i + 1]?.value ?? max)}%`).join(', ')})`
             : `linear-gradient(to right, ${stops.map(stop => `${stop.color} ${at(stop.value)}%`).join(', ')})`;
-          bar.style.opacity = String(DATA_OPACITY);
+          colourBar.style.opacity = String(DATA_OPACITY);
           const scale = document.createElement('div'); scale.className = 'map-legend-ticks';
           const width = legendBox.clientWidth || 300;
           ticks(min, max, Math.max(2, Math.floor(width / 90))).forEach(value => {
@@ -386,7 +858,7 @@
             if (position < 4) tick.classList.add('start'); else if (position > 96) tick.classList.add('end');
             scale.append(tick);
           });
-          legendScale.replaceChildren(bar,scale);
+          legendScale.replaceChildren(colourBar,scale);
         }
         const title = legend.parameter ? parameterTitle(legend.parameter, legend.unit) : (legend.title || styleTitle);
         legendTitle.textContent = styleTitle && styleTitle !== 'Default' ? `${title} · ${styleTitle}` : title;
@@ -397,6 +869,12 @@
         defaultParameter = known?.name || name;
         if (parameter) parameter.options[0].textContent = `Default · ${known?.label || name}`;
         if (shown && statusShowsFrame) showing(shown);
+        // The default parameter on its own axis: the time bar follows it.
+        if (!state['parameter-name']) {
+          const before = state.datetime;
+          rebind();
+          if (state.datetime !== before) render();
+        }
       }
       // A style's legend document for a parameter, fetched once per page:
       // revalidated on first use, since an operator can change a style in
@@ -456,17 +934,19 @@
       }
       // What a frame shows, as the status line names it: the instant, the
       // parameter, and any style or level chosen.
-      function frameText(info) {
-        const { want, drawn } = info;
-        const parts = [drawn ? `${formatTime(drawn)} UTC${want.nearNow ? ', the time nearest now' : ''}` : time ? 'the default time' : 'the map data'];
+      function frameText(frame) {
+        const { want, drawn } = frame;
+        const parts = [drawn ? `${formatTime(drawn)} UTC` : time || axis.length ? 'the default time' : 'the map data'];
         const name = want['parameter-name'] || defaultParameter;
         if (name) parts.push(parameterTitle(name));
         if (want.style > 0) parts.push(style.options[want.style]?.textContent);
         if (want.elevation) parts.push([...(level?.options || [])].find(option => option.value === want.elevation)?.textContent || want.elevation);
         return parts.filter(Boolean).join(' · ');
       }
-      // The status line. While a request is out or after it failed, it
-      // also names the frame still on the map; a failure marks it stale.
+      // The status line, a live region: loading, errors, steps, pauses. It
+      // is left alone for each played frame. While a request is out or
+      // after it failed, it also names the frame still on the map; a
+      // failure marks it stale.
       let shown, statusShowsFrame = false;
       function report(text, kind) {
         const still = kind && shown;
@@ -477,18 +957,16 @@
       function disableImageLink() {
         link.removeAttribute('href'); link.setAttribute('aria-disabled','true');
       }
-      // A frame has been swapped in: its request is the one linked, and the
-      // status names what it shows.
-      function showing(info) {
-        shown = info;
-        link.href = info.href; link.removeAttribute('aria-disabled');
-        requestText.textContent = info.text;
-        if (info.kind === 'image' && !info.want.datetime && timeList) {
-          drawnDefault = info.drawn;
-          time.options[0].textContent = info.drawn ? `Default · ${formatTime(info.drawn)}` : 'Default';
-          updateTimeButtons();
-        }
-        report(`${info.kind === 'tiles' ? 'Map tiles · ' : ''}Showing ${frameText(info)}${info.note ? `. ${info.note}` : ''}`);
+      // A frame has been swapped in: its request is the one linked, the time
+      // bar names its time, and the status names what it shows unless it
+      // was played.
+      function showing(frame) {
+        shown = frame;
+        link.href = frame.href; link.removeAttribute('aria-disabled');
+        requestText.textContent = frame.text;
+        labelFrame(frame);
+        if (playing) return;
+        report(`${frame.kind === 'tiles' ? 'Map tiles · ' : ''}Showing ${frameText(frame)}${frame.note ? `. ${frame.note}` : ''}`);
         statusShowsFrame = true;
       }
       // A request that drew nothing new. The frame on the map stays; the
@@ -511,14 +989,18 @@
       // without data; the viewer's are a time or layer without any.
       function noDataError(want, description) {
         const error = new Error();
+        error.nothing = true;
         const choseLayer = Boolean(want['parameter-name'] || want.style > 0 || want.elevation);
         if (!want.datetime && !choseLayer) error.noData = true;
         else if (choseLayer && description) error.message = `Nothing to draw for this choice: ${description}`;
-        else if (want.datetime) error.message = `No data at ${formatTime(new Date(want.datetime))} UTC. Choose another time or Default.`;
+        else if (want.datetime) error.message = `No data at ${formatTime(new Date(want.datetime))} UTC. Choose another time.`;
         else error.message = 'No data for this choice right now. Choose another parameter, style or level, or Default.';
         return error;
       }
       const BUSY = 'The server is busy. Pan, zoom or change a choice to try again.';
+      const busyError = after => Object.assign(new Error(BUSY), { retry: true, after: after || 0 });
+      // The server's words as a sentence of the status line.
+      const sentence = text => /[.!?]$/.test(text) ? text : `${text}.`;
       // A failed map request as a sentence. A 404 for the viewer's own
       // choice says why in the server's words: a style the parameter does
       // not have is no lack of data. A 503 is retried.
@@ -528,89 +1010,257 @@
         if (response.status === 204 || [404,500,502].includes(response.status)) {
           return noDataError(want, response.status === 404 && typeof description === 'string' ? description : undefined);
         }
-        const error = new Error();
         if ([503,504].includes(response.status)) {
-          error.retry = true; error.message = BUSY;
           const after = response.headers.get('retry-after');
-          error.after = /^\d+$/.test(after || '') ? Number(after) : Math.max(0, (Date.parse(after || '') - Date.now()) / 1000) || 0;
-        } else if (response.status === 400 && typeof description === 'string') {
-          error.message = `The server rejected this request: ${description}`;
-        } else {
-          error.message = `Map request failed (HTTP ${response.status}).`;
+          return busyError(/^\d+$/.test(after || '') ? Number(after) : Math.max(0, (Date.parse(after || '') - Date.now()) / 1000) || 0);
         }
-        return error;
+        if (response.status === 400 && typeof description === 'string') return new Error(`The server rejected this request: ${sentence(description)}`);
+        return new Error(`Map request failed (HTTP ${response.status}).`);
+      }
+      // A WMS GetMap that drew nothing: the ServiceException its XML names
+      // (WMS 1.3.0 answers every request error with one), or the error
+      // tile (`x-cache: ERROR`), never shown as a frame.
+      async function wmsError(response, want) {
+        if ([503,504].includes(response.status)) return requestError(response, want);
+        if (/xml/i.test(response.headers.get('content-type') || '')) {
+          let text = '';
+          try { text = await response.text(); } catch (_) {}
+          const found = /<ServiceException\b([^>]*)>([\s\S]*?)<\/ServiceException>/.exec(text);
+          const message = (found?.[2] || '').trim()
+            .replace(/&(lt|gt|quot|apos|amp);/g, (_, name) => ({ lt: '<', gt: '>', quot: '"', apos: "'", amp: '&' })[name]);
+          const error = new Error(message ? `The server rejected this request: ${sentence(message)}` : `WMS request failed (HTTP ${response.status}).`);
+          error.code = /\bcode="([^"]*)"/.exec(found?.[1] || '')?.[1];
+          return error;
+        }
+        if (response.ok && response.headers.get('x-cache') === 'ERROR') return new Error('The server could not draw this map.');
+        return new Error(`WMS request failed (HTTP ${response.status}).`);
       }
       // Busy: try again after `Retry-After`, or 1, 2 and 4 s, at most three
-      // times; the frame stays meanwhile.
+      // times; the frame stays meanwhile. `refill` draws the same frame
+      // again to fill the tiles a busy server left out.
       const RETRIES = 3;
       let retryTimer;
-      function retryLater(attempt, after) {
+      function retryLater(attempt, after, refill) {
         const seconds = Math.min(30, Math.max(after || 0, 2 ** attempt));
-        report(`Server busy, retrying in ${seconds} s…`, 'loading');
-        retryTimer = setTimeout(() => render(attempt + 1), seconds * 1000);
+        if (!playing) report(`Server busy, retrying in ${seconds} s…`, 'loading');
+        retryTimer = setTimeout(() => render(attempt + 1, refill), seconds * 1000);
       }
 
-      // The data layer is a stack of frames, each one raster source and
-      // layer under the borders: `front` is drawn, `staged` loads at
-      // opacity 0. `stageFrame` owns a frame's whole life, so the time bar
-      // can grow it into a pool of buffered frames.
+      // The data layer is a set of frames. A frame is one combination of
+      // draw mode, style, parameter, level and time (and for an image, the
+      // view), staged as its own raster source and layer under the borders
+      // by `stageFrame`, the only place that adds one. `front` is drawn;
+      // the pool holds the frames buffered ahead, hidden at opacity 0. The
+      // visible source is never removed or retargeted.
       const NO_TRANSITION = { duration: 0, delay: 0 };
-      let front, staged, frameCount = 0;
-      function dropFrame(frame) {
-        if (!frame) return;
-        map.off('render',frame.onRender);
-        if (map.getLayer(frame.id)) map.removeLayer(frame.id);
-        if (map.getSource(frame.id)) map.removeSource(frame.id);
+      const MAX_IMAGE_FETCHES = 2, MAX_DECODED_AHEAD = 3;
+      const pool = new Map();
+      let front, pendingFront, frameCount = 0, backoffUntil = 0, backoffTimer, busyStreak = 0, onScreen = true;
+      const layerKey = want => [want.mode, want.style, want['parameter-name'], want.elevation].join('|');
+      const frameKey = (want, view) => `${layerKey(want)}|${want.datetime}|${view?.key || ''}`;
+      function removeFrame(frame) {
+        frame.dropped = true;
+        frame.controller?.abort();
+        if (frame.onRender) map.off('render',frame.onRender);
+        if (frame.id && map.getLayer(frame.id)) map.removeLayer(frame.id);
+        if (frame.id && map.getSource(frame.id)) map.removeSource(frame.id);
       }
-      function discardStaged() { const frame = staged; staged = undefined; dropFrame(frame); }
-      function clearFrames() { discardStaged(); const frame = front; front = undefined; dropFrame(frame); shown = undefined; }
-      // Stage `source` invisibly. Once MapLibre reports every tile in view
-      // loaded or failed, `settle(frame)` judges it: true swaps it in with
-      // one paint, the new layer to the data opacity and the old to 0, both
-      // without a transition (MapLibre's default 300 ms fade would show the
-      // basemap through both), and retires the old frame after that paint.
-      // False drops it and leaves the front frame up. The visible source is
-      // never removed or retargeted.
-      function stageFrame(source, settle) {
-        discardStaged();
-        const frame = { id: `map-frame-${++frameCount}`, loaded: 0, errors: [] };
-        staged = frame;
+      // Drop a frame that is not drawn: buffered, loading or failed.
+      function dropFrame(frame) {
+        if (!frame || frame === front) return;
+        if (pool.get(frame.key) === frame) pool.delete(frame.key);
+        if (pendingFront === frame) pendingFront = undefined;
+        removeFrame(frame);
+      }
+      function clearFrames() {
+        resetFrames();
+        const old = front; front = undefined; shown = undefined;
+        if (old) removeFrame(old);
+      }
+      // Another layer: abort everything in flight and drop every buffered
+      // frame. The drawn one stays until the next is in.
+      function resetFrames() {
+        clearTimeout(backoffTimer); backoffUntil = 0; busyStreak = 0;
+        [...pool.values()].forEach(dropFrame);
+        if (pendingFront) dropFrame(pendingFront);
+        pendingFront = undefined;
+        marks.clear();
+        drawBuffer();
+      }
+      // Stage `source` invisibly for `frame`. Once MapLibre reports every
+      // tile in view loaded or failed, `frame.settle` judges it, in that
+      // `render` callback.
+      function stageFrame(frame, source) {
+        frame.id = `map-frame-${++frameCount}`;
         map.addSource(frame.id, source);
         map.addLayer({ id: frame.id, type: 'raster', source: frame.id,
           paint: { 'raster-opacity': 0, 'raster-opacity-transition': NO_TRANSITION, 'raster-fade-duration': 0 } },
         map.getLayer('border-halo') ? 'border-halo' : 'outlines');
         frame.onRender = () => {
-          if (staged !== frame || !map.isSourceLoaded(frame.id)) return;
-          map.off('render',frame.onRender);
-          staged = undefined;
-          if (!settle(frame)) { dropFrame(frame); return; }
-          const old = front;
-          front = frame;
-          map.setPaintProperty(frame.id,'raster-opacity',DATA_OPACITY);
-          if (old) {
-            map.setPaintProperty(old.id,'raster-opacity',0);
-            map.once('render',() => { if (front !== old) dropFrame(old); });
-          }
+          if (frame.dropped || !map.isSourceLoaded(frame.id)) return;
+          map.off('render',frame.onRender); frame.onRender = undefined;
+          frame.settle(frame);
         };
         map.on('render',frame.onRender);
         map.triggerRepaint();
+      }
+      // Show a loaded frame in one paint: it goes to the data opacity and
+      // the old to 0, both without a transition (MapLibre's default 300 ms
+      // fade would show the basemap through both). The old frame stays,
+      // hidden, while it is one of the frames ahead; else it is removed
+      // after that paint.
+      function swapTo(frame) {
+        const old = front;
+        if (pool.get(frame.key) === frame) pool.delete(frame.key);
+        front = frame;
+        map.setPaintProperty(frame.id,'raster-opacity',DATA_OPACITY);
+        if (!old || old === frame) return;
+        map.setPaintProperty(old.id,'raster-opacity',0);
+        if (old.key !== frame.key && !pool.has(old.key) && wantedKeys().has(old.key)) pool.set(old.key, old);
+        else map.once('render',() => { if (front !== old && pool.get(old.key) !== old) removeFrame(old); });
+      }
+      // The frames worth keeping: the next ones to show, as many as may be
+      // buffered ahead.
+      function aheadLimit() {
+        if (saveData) return 1;
+        if (state.mode !== 'tiles') return MAX_DECODED_AHEAD;
+        // K = clamp(⌊160 / tiles in view⌋, 2, 6).
+        const tiles = (Math.ceil(element.clientWidth / 256) + 1) * (Math.ceil(element.clientHeight / 256) + 1);
+        return Math.max(2, Math.min(6, Math.floor(160 / Math.max(1, tiles))));
+      }
+      function wantedKeys() {
+        const keys = new Set();
+        if (!engaged || !axis.length) return keys;
+        const view = state.mode === 'tiles' ? undefined : imageView();
+        upcoming(aheadLimit()).forEach(index => keys.add(frameKey({ ...state, datetime: instant(axis[index]) }, view)));
+        return keys;
+      }
+      function trimPool() {
+        const keep = wantedKeys();
+        [...pool.values()].forEach(frame => { if (frame !== pendingFront && !keep.has(frame.key)) dropFrame(frame); });
+        drawBuffer();
+      }
+      // Stop buffering: drop every frame still loading ahead.
+      function stopPrefetch() {
+        clearTimeout(backoffTimer);
+        [...pool.values()].forEach(frame => { if (frame.state === 'loading' && frame !== pendingFront) dropFrame(frame); });
+      }
+      // Buffer ahead, after the drawn frame is in and only for a viewer
+      // using the time bar, never while the tab is hidden or the map is off
+      // screen. Map tiles stage one frame at a time, up to K; images fetch
+      // at most 2 at a time and keep up to 3 ahead. A busy server backs off.
+      function prefetch() {
+        if (!engaged || axis.length < 2 || state.mode === 'vector' || !front || pendingFront || !onScreen || document.visibilityState === 'hidden') return;
+        const wait = backoffUntil - Date.now();
+        if (wait > 0) { clearTimeout(backoffTimer); backoffTimer = setTimeout(prefetch, wait); return; }
+        const tiles = state.mode === 'tiles';
+        const view = tiles ? undefined : imageView();
+        if (!tiles && !view) return;
+        trimPool();
+        const loading = [...pool.values()].filter(frame => frame.state === 'loading');
+        let free = tiles ? 1 - loading.length : MAX_IMAGE_FETCHES - loading.filter(frame => frame.fetching).length;
+        for (const index of upcoming(aheadLimit())) {
+          if (free <= 0) break;
+          const want = { ...state, datetime: instant(axis[index]) };
+          const key = frameKey(want, view);
+          if (pool.has(key) || front.key === key) continue;
+          load(newFrame(want, view));
+          free--;
+        }
+        drawBuffer();
+      }
+      function newFrame(want, view, attempt = 0) {
+        const frame = { key: frameKey(want, view), want, view, ms: Date.parse(want.datetime), state: 'loading', loaded: 0, errors: [], attempt,
+          kind: want.mode === 'tiles' ? 'tiles' : 'image' };
+        pool.set(frame.key, frame);
         return frame;
+      }
+      function load(frame) {
+        if (frame.kind === 'tiles') loadTiles(frame); else loadImage(frame);
+      }
+      // A frame is in. The one awaited is shown at once; a buffered one
+      // waits, and buffering goes on.
+      function frameReady(frame) {
+        frame.state = 'ready';
+        busyStreak = 0;
+        if (marks.delete(frame.ms)) drawBuffer();
+        if (pendingFront === frame) promote(frame);
+        else { drawBuffer(); prefetch(); }
+      }
+      // A frame drew nothing. One awaited keeps the frame on the map and
+      // says why, or while playing is skipped; a buffered one is marked.
+      // A busy server is retried for the frame awaited, and stops
+      // buffering for a while, unmarked.
+      function frameFailed(frame, error) {
+        const awaited = pendingFront === frame;
+        dropFrame(frame);
+        if (error.retry || (!awaited && (error.name === 'AbortError' || error.name === 'TimeoutError'))) {
+          if (!awaited) {
+            // 2, 4, 8 … s, at most 30, or longer when the server says so;
+            // fetches refused together count once.
+            if (Date.now() >= backoffUntil) busyStreak++;
+            backoffUntil = Math.max(backoffUntil, Date.now() + Math.min(30, Math.max(error.after || 0, 2 ** busyStreak)) * 1000);
+            prefetch();
+            return;
+          }
+          if (frame.attempt < RETRIES) { retryLater(frame.attempt, error.after); return; }
+          if (playing) { pause(`${BUSY} Paused.`); return; }
+          failed(error, frame.text);
+          return;
+        }
+        if (Number.isFinite(frame.ms) && error.name !== 'AbortError' && error.name !== 'TimeoutError') {
+          marks.set(frame.ms, error.nothing ? 'nodata' : 'error');
+        }
+        drawBuffer();
+        if (!awaited) { prefetch(); return; }
+        if (playing) {
+          report(`${error.nothing ? 'No data' : 'Failed'} at ${formatTime(new Date(frame.ms))} UTC, skipped.`);
+          tick();
+          return;
+        }
+        failed(error, frame.text);
+      }
+      // The awaited frame is in: swap it in with its label, then go on.
+      function promote(frame) {
+        if (pendingFront !== frame || frame.dropped) return;
+        pendingFront = undefined;
+        swapTo(frame);
+        showing(frame);
+        // Fill the holes a busy server left.
+        if (frame.busy && frame.attempt < RETRIES) retryLater(frame.attempt, 0, true);
+        shownNext();
+        trimPool();
+        prefetch();
+      }
+      // Await `frame`, buffered or not; it is swapped in once loaded. Map
+      // tiles buffered before a pan load the new view first.
+      function awaitFrame(frame) {
+        pendingFront = frame;
+        if (frame.state !== 'ready') return;
+        if (map.isSourceLoaded(frame.id)) { promote(frame); return; }
+        const check = () => {
+          if (pendingFront !== frame || frame.dropped) { map.off('render',check); return; }
+          if (map.isSourceLoaded(frame.id)) { map.off('render',check); promote(frame); }
+        };
+        map.on('render',check); map.triggerRepaint();
       }
       // Tiles report per frame: a loaded tile counts, a failed one keeps its
       // HTTP status. A 404 tile is no event at all in MapLibre: no tile
       // loaded and none failed means nothing to draw.
+      const frameById = id => front?.id === id ? front : [...pool.values()].find(frame => frame.id === id);
       map.on('sourcedata', event => {
-        if (event.tile && staged && event.sourceId === staged.id) staged.loaded++;
+        const frame = event.tile && frameById(event.sourceId);
+        if (frame) frame.loaded++;
       });
       map.on('error', event => {
         if (event.sourceId === 'map-vector') {
           report('Some tiles failed to load; the rest of the view is shown.');
           return;
         }
-        const frame = [staged, front].find(f => f && f.id === event.sourceId);
+        const frame = frameById(event.sourceId);
         if (!frame) return;
         frame.errors.push(event.error?.status);
-        if (frame === front && frame !== staged) report('Some tiles failed to load; the rest of the view is shown.');
+        if (frame === front && !playing) report('Some tiles failed to load; the rest of the view is shown.');
       });
       // The Web Mercator tileset of one kind from an advertised tileset list
       // (a per-API list may hold map and vector tilesets side by side).
@@ -643,13 +1293,17 @@
       function applyMode() {
         const mode = state.mode;
         const vector = mode === 'vector';
+        if (vector) halt();
         [parameterField, levelField].forEach(field => { if (field) field.hidden = vector; });
-        // The time row stays even when a frame has no data: another time may.
-        if (timeField) timeField.hidden = vector;
+        // The time row and bar stay even when a frame has no data: another
+        // time may have some.
+        if (timeField) timeField.hidden = vector || axis.length > 0;
+        if (bar) bar.hidden = vector || !axis.length;
         // A vector-only collection has nothing to choose: no controls at all.
         block.hidden = vector && modes.length === 1;
         let usable = 0;
         for (const option of style.options) {
+          // WMS serves every style by name; Maps and map tiles where linked.
           option.disabled = mode === 'maps' ? !option.value : mode === 'tiles' ? !option.dataset.tiles : false;
           if (!option.disabled) usable++;
         }
@@ -660,18 +1314,54 @@
         state.style = Math.max(0, style.selectedIndex);
         // One style is no choice.
         styleField.hidden = vector || usable < 2;
-        link.textContent = mode === 'maps' ? 'Open rendered image ↗' : 'Open tileset metadata ↗';
+        link.textContent = mode === 'maps' || mode === 'wms' ? 'Open rendered image ↗' : 'Open tileset metadata ↗';
         if (help) help.textContent = vector ? 'Vector tiles load as you pan and zoom: feature geometry in one outline color.' : generalHelp;
       }
       // The request a render makes, fixed when it starts.
-      const snapshot = () => ({ ...state, nearNow: nearNow && Boolean(state.datetime) });
+      const snapshot = () => ({ ...state });
       const pixelRatio = () => typeof devicePixelRatio === 'number' && devicePixelRatio > 0 ? devicePixelRatio : 1;
-      let generation = 0, pending, timer;
-      function render(attempt = 0) {
+      let timer;
+      function render(attempt = 0, refill = false) {
         clearTimeout(timer); clearTimeout(retryTimer);
         if (state.mode === 'vector') return renderVector();
         clearVector();
-        return state.mode === 'maps' ? renderImage(attempt) : renderTiles(attempt);
+        return requestFrame(attempt, refill);
+      }
+      // Draw what the state names: at once when that frame is buffered,
+      // else once it has loaded, the current frame holding meanwhile.
+      function requestFrame(attempt, refill) {
+        const want = snapshot();
+        showLegend(want);
+        let view;
+        if (want.mode !== 'tiles') {
+          if (!element.clientWidth || !element.clientHeight) return;
+          view = imageView();
+          if (!view) { stopPrefetch(); if (pendingFront) dropFrame(pendingFront); failed(new Error('Pan back to the collection to view data.')); return; }
+        }
+        const key = frameKey(want, view);
+        if (!refill && front?.key === key) {
+          if (pendingFront) dropFrame(pendingFront);
+          pendingFront = undefined;
+          if (!playing) showing(front);
+          shownNext(); prefetch();
+          return;
+        }
+        let frame = refill ? undefined : pool.get(key);
+        if (frame && pendingFront === frame) return;
+        // A frame not yet asked for goes first: nothing loading for
+        // prefetch may queue ahead of its tiles or take its fetch slot.
+        if (!frame) stopPrefetch();
+        // A frame awaited before is given up; a buffered one stays.
+        if (pendingFront && pendingFront !== frame) {
+          const old = pendingFront;
+          pendingFront = undefined;
+          if (old.state !== 'ready') dropFrame(old);
+        }
+        if (frame?.state === 'ready') { awaitFrame(frame); return; }
+        if (!frame) { frame = newFrame(want, view, attempt); pendingFront = frame; load(frame); }
+        else { frame.attempt = attempt; pendingFront = frame; }
+        if (playing) { holding = true; updatePlay(); }
+        else report(want.mode === 'tiles' ? 'Loading map tiles…' : 'Loading the map image…', 'loading');
       }
       // Map tiles at the chosen time, parameter, style and level. HiDPI
       // screens get 512-pixel tiles over the same 256-pixel tile area
@@ -696,37 +1386,31 @@
         const start = wrapLongitude(west);
         return [-360, 0, 360].some(shift => start + shift <= bounds[2] && start + shift + width >= bounds[0]);
       }
-      async function renderTiles(attempt) {
-        const current = ++generation;
-        pending?.abort(); discardStaged();
-        const want = snapshot();
-        showLegend(want);
-        const option = style.options[want.style];
+      async function loadTiles(frame) {
+        const want = frame.want;
         try {
-          report('Loading map tiles…', 'loading');
-          const tileset = await webMercatorTileset(option.dataset.tiles, 'map');
-          if (current !== generation) return;
+          const tileset = await webMercatorTileset(style.options[want.style].dataset.tiles, 'map');
+          if (frame.dropped) return;
           const template = tileTemplate(tileset, want);
+          frame.href = tileset.self; frame.text = template;
+          frame.drawn = want.datetime ? new Date(want.datetime) : undefined;
+          frame.settle = judgeTiles;
           const source = { type: 'raster', tiles: [template], minzoom: tileset.minzoom, maxzoom: tileset.maxzoom, tileSize: 256 };
           if (tileBounds) source.bounds = tileBounds;
-          stageFrame(source, frame => {
-            if (current !== generation) return false;
-            const busy = frame.errors.some(code => code === 503 || code === 504);
-            if (!frame.loaded && (frame.errors.length || viewReaches(tileBounds))) {
-              if (busy && attempt < RETRIES) retryLater(attempt);
-              else failed(busy ? new Error(BUSY) : frame.errors.length ? new Error('Map tiles failed to load.') : noDataError(want), template);
-              return false;
-            }
-            showing({ kind: 'tiles', want, drawn: want.datetime ? new Date(want.datetime) : undefined, href: tileset.self, text: template,
-              note: frame.errors.length ? 'Some tiles failed to load; the rest of the view is shown' : '' });
-            // Fill the holes a busy server left.
-            if (busy && attempt < RETRIES) retryLater(attempt);
-            return true;
-          });
+          stageFrame(frame, source);
         } catch (error) {
-          if (current !== generation) return;
-          failed(error);
+          if (!frame.dropped) frameFailed(frame, error);
         }
+      }
+      function judgeTiles(frame) {
+        const busy = frame.errors.some(code => code === 503 || code === 504);
+        if (!frame.loaded && (frame.errors.length || viewReaches(tileBounds))) {
+          frameFailed(frame, busy ? busyError() : frame.errors.length ? new Error('Map tiles failed to load.') : noDataError(frame.want));
+          return;
+        }
+        frame.busy = busy;
+        frame.note = frame.errors.length ? 'Some tiles failed to load; the rest of the view is shown' : '';
+        frameReady(frame);
       }
       // The visible area as a Maps request and where its image goes. A view
       // across the antimeridian is requested in the Maps form, west greater
@@ -748,8 +1432,8 @@
         return { bbox: [w,south,e > 180 ? e - 360 : e,north], west, east, south, north, share: 1 };
       }
       // The image in device pixels, so it is sharp on HiDPI screens, within
-      // about 4 Mpx: under the Maps caps (8000 a side, 64 Mpx) and a small
-      // share of the server's render memory budget.
+      // about 4 Mpx: under the Maps and WMS caps (8000 a side, 64 Mpx) and a
+      // small share of the server's render memory budget.
       const MAX_IMAGE_PIXELS = 4 * 1024 * 1024, MAX_IMAGE_SIDE = 8000;
       function imageSize(share) {
         const ratio = pixelRatio();
@@ -757,55 +1441,97 @@
         const scale = Math.min(1, Math.sqrt(MAX_IMAGE_PIXELS / (width * height)), MAX_IMAGE_SIDE / width, MAX_IMAGE_SIDE / height);
         return [Math.max(1, Math.floor(width * scale)), Math.max(1, Math.floor(height * scale))];
       }
-      async function renderImage(attempt) {
-        if (!element.clientWidth || !element.clientHeight) return;
-        const current = ++generation;
-        pending?.abort(); discardStaged();
-        pending = new AbortController();
-        const controller = pending;
+      // The view an image is drawn for, with its size; its key tells images
+      // of one view from another's.
+      function imageView() {
+        const box = viewBox();
+        if (!box || !element.clientWidth || !element.clientHeight) return undefined;
+        const [width, height] = imageSize(box.share);
+        return { ...box, width, height, key: [box.west, box.south, box.east, box.north, width, height].join(',') };
+      }
+      function mapsUrl(want, view) {
+        const option = style.options[want.style];
+        if (!option?.value || !sameOrigin(option.value)) throw new Error('Map endpoint must use this server.');
+        const url = new URL(option.value, location.href);
+        url.searchParams.set('bbox',view.bbox.join(','));
+        url.searchParams.set('bbox-crs','CRS:84'); url.searchParams.set('crs','EPSG:3857');
+        url.searchParams.set('width',view.width); url.searchParams.set('height',view.height);
+        url.searchParams.set('f','image/png'); url.searchParams.set('transparent','true');
+        ['parameter-name','datetime','elevation'].forEach(key => { if (want[key]) url.searchParams.set(key,want[key]); else url.searchParams.delete(key); });
+        return url;
+      }
+      // EPSG:3857 metres from MapLibre's own Web Mercator. Nothing is
+      // clamped: x keeps the view's unwrapped longitude, as a WMS client
+      // sends a view across the antimeridian.
+      const WEB_MERCATOR_HALF_WORLD = 20037508.342789244;
+      function webMercator(lng, lat) {
+        const point = maplibregl.MercatorCoordinate.fromLngLat([lng, lat]);
+        return [(point.x - 0.5) * 2 * WEB_MERCATOR_HALF_WORLD, (0.5 - point.y) * 2 * WEB_MERCATOR_HALF_WORLD];
+      }
+      // A WMS 1.3.0 GetMap of the view: in EPSG:3857, so the BBOX is
+      // minx,miny,maxx,maxy in metres with no axis-order trap; the
+      // parameter's own layer, `coll/<parameter>`, or the collection's;
+      // errors as XML, never an image.
+      function wmsUrl(want, view) {
+        const wms = request.wms;
+        if (!wms?.href || !sameOrigin(wms.href)) throw new Error('WMS endpoint must use this server.');
+        const url = new URL(wms.href, location.href);
+        const west = view.share === 1 ? view.bbox[0] : -180;
+        const east = west + (view.share === 1 ? view.east - view.west : 360);
+        const [minx, miny] = webMercator(west, view.south), [maxx, maxy] = webMercator(east, view.north);
+        const params = {
+          SERVICE: 'WMS', VERSION: '1.3.0', REQUEST: 'GetMap',
+          LAYERS: want['parameter-name'] ? `${wms.layer}/${want['parameter-name']}` : wms.layer,
+          STYLES: want.style > 0 ? style.options[want.style]?.dataset.id || '' : '',
+          CRS: 'EPSG:3857', BBOX: [minx, miny, maxx, maxy].map(n => Number(n.toFixed(2))).join(','),
+          WIDTH: view.width, HEIGHT: view.height,
+          FORMAT: 'image/png', TRANSPARENT: 'TRUE', EXCEPTIONS: 'XML'
+        };
+        if (want.datetime) params.TIME = want.datetime;
+        if (want.elevation) params.ELEVATION = want.elevation;
+        Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+        return url;
+      }
+      // An image frame, Maps or WMS: fetched as a Blob, decoded and staged
+      // as a canvas source where its view lies.
+      async function loadImage(frame) {
+        const want = frame.want, view = frame.view, wms = want.mode === 'wms';
+        const controller = frame.controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 15000);
-        const want = snapshot();
-        showLegend(want);
-        let requested;
+        frame.fetching = true;
         try {
-          const option = style.options[want.style];
-          const url = new URL(option?.value || '', location.href);
-          if (!option?.value || url.origin !== location.origin || !['http:','https:'].includes(url.protocol)) throw new Error('Map endpoint must use this server.');
-          const view = viewBox();
-          if (!view) throw new Error('Pan back to the collection to view data.');
-          const [width, height] = imageSize(view.share);
-          url.searchParams.set('bbox',view.bbox.join(','));
-          url.searchParams.set('bbox-crs','CRS:84'); url.searchParams.set('crs','EPSG:3857');
-          url.searchParams.set('width',width); url.searchParams.set('height',height);
-          url.searchParams.set('f','image/png'); url.searchParams.set('transparent','true');
-          ['parameter-name','datetime','elevation'].forEach(key => { if (want[key]) url.searchParams.set(key,want[key]); else url.searchParams.delete(key); });
-          requested = url.href;
-          if (!shown) requestText.textContent = requested;
-          report('Loading the map image…', 'loading');
+          const url = wms ? wmsUrl(want, view) : mapsUrl(want, view);
+          frame.href = frame.text = url.href;
+          if (pendingFront === frame && !shown) requestText.textContent = url.href;
           const response = await fetch(url,{signal:controller.signal});
-          if (!response.ok || response.status === 204) throw await requestError(response, want);
-          if (!response.headers.get('content-type')?.startsWith('image/')) throw new Error('Map endpoint did not return an image.');
-          // The instant drawn, which the request may have left to the server;
-          // without the header, the one asked for.
-          const header = response.headers.get('content-datetime');
-          const drawn = header && !Number.isNaN(Date.parse(header)) ? new Date(header)
+          const type = response.headers.get('content-type') || '';
+          if (wms) {
+            if (!response.ok || !type.startsWith('image/') || response.headers.get('x-cache') === 'ERROR') throw await wmsError(response, want);
+          } else {
+            if (!response.ok || response.status === 204) throw await requestError(response, want);
+            if (!type.startsWith('image/')) throw new Error('Map endpoint did not return an image.');
+          }
+          // The instant drawn: Maps names it, which the request may have
+          // left to the server to snap; WMS does not, so it is the one asked.
+          const header = wms ? null : response.headers.get('content-datetime');
+          frame.drawn = header && !Number.isNaN(Date.parse(header)) ? new Date(header)
             : want.datetime ? new Date(want.datetime) : undefined;
           const bitmap = await createImageBitmap(await response.blob());
-          if (current !== generation || controller.signal.aborted) { bitmap.close(); return; }
+          if (frame.dropped) { bitmap.close(); return; }
+          frame.fetching = false;
           const canvas = document.createElement('canvas');
           canvas.width = bitmap.width; canvas.height = bitmap.height;
           canvas.getContext('2d').drawImage(bitmap,0,0); bitmap.close();
-          const coordinates = [[view.west,view.north],[view.east,view.north],[view.east,view.south],[view.west,view.south]];
-          stageFrame({ type: 'canvas', canvas, coordinates, animate: false }, () => {
-            if (current !== generation) return false;
-            showing({ kind: 'image', want, drawn, href: requested, text: requested });
-            return true;
-          });
+          frame.settle = frameReady;
+          stageFrame(frame, { type: 'canvas', canvas, animate: false,
+            coordinates: [[view.west,view.north],[view.east,view.north],[view.east,view.south],[view.west,view.south]] });
         } catch (error) {
-          if (current !== generation) return;
-          if (error.retry && attempt < RETRIES) retryLater(attempt, error.after);
-          else failed(error, requested);
-        } finally { clearTimeout(timeout); }
+          if (!frame.dropped) frameFailed(frame, error);
+        } finally {
+          frame.fetching = false;
+          clearTimeout(timeout);
+          if (!frame.dropped && frame.state === 'loading' && pendingFront !== frame) prefetch();
+        }
       }
       const VECTOR_LAYERS = ['map-vector-fill','map-vector-line','map-vector-points'];
       function clearVector() {
@@ -814,14 +1540,15 @@
       }
       // Vector tiles take no time, parameter, style or level, and have no
       // frames to swap: the layers follow the view by themselves.
+      let vectorGeneration = 0;
       async function renderVector() {
-        const current = ++generation;
-        pending?.abort(); clearFrames(); clearVector();
+        const current = ++vectorGeneration;
+        clearFrames(); clearVector();
         noLegend('Vector tiles draw feature geometry in one color; there is no legend.');
         try {
           report('Loading tileset…');
           const tileset = await webMercatorTileset(request.vector.href, 'vector');
-          if (current !== generation) return;
+          if (current !== vectorGeneration || state.mode !== 'vector') return;
           const colors = palette(), layer = request.vector.layer;
           const source = { type: 'vector', tiles: [tileset.template], minzoom: tileset.minzoom, maxzoom: tileset.maxzoom };
           if (tileBounds) source.bounds = tileBounds;
@@ -835,15 +1562,16 @@
           requestText.textContent = tileset.template;
           report('Vector tiles · loading as you pan and zoom');
         } catch (error) {
-          if (current !== generation) return;
+          if (current !== vectorGeneration || state.mode !== 'vector') return;
           clearVector(); disableImageLink();
           report(error.message || 'Tiles unavailable.');
         }
       }
-      // A pan or zoom: tiles follow the view by themselves; only a map
-      // image is requested again, 300 ms after the view settles, with the
-      // choices already applied. A resize that leaves the view as it was
-      // changes nothing.
+      // A pan or zoom: tiles follow the view by themselves, buffered ones
+      // too; a map image is requested again, 300 ms after the view
+      // settles, with the choices already applied. Images buffered for the
+      // old view are dropped, and playback pauses. A resize that leaves the
+      // view as it was changes nothing.
       const viewKey = () => { const b = map.getBounds(); return [b.getWest(), b.getSouth(), b.getEast(), b.getNorth(), element.clientWidth, element.clientHeight].join(','); };
       let lastView = viewKey();
       function viewChanged() {
@@ -851,15 +1579,34 @@
         if (key === lastView) return;
         lastView = key;
         saveFragment();
-        if (state.mode !== 'maps') return;
+        if (state.mode !== 'maps' && state.mode !== 'wms') return;
+        if (playing) pause('Paused: the view changed.');
         // Invalidate at once so an old response cannot replace a new view.
-        ++generation; pending?.abort(); clearTimeout(retryTimer); discardStaged(); clearTimeout(timer);
+        clearTimeout(retryTimer); clearTimeout(timer);
+        [...pool.values()].forEach(dropFrame);
+        pendingFront = undefined;
         timer = setTimeout(render,300);
       }
       map.on('moveend',viewChanged);
       new ResizeObserver(() => { if (element.clientWidth && element.clientHeight) map.resize(); }).observe(element);
+      // A hidden tab pauses playback and buffering; a map scrolled out of
+      // view does too.
+      document.addEventListener('visibilitychange',() => {
+        if (document.visibilityState === 'hidden') { pause(); stopPrefetch(); } else prefetch();
+      });
+      if (typeof IntersectionObserver === 'function') {
+        new IntersectionObserver(entries => {
+          onScreen = entries.some(entry => entry.isIntersecting);
+          if (onScreen) prefetch(); else { pause(); stopPrefetch(); }
+        }).observe(element);
+      }
+      const savedTime = Date.parse(saved?.datetime || '');
+      const savedWindow = (saved?.window || '').split('/').map(Date.parse);
+      bindAxis(axisOf(state['parameter-name']), Number.isFinite(savedTime) ? savedTime : undefined,
+        savedWindow.length === 2 && savedWindow.every(Number.isFinite) ? savedWindow : undefined);
+      if (!axis.length) state.datetime = selectedTimeValue();
       applyMode();
-      updateTimeButtons();
+      updatePlay();
       render();
     }
     map.on('style.load', async () => {

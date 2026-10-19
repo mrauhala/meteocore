@@ -833,7 +833,7 @@ async fn main() {
             api_common::mounts::FEATURES,
             api_features::router(features_swap.clone()),
         )
-        .nest("/wms", api_wms::router(wms_swap.clone()))
+        .nest(api_common::mounts::WMS, api_wms::router(wms_swap.clone()))
         .nest(
             api_common::mounts::MAPS,
             api_maps::router(maps_swap.clone()),

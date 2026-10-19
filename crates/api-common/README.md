@@ -255,12 +255,14 @@ resource as currently filtered and paged.
 - **Map preview.** Drawn with MapLibre over Natural Earth outlines, which
   the server serves under `/preview/vendor/`.
   - It draws with whatever the collection advertises: map tiles, Maps
-    images (Web Mercator PNG) or vector tiles. Map tiles are the default
-    where advertised, else Maps. A "Draw with" switch appears when there is
-    more than one.
-  - Maps images and map tiles get parameter, style, time and level controls
-    when the collection advertises them. The style select is hidden when
-    there is one style. Vector tiles take none.
+    images (Web Mercator PNG) or vector tiles. On the shared root, a
+    collection the WMS serves (its `apis` lists `wms`) can also be drawn with
+    WMS 1.3.0 GetMap, the meta-tiled path desktop WMS clients see. Map tiles
+    are the default where advertised, else Maps. A "Draw with" switch
+    appears when there is more than one.
+  - Maps images, map tiles and WMS get parameter, style, time and level
+    controls when the collection advertises them. The style select is hidden
+    when there is one style. Vector tiles take none.
   - Every control applies on `change`; there is no Update button. Pan and
     zoom request a new Maps image 300 ms after the view settles, and map
     tiles follow the view by themselves. Every request reads one drawn
@@ -282,11 +284,68 @@ resource as currently filtered and paged.
     512 × 512 pixels (Tiles `width`/`height`) over the same 256-pixel tile
     area.
   - The status line names the time drawn: for a Maps image, the instant
-    from `Content-Datetime`; for map tiles, the time requested, and only
-    once the tiles have loaded.
+    from `Content-Datetime`; for map tiles and WMS, which name none, the
+    time requested, and only once the frame has loaded.
+  - **Time bar.** A collection with a time axis gets a time bar under the
+    map. `mapRequest` carries the axis compactly, `{start, step, count}`
+    (step in seconds) for a regular grid and the list of times for an
+    irregular one, and each parameter's own axis (`parameter_names[*].extent.temporal`).
+    The page emits no option per time step.
+    - Play and pause, one step either way, first and last frame of the
+      loop, speed (1, 2, 4 or 8 frames a second; 4 at cadences of 15 min
+      or less, else 2) and Loop, Bounce or Once. The last frame of a loop
+      holds for 1.2 s. A `…` menu jumps to a date and time in UTC and sets
+      the loop's ends.
+    - The track is laid out by time: notches where frames are at least
+      4 px apart, else a strip broken at gaps; day and hour ticks; the
+      viewer's clock; the frames buffered; failed frames in red.
+    - The loop window is a band with two handles; `[` and `]` set its ends
+      at the playhead. By default it holds the last 24 frames of
+      observations, or a forecast's 24 frames from the step nearest now, or
+      every frame when there are fewer, at most 96. An axis counts as a
+      forecast when it ends more than 10 min after the viewer's clock.
+    - The label shows the time drawn, in UTC with how long ago or ahead it
+      is ("25 min ago", "in 3 h"), and changes in the paint that swaps the
+      pixels.
+    - The map opens on the latest frame of observations, or a forecast's
+      step nearest now. Every frame request names its time from the axis
+      (`datetime`, or WMS `TIME`), so it is cached as `immutable` and a
+      second loop asks the server for nothing new.
+    - Playback shows a frame only once it has fully loaded; until then the
+      current frame holds. Failed and empty frames are marked and skipped.
+      Frames change with hard cuts.
+    - Frames are buffered ahead only once the viewer uses the time bar:
+      map tiles one frame at a time, up to K = clamp(⌊160 / tiles in
+      view⌋, 2, 6); images at most 2 fetches at a time and 3 frames ahead;
+      one frame under Save-Data. A frame not buffered goes first. A layer
+      change drops them all; a hidden tab or a map scrolled out of view
+      pauses playback and buffering; a pan pauses image playback. Before
+      the first play on a metered connection the bar says about how many
+      frames are to load.
+    - Dragging the playhead shows buffered frames at once and asks for the
+      frame under the pointer after 150 ms at rest or on release.
+    - Another parameter rebinds the bar to that parameter's axis at the
+      nearest instant.
+    - Keys, while focus is in the map or its time bar: Space or K play and
+      pause; `,` and `.` step (Shift: 10 frames), as do the arrows on the
+      time slider; Page Up and Page Down a day; Home and End the axis ends;
+      `[` and `]` the loop's ends; `<` and `>` the speed; N the frame
+      nearest now; `?` lists them. Arrow keys on the map pan it.
+    - The playhead is a native range input whose `aria-valuetext` is the
+      time. Steps, pauses and errors are announced, played frames are not,
+      and nothing ever plays by itself.
+  - **WMS GetMap.** `CRS=EPSG:3857`, so the BBOX is minx,miny,maxx,maxy in
+    metres from MapLibre's Web Mercator; `LAYERS=<collection>/<parameter>`
+    or the collection layer, `STYLES`, `TIME` and `ELEVATION`;
+    `FORMAT=image/png&TRANSPARENT=TRUE&EXCEPTIONS=XML`. An XML answer is
+    the ServiceException it carries, and an error image (`x-cache: ERROR`)
+    is never drawn. Images are sized and swapped as Maps images are. It is
+    not in the no-JavaScript form.
   - The URL fragment keeps the view and the choices under the API's own
     parameter names, for example
-    `#map=6/61.5/24.25&parameter-name=t&style=warm&datetime=2024-01-01T01:00:00Z&elevation=850&mode=maps`.
+    `#map=6/61.5/24.25&parameter-name=t&style=warm&datetime=2024-01-01T01:00:00Z&elevation=850&mode=maps`,
+    and a loop window the viewer set as `window=<start>/<end>`. It is not
+    written for each played frame.
     A reload or a shared link reopens them. It is written with
     `history.replaceState` at most about once a second, and never over
     another fragment such as `#metadata`.
@@ -299,7 +358,8 @@ resource as currently filtered and paged.
   text search all work. The map controls are a `GET` form to the
   collection's Maps endpoint. Its only fields are Maps parameters
   (`parameter-name`, `datetime`, `elevation`), and each style has its own
-  "Open map image" button. JavaScript adds the optional search fields, the
+  "Open map image" button. The time is a date and time input bounded by
+  the axis and stepping by a regular grid's step. JavaScript adds the optional search fields, the
   map, clipboard buttons and view switching.
 - **Theme.** Light, dark or system, remembered in the browser.
 
