@@ -79,8 +79,10 @@ impl fmt::Debug for LayerStyleError<'_> {
 ///   precipitation palette.
 /// - A single-parameter collection keeps the collection's style: its one
 ///   layer, as WMS advertises it, is the collection's, and the operator's
-///   `[wms]` palette is the one it draws. The built-in parameter defaults
-///   are for the parameters of multi-parameter collections (#320).
+///   `[wms]` palette is the one it draws. With no palette configured, the
+///   loader gives that layer its parameter's built-in default
+///   (`StyleContext::base_layer_default`), since only the engine names
+///   the parameter.
 ///
 /// `info` is `None` when the collection has no map engine; the request is
 /// then styled from the layer it names.
