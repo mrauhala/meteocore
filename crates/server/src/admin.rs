@@ -4683,6 +4683,16 @@ pub fn load_collections(
         );
     }
 
+    warn_generic_root_layers(
+        style_ctx,
+        &bundle_index,
+        [
+            (&map_engines, &map_collections, &map_styles),
+            (&maps_engines, &maps_collections, &maps_styles),
+            (&tiles_engines, &tiles_collections, &tiles_styles),
+        ],
+    );
+
     // Determine rendered cache size from first WMS collection config, or the
     // same default a `[wms]` block without `rendered_cache_mb` gets (#1010).
     let rendered_cache_mb = map_collections
@@ -4942,6 +4952,93 @@ fn is_generic_fallback(ctx: &ds_render::StyleContext, palette: &ds_render::Palet
         .is_some_and(|p| p.normalized)
 }
 
+/// The root map layer's style, WMS `LAYERS=<collection>` or a Maps or
+/// Tiles request without `parameter-name`, when it draws the generic
+/// normalized palette that nothing configured chose: the #320 warning's
+/// condition. Resolved as those requests resolve it
+/// ([`ds_render::resolve_layer_style`]), so a multi-parameter collection's
+/// root layer is its default parameter's layer (#1161), which a built-in
+/// parameter default may style. A configured palette is never warned, a
+/// deliberate viridis included: a style bundle, the `[wms]` colormap or
+/// stops, or the drawn parameter's own `[[wms.parameters]]` palette.
+fn generic_root_layer<'a>(
+    ctx: &ds_render::StyleContext,
+    collection: &CollectionConfig,
+    bundles: &HashMap<&str, &StyleBundle>,
+    styles: &'a HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+    id: &str,
+    info: &'a ds_core::map_engine::RasterInfo,
+) -> Option<ds_render::LayerStyle<'a>> {
+    if resolve_bundle(collection, bundles).is_some() {
+        return None;
+    }
+    let root = ds_render::resolve_layer_style(styles, id, None, Some(info), "default").ok()?;
+    let configured = collection.wms.as_ref().is_some_and(|w| {
+        w.colormap.is_some()
+            || !w.color_stops.is_empty()
+            || root.parameter.is_some_and(|drawn| {
+                w.parameters
+                    .iter()
+                    .any(|p| p.name == drawn && (p.colormap.is_some() || !p.color_stops.is_empty()))
+            })
+    });
+    (!configured && is_generic_fallback(ctx, &root.style.palette)).then_some(root)
+}
+
+/// One map API's registries: its engines, collections and style layers.
+type MapRegistry<'a> = (
+    &'a HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>>,
+    &'a HashMap<String, CollectionConfig>,
+    &'a HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+);
+
+/// The #320 warning, once per map collection of a load: its root layer
+/// draws the generic palette ([`generic_root_layer`]).
+fn warn_generic_root_layers(
+    ctx: &ds_render::StyleContext,
+    bundles: &HashMap<&str, &StyleBundle>,
+    registries: [MapRegistry<'_>; 3],
+) {
+    let mut checked = std::collections::HashSet::new();
+    for (engines, collections, styles) in registries {
+        for (id, engine) in engines {
+            let Some(collection) = collections.get(id) else {
+                continue;
+            };
+            if !checked.insert(id.as_str()) {
+                continue;
+            }
+            let info = engine.raster_info_shared();
+            let Some(root) = generic_root_layer(ctx, collection, bundles, styles, id, &info) else {
+                continue;
+            };
+            let style = root.style;
+            match root.parameter.filter(|_| root.layer != id) {
+                Some(parameter) => tracing::warn!(
+                    "Collection '{id}': no colormap configured and no built-in default for \
+                     its default parameter '{parameter}' — collection layer renders generic \
+                     {} {:.0}..{:.0}",
+                    style.palette.name,
+                    style.min,
+                    style.max
+                ),
+                None => tracing::warn!(
+                    "Collection '{id}': no colormap configured — collection layer renders \
+                     generic {} {:.0}..{:.0}{}",
+                    style.palette.name,
+                    style.min,
+                    style.max,
+                    if info.parameters.len() > 1 {
+                        " (parameter layers keep their own styles)"
+                    } else {
+                        ""
+                    }
+                ),
+            }
+        }
+    }
+}
+
 /// Compute (once per collection) the full style-layer map: the collection
 /// key plus one "{id}/{param}" key per parameter, resolved through the
 /// shared StyleContext. Cached so the WMS, Maps and Tiles registries (and
@@ -4979,29 +5076,6 @@ fn collection_layer_styles(
     let mut layers = HashMap::new();
     match ctx.collection_styles(collection, bundle) {
         Ok(styles) => {
-            // #320: make the generic fallback visible. Only when the
-            // collection genuinely configures nothing (no inline colormap/
-            // stops and no bundle) — a deliberate viridis is not warned.
-            let unstyled = bundle.is_none()
-                && collection
-                    .wms
-                    .as_ref()
-                    .is_none_or(|w| w.colormap.is_none() && w.color_stops.is_empty());
-            if unstyled {
-                if let Some(d) = styles.get("default") {
-                    if is_generic_fallback(ctx, &d.palette) {
-                        tracing::warn!(
-                            "Collection '{}': no colormap configured — collection layer \
-                             renders generic {} {:.0}..{:.0} (parameter layers may still \
-                             match built-in defaults)",
-                            collection.id,
-                            d.palette.name,
-                            d.min,
-                            d.max
-                        );
-                    }
-                }
-            }
             layers.insert(collection.id.clone(), styles);
         }
         Err(e) => {
@@ -7803,6 +7877,140 @@ mod tests {
             .contains(&"WindSpeedMS".to_string()));
         assert!(!off.wms_state.styles.contains_key("kenya/WindSpeedMS"));
         assert!(off.wind_by_id.is_empty());
+    }
+
+    /// #1211: QueryData reports each parameter's unit from its FMI number,
+    /// so the unit-gated built-in defaults style the committed fixtures'
+    /// temperature and pressure layers with no `[wms]` configured, and the
+    /// MEPS root layer draws its default `Temperature` with its own style
+    /// (#1161), so it is not the generic palette the #320 warning names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn querydata_fixtures_take_the_unit_gated_defaults() {
+        let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
+        let collection = |id: &str, dir: &str| -> CollectionConfig {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "title": id, "description": "QueryData",
+                "engine_type": "querydata", "apis": ["wms", "maps", "tiles"],
+                "data_path": format!("{testdata}/{dir}"),
+            }))
+            .unwrap()
+        };
+        let collections = [
+            collection("kenya", "ecmwf-kenya"),
+            collection("meps", "meps"),
+        ];
+        assert!(collections.iter().all(|c| c.wms.is_none()));
+        let ctx = ds_render::StyleContext::with_builtins();
+        let result = super::load_collections(
+            &ctx,
+            &collections,
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let styles = &result.wms_state.styles;
+        for (layer, palette, range) in [
+            ("kenya/2t", "temperature", (-90.0, 50.0)),
+            ("kenya/msl", "pressure", (950.0, 1050.0)),
+            ("kenya/rr1h", "precipitation", (0.0, 50.0)),
+            ("meps/Temperature", "temperature", (-90.0, 50.0)),
+            ("meps/Mean Sea Level Pressure", "pressure", (950.0, 1050.0)),
+        ] {
+            let style = &styles[layer]["default"];
+            assert_eq!(style.palette.name, palette, "{layer}");
+            assert_eq!((style.min, style.max), range, "{layer}");
+        }
+
+        let info = result.wms_state.engines["meps"].raster_info_shared();
+        let root =
+            ds_render::resolve_layer_style(styles, "meps", None, Some(&info), "default").unwrap();
+        assert_eq!(root.layer, "meps/Temperature");
+        let no_bundles = HashMap::new();
+        assert!(super::generic_root_layer(
+            &ctx,
+            &collections[1],
+            &no_bundles,
+            styles,
+            "meps",
+            &info
+        )
+        .is_none());
+    }
+
+    /// #320 / #1161: the generic-palette warning fires only when the root
+    /// map layer really draws the generic palette, as WMS, Maps and Tiles
+    /// resolve it, and nothing configured chose it.
+    #[test]
+    fn generic_root_layer_warns_only_on_a_real_fallback() {
+        use ds_core::map_engine::{ParameterInfo, RasterInfo};
+        let collection = |wms: &str| -> CollectionConfig {
+            toml::from_str(&format!(
+                "id = \"c\"\ntitle = \"C\"\ndescription = \"C\"\n\
+                 engine_type = \"querydata\"\n[querydata]\n{wms}"
+            ))
+            .unwrap()
+        };
+        let parameter = |name: &str, unit: &str| ParameterInfo {
+            name: name.to_string(),
+            title: name.to_string(),
+            unit: unit.to_string(),
+        };
+        let info = |default: &str, parameters: Vec<ParameterInfo>| RasterInfo {
+            native_crs: "CRS:84".to_string(),
+            spatial_extent: None,
+            times: Vec::new(),
+            parameter: default.to_string(),
+            unit: String::new(),
+            parameters,
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+        };
+        let bundles = HashMap::new();
+        // The resolved root layer and its drawn parameter, when warned.
+        let warned = |collection: &CollectionConfig, info: &RasterInfo| {
+            let ctx = ds_render::StyleContext::with_builtins();
+            let styles = layer_styles(collection, &info.parameters, &bundles);
+            super::generic_root_layer(&ctx, collection, &bundles, &styles, "c", info)
+                .map(|root| (root.layer.to_string(), root.parameter.map(str::to_string)))
+        };
+        let unstyled = collection("");
+        let some = |layer: &str, parameter: Option<&str>| {
+            Some((layer.to_string(), parameter.map(str::to_string)))
+        };
+
+        // A multi-parameter collection whose default takes a built-in
+        // default draws it: no warning, where the collection layer alone
+        // is viridis 0..1.
+        let celsius = info("t", vec![parameter("t", "°C"), parameter("foo", "")]);
+        assert_eq!(warned(&unstyled, &celsius), None);
+        // Without a unit the temperature default does not apply: the
+        // default parameter's layer is the generic fallback.
+        let unitless = info("t", vec![parameter("t", ""), parameter("foo", "")]);
+        assert_eq!(warned(&unstyled, &unitless), some("c/t", Some("t")));
+        // A default no parameter layer is named for leaves the root layer
+        // on the collection's style.
+        let unnamed = info("Temp (t)", celsius.parameters.clone());
+        assert_eq!(warned(&unstyled, &unnamed), some("c", None));
+        // A single-parameter collection keeps the collection's style.
+        assert_eq!(warned(&unstyled, &info("t", Vec::new())), some("c", None));
+
+        // Configured palettes are never warned, a deliberate viridis
+        // included: the collection's, or the drawn parameter's own.
+        let collection_viridis = collection("[wms]\ncolormap = \"viridis\"\n");
+        assert_eq!(warned(&collection_viridis, &unitless), None);
+        assert_eq!(warned(&collection_viridis, &info("t", Vec::new())), None);
+        let parameter_viridis =
+            collection("[[wms.parameters]]\nname = \"t\"\ncolormap = \"viridis\"\n");
+        assert_eq!(warned(&parameter_viridis, &unitless), None);
+        // Another parameter's palette is not the drawn one's.
+        let other_viridis =
+            collection("[[wms.parameters]]\nname = \"foo\"\ncolormap = \"viridis\"\n");
+        assert_eq!(warned(&other_viridis, &unitless), some("c/t", Some("t")));
     }
 
     /// WMS GetFeatureInfo (#1064): a WMS collection whose engine answers

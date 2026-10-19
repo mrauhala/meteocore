@@ -9,31 +9,10 @@ apis = ["edr", "wms", "maps", "tiles"]
 wms_parameter = "2t"
 poll_interval_secs = 60
 
-# QueryData carries no units; ECMWF surface temperature is in °C. The
-# default layer (2t) takes the temperature palette over a Kenyan range.
+# Each parameter's unit comes from its FMI parameter number, so the parameter
+# layers take the built-in defaults: 2t temperature (°C), msl pressure (hPa),
+# rr1h precipitation (mm). Kept on purpose: the collection layer draws this
+# palette, since its default is the full descriptor "2 Metre Temperature
+# (2t)", which names no `2t` layer.
 [wms]
 colormap = "temperature"
-min = 0.0
-max = 40.0
-
-[[wms.parameters]]
-name = "2t"
-colormap = "temperature"
-
-[[wms.parameters]]
-name = "2d"
-colormap = "temperature"
-
-[[wms.parameters]]
-name = "msl"
-colormap = "viridis"
-min = 980.0
-max = 1040.0
-
-[[wms.parameters]]
-name = "rr1h"
-colormap = "precipitation_rate"
-
-[[wms.parameters]]
-name = "tp"
-colormap = "precipitation"
