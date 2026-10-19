@@ -680,6 +680,18 @@ async fn collections(
     )
 }
 
+/// The WMS endpoint of a collection the WMS serves, for its page's map to
+/// draw with GetMap (#1220). The collection's `apis`, which the server
+/// enforces, wire it to WMS as the layer named by its id; nothing in the
+/// collection document says so.
+fn wms_endpoint(config: &CollectionConfig, base: &str) -> Option<String> {
+    config
+        .apis
+        .iter()
+        .any(|api| api == "wms")
+        .then(|| format!("{base}{}", crate::mounts::WMS))
+}
+
 /// GET {mount}/collections/{id} — one collection, merged from every block
 async fn collection(
     Path(id): Path<String>,
@@ -705,6 +717,7 @@ async fn collection(
             &format!("Collection '{id}' not found"),
         );
     };
+    let wms = wms_endpoint(&merged.config, base);
     with_vary(match wanted {
         Wanted::Json => Json(merged.metadata).into_response(),
         Wanted::Html => Html(workbench::collection_page(
@@ -716,6 +729,7 @@ async fn collection(
             &merged.metadata,
             merged.config.license.as_ref(),
             merged.items.as_ref(),
+            wms.as_deref(),
         ))
         .into_response(),
     })
@@ -736,6 +750,24 @@ mod tests {
             claims: &[],
             items: None,
         }
+    }
+
+    #[test]
+    fn the_page_draws_with_wms_only_for_a_collection_wired_to_it() {
+        let config = |apis: Value| -> CollectionConfig {
+            serde_json::from_value(
+                json!({"id": "c", "title": "c", "description": "", "apis": apis}),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            wms_endpoint(&config(json!(["maps", "wms"])), "https://x/base"),
+            Some("https://x/base/wms".to_owned())
+        );
+        assert_eq!(
+            wms_endpoint(&config(json!(["maps", "tiles"])), "https://x"),
+            None
+        );
     }
 
     #[test]

@@ -2620,7 +2620,7 @@ a {
 .detail-layout>div,.detail-layout>aside{min-width:0}
 
 /* Keep map refreshes inside a stable panel: no page reflow during pan/zoom. */
-#feature-map[aria-label="Collection map data"]:not([hidden])+#map-status{height:6em;overflow:auto;margin:0}
+#feature-map[aria-label="Collection map data"]:not([hidden])~#map-status{height:6em;overflow:auto;margin:0}
 .map-request code{height:4.5em;line-height:1.5;overflow:auto;overflow-wrap:anywhere}
 #map-image-link[aria-disabled="true"]{cursor:default;color:var(--muted)}
 /* Fields wrap at a 170px minimum; the parameter's long labels and time,
@@ -2648,13 +2648,51 @@ a {
    controls, request link and legend. */
 .js .enhanced[hidden]{display:none!important}
 
-/* Keep time navigation and the style/action row aligned at every width. */
+/* The form's date and time, for a page without the script. */
 .map-time-field{display:flex;flex-direction:column;gap:8px;min-width:0}
-.map-time-picker{display:flex;align-items:center;gap:6px;min-width:0}
-.map-time-picker select,.map-time-picker input{min-width:0;flex:1}
-.map-time-picker .btn{height:46px;min-width:40px;padding:0 10px;margin:0;flex:none}
-/* One column (a phone): the time on its own line, the arrows under it. */
-@container (max-width:399px){.map-time-picker{flex-wrap:wrap}.map-time-picker select,.map-time-picker input{flex:1 0 100%;order:-1}.map-time-picker .btn{min-width:56px}}
+/* The time bar under the map (#1220): controls, then the track laid out by
+   time. Phase 3 restyles it; this keeps it usable in the current layout. */
+.map-timebar{display:flex;flex-direction:column;gap:6px;padding:12px 18px 6px;border-top:1px solid var(--line);font-variant-numeric:tabular-nums}
+.js .map-timebar.enhanced{display:flex!important}
+.js .map-timebar.enhanced[hidden]{display:none!important}
+.map-timebar-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.map-timebar-row .btn{min-width:44px;height:44px;margin:0;padding:0 10px;justify-content:center;font-size:18px}
+#map-play.buffering{box-shadow:0 0 0 3px var(--mint)}
+.map-time-label{flex:1 1 220px;margin:0 6px;font-size:16px}
+#map-time-drawn{font-weight:600}
+#map-time-relative,#map-time-seek{color:var(--muted);font-size:14px;margin-left:6px}
+.map-timebar-row label{display:flex;align-items:center;gap:6px;font-size:14px}
+.map-timebar-row select{height:44px;font-size:16px}
+.map-time-menu{position:relative}
+.map-time-menu summary{display:flex;align-items:center;justify-content:center;min-width:44px;height:44px;border:1px solid var(--control-border);border-radius:6px;cursor:pointer;list-style:none;font-size:18px}
+.map-time-menu summary::-webkit-details-marker{display:none}
+.map-time-menu-body{position:absolute;right:0;bottom:calc(100% + 6px);z-index:5;display:grid;gap:8px;min-width:250px;padding:12px;background:var(--white);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}
+.map-time-menu-body label{flex-direction:column;align-items:stretch}
+.map-time-menu-body input{height:44px;font-size:16px}
+.map-track{position:relative;height:52px;margin:4px 8px 0}
+.map-track-marks,.map-track-buffer{position:absolute;inset:0;pointer-events:none}
+.map-track-marks::before{content:"";position:absolute;left:0;right:0;top:12px;height:4px;border-radius:2px;background:var(--line)}
+.map-notch{position:absolute;top:10px;width:1px;height:8px;background:var(--muted)}
+.map-strip{position:absolute;top:12px;height:4px;background:var(--muted)}
+.map-tick{position:absolute;top:24px;padding-left:3px;border-left:1px solid var(--line);font-size:13px;line-height:18px;color:var(--muted);white-space:nowrap}
+.map-tick.day{color:var(--ink);font-weight:600}
+.map-now{position:absolute;top:2px;width:2px;height:22px;margin-left:-1px;background:var(--amber)}
+.map-buffered{position:absolute;top:18px;height:3px;background:var(--mint)}
+.map-errored{position:absolute;top:6px;width:3px;height:14px;margin-left:-1px;background:var(--error)}
+.map-window{position:absolute;top:6px;height:16px;background:color-mix(in srgb,var(--teal) 18%,transparent);pointer-events:none}
+.map-window-handle{position:absolute;top:-4px;width:12px;height:24px;margin-left:-6px;border-radius:3px;background:var(--teal);cursor:ew-resize;pointer-events:auto;touch-action:none}
+#map-window-lo{left:0}#map-window-hi{left:100%}
+.map-playhead-mark{position:absolute;top:0;width:3px;height:28px;margin-left:-1px;background:var(--teal);pointer-events:none}
+/* The native range is the playhead for keyboards and assistive
+   technology, transparent over the track; the mark above shows it. */
+#map-playhead{position:absolute;left:0;right:0;top:0;width:100%;height:28px;margin:0;opacity:0;cursor:pointer}
+.map-track:focus-within{outline:3px solid var(--focus);outline-offset:4px;border-radius:4px}
+.map-window-text{margin:0;font-size:14px;color:var(--muted)}
+.map-keys-help{padding:8px 0 4px;font-size:14px}
+.map-keys-help p{margin:0 0 6px}
+.map-keys-help dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px;margin:0}
+.map-keys-help dt{font-weight:600}
+.map-keys-help dd{margin:0}
 #breadcrumbs{min-width:0;flex-wrap:wrap}
 #breadcrumbs a{overflow-wrap:anywhere}
 

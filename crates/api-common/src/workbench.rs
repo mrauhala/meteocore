@@ -847,67 +847,90 @@ pub fn map_head(base: &str) -> String {
     )
 }
 
-/// Expand only advertised temporal grids, never infer a cadence from bounds.
-/// Large axes fall back to a native UTC date/time input instead of huge HTML.
-/// Each time is RFC 3339 in UTC with `Z`, the form `datetime` takes and the
-/// map script writes to the URL fragment.
-fn map_times(temporal: &Value) -> Vec<String> {
-    let utc = |t: chrono::DateTime<chrono::FixedOffset>| {
-        crate::subset::rfc3339(t.with_timezone(&chrono::Utc))
+/// The most times an irregular axis lists in `mapRequest`, which carries
+/// them a second time after the collection document.
+const MAX_LISTED_FRAMES: u64 = 10_000;
+/// The most frames of a regular axis the time bar takes: numbers in the
+/// script, never markup.
+const MAX_GRID_FRAMES: u64 = 100_000;
+
+/// A temporal extent's axis as the map's time bar reads it (#1220):
+/// `{"start", "step", "count"}` for a regular grid, `step` in whole
+/// seconds, else `{"times": [...]}`. Times are RFC 3339 in UTC with `Z`,
+/// the form `datetime` takes and the map writes to the URL fragment. Only
+/// an advertised grid is read, never a cadence inferred from the bounds; an
+/// interval of one instant is that instant. `None` without an axis.
+fn map_axis(temporal: &Value) -> Option<Value> {
+    let parse = |t: &Value| {
+        chrono::DateTime::parse_from_rfc3339(t.as_str()?)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc))
     };
-    let expand = |temporal: &Value| -> Option<Vec<String>> {
-        let grid = &temporal["grid"];
-        let count = grid["cellsCount"].as_u64()?;
-        if !(1..=10_000).contains(&count) {
+    let grid = &temporal["grid"];
+    let Some(count) = grid["cellsCount"].as_u64().filter(|count| *count >= 1) else {
+        let bounds = temporal["interval"][0].as_array()?;
+        let (start, end) = (parse(bounds.first()?)?, parse(bounds.get(1)?)?);
+        return (start == end).then(|| json!({"times": [crate::subset::rfc3339(start)]}));
+    };
+    if let Some(coordinates) = grid["coordinates"].as_array() {
+        if coordinates.len() as u64 != count || count > MAX_LISTED_FRAMES {
             return None;
         }
-        if let Some(coordinates) = grid["coordinates"].as_array() {
-            if coordinates.len() as u64 != count {
-                return None;
-            }
-            return coordinates
-                .iter()
-                .map(|t| {
-                    chrono::DateTime::parse_from_rfc3339(t.as_str()?)
-                        .ok()
-                        .map(utc)
-                })
-                .collect();
-        }
-        let step = ds_core::datetime::parse_iso8601_duration(grid["resolution"].as_str()?).ok()?;
-        let start =
-            chrono::DateTime::parse_from_rfc3339(temporal["interval"][0][0].as_str()?).ok()?;
-        let end =
-            chrono::DateTime::parse_from_rfc3339(temporal["interval"][0][1].as_str()?).ok()?;
-        let last = start.checked_add_signed(step.checked_mul((count - 1) as i32)?)?;
-        if last > end {
-            return None;
-        }
-        (0..count)
-            .map(|i| {
-                start
-                    .checked_add_signed(step.checked_mul(i as i32)?)
-                    .map(utc)
-            })
-            .collect()
-    };
-    expand(temporal).unwrap_or_default()
+        let times = coordinates
+            .iter()
+            .map(|t| parse(t).map(crate::subset::rfc3339))
+            .collect::<Option<Vec<_>>>()?;
+        return Some(json!({"times": times}));
+    }
+    if count > MAX_GRID_FRAMES {
+        return None;
+    }
+    let step = ds_core::datetime::parse_iso8601_duration(grid["resolution"].as_str()?).ok()?;
+    let seconds = step.num_seconds();
+    if seconds <= 0 || step != chrono::Duration::seconds(seconds) {
+        return None;
+    }
+    let start = parse(&grid["firstCoordinate"]).or_else(|| parse(&temporal["interval"][0][0]))?;
+    let end = parse(&temporal["interval"][0][1])?;
+    let last = start.checked_add_signed(step.checked_mul(i32::try_from(count - 1).ok()?)?)?;
+    if last > end {
+        return None;
+    }
+    Some(json!({"start": crate::subset::rfc3339(start), "step": seconds, "count": count}))
 }
 
-/// A time choice as the map controls show it: UTC to the minute, with
-/// seconds only when the instant has them.
-fn map_time_label(time: &str) -> String {
-    use chrono::Timelike;
-    chrono::DateTime::parse_from_rfc3339(time)
-        .map(|t| {
-            let t = t.with_timezone(&chrono::Utc);
-            if t.second() == 0 && t.nanosecond() == 0 {
-                t.format("%Y-%m-%d %H:%M").to_string()
-            } else {
-                t.format("%Y-%m-%d %H:%M:%S").to_string()
-            }
-        })
-        .unwrap_or_else(|_| time.to_owned())
+/// The first and last time of a [`map_axis`], and its step in seconds when
+/// it is a regular grid.
+fn axis_ends(
+    axis: &Value,
+) -> Option<(
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+    Option<u64>,
+)> {
+    let parse = |t: &Value| {
+        chrono::DateTime::parse_from_rfc3339(t.as_str()?)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc))
+    };
+    if let Some(times) = axis["times"].as_array() {
+        return Some((parse(times.first()?)?, parse(times.last()?)?, None));
+    }
+    let start = parse(&axis["start"])?;
+    let step = axis["step"].as_u64()?;
+    let count = axis["count"].as_u64()?.checked_sub(1)?;
+    let last = start.checked_add_signed(chrono::Duration::seconds(
+        i64::try_from(step.checked_mul(count)?).ok()?,
+    ))?;
+    Some((start, last, Some(step)))
+}
+
+/// How many times a [`map_axis`] holds.
+fn axis_len(axis: &Value) -> u64 {
+    axis["times"].as_array().map_or_else(
+        || axis["count"].as_u64().unwrap_or(0),
+        |times| times.len() as u64,
+    )
 }
 
 /// The parameters a map draws, from the collection's `parameter_names` (the
@@ -916,7 +939,9 @@ fn map_time_label(time: &str) -> String {
 /// `unit.symbol.value`) and EDR's (`label`, `unit.symbol` or `unit.label`).
 /// A label that ends in its own name, as QueryData's
 /// "2 Metre Temperature (2t)" does, drops it: the controls add the unit in
-/// parentheses, and "(2t) (°C)" read as two units.
+/// parentheses, and "(2t) (°C)" read as two units. A parameter on its own
+/// time axis (`extent.temporal`, #819) carries it as `axis`, the
+/// [`map_axis`] form, which the time bar binds to when it is chosen.
 fn map_parameters(parameters: &Value) -> Vec<Value> {
     fn text(value: &Value) -> Option<String> {
         value
@@ -945,10 +970,57 @@ fn map_parameters(parameters: &Value) -> Vec<Value> {
                 .or_else(|| text(&parameter["unit"]["symbol"]))
                 .or_else(|| text(&parameter["unit"]["label"]))
                 .unwrap_or_default();
-            json!({"name": name, "label": label, "unit": unit})
+            let mut entry = json!({"name": name, "label": label, "unit": unit});
+            if let Some(axis) = map_axis(&parameter["extent"]["temporal"]) {
+                entry["axis"] = axis;
+            }
+            entry
         })
         .collect()
 }
+
+/// The map's time bar (#1220), the script's alone: hidden until the script
+/// binds a time axis to it. The track is laid out by time; its range input
+/// is the playhead, and the marks over it are drawn by the script.
+const MAP_TIME_BAR: &str = concat!(
+    "<div id=\"map-timebar\" class=\"map-timebar enhanced\" role=\"group\" aria-label=\"Time\" hidden>",
+    "<div class=\"map-timebar-row\">",
+    "<button type=\"button\" class=\"btn\" id=\"map-first\" aria-label=\"First frame of the loop\" title=\"First frame of the loop; with Shift, of all\">⇤</button>",
+    "<button type=\"button\" class=\"btn\" id=\"map-prev\" aria-label=\"Previous frame\" title=\"Previous frame (,); with Shift, 10 frames\">‹</button>",
+    "<button type=\"button\" class=\"btn primary\" id=\"map-play\" aria-label=\"Play\" title=\"Play or pause (Space or K)\">▶\u{fe0e}</button>",
+    "<button type=\"button\" class=\"btn\" id=\"map-next\" aria-label=\"Next frame\" title=\"Next frame (.); with Shift, 10 frames\">›</button>",
+    "<button type=\"button\" class=\"btn\" id=\"map-last\" aria-label=\"Last frame of the loop\" title=\"Last frame of the loop; with Shift, of all\">⇥</button>",
+    "<p class=\"map-time-label\"><span id=\"map-time-drawn\">–</span> <span id=\"map-time-relative\"></span> <span id=\"map-time-seek\" hidden></span></p>",
+    "<label>Speed<select id=\"map-speed\"><option value=\"1\">1 fps</option><option value=\"2\">2 fps</option><option value=\"4\">4 fps</option><option value=\"8\">8 fps</option></select></label>",
+    "<label>Repeat<select id=\"map-repeat\"><option value=\"loop\">Loop</option><option value=\"bounce\">Bounce</option><option value=\"once\">Once</option></select></label>",
+    "<details id=\"map-time-menu\" class=\"map-time-menu\"><summary aria-label=\"More time options\">…</summary><div class=\"map-time-menu-body\">",
+    "<label>Jump to · UTC<input id=\"map-jump\" type=\"datetime-local\" step=\"1\"></label>",
+    "<button type=\"button\" class=\"btn small\" id=\"map-window-start\">Start the loop here</button>",
+    "<button type=\"button\" class=\"btn small\" id=\"map-window-end\">End the loop here</button>",
+    "<button type=\"button\" class=\"btn small\" id=\"map-window-reset\">Default loop</button>",
+    "</div></details>",
+    "<button type=\"button\" class=\"btn\" id=\"map-keys\" aria-expanded=\"false\" aria-controls=\"map-keys-help\" aria-label=\"Keyboard shortcuts\">?</button>",
+    "</div>",
+    "<div id=\"map-track\" class=\"map-track\">",
+    "<div id=\"map-track-marks\" class=\"map-track-marks\" aria-hidden=\"true\"></div>",
+    "<div id=\"map-track-buffer\" class=\"map-track-buffer\" aria-hidden=\"true\"></div>",
+    "<div id=\"map-window\" class=\"map-window\" aria-hidden=\"true\"><span id=\"map-window-lo\" class=\"map-window-handle\"></span><span id=\"map-window-hi\" class=\"map-window-handle\"></span></div>",
+    "<span id=\"map-playhead-mark\" class=\"map-playhead-mark\" aria-hidden=\"true\"></span>",
+    "<input id=\"map-playhead\" type=\"range\" min=\"0\" max=\"0\" value=\"0\" step=\"any\" aria-label=\"Time · UTC\">",
+    "</div>",
+    "<p id=\"map-window-text\" class=\"map-window-text\"></p>",
+    "<div id=\"map-keys-help\" class=\"map-keys-help\" hidden><p>With focus on the map or its time bar:</p><dl>",
+    "<dt>Space or K</dt><dd>Play or pause</dd>",
+    "<dt>, and .</dt><dd>Previous or next frame; with Shift, 10 frames</dd>",
+    "<dt>← and → on the time slider</dt><dd>Previous or next frame; with Shift, 10 frames</dd>",
+    "<dt>Page Up and Page Down</dt><dd>One day earlier or later</dd>",
+    "<dt>Home and End</dt><dd>First or last frame</dd>",
+    "<dt>[ and ]</dt><dd>Start or end the loop at this frame</dd>",
+    "<dt>&lt; and &gt;</dt><dd>Slower or faster</dd>",
+    "<dt>N</dt><dd>The frame nearest now</dd>",
+    "<dt>?</dt><dd>This list</dd>",
+    "</dl></div></div>"
+);
 
 /// The map panel: the map, its status line, and for a collection with a
 /// `mapRequest` the controls, the rendered-request link and the legend.
@@ -965,7 +1037,17 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
     let raster = features.get("mapRequest");
     let mut controls = String::new();
     let mut legend = "";
+    let mut time_bar = "";
     if let Some(request) = raster {
+        // A time axis, the collection's or a parameter's own: the time bar.
+        let has_axis = |value: &Value| value.get("axis").is_some_and(|axis| !axis.is_null());
+        if has_axis(request)
+            || request["parameter_names"]
+                .as_array()
+                .is_some_and(|parameters| parameters.iter().any(has_axis))
+        {
+            time_bar = MAP_TIME_BAR;
+        }
         let modes: Vec<&str> = request["modes"]
             .as_array()
             .into_iter()
@@ -974,7 +1056,7 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
             .collect();
         // Map tiles where advertised, else Maps (#1220): pans keep the
         // tiles, and the server's tile cache is shared between viewers.
-        let default_mode = ["tiles", "maps", "vector"]
+        let default_mode = ["tiles", "maps", "wms", "vector"]
             .into_iter()
             .find(|mode| modes.contains(mode))
             .unwrap_or("maps");
@@ -995,6 +1077,7 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
             for (mode, label) in [
                 ("tiles", "Map tiles"),
                 ("maps", "Maps · one image per view"),
+                ("wms", "WMS GetMap · one image per view"),
                 ("vector", "Vector tiles"),
             ]
             .into_iter()
@@ -1082,28 +1165,27 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
             ));
         }
         controls.push_str("</select></label>");
-        let times = request["times"]
-            .as_array()
-            .filter(|times| !times.is_empty());
+        let axis = request.get("axis").filter(|axis| !axis.is_null());
         // No temporal extent (a static source, or one with no data yet):
-        // there is no time to choose, so no time row.
-        if times.is_some() || request["temporal"] == true {
-            controls.push_str("<div class=\"map-time-field\"><label for=\"map-time\">Time · UTC</label><div class=\"map-time-picker\">");
-            if let Some(times) = times {
-                controls.push_str("<button type=\"button\" class=\"btn enhanced\" id=\"map-time-prev\" aria-label=\"Previous available time\">←</button><select id=\"map-time\" name=\"datetime\" aria-describedby=\"map-help\"><option value=\"\">Default</option>");
-                for time in times.iter().filter_map(Value::as_str) {
-                    controls.push_str(&format!(
-                        "<option value=\"{}\">{}</option>",
-                        escape(time),
-                        escape(&map_time_label(time))
-                    ));
+        // there is no time to choose, so no time row. Otherwise a date and
+        // time without a zone, which `datetime` reads as UTC, bounded by
+        // the axis and stepping by a regular one's step. The script hides
+        // it for the time bar under the map, or applies it on `change`
+        // when there is no axis to bind.
+        if axis.is_some() || request["temporal"] == true {
+            let bounds = match axis.and_then(axis_ends) {
+                Some((first, last, step)) => {
+                    let local = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S");
+                    format!(
+                        " min=\"{}\" max=\"{}\" step=\"{}\"",
+                        local(first),
+                        local(last),
+                        step.unwrap_or(1)
+                    )
                 }
-                controls.push_str("</select><button type=\"button\" class=\"btn enhanced\" id=\"map-time-next\" aria-label=\"Next available time\">→</button>");
-            } else {
-                // A date and time without a zone, which `datetime` reads as UTC.
-                controls.push_str("<input id=\"map-time\" name=\"datetime\" type=\"datetime-local\" step=\"1\" aria-describedby=\"map-help\">");
-            }
-            controls.push_str("</div></div>");
+                None => " step=\"1\"".to_owned(),
+            };
+            controls.push_str(&format!("<div class=\"map-time-field\"><label for=\"map-time\">Time · UTC</label><input id=\"map-time\" name=\"datetime\" type=\"datetime-local\"{bounds} aria-describedby=\"map-help\"></div>"));
         }
         let vertical = &request["vertical"];
         let levels = vertical_values(vertical);
@@ -1124,10 +1206,10 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
             controls.push_str("</select></label>");
         }
         controls.push_str("<p id=\"map-help\" class=\"enhanced\">Every choice applies at once. Pan or zoom to draw the visible area. ");
-        if let Some(times) = times {
+        if let Some(axis) = axis {
             controls.push_str(&format!(
-                "{} advertised times; the arrows step through them. ",
-                times.len()
+                "The time bar under the map steps through and plays the {} advertised times; ? on it lists its keys. ",
+                axis_len(axis)
             ));
         }
         controls.push_str("Default leaves the choice to the server; the line under the map names what it drew.</p>");
@@ -1164,7 +1246,7 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
         ""
     };
     let fallback = escape(fallback);
-    format!("{controls}<div class=\"map-panel\"><div id=\"feature-map\" data-land=\"{base}/preview/vendor/workbench-land.json\" data-quicklook=\"{quicklook}\" data-fallback=\"{fallback}\" role=\"region\" aria-label=\"{label}\"></div><p id=\"map-status\" role=\"status\">The map needs JavaScript and WebGL. {fallback}</p>{legend}{request_link}<div id=\"map-data\" hidden>{}</div></div><script src=\"{base}/preview/vendor/maplibre-gl.js\"></script><script>{}</script>",escape(&features.to_string()),include_str!("workbench/map.js"),base=escape(base))
+    format!("{controls}<div class=\"map-panel\"><div id=\"feature-map\" data-land=\"{base}/preview/vendor/workbench-land.json\" data-quicklook=\"{quicklook}\" data-fallback=\"{fallback}\" role=\"region\" aria-label=\"{label}\"></div>{time_bar}<p id=\"map-status\" role=\"status\">The map needs JavaScript and WebGL. {fallback}</p>{legend}{request_link}<div id=\"map-data\" hidden>{}</div></div><script src=\"{base}/preview/vendor/maplibre-gl.js\"></script><script>{}</script>",escape(&features.to_string()),include_str!("workbench/map.js"),base=escape(base))
 }
 
 /// What a collection's Overview says of its feature items beyond the
@@ -1182,7 +1264,7 @@ pub fn collection_html(
     doc: &Value,
     license: Option<&LicenseConfig>,
 ) -> String {
-    collection_page(surface, doc, license, None)
+    collection_page(surface, doc, license, None, None)
 }
 
 /// A chip row of item properties on the Overview, each opening the items
@@ -1208,12 +1290,15 @@ fn item_field_chips(items: &str, label: &str, kind: &str, names: &[String]) -> S
 }
 
 /// [`collection_html`] with what the Features API says of the collection's
-/// items, when it serves them.
+/// items, when it serves them, and the WMS endpoint when WMS serves the
+/// collection as a layer named by its id: the map then offers WMS GetMap
+/// as a draw mode (#1220).
 pub fn collection_page(
     surface: Surface<'_>,
     doc: &Value,
     license: Option<&LicenseConfig>,
     overview: Option<&ItemsOverview>,
+    wms: Option<&str>,
 ) -> String {
     let Surface { base, root, api } = surface;
     let title = doc["title"]
@@ -1262,11 +1347,13 @@ pub fn collection_page(
                 styles.push(json!({"id":style["id"],"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"tiles":tiles,"legend":legend(style)}));
             }
         }
+        // WMS draws a raster collection, as the layer named by its id.
+        let wms = wms.filter(|_| map_href.is_some() || tiles_href.is_some()).map(safe_href).filter(|href| *href != "#");
         // In the order the switch offers them, the default first (#1220).
-        let modes: Vec<&str> = [tiles_href.map(|_| "tiles"), map_href.map(|_| "maps"), vector_href.map(|_| "vector")].into_iter().flatten().collect();
+        let modes: Vec<&str> = [tiles_href.map(|_| "tiles"), map_href.map(|_| "maps"), wms.map(|_| "wms"), vector_href.map(|_| "vector")].into_iter().flatten().collect();
         // A time axis to choose from: an interval with at least one bound.
         let temporal = doc["extent"]["temporal"]["interval"][0].as_array().is_some_and(|bounds| bounds.iter().any(Value::is_string));
-        json!({"styles":styles,"modes":modes,"vector":vector_href.map(|href| json!({"href":href,"layer":id})),"parameter_names":map_parameters(&doc["parameter_names"]),"times":map_times(&doc["extent"]["temporal"]),"temporal":temporal,"vertical":doc["extent"]["vertical"]})
+        json!({"styles":styles,"modes":modes,"vector":vector_href.map(|href| json!({"href":href,"layer":id})),"wms":wms.map(|href| json!({"href":href,"layer":id})),"parameter_names":map_parameters(&doc["parameter_names"]),"axis":map_axis(&doc["extent"]["temporal"]),"temporal":temporal,"vertical":doc["extent"]["vertical"]})
     });
     // One chip per OGC API the collection is available through. Its kind
     // (`dataType`/`itemType`) is under "Collection details" as Data type; a
@@ -2902,23 +2989,79 @@ mod tests {
         assert_eq!(collection_time_html(&Value::Null), "Not advertised");
     }
 
+    /// #1220: the map's time axis is compact, `{start, step, count}` for a
+    /// regular grid and the list for any other, read from the advertised
+    /// grid only. Nothing is inferred from the bounds alone.
     #[test]
-    fn time_choices_respect_regular_and_irregular_grids_without_inventing_samples() {
+    fn map_axis_encodes_regular_grids_compactly_and_lists_irregular_ones() {
         let mut temporal = json!({"interval":[["2026-09-18T00:00:00Z","2026-09-18T06:00:00Z"]]});
-        assert!(map_times(&temporal).is_empty());
+        assert_eq!(map_axis(&temporal), None);
         temporal["grid"] = json!({"cellsCount":3,"resolution":"PT3H"});
-        let times = map_times(&temporal);
-        assert_eq!(times.len(), 3);
-        // UTC with `Z`, the form `datetime` and the map's fragment take.
-        assert_eq!(times[1], "2026-09-18T03:00:00Z");
-        temporal["grid"] = json!({"cellsCount":3,"coordinates":["2026-09-18T00:00:00Z","2026-09-18T03:00:00+02:00","2026-09-18T06:00:00Z"]});
-        assert_eq!(map_times(&temporal)[1], "2026-09-18T01:00:00Z");
-        temporal["grid"] = json!({"cellsCount":10001,"resolution":"PT1S"});
-        assert!(map_times(&temporal).is_empty());
+        assert_eq!(
+            map_axis(&temporal),
+            Some(json!({"start":"2026-09-18T00:00:00Z","step":10800,"count":3}))
+        );
+        // The grid's first coordinate wins over the interval start, and an
+        // offset is written in UTC with `Z`.
+        temporal["grid"] = json!({"cellsCount":2,"resolution":"PT3H","firstCoordinate":"2026-09-18T05:00:00+02:00"});
+        assert_eq!(
+            map_axis(&temporal),
+            Some(json!({"start":"2026-09-18T03:00:00Z","step":10800,"count":2}))
+        );
+        // 288 five-minute steps or far more stay three numbers.
+        temporal["interval"] = json!([["2026-09-18T00:00:00Z", "2026-10-18T00:00:00Z"]]);
+        temporal["grid"] = json!({"cellsCount":8641,"resolution":"PT5M"});
+        assert_eq!(map_axis(&temporal).unwrap()["count"], 8641);
+        assert!(map_axis(&temporal).unwrap().to_string().len() < 64);
+        temporal["grid"] = json!({"cellsCount":100_001,"resolution":"PT1S"});
+        assert_eq!(map_axis(&temporal), None);
+        temporal["interval"] = json!([["2026-09-18T00:00:00Z", "2026-09-18T06:00:00Z"]]);
+        // A grid reaching past the interval end is no grid of it.
         temporal["grid"] = json!({"cellsCount":3,"resolution":"P1D"});
-        assert!(map_times(&temporal).is_empty());
+        assert_eq!(map_axis(&temporal), None);
+        temporal["grid"] = json!({"cellsCount":3,"resolution":"PT0S"});
+        assert_eq!(map_axis(&temporal), None);
+        // An irregular grid: its coordinates, in UTC with `Z`.
+        temporal["grid"] = json!({"cellsCount":3,"coordinates":["2026-09-18T00:00:00Z","2026-09-18T03:00:00+02:00","2026-09-18T06:00:30Z"]});
+        assert_eq!(
+            map_axis(&temporal),
+            Some(
+                json!({"times":["2026-09-18T00:00:00Z","2026-09-18T01:00:00Z","2026-09-18T06:00:30Z"]})
+            )
+        );
         temporal["grid"] = json!({"cellsCount":2,"coordinates":["invalid","2026-09-18T01:00:00Z"]});
-        assert!(map_times(&temporal).is_empty());
+        assert_eq!(map_axis(&temporal), None);
+        temporal["grid"] = json!({"cellsCount":3,"coordinates":["2026-09-18T00:00:00Z"]});
+        assert_eq!(map_axis(&temporal), None);
+        // An interval of one instant is that instant; an open one is none.
+        let one = json!({"interval":[["2026-09-18T00:00:00Z","2026-09-18T00:00:00Z"]]});
+        assert_eq!(
+            map_axis(&one),
+            Some(json!({"times":["2026-09-18T00:00:00Z"]}))
+        );
+        assert_eq!(
+            map_axis(&json!({"interval":[["2026-09-18T00:00:00Z",null]]})),
+            None
+        );
+        // The form's bounds come from either form.
+        let regular = json!({"start":"2026-09-18T00:00:00Z","step":10800,"count":3});
+        let (first, last, step) = axis_ends(&regular).unwrap();
+        assert_eq!(
+            (
+                crate::subset::rfc3339(first),
+                crate::subset::rfc3339(last),
+                step
+            ),
+            (
+                "2026-09-18T00:00:00Z".into(),
+                "2026-09-18T06:00:00Z".into(),
+                Some(10800)
+            )
+        );
+        assert_eq!(axis_len(&regular), 3);
+        let listed = json!({"times":["2026-09-18T00:00:00Z","2026-09-18T06:00:30Z"]});
+        assert_eq!(axis_ends(&listed).unwrap().2, None);
+        assert_eq!(axis_len(&listed), 2);
     }
 
     #[test]
@@ -3403,17 +3546,36 @@ mod tests {
         assert!(map_controls(&html)
             .contains("<input id=\"map-time\" name=\"datetime\" type=\"datetime-local\""));
 
-        // A grid: its times, to the minute unless they have seconds.
+        // No axis: no time bar either.
+        assert!(!html.contains("id=\"map-timebar\""));
+
+        // A grid (#1220): one date and time bounded by the axis, never an
+        // option per step, and the time bar under the map for the script.
         doc["extent"]["temporal"] = json!({"interval":[["2026-10-17T17:00:00Z","2026-10-17T17:10:30Z"]],
             "grid":{"cellsCount":2,"coordinates":["2026-10-17T17:00:00Z","2026-10-17T17:10:30Z"]}});
         let html = collection_html(shared, &doc, None);
         let controls = map_controls(&html);
-        assert!(controls.contains("<select id=\"map-time\" name=\"datetime\" aria-describedby=\"map-help\"><option value=\"\">Default</option><option value=\"2026-10-17T17:00:00Z\">2026-10-17 17:00</option><option value=\"2026-10-17T17:10:30Z\">2026-10-17 17:10:30</option></select>"));
-        // The arrows step with the script only.
-        assert!(controls
-            .contains("<button type=\"button\" class=\"btn enhanced\" id=\"map-time-prev\""));
-        assert!(controls
-            .contains("<button type=\"button\" class=\"btn enhanced\" id=\"map-time-next\""));
+        assert!(controls.contains("<div class=\"map-time-field\"><label for=\"map-time\">Time · UTC</label><input id=\"map-time\" name=\"datetime\" type=\"datetime-local\" min=\"2026-10-17T17:00:00\" max=\"2026-10-17T17:10:30\" step=\"1\" aria-describedby=\"map-help\"></div>"), "{controls}");
+        assert!(!controls.contains("<option value=\"2026-10-17T17:00:00Z\""));
+        assert!(!controls.contains("map-time-prev"));
+        assert_eq!(
+            map_data(&html)["mapRequest"]["axis"],
+            json!({"times":["2026-10-17T17:00:00Z","2026-10-17T17:10:30Z"]})
+        );
+        let panel = html.split("<div class=\"map-panel\">").nth(1).unwrap();
+        assert!(panel.contains("<div id=\"map-timebar\" class=\"map-timebar enhanced\" role=\"group\" aria-label=\"Time\" hidden>"));
+        assert!(panel.contains("<input id=\"map-playhead\" type=\"range\""));
+        // A regular grid steps the input by its step.
+        doc["extent"]["temporal"] = json!({"interval":[["2026-10-17T00:00:00Z","2026-10-17T23:55:00Z"]],
+            "grid":{"cellsCount":288,"resolution":"PT5M"}});
+        let html = collection_html(shared, &doc, None);
+        assert!(map_controls(&html)
+            .contains(" min=\"2026-10-17T00:00:00\" max=\"2026-10-17T23:55:00\" step=\"300\""));
+        assert!(map_controls(&html).contains("the 288 advertised times"));
+        assert_eq!(
+            map_controls(&html).matches("<option value=\"2026").count(),
+            0
+        );
     }
 
     /// #1136: the panel says where the page lists the same facts when the
@@ -3553,9 +3715,74 @@ mod tests {
         assert_eq!(map_controls(&html).matches(" formaction=").count(), 0);
     }
 
+    /// #1220: `mapRequest` carries each parameter's own axis, and offers
+    /// WMS GetMap as a draw mode for a raster collection the WMS serves:
+    /// after Maps, outside the no-JS form, as the layer named by its id.
+    #[test]
+    fn map_request_carries_parameter_axes_and_the_wms_draw_mode() {
+        let shared = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let doc = json!({"id":"sat","extent":{"spatial":{"bbox":[[20,60,30,70]]},
+                "temporal":{"interval":[["2026-10-17T00:00:00Z","2026-10-17T00:20:00Z"]],
+                    "grid":{"cellsCount":3,"resolution":"PT10M"}}},
+            "links":[{"rel":"self","href":"https://x/collections/sat"},
+                {"rel":rel::MAP,"href":"https://x/collections/sat/map"},
+                {"rel":rel::TILESETS_MAP,"href":"https://x/collections/sat/map/tiles"}],
+            "parameter_names":{
+                "ir":{"type":"Parameter","label":"Infrared",
+                    "extent":{"temporal":{"interval":[["2026-10-17T00:05:00Z","2026-10-17T00:15:00Z"]],
+                        "grid":{"cellsCount":2,"resolution":"PT10M","firstCoordinate":"2026-10-17T00:05:00Z"}}}},
+                "vis":{"type":"Parameter","label":"Visible"}}});
+        let html = collection_page(shared, &doc, None, None, Some("https://x/wms"));
+        let request = &map_data(&html)["mapRequest"];
+        assert_eq!(request["modes"], json!(["tiles", "maps", "wms"]));
+        assert_eq!(
+            request["wms"],
+            json!({"href":"https://x/wms","layer":"sat"})
+        );
+        assert_eq!(
+            request["axis"],
+            json!({"start":"2026-10-17T00:00:00Z","step":600,"count":3})
+        );
+        assert!(request.get("times").is_none());
+        let axes: Vec<(&str, &Value)> = request["parameter_names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["name"].as_str().unwrap(), &p["axis"]))
+            .collect();
+        assert!(axes.contains(&(
+            "ir",
+            &json!({"start":"2026-10-17T00:05:00Z","step":600,"count":2})
+        )));
+        assert!(axes.contains(&("vis", &Value::Null)));
+        let controls = map_controls(&html);
+        let (switch, form) = controls.split_once("<form").unwrap();
+        assert!(switch.contains("<label><input type=\"radio\" name=\"map-mode\" value=\"wms\"> WMS GetMap · one image per view</label>"));
+        assert!(!form.contains("wms"));
+        // Map tiles stay the default.
+        assert!(switch.contains("value=\"tiles\" checked"));
+
+        // Without WMS, or for vector tiles alone, there is no WMS mode.
+        let html = collection_html(shared, &doc, None);
+        assert!(map_data(&html)["mapRequest"]["wms"].is_null());
+        assert_eq!(
+            map_data(&html)["mapRequest"]["modes"],
+            json!(["tiles", "maps"])
+        );
+        let vector = json!({"id":"regions","links":[{"rel":"self","href":"https://x/collections/regions"},
+            {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/regions/tiles"}]});
+        let html = collection_page(shared, &vector, None, None, Some("https://x/wms"));
+        assert_eq!(map_data(&html)["mapRequest"]["modes"], json!(["vector"]));
+    }
+
     /// The map panel of `tests/fixtures/map-panel.html`, which the map
     /// script's node tests (`tests/map.test.cjs`) parse and run against: map
-    /// tiles and Maps, two parameters, two styles, a time grid and levels.
+    /// tiles, Maps and WMS, two parameters (one on its own time axis), two
+    /// styles, a time grid and levels.
     fn map_panel_fixture() -> String {
         let shared = Surface {
             base: "https://x",
@@ -3574,7 +3801,9 @@ mod tests {
             // In name order, which is also document order: the options read
             // the same with and without serde_json's `preserve_order`.
             "parameter_names":{
-                "r":{"type":"Parameter","label":"Relative humidity","unit":{"symbol":"%"}},
+                "r":{"type":"Parameter","label":"Relative humidity","unit":{"symbol":"%"},
+                    "extent":{"temporal":{"interval":[["2024-01-01T00:30:00Z","2024-01-01T01:30:00Z"]],
+                        "grid":{"cellsCount":2,"coordinates":["2024-01-01T00:30:00Z","2024-01-01T01:30:00Z"]}}}},
                 "t":{"type":"Parameter","observedProperty":{"label":{"en":"Temperature (t)"}},
                     "unit":{"symbol":{"value":"K"}}}},
             "styles":[{"id":"default","title":"Default","links":[legend("default")]},
@@ -3582,7 +3811,7 @@ mod tests {
                     {"rel":rel::MAP,"href":"https://x/collections/nwp/styles/warm/map"},
                     {"rel":rel::TILESETS_MAP,"href":"https://x/collections/nwp/styles/warm/map/tiles"},
                     legend("warm")]}]});
-        let html = collection_html(shared, &doc, None);
+        let html = collection_page(shared, &doc, None, None, Some("https://x/wms"));
         let start = html.find("<div id=\"map-controls\"").unwrap();
         let end = start + html[start..].find("<script").unwrap();
         format!("{}\n", &html[start..end])
@@ -3929,23 +4158,25 @@ mod tests {
             filterables: vec!["name".into(), "a b/c".into()],
             sortables: vec!["volume_count".into()],
         };
-        let html = collection_page(SHARED_X, &doc, None, Some(&overview));
+        let html = collection_page(SHARED_X, &doc, None, Some(&overview), None);
         assert!(html.contains("<p>Polar volumes</p><p class=\"items-note\">Radar site inventory: one point per radar.</p>"));
         assert!(html.contains("<span class=\"row-label\">Filter by</span><span class=\"chip-row\"><a class=\"chip\" href=\"https://x/collections/b/items?f=html#filter=name\">name</a><a class=\"chip\" href=\"https://x/collections/b/items?f=html#filter=a%20b%2Fc\">a b/c</a></span>"), "{html}");
         assert!(html.contains("<a class=\"chip\" href=\"https://x/collections/b/items?f=html#sort=volume_count\">volume_count</a>"));
         // Nothing to say, no rows; no items link, no chips.
-        let html = collection_page(SHARED_X, &doc, None, Some(&ItemsOverview::default()));
+        let html = collection_page(SHARED_X, &doc, None, Some(&ItemsOverview::default()), None);
         // The stylesheet is inline: look for the elements.
         assert!(
             !html.contains("class=\"row-line item-fields\"")
                 && !html.contains("class=\"items-note\"")
         );
         let no_items = json!({"id": "b", "links": []});
-        assert!(!collection_page(SHARED_X, &no_items, None, Some(&overview))
-            .contains("class=\"row-line item-fields\""));
+        assert!(
+            !collection_page(SHARED_X, &no_items, None, Some(&overview), None)
+                .contains("class=\"row-line item-fields\"")
+        );
         assert_eq!(
             collection_html(SHARED_X, &doc, None),
-            collection_page(SHARED_X, &doc, None, None)
+            collection_page(SHARED_X, &doc, None, None, None)
         );
     }
 

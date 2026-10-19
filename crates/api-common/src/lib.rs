@@ -58,6 +58,9 @@ pub mod mounts {
     pub const FEATURES: &str = "/features";
     pub const MAPS: &str = "/maps";
     pub const TILES: &str = "/tiles";
+    /// WMS 1.3.0, outside the shared root: the collection page's WMS draw
+    /// mode requests its GetMap here (#1220).
+    pub const WMS: &str = "/wms";
 }
 
 /// Registered OGC link relation types. Standards print some as `https://`
