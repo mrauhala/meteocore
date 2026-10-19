@@ -521,6 +521,17 @@
       // Frames of the current layer that failed or had no data, by instant:
       // marked on the track and skipped in playback.
       const marks = new Map();
+      // Frames that have loaded at least once, by frame key. The pool keeps
+      // only the frames ahead, so a frame shown and dropped is still in: its
+      // explicit-time response is in the browser cache for the next loop.
+      // Keys of other layers and views never match again, so the set is
+      // cleared when it reaches LOADED_LIMIT, far above any loop window.
+      const loaded = new Set();
+      const LOADED_LIMIT = 2048;
+      // A hold shorter than this shows no chip: a frame a moment late on
+      // every step would otherwise flash the chip once a frame.
+      const HOLD_CHIP_DELAY = 400;
+      let holdChipTimer;
       const connection = typeof navigator === 'object' ? navigator.connection : undefined;
       const saveData = Boolean(connection?.saveData);
       const metered = saveData || /^(slow-2g|2g|3g)$/.test(connection?.effectiveType || '') || connection?.type === 'cellular';
@@ -786,15 +797,33 @@
         playButton.classList.toggle('buffering', playing && holding);
         bufferChip();
       }
-      // While playback waits for a frame, the chip counts the loop's frames
-      // in, "Loading 6/24"; the live region says nothing per frame.
+      // While playback waits for a frame longer than HOLD_CHIP_DELAY, the
+      // chip counts the loop's frames loaded so far, "Loading 6/24": every
+      // frame that has loaded once counts, not only those still buffered.
+      // The live region says nothing per frame.
       function bufferChip() {
         if (playing && holding && axis.length) {
-          let ready = 0;
-          for (let i = win.lo; i <= win.hi; i++) if (readyAt(i)) ready++;
-          showChip(`Loading ${ready}/${win.hi - win.lo + 1}`, 'loading');
-          chipBuffering = true;
-        } else if (chipBuffering) showChip('');
+          if (chipBuffering) { showBufferCount(); return; }
+          if (holdChipTimer === undefined) {
+            holdChipTimer = setTimeout(() => {
+              holdChipTimer = undefined;
+              if (playing && holding) showBufferCount();
+            }, HOLD_CHIP_DELAY);
+          }
+          return;
+        }
+        clearTimeout(holdChipTimer); holdChipTimer = undefined;
+        if (chipBuffering) showChip('');
+      }
+      function showBufferCount() {
+        const view = state.mode === 'tiles' ? undefined : imageView();
+        let ready = 0;
+        for (let i = win.lo; i <= win.hi; i++) {
+          if (readyAt(i, view) || loaded.has(frameKey({ ...state, datetime: instant(axis[i]) }, view))) ready++;
+        }
+        const total = win.hi - win.lo + 1;
+        showChip(ready < total ? `Loading ${ready}/${total}` : 'Loading…', 'loading');
+        chipBuffering = true;
       }
       function play() {
         if (playing || axis.length < 2) return;
@@ -1408,6 +1437,8 @@
       // waits, and buffering goes on.
       function frameReady(frame) {
         frame.state = 'ready';
+        if (loaded.size >= LOADED_LIMIT) loaded.clear();
+        loaded.add(frame.key);
         busyStreak = 0;
         if (marks.delete(frame.ms)) drawBuffer();
         if (pendingFront === frame) promote(frame);
