@@ -17,8 +17,8 @@ pressure axis as the collection's vertical axis (PR 8, the last of the
   level or units is skipped with a WARN. Units, and level units, compare in
   any spelling (`Variable::same_quantity`, `ds_core::units::same_unit`):
   `kg m-2` in a later file is the first file's `kg/m^2`. The first file's
-  unit decides the display conversion (see "Display units"), and its
-  spelling is served where none applies. The layout lives as long as the
+  unit and standard name decide the display conversion (see "Display
+  units"), and its spelling is served where none applies. The layout lives as long as the
   engine.
 - **Time from the file, never its name:** valid times from the fields'
   `time` axis (`ds_core::cf::decode_times`, which reads MEPS's
@@ -408,12 +408,15 @@ and every other unit-keyed match read them through
 ## Display units (#1209)
 
 - **One rule per variable:** `Layout::display`, built once with the layout
-  from each variable's CF `units` through
-  `ds_core::units::display_conversion`, the rules engine-bufr uses and
-  engine-grib's `default_display` twins: K → °C, Pa → hPa, kg m-2 → mm
-  (identity), kg m-2 s-1 → mm/h (× 3600, #1213), m2 s-2 → gpm, in any
-  spelling. A unit without a rule (CF's
-  `1`, m/s, `%`) is `None` and served as stored. Never a name table.
+  from each variable's CF `units` and `standard_name` through
+  `ds_core::units::cf_display_conversion`: the rules engine-bufr uses and
+  engine-grib's `default_display` twins (K → °C, Pa → hPa, kg m-2 → mm
+  identity, kg m-2 s-1 → mm/h × 3600 #1213, m2 s-2 → gpm, in any
+  spelling), plus CF's `1` → % × 100 when the standard name is
+  `relative_humidity` or ends in `_area_fraction` or `_area_fraction_in_atmosphere_layer` (MEPS relative humidity and cloud cover). A unit without a rule
+  (m/s, `%`, `1` with any other standard name or none) is `None` and served
+  as stored. Never a name table: the standard name is source metadata, the
+  variable name decides nothing.
 - **Sample, then convert, in `f64`:** maps through
   `OutputMap::sample_f32_with` (`lib.rs` `sample_display`; an identity rule
   takes plain `sample_f32`), EDR position/area/radius and GetFeatureInfo by
@@ -433,11 +436,13 @@ and every other unit-keyed match read them through
 - **Styles:** MEPS takes the defaults by served unit: temperature
   `temperature` −90…50 °C, MSLP `pressure` 950–1050 hPa, the run-start
   accumulation `precipitation_accumulation` 0–200 mm, geopotential
-  `viridis` 0–21 000 gpm, relative humidity and cloud cover the fraction
-  palettes 0–1 (unit `1`). The shipped examples keep only the ±20 m/s
+  `viridis` 0–21 000 gpm, relative humidity and cloud cover `humidity` and
+  `cloud_cover` 0–100 (served in %). The shipped examples keep only the ±20 m/s
   surface wind components and a collection-level `temperature` palette with
   no range.
-- Pinned by `tests/integration.rs` `values_are_served_in_display_units`,
+- Pinned by `tests/integration.rs` `values_are_served_in_display_units`
+  (relative humidity and cloud cover in % included), `catalog/tests.rs`
+  `unit_1_is_percent_only_for_a_fraction_standard_name`,
   ds-core's `a_converting_render_converts_each_sample_before_narrowing`,
   the server's `wms_get_feature_info` (values and `unit` per variable),
   `netcdf_edr` (QUDT `DEG_C`/`HectoPA`) and the admin example-style tests.
