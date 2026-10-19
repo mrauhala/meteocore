@@ -1348,6 +1348,7 @@ mod tests {
                 unit: "°C".into(),
                 observed_property: "air_temperature".into(),
                 source_key: "t2m".into(),
+                filter: Default::default(),
             },
             ValidatedParameter {
                 name: "ws".into(),
@@ -1355,6 +1356,7 @@ mod tests {
                 unit: "m/s".into(),
                 observed_property: "wind_speed".into(),
                 source_key: "ws".into(),
+                filter: Default::default(),
             },
         ];
         let descs = build_parameter_descriptions(&params);

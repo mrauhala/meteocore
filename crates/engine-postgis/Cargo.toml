@@ -31,3 +31,7 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
+# The database tests grid a PostGIS source through the station-grid engine,
+# as the server wires one, to show filtered values never reach an analysis
+# (#1210).
+engine-station-grid = { path = "../engine-station-grid" }

@@ -71,6 +71,8 @@ pub enum PostgisConfigError {
         key: String,
         where_: &'static str,
     },
+    #[error("parameter '{name}' {reason}")]
+    InvalidValueFilter { name: String, reason: String },
 }
 
 /// Validated, engine-ready view of [`ds_core::config::PostgisConfig`]. All
@@ -188,6 +190,24 @@ pub struct ValidatedParameter {
     pub unit: String,
     pub observed_property: String,
     pub source_key: String,
+    /// `valid_range` and `missing_values` (#1210).
+    pub filter: ValueFilter,
+}
+
+/// Which values of a parameter are observations (#1210): those inside the
+/// inclusive `range` and equal to none of the `missing` sentinels. The query
+/// builders select every other value as NULL, so a series keeps its time and
+/// every latest-value read skips it. Empty: every value is one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ValueFilter {
+    pub range: Option<(f64, f64)>,
+    pub missing: Vec<f64>,
+}
+
+impl ValueFilter {
+    pub fn is_empty(&self) -> bool {
+        self.range.is_none() && self.missing.is_empty()
+    }
 }
 
 impl PostgisEngineConfig {
@@ -271,6 +291,11 @@ impl PostgisEngineConfig {
                     check_identifier(&source_key, "parameters[].source_key (events column)")?;
                 }
             }
+            p.check_value_filter()
+                .map_err(|reason| PostgisConfigError::InvalidValueFilter {
+                    name: p.name.clone(),
+                    reason,
+                })?;
             parameters.push(ValidatedParameter {
                 name: check_identifier(&p.name, "parameters[].name")?,
                 label: p.label.clone(),
@@ -280,6 +305,13 @@ impl PostgisEngineConfig {
                     .clone()
                     .unwrap_or_else(|| p.name.clone()),
                 source_key,
+                filter: ValueFilter {
+                    range: match p.valid_range.as_deref() {
+                        Some(&[min, max]) => Some((min, max)),
+                        _ => None,
+                    },
+                    missing: p.missing_values.clone(),
+                },
             });
         }
 
@@ -466,6 +498,8 @@ mod tests {
                     unit: "°C".into(),
                     observed_property: Some("air_temperature".into()),
                     source_key: None,
+                    valid_range: None,
+                    missing_values: vec![],
                 },
                 PostgisParameterConfig {
                     name: "ws_10m".into(),
@@ -473,6 +507,8 @@ mod tests {
                     unit: "m/s".into(),
                     observed_property: Some("wind_speed".into()),
                     source_key: None,
+                    valid_range: None,
+                    missing_values: vec![],
                 },
             ],
             map: None,
@@ -751,6 +787,8 @@ mod tests {
                 unit: "kA".into(),
                 observed_property: None,
                 source_key: None,
+                valid_range: None,
+                missing_values: vec![],
             }],
             map: None,
         }
@@ -848,6 +886,44 @@ mod tests {
                 PostgisEngineConfig::resolve(&cfg),
                 Err(PostgisConfigError::InvalidMap(_))
             ));
+        }
+    }
+
+    /// #1210: `valid_range` and `missing_values` lower into the parameter's
+    /// `ValueFilter`; without them it is empty. A bad one is an error even if
+    /// config validation was bypassed.
+    #[test]
+    fn resolve_value_filters() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let mut cfg = nexus_config();
+        cfg.parameters[0].valid_range = Some(vec![-80.0, 60.0]);
+        cfg.parameters[0].missing_values = vec![-32766.0, -9999.0];
+        let resolved = PostgisEngineConfig::resolve(&cfg).unwrap();
+        assert_eq!(
+            resolved.parameters[0].filter,
+            ValueFilter {
+                range: Some((-80.0, 60.0)),
+                missing: vec![-32766.0, -9999.0],
+            }
+        );
+        assert!(!resolved.parameters[0].filter.is_empty());
+        assert!(resolved.parameters[1].filter.is_empty());
+
+        for (range, missing) in [
+            (Some(vec![60.0, -80.0]), vec![]),
+            (Some(vec![f64::NAN, 1.0]), vec![]),
+            (Some(vec![1.0]), vec![]),
+            (None, vec![f64::INFINITY]),
+            (None, vec![0.0; 17]),
+        ] {
+            cfg.parameters[0].valid_range = range;
+            cfg.parameters[0].missing_values = missing;
+            let err = PostgisEngineConfig::resolve(&cfg).unwrap_err();
+            assert!(
+                matches!(err, PostgisConfigError::InvalidValueFilter { ref name, .. } if name == "t2m"),
+                "got: {err:?}"
+            );
         }
     }
 }

@@ -3155,6 +3155,58 @@ pub struct PostgisParameterConfig {
     /// For `long`: the string literal stored in `param_col`.
     /// For `wide`/`per_parameter`: column/table key. Defaults to `name`.
     pub source_key: Option<String>,
+    /// Inclusive `[min, max]` of the values that are observations (#1210).
+    /// A value outside it is served as null, so a series keeps its time and
+    /// the latest-value reads (station map layers, a station grid over the
+    /// collection) skip it. Optional. A list rather than `[f64; 2]`, whose
+    /// TOML parse ignores a third number: the check below wants exactly two.
+    #[serde(default)]
+    pub valid_range: Option<Vec<f64>>,
+    /// Values a source stores for "missing" instead of NULL (#1210), such as
+    /// `[-32766]`: served as null, like a value outside `valid_range`. At most
+    /// [`POSTGIS_MAX_MISSING_VALUES`]. Optional.
+    #[serde(default)]
+    pub missing_values: Vec<f64>,
+}
+
+/// Most `missing_values` one `[[postgis.parameters]]` entry lists (#1210):
+/// sentinels are a handful of codes, and each statement binds them all.
+pub const POSTGIS_MAX_MISSING_VALUES: usize = 16;
+
+impl PostgisParameterConfig {
+    /// Check `valid_range` and `missing_values` (#1210): finite numbers,
+    /// `min <= max`, at most [`POSTGIS_MAX_MISSING_VALUES`] sentinels. Config
+    /// load and engine-postgis's resolve both run it.
+    pub fn check_value_filter(&self) -> Result<(), String> {
+        if let Some(range) = &self.valid_range {
+            let &[min, max] = range.as_slice() else {
+                return Err(format!(
+                    "valid_range must be two numbers [min, max], got {}",
+                    range.len()
+                ));
+            };
+            if !(min.is_finite() && max.is_finite()) {
+                return Err(format!(
+                    "valid_range [{min}, {max}] must be two finite numbers"
+                ));
+            }
+            if min > max {
+                return Err(format!(
+                    "valid_range [{min}, {max}] has its minimum above its maximum"
+                ));
+            }
+        }
+        if self.missing_values.len() > POSTGIS_MAX_MISSING_VALUES {
+            return Err(format!(
+                "missing_values lists {} values, at most {POSTGIS_MAX_MISSING_VALUES}",
+                self.missing_values.len()
+            ));
+        }
+        if let Some(v) = self.missing_values.iter().find(|v| !v.is_finite()) {
+            return Err(format!("missing_values entry {v} is not a finite number"));
+        }
+        Ok(())
+    }
 }
 
 /// Byte-level check for `^[A-Za-z_][A-Za-z0-9_]{0,62}$` — no regex dep.
@@ -3350,6 +3402,8 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
                 p.name
             )));
         }
+        p.check_value_filter()
+            .map_err(|e| Config(format!("Collection '{id}': parameter '{}' {e}", p.name)))?;
     }
 
     // -- stations (optional) ----------------------------------------------
@@ -6947,6 +7001,89 @@ observed_property = "wind_speed"
 
         // A negative count is not a usize: rejected by the parser.
         assert!(load(&with("-5")).is_err());
+    }
+
+    /// #1210: `valid_range` and `missing_values` are optional, read as
+    /// numbers (TOML integers included) and bounded at load: two finite
+    /// numbers with `min <= max`, at most 16 finite sentinels.
+    #[test]
+    fn postgis_parameter_value_filter_validated_at_load() {
+        let with = |lines: &str| {
+            nexus_postgis_toml().replace(
+                "observed_property = \"air_temperature\"",
+                &format!("observed_property = \"air_temperature\"\n{lines}"),
+            )
+        };
+        let load = |toml: &str| {
+            let tmp = TempDir::new().unwrap();
+            let path = write_config(tmp.path(), "config.toml", toml);
+            ServerConfig::from_file(path.to_str().unwrap()).map(|(config, _)| config)
+        };
+
+        let config = load(nexus_postgis_toml()).unwrap();
+        let p = &config.collections[0].postgis.as_ref().unwrap().parameters[0];
+        assert_eq!(p.valid_range, None);
+        assert!(p.missing_values.is_empty());
+
+        let config = load(&with(
+            "valid_range = [-80, 60.5]\nmissing_values = [-32766, -9999.5]",
+        ))
+        .unwrap();
+        let pg = config.collections[0].postgis.as_ref().unwrap();
+        assert_eq!(pg.parameters[0].valid_range, Some(vec![-80.0, 60.5]));
+        assert_eq!(pg.parameters[0].missing_values, vec![-32766.0, -9999.5]);
+        // The other parameter is untouched.
+        assert_eq!(pg.parameters[1].valid_range, None);
+        // A single-value range is valid.
+        assert!(load(&with("valid_range = [0, 0]")).is_ok());
+        let sixteen = vec!["-1"; POSTGIS_MAX_MISSING_VALUES].join(", ");
+        assert!(load(&with(&format!("missing_values = [{sixteen}]"))).is_ok());
+
+        let seventeen = vec!["-1"; POSTGIS_MAX_MISSING_VALUES + 1].join(", ");
+        for (lines, expected) in [
+            (
+                "valid_range = [60, -80]".to_string(),
+                "parameter 't2m' valid_range [60, -80] has its minimum above its maximum",
+            ),
+            (
+                "valid_range = [nan, 1]".to_string(),
+                "parameter 't2m' valid_range [NaN, 1] must be two finite numbers",
+            ),
+            (
+                "valid_range = [-inf, 1]".to_string(),
+                "valid_range [-inf, 1] must be two finite numbers",
+            ),
+            (
+                format!("missing_values = [{seventeen}]"),
+                "parameter 't2m' missing_values lists 17 values, at most 16",
+            ),
+            (
+                "missing_values = [-32766, inf]".to_string(),
+                "missing_values entry inf is not a finite number",
+            ),
+        ] {
+            let err = load(&with(&lines)).unwrap_err().to_string();
+            assert!(err.contains(expected), "{lines}: {err}");
+        }
+        // Not a pair.
+        for (lines, expected) in [
+            (
+                "valid_range = [1]",
+                "valid_range must be two numbers [min, max], got 1",
+            ),
+            (
+                "valid_range = [1, 2, 3]",
+                "valid_range must be two numbers [min, max], got 3",
+            ),
+            (
+                "valid_range = []",
+                "valid_range must be two numbers [min, max], got 0",
+            ),
+        ] {
+            let err = load(&with(lines)).unwrap_err().to_string();
+            assert!(err.contains(expected), "{lines}: {err}");
+        }
+        assert!(load(&with("valid_range = [\"0\", 1]")).is_err());
     }
 
     /// #1061: the events shape has no location list, so the knob would do
