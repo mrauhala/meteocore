@@ -1145,6 +1145,13 @@ FMI QueryData (.sqd) binary format for NWP gridded data. Implements `EdrEngine` 
 - **EDR position queries** use bilinear interpolation across grid points.
 - **Map rendering** uses nearest-neighbor resampling.
 - **Missing value sentinel:** 32700.0 (treated as `None`).
+- **Names:** a descriptor that ends in a short name in parentheses,
+  `2 Metre Temperature (2t)`, goes by that short name on the map APIs: the
+  WMS layer `ecmwf-kenya/2t`, Maps/Tiles `parameter-name=2t`, and the
+  default the collection layer draws. EDR advertises the full descriptor
+  and also takes the short name in `parameter-name`, keying the coverage by
+  the name asked for (#1215). A descriptor without parentheses is the one
+  name everywhere.
 - **Units** come from each parameter's FMI newbase number, since a `.sqd`
   file carries no unit string (#1211): `Pressure` hPa, `Temperature` and
   `DewPoint` °C, `Humidity` and the cloud covers %, `WindSpeedMS`, `WindUMS`, `WindVMS` and the gusts m/s,
@@ -1180,11 +1187,9 @@ apis = ["edr", "wms", "maps", "tiles"]
 wms_parameter = "2t"
 poll_interval_secs = 60
 
-# The parameter layers take the built-in defaults by unit (2t → temperature,
-# msl → pressure). The collection layer draws this palette: its default is
-# the full descriptor "2 Metre Temperature (2t)", which names no `2t` layer.
-[collections.wms]
-colormap = "temperature"
+# No [collections.wms]: the parameter layers take the built-in defaults by
+# unit (2t → temperature, msl → pressure), and the collection layer draws
+# its default parameter, 2t, with that layer's style.
 ```
 
 ### Zarr

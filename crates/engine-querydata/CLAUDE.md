@@ -5,7 +5,8 @@ FMI QueryData (`.sqd`) binary-format engine. Memory-mapped file access via
 runtime).
 
 - **Multi-parameter:** exposes all parameters from the file; `wms_parameter`
-  config (name / short name / ID) selects which to render.
+  config (name / short name / ID) selects which to render, reported by its
+  map name.
 - **Model runs (#337):** polls the directory and retains the most recent
   `max_runs` `.sqd` files as model runs, keyed by each file's **origin
   (analysis) time** (`RunSet: BTreeMap<DateTime<Utc>, _>`), atomically
@@ -83,12 +84,18 @@ runtime).
   PrecipitationRate (49) because FMI's converters write it in both mm/h
   and kg m-2 s-1. Every unit-reporting path reads it: EDR descriptions
   (`description()`), `RasterInfo.parameters`/`unit`, and `wind_facts`
-  (derived speed takes the components' `m s-1`). `RasterInfo.parameter` is
-  still the full descriptor (`2 Metre Temperature (2t)`), not the map name,
-  so a parenthesised default does not route the root layer to its
-  parameter's style (#1161, follow-up #1215).
-- **Names:** EDR uses the full descriptor (`2 Metre Temperature (2t)`), the
-  map APIs the short name in parentheses (`2t`, `map_name`).
+  (derived speed takes the components' `m s-1`).
+- **Names (#1215):** the map APIs name a parameter by the short name in
+  parentheses at the end of its descriptor (`2t` for
+  `2 Metre Temperature (2t)`, `map_name`), and so does `RasterInfo.parameter`,
+  so the root layer draws `{collection}/{default}`'s style (#1161). EDR
+  advertises the full descriptor (`get_parameters`, descriptions) and
+  `select_parameters` also takes the short name as its alias on every query
+  type, descriptor first (the map's `param_index_by_name` order), keying the
+  coverage by the name asked for: WMS GetFeatureInfo asks for the map name.
+  Both names of one parameter are two ranges, which `DerivedWind` relies on
+  (it asks for components by descriptor). Errors stay the shared
+  `ds_core::edr_engine::select_parameters` 400.
 - **Wind (#897):** `wind_facts` reports each parameter's FMI number and both
   names, built with the run set. `ds_core::wind` pairs `kFmiWindUMS` /
   `kFmiWindVMS` (23/24), or vocabulary short names, into `WindSpeedMS` (or

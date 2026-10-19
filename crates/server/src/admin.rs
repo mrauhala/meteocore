@@ -7934,9 +7934,12 @@ mod tests {
 
     /// #1211: QueryData reports each parameter's unit from its FMI number,
     /// so the unit-gated built-in defaults style the committed fixtures'
-    /// temperature and pressure layers with no `[wms]` configured, and the
-    /// MEPS root layer draws its default `Temperature` with its own style
-    /// (#1161), so it is not the generic palette the #320 warning names.
+    /// temperature and pressure layers with no `[wms]` configured, and each
+    /// root layer draws its default parameter with that parameter's own
+    /// style (#1161), so it is not the generic palette the #320 warning
+    /// names: MEPS's `Temperature`, and Kenya's first parameter, the
+    /// descriptor `Mean Sea Level Pressure (msl)`, named `msl` as its layer
+    /// is (#1215).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn querydata_fixtures_take_the_unit_gated_defaults() {
         let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
@@ -7977,20 +7980,76 @@ mod tests {
             assert_eq!((style.min, style.max), range, "{layer}");
         }
 
-        let info = result.wms_state.engines["meps"].raster_info_shared();
-        let root =
-            ds_render::resolve_layer_style(styles, "meps", None, Some(&info), "default").unwrap();
-        assert_eq!(root.layer, "meps/Temperature");
         let no_bundles = HashMap::new();
-        assert!(super::generic_root_layer(
-            &ctx,
-            &collections[1],
-            &no_bundles,
-            styles,
-            "meps",
-            &info
-        )
-        .is_none());
+        for (collection, default) in collections.iter().zip(["kenya/msl", "meps/Temperature"]) {
+            let id = collection.id.as_str();
+            let info = result.wms_state.engines[id].raster_info_shared();
+            let root =
+                ds_render::resolve_layer_style(styles, id, None, Some(&info), "default").unwrap();
+            assert_eq!(root.layer, default);
+            assert!(
+                super::generic_root_layer(&ctx, collection, &no_bundles, styles, id, &info)
+                    .is_none(),
+                "{id}"
+            );
+        }
+    }
+
+    /// #1215: the shipped Kenya QueryData example, loaded over its committed
+    /// fixture, has no `[wms]`. Its default, `wms_parameter = "2t"`, is the
+    /// descriptor `2 Metre Temperature (2t)`, named `2t` as its layer is, so
+    /// the root layer draws `2t`'s own built-in temperature style on WMS,
+    /// Maps and Tiles, and no generic-palette warning fires.
+    #[test]
+    fn querydata_kenya_example_root_layer_draws_its_default_parameter() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = std::fs::read_to_string(root.join("collections.d/ecmwf-kenya.toml")).unwrap();
+        let mut collection: CollectionConfig = toml::from_str(&text).unwrap();
+        assert!(collection.wms.is_none(), "the example needs no [wms]");
+        collection.data_path = Some(
+            root.join("testdata/ecmwf-kenya")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let id = "ecmwf-kenya";
+        let loaded = load_with_reuse(
+            std::slice::from_ref(&collection),
+            super::EngineReuse::default(),
+        );
+        for (engines, styles) in [
+            (&loaded.wms_state.engines, &loaded.wms_state.styles),
+            (&loaded.maps_state.engines, &loaded.maps_state.styles),
+            (&loaded.tiles_state.map_engines, &loaded.tiles_state.styles),
+        ] {
+            let info = engines[id].raster_info_shared();
+            assert_eq!((info.parameter.as_str(), info.unit.as_str()), ("2t", "°C"));
+            let drawn =
+                ds_render::resolve_layer_style(styles, id, None, Some(&info), "default").unwrap();
+            assert_eq!(drawn.layer, "ecmwf-kenya/2t");
+            assert_eq!(drawn.parameter, Some("2t"));
+            assert_eq!(
+                (
+                    drawn.style.palette.name.as_str(),
+                    drawn.style.min,
+                    drawn.style.max
+                ),
+                ("temperature", -90.0, 50.0)
+            );
+            let ctx = ds_render::StyleContext::with_builtins();
+            assert!(super::generic_root_layer(
+                &ctx,
+                &collection,
+                &HashMap::new(),
+                styles,
+                id,
+                &info
+            )
+            .is_none());
+        }
+        // EDR still advertises the descriptors.
+        assert!(loaded.edr_state.engines[id]
+            .get_parameters()
+            .contains(&"2 Metre Temperature (2t)".to_string()));
     }
 
     /// #320 / #1161: the generic-palette warning fires only when the root

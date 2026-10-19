@@ -197,11 +197,12 @@ static RULES: &[DefaultRule] = &[
     // rule's scale. Before it, so a "u-component of wind gust" title stays
     // signed. CF's grid-relative `x_wind`/`y_wind` and MET Norway's
     // `x_wind_10m`/`y_wind_10m` (#1067) are exact names: a `contains`
-    // "xwind" would claim every `max_wind…`.
+    // "xwind" would claim every `max_wind…`. FMI newbase's `WindUMS` /
+    // `WindVMS` (#1215) are QueryData's u and v, in m/s by their numbers.
     DefaultRule {
         names: &[
             "u", "v", "10u", "10v", "100u", "100v", "u10", "v10", "u100", "v100", "ugrd", "vgrd",
-            "xwind", "ywind", "xwind10m", "ywind10m",
+            "xwind", "ywind", "xwind10m", "ywind10m", "windums", "windvms",
         ],
         contains: &[
             "componentofwind",
@@ -218,10 +219,22 @@ static RULES: &[DefaultRule] = &[
     },
     // Wind speed, native or derived from u/v (#897: `10si`, `100si`, `ws`,
     // wgrib2 `WIND`, FMI `WindSpeedMS`, CF stores' `…wind_speed…`; every
-    // derived title starts "Wind speed").
+    // derived title starts "Wind speed"), and gusts. FMI newbase's
+    // `HourlyMaximumGust` (#1215, m/s by its number) needs its exact name:
+    // it holds no "windgust".
     DefaultRule {
         names: &[
-            "ws", "ff", "si10", "10si", "si100", "100si", "wind", "gust", "fg", "wgust",
+            "ws",
+            "ff",
+            "si10",
+            "10si",
+            "si100",
+            "100si",
+            "wind",
+            "gust",
+            "fg",
+            "wgust",
+            "hourlymaximumgust",
         ],
         contains: &["windspeed", "windgust"],
         palette: "wind_speed",
@@ -691,6 +704,48 @@ mod tests {
             ("WindDirection", "Wind direction"),
         ] {
             assert_eq!(d.match_default(name, title, Some("°")), None, "{name}");
+        }
+    }
+
+    /// #1215: FMI newbase's u and v components, `WindUMS` / `WindVMS`, are
+    /// signed winds on the u/v rule's diverging scale, and its
+    /// `HourlyMaximumGust` a speed, both by unit like the other winds.
+    /// QueryData lists each descriptor as its own title.
+    #[test]
+    fn newbase_wind_components_and_gusts_get_the_wind_defaults() {
+        let d = builtin();
+        for name in ["WindUMS", "WindVMS"] {
+            for (unit, range) in [
+                (Some("m s-1"), (-40.0, 40.0)),
+                (Some("m/s"), (-40.0, 40.0)),
+                (Some("kt"), (-80.0, 80.0)),
+            ] {
+                let m = d
+                    .match_default(name, name, unit)
+                    .unwrap_or_else(|| panic!("no default for {name} in {unit:?}"));
+                assert_eq!(
+                    (m.palette.as_str(), m.range),
+                    ("diverging", Some(range)),
+                    "{name}"
+                );
+            }
+            // Signed: no unit, no guess.
+            assert_eq!(d.match_default(name, name, None), None, "{name}");
+        }
+        for (unit, range) in [
+            (Some("m s-1"), (0.0, 40.0)),
+            (Some("kt"), (0.0, 80.0)),
+            // The speed rule's own fallback.
+            (None, (0.0, 40.0)),
+        ] {
+            let m = d
+                .match_default("HourlyMaximumGust", "HourlyMaximumGust", unit)
+                .unwrap_or_else(|| panic!("no default for HourlyMaximumGust in {unit:?}"));
+            assert_eq!(
+                (m.palette.as_str(), m.range),
+                ("wind_speed", Some(range)),
+                "{unit:?}"
+            );
         }
     }
 
