@@ -42,9 +42,13 @@ disk, no TOML needed.
 - **APIs:** each collection enables ALL APIs relevant to its type (mirrors
   the `engine_type → supported_apis` allowlist): raster/grid
   (zarr/grib/querydata) get edr+wms+maps+tiles, csv gets edr+features,
-  geojson gets features+tiles. Rendering works without a `[wms]` block via a
-  default viridis colormap; range is generic `0..1` until a per-collection
-  colormap/min-max is set (#320).
+  geojson gets features+tiles. Rendering works without a `[wms]` block: each
+  parameter layer takes its built-in default when its name and unit match
+  one, and a multi-parameter collection's root layer draws its default
+  parameter's layer (#1161). Otherwise generic viridis `0..1` until a
+  colormap/min-max is set (#320); the load WARNs once per map collection
+  only when the root layer, resolved as requests resolve it
+  (`generic_root_layer`), really draws that fallback.
 - Synthesized configs are appended to `config.collections` and run through
   the same `ServerConfig::validate()` as TOML (duplicate ids rejected).
 - Resolved once at startup — reload does NOT re-scan auto roots (v1).

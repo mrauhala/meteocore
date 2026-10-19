@@ -324,8 +324,8 @@ static RULES: &[DefaultRule] = &[
         unit_ranges: &[(FRACTION, 0.0, 1.0)],
         fallback_range: None,
     },
-    // Relative humidity in percent. A bare `Humidity` short name (FMI
-    // QueryData, no unit metadata) still matches.
+    // Relative humidity in percent. A bare `Humidity` short name with no
+    // known unit still matches.
     DefaultRule {
         names: RH_NAMES,
         contains: RH_CONTAINS,
@@ -351,8 +351,8 @@ static RULES: &[DefaultRule] = &[
     },
     // The CF area fractions in percent. Unit-gated: CF's unit for them is
     // 1, so without a known unit their names guess nothing (unlike the cover
-    // names below, whose percent fallback serves QueryData). A title naming
-    // cloud cover still reaches that fallback.
+    // names below, whose percent fallback serves a source without units). A
+    // title naming cloud cover still reaches that fallback.
     DefaultRule {
         names: &[],
         contains: CF_CLOUD_CONTAINS,
@@ -652,7 +652,8 @@ mod tests {
             // A native GFS speed before its header has been probed.
             ("WIND", "WIND", None),
             ("si10", "Wind speed", Some("m s**-1")),
-            // QueryData publishes no units.
+            // FMI's name, with its number's unit and with none.
+            ("WindSpeedMS", "Wind speed", Some("m s-1")),
             ("WindSpeedMS", "Wind speed", None),
             ("wind_speed_10m", "Wind speed", Some("m s-1")),
             ("10m_wind_speed", "Wind speed", Some("m/s")),
@@ -845,8 +846,8 @@ mod tests {
         );
     }
 
-    /// Relative humidity keeps its percent and fraction ranges, and the
-    /// unit-less FMI QueryData `Humidity` its percent fallback; MSLP keeps
+    /// Relative humidity keeps its percent and fraction ranges, and a
+    /// unit-less FMI `Humidity` its percent fallback; MSLP keeps
     /// 950–1050 hPa.
     #[test]
     fn relative_humidity_and_mslp_keep_their_defaults() {
@@ -1310,7 +1311,7 @@ mod tests {
     /// CF's unit for them being 1, their names guess nothing without a known
     /// unit, nor in a unit with no letters (`-` is not `%`). A title that
     /// names cloud cover still takes the cover rule's percent fallback, as
-    /// for any cloud-cover title (QueryData's have no units).
+    /// does any cloud-cover title without a unit.
     #[test]
     fn cloud_and_fog_fractions_follow_their_unit() {
         let d = builtin();
@@ -1416,10 +1417,12 @@ mod tests {
         assert_eq!(d.match_default("snowfall_amount_acc", "", Some("m")), None);
     }
 
-    /// GRIB (display units), Zarr (CF units as stored) and QueryData (no
-    /// units) parameters keep the defaults they had before units were
-    /// normalised, apart from fractions, which leave the percent palettes'
-    /// bottom 1 % for their fraction twins (#872).
+    /// GRIB (display units), Zarr (CF units as stored) and QueryData (its
+    /// FMI parameter numbers' units, #1211) parameters keep the defaults
+    /// they had before units were normalised, apart from fractions, which
+    /// leave the percent palettes' bottom 1 % for their fraction twins
+    /// (#872). QueryData's unit-gated temperature and pressure match now
+    /// that it reports units.
     #[test]
     fn engine_parameters_keep_their_defaults() {
         let d = builtin();
@@ -1559,26 +1562,60 @@ mod tests {
                 "viridis",
                 Some((0.0, 206_000.0)),
             ),
-            // QueryData: no units.
-            ("Humidity", "Humidity", None, "humidity", Some((0.0, 100.0))),
+            // QueryData: FMI names, their numbers' units.
+            (
+                "Temperature",
+                "Temperature",
+                Some("°C"),
+                "temperature",
+                Some((-90.0, 50.0)),
+            ),
+            (
+                "DewPoint",
+                "DewPoint",
+                Some("°C"),
+                "temperature",
+                Some((-90.0, 50.0)),
+            ),
+            (
+                "Pressure",
+                "Pressure",
+                Some("hPa"),
+                "pressure",
+                Some((950.0, 1050.0)),
+            ),
+            (
+                "Humidity",
+                "Humidity",
+                Some("%"),
+                "humidity",
+                Some((0.0, 100.0)),
+            ),
             (
                 "TotalCloudCover",
                 "TotalCloudCover",
-                None,
+                Some("%"),
                 "cloud_cover",
                 Some((0.0, 100.0)),
             ),
             (
                 "WindSpeedMS",
-                "Wind speed",
-                None,
+                "WindSpeedMS",
+                Some("m s-1"),
+                "wind_speed",
+                Some((0.0, 40.0)),
+            ),
+            (
+                "WindGust",
+                "WindGust",
+                Some("m s-1"),
                 "wind_speed",
                 Some((0.0, 40.0)),
             ),
             (
                 "Precipitation1h",
                 "Precipitation1h",
-                None,
+                Some("mm"),
                 "precipitation",
                 Some((0.0, 50.0)),
             ),

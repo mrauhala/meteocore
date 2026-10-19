@@ -568,7 +568,7 @@ to leave it out when it equals `observedProperty.label`, which holds it.
 | CSV | built-in column table (`temperature` °C, `humidity` %, `wind_speed` m/s, `pressure` hPa, `precipitation` mm); other columns none | – |
 | GeoTIFF | config `unit` | – |
 | GRIB | Code Table 4.2 unit after display conversion (`°C`, `hPa`, `m s-1`, `mm`, `%`, …) | – (WMO triples are not mapped to CF); ✓ derived wind |
-| QueryData | none: descriptors carry no trustworthy unit | – ; ✓ derived wind |
+| QueryData | the FMI newbase parameter number's unit (`engine-querydata/src/units.rs`, #1211: `Pressure` hPa, `Temperature`/`DewPoint` °C, `Humidity` and cloud covers %, `WindSpeedMS`/`WindUMS`/`WindVMS`/gusts `m s-1`, `WindDirection` °, `Precipitation1h`/`3h`/`Amount` mm); a number without a sourced unit has none | – ; ✓ derived wind, speed in the components' `m s-1` |
 | Zarr | CF `units` attribute | ✓ `standard_name` attribute |
 | ODIM composite | config `unit` | – |
 | ODIM PVOL | ODIM quantity table (`dBZ`, `m/s`, `dB`, `deg`, …), in `parameter_names` too; none for dimensionless quantities (RHOHV, SQI, QIND) | – |
@@ -582,8 +582,7 @@ to leave it out when it equals `observedProperty.label`, which holds it.
 Remaining for Requirement 7: CF standard names for every engine but Zarr and
 NetCDF (a
 vocabulary for GRIB/ODIM/BUFR built-ins, a `standard_name` config key for the
-config-driven engines), QueryData units, and a check that config-given
-labels are English.
+config-driven engines), and a check that config-given labels are English.
 
 ## Derived wind (#897)
 

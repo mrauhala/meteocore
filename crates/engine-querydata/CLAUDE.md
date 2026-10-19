@@ -72,6 +72,21 @@ runtime).
   is memory mapped, so there is no I/O to group. No vertical axis: a Z
   coordinate is ignored.
 - Missing-value sentinel: `32700.0`.
+- **Units (#1211):** a `.sqd` descriptor has no unit string; the FMI newbase
+  parameter number fixes it. `src/units.rs` is the one table (number → unit),
+  each entry sourced from FMI code (newbase `NFmiTotalWind`, smartmet-qdtools
+  nctoqd `apply_unit_conversion` and gribtoqd `cnf/grib.conf`; newbase itself
+  keeps no unit table). Values are stored in these units: never convert. A
+  number not in the table reports `""`, never a unit guessed from a name;
+  Max/MinTemperature (5/6) stay out because gribtoqd copies DWD Kelvin
+  into them unconverted (`grib.conf` `121;5`, `122;6`), and
+  PrecipitationRate (49) because FMI's converters write it in both mm/h
+  and kg m-2 s-1. Every unit-reporting path reads it: EDR descriptions
+  (`description()`), `RasterInfo.parameters`/`unit`, and `wind_facts`
+  (derived speed takes the components' `m s-1`). `RasterInfo.parameter` is
+  still the full descriptor (`2 Metre Temperature (2t)`), not the map name,
+  so a parenthesised default does not route the root layer to its
+  parameter's style (#1161, follow-up #1215).
 - **Names:** EDR uses the full descriptor (`2 Metre Temperature (2t)`), the
   map APIs the short name in parentheses (`2t`, `map_name`).
 - **Wind (#897):** `wind_facts` reports each parameter's FMI number and both

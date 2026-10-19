@@ -20,7 +20,8 @@ use ds_core::temp_files;
 use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindRole, WindSource};
 
-use crate::parse::QueryData;
+use crate::parse::{ParamInfo, QueryData};
+use crate::units;
 
 /// One retained model run: a parsed `.sqd` file plus its source path (for
 /// change detection on poll). Keyed in [`RunSet`] by the file's origin time.
@@ -269,17 +270,7 @@ impl EdrEngine for QueryDataEngine {
         };
         data.params
             .iter()
-            .map(|p| {
-                (
-                    p.name.clone(),
-                    ParameterDescription {
-                        label: p.name.clone(),
-                        unit: String::new(),
-                        observed_property: p.name.clone(),
-                        standard_name: None,
-                    },
-                )
-            })
+            .map(|p| (p.name.clone(), description(p)))
             .collect()
     }
 
@@ -371,17 +362,7 @@ impl EdrEngine for QueryDataEngine {
             .collect();
         let descriptions: Vec<(String, ParameterDescription)> = param_indices
             .iter()
-            .map(|(_, param)| {
-                (
-                    param.name.clone(),
-                    ParameterDescription {
-                        label: param.name.clone(),
-                        unit: String::new(),
-                        observed_property: param.name.clone(),
-                        standard_name: None,
-                    },
-                )
-            })
+            .map(|(_, param)| (param.name.clone(), description(param)))
             .collect();
         plan.into_response(&descriptions, &values)
     }
@@ -462,15 +443,7 @@ impl EdrEngine for QueryDataEngine {
                     })
                 }));
             }
-            params_map.insert(
-                param.name.clone(),
-                ParameterDescription {
-                    label: param.name.clone(),
-                    unit: String::new(),
-                    observed_property: param.name.clone(),
-                    standard_name: None,
-                },
-            );
+            params_map.insert(param.name.clone(), description(param));
             let (shape, axis_names) = if has_time {
                 (
                     vec![times.len(), ny, nx],
@@ -541,15 +514,7 @@ impl EdrEngine for QueryDataEngine {
                 .map(|(ti, _)| interpolate(&data, lon, lat, *pi, 0, *ti))
                 .collect();
 
-            params_map.insert(
-                param.name.clone(),
-                ParameterDescription {
-                    label: param.name.clone(),
-                    unit: String::new(),
-                    observed_property: param.name.clone(),
-                    standard_name: None,
-                },
-            );
+            params_map.insert(param.name.clone(), description(param));
 
             ranges.insert(
                 param.name.clone(),
@@ -760,10 +725,10 @@ impl MapEngine for QueryDataEngine {
         drop(set);
         let param_idx = self.resolve_map_param_idx(&data);
 
-        let param_name = data
+        let (param_name, param_unit) = data
             .params
             .get(param_idx)
-            .map(|p| p.name.clone())
+            .map(|p| (p.name.clone(), units::unit(p.id).to_string()))
             .unwrap_or_default();
 
         let gt = data.grid.geo_transform();
@@ -780,8 +745,8 @@ impl MapEngine for QueryDataEngine {
             _ => "projected".to_string(),
         };
 
-        // QueryData descriptors carry no trustworthy unit metadata. Keep units
-        // unknown instead of inferring physical units from names.
+        // Each unit is its FMI parameter number's (`units`), never one
+        // inferred from a name: the style defaults key on it (#1211).
         let parameters: Vec<ds_core::map_engine::ParameterInfo> = data
             .params
             .iter()
@@ -791,7 +756,7 @@ impl MapEngine for QueryDataEngine {
                 ds_core::map_engine::ParameterInfo {
                     name: short,
                     title: p.name.clone(),
-                    unit: String::new(),
+                    unit: units::unit(p.id).to_string(),
                 }
             })
             .collect();
@@ -801,7 +766,7 @@ impl MapEngine for QueryDataEngine {
             spatial_extent: Some(bbox),
             times: data.times.clone(),
             parameter: param_name,
-            unit: String::new(),
+            unit: param_unit,
             parameters,
             vertical: None,
             grid_size: Some([gt.width, gt.height]),
@@ -911,7 +876,8 @@ fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id
 }
 
 /// What a run states about its wind components (#897): each parameter's
-/// FMI number and its map and EDR names, and the frame of its u/v.
+/// FMI number, the unit that number fixes (#1211), its map and EDR names,
+/// and the frame of its u/v.
 ///
 /// The format has no u/v frame flag (neither the header, a parameter
 /// descriptor nor an area class carries one), so the frame is FMI newbase's
@@ -941,6 +907,7 @@ fn wind_facts(data: &QueryData) -> WindFacts {
                     fmi_param: WindRole::from_fmi_param(p.id).map(|_| p.id),
                     // newbase's convention, see above.
                     frame: VectorFrame::Grid,
+                    unit: units::unit(p.id).to_string(),
                     ..ParameterFacts::new(name)
                 }
             })
@@ -955,6 +922,17 @@ fn map_name(name: &str) -> &str {
     name.rfind('(')
         .and_then(|start| name[start + 1..].strip_suffix(')'))
         .unwrap_or(name)
+}
+
+/// A parameter's EDR description: its full descriptor, and the unit its
+/// FMI parameter number fixes (`units`, #1211), empty when unsourced.
+fn description(param: &ParamInfo) -> ParameterDescription {
+    ParameterDescription {
+        label: param.name.clone(),
+        unit: units::unit(param.id).to_string(),
+        observed_property: param.name.clone(),
+        standard_name: None,
+    }
 }
 
 fn load_file(path: &Path, collection_id: &str) -> Result<QueryData, DataServerError> {
@@ -1010,7 +988,7 @@ fn interpolate(
 fn select_param_indices<'a>(
     data: &'a QueryData,
     parameters: Option<&[String]>,
-) -> Result<Vec<(usize, &'a crate::parse::ParamInfo)>, DataServerError> {
+) -> Result<Vec<(usize, &'a ParamInfo)>, DataServerError> {
     let names: Vec<&str> = data.params.iter().map(|p| p.name.as_str()).collect();
     let selected = ds_core::edr_engine::select_parameters(parameters, &names)?;
     if selected.is_empty() {
@@ -1924,5 +1902,7 @@ mod footprint_tests;
 mod global_tests;
 #[cfg(test)]
 mod sampler_tests;
+#[cfg(test)]
+mod units_tests;
 #[cfg(test)]
 mod wind_tests;

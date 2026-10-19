@@ -9,14 +9,7 @@ apis = ["edr", "wms", "maps", "tiles"]
 wms_parameter = "Temperature"
 poll_interval_secs = 60
 
-# QueryData carries no units; MEPS surface temperature is in °C.
-[wms]
-colormap = "temperature"
-min = -20.0
-max = 20.0
-
-[[wms.parameters]]
-name = "Mean Sea Level Pressure"
-colormap = "viridis"
-min = 980.0
-max = 1040.0
+# No [wms]: each parameter's unit comes from its FMI parameter number, so
+# Temperature (°C) and Mean Sea Level Pressure (hPa) take the built-in
+# temperature and pressure defaults, and the collection layer draws its
+# default Temperature with that style.

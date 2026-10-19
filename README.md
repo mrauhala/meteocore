@@ -1144,6 +1144,15 @@ FMI QueryData (.sqd) binary format for NWP gridded data. Implements `EdrEngine` 
 - **EDR position queries** use bilinear interpolation across grid points.
 - **Map rendering** uses nearest-neighbor resampling.
 - **Missing value sentinel:** 32700.0 (treated as `None`).
+- **Units** come from each parameter's FMI newbase number, since a `.sqd`
+  file carries no unit string (#1211): `Pressure` hPa, `Temperature` and
+  `DewPoint` °C, `Humidity` and the cloud covers %, `WindSpeedMS`, `WindUMS`, `WindVMS` and the gusts m/s,
+  `WindDirection` °, `Precipitation1h`, `Precipitation3h` and
+  `PrecipitationAmount` mm. Values are served as stored, already in these
+  units. Another number reports no unit, as do `MaximumTemperature` and
+  `MinimumTemperature`, which FMI's GRIB converter fills with °C or Kelvin. The units drive the built-in
+  per-parameter default styles, so a QueryData collection needs no `[wms]`
+  palette for these parameters.
 
 **Supported CRS:** WGS84, Stereographic, Rotated Lat-Lon.
 
@@ -1170,11 +1179,10 @@ apis = ["edr", "wms", "maps", "tiles"]
 wms_parameter = "2t"
 poll_interval_secs = 60
 
+# The parameter layers take the built-in defaults by unit (2t → temperature,
+# msl → pressure). The collection layer draws this palette: its default is
+# the full descriptor "2 Metre Temperature (2t)", which names no `2t` layer.
 [collections.wms]
-colormap = "viridis"
-
-[[collections.wms.parameters]]
-name = "2t"
 colormap = "temperature"
 ```
 
@@ -1927,12 +1935,13 @@ too (#1133).
 
 For multi-parameter rasters, defaults and legend labels use each selected
 parameter's own unit: GRIB and NetCDF display units, Zarr CF units as the
-files spell them, or ODIM quantity units.
+files spell them, QueryData FMI parameter-number units, or ODIM quantity
+units.
 Temperature, pressure and the signed, geopotential, specific-humidity,
 column-water, snowfall, run-start accumulation and CF area-fraction defaults
-above require a known unit; unknown units (including
-QueryData descriptors without unit metadata) stay unlabelled and use the
-configured fallback style. Explicit parameter styles still take precedence.
+above require a known unit; unknown units (including a QueryData parameter
+number without a sourced unit) stay unlabelled and use the configured
+fallback style. Explicit parameter styles still take precedence.
 
 **Named custom colormaps** — define once, reference anywhere a built-in
 name works (`[wms] colormap`, `[[wms.styles]]`, `[[wms.parameters]]`, style
