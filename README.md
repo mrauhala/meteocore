@@ -1614,6 +1614,11 @@ poll_interval_secs = 60
   times of every parameter each cycle, so late reports for them show within
   one poll interval; an older time is checked when its grid is next
   computed.
+- **Input values.** A station's latest finite value not after the analysis
+  time and at most `max_age` old; a null is no value. A PostGIS source turns
+  the values its parameters' `valid_range` and `missing_values` reject into
+  nulls (see [PostGIS observation data](#postgis-observation-data)), so a
+  missing-value code such as `-32766` never reaches an analysis.
 - **EDR.** `position`, `area`, `radius` and `cube` sample the cached grid
   the maps draw, at the cell under each point: a position query and WMS
   GetFeatureInfo answer the value the map shows, not an estimate at the exact
@@ -1733,9 +1738,12 @@ name = "air_temperature"
 label = "2 m air temperature"
 unit = "degC"
 observed_property = "air_temperature"
+valid_range = [-80.0, 60.0]         # optional, inclusive: values outside are null
+missing_values = [-32766]           # optional, ≤ 16 sentinels stored instead of NULL
 ```
 
 - Requires PostgreSQL ≥ 13, PostGIS ≥ 3.0; TimescaleDB optional but recommended.
+- A value outside a parameter's `valid_range` or equal to one of its `missing_values` is served as null, like a NULL ([#1210](https://github.com/mrauhala/meteocore/issues/1210)): EDR series keep its time, and the station map layers and a `station-grid` collection over the source use each station's latest valid value.
 - TLS is deferred to [#110](https://github.com/mrauhala/meteocore/issues/110); v1 connects with `NoTls` — deploy the DB behind a private network or loopback.
 - Add `wms` or `maps` to `apis`, or a `[collections.postgis.map]` section, for one map layer per parameter, each station a marker coloured by its latest value within `max_age` (default `PT1H`), on `time_step` frames (default `PT10M`), the most extreme value on top. With either, `tiles` serves them as raster tiles beside the vector tiles.
 - Full reference lives in `crates/engine-postgis/README.md` (role SQL, index recipes, station map layers, startup hard-error vs. WARN list).

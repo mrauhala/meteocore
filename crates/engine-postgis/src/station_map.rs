@@ -590,6 +590,7 @@ pub(crate) mod tests {
                     unit: "°C".into(),
                     observed_property: "air_temperature".into(),
                     source_key: "TA".into(),
+                    filter: Default::default(),
                 },
                 ValidatedParameter {
                     name: "rh".into(),
@@ -597,6 +598,7 @@ pub(crate) mod tests {
                     unit: "%".into(),
                     observed_property: "relative_humidity".into(),
                     source_key: "RH".into(),
+                    filter: Default::default(),
                 },
             ],
             locations_window: None,

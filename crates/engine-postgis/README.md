@@ -154,6 +154,46 @@ For inline configuration, put collection fields under `[[collections]]` and
 prefix the remaining tables with `collections`, for example
 `[collections.postgis]` and `[[collections.postgis.parameters]]`.
 
+### Valid values and missing-value sentinels
+
+Some sources store a code such as `-32766` instead of NULL when a value is
+missing. Two optional parameter keys mark which stored values are
+observations:
+
+```toml
+[[postgis.parameters]]
+name = "t2m"
+label = "2 m air temperature"
+unit = "degC"
+valid_range = [-80.0, 60.0]   # inclusive [min, max]
+missing_values = [-32766]     # at most 16 sentinels
+```
+
+A value outside `valid_range` or equal to one of `missing_values` is served
+as null, exactly like a NULL value:
+
+- **EDR** location, position, area and radius series keep the row's time
+  with a null value. On the events shape the event stays in the answer with
+  a null value.
+- **Latest-value reads** pass over it and use the station's latest valid
+  value: the station map layers and a `station-grid` collection over this
+  one. A station whose values in the window are all filtered is left out,
+  as one with only NULLs is.
+- Stations reporting only filtered values are still listed, and the
+  temporal extent still counts their rows.
+
+The test runs in SQL: the value, cast to `double precision`, must lie inside
+the range and differ from every sentinel, each bound and the sentinel list a
+bound parameter. Sentinels compare as `double precision`, so a `real` column
+holding `-999.9` stores a number a little different from the `-999.9`
+written in TOML; list such a code as it reads back in `double precision`, or
+exclude it with `valid_range`. NaN lies outside every range. Both keys are
+checked at config load: finite numbers, `min <= max`, at most 16 sentinels.
+Features properties come from the stations table and are not affected. On
+the events shape the filter applies to the EDR values only; the
+`cloud_indicator_col` and `peak_current_col` attributes the nowcast's
+lightning join reads are not parameters and are never filtered.
+
 ### Other station layouts
 
 Keep the station and parameter definitions above and replace the observations
@@ -276,7 +316,8 @@ max = 30.0
   8601 duration of at most seven days. A station without one is left out;
   with `draw_missing = true` it is drawn in the palette's `nodata_color`
   (set it on a named `[[colormaps]]` palette; without one such markers are
-  transparent). Null, NaN and infinite values count as no value.
+  transparent). Null, NaN and infinite values count as no value, and so do
+  values the parameter's `valid_range` or `missing_values` rejects.
 - **Time.** The layers advertise steps of `time_step` over the latest six
   hours of data, updated on metadata refresh; without `TIME` they draw the
   latest step. A requested `TIME` floors to its step, counted from
@@ -395,7 +436,8 @@ paging and property filters, but reject `datetime` because the inventory has
 no time dimension. See the [EDR](../api-edr/README.md) and
 [Features](../api-features/README.md) references for full request/format rules.
 
-EDR engine queries have a **500,000-value budget**, counting NULLs, and station
+EDR engine queries have a **500,000-value budget**, counting NULLs and values a
+`valid_range` or `missing_values` filters, and station
 areas may select at most 200,000 stations. Long-window or unbounded area
 queries can also hit the 20,000-statement and 10,000-row-per-statement guards;
 single-station queries do not have that row cap. Observation-derived polygon

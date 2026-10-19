@@ -16,7 +16,9 @@ pub use maps::strike_window_cache_metrics;
 pub use metadata::LocationsCut;
 pub use station_map::{station_frame_cache_metrics, StationSymbols, NODATA_MARKER};
 
-pub use config::{PostgisConfigError, PostgisEngineConfig, StationMapSettings, ValidatedParameter};
+pub use config::{
+    PostgisConfigError, PostgisEngineConfig, StationMapSettings, ValidatedParameter, ValueFilter,
+};
 pub use schema::{
     LongShape, ObservationSchema, PerParameterShape, PerParameterTable, QualifiedTable,
     SchemaError, StationsMapping, WideShape,

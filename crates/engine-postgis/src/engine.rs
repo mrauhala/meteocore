@@ -522,8 +522,15 @@ impl PostgisEngine {
         // +1 sentinel row: crossing the budget is detected as "one more row
         // than fits" rather than silently truncating an over-budget window.
         let row_limit = MAX_RESPONSE_VALUES / per_row + 1;
-        let built = build_events_area(shape, &polygon_wkt, (t0, t1), &key_refs, row_limit)
-            .map_err(|e| DataServerError::Engine(format!("build_events_area: {e}")))?;
+        let built = build_events_area(
+            shape,
+            &self.config.parameters,
+            &polygon_wkt,
+            (t0, t1),
+            &key_refs,
+            row_limit,
+        )
+        .map_err(|e| DataServerError::Engine(format!("build_events_area: {e}")))?;
 
         let rows = run_single_query_sync(&self.pool, built)?;
         for row in &rows {
@@ -1954,6 +1961,7 @@ mod tests {
                     unit: "°C".into(),
                     observed_property: "air_temperature".into(),
                     source_key: "TEMP".into(),
+                    filter: Default::default(),
                 },
                 ValidatedParameter {
                     name: "ws".into(),
@@ -1961,6 +1969,7 @@ mod tests {
                     unit: "m/s".into(),
                     observed_property: "wind_speed".into(),
                     source_key: "WIND".into(),
+                    filter: Default::default(),
                 },
             ],
             locations_window: None,
@@ -2021,6 +2030,7 @@ mod tests {
                 unit: "kA".into(),
                 observed_property: "peak_current".into(),
                 source_key: "peak_current".into(),
+                filter: Default::default(),
             }],
             locations_window: None,
             events_default_window: Some(chrono::Duration::hours(1)),
@@ -2058,6 +2068,7 @@ mod tests {
                 unit: "°C".into(),
                 observed_property: "air_temperature".into(),
                 source_key: "TEMP".into(),
+                filter: Default::default(),
             }],
             locations_window: None,
             events_default_window: None,
@@ -2118,6 +2129,7 @@ mod tests {
                 unit: "kA".into(),
                 observed_property: "peak_current".into(),
                 source_key: "peak_current".into(),
+                filter: Default::default(),
             }],
             locations_window: None,
             events_default_window: Some(chrono::Duration::hours(1)),
@@ -2499,6 +2511,7 @@ mod tests {
                     unit: "°C".into(),
                     observed_property: "air_temperature".into(),
                     source_key: "TEMP".into(),
+                    filter: Default::default(),
                 },
                 ValidatedParameter {
                     name: "ws".into(),
@@ -2506,6 +2519,7 @@ mod tests {
                     unit: "m/s".into(),
                     observed_property: "wind_speed".into(),
                     source_key: "WIND".into(),
+                    filter: Default::default(),
                 },
             ],
             ..stations_engine_config(&[])

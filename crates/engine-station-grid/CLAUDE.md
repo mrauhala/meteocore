@@ -18,7 +18,10 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
 - A slice is ONE EDR area query over the grid's search box
   (`GridGeom::query_bbox`: the grid widened by the search radius, across the
   seam or to every longitude at a pole) with the window `[t - max_age, t]`;
-  each station's latest finite value in it is used (`source.rs`). That is
+  each station's latest finite value in it is used (`source.rs`). A PostGIS
+  source has already turned the values its parameters' `valid_range` and
+  `missing_values` reject into nulls (#1210), so a missing-value code never
+  reaches a slice; do not filter again here. That is
   the set-based "every station at one time" read (#1062). CSV caps an area
   query at 500 stations — a demo source; BUFR and PostGIS have no station
   ceiling, only their value budgets.

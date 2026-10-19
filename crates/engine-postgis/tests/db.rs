@@ -213,6 +213,8 @@ fn parameters() -> Vec<PostgisParameterConfig> {
         unit: unit.into(),
         observed_property: None,
         source_key: None,
+        valid_range: None,
+        missing_values: vec![],
     })
     .collect()
 }
@@ -871,11 +873,12 @@ async fn station_frame(engine: &Arc<PostgisEngine>, at: &str) -> ds_core::map_en
 
 /// The value at the pixel holding a fixture station: (1.05, 1.05) is column
 /// 10, row 89; (3.05, 3.05) column 30, row 69; (5.05, 5.05) column 50, row 49.
+/// The value-filter fixture's stations stand in the same places.
 fn at_station(tile: &ds_core::map_engine::RasterTile, station: &str) -> Option<f64> {
     let (col, row) = match station {
-        "fresh" => (10, 89),
-        "stale" => (30, 69),
-        "nulls" => (50, 49),
+        "fresh" | "ok1" => (10, 89),
+        "stale" | "ok2" => (30, 69),
+        "nulls" | "bad" => (50, 49),
         other => panic!("no fixture station {other}"),
     };
     tile.values.value_at(row * 100 + col)
@@ -984,6 +987,411 @@ async fn station_map_wide_shape() {
          FROM __S__.stations WHERE id = 'stale';",
     )
     .await;
+}
+
+/// The value-filter fixture (#1210): three stations where the station map's
+/// stand, `t2m` and `rh` rows from 05:20 to 05:50 in every station shape's
+/// tables: a `long` table, a `wide` one with a naive UTC column, and one
+/// table per parameter. With [`filtered_parameters`], `t2m` keeps
+/// `[-80, 60]` without `-32766` and `-9.5`, and `rh` drops `999`.
+///
+/// - `ok1` (1.05, 1.05): `t2m` 60 at 05:20 (the range's top, kept), 1 at
+///   05:30, the sentinel -9.5 at 05:50: its latest valid `t2m` is 1.
+/// - `ok2` (3.05, 3.05): `t2m` 2 at 05:30, 75 at 05:50 (out of range): its
+///   latest valid `t2m` is 2. `rh` is the sentinel 999 at 05:30 and -32766
+///   at 05:50, which is no `rh` sentinel and kept.
+/// - `bad` (5.05, 5.05): `t2m` the sentinel -32766 at 05:40 and NaN at 05:45
+///   (outside every range): no valid `t2m`.
+const VALUE_FILTERS: &str = "
+DROP SCHEMA IF EXISTS __S__ CASCADE;
+CREATE SCHEMA __S__;
+CREATE TABLE __S__.stations (
+    id text PRIMARY KEY,
+    name text NOT NULL,
+    geom geometry(Point, 4326) NOT NULL
+);
+INSERT INTO __S__.stations VALUES
+    ('ok1', 'Ok 1', ST_SetSRID(ST_MakePoint(1.05, 1.05), 4326)),
+    ('ok2', 'Ok 2', ST_SetSRID(ST_MakePoint(3.05, 3.05), 4326)),
+    ('bad', 'Bad', ST_SetSRID(ST_MakePoint(5.05, 5.05), 4326));
+CREATE TABLE __S__.src (
+    station_id text NOT NULL,
+    obstime timestamptz NOT NULL,
+    t2m double precision,
+    rh double precision
+);
+INSERT INTO __S__.src VALUES
+    ('ok1', '2026-01-01 05:20:00+00', 60, 40),
+    ('ok1', '2026-01-01 05:30:00+00', 1, 50),
+    ('ok1', '2026-01-01 05:50:00+00', -9.5, 60),
+    ('ok2', '2026-01-01 05:30:00+00', 2, 999),
+    ('ok2', '2026-01-01 05:50:00+00', 75, -32766),
+    ('bad', '2026-01-01 05:40:00+00', -32766, 70),
+    ('bad', '2026-01-01 05:45:00+00', 'NaN', 70);
+CREATE TABLE __S__.obs (
+    station_id text NOT NULL,
+    obstime timestamptz NOT NULL,
+    param text NOT NULL,
+    value double precision
+);
+INSERT INTO __S__.obs
+SELECT station_id, obstime, 't2m', t2m FROM __S__.src
+UNION ALL
+SELECT station_id, obstime, 'rh', rh FROM __S__.src;
+CREATE INDEX ON __S__.obs (station_id, obstime DESC);
+CREATE TABLE __S__.synop (
+    station_id text NOT NULL,
+    valid_time timestamp NOT NULL,
+    temp_c double precision,
+    humidity double precision,
+    geom geometry(Point, 4326)
+);
+INSERT INTO __S__.synop
+SELECT o.station_id, o.obstime AT TIME ZONE 'UTC', o.t2m, o.rh, s.geom
+FROM __S__.src o JOIN __S__.stations s ON s.id = o.station_id;
+CREATE INDEX ON __S__.synop (station_id, valid_time DESC);
+CREATE TABLE __S__.obs_t2m (
+    wigos_id text NOT NULL,
+    time timestamptz NOT NULL,
+    value double precision,
+    the_geom geometry(Point, 4326)
+);
+CREATE TABLE __S__.obs_rh (LIKE __S__.obs_t2m);
+INSERT INTO __S__.obs_t2m
+SELECT o.station_id, o.obstime, o.t2m, s.geom
+FROM __S__.src o JOIN __S__.stations s ON s.id = o.station_id;
+INSERT INTO __S__.obs_rh
+SELECT o.station_id, o.obstime, o.rh, s.geom
+FROM __S__.src o JOIN __S__.stations s ON s.id = o.station_id;
+DROP TABLE __S__.src;
+ANALYZE;
+";
+
+/// [`parameters`] with the value-filter fixture's filters.
+fn filtered_parameters() -> Vec<PostgisParameterConfig> {
+    let mut parameters = parameters();
+    parameters[0].valid_range = Some(vec![-80.0, 60.0]);
+    parameters[0].missing_values = vec![-32766.0, -9.5];
+    parameters[1].missing_values = vec![999.0];
+    parameters
+}
+
+/// `2026-01-01T<hh:mm>:00Z`.
+fn on_jan_1(hh_mm: &str) -> DateTime<Utc> {
+    format!("2026-01-01T{hh_mm}:00Z").parse().unwrap()
+}
+
+/// The value-filter fixture's station at longitude `x`.
+fn filter_station(x: f64) -> &'static str {
+    match (x * 100.0).round() as i64 {
+        105 => "ok1",
+        305 => "ok2",
+        505 => "bad",
+        _ => panic!("({x}, …) is no value-filter fixture station"),
+    }
+}
+
+/// A station's series over 05:00–06:00 with the filters: its times, then
+/// the `rh` and `t2m` values. Every row keeps its time; a rejected value is
+/// null there, as a NULL is.
+fn expected_filtered(station: &str) -> (Vec<DateTime<Utc>>, Vec<Vec<Option<f64>>>) {
+    match station {
+        "ok1" => (
+            vec![on_jan_1("05:20"), on_jan_1("05:30"), on_jan_1("05:50")],
+            vec![
+                vec![Some(40.0), Some(50.0), Some(60.0)],
+                vec![Some(60.0), Some(1.0), None],
+            ],
+        ),
+        "ok2" => (
+            vec![on_jan_1("05:30"), on_jan_1("05:50")],
+            vec![vec![None, Some(-32766.0)], vec![Some(2.0), None]],
+        ),
+        "bad" => (
+            vec![on_jan_1("05:40"), on_jan_1("05:45")],
+            vec![vec![Some(70.0), Some(70.0)], vec![None, None]],
+        ),
+        other => panic!("no value-filter fixture station {other}"),
+    }
+}
+
+/// A coverage's times and its ranges' values, sorted by name.
+fn series(c: &Coverage) -> (Vec<DateTime<Utc>>, Vec<Vec<Option<f64>>>) {
+    (
+        c.t.clone(),
+        c.ranges
+            .iter()
+            .map(|(_, _, values)| values.clone())
+            .collect(),
+    )
+}
+
+/// The location query for `station`, on a blocking thread as the EDR
+/// executor runs it.
+async fn location_series(
+    engine: &Arc<PostgisEngine>,
+    station: &str,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Coverage {
+    let engine = Arc::clone(engine);
+    let id = station.to_string();
+    let response = tokio::task::spawn_blocking(move || {
+        engine
+            .query_location(&id, window, None, None, None)
+            .unwrap_or_else(|e| panic!("location {id}: {e:?}"))
+    })
+    .await
+    .expect("location task");
+    let CoverageResponse::Single(coverage) = response else {
+        panic!("a location answers one coverage");
+    };
+    comparable(&[coverage]).remove(0)
+}
+
+/// What #1210 asks of a station shape, on the value-filter fixture:
+///
+/// 1. EDR: a value outside `valid_range` or equal to a sentinel is null in
+///    the series, which keeps its time, on the location query and on both
+///    area paths; without filters the same rows are served as stored;
+/// 2. the station map layer draws each station's latest VALID value and no
+///    marker for a station without one;
+/// 3. a station grid over the collection, as the server wires one, never
+///    sees a filtered value: two stations behind the analysis, every cell
+///    between their valid values.
+async fn check_value_filters(schema: &str, cfg: fn(&str) -> PostgisConfig) {
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let client = connect(&dsn).await;
+    {
+        let _setup = SETUP.lock().await;
+        exec(&client, schema, "CREATE EXTENSION IF NOT EXISTS postgis;").await;
+        exec(&client, schema, VALUE_FILTERS).await;
+    }
+    let mut filtered = cfg(schema);
+    filtered.parameters = filtered_parameters();
+    let pg = engine(schema, &filtered).await;
+    let window = Some((on_jan_1("05:00"), on_jan_1("06:00")));
+
+    // 1. EDR series.
+    for station in ["ok1", "ok2", "bad"] {
+        let coverage = location_series(&pg, station, window).await;
+        assert_eq!(
+            series(&coverage),
+            expected_filtered(station),
+            "{schema}: location {station}"
+        );
+    }
+    for path in [AreaPath::SetBased, AreaPath::FanOut] {
+        let coverages = area(
+            &pg,
+            Some(path),
+            "POLYGON((0 0,10 0,10 10,0 10,0 0))",
+            window,
+            Some(&["t2m", "rh"][..]),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{schema} {path:?}: {e:?}"));
+        let coverages = comparable(&coverages);
+        assert_eq!(coverages.len(), 3, "{schema} {path:?}");
+        for c in &coverages {
+            let station = filter_station(c.x);
+            assert_eq!(
+                series(c),
+                expected_filtered(station),
+                "{schema} {path:?}: {station}"
+            );
+        }
+    }
+    let raw = engine(schema, &cfg(schema)).await;
+    let ok1 = location_series(&raw, "ok1", window).await;
+    assert_eq!(
+        series(&ok1).1[1],
+        vec![Some(60.0), Some(1.0), Some(-9.5)],
+        "{schema}: without filters a sentinel is served as stored"
+    );
+    let ok2 = location_series(&raw, "ok2", window).await;
+    assert_eq!(
+        series(&ok2).1,
+        vec![
+            vec![Some(999.0), Some(-32766.0)],
+            vec![Some(2.0), Some(75.0)]
+        ],
+        "{schema}: without filters"
+    );
+
+    // 2. The station map frame at 06:00 (max_age PT1H).
+    pg.set_station_symbols(engine_postgis::StationSymbols::new(
+        std::collections::HashMap::from([("t2m".to_string(), 0.0)]),
+    ));
+    pg.refresh_metadata().await.expect("refresh");
+    let tile = station_frame(&pg, "2026-01-01T06:00:00Z").await;
+    assert_eq!(at_station(&tile, "ok1"), Some(1.0), "{schema}: past -9.5");
+    assert_eq!(at_station(&tile, "ok2"), Some(2.0), "{schema}: past 75");
+    assert_eq!(
+        at_station(&tile, "bad"),
+        None,
+        "{schema}: no valid value, no marker"
+    );
+
+    // 3. A station grid over the collection, analysis at 05:50.
+    let source: Arc<dyn EdrEngine> = pg.clone();
+    let grid_config = ds_core::config::StationGridConfig {
+        source: schema.into(),
+        parameters: vec!["t2m".into()],
+        grid: ds_core::config::StationGridGeometry {
+            crs: "EPSG:4326".into(),
+            bbox: [0.0, 0.0, 6.0, 6.0],
+            resolution: 0.5,
+        },
+        method: "idw".into(),
+        power: None,
+        correlation_length_km: None,
+        max_neighbours: 8,
+        search_radius_km: 1000.0,
+        max_age: "PT1H".into(),
+        cadence: Some("PT10M".into()),
+        poll_interval_secs: 60,
+        precompute: 1,
+    };
+    let grid_id = format!("{schema}_grid");
+    let analysis = on_jan_1("05:50");
+    let (stations, values) = tokio::task::spawn_blocking(move || {
+        let grid = engine_station_grid::StationGridEngine::new(
+            &grid_id,
+            &grid_config.source,
+            source,
+            &grid_config,
+        )
+        .expect("station grid over the postgis collection");
+        let response = grid
+            .query_area("0,0,6,6", Some((analysis, analysis)), None, None, None)
+            .expect("grid area");
+        let stations = grid.station_counts();
+        grid.shutdown();
+        let result = match response {
+            CoverageResponse::Single(result) => result,
+            CoverageResponse::Collection(mut results) => results.remove(0),
+        };
+        (stations, result.ranges["t2m"].values.clone())
+    })
+    .await
+    .expect("grid task");
+    assert_eq!(
+        stations,
+        vec![("t2m".to_string(), Some(2))],
+        "{schema}: `bad` has no valid value and stays out of the analysis"
+    );
+    let cells: Vec<f64> = values.into_iter().flatten().collect();
+    assert!(!cells.is_empty(), "{schema}: the grid has values");
+    for v in &cells {
+        assert!(
+            (1.0 - 1e-4..=2.0 + 1e-4).contains(v),
+            "{schema}: a cell of {v} is outside the valid values 1 and 2"
+        );
+    }
+    exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn value_filters_long_shape() {
+    check_value_filters("mc1210_long", long_config).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn value_filters_wide_shape() {
+    check_value_filters("mc1210_wide", wide_config).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn value_filters_per_parameter_shape() {
+    check_value_filters("mc1210_per_parameter", per_parameter_config).await;
+}
+
+/// An events table whose `real` peak current stores 0 for "not measured".
+const VALUE_FILTER_EVENTS: &str = "
+DROP SCHEMA IF EXISTS __S__ CASCADE;
+CREATE SCHEMA __S__;
+CREATE TABLE __S__.strikes (
+    id bigint PRIMARY KEY,
+    time timestamptz NOT NULL,
+    geom geometry(Point, 4326) NOT NULL,
+    peak_current real
+);
+INSERT INTO __S__.strikes VALUES
+    (1, '2026-01-01 05:10:00+00', ST_SetSRID(ST_MakePoint(1, 1), 4326), 12.5),
+    (2, '2026-01-01 05:20:00+00', ST_SetSRID(ST_MakePoint(2, 2), 4326), 0),
+    (3, '2026-01-01 05:30:00+00', ST_SetSRID(ST_MakePoint(3, 3), 4326), 900),
+    (4, '2026-01-01 05:40:00+00', ST_SetSRID(ST_MakePoint(4, 4), 4326), NULL);
+CREATE INDEX ON __S__.strikes (time);
+ANALYZE;
+";
+
+/// #1210 on the events shape: every event stays in the answer; a peak
+/// current outside `[-300, 300]` or equal to the sentinel 0 is null, as a
+/// NULL is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn value_filters_events_shape() {
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let schema = "mc1210_events";
+    let client = connect(&dsn).await;
+    {
+        let _setup = SETUP.lock().await;
+        exec(&client, schema, "CREATE EXTENSION IF NOT EXISTS postgis;").await;
+        exec(&client, schema, VALUE_FILTER_EVENTS).await;
+    }
+    let mut cfg = config(
+        None,
+        PostgisObservationsConfig {
+            table: Some(format!("{schema}.strikes")),
+            time_col: Some("time".into()),
+            geom_col: Some("geom".into()),
+            id_col: Some("id".into()),
+            extent_bbox: Some([0.0, 0.0, 10.0, 10.0]),
+            ..observations("events")
+        },
+    );
+    cfg.parameters = vec![PostgisParameterConfig {
+        name: "peak_current".into(),
+        label: "Peak current".into(),
+        unit: "kA".into(),
+        observed_property: None,
+        source_key: None,
+        valid_range: Some(vec![-300.0, 300.0]),
+        missing_values: vec![0.0],
+    }];
+    let engine = engine(schema, &cfg).await;
+    let events = area(
+        &engine,
+        None,
+        "POLYGON((0 0,10 0,10 10,0 10,0 0))",
+        Some((on_jan_1("05:00"), on_jan_1("06:00"))),
+        None,
+    )
+    .await
+    .expect("events area");
+    let values: Vec<(Option<DateTime<Utc>>, Option<f64>)> = events
+        .iter()
+        .map(|c| {
+            let DomainDescription::Point { t, .. } = &c.domain else {
+                panic!("an event is a Point, got {:?}", c.domain);
+            };
+            (*t, c.ranges["peak_current"].values[0])
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (Some(on_jan_1("05:40")), None),
+            (Some(on_jan_1("05:30")), None),
+            (Some(on_jan_1("05:20")), None),
+            (Some(on_jan_1("05:10")), Some(12.5)),
+        ],
+        "newest first; out of range, sentinel and NULL are all null"
+    );
+    exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
 }
 
 #[path = "support/schema_validation.rs"]

@@ -738,6 +738,13 @@ During the repeated autumn hour, a naive local-time column can end it up to an
 hour after the refresh; see the
 [engine README](../engine-postgis/README.md#operations).
 
+A PostGIS parameter's optional `valid_range` and `missing_values` (#1210)
+make a value outside the range, or equal to a sentinel such as `-32766`, a
+null on every query of the collection, events included: a series keeps that
+time, as for a NULL, and the null counts against the value budget. A station
+grid over the collection therefore uses each station's latest valid value.
+See [valid values](../engine-postgis/README.md#valid-values-and-missing-value-sentinels).
+
 Radius, corridor, items and location lists have no engine-specific code:
 radius is answered by every engine that answers area, items by every engine
 that implements `FeatureEngine` for its EDR collection (the Features engine
