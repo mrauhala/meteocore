@@ -30,7 +30,9 @@ or map window. Nothing is converted or copied first.
   or infinite values, are null.
 - **Units.** Values are served in the display unit of the array's CF
   `units`, in any spelling: K → °C, Pa → hPa, kg m⁻² → mm, kg m⁻² s⁻¹ →
-  mm/h, m² s⁻² → gpm, proportion → %. Other units are served as the store
+  mm/h, m² s⁻² → gpm, proportion → %, and CF's `1` → % when the array's
+  `standard_name` is `relative_humidity` or ends in `_area_fraction` (or
+  `_area_fraction_in_atmosphere_layer`). Other units are served as the store
   spells them. Every API, derived wind included, reads the converted
   values and reports the converted unit.
 - **Reads.** A position reads the 2×2 cells around the point over the
@@ -108,10 +110,12 @@ colormap = "pressure"   # the collection layer draws msl, the first variable
 ```
 
 In `config.toml` the tables are `[collections.zarr]` and `[collections.wms]`.
-Set colormap ranges in the served units (°C, not K). On a store with several
-variables, each variable's layer takes the built-in default its name and
-unit select ahead of the `[wms]` palette; a layer that neither styles draws
-a generic palette.
+Set colormap ranges in the served units (°C, not K). Without a `[wms]`
+palette, each variable's layer, and the collection layer drawing the first
+variable, take the built-in default style the variable's name and unit
+select. On a store with several variables, that default also comes before
+the `[wms]` palette on each variable's own layer. A layer that neither
+styles draws a generic palette.
 
 | Field | Default | Meaning |
 |---|---|---|

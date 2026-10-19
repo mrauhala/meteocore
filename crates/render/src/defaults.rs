@@ -4,7 +4,9 @@
 //! the resolver consults this table (config `[[parameter_defaults]]` rules
 //! first, then the embedded rules) so temperature renders as temperature and
 //! pressure as pressure instead of everything getting one collection-wide
-//! colormap — or viridis 0..1.
+//! colormap — or viridis 0..1. A single-parameter collection's layer with
+//! no palette configured consults it too, for the parameter its engine
+//! draws (`StyleContext::base_layer_default`).
 //!
 //! Matching is **display styling only** — never unit conversion or semantic
 //! interpretation. It is best-effort by normalized parameter name/title plus
@@ -63,6 +65,17 @@ static RULES: &[DefaultRule] = &[
         contains: &["dbz"],
         palette: "radar_dbz",
         unit_ranges: &[],
+        fallback_range: None,
+    },
+    // The lightning strike-age layer (engine-postgis events shape, #504):
+    // the value is the strike's age in minutes, on the data-valued
+    // `lightning_age` palette (0–60 min, the default one-hour window).
+    // Unit-gated: a `lightning_age` in other units says nothing about age.
+    DefaultRule {
+        names: &["lightningage"],
+        contains: &[],
+        palette: "lightning_age",
+        unit_ranges: &[(&["min"], 0.0, 60.0)],
         fallback_range: None,
     },
     // Doppler radial velocity — diverging about zero.
@@ -184,11 +197,12 @@ static RULES: &[DefaultRule] = &[
     // rule's scale. Before it, so a "u-component of wind gust" title stays
     // signed. CF's grid-relative `x_wind`/`y_wind` and MET Norway's
     // `x_wind_10m`/`y_wind_10m` (#1067) are exact names: a `contains`
-    // "xwind" would claim every `max_wind…`.
+    // "xwind" would claim every `max_wind…`. FMI newbase's `WindUMS` /
+    // `WindVMS` (#1215) are QueryData's u and v, in m/s by their numbers.
     DefaultRule {
         names: &[
             "u", "v", "10u", "10v", "100u", "100v", "u10", "v10", "u100", "v100", "ugrd", "vgrd",
-            "xwind", "ywind", "xwind10m", "ywind10m",
+            "xwind", "ywind", "xwind10m", "ywind10m", "windums", "windvms",
         ],
         contains: &[
             "componentofwind",
@@ -205,10 +219,22 @@ static RULES: &[DefaultRule] = &[
     },
     // Wind speed, native or derived from u/v (#897: `10si`, `100si`, `ws`,
     // wgrib2 `WIND`, FMI `WindSpeedMS`, CF stores' `…wind_speed…`; every
-    // derived title starts "Wind speed").
+    // derived title starts "Wind speed"), and gusts. FMI newbase's
+    // `HourlyMaximumGust` (#1215, m/s by its number) needs its exact name:
+    // it holds no "windgust".
     DefaultRule {
         names: &[
-            "ws", "ff", "si10", "10si", "si100", "100si", "wind", "gust", "fg", "wgust",
+            "ws",
+            "ff",
+            "si10",
+            "10si",
+            "si100",
+            "100si",
+            "wind",
+            "gust",
+            "fg",
+            "wgust",
+            "hourlymaximumgust",
         ],
         contains: &["windspeed", "windgust"],
         palette: "wind_speed",
@@ -314,9 +340,12 @@ static RULES: &[DefaultRule] = &[
         unit_ranges: &[(&["mm", "kgm2"], 0.0, 70.0)],
         fallback_range: None,
     },
-    // Relative humidity as a fraction (CF's unit 1, MEPS
-    // `relative_humidity_2m`): the fraction-valued twin of the percent
-    // palette. The percent palette over 0..1 would overlap its stops, so
+    // Relative humidity as a fraction, in unit 1 as a source serves it
+    // unconverted (engine-netcdf and engine-zarr serve CF's
+    // `relative_humidity` in %, `ds_core::units::cf_display_conversion`,
+    // so MEPS `relative_humidity_2m` takes the percent rule below): the
+    // fraction-valued twin of the percent palette. The percent palette
+    // over 0..1 would overlap its stops, so
     // #823 clips instead of rescaling and the field sits in its bottom 1 %
     // (#872). `contains` names relative humidity explicitly: "Specific
     // humidity" must not reach these ranges.
@@ -337,8 +366,8 @@ static RULES: &[DefaultRule] = &[
         fallback_range: Some((0.0, 100.0)),
     },
     // Cloud and fog cover as a fraction, on the fraction-valued twin of the
-    // percent palette (as for relative humidity above), including the CF
-    // area fractions MEPS publishes in unit 1.
+    // percent palette (as for relative humidity above), including a CF area
+    // fraction in unit 1 that a source serves unconverted.
     DefaultRule {
         names: CLOUD_NAMES,
         contains: &[
@@ -352,10 +381,12 @@ static RULES: &[DefaultRule] = &[
         unit_ranges: &[(FRACTION, 0.0, 1.0)],
         fallback_range: None,
     },
-    // The CF area fractions in percent. Unit-gated: CF's unit for them is
-    // 1, so without a known unit their names guess nothing (unlike the cover
-    // names below, whose percent fallback serves a source without units). A
-    // title naming cloud cover still reaches that fallback.
+    // The CF area fractions in percent, as engine-netcdf and engine-zarr
+    // serve them from their standard name (MEPS `cloud_area_fraction`).
+    // Unit-gated: CF's unit for them is 1, so without a known unit their
+    // names guess nothing (unlike the cover names below, whose percent
+    // fallback serves a source without units). A title naming cloud cover
+    // still reaches that fallback.
     DefaultRule {
         names: &[],
         contains: CF_CLOUD_CONTAINS,
@@ -676,6 +707,48 @@ mod tests {
         }
     }
 
+    /// #1215: FMI newbase's u and v components, `WindUMS` / `WindVMS`, are
+    /// signed winds on the u/v rule's diverging scale, and its
+    /// `HourlyMaximumGust` a speed, both by unit like the other winds.
+    /// QueryData lists each descriptor as its own title.
+    #[test]
+    fn newbase_wind_components_and_gusts_get_the_wind_defaults() {
+        let d = builtin();
+        for name in ["WindUMS", "WindVMS"] {
+            for (unit, range) in [
+                (Some("m s-1"), (-40.0, 40.0)),
+                (Some("m/s"), (-40.0, 40.0)),
+                (Some("kt"), (-80.0, 80.0)),
+            ] {
+                let m = d
+                    .match_default(name, name, unit)
+                    .unwrap_or_else(|| panic!("no default for {name} in {unit:?}"));
+                assert_eq!(
+                    (m.palette.as_str(), m.range),
+                    ("diverging", Some(range)),
+                    "{name}"
+                );
+            }
+            // Signed: no unit, no guess.
+            assert_eq!(d.match_default(name, name, None), None, "{name}");
+        }
+        for (unit, range) in [
+            (Some("m s-1"), (0.0, 40.0)),
+            (Some("kt"), (0.0, 80.0)),
+            // The speed rule's own fallback.
+            (None, (0.0, 40.0)),
+        ] {
+            let m = d
+                .match_default("HourlyMaximumGust", "HourlyMaximumGust", unit)
+                .unwrap_or_else(|| panic!("no default for HourlyMaximumGust in {unit:?}"));
+            assert_eq!(
+                (m.palette.as_str(), m.range),
+                ("wind_speed", Some(range)),
+                "{unit:?}"
+            );
+        }
+    }
+
     #[test]
     fn data_valued_palette_uses_stop_range() {
         let d = builtin();
@@ -686,6 +759,19 @@ mod tests {
             d.match_default("ws", "", Some("kt")).unwrap().range,
             Some((0.0, 80.0))
         );
+    }
+
+    /// The events shape's strike-age layer (#504): age in minutes on the
+    /// `lightning_age` palette over its one-hour stops; other units say
+    /// nothing about age.
+    #[test]
+    fn lightning_age_in_minutes_takes_its_palette() {
+        let d = builtin();
+        let m = d.match_default("lightning_age", "", Some("min")).unwrap();
+        assert_eq!(m.palette, "lightning_age");
+        assert_eq!(m.range, Some((0.0, 60.0)));
+        assert_eq!(d.match_default("lightning_age", "", None), None);
+        assert_eq!(d.match_default("lightning_age", "", Some("s")), None);
     }
 
     #[test]
@@ -1100,8 +1186,10 @@ mod tests {
     /// units engine-netcdf reports for them (`long_name` as in
     /// testdata/meps-netcdf, or the example's `[netcdf.titles]`; the files'
     /// `units` in their display unit, #1209: K as °C, Pa as hPa, kg/m^2 as
-    /// mm), and the files' own spellings, as a CF store that serves them
-    /// unconverted would.
+    /// mm, and unit 1 as % for relative humidity and the cloud and fog area
+    /// fractions, whose standard names say they are fractions), and the
+    /// files' own spellings, as a CF store that serves them unconverted
+    /// would.
     #[test]
     fn meps_names_get_their_defaults() {
         let d = builtin();
@@ -1119,6 +1207,13 @@ mod tests {
                 "K",
                 "temperature",
                 Some((183.15, 323.15)),
+            ),
+            (
+                "relative_humidity_2m",
+                "Screen level relative humidity (RH2M)",
+                "%",
+                "humidity",
+                Some((0.0, 100.0)),
             ),
             (
                 "relative_humidity_2m",
@@ -1200,6 +1295,13 @@ mod tests {
             (
                 "cloud_area_fraction",
                 "Total cloud cover (TCC)",
+                "%",
+                "cloud_cover",
+                Some((0.0, 100.0)),
+            ),
+            (
+                "cloud_area_fraction",
+                "Total cloud cover (TCC)",
                 "1",
                 "cloud_cover_fraction",
                 Some((0.0, 1.0)),
@@ -1207,9 +1309,23 @@ mod tests {
             (
                 "low_type_cloud_area_fraction",
                 "Low cloud cover (LCC)",
+                "%",
+                "cloud_cover",
+                Some((0.0, 100.0)),
+            ),
+            (
+                "low_type_cloud_area_fraction",
+                "Low cloud cover (LCC)",
                 "1",
                 "cloud_cover_fraction",
                 Some((0.0, 1.0)),
+            ),
+            (
+                "fog_area_fraction",
+                "Fog",
+                "%",
+                "cloud_cover",
+                Some((0.0, 100.0)),
             ),
             (
                 "fog_area_fraction",
@@ -1229,8 +1345,8 @@ mod tests {
 
     /// #1067 PR 8: MEPS's pressure-level variables, with the titles and units
     /// engine-netcdf reports for them (testdata/meps-netcdf-pl; temperature
-    /// in °C and geopotential in gpm, #1209, and in the files' K and
-    /// m^2/s^2). Their wind
+    /// in °C, geopotential in gpm and relative humidity in %, #1209, and in
+    /// the files' K, m^2/s^2 and 1). Their wind
     /// components and the speed derived from them span ±80 / 0–80 m/s, twice
     /// the surface scale, for the jet; temperature, geopotential and
     /// relative humidity keep their all-levels ranges. The surface
@@ -1287,6 +1403,13 @@ mod tests {
                 "m^2/s^2",
                 "viridis",
                 Some((0.0, 206_000.0)),
+            ),
+            (
+                "relative_humidity_pl",
+                "Relative humidity pressure levels",
+                "%",
+                "humidity",
+                Some((0.0, 100.0)),
             ),
             (
                 "relative_humidity_pl",

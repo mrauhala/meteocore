@@ -41,9 +41,12 @@ Each file is one model run, and the newest run is the default.
   `ds_core::resample::SourceGrid`: a coarse projection grid, bounded by a
   projected grid's footprint. A global lat/lon grid's map is periodic in
   longitude, so polar and EPSG:3035 views stay registered.
-- **Names.** EDR uses each parameter's full descriptor, such as
-  `2 Metre Temperature (2t)`. The map APIs use the short name in the
-  trailing parentheses (`2t`), or the full descriptor when there is none.
+- **Names.** EDR lists each parameter by its full descriptor, such as
+  `2 Metre Temperature (2t)`, and also accepts the short name in the
+  trailing parentheses (`2t`) in `parameter-name`; the coverage is keyed by
+  the name asked for. The map APIs use the short name, or the full
+  descriptor when there is none, so WMS GetFeatureInfo on `<collection>/2t`
+  reads the same parameter.
 - **Units.** A `.sqd` file has no unit strings. Each parameter's unit
   comes from its FMI parameter number, and values are served as stored:
   pressure (1) in hPa, temperature and dew point (4, 10) in °C, relative
@@ -119,11 +122,11 @@ apis = ["edr", "wms", "maps", "tiles"]
 wms_parameter = "2t"                 # default: the file's first parameter
 poll_interval_secs = 60              # default 30, minimum 1
 max_runs = 4                         # default 4; 1 keeps only the latest run
-
-[collections.wms]                    # for the collection layer, see Limits
-colormap = "temperature"
 ```
 
+- Without a `[wms]` block, each parameter layer takes the built-in default
+  style its name and unit select, and the collection layer draws
+  `wms_parameter` in that parameter's style.
 - `data_path` is a local directory. A relative path resolves against the
   server's working directory.
 - `wms_parameter` matches the full descriptor, the short name or the FMI
@@ -150,11 +153,6 @@ colormap = "temperature"
   default palettes do not match it: set its palette in `[wms]`. Maximum
   and minimum temperature (5, 6) and precipitation rate (49) are among
   them, since FMI's converters store each in more than one unit.
-- A map request naming no parameter (WMS layer `<collection>`, Maps or
-  Tiles without `parameter-name`) draws the default parameter in that
-  parameter's layer style only when its descriptor has no short name in
-  parentheses, such as `Temperature`. With `2 Metre Temperature (2t)` it
-  takes the collection's `[wms]` palette, so set one.
 - The run window is chosen by file name, so names must sort in origin-time
   order, as timestamped names do. Of two files with the same origin time,
   the later name is kept.

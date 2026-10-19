@@ -239,14 +239,15 @@ label = "Peak current"
 unit = "kA"
 ```
 
-Style it with `[wms] colormap = "lightning_age"`, whose stops span 0–60
-minutes, the default window. A map frame draws the events of the
-`default_datetime` window ending at `TIME` (floored to the minute) as discs
-of 2-pixel radius, valued by age in minutes. Advertised times are one-minute
-steps over the newest six hours of data; without `TIME` the frame follows
-the newest step, updated on refresh. Each window is one read, cached
-(`MC_LIGHTNING_STRIKE_CACHE_MB`, default 32) and capped at the newest
-200 000 events.
+Without a `[wms]` palette the layer takes the built-in `lightning_age`
+style, 0–60 minutes, which fits the default one-hour window; for another
+window, set `[wms] max` to its length in minutes. A map frame draws the
+events of the `default_datetime` window ending at `TIME` (floored to the
+minute) as discs of 2-pixel radius, valued by age in minutes. Advertised
+times are one-minute steps over the newest six hours of data; without `TIME`
+the frame follows the newest step, updated on refresh. Each window is one
+read, cached (`MC_LIGHTNING_STRIKE_CACHE_MB`, default 32) and capped at the
+newest 200 000 events.
 
 A nowcast `lightning_source` reads the same table. Optional
 `cloud_indicator_col` (0 cloud-to-ground, 1 intra-cloud), `peak_current_col`

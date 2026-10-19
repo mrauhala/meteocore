@@ -70,13 +70,16 @@ three take WGS84 only, or GRS80, which matches it to 0.1 mm. A grid that
 holds a pole, such as an Arctic polar stereographic grid, advertises an
 extent reaching the pole.
 
-**Display units.** Each variable's CF `units`, in any spelling, picks
-the unit it is served in: K as °C, Pa as hPa, kg m-2 as mm, kg m-2 s-1 as
-mm/h, m2 s-2 as gpm. A unit without a rule, such as CF's `1` or m/s, is
-served as stored. Values are sampled from the stored field and converted
-after, so a map pixel, an EDR value and GetFeatureInfo at one point
-agree. Layers without a `[[wms.parameters]]` style take the built-in
-default their name and served unit select.
+**Display units.** Each variable's CF `units`, in any spelling, picks the
+unit it is served in: K as °C, Pa as hPa, kg m-2 as mm, kg m-2 s-1 as mm/h,
+m2 s-2 as gpm. CF's dimensionless `1` is served as % when the variable's
+`standard_name` is a fraction: `relative_humidity`, or a name ending in
+`_area_fraction` or `_area_fraction_in_atmosphere_layer`, such as
+`cloud_area_fraction`. Any other unit, such as m/s or the `1` of
+`specific_humidity`, is served as stored. Values are sampled from the stored
+field and converted after, so a map pixel, an EDR value and GetFeatureInfo
+at one point agree. Layers without a `[[wms.parameters]]` style take the
+built-in default their name and served unit select.
 
 **Pressure levels.** A dimension whose coordinate has pressure units
 (`Pa`, `hPa`, `mbar`, …) and is not a parametric coordinate is the

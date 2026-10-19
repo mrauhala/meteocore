@@ -417,9 +417,10 @@ max = 70.0
 `[collections.wms]` is optional. Its other fields are `color_stops`,
 `[[collections.wms.parameters]]` (per-parameter defaults), `style_bundle`,
 `parameter_defaults = false` (turns off the built-in per-parameter styles)
-and `rendered_cache_mb`. Without a colormap a layer gets a generic fallback
-palette, though parameter layers may match the built-in per-parameter
-defaults. Palettes, bundles and style rules are
+and `rendered_cache_mb`. Without a colormap, a parameter layer, and a
+collection layer drawing one parameter, take the built-in default style
+that parameter's name and unit select; a layer no default matches gets a
+generic fallback palette. Palettes, bundles and style rules are
 documented in the root README's
 [Styling](../../README.md#styling-shared-with-maps-and-tiles) section.
 

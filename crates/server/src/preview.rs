@@ -613,23 +613,13 @@ fn collection_parameters(
     Some(out)
 }
 
-/// The `parameters[]` name of the engine's default, `info.parameter`.
-/// Engines name it as they list it, except QueryData, whose default is the
-/// descriptor's full name ("2 Metre Temperature (2t)"), listed as the title
-/// of `2t`: a default no name matches is the one parameter with that title.
+/// The `parameters[]` name of the engine's default, `info.parameter`, when
+/// the list holds it. Engines name the default as they list it, QueryData
+/// by its short name too (#1215).
 fn default_parameter_name(info: &ds_core::map_engine::RasterInfo) -> Option<String> {
     let default = info.parameter.as_str();
-    if default.is_empty() {
-        return None;
-    }
-    if info.parameters.iter().any(|p| p.name == default) {
-        return Some(default.to_string());
-    }
-    let mut titled = info.parameters.iter().filter(|p| p.title == default);
-    match (titled.next(), titled.next()) {
-        (Some(p), None) => Some(p.name.clone()),
-        _ => None,
-    }
+    (!default.is_empty() && info.parameters.iter().any(|p| p.name == default))
+        .then(|| default.to_string())
 }
 
 /// One parameter's own time axis in the manifest's `temporal_extent` shape.
@@ -2663,8 +2653,8 @@ mod tests {
         tiles.map_engines.insert(
             "grid".into(),
             Arc::new(RasterMock {
-                // A default no parameter carries as its name or title,
-                // as GRIB's hard-coded fallback can be.
+                // A default the list does not name, as GRIB's hard-coded
+                // fallback can be.
                 parameter: "value".into(),
                 parameters: ["msl", "t2m"]
                     .map(|name| ds_core::map_engine::ParameterInfo {
@@ -2691,27 +2681,26 @@ mod tests {
         assert!(params.iter().all(|p| p.get("default").is_none()));
     }
 
-    /// QueryData names its default by the descriptor's full name, which it
-    /// lists as the short-named parameter's title.
+    /// QueryData lists a descriptor with a short name in parentheses by the
+    /// short name, and names its default by it too (#1215): the committed
+    /// Kenya run, drawing `2 Metre Temperature (2t)`, marks `2t`.
     #[test]
-    fn manifest_marks_a_default_named_by_its_title() {
+    fn manifest_marks_querydatas_short_named_default() {
         let mut tiles = empty_tiles();
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/ecmwf-kenya");
         tiles.map_engines.insert(
             "sqd".into(),
-            Arc::new(RasterMock {
-                parameter: "2 Metre Temperature (2t)".into(),
-                parameters: [
-                    ("10u", "10 Metre U Wind Component (10u)"),
-                    ("2t", "2 Metre Temperature (2t)"),
-                ]
-                .map(|(name, title)| ds_core::map_engine::ParameterInfo {
-                    name: name.into(),
-                    title: title.into(),
-                    unit: String::new(),
-                })
-                .into(),
-                ..RasterMock::default()
-            }),
+            Arc::new(
+                engine_querydata::QueryDataEngine::new(
+                    &dir,
+                    "sqd",
+                    Some("2 Metre Temperature (2t)"),
+                    3600,
+                    1,
+                )
+                .unwrap(),
+            ),
         );
         tiles
             .collections
@@ -2725,10 +2714,15 @@ mod tests {
         );
         let manifest = build_manifest(&state, 0, 100);
         let params = manifest["collections"][0]["parameters"].as_array().unwrap();
-        assert_eq!(params[0]["name"], "10u");
-        assert!(params[0].get("default").is_none());
-        assert_eq!(params[1]["name"], "2t");
-        assert_eq!(params[1]["default"], true);
+        let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["2t", "msl", "rr1h"]);
+        assert_eq!(params[0]["title"], "2 Metre Temperature (2t)");
+        let defaults: Vec<&str> = params
+            .iter()
+            .filter(|p| p["default"] == json!(true))
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(defaults, ["2t"]);
     }
 
     struct VolumeMock;

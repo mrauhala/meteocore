@@ -274,12 +274,15 @@ set of builders and follow Requirement 7 of the Metocean EDR profile:
   label as `observedProperty.label`. `description` is the full label plus
   its unit.
 - The unit is the unit of the values served. GRIB, BUFR, Zarr and NetCDF
-  convert values and unit from the source's: K → °C, Pa → hPa,
-  kg m⁻² → mm, kg m⁻² s⁻¹ → mm/h, m² s⁻² → gpm, a proportion → %. Other
-  units are served as the source spells them. GRIB, Zarr and NetCDF maps
-  draw the same converted values. QueryData takes each unit from the FMI
-  parameter number, and gives none where the number has no known unit. A
-  station grid takes its source's units.
+  convert values and unit from the source's: K → °C, Pa → hPa, kg m⁻² → mm,
+  kg m⁻² s⁻¹ → mm/h, m² s⁻² → gpm, a proportion → %. Zarr and NetCDF also
+  serve CF's `1` as % when the `standard_name` is a fraction
+  (`relative_humidity`, `…_area_fraction`). Other units are served as the
+  source spells them. GRIB, Zarr and NetCDF maps draw the same converted
+  values. QueryData takes each unit from the FMI parameter number, and gives
+  none where the number has no known unit; its `parameter-name` also accepts
+  a descriptor's short name, such as `2t` for `2 Metre Temperature (2t)`,
+  keyed as asked. A station grid takes its source's units.
 - `unit.symbol` is the QUDT unit when `ds_core::units` knows one, else
   UCUM-typed for a UCUM unit, else a plain string (`dBZ`, `gpm`).
 - `observedProperty.id` is the NERC CF standard-name URI when the engine

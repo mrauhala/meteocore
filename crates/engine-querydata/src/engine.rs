@@ -315,7 +315,7 @@ impl EdrEngine for QueryDataEngine {
         // any step of the run.
         let time_indices = find_time_range(&data, datetime.filter(|_| !path.has_m));
         let times: Vec<DateTime<Utc>> = time_indices.iter().map(|(_, t)| *t).collect();
-        let param_indices = select_param_indices(&data, parameters)?;
+        let selected = select_parameters(&data, parameters)?;
         // The native cell size the area query samples at: exact for lat-lon
         // grids, a fair mean for projected ones.
         let extent = data.grid.lonlat_extent();
@@ -330,7 +330,7 @@ impl EdrEngine for QueryDataEngine {
                 vertical: None,
                 z: None,
             },
-            param_indices.len(),
+            selected.len(),
         )?;
         plan.require_extent(Some(extent))?;
 
@@ -341,9 +341,9 @@ impl EdrEngine for QueryDataEngine {
             .iter()
             .map(|&(lon, lat)| world_to_grid_px(gt, lon, lat))
             .collect();
-        let values: Vec<Vec<Vec<Option<f64>>>> = param_indices
+        let values: Vec<Vec<Vec<Option<f64>>>> = selected
             .iter()
-            .map(|(pi, _)| {
+            .map(|parameter| {
                 plan.fields()
                     .iter()
                     .map(|field| {
@@ -353,16 +353,16 @@ impl EdrEngine for QueryDataEngine {
                             .iter()
                             .map(|&p| {
                                 let (col_f, row_f) = pixels[p];
-                                sample_grid_bilinear(&data, col_f, row_f, *pi, 0, ti)
+                                sample_grid_bilinear(&data, col_f, row_f, parameter.index, 0, ti)
                             })
                             .collect()
                     })
                     .collect()
             })
             .collect();
-        let descriptions: Vec<(String, ParameterDescription)> = param_indices
+        let descriptions: Vec<(String, ParameterDescription)> = selected
             .iter()
-            .map(|(_, param)| (param.name.clone(), description(param)))
+            .map(|parameter| (parameter.key.to_string(), description(parameter.param)))
             .collect();
         plan.into_response(&descriptions, &values)
     }
@@ -392,7 +392,7 @@ impl EdrEngine for QueryDataEngine {
             ));
         }
 
-        let param_indices = select_param_indices(&data, parameters)?;
+        let selected = select_parameters(&data, parameters)?;
 
         // A polygon entirely outside the run's coverage is a 404, not an
         // all-null 200 (GRIB answers the same way).
@@ -409,7 +409,7 @@ impl EdrEngine for QueryDataEngine {
         let res_lat = (extent[3] - extent[1]) / data.grid.ny.max(1) as f64;
         let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
         let (nx, ny) = axes.dims();
-        check_area_budget(time_indices.len(), ny, nx, param_indices.len())?;
+        check_area_budget(time_indices.len(), ny, nx, selected.len())?;
         check_mask_budget(nx * ny, &polygon)?;
 
         // Project each cell centre ONCE (the CRS forward transform is the
@@ -434,16 +434,16 @@ impl EdrEngine for QueryDataEngine {
         let mut params_map = HashMap::new();
         let mut ranges = HashMap::new();
 
-        for (pi, param) in &param_indices {
+        for parameter in &selected {
             let mut values: Vec<Option<f64>> = Vec::with_capacity(time_indices.len() * ny * nx);
             for (ti, _) in &time_indices {
                 values.extend(cell_px.iter().map(|px| {
                     px.and_then(|(col_f, row_f)| {
-                        sample_grid_bilinear(&data, col_f, row_f, *pi, 0, *ti)
+                        sample_grid_bilinear(&data, col_f, row_f, parameter.index, 0, *ti)
                     })
                 }));
             }
-            params_map.insert(param.name.clone(), description(param));
+            params_map.insert(parameter.key.to_string(), description(parameter.param));
             let (shape, axis_names) = if has_time {
                 (
                     vec![times.len(), ny, nx],
@@ -453,7 +453,7 @@ impl EdrEngine for QueryDataEngine {
                 (vec![ny, nx], vec!["y".to_string(), "x".to_string()])
             };
             ranges.insert(
-                param.name.clone(),
+                parameter.key.to_string(),
                 NdArray {
                     shape,
                     axis_names,
@@ -496,7 +496,7 @@ impl EdrEngine for QueryDataEngine {
 
         let times: Vec<DateTime<Utc>> = time_indices.iter().map(|(_, t)| *t).collect();
 
-        let param_indices = select_param_indices(&data, parameters)?;
+        let selected = select_parameters(&data, parameters)?;
 
         let domain = DomainDescription::PointSeries {
             x: lon,
@@ -508,16 +508,16 @@ impl EdrEngine for QueryDataEngine {
         let mut params_map = HashMap::new();
         let mut ranges = HashMap::new();
 
-        for (pi, param) in &param_indices {
+        for parameter in &selected {
             let values: Vec<Option<f64>> = time_indices
                 .iter()
-                .map(|(ti, _)| interpolate(&data, lon, lat, *pi, 0, *ti))
+                .map(|(ti, _)| interpolate(&data, lon, lat, parameter.index, 0, *ti))
                 .collect();
 
-            params_map.insert(param.name.clone(), description(param));
+            params_map.insert(parameter.key.to_string(), description(parameter.param));
 
             ranges.insert(
-                param.name.clone(),
+                parameter.key.to_string(),
                 NdArray {
                     shape: vec![values.len()],
                     axis_names: vec!["t".to_string()],
@@ -725,10 +725,12 @@ impl MapEngine for QueryDataEngine {
         drop(set);
         let param_idx = self.resolve_map_param_idx(&data);
 
+        // The default is named as its map layer, the short name (#1215), so
+        // the root layer draws `{collection}/{parameter}`'s style (#1161).
         let (param_name, param_unit) = data
             .params
             .get(param_idx)
-            .map(|p| (p.name.clone(), units::unit(p.id).to_string()))
+            .map(|p| (map_name(&p.name).to_string(), units::unit(p.id).to_string()))
             .unwrap_or_default();
 
         let gt = data.grid.geo_transform();
@@ -917,7 +919,8 @@ fn wind_facts(data: &QueryData) -> WindFacts {
 
 /// A parameter's map name: the short name in parentheses at the end of its
 /// descriptor (`"2 Metre Temperature (2t)"` → `"2t"`), else the descriptor.
-/// EDR uses the full descriptor.
+/// The map APIs list and default by it; EDR advertises the full descriptor
+/// and takes the short name as its alias ([`select_parameters`], #1215).
 fn map_name(name: &str) -> &str {
     name.rfind('(')
         .and_then(|start| name[start + 1..].strip_suffix(')'))
@@ -981,25 +984,85 @@ fn interpolate(
     sample_grid_bilinear(data, col_f, row_f, param_idx, level_idx, time_idx)
 }
 
-/// The parameters an EDR query addresses, with their indices: every one
-/// when `parameters` is absent, else exactly the named ones
-/// (`select_parameters`: case-insensitive, an unknown name is a 400), in
-/// request order. Shared by position and area so the two cannot drift.
-fn select_param_indices<'a>(
+/// A parameter an EDR query addresses.
+struct Selected<'a> {
+    /// Its index in the run.
+    index: usize,
+    param: &'a ParamInfo,
+    /// The name its coverage is keyed by: the name the request used, in its
+    /// canonical spelling, or the full descriptor when none was named.
+    key: &'a str,
+}
+
+/// The parameters an EDR query addresses, shared by every query type so
+/// they cannot drift (position, area and radius, trajectory). Absent
+/// `parameters` is every parameter, keyed by its full descriptor, which EDR
+/// advertises. Otherwise exactly the named ones, in request order: a name
+/// is a parameter's full descriptor (`2 Metre Temperature (2t)`) or the
+/// short name in its parentheses (`2t`, its map name, [`map_name`]),
+/// case-insensitively, a descriptor first (#1215). The coverage is keyed by
+/// that name, so WMS GetFeatureInfo, which asks for the map layer's name,
+/// finds its value under it, and `DerivedWind` finds the descriptors it
+/// asks for. Repeats of one name collapse; the two names of one parameter
+/// are two ranges. What fails is the shared rule's (#666): an empty list,
+/// or a name that is neither, is a 400 listing the advertised descriptors.
+fn select_parameters<'a>(
     data: &'a QueryData,
     parameters: Option<&[String]>,
-) -> Result<Vec<(usize, &'a ParamInfo)>, DataServerError> {
-    let names: Vec<&str> = data.params.iter().map(|p| p.name.as_str()).collect();
-    let selected = ds_core::edr_engine::select_parameters(parameters, &names)?;
+) -> Result<Vec<Selected<'a>>, DataServerError> {
+    let selected: Vec<Selected<'a>> = match parameters {
+        None => data
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| Selected {
+                index,
+                param,
+                key: &param.name,
+            })
+            .collect(),
+        Some(requested) => {
+            let resolved: Vec<Option<Selected<'a>>> = requested
+                .iter()
+                .map(|name| select_parameter(data, name))
+                .collect();
+            let descriptors: Vec<String> = requested
+                .iter()
+                .zip(&resolved)
+                .map(|(name, found)| found.as_ref().map_or(name, |s| &s.param.name).clone())
+                .collect();
+            // The shared rule decides what fails, with its message: each
+            // name found stands as its descriptor, an unknown one as sent.
+            let names: Vec<&str> = data.params.iter().map(|p| p.name.as_str()).collect();
+            ds_core::edr_engine::select_parameters(Some(&descriptors), &names)?;
+            let mut selected: Vec<Selected<'a>> = Vec::with_capacity(resolved.len());
+            for found in resolved.into_iter().flatten() {
+                if !selected.iter().any(|s| s.key == found.key) {
+                    selected.push(found);
+                }
+            }
+            selected
+        }
+    };
     if selected.is_empty() {
         return Err(DataServerError::InvalidParameter(
             "No parameters available".into(),
         ));
     }
-    Ok(selected
-        .into_iter()
-        .filter_map(|name| data.params.iter().enumerate().find(|(_, p)| p.name == name))
-        .collect())
+    Ok(selected)
+}
+
+/// The parameter `name` selects: the one whose full descriptor it is, else
+/// the one whose short name it is, case-insensitively, keyed by that name.
+fn select_parameter<'a>(data: &'a QueryData, name: &str) -> Option<Selected<'a>> {
+    let by = |name_of: fn(&ParamInfo) -> &str| {
+        data.params.iter().enumerate().find_map(|(index, param)| {
+            let key = name_of(param);
+            key.eq_ignore_ascii_case(name)
+                .then_some(Selected { index, param, key })
+        })
+    };
+    by(|p| p.name.as_str()).or_else(|| by(|p| map_name(&p.name)))
 }
 
 /// Map WGS84 (lon, lat) to fractional source-grid pixel `(col_f, row_f)` — the
@@ -1767,7 +1830,8 @@ mod tests {
                 .unwrap();
         let info = engine.raster_info();
 
-        assert_eq!(info.parameter, "2 Metre Temperature (2t)");
+        // The default's map name, the layer it draws (#1215).
+        assert_eq!(info.parameter, "2t");
         // Lon-first geographic grid -> CRS:84 (not lat-first EPSG:4326).
         assert_eq!(info.native_crs, "CRS:84");
         assert_eq!(info.times.len(), 4);
@@ -1900,6 +1964,8 @@ mod tests {
 mod footprint_tests;
 #[cfg(test)]
 mod global_tests;
+#[cfg(test)]
+mod names_tests;
 #[cfg(test)]
 mod sampler_tests;
 #[cfg(test)]
