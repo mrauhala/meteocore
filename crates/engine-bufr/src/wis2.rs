@@ -497,6 +497,7 @@ mod tests {
                 position_radius_km: 25.0,
                 builtin_parameters: true,
                 parameters: vec![],
+                map: None,
             },
             "obs-wis2-test",
         )

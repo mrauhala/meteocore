@@ -218,6 +218,11 @@ on the events shape. An unknown key in it is a load error.
   marker's latest value within `max_age` is not what an EDR position query
   returns.
 
+CSV and BUFR station collections serve the same layers from their
+in-memory rows, configured by `[csv.map]` or `[bufr.map]` with the same keys
+and defaults, and drawn by the same shared code, so a station looks the
+same in all three.
+
 ### Event collection
 
 Top-level fields and `[postgis]` as above, with

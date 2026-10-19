@@ -264,8 +264,8 @@ them. `text/plain` writes `layer:` and then one `name: value` line per field,
 - **Queryable layers.** A layer is `queryable="1"` when its collection's
   engine answers EDR position queries for the values the layer shows,
   whether or not the collection lists `edr`. RGB composites, the ODIM
-  per-site `CELLS` overlay, CAP, PostGIS events (lightning), PostGIS
-  station symbols and nowcast layers are `queryable="0"` and answer
+  per-site `CELLS` overlay, CAP, PostGIS events (lightning), station
+  symbols (CSV, BUFR, PostGIS) and nowcast layers are `queryable="0"` and answer
   `LayerNotQueryable`. A station marker shows the station's latest value
   within `max_age`, which a position query, an exact instant at the
   nearest station, does not answer.
@@ -357,7 +357,7 @@ only in the server log.
 | Response | `Cache-Control` |
 |---|---|
 | GetMap with a `TIME` that resolved, on content never revised in place | `public, max-age=86400, immutable` |
-| GetMap otherwise (no `TIME`, CAP alerts, station symbols, station grids, the error image) | `public, max-age=60, must-revalidate` |
+| GetMap otherwise (no `TIME`, CAP alerts, BUFR and PostGIS station symbols, station grids, the error image) | `public, max-age=60, must-revalidate` |
 | GetFeatureInfo | As GetMap, and a null value always revalidates |
 | GetLegendGraphic | `public, max-age=86400` |
 
@@ -383,9 +383,10 @@ on every retry; see
 
 A collection is served when its engine draws maps and `apis` lists `wms`:
 `geotiff`, `grib`, `querydata`, `zarr`, `netcdf`, `satellite`, `odim`,
-`odim-volume`, `cap`, `nowcast`, `station-grid` and `postgis`. A PostGIS
-events collection draws its strikes; a station collection draws a layer
-per parameter, each station a marker coloured by its value.
+`odim-volume`, `cap`, `nowcast`, `station-grid`, `postgis`, `csv` and
+`bufr`. A PostGIS events collection draws its strikes; a CSV, BUFR or
+PostGIS station collection draws a layer per parameter, each station a
+marker coloured by its value.
 
 ```toml
 [[collections]]

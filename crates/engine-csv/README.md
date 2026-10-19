@@ -1,7 +1,7 @@
 # engine-csv
 
-Serves station observations from one CSV file through OGC API - EDR and
-OGC API - Features.
+Serves station observations from one CSV file through OGC API - EDR,
+OGC API - Features and station symbol map layers (WMS, Maps, Tiles).
 
 ## What it solves
 
@@ -38,6 +38,7 @@ inventory as points.
 | EDR | `radius` | the circle as a 64-vertex geodesic polygon, then answered as `area` |
 | EDR | `items` | the station features below, whenever the collection lists `edr` |
 | Features | `/items`, `/items/{featureId}` | one Point per station, properties `name`, `latitude`, `longitude` |
+| WMS, Maps, Tiles | map | one station symbol layer per parameter: each station a marker coloured by its latest value within `max_age` |
 
 - EDR `datetime` selects rows whose time falls in the window, both ends
   included. On `/locations` and on Features `/items` it keeps the stations
@@ -103,12 +104,19 @@ apis = ["edr", "features"]          # default ["edr"]
 
 - `data_path` is a local file path. A relative path resolves against the
   server's working directory.
-- `apis` accepts only `edr` and `features`. Any other API makes the
-  collection fail to load.
+- `apis` accepts `edr`, `features`, `wms`, `maps` and `tiles`. Any other
+  API makes the collection fail to load.
+- The map layers are on when `apis` lists `wms`, `maps` or `tiles`, or the
+  collection has a `[csv.map]` section, which takes the keys and defaults
+  of [`[postgis.map]`](../engine-postgis/README.md#station-map-layers)
+  (`max_age`, `time_step`, `marker_size`, `draw_missing`). `[csv]` holds only `map`. A frame reads the in-memory
+  rows: per station the latest value in `[TIME - max_age, TIME]`, drawn at
+  its inventory position. The file is static, so an explicit `TIME` is
+  cached as immutable. WMS GetFeatureInfo does not answer these layers.
 - The runnable example is
   [`collections.d/weather.toml`](../../collections.d/weather.toml).
 - `server --auto-collections <DIR>` creates one such collection, with EDR
-  and Features, per `.csv` file in a directory that holds no QueryData,
+  and Features only, per `.csv` file in a directory that holds no QueryData,
   GRIB, GeoTIFF or HDF5 files.
 
 ## Limits

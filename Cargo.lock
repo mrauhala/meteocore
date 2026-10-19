@@ -1392,6 +1392,7 @@ dependencies = [
  "ds-bufr",
  "ds-core",
  "ds-poll",
+ "ds-render",
  "ds-storage",
  "ds-wis2",
  "flate2",
@@ -1433,6 +1434,7 @@ dependencies = [
  "criterion",
  "csv",
  "ds-core",
+ "ds-render",
  "tracing",
 ]
 
@@ -1567,6 +1569,7 @@ dependencies = [
  "ds-cache",
  "ds-core",
  "ds-poll",
+ "ds-render",
  "engine-station-grid",
  "futures",
  "postgis",

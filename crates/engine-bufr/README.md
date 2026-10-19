@@ -1,8 +1,8 @@
 # engine-bufr
 
 Serves WMO BUFR surface station reports (SYNOP, SHIP) as OGC API - EDR
-station time series and OGC API - Features station points
-(`engine_type = "bufr"`).
+station time series, OGC API - Features station points and station symbol
+map layers (WMS, Maps, Tiles) (`engine_type = "bufr"`).
 
 ## What it solves
 
@@ -65,6 +65,7 @@ memory, and answers EDR and Features queries from that store.
 | EDR | `area` | One `PointSeries` per station inside the polygon with data in the window; none gives an empty `CoverageCollection` |
 | EDR | `radius` | The circle as a polygon, then `area` |
 | Features | `/items` | One Point feature per station: `wigos_station_identifier`, `name`, `elevation`, `first_report`, `last_report`, `report_count` |
+| WMS, Maps, Tiles | map | One station symbol layer per parameter: each station a marker coloured by its latest value within `max_age` |
 
 - EDR formats: CoverageJSON (default), CSV and HTML for every query; EDR
   GeoJSON for `locations`, `position` and `radius`; a PNG plot for
@@ -98,7 +99,7 @@ id = "obs-synop"
 title = "Surface observations"
 description = "SYNOP station reports decoded from BUFR"
 engine_type = "bufr"
-apis = ["edr", "features"]        # the only APIs this engine serves
+apis = ["edr", "features"]        # also "wms", "maps", "tiles"
 
 [collections.bufr]
 data_path = "data/synop"          # or a [collections.bufr.wis2] block, not both
@@ -123,6 +124,14 @@ period_hours = 2                  # only for period-qualified elements
 | `stale_after` | `PT2H` | WIS2: degraded when no notification arrived this long |
 | `position_radius_km` | `25.0` | EDR `position` search radius |
 | `builtin_parameters` | `true` | `false` serves only `[[bufr.parameters]]` (at least one required) |
+
+The map layers are on when `apis` lists `wms`, `maps` or `tiles`, or the
+collection has a `[bufr.map]` section, which takes the keys and defaults of
+[`[postgis.map]`](../engine-postgis/README.md#station-map-layers)
+(`max_age`, `time_step`, `marker_size`, `draw_missing`). A frame reads the in-memory store: per station the latest
+value in `[TIME - max_age, TIME]`. Late and corrected reports revise the
+store, so the layers' cached frames follow the snapshot and an explicit
+`TIME` revalidates. WMS GetFeatureInfo does not answer these layers.
 
 Runnable examples: `collections.d/obs-bufr-local.toml` reads the fixtures
 (its long `retention` keeps the dated fixtures in the window), and

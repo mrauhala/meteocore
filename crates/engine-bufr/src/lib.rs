@@ -11,6 +11,7 @@
 pub mod decode;
 mod engine;
 pub mod health;
+mod map;
 mod metadata;
 pub mod params;
 mod persist;

@@ -122,6 +122,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             bufr: None,
             satellite: None,
             netcdf: None,
+            csv: None,
             preview: None,
             derive_wind: None,
         },

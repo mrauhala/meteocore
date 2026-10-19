@@ -652,15 +652,16 @@ static LIGHTNING_STRIKE_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(
     )
 });
 
-// Station-frame cache (#1063) — process-global, byte-bounded LRU of the
-// station map layers' decoded frames, so the meta-tiles of one frame share
-// ONE DB fetch.
+// Station-frame cache (#1063, #1204) — process-global, byte-bounded LRU of
+// the station map layers' frames (`ds_render::station_symbols`), shared by
+// the CSV, BUFR and PostGIS station engines, so the meta-tiles of one frame
+// share ONE frame read (a DB statement for PostGIS).
 static STATION_FRAME_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
     CacheMetricSet::new(
         "station_frame_cache",
         "Station map frame cache",
         Some("station map layers"),
-        Some("frame DB fetches"),
+        Some("frame reads: a DB statement for PostGIS, the in-memory store for CSV and BUFR"),
         false,
     )
 });
@@ -2237,6 +2238,54 @@ pub fn load_collections(
     let mut wind_by_id: WindHandles = HashMap::new();
     let mut nowcast_dependency_updates = Vec::new();
 
+    // A CSV or BUFR station collection's symbol layers (#1204), when
+    // `station_map_wiring` turns them on: styles resolved on every load,
+    // built or reused (a reload can change the styles alone), each
+    // parameter layer's midpoint handed to the engine, and the engine
+    // registered with each map API the collection lists. The PostGIS arm
+    // does the same inline, next to its events layer.
+    macro_rules! wire_station_layers {
+        ($collection:expr, $engine:expr) => {{
+            let collection: &CollectionConfig = $collection;
+            let wiring = station_map_wiring(collection);
+            if wiring.station_layers {
+                use ds_core::map_engine::MapEngine as _;
+                let layer_params = $engine.raster_info_shared().parameters.clone();
+                let styles = collection_layer_styles(
+                    style_ctx,
+                    &mut styles_cache,
+                    collection,
+                    &layer_params,
+                    &bundle_index,
+                );
+                $engine.set_station_symbols(station_symbols(
+                    &styles,
+                    &collection.id,
+                    &layer_params,
+                ));
+                let engine = $engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>;
+                for api in &wiring.raster_apis {
+                    let (engines, collections, api_styles) = match *api {
+                        "wms" => (&mut map_engines, &mut map_collections, &mut map_styles),
+                        "maps" => (&mut maps_engines, &mut maps_collections, &mut maps_styles),
+                        _ => (
+                            &mut tiles_engines,
+                            &mut tiles_collections,
+                            &mut tiles_styles,
+                        ),
+                    };
+                    engines.insert(collection.id.clone(), engine.clone());
+                    collections.insert(collection.id.clone(), collection.clone());
+                    api_styles.extend(styles.clone());
+                }
+                info!(
+                    "Collection '{}': station symbol layers wired to {:?}",
+                    collection.id, wiring.raster_apis
+                );
+            }
+        }};
+    }
+
     for collection in collections {
         let data_path_display = collection
             .data_path
@@ -2249,7 +2298,7 @@ pub fn load_collections(
 
         // Validate engine+API compatibility
         let supported_apis: &[&str] = match collection.engine_type.as_str() {
-            "csv" => &["edr", "features"],
+            "csv" => &["edr", "features", "wms", "maps", "tiles"],
             "geojson" => &["features", "tiles"],
             "geotiff" => &["edr", "wms", "maps", "tiles"],
             "querydata" => &["edr", "wms", "maps", "tiles"],
@@ -2260,7 +2309,7 @@ pub fn load_collections(
             "odim" => &["edr", "wms", "maps", "tiles"],
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
-            "bufr" => &["edr", "features"],
+            "bufr" => &["edr", "features", "wms", "maps", "tiles"],
             "postgis" => &["edr", "features", "tiles", "wms", "maps"],
             "nowcast" => &["wms", "maps", "tiles", "features", "edr"],
             "station-grid" => &["wms", "maps", "tiles", "edr"],
@@ -2338,7 +2387,27 @@ pub fn load_collections(
                             store.parameter_names.len()
                         );
 
-                        Arc::new(engine_csv::CsvEngine::new(store))
+                        // `[csv.map]` (#1204), already checked by config
+                        // validation.
+                        let settings = match ds_core::station_map::StationMapSettings::resolve(
+                            collection.csv.as_ref().and_then(|c| c.map.as_ref()),
+                        ) {
+                            Ok(settings) => settings,
+                            Err(e) => {
+                                tracing::error!(
+                                    "Collection '{}': invalid [csv.map] {e}",
+                                    collection.id
+                                );
+                                health.push(CollectionHealth {
+                                    id: collection.id.clone(),
+                                    engine_type: "csv".into(),
+                                    status: CollectionStatus::Failed,
+                                    error: Some(format!("invalid [csv.map] {e}")),
+                                });
+                                continue;
+                            }
+                        };
+                        Arc::new(engine_csv::CsvEngine::new(store).with_station_map(settings))
                     }
                 };
                 engines_by_id.insert(collection.id.clone(), EngineHandle::Csv(engine.clone()));
@@ -2357,6 +2426,7 @@ pub fn load_collections(
                     );
                     feature_collections.insert(collection.id.clone(), collection.clone());
                 }
+                wire_station_layers!(collection, engine);
                 health.push(CollectionHealth {
                     id: collection.id.clone(),
                     engine_type: "csv".into(),
@@ -3965,6 +4035,7 @@ pub fn load_collections(
                     feature_collections.insert(collection.id.clone(), collection.clone());
                     info!("Collection '{}': wired to Features API", collection.id);
                 }
+                wire_station_layers!(collection, engine);
 
                 // Ready once the source has been scanned successfully — even
                 // with zero reports (an empty directory is a valid, quiet
@@ -4135,10 +4206,10 @@ pub fn load_collections(
 
                 // Raster surfaces: the events shape's age-colored lightning
                 // layer (#504), and a station shape's symbol layers (#1063)
-                // when opted in (`postgis_map_wiring`). Station shapes keep
+                // when opted in (`station_map_wiring`). Station shapes keep
                 // the MVT feature-tile path.
                 let is_events = engine.config().events().is_some();
-                let wiring = postgis_map_wiring(collection);
+                let wiring = station_map_wiring(collection);
                 let layer_params = if wiring.station_layers {
                     use ds_core::map_engine::MapEngine as _;
                     engine.raster_info_shared().parameters.clone()
@@ -4155,7 +4226,7 @@ pub fn load_collections(
                         &layer_params,
                         &bundle_index,
                     );
-                    engine.set_station_symbols(postgis_station_symbols(
+                    engine.set_station_symbols(station_symbols(
                         &styles,
                         &collection.id,
                         &layer_params,
@@ -5045,7 +5116,7 @@ fn root_layer_default(
     if root.layer == id {
         match ctx.base_layer_default(collection, None, &info.parameter, Some(&info.unit)) {
             Ok(Some(mut default)) => {
-                if is_postgis_station_collection(collection) {
+                if is_station_symbol_collection(collection) {
                     wrap_station_symbols(&mut default);
                 }
                 info!(
@@ -5147,10 +5218,10 @@ fn collection_layer_styles(
             ),
         }
     }
-    if is_postgis_station_collection(collection) {
-        // Station symbol layers (#1063): every style of the collection, so
-        // no path draws the transparent ground in an opaque nodata colour
-        // or a nodata marker as a value.
+    if is_station_symbol_collection(collection) {
+        // Station symbol layers (#1063, #1204): every style of the
+        // collection, so no path draws the transparent ground in an opaque
+        // nodata colour or a nodata marker as a value.
         for styles in layers.values_mut() {
             styles.values_mut().for_each(wrap_station_symbols);
         }
@@ -5159,74 +5230,99 @@ fn collection_layer_styles(
     layers
 }
 
-/// A station symbol layer's colormap (#1063): the transparent ground and
-/// the nodata marker drawn as symbols, never as values.
+/// A station symbol layer's colormap (#1063, #1204): the transparent ground
+/// and the nodata marker drawn as symbols, never as values.
 fn wrap_station_symbols(style: &mut ds_render::StyleInfo) {
     style.colormap = Arc::new(ds_render::SymbolColorMap::new(
         style.colormap.clone(),
-        engine_postgis::NODATA_MARKER,
+        ds_render::station_symbols::NODATA_MARKER,
     ));
 }
 
-/// Which map surfaces a PostGIS collection is wired to.
+/// Which map surfaces a station collection (CSV, BUFR, PostGIS) is wired
+/// to.
 #[derive(Debug, PartialEq, Eq)]
-struct PostgisMapWiring {
+struct StationMapWiring {
     /// The raster map APIs it is registered with, of `wms`, `maps`, `tiles`.
     raster_apis: Vec<&'static str>,
-    /// A station shape's symbol layers (#1063): styles resolved, midpoints
-    /// handed to the engine, and the per-refresh frame fingerprint on.
+    /// Its station symbol layers (#1063, #1204): styles resolved, midpoints
+    /// handed to the engine, and for PostGIS the per-refresh frame
+    /// fingerprint on.
     station_layers: bool,
-    /// The station inventory as vector tiles (MVT).
+    /// The station inventory as vector tiles (MVT): PostGIS station shapes.
     vector_tiles: bool,
 }
 
-/// The map wiring of a PostGIS collection. The events shape's strike layer
-/// (#504) serves every raster API listed. A station shape's symbol layers
-/// (#1063) are opt-in: a `[postgis.map]` section, or `wms`/`maps` in
-/// `apis`. A station collection listing only `tiles` without the section
-/// keeps its vector tiles alone, as before the layers existed: no raster
-/// tileset, no fingerprint statement per refresh, no style resolution and
-/// so no generic-colormap warning.
-fn postgis_map_wiring(collection: &CollectionConfig) -> PostgisMapWiring {
+/// The map wiring of a station collection; nothing for any other engine.
+///
+/// - PostGIS: the events shape's strike layer (#504) serves every raster
+///   API listed. A station shape's symbol layers (#1063) are opt-in: a
+///   `[postgis.map]` section, or `wms`/`maps` in `apis`. A station
+///   collection listing only `tiles` without the section keeps its vector
+///   tiles alone, as before the layers existed: no raster tileset, no
+///   fingerprint statement per refresh, no style resolution and so no
+///   generic-colormap warning.
+/// - CSV and BUFR (#1204): the same opt-in, a `[csv.map]`/`[bufr.map]`
+///   section or `wms`/`maps` in `apis`, and `tiles` alone opts in too: these
+///   engines have no vector tiles, so a listed `tiles` would otherwise serve
+///   nothing.
+fn station_map_wiring(collection: &CollectionConfig) -> StationMapWiring {
     let lists = |api: &str| collection.apis.iter().any(|a| a == api);
-    let events = collection
-        .postgis
-        .as_ref()
-        .is_some_and(|p| p.observations.shape == "events");
-    let station_layers = !events
-        && (collection.postgis.as_ref().is_some_and(|p| p.map.is_some())
-            || lists("wms")
-            || lists("maps"));
-    PostgisMapWiring {
+    let postgis = collection.engine_type == "postgis";
+    let map_section = match collection.engine_type.as_str() {
+        "postgis" => collection.postgis.as_ref().is_some_and(|p| p.map.is_some()),
+        "csv" => collection.csv.as_ref().is_some_and(|c| c.map.is_some()),
+        "bufr" => collection.bufr.as_ref().is_some_and(|b| b.map.is_some()),
+        _ => {
+            return StationMapWiring {
+                raster_apis: Vec::new(),
+                station_layers: false,
+                vector_tiles: false,
+            }
+        }
+    };
+    let events = postgis
+        && collection
+            .postgis
+            .as_ref()
+            .is_some_and(|p| p.observations.shape == "events");
+    // `tiles` alone keeps a PostGIS station collection's vector tiles; CSV
+    // and BUFR have none, so for them it opts in like `wms` and `maps`.
+    let station_layers =
+        !events && (map_section || lists("wms") || lists("maps") || (!postgis && lists("tiles")));
+    StationMapWiring {
         raster_apis: ["wms", "maps", "tiles"]
             .into_iter()
             .filter(|api| lists(api) && (events || station_layers))
             .collect(),
         station_layers,
-        vector_tiles: !events && lists("tiles"),
+        vector_tiles: postgis && !events && lists("tiles"),
     }
 }
 
-/// A PostGIS collection of a station shape: its map layers draw station
-/// symbols (#1063), not a raster.
-fn is_postgis_station_collection(collection: &CollectionConfig) -> bool {
-    collection.engine_type == "postgis"
-        && collection
+/// A station collection whose map layers draw station symbols (#1063,
+/// #1204), not a raster: CSV, BUFR and the PostGIS station shapes.
+fn is_station_symbol_collection(collection: &CollectionConfig) -> bool {
+    match collection.engine_type.as_str() {
+        "csv" | "bufr" => true,
+        "postgis" => collection
             .postgis
             .as_ref()
-            .is_some_and(|p| p.observations.shape != "events")
+            .is_some_and(|p| p.observations.shape != "events"),
+        _ => false,
+    }
 }
 
-/// The station layers' overlap order (#1063): each parameter layer's
+/// The station layers' overlap order (#1063, #1204): each parameter layer's
 /// midpoint, the middle of its default style's value range. That range is
 /// the style's `min`/`max`, which fall back to the palette's first and last
 /// stops, so markers draw in ascending distance from it and the most
 /// extreme value lands on top.
-fn postgis_station_symbols(
+fn station_symbols(
     layers: &HashMap<String, HashMap<String, ds_render::StyleInfo>>,
     collection_id: &str,
     params: &[ds_core::map_engine::ParameterInfo],
-) -> engine_postgis::StationSymbols {
+) -> ds_render::station_symbols::StationSymbols {
     let midpoints = params
         .iter()
         .filter_map(|p| {
@@ -5236,7 +5332,7 @@ fn postgis_station_symbols(
             Some((p.name.clone(), (style.min + style.max) / 2.0))
         })
         .collect();
-    engine_postgis::StationSymbols::new(midpoints)
+    ds_render::station_symbols::StationSymbols::new(midpoints)
 }
 
 /// Resolve a collection's bound bundle; None if unset (validation rejects unresolved refs).
@@ -6887,9 +6983,8 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         }
     }
 
-    // Lightning strike-window (#504) and station-frame (#1063) caches: only
-    // meaningful once a postgis map layer has rendered, but the families are
-    // cheap either way.
+    // Lightning strike-window cache (#504): only meaningful once a postgis
+    // map layer has rendered, but the family is cheap either way.
     if !state
         .postgis_engines
         .read()
@@ -6897,8 +6992,13 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         .is_empty()
     {
         LIGHTNING_STRIKE_CACHE_METRICS.update(engine_postgis::strike_window_cache_metrics(), None);
-        STATION_FRAME_CACHE_METRICS.update(engine_postgis::station_frame_cache_metrics(), None);
     }
+    // The station-frame cache (#1063) is shared by every station engine's
+    // symbol layers: CSV and BUFR as well as PostGIS (#1204).
+    STATION_FRAME_CACHE_METRICS.update(
+        ds_render::station_symbols::station_frame_cache_metrics(),
+        None,
+    );
 
     // Tile cache: per-collection
     if let Ok(engines) = state.geotiff_engines.read() {
@@ -7737,6 +7837,7 @@ mod tests {
             bufr: None,
             satellite: None,
             netcdf: None,
+            csv: None,
             nowcast: source.map(|s| ds_core::config::NowcastConfig {
                 source: s.to_string(),
                 horizon: "PT1H".to_string(),
@@ -10300,11 +10401,11 @@ colormap = "radar_fmi"
             c.postgis = Some(toml::from_str(&toml).unwrap());
             c
         };
-        let wiring = |c: &CollectionConfig| super::postgis_map_wiring(c);
+        let wiring = |c: &CollectionConfig| super::station_map_wiring(c);
 
         assert_eq!(
             wiring(&station(&["edr", "features", "tiles"], false)),
-            super::PostgisMapWiring {
+            super::StationMapWiring {
                 raster_apis: vec![],
                 station_layers: false,
                 vector_tiles: true,
@@ -10313,7 +10414,7 @@ colormap = "radar_fmi"
         );
         assert_eq!(
             wiring(&station(&["edr", "tiles"], true)),
-            super::PostgisMapWiring {
+            super::StationMapWiring {
                 raster_apis: vec!["tiles"],
                 station_layers: true,
                 vector_tiles: true,
@@ -10321,7 +10422,7 @@ colormap = "radar_fmi"
         );
         assert_eq!(
             wiring(&station(&["wms", "tiles"], false)),
-            super::PostgisMapWiring {
+            super::StationMapWiring {
                 raster_apis: vec!["wms", "tiles"],
                 station_layers: true,
                 vector_tiles: true,
@@ -10334,7 +10435,7 @@ colormap = "radar_fmi"
         events.postgis.as_mut().unwrap().observations.shape = "events".into();
         assert_eq!(
             wiring(&events),
-            super::PostgisMapWiring {
+            super::StationMapWiring {
                 raster_apis: vec!["wms", "tiles"],
                 station_layers: false,
                 vector_tiles: false,
@@ -10429,7 +10530,7 @@ colormap = "grayscale"
                 );
             }
         }
-        let symbols = super::postgis_station_symbols(&layers, "surface-obs", &params);
+        let symbols = super::station_symbols(&layers, "surface-obs", &params);
         assert_eq!(symbols.midpoint("t2m"), -5.0);
         let rh = &layers["surface-obs/rh"]["default"];
         assert_eq!(symbols.midpoint("rh"), (rh.min + rh.max) / 2.0);
@@ -10443,6 +10544,149 @@ colormap = "grayscale"
             style.colormap.color(Some(engine_postgis::NODATA_MARKER))[3],
             0
         );
+    }
+
+    /// #1204: a CSV or BUFR station collection's symbol layers are on with
+    /// its `[csv.map]`/`[bufr.map]` section or any map API in `apis`; `tiles`
+    /// alone opts in too, since these engines have no vector tiles. Nothing
+    /// else is wired, and other engines get nothing from the helper.
+    #[test]
+    fn csv_and_bufr_station_map_layers_are_opt_in() {
+        let wiring = |engine_type: &str, apis: &[&str], map: bool| {
+            let mut c = nowcast_test_collection("obs", engine_type, None);
+            c.apis = apis.iter().map(|a| a.to_string()).collect();
+            let section = map.then(ds_core::config::StationMapConfig::default);
+            match engine_type {
+                "csv" => {
+                    c.csv = Some(ds_core::config::CsvConfig { map: section });
+                }
+                _ => {
+                    let mut bufr: ds_core::config::BufrConfig =
+                        toml::from_str("data_path = \"x\"").unwrap();
+                    bufr.map = section;
+                    c.bufr = Some(bufr);
+                }
+            }
+            super::station_map_wiring(&c)
+        };
+        for engine_type in ["csv", "bufr"] {
+            assert_eq!(
+                wiring(engine_type, &["edr", "features"], false),
+                super::StationMapWiring {
+                    raster_apis: vec![],
+                    station_layers: false,
+                    vector_tiles: false,
+                },
+                "{engine_type}: no map API, no layers"
+            );
+            for apis in [
+                &["wms"][..],
+                &["maps"],
+                &["tiles"],
+                &["edr", "wms", "maps", "tiles"],
+            ] {
+                let w = wiring(engine_type, apis, false);
+                assert!(w.station_layers, "{engine_type} {apis:?}");
+                assert_eq!(
+                    w.raster_apis,
+                    apis.iter()
+                        .filter(|a| **a != "edr")
+                        .copied()
+                        .collect::<Vec<_>>()
+                );
+                assert!(!w.vector_tiles);
+            }
+            assert_eq!(
+                wiring(engine_type, &["features", "tiles"], true).raster_apis,
+                vec!["tiles"]
+            );
+        }
+        let geojson = nowcast_test_collection("areas", "geojson", None);
+        assert!(!super::station_map_wiring(&geojson).station_layers);
+        assert!(super::station_map_wiring(&geojson).raster_apis.is_empty());
+    }
+
+    /// #1204 end to end through the load: a CSV collection listing the map
+    /// APIs and a BUFR one with `[bufr.map]` and `tiles` pass the
+    /// `engine_type → apis` allowlist and are registered with each map API
+    /// they list, every style wrapped for symbols and each layer's midpoint
+    /// handed to the engine; a CSV collection without a map API stays off
+    /// the map registries. Rendered through the registry, a frame has
+    /// markers.
+    #[test]
+    fn csv_and_bufr_station_layers_wire_into_the_map_apis() {
+        let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
+        let mut csv = nowcast_test_collection("weather", "csv", None);
+        csv.data_path = Some(format!("{testdata}/weather.csv"));
+        csv.apis = ["edr", "wms", "maps", "tiles"].map(String::from).to_vec();
+        let mut plain = csv.clone();
+        plain.id = "weather-plain".into();
+        plain.apis = vec!["edr".to_string(), "features".to_string()];
+        let mut bufr = nowcast_test_collection("synop", "bufr", None);
+        bufr.apis = ["edr", "features", "tiles"].map(String::from).to_vec();
+        bufr.bufr = Some(
+            toml::from_str(&format!(
+                "data_path = \"{testdata}/bufr-synop\"\nretention = \"P36500D\"\n\
+                 [map]\nmarker_size = 4\n"
+            ))
+            .unwrap(),
+        );
+        let result = load_with_reuse(&[csv, plain, bufr], super::EngineReuse::default());
+        for id in ["weather", "weather-plain", "synop"] {
+            let h = health_of(&result, id);
+            assert_eq!(
+                h.status,
+                super::CollectionStatus::Ready,
+                "{id}: {:?}",
+                h.error
+            );
+        }
+        assert!(result.wms_state.engines.contains_key("weather"));
+        assert!(result.maps_state.engines.contains_key("weather"));
+        assert!(result.tiles_state.map_engines.contains_key("weather"));
+        assert!(!result.wms_state.engines.contains_key("synop"));
+        assert!(!result.maps_state.engines.contains_key("synop"));
+        assert!(result.tiles_state.map_engines.contains_key("synop"));
+        assert!(!result.tiles_state.feature_engines.contains_key("synop"));
+        for registry in [
+            &result.wms_state.engines,
+            &result.maps_state.engines,
+            &result.tiles_state.map_engines,
+        ] {
+            assert!(!registry.contains_key("weather-plain"));
+        }
+        // One layer per parameter, each styled for symbols: transparent
+        // ground, the nodata marker in the palette's nodata colour.
+        let temperature = &result.wms_state.styles["weather/temperature"]["default"];
+        assert_eq!(temperature.colormap.color(None), [0, 0, 0, 0]);
+        assert_eq!(
+            temperature
+                .colormap
+                .color(Some(ds_render::station_symbols::NODATA_MARKER)),
+            [0, 0, 0, 0]
+        );
+        assert!(result
+            .tiles_state
+            .styles
+            .contains_key("synop/air_temperature"));
+        // Rendered through the registry: the BUFR fixtures' eight stations
+        // at 08:00Z, 4-pixel markers on a whole-world CRS:84 frame.
+        let engine = &result.tiles_state.map_engines["synop"];
+        let time = "2026-09-12T08:00:00Z".parse().unwrap();
+        let tile = engine
+            .get_raster_tile(
+                [-180.0, -90.0, 180.0, 90.0],
+                360,
+                180,
+                Some(time),
+                &ds_core::map_engine::OutputCrs::Wgs84,
+                Some("air_temperature"),
+                None,
+                None,
+            )
+            .unwrap();
+        let painted = tile.values.iter_values().filter(Option::is_some).count();
+        assert!(painted >= 4 * 8, "{painted} pixels painted");
     }
 
     #[test]

@@ -12,21 +12,29 @@ use ds_core::feature_engine::FeatureEngine;
 use ds_core::model::*;
 
 use crate::loader::CsvDataStore;
+use crate::map::StationMap;
+use ds_core::station_map::StationMapSettings;
+use ds_render::station_symbols::StationSymbols;
 
 pub struct CsvEngine {
-    store: CsvDataStore,
+    pub(crate) store: CsvDataStore,
     /// Immutable station inventory in first-observation order. Observation
     /// history must not be scanned or turned into Features on each page request.
     stations: Vec<Feature>,
     /// The EDR location inventory in first-observation order, built once:
     /// `get_locations` hands every request this `Arc` (#1083).
-    locations: Arc<LocationSnapshot>,
+    pub(crate) locations: Arc<LocationSnapshot>,
     /// First and last observation time, computed once: the Features
     /// temporal extent is read per request (Critical Rule 10).
     time_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// The station-symbol map layers (#1204), built once: the file is
+    /// static until a reload rebuilds the engine.
+    pub(crate) map: StationMap,
 }
 
 impl CsvEngine {
+    /// The engine over a loaded file, its map layers on the default
+    /// `[csv.map]` settings ([`Self::with_station_map`] sets others).
     pub fn new(store: CsvDataStore) -> Self {
         let mut first_rows: Vec<_> = store
             .location_index
@@ -45,12 +53,27 @@ impl CsvEngine {
             .min()
             .zip(store.rows.iter().map(|row| row.time).max());
         let locations = Arc::new(LocationSnapshot::new(inventory(&store)));
+        let map = StationMap::new(&store, time_extent, StationMapSettings::default());
         Self {
             store,
             stations,
             locations,
             time_extent,
+            map,
         }
+    }
+
+    /// The station-symbol map layers on `settings` (`[csv.map]`, #1204).
+    pub fn with_station_map(mut self, settings: StationMapSettings) -> Self {
+        self.map = StationMap::new(&self.store, self.time_extent, settings);
+        self
+    }
+
+    /// Hand the map layers their style facts (#1204): each parameter
+    /// layer's midpoint, which the overlap order measures from. The server
+    /// calls this whenever it wires the collection to a map API.
+    pub fn set_station_symbols(&self, symbols: StationSymbols) {
+        self.map.layers.set_symbols(symbols);
     }
 
     /// Whether `location_id` has an observation row inside `interval`
@@ -361,23 +384,7 @@ impl EdrEngine for CsvEngine {
     }
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
-        if self.store.rows.is_empty() {
-            return None;
-        }
-
-        let mut min_lon = f64::MAX;
-        let mut min_lat = f64::MAX;
-        let mut max_lon = f64::MIN;
-        let mut max_lat = f64::MIN;
-
-        for row in &self.store.rows {
-            min_lon = min_lon.min(row.longitude);
-            min_lat = min_lat.min(row.latitude);
-            max_lon = max_lon.max(row.longitude);
-            max_lat = max_lat.max(row.latitude);
-        }
-
-        Some([min_lon, min_lat, max_lon, max_lat])
+        spatial_extent(&self.store)
     }
 }
 
@@ -468,6 +475,27 @@ impl FeatureEngine for CsvEngine {
 
         Ok(station_feature(&self.store.rows[indices[0]]))
     }
+}
+
+/// The bounding box of every row's coordinates; `None` for an empty file.
+pub(crate) fn spatial_extent(store: &CsvDataStore) -> Option<[f64; 4]> {
+    if store.rows.is_empty() {
+        return None;
+    }
+
+    let mut min_lon = f64::MAX;
+    let mut min_lat = f64::MAX;
+    let mut max_lon = f64::MIN;
+    let mut max_lat = f64::MIN;
+
+    for row in &store.rows {
+        min_lon = min_lon.min(row.longitude);
+        min_lat = min_lat.min(row.latitude);
+        max_lon = max_lon.max(row.longitude);
+        max_lat = max_lat.max(row.latitude);
+    }
+
+    Some([min_lon, min_lat, max_lon, max_lat])
 }
 
 /// One location per station, at its first row's coordinates, in

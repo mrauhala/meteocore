@@ -60,11 +60,14 @@ pub struct Strike {
 /// station layers step on `[postgis.map] time_step` instead (#1063).
 pub(crate) const EVENTS_TIME_STEP: Duration = Duration::minutes(1);
 
-/// Advertised TIME dimension depth: steps over the most recent 6 h (361
-/// one-minute entries for a full events window, both endpoints inclusive).
-/// Older frames still render via an explicit TIME — membership in the
-/// advertised list is not required.
-pub(crate) const WMS_TIME_DEPTH: Duration = ds_core::config::POSTGIS_MAP_TIME_WINDOW;
+// The advertised TIME dimension spans the most recent 6 h
+// (`ds_core::config::STATION_MAP_TIME_WINDOW`: 361 one-minute entries for a
+// full events window, both endpoints inclusive). Older frames still render
+// via an explicit TIME — membership in the advertised list is not required.
+// The axis helpers are shared with the CSV and BUFR station layers (#1204).
+pub(crate) use ds_core::station_map::advertised_times as build_wms_times;
+#[cfg(test)]
+use ds_core::station_map::quantize_time;
 
 /// Fixed splat radius in output pixels. Constant across zoom — classic
 /// lightning markers stay marker-sized rather than scaling with the map
@@ -138,48 +141,17 @@ pub(crate) fn time_step(cfg: &PostgisEngineConfig) -> Duration {
     }
 }
 
-/// Floor a requested instant to a multiple of `step` since the epoch.
-pub(crate) fn quantize_time(t: DateTime<Utc>, step: Duration) -> DateTime<Utc> {
-    let step = step.num_seconds().max(1);
-    let secs = t.timestamp();
-    DateTime::from_timestamp(secs - secs.rem_euclid(step), 0).unwrap_or(t)
-}
-
 /// The window end `get_raster_tile` renders for a requested time — the
 /// #507 cache-key authority for this engine: explicit TIME floors to the
 /// step ([`time_step`]); no TIME ⇒ the latest advertised step. `None` only
-/// when the collection has no data yet.
+/// when the collection has no data yet. The selection is the shared
+/// `ds_core::station_map::resolve_frame_end` (#1204).
 pub(crate) fn resolve_window_end(
     meta: &CollectionMeta,
     time: Option<DateTime<Utc>>,
     step: Duration,
 ) -> Option<DateTime<Utc>> {
-    match time {
-        Some(t) => Some(quantize_time(t, step)),
-        None => meta.wms_times.last().copied(),
-    }
-}
-
-/// The advertised TIME steps for the collection metadata: on `step`,
-/// ascending, newest last, clamped to [`WMS_TIME_DEPTH`] below the newest
-/// observation. Rebuilt per metadata refresh (never per request).
-pub(crate) fn build_wms_times(
-    temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
-    step: Duration,
-) -> Vec<DateTime<Utc>> {
-    let Some((first, last)) = temporal_extent else {
-        return Vec::new();
-    };
-    let newest = quantize_time(last, step);
-    let floor = quantize_time((last - WMS_TIME_DEPTH).max(first), step);
-    let step = Duration::seconds(step.num_seconds().max(1));
-    let mut steps = Vec::new();
-    let mut t = floor;
-    while t <= newest {
-        steps.push(t);
-        t += step;
-    }
-    steps
+    ds_core::station_map::resolve_frame_end(&meta.wms_times, time, step)
 }
 
 /// Process-global strike-window cache. Global (not per-engine) so a reload

@@ -27,6 +27,7 @@ pub mod satellite_recipes;
 pub mod significance;
 pub mod simplify;
 pub mod state;
+pub mod station_map;
 pub mod temp_files;
 pub mod time_axis;
 pub mod trajectory;

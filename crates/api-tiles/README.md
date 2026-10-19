@@ -126,10 +126,11 @@ TMS 2.0 (tilematrixset, json-tilematrixset). The shared root adds Maps
 A collection serves tiles when its `apis` list includes `"tiles"`. Map tiles
 come from `geotiff`, `grib`, `querydata`, `zarr`, `netcdf`, `satellite`,
 `odim`, `odim-volume` (per-site collections), `nowcast`, `station-grid`,
-`cap` and `postgis`: its events shape, and a station shape with map layers
-on (a `[postgis.map]` block, or `wms` or `maps` in `apis`), drawn as one
-marker per station coloured by value. Vector tiles come from `geojson`,
-`cap` and the `postgis` station shapes.
+`cap`, `csv`, `bufr` and `postgis`: its events shape, and a station shape
+with map layers on (a `[postgis.map]` block, or `wms` or `maps` in `apis`).
+Station layers draw one marker per station coloured by value; for CSV and
+BUFR, `tiles` alone turns them on. Vector tiles come from `geojson`, `cap`
+and the `postgis` station shapes.
 
 Map styles come from the `[wms]` block shared with WMS and Maps: `colormap`
 (the `default` style), `[[wms.styles]]` and `[[wms.parameters]]`.

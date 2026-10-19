@@ -2,7 +2,8 @@
 
 PostGIS/TimescaleDB observation engine (`EdrEngine` + `FeatureEngine` +
 `MapEngine`: the events shape's strike layer, #504, and the station shapes'
-symbol layers, #1063).
+symbol layers, #1063, drawn through the shared helper:
+`ds_render::station_symbols` + `ds_core::station_map`, #1204).
 Read the root `CLAUDE.md` first — Critical Rule 8 (SQL safety) is enforced
 in CI by `scripts/check_sql_safety.sh`: keep `SELECT` keywords in plain
 `String` literals, never inside `format!`; no string concatenation onto SQL
@@ -378,7 +379,7 @@ in step when changing this lifecycle.
   CI's `.github/workflows/postgis-db.yml` runs them against a
   `timescale/timescaledb-ha:pg17` service container with both set, on PRs
   touching engine-postgis, its path dependencies (ds-core, ds-poll,
-  ds-cache), api-edr, engine-station-grid and ds-executor (a dev-dependency
+  ds-cache, ds-render), api-edr, engine-station-grid and ds-executor (a dev-dependency
   and its executor, #1210), `Cargo.toml`, `Cargo.lock` or the workflow, and
   on every main push. `cargo test` elsewhere skips them.
 - They go through the public load path (`PostgisEngineConfig::resolve`,
