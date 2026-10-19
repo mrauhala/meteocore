@@ -39,9 +39,9 @@ target is MET Norway's MEPS, as published per lead time on thredds.met.no.
   `missing_value`, NaN.
 - Display units, as GRIB and BUFR serve them (#1209): each variable's CF
   `units`, in any spelling, through `ds_core::units::display_conversion`:
-  K as °C, Pa as hPa, kg m⁻² as mm, m² s⁻² as gpm. Values are sampled from
-  the stored field and converted after, in `f64`, on every API, so a map
-  pixel, an EDR value and GetFeatureInfo agree. A unit without a rule,
+  K as °C, Pa as hPa, kg m⁻² as mm, kg m⁻² s⁻¹ as mm/h, m² s⁻² as gpm.
+  Values are sampled from the stored field and converted after, in `f64`,
+  on every API, so a map pixel, an EDR value and GetFeatureInfo agree. A unit without a rule,
   such as CF's `1` or m/s, is served as stored.
 - EDR position (one point or several), area and radius, each model run an
   EDR instance; WMS GetFeatureInfo reads a layer's value through the

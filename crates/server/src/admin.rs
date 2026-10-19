@@ -9022,6 +9022,67 @@ mod tests {
         assert!(!Arc::ptr_eq(&live, &third.netcdf_engines[0]));
     }
 
+    /// #1213: the shipped local Zarr example, loaded over its committed
+    /// fixture. The engine serves each variable in the display unit of its
+    /// CF `units` (K as °C, Pa as hPa, `kg m**-2 s**-1` as mm/h), so every
+    /// layer takes the built-in default its name and served unit select,
+    /// with no style in the example; the collection's own style is the
+    /// pressure palette over its own range, for `msl`, the first variable.
+    #[test]
+    fn zarr_example_layers_get_default_styles() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text =
+            std::fs::read_to_string(root.join("collections.d/zarr-era5-t2m-local.toml")).unwrap();
+        let mut collection: CollectionConfig = toml::from_str(&text).unwrap();
+        let wms = collection.wms.as_ref().unwrap();
+        assert!(wms.parameters.is_empty() && wms.styles.is_empty());
+        collection.zarr.as_mut().unwrap().data_path = Some(
+            root.join("testdata/zarr-era5-t2m")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let id = "zarr-era5-t2m-local";
+        let loaded = load_with_reuse(&[collection], super::EngineReuse::default());
+        let styles = &loaded.wms_state.styles;
+        let style = |name: &str| {
+            let s = &styles[&format!("{id}/{name}")]["default"];
+            (s.palette.name.as_str(), s.min, s.max)
+        };
+        for (name, expected) in [
+            ("t2m", ("temperature", -90.0, 50.0)),
+            ("t2m_packed", ("temperature", -90.0, 50.0)),
+            ("msl", ("pressure", 950.0, 1050.0)),
+            ("mtpr", ("precipitation_rate", 0.0, 30.0)),
+        ] {
+            assert_eq!(style(name), expected, "{name}");
+        }
+        let parent = &styles[id]["default"];
+        assert_eq!(
+            (parent.palette.name.as_str(), parent.min, parent.max),
+            ("pressure", 950.0, 1050.0)
+        );
+        let info = loaded.wms_state.engines[id].raster_info();
+        assert_eq!(
+            (info.parameter.as_str(), info.unit.as_str()),
+            ("msl", "hPa")
+        );
+        let units: HashMap<String, String> = info
+            .parameters
+            .into_iter()
+            .map(|p| (p.name, p.unit))
+            .collect();
+        for (name, unit) in [
+            ("t2m", "°C"),
+            ("t2m_packed", "°C"),
+            ("msl", "hPa"),
+            ("mtpr", "mm/h"),
+        ] {
+            assert_eq!(units[name], unit, "{name}");
+        }
+        let descriptions = loaded.edr_state.engines[id].get_parameter_descriptions();
+        assert_eq!(descriptions["mtpr"].unit, "mm/h");
+    }
+
     /// #1067 PR 6, #1209: the shipped local MEPS example, loaded over its
     /// committed sample. Every layer has its style at load: the layers the
     /// example does not configure take the built-in default their name and

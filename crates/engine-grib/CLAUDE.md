@@ -114,10 +114,12 @@ unlike GeoTIFF's one band per collection.
   short-name tables. Source units come from WMO Code Table 4.2
   (`src/units.rs`) plus per-center overlays for local parameter numbers
   192–254.
-- Display conversions are mechanical: K→°C, Pa→hPa, kg m⁻²→mm, m² s⁻²→gpm,
+- Display conversions are mechanical: K→°C, Pa→hPa, kg m⁻²→mm,
+  kg m⁻² s⁻¹→mm/h (× 3600, PRATE / ECMWF `tprate`, #1213), m² s⁻²→gpm,
   proportion→%. Colormap ranges use display units. The string-keyed twin
   of this table lives in `ds_core::units::display_conversion` (used by
-  engine-bufr); keep the two rule for rule. The units test
+  engine-bufr, engine-netcdf and engine-zarr); keep the two rule for rule.
+  The units test
   `every_spelled_variant_has_ds_core_rule` checks each `SourceUnit` through
   its WMO spelling, and `display_rules_agree_with_ds_core_for_every_spelling`
   each spelling `parse_source_unit` reads (through
@@ -125,7 +127,7 @@ unlike GeoTIFF's one band per collection.
   rules are GRIB-only, since no unit string identifies them: the code
   tables assign `KelvinDifference` (stays K) and ECMWF's `MetresOfWater`
   (× 1000 to mm) from the parameter. Served units come from the code table,
-  already canonical (`m s-1`, `kg m-2 s-1`, `J kg-1`), so unit
+  already canonical (`m s-1`, `J kg-1`, `W m-2`), so unit
   normalisation (#1067 PR 6) changes no GRIB output.
 - Distinguish absolute temperature from temperature differences using the
   WMO parameter semantics: dewpoint depression uses `KelvinDifference` and

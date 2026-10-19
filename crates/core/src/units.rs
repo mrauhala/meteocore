@@ -41,7 +41,7 @@
 //!
 //! Source units are whatever the format encodes (BUFR Table B, WMO GRIB
 //! Code Table 4.2, a CF `units` attribute); clients want the everyday
-//! forms. engine-bufr and engine-netcdf convert through
+//! forms. engine-bufr, engine-netcdf and engine-zarr convert through
 //! [`display_conversion`]. The rules are keyed on the **source unit**,
 //! through [`canonical_unit`], never on a parameter name (see the
 //! unit-conversion rule in root `CLAUDE.md`), and mirror
@@ -60,6 +60,7 @@
 //! | `K` | `°C` | − 273.15 |
 //! | `Pa` | `hPa` | × 0.01 |
 //! | `kg m-2` | `mm` | identity (1 kg m⁻² of water ≈ 1 mm) |
+//! | `kg m-2 s-1` | `mm/h` | × 3600 (a precipitation rate: 1 kg m⁻² s⁻¹ of water ≈ 1 mm s⁻¹) |
 //! | `m2 s-2` | `gpm` | ÷ 9.80665 |
 //! | `Proportion`, `proportion`, `(0 - 1)` (WMO's fraction) | `%` | × 100 |
 //! | anything else | unchanged | identity |
@@ -445,6 +446,13 @@ pub fn display_conversion(source_unit: &str) -> Option<DisplayConversion> {
         "kg m-2" => DisplayConversion {
             unit: "mm",
             scale: 1.0,
+            offset: 0.0,
+        },
+        // A precipitation rate, served per hour as rain gauges and radar
+        // report it: 1 kg m-2 s-1 of water is 1 mm s-1.
+        "kg m-2 s-1" => DisplayConversion {
+            unit: "mm/h",
+            scale: 3600.0,
             offset: 0.0,
         },
         "m2 s-2" => DisplayConversion {
@@ -918,6 +926,19 @@ mod tests {
             ),
             (&["m2 s-2", "m**2 s**-2", "m^2/s^2", "m2/s2"][..], "gpm"),
             (
+                &[
+                    "kg m-2 s-1",
+                    "kg m**-2 s**-1",
+                    "kg/m^2/s",
+                    "kg/m2/s",
+                    "kg/(m2 s)",
+                    "kg m^-2 s^-1",
+                    "kg.m-2.s-1",
+                    "kg m⁻² s⁻¹",
+                ][..],
+                "mm/h",
+            ),
+            (
                 &["Proportion", "proportion", "(0 - 1)", " (0 - 1) "][..],
                 "%",
             ),
@@ -935,7 +956,8 @@ mod tests {
             "hPa",
             "m/s",
             "percent",
-            "kg m-2 s-1",
+            "mm/h",
+            "mm h-1",
         ] {
             assert_eq!(display_conversion(unit), None, "{unit:?}");
         }
@@ -1050,7 +1072,7 @@ mod tests {
 
     #[test]
     fn every_mechanical_display_unit_but_gpm_has_a_qudt_entry() {
-        for source in ["K", "Pa", "kg m-2", "Proportion"] {
+        for source in ["K", "Pa", "kg m-2", "kg m-2 s-1", "Proportion"] {
             let display = display_conversion(source).unwrap().unit;
             assert!(qudt_unit(display).is_some(), "{display}");
         }
@@ -1067,6 +1089,11 @@ mod tests {
         let mm = display_conversion("kg m-2").unwrap();
         assert_eq!((mm.unit, mm.has_conversion()), ("mm", false));
         assert_eq!(display_conversion("m2 s-2").unwrap().unit, "gpm");
+        // A precipitation rate: 1 mm/h is 1/3600 kg m-2 s-1.
+        let rate = display_conversion("kg m-2 s-1").unwrap();
+        assert_eq!(rate.unit, "mm/h");
+        assert!((rate.convert(1.0 / 3600.0) - 1.0).abs() < 1e-12);
+        assert!((rate.convert(2.5e-4) - 0.9).abs() < 1e-12);
         let proportion = display_conversion("(0 - 1)").unwrap();
         assert_eq!(proportion.unit, "%");
         assert!((proportion.convert(0.75) - 75.0).abs() < 1e-12);
@@ -1085,6 +1112,6 @@ mod tests {
         ] {
             assert!(display_conversion(u).is_none(), "{u}");
         }
-        assert!(k.has_conversion() && pa.has_conversion());
+        assert!(k.has_conversion() && pa.has_conversion() && rate.has_conversion());
     }
 }

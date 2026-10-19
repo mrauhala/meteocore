@@ -25,6 +25,7 @@ use ds_core::cf::{
 use ds_core::error::DataServerError;
 use ds_core::instances;
 use ds_core::map_engine::RasterInfo;
+use ds_core::units::{display_conversion, DisplayConversion};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 
 use crate::cf;
@@ -55,6 +56,12 @@ pub struct Variable {
     /// Opened zarr array handle, used for on-demand chunk reads.
     array: Array<Store>,
     decoded: Option<DecodedArray>,
+    /// The unit values are served in (#1213): the display unit of the CF
+    /// `units` attribute where `ds_core::units::display_conversion` has a
+    /// rule (K → °C, Pa → hPa, kg m-2 → mm, kg m-2 s-1 → mm/h, m2 s-2 →
+    /// gpm, in any spelling), else `units` as the store spells it. Every
+    /// report of the unit reads this: `RasterInfo`, EDR descriptions and
+    /// coverages, wind facts.
     pub units: String,
     pub label: String,
     /// The CF `standard_name` attribute, when the variable has one.
@@ -76,20 +83,41 @@ pub struct Variable {
     /// CF missing-value sentinels (`_FillValue`, `missing_value`), compared
     /// against the *raw* (pre-scale) value.
     fill_values: Vec<f64>,
+    /// The display conversion of the CF `units` attribute ([`Self::units`]),
+    /// `None` without a rule or for an identity one (kg m-2 → mm).
+    display: Option<DisplayConversion>,
 }
 
 impl Variable {
-    /// Convert a raw stored sample to a physical value, mapping fill sentinels
-    /// and non-finite values to `None`.
+    /// Convert a raw stored sample to the value served, mapping fill
+    /// sentinels and non-finite values to `None`: CF unpacking, then the
+    /// display conversion, both in `f64`. Every read path samples windows
+    /// and corners converted here, so a map pixel, an EDR value and
+    /// GetFeatureInfo agree (#1213).
     fn convert(&self, raw: f64) -> Option<f64> {
-        convert_sample(raw, self.scale_factor, self.add_offset, &self.fill_values)
+        convert_sample(
+            raw,
+            self.scale_factor,
+            self.add_offset,
+            &self.fill_values,
+            self.display,
+        )
     }
 }
 
-/// Map a raw sample to a physical value: NaN / ±infinity and fill sentinels
+/// Map a raw sample to the value served: NaN / ±infinity and fill sentinels
 /// become `None` (an infinite sample would otherwise scale to ±inf and break
-/// CoverageJSON serialisation); everything else gets CF `scale`/`offset`.
-fn convert_sample(raw: f64, scale: f64, offset: f64, fills: &[f64]) -> Option<f64> {
+/// CoverageJSON serialisation); everything else gets CF `scale`/`offset`, then
+/// the `display` conversion. The conversion is affine and bilinear weights
+/// sum to one, so converting each stored cell before sampling gives what
+/// engine-grib and engine-netcdf get by converting the sampled value.
+fn convert_sample(
+    raw: f64,
+    scale: f64,
+    offset: f64,
+    fills: &[f64],
+    display: Option<DisplayConversion>,
+) -> Option<f64> {
     if !raw.is_finite() {
         return None;
     }
@@ -98,7 +126,8 @@ fn convert_sample(raw: f64, scale: f64, offset: f64, fills: &[f64]) -> Option<f6
     if fills.contains(&raw) {
         return None;
     }
-    let value = raw * scale + offset;
+    let physical = raw * scale + offset;
+    let value = display.map_or(physical, |display| display.convert(physical));
     value.is_finite().then_some(value)
 }
 
@@ -873,11 +902,14 @@ fn build_with_codec_setup(
         }
 
         let attrs = array.attributes();
-        let units = attrs
-            .get("units")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
+        let stored_units = attrs.get("units").and_then(|v| v.as_str()).unwrap_or("");
+        // Served in the display unit where a rule exists (#1213), as GRIB,
+        // BUFR and NetCDF serve theirs; the stored spelling otherwise.
+        let display = display_conversion(stored_units);
+        let units = display
+            .map_or(stored_units, |display| display.unit)
             .to_string();
+        let display = display.filter(DisplayConversion::has_conversion);
         let standard_name = attrs
             .get("standard_name")
             .and_then(|v| v.as_str())
@@ -948,6 +980,7 @@ fn build_with_codec_setup(
             scale_factor,
             add_offset,
             fill_values,
+            display,
         });
     }
 
@@ -996,7 +1029,8 @@ fn build_with_codec_setup(
 /// `standard_name` gives both the component and its frame
 /// (`eastward_wind` earth-relative, `x_wind` grid-relative). The catalog
 /// reads only 1-D latitude/longitude coordinate axes, so the grid's x is
-/// east and y north.
+/// east and y north. The unit is the one served ([`Variable::units`]):
+/// `DerivedWind` combines the values the engine serves.
 fn wind_facts(vars: &[Variable]) -> WindFacts {
     WindFacts {
         grid: GridAxes::NorthAligned,
@@ -1365,15 +1399,16 @@ mod tests {
                     if message == "Zarr store has no usable geographic data variables"));
             } else {
                 let catalog = result.unwrap();
-                assert_eq!(catalog.vars.len(), 1);
-                assert_eq!(catalog.vars[0].name, "t2m_packed");
-                assert_eq!(catalog.raster_info.parameters.len(), 1);
-                assert_eq!(catalog.raster_info.parameter, "t2m_packed");
+                let names: Vec<&str> = catalog.vars.iter().map(|v| v.name.as_str()).collect();
+                assert_eq!(names, ["msl", "mtpr", "t2m_packed"]);
+                assert_eq!(catalog.raster_info.parameters.len(), 3);
+                let packed = &catalog.vars[2];
                 let window = catalog
-                    .read_window(&catalog.vars[0], None, 0, catalog.extent)
+                    .read_window(packed, None, 0, catalog.extent)
                     .unwrap()
                     .unwrap();
-                let expected = 273.15 + 0.1 * 54.5 + 0.01 * 5.5;
+                // Served in °C (#1213): 278.655 K.
+                let expected = 0.1 * 54.5 + 0.01 * 5.5;
                 assert!((window.sample(5.5, 54.5).unwrap() - expected).abs() < 0.01);
             }
         }
@@ -1604,19 +1639,42 @@ mod tests {
     #[test]
     fn convert_sample_scales_and_maps_nodata() {
         // Plain scale/offset.
-        assert_eq!(convert_sample(5.0, 2.0, 1.0, &[]), Some(11.0));
+        assert_eq!(convert_sample(5.0, 2.0, 1.0, &[], None), Some(11.0));
         // CF packing with a fill sentinel.
         assert_eq!(
-            convert_sample(550.0, 0.01, 273.15, &[-9999.0]),
+            convert_sample(550.0, 0.01, 273.15, &[-9999.0], None),
             Some(278.65)
         );
-        assert_eq!(convert_sample(-9999.0, 0.01, 273.15, &[-9999.0]), None);
+        assert_eq!(
+            convert_sample(-9999.0, 0.01, 273.15, &[-9999.0], None),
+            None
+        );
         // Non-finite samples are nodata (an inf would otherwise scale to inf
         // and break CoverageJSON).
-        assert_eq!(convert_sample(f64::NAN, 1.0, 0.0, &[]), None);
-        assert_eq!(convert_sample(f64::INFINITY, 1.0, 0.0, &[]), None);
-        assert_eq!(convert_sample(f64::NEG_INFINITY, 1.0, 0.0, &[]), None);
-        assert_eq!(convert_sample(f64::MAX, 2.0, 0.0, &[]), None);
+        assert_eq!(convert_sample(f64::NAN, 1.0, 0.0, &[], None), None);
+        assert_eq!(convert_sample(f64::INFINITY, 1.0, 0.0, &[], None), None);
+        assert_eq!(convert_sample(f64::NEG_INFINITY, 1.0, 0.0, &[], None), None);
+        assert_eq!(convert_sample(f64::MAX, 2.0, 0.0, &[], None), None);
+    }
+
+    /// #1213: the display conversion applies after CF unpacking, and the
+    /// fill sentinel is still compared with the raw value.
+    #[test]
+    fn convert_sample_unpacks_then_converts_to_the_display_unit() {
+        let kelvin = display_conversion("K");
+        let celsius = convert_sample(550.0, 0.01, 273.15, &[-9999.0], kelvin).unwrap();
+        assert!((celsius - 5.5).abs() < 1e-9, "{celsius}");
+        assert_eq!(
+            convert_sample(-9999.0, 0.01, 273.15, &[-9999.0], kelvin),
+            None
+        );
+        let pascal = display_conversion("Pa");
+        let hpa = convert_sample(101_325.0, 1.0, 0.0, &[], pascal).unwrap();
+        assert!((hpa - 1013.25).abs() < 1e-9, "{hpa}");
+        let rate = display_conversion("kg m**-2 s**-1");
+        let mm_per_hour = convert_sample(2.5e-4, 1.0, 0.0, &[], rate).unwrap();
+        assert!((mm_per_hour - 0.9).abs() < 1e-12, "{mm_per_hour}");
+        assert_eq!(convert_sample(f64::MAX, 1.0, 0.0, &[], rate), None);
     }
 
     /// A MEPS-like projected store: 1-D x/y in metres placed by a

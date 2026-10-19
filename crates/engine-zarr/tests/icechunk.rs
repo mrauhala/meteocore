@@ -11,6 +11,7 @@ use std::sync::Arc;
 use chrono::{TimeZone, Utc};
 use ds_core::config::{IcechunkConfig, ZarrConfig};
 use ds_core::edr_engine::EdrEngine;
+use ds_core::map_engine::{MapEngine, OutputCrs};
 use ds_core::model::CoverageResponse;
 use engine_zarr::ZarrEngine;
 
@@ -29,6 +30,16 @@ fn attrs(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
 
 fn field(lat: f64, lon: f64, t: usize) -> f64 {
     273.15 + 0.1 * lat + 0.01 * lon + 0.5 * t as f64
+}
+
+/// Mean sea level pressure in Pa: 1013.25 hPa at 55°N, 0°E.
+fn msl(lat: f64, lon: f64, t: usize) -> f64 {
+    101_325.0 + 100.0 * (lat - 55.0) - 20.0 * lon + 50.0 * t as f64
+}
+
+/// A precipitation rate in kg m-2 s-1: the mm/h rate over 3600.
+fn rate(lat: f64, lon: f64, t: usize) -> f64 {
+    (0.5 + 0.1 * (60.0 - lat) + 0.05 * lon + 0.25 * t as f64) / 3600.0
 }
 
 /// Write a tiny CF Zarr V3 dataset into a fresh local Icechunk repo at `dir`
@@ -91,33 +102,53 @@ async fn write_repo(dir: &std::path::Path) {
     )
     .await;
 
-    // Data variable t2m (float32), single chunk.
-    let mut t2m = Vec::with_capacity(NT * NY * NX);
-    for t in 0..NT {
-        for &lat in &lat_vals {
-            for &lon in &lon_vals {
-                t2m.push(field(lat, lon, t) as f32);
+    // Data variables (float32), each a single chunk, in the units a CF
+    // store states (#1213: served as °C, hPa and mm/h).
+    for (path, value, attributes) in [
+        (
+            "/t2m",
+            field as fn(f64, f64, usize) -> f64,
+            serde_json::json!({"units": "K", "long_name": "2 metre temperature"}),
+        ),
+        (
+            "/msl",
+            msl,
+            serde_json::json!({"units": "Pa", "long_name": "Mean sea level pressure"}),
+        ),
+        (
+            "/tprate",
+            rate,
+            serde_json::json!({"units": "kg m-2 s-1", "long_name": "Total precipitation rate"}),
+        ),
+    ] {
+        let mut values = Vec::with_capacity(NT * NY * NX);
+        for t in 0..NT {
+            for &lat in &lat_vals {
+                for &lon in &lon_vals {
+                    values.push(value(lat, lon, t) as f32);
+                }
             }
         }
+        let array = ArrayBuilder::new(
+            vec![NT as u64, NY as u64, NX as u64],
+            vec![NT as u64, NY as u64, NX as u64],
+            data_type::float32(),
+            f32::NAN,
+        )
+        .dimension_names(Some(["time", "lat", "lon"]))
+        .attributes(attrs(attributes))
+        .build(store.clone(), path)
+        .expect("data variable builder");
+        array
+            .async_store_metadata()
+            .await
+            .expect("data variable metadata");
+        let all = ArraySubset::new_with_shape(array.chunk_grid_shape().to_vec());
+        array
+            .async_store_chunks(&all, values)
+            .await
+            .expect("data variable chunks");
     }
-    let array = ArrayBuilder::new(
-        vec![NT as u64, NY as u64, NX as u64],
-        vec![NT as u64, NY as u64, NX as u64],
-        data_type::float32(),
-        f32::NAN,
-    )
-    .dimension_names(Some(["time", "lat", "lon"]))
-    .attributes(attrs(serde_json::json!({
-        "units": "K", "long_name": "2 metre temperature",
-    })))
-    .build(store.clone(), "/t2m")
-    .expect("t2m builder");
-    array.async_store_metadata().await.expect("t2m metadata");
-    let all = ArraySubset::new_with_shape(array.chunk_grid_shape().to_vec());
-    array
-        .async_store_chunks(&all, t2m)
-        .await
-        .expect("t2m chunks");
 
     // Commit the snapshot to branch main.
     store
@@ -336,13 +367,16 @@ async fn reads_local_icechunk_repo() {
     };
     let engine = ZarrEngine::new("ic-test", &config).expect("open icechunk repo");
 
-    assert_eq!(engine.get_parameters(), vec!["t2m".to_string()]);
+    assert_eq!(engine.get_parameters(), ["msl", "t2m", "tprate"]);
     let (first, last) = engine.get_temporal_extent().unwrap();
     assert_eq!(first, Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
     assert_eq!(last, Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap());
 
-    // Position at an exact grid point (lon=2, lat=58): 273.15 + 5.8 + 0.02 =
-    // 278.97 at t=0, +0.5/step.
+    // Position at an exact grid point (lon=2, lat=58), at t=0, in the
+    // display units (#1213): t2m 273.15 + 5.8 + 0.02 = 278.97 K = 5.82 °C;
+    // msl 101 325 + 300 - 40 = 101 585 Pa = 1015.85 hPa; tprate
+    // (0.5 + 0.2 + 0.1) / 3600 kg m-2 s-1 = 0.8 mm/h. The map pixel there
+    // reads the same value, and every report names the served unit.
     let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let resp = engine
         .query_position("POINT(2 58)", Some((t0, t0)), None, None, None)
@@ -351,6 +385,37 @@ async fn reads_local_icechunk_repo() {
         CoverageResponse::Single(qr) => qr,
         CoverageResponse::Collection(_) => panic!("expected Single"),
     };
-    let v = qr.ranges.get("t2m").unwrap().values[0].expect("value");
-    assert!((v - 278.97).abs() < 0.02, "icechunk t2m value {v}");
+    let descriptions = engine.get_parameter_descriptions();
+    let info = engine.raster_info();
+    for (name, unit, expected, tolerance) in [
+        ("t2m", "°C", 5.82, 0.02),
+        ("msl", "hPa", 1015.85, 1e-3),
+        ("tprate", "mm/h", 0.8, 1e-5),
+    ] {
+        let v = qr.ranges[name].values[0].expect("value");
+        assert!(
+            (v - expected).abs() < tolerance,
+            "icechunk {name} value {v}, expected {expected} {unit}"
+        );
+        assert_eq!(qr.parameters[name].unit, unit, "{name}");
+        assert_eq!(descriptions[name].unit, unit, "{name}");
+        assert_eq!(info.parameter_unit(Some(name)), Some(unit), "{name}");
+        let tile = engine
+            .get_raster_tile(
+                [1.75, 57.75, 2.25, 58.25],
+                1,
+                1,
+                Some(t0),
+                &OutputCrs::Wgs84,
+                Some(name),
+                None,
+                None,
+            )
+            .expect("map read");
+        let pixel = tile.values.value_at(0).expect("pixel");
+        assert!(
+            (pixel - v).abs() < 1e-9,
+            "{name}: pixel {pixel}, position {v}"
+        );
+    }
 }

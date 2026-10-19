@@ -411,7 +411,8 @@ and every other unit-keyed match read them through
   from each variable's CF `units` through
   `ds_core::units::display_conversion`, the rules engine-bufr uses and
   engine-grib's `default_display` twins: K → °C, Pa → hPa, kg m-2 → mm
-  (identity), m2 s-2 → gpm, in any spelling. A unit without a rule (CF's
+  (identity), kg m-2 s-1 → mm/h (× 3600, #1213), m2 s-2 → gpm, in any
+  spelling. A unit without a rule (CF's
   `1`, m/s, `%`) is `None` and served as stored. Never a name table.
 - **Sample, then convert, in `f64`:** maps through
   `OutputMap::sample_f32_with` (`lib.rs` `sample_display`; an identity rule

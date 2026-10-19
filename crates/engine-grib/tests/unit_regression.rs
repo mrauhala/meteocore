@@ -82,13 +82,16 @@ fn ecmwf_unit_conversion_snapshot() {
         // z: (98, 0, 3, 4) Geopotential m² s⁻² → gpm (divide by g = 9.80665)
         // 9806.65 m²/s² = 1000 gpm
         ("Geopotential", (98, 0, 3, 4), "gpm", 9806.65, 1000.0),
-        // Precipitation rate: (98, 0, 1, 7) kg m-2 s-1 → identity
+        // Precipitation rate: (98, 0, 1, 7) kg m-2 s-1 → mm/h (× 3600,
+        // #1213; the removed table served the raw rate).
+        ("Precipitation rate", (98, 0, 1, 7), "mm/h", 1e-4, 0.36),
+        // Total precipitation rate: (98, 0, 1, 52), ECMWF `tprate`.
         (
-            "Precipitation rate",
-            (98, 0, 1, 7),
-            "kg m-2 s-1",
-            1e-4,
-            1e-4,
+            "Total precipitation rate",
+            (98, 0, 1, 52),
+            "mm/h",
+            2.5e-4,
+            0.9,
         ),
     ];
 

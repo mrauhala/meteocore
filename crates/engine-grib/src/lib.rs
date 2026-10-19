@@ -4,6 +4,8 @@ pub mod catalog;
 mod cube;
 mod diagnostics;
 mod discovery;
+#[cfg(test)]
+mod display_units_tests;
 pub mod index;
 mod message_cache;
 mod metadata;

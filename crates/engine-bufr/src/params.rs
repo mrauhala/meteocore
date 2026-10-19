@@ -5,8 +5,8 @@
 //! Units: each entry names the **BUFR Table B unit** (K, Pa, m s-1,
 //! kg m-2, …) — the source metadata is authoritative — and the mechanical
 //! display conversion of `ds_core::units` is applied on top at row
-//! extraction (K → °C, Pa → hPa, kg m-2 → mm; everything else unchanged),
-//! exactly as engine-grib does for its Code Table 4.2 units. The store
+//! extraction (K → °C, Pa → hPa, kg m-2 → mm, kg m-2 s-1 → mm/h; everything
+//! else unchanged), exactly as engine-grib does for its Code Table 4.2 units. The store
 //! therefore holds display units and `descriptions()` advertises them.
 //! The rule is keyed on the unit string, never on the parameter name.
 

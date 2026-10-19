@@ -727,9 +727,10 @@ one never implies the other.
   (#1067 PR 6). `canonical_unit` reduces every spelling of a product of
   powers to one (`kg/m^2`, `kg m**-2`, `kg.m-2` → `kg m-2`; `m/s` → `m s-1`;
   `degC` → `°C`); a scale factor or free text stays as written. Every
-  unit-keyed match goes through it — `display_conversion` (engine-bufr and
-  engine-netcdf, #1209; engine-grib's enum-keyed `default_display` is its
-  twin, rule for rule),
+  unit-keyed match goes through it — `display_conversion` (engine-bufr,
+  engine-netcdf #1209 and engine-zarr #1213; engine-grib's enum-keyed
+  `default_display` is its twin, rule for rule: K → °C, Pa → hPa,
+  kg m-2 → mm, kg m-2 s-1 → mm/h × 3600, m2 s-2 → gpm, proportion → %),
   `qudt_unit` (EDR), ds-render's defaults table and `[[parameter_defaults]]`
   unit ranges, `same_unit` (wind u/v pairing, engine-netcdf's per-file
   check, the satellite recipes' K check) — never a raw string compare. The
@@ -892,7 +893,7 @@ one never implies the other.
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; derived wind speed from u/v, direction on lat/lon areas (newbase's grid-relative convention) |
-| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP; derived wind speed + direction from CF-identified u/v |
+| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP; derived wind speed + direction from CF-identified u/v; values and units in display units from CF `units` through `ds_core::units::display_conversion` (°C, hPa, mm, mm/h, gpm; plain Zarr and Icechunk, #1213) |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (position, locations, area), Features; station shapes also WMS/Maps/Tiles when opted in (`[postgis.map]`, or `wms`/`maps` in `apis`): one symbol layer per parameter, each station a marker coloured by its latest value within `max_age` on `time_step` frames, most extreme on top (#1063); events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles, GK2A AMI L1B and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |

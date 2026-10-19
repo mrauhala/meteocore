@@ -15,6 +15,9 @@
 //!   same grid on four pressure levels, where GetMap and GetFeatureInfo
 //!   without `ELEVATION` use one level, and OGC API Maps' `elevation`
 //!   selects the same levels.
+//! - Zarr: `testdata/zarr-era5-t2m`, a synthetic ERA5-like store whose
+//!   fields are linear in lat/lon and stored in K, Pa and kg m-2 s-1,
+//!   served in °C, hPa and mm/h (#1213).
 //!
 //! No collection lists `edr` for the WMS: the WMS state carries the
 //! engine's EDR side in `point_engines`, as the server wires it.
@@ -48,6 +51,7 @@ use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 use engine_geotiff::GeoTiffEngine;
 use engine_grib::GribEngine;
 use engine_netcdf::NetcdfEngine;
+use engine_zarr::ZarrEngine;
 
 fn testdata(dir: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -737,6 +741,61 @@ fn a_netcdf_pressure_level_map_draws_the_elevation_asked_for() {
             let (status, body) = map("&elevation=600").await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
         });
+}
+
+fn era5() -> Apis {
+    let config = ds_core::config::ZarrConfig::auto_local(
+        testdata("zarr-era5-t2m").to_string_lossy().into_owned(),
+    );
+    let engine = Arc::new(ZarrEngine::new("era5", &config).unwrap());
+    apis(
+        "era5",
+        "zarr",
+        engine,
+        &["msl", "mtpr", "t2m", "t2m_packed"],
+    )
+}
+
+/// Zarr (#1213): at a grid cell's centre, 8°E 54°N, the latest step
+/// (18Z, the fixture's fourth), GetFeatureInfo reads each field in its
+/// display unit, converted from the store's, and names that unit; the EDR
+/// position value there is the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zarr_pixel_reads_the_display_unit_value() {
+    let Apis { wms, edr } = era5();
+    let (lon, lat) = (8.0, 54.0);
+    let d = 0.003;
+    let bbox = format!("{},{},{},{}", lon - d, lat - d, lon + d, lat + d);
+    for (parameter, served, unit, tolerance) in [
+        // 273.15 + 5.4 + 0.08 + 1.5 K.
+        ("t2m", 5.4 + 0.08 + 1.5, "°C", 1e-4),
+        // The packed copy holds the same field to 0.01 K.
+        ("t2m_packed", 5.4 + 0.08 + 1.5, "°C", 6e-3),
+        // 101 325 + 100 × (54 - 55) - 20 × 8 + 50 × 3 Pa.
+        ("msl", 1013.25 - 1.0 - 1.6 + 1.5, "hPa", 1e-3),
+        // (0.5 + 0.6 + 0.4 + 0.75) / 3600 kg m-2 s-1.
+        ("mtpr", 0.5 + 0.6 + 0.4 + 0.75, "mm/h", 1e-5),
+    ] {
+        let layer = format!("era5/{parameter}");
+        let info = feature_info(&wms, &layer, "CRS:84", &bbox, (3, 3), (1, 1), "").await;
+        assert_eq!(info.time, "2026-01-01T18:00:00Z", "{parameter}");
+        assert_eq!(info.reference_time, Value::Null, "{parameter}");
+        let value = info.value.as_f64().unwrap();
+        assert!(
+            (value - served).abs() < tolerance,
+            "{parameter}: {value}, expected {served} {unit}"
+        );
+        assert_eq!(info.unit, unit, "{parameter}");
+        let position = edr_position(
+            &edr,
+            "era5",
+            parameter,
+            (info.lon, info.lat),
+            "2026-01-01T18:00:00Z",
+        )
+        .await;
+        assert_eq!(info.value, position, "{parameter}");
+    }
 }
 
 /// The layers GetCapabilities marks queryable are the ones answered above.
