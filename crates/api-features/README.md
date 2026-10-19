@@ -1,166 +1,138 @@
-# api-features — OGC API - Features 1.0 status
+# api-features
 
-This page is the single source of truth for **what MeteoCore's Features
-implementation supports and what it does not**, per conformance class,
-parameter and engine. It is written for integrators and for anyone planning
-Features work.
+OGC API - Features for MeteoCore: GeoJSON and HTML access to every collection
+whose engine implements `FeatureEngine`.
 
-**Keep it current: every PR that touches Features behaviour —
-`crates/api-features`, `FeatureEngine` in `crates/core/src/feature_engine.rs`,
-`FeatureQuery` / `Bbox` in `crates/core/src/feature.rs`, or an engine's
-`FeatureEngine` implementation (including `sortables`, `filterables`, `spatial_extent`,
-`temporal_extent`) — must update the tables below in the same PR.** The
-`crates/api-features/CLAUDE.md` rule points here.
+This page is the Features support-status page: what works per conformance
+class, `/items` parameter and engine. Update it with every change to Features
+behaviour, including an engine's `FeatureEngine` implementation. Contributor
+rules are in [CLAUDE.md](CLAUDE.md).
 
-Spec: OGC API - Features - Part 1: Core 1.0 (OGC 17-069r4) and Part 2:
-Coordinate Reference Systems by Reference 1.0 (OGC 18-058). Served twice from
-the same handlers and state: the per-API service at `/features`, and as a
-building block of the shared OGC API root at `/` (see
-[Shared OGC API root](#shared-ogc-api-root)).
+## What it solves
+
+Much weather data is a set of discrete objects rather than a grid: observation
+stations, radar sites, warning areas, tracked storm cells, boundary polygons.
+Clients want them as standard GeoJSON that they can filter by area, time and
+property, and page through. This crate serves them as OGC API - Features
+Part 1 (Core) and Part 2 (CRS by reference), so any Features client works,
+while the engines stay free of HTTP and JSON.
+
+## How it works
+
+- An engine implements `ds_core::feature_engine::FeatureEngine`. It answers a
+  `FeatureQuery` (`bbox`, `datetime`, `sortby`, property filters, `limit`,
+  `offset`) with a `FeaturePage` of domain `Feature`s: an id, CRS84 geometry
+  and typed `PropertyValue` properties.
+- The handlers check each parameter against what the engine advertises
+  (`filterables`, `sortables`, `has_time_dimension`). An unsupported
+  parameter is a 400, never ignored; where there is a list of valid values,
+  the message names it.
+- The engine filters, sorts and pages. Sorting happens before paging, through
+  `ds_core::feature::sort_features`: missing and null values sort last in
+  both directions, and ties break on feature id.
+- This crate encodes the response: GeoJSON, or an HTML page built from the
+  same GeoJSON document. For the Part 2 `crs` parameter it reprojects
+  geometry per vertex with `ds_core::web_mercator` and `ds_core::geo`.
+- An engine can also say how to present its features: `label` names a
+  feature, `summary_properties` picks a listing's first columns,
+  `items_description` says in one line what an item is, and
+  `Feature::related` names resources a feature leads to. The engine names
+  them; this crate builds the URLs and drops a link that no API here
+  serves. See
+  [Labels, columns and related links](#labels-columns-and-related-links).
+- State is `FeaturesState`: engines and collection configs keyed by
+  collection id, the base URL and proxy setting, the ids that api-tiles
+  serves as vector tiles, and the pages of the collections a feature may
+  link to. It sits behind an `ArcSwap`, so a reload swaps it in one step.
+- [api-common](../api-common/README.md) supplies collection discovery, Common
+  metadata, the HTML workbench pages, HTML error pages and conditional GET.
+- The `/items` and `/items/{featureId}` handlers serve two mounts: the
+  per-API service at `/features` (`router`) and the `FeaturesBlock` building
+  block of the shared OGC API root at `/`.
+- api-edr reuses `params`, `response` and `crs` for EDR `items`, so changes
+  there also change EDR.
+
+## Routes
+
+| Route | Formats | Notes |
+|---|---|---|
+| `/features/` | JSON, HTML | landing page |
+| `/features/api` | OpenAPI 3.0 | hand-written; the collection, items and item operations of every collection |
+| `/features/api/docs` | HTML | Swagger UI from embedded assets under `/features/api/docs/`; no CDN |
+| `/features/conformance` | JSON, HTML | |
+| `/features/collections` | JSON, HTML | collections that have a feature engine; Common collection search |
+| `/features/collections/{id}` | JSON, HTML | `itemType: "feature"`, `crs`, `storageCrs` (CRS84), `numberItems`, `extent`, an `items` link, and a `tilesets-vector` link when api-tiles serves the collection as vector tiles |
+| `/features/collections/{id}/items` | GeoJSON, HTML | a page of features |
+| `/features/collections/{id}/items/{featureId}` | GeoJSON, HTML | one feature; takes only `f` and `crs` |
+
+`/collections` takes `bbox`, `bbox-crs` (CRS84 only), `datetime`, `q`,
+`query`, `sortby` (`title` or `id`), `limit`, `offset` and `f`. Unknown or
+repeated parameters are a 400. A collection's extent comes from the engine's
+`spatial_extent` and `temporal_extent`, and a collection without one matches
+any `bbox` or `datetime`. The search rules are in
+[api-common](../api-common/README.md).
 
 ## Conformance classes
 
 | Class | Declared | Notes |
 |---|---|---|
-| Part 1 `core` | ✓ | landing, `/conformance`, `/collections`, `/collections/{id}`, `/items`, `/items/{featureId}`; optional Part 1 property equality filters implemented (#700) |
-| Part 1 `oas30` | ✓ | `/features/api` (hand-written `api_definition()`, validated against the bundled OpenAPI 3.0 meta-schema in tests), Swagger UI at `/features/api/docs`; `limit`, `bbox` and `datetime` are declared as Part 1 defines them, `style: form` and `explode: false` included (the test suite checks them) |
-| Part 1 `geojson` | ✓ | GeoJSON feature encoding (default) |
-| Part 1 `html` | ✓ | metadata, feature pages and individual features negotiate HTML; property tables, geometry details and a map using the preview’s vendored MapLibre assets. Property numbers, in the tables and the map's quick look, show an integral float without `.0` and a latitude or longitude property to 5 decimals, its exact value in the `title` (#1140); the collection page shows its metadata as tables and anchors, and the conformance page groups classes by standard |
-| Part 1 `gmlsf0` / `gmlsf2` | ✗ | no GML |
-| Part 2 CRS by reference (`crs`) | ✓ | `crs` on `/items` and `/items/{featureId}`, `bbox-crs` on `/items`, `Content-Crs` on every feature response; collections advertise CRS84, EPSG:4326, EPSG:3857, EPSG:3067 and EPSG:3035 with `storageCrs` CRS84 — see [CRS by reference](#crs-by-reference-part-2) (#685) |
-| Part 3 Filtering / CQL2 (`filter`, `queryables`) | ✗ | `filter` controls return 400; no `/queryables` |
-| Part 4 Create/Replace/Update/Delete | ✗ | read-only server by design |
-| Part 5 Schemas | ✗ | no `/schema`; properties are untyped `PropertyValue`s |
-| Part 8 Sorting (draft) | partial | `sortby` implemented (#605 rule: validated against `FeatureEngine::sortables`, 400 naming the valid ones) but the class is not declared and no `/sortables` resource exists |
+| Part 1 `core` | yes | including the optional property equality filters |
+| Part 1 `oas30` | yes | `/api`, validated against the OpenAPI 3.0 meta-schema in tests |
+| Part 1 `geojson` | yes | the default encoding |
+| Part 1 `html` | yes | metadata, item listings and single features |
+| Part 2 `crs` | yes | `crs`, `bbox-crs`, `Content-Crs`; see [CRS by reference](#crs-by-reference) |
+| Part 1 `gmlsf0` / `gmlsf2` | no | no GML encoding |
+| Part 3 Filtering (CQL2) | no | `filter`, `filter-lang`, `filter-crs` are a 400; no `/queryables` |
+| Part 4 Create, Replace, Update, Delete | no | read-only |
+| Part 5 Schemas | no | no `/schema` |
+| Part 8 Sorting (draft) | no | `sortby` works on `/items`; the class and `/sortables` are absent |
 
-Also declared: OGC API - Common Part 1 (core, landing-page, oas30) and
-Part 2 (collections, json, html). The landing page links `/conformance` and
-`/collections` with both the short `conformance`/`data` relations this standard
-requires and the registered `http://www.opengis.net/def/rel/ogc/1.0/conformance`
-/ `…/data` relations Common Part 1 names. Collection discovery supports `bbox`,
-`bbox-crs` (CRS84 only), `datetime`, `q`, `query`, `sortby` (`title` or `id`),
-`limit`, `offset` and `f` through
-[api-common](../api-common/README.md). Unknown/unsupported or duplicate controls
-return structured HTTP 400 errors. Filters and sorting run before paging; JSON/HTML links
-preserve filters and the negotiated format. Without `sortby` and `limit`, JSON
-lists every collection by id and the HTML catalog 24 a page by title (#1141). Collection descriptions expose HTML
-alternate links and configured keywords/license metadata through the shared helper.
-
-Text discovery supports whitespace-normalized whole-word phrases in `q`, and
-`query` adds required (`+`) and excluded (`-`) terms within comma-separated OR
-alternatives. Encode `+` as `%2B`; `q` and `query` are ANDed when both supplied.
-See [the shared text-search contract](../api-common/README.md)
-for examples and validation choices.
-
-Part 4 `searchable-collections` is **not declared**: the 2026-09-17 draft also
-requires `sd` and `resolution`, which are not implemented. Existing
-basic search remains supported. See the [Common Parts 1–4 matrix](../../docs/ogc-api-common-matrix.md)
-for the specification baselines and remaining gaps.
-
-Features collection search now uses `FeatureEngine::temporal_extent()`, matching
-the advertised metadata. Unknown extents remain eligible; temporal bounds do not
-imply a regular sampling grid.
-
-## Routes
-
-| Route | Status | Notes |
-|---|---|---|
-| `/features/` | ✓ | JSON + HTML |
-| `/features/api`, `/api/docs` | ✓ | OpenAPI 3.0 + Swagger UI |
-| `/features/conformance` | ✓ | JSON + HTML |
-| `/features/collections` | ✓ | JSON + HTML; Common Part 4 search |
-| `/features/collections/{id}` | ✓ | JSON + HTML; `extent.spatial` from `spatial_extent`, `extent.temporal` from `temporal_extent` (omitted when `None`); `keywords`, `license` link (typed `text/html` unless `[collections.license] type` says otherwise, #964); a `tilesets-vector` link when the Tiles service registered the collection for vector tiles (listing `tiles` in `apis` is not enough: a nowcast renders only map tiles) |
-| `/features/collections/{id}/items` | ✓ | GeoJSON `FeatureCollection` or HTML with `numberMatched`, `numberReturned`, `timeStamp`, `self`/`next`/`prev` links that carry the caller's filters and sort; on a page past the end, `prev` is the last page with features, not the empty page before it (#1143) |
-| `/features/collections/{id}/items/{featureId}` | ✓ | GeoJSON `Feature` or HTML with `self`, `alternate` + `collection` links, and `related` links where the feature leads on (see [Labels, columns and related links](#labels-columns-and-related-links)); takes only `f` and `crs` — any other parameter (`bbox-crs`, `properties`, a filter, a duplicate) → 400 (#681) |
-| `/features/collections/{id}/queryables`, `/schema`, `/sortables` | ✗ | not routed |
-
-On the landing page, `/conformance` and `/collections/{id}`, an `f` given
-twice is the JSON 400 `{code, description}` naming it, like every other 400
-here, not the HTTP framework's plain text (`api_common::JsonQuery`, #1121);
-the shared root's Common routes answer it the same way.
-
-## Shared OGC API root
-
-Features is the third building block of the shared root
-([#789](https://github.com/mrauhala/meteocore/issues/789) Phase 2), after Maps
-and Tiles. The same handlers serve:
-
-| Route | Notes |
-|---|---|
-| `/collections/{id}/items` | as `/features/collections/{id}/items`, with every link on the shared root; conditional GET (ETag/304) as on `/features` |
-| `/collections/{id}/items/{featureId}` | as `/features/collections/{id}/items/{featureId}` |
-
-- **Feature collections only** get `itemType: "feature"` and two `items` links,
-  `application/geo+json` and `text/html` (Features Part 1 §7.1 scopes its
-  requirements to feature collections; the Features test suite skips entries
-  without a GeoJSON `items` link). A map-only collection has neither, and its
-  `/items` is 404.
-- **Field precedence** follows block order. A collection only Features serves
-  (CSV observations, BUFR stations, the PVOL site inventory) is
-  `dataType: vector` with Features' `crs` list and CRS84 `storageCrs`. Where
-  Maps also serves it (CAP, nowcast, lightning events), the extent and
-  `dataType` are Maps', collection search follows that extent, and a projected
-  raster's unknown `storageCrs` stays unlabelled instead of becoming CRS84.
-  Vector-tiled GeoJSON takes `dataType` from Tiles and `storageCrs` from
-  Features. `crs` lists union in block order; Maps' and Tiles' lists hold no
-  CRS Features lacks, so a feature collection's list is exactly what `/items`
-  accepts (the `common_discovery` contract test pins this).
-- **Links:** vector tilesets are Tiles' own shared-root link
-  (`/collections/{id}/tiles`); the per-API service's cross-link to
-  `/tiles/…` is not repeated.
-- **OpenAPI:** the items operations join the shared `/api`, with components
-  named `features-bbox`, `features-limit`, … because Maps already defines a
-  different `bbox`, `datetime` and `link`.
-- **Conformance:** `/conformance` adds Features `core`, `oas30`, `geojson`,
-  `html` and Part 2 `crs`.
-
-The per-API `/features` service is unchanged: the tutka.meteo.fi client and the
-MCP tool guide use it.
-
-Vector tiles: a collection with a `FeatureEngine` and `tiles` in its `apis`
-serves Mapbox Vector Tiles through `api-tiles` (`?f=mvt`), keyed on
-`FeatureEngine::data_version` for ETags. CAP registers both raster and vector
-sources, so its advertised vector tileset links resolve; vector tiles contain
-the loaded alert areas, including historical/future windows, while raster
-tiles render the selected instant. Not part of this crate.
+`/conformance` also lists OGC API - Common Part 1 (`core`, `landing-page`,
+`oas30`) and Part 2 (`collections`, `json`, `html`). Common Part 4
+`searchable-collections` is not declared; see the
+[Common matrix](../../docs/ogc-api-common-matrix.md).
 
 ## Parameters on `/items`
 
-| Parameter | Status | Notes |
-|---|---|---|
-| `bbox` | ✓ | 4 or 6 values (heights ignored), in `bbox-crs`; `west > east` is an antimeridian-crossing box (Features §7.15.3); 400 on malformed input |
-| `datetime` | ✓ | RFC 3339 instant, `start/end`, `../end`, `start/..`; an interval that ends before it starts is 400. Engines with no time dimension (GeoJSON, PostGIS stations) answer 400 rather than ignoring it (#682); CSV filters stations to those with a report in the interval — see matrix |
-| `limit` | ✓ | default 100, clamped to `[1, 1000]` (out-of-range values are clamped, not rejected) |
-| `offset` | ✓ | offset pagination (non-standard extension; Part 1 only mandates `next`) |
-| `sortby` | ✓ | Part 8 syntax `[+\|-]property,…`; a decoded `+` (space) is accepted as ascending; 400 unless every property is in `FeatureEngine::sortables`; applied before paging (`ds_core::feature::sort_features`) |
-| `f` | ✓ | `json` (GeoJSON for features) / `html` on metadata, `/items` and `/items/{featureId}`; overrides `Accept`; feature routes also accept `application/geo+json` (encode `+` as `%2B`), `application/json`, and `text/html` aliases, case-insensitively; unsupported formats → 400. HTML pagination retains format, filters and sort |
-| `crs` | ✓ | Part 2: one of the collection's `crs` URIs (or its `https` / `[EPSG:4326]` / `EPSG:4326` forms); geometry reprojected per vertex in that CRS's axis order; default CRS84; 400 naming the valid URIs otherwise. GeoJSON only: HTML with another CRS → 400 |
-| `bbox-crs` | ✓ | Part 2: CRS of `bbox`, same values as `crs`; the engine gets a CRS84 box. Validated even without `bbox` |
-| `filter`, `filter-lang`, `filter-crs` | ✗ | 400 (CQL2 is not implemented) |
-| `properties` | ✗ | 400; every property is always returned |
-| `<property>=value` (Part 1 §7.15.5–6 optional property filters) | ✓ | validated against `FeatureEngine::filterables`; unknown names → 400 listing valid ones; exact strings, list membership, canonical numbers/bools; numeric comma-separated alternatives; predicates ANDed before counting/sorting/paging |
+| Parameter | Behaviour |
+|---|---|
+| `bbox` | 4 values, or 6 with the heights ignored, in `bbox-crs` axis order. In CRS84 and EPSG:4326 a west edge east of the east edge crosses the antimeridian. Malformed values, a south edge above the north edge, and latitudes or longitudes out of range are a 400 |
+| `bbox-crs` | CRS of `bbox`, one of the collection's `crs` values; default CRS84. The engine always gets a CRS84 box. Checked even without `bbox` |
+| `datetime` | RFC 3339 instant, `start/end`, `../end`, `start/..` or `../..`. A reversed interval is a 400. On a collection without a time dimension it is a 400 |
+| `limit` | default 100; a value outside 1–1000 is clamped. A value that is not a non-negative integer is a 400 |
+| `offset` | default 0; a value that is not a non-negative integer is a 400 |
+| `sortby` | `[+\|-]property,…`. Every property must be in the engine's `sortables`, else a 400 naming the valid ones. A `+` decoded to a space counts as ascending. A property listed twice is a 400 |
+| `crs` | response CRS, one of the collection's `crs` values; default CRS84. HTML takes CRS84 only |
+| `f` | `json` or `html` (also `application/json`, `text/html`), case-insensitive. Feature routes also take `application/geo+json` (send `+` as `%2B`). Overrides `Accept` |
+| `properties` | not supported: a 400 |
+| `<property>=<value>` | Part 1 property equality filter; see below |
 
-Property filter names are case-sensitive. Values are exact (no wildcards,
-substring search or numeric coercion). Numeric properties additionally accept
-comma-separated alternatives: `size=10,30` means 10 OR 30, with no spaces.
-Commas remain literal in string properties; this is not generic text OR or CQL2.
-Integers/floats use Rust's shortest
-`Display` string (`12`, `1.5`), booleans `true`/`false`; missing, null and
-non-finite values never match. Multiple predicates, including repeated names,
-are ANDed with each other and with `bbox`/`datetime`. For a list, each predicate
-can match a different element. Empty strings remain valid literal values.
-Names and values are URL-encoded in every `self`/`next`/`prev` link, including
-numeric alternative lists.
+Each control parameter may appear once; a repeat is a 400.
 
-### CRS by reference (Part 2)
+Property filters:
 
-Engines hold CRS84 geometry; `crs` and `bbox-crs` are an output and input
-transform in this crate (`src/crs.rs`), with the projection math from
-`ds_core::web_mercator` and `ds_core::geo::projected_output_crs` — the same
-definitions Maps renders with. Each collection's `crs` list is exactly the set
-`/items` accepts, on `/features` and at the shared root.
+- A name must be in the engine's `filterables`; an unknown name is a 400 that
+  lists the valid ones. The control names above cannot be property filters.
+  `/features/api` lists each collection's filter names as query parameters.
+- Names are case-sensitive and matching is exact: no wildcards, substrings or
+  type coercion. Numbers match their canonical form (`12`, `1.5`), booleans
+  match `true` or `false`.
+- On a numeric property, `size=10,30` means 10 or 30. In a string property
+  the comma is literal.
+- A list property matches when any element matches. Missing, null and
+  non-finite values never match.
+- All predicates, repeated names included, are ANDed with each other and
+  with `bbox` and `datetime`, before counting, sorting and paging.
 
-| CRS | URI | Axis order (`crs` output and `bbox-crs` input) |
+Example: `/features/collections/cap-alerts/items?severity=Severe&limit=10`.
+
+### CRS by reference
+
+Engines hold CRS84 geometry. `crs` transforms the output and `bbox-crs` the
+input, in `src/crs.rs`, with the same projection definitions that Maps
+renders with. A collection's `crs` list is exactly what `/items` accepts.
+
+| CRS | URI | Axis order |
 |---|---|---|
 | CRS84 (default, `storageCrs`) | `http://www.opengis.net/def/crs/OGC/1.3/CRS84` | longitude, latitude |
 | EPSG:4326 | `http://www.opengis.net/def/crs/EPSG/0/4326` | latitude, longitude |
@@ -168,354 +140,210 @@ definitions Maps renders with. Each collection's `crs` list is exactly the set
 | EPSG:3067 | `http://www.opengis.net/def/crs/EPSG/0/3067` | easting, northing |
 | EPSG:3035 | `http://www.opengis.net/def/crs/EPSG/0/3035` | northing, easting |
 
-Axis orders are EPSG's, as PROJ's `cs2cs` prints them; the tests pin projected
-coordinates against it. Note that WMS here takes EPSG:3035 `BBOX` easting first.
+- Accepted forms: the URI, its `https` form, the CURIE with or without
+  brackets (`EPSG:3067`, `[OGC:CRS84]`) and `CRS84`. Anything else is a 400
+  listing the URIs.
+- Axis orders are EPSG's, as PROJ `cs2cs` prints them. WMS takes an
+  EPSG:3035 `BBOX` easting first.
+- Every `/items` and `/items/{featureId}` response carries `Content-Crs`,
+  CRS84 included.
+- Every vertex is reprojected. A geometry with a vertex that has no finite
+  coordinates in the CRS, such as the South Pole in EPSG:3857, is `null`.
+- An EPSG:3857 `bbox` maps exactly; a box past ±180° or with `minx > maxx`
+  crosses the antimeridian. An EPSG:3067 or EPSG:3035 `bbox` (lower corner
+  first) becomes the CRS84 envelope of densely sampled edge points, widened
+  to a pole inside the box. Near the box corners, it can also match features
+  just outside the projected rectangle. A box wholly outside the area the CRS
+  can represent is a 400.
+- Links repeat a requested `crs`. They carry `bbox` as its CRS84 conversion,
+  without `bbox-crs`.
 
-- **`Content-Crs`** (`<uri>`) is on every `/items` and `/items/{featureId}`
-  response, CRS84 included.
-- **Output:** every vertex is reprojected. A geometry with a vertex that has no
-  finite coordinates in the CRS (the South Pole in EPSG:3857) is `null`.
-  Regional projections stay defined far outside their area of use, where the
-  numbers mean little.
-- **`bbox-crs`:** EPSG:4326 swaps the axes; a longitude west edge east of the
-  east edge still crosses the antimeridian. EPSG:3857 maps exactly, and a box
-  with `minx > maxx` or past ±180° crosses the antimeridian. EPSG:3067/3035
-  boxes (lower corner first) become the envelope of densely sampled edge points,
-  so a curved edge between corners is covered, widened to a pole the box
-  contains. The envelope may also match features just outside the projected
-  rectangle near its corners, never fewer. EPSG:3067 points past a pole's
-  northing, or with an easting more than 9 997 965 m from 27°E's, name no
-  place (#1113, #1130): there its series stops being exact, on the equator
-  66.3° from 27°E, and from 23.4° of latitude poleward the meridians 90° out,
-  63°W and 117°E. The envelope of a box reaching past them ends at that edge,
-  though around a pole it still spans every longitude; a box around the whole
-  area matches every feature, and one wholly past them is a 400.
-- **Links:** `self`/`next`/`prev` and each feature's `self` repeat a requested
-  `crs`; the bbox is repeated as its CRS84 conversion, without `bbox-crs`. The
-  HTML view is CRS84, so the GeoJSON response's `alternate` HTML link drops `crs`.
-- Not implemented: the optional `/collections` global CRS list (`#/crs`
-  references), `storageCrsCoordinateEpoch`, 3D CRSs (CRS84h).
+## Responses
 
-`/features/api` lists the accepted property parameters per collection from
-cached engine catalogs. GeoJSON advertises names present in at least one
-loaded record (including null values), refreshed with the data. PostGIS
-stations advertise the configured `stations.property_cols` from engine
-construction, even before the first metadata refresh or with an empty
-stations table, so a filter on one of them returns 200 with no matches
-rather than a 400 (#1024); names the loaded rows carry are added at each
-refresh. CSV, BUFR and ODIM use fixed schemas; Nowcast includes optional
-property groups only when their sources are wired. CAP combines both: every
-standard CAP alert/info/area property it can emit (`identifier`, `sender`, `sent`,
-`status`, `msgType`, `scope`, `language`, `category`, `event`,
-`responseType`, `urgency`, `severity`, `certainty`, `effective`, `onset`,
-`expires`, `senderName`, `headline`, `description`, `instruction`, `web`,
-`areaDesc`) and its derived `active_until`, `radius_km`, `geometry_source`
-and `awareness_type_code` are always advertised, even with no alerts loaded,
-so a filter on a field no held alert carries returns 200 with no matches
-rather than a 400 (#1001); producer `<parameter>` and `eventCode:*` names are
-added from the loaded alerts. A producer parameter named like a standard
-property is `parameter:<valueName>` even on an alert that omits that field.
-Reserved API controls (`bbox`, `datetime`,
-`limit`, `offset`, `sortby`, `f`, `crs`, `bbox-crs`, `filter`, `filter-lang`,
-`filter-crs`, `properties`) take precedence over source property names and
-cannot be used as property filters. Duplicate control parameters return 400.
-This does not declare Part 3 conformance or add `/queryables`.
+- `/items` is a GeoJSON `FeatureCollection` with `numberMatched`,
+  `numberReturned`, `timeStamp` and `self`, `next` (when more remain), `prev`
+  (when `offset` > 0) and `alternate` links. Past the end, `prev` is the last
+  page that has features.
+- Each feature has `self` and `collection` links, plus a `related` link for
+  each resource its engine names and an API here serves.
+- A feature's `title` property is its engine's label, unless the feature
+  has a `title` of its own. EDR `items` carries the same `title`, without
+  the `related` links.
+- Paging links carry `offset`, `limit`, the explicit format and the parsed
+  `bbox`, `datetime`, `sortby`, property filters and `crs`. Following `next`
+  keeps the same query.
+- Geometry types are `Point`, `Polygon`, `MultiPolygon` and `null`.
+- Feature ids are opaque strings. Links percent-encode an id as one path
+  segment. Build URLs the same way, or follow the links.
+- Content negotiation: `f` first, then `Accept`. `text/html` or `text/*`
+  selects HTML; `*/*` stays JSON. Negotiated responses send `Vary: Accept`.
+- Every 200 has a strong ETag, and `If-None-Match` gets a 304. The `/items`
+  ETag ignores `timeStamp`. Cache-Control is `public, max-age=60` by default.
+  An `/items` request whose closed `datetime` interval ended at least an hour
+  ago gets `public, max-age=86400`.
+- Errors are `{"code", "description"}`, and a 500 never shows internal
+  detail. A request that asked for HTML gets the error as an HTML page with
+  the same status. A rejected `/items` HTML request returns the items page
+  with the request form filled in and the faulty field marked.
 
-The GeoJSON engine preserves flat arrays of scalars (including empty arrays)
-as typed lists, so JSON responses retain arrays, HTML can display chips, and
-property filters match list elements. Strings containing JSON remain strings.
-Objects and arrays containing nested structures retain the engine's existing
-JSON-string fallback; they are not represented as nested typed properties.
+## HTML
 
-Example: `/features/collections/cap-meteoalarm-wis2/items?awareness_type=1%3B%20Wind&severity=Severe`.
+Metadata, item listings and single features render as pages of the shared
+workbench (see [HTML API workbench](../api-common/README.md#html-api-workbench)).
+An item listing has:
 
-CAP also exposes `awareness_type_code`, derived from the positive integer
-prefix of MeteoAlarm's `code; label` convention. Original `awareness_type`
-values remain unchanged. Repeated awareness types produce a list of numeric
-codes; malformed values contribute no code. A producer parameter named
-`awareness_type_code` is preserved as `parameter:awareness_type_code`.
-Like the standard properties, the derived code remains queryable when the
-collection has no valid codes or no alerts, returning no matches rather than
-an unknown-property error.
+- a request builder, open when the request filters, sorts or was rejected.
+  Its groups follow what the engine advertises: property equality, time
+  (two UTC pickers that fill `datetime`, `..` for an open end), area
+  (`bbox`, or **Use map view** for the map's current view), order (a
+  sortable property and a direction) and paging;
+- a property table of up to eight selectable columns. By default it shows up
+  to four that have values on the page: the engine's `summary_properties`,
+  else its sortables and then the other properties alphabetically, without
+  labels, ids and coordinates. The browser's `localStorage` keeps a choice
+  per collection id;
+- a MapLibre locator map of the page.
 
-One request selects three types across label capitalization variants:
-`/features/collections/cap-meteoalarm-wis2/items?awareness_type_code=1,3,5`.
-A single code is `?awareness_type_code=3`; add `&severity=Severe` for an AND
-condition. This remains exact numeric equality, not a text prefix match.
-The code convention is defined in the
-[MeteoAlarm CAP profile](https://gitlab.com/meteoalarm-pm-group/documents/-/raw/master/MeteoAlarm_CAP_Profile_v2.0.pdf), §2.2.17.
+The map draws only the returned page, simplified for display, over locally
+bundled Natural Earth outlines. It makes no extra feature or tile requests.
+A feature page lists every property with its JSON type, and shows its
+`related` links as buttons. Feature titles come from a `name`-like property
+(an engine's label arrives as `title`), else the id.
 
+A collection's overview page adds the engine's `items_description` and two
+chip rows: the properties its items page filters and sorts by. A chip opens
+the items page with the builder set to that property, through the URL
+fragment (`#filter=<name>`, `#sort=<name>`), never a query parameter.
 
-Every 200 carries `Cache-Control` + a strong ETag; `If-None-Match` → 304
-(#499). Both feature routes send `Vary: Accept`, explicit-format pagination and alternate
-links, and representation-specific ETags. `/items` hashes the selected
-representation with `timeStamp` blanked; an HTML page is rendered once, hashed,
-and then given its generation time (#1135). A closed
-`datetime` window entirely in the past gets the long cache policy.
+## Shared OGC API root
 
-Error bodies are `{ "code", "description" }`; 500s never leak internals.
-Structured `ErrorReason` codes are #119. A request that asked for HTML gets
-each error as an HTML page with the same status instead (#1132): the
-message, the parameter at fault, and links back to the collection and to
-Collections; a 5xx page carries no details. `f` is read from the raw query
-before the other parameters, and an empty `f` counts as none. On `/items`, a
-rejected `bbox`, `bbox-crs`, `datetime`, `sortby`, `limit`, `offset`,
-property filter or `crs` follows the items page's own negotiation: `f=html`,
-or without `f` an `Accept` listing `text/html`. Its 400 is the items page
-again: the data request form holding what was sent, the field at fault
-marked `aria-invalid` with the message beside it, and the `datetime` field
-showing its accepted forms. Every other error is a page for `f=html`, or
-without `f` an `Accept` that ranks `text/html` first, as a browser's does:
-above every other type it lists, or equal and listed first, where `*/*`,
-`text/*` and the XML types do not count. A bad `f` is no HTML request, and
-with another bad parameter its JSON 400 names that parameter first, as it
-always has. JSON requests get the JSON body unchanged; `/api` lists both
-media types on the items and item 4xx and 500 responses.
+`FeaturesBlock` adds `/collections/{id}/items` and
+`/collections/{id}/items/{featureId}` to the shared root at `/`, with the same
+handlers, parameters and conditional GET.
 
-`/api/docs` uses embedded Swagger UI 5.33.0 assets, served under
-`/api/docs/{asset}`, with a same-origin script policy and `nosniff` headers.
-No executable documentation assets or validation requests use a CDN (#587).
-
-## Geometry types produced
-
-`Point`, `Polygon`, `MultiPolygon`, and `null` (CAP geocode-only areas).
-
-Feature IDs are opaque domain strings; URL path segments in advertised links
-are percent-encoded once by the API. This includes CAP sender-scoped IDs with
-URL-shaped senders, slashes, brackets, literal percent sequences or Unicode.
-CAP IDs now retain those characters in JSON rather than pre-encoding them in
-the engine; producer `sender`/`identifier` properties are unchanged. Follow
-the advertised links, or encode the complete ID as one path segment when
-constructing a URL. Existing correctly encoded URLs remain valid.
-`LineString` does not exist in `ds_core::feature::Geometry` (#408 — storm
-tracks).
+- Only collections with a feature engine get `itemType: "feature"` and two
+  `items` links, GeoJSON and HTML. A map-only collection's `/items` is a 404.
+- Blocks merge in the order Maps, Tiles, Features. An earlier block's
+  `extent` and `dataType` win, and the `crs` lists are merged. A
+  Features-only collection is `dataType: "vector"` with a CRS84
+  `storageCrs`.
+- The items operations join the shared `/api` with components named
+  `features-bbox`, `features-limit` and so on, because Maps defines its own
+  `bbox`, `datetime` and `link`.
+- The root's `/conformance` adds Features `core`, `oas30`, `geojson`, `html`
+  and Part 2 `crs`.
 
 ## Per-engine matrix
 
-✓ implemented · – not implemented · ignored = parameter accepted by the API
-layer but has no effect on this engine.
+"400" means the API rejects the parameter for that engine. Extents feed
+collection metadata and collection search. `data_version` is part of the
+api-tiles vector-tile cache key.
 
-| Engine | Feature = | `bbox` semantics | `datetime` semantics | `sortby` | Property filters | `spatial_extent` | `temporal_extent` | `data_version` |
-|---|---|---|---|---|---|---|---|---|
-| CSV | one station per distinct location (Point) | station point inside box | stations with at least one observation row in the interval; EDR `/locations?datetime=` lists the same stations, from the same code (#932) | – (400) | ✓ name, latitude, longitude | – | ✓ (first/last observation) | 0 (static) |
-| GeoJSON file | file features as loaded | feature geometry intersects query box (R-tree candidates, then a point / polygon-edge / containment test; `west > east` split at the antimeridian) | – (400: no time dimension) | – (400) | ✓ all loaded property names | ✓ | – | ✓ |
-| CAP | one alert area (Polygon / MultiPolygon / null geometry); `properties.geometry_source` = `inline`/`geocode`/`notification`/`bbox`; producer `<parameter>`s as top-level properties under their valueName (MeteoAlarm `awareness_level`, `awareness_type`; repeats → list; `impacts`), `<eventCode>`s as `eventCode:<valueName>`. Identity is scoped to sender; canonical IDs include a length-prefixed sender, and old identifier-only URLs resolve only when unambiguous. Status filtering precedes exact sender/identifier/sent Update/Cancel resolution (at ingest for WIS2, on rebuild for directory/feed). Failed documents retain their last good data while successfully fetched documents update. A WIS2 source holds at most `max_alerts` (10 000) alerts: past it, still-valid alerts are dropped from `/items` and the map, not-yet-active and lowest severity first, and the collection reports `degraded` in `/health` (#805) | area bbox intersects query box; crossing bboxes split at the antimeridian; null-geometry areas excluded when `bbox` is set | alert active window intersects the interval | – (400) | ✓ every standard CAP property, even with no alerts loaded (#1001), + producer names from the loaded alerts (including lists) | ✓ | ✓ (union of active windows; `None` when fully open) | ✓ |
-| PostGIS stations | one station (Point) from the cached location set, at most `[postgis] max_locations` (default 200 000; a list cut there degrades `/health`, #1061) | station point inside box (in memory, not SQL) | – (400: no time dimension) | – (400) | ✓ configured `stations.property_cols`, even with no stations loaded (#1024), + names the loaded rows carry | ✓ | – | ✓ |
-| PostGIS events | — no `FeatureEngine` (EDR area + WMS only; Features items = #503) — | | | | — | | | |
-| BUFR | one station (Point) from the observation store; properties `wigos_station_identifier`, `name`, `elevation`, `first_report`, `last_report`, `report_count` | station point inside box | station has ≥ 1 report inside the interval; EDR `/locations?datetime=` lists the same stations, from the same code (#932) | ✓ last_report, first_report, report_count, name | ✓ name, wigos_station_identifier, elevation, first_report, last_report, report_count | ✓ | ✓ (oldest → newest report held) | ✓ (snapshot version) |
-| ODIM PVOL network | one radar site (Point) — site inventory | site point inside box | sites with a volume inside the interval; each site collection's EDR `/locations?datetime=` lists its site by the same rule (#932) | – (400) | ✓ all site inventory properties (including quantities/elevation_angles lists) | ✓ | ✓ (earliest → latest retained volume, #1143) | ✓ (inventory-sensitive) |
-| Nowcast | one tracked storm cell (Point + fact-sheet properties) from one generation | cell centroid inside box | with none: latest generation; with `datetime`: the newest retained generation inside the interval (~4 h history) | ✓ significance, significance_rank, max_dbz, area_km2, track_age, speed_ms, bearing_deg, intensity_trend_dbz_min + lightning / impact / radar extras when those sources are wired | ✓ all base cell properties except `significance_contributions` + wired lightning/impact/radar groups | ✓ | ✓ (retained history span) | ✓ |
-| GeoTIFF, GRIB, QueryData, Zarr, ODIM composite, ODIM PVOL site | — no `FeatureEngine` (EDR / Maps only) — | | | | — | | | |
+| Engine | Feature | `bbox` | `datetime` | `sortby` | Property filters | Spatial / temporal extent | `data_version` |
+|---|---|---|---|---|---|---|---|
+| CSV | one station (Point), in first-observation order | point inside the box | stations with an observation in the interval | 400 | `name`, `latitude`, `longitude` | – / first to last observation | 0 (static) |
+| GeoJSON | each feature of the file | geometry intersects the box | 400: no time dimension | 400 | every property name in the loaded file | yes / – | the file's modification time |
+| CAP | one alert area (Polygon, MultiPolygon or null) | area's bounding box intersects the box; null geometry excluded | alert active window intersects the interval | 400 | the standard CAP alert, info and area properties and derived ones (always), plus producer parameter and `eventCode:` names from loaded alerts | yes / earliest window start to latest window end, extended to the catalog time; none when every window is open | changes with the alert set |
+| PostGIS stations | one station (Point) from the cached station list | point inside the box | 400: no time dimension | 400 | configured `stations.property_cols` (always), plus names the loaded rows carry | yes / – | changes per metadata refresh |
+| BUFR | one station (Point) | point inside the box | stations with a report in the interval | `last_report`, `first_report`, `report_count`, `name` | `name`, `wigos_station_identifier`, `elevation`, `first_report`, `last_report`, `report_count` | yes / oldest to newest report | changes per snapshot |
+| ODIM PVOL network | one radar site (Point), the site inventory | point inside the box | sites with a retained volume in the interval | 400 | site properties (below) | yes / earliest to latest retained volume | changes with the inventory |
+| Nowcast | one tracked storm cell (Point) of one generation | cell point inside the box | the newest retained generation inside the interval; none inside: no features. Without `datetime`: the latest | cell facts (below) | every cell property except `significance_contributions`, including the groups of wired sources | yes / retained history | changes every generation |
+
+- Every `bbox` test above handles a box that crosses the antimeridian.
+- ODIM PVOL site filters: `nod`, `name`, `wmo`, `longitude`, `latitude`,
+  `antenna_height_m`, `quantities`, `elevation_angles`,
+  `coverage_radius_m`, `latest_volume_time`, `volume_count`, `collection`.
+- Nowcast sorts on `significance`, `significance_rank`, `max_dbz`,
+  `area_km2`, `track_age`, `speed_ms`, `bearing_deg`,
+  `intensity_trend_dbz_min`, `net_displacement_km`, `path_straightness` and
+  `likely_clutter`, plus lightning, impact and radar fields when those
+  sources are wired. It keeps the last 48 generations (4 hours at a 5-minute
+  cadence). `/items/{featureId}` returns the cell as it is in the latest
+  generation.
+- PostGIS `events` collections have no Features surface: `apis = ["features"]`
+  on them is a config error.
+- An ODIM volume source with `features` in `apis` serves the site inventory
+  under its own id. The per-site radar collections are not feature
+  collections.
+- GeoTIFF, GRIB, QueryData, Zarr, NetCDF, Satellite, ODIM composite and
+  station-grid collections have no `FeatureEngine`.
 
 ### Labels, columns and related links
 
-Three `FeatureEngine` hooks and one `Feature` field (#1143) let an engine say
-what a feature is called, which properties a listing shows first, what its
-items are and where a feature leads. Defaults keep the generic behaviour.
+| Engine | Label (`title`) | First columns | `related` link |
+|---|---|---|---|
+| CSV | – | default | the station's EDR location |
+| GeoJSON | – | default | – |
+| CAP | `event · areaDesc`, the parts the area has | `severity`, `onset`, `active_until`, then `awareness_level` or `urgency` | – |
+| PostGIS stations | – | default | the station's EDR location |
+| BUFR | – | default | the station's EDR location |
+| ODIM PVOL network | – | default | the site's own collection |
+| Nowcast | `Rank 2 · very severe · max 52 dBZ` from `significance_rank`, `severity` and `max_dbz`, plus `· likely clutter` when flagged | `significance`, `severity`, `max_dbz`, `area_km2` | – |
 
-- **`label(&Feature)`** — served as the feature's `title` property, in
-  GeoJSON and HTML alike (and EDR `items`), unless the feature has a `title`
-  of its own. The label is built from the feature's own values; it adds none.
-  The HTML label rule below then picks it up; the id stays as secondary text.
-- **`summary_properties()`** — the listing's first columns (up to four, those
-  this page has values for). Empty falls back to `sortables`, then the other
-  properties alphabetically, skipping label keys, `id`, `collection`,
-  `latitude`, `longitude` and any property that only repeats the feature id.
-- **`items_description()`** — one line on the collection's HTML overview,
-  where the collection's description could mislead.
-- **`Feature::related`** — resources a feature leads to, named, not
-  addressed: `RelatedTarget::Collection(id)` or `RelatedTarget::EdrLocation(id)`.
-  The API resolves them to `rel="related"` links below the base URL, and
-  leaves out one it has no route for: a collection page only from the
-  server's `FeaturesState::collection_pages` (per-site radar collections: the
-  shared root when Maps or Tiles serve the site, else EDR), an EDR location
-  only when the feature's collection lists `edr` in `apis`. HTML links them as
-  buttons in the item page's aside, to the HTML view.
+- Without a label, a page titles a feature by its `name`-like property, else
+  its id. "Default" columns are the sortables, then the other properties
+  alphabetically.
+- An EDR location link needs `edr` in the collection's `apis`. A radar
+  site's collection link goes to the shared root when Maps or Tiles serve
+  the site, else to EDR, else it is left out.
+- The ODIM PVOL network's overview says what an item is: "Radar site
+  inventory: one point per radar. Each site's volumes are in its own
+  collection." No other engine sets `items_description`.
+- The nowcast label's rank orders a heuristic significance, and the
+  severity class is the engine's own. Neither is a warning.
 
-| Engine | Label (`title`) | First columns | Overview line | Related |
-|---|---|---|---|---|
-| CAP | `event · areaDesc`, the parts the area has | `severity`, `onset`, `active_until`, then `awareness_level` or `urgency` | – | – |
-| Nowcast | `Rank 2 · very severe · max 52 dBZ` (`significance_rank`, `severity`, `max_dbz`; `· likely clutter` when flagged). The rank orders a heuristic significance and the class is the engine's, neither a warning | `significance`, `severity`, `max_dbz`, `area_km2` | – | – |
-| ODIM PVOL network | its `name` (generic rule) | fallback | "Radar site inventory: one point per radar. Each site's volumes are in its own collection." | the site's own collection |
-| BUFR, CSV, PostGIS stations | `name` (generic rule) | fallback (BUFR: its sortables) | – | the station's EDR location, when the collection serves EDR |
-| GeoJSON | generic rule | fallback | – | – |
+## Configuration
 
-PostGIS checks timestamp mappings and point/SRID requirements before publishing
-data. A schema mismatch blocks data queries and degrades collection health;
-a successful reachability ping cannot clear it. Generic geometry views remain
-supported with bounded startup checks and validation of returned coordinates.
-See [database validation](../engine-postgis/README.md#column-requirements).
+The crate has no config section of its own. List `features` in a
+collection's `apis`. The engine types that accept it are `csv`, `geojson`,
+`cap`, `bufr`, `postgis` (station shapes), `odim-volume` and `nowcast`.
 
-CSV pagination uses an immutable station inventory built at load time, in
-first-observation order. Unfiltered pages slice that inventory directly;
-filtered pages count matching stations but clone only the requested page.
-Requests never scan the CSV observation history or rebuild all station features
-(#532). Other engines retain their own filtering/sorting/paging strategies;
-responses are buffered rather than streamed.
+```toml
+[server]
+# base_url = "https://api.example.com"  # absolute links behind a proxy
+# trust_proxy_headers = true            # links from X-Forwarded-* / Forwarded
 
-## Known gaps, in suggested order
+[[collections]]
+id = "weather"
+title = "Finnish Weather Observations"
+data_path = "testdata/weather.csv"
+engine_type = "csv"
+apis = ["edr", "features"]
+```
 
-1. Honour or reject `datetime` on engines without a time dimension (#682).
-   `/items` rejects unsupported/unknown names (#700), `/items/{featureId}`
-   everything but `f` (#681).
-2. Declare Part 8 sorting + serve `/sortables` (#683).
-3. PostGIS events shape as Features items with keyset pagination (#503).
-4. `Geometry::LineString` for storm tracks (#408); polygon cells.
-5. Part 3 CQL2 filtering + `/queryables`; Part 5 `/schema` (#686).
-6. GeoJSON engine `bbox` refines envelope hits against the geometry (#687).
+Runnable examples in `collections.d/`: `weather.toml` (CSV), `regions.toml`
+and `municipalities.toml` (GeoJSON), `cap-alerts.toml` and
+`cap-meteoalarm-wis2.toml` (CAP), `obs-bufr-local.toml` and
+`obs-synop-wis2.toml` (BUFR), and `radar-fi-nowcast.toml` (Nowcast).
 
-Related issues: #605 sortby · #532 pagination without materializing · #503
-PostGIS events items · #408 LineString · #119 ErrorReason · #127 MVT ·
-#138 vector-tile cache key · #303 Part 4 search follow-ups · #306 shared
-content-negotiation glue.
+## Limits
 
-Nowcast tracks survive one missed detection for reassociation only: the missing
-cell is absent from that generation's features, and `track_age` counts observed
-frames. Startup reconstructs up to eight retained source frames without publishing
-historical forecast runs. Lightning fields require explicitly known source
-coverage of the labeled footprint and attribution radius. With a source wired,
-`lightning_coverage` is `true`, `false`, or `null` (unknown); flash fields are null
-outside/unknown coverage and on failed or capped joins. An advertised source
-extent alone does not establish coverage.
+- `limit` is at most 1000. Paging is by `offset`. Responses are buffered,
+  not streamed.
+- Geometry is Point, Polygon, MultiPolygon or null: no lines and no
+  multi-points. There is no `properties` selection. The classes marked "no"
+  under [Conformance classes](#conformance-classes) are not implemented.
+- Part 2: no global CRS list on `/collections`, no
+  `storageCrsCoordinateEpoch`, no 3D CRS.
+- The HTML representation is CRS84 only.
 
-`FeatureEngine::available_times` and `get_feature_at` (#646) are not exposed
-over HTTP: `/items` does not list snapshot instants, and `/items/{featureId}`
-still serves the latest snapshot. They serve the MCP `get_cell_track` walk;
-only Nowcast implements them, one instant per retained cell snapshot, quiet
-ones included. Other engines return no instants, and the by-id-at-a-time
-lookup refuses rather than scanning pages.
+## Testing
 
-Compatible nowcast reloads preserve retained cell snapshots and track IDs (#604).
-Edited GeoJSON impact areas are used by the next generation; past snapshots
-keep their original facts. Replaced lightning sources restart the jump baseline
-without restarting radar tracks. Reuse requires unchanged nowcast config, the
-same raster engine and a matching retained geometry/product contract. Missing
-or invalid configured dependencies still fail load validation.
+```bash
+cargo test -p api-features
+```
 
-Nowcast optional property groups (lightning, impact, radar) share one rule:
-absent when no source is wired, present with its per-generation values `null`
-when that generation's join was skipped, values when it ran (#650);
-`lightning_coverage` describes the source's footprint and survives a failed
-fetch. `impact_exposure`
-is numeric whenever the impact join ran, so a null `impact_over` beside it
-means "over no area". `significance_contributions` lists every term that moved
-the score as signed `{term, value}` objects, largest first; negative values
-(`clutter`, `weakening`) pulled the cell down, the values sum to `significance`
-up to rounding, and `significance_reasons` names the first three. It is a list
-of objects, so it is not a property filter. `age_minutes` is wall-clock time
-since first detection; `track_age` counts observed frames. An unmeasured flash
-rate and a zero-area cell's flash density are `null`, never `0`.
+The tests run the router against in-memory mock engines; they need no data
+files.
 
-Nowcast cells have a 2.5 km² minimum footprint, summed at each pixel row's
-latitude. `area_km2`, severity and flash density use that physical area;
-tracking distances and speeds use local latitude. Working resolution depends
-on the source and configured pixel budget.
+- `ogc_features_api_tests.rs`: routes, links, paging, `bbox`, `datetime`,
+  `f` and `Accept` negotiation, errors, the vector-tileset link, and engine
+  labels, columns and overview in HTML.
+- `sorting_tests.rs`: `sortby` validation and order. It also validates
+  `/api` against `schemas/openapi-3.0.json`.
+- `crs_tests.rs`: Part 2, with expected coordinates taken from PROJ `cs2cs`.
+- `caching_tests.rs`: ETag, `If-None-Match` and Cache-Control.
 
-BUFR decoding supports compressed character fields and delayed replication,
-operators 203 (uncompressed), 204 and 208, numeric fields through 64 bits,
-SYNOP radiation widths of master tables before version 14, and DWD local
-tables 1–8 (#1008). Station reports of one station, time and position from
-several messages of one bulletin merge into one row. Unsupported operators or unknown
-national descriptors skip the affected message (counted in
-`bufr_decode_failures_total` by `kind`); other messages in the same file
-remain available. See
-[`engine-bufr` decoder notes](../engine-bufr/CLAUDE.md#the-decoder-boundary).
-
-### HTML workbench
-
-Metadata and items share the `api-common::workbench` navigation, themes and
-current-resource JSON switch. The item data request builder (#1143) is open
-when the request filters or sorts, when it was rejected, or when an Overview
-chip names it in the URL fragment (`#filter=<name>`, `#sort=<name>`; never a
-query parameter, which `/items` would reject). Its groups, in order: an exact
-property predicate (the engine's filterables) with the applied ones; time,
-two UTC `datetime-local` pickers that fill the `datetime` field as
-`start/end`, `..` for an open end, the field taking any other form typed with
-its examples beside it; area, a `bbox` field and **Use map view**, which takes
-the items map's current view as a CRS84 box (west > east across the
-antimeridian); order, a sortable property and a direction joined into
-`sortby` (a multi-key `sortby` stays selected as given); paging; and the
-submit button last. The time group is there whenever `/items` takes
-`datetime` (`has_time_dimension`), whether or not the collection advertises
-a temporal extent. Repeated predicates and intentional empty predicates from
-an existing URL are preserved. Collection search uses Common `q`/`query`;
-item queries keep their existing Features semantics.
-
-The collection Overview, on `/features` and at the shared root, lists the
-properties its items page filters by and sorts by as two chip rows, each chip
-opening that page with the builder at the property, and the engine's
-`items_description` line under the description.
-
-Individual items show every property with its JSON type, distinguishing null,
-empty strings, arrays and nested objects. Flat arrays render as visible wrapping
-chips, including in selected listing columns; empty arrays are labelled explicitly.
-Nested arrays and objects retain expandable JSON views. The renderer does not assign weather
-semantics, units, severity, expiry state or observation times based on property
-names. Display titles use case-insensitive common label keys in priority order (an
-engine's own label arrives as `title`):
-`name`, `label`, `title`, `display_name`, `displayname`, `nimi`, `namn`, `nom`,
-`nombre`, `naam`, `bezeichnung`, then the feature ID. Coordinates are rounded to
-five decimal places in the summary; raw geometry retains full precision.
-A feature page's title is that label and the collection title; an items page's
-names its item range, whether filters apply, and the collection
-(`Items 101–110 · filtered · Towns`), so pages differ in tabs and history
-(#1131); paging, `sortby`, `properties`, `crs` and `bbox-crs` alone filter
-nothing. Below 600 px the property table stacks: key and type on one line, the
-value below at full width.
-
-Listings derive selectable columns from response properties and advertised
-filter fields, defaulting to the engine's choice (see
-[Labels, columns and related links](#labels-columns-and-related-links)).
-Up to eight property columns can be selected; the choice is kept in this
-browser's `localStorage` by collection id, so `/features/…` and the shared
-root share it, and the page says so. Missing properties are shown as **Absent**, separately from
-JSON null. Stored columns survive pages where those fields are absent. Column
-choices never change API requests or JSON output. Without JavaScript, the default
-columns, paging and item links still work.
-
-The response table shows every row returned for the requested limit and grows
-with the page, without a separate vertical scrollbar. Horizontal scrolling is
-available for wide sets of selected columns. The map sits to the right on wide
-screens; below 1100 px it comes before the table, 240 px tall. Paging and spaced page-size
-controls appear above and below the table. An empty offset with
-matches offers a first-page link that retains filters, repeated/empty predicates
-and sorting, its **Previous** link leads to the last page with features, and
-its map says "No features on this page". The request builder and applied/draft URL tools are collapsible;
-builder and advanced-filter disclosure choices persist per collection;
-applied filters stay visible and the global JSON switch retains the applied URL.
-
-The MapLibre locator shows this response page over locally bundled Natural Earth
-outlines, with a generic property quick look and item links. It makes no additional
-feature or external tile requests. A listing's map draws simplified shapes
-(#1135): each ring and line is reduced by Douglas–Peucker to about one pixel at
-the initial zoom, measured in Web Mercator over the page's extent; holes and
-multipolygon parts smaller than a pixel are dropped, but a feature keeps its
-largest part; coordinates are rounded to five decimals. The initial view is
-never closer than zoom 5, so a page of a few small features is simplified to a
-zoom-5 pixel, 2.4 km at the equator, and zooming in shows that coarse shape. The page's
-shapes share a budget of 10 000 positions. Past it, a feature is drawn as its
-bounding box when that is smaller: shaded for an area, an outline for a line
-or a set of points. GeoJSON responses and the item page keep every vertex. The
-map does not draw from the collection's vector tiles. Raw geometry is displayed on item details,
-not repeated beneath the listing map. JavaScript enables query editing, property
-column selection, map interaction and property search. Server HTML remains
-deterministic. Response generation timestamps are labelled explicitly.
-
-In HTML, the collection’s **Request data** tab opens the `/items` data request
-builder. **Request features** applies filters within that collection; collection
-discovery remains under **Collections → Find collections**.
-
-HTML breadcrumbs display collection and item titles when available; resource
-URLs continue to use the original IDs. Parent titles are passed from the existing
-collection snapshot, without additional data queries.
-
-Collection advanced search starts closed and retains the user's open/closed
-choice across searches in the browser session. Resource URLs are clickable.
-
-HTML catalogs now use compact search and metadata summaries, retain UTC time
-precision, and distinguish empty offsets from zero matching collections. Returning
-to the first page preserves discovery filters; list/cards preference persists.
-
-The shared collection HTML renderer displays vertical bounds and available levels
-when advertised in metadata. Features collections without a vertical extent
-continue to omit that dimension.
+Shared code paths have tests elsewhere: run `cargo test -p api-edr --test
+items_tests` for EDR `items`, and `cargo test -p server --test
+common_discovery` for the shared root and collection discovery.
