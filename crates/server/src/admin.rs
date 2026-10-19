@@ -1679,6 +1679,9 @@ pub struct ServerState {
     pub maps: Arc<ArcSwap<MapsState>>,
     pub tiles: Arc<ArcSwap<TilesState>>,
     pub tiles_3d: Arc<ArcSwap<api_3dtiles::TilesState3d>>,
+    /// [`LoadResult::served_by`] of the accepted load, which the shared
+    /// root's collection pages read (`api_common::shared::CollectionServices`).
+    pub served_by: Arc<ArcSwap<api_common::shared::ServedByMap>>,
     pub config_path: String,
     /// Last accepted config/styles, used by recovery without reading config files.
     pub accepted_load: RwLock<Option<Arc<AcceptedLoad>>>,
@@ -1743,6 +1746,9 @@ pub struct LoadResult {
     pub maps_state: MapsState,
     pub tiles_state: TilesState,
     pub tiles_3d_state: api_3dtiles::TilesState3d,
+    /// What EDR, WMS and 3D Tiles serve of each collection id (#1228), for
+    /// the shared root's collection pages ([`served_by`]).
+    pub served_by: api_common::shared::ServedByMap,
     pub health: Vec<CollectionHealth>,
     pub geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>>,
     pub querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>>,
@@ -4832,7 +4838,10 @@ pub fn load_collections(
         })
         .collect();
 
+    let served_by = served_by(&edr_engines, &map_engines, &volume_engines);
+
     LoadResult {
+        served_by,
         edr_state: EdrState {
             engines: edr_engines,
             feature_engines: edr_feature_engines,
@@ -4914,6 +4923,45 @@ pub fn load_collections(
         station_grid_engines,
         engines_by_id,
         wind_by_id,
+    }
+}
+
+/// What EDR, WMS and 3D Tiles serve of each collection id this load
+/// registered (#1228): EDR's query types, and whether WMS and 3D Tiles
+/// serve the id. The shared root's collection page links each and builds
+/// its example requests from them, so it offers no service or EDR query the
+/// id does not reach. `apis` cannot say: it lists what a configured
+/// collection is wired to, which the ids derived from it need not all be —
+/// a radar volume's network inventory keeps the configured id for Features
+/// alone, its sites get the rest — and an EDR engine offers its own query
+/// types (a nowcast answers no position). Read once per load, never per
+/// request (root CLAUDE.md rule 10).
+pub(crate) fn served_by(
+    edr: &HashMap<String, Arc<dyn ds_core::edr_engine::EdrEngine>>,
+    wms: &HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>>,
+    volume: &HashMap<String, Arc<dyn ds_core::volume::VolumeEngine>>,
+) -> api_common::shared::ServedByMap {
+    edr.keys()
+        .chain(wms.keys())
+        .chain(volume.keys())
+        .map(|id| {
+            let served = api_common::shared::ServedBy {
+                edr: edr.get(id).map(|engine| engine.supported_query_types()),
+                wms: wms.contains_key(id),
+                tiles_3d: volume.contains_key(id),
+            };
+            (id.clone(), Arc::new(served))
+        })
+        .collect()
+}
+
+/// The [`ServerState::served_by`] snapshot as the shared root reads it: a
+/// lookup in the accepted load's map.
+pub struct ServedBySnapshot(pub Arc<ArcSwap<api_common::shared::ServedByMap>>);
+
+impl api_common::shared::CollectionServices for ServedBySnapshot {
+    fn served_by(&self, id: &str) -> Option<Arc<api_common::shared::ServedBy>> {
+        self.0.load().get(id).cloned()
     }
 }
 
@@ -6144,6 +6192,7 @@ fn apply_load(
     state.maps.store(Arc::new(result.maps_state));
     state.tiles.store(Arc::new(result.tiles_state));
     state.tiles_3d.store(Arc::new(result.tiles_3d_state));
+    state.served_by.store(Arc::new(result.served_by));
 
     // Cache hygiene for the incremental path (#574): a collection that was
     // live before this reload but was NOT reused (config changed, removed,
@@ -8666,6 +8715,74 @@ mod tests {
             h.error
         );
         assert!(!result.wms_state.engines.contains_key("nc"));
+    }
+
+    /// #1228: what EDR, WMS and 3D Tiles serve of each collection id comes
+    /// from the registries a load built, never from `apis`: a nowcast's EDR
+    /// answers areas alone, CSV stations have no position query, and a
+    /// radar volume's network inventory, though its config lists every API,
+    /// is served by none of them; its sites are.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn served_by_follows_the_registries_not_the_apis() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pvol.h5"),
+            include_bytes!("../../../testdata/pvol-cold-batch.h5"),
+        )
+        .unwrap();
+        let volume: CollectionConfig = toml::from_str(&format!(
+            r#"
+id = "pvol"
+title = "Volumes"
+description = "test"
+engine_type = "odim-volume"
+apis = ["edr", "wms", "maps", "tiles", "3dtiles", "features"]
+data_path = {path:?}
+
+[odim]
+prewarm_sweeps = 0
+"#,
+            path = dir.path().to_str().unwrap()
+        ))
+        .unwrap();
+        let mut csv = nowcast_test_collection("weather", "csv", None);
+        csv.data_path = Some("../../testdata/weather.csv".to_string());
+        csv.apis = ["edr", "features"].map(String::from).to_vec();
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.apis = ["wms", "maps", "tiles", "features", "edr"]
+            .map(String::from)
+            .to_vec();
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[tm35_source_collection("radar"), nc, csv, volume],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let served = |id: &str| result.served_by.get(id).map(|s| (**s).clone());
+        let queries = |id: &str| served(id).and_then(|s| s.edr).unwrap_or_default();
+        assert_eq!(queries("nc"), ["area", "radius"]);
+        assert_eq!(queries("weather"), ["locations", "area", "radius"]);
+        assert_eq!(
+            health_of(&result, "pvol").status,
+            super::CollectionStatus::Ready
+        );
+        assert_eq!(served("pvol"), None, "the network inventory");
+        let site = served("pvol-test").expect("the radar site");
+        assert!(site.wms && site.tiles_3d, "{site:?}");
+        assert!(site.edr.unwrap().iter().any(|q| q == "position"));
+        // The nowcast's source lists `wms` alone: WMS serves it, EDR not.
+        assert_eq!(
+            served("radar"),
+            Some(api_common::shared::ServedBy {
+                edr: None,
+                wms: true,
+                tiles_3d: false,
+            })
+        );
     }
 
     /// A CSV station collection and a station grid over it (#1082).

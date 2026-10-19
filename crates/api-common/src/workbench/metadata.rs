@@ -154,7 +154,7 @@ fn media_name(media: &str) -> String {
 
 /// `href` without its `f` parameter: the resource every representation of
 /// it shares.
-fn resource_key(href: &str) -> String {
+pub(super) fn resource_key(href: &str) -> String {
     let (path, query) = href.split_once('?').unwrap_or((href, ""));
     let mut out = form_urlencoded::Serializer::new(String::new());
     let mut kept = false;
@@ -479,36 +479,142 @@ fn fact(label: &str, value: &str, wide: bool) -> String {
     )
 }
 
-/// The Overview's coverage facts: time with the catalog's formatting,
-/// cadence and steps where advertised, and the bounds to 2 decimals with
-/// the exact values in the `title` and a Copy bbox button.
-pub(super) fn coverage_facts(doc: &Value) -> String {
-    let extent = &doc["extent"];
-    let temporal = &extent["temporal"];
-    let mut out = String::from("<div class=\"coverage-facts\">");
-    let time = if temporal["interval"][0].is_array() {
-        collection_time_html(temporal)
-    } else {
-        NOT_ADVERTISED.into()
+/// One row of the Extent box: its dimension and that dimension's facts.
+fn extent_row(label: &str, facts: &str) -> String {
+    format!(
+        "<div class=\"extent-row\"><dt>{}</dt><dd class=\"extent-facts\">{facts}</dd></div>",
+        escape(label)
+    )
+}
+
+/// The cells and resolution `extent.spatial.grid` gives, one entry per axis
+/// of the bbox's CRS (Common Part 2), as facts: `16 × 21 cells` and
+/// `0.5°`, one value when every axis has the same, else one per axis.
+/// Degrees for a CRS84 or EPSG:4326 box. Empty without a grid.
+pub(super) fn spatial_grid_facts(spatial: &Value) -> String {
+    let Some(axes) = spatial["grid"].as_array().filter(|axes| !axes.is_empty()) else {
+        return String::new();
     };
-    out.push_str(&fact("Time", &time, true));
-    if let Some(resolution) = temporal["grid"]["resolution"].as_str() {
-        out.push_str(&fact("Cadence", &escape(&cadence_label(resolution)), false));
+    let crs = spatial["crs"]
+        .as_str()
+        .map_or_else(|| "CRS84".to_owned(), crs_name);
+    let (order, unit) = match (crs.as_str(), axes.len()) {
+        ("CRS84", 2) => (" · lon × lat", "°"),
+        ("EPSG:4326", 2) => (" · lat × lon", "°"),
+        _ => ("", ""),
+    };
+    let mut out = String::new();
+    let cells: Option<Vec<String>> = axes
+        .iter()
+        .map(|axis| axis["cellsCount"].as_u64().map(|n| n.to_string()))
+        .collect();
+    if let Some(cells) = cells {
+        out.push_str(&fact(
+            &format!("Grid{order}"),
+            &escape(&format!("{} cells", cells.join(" × "))),
+            false,
+        ));
     }
-    if let Some(steps) = time_steps(temporal) {
-        out.push_str(&fact("Steps", &escape(&steps_text(steps)), false));
+    let resolution: Option<Vec<f64>> = axes
+        .iter()
+        .map(|axis| {
+            axis["resolution"]
+                .as_f64()
+                .filter(|r| r.is_finite() && *r > 0.0)
+        })
+        .collect();
+    if let Some(resolution) = resolution {
+        let shown: Vec<String> = resolution
+            .iter()
+            .map(|r| format!("{}{unit}", ds_core::html::display_value(*r)))
+            .collect();
+        let text = if shown.iter().all(|s| *s == shown[0]) {
+            shown[0].clone()
+        } else {
+            shown.join(" × ")
+        };
+        let exact: Vec<String> = resolution.iter().map(f64::to_string).collect();
+        out.push_str(&fact(
+            &format!("Resolution{order}"),
+            &format!(
+                "<span title=\"{}\">{}</span>",
+                escape(&exact.join(" × ")),
+                escape(&text)
+            ),
+            false,
+        ));
     }
-    match bbox_xy(&extent["spatial"]["bbox"][0]) {
-        Some(v) => out.push_str(&format!(
-            "<div class=\"fact wide\"><small>Bounds · CRS84 · west, south → east, north</small><div class=\"bbox-fact\"><strong class=\"mono\" title=\"{exact}\">{}</strong><button type=\"button\" class=\"btn small enhanced\" data-copy=\"{exact}\">Copy bbox</button></div></div>",
+    out
+}
+
+/// The Overview's Extent box rows (#1228), one per dimension the document
+/// describes, with the facts it carries and nothing inferred:
+/// - Spatial: the bounds in the bbox's CRS to 2 decimals (the exact values
+///   in the `title`, a Copy bbox button), the storage CRS, and the cells
+///   and resolution of `extent.spatial.grid`.
+/// - Temporal: the interval, the step from the grid's `resolution`, the
+///   number of steps, and the model runs where the document links them
+///   (EDR `instances`).
+/// - Vertical: the range, the levels in their unit, the reference system.
+///
+/// `None` when the document describes no dimension.
+pub(super) fn extent_rows(doc: &Value) -> Option<String> {
+    let extent = &doc["extent"];
+    let mut rows = String::new();
+    let spatial = &extent["spatial"];
+    let mut facts = String::new();
+    if let Some(v) = bbox_xy(&spatial["bbox"][0]) {
+        let crs = spatial["crs"]
+            .as_str()
+            .map_or_else(|| "CRS84".to_owned(), crs_name);
+        facts.push_str(&format!(
+            "<div class=\"fact wide\"><small>Bounds · {} · west, south → east, north</small><div class=\"bbox-fact\"><strong class=\"mono\" title=\"{exact}\">{}</strong><button type=\"button\" class=\"btn small enhanced\" data-copy=\"{exact}\">Copy bbox</button></div></div>",
+            escape(&crs),
             escape(&bbox_label(v)),
             exact = escape(&bbox_exact(v))
-        )),
-        None => out.push_str(&fact("Bounds · CRS84", NOT_ADVERTISED, true)),
+        ));
     }
-    out.push_str(&super::vertical_coverage(&extent["vertical"]));
-    out.push_str("</div>");
-    out
+    if let Some(storage) = doc["storageCrs"].as_str() {
+        facts.push_str(&fact(
+            "Storage coordinate system",
+            &crs_chip(storage),
+            false,
+        ));
+    }
+    facts.push_str(&spatial_grid_facts(spatial));
+    if !facts.is_empty() {
+        rows.push_str(&extent_row("Spatial", &facts));
+    }
+    let temporal = &extent["temporal"];
+    if temporal["interval"][0].is_array() {
+        let mut facts = fact("Interval", &collection_time_html(temporal), true);
+        if let Some(resolution) = temporal["grid"]["resolution"].as_str() {
+            facts.push_str(&fact(
+                "Step",
+                &format!(
+                    "<span title=\"{}\">{}</span>",
+                    escape(resolution),
+                    escape(&cadence_label(resolution))
+                ),
+                false,
+            ));
+        }
+        if let Some(steps) = time_steps(temporal) {
+            facts.push_str(&fact("Steps", &escape(&steps_text(steps)), false));
+        }
+        if let Some(runs) = doc["data_queries"]["instances"]["link"]["href"].as_str() {
+            facts.push_str(&fact(
+                "Model runs",
+                &plain_anchor(&with_format(runs, "html"), "Browse model runs →"),
+                false,
+            ));
+        }
+        rows.push_str(&extent_row("Temporal", &facts));
+    }
+    if let Some(facts) = super::vertical_facts(&extent["vertical"]) {
+        rows.push_str(&extent_row("Vertical", &facts));
+    }
+    (!rows.is_empty()).then(|| format!("<dl class=\"extent-rows\">{rows}</dl>"))
 }
 
 /// A parameter's label: its `label`, else its observed property's.

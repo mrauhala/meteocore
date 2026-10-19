@@ -455,7 +455,7 @@ step and bounds formatting; `parameter_names` as a parameter table (the name a
 request gives `parameter-name`, label, unit or "unit not provided by source",
 and a parameter's own levels and times where it advertises them: no
 parameter builder sets a per-parameter vertical extent yet, so a collection's
-levels stay in its coverage facts); `data_queries` with formats, CRS and, where
+levels stay in its Extent box); `data_queries` with formats, CRS and, where
 a query takes them, units; CRS lists as short names (`EPSG:3067`) with the URI
 as the title. A member without a layout of its own is a collapsed nested list,
 in which JSON `null` shows as `null`. Labels are
@@ -464,6 +464,17 @@ Overview lists each resource once. The conformance page groups the declared
 classes by standard and version and links each class URI, with a class
 declared in its `http` and `https` forms on one row. The JSON and the
 declared conformance classes are unchanged.
+
+The Overview (#1228) names every API serving the collection as a chip
+linking to that API's view of it, puts the keywords and licence in the
+heading, holds one Extent box with a row each for the spatial, temporal and
+vertical extent, and ends with a request guide: per API its endpoint and
+ready requests over the collection's extent at its latest time. The Extent
+box shows only facts the document carries; spatial grid size and resolution
+appear for geographic grids, the only ones whose `extent.spatial.grid` the
+APIs advertise. EDR, WMS and 3D Tiles come from the server's registries,
+since no Common member names them. This is a presentation change: the JSON,
+its links and the declared conformance classes are unchanged.
 
 Maps HTML collection overviews additionally preview actual data using the
 advertised map/style endpoints. This is API-specific data access; the page’s

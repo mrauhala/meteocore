@@ -627,6 +627,7 @@ async fn main() {
     let maps_swap = Arc::new(ArcSwap::from_pointee(result.maps_state));
     let tiles_swap = Arc::new(ArcSwap::from_pointee(result.tiles_state));
     let tiles_3d_swap = Arc::new(ArcSwap::from_pointee(result.tiles_3d_state));
+    let served_by_swap = Arc::new(ArcSwap::from_pointee(result.served_by));
 
     // MCP (#605 follow-up): served only when configured AND a token resolves.
     // ServerConfig::validate already rejected enabled-without-token, so an
@@ -728,6 +729,7 @@ async fn main() {
         maps: maps_swap.clone(),
         tiles: tiles_swap.clone(),
         tiles_3d: tiles_3d_swap.clone(),
+        served_by: served_by_swap.clone(),
         accepted_load: RwLock::new(Some(Arc::new(admin::AcceptedLoad::new(
             &config,
             style_ctx,
@@ -823,7 +825,10 @@ async fn main() {
             Arc::new(api_features::FeaturesBlock::new(features_swap.clone())),
         ],
         related_services(),
-    );
+    )
+    // Its collection pages read what EDR, WMS and 3D Tiles serve of each
+    // collection from their registries (#1228).
+    .with_services(Arc::new(admin::ServedBySnapshot(served_by_swap)));
 
     // Public routes get permissive CORS (OGC APIs, health, metrics)
     let mut public = Router::new()
@@ -842,7 +847,10 @@ async fn main() {
             api_common::mounts::TILES,
             api_tiles::router(tiles_swap.clone()),
         )
-        .nest("/3dtiles", api_3dtiles::router(tiles_3d_swap.clone()))
+        .nest(
+            api_common::mounts::TILES_3D,
+            api_3dtiles::router(tiles_3d_swap.clone()),
+        )
         // Trailing-slash variants for /edr/ and /3dtiles/. Maps, Tiles and
         // Features need none: `NormalizePathLayer` below trims the slash before
         // routing, and their handlers require the router's `Mount` extension.
