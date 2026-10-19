@@ -137,3 +137,67 @@ fn files_without_a_run_form_one_timeline() {
     ));
     assert!(Catalog::empty(1).select(None, None).is_err());
 }
+
+/// CF's unit `1` is served in % only where the variable's `standard_name`
+/// names a fraction (relative humidity, an area fraction); the variable's
+/// own name decides nothing. A mass fraction, a flag, or a variable
+/// without a standard name keeps `1` and its stored values.
+#[test]
+fn unit_1_is_percent_only_for_a_fraction_standard_name() {
+    let variable = |name: &str, units: &str, standard_name: Option<&str>| Variable {
+        name: name.into(),
+        title: name.into(),
+        units: units.into(),
+        standard_name: standard_name.map(str::to_string),
+        levels: Vec::new(),
+        pressure: None,
+    };
+    let layout = Layout::new(
+        vec![
+            variable("relative_humidity_2m", "1", Some("relative_humidity")),
+            variable("cloud_area_fraction", "1", Some("cloud_area_fraction")),
+            variable("lcc", "1", Some("low_type_cloud_area_fraction")),
+            variable("rh_percent", "%", Some("relative_humidity")),
+            variable("specific_humidity_2m", "1", Some("specific_humidity")),
+            variable("land_binary_mask", "1", Some("land_binary_mask")),
+            variable("relative_humidity", "1", None),
+            variable("air_temperature_2m", "K", Some("air_temperature")),
+        ],
+        FileGrid {
+            transform: ds_core::geo::GeoTransform {
+                origin_x: 0.0,
+                origin_y: 2.0,
+                pixel_width: 1.0,
+                pixel_height: -1.0,
+                width: 2,
+                height: 2,
+                crs: Crs::Wgs84,
+            },
+            flipped: false,
+        },
+    );
+    let served: Vec<(&str, f64)> = (0..layout.variables.len())
+        .map(|i| (layout.unit(i), layout.to_display(i, 0.5)))
+        .collect();
+    assert_eq!(
+        served,
+        [
+            ("%", 50.0),
+            ("%", 50.0),
+            ("%", 50.0),
+            ("%", 0.5),
+            ("1", 0.5),
+            ("1", 0.5),
+            ("1", 0.5),
+            ("°C", 0.5 - 273.15),
+        ]
+    );
+    // The wind facts report the served unit too.
+    let units: Vec<&str> = layout
+        .wind
+        .parameters
+        .iter()
+        .map(|p| p.unit.as_str())
+        .collect();
+    assert_eq!(units, ["%", "%", "%", "%", "1", "1", "1", "°C"]);
+}

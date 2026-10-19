@@ -25,7 +25,7 @@ use ds_core::cf::{
 use ds_core::error::DataServerError;
 use ds_core::instances;
 use ds_core::map_engine::RasterInfo;
-use ds_core::units::{display_conversion, DisplayConversion};
+use ds_core::units::{cf_display_conversion, DisplayConversion};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 
 use crate::cf;
@@ -57,11 +57,12 @@ pub struct Variable {
     array: Array<Store>,
     decoded: Option<DecodedArray>,
     /// The unit values are served in (#1213): the display unit of the CF
-    /// `units` attribute where `ds_core::units::display_conversion` has a
+    /// `units` attribute where `ds_core::units::cf_display_conversion` has a
     /// rule (K → °C, Pa → hPa, kg m-2 → mm, kg m-2 s-1 → mm/h, m2 s-2 →
-    /// gpm, in any spelling), else `units` as the store spells it. Every
-    /// report of the unit reads this: `RasterInfo`, EDR descriptions and
-    /// coverages, wind facts.
+    /// gpm, in any spelling; `1` → % where the `standard_name` is a
+    /// fraction: `relative_humidity`, any `…_area_fraction` or `…_area_fraction_in_atmosphere_layer`), else `units`
+    /// as the store spells it. Every report of the unit reads this:
+    /// `RasterInfo`, EDR descriptions and coverages, wind facts.
     pub units: String,
     pub label: String,
     /// The CF `standard_name` attribute, when the variable has one.
@@ -83,8 +84,9 @@ pub struct Variable {
     /// CF missing-value sentinels (`_FillValue`, `missing_value`), compared
     /// against the *raw* (pre-scale) value.
     fill_values: Vec<f64>,
-    /// The display conversion of the CF `units` attribute ([`Self::units`]),
-    /// `None` without a rule or for an identity one (kg m-2 → mm).
+    /// The display conversion of the CF `units` and `standard_name`
+    /// attributes ([`Self::units`]), `None` without a rule or for an
+    /// identity one (kg m-2 → mm).
     display: Option<DisplayConversion>,
 }
 
@@ -903,17 +905,18 @@ fn build_with_codec_setup(
 
         let attrs = array.attributes();
         let stored_units = attrs.get("units").and_then(|v| v.as_str()).unwrap_or("");
-        // Served in the display unit where a rule exists (#1213), as GRIB,
-        // BUFR and NetCDF serve theirs; the stored spelling otherwise.
-        let display = display_conversion(stored_units);
-        let units = display
-            .map_or(stored_units, |display| display.unit)
-            .to_string();
-        let display = display.filter(DisplayConversion::has_conversion);
         let standard_name = attrs
             .get("standard_name")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // Served in the display unit where a rule exists (#1213), as GRIB,
+        // BUFR and NetCDF serve theirs, CF's `1` in % where the standard
+        // name is a fraction; the stored spelling otherwise.
+        let display = cf_display_conversion(stored_units, standard_name.as_deref());
+        let units = display
+            .map_or(stored_units, |display| display.unit)
+            .to_string();
+        let display = display.filter(DisplayConversion::has_conversion);
         let label = attrs
             .get("long_name")
             .and_then(|v| v.as_str())
@@ -1368,6 +1371,7 @@ fn retrieve_raw_f64(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ds_core::units::display_conversion;
 
     #[test]
     fn codec_setup_failure_skips_only_the_affected_variable() {

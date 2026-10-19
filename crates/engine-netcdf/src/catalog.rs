@@ -10,7 +10,7 @@ use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{ParameterInfo, RasterInfo};
 use ds_core::resample::SourceGrid;
-use ds_core::units::{display_conversion, DisplayConversion};
+use ds_core::units::{cf_display_conversion, DisplayConversion};
 use ds_core::vertical::{VerticalDimension, VerticalKind};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 use ds_storage::ObjectVersion;
@@ -57,12 +57,15 @@ pub(crate) struct OpenFile {
 pub(crate) struct Layout {
     pub variables: Vec<Variable>,
     /// Each variable's display conversion (#1209), in `variables` order,
-    /// from its CF `units` through `ds_core::units::display_conversion`,
-    /// as engine-bufr's and engine-grib's: K to °C, Pa to hPa, kg m-2 to
-    /// mm, kg m-2 s-1 to mm/h, m2 s-2 to gpm, in any spelling. `None` for a
-    /// unit without a rule (CF's `1`, m/s), served as stored. Every value the engine serves is
-    /// sampled from the stored field first and converted after, in `f64`
-    /// ([`Self::to_display`]), so a map pixel and an EDR value agree.
+    /// from its CF `units` and `standard_name` through
+    /// `ds_core::units::cf_display_conversion`, the rules of engine-bufr
+    /// and engine-grib: K to °C, Pa to hPa, kg m-2 to mm, kg m-2 s-1 to
+    /// mm/h, m2 s-2 to gpm, in any spelling, and CF's `1` to % where the
+    /// standard name is a fraction (`relative_humidity`, any
+    /// `…_area_fraction`). `None` for a unit without a rule (m/s, `1` of
+    /// any other quantity), served as stored. Every value the engine serves
+    /// is sampled from the stored field first and converted after, in
+    /// `f64` ([`Self::to_display`]), so a map pixel and an EDR value agree.
     pub display: Vec<Option<DisplayConversion>>,
     pub grid: FileGrid,
     /// The sampler over the grid, built once.
@@ -82,7 +85,7 @@ impl Layout {
     pub(crate) fn new(variables: Vec<Variable>, grid: FileGrid) -> Self {
         let display: Vec<Option<DisplayConversion>> = variables
             .iter()
-            .map(|v| display_conversion(&v.units))
+            .map(|v| cf_display_conversion(&v.units, v.standard_name.as_deref()))
             .collect();
         let wind = Arc::new(wind_facts(&variables, &display, &grid.transform.crs));
         // Every variable of a layout is on the same levels, or none is
@@ -102,7 +105,7 @@ impl Layout {
     }
 
     /// The unit variable `index` is served in: its display unit (`°C`,
-    /// `hPa`, `mm`, `gpm`), else its `units` as the file spells them.
+    /// `hPa`, `mm`, `gpm`, `%`), else its `units` as the file spells them.
     pub(crate) fn unit(&self, index: usize) -> &str {
         served_unit(&self.variables[index], self.display[index])
     }

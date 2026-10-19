@@ -220,6 +220,59 @@ impl StyleContext {
         Ok(styles)
     }
 
+    /// The base layer's `default` style from the built-in parameter defaults
+    /// (#320), for a layer that draws one parameter (`parameter`, in `unit`)
+    /// when nothing configured its palette: no bundle default, no `[wms]`
+    /// colormap or stops. [`collection_styles`](Self::collection_styles)
+    /// gives such a layer the generic palette, because only the map engine
+    /// knows the parameter it draws. `[wms]` `min`/`max` still win their
+    /// slots, as they do over a configured palette.
+    ///
+    /// `None` when a palette is configured, `[wms] parameter_defaults =
+    /// false`, or no rule matches the parameter.
+    pub fn base_layer_default(
+        &self,
+        collection: &CollectionConfig,
+        bundle: Option<&StyleBundle>,
+        parameter: &str,
+        unit: Option<&str>,
+    ) -> Result<Option<StyleInfo>, String> {
+        let configured = self.collection_default_spec(collection, bundle);
+        if configured.colormap.is_some() || !configured.color_stops.is_empty() {
+            return Ok(None);
+        }
+        let defaults_enabled = collection
+            .wms
+            .as_ref()
+            .and_then(|w| w.parameter_defaults)
+            .unwrap_or(true);
+        let unit = unit.filter(|u| !u.is_empty());
+        let Some(matched) = defaults_enabled
+            .then(|| self.defaults.match_default(parameter, "", unit))
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let r = self.build_colormap(&merge_specs(
+            configured,
+            StyleSpec {
+                colormap: Some(&matched.palette),
+                color_stops: &[],
+                min: matched.range.map(|r| r.0),
+                max: matched.range.map(|r| r.1),
+            },
+        ))?;
+        Ok(Some(StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: r.colormap,
+            palette: r.palette,
+            min: r.min,
+            max: r.max,
+            parameter: None,
+        }))
+    }
+
     /// Named styles: the union of bundle extras and inline `[[wms.styles]]`
     /// (bundles v2), inline winning a name clash because it is inserted
     /// second into the same map. Each keeps its `parameters` list.
@@ -1299,12 +1352,13 @@ mod tests {
 
     /// #1067 PR 6: a NetCDF MEPS collection's layers, with the names,
     /// titles and units engine-netcdf reports from testdata/meps-netcdf (the
-    /// display units of #1209: °C, hPa, mm) and only a collection-level
-    /// colormap, as the shipped example has. Every
-    /// layer gets its own default, and representative values render
-    /// distinct colours: the fraction palettes span 0..1 rather than sitting
-    /// in the percent palettes' bottom 1 % (#872), and the run-start
-    /// accumulation still separates 100 from 200 mm.
+    /// display units of #1209: °C, hPa, mm, and % for the CF fractions
+    /// whose standard name is `relative_humidity` or `cloud_area_fraction`)
+    /// and only a collection-level colormap, as the shipped example has.
+    /// Every layer gets its own default, and representative values render
+    /// distinct colours: relative humidity and cloud cover on the percent
+    /// palettes over 0..100, and the run-start accumulation still separates
+    /// 100 from 200 mm.
     #[test]
     fn meps_netcdf_parameters_render_their_defaults() {
         let ctx = StyleContext::with_builtins();
@@ -1314,7 +1368,7 @@ mod tests {
             (
                 "relative_humidity_2m",
                 "Screen level relative humidity (RH2M)",
-                "1",
+                "%",
             ),
             ("x_wind_10m", "10 m wind along the grid's x axis", "m/s"),
             ("y_wind_10m", "10 m wind along the grid's y axis", "m/s"),
@@ -1329,7 +1383,7 @@ mod tests {
                 "Precipitation accumulated since run start",
                 "mm",
             ),
-            ("cloud_area_fraction", "Total cloud cover (TCC)", "1"),
+            ("cloud_area_fraction", "Total cloud cover (TCC)", "%"),
         ]
         .map(|(name, title, unit)| ds_core::map_engine::ParameterInfo {
             name: name.into(),
@@ -1350,9 +1404,9 @@ mod tests {
             ),
             (
                 "relative_humidity_2m",
-                "humidity_fraction",
-                (0.0, 1.0),
-                &[0.1, 0.5, 0.9],
+                "humidity",
+                (0.0, 100.0),
+                &[10.0, 50.0, 90.0],
             ),
             (
                 "x_wind_10m",
@@ -1386,9 +1440,9 @@ mod tests {
             ),
             (
                 "cloud_area_fraction",
-                "cloud_cover_fraction",
-                (0.0, 1.0),
-                &[0.0, 0.25, 0.5, 1.0],
+                "cloud_cover",
+                (0.0, 100.0),
+                &[0.0, 25.0, 50.0, 100.0],
             ),
         ];
         for (name, palette, (min, max), values) in cases {
@@ -1402,11 +1456,12 @@ mod tests {
                 }
             }
         }
-        // A fraction draws the colour its percentage draws on the percent
-        // palette, and clear sky stays transparent.
-        let percent = ctx
+        // A percentage draws the colour its fraction draws on the fraction
+        // palette, which a CF fraction without a fraction standard name
+        // still takes, and clear sky stays transparent.
+        let fraction = ctx
             .build_colormap(&StyleSpec {
-                colormap: Some("cloud_cover"),
+                colormap: Some("cloud_cover_fraction"),
                 ..StyleSpec::default()
             })
             .unwrap();
@@ -1414,14 +1469,14 @@ mod tests {
         for f in [0.1, 0.4, 0.8] {
             assert!(
                 close(
-                    cloud.colormap.color(Some(f)),
-                    percent.colormap.color(Some(f * 100.0))
+                    cloud.colormap.color(Some(f * 100.0)),
+                    fraction.colormap.color(Some(f))
                 ),
                 "{f}"
             );
         }
         assert_eq!(cloud.colormap.color(Some(0.0))[3], 0);
-        assert_eq!(cloud.colormap.color(Some(1.0))[3], 255);
+        assert_eq!(cloud.colormap.color(Some(100.0))[3], 255);
     }
 
     /// #1067 PR 8: MEPS's pressure-level layers, as engine-netcdf reports
@@ -1706,5 +1761,57 @@ mod tests {
             .unwrap();
         assert_eq!(maps["c1/PRMSL"]["fmi"].palette.name, "viridis");
         assert_eq!(maps["c1/TMP"]["fmi"].palette.name, "viridis");
+    }
+
+    /// The base layer of a collection whose engine draws one parameter takes
+    /// that parameter's built-in default when nothing configured a palette:
+    /// the events shape's strike-age layer (#504) no longer draws viridis
+    /// 0..1. A configured palette, `parameter_defaults = false` and a
+    /// parameter with no rule leave the generic fallback in place.
+    #[test]
+    fn base_layer_default_styles_an_unconfigured_single_parameter_layer() {
+        let ctx = StyleContext::with_builtins();
+        let bare: CollectionConfig =
+            toml::from_str("id = \"c1\"\ntitle = \"t\"\ndescription = \"d\"\n").unwrap();
+        assert!(bare.wms.is_none());
+        let age = |c: &CollectionConfig| {
+            ctx.base_layer_default(c, None, "lightning_age", Some("min"))
+                .unwrap()
+        };
+
+        for c in [&bare, &coll("")] {
+            let style = age(c).expect("lightning_age default");
+            assert_eq!(style.name, "default");
+            assert_eq!(style.palette.name, "lightning_age");
+            assert_eq!((style.min, style.max), (0.0, 60.0));
+            assert_eq!(style.parameter, None);
+        }
+        // `[wms]` min/max still win their slots over the default's range.
+        let short_window = age(&coll("max = 30.0\n")).unwrap();
+        assert_eq!(short_window.palette.name, "lightning_age");
+        assert_eq!((short_window.min, short_window.max), (0.0, 30.0));
+
+        // A configured palette, a deliberate viridis included, is kept.
+        assert!(age(&coll("colormap = \"viridis\"\n")).is_none());
+        let stops = "color_stops = [{value = 0.0, color = \"#000000\"}, \
+                     {value = 1.0, color = \"#ffffff\"}]\n";
+        assert!(age(&coll(stops)).is_none());
+        // Opted out.
+        assert!(age(&coll("parameter_defaults = false\n")).is_none());
+        // No rule for the parameter, or a unit-gated rule without its unit.
+        assert!(ctx
+            .base_layer_default(&bare, None, "foo", Some("min"))
+            .unwrap()
+            .is_none());
+        assert!(ctx
+            .base_layer_default(&bare, None, "lightning_age", Some(""))
+            .unwrap()
+            .is_none());
+        // A data-valued palette without a gate keeps its own stop range.
+        let radar = ctx
+            .base_layer_default(&bare, None, "reflectivity", Some("dBZ"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(radar.palette.name, "radar_dbz");
     }
 }

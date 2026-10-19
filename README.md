@@ -1149,6 +1149,13 @@ FMI QueryData (.sqd) binary format for NWP gridded data. Implements `EdrEngine` 
 - **EDR position queries** use bilinear interpolation across grid points.
 - **Map rendering** uses nearest-neighbor resampling.
 - **Missing value sentinel:** 32700.0 (treated as `None`).
+- **Names:** a descriptor that ends in a short name in parentheses,
+  `2 Metre Temperature (2t)`, goes by that short name on the map APIs: the
+  WMS layer `ecmwf-kenya/2t`, Maps/Tiles `parameter-name=2t`, and the
+  default the collection layer draws. EDR advertises the full descriptor
+  and also takes the short name in `parameter-name`, keying the coverage by
+  the name asked for (#1215). A descriptor without parentheses is the one
+  name everywhere.
 - **Units** come from each parameter's FMI newbase number, since a `.sqd`
   file carries no unit string (#1211): `Pressure` hPa, `Temperature` and
   `DewPoint` °C, `Humidity` and the cloud covers %, `WindSpeedMS`, `WindUMS`, `WindVMS` and the gusts m/s,
@@ -1184,11 +1191,9 @@ apis = ["edr", "wms", "maps", "tiles"]
 wms_parameter = "2t"
 poll_interval_secs = 60
 
-# The parameter layers take the built-in defaults by unit (2t → temperature,
-# msl → pressure). The collection layer draws this palette: its default is
-# the full descriptor "2 Metre Temperature (2t)", which names no `2t` layer.
-[collections.wms]
-colormap = "temperature"
+# No [collections.wms]: the parameter layers take the built-in defaults by
+# unit (2t → temperature, msl → pressure), and the collection layer draws
+# its default parameter, 2t, with that layer's style.
 ```
 
 ### Zarr
@@ -1211,7 +1216,7 @@ Plain-Zarr generations isolate cache entries; they are not transactional snapsho
 
 **Forecast (reference + lead) handling:** when a store has a CF `forecast_reference_time` axis (model run) **and** a `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/ICON-EU), the engine uses the **latest run** and exposes valid time (= run + lead) as the time axis. Selecting older runs (EDR instances / WMS `reference_time`) is tracked in [#337](https://github.com/mrauhala/meteocore/issues/337).
 
-**Units:** values are served in display units, as GRIB's, BUFR's and NetCDF's are: each array's CF `units`, in any spelling, goes through `ds_core::units::display_conversion` (K as °C, Pa as hPa, kg m⁻² as mm, kg m⁻² s⁻¹ as mm/h, m² s⁻² as gpm), on every API and on plain Zarr and Icechunk alike, and the converted unit is reported (legends, EDR, GetFeatureInfo). A unit without a rule, such as m/s or a store's `degree_Celsius`, is served as stored. Layers without a style of their own take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
+**Units:** values are served in display units, as GRIB's, BUFR's and NetCDF's are: each array's CF `units`, in any spelling, goes through `ds_core::units::cf_display_conversion` (K as °C, Pa as hPa, kg m⁻² as mm, kg m⁻² s⁻¹ as mm/h, m² s⁻² as gpm, and CF's dimensionless `1` as % where the array's `standard_name` is a fraction: `relative_humidity` or any `…_area_fraction` or `…_area_fraction_in_atmosphere_layer`), on every API and on plain Zarr and Icechunk alike, and the converted unit is reported (legends, EDR, GetFeatureInfo). A unit without a rule, such as m/s, a store's `degree_Celsius`, or `1` with any other standard name or none, is served as stored. Layers without a style of their own take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
 
 #### Data Source Modes
 
@@ -1519,7 +1524,7 @@ poll_interval_secs = 60
 precipitation_amount_acc = "Precipitation accumulated since run start"
 ```
 
-`apis` defaults to `["edr"]`; the examples serve all four, `["edr", "wms", "maps", "tiles"]`. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs). Values are served in display units, as GRIB's and BUFR's are: each variable's CF `units`, in any spelling, converted after sampling on every API (K as °C, Pa as hPa, kg m⁻² as mm, kg m⁻² s⁻¹ as mm/h, m² s⁻² as gpm), and reported in the converted unit; a unit without a rule, such as CF's `1` or m/s, is served as stored. Layers the example does not style take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
+`apis` defaults to `["edr"]`; the examples serve all four, `["edr", "wms", "maps", "tiles"]`. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs). Values are served in display units, as GRIB's and BUFR's are: each variable's CF `units`, in any spelling, converted after sampling on every API (K as °C, Pa as hPa, kg m⁻² as mm, kg m⁻² s⁻¹ as mm/h, m² s⁻² as gpm, and CF's `1` as % where the `standard_name` is a fraction: `relative_humidity` or any `…_area_fraction` or `…_area_fraction_in_atmosphere_layer`, so MEPS's relative humidity and cloud cover are in %), and reported in the converted unit; a unit without a rule, such as m/s, or `1` with any other standard name or none, is served as stored. Layers the example does not style take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
 
 **Remote files.** An `http(s)://` `data_path` is a server whose files are found by name and read in place by HTTP range, never downloaded whole: MEPS on thredds.met.no's fileServer, which cannot be listed.
 
@@ -1935,9 +1940,11 @@ palette's title keeps its original unit. The same rule applies to inline
 `color_stops`.
 
 **Per-parameter default styles** (#320) — parameters of multi-parameter
-collections (GRIB, QueryData, Zarr, NetCDF, radar volumes) with no explicit style
-are matched against a built-in defaults table by normalized name/title plus
-each parameter's unit: temperature and dew point such as `t`/`t2m`/`2t`/`TMP`/`2d`
+collections (GRIB, QueryData, Zarr, NetCDF, radar volumes) with no explicit style,
+and the one parameter a single-parameter collection with no configured palette
+draws, are matched against a built-in defaults table by normalized name/title plus
+each parameter's unit: the lightning strike-age layer `lightning_age` (min) →
+`lightning_age` over 0–60 min, temperature and dew point such as `t`/`t2m`/`2t`/`TMP`/`2d`
 (unit K or C) → `temperature` over one range for every level, −90…50 °C or
 183.15…323.15 K, so a colour means the same temperature from the surface to
 the stratosphere,
@@ -1946,8 +1953,11 @@ the stratosphere,
 temperature (unit K) → `ir_bt_enhanced`, relative humidity/cloud/wind
 speed/precipitation likewise; a precipitation rate in mm/h (the engines
 that convert units serve a kg m⁻² s⁻¹ rate in mm/h) → `precipitation_rate`
-over 0–30 mm/h. Relative humidity and cloud cover in unit `1`
-(CF fractions, such as MEPS `relative_humidity_2m`) take the fraction twins
+over 0–30 mm/h. Relative humidity and cloud cover in `%` take `humidity`
+and `cloud_cover` over 0–100; NetCDF and Zarr serve CF fractions in `%` where
+the `standard_name` says so (`relative_humidity`, any `…_area_fraction` or `…_area_fraction_in_atmosphere_layer`, such
+as MEPS `relative_humidity_2m` and `cloud_area_fraction`). In unit `1`, as a
+source serves a fraction unconverted, they take the fraction twins
 `humidity_fraction` and `cloud_cover_fraction` over 0–1, since the percent
 palettes would clip a 0–1 range to their bottom 1 %; the CF area fractions
 `cloud_area_fraction`, its `low_`/`medium_`/`high_type_` layers and

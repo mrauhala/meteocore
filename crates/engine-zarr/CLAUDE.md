@@ -102,9 +102,11 @@ pool: they do not use the Icechunk runtime bridge.
   int/float to `f64`. Fill sentinels are compared against the RAW
   (pre-scale) value; NaN/±inf map to nodata.
 - **Display units (#1213):** `Variable::display` is the
-  `ds_core::units::display_conversion` of the array's CF `units`, built once
-  per catalog (K → °C, Pa → hPa, kg m-2 → mm, kg m-2 s-1 → mm/h, m2 s-2 →
-  gpm, any spelling; no name tables). `Variable::units` is the SERVED unit,
+  `ds_core::units::cf_display_conversion` of the array's CF `units` and
+  `standard_name`, built once per catalog (K → °C, Pa → hPa, kg m-2 → mm,
+  kg m-2 s-1 → mm/h, m2 s-2 → gpm, any spelling; `1` → % only when the
+  standard name is `relative_humidity` or ends in `_area_fraction` or `_area_fraction_in_atmosphere_layer`; no name tables). `Variable::units` is the SERVED
+  unit,
   so `RasterInfo`, EDR descriptions/coverages and `WindFacts` all report it;
   a unit without a rule stays as the store spells it. The conversion runs in
   `Variable::convert` (`convert_sample`), after CF unpacking, in `f64`, for

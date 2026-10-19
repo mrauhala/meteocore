@@ -727,10 +727,13 @@ one never implies the other.
   (#1067 PR 6). `canonical_unit` reduces every spelling of a product of
   powers to one (`kg/m^2`, `kg m**-2`, `kg.m-2` → `kg m-2`; `m/s` → `m s-1`;
   `degC` → `°C`); a scale factor or free text stays as written. Every
-  unit-keyed match goes through it — `display_conversion` (engine-bufr,
-  engine-netcdf #1209 and engine-zarr #1213; engine-grib's enum-keyed
-  `default_display` is its twin, rule for rule: K → °C, Pa → hPa,
-  kg m-2 → mm, kg m-2 s-1 → mm/h × 3600, m2 s-2 → gpm, proportion → %),
+  unit-keyed match goes through it — `display_conversion` (engine-bufr;
+  engine-grib's enum-keyed `default_display` is its twin, rule for rule:
+  K → °C, Pa → hPa, kg m-2 → mm, kg m-2 s-1 → mm/h × 3600, m2 s-2 → gpm,
+  proportion → %), `cf_display_conversion` (engine-netcdf #1209 and
+  engine-zarr #1213: the same rules, plus CF's `1` → % × 100 only when the
+  variable's `standard_name` is `relative_humidity` or ends in `_area_fraction` or `_area_fraction_in_atmosphere_layer`; every other `1` — specific_humidity,
+  land_binary_mask, no standard name — is served as stored),
   `qudt_unit` (EDR), ds-render's defaults table and `[[parameter_defaults]]`
   unit ranges, `same_unit` (wind u/v pairing, engine-netcdf's per-file
   check, the satellite recipes' K check) — never a raw string compare. The
@@ -848,6 +851,17 @@ one never implies the other.
   `MapEngine`s (engine-cap today) may depend on ds-render for it — an
   approved exception; engines still return `RasterTile` domain types and
   colorization stays in the API layer.
+- **Station symbol layers** (#1063, #1204) — every station collection's
+  marker layers share one implementation: `ds_core::station_map` (resolved
+  `[<engine>.map]` settings, the `time_step` frame axis and
+  `resolve_frame_end` that `get_raster_tile`/`resolve_time` share, the
+  frame window, `LatestValues`, `MAX_FRAME_ROWS`) and
+  `ds_render::station_symbols` (overlap order around the server-handed
+  midpoint, `draw_markers` projecting per station, `NODATA_MARKER` for
+  `SymbolColorMap`, the shared `MC_STATION_FRAME_CACHE_MB` frame cache keyed
+  by a `next_frame_source()` id, `StationLayers` for in-memory engines).
+  The server wires them with `admin::station_map_wiring`. Never fork it per
+  engine.
 - **`ds_render::resolve_layer_style`** — the one style lookup for WMS GetMap
   and GetLegendGraphic, and the Maps and Tiles map, tile and legend routes
   (#1133). A named parameter styles from `"{collection}/{param}"`, else the
@@ -893,11 +907,11 @@ one never implies the other.
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; derived wind speed from u/v, direction on lat/lon areas (newbase's grid-relative convention) |
-| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP; derived wind speed + direction from CF-identified u/v; values and units in display units from CF `units` through `ds_core::units::display_conversion` (°C, hPa, mm, mm/h, gpm; plain Zarr and Icechunk, #1213) |
+| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP; derived wind speed + direction from CF-identified u/v; values and units in display units from CF `units` and `standard_name` through `ds_core::units::cf_display_conversion` (°C, hPa, mm, mm/h, gpm, % for a CF fraction in unit 1; plain Zarr and Icechunk, #1213) |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (position, locations, area), Features; station shapes also WMS/Maps/Tiles when opted in (`[postgis.map]`, or `wms`/`maps` in `apis`): one symbol layer per parameter, each station a marker coloured by its latest value within `max_age` on `time_step` frames, most extreme on top (#1063); events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles, GK2A AMI L1B and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
-| NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields, or fields on one pressure axis (`RasterInfo.vertical`: hPa, bottom first; WMS `ELEVATION`, Maps/Tiles `elevation`, EDR `z`; a map without one draws the bottom level, EDR without `z` reads every level; the MEPS `pl` family is a collection of its own). EDR samples each point or area cell as the map draws it (one projection per point, a CRS84 area grid), runs as instances, GetFeatureInfo through position at the level drawn; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (steps × levels × variables); derived wind speed from CF `x_wind`/`y_wind`, per pressure level (no direction on MEPS's Lambert grid); values and units in display units from CF `units` through `ds_core::units::display_conversion` (°C, hPa, mm, gpm; #1209) |
+| NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields, or fields on one pressure axis (`RasterInfo.vertical`: hPa, bottom first; WMS `ELEVATION`, Maps/Tiles `elevation`, EDR `z`; a map without one draws the bottom level, EDR without `z` reads every level; the MEPS `pl` family is a collection of its own). EDR samples each point or area cell as the map draws it (one projection per point, a CRS84 area grid), runs as instances, GetFeatureInfo through position at the level drawn; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (steps × levels × variables); derived wind speed from CF `x_wind`/`y_wind`, per pressure level (no direction on MEPS's Lambert grid); values and units in display units from CF `units` and `standard_name` through `ds_core::units::cf_display_conversion` (°C, hPa, mm, gpm, % for a CF fraction in unit 1; #1209) |
 | BUFR | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count); WMS/Maps/Tiles station symbol layers when opted in (`[bufr.map]`, or any map API in `apis`; #1204), `content_version` = the metadata snapshot version. Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
 | Station grid | `MapEngine` + `EdrEngine` (derived: wraps a CSV, BUFR or PostGIS stations collection's `EdrEngine`) | WMS, Maps, Tiles (one layer per parameter), EDR (position, area, radius, cube without `z`) — one time slice of the source's observations (latest per station within `max_age`, one area query) interpolated by IDW, ADW or nearest onto a CRS84 analysis grid (#1082); great-circle neighbours via a 3-D k-d tree (seam and poles); grids cached per (parameter, time, content version) in `MC_STATION_GRID_CACHE_MB`, computed on a dedicated pool under the request deadline (503, never partial); `cadence` axis; content_version moves with revised input fingerprints; EDR samples the grid the maps draw |
 
@@ -972,8 +986,9 @@ color_stops = [
 ]
 
 # Optional per-parameter default-style override rules, checked before the
-# EMBEDDED defaults table (#320: parameters of multi-parameter collections
-# with no explicit style match built-in defaults — temperature palette for
+# EMBEDDED defaults table (#320: parameters of multi-parameter collections,
+# and a single-parameter collection's one layer, with no explicit style
+# match built-in defaults — temperature palette for
 # t2m/2t/TMP/dew point by unit K|C over one all-levels range, −90…50 °C =
 # 183.15…323.15 K, pressure for msl by unit Pa|hPa, radar_dbz for
 # DBZH, fraction twins of the humidity/cloud palettes for unit 1, etc. —

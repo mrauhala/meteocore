@@ -386,10 +386,6 @@ name = "peak_current"
 label = "Peak current"
 unit = "kA"
 
-[wms]
-colormap = "lightning_age"
-min = 0.0
-max = 60.0
 ```
 
 `extent_bbox` is required: it supplies the advertised extent as
@@ -400,7 +396,9 @@ foreign key; `locations_window` and `max_locations` are invalid for this shape.
 EDR returns events newest first. Without `datetime`, it queries
 `default_datetime` ending now (default one hour). Event maps use that window
 ending at TIME, floored to the minute, and draw two-pixel-radius discs colored
-by **age in minutes**. Match the style maximum to the window length.
+by **age in minutes**. With no `[wms]` palette the layer takes the built-in
+`lightning_age` default, 0–60 minutes, which fits the default one-hour
+window. For another window, set `[wms] max` to its length in minutes.
 Advertised steps cover up to the latest six hours at one-minute intervals;
 older frames can be requested explicitly. Omitted TIME follows the latest
 advertised step, updated on metadata refresh; live clients should send TIME.

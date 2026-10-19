@@ -573,8 +573,10 @@ static BUILTIN_DEFS: &[BuiltinDef] = &[
             (100.0, [30, 120, 180, 255]), // saturated — blue
         ],
     },
-    // `humidity` for a fraction (CF unit 1): the same colours at a
-    // hundredth of the values. The percent palette over 0..1 overlaps its
+    // `humidity` for a fraction in unit 1, as a source serves it
+    // unconverted (engine-netcdf and engine-zarr serve CF's
+    // `relative_humidity` in %): the same colours at a hundredth of the
+    // values. The percent palette over 0..1 overlaps its
     // stops, so #823 would clip it to its bottom 1 % (#872), as the IR
     // palettes are kelvin-valued for the same reason.
     BuiltinDef {
@@ -605,8 +607,10 @@ static BUILTIN_DEFS: &[BuiltinDef] = &[
             (100.0, [200, 200, 205, 255]), // overcast — light gray
         ],
     },
-    // `cloud_cover` for a fraction (CF unit 1: MEPS `cloud_area_fraction`,
-    // `fog_area_fraction`), as `humidity_fraction` is to `humidity`.
+    // `cloud_cover` for a fraction in unit 1, as a source serves it
+    // unconverted (engine-netcdf and engine-zarr serve the CF
+    // `…_area_fraction` standard names in %), as `humidity_fraction` is to
+    // `humidity`.
     BuiltinDef {
         name: "cloud_cover_fraction",
         title: "Cloud cover (fraction 0–1)",

@@ -770,6 +770,193 @@ fn values_are_served_in_display_units() {
     }
 }
 
+/// A variable of [`write_cf_store`]: its name, CF `units`, `standard_name`
+/// when given, `scale_factor`, and nine values, row 59°N first, west first.
+type CfVariable<'a> = (&'a str, &'a str, Option<&'a str>, f64, [f32; 9]);
+
+/// Write a one-step store on a 3 × 3 lat/lon grid (59–61°N, 24–26°E)
+/// holding `variables`.
+fn write_cf_store(dir: &std::path::Path, variables: &[CfVariable<'_>]) {
+    use zarrs::array::{data_type, ArrayBuilder};
+    use zarrs::filesystem::FilesystemStore;
+    use zarrs::group::GroupBuilder;
+
+    let store = std::sync::Arc::new(FilesystemStore::new(dir).unwrap());
+    GroupBuilder::new()
+        .build(store.clone(), "/")
+        .unwrap()
+        .store_metadata()
+        .unwrap();
+    for (name, values, units) in [
+        ("time", vec![0.0], "hours since 2026-01-01"),
+        ("lat", vec![59.0, 60.0, 61.0], "degrees_north"),
+        ("lon", vec![24.0, 25.0, 26.0], "degrees_east"),
+    ] {
+        let array = ArrayBuilder::new(
+            vec![values.len() as u64],
+            vec![values.len() as u64],
+            data_type::float64(),
+            f64::NAN,
+        )
+        .dimension_names(Some([name]))
+        .attributes(
+            serde_json::json!({ "units": units })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .build(store.clone(), &format!("/{name}"))
+        .unwrap();
+        array.store_metadata().unwrap();
+        array.store_chunk(&[0], values).unwrap();
+    }
+    for (name, units, standard_name, scale, values) in variables {
+        let mut attributes = serde_json::json!({ "units": units, "scale_factor": scale });
+        if let Some(standard_name) = standard_name {
+            attributes["standard_name"] = (*standard_name).into();
+        }
+        let array = ArrayBuilder::new(vec![1, 3, 3], vec![1, 3, 3], data_type::float32(), f32::NAN)
+            .dimension_names(Some(["time", "lat", "lon"]))
+            .attributes(attributes.as_object().unwrap().clone())
+            .build(store.clone(), &format!("/{name}"))
+            .unwrap();
+        array.store_metadata().unwrap();
+        array.store_chunk(&[0, 0, 0], values.to_vec()).unwrap();
+    }
+}
+
+/// CF's unit `1` is served in % where the array's `standard_name` names a
+/// fraction (relative humidity, an area fraction), after CF unpacking, on
+/// the map, EDR position, area and trajectory alike, and every report of
+/// the unit says `%`. A mass fraction, a flag and an array without a
+/// standard name keep `1` and their stored values: the array's own name
+/// decides nothing.
+#[test]
+fn cf_fractions_in_unit_1_are_served_in_percent() {
+    use ds_core::wind::WindSource;
+
+    const RH: [f32; 9] = [0.51, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.88];
+    let dir = tempfile::tempdir().unwrap();
+    write_cf_store(
+        dir.path(),
+        &[
+            ("rh", "1", Some("relative_humidity"), 1.0, RH),
+            // Packed at 0.01 per count: the centre's 40 is 0.4, served as 40 %.
+            (
+                "tcc",
+                "1",
+                Some("cloud_area_fraction"),
+                0.01,
+                [0., 10., 20., 30., 40., 50., 60., 70., 95.],
+            ),
+            ("q", "1", Some("specific_humidity"), 1.0, [0.005; 9]),
+            (
+                "lsm",
+                "1",
+                Some("land_binary_mask"),
+                1.0,
+                [0., 1., 1., 0., 1., 1., 0., 0., 1.],
+            ),
+            ("relative_humidity", "1", None, 1.0, RH),
+        ],
+    );
+    let config = ZarrConfig::auto_local(dir.path().to_string_lossy().into_owned());
+    let e = ZarrEngine::new("cf-fractions", &config).unwrap();
+    let t = e.get_available_times().unwrap()[0];
+    let cases = [
+        ("lsm", "1", 1.0),
+        ("q", "1", 0.005),
+        ("relative_humidity", "1", 0.7),
+        ("rh", "%", 70.0),
+        ("tcc", "%", 40.0),
+    ];
+    let names: Vec<String> = cases.iter().map(|(n, ..)| n.to_string()).collect();
+    assert_eq!(e.get_parameters(), names);
+    let descriptions = e.get_parameter_descriptions();
+    let info = e.raster_info();
+    let wind = e.wind_facts();
+    let position = single(
+        e.query_position("POINT(25 60)", Some((t, t)), Some(&names), None, None)
+            .unwrap(),
+    );
+    let area = single(
+        e.query_area(
+            "POLYGON((24.5 59.5, 25.5 59.5, 25.5 60.5, 24.5 60.5, 24.5 59.5))",
+            Some((t, t)),
+            Some(&names),
+            None,
+            None,
+        )
+        .unwrap(),
+    );
+    let trajectory = single(
+        e.query_trajectory(
+            "LINESTRING(25 59.5, 25 60.5)",
+            Some((t, t)),
+            Some(&names),
+            None,
+            None,
+        )
+        .unwrap(),
+    );
+    for (name, unit, expected) in cases {
+        assert_eq!(descriptions[name].unit, unit, "{name}: EDR metadata");
+        assert_eq!(
+            info.parameter_unit(Some(name)),
+            Some(unit),
+            "{name}: RasterInfo"
+        );
+        let facts = wind.parameters.iter().find(|p| p.name == name).unwrap();
+        assert_eq!(facts.unit, unit, "{name}: wind facts");
+
+        assert_eq!(position.parameters[name].unit, unit, "{name}: position");
+        let value = position.ranges[name].values[0].unwrap();
+        assert!(
+            (value - expected).abs() < 1e-4,
+            "{name}: {value}, expected {expected}"
+        );
+        let d = 0.01;
+        let pixel = e
+            .get_raster_tile(
+                [25.0 - d, 60.0 - d, 25.0 + d, 60.0 + d],
+                1,
+                1,
+                Some(t),
+                &OutputCrs::Wgs84,
+                Some(name),
+                None,
+                None,
+            )
+            .unwrap()
+            .values
+            .value_at(0)
+            .unwrap();
+        assert!(
+            (pixel - value).abs() < 1e-6,
+            "{name}: pixel {pixel}, position {value}"
+        );
+
+        // Away from the node too: a fraction in % lies above 1, the others
+        // within their stored 0..1.
+        for (coverage, what) in [(&area, "area"), (&trajectory, "trajectory")] {
+            assert_eq!(coverage.parameters[name].unit, unit, "{name}: {what}");
+            let values: Vec<f64> = coverage.ranges[name]
+                .values
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
+            assert!(!values.is_empty(), "{name}: no {what} value");
+            assert!(
+                values
+                    .iter()
+                    .all(|&v| (v > 1.0) == (unit == "%") && (0.0..=100.0).contains(&v)),
+                "{name} {what}: {values:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn temporal_extent_and_available_times() {
     let e = engine();
