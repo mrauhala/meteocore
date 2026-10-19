@@ -91,8 +91,7 @@ html:not(.js) .map-raster #feature-map{display:none}
 .map-controls label,.map-time-field{display:grid;gap:4px;min-width:0;margin:0;font-size:14px;font-weight:600;line-height:1.4;color:var(--ink)}
 /* On the map: a label column and a control column, so the card stays
    short over the map. */
-.js .map-layer :is(.map-controls label,.map-time-field,.map-choice){grid-template-columns:92px minmax(0,1fr);align-items:center;column-gap:10px}
-.js .map-layer .map-choice legend{float:left;margin:0}
+.js .map-layer :is(.map-controls label,.map-time-field,.map-choice-row){grid-template-columns:92px minmax(0,1fr);align-items:center;column-gap:10px}
 .js .map-layer .map-opacity{grid-template-columns:92px minmax(0,1fr) auto;column-gap:10px}
 .js .map-layer .map-opacity input{grid-column:2;grid-row:1}
 .js .map-layer .map-opacity output{grid-column:3;grid-row:1}
@@ -105,10 +104,15 @@ html:not(.js) .map-raster #feature-map{display:none}
 .map-keys-help .map-help{margin:0 0 10px;padding-bottom:10px;border-bottom:1px solid var(--line);color:var(--ink)}
 html:not(.js) .map-layer{padding:16px}
 
-/* Segmented choices: draw mode, basemap. Native radios under the labels. */
-.map-choice{display:grid;min-width:0;margin:0;padding:0;border:0}
-.js .map-choice.enhanced:not([hidden]){display:grid!important}
-.map-choice legend{margin:0 0 4px;padding:0;font-size:14px;font-weight:600;color:var(--ink)}
+/* Segmented choices: draw mode, basemap. Native radios under the labels.
+   The legend is for assistive technology only; the visible label and the
+   buttons are a grid row inside a plain div, because Safari never makes a
+   fieldset's legend a grid item (Chrome does) and squeezed the buttons into
+   the label column. */
+.map-choice{display:block;min-width:0;margin:0;padding:0;border:0}
+.js .map-choice.enhanced:not([hidden]){display:block!important}
+.map-choice-row{display:grid;gap:4px;min-width:0}
+.map-choice-label{font-size:14px;font-weight:600;line-height:1.4;color:var(--ink)}
 .map-segmented{display:flex;gap:2px;padding:2px;border:1px solid var(--control-border);border-radius:10px}
 .map-segmented label{position:relative;flex:1 1 0;min-width:0;margin:0}
 .map-segmented input,.map-repeat input{position:absolute;inset:0;width:100%;height:100%;min-height:0;margin:0;padding:0;opacity:0;cursor:pointer}
@@ -197,7 +201,8 @@ html:not(.js) .map-layer{padding:16px}
 #map-time-relative,#map-time-seek{margin-left:6px;white-space:nowrap}
 .map-speed{margin:0}
 .map-speed select{height:44px;min-height:44px;padding:6px 8px;font-size:16px}
-.map-repeat{display:flex;margin:0;padding:0;border:1px solid var(--control-border);border-radius:10px}
+.map-repeat{display:block;margin:0;padding:0;border:1px solid var(--control-border);border-radius:10px}
+.map-repeat-row{display:flex}
 .map-repeat label{position:relative;margin:0}
 .map-repeat span{display:grid;place-items:center;width:44px;height:44px;border-radius:9px;color:var(--ink)}
 .map-time-menu{position:relative}

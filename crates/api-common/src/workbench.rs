@@ -1059,7 +1059,7 @@ fn map_time_bar(help: &str) -> String {
     ));
     bar.push_str("</div><div class=\"map-time-text\"><p class=\"map-time-label\"><span id=\"map-time-drawn\">–</span> <span id=\"map-time-relative\"></span> <span id=\"map-time-seek\" hidden></span></p><p id=\"map-window-text\" class=\"map-window-text\"></p></div><div class=\"map-time-options\">");
     bar.push_str("<label class=\"map-speed\"><span class=\"visually-hidden\">Speed</span><select id=\"map-speed\"><option value=\"1\">1 fps</option><option value=\"2\">2 fps</option><option value=\"4\">4 fps</option><option value=\"8\">8 fps</option></select></label>");
-    bar.push_str("<fieldset id=\"map-repeat\" class=\"map-repeat\"><legend class=\"visually-hidden\">Repeat</legend>");
+    bar.push_str("<fieldset id=\"map-repeat\" class=\"map-repeat\"><legend class=\"visually-hidden\">Repeat</legend><div class=\"map-repeat-row\">");
     for (value, label, checked) in [
         ("loop", "Loop", " checked"),
         ("bounce", "Bounce", ""),
@@ -1070,7 +1070,7 @@ fn map_time_bar(help: &str) -> String {
             icon(value)
         ));
     }
-    bar.push_str("</fieldset>");
+    bar.push_str("</div></fieldset>");
     bar.push_str("<details id=\"map-time-menu\" class=\"map-time-menu\"><summary aria-label=\"More time options\" title=\"More time options\">…</summary><div class=\"map-time-menu-body map-card\"><label>Jump to · UTC<input id=\"map-jump\" type=\"datetime-local\" step=\"1\"></label><button type=\"button\" class=\"btn small\" id=\"map-window-start\">Start the loop here</button><button type=\"button\" class=\"btn small\" id=\"map-window-end\">End the loop here</button><button type=\"button\" class=\"btn small\" id=\"map-window-reset\">Default loop</button></div></details>");
     bar.push_str(&map_button(
         "map-keys",
@@ -1180,7 +1180,7 @@ fn map_tools() -> String {
         &icon("basemap"),
         " aria-expanded=\"false\" aria-controls=\"map-basemap\"",
     ));
-    tools.push_str("<div id=\"map-basemap\" class=\"map-basemap map-card\" role=\"group\" aria-label=\"Basemap and data opacity\" hidden><fieldset class=\"map-choice\"><legend>Basemap</legend><div class=\"map-segmented\">");
+    tools.push_str("<div id=\"map-basemap\" class=\"map-basemap map-card\" role=\"group\" aria-label=\"Basemap and data opacity\" hidden><fieldset class=\"map-choice\"><legend class=\"visually-hidden\">Basemap</legend><div class=\"map-choice-row\"><span class=\"map-choice-label\" aria-hidden=\"true\">Basemap</span><div class=\"map-segmented\">");
     for (value, label, title, checked) in [
         ("land", "Land", "Land and borders", " checked"),
         ("borders", "Borders", "Borders only", ""),
@@ -1190,7 +1190,7 @@ fn map_tools() -> String {
             "<label title=\"{title}\"><input type=\"radio\" name=\"map-basemap\" value=\"{value}\"{checked}><span>{label}</span></label>"
         ));
     }
-    tools.push_str("</div></fieldset><label class=\"map-check\"><input type=\"checkbox\" id=\"map-labels\" checked><span>Country labels</span></label><div class=\"map-opacity\"><label for=\"map-opacity\">Data opacity</label><output id=\"map-opacity-value\" for=\"map-opacity\">85 %</output><input type=\"range\" id=\"map-opacity\" min=\"0\" max=\"100\" step=\"5\" value=\"85\"></div></div></div>");
+    tools.push_str("</div></div></fieldset><label class=\"map-check\"><input type=\"checkbox\" id=\"map-labels\" checked><span>Country labels</span></label><div class=\"map-opacity\"><label for=\"map-opacity\">Data opacity</label><output id=\"map-opacity-value\" for=\"map-opacity\">85 %</output><input type=\"range\" id=\"map-opacity\" min=\"0\" max=\"100\" step=\"5\" value=\"85\"></div></div></div>");
     tools
 }
 
@@ -1417,7 +1417,7 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
     // More than one mechanism draws this collection: let the viewer
     // choose. The switch is the script's, so it is no form field.
     if modes.len() > 1 {
-        card.push_str("<fieldset class=\"map-mode map-choice enhanced\"><legend>Draw with</legend><div class=\"map-segmented\">");
+        card.push_str("<fieldset class=\"map-mode map-choice enhanced\"><legend class=\"visually-hidden\">Draw with</legend><div class=\"map-choice-row\"><span class=\"map-choice-label\" aria-hidden=\"true\">Draw with</span><div class=\"map-segmented\">");
         for (mode, label, title) in [
             ("tiles", "Tiles", "Map tiles (OGC API - Tiles)"),
             ("maps", "Image", "One image per view (OGC API - Maps)"),
@@ -1432,7 +1432,7 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
                 if mode == default_mode { " checked" } else { "" }
             ));
         }
-        card.push_str("</div></fieldset>");
+        card.push_str("</div></div></fieldset>");
     }
     card.push_str("</div></div>");
     let ladder = map_ladder(vertical, &levels);
@@ -3600,6 +3600,16 @@ mod tests {
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{switch}");
         assert!(switch.contains("value=\"tiles\" checked"));
         assert_eq!(switch.matches(" checked").count(), 1);
+        // The visible label and the buttons are one grid row inside a div:
+        // Safari never lays a fieldset's legend out as a grid item, so a
+        // legend in the label column squeezed the buttons into it. The
+        // legend stays for assistive technology only.
+        assert!(switch.starts_with(
+            "<legend class=\"visually-hidden\">Draw with</legend><div class=\"map-choice-row\"><span class=\"map-choice-label\" aria-hidden=\"true\">Draw with</span><div class=\"map-segmented\">"
+        ));
+        let css = include_str!("workbench/map.css");
+        assert!(!css.contains("map-choice legend"));
+        assert!(css.contains(".map-choice{display:block;"));
         // Style ids name a style in the fragment.
         assert!(html.contains("data-id=\"default\""));
         assert!(html.contains("data-id=\"severity\""));
