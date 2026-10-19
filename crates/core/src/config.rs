@@ -1356,6 +1356,9 @@ pub struct SatelliteConfig {
     /// Imagery, `GMGSI_<product>/%Y/%m/%d/%H/GLOBCOMP…_s<start>_…nc`, one
     /// global spherical-Mercator file per hour. Its values are 8-bit display
     /// counts, not physical units.
+    /// `"gk2a"`: KMA GK2A AMI L1B NetCDF-4 as NOAA publishes it,
+    /// `AMI/L1B/<sector>/%Y%m/%d/%H/gk2a_ami_le1b_<channel>_…_<%Y%m%d%H%M>.nc`,
+    /// counts calibrated to brightness temperature on ingest.
     #[serde(default = "default_satellite_provider")]
     pub provider: String,
     /// Local directory holding the files (listed recursively). Mutually
@@ -1449,10 +1452,12 @@ pub struct SatelliteProductConfig {
     /// GOES-R product, e.g. `"ABI-L2-CMIPF"` (full-disk cloud and moisture
     /// imagery) or `"ABI-L2-ACHTF"` (full-disk cloud top temperature); for
     /// ISatSS the sector, `"HFD"` (full disk); for GMGSI the mosaic, one of
-    /// [`GMGSI_PRODUCTS`] (`"LW"` is longwave IR).
+    /// [`GMGSI_PRODUCTS`] (`"LW"` is longwave IR); for GK2A the observation
+    /// mode, one of [`GK2A_SECTORS`] (`"FD"` is the full disk).
     pub product: String,
-    /// ABI or AHI band (1–16), for per-band products such as CMIP; required
-    /// for ISatSS; not taken by GMGSI, whose product is the band.
+    /// ABI, AHI or AMI band (1–16), for per-band products such as CMIP;
+    /// required for ISatSS and GK2A (one of [`GK2A_BANDS`]); not taken by
+    /// GMGSI, whose product is the band.
     #[serde(default)]
     pub band: Option<u8>,
     /// NetCDF variable holding the values, e.g. `"CMI"` or `"TEMP"`.
@@ -1469,6 +1474,15 @@ fn default_satellite_provider() -> String {
 /// differently.
 pub const GMGSI_PRODUCTS: [&str; 4] = ["LW", "SW", "WV", "VIS"];
 
+/// The GK2A AMI observation modes served (#819): the full disk. The local
+/// area (`LA`) sector is a different grid and cadence, not yet tested.
+pub const GK2A_SECTORS: [&str; 1] = ["FD"];
+
+/// The GK2A AMI bands served (#819): band 13, IR105. Brightness temperature
+/// needs each channel's central wavenumber, which the files do not carry;
+/// only IR105's is sourced so far (engine-satellite `ami.rs`, `CHANNELS`).
+pub const GK2A_BANDS: [u8; 1] = [13];
+
 fn default_satellite_poll_interval_secs() -> u64 {
     60
 }
@@ -1480,10 +1494,13 @@ pub fn validate_satellite(
 ) -> Result<(), crate::error::DataServerError> {
     use crate::error::DataServerError::Config;
 
-    if !matches!(cfg.provider.as_str(), "goes-r" | "isatss" | "gmgsi") {
+    if !matches!(
+        cfg.provider.as_str(),
+        "goes-r" | "isatss" | "gmgsi" | "gk2a"
+    ) {
         return Err(Config(format!(
             "Collection '{id}': [satellite].provider '{}' is not supported \
-             (supported: goes-r, isatss, gmgsi)",
+             (supported: goes-r, isatss, gmgsi, gk2a)",
             cfg.provider
         )));
     }
@@ -1565,6 +1582,9 @@ pub fn validate_satellite(
         if cfg.provider == "gmgsi" {
             validate_gmgsi_product(id, product)?;
         }
+        if cfg.provider == "gk2a" {
+            validate_gk2a_product(id, product)?;
+        }
     }
     validate_satellite_composites(id, cfg)
 }
@@ -1588,6 +1608,32 @@ fn validate_gmgsi_product(
         )));
     }
     Ok(())
+}
+
+/// A GK2A product names its sector (`FD`) and one of the calibrated bands.
+fn validate_gk2a_product(
+    id: &str,
+    product: &SatelliteProductConfig,
+) -> Result<(), crate::error::DataServerError> {
+    let name = &product.parameter;
+    if !GK2A_SECTORS.contains(&product.product.as_str()) {
+        return Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GK2A product '{}' is not one of {}",
+            product.product,
+            GK2A_SECTORS.join(", ")
+        )));
+    }
+    match product.band {
+        Some(band) if GK2A_BANDS.contains(&band) => Ok(()),
+        Some(band) => Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GK2A parameter '{name}' band {band} is not served: brightness \
+             temperature needs the channel's central wavenumber, which the files do not carry, \
+             and only band 13 (IR105) has a sourced one"
+        ))),
+        None => Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GK2A parameter '{name}' needs a 'band' (13, IR105)"
+        ))),
+    }
 }
 
 /// A satellite parameter or composite name: `^[a-z0-9_]+$`.
@@ -8007,6 +8053,45 @@ unit = "C"
             .unwrap_err()
             .to_string()
             .contains("gmgsi"));
+    }
+
+    /// A GK2A product names the full disk and a calibrated band; any other
+    /// band is refused at load, naming why.
+    #[test]
+    fn validate_satellite_gk2a_products() {
+        let config = |product: &str, band: Option<u8>| SatelliteConfig {
+            provider: "gk2a".into(),
+            data_path: Some("testdata/gk2a-ami".into()),
+            endpoint: None,
+            bucket: None,
+            time_window: None,
+            poll_interval_secs: 60,
+            composites: Vec::new(),
+            products: vec![SatelliteProductConfig {
+                parameter: "ir_10_5".into(),
+                title: "IR 10.5 µm brightness temperature".into(),
+                unit: "K".into(),
+                product: product.into(),
+                band,
+                variable: "image_pixel_values".into(),
+            }],
+        };
+        assert!(validate_satellite("g", &config("FD", Some(13))).is_ok());
+        let err = |product: &str, band| {
+            validate_satellite("g", &config(product, band))
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err("FD", Some(14)).contains("only band 13 (IR105)"));
+        assert!(err("FD", Some(7)).contains("central wavenumber"));
+        assert!(err("FD", None).contains("needs a 'band'"));
+        assert!(err("LA", Some(13)).contains("not one of FD"));
+        let mut other = config("FD", Some(13));
+        other.provider = "gk2b".into();
+        assert!(validate_satellite("g", &other)
+            .unwrap_err()
+            .to_string()
+            .contains("gk2a"));
     }
 }
 

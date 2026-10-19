@@ -1,0 +1,45 @@
+id = "gk2a-fd"
+title = "GK2A full disk"
+description = "KMA GEO-KOMPSAT-2A (GK2A, 128.2°E) AMI full-disk imagery every 10 minutes: IR 10.5 µm channel (IR105) brightness temperature, calibrated from the L1B counts NOAA republishes on AWS. Source: Korea Meteorological Administration. The disk crosses the antimeridian: its extent runs west > east, from about 47°E to 151°W"
+engine_type = "satellite"
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["satellite", "GK2A", "GEO-KOMPSAT-2A", "KMA", "Asia", "Pacific", "infrared", "brightness temperature"]
+
+[license]
+title = "NOAA Open Data Dissemination (NODD); KMA GK-2A data, attribution requested"
+url = "https://registry.opendata.aws/noaa-gk2a-pds/"
+
+# One scan is one ~35 MB file per channel, published ~25 minutes after its
+# nominal time (6 per hour, ~210 MB/hour). Startup ingests the whole
+# time_window, at most 24 h of hourly prefixes. Keep it short on a metered
+# link.
+[satellite]
+provider = "gk2a"
+endpoint = "https://s3.us-east-1.amazonaws.com"
+bucket = "noaa-gk2a-pds"
+time_window = "-PT1H"
+poll_interval_secs = 60
+
+# Band 13 (IR105) is the only AMI channel served: brightness temperature
+# needs the channel's central wavenumber, which the files do not carry.
+[[satellite.products]]
+parameter = "ir_10_5"
+title = "IR 10.5 µm brightness temperature"
+unit = "K"
+product = "FD"
+band = 13
+variable = "image_pixel_values"
+
+# The enhanced-IR palette over 180–330 K from the built-in parameter
+# defaults; the classic grey IR is a named style.
+[wms]
+colormap = "ir_bt_enhanced"
+min = 180.0
+max = 330.0
+
+[[wms.styles]]
+name = "ir-grey"
+title = "IR brightness temperature · grey"
+colormap = "ir_bt_grey"
+min = 180.0
+max = 330.0
