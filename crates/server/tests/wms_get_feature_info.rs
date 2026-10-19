@@ -450,13 +450,13 @@ const MEPS_CELL_11Z: (f64, f64) = (1.137_076_4, 5.762_552_3);
 /// [`MEPS_CELL`]'s other 11Z values, as the CDL holds them in the file's
 /// unit, converted to what GetFeatureInfo serves and named in the unit it
 /// reports (#1209): 2 m temperature from K to °C, MSLP from Pa to hPa, the
-/// accumulated precipitation's kg/m^2 as mm; relative humidity, a fraction
-/// in unit 1, as stored.
+/// accumulated precipitation's kg/m^2 as mm, and relative humidity, a
+/// fraction in unit 1 whose standard name is `relative_humidity`, as %.
 const MEPS_CELL_11Z_DISPLAY: [(&str, f64, &str); 4] = [
     ("air_temperature_2m", 278.38034 - 273.15, "°C"),
     ("air_pressure_at_sea_level", 100_751.086 / 100.0, "hPa"),
     ("precipitation_amount_acc", 0.021_972_656, "mm"),
-    ("relative_humidity_2m", 1.000_006, "1"),
+    ("relative_humidity_2m", 1.000_006 * 100.0, "%"),
 ];
 
 /// NetCDF (#1067): MEPS on its Lambert grid, south-up rows. The pixel over

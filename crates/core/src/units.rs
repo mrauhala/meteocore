@@ -41,9 +41,11 @@
 //!
 //! Source units are whatever the format encodes (BUFR Table B, WMO GRIB
 //! Code Table 4.2, a CF `units` attribute); clients want the everyday
-//! forms. engine-bufr, engine-netcdf and engine-zarr convert through
-//! [`display_conversion`]. The rules are keyed on the **source unit**,
-//! through [`canonical_unit`], never on a parameter name (see the
+//! forms. engine-bufr converts through [`display_conversion`];
+//! engine-netcdf and engine-zarr through [`cf_display_conversion`], the same
+//! rules plus the CF fractions below. The rules are keyed on the **source
+//! unit**, through [`canonical_unit`], and for CF's `1` on the CF
+//! `standard_name` the source states, never on a parameter name (see the
 //! unit-conversion rule in root `CLAUDE.md`), and mirror
 //! `crates/engine-grib/src/units.rs::default_display` — GRIB keeps its
 //! enum-keyed twin for now because its source units come from code-table
@@ -63,10 +65,16 @@
 //! | `kg m-2 s-1` | `mm/h` | × 3600 (a precipitation rate: 1 kg m⁻² s⁻¹ of water ≈ 1 mm s⁻¹) |
 //! | `m2 s-2` | `gpm` | ÷ 9.80665 |
 //! | `Proportion`, `proportion`, `(0 - 1)` (WMO's fraction) | `%` | × 100 |
+//! | `1` with a fraction's CF `standard_name` ([`cf_display_conversion`]) | `%` | × 100 |
 //! | anything else | unchanged | identity |
 //!
-//! CF's dimensionless `1` has no rule: it names many quantities besides a
-//! fraction.
+//! CF's dimensionless `1` alone has no rule: it names many quantities
+//! besides a fraction (`specific_humidity`, a `land_binary_mask` flag,
+//! counts, codes). The one exception is keyed on the variable's CF
+//! `standard_name`, which says what the quantity is: `relative_humidity`
+//! and every `…_area_fraction` and `…_area_fraction_in_atmosphere_layer` ([`is_cf_fraction`]) are served in `%`.
+//! engine-netcdf and engine-zarr convert through [`cf_display_conversion`],
+//! which applies [`display_conversion`] first and this exception after.
 //!
 //! ## Vocabularies
 //!
@@ -461,14 +469,50 @@ pub fn display_conversion(source_unit: &str) -> Option<DisplayConversion> {
             offset: 0.0,
         },
         // WMO Code Table 4.2's words for a fraction in [0, 1].
-        "Proportion" | "proportion" | "(0 - 1)" => DisplayConversion {
-            unit: "%",
-            scale: 100.0,
-            offset: 0.0,
-        },
+        "Proportion" | "proportion" | "(0 - 1)" => FRACTION_AS_PERCENT,
         _ => return None,
     };
     Some(c)
+}
+
+/// A fraction in [0, 1] served as a percentage.
+const FRACTION_AS_PERCENT: DisplayConversion = DisplayConversion {
+    unit: "%",
+    scale: 100.0,
+    offset: 0.0,
+};
+
+/// The display conversion for a CF variable from its `units` and
+/// `standard_name`: [`display_conversion`] of the unit, else, for the
+/// dimensionless `1`, × 100 to `%` when the standard name names a fraction
+/// ([`is_cf_fraction`]). CF's `1` alone says nothing: `specific_humidity`
+/// is `1` too, and so are flags, counts and codes, which keep their unit
+/// and values. engine-netcdf and engine-zarr convert through this.
+pub fn cf_display_conversion(
+    source_unit: &str,
+    standard_name: Option<&str>,
+) -> Option<DisplayConversion> {
+    display_conversion(source_unit).or_else(|| {
+        (canonical_unit(source_unit) == "1" && standard_name.is_some_and(is_cf_fraction))
+            .then_some(FRACTION_AS_PERCENT)
+    })
+}
+
+/// Whether a CF `standard_name` names a fraction in [0, 1] served in
+/// percent: `relative_humidity`, and every name ending in `_area_fraction`
+/// (`cloud_area_fraction`, its `low_`/`medium_`/`high_type_` and
+/// `convective_` layers, `fog_area_fraction`, `land_area_fraction`,
+/// `sea_ice_area_fraction`, …), and the per-layer form ending in
+/// `_area_fraction_in_atmosphere_layer` (`cloud_area_fraction_in_atmosphere_layer`
+/// and its convective, stratiform, ice and liquid-water cloud forms). The
+/// name as CF writes it, surrounding whitespace aside: a standard name with
+/// a modifier (`cloud_area_fraction standard_error`) is not one.
+pub fn is_cf_fraction(standard_name: &str) -> bool {
+    let name = standard_name.trim();
+    name == "relative_humidity"
+        || ["_area_fraction", "_area_fraction_in_atmosphere_layer"]
+            .iter()
+            .any(|suffix| name.len() > suffix.len() && name.ends_with(suffix))
 }
 
 /// Namespace of QUDT unit identifiers, in the form the OGC API - EDR
@@ -1113,5 +1157,103 @@ mod tests {
             assert!(display_conversion(u).is_none(), "{u}");
         }
         assert!(k.has_conversion() && pa.has_conversion() && rate.has_conversion());
+    }
+
+    /// CF's `1` is served in percent only where the `standard_name` says the
+    /// quantity is a fraction: relative humidity and the area fractions,
+    /// such as MEPS's `relative_humidity_2m` (0.51–0.88) and
+    /// `cloud_area_fraction`.
+    #[test]
+    fn cf_fractions_in_unit_1_are_served_in_percent() {
+        for name in [
+            "relative_humidity",
+            "cloud_area_fraction",
+            "low_type_cloud_area_fraction",
+            "medium_type_cloud_area_fraction",
+            "high_type_cloud_area_fraction",
+            "convective_cloud_area_fraction",
+            "fog_area_fraction",
+            "land_area_fraction",
+            "sea_ice_area_fraction",
+            "cloud_area_fraction_in_atmosphere_layer",
+            "convective_cloud_area_fraction_in_atmosphere_layer",
+            " cloud_area_fraction ",
+        ] {
+            assert!(is_cf_fraction(name), "{name:?}");
+            for unit in ["1", " 1 "] {
+                let rule = cf_display_conversion(unit, Some(name))
+                    .unwrap_or_else(|| panic!("{name:?} in {unit:?}"));
+                assert_eq!(rule.unit, "%", "{name:?}");
+                assert!((rule.convert(0.51) - 51.0).abs() < 1e-12, "{name:?}");
+                assert!((rule.convert(0.95) - 95.0).abs() < 1e-12, "{name:?}");
+            }
+        }
+        let rh = cf_display_conversion("1", Some("relative_humidity")).unwrap();
+        assert_eq!(
+            Some(rh),
+            display_conversion("(0 - 1)"),
+            "WMO's fraction rule"
+        );
+        assert!(qudt_unit(rh.unit).is_some());
+    }
+
+    /// Every other quantity in unit `1` keeps its unit and values: a mass
+    /// fraction, a flag, a variable without a standard name, a modified or
+    /// differently named fraction. A fraction in any other unit is not
+    /// touched either: `%` is already the display unit, and an empty unit
+    /// says nothing about the scale.
+    #[test]
+    fn other_quantities_in_unit_1_are_served_as_stored() {
+        for name in [
+            Some("specific_humidity"),
+            Some("land_binary_mask"),
+            Some("mass_fraction_of_cloud_liquid_water_in_air"),
+            Some("cloud_area_fraction standard_error"),
+            Some("area_fraction"),
+            Some("_area_fraction"),
+            Some("_area_fraction_in_atmosphere_layer"),
+            Some("Relative_Humidity"),
+            Some(""),
+            None,
+        ] {
+            assert_eq!(cf_display_conversion("1", name), None, "{name:?}");
+        }
+        for unit in ["%", "percent", "", "kg kg-1", "0.01", "m"] {
+            for name in ["relative_humidity", "cloud_area_fraction"] {
+                assert_eq!(
+                    cf_display_conversion(unit, Some(name)),
+                    None,
+                    "{name} {unit:?}"
+                );
+            }
+        }
+    }
+
+    /// The unit rules come first and do not depend on the standard name.
+    #[test]
+    fn cf_display_conversion_keeps_the_unit_rules() {
+        for unit in [
+            "K",
+            "Pa",
+            "kg/m^2",
+            "kg m**-2 s**-1",
+            "m^2/s^2",
+            "(0 - 1)",
+            "m/s",
+            "1",
+            "",
+        ] {
+            for name in [None, Some("air_temperature"), Some("relative_humidity")] {
+                let expected = match (unit, name) {
+                    ("1", Some("relative_humidity")) => Some(FRACTION_AS_PERCENT),
+                    _ => display_conversion(unit),
+                };
+                assert_eq!(
+                    cf_display_conversion(unit, name),
+                    expected,
+                    "{unit} {name:?}"
+                );
+            }
+        }
     }
 }
