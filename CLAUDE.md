@@ -172,6 +172,14 @@ Violating these has caused production incidents. Never break them.
      Anything a request can wait on, a single-flight cache fill included,
      keeps `FetchBudget::Request` (30 s or the render deadline). See
      `crates/storage/README.md` (#1011).
+   - Never wait on a runtime worker for work that needs that runtime: a
+     `std` lock or condvar, or a single-flight cache wait (`quick_cache`
+     placeholders park the thread), whose holder downloads through this
+     bridge or a task on the same runtime. Waiters parked on every worker
+     leave nothing to run that task or drive its I/O and the deadline
+     timers, and the runtime stalls for good (#1200). Take the lock if it is
+     free, else wait inside `block_in_place`, until the request deadline:
+     engine-odim's `PixelCache::with_file_load`, GRIB's field jobs.
 8. **SQL safety:** every identifier goes through `quote_ident`, every value
    is a `$N` bind, no SQL text inside `format!()`.
    `scripts/check_sql_safety.sh` enforces this in CI.

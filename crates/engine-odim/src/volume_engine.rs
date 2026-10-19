@@ -1297,7 +1297,7 @@ impl<'a> Pixels<'a> {
                     Ok(None)
                 }
             }
-        })
+        })?
     }
 }
 
@@ -8000,6 +8000,126 @@ mod tests {
             other.wait(Some(runtime)),
             Err(PixelReadError::Abort(DataServerError::ResourceExhausted))
         ));
+        assert_none_marked_bad(&source, &volumes);
+    }
+
+    /// A runtime of `workers` workers that is never dropped (#1200): a test
+    /// whose tasks stall it then fails at its watchdog, where dropping it
+    /// would wait on them for good.
+    fn leaked_runtime(workers: usize) -> &'static tokio::runtime::Runtime {
+        Box::leak(Box::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .enable_all()
+                .build()
+                .unwrap(),
+        ))
+    }
+
+    /// Run `walk` over `volumes` on `runtime` under `deadline` on a thread of
+    /// its own, sending its result and wall time to `done`.
+    fn spawn_walk(
+        runtime: &'static tokio::runtime::Runtime,
+        source: &Arc<Source>,
+        volumes: &Arc<Vec<VolumeEntry>>,
+        deadline: Option<Duration>,
+        start: Option<Arc<std::sync::Barrier>>,
+        done: &std::sync::mpsc::Sender<(Result<Vec<QueryResult>, DataServerError>, Duration)>,
+    ) {
+        let (source, volumes, done) = (source.clone(), volumes.clone(), done.clone());
+        std::thread::spawn(move || {
+            if let Some(start) = start {
+                start.wait();
+            }
+            let started = std::time::Instant::now();
+            let deadline = deadline.map(|deadline| started + deadline);
+            let result = run_walk(Walk::Profiles, source, volumes, Some(runtime), deadline);
+            let _ = done.send((result, started.elapsed()));
+        });
+    }
+
+    /// How long a #1200 test waits for a walk before it calls the runtime
+    /// stalled.
+    const STALL_WATCHDOG: Duration = Duration::from_secs(20);
+
+    /// #1200: more concurrent one-volume walks on one cold remote file than
+    /// the runtime has workers all answer, and the file is downloaded once.
+    /// The first takes the per-file lock and downloads the file as a task on
+    /// the runtime; the rest wait for the lock without holding a worker, so
+    /// that task runs. Waiting on the workers would park both of them and
+    /// stall the runtime for good, every deadline timer with it.
+    #[test]
+    fn one_volume_walks_waiting_on_a_cold_file_leave_the_runtime_running() {
+        let workers = 2;
+        let walks = workers + 2;
+        let (source, volumes) = throttled_remote_volumes(1, Duration::ZERO, None);
+        let alone = run_walk(Walk::Profiles, source, volumes, None, None).unwrap();
+
+        let runtime = leaked_runtime(workers);
+        let (source, volumes, store) = counted_remote_volumes(1, READ_DELAY, None);
+        let start = Arc::new(std::sync::Barrier::new(walks));
+        let (done, finished) = std::sync::mpsc::channel();
+        for _ in 0..walks {
+            let deadline = Some(Duration::from_secs(10));
+            spawn_walk(
+                runtime,
+                &source,
+                &volumes,
+                deadline,
+                Some(start.clone()),
+                &done,
+            );
+        }
+        for _ in 0..walks {
+            let (result, _) = finished
+                .recv_timeout(STALL_WATCHDOG)
+                .expect("the runtime stalled");
+            assert_eq!(fingerprint(&result.unwrap()), fingerprint(&alone));
+        }
+        assert_eq!(store.gets(&volumes[0].id), 1, "one download, read by all");
+    }
+
+    /// #1200: walks waiting for another request's load of a cold file give
+    /// up at their own deadline, not when that load ends, and download
+    /// nothing. More of them than the runtime has workers.
+    #[test]
+    fn walks_waiting_on_a_cold_file_stop_at_their_deadline() {
+        let workers = 2;
+        let download = Duration::from_secs(2);
+        let deadline = Duration::from_millis(300);
+        let runtime = leaked_runtime(workers);
+        let (source, volumes, store) = counted_remote_volumes(1, download, None);
+        let (done, finished) = std::sync::mpsc::channel();
+        spawn_walk(runtime, &source, &volumes, None, None, &done);
+        // The walk takes the lock before it asks the store for the file.
+        let asked = std::time::Instant::now();
+        while store.gets(&volumes[0].id) == 0 {
+            assert!(
+                asked.elapsed() < STALL_WATCHDOG,
+                "the first walk never read"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (waited, waits) = std::sync::mpsc::channel();
+        for _ in 0..workers + 1 {
+            spawn_walk(runtime, &source, &volumes, Some(deadline), None, &waited);
+        }
+        for _ in 0..workers + 1 {
+            let (result, took) = waits
+                .recv_timeout(STALL_WATCHDOG)
+                .expect("the runtime stalled");
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "got {:?}",
+                result.map(|r| r.len())
+            );
+            assert!(took < download / 2, "a waiter took {took:?}");
+        }
+        let (first, _) = finished
+            .recv_timeout(STALL_WATCHDOG)
+            .expect("the runtime stalled");
+        first.expect("the first walk downloads and answers");
+        assert_eq!(store.gets(&volumes[0].id), 1);
         assert_none_marked_bad(&source, &volumes);
     }
 

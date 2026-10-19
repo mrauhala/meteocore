@@ -167,6 +167,18 @@ around `ds-storage` calls (Critical Rules 6–7).
   the joiner's, and nothing is marked bad. Pinned by
   `concurrent_cold_walks_download_each_volume_once` (GETs counted at the
   store) and `a_joined_download_that_fails_is_read_again`.
+- **A request waiting for the per-file lock leaves its runtime running
+  (#1200).** `PixelCache::with_file_load` takes a free lock at once. A
+  request that finds another's load of the file in flight waits inside
+  `block_in_place` on a multi-thread runtime (`off_core`), because that load
+  may be downloading the file as a task on the same runtime: requests
+  parked on every query-runtime worker left nothing to run the download or
+  the deadline timers, and the runtime stalled for good. The wait ends at
+  the request deadline with `DeadlineExceeded`: its load never runs and
+  nothing is marked bad. The lock's mutex guards a flag, never the load.
+  Pinned by `one_volume_walks_waiting_on_a_cold_file_leave_the_runtime_running`
+  (more walks than workers), `walks_waiting_on_a_cold_file_stop_at_their_deadline`
+  and `file_load_waiter_gives_up_at_its_deadline`.
 - **Cold single-moment misses (#293, #994):** only a map render reads one
   moment at a time. A `Pixels::moment` miss fetches the source-qualified
   file once, decodes **only the requested moment** on the caller's thread
