@@ -175,6 +175,37 @@ async fn netcdf_edr_responses_validate() {
         unit["observedProperty"]["id"],
         "https://vocab.nerc.ac.uk/standard_name/air_temperature"
     );
+    // Display units (#1209): the files' K and Pa are served in °C and hPa,
+    // each value and its QUDT unit.
+    for (what, parameter, qudt, range) in [
+        (
+            "position series",
+            "air_temperature_2m",
+            "DEG_C",
+            -60.0..50.0,
+        ),
+        (
+            "area",
+            "air_pressure_at_sea_level",
+            "HectoPA",
+            900.0..1100.0,
+        ),
+    ] {
+        let answer = &answers[what];
+        assert_eq!(
+            answer["parameters"][parameter]["unit"]["symbol"]["type"],
+            format!("https://qudt.org/vocab/unit/{qudt}"),
+            "{what}"
+        );
+        let values = answer["ranges"][parameter]["values"].as_array().unwrap();
+        assert!(
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_f64)
+                .all(|v| range.contains(&v)),
+            "{what}: {values:?}"
+        );
+    }
 
     // No step at the instant, or outside the grid's extent: 404.
     for query in [

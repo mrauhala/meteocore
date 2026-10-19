@@ -101,14 +101,15 @@ y_wind_pl = "Wind along the grid's y axis"
 geopotential_pl = "Geopotential"
 relative_humidity_pl = "Relative humidity"
 
-# Values are served in the files' own units: K, m/s, m^2/s^2 and fractions
-# (units "1"). Every layer takes the built-in default its name and unit
-# select, one range for every level: temperature over -90…50 °C in kelvin,
-# the x/y wind components over ±80 m/s and the derived speed over 0-80 m/s
-# (twice the surface scale, for the jet at 300-250 hPa), geopotential over
-# 0-206 000 m^2/s^2 and relative humidity over 0-1.
+# Values are served in display units, converted from each variable's CF
+# units: temperature in °C (the files' K) and geopotential in gpm
+# (m^2/s^2); wind in m/s and relative humidity (unit "1") as stored. Every
+# layer takes the built-in default its name and unit select, one range for
+# every level: temperature over -90…50 °C, the x/y wind components over
+# ±80 m/s and the derived speed over 0-80 m/s (twice the surface scale, for
+# the jet at 300-250 hPa), geopotential over 0-21 000 gpm and relative
+# humidity on the fraction palette over 0-1.
 [wms]
-# The parent layer's: the °C temperature palette over -90…50 °C in kelvin.
+# The collection's own palette, for a variable no default matches: the
+# temperature palette over its own -90…50 °C, the first variable's.
 colormap = "temperature"
-min = 183.15
-max = 323.15

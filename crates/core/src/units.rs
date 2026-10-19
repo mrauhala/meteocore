@@ -40,9 +40,11 @@
 //! ## Display conversions
 //!
 //! Source units are whatever the format encodes (BUFR Table B, WMO GRIB
-//! Code Table 4.2); clients want the everyday forms. The rules are keyed
-//! on the **source unit**, through [`canonical_unit`], never on a parameter
-//! name (see the unit-conversion rule in root `CLAUDE.md`), and mirror
+//! Code Table 4.2, a CF `units` attribute); clients want the everyday
+//! forms. engine-bufr and engine-netcdf convert through
+//! [`display_conversion`]. The rules are keyed on the **source unit**,
+//! through [`canonical_unit`], never on a parameter name (see the
+//! unit-conversion rule in root `CLAUDE.md`), and mirror
 //! `crates/engine-grib/src/units.rs::default_display` — GRIB keeps its
 //! enum-keyed twin for now because its source units come from code-table
 //! lookups. Both tables agree rule for rule on every unit a spelling names:

@@ -485,8 +485,8 @@ colormap = "temperature"
 [[collections.wms.parameters]]
 name = "air_pressure_at_sea_level"
 colormap = "pressure"
-min = 95000.0
-max = 105000.0
+min = 950.0
+max = 1050.0
 "#,
                 meps = meps.to_string_lossy()
             ),
@@ -533,11 +533,9 @@ max = 105000.0
             RecoveryOutcome::Recovered
         );
         assert_eq!(style(&state, pressure).unwrap().0, "pressure");
-        // The kelvin temperature default, which the file's unit selects.
-        assert_eq!(
-            style(&state, t2m),
-            Some(("temperature".to_string(), 323.15))
-        );
+        // The °C temperature default, which the served unit selects: the
+        // file's K converted (#1209).
+        assert_eq!(style(&state, t2m), Some(("temperature".to_string(), 50.0)));
         assert!(Arc::ptr_eq(
             &engine,
             &state.netcdf_engines.read().unwrap()[0]

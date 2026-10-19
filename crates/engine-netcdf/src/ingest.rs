@@ -206,7 +206,10 @@ pub(crate) struct Variable {
     pub name: Arc<str>,
     /// `long_name`, else the name.
     pub title: String,
-    /// `units` as the file spells it, empty when absent.
+    /// `units` as the file spells it, empty when absent: the stored
+    /// values' unit. The layer is served in its display unit where
+    /// `ds_core::units::display_conversion` has a rule (`Layout::display`,
+    /// #1209).
     pub units: String,
     /// CF `standard_name`, when the file states one: EDR's observed
     /// property, and what identifies wind components (`x_wind`).
@@ -226,8 +229,9 @@ impl Variable {
     /// same units and level units in any spelling
     /// (`ds_core::units::same_unit`: `kg/m^2` is `kg m-2`), the same level
     /// values, and the same pressure levels (in hPa, whatever unit and
-    /// order each file stores them in). The served spelling stays the
-    /// first file's.
+    /// order each file stores them in). The first file's unit decides the
+    /// display conversion, and its spelling is served where none applies:
+    /// one canonical unit has one rule, so every file converts alike.
     pub(crate) fn same_quantity(&self, other: &Variable) -> bool {
         use ds_core::units::same_unit;
         same_unit(&self.units, &other.units)

@@ -36,7 +36,10 @@
 //!   per request.
 //!
 //! The output is [`RasterValues::F32`]: interpolation runs in `f64` and only
-//! the stored value is narrowed, with NaN for nodata.
+//! the stored value is narrowed, with NaN for nodata. An engine serving
+//! display units converts each sampled value in `f64` before that
+//! ([`OutputMap::sample_f32_with`]), and a point query converts what
+//! [`SourceGrid::value_at`] returns the same way (engine-netcdf, #1209).
 //!
 //! Three engines keep a sampler of their own. engine-querydata cannot
 //! afford a decoded field, since its memory-mapped layout strides one field
@@ -396,6 +399,20 @@ impl OutputMap<'_> {
         values: &[f32],
         nodata: Option<f32>,
     ) -> Result<RasterTile, DataServerError> {
+        self.sample_f32_with(values, nodata, |v| v)
+    }
+
+    /// [`Self::sample_f32`] with `convert` applied to each sampled value in
+    /// `f64`, before it is narrowed: a display conversion
+    /// ([`crate::units::DisplayConversion::convert`]) after sampling, as
+    /// engine-grib converts, so a pixel holds `convert` of what
+    /// [`SourceGrid::value_at`] reads at its position. Nodata stays NaN.
+    pub fn sample_f32_with(
+        &self,
+        values: &[f32],
+        nodata: Option<f32>,
+        convert: impl Fn(f64) -> f64,
+    ) -> Result<RasterTile, DataServerError> {
         let gt = &self.source.transform;
         let cells = gt.width as usize * gt.height as usize;
         if values.len() != cells {
@@ -413,7 +430,7 @@ impl OutputMap<'_> {
                 let value = self
                     .mapped(ox, oy)
                     .and_then(|(col, row)| self.source.sample(values, nodata, col, row));
-                data.push(value.map_or(f32::NAN, |v| v as f32));
+                data.push(value.map_or(f32::NAN, |v| convert(v) as f32));
             }
         }
         Ok(RasterTile {

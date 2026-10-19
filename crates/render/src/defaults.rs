@@ -248,7 +248,7 @@ static RULES: &[DefaultRule] = &[
     // up to 50 hPa (~20.6 km), and 206 000 m2 s-2 is the same height as
     // geopotential. Names only: a "Geopotential height anomaly" title is
     // signed and must not match. MEPS's `geopotential_pl` (#1067 PR 8) is
-    // in m^2/s^2.
+    // stored in m^2/s^2 and served in gpm (#1209).
     DefaultRule {
         names: &[
             "z",
@@ -1069,12 +1069,22 @@ mod tests {
     }
 
     /// #1067 PR 6: MET Norway's MEPS sfc variables, with the titles and
-    /// units engine-netcdf reports for them (`long_name` and `units` as in
-    /// testdata/meps-netcdf, or the example's `[netcdf.titles]`).
+    /// units engine-netcdf reports for them (`long_name` as in
+    /// testdata/meps-netcdf, or the example's `[netcdf.titles]`; the files'
+    /// `units` in their display unit, #1209: K as °C, Pa as hPa, kg/m^2 as
+    /// mm), and the files' own spellings, as a CF store that serves them
+    /// unconverted would.
     #[test]
     fn meps_names_get_their_defaults() {
         let d = builtin();
         for (name, title, unit, palette, range) in [
+            (
+                "air_temperature_2m",
+                "Screen level temperature (T2M)",
+                "°C",
+                "temperature",
+                Some((-90.0, 50.0)),
+            ),
             (
                 "air_temperature_2m",
                 "Screen level temperature (T2M)",
@@ -1120,9 +1130,23 @@ mod tests {
             (
                 "air_pressure_at_sea_level",
                 "Mean Sea Level Pressure (MSLP)",
+                "hPa",
+                "pressure",
+                Some((950.0, 1050.0)),
+            ),
+            (
+                "air_pressure_at_sea_level",
+                "Mean Sea Level Pressure (MSLP)",
                 "Pa",
                 "pressure",
                 Some((95_000.0, 105_000.0)),
+            ),
+            (
+                "precipitation_amount_acc",
+                "Accumulated total precipitation",
+                "mm",
+                "precipitation_accumulation",
+                Some((0.0, 200.0)),
             ),
             (
                 "precipitation_amount_acc",
@@ -1176,7 +1200,9 @@ mod tests {
     }
 
     /// #1067 PR 8: MEPS's pressure-level variables, with the titles and units
-    /// engine-netcdf reports for them (testdata/meps-netcdf-pl). Their wind
+    /// engine-netcdf reports for them (testdata/meps-netcdf-pl; temperature
+    /// in °C and geopotential in gpm, #1209, and in the files' K and
+    /// m^2/s^2). Their wind
     /// components and the speed derived from them span ±80 / 0–80 m/s, twice
     /// the surface scale, for the jet; temperature, geopotential and
     /// relative humidity keep their all-levels ranges. The surface
@@ -1209,9 +1235,23 @@ mod tests {
             (
                 "air_temperature_pl",
                 "Air temperature pressure levels",
+                "°C",
+                "temperature",
+                Some((-90.0, 50.0)),
+            ),
+            (
+                "air_temperature_pl",
+                "Air temperature pressure levels",
                 "K",
                 "temperature",
                 Some((183.15, 323.15)),
+            ),
+            (
+                "geopotential_pl",
+                "Geopotential pressure levels",
+                "gpm",
+                "viridis",
+                Some((0.0, 21_000.0)),
             ),
             (
                 "geopotential_pl",

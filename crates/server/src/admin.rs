@@ -8814,11 +8814,14 @@ mod tests {
         assert!(!Arc::ptr_eq(&live, &third.netcdf_engines[0]));
     }
 
-    /// #1067 PR 6: the shipped local MEPS example, loaded over its
+    /// #1067 PR 6, #1209: the shipped local MEPS example, loaded over its
     /// committed sample. Every layer has its style at load: the layers the
-    /// example no longer configures take the built-in default their name
-    /// and the file's unit select (the gusts, MSLP in pascals, the run-start
-    /// accumulation in `kg/m^2`), the rest keep their entries.
+    /// example does not configure take the built-in default their name and
+    /// served unit select (the temperature in °C, MSLP in hPa, the
+    /// run-start accumulation in mm, the fractions in unit `1`, the gusts),
+    /// the wind components keep their narrower entries, and the
+    /// collection's own style is the temperature palette over its own
+    /// range.
     #[test]
     fn meps_netcdf_example_layers_get_default_styles() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -8837,31 +8840,50 @@ mod tests {
             (s.palette.name.as_str(), s.min, s.max)
         };
         for (name, expected) in [
-            ("air_temperature_2m", ("temperature", 183.15, 323.15)),
+            ("air_temperature_2m", ("temperature", -90.0, 50.0)),
             ("wind_speed_of_gust", ("wind_speed", 0.0, 40.0)),
-            (
-                "air_pressure_at_sea_level",
-                ("pressure", 95_000.0, 105_000.0),
-            ),
+            ("wind_speed_10m", ("wind_speed", 0.0, 40.0)),
+            ("air_pressure_at_sea_level", ("pressure", 950.0, 1050.0)),
             (
                 "precipitation_amount_acc",
                 ("precipitation_accumulation", 0.0, 200.0),
             ),
+            ("relative_humidity_2m", ("humidity_fraction", 0.0, 1.0)),
+            ("cloud_area_fraction", ("cloud_cover_fraction", 0.0, 1.0)),
             // Configured by the example.
-            ("relative_humidity_2m", ("viridis", 0.0, 1.0)),
             ("x_wind_10m", ("diverging", -20.0, 20.0)),
             ("y_wind_10m", ("diverging", -20.0, 20.0)),
-            ("cloud_area_fraction", ("grayscale", 0.0, 1.0)),
         ] {
             assert_eq!(style(name), expected, "{name}");
         }
+        let parent = &styles["meps-netcdf-local"]["default"];
+        assert_eq!(
+            (parent.palette.name.as_str(), parent.min, parent.max),
+            ("temperature", -90.0, 50.0)
+        );
+        let units: HashMap<String, String> = loaded.wms_state.engines["meps-netcdf-local"]
+            .raster_info()
+            .parameters
+            .into_iter()
+            .map(|p| (p.name, p.unit))
+            .collect();
+        for (name, unit) in [
+            ("air_temperature_2m", "°C"),
+            ("air_pressure_at_sea_level", "hPa"),
+            ("precipitation_amount_acc", "mm"),
+            ("relative_humidity_2m", "1"),
+            ("wind_speed_10m", "m/s"),
+        ] {
+            assert_eq!(units[name], unit, "{name}");
+        }
     }
 
-    /// #1067 PR 8: the shipped local MEPS pressure-level example, loaded
-    /// over its committed sample. The layers advertise the pressure axis
-    /// (WMS ELEVATION, EDR `z`), and every layer, the derived
+    /// #1067 PR 8, #1209: the shipped local MEPS pressure-level example,
+    /// loaded over its committed sample. The layers advertise the pressure
+    /// axis (WMS ELEVATION, EDR `z`), and every layer, the derived
     /// `wind_speed_pl` included, takes the built-in default its name and
-    /// unit select: the wind on twice the surface scale, for the jet.
+    /// served unit select: the temperature in °C, geopotential in gpm, the
+    /// wind on twice the surface scale, for the jet.
     #[test]
     fn meps_netcdf_pressure_level_example_serves_its_levels_and_styles() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -8891,15 +8913,20 @@ mod tests {
             (s.palette.name.as_str(), s.min, s.max)
         };
         for (name, expected) in [
-            ("air_temperature_pl", ("temperature", 183.15, 323.15)),
+            ("air_temperature_pl", ("temperature", -90.0, 50.0)),
             ("x_wind_pl", ("diverging", -80.0, 80.0)),
             ("y_wind_pl", ("diverging", -80.0, 80.0)),
             ("wind_speed_pl", ("wind_speed", 0.0, 80.0)),
-            ("geopotential_pl", ("viridis", 0.0, 206_000.0)),
+            ("geopotential_pl", ("viridis", 0.0, 21_000.0)),
             ("relative_humidity_pl", ("humidity_fraction", 0.0, 1.0)),
         ] {
             assert_eq!(style(name), expected, "{name}");
         }
+        let parent = &styles[id]["default"];
+        assert_eq!(
+            (parent.palette.name.as_str(), parent.min, parent.max),
+            ("temperature", -90.0, 50.0)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
