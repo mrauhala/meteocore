@@ -15,7 +15,7 @@ arc-swap = "1"
 quick_cache = "0.6"
 ds-cache = { path = "../ds-cache" }
 ds-executor = { path = "../ds-executor" }
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
