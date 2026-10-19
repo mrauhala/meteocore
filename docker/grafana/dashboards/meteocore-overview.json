@@ -1019,7 +1019,7 @@
     {
       "type": "timeseries",
       "title": "Rendered-output cache — hit ratio and fill",
-      "description": "Exact-request repeats (fixed-viewport animation loops). Low hit% is EXPECTED with diverse clients — it only pays for loopers. Bimodal by design (#202).",
+      "description": "Exact-request repeats: a WMS view requested again unchanged (a fixed display cycling its animation frames, a client's default view) and Tiles z/x/y. A few % is EXPECTED with viewport WMS clients, whose shared work the meta-tile cache holds (#202). Fill pinned at 100% with a low ratio is not a sizing signal: replayed traffic gained no hits above the 256 MB default (#1010).",
       "id": 20,
       "gridPos": {
         "h": 8,
@@ -1418,6 +1418,11 @@
           "legendFormat": "Lightning strike windows (#504)"
         },
         {
+          "expr": "rate(station_frame_cache_hits_total[$__rate_interval]) / clamp_min(rate(station_frame_cache_hits_total[$__rate_interval]) + rate(station_frame_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "SF",
+          "legendFormat": "Station map frames (#1063)"
+        },
+        {
           "expr": "rate(satellite_frame_cache_hits_total[$__rate_interval]) / clamp_min(rate(satellite_frame_cache_hits_total[$__rate_interval]) + rate(satellite_frame_cache_misses_total[$__rate_interval]), 1e-9)",
           "refId": "F",
           "legendFormat": "Satellite scans (#819)"
@@ -1426,6 +1431,21 @@
           "expr": "rate(satellite_strip_cache_hits_total[$__rate_interval]) / clamp_min(rate(satellite_strip_cache_hits_total[$__rate_interval]) + rate(satellite_strip_cache_misses_total[$__rate_interval]), 1e-9)",
           "refId": "H",
           "legendFormat": "Satellite decoded strips (#819)"
+        },
+        {
+          "expr": "rate(netcdf_field_cache_hits_total[$__rate_interval]) / clamp_min(rate(netcdf_field_cache_hits_total[$__rate_interval]) + rate(netcdf_field_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "I",
+          "legendFormat": "NetCDF decoded fields (#1067)"
+        },
+        {
+          "expr": "rate(netcdf_block_cache_hits_total[$__rate_interval]) / clamp_min(rate(netcdf_block_cache_hits_total[$__rate_interval]) + rate(netcdf_block_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "K",
+          "legendFormat": "NetCDF remote metadata blocks (#1067)"
+        },
+        {
+          "expr": "rate(netcdf_chunk_cache_hits_total[$__rate_interval]) / clamp_min(rate(netcdf_chunk_cache_hits_total[$__rate_interval]) + rate(netcdf_chunk_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "L",
+          "legendFormat": "NetCDF remote compressed chunks (#1067)"
         }
       ]
     },
@@ -1531,6 +1551,11 @@
           "legendFormat": "Lightning strike windows (#504)"
         },
         {
+          "expr": "rate(station_frame_cache_misses_total[$__rate_interval])",
+          "refId": "SF",
+          "legendFormat": "Station map frames (#1063)"
+        },
+        {
           "expr": "rate(satellite_frame_cache_misses_total[$__rate_interval])",
           "refId": "F",
           "legendFormat": "Satellite scans (#819)"
@@ -1539,6 +1564,21 @@
           "expr": "rate(satellite_strip_cache_misses_total[$__rate_interval])",
           "refId": "G",
           "legendFormat": "Satellite decoded strips (#819)"
+        },
+        {
+          "expr": "rate(netcdf_field_cache_misses_total[$__rate_interval])",
+          "refId": "I",
+          "legendFormat": "NetCDF decoded fields (#1067)"
+        },
+        {
+          "expr": "rate(netcdf_block_cache_misses_total[$__rate_interval])",
+          "refId": "J",
+          "legendFormat": "NetCDF remote metadata blocks (#1067)"
+        },
+        {
+          "expr": "rate(netcdf_chunk_cache_misses_total[$__rate_interval])",
+          "refId": "L",
+          "legendFormat": "NetCDF remote compressed chunks (#1067)"
         }
       ]
     },
@@ -1646,6 +1686,11 @@
           "legendFormat": "Lightning strike windows (#504)"
         },
         {
+          "expr": "station_frame_cache_bytes / clamp_min(station_frame_cache_capacity_bytes, 1)",
+          "refId": "SF",
+          "legendFormat": "Station map frames (#1063)"
+        },
+        {
           "expr": "satellite_frame_cache_bytes / clamp_min(satellite_frame_cache_capacity_bytes, 1)",
           "refId": "G",
           "legendFormat": "Satellite scans (#819)"
@@ -1654,13 +1699,28 @@
           "expr": "satellite_strip_cache_bytes / clamp_min(satellite_strip_cache_capacity_bytes, 1)",
           "refId": "H",
           "legendFormat": "Satellite decoded strips (#819)"
+        },
+        {
+          "expr": "netcdf_field_cache_bytes / clamp_min(netcdf_field_cache_capacity_bytes, 1)",
+          "refId": "J",
+          "legendFormat": "NetCDF decoded fields (#1067)"
+        },
+        {
+          "expr": "netcdf_block_cache_bytes / clamp_min(netcdf_block_cache_capacity_bytes, 1)",
+          "refId": "K",
+          "legendFormat": "NetCDF remote metadata blocks (#1067)"
+        },
+        {
+          "expr": "netcdf_chunk_cache_bytes / clamp_min(netcdf_chunk_cache_capacity_bytes, 1)",
+          "refId": "M",
+          "legendFormat": "NetCDF remote compressed chunks (#1067)"
         }
       ]
     },
     {
       "type": "timeseries",
       "title": "PVOL pixel cache — eviction pressure (#476)",
-      "description": "The #461/#472 pre-warm keeps every advertised timestep's lowest sweep resident — IF it fits. Sustained inserts/s while entries stay flat at capacity = LRU churn: pre-warmed frames evicted, and the next animation pays burst S3/disk re-reads (the 11 s fikan renders). Fix: raise MC_PVOL_PIXEL_CACHE_MB above the working set (sites × window/cadence × ~4 MB).",
+      "description": "The #461/#472 pre-warm keeps every advertised timestep's lowest-sweep default quantity (DBZH) resident — IF it fits. Unread inserts share half the budget (#992 hot allocation 0.5), first in, first out. Sustained inserts/s while entries stay flat at capacity = churn: pre-warmed frames evicted, and the next animation pays burst S3/disk re-reads (the 11 s fikan renders). Fix: raise MC_PVOL_PIXEL_CACHE_MB to twice the working set (sites × window/cadence × one sweep, ~0.2–0.4 MB FMI).",
       "id": 26,
       "gridPos": {
         "h": 8,
@@ -2051,6 +2111,57 @@
           "expr": "min(postgis_up)",
           "refId": "A",
           "legendFormat": "up"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Truncated station lists",
+      "description": "Collections whose cached station list was cut at [postgis] max_locations (#1061): stations past the cap are missing from /locations, Features and, in the observations-derived modes, from position and area queries. In mode B a cut station registry counts too: reporters whose registry row was past the cap are served without their label and properties. /health shows them degraded with the reason. Should be 0. Raise max_locations (memory sizing in the engine-postgis README) or narrow the station set.",
+      "id": 79,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 124
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(postgis_locations_truncated) or vector(0)",
+          "refId": "A",
+          "legendFormat": "truncated"
         }
       ]
     },
@@ -2982,9 +3093,9 @@
           "legendFormat": "{{collection}} {{result}}"
         },
         {
-          "expr": "sum by (collection, reason) (rate(bufr_decode_failures_total[1h]) * 3600)",
+          "expr": "sum by (collection, kind) (rate(bufr_decode_failures_total[1h]) * 3600)",
           "refId": "B",
-          "legendFormat": "{{collection}} decode {{reason}}"
+          "legendFormat": "{{collection}} decode {{kind}}"
         },
         {
           "expr": "rate(bufr_scans_total{result=\"failed\"}[1h]) * 3600",
@@ -3621,6 +3732,564 @@
           "mode": "multi"
         }
       }
+    },
+    {
+      "id": 76,
+      "type": "timeseries",
+      "title": "Satellite scans — time windows vs scan cache",
+      "description": "Bytes of the scans in each satellite collection's time window, the part held in memory, and MC_SATELLITE_FRAME_CACHE_MB. Each poll drops the scans that left its window and downloads evicted in-window scans back while all windows fit. Bad: 'all windows' above capacity, where the poll logs a WARN and stops downloading back, or resident below window for more than a poll or two. Requests then download scans from the bucket within the render deadline, and an animation's older frames return 503.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 238
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(satellite_frame_window_bytes)",
+          "legendFormat": "all windows",
+          "refId": "A"
+        },
+        {
+          "expr": "satellite_frame_cache_capacity_bytes",
+          "legendFormat": "capacity",
+          "refId": "B"
+        },
+        {
+          "expr": "satellite_frame_window_bytes",
+          "legendFormat": "window {{collection}}",
+          "refId": "C"
+        },
+        {
+          "expr": "satellite_frame_window_resident_bytes",
+          "legendFormat": "resident {{collection}}",
+          "refId": "D"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 77,
+      "type": "timeseries",
+      "title": "Satellite scan downloads — poll re-downloads vs request fetches",
+      "description": "Scans per hour downloaded again by a poll after the scan cache evicted them, and scans a request had to download (scan-cache misses). Once the windows fit, request fetches should stay near 0. A steady re-download rate means the windows barely fit, so something keeps evicting them.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 238
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(satellite_frame_reingests_total[$__rate_interval]) * 3600",
+          "legendFormat": "re-downloaded by the poll /h",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(satellite_frame_cache_misses_total[$__rate_interval]) * 3600",
+          "legendFormat": "downloaded by requests /h",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 78,
+      "type": "timeseries",
+      "title": "Data age — per collection",
+      "description": "Seconds since the newest data each collection serves, the /health data_age_secs: GeoTIFF newest timestep, QueryData newest run's origin time, BUFR newest report, satellite newest scan, nowcast anchor frame. A sawtooth is normal: it climbs between deliveries and drops when new data lands, with the feed's cadence (minutes for radar, hours for model runs). Bad: a line climbing past its usual peak. The feeder has stalled while the collection still reports ready and serves an ever older latest. Alert per collection, since a radar and a model run need different thresholds. Negative = the newest data lies in the future.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 246
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "collection_data_age_seconds",
+          "legendFormat": "{{collection}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 80,
+      "type": "timeseries",
+      "title": "NetCDF field-read memory admission",
+      "description": "Process-wide transient memory reserved by NetCDF field reads in progress: each cold field's read owner reserves 3 × its decoded chunk + 3 × its compressed chunk (~24 MB for a MEPS field); cache hits and readers waiting for that read reserve nothing. MC_NETCDF_READ_MEMORY_MB defaults to 1024 MiB. An admission estimate, not measured RSS; resident fields are the netcdf_field_cache family.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 254
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "netcdf_read_reserved_bytes",
+          "legendFormat": "Reserved estimate",
+          "refId": "A"
+        },
+        {
+          "expr": "netcdf_read_capacity_bytes",
+          "legendFormat": "Capacity",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 81,
+      "type": "timeseries",
+      "title": "NetCDF field-read admission rejections",
+      "description": "Field reads turned away with 503 because their transient peak did not fit what other reads held. Admission fails at once; it does not wait while holding a render slot.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 254
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(netcdf_read_rejected_total[$__rate_interval])",
+          "legendFormat": "Rejected reads/s",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 82,
+      "type": "timeseries",
+      "title": "Remote requests per host",
+      "description": "Requests to each remote host through its request limit (ds_storage::build_http_store_limited; today the remote NetCDF sources, #1067): in flight, waiting for a permit, and the limit. thredds.met.no allows 8 at once, shared by every collection on it; polls (probing, ingest, prewarm) take at most 2. A queue that stays up means requests wait on the host, and that wait counts against their deadline.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 262
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "storage_host_requests_in_flight",
+          "legendFormat": "{{host}} in flight",
+          "refId": "A"
+        },
+        {
+          "expr": "storage_host_requests_queued",
+          "legendFormat": "{{host}} queued",
+          "refId": "B"
+        },
+        {
+          "expr": "storage_host_request_limit",
+          "legendFormat": "{{host}} limit",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 83,
+      "type": "timeseries",
+      "title": "NetCDF detached field fills",
+      "description": "Cold remote NetCDF fields are fetched by a task the request hands its fill to, which finishes after the request's 3 s deadline and leaves the field cached (#1067). Pending: running now, at most 16. Inline: fills a request ran itself, under its deadline, because 16 were running. A steady inline rate means fetches cannot keep up with the frames asked for. EDR and GetFeatureInfo reads detach from a pool of their own, at most 8, and are not counted here.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 262
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "netcdf_detached_fills_pending",
+          "legendFormat": "Pending",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(netcdf_detached_fills_total[$__rate_interval])",
+          "legendFormat": "Detached/s",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(netcdf_detached_fills_inline_total[$__rate_interval])",
+          "legendFormat": "Inline past the cap/s",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Station grids (derived collections, #1082)",
+      "id": 84,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 270
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Stations behind the latest analysis",
+      "description": "Stations the latest analysis of each station-grid parameter was computed from: the first thing to check when an analysis looks wrong. A drop means the source lost stations (a feed outage, a filtered window) and the field is interpolated from fewer, farther stations; 0 draws an empty map.",
+      "id": 85,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 271
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "none",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "station_grid_stations",
+          "refId": "A",
+          "legendFormat": "{{collection}} {{parameter}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Analyses, failures and last duration",
+      "description": "Analyses computed per hour (request misses plus the poll's pre-compute and revisions), failed analyses and source reads per hour, and the last analysis's wall-clock duration. A duration near the 3 s render deadline means cold map requests answer 503 until the pre-compute catches up: coarsen the grid or raise MC_STATION_GRID_WORKERS. Rejected/h counts analyses turned away (503) because MC_STATION_GRID_MEMORY_MB was full.",
+      "id": 86,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 271
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(station_grid_analyses_total[$__rate_interval]) * 3600",
+          "refId": "A",
+          "legendFormat": "{{collection}} analyses/h"
+        },
+        {
+          "expr": "rate(station_grid_failures_total[$__rate_interval]) * 3600",
+          "refId": "B",
+          "legendFormat": "{{collection}} failures/h"
+        },
+        {
+          "expr": "station_grid_last_analysis_ms / 1000",
+          "refId": "C",
+          "legendFormat": "{{collection}} last analysis (s)"
+        },
+        {
+          "expr": "rate(station_grid_compute_rejected_total[$__rate_interval]) * 3600",
+          "refId": "D",
+          "legendFormat": "rejected/h"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Station-grid cache — hit ratio and fill",
+      "description": "Hit ratio of the shared analysis cache and its fill against MC_STATION_GRID_CACHE_MB. Every revision of the observations re-keys a collection's grids, so a burst of misses after a late report is expected; a low ratio otherwise means the cache holds fewer grids than the maps animate over.",
+      "id": 87,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 279
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "percentunit",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(station_grid_cache_hits_total[$__rate_interval]) / clamp_min(rate(station_grid_cache_hits_total[$__rate_interval]) + rate(station_grid_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "A",
+          "legendFormat": "hit ratio"
+        },
+        {
+          "expr": "station_grid_cache_bytes / clamp_min(station_grid_cache_capacity_bytes, 1)",
+          "refId": "B",
+          "legendFormat": "fill"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Station-grid computation admission",
+      "description": "Bytes reserved by analyses being computed against MC_STATION_GRID_MEMORY_MB. Analyses it turned away (503) are under “Analyses, failures and last duration”.",
+      "id": 88,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 279
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "station_grid_compute_reserved_bytes",
+          "refId": "A",
+          "legendFormat": "reserved"
+        },
+        {
+          "expr": "station_grid_compute_capacity_bytes",
+          "refId": "B",
+          "legendFormat": "capacity"
+        }
+      ]
     }
   ]
 }

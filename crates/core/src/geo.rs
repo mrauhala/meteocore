@@ -1,4 +1,4 @@
-use std::f64::consts::PI;
+use std::f64::consts::{FRAC_PI_2, PI};
 
 use crate::feature::Geometry;
 use crate::map_engine::OutputCrs;
@@ -7,7 +7,15 @@ use crate::map_engine::OutputCrs;
 /// radius themselves (`scripts/check_geo_safety.sh` flags the literal);
 /// numerically equal to `web_mercator::EARTH_RADIUS` (the 3857 sphere).
 pub const WGS84_A: f64 = 6_378_137.0;
-const WGS84_F: f64 = 1.0 / 298.257223563; // flattening
+
+/// OGC:CRS84 as WKT: WGS 84 with longitude as the first axis, in ISO
+/// 19162:2019 (WKT2) form with an explicit axis `ORDER`. EDR advertises it
+/// in every data query's `crs_details`. The EDR standard's own examples pair
+/// `CRS84` with EPSG:4326's WKT, whose axes are latitude first, so this is
+/// not copied from them. PROJ 9.8 identifies it:
+/// `projinfo '<wkt>' --identify` → `OGC:CRS84: 100 %`.
+pub const CRS84_WKT: &str = r#"GEOGCRS["WGS 84 (CRS84)",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],CS[ellipsoidal,2],AXIS["geodetic longitude (Lon)",east,ORDER[1],ANGLEUNIT["degree",0.0174532925199433]],AXIS["geodetic latitude (Lat)",north,ORDER[2],ANGLEUNIT["degree",0.0174532925199433]],ID["OGC","CRS84"]]"#;
+pub(crate) const WGS84_F: f64 = 1.0 / 298.257223563; // flattening
 const WGS84_E2: f64 = 2.0 * WGS84_F - WGS84_F * WGS84_F; // eccentricity squared
 
 /// Convert WGS84 geodetic coordinates to Earth-Centered, Earth-Fixed (ECEF)
@@ -128,6 +136,48 @@ pub fn destination_point(
     (lon, lat.to_degrees())
 }
 
+/// The point a fraction `f` (0 = start, 1 = end) of the way along the
+/// **great circle** from (`lon0`, `lat0`) to (`lon1`, `lat1`), degrees, with
+/// longitude wrapped into (−180, 180] by [`wrap_lon`]. The short way round,
+/// so a segment from 170° to −170° crosses the antimeridian rather than
+/// the Greenwich meridian — the path [`destination_point`] walks too.
+///
+/// Returns `None` when the endpoints are (nearly) antipodal: every great
+/// circle through them is equally short, so no single path is defined.
+/// Coincident endpoints return the start point.
+pub fn intermediate_point(
+    lon0: f64,
+    lat0: f64,
+    lon1: f64,
+    lat1: f64,
+    f: f64,
+) -> Option<(f64, f64)> {
+    let unit = |lon: f64, lat: f64| {
+        let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+        let (sin_lon, cos_lon) = lon.to_radians().sin_cos();
+        [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat]
+    };
+    let (a, b) = (unit(lon0, lat0), unit(lon1, lat1));
+    let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0);
+    let d = dot.acos();
+    let sin_d = d.sin();
+    if sin_d < 1e-12 {
+        // Coincident (d ≈ 0) or antipodal (d ≈ π).
+        return (d < 1.0).then_some((wrap_lon(lon0), lat0));
+    }
+    // Spherical linear interpolation of the two unit vectors.
+    let wa = ((1.0 - f) * d).sin() / sin_d;
+    let wb = (f * d).sin() / sin_d;
+    let p = [
+        wa * a[0] + wb * b[0],
+        wa * a[1] + wb * b[1],
+        wa * a[2] + wb * b[2],
+    ];
+    let lat = p[2].atan2(p[0].hypot(p[1])).to_degrees();
+    let lon = p[1].atan2(p[0]).to_degrees();
+    Some((wrap_lon(lon), lat))
+}
+
 /// Coordinate reference system.
 ///
 /// Stores projection parameters and provides forward/inverse transforms
@@ -136,7 +186,22 @@ pub fn destination_point(
 pub enum Crs {
     /// WGS84 geographic (EPSG:4326 / CRS84). Coordinates are (lon, lat) in degrees.
     Wgs84,
-    /// Transverse Mercator (e.g., EPSG:3067 TM35FIN).
+    /// Transverse Mercator (e.g., EPSG:3067 TM35FIN, UTM) on the WGS84
+    /// ellipsoid, by Krüger's series to sixth order (#1130).
+    ///
+    /// Its valid area, where the inverse answers, is a square in projected
+    /// metres around the point where the central meridian crosses the
+    /// equator, of half-side k₀ times the quarter meridian (k₀ ·
+    /// 10 001 965.729 m): up to the poles' northings, and as far east and
+    /// west. The inverse is `None` past them (#1113). On the Earth that is
+    /// the hemisphere within 90° of the central meridian, except near the
+    /// equator, where it ends 66.29° from the meridian; from 23.41° of
+    /// latitude to the poles it reaches the meridians 90° out. Inside it,
+    /// the series matches the exact projection to under a millimetre
+    /// (`TM_MAX_ETA`). Past a pole lies the far side of the Earth, and
+    /// past the eastings the series runs away from the projection.
+    /// The forward transform answers everywhere: exact inside the area,
+    /// and past it unbounded near the equator 90° from the meridian.
     TransverseMercator {
         lat0: f64,    // latitude of natural origin (radians)
         lon0: f64,    // central meridian (radians)
@@ -202,6 +267,18 @@ pub enum Crs {
         semi_minor: f64, // ellipsoid semi-minor axis (metres); equal for a sphere
         sweep: SweepAxis,
     },
+    /// Spherical Web Mercator (EPSG:3857) as a **source** grid's CRS, e.g.
+    /// NOAA's GMGSI global satellite mosaic. The math is
+    /// [`crate::web_mercator`]; Web Mercator as an *output* CRS is
+    /// [`OutputCrs::WebMercator`](crate::map_engine::OutputCrs::WebMercator).
+    ///
+    /// `forward` keeps longitude unwrapped: x is linear in longitude for
+    /// any input, so a longitude past ±180° (a client wrapping the world)
+    /// lands a turn (2π·R) further along x rather than jumping back. A grid
+    /// that spans the globe wraps its columns itself. `inverse` returns
+    /// longitude in [-180, 180]. At the poles the northing is unbounded:
+    /// `forward` is ±∞ (or a huge finite value) there.
+    WebMercator,
 }
 
 /// The axis a geostationary imager sweeps, which fixes the order of its
@@ -226,10 +303,9 @@ pub enum SweepAxis {
 ///
 /// This is keyed on the engine's `native_crs` *label*: a CRS only gets a
 /// `storageCrs` if some engine's `crs_label` emits the matching string. The
-/// `"EPSG:4326"` and `"EPSG:3857"` arms are forward-looking — no current engine
-/// emits those labels (WGS84 grids are tagged `"CRS:84"`, and there is no Web
-/// Mercator `Crs` variant) — so a new engine for one of those must emit the
-/// label here for the URI to apply.
+/// `"EPSG:4326"` arm is forward-looking — no current engine emits it (WGS84
+/// grids are tagged `"CRS:84"`). `"EPSG:3857"` is the label of a
+/// [`Crs::WebMercator`] source grid (engine-satellite's GMGSI mosaic).
 pub fn native_crs_uri(label: &str) -> Option<&'static str> {
     match label {
         "CRS:84" => Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84"),
@@ -389,14 +465,197 @@ fn edge_envelope(bbox: [f64; 4], map: impl Fn(f64, f64) -> Option<(f64, f64)>) -
 /// corners. Used to derive the WGS84 read window for a projected-output render
 /// (the engine still reads source pixels by lon/lat).
 ///
-/// Returns `None` when **every** sampled point fails to inverse-project — i.e.
-/// the projected bbox lies entirely outside the projection's valid domain. The
-/// caller must surface that as a client error (HTTP 400), *not* fall back to a
-/// global extent: a global read window on a planet-scale GRIB/COG source would
-/// decode the whole dataset for one bogus request (a DoS vector). Unreachable
-/// for any valid EPSG:3067/3035 bbox.
+/// Two kinds of place in the bbox have no edge sample. A pole inside it is
+/// its latitude extreme, where every meridian of the valid area meets: the
+/// envelope runs to the pole and spans the longitudes the inverse gives
+/// there, LAEA's central meridian ± 180° ([-170°, 190°] for EPSG:3035), or
+/// [-180°, 180°] for another CRS. And Transverse Mercator's area ends at
+/// the poles' northings and at eastings k₀ times a quarter meridian from
+/// its central meridian ([`Crs::TransverseMercator`]), so a TM box's
+/// envelope takes [`area_edge_points`] too: where those edges enter and
+/// leave the bbox, and the pole or equator between. It then reaches the
+/// area's edge inside the bbox, at the longitudes its inverse gives,
+/// unwrapped.
+///
+/// Returns `None` when **every** sampled point fails to inverse-project and
+/// no TM area edge runs inside the bbox. Ask [`outside_projection_domain`]
+/// first: for a bbox it keeps, `None` means the edge samples miss a valid
+/// area that reaches into the bbox. That is an EPSG:3035 box wider than the
+/// LAEA disk, or a tall one whose edges cross the disk only between
+/// samples. The edges then give no read window, and the caller must not
+/// fall back to a global extent: a global read window on a planet-scale
+/// GRIB/COG source would decode the whole dataset for one request.
+///
+/// The edge samples skip what lies past the valid area. Where the LAEA
+/// disk's rim cuts an edge of the bbox between two samples, the envelope
+/// can stop short of the disk by up to a sample's spacing along that edge.
 pub fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> Option<[f64; 4]> {
-    edge_envelope(bbox, |x, y| crs.inverse(x, y))
+    let mut envelope = edge_envelope(bbox, |x, y| crs.inverse(x, y));
+    for (lon, lat) in area_edge_points(crs, bbox) {
+        let [w, s, e, n] = envelope.unwrap_or([lon, lat, lon, lat]);
+        envelope = Some([w.min(lon), s.min(lat), e.max(lon), n.max(lat)]);
+    }
+    let [mut west, mut south, mut east, mut north] = envelope?;
+    for pole in [90.0, -90.0] {
+        if holds_pole(crs, bbox, pole) {
+            south = south.min(pole);
+            north = north.max(pole);
+            if let Some(lons) = pole_longitudes(crs) {
+                (west, east) = lons;
+            }
+        }
+    }
+    Some([west, south, east, north])
+}
+
+/// Whether the projected `bbox` holds the pole at latitude `pole` (±90°),
+/// edges included. A geographic bbox's pole is a whole edge, which its
+/// samples already reach: never.
+///
+/// The pole is projected from the central meridian, where TM's and LAEA's
+/// forward transforms put it exactly. From another meridian it lands a
+/// rounding error off, EPSG:3067's at easting 499 999.999 999 999 8 from
+/// 0°, and misses a bbox whose west edge is the pole's easting.
+pub fn holds_pole(crs: &Crs, bbox: [f64; 4], pole: f64) -> bool {
+    let lon = match *crs {
+        Crs::Wgs84 => return false,
+        Crs::TransverseMercator { lon0, .. } | Crs::LambertAzimuthalEqualArea { lon0, .. } => {
+            lon0.to_degrees()
+        }
+        _ => 0.0,
+    };
+    let (x, y) = crs.forward(lon, pole);
+    (bbox[0]..=bbox[2]).contains(&x) && (bbox[1]..=bbox[3]).contains(&y)
+}
+
+/// The longitudes `crs`'s inverse gives around a pole, where every meridian
+/// meets: LAEA's central meridian ± 180°, [-180°, 180°] for a CRS other
+/// than Transverse Mercator. For TM `None`: its area's north and south
+/// edges run through the pole, along the meridians 90° from the central
+/// one, and [`area_edge_points`] already takes where they run.
+fn pole_longitudes(crs: &Crs) -> Option<(f64, f64)> {
+    match *crs {
+        Crs::TransverseMercator { .. } => None,
+        Crs::LambertAzimuthalEqualArea { lon0, .. } => {
+            let lon0 = lon0.to_degrees();
+            Some((lon0 - 180.0, lon0 + 180.0))
+        }
+        _ => Some((-180.0, 180.0)),
+    }
+}
+
+/// The places of a Transverse Mercator projection's valid area inside the
+/// projected `bbox` that samples along its edges miss: where the area's
+/// own edges run inside the bbox (#1113, #1130). In projected metres the
+/// area is a square ([`Crs::TransverseMercator`]): the poles' northings
+/// north and south, which the meridians 90° from the central one follow
+/// down from the pole, and eastings k₀ times a quarter meridian either side
+/// of it. Along each of its edges longitude and latitude each run one way
+/// from the equator or the pole, so the ends of its stretch inside the
+/// bbox, with the equator or the pole between them, are its extremes
+/// there. With the edge samples they give the area's extremes inside the
+/// bbox. The samples alone stop short of the area's edge by up to their
+/// spacing, and find nothing in a box whose edges all miss the area.
+/// Longitudes are the central meridian's plus the offset, unwrapped, as
+/// the inverse gives them. Empty for any other CRS.
+pub fn area_edge_points(crs: &Crs, bbox: [f64; 4]) -> Vec<(f64, f64)> {
+    let Crs::TransverseMercator {
+        lat0,
+        lon0,
+        k0,
+        false_e,
+        false_n,
+    } = *crs
+    else {
+        return Vec::new();
+    };
+    let ka = k0 * TM_A;
+    let [min_e, min_n, max_e, max_n] = bbox;
+    let (eta_lo, eta_hi) = ((min_e - false_e) / ka, (max_e - false_e) / ka);
+    let xi0 = tm_xi0(lat0);
+    let (xi_lo, xi_hi) = ((min_n - false_n) / ka + xi0, (max_n - false_n) / ka + xi0);
+    let mut points = Vec::new();
+    // The edge at `fixed` (an η for the east and west edges, a ξ for the
+    // north and south ones) when the bbox reaches it, over the bbox's span
+    // `(lo, hi)` of the other coordinate cut to the area's `limit`.
+    let mut edge =
+        |fixed: f64, reached: bool, (lo, hi): (f64, f64), limit: f64, east_west: bool| {
+            let (lo, hi) = (lo.max(-limit), hi.min(limit));
+            if !reached || lo > hi {
+                return;
+            }
+            let mid = (lo < 0.0 && 0.0 < hi).then_some(0.0);
+            for t in [Some(lo), Some(hi), mid].into_iter().flatten() {
+                let (xi, eta) = if east_west { (t, fixed) } else { (fixed, t) };
+                let (lat, lam) = tm_lat_lam(xi, eta);
+                points.push((lon0.to_degrees() + lam.to_degrees(), lat.to_degrees()));
+            }
+        };
+    for eta in [-TM_MAX_ETA, TM_MAX_ETA] {
+        let reached = (eta_lo..=eta_hi).contains(&eta);
+        edge(eta, reached, (xi_lo, xi_hi), FRAC_PI_2, true);
+    }
+    for xi in [-FRAC_PI_2, FRAC_PI_2] {
+        let reached = (xi_lo..=xi_hi).contains(&xi);
+        edge(xi, reached, (eta_lo, eta_hi), TM_MAX_ETA, false);
+    }
+    points
+}
+
+/// Whether the projected bbox `[min_e, min_n, max_e, max_n]` lies wholly
+/// outside `crs`'s valid area, where no point maps to the Earth. A map of it
+/// is empty content (WMS 1.3.0 §7.3.3.6), with nothing to read.
+///
+/// For the projected output CRSs ([`projected_output_crs`]) that area is
+/// symmetric about the axes through a centre and narrows away from it: a
+/// point no farther from the centre than an inside one, along each axis, is
+/// inside too.
+/// - LAEA: the ellipse `ρ ≤ 2·Rq` around the false origin. Past it the
+///   inverse is NaN.
+/// - Transverse Mercator: where its inverse answers (#1113, #1130),
+///   centred on `(false_e, N_eq)`, `N_eq` the equator's northing. That is
+///   the square of eastings and northings within k₀ times a quarter
+///   meridian of the centre ([`Crs::TransverseMercator`]). Past a pole lies
+///   the far side of the Earth; farther east or west, the series is no
+///   longer exact, and next to TM's singular points on the equator it has
+///   no finite result. The inverse is `None` for all of them.
+///
+/// So the bbox meets the area exactly when its point nearest the centre
+/// does, the centre clamped into the bbox: one test. Unlike the edge samples
+/// of [`wgs84_envelope`], it also sees an area the bbox encloses. `false`
+/// for every other variant, none of which is an output CRS.
+pub fn outside_projection_domain(crs: &Crs, bbox: [f64; 4]) -> bool {
+    let (centre_e, centre_n) = match *crs {
+        Crs::LambertAzimuthalEqualArea {
+            false_e, false_n, ..
+        } => (false_e, false_n),
+        Crs::TransverseMercator {
+            lat0,
+            k0,
+            false_e,
+            false_n,
+            ..
+        } => (false_e, tm_equator_northing(lat0, k0, false_n)),
+        _ => return false,
+    };
+    let [min_e, min_n, max_e, max_n] = bbox;
+    // `max` then `min`, not `clamp`, which panics on an inverted range.
+    let e = centre_e.max(min_e).min(max_e);
+    let n = centre_n.max(min_n).min(max_n);
+    !maps_to_earth(crs, e, n)
+}
+
+/// Whether the projected point `(e, n)` lies in `crs`'s valid area: it
+/// inverse-projects. Both output CRSs' inverses are `None` past it.
+fn maps_to_earth(crs: &Crs, e: f64, n: f64) -> bool {
+    crs.inverse(e, n).is_some()
+}
+
+/// The northing of a Transverse Mercator projection's equator: the centre
+/// line of its valid area, which reaches `k0` times a quarter meridian
+/// either side of it.
+fn tm_equator_northing(lat0: f64, k0: f64, false_n: f64) -> f64 {
+    false_n - k0 * TM_A * tm_xi0(lat0)
 }
 
 /// Projected envelope `[min_e, min_n, max_e, max_n]` (in `crs`'s metres) of a
@@ -406,11 +665,48 @@ pub fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> Option<[f64; 4]> {
 /// The inverse of [`wgs84_envelope`]: used by OGC API Maps, where the request
 /// `bbox` is in CRS:84 but the output `crs` is projected — the projected map
 /// frame must cover the requested geographic box. `Crs::forward` is total for
-/// every output CRS (Geostationary, the one partial variant, is never an
-/// output CRS), so this always returns `Some`; the `unwrap_or` is a defensive
-/// identity fallback.
+/// every output CRS (Geostationary and WebMercator, the partial variants, are
+/// source CRSs only), so this always returns `Some`; the `unwrap_or` is a
+/// defensive identity fallback.
+///
+/// Transverse Mercator's eastings run off without bound toward its singular
+/// points, on the equator 90° either side of the central meridian. A box
+/// holding one has no easting extreme on its edges, which can lie as close
+/// to the meridian as the far side of the Earth does: the edges of a global
+/// box map within 3 100 km of it in EPSG:3067. The envelope then reaches
+/// the valid area's edge on that side, where it crosses the equator, so it
+/// holds the area the box does (#1130). An edge passing within a few
+/// degrees of a singular point maps without bound itself, where the series
+/// diverges, and so does the envelope.
 pub fn projected_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
-    edge_envelope(bbox, |lon, lat| Some(crs.forward(lon, lat))).unwrap_or(bbox)
+    let envelope = edge_envelope(bbox, |lon, lat| Some(crs.forward(lon, lat))).unwrap_or(bbox);
+    let Crs::TransverseMercator {
+        lat0,
+        lon0,
+        k0,
+        false_e,
+        false_n,
+    } = *crs
+    else {
+        return envelope;
+    };
+    let [west, south, east, north] = bbox;
+    let [mut min_e, mut min_n, mut max_e, mut max_n] = envelope;
+    if south <= 0.0 && 0.0 <= north {
+        let n_eq = tm_equator_northing(lat0, k0, false_n);
+        for side in [-1.0, 1.0] {
+            // The singular point's longitude, the first turn of it at or
+            // east of the box's west edge.
+            let lon = lon0.to_degrees() + side * 90.0;
+            let lon = lon + 360.0 * ((west - lon) / 360.0).ceil();
+            if lon <= east {
+                let e = false_e + side * k0 * TM_A * TM_MAX_ETA;
+                (min_e, max_e) = (min_e.min(e), max_e.max(e));
+                (min_n, max_n) = (min_n.min(n_eq), max_n.max(n_eq));
+            }
+        }
+    }
+    [min_e, min_n, max_e, max_n]
 }
 
 impl Crs {
@@ -418,7 +714,8 @@ impl Crs {
     /// For Wgs84, returns (lon, lat) unchanged.
     /// For RotatedLatLon, returns rotated (lon, lat) in degrees.
     /// For Geostationary, returns `(NaN, NaN)` for a point the satellite
-    /// cannot see; every other variant is total. Callers mapping many points
+    /// cannot see; for WebMercator the northing is unbounded at the poles.
+    /// Every other variant is total. Callers mapping many points
     /// (`ProjectionGrid`, envelopes) must skip non-finite results.
     pub fn forward(&self, lon_deg: f64, lat_deg: f64) -> (f64, f64) {
         match self {
@@ -490,6 +787,10 @@ impl Crs {
                 geos.forward(lat_deg.to_radians(), lon_deg.to_radians())
                     .unwrap_or((f64::NAN, f64::NAN))
             }
+            Crs::WebMercator => (
+                crate::web_mercator::lon_to_x(lon_deg),
+                crate::web_mercator::lat_to_y(lat_deg),
+            ),
         }
     }
 
@@ -497,6 +798,10 @@ impl Crs {
     /// For Wgs84, returns (x, y) unchanged.
     /// For RotatedLatLon, input is rotated (lon, lat) in degrees.
     /// Returns `None` if the projection math produces NaN/Inf (e.g., near poles).
+    /// Transverse Mercator's is `None` outside its valid area, past a pole
+    /// or too far east or west for its series ([`Crs::TransverseMercator`],
+    /// #1113); its longitude is the central meridian's plus the offset, not
+    /// wrapped into [-180°, 180°].
     pub fn inverse(&self, x: f64, y: f64) -> Option<(f64, f64)> {
         let result = match self {
             Crs::Wgs84 => (x, y),
@@ -507,7 +812,7 @@ impl Crs {
                 false_e,
                 false_n,
             } => {
-                let (lat, lon) = tm_inverse(x, y, *lat0, *lon0, *k0, *false_e, *false_n);
+                let (lat, lon) = tm_inverse(x, y, *lat0, *lon0, *k0, *false_e, *false_n)?;
                 (lon.to_degrees(), lat.to_degrees())
             }
             Crs::LambertAzimuthalEqualArea {
@@ -556,6 +861,10 @@ impl Crs {
                 let (lat, lon) = geos.inverse(x, y)?;
                 (wrap_lon(lon.to_degrees()), lat.to_degrees())
             }
+            Crs::WebMercator => (
+                wrap_lon(crate::web_mercator::x_to_lon(x)),
+                crate::web_mercator::y_to_lat(y),
+            ),
         };
         if result.0.is_finite() && result.1.is_finite() {
             Some(result)
@@ -820,6 +1129,32 @@ impl GeoTransform {
         [min_lon, min_lat, max_lon, max_lat]
     }
 
+    /// [`bbox`](Self::bbox) reaching every pole the grid holds, at every
+    /// longitude. A polar stereographic or azimuthal grid's edges circle
+    /// its pole and stay short of it, so the edge samples alone miss the
+    /// pole and the latitudes around it. The sentinel stays the sentinel.
+    pub fn bbox_with_poles(&self) -> [f64; 4] {
+        let [mut w, mut s, mut e, mut n] = self.bbox();
+        if s > n {
+            return [w, s, e, n];
+        }
+        for pole in [90.0, -90.0] {
+            if self.cells_hold_pole(pole) {
+                (w, e) = (-180.0, 180.0);
+                s = s.min(pole);
+                n = n.max(pole);
+            }
+        }
+        [w, s, e, n]
+    }
+
+    /// Whether the grid's forward transform puts the pole at latitude
+    /// `pole` (±90°) inside its cells.
+    pub fn cells_hold_pole(&self, pole: f64) -> bool {
+        let (col, row) = self.world_to_pixel_f64(0.0, pole);
+        (0.0..f64::from(self.width)).contains(&col) && (0.0..f64::from(self.height)).contains(&row)
+    }
+
     /// [`bbox`](Self::bbox) of a geostationary raster.
     ///
     /// Longitude and latitude have no extremum inside the visible part of
@@ -1008,9 +1343,204 @@ impl GeoTransform {
 }
 
 // ============================================================================
-// Transverse Mercator — used by EPSG:3067 (TM35FIN) and UTM zones
-// Reference: Snyder, USGS PP 1395, equations 8-9 through 8-15
+// Transverse Mercator — used by EPSG:3067 (TM35FIN) and UTM zones.
+// Krüger's series to sixth order in the third flattening n, in the form of
+// C. F. F. Karney, "Transverse Mercator with an accuracy of a few
+// nanometers", J. Geodesy 85 (2011) 475–485: τ′ = tan χ of the conformal
+// latitude, the spherical TM ζ′ = ξ′ + iη′ of (χ, λ), the series
+// ζ = ζ′ + Σ αⱼ sin 2jζ′ and its reverse ζ′ = ζ − Σ βⱼ sin 2jζ, and
+// Newton's method for τ of τ′. PROJ's `tmerc` sums the same series (its
+// `+approx` selects Snyder's older one).
 // ============================================================================
+
+/// WGS84's third flattening n = f / (2 − f), the series' small parameter.
+const TM_N: f64 = WGS84_F / (2.0 - WGS84_F);
+
+/// The rectifying radius A, to n⁶: a quarter meridian is A·π/2,
+/// 10 001 965.729 m.
+const TM_A: f64 = WGS84_A / (1.0 + TM_N)
+    * (1.0 + TM_N * TM_N * (1.0 / 4.0 + TM_N * TM_N * (1.0 / 64.0 + TM_N * TM_N / 256.0)));
+
+/// Krüger's αⱼ, j = 1…6, to n⁶ (Karney 2011).
+const TM_ALPHA: [f64; 6] = [
+    TM_N * (1.0 / 2.0
+        + TM_N
+            * (-2.0 / 3.0
+                + TM_N
+                    * (5.0 / 16.0
+                        + TM_N
+                            * (41.0 / 180.0 + TM_N * (-127.0 / 288.0 + TM_N * 7891.0 / 37800.0))))),
+    TM_N * TM_N
+        * (13.0 / 48.0
+            + TM_N
+                * (-3.0 / 5.0
+                    + TM_N
+                        * (557.0 / 1440.0
+                            + TM_N * (281.0 / 630.0 - TM_N * 1983433.0 / 1935360.0)))),
+    TM_N * TM_N
+        * TM_N
+        * (61.0 / 240.0
+            + TM_N * (-103.0 / 140.0 + TM_N * (15061.0 / 26880.0 + TM_N * 167603.0 / 181440.0))),
+    TM_N * TM_N
+        * TM_N
+        * TM_N
+        * (49561.0 / 161280.0 + TM_N * (-179.0 / 168.0 + TM_N * 6601661.0 / 7257600.0)),
+    TM_N * TM_N * TM_N * TM_N * TM_N * (34729.0 / 80640.0 - TM_N * 3418889.0 / 1995840.0),
+    TM_N * TM_N * TM_N * TM_N * TM_N * TM_N * 212378941.0 / 319334400.0,
+];
+
+/// Krüger's βⱼ, j = 1…6, to n⁶ (Karney 2011).
+const TM_BETA: [f64; 6] = [
+    TM_N * (1.0 / 2.0
+        + TM_N
+            * (-2.0 / 3.0
+                + TM_N
+                    * (37.0 / 96.0
+                        + TM_N
+                            * (-1.0 / 360.0
+                                + TM_N * (-81.0 / 512.0 + TM_N * 96199.0 / 604800.0))))),
+    TM_N * TM_N
+        * (1.0 / 48.0
+            + TM_N
+                * (1.0 / 15.0
+                    + TM_N
+                        * (-437.0 / 1440.0
+                            + TM_N * (46.0 / 105.0 - TM_N * 1118711.0 / 3870720.0)))),
+    TM_N * TM_N
+        * TM_N
+        * (17.0 / 480.0
+            + TM_N * (-37.0 / 840.0 + TM_N * (-209.0 / 4480.0 + TM_N * 5569.0 / 90720.0))),
+    TM_N * TM_N
+        * TM_N
+        * TM_N
+        * (4397.0 / 161280.0 + TM_N * (-11.0 / 504.0 - TM_N * 830251.0 / 7257600.0)),
+    TM_N * TM_N * TM_N * TM_N * TM_N * (4583.0 / 161280.0 - TM_N * 108847.0 / 3991680.0),
+    TM_N * TM_N * TM_N * TM_N * TM_N * TM_N * 20648693.0 / 638668800.0,
+];
+
+/// The normalized easting η = (E − E₀) / (k₀A) where a Transverse Mercator
+/// projection's valid area ends, east and west of its central meridian
+/// (#1130). The poles' northings, ξ = ±π/2, end it north and south, so the
+/// area is a square of half-side k₀ times the quarter meridian.
+///
+/// The series' error grows with η, each omitted term as e^(2jη). Against
+/// the exact projection, found by integrating the meridian arc along a
+/// complex isometric latitude, it is under 0.6 mm forward and 7 µm inverse
+/// anywhere on this edge, and 1 mm forward at η = 1.65, 1 m at 2.13 and
+/// 140 m at 2.50: 68°, 76° and 80° from the meridian on the equator. PROJ's
+/// `tmerc` answers to about 80.5° there.
+const TM_MAX_ETA: f64 = FRAC_PI_2;
+
+/// How far past a pole's northing, in ξ, a point still counts as the pole:
+/// a few rounding errors, the pole projected and inverted again.
+const TM_POLE_SLACK: f64 = 4.0 * f64::EPSILON;
+
+/// τ′ = tan χ, the conformal latitude's tangent, of τ = tan φ.
+fn tm_taup(tau: f64) -> f64 {
+    let tau1 = tau.hypot(1.0);
+    let sigma = tm_sigma(tau / tau1);
+    sigma.hypot(1.0) * tau - sigma * tau1
+}
+
+/// σ = sinh(e · atanh(e · sin φ)), of `sin φ`: τ′ = τ √(1 + σ²) − σ √(1 + τ²).
+fn tm_sigma(sin_lat: f64) -> f64 {
+    let e = WGS84_E2.sqrt();
+    (e * (e * sin_lat).atanh()).sinh()
+}
+
+/// τ = tan φ of τ′ = tan χ, by Newton's method from τ′ / (1 − e²). It
+/// converges quadratically, so a step under √ε/10 leaves an error under ε:
+/// one or two steps.
+fn tm_tau(taup: f64) -> f64 {
+    let e2m = 1.0 - WGS84_E2;
+    let tol = f64::EPSILON.sqrt() / 10.0 * taup.abs().max(1.0);
+    let mut tau = taup / e2m;
+    for _ in 0..5 {
+        let taupa = tm_taup(tau);
+        // dτ′/dτ = (1 − e²) √(1 + τ′²) √(1 + τ²) / (1 + (1 − e²) τ²).
+        let step =
+            (taup - taupa) * (1.0 + e2m * tau * tau) / (e2m * tau.hypot(1.0) * taupa.hypot(1.0));
+        tau += step;
+        if step.abs() < tol || !step.is_finite() {
+            break;
+        }
+    }
+    tau
+}
+
+/// `Σ cⱼ sin 2jζ`, j = 1…6, of the complex `ζ = ξ + iη`, as its real and
+/// imaginary parts, by Clenshaw's recurrence, from `[sin 2ξ, cos 2ξ,
+/// sinh 2η, cosh 2η]`.
+fn tm_sine_series(c: &[f64; 6], [sin, cos, sinh, cosh]: [f64; 4]) -> (f64, f64) {
+    // 2 cos 2ζ, and sin 2ζ.
+    let (ar, ai) = (2.0 * cos * cosh, -2.0 * sin * sinh);
+    let (sr, si) = (sin * cosh, cos * sinh);
+    // b_k = c_k + 2 cos 2ζ · b_(k+1) − b_(k+2), down from k = 6.
+    let (mut b1, mut b2) = ((0.0, 0.0), (0.0, 0.0));
+    for &ck in c.iter().rev() {
+        let b = (
+            ck + ar * b1.0 - ai * b1.1 - b2.0,
+            ar * b1.1 + ai * b1.0 - b2.1,
+        );
+        (b1, b2) = (b, b1);
+    }
+    // The sum is sin 2ζ · b_1.
+    (sr * b1.0 - si * b1.1, sr * b1.1 + si * b1.0)
+}
+
+/// The normalized coordinates `(ξ, η)`, northing and easting from the
+/// equator on the central meridian over k₀A, of latitude `lat` and
+/// longitude `lam` from the central meridian, in radians. Exact to the
+/// series' error inside the valid area ([`TM_MAX_ETA`]); past it the
+/// series diverges, without bound near the equator 90° from the meridian.
+fn tm_xi_eta(lat: f64, lam: f64) -> (f64, f64) {
+    let (sin_lat, cos_lat) = lat.sin_cos();
+    let sigma = tm_sigma(sin_lat);
+    // τ′ over cos φ, as `tm_taup` of tan φ.
+    let taup = (sin_lat * sigma.hypot(1.0) - sigma) / cos_lat;
+    let (sin_lam, cos_lam) = lam.sin_cos();
+    // ξ′ = atan2(τ′, cos λ) and sinh η′ = sin λ / r, r² = τ′² + cos² λ, so
+    // the series' double angles follow from τ′ and λ alone.
+    let r2 = taup * taup + cos_lam * cos_lam;
+    let xip = taup.atan2(cos_lam);
+    let etap = (sin_lam / r2.sqrt()).asinh();
+    let double = [
+        2.0 * taup * cos_lam / r2,
+        (cos_lam * cos_lam - taup * taup) / r2,
+        2.0 * sin_lam * taup.hypot(1.0) / r2,
+        (1.0 + taup * taup + sin_lam * sin_lam) / r2,
+    ];
+    let (dxi, deta) = tm_sine_series(&TM_ALPHA, double);
+    (xip + dxi, etap + deta)
+}
+
+/// Latitude and longitude from the central meridian, radians, of the
+/// normalized coordinates `(ξ, η)`. Unchecked: [`tm_inverse`] keeps it to
+/// the valid area.
+fn tm_lat_lam(xi: f64, eta: f64) -> (f64, f64) {
+    let (sin, cos) = (2.0 * xi).sin_cos();
+    let sinh = (2.0 * eta).sinh();
+    let (dxi, deta) = tm_sine_series(&TM_BETA, [sin, cos, sinh, sinh.hypot(1.0)]);
+    let (sin_xip, cos_xip) = (xi - dxi).sin_cos();
+    let sinh_etap = (eta - deta).sinh();
+    let r = sinh_etap.hypot(cos_xip);
+    let lam = sinh_etap.atan2(cos_xip);
+    let lat = if r > 0.0 {
+        tm_tau(sin_xip / r).atan()
+    } else {
+        FRAC_PI_2.copysign(xi)
+    };
+    (lat, lam)
+}
+
+/// ξ of the latitude of natural origin `lat0`, on the central meridian.
+fn tm_xi0(lat0: f64) -> f64 {
+    if lat0 == 0.0 {
+        0.0
+    } else {
+        tm_xi_eta(lat0, 0.0).0
+    }
+}
 
 fn tm_forward(
     lat: f64,
@@ -1021,42 +1551,16 @@ fn tm_forward(
     false_e: f64,
     false_n: f64,
 ) -> (f64, f64) {
-    let e2 = WGS84_E2;
-    let ep2 = e2 / (1.0 - e2); // e'^2
-
-    let dl = lon - lon0;
-    let cos_lat = lat.cos();
-    let sin_lat = lat.sin();
-    let tan_lat = lat.tan();
-
-    let n_val = WGS84_A / (1.0 - e2 * sin_lat * sin_lat).sqrt();
-    let t = tan_lat;
-    let t2 = t * t;
-    let c = ep2 * cos_lat * cos_lat;
-    let a_coeff = dl * cos_lat;
-    let a2 = a_coeff * a_coeff;
-
-    let m = meridian_arc(lat);
-    let m0 = meridian_arc(lat0);
-
-    let x = k0
-        * n_val
-        * (a_coeff
-            + (1.0 - t2 + c) * a2 * a_coeff / 6.0
-            + (5.0 - 18.0 * t2 + t2 * t2 + 72.0 * c - 58.0 * ep2) * a2 * a2 * a_coeff / 120.0);
-
-    let y = k0
-        * (m - m0
-            + n_val
-                * tan_lat
-                * (a2 / 2.0
-                    + (5.0 - t2 + 9.0 * c + 4.0 * c * c) * a2 * a2 / 24.0
-                    + (61.0 - 58.0 * t2 + t2 * t2 + 600.0 * c - 330.0 * ep2) * a2 * a2 * a2
-                        / 720.0));
-
-    (false_e + x, false_n + y)
+    let (xi, eta) = tm_xi_eta(lat, lon - lon0);
+    let ka = k0 * TM_A;
+    (false_e + ka * eta, false_n + ka * (xi - tm_xi0(lat0)))
 }
 
+/// `(lat, lon)` in radians of the projected point `(x, y)`, `None` outside
+/// the valid area ([`TM_MAX_ETA`]): past a pole, where the far side of the
+/// Earth lies, or so far east or west that the series is no longer exact
+/// (#1113, #1130). The longitude is the central meridian's plus the
+/// offset, unwrapped.
 fn tm_inverse(
     x: f64,
     y: f64,
@@ -1065,98 +1569,16 @@ fn tm_inverse(
     k0: f64,
     false_e: f64,
     false_n: f64,
-) -> (f64, f64) {
-    // Newton iteration approach — works at any distance from central meridian.
-    // Start with the footpoint latitude, then iterate to find (lat, lon).
-    let e2 = WGS84_E2;
-    let ep2 = e2 / (1.0 - e2);
-    let e1 = (1.0 - (1.0 - e2).sqrt()) / (1.0 + (1.0 - e2).sqrt());
-
-    let m0 = meridian_arc(lat0);
-    let m = m0 + (y - false_n) / k0;
-
-    // Footpoint latitude from meridian arc
-    let mu = m / (WGS84_A * (1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0));
-    let lat1 = mu
-        + (3.0 * e1 / 2.0 - 27.0 * e1 * e1 * e1 / 32.0) * (2.0 * mu).sin()
-        + (21.0 * e1 * e1 / 16.0 - 55.0 * e1 * e1 * e1 * e1 / 32.0) * (4.0 * mu).sin()
-        + (151.0 * e1 * e1 * e1 / 96.0) * (6.0 * mu).sin()
-        + (1097.0 * e1 * e1 * e1 * e1 / 512.0) * (8.0 * mu).sin();
-
-    // Use series for initial guess, then refine with Newton iteration
-    let sin_lat1 = lat1.sin();
-    let cos_lat1 = lat1.cos();
-    let tan_lat1 = lat1.tan();
-    let n1 = WGS84_A / (1.0 - e2 * sin_lat1 * sin_lat1).sqrt();
-    let r1 = WGS84_A * (1.0 - e2) / (1.0 - e2 * sin_lat1 * sin_lat1).powf(1.5);
-    let t12 = tan_lat1 * tan_lat1;
-    let c1 = ep2 * cos_lat1 * cos_lat1;
-    let d = (x - false_e) / (n1 * k0);
-    let d2 = d * d;
-
-    // Series initial guess
-    let mut lat = lat1
-        - (n1 * tan_lat1 / r1)
-            * (d2 / 2.0
-                - (5.0 + 3.0 * t12 + 10.0 * c1 - 4.0 * c1 * c1 - 9.0 * ep2) * d2 * d2 / 24.0
-                + (61.0 + 90.0 * t12 + 298.0 * c1 + 45.0 * t12 * t12
-                    - 252.0 * ep2
-                    - 3.0 * c1 * c1)
-                    * d2
-                    * d2
-                    * d2
-                    / 720.0);
-
-    let mut lon = lon0
-        + (d - (1.0 + 2.0 * t12 + c1) * d2 * d / 6.0
-            + (5.0 - 2.0 * c1 + 28.0 * t12 - 3.0 * c1 * c1 + 8.0 * ep2 + 24.0 * t12 * t12)
-                * d2
-                * d2
-                * d
-                / 120.0)
-            / cos_lat1;
-
-    // Newton refinement: iterate forward(lat,lon) towards target (x,y)
-    for _ in 0..20 {
-        let (fx, fy) = tm_forward(lat, lon, lat0, lon0, k0, false_e, false_n);
-        let ex = x - fx; // easting residual
-        let ey = y - fy; // northing residual
-        if ex.abs() < 0.001 && ey.abs() < 0.001 {
-            break;
-        }
-        // Numerical Jacobian: d(easting,northing)/d(lat,lon)
-        let h = 1e-8;
-        let (fx_dlat, fy_dlat) = tm_forward(lat + h, lon, lat0, lon0, k0, false_e, false_n);
-        let (fx_dlon, fy_dlon) = tm_forward(lat, lon + h, lat0, lon0, k0, false_e, false_n);
-        // J = [[de/dlat, de/dlon], [dn/dlat, dn/dlon]]
-        let de_dlat = (fx_dlat - fx) / h;
-        let de_dlon = (fx_dlon - fx) / h;
-        let dn_dlat = (fy_dlat - fy) / h;
-        let dn_dlon = (fy_dlon - fy) / h;
-        let det = de_dlat * dn_dlon - de_dlon * dn_dlat;
-        if det.abs() < 1e-30 {
-            break;
-        }
-        // J^-1 * [ex, ey]
-        let dlat = (dn_dlon * ex - de_dlon * ey) / det;
-        let dlon = (-dn_dlat * ex + de_dlat * ey) / det;
-        lat += dlat;
-        lon += dlon;
+) -> Option<(f64, f64)> {
+    let ka = k0 * TM_A;
+    let xi = (y - false_n) / ka + tm_xi0(lat0);
+    let eta = (x - false_e) / ka;
+    // `!(a <= b)` also rejects NaN.
+    if !(xi.abs() <= FRAC_PI_2 + TM_POLE_SLACK && eta.abs() <= TM_MAX_ETA) {
+        return None;
     }
-
-    (lat, lon)
-}
-
-/// Meridian arc from equator to latitude (Helmert series).
-fn meridian_arc(lat: f64) -> f64 {
-    let e2 = WGS84_E2;
-    let e4 = e2 * e2;
-    let e6 = e4 * e2;
-    WGS84_A
-        * ((1.0 - e2 / 4.0 - 3.0 * e4 / 64.0 - 5.0 * e6 / 256.0) * lat
-            - (3.0 * e2 / 8.0 + 3.0 * e4 / 32.0 + 45.0 * e6 / 1024.0) * (2.0 * lat).sin()
-            + (15.0 * e4 / 256.0 + 45.0 * e6 / 1024.0) * (4.0 * lat).sin()
-            - (35.0 * e6 / 3072.0) * (6.0 * lat).sin())
+    let (lat, lam) = tm_lat_lam(xi.clamp(-FRAC_PI_2, FRAC_PI_2), eta);
+    Some((lat, lon0 + lam))
 }
 
 // ============================================================================
@@ -1176,15 +1598,12 @@ fn laea_forward(
     let e = e2.sqrt();
 
     let q_val = q_authalic(lat, e);
-    let q0 = q_authalic(lat0, e);
     let qp = q_authalic(PI / 2.0, e);
 
     let beta = (q_val / qp).clamp(-1.0, 1.0).asin();
-    let beta0 = (q0 / qp).clamp(-1.0, 1.0).asin();
 
     let rq = WGS84_A * (qp / 2.0).sqrt();
-    let m0 = lat0.cos() / (1.0 - e2 * lat0.sin().powi(2)).sqrt();
-    let dd = WGS84_A * m0 / (rq * beta0.cos());
+    let (beta0, dd) = laea_origin(lat0, e, qp, rq);
 
     let dl = lon - lon0;
 
@@ -1214,10 +1633,8 @@ fn laea_inverse(x: f64, y: f64, lat0: f64, lon0: f64, false_e: f64, false_n: f64
     let e2 = WGS84_E2;
     let e = e2.sqrt();
     let qp = q_authalic(PI / 2.0, e);
-    let beta0 = (q_authalic(lat0, e) / qp).clamp(-1.0, 1.0).asin();
     let rq = WGS84_A * (qp / 2.0).sqrt();
-    let m0 = lat0.cos() / (1.0 - e2 * lat0.sin().powi(2)).sqrt();
-    let dd = WGS84_A * m0 / (rq * beta0.cos());
+    let (beta0, dd) = laea_origin(lat0, e, qp, rq);
 
     let (x, y) = (x - false_e, y - false_n);
     let rho = ((x / dd).powi(2) + (dd * y).powi(2)).sqrt();
@@ -1232,12 +1649,33 @@ fn laea_inverse(x: f64, y: f64, lat0: f64, lon0: f64, false_e: f64, false_n: f64
     (authalic_inverse(q, e), lon)
 }
 
+/// The origin's authalic latitude `β₀` and Snyder's `D` (eq. 24-20), how
+/// much the oblique aspect stretches x, and shrinks y, at the origin, for
+/// the origin latitude `lat0`, eccentricity `e`, `qp` and the authalic
+/// radius `rq`. A polar origin (EASE-Grid 2.0, EPSG:6931/6932) is the
+/// limit, `β₀ = ±90°` and `D = 1`: there `D`'s factors `cos φ₀` and
+/// `cos β₀` both vanish, and the ratio of their rounded values is 0.45 %
+/// off it, which put a point 2300 km from the pole 10 km out of place.
+fn laea_origin(lat0: f64, e: f64, qp: f64, rq: f64) -> (f64, f64) {
+    if FRAC_PI_2 - lat0.abs() < 1e-10 {
+        return (FRAC_PI_2.copysign(lat0), 1.0);
+    }
+    let beta0 = (q_authalic(lat0, e) / qp).clamp(-1.0, 1.0).asin();
+    let m0 = lat0.cos() / (1.0 - WGS84_E2 * lat0.sin().powi(2)).sqrt();
+    (beta0, WGS84_A * m0 / (rq * beta0.cos()))
+}
+
+/// Snyder's `q` (eq. 3-12), odd in `lat` to the bit: computed as written
+/// for a southern latitude, the logarithm's quotient rounds differently,
+/// `q(−90°)/q(90°)` misses −1, and `asin` turns that ulp into 20 cm at the
+/// south pole.
 fn q_authalic(lat: f64, e: f64) -> f64 {
-    let sin_lat = lat.sin();
+    let sin_lat = lat.abs().sin();
     let e_sin = e * sin_lat;
-    (1.0 - e * e)
+    let q = (1.0 - e * e)
         * (sin_lat / (1.0 - e_sin * e_sin)
-            - (1.0 / (2.0 * e)) * ((1.0 - e_sin) / (1.0 + e_sin)).ln())
+            - (1.0 / (2.0 * e)) * ((1.0 - e_sin) / (1.0 + e_sin)).ln());
+    q.copysign(lat)
 }
 
 fn authalic_inverse(q: f64, e: f64) -> f64 {
@@ -1385,6 +1823,43 @@ fn lcc_t(lat: f64, e: f64) -> f64 {
 // Reference: EPSG guidance note 7-2, method 9809 (Oblique Stereographic)
 // Uses conformal sphere approach (Gauss conformal latitude)
 // ============================================================================
+
+/// The scale factor at the pole, `k₀` of a polar [`Crs::Stereographic`],
+/// of a projection on WGS84 whose scale is true at latitude `lat_ts`
+/// (radians): the standard parallel of EPSG method 9829, PROJ's `+lat_ts`
+/// and CF's `standard_parallel`. `lat_ts` lies on the pole's side of the
+/// equator, measured toward that pole: a south-polar projection's −71° is
+/// passed as 71°.
+///
+/// PROJ's `+proj=stere +lat_ts` uses Snyder eq. 21-39, `ρ = a·m_c·t/t_c`,
+/// and [`Crs::Stereographic`]'s polar form is eq. 21-33, `ρ = 2·a·k₀·t/D`,
+/// so they agree for
+///
+/// ```text
+/// k₀  = m_c · D / (2 · t_c)
+/// m_c = cos(lat_ts) / √(1 − e²·sin²(lat_ts))
+/// t_c = tan(π/4 − lat_ts/2) · ((1 + e·sin lat_ts)/(1 − e·sin lat_ts))^(e/2)
+/// D   = √((1+e)^(1+e) · (1−e)^(1−e))
+/// ```
+///
+/// (Snyder, "Map Projections — A Working Manual", USGS PP 1395, 1987). The
+/// spherical shortcut `(1 + sin lat_ts)/2` is 0.012 % off at 60°, some
+/// 200 m at 3000 km from the pole. Scale true at the pole itself is
+/// `k₀ = 1`, the limit as `t_c → 0`.
+pub fn polar_stereographic_k0(lat_ts: f64) -> f64 {
+    if FRAC_PI_2 - lat_ts < 1e-10 {
+        return 1.0;
+    }
+    let e2 = WGS84_E2;
+    let e = e2.sqrt();
+    let sin_lat_ts = lat_ts.sin();
+    let cos_lat_ts = lat_ts.cos();
+    let m_c = cos_lat_ts / (1.0 - e2 * sin_lat_ts * sin_lat_ts).sqrt();
+    let t_c = (std::f64::consts::FRAC_PI_4 - lat_ts / 2.0).tan()
+        * ((1.0 + e * sin_lat_ts) / (1.0 - e * sin_lat_ts)).powf(e / 2.0);
+    let d = ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
+    m_c * d / (2.0 * t_c)
+}
 
 /// Oblique stereographic projection on the conformal sphere, EPSG 9809.
 ///
@@ -2058,6 +2533,57 @@ mod tests {
     }
 
     #[test]
+    fn intermediate_point_follows_the_short_great_circle() {
+        let close = |(lon, lat): (f64, f64), want: (f64, f64)| {
+            assert!(
+                (lon - want.0).abs() < 1e-9 && (lat - want.1).abs() < 1e-9,
+                "got ({lon}, {lat}), want {want:?}"
+            );
+        };
+        // Endpoints are exact; a meridian and the equator are closed forms.
+        close(
+            intermediate_point(10.0, 20.0, 30.0, 40.0, 0.0).unwrap(),
+            (10.0, 20.0),
+        );
+        close(
+            intermediate_point(10.0, 20.0, 30.0, 40.0, 1.0).unwrap(),
+            (30.0, 40.0),
+        );
+        close(
+            intermediate_point(0.0, 0.0, 0.0, 10.0, 0.5).unwrap(),
+            (0.0, 5.0),
+        );
+        close(
+            intermediate_point(0.0, 0.0, 20.0, 0.0, 0.25).unwrap(),
+            (5.0, 0.0),
+        );
+        // The antimeridian seam (170,10 → −170,20): the short way crosses
+        // ±180, never the Greenwich meridian, and wraps into (−180, 180].
+        let (lon, lat) = intermediate_point(170.0, 10.0, -170.0, 20.0, 0.5).unwrap();
+        assert!(lon.abs() > 175.0, "midpoint crosses the seam, got {lon}");
+        assert!((14.0..16.0).contains(&lat), "lat {lat}");
+        close(
+            intermediate_point(179.0, 0.0, -179.0, 0.0, 0.75).unwrap(),
+            (-179.5, 0.0),
+        );
+        // Off the equator a great circle bulges poleward of the rhumb line,
+        // and its midpoint is equidistant from both ends.
+        let mid = intermediate_point(0.0, 60.0, 90.0, 60.0, 0.5).unwrap();
+        assert!(mid.1 > 60.0, "poleward bulge, got {mid:?}");
+        let (d0, d1) = (
+            great_circle_distance_m(0.0, 60.0, mid.0, mid.1),
+            great_circle_distance_m(90.0, 60.0, mid.0, mid.1),
+        );
+        assert!((d0 - d1).abs() < 1e-3, "{d0} vs {d1}");
+        // Antipodal endpoints define no single path; coincident ones do.
+        assert!(intermediate_point(0.0, 0.0, 180.0, 0.0, 0.5).is_none());
+        close(
+            intermediate_point(5.0, 5.0, 5.0, 5.0, 0.5).unwrap(),
+            (5.0, 5.0),
+        );
+    }
+
+    #[test]
     fn envelope_roundtrip_contains_original_box() {
         // Forward a CRS:84 Finland box into EPSG:3067, then inverse-envelope
         // back: the WGS84 envelope must *contain* the original box (projection
@@ -2106,11 +2632,11 @@ mod tests {
     #[test]
     fn edge_envelope_is_none_when_every_sample_fails() {
         // Backs the wgs84_envelope DoS guard (#267 review): if no sampled point
-        // transforms, the envelope is None so the caller returns HTTP 400 —
-        // never a fabricated or global-extent box that would trigger a
-        // whole-dataset read. (The projection inverses are Newton-based and
-        // return finite values almost everywhere, so this contract is exercised
-        // at the edge-sampling level rather than via a specific CRS.)
+        // transforms, the envelope is None — never a fabricated or
+        // global-extent box that would trigger a whole-dataset read. The
+        // caller tells a box wholly outside the projection (the empty map)
+        // from one enclosing what its edges miss (a 400) with
+        // `outside_projection_domain`; see its test for real CRSs.
         assert_eq!(edge_envelope([0.0, 0.0, 1.0, 1.0], |_, _| None), None);
         // And Some, with correct min/max, when points do transform.
         assert_eq!(
@@ -2124,6 +2650,103 @@ mod tests {
         let crs = projected_output_crs("EPSG:3035").unwrap();
         let proj = projected_envelope(&crs, [5.0, 48.0, 15.0, 55.0]);
         assert!(wgs84_envelope(&crs, proj).is_some());
+    }
+
+    /// `outside_projection_domain` says whether any point of a box maps to
+    /// the Earth, checked here against a 41 × 41 grid of points. It also sees
+    /// a valid area the box encloses, where the edge samples of
+    /// `wgs84_envelope` find nothing (#1089). TM's area is the square
+    /// around its equator's point on the central meridian of half-side k₀
+    /// times a quarter meridian, 9 997 964.943 m for EPSG:3067 (#1113,
+    /// #1130).
+    #[test]
+    fn outside_projection_domain_matches_the_inverse() {
+        let laea = projected_output_crs("EPSG:3035").unwrap();
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        let meets = |crs: &Crs, [x0, y0, x1, y1]: [f64; 4]| {
+            let at = |lo: f64, hi: f64, k: u32| lo + (hi - lo) * f64::from(k) / 40.0;
+            (0..=40).any(|i| (0..=40).any(|j| maps_to_earth(crs, at(x0, x1, i), at(y0, y1, j))))
+        };
+        // (crs, box, wholly outside, has an envelope). The LAEA disk is
+        // centred at (4 321 000, 3 210 000), its radius about 12 742 km.
+        for (crs, bbox, outside, envelope) in [
+            // Europe.
+            (&laea, [4.0e6, 3.0e6, 4.5e6, 3.5e6], false, true),
+            // Across the rim, east of the centre.
+            (&laea, [1.6e7, 2.2e6, 1.8e7, 4.2e6], false, true),
+            // Past the rim: east, west, north, south.
+            (&laea, [1.8e7, 2.2e6, 1.9e7, 4.2e6], true, false),
+            (&laea, [1.71e7, 3.0e6, 1.72e7, 3.1e6], true, false),
+            (&laea, [-1.5e7, 2.2e6, -1.0e7, 4.2e6], true, false),
+            (&laea, [3.0e6, 1.7e7, 5.0e6, 1.8e7], true, false),
+            (&laea, [3.0e6, -1.2e7, 5.0e6, -1.0e7], true, false),
+            // Past it diagonally, though each axis range overlaps the disk's.
+            (&laea, [1.4e7, 1.2e7, 1.5e7, 1.3e7], true, false),
+            // Wider than the disk: the edges miss it, the box encloses it.
+            (&laea, [-3.0e7, -3.0e7, 3.0e7, 3.0e7], false, false),
+            // Tall: its west edge crosses the disk only for northings of
+            // about 1.9e6 to 4.5e6, between the edge samples at 0 and 5e6.
+            (&laea, [1.7e7, -5.0e7, 1.8e7, 5.0e7], false, false),
+            // Finland.
+            (&tm, [-1.2e5, 6.3e6, 8.8e5, 7.9e6], false, true),
+            // The #1110 meta-tile, whose north-east corner, 62° east of the
+            // meridian, the Snyder series could not place (#1113).
+            (
+                &tm,
+                [1_448_154.7, 7_240_773.4, 2_896_309.4, 8_688_928.1],
+                false,
+                true,
+            ),
+            // Across the North Pole.
+            (&tm, [0.0, 9.0e6, 1.0e6, 1.1e7], false, true),
+            // On the equator, 44° to 48° east.
+            (&tm, [6.0e6, -1.0e5, 6.6e6, 1.0e5], false, true),
+            // Past the North Pole, on the far side of the Earth, and on past
+            // the far side's equator.
+            (&tm, [0.0, 1.5e7, 1.0e6, 1.6e7], true, false),
+            (&tm, [0.0, 1.9e7, 1.0e6, 2.1e7], true, false),
+            (&tm, [0.0, 2.1e7, 1.0e6, 2.2e7], true, false),
+            (&tm, [0.0, -2.2e7, 1.0e6, -2.1e7], true, false),
+            (&tm, [-5.0e7, 2.1e7, 5.0e7, 2.2e7], true, false),
+            // At Finland's northings, 59° to 77° east and 49° to 63° west
+            // of the meridian, past the Snyder series' 50° (#1113).
+            (&tm, [5.0e6, 6.5e6, 6.0e6, 7.0e6], false, true),
+            (&tm, [-5.0e6, 6.5e6, -4.0e6, 7.0e6], false, true),
+            // Across the area's east and west edges, 10 497 964.943 and
+            // -9 497 964.943, and past them, where the series is no longer
+            // exact.
+            (&tm, [1.0e7, -1.0e6, 1.1e7, 1.0e6], false, true),
+            (&tm, [-1.0e7, 6.5e6, -9.0e6, 7.0e6], false, true),
+            (&tm, [1.05e7, 6.5e6, 1.1e7, 7.0e6], true, false),
+            (&tm, [-1.0e7, -1.0e6, -9.5e6, 1.0e6], true, false),
+            // Eastings so far out that the TM inverse has no finite result,
+            // each side.
+            (&tm, [1.0e20, 6.5e6, 2.0e20, 7.0e6], true, false),
+            (&tm, [-2.0e20, 6.5e6, -1.0e20, 7.0e6], true, false),
+            // Wider than the area: the edges miss it, the box encloses it,
+            // and both poles, which bound it.
+            (&tm, [-3.0e7, -3.0e7, 3.0e7, 3.0e7], false, true),
+        ] {
+            assert_eq!(outside_projection_domain(crs, bbox), outside, "{bbox:?}");
+            assert_eq!(meets(crs, bbox), !outside, "{bbox:?}");
+            assert_eq!(wgs84_envelope(crs, bbox).is_some(), envelope, "{bbox:?}");
+        }
+        // The area's north and south edge, a pole's northing: against the
+        // WGS84 quarter meridian of 10 001 965.729 m, EPSG:3067's poles lie
+        // 0.9996 · 10 001 965.729 = 9 997 964.943 m from the equator.
+        assert_eq!(tm_equator_northing(0.0, 0.9996, 0.0), 0.0);
+        for (north, outside) in [(9_997_000.0, false), (9_999_000.0, true)] {
+            for bbox in [[0.0, north, 1.0e6, 2.1e7], [0.0, -2.1e7, 1.0e6, -north]] {
+                assert_eq!(outside_projection_domain(&tm, bbox), outside, "{bbox:?}");
+            }
+        }
+        // No other variant is an output CRS: never known to be outside.
+        assert!(!outside_projection_domain(
+            &Crs::Wgs84,
+            [1.0e300, 1.0e300, 1.5e300, 1.5e300]
+        ));
+        // An inverted box does not panic.
+        outside_projection_domain(&laea, [1.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -2255,6 +2878,588 @@ mod tests {
         let (lon, lat) = crs.inverse(e, n).unwrap();
         assert!((lon - 24.9384).abs() < 0.001, "lon={lon}");
         assert!((lat - 60.1699).abs() < 0.001, "lat={lat}");
+    }
+
+    /// EPSG:3067's Transverse Mercator both ways against PROJ 9.8.1's
+    /// `tmerc`, which sums the same Krüger series (#1130). Forward
+    /// `cs2cs -f %.6f +proj=longlat +datum=WGS84 +to +proj=tmerc +lat_0=0
+    /// +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0 +datum=WGS84`, inverse
+    /// `cs2cs -f %.12f +proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000
+    /// +y_0=0 +datum=WGS84 +to +proj=longlat +datum=WGS84`. EPSG:3067 itself
+    /// is on GRS80, whose flattening moves these points by 0.1 mm at most.
+    /// Places 0°, 30°, 50°, 70° and 85° from the meridian, a tenth of a
+    /// degree from each pole, 90° out, and the area's corner; `None` past
+    /// the area's edge on the equator, which PROJ answers out to about
+    /// 80.5°, and past each pole.
+    #[test]
+    fn tm35fin_matches_proj_both_ways_out_to_the_edge_of_its_area() {
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        // (longitude, latitude, PROJ easting, northing)
+        for (lon, lat, e, n) in [
+            (27.0, 60.0, 500_000.0, 6_651_411.190_363),
+            (57.0, 0.0, 4_003_410.936_147, 0.0),
+            (57.0, 45.0, 2_859_847.360_033, 5_440_824.092_18),
+            (77.0, 0.0, 6_952_810.991_415, 0.0),
+            // West Iceland and Cape Farewell, past the old bound at 23°W
+            // (#1113).
+            (-23.0, 64.0, -1_733_433.793_648, 8_055_898.753_958),
+            (-43.0, 60.0, -2_758_677.999_706, 8_752_133.641_064),
+            (97.0, 30.0, 7_757_639.034_713, 6_598_258.963_854),
+            (112.0, 60.0, 3_994_363.401_504, 9_676_700.451_656),
+            (-58.0, 75.0, -1_187_060.909_154, 9_848_636.264_365),
+            (77.0, 89.9, 508_552.833_401, 9_990_788.260_025),
+            (-43.0, -89.9, 489_508.393_51, -9_994_146.308_61),
+            // 90° out lies on the poles' northing.
+            (117.0, 45.0, 6_124_969.706_223, 9_997_964.943_021),
+            // 66° east on the equator, inside the edge at 66.29°.
+            (93.0, 0.0, 10_416_469.103_711, 0.0),
+        ] {
+            let (x, y) = tm.forward(lon, lat);
+            assert!(
+                (x - e).abs() < 1e-6 && (y - n).abs() < 1e-6,
+                "forward({lon}, {lat}) = ({x}, {y}), PROJ ({e}, {n})"
+            );
+            // The two truncated series undo each other to 0.2 mm at the
+            // area's edge, as in PROJ: the inverse table below pins its
+            // inverse of the last point.
+            let (back_lon, back_lat) = tm.inverse(e, n).unwrap();
+            let off = great_circle_distance_m(back_lon, back_lat, lon, lat);
+            assert!(
+                off < 2e-4,
+                "inverse({e}, {n}) = ({back_lon}, {back_lat}), ({lon}, {lat}): {off} m"
+            );
+        }
+        // (easting, northing, PROJ longitude, latitude)
+        for (e, n, lon, lat) in [
+            (
+                385_611.316_7,
+                6_672_118.380_3,
+                24.938_400_000_260,
+                60.169_899_999_779,
+            ),
+            (
+                -9_000_000.0,
+                3_000_000.0,
+                -39.944_935_355_950,
+                11.177_476_006_966,
+            ),
+            (
+                10_000_000.0,
+                1_000_000.0,
+                91.733_854_525_468,
+                3.829_538_675_150,
+            ),
+            (10_400_000.0, 0.0, 92.940_774_462_260, 0.0),
+            (10_416_469.103_711, 0.0, 92.999_999_998_890, 0.0),
+            (
+                4_000_000.0,
+                9_500_000.0,
+                109.295_272_735_154,
+                59.780_888_391_314,
+            ),
+            (
+                -2_000_000.0,
+                -8_000_000.0,
+                -25.526_215_498_894,
+                -62.022_753_081_320,
+            ),
+            // The #1110 meta-tile's north-east corner, 62° east, which the
+            // Snyder series could not place (#1113).
+            (
+                2_896_309.4,
+                8_688_928.1,
+                89.076_769_352_368,
+                66.084_369_520_925,
+            ),
+            (500_000.0, 9_997_000.0, 27.0, 89.991_357_375_245),
+            (
+                6_000_000.0,
+                9_997_964.943,
+                116.999_999_999_806,
+                45.802_232_611_787,
+            ),
+            // The area's north-west corner, a fiftieth of a millimetre in.
+            (
+                -9_497_964.0,
+                9_997_964.943,
+                -62.999_999_999_917,
+                23.407_095_063_655,
+            ),
+        ] {
+            let (got_lon, got_lat) = tm.inverse(e, n).unwrap();
+            let off = great_circle_distance_m(got_lon, got_lat, lon, lat);
+            assert!(
+                off < 1e-5,
+                "inverse({e}, {n}) = ({got_lon}, {got_lat}), PROJ ({lon}, {lat}): {off} m"
+            );
+        }
+        // The poles, projected and inverted again: a rounding error past
+        // their northing still names them.
+        for pole in [90.0, -90.0] {
+            let (x, y) = tm.forward(27.0, pole);
+            let (lon, lat) = tm.inverse(x, y).unwrap();
+            assert!(lon == 27.0 && lat == pole, "({x}, {y}): {lon}, {lat}");
+        }
+        for (e, n) in [
+            // On the equator 67° west and 66.5° and 70° east, past the
+            // edge at 66.29°: PROJ's forward of 40°W, 93.5°E and 97°E.
+            (-9_700_752.241_974, 0.0),
+            (10_557_119.801_428, 0.0),
+            (11_634_054.513_902, 0.0),
+            // A kilometre past each pole, on the far meridian.
+            (500_000.0, 9_999_000.0),
+            (500_000.0, -9_999_000.0),
+            // So far east that the series has no finite answer.
+            (1.0e20, 6_500_000.0),
+            (f64::NAN, 6_500_000.0),
+        ] {
+            assert_eq!(tm.inverse(e, n), None, "({e}, {n})");
+        }
+    }
+
+    /// Transverse Mercator measures its area from the central meridian
+    /// unwrapped, so a meridian near the antimeridian answers across it:
+    /// UTM zone 60N (177°E) at the corners of the seam box 170,10,-170,20,
+    /// 70° either side and 85° east at high latitude. References are PROJ
+    /// 9.8.1, `cs2cs -f %.6f +proj=longlat +datum=WGS84 +to +proj=utm
+    /// +zone=60 +datum=WGS84` forward and `cs2cs -f %.12f +proj=utm
+    /// +zone=60 +datum=WGS84 +to +proj=longlat +datum=WGS84` inverse. The
+    /// inverse's longitude is 177° plus the offset, unwrapped, so the seam
+    /// box's envelope runs on past 180°.
+    #[test]
+    fn tm_area_follows_a_meridian_near_the_antimeridian() {
+        let utm60 = Crs::TransverseMercator {
+            lat0: 0.0,
+            lon0: 177.0_f64.to_radians(),
+            k0: 0.9996,
+            false_e: 500_000.0,
+            false_n: 0.0,
+        };
+        // (longitude, latitude, PROJ easting, northing)
+        for (lon, lat, e, n) in [
+            (170.0, 10.0, -268_980.132_218, 1_113_599.929_721),
+            (-170.0, 10.0, 1_936_441.770_924, 1_134_078.785_879),
+            (170.0, 20.0, -233_644.415_888, 2_226_862.893_669),
+            (-170.0, 20.0, 1_868_929.815_994, 2_265_245.961_019),
+            (-113.0, 60.0, 3_758_677.999_706, 8_752_133.641_064),
+            (107.0, 60.0, -2_758_677.999_706, 8_752_133.641_064),
+            (-98.0, 70.0, 2_769_394.615_151, 9_795_195.992_305),
+        ] {
+            let (x, y) = utm60.forward(lon, lat);
+            assert!(
+                (x - e).abs() < 1e-6 && (y - n).abs() < 1e-6,
+                "forward({lon}, {lat}) = ({x}, {y}), PROJ ({e}, {n})"
+            );
+        }
+        // (easting, northing, PROJ longitude, latitude)
+        for (e, n, lon, lat) in [
+            (
+                -268_980.13,
+                1_113_599.93,
+                170.000_000_020_029,
+                10.000_000_002_927,
+            ),
+            (
+                1_936_441.77,
+                1_134_078.79,
+                -170.000_000_006_741,
+                10.000_000_036_636,
+            ),
+            (5.0e6, 7.0e6, -123.630_924_146_791, 45.102_686_586_664),
+            (-4.0e6, 7.0e6, 117.630_924_146_791, 45.102_686_586_664),
+            (2.0e6, -9.0e6, -126.288_196_476_995, -74.005_333_893_791),
+        ] {
+            let (got_lon, got_lat) = utm60.inverse(e, n).unwrap();
+            assert!((got_lon - 177.0).abs() < 90.0, "unwrapped: {got_lon}");
+            let off = great_circle_distance_m(got_lon, got_lat, lon, lat);
+            assert!(
+                off < 1e-5,
+                "inverse({e}, {n}) = ({got_lon}, {got_lat}), PROJ ({lon}, {lat}): {off} m"
+            );
+        }
+        // Past the area's east and west edges, k₀ times a quarter meridian
+        // from 500 000 m.
+        for e in [10_498_000.0, -9_498_000.0] {
+            assert_eq!(utm60.inverse(e, 7.0e6), None, "{e}");
+        }
+        let seam = projected_envelope(&utm60, [170.0, 10.0, 190.0, 20.0]);
+        let [w, s, e, n] = wgs84_envelope(&utm60, seam).unwrap();
+        assert!(
+            (165.0..170.0).contains(&w) && (190.0..195.0).contains(&e),
+            "lon {w}..{e}"
+        );
+        assert!(
+            (5.0..10.0).contains(&s) && (20.0..25.0).contains(&n),
+            "lat {s}..{n}"
+        );
+    }
+
+    /// A CRS84 box holding a singular point of Transverse Mercator, on the
+    /// equator 90° from its meridian, has no easting extreme on its edges:
+    /// a global box's edges are the poles and the far meridian, which
+    /// EPSG:3067 maps within 3 100 km of its own. Its envelope reaches the
+    /// valid area's east and west edges on the equator, 500 000 ± k₀ times
+    /// a quarter meridian, as a box across the antimeridian holding 63°W
+    /// does on its side. A box short of both keeps its edges' envelope
+    /// (#1130). An edge within a few degrees of a singular point maps past
+    /// where the series converges, without bound: these boxes keep clear.
+    #[test]
+    fn tm_projected_envelope_reaches_the_area_around_its_singular_points() {
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        let half = 0.9996 * TM_A * FRAC_PI_2;
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        let edges = edge_envelope([-180.0, -90.0, 180.0, 90.0], |lon, lat| {
+            Some(tm.forward(lon, lat))
+        })
+        .unwrap();
+        assert!(edges[0] > -3.0e6 && edges[2] < 4.0e6, "{edges:?}");
+        let [w, s, e, n] = projected_envelope(&tm, [-180.0, -90.0, 180.0, 90.0]);
+        assert!(
+            near(w, 500_000.0 - half) && near(e, 500_000.0 + half) && s < -half && n > half,
+            "{w}, {s}, {e}, {n}"
+        );
+        // 63°W only, as 297°E, 40° from the box's sides and 30° from its
+        // top and bottom, whose edges stay over a million metres short of
+        // the area's west edge.
+        let around = [257.0, -30.0, 337.0, 30.0];
+        let [edge_w, ..] = edge_envelope(around, |lon, lat| Some(tm.forward(lon, lat))).unwrap();
+        assert!(edge_w > 500_000.0 - half + 1.0e6, "{edge_w}");
+        let [w, _, e, _] = projected_envelope(&tm, around);
+        assert!(near(w, 500_000.0 - half) && e < 500_000.0, "{w}, {e}");
+        // Short of both: Africa and Asia, 10°S to 10°N.
+        let inside = [-20.0, -10.0, 90.0, 10.0];
+        assert_eq!(
+            projected_envelope(&tm, inside),
+            edge_envelope(inside, |lon, lat| Some(tm.forward(lon, lat))).unwrap()
+        );
+    }
+
+    /// Krüger's sixth-order series against the exact Transverse Mercator,
+    /// which no series truncates (#1130). Conformal, and true to scale on
+    /// the central meridian, it is `northing + i·easting = k₀·F(ψ + iλ)`,
+    /// `F` the meridian arc `M` as an analytic function of the isometric
+    /// latitude `ψ`. Along `ψ + it` that is `M(φ) + i ∫₀^λ ν cos φ dt`, at
+    /// the complex latitude `φ` of each `ψ + it`, found by Newton's method.
+    /// Simpson's rule on 4 000 steps is good to 1e-7 m there, 1e-6 m at 76°
+    /// on the equator. Just inside the area's east edge, from the equator
+    /// to 23° north, the series is within 0.6 mm of it forward and 10 µm
+    /// inverse; 76° east on the equator, past the edge, it is half a metre
+    /// off and more.
+    #[test]
+    fn tm_series_is_exact_inside_its_area() {
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        let (k0, lon0) = (0.9996, 27.0_f64.to_radians());
+        // The exact (easting, northing) of (lon, lat), degrees.
+        let exact = |lon: f64, lat: f64| {
+            let (phi, lam) = (lat.to_radians(), lon.to_radians() - lon0);
+            let simpson = |f: &mut dyn FnMut(f64) -> Cx, hi: f64| {
+                let steps = 4000;
+                let h = hi / f64::from(steps);
+                let mut sum = Cx(0.0, 0.0);
+                for k in 0..=steps {
+                    let w = match k {
+                        0 => 1.0,
+                        _ if k == steps => 1.0,
+                        _ if k % 2 == 1 => 4.0,
+                        _ => 2.0,
+                    };
+                    sum = sum + f(h * f64::from(k)) * w;
+                }
+                sum * (h / 3.0)
+            };
+            let e2 = WGS84_E2;
+            let e = e2.sqrt();
+            let one = Cx(1.0, 0.0);
+            let psi_of = |phi: Cx| {
+                let s = phi.sin();
+                s.atanh() - (s * e).atanh() * e
+            };
+            let arc = simpson(
+                &mut |t| {
+                    Cx(
+                        WGS84_A * (1.0 - e2) / (1.0 - e2 * t.sin().powi(2)).powf(1.5),
+                        0.0,
+                    )
+                },
+                phi,
+            )
+            .0;
+            let psi = psi_of(Cx(phi, 0.0)).0;
+            // Continued along the path from the real latitude.
+            let mut p = Cx(phi, 0.0);
+            let g = simpson(
+                &mut |t| {
+                    let w = Cx(psi, t);
+                    for _ in 0..30 {
+                        let s = p.sin();
+                        let dpsi = Cx(1.0 - e2, 0.0) / ((one - s * s * e2) * p.cos());
+                        let step = (psi_of(p) - w) / dpsi;
+                        p = p - step;
+                        if step.abs() < 1e-15 {
+                            break;
+                        }
+                    }
+                    let s = p.sin();
+                    p.cos() * WGS84_A / (one - s * s * e2).sqrt()
+                },
+                lam,
+            );
+            (500_000.0 + k0 * g.0, k0 * (arc - g.1))
+        };
+        let edge = 500_000.0 + k0 * TM_A * (TM_MAX_ETA - 1e-6);
+        for xi in [0.0, 0.1, 0.2, 0.3, 0.4] {
+            let (lon, lat) = tm.inverse(edge, k0 * TM_A * xi).unwrap();
+            let (x, y) = exact(lon, lat);
+            let (fx, fy) = tm.forward(lon, lat);
+            assert!(
+                (fx - x).hypot(fy - y) < 6e-4,
+                "({lon}, {lat}): ({fx}, {fy}), exact ({x}, {y})"
+            );
+            let (ilon, ilat) = tm.inverse(x, y).unwrap();
+            let off = great_circle_distance_m(ilon, ilat, lon, lat);
+            assert!(off < 1e-5, "({lon}, {lat}): inverse {off} m off");
+        }
+        let (x, y) = exact(103.0, 0.0);
+        let (fx, fy) = tm.forward(103.0, 0.0);
+        assert!(
+            (fx - x).hypot(fy - y) > 0.5,
+            "({fx}, {fy}), exact ({x}, {y})"
+        );
+    }
+
+    /// A complex number for [`tm_series_is_exact_inside_its_area`]'s exact
+    /// projection, with the few functions it takes.
+    #[derive(Clone, Copy, Debug)]
+    struct Cx(f64, f64);
+
+    impl std::ops::Add for Cx {
+        type Output = Cx;
+        fn add(self, o: Cx) -> Cx {
+            Cx(self.0 + o.0, self.1 + o.1)
+        }
+    }
+
+    impl std::ops::Sub for Cx {
+        type Output = Cx;
+        fn sub(self, o: Cx) -> Cx {
+            Cx(self.0 - o.0, self.1 - o.1)
+        }
+    }
+
+    impl std::ops::Mul for Cx {
+        type Output = Cx;
+        fn mul(self, o: Cx) -> Cx {
+            Cx(self.0 * o.0 - self.1 * o.1, self.0 * o.1 + self.1 * o.0)
+        }
+    }
+
+    impl std::ops::Mul<f64> for Cx {
+        type Output = Cx;
+        fn mul(self, k: f64) -> Cx {
+            Cx(self.0 * k, self.1 * k)
+        }
+    }
+
+    impl std::ops::Div for Cx {
+        type Output = Cx;
+        fn div(self, o: Cx) -> Cx {
+            let d = o.0 * o.0 + o.1 * o.1;
+            Cx(
+                (self.0 * o.0 + self.1 * o.1) / d,
+                (self.1 * o.0 - self.0 * o.1) / d,
+            )
+        }
+    }
+
+    impl Cx {
+        fn abs(self) -> f64 {
+            self.0.hypot(self.1)
+        }
+        fn sin(self) -> Cx {
+            Cx(self.0.sin() * self.1.cosh(), self.0.cos() * self.1.sinh())
+        }
+        fn cos(self) -> Cx {
+            Cx(self.0.cos() * self.1.cosh(), -self.0.sin() * self.1.sinh())
+        }
+        fn ln(self) -> Cx {
+            Cx(self.abs().ln(), self.1.atan2(self.0))
+        }
+        fn sqrt(self) -> Cx {
+            let (r, half) = (self.abs().sqrt(), self.1.atan2(self.0) / 2.0);
+            Cx(r * half.cos(), r * half.sin())
+        }
+        fn atanh(self) -> Cx {
+            let one = Cx(1.0, 0.0);
+            ((one + self) / (one - self)).ln() * 0.5
+        }
+    }
+
+    /// A pole inside a projected box is its latitude extreme, and no edge
+    /// sample reaches it: the read window runs to the pole and spans the
+    /// area's longitudes, for EPSG:3067 those within 90° of 27°E (#1113,
+    /// #1130). EPSG:3067's North Pole lies at
+    /// (500 000, 9 997 964.943), EPSG:3035's at northing 7 369 716.255,
+    /// easting 4 321 000: PROJ 9.8.1, `cs2cs -d 3 EPSG:4326 EPSG:3067` of
+    /// `90 27` and `cs2cs -d 3 EPSG:4326 EPSG:3035` of `90 10`.
+    #[test]
+    fn wgs84_envelope_reaches_a_pole_the_box_holds() {
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        let laea = projected_output_crs("EPSG:3035").unwrap();
+        let pole_n = 9_997_964.943;
+        for (crs, lon, (e, n)) in [
+            (&tm, 0.0, (500_000.0, pole_n)),
+            (&tm, 27.0, (500_000.0, pole_n)),
+            (&laea, 0.0, (4_321_000.0, 7_369_716.255)),
+        ] {
+            let (x, y) = crs.forward(lon, 90.0);
+            assert!((x - e).abs() < 0.01 && (y - n).abs() < 0.01, "({x}, {y})");
+        }
+        let near = |a: f64, b: f64, tol: f64| (a - b).abs() < tol;
+        // EPSG:3067 boxes, each with its lowest latitude, PROJ's at a
+        // bottom corner (`cs2cs -d 9 EPSG:3067 EPSG:4326`).
+        for (bbox, south) in [
+            // From Germany over Svalbard and the Arctic Ocean, past the
+            // pole: (-1 000 000, 6 000 000) is 52.059 130°N 4.976 770°E.
+            ([-1.0e6, 6.0e6, 2.0e6, 1.05e7], 52.059_130),
+            // The level-9 meta-tile holding the pole: (1 448 155,
+            // 8 688 928) is 75.572 844°N 63.206 699°E.
+            ([0.0, 8_688_928.0, 1_448_155.0, 10_137_083.0], 75.572_844),
+        ] {
+            let [w, s, e, n] = wgs84_envelope(&tm, bbox).unwrap();
+            assert_eq!(n, 90.0, "{bbox:?}");
+            assert!(
+                near(w, -63.0, 1e-9) && near(e, 117.0, 1e-9),
+                "{bbox:?}: {w}..{e}"
+            );
+            assert!(near(s, south, 0.01), "{bbox:?}: south {s}");
+        }
+        // Its bottom edge 5 km short of the pole. The area's north edge,
+        // the pole's northing, runs through the box on the meridians 90°
+        // either side of 27°E, and leaves it through its sides, 5 km above
+        // its bottom corners: PROJ's (-1 030 000, 9 992 964.943) is
+        // 76.422 576°N 62.814 532°W, (1 970 000, 9 992 964.943) 76.945 806°N
+        // 116.806 821°E. Every place in the box, found on a fine grid, lies
+        // inside the envelope, and the lowest of them at its south edge.
+        let bbox = [-1_030_000.0, pole_n - 5_000.0, 1_970_000.0, pole_n + 1.0e6];
+        let [w, s, e, n] = wgs84_envelope(&tm, bbox).unwrap();
+        assert_eq!(n, 90.0);
+        assert!(near(w, -63.0, 1e-9) && near(e, 117.0, 1e-9), "{w}..{e}");
+        let mut lowest = f64::MAX;
+        for i in 0..=400 {
+            for j in 0..=400 {
+                let x = bbox[0] + (bbox[2] - bbox[0]) * f64::from(i) / 400.0;
+                let y = bbox[1] + 10_000.0 * f64::from(j) / 400.0;
+                if let Some((lon, lat)) = tm.inverse(x, y) {
+                    assert!(
+                        (w..=e).contains(&lon) && lat >= s,
+                        "({x}, {y}): {lon}, {lat}"
+                    );
+                    lowest = lowest.min(lat);
+                }
+            }
+        }
+        assert!(
+            near(s, 76.422_576, 1e-6) && near(lowest, s, 1e-9),
+            "{s}, {lowest}"
+        );
+        // EPSG:3035: around its North Pole, every longitude its inverse
+        // gives, 10°E ± 180°. A store on 0°..360° then reads its 180°-190°
+        // sector too, where the view's nodes reach.
+        let [w, _, e, n] = wgs84_envelope(&laea, [3.0e6, 6.0e6, 5.5e6, 8.5e6]).unwrap();
+        assert!(
+            near(w, -170.0, 1e-9) && near(e, 190.0, 1e-9) && n == 90.0,
+            "{w}..{e}, {n}"
+        );
+        // Boxes short of a pole keep their edges' envelope.
+        let [_, _, _, n] = wgs84_envelope(&tm, [0.0, 9.0e6, 1.0e6, 9.99e6]).unwrap();
+        assert!(n < 90.0, "{n}");
+        // A box whose west edge is the pole's easting, 500 000 m, holds it.
+        // Projected from 0°E, not the central meridian, the pole lands a
+        // rounding error west of that edge, and the box missed it.
+        assert!(tm.forward(0.0, 90.0).0 < 500_000.0);
+        let bbox = [500_000.0, 9.0e6, 1.0e6, 1.05e7];
+        assert!(holds_pole(&tm, bbox, 90.0));
+        assert!(holds_pole(&laea, [4_321_000.0, 7.0e6, 5.0e6, 8.0e6], 90.0));
+        let [w, s, e, n] = wgs84_envelope(&tm, bbox).unwrap();
+        // East of the central meridian, up to the area's edge 90° out: PROJ's
+        // corner (1 000 000, 9 000 000) is 80.011 663 590°N.
+        assert!(
+            n == 90.0 && near(w, 27.0, 1e-6) && near(e, 117.0, 1e-9) && near(s, 80.011_664, 0.01),
+            "{w}, {s}, {e}, {n}"
+        );
+    }
+
+    /// Where an edge of EPSG:3067's area crosses a box, it is the box's
+    /// longitude or latitude extreme there, which edge samples 150 km or
+    /// 50 km apart stop short of (#1113, #1130). The envelope takes where
+    /// it enters and leaves the box, and the equator between. Its bounds
+    /// are PROJ 9.8.1's, `cs2cs -f %.9f +proj=tmerc +lat_0=0 +lon_0=27
+    /// +k=0.9996 +x_0=500000 +y_0=0 +datum=WGS84 +to +proj=longlat
+    /// +datum=WGS84`. Across the east edge, easting 10 497 964.943: the
+    /// box's west edge on the equator, (9 000 000, 0), is 87.355 016 295°E,
+    /// its corners (9 000 000, -2 000 000) 8.744 819 763°S and (9 000 000,
+    /// 3 000 000) 12.906 601 967°N, and the area's edge at its top,
+    /// (10 497 964.943, 3 000 000), 95.638 859 216°E. Across the north
+    /// edge, the pole's northing 9 997 964.943, which 90° out runs along
+    /// 117°E: (2 000 000, 9 500 000) is 98.808 317 361°E, (4 000 000,
+    /// 9 500 000) 59.780 888 391°N and (2 000 000, 9 997 964.943) 76.684
+    /// 126 655°N. Every place in either box lies in its envelope.
+    #[test]
+    fn wgs84_envelope_reaches_the_tm_area_edge_between_edge_samples() {
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        let near = |a: f64, b: f64, tol: f64| (a - b).abs() < tol;
+        for (bbox, [west, south, east, north]) in [
+            (
+                [9.0e6, -2.0e6, 1.2e7, 3.0e6],
+                [
+                    87.355_016_295,
+                    -8.744_819_763,
+                    95.638_859_216,
+                    12.906_601_967,
+                ],
+            ),
+            (
+                [2.0e6, 9.5e6, 4.0e6, 1.05e7],
+                [98.808_317_361, 59.780_888_391, 117.0, 76.684_126_655],
+            ),
+        ] {
+            let [w, s, e, n] = wgs84_envelope(&tm, bbox).unwrap();
+            assert!(
+                near(w, west, 1e-8)
+                    && near(s, south, 1e-8)
+                    && near(e, east, 1e-8)
+                    && near(n, north, 1e-8),
+                "{bbox:?}: {w}, {s}, {e}, {n}"
+            );
+            let [.., edge_e, _] = edge_envelope(bbox, |x, y| tm.inverse(x, y)).unwrap();
+            assert!(edge_e < east - 0.1, "{bbox:?}: the edges reach {edge_e}");
+            let (mut low, mut high) = (f64::MAX, f64::MIN);
+            for i in 0..=300 {
+                for j in 0..=300 {
+                    let x = bbox[0] + (bbox[2] - bbox[0]) * f64::from(i) / 300.0;
+                    let y = bbox[1] + (bbox[3] - bbox[1]) * f64::from(j) / 300.0;
+                    if let Some((lon, lat)) = tm.inverse(x, y) {
+                        assert!(
+                            (w..=e).contains(&lon) && (s..=n).contains(&lat),
+                            "{bbox:?}: ({x}, {y}) at {lon}, {lat}"
+                        );
+                        (low, high) = (low.min(lon), high.max(lon));
+                    }
+                }
+            }
+            assert!(
+                near(low, w, 0.2) && near(high, e, 0.2),
+                "{bbox:?}: {low}..{high}"
+            );
+        }
+        // The north edge is the second box's latitude extreme too.
+        let [.., edge_n] =
+            edge_envelope([2.0e6, 9.5e6, 4.0e6, 1.05e7], |x, y| tm.inverse(x, y)).unwrap();
+        assert!(edge_n < 76.684_126_655 - 0.005, "the edges reach {edge_n}");
+        // A box wholly inside the area, and one wholly past it, have no
+        // area edge in them.
+        assert!(area_edge_points(&tm, [-1.2e5, 6.3e6, 8.8e5, 7.9e6]).is_empty());
+        assert!(area_edge_points(&tm, [1.1e7, 6.5e6, 1.2e7, 7.0e6]).is_empty());
     }
 
     // LAEA EPSG:3035-like: center (10, 55), false origin (1950000, -2100000)
@@ -2746,6 +3951,21 @@ mod tests {
         }
     }
 
+    /// `polar_stereographic_k0` gives the `k0` above for 60°, which the
+    /// spherical shortcut misses, and 1 for scale true at the pole, the
+    /// limit its formula approaches and cannot evaluate (`t_c = 0`).
+    #[test]
+    fn polar_stereographic_k0_from_the_standard_parallel() {
+        assert_eq!(
+            polar_stereographic_k0(60.0_f64.to_radians()),
+            0.933_069_071_736_356_6
+        );
+        assert!((polar_stereographic_k0(60.0_f64.to_radians()) - 0.933_012_7).abs() > 5e-5);
+        assert_eq!(polar_stereographic_k0(FRAC_PI_2), 1.0);
+        let near_pole = polar_stereographic_k0(89.999_f64.to_radians());
+        assert!((near_pole - 1.0).abs() < 1e-9, "{near_pole}");
+    }
+
     // Test at ~1000km from center (edge of typical radar composite)
     #[test]
     fn stereographic_far_from_center() {
@@ -2988,6 +4208,51 @@ mod tests {
         let one_deg = great_circle_distance_m(25.0, 60.0, 25.0, 61.0);
         assert!((one_deg - 111_195.0).abs() < 200.0, "got {one_deg}");
         assert_eq!(great_circle_distance_m(25.0, 60.0, 25.0, 60.0), 0.0);
+    }
+
+    // --- Web Mercator source grid -----------------------------------------
+
+    /// `Crs::WebMercator` against PROJ 9.8.1:
+    /// `cs2cs -d 6 EPSG:4326 EPSG:3857` (input `lat lon`). The first two are
+    /// GMGSI pixel centres (the global mosaic's first and last pixel).
+    #[test]
+    fn web_mercator_matches_cs2cs() {
+        let crs = Crs::WebMercator;
+        for (lon, lat, x, y) in [
+            (179.9996, 72.71541, 20_037_463.814_993, 12_015_991.631_465),
+            (179.9004, -72.73677, 20_026_420.921_506, -12_023_999.255_654),
+            (24.94, 60.17, 2_776_308.100_384, 8_437_684.160_973),
+            (151.2, -33.9, 16_831_507.007_943, -4_015_382.360_073),
+            (0.0, 0.0, 0.0, 0.0),
+        ] {
+            let (fx, fy) = crs.forward(lon, lat);
+            assert!(
+                (fx - x).abs() < 1e-3 && (fy - y).abs() < 1e-3,
+                "forward({lon}, {lat}) = ({fx}, {fy}), cs2cs ({x}, {y})"
+            );
+            let (ilon, ilat) = crs.inverse(x, y).unwrap();
+            assert!(
+                (ilon - lon).abs() < 1e-9 && (ilat - lat).abs() < 1e-9,
+                "inverse({x}, {y}) = ({ilon}, {ilat})"
+            );
+        }
+        // `cs2cs -d 9 EPSG:3857 EPSG:4326`: an easting past the world's
+        // edge comes back wrapped into [-180, 180].
+        let (lon, lat) = crs.inverse(21_000_000.0, 5_000_000.0).unwrap();
+        assert!((lon - -171.353_790_335).abs() < 1e-8, "{lon}");
+        assert!((lat - 40.916_274_471).abs() < 1e-8, "{lat}");
+    }
+
+    /// Forward keeps longitude unwrapped: past 180° the easting keeps
+    /// growing a turn along, so a render across the seam stays continuous.
+    #[test]
+    fn web_mercator_forward_is_unwrapped() {
+        let crs = Crs::WebMercator;
+        let turn = crs.forward(360.0, 0.0).0;
+        let (a, _) = crs.forward(-170.0, 10.0);
+        let (b, _) = crs.forward(190.0, 10.0);
+        assert!((b - a - turn).abs() < 1e-6, "{a} {b} {turn}");
+        assert!(crs.forward(179.0, 0.0).0 < crs.forward(181.0, 0.0).0);
     }
 
     // --- Geostationary -----------------------------------------------------

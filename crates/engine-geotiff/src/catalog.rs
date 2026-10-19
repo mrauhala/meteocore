@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
-use ds_storage::discovery::{self, FilenameMatcher, RemoteFile, RemoteScan, ScanSpec};
+use ds_storage::discovery::{self, FilenameMatcher, PendingFile, RemoteFile, RemoteScan, ScanSpec};
 use ds_storage::object_store::path::Path as ObjectPath;
+use ds_storage::ObjectVersion;
 
 use crate::reader::{DataSource, TiffMetadata};
 
@@ -109,6 +110,16 @@ impl FileEntry {
         }
     }
 
+    /// Whether a tile read found this entry's remote object gone after the
+    /// scan (#1074): a 404, or a range past its end. Every catalog accessor
+    /// skips such an entry, and the next catalog swap removes it
+    /// ([`crate::gone`]).
+    pub fn is_gone(&self) -> bool {
+        self.source()
+            .and_then(|source| source.health())
+            .is_some_and(|health| health.gone().is_some())
+    }
+
     /// Get the STAC stub if this is a stub entry.
     pub fn stac_stub_info(&self) -> Option<&StacStub> {
         match &self.state {
@@ -157,10 +168,16 @@ impl Catalog {
         self.spatial_extent = compute_spatial_union(self.entries.values());
     }
 
+    /// The entries no tile read has found gone (#1074), oldest first.
+    pub fn live(&self) -> impl DoubleEndedIterator<Item = (&DateTime<Utc>, &FileEntry)> {
+        self.entries.iter().filter(|(_, entry)| !entry.is_gone())
+    }
+
     /// The timestep `get_raster_tile` renders for a requested `time` (#507):
     /// the newest entry not after `time`, falling back to the earliest entry
-    /// for pre-range requests; `None` request ⇒ the newest entry. Returns
-    /// `None` only for an empty catalog. This is the ONLY implementation of
+    /// for pre-range requests; `None` request ⇒ the newest entry. Entries
+    /// whose object a read found gone are skipped (#1074). Returns `None`
+    /// only when no entry is left. This is the ONLY implementation of
     /// that selection — `MapEngine::resolve_time` (the cache-key authority)
     /// and the render path both call it, so they cannot drift.
     pub fn select_timestamp(&self, time: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
@@ -168,10 +185,11 @@ impl Catalog {
             Some(t) => self
                 .entries
                 .range(..=t)
-                .next_back()
-                .or_else(|| self.entries.iter().next())
+                .rev()
+                .find(|(_, entry)| !entry.is_gone())
+                .or_else(|| self.live().next())
                 .map(|(ts, _)| *ts),
-            None => self.entries.keys().next_back().copied(),
+            None => self.live().next_back().map(|(ts, _)| *ts),
         }
     }
 
@@ -211,14 +229,6 @@ fn compute_spatial_union<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Op
         });
     }
     result
-}
-
-/// Tracks files seen but not yet confirmed as fully written.
-#[derive(Debug)]
-pub struct PendingFile {
-    pub size: u64,
-    /// Number of consecutive polls with the same size.
-    pub stable_count: u8,
 }
 
 /// Scan a directory for GeoTIFF files matching a filename pattern.
@@ -274,31 +284,21 @@ pub fn scan_directory(
 
         // File readiness: check size stability for genuinely NEW files only.
         // Files already in the catalog (existing) skip the readiness check.
+        // The shared `PendingFile` settles a file once its size is unchanged
+        // on two polls after the first; a size change restarts the count.
         let existing_entry = existing.get(path.as_path());
 
         if existing_entry.is_none() {
             if let Some(prev) = pending.get_mut(&path) {
-                if prev.size != file_size {
-                    // Size changed — still being written, reset counter
-                    prev.size = file_size;
-                    prev.stable_count = 0;
+                if !prev.observe(ObjectVersion::sized(file_size)) {
                     continue;
                 }
-                prev.stable_count += 1;
-                if prev.stable_count < 2 {
-                    // Need 2 consecutive stable polls before accepting
-                    continue;
-                }
-                // Size stable for 2 polls — promote from pending
                 pending.remove(&path);
             } else if !existing.is_empty() {
                 // Genuinely new file during a poll cycle — add to pending, skip this cycle
                 pending.insert(
                     path.clone(),
-                    PendingFile {
-                        size: file_size,
-                        stable_count: 0,
-                    },
+                    PendingFile::new(ObjectVersion::sized(file_size)),
                 );
                 continue;
             }
@@ -405,9 +405,11 @@ pub type FailedPrefix = (ObjectPath, DataServerError);
 /// [`MAX_REMOTE_FILE_SIZE`] are skipped. `spec.label` is the collection id
 /// the log lines name.
 ///
-/// Uses COG-style byte-range reads to fetch only the IFD metadata (first 64 KB)
-/// instead of downloading entire files. Falls back to full download if the
-/// header-only parse fails (e.g., non-COG layout or unsupported compression).
+/// Uses COG-style byte-range reads to fetch only the IFD metadata (the first
+/// 512 KB) instead of downloading entire files. Falls back to full download
+/// only if the header bytes do not parse as a COG (e.g., non-COG layout or
+/// unsupported compression). A storage error on the header read instead
+/// leaves the file out of this catalog, so the next scan retries it (#1003).
 ///
 /// `existing` provides a path-based index of entries already in the catalog.
 /// Files with unchanged size reuse their cached entry (no re-download).
@@ -419,6 +421,27 @@ pub fn scan_remote(
     prefixes: &[ObjectPath],
     spec: &ScanSpec<'_>,
     existing: &HashMap<&Path, &FileEntry>,
+) -> Result<(Catalog, Vec<FailedPrefix>), DataServerError> {
+    scan_remote_within(
+        store,
+        prefixes,
+        spec,
+        existing,
+        ds_storage::DataStore::BACKGROUND_TIMEOUT,
+    )
+}
+
+/// [`scan_remote`] with `read_budget`: the time one scan may spend reading
+/// new files' metadata before it defers the rest to the next poll. Those
+/// reads run one file at a time under the background fetch budget (#1011),
+/// so without a bound a storage stall across many new files would hold the
+/// poll for files × that budget. Already-catalogued files never read.
+pub(crate) fn scan_remote_within(
+    store: &ds_storage::DataStore,
+    prefixes: &[ObjectPath],
+    spec: &ScanSpec<'_>,
+    existing: &HashMap<&Path, &FileEntry>,
+    read_budget: std::time::Duration,
 ) -> Result<(Catalog, Vec<FailedPrefix>), DataServerError> {
     let collection_id = spec.label;
     let spec = ScanSpec {
@@ -458,7 +481,10 @@ pub fn scan_remote(
         }
     }
 
-    Ok((load_remote(store, files, existing, collection_id), failed))
+    Ok((
+        load_remote(store, files, existing, collection_id, read_budget),
+        failed,
+    ))
 }
 
 /// Build the catalog of the files a remote scan kept, reading each one's
@@ -468,9 +494,12 @@ fn load_remote(
     files: Vec<RemoteFile>,
     existing: &HashMap<&Path, &FileEntry>,
     collection_id: &str,
+    read_budget: std::time::Duration,
 ) -> Catalog {
     // Parse metadata (range read, falling back to full download)
     let mut entries = BTreeMap::new();
+    let started = std::time::Instant::now();
+    let mut deferred = 0usize;
 
     for file in &files {
         let datetime = file.time;
@@ -487,34 +516,64 @@ fn load_remote(
             }
         }
 
-        // Try COG range read first (header only)
-        if let Some((metadata, tile_info)) =
-            TiffMetadata::from_header_read(store, location, file_size)
-        {
-            tracing::debug!("[{}] {} — range read OK", collection_id, key);
-            let source = DataSource::Remote {
-                store: store.clone(),
-                path: location.clone(),
-                tile_info,
-            };
-            entries.insert(
-                datetime,
-                FileEntry::loaded(pseudo_path, source, metadata, file_size, None, None),
-            );
+        // The scan's read budget is spent: leave the remaining new files to
+        // the next poll, which retries them, instead of stalling this one.
+        if started.elapsed() >= read_budget {
+            deferred += 1;
             continue;
         }
 
-        // Fallback: download full file — this means the file is not a valid COG
-        // (missing tiled layout or non-standard IFD). Full downloads are much slower
-        // and cost more on S3. Convert to COG: gdal_translate -of COG input.tif output.tif
-        tracing::warn!(
-            "[{}] {} — COG range read failed, falling back to full download ({}). \
-             Convert to COG for faster serving.",
-            collection_id,
-            key,
-            super::format_bytes(file_size)
-        );
-        let data = match store.get(location) {
+        // Try COG range read first (header only)
+        match TiffMetadata::from_header_read(store, location, file_size) {
+            Ok(Some((metadata, tile_info))) => {
+                tracing::debug!("[{}] {} — range read OK", collection_id, key);
+                let source = DataSource::remote(store.clone(), location.clone(), tile_info);
+                entries.insert(
+                    datetime,
+                    FileEntry::loaded(pseudo_path, source, metadata, file_size, None, None),
+                );
+                continue;
+            }
+            // The header arrived but is not a COG: download it whole below.
+            Ok(None) => {
+                tracing::warn!(
+                    "[{}] {} — header is not a COG, falling back to full download ({}). \
+                     Convert to COG for faster serving.",
+                    collection_id,
+                    key,
+                    super::format_bytes(file_size)
+                );
+            }
+            // A source that ignores Range answers the header read with the
+            // whole object, which object_store rejects. Only a full download
+            // can serve it, as before #1003.
+            Err(e) if range_not_honoured(&e) => {
+                tracing::warn!(
+                    "[{}] {} — the source ignores range requests, falling back to full download ({})",
+                    collection_id,
+                    key,
+                    super::format_bytes(file_size)
+                );
+            }
+            // The storage failed, not the format (#1003): a full download
+            // would go to the same storage and could stall the same way.
+            // The file stays out of this catalog, so the next scan retries
+            // its header read.
+            Err(e) => {
+                tracing::warn!(
+                    "[{}] {} — header read failed, retrying next poll: {e}",
+                    collection_id,
+                    key
+                );
+                continue;
+            }
+        }
+
+        // Fallback: download the full file. Full downloads are much slower and
+        // cost more on S3. Convert to COG: gdal_translate -of COG input.tif output.tif
+        // The poll runtime (or engine construction) waits on this, not a
+        // request: the background budget lets a stalled attempt retry (#1011).
+        let data = match store.get_with_budget(location, ds_storage::FetchBudget::Background) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("[{}] Failed to download {}: {e}", collection_id, key);
@@ -536,6 +595,13 @@ fn load_remote(
             FileEntry::loaded(pseudo_path, source, metadata, file_size, None, None),
         );
     }
+    if deferred > 0 {
+        tracing::warn!(
+            "[{}] {deferred} new file(s) left to the next poll: this scan spent over {}s reading remote metadata",
+            collection_id,
+            read_budget.as_secs()
+        );
+    }
 
     let temporal_extent = match (entries.keys().next(), entries.keys().next_back()) {
         (Some(&first), Some(&last)) => Some((first, last)),
@@ -549,6 +615,18 @@ fn load_remote(
         temporal_extent,
         spatial_extent,
     }
+}
+
+/// Whether a header range read failed because the source does not honour
+/// `Range`. object_store reports it in two ways: its HTTP store as
+/// "Range request not supported by <path>" (`NotSupported`, pinned against
+/// a real origin in `remote_header_tests`), its other clients as
+/// "Received non-partial response when range requested" (`NotPartial`).
+/// ds-storage flattens object_store errors to text, so this matches both.
+pub(crate) fn range_not_honoured(e: &DataServerError) -> bool {
+    let text = e.to_string();
+    text.contains("Range request not supported")
+        || text.contains("non-partial response when range requested")
 }
 
 /// Create a catalog seeded from STAC collection extent — no items fetched.
@@ -581,7 +659,24 @@ pub fn fetch_stac_range(
     collection_id: &str,
 ) -> Result<Catalog, DataServerError> {
     let items = client.fetch_items(Some(time_range), None)?;
+    Ok(merge_stac_range(
+        existing_catalog,
+        &items,
+        time_range,
+        collection_id,
+    ))
+}
 
+/// Merge the STAC items listed for `time_range` into a copy of
+/// `existing_catalog` as stub entries, the second half of
+/// [`fetch_stac_range`] for a caller that lists the items itself (an EDR
+/// query's bounded listing, #1075). Existing entries are preserved.
+pub fn merge_stac_range(
+    existing_catalog: &Catalog,
+    items: &[crate::stac::StacItem],
+    time_range: (chrono::DateTime<Utc>, chrono::DateTime<Utc>),
+    collection_id: &str,
+) -> Catalog {
     tracing::info!(
         "[{}] STAC: fetched {} items for range {}/{}",
         collection_id,
@@ -593,7 +688,7 @@ pub fn fetch_stac_range(
     // Start with existing entries
     let mut entries = existing_catalog.entries.clone();
 
-    for item in &items {
+    for item in items {
         // Skip if we already have this timestamp
         if entries.contains_key(&item.datetime) {
             continue;
@@ -618,11 +713,11 @@ pub fn fetch_stac_range(
     let temporal_extent = existing_catalog.temporal_extent;
     let spatial_extent = existing_catalog.spatial_extent;
 
-    Ok(Catalog {
+    Catalog {
         entries,
         temporal_extent,
         spatial_extent,
-    })
+    }
 }
 
 /// Poll STAC for new items since the latest catalog entry.
@@ -953,6 +1048,75 @@ mod tests {
             cached_lock_ptr, reused_lock_ptr,
             "scan_directory must clone the prior DataSource (sharing Arc<OnceLock<...>>) for unchanged files"
         );
+    }
+
+    /// A file that appears between polls waits in `pending` until the
+    /// shared `PendingFile` has seen its size unchanged on two polls after
+    /// the first; a size change restarts the count. The initial scan
+    /// accepts every file at once.
+    #[test]
+    fn scan_directory_holds_a_new_file_until_its_size_is_stable() {
+        use std::io::Write;
+        use std::time::SystemTime;
+
+        let src_dir = ["testdata/radar", "../../testdata/radar"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .expect("testdata/radar fixture");
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "meteocore_pending_test_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(tmp_dir.clone());
+        let copy = |name: &str| {
+            std::fs::copy(src_dir.join(name), tmp_dir.join(name)).unwrap();
+        };
+        let pattern = FilenameMatcher::from_pattern(
+            r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif",
+            "%Y%m%dT%H%MZ",
+        )
+        .unwrap();
+        let mut pending = BTreeMap::new();
+        let mut scan = |previous: &Catalog| {
+            let existing: HashMap<&Path, &FileEntry> = previous
+                .entries
+                .values()
+                .map(|e| (e.path.as_path(), e))
+                .collect();
+            scan_directory(&tmp_dir, &pattern, &[], &mut pending, &existing).unwrap()
+        };
+
+        copy("radar_20260324T2315Z.tif");
+        let catalog = scan(&Catalog::empty());
+        assert_eq!(catalog.entries.len(), 1, "the initial scan accepts at once");
+
+        copy("radar_20260324T2320Z.tif");
+        let catalog = scan(&catalog);
+        assert_eq!(catalog.entries.len(), 1, "first seen: pending");
+        // Still being written: the size grows, which restarts the count.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(tmp_dir.join("radar_20260324T2320Z.tif"))
+            .unwrap()
+            .write_all(b"tail")
+            .unwrap();
+        let catalog = scan(&catalog);
+        let catalog = scan(&catalog);
+        assert_eq!(catalog.entries.len(), 1, "one unchanged poll is not enough");
+        let catalog = scan(&catalog);
+        assert_eq!(catalog.entries.len(), 2, "two unchanged polls settle it");
     }
 
     /// Regression test for the #253 round-2 reviewer catch: when a local file

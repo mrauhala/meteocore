@@ -22,6 +22,9 @@
   document.querySelectorAll('[data-page-size]').forEach(select => select.addEventListener('change', event => {
     const url = new URL(location.href); url.searchParams.set('limit', event.target.value); url.searchParams.delete('offset'); url.searchParams.set('f','html'); location.href = url.href;
   }));
+  document.querySelectorAll('[data-sort]').forEach(select => select.addEventListener('change', event => {
+    const url = new URL(location.href); url.searchParams.set('sortby', event.target.value); url.searchParams.delete('offset'); url.searchParams.set('f','html'); location.href = url.href;
+  }));
   function collectionTab() {
     const active = location.hash === '#metadata' ? 'metadata' : 'overview';
     document.querySelectorAll('[data-collection-view]').forEach(view => { view.hidden = view.id !== active; });
@@ -54,12 +57,21 @@
     if (!form) return;
     const prefix = details.dataset.disclosure === 'collection-search' ? 'meteocore-search-disclosure:' : 'meteocore-disclosure:' + details.dataset.disclosure + ':';
     const key = prefix + new URL(form.action,location.href).pathname;
-    try { details.open = sessionStorage.getItem(key) === 'open'; } catch (_) {}
-    const remember = () => {
-      try { sessionStorage.setItem(key,details.open ? 'open' : 'closed'); } catch (_) {}
+    // A field the request was rejected for stays in view (#1132), as does
+    // the server's choice to open it: an items request that filters or
+    // sorts (#1143). An Overview chip names the builder in the fragment.
+    const invalid = details.querySelector('[aria-invalid="true"]') !== null;
+    const requested = details.id === 'item-builder' && /^#(item-builder|filter=|sort=)/.test(location.hash);
+    let stored = false;
+    try { stored = sessionStorage.getItem(key) === 'open'; } catch (_) {}
+    details.open = details.open || invalid || requested || stored;
+    // Only the reader's own choice is remembered: a toggle event also
+    // follows the opening above, which must not outlast this page.
+    const remember = open => {
+      try { sessionStorage.setItem(key,open ? 'open' : 'closed'); } catch (_) {}
     };
-    details.addEventListener('toggle',remember);
-    form.addEventListener('submit',remember);
+    details.querySelector(':scope > summary')?.addEventListener('click',() => remember(!details.open));
+    form.addEventListener('submit',() => remember(details.open));
   });
 
   document.querySelectorAll('.query-form').forEach(form => {
@@ -103,6 +115,56 @@
       }
       update();
     });
+    // The pickers fill `datetime` (#1143): UTC, `..` for an open end. They
+    // listen before the form, so the draft sees the joined value.
+    const datetime = form.querySelector('[data-param="datetime"]');
+    const pickers = [form.querySelector('[data-datetime-start]'), form.querySelector('[data-datetime-end]')];
+    if (datetime && pickers.every(Boolean)) {
+      const bound = input => input.value ? (input.value.length === 16 ? input.value + ':00' : input.value) + 'Z' : '..';
+      pickers.forEach(picker => picker.addEventListener('input', () => {
+        datetime.value = pickers.some(p => p.value) ? pickers.map(bound).join('/') : '';
+      }));
+    }
+    // A sortable property and a direction make `sortby`; a value the
+    // selects cannot show (several keys) stays as given.
+    const sortProperty = form.querySelector('[data-sort-property]');
+    const sortDirection = form.querySelector('[data-sort-direction]');
+    const sortby = form.querySelector('[data-sortby]');
+    if (sortProperty && sortDirection && sortby) {
+      const compose = () => {
+        const raw = sortProperty.selectedOptions[0]?.hasAttribute('data-raw');
+        sortby.value = !sortProperty.value ? '' : raw ? sortProperty.value : sortDirection.value + sortProperty.value;
+        sortDirection.disabled = !sortProperty.value || raw;
+      };
+      sortProperty.addEventListener('input', compose); sortDirection.addEventListener('input', compose);
+      compose();
+    }
+    // The map's view as the box, from the items page's map (map.js keeps
+    // it in `data-view`).
+    const useView = form.querySelector('[data-use-map-view]');
+    const mapElement = document.getElementById('feature-map');
+    if (useView && mapElement) {
+      useView.hidden = false;
+      useView.addEventListener('click', () => {
+        const bbox = form.querySelector('[data-param="bbox"]');
+        const status = form.querySelector('[data-map-view-status]');
+        if (mapElement.hidden || !mapElement.dataset.view) { status.textContent = 'The map is not available. Enter the bounds.'; return; }
+        bbox.value = mapElement.dataset.view; status.textContent = '';
+        bbox.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+    }
+    // An Overview chip opens the builder at its property (#1143).
+    const chosen = /^#(filter|sort)=(.+)$/.exec(location.hash);
+    if (chosen) {
+      let name = chosen[2];
+      try { name = decodeURIComponent(name); } catch (_) {}
+      const select = form.querySelector(chosen[1] === 'filter' ? '[data-new-property]' : '[data-sort-property]');
+      if (select && [...select.options].some(option => option.value === name)) {
+        select.value = name;
+        select.dispatchEvent(new Event('input', { bubbles: true }));
+        (chosen[1] === 'filter' ? form.querySelector('[data-new-value]') : sortDirection)?.focus();
+      }
+    }
     form.querySelectorAll('[data-clear-predicate]').forEach(button => button.addEventListener('click', () => {
       const input = button.closest('[data-predicate]').querySelector('[data-param]');
       input.value = '';
@@ -136,7 +198,9 @@
     const rows = JSON.parse(itemProperties.textContent);
     const table = document.querySelector('.item-table');
     const choices = [...document.querySelectorAll('[data-item-column]')];
-    const key = 'meteocore-item-columns:' + location.pathname;
+    // Kept in this browser for the collection, the same on every API root
+    // serving it (#1143).
+    const key = 'meteocore-item-columns:' + itemProperties.dataset.collection;
     const status = document.querySelector('[data-column-status]');
     function cellValue(cell, value, present) {
       if (!present) { cell.textContent = 'Absent'; return; }
@@ -170,7 +234,7 @@
       status.textContent = `${names.length} property columns selected`;
     }
     try {
-      const saved = JSON.parse(sessionStorage.getItem(key));
+      const saved = JSON.parse(localStorage.getItem(key));
       if (Array.isArray(saved) && saved.every(n => typeof n === 'string')) {
         // Retain selected fields even when absent from a later response page.
         saved.slice(0,8).forEach(name => {
@@ -184,7 +248,7 @@
     } catch (_) { /* Server-rendered defaults remain usable. */ }
     choices.forEach(choice => choice.addEventListener('change',() => {
       const names=choices.filter(c => c.checked).map(c => c.value).slice(0,8);
-      applyColumns(names); try { sessionStorage.setItem(key,JSON.stringify(names)); } catch (_) {}
+      applyColumns(names); try { localStorage.setItem(key,JSON.stringify(names)); } catch (_) {}
     }));
   }
   document.getElementById('property-search')?.addEventListener('input', event => {

@@ -1,0 +1,27 @@
+[package]
+name = "engine-netcdf"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "CF-NetCDF gridded forecast engine (local or HTTP-range NetCDF files -> WMS/Maps/Tiles)"
+
+[dependencies]
+ds-core = { path = "../core" }
+ds-cache = { path = "../ds-cache" }
+ds-executor = { path = "../ds-executor" }
+ds-poll = { path = "../ds-poll" }
+ds-storage = { path = "../storage" }
+arc-swap = "1"
+chrono = { version = "0.4", features = ["serde"] }
+hdf5-reader = { version = "0.9.1", default-features = false }
+netcdf-reader = { version = "0.9.1", default-features = false, features = ["netcdf4"] }
+thiserror = "2"
+# The I/O runtime remote reads run on, and `block_in_place` around a field
+# read's fill and wait (io.rs, field.rs).
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+toml = "1"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }

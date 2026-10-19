@@ -5,6 +5,7 @@ mod encode;
 /// 5×7 bitmap font for in-image text (legend labels). Crate-internal — an
 /// implementation detail of the legend renderer, not part of the public API.
 pub(crate) mod font;
+mod layer_style;
 pub mod metatile;
 pub mod palette;
 pub mod palette_formats;
@@ -14,24 +15,28 @@ pub mod style;
 
 pub use colormap::{
     parse_hex_color, BuiltinColormap, ColorMap, ColorStop, IntegerLutColorMap, LinearColorMap,
-    LutColorMap, OverlayColorMap,
+    LutColorMap, OverlayColorMap, SymbolColorMap,
 };
 pub use composite::{
     compose_rgb, compose_tiles, composite_legend_json, composite_units, render_composite,
-    render_composite_legend, render_composite_tiles, ChannelSource, ChannelSpec, CompositeSpec,
-    COMPOSITE_STYLE,
+    render_composite_legend, render_composite_tiles, render_composite_tiles_rgba, ChannelSource,
+    ChannelSpec, CompositeSpec, COMPOSITE_STYLE,
 };
-pub use encode::{encode_jpeg, encode_png, encode_webp, flatten_onto};
+pub use encode::{draw_over, encode_jpeg, encode_png, encode_webp, flatten_onto};
+pub use layer_style::{resolve_layer_style, LayerStyle, LayerStyleError};
 pub use metatile::{
-    render_metatiled, render_metatiled_composite, MetaTile, MetaTileStats, TileKeyPrefix,
-    TilePixelCache,
+    assemble_metatiled, assemble_metatiled_composite, render_metatiled, render_metatiled_composite,
+    MetaTile, MetaTilePixels, MetaTileStats, TileKeyPrefix, TilePixelCache,
 };
 pub use palette::{
     builtin_palette, builtin_palette_arc, builtin_palettes, Interpolation, Palette, PaletteInsert,
     PaletteRegistry,
 };
 pub use palette_formats::{parse_cpt, parse_gdal_txt, parse_pal};
-pub use plot::{render_chart, render_heatmap, Heatmap, OverlayLine, Panel, Series};
+pub use plot::{
+    render_chart, render_heatmap, Heatmap, OverlayLine, Panel, Series, HEATMAP_MAX_HEIGHT_PX,
+    HEATMAP_MIN_PANEL_PX,
+};
 pub use rasterize::{fill_polygon, Combine};
 pub use style::{ResolvedColormap, StyleContext, StyleSpec};
 
@@ -39,12 +44,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use quick_cache::sync::Cache;
 
 use ds_core::error::DataServerError;
 use ds_core::map_engine::RasterTile;
 
-/// Output image format.
+/// Output image format, with the encoder quality it is written at.
 ///
 /// [`Png`] auto-selects an 8-bit indexed-palette encoding ("PNG8") when the
 /// rendered image carries ≤256 distinct RGBA colours — typical of every
@@ -52,21 +56,118 @@ use ds_core::map_engine::RasterTile;
 /// Bytes are roughly 3–4× smaller than the 32-bit RGBA path for the same
 /// image; content-type is `image/png` either way. See [`encode_png`] for the
 /// byte-level contract.
+///
+/// `Jpeg` and `Webp` carry a quality from 1 to [`MAX_QUALITY`]: the JPEG
+/// quality factor, and for WebP 1–99 lossy encoding at that quality and 100
+/// lossless (see [`encode_webp`]). The quality is part of the value, so every
+/// cache key holding a format (the rendered-image [`CacheKey`]) keeps a lossy
+/// and a lossless encode of one view apart. [`ImageFormat::JPEG`] and
+/// [`ImageFormat::WEBP`] are the defaults a request gets without a quality.
+///
+/// [`Png`]: ImageFormat::Png
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageFormat {
     Png,
-    Jpeg,
-    Webp,
+    Jpeg { quality: u8 },
+    Webp { quality: u8 },
 }
 
+/// The highest encoder quality. For WebP it selects lossless encoding.
+pub const MAX_QUALITY: u8 = 100;
+
+/// JPEG quality when a request names none.
+pub const DEFAULT_JPEG_QUALITY: u8 = 85;
+
 impl ImageFormat {
+    /// JPEG at [`DEFAULT_JPEG_QUALITY`].
+    pub const JPEG: Self = Self::Jpeg {
+        quality: DEFAULT_JPEG_QUALITY,
+    };
+
+    /// Lossless WebP, the WebP default.
+    pub const WEBP: Self = Self::Webp {
+        quality: MAX_QUALITY,
+    };
+
     pub fn content_type(&self) -> &'static str {
         match self {
             ImageFormat::Png => "image/png",
-            ImageFormat::Jpeg => "image/jpeg",
-            ImageFormat::Webp => "image/webp",
+            ImageFormat::Jpeg { .. } => "image/jpeg",
+            ImageFormat::Webp { .. } => "image/webp",
         }
     }
+
+    /// The encoder quality, `None` for PNG.
+    pub fn quality(&self) -> Option<u8> {
+        match *self {
+            ImageFormat::Png => None,
+            ImageFormat::Jpeg { quality } | ImageFormat::Webp { quality } => Some(quality),
+        }
+    }
+
+    /// This format at the quality a request without one gets.
+    pub fn with_default_quality(self) -> Self {
+        match self {
+            ImageFormat::Png => ImageFormat::Png,
+            ImageFormat::Jpeg { .. } => ImageFormat::JPEG,
+            ImageFormat::Webp { .. } => ImageFormat::WEBP,
+        }
+    }
+
+    /// The format a request is encoded in: its explicit `quality`, else for
+    /// WebP the collection's `webp_default` (`[wms] webp_quality`), else the
+    /// format's own default (JPEG 85, lossless WebP). PNG has no quality;
+    /// [`parse_quality`] rejects one for it, so PNG is returned as is.
+    pub fn with_quality(self, requested: Option<u8>, webp_default: Option<u8>) -> Self {
+        match self {
+            ImageFormat::Png => ImageFormat::Png,
+            ImageFormat::Jpeg { quality } => ImageFormat::Jpeg {
+                quality: requested.unwrap_or(quality),
+            },
+            ImageFormat::Webp { quality } => ImageFormat::Webp {
+                quality: requested.or(webp_default).unwrap_or(quality),
+            },
+        }
+    }
+
+    /// One byte per media type for the key-derived ETag, fixed so a
+    /// default-quality key keeps the ETag it had before formats carried one.
+    fn etag_code(&self) -> u8 {
+        match self {
+            ImageFormat::Png => 0,
+            ImageFormat::Jpeg { .. } => 1,
+            ImageFormat::Webp { .. } => 2,
+        }
+    }
+}
+
+/// Parse a request's encoder quality: WMS `QUALITY`, Maps and Tiles
+/// `quality`. `param` is the parameter's name as the request spells it, for
+/// the error message.
+///
+/// An integer from 1 to [`MAX_QUALITY`]; omitted or blank is `None`. It
+/// applies to JPEG and WebP only, so any value with `format` PNG is an error
+/// rather than silently ignored. The `Err` is the client-facing message for
+/// the API's 400.
+pub fn parse_quality(
+    param: &str,
+    raw: Option<&str>,
+    format: ImageFormat,
+) -> Result<Option<u8>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let quality = raw
+        .parse::<u8>()
+        .ok()
+        .filter(|q| (1..=MAX_QUALITY).contains(q))
+        .ok_or_else(|| format!("{param} '{raw}' must be an integer from 1 to {MAX_QUALITY}"))?;
+    if format == ImageFormat::Png {
+        return Err(format!(
+            "{param} applies only to image/jpeg and image/webp, not image/png"
+        ));
+    }
+    Ok(Some(quality))
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +198,10 @@ pub struct StyleInfo {
 pub struct CacheKey {
     pub layer: String,
     pub style: String,
-    pub format: u8, // 0=png, 1=jpeg, 2=webp
+    /// The format as encoded, quality included: the request's effective
+    /// quality (after the collection's WebP default), so a lossy and a
+    /// lossless response never share an entry.
+    pub format: ImageFormat,
     pub crs: String,
     pub bbox: [i64; 4], // bbox quantized to microdegrees (6 decimal places)
     pub width: u32,
@@ -160,7 +264,7 @@ impl CacheKey {
         fnv1a_mix(&mut h, b"|");
         fnv1a_mix(&mut h, self.style.as_bytes());
         fnv1a_mix(&mut h, b"|");
-        fnv1a_mix(&mut h, &[self.format]);
+        fnv1a_mix(&mut h, &[self.format.etag_code()]);
         fnv1a_mix(&mut h, self.crs.as_bytes());
         fnv1a_mix(&mut h, b"|");
         for v in &self.bbox {
@@ -220,6 +324,14 @@ impl CacheKey {
         if let Some(bg) = self.background {
             fnv1a_mix(&mut h, b"|bg");
             fnv1a_mix(&mut h, &bg);
+        }
+        // The encoder quality, only when it is not the format's default
+        // (JPEG 85, lossless WebP), so default-quality keys keep theirs.
+        if self.format != self.format.with_default_quality() {
+            if let Some(quality) = self.format.quality() {
+                fnv1a_mix(&mut h, b"|q");
+                fnv1a_mix(&mut h, &[quality]);
+            }
         }
         format!("\"{h:016x}\"")
     }
@@ -312,61 +424,147 @@ impl CachedRendered {
     }
 }
 
-/// Max distinct `(width, height, background)` all-nodata tiles retained (see
-/// [`background_tile`]). 64 covers any realistic mix of client viewport sizes;
-/// beyond that the LRU recycles.
-const EMPTY_TILE_CACHE_ITEMS: usize = 64;
+/// Which deterministic solid image a [`SOLID_IMAGE_CACHE`] entry holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SolidImage {
+    /// The all-nodata image ([`background_tile`]): every pixel transparent.
+    Empty,
+    /// The WMS error tile ([`error_tile`]): every pixel [`ERROR_TILE_RGBA`].
+    Error,
+}
 
-/// `(width, height, background)` of a memoized all-nodata tile.
-type EmptyTileKey = (u32, u32, Option<[u8; 3]>);
+/// The pixel of the WMS error tile: semi-transparent red, which makes the
+/// failed area of a map visible without hiding the layers under it.
+const ERROR_TILE_RGBA: [u8; 4] = [255, 0, 0, 100];
 
-/// Process-global cache of all-nodata PNGs keyed by output dimensions and
-/// background (`None` = transparent), as ready-to-serve [`CachedRendered`]
-/// entries (bytes + their stable FNV-1a ETag).
+/// `(image, width, height, background, format)` of a memoized solid image.
+/// The format carries its encoder quality, so a PNG, a JPEG and a lossy and a
+/// lossless WebP of one size are four entries (#1091).
+type SolidImageKey = (SolidImage, u32, u32, Option<[u8; 3]>, ImageFormat);
+
+/// Byte budget of [`SOLID_IMAGE_CACHE`]. A solid lossless WebP stays a few
+/// dozen bytes at any size, but the other formats grow with the pixel count.
+/// A solid 1920 × 1080 image is about 13 kB in PNG and 33 kB in JPEG at the
+/// default quality. At 8000 × 8000, the API cap, which only a raised
+/// `MC_RENDER_MEMORY_MB` admits, about 0.4 MB in PNG, 1 MB in JPEG and nearly
+/// 2 MB in JPEG at quality 100, scaled from measurements at 2048 × 2048.
+/// 32 MiB keeps several hundred full-screen viewports. The 64-entry bound it
+/// replaces let a WIDTH/HEIGHT/FORMAT fan-out pin over 100 MB.
+const SOLID_IMAGE_CACHE_BYTES: u64 = 32 * ds_cache::MIB;
+
+/// Process-global memo of the all-nodata images and the WMS error tile, keyed
+/// by [`SolidImageKey`], as ready-to-serve [`CachedRendered`] entries (bytes +
+/// their stable FNV-1a ETag).
 ///
-/// WMS / Maps `GetMap` take an all-nodata fast path on off-coverage viewports;
-/// the encoded PNG and its ETag are identical for a given
-/// `(width, height, background)`, so encoding once per distinct key and cloning
-/// the `Arc`-backed bytes is far cheaper than re-allocating `width·height·4`
-/// bytes and re-encoding + re-hashing on every empty response (#171). The Tiles
-/// service (always 256×256) sources its single global from here too, so all
-/// three raster APIs share one mechanism. Bounded by item count so a
-/// `?WIDTH=…&HEIGHT=…&BGCOLOR=…` fan-out can't pin unbounded memory — an abuser
-/// just cycles the LRU; a real client uses a handful of viewport sizes.
-static EMPTY_TILE_CACHE: std::sync::LazyLock<Cache<EmptyTileKey, CachedRendered>> =
-    std::sync::LazyLock::new(|| Cache::new(EMPTY_TILE_CACHE_ITEMS));
+/// WMS / Maps / Tiles take an all-nodata fast path on off-coverage views, and
+/// WMS answers a failed render with the error tile; the encoded image and its
+/// ETag are identical for a given key, so encoding once per distinct key and
+/// cloning the `Arc`-backed bytes is far cheaper than re-allocating
+/// `width·height·4` bytes and re-encoding + re-hashing on every such response
+/// (#171, #1093). The Tiles service's 256×256 PNG global is sourced from here
+/// too, so all three raster APIs share one mechanism.
+///
+/// Bounded by bytes ([`SOLID_IMAGE_CACHE_BYTES`]), not entries, so a
+/// `?WIDTH=…&HEIGHT=…&BGCOLOR=…&FORMAT=…` fan-out can't pin unbounded memory
+/// whatever the sizes: an abuser just cycles the LRU; a real client uses a
+/// handful of viewport sizes. One shard, so an entry up to nearly the whole
+/// budget is admitted: the default sharding would split the budget into
+/// slices smaller than one large JPEG, and never keep it.
+static SOLID_IMAGE_CACHE: std::sync::LazyLock<
+    ds_cache::ByteBoundedCache<SolidImageKey, CachedRendered>,
+> = std::sync::LazyLock::new(|| {
+    ds_cache::ByteBoundedCache::new_single_shard(
+        SOLID_IMAGE_CACHE_BYTES,
+        4 * 1024,
+        weigh_cached::<SolidImageKey>,
+    )
+});
 
-/// A fully-transparent `width`×`height` PNG as a ready-to-serve
-/// [`CachedRendered`], encoded once per distinct size and cloned thereafter
-/// (#171). Use this for the all-nodata fast path instead of allocating and
-/// encoding a fresh transparent image on every empty response.
-pub fn empty_tile(width: u32, height: u32) -> Result<CachedRendered, DataServerError> {
-    background_tile(width, height, None)
+/// An all-nodata `width`×`height` image in `format` as a ready-to-serve
+/// [`CachedRendered`], encoded once per distinct size and format and cloned
+/// thereafter (#171): transparent in PNG and WebP, white in JPEG, which has
+/// no alpha (what [`encode_jpeg`] makes of a transparent pixel). Use this for
+/// the all-nodata fast path instead of allocating and encoding a fresh image
+/// on every empty response.
+///
+/// A miss encodes on the calling thread, and a concurrent caller for the same
+/// image waits for that encode: call it from a blocking worker, such as the
+/// render job that found the view empty (#1093), never from an async request
+/// worker.
+pub fn empty_tile(
+    width: u32,
+    height: u32,
+    format: ImageFormat,
+) -> Result<CachedRendered, DataServerError> {
+    background_tile(width, height, None, format)
 }
 
 /// [`empty_tile`] for a request that may ask for opaque output: `None` is the
-/// transparent tile, `Some(rgb)` a solid opaque PNG of that colour — what an
-/// all-nodata WMS `TRANSPARENT=FALSE` view renders to (every pixel is
-/// background). Memoized per `(width, height, background)` alike.
+/// transparent image, `Some(rgb)` a solid opaque image of that colour — what
+/// an all-nodata WMS `TRANSPARENT=FALSE` or JPEG view renders to (every pixel
+/// is background). Encoded by [`encode_rgba`], the entry point every
+/// populated render goes through, so an empty image is the format and quality
+/// the request asked for (#1091). Memoized per
+/// `(width, height, background, format)`; like [`empty_tile`], call it from a
+/// blocking worker.
 pub fn background_tile(
     width: u32,
     height: u32,
     background: Option<[u8; 3]>,
+    format: ImageFormat,
 ) -> Result<CachedRendered, DataServerError> {
-    EMPTY_TILE_CACHE.get_or_insert_with(&(width, height, background), || {
-        let mut rgba = vec![0u8; width as usize * height as usize * 4];
-        if let Some(bg) = background {
-            flatten_onto(&mut rgba, bg);
-        }
-        Ok(CachedRendered::new(Bytes::from(encode_png(
-            &rgba, width, height,
+    solid_image(SolidImage::Empty, width, height, background, format)
+}
+
+/// The WMS error tile: a `width`×`height` image of semi-transparent red that
+/// a GetMap whose render failed answers with, so the failed area stays
+/// visible. In `format` at its quality like any map image (#1091), composited
+/// over `background` when the request asked for opaque output (always for
+/// JPEG, which has no alpha), so PNG and WebP keep the alpha a JPEG cannot.
+///
+/// Memoized like [`background_tile`], per
+/// `(width, height, background, format)` (#1093): during an engine outage
+/// every GetMap fails, and each would otherwise re-encode the same image.
+/// Single-flight, so concurrent failures of one size share one encode. Like
+/// [`empty_tile`], call it from a blocking worker, such as the render job
+/// whose render failed.
+pub fn error_tile(
+    width: u32,
+    height: u32,
+    background: Option<[u8; 3]>,
+    format: ImageFormat,
+) -> Result<CachedRendered, DataServerError> {
+    solid_image(SolidImage::Error, width, height, background, format)
+}
+
+/// One [`SOLID_IMAGE_CACHE`] entry, encoded by [`encode_rgba`] on a miss.
+/// Concurrent callers for one key share one encode: `get_or_insert_with` is
+/// single-flight, and a failed encode inserts nothing.
+fn solid_image(
+    image: SolidImage,
+    width: u32,
+    height: u32,
+    background: Option<[u8; 3]>,
+    format: ImageFormat,
+) -> Result<CachedRendered, DataServerError> {
+    SOLID_IMAGE_CACHE.get_or_insert_with(&(image, width, height, background, format), || {
+        let pixel = match image {
+            SolidImage::Empty => [0u8; 4],
+            SolidImage::Error => ERROR_TILE_RGBA,
+        };
+        let mut rgba = pixel.repeat(width as usize * height as usize);
+        Ok(CachedRendered::new(Bytes::from(encode_rgba(
+            &mut rgba, width, height, format, background,
         )?)))
     })
 }
 
 /// Weight function: count the byte size of each cached rendered image
 /// (bytes + 18-byte quoted 16-hex-char ETag string + 64-byte overhead).
-fn weigh_rendered(_key: &CacheKey, val: &CachedRendered) -> u64 {
+/// The length is the whole allocation only because the encoders return
+/// exact-length buffers (#1052): `Bytes::from(vec)` keeps spare capacity.
+/// Shared by the rendered cache and the solid-image memo, whatever the key.
+fn weigh_cached<K>(_key: &K, val: &CachedRendered) -> u64 {
     val.bytes().len() as u64 + val.etag().len() as u64 + 64
 }
 
@@ -385,7 +583,7 @@ impl RenderedCache {
             cache: ds_cache::ByteBoundedCache::new(
                 capacity_mb.saturating_mul(ds_cache::MIB),
                 60 * 1024,
-                weigh_rendered,
+                weigh_cached::<CacheKey>,
             ),
         }
     }
@@ -486,20 +684,37 @@ pub fn render_tile_with_background(
     format: ImageFormat,
     background: Option<[u8; 3]>,
 ) -> Result<Vec<u8>, DataServerError> {
-    ds_core::deadline::check()?;
-    // Short-circuit for empty tiles: skip colorization, produce transparent RGBA directly.
-    let mut rgba = if tile.is_empty() {
-        vec![0u8; (tile.width * tile.height * 4) as usize]
-    } else {
-        colorize(tile, colormap)
-    };
+    let mut rgba = render_tile_rgba(tile, colormap)?;
     encode_rgba(&mut rgba, tile.width, tile.height, format, background)
 }
 
-/// Encode a rendered RGBA image in `format`, first compositing it over
-/// `background` when one is given (opaque output). `None` keeps the alpha
-/// channel; JPEG, which has none, then flattens onto white itself.
-pub(crate) fn encode_rgba(
+/// The RGBA pixels [`render_tile_with_background`] encodes: the tile
+/// through `colormap`, with no background. A WMS GetMap of several layers
+/// draws each layer's pixels over the last with [`draw_over`] and encodes
+/// the result once (#1181).
+pub fn render_tile_rgba(
+    tile: &RasterTile,
+    colormap: &dyn ColorMap,
+) -> Result<Vec<u8>, DataServerError> {
+    ds_core::deadline::check()?;
+    // Short-circuit for empty tiles: skip colorization, produce transparent RGBA directly.
+    Ok(if tile.is_empty() {
+        vec![0u8; (tile.width * tile.height * 4) as usize]
+    } else {
+        colorize(tile, colormap)
+    })
+}
+
+/// Encode a rendered RGBA image in `format` at its quality, first
+/// compositing it over `background` when one is given (opaque output).
+/// `None` keeps the alpha channel; JPEG, which has none, then flattens onto
+/// white itself.
+///
+/// The one encoder entry point for map images: colormapped and composite
+/// renders, meta-tile assembly, the all-nodata image ([`background_tile`])
+/// and the WMS error tile ([`error_tile`]) all go through it, so they cannot
+/// drift apart in format, quality or background handling.
+pub fn encode_rgba(
     rgba: &mut [u8],
     width: u32,
     height: u32,
@@ -511,8 +726,8 @@ pub(crate) fn encode_rgba(
     }
     match format {
         ImageFormat::Png => encode::encode_png(rgba, width, height),
-        ImageFormat::Jpeg => encode::encode_jpeg(rgba, width, height),
-        ImageFormat::Webp => encode::encode_webp(rgba, width, height),
+        ImageFormat::Jpeg { quality } => encode::encode_jpeg(rgba, width, height, quality),
+        ImageFormat::Webp { quality } => encode::encode_webp(rgba, width, height, quality),
     }
 }
 
@@ -852,11 +1067,7 @@ pub fn render_legend(
         }
     }
 
-    match format {
-        ImageFormat::Png => encode::encode_png(&rgba, width, height),
-        ImageFormat::Jpeg => encode::encode_jpeg(&rgba, width, height),
-        ImageFormat::Webp => encode::encode_webp(&rgba, width, height),
-    }
+    encode_rgba(&mut rgba, width, height, format, None)
 }
 
 /// Write one RGBA pixel, clipped to the buffer bounds. The legend's geometry can
@@ -998,7 +1209,7 @@ mod tests {
         let key_for = |layer: &str| CacheKey {
             layer: layer.to_string(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:4326".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1216,8 +1427,8 @@ mod tests {
 
     #[test]
     fn empty_tile_is_deterministic_and_memoized() {
-        let a = empty_tile(64, 48).expect("encode empty tile");
-        let b = empty_tile(64, 48).expect("encode empty tile");
+        let a = empty_tile(64, 48, ImageFormat::Png).expect("encode empty tile");
+        let b = empty_tile(64, 48, ImageFormat::Png).expect("encode empty tile");
         // Same dimensions → identical bytes + ETag (the second call is a cache
         // hit), so browsers can revalidate empty responses across requests.
         assert_eq!(a.etag(), b.etag(), "same (w,h) must yield a stable ETag");
@@ -1226,31 +1437,114 @@ mod tests {
             b.bytes(),
             "same (w,h) must yield identical bytes"
         );
+        assert_eq!(a.bytes().as_ptr(), b.bytes().as_ptr(), "one encode");
         // Different dimensions → different content (and a different ETag).
-        let c = empty_tile(100, 100).expect("encode empty tile");
+        let c = empty_tile(100, 100, ImageFormat::Png).expect("encode empty tile");
         assert_ne!(a.etag(), c.etag(), "different (w,h) must differ");
         assert!(!a.bytes().is_empty(), "an empty tile is still a real PNG");
     }
 
+    /// #1093: the WMS error tile is memoized like the empty image. Two
+    /// failures of one size and format share one encode (the same
+    /// allocation), each entry is the shared encoder's image of the red pixel
+    /// in its format, over its background, and the error tile never aliases
+    /// the empty image of the same key.
+    #[test]
+    fn error_tile_is_memoized_per_size_background_and_format() {
+        let (w, h) = (37, 23);
+        let red = ERROR_TILE_RGBA.repeat((w * h) as usize);
+        let first = error_tile(w, h, None, ImageFormat::Png).unwrap();
+        let second = error_tile(w, h, None, ImageFormat::Png).unwrap();
+        assert_eq!(
+            first.bytes().as_ptr(),
+            second.bytes().as_ptr(),
+            "the second error tile is the first one's bytes, not a second encode"
+        );
+        assert_eq!(first.etag(), second.etag());
+        assert_eq!(first.bytes().as_ref(), encode_png(&red, w, h).unwrap());
+
+        let white = [255, 255, 255];
+        let jpeg = error_tile(w, h, Some(white), ImageFormat::Jpeg { quality: 40 }).unwrap();
+        let mut on_white = red.clone();
+        flatten_onto(&mut on_white, white);
+        assert_eq!(
+            jpeg.bytes().as_ref(),
+            encode_jpeg(&on_white, w, h, 40).unwrap()
+        );
+        let webp = error_tile(w, h, None, ImageFormat::WEBP).unwrap();
+        assert_eq!(webp.bytes().as_ref(), encode_webp(&red, w, h, 100).unwrap());
+
+        for (other, what) in [
+            (
+                error_tile(w, h, Some(white), ImageFormat::Png),
+                "a background",
+            ),
+            (error_tile(w + 1, h, None, ImageFormat::Png), "another size"),
+            (
+                background_tile(w, h, None, ImageFormat::Png),
+                "the empty image",
+            ),
+        ] {
+            assert_ne!(
+                other.unwrap().etag(),
+                first.etag(),
+                "{what} is another entry"
+            );
+        }
+        assert_eq!(
+            error_tile(w, h, None, ImageFormat::Png)
+                .unwrap()
+                .bytes()
+                .as_ptr(),
+            first.bytes().as_ptr(),
+            "the other entries did not replace the first"
+        );
+    }
+
+    /// Concurrent failures of one size wait for one encode instead of each
+    /// encoding the same image: every caller gets the same allocation.
+    #[test]
+    fn concurrent_error_tiles_share_one_encode() {
+        let (w, h, format) = (311, 197, ImageFormat::Jpeg { quality: 61 });
+        let barrier = std::sync::Barrier::new(8);
+        let pointers: Vec<usize> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let tile = error_tile(w, h, Some([0, 0, 0]), format).unwrap();
+                        tile.bytes().as_ptr() as usize
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        assert!(
+            pointers.iter().all(|&p| p == pointers[0]),
+            "one encode shared by every caller: {pointers:?}"
+        );
+    }
+
     #[test]
     fn background_tile_is_opaque_and_keyed_by_colour() {
-        let transparent = background_tile(8, 4, None).expect("encode");
+        let png = ImageFormat::Png;
+        let transparent = background_tile(8, 4, None, png).expect("encode");
         assert_eq!(
             transparent.etag(),
-            empty_tile(8, 4).expect("encode").etag(),
+            empty_tile(8, 4, png).expect("encode").etag(),
             "None is the transparent empty tile"
         );
         let bg = [0x33, 0x66, 0x99];
-        let opaque = background_tile(8, 4, Some(bg)).expect("encode");
+        let opaque = background_tile(8, 4, Some(bg), png).expect("encode");
         assert_ne!(opaque.etag(), transparent.etag());
         assert_eq!(
             opaque.etag(),
-            background_tile(8, 4, Some(bg)).expect("encode").etag(),
+            background_tile(8, 4, Some(bg), png).expect("encode").etag(),
             "memoized per (w, h, background)"
         );
         assert_ne!(
             opaque.etag(),
-            background_tile(8, 4, Some([255, 255, 255]))
+            background_tile(8, 4, Some([255, 255, 255]), png)
                 .expect("encode")
                 .etag()
         );
@@ -1267,6 +1561,92 @@ mod tests {
         let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
         let frame = reader.next_frame(&mut buf).unwrap();
         assert!(buf[..frame.buffer_size()].iter().all(|&i| i == 0));
+    }
+
+    /// #1091: the all-nodata image is the format and quality asked for, with
+    /// one memo entry per `(width, height, background, format)`: a PNG and a
+    /// JPEG of one size, or two qualities of one format, never share bytes.
+    #[test]
+    fn empty_tile_cache_keys_format_and_quality() {
+        let (w, h) = (24, 16);
+        let png = empty_tile(w, h, ImageFormat::Png).expect("png");
+        let jpeg = empty_tile(w, h, ImageFormat::JPEG).expect("jpeg");
+        let lossless = empty_tile(w, h, ImageFormat::WEBP).expect("webp");
+        let lossy = empty_tile(w, h, ImageFormat::Webp { quality: 60 }).expect("webp");
+        assert!(png.bytes().starts_with(&[0x89, b'P', b'N', b'G']));
+        assert!(jpeg.bytes().starts_with(&[0xFF, 0xD8, 0xFF]), "a JPEG");
+        for webp in [&lossless, &lossy] {
+            assert_eq!(&webp.bytes()[..4], b"RIFF");
+            assert_eq!(&webp.bytes()[8..12], b"WEBP");
+        }
+        // Lossless is one VP8L chunk; lossy with alpha is the extended
+        // container (VP8X + ALPH + VP8).
+        assert_eq!(&lossless.bytes()[12..16], b"VP8L");
+        assert_eq!(&lossy.bytes()[12..16], b"VP8X");
+
+        // Two JPEG qualities: different quantisation tables, different bytes.
+        let q85 = jpeg.bytes().clone();
+        let q20 = empty_tile(w, h, ImageFormat::Jpeg { quality: 20 }).expect("jpeg");
+        assert_ne!(q20.bytes(), &q85);
+        assert_ne!(q20.etag(), jpeg.etag());
+
+        // Each entry is what the shared encoder makes of the empty image, so a
+        // later call of another format cannot have overwritten it.
+        let transparent = vec![0u8; (w * h * 4) as usize];
+        assert_eq!(
+            jpeg.bytes().as_ref(),
+            encode_jpeg(&transparent, w, h, DEFAULT_JPEG_QUALITY).unwrap(),
+        );
+        assert_eq!(
+            lossy.bytes().as_ref(),
+            encode_webp(&transparent, w, h, 60).unwrap(),
+        );
+        assert_eq!(
+            empty_tile(w, h, ImageFormat::Png).unwrap().bytes(),
+            png.bytes()
+        );
+        assert_eq!(
+            empty_tile(w, h, ImageFormat::JPEG).unwrap().bytes(),
+            &q85,
+            "memoized per format: the q20 JPEG did not replace the q85 one"
+        );
+
+        // WebP keeps the alpha: every pixel decodes transparent.
+        let decoded = webp::Decoder::new(lossless.bytes()).decode().unwrap();
+        assert!(decoded.is_alpha());
+        assert!(decoded.as_chunks::<4>().0.iter().all(|p| p[3] == 0));
+    }
+
+    /// A background in a non-PNG format: JPEG and WebP of a solid BGCOLOR,
+    /// keyed apart from the transparent image of that format.
+    #[test]
+    fn background_tile_in_jpeg_and_webp() {
+        let (w, h) = (16, 8);
+        let bg = [0x33, 0x66, 0x99];
+        let mut solid = vec![0u8; (w * h * 4) as usize];
+        flatten_onto(&mut solid, bg);
+
+        let jpeg = background_tile(w, h, Some(bg), ImageFormat::Jpeg { quality: 70 }).unwrap();
+        assert_eq!(
+            jpeg.bytes().as_ref(),
+            encode_jpeg(&solid, w, h, 70).unwrap(),
+            "JPEG of the solid background at the requested quality"
+        );
+        assert_ne!(
+            jpeg.etag(),
+            empty_tile(w, h, ImageFormat::Jpeg { quality: 70 })
+                .unwrap()
+                .etag(),
+            "the white no-background JPEG is another entry"
+        );
+
+        let webp = background_tile(w, h, Some(bg), ImageFormat::WEBP).unwrap();
+        let decoded = webp::Decoder::new(webp.bytes()).decode().unwrap();
+        // An opaque lossless WebP may decode without an alpha channel.
+        let channels = if decoded.is_alpha() { 4 } else { 3 };
+        assert!(decoded
+            .chunks_exact(channels)
+            .all(|p| p[..3] == bg && (channels == 3 || p[3] == 255)));
     }
 
     /// The #206 correctness property: colorizing a `U8` tile through the
@@ -1421,7 +1801,7 @@ mod tests {
                 .into(),
         };
         let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 1.0);
-        let jpeg_bytes = render_tile(&tile, &cmap, ImageFormat::Jpeg).unwrap();
+        let jpeg_bytes = render_tile(&tile, &cmap, ImageFormat::JPEG).unwrap();
         assert!(jpeg_bytes[0] == 0xFF && jpeg_bytes[1] == 0xD8);
     }
 
@@ -1694,7 +2074,7 @@ mod tests {
         let base = CacheKey {
             layer: "radar".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1724,7 +2104,7 @@ mod tests {
         let base = CacheKey {
             layer: "ecmwf-fc".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1753,7 +2133,7 @@ mod tests {
         let base = CacheKey {
             layer: "ecmwf-fc".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1790,7 +2170,7 @@ mod tests {
         let base = CacheKey {
             layer: "cap".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1834,7 +2214,7 @@ mod tests {
         let base = CacheKey {
             layer: "radar".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 1, 1],
             width: 256,
@@ -1872,7 +2252,7 @@ mod tests {
         let key = CacheKey {
             layer: "radar".into(),
             style: "default".into(),
-            format: 0,
+            format: ImageFormat::Png,
             crs: "EPSG:3857".into(),
             bbox: [0, 0, 0, 0],
             width: 256,
@@ -1886,6 +2266,204 @@ mod tests {
         };
         // Pinned after introducing the `reference_time` field (cache-bust event).
         assert_eq!(key.etag(), "\"92a1d2349689898e\"");
+        // JPEG and WebP at their default quality keep the ETags they had
+        // when `format` was a bare 1 / 2 code; only another quality mixes in.
+        let jpeg = CacheKey {
+            format: ImageFormat::JPEG,
+            ..key.clone()
+        };
+        assert_eq!(jpeg.etag(), "\"fed5ae3148cdd289\"");
+        let webp = CacheKey {
+            format: ImageFormat::WEBP,
+            ..key.clone()
+        };
+        assert_eq!(webp.etag(), "\"4d28f2fa26aa942c\"");
+        let lossy = CacheKey {
+            format: ImageFormat::Webp { quality: 80 },
+            ..key
+        };
+        assert_eq!(lossy.etag(), "\"b05b73b226084439\"");
+    }
+
+    #[test]
+    fn cache_key_distinguishes_encoder_quality() {
+        // A lossy and a lossless WebP of one view differ in bytes; neither
+        // may be served for the other, nor one lossy quality for another.
+        let lossless = CacheKey {
+            layer: "sat/c13".into(),
+            style: "default".into(),
+            format: ImageFormat::WEBP,
+            crs: "EPSG:3857".into(),
+            bbox: [0, 0, 1, 1],
+            width: 256,
+            height: 256,
+            time: None,
+            parameter: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+            background: None,
+        };
+        let q80 = CacheKey {
+            format: ImageFormat::Webp { quality: 80 },
+            ..lossless.clone()
+        };
+        let q75 = CacheKey {
+            format: ImageFormat::Webp { quality: 75 },
+            ..lossless.clone()
+        };
+        let jpeg75 = CacheKey {
+            format: ImageFormat::Jpeg { quality: 75 },
+            ..lossless.clone()
+        };
+        for (a, b) in [(&lossless, &q80), (&q80, &q75), (&q75, &jpeg75)] {
+            assert_ne!(a, b);
+            assert_ne!(a.etag(), b.etag());
+        }
+        let cache = RenderedCache::new(1);
+        cache.insert(
+            lossless.clone(),
+            CachedRendered::new(Bytes::from_static(b"lossless")),
+        );
+        assert!(cache.get(&lossless).is_some());
+        assert!(cache.get(&q80).is_none());
+        cache.insert(q80.clone(), CachedRendered::new(Bytes::from_static(b"q80")));
+        assert_eq!(cache.get(&q80).unwrap().bytes().as_ref(), b"q80");
+        assert_eq!(cache.get(&lossless).unwrap().bytes().as_ref(), b"lossless");
+    }
+
+    #[test]
+    fn parse_quality_accepts_1_to_100_for_jpeg_and_webp() {
+        for format in [ImageFormat::JPEG, ImageFormat::WEBP] {
+            assert_eq!(parse_quality("quality", Some("1"), format), Ok(Some(1)));
+            assert_eq!(parse_quality("quality", Some(" 80 "), format), Ok(Some(80)));
+            assert_eq!(parse_quality("quality", Some("100"), format), Ok(Some(100)));
+            // Omitted or blank: no explicit quality.
+            assert_eq!(parse_quality("quality", None, format), Ok(None));
+            assert_eq!(parse_quality("quality", Some(""), format), Ok(None));
+        }
+        // PNG without a quality is fine.
+        assert_eq!(parse_quality("QUALITY", None, ImageFormat::Png), Ok(None));
+    }
+
+    #[test]
+    fn parse_quality_rejects_out_of_range_and_non_integers() {
+        for bogus in ["0", "101", "255", "256", "-1", "80.5", "1e2", "abc", "0x50"] {
+            let err = parse_quality("QUALITY", Some(bogus), ImageFormat::WEBP).expect_err(bogus);
+            assert_eq!(
+                err,
+                format!("QUALITY '{bogus}' must be an integer from 1 to 100"),
+                "{bogus}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_quality_rejects_a_value_for_png() {
+        let err = parse_quality("quality", Some("80"), ImageFormat::Png).unwrap_err();
+        assert_eq!(
+            err,
+            "quality applies only to image/jpeg and image/webp, not image/png"
+        );
+    }
+
+    #[test]
+    fn with_quality_resolves_request_then_collection_then_format_default() {
+        let webp = ImageFormat::WEBP;
+        // Neither: lossless, as before the parameter existed.
+        assert_eq!(webp.with_quality(None, None), ImageFormat::WEBP);
+        // The collection default applies when the request names none.
+        assert_eq!(
+            webp.with_quality(None, Some(70)),
+            ImageFormat::Webp { quality: 70 }
+        );
+        // An explicit quality wins, including 100 = lossless over a lossy
+        // collection default.
+        assert_eq!(
+            webp.with_quality(Some(90), Some(70)),
+            ImageFormat::Webp { quality: 90 }
+        );
+        assert_eq!(webp.with_quality(Some(100), Some(70)), ImageFormat::WEBP);
+        // The WebP default is not a JPEG default: JPEG keeps 85.
+        let jpeg = ImageFormat::JPEG;
+        assert_eq!(jpeg.with_quality(None, Some(70)), ImageFormat::JPEG);
+        assert_eq!(
+            jpeg.with_quality(Some(60), Some(70)),
+            ImageFormat::Jpeg { quality: 60 }
+        );
+        assert_eq!(
+            ImageFormat::Png.with_quality(None, Some(70)),
+            ImageFormat::Png
+        );
+        assert_eq!(ImageFormat::JPEG.quality(), Some(DEFAULT_JPEG_QUALITY));
+        assert_eq!(ImageFormat::WEBP.quality(), Some(MAX_QUALITY));
+        assert_eq!(ImageFormat::Png.quality(), None);
+        assert_eq!(
+            ImageFormat::Webp { quality: 40 }.with_default_quality(),
+            ImageFormat::WEBP
+        );
+    }
+
+    #[test]
+    fn render_tile_encodes_at_the_format_quality() {
+        // The quality carried by the format reaches the encoder: lossy WebP
+        // for 1–99, the lossless bitstream for 100.
+        let tile = RasterTile {
+            width: 64,
+            height: 64,
+            values: (0..64 * 64)
+                .map(|i| Some((i % 64) as f64 / 64.0 + (i / 64) as f64 / 128.0))
+                .collect::<Vec<_>>()
+                .into(),
+        };
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::Viridis, 0.0, 1.5);
+        let lossless = render_tile(&tile, &cmap, ImageFormat::WEBP).unwrap();
+        let lossy = render_tile(&tile, &cmap, ImageFormat::Webp { quality: 60 }).unwrap();
+        assert_eq!(&lossless[12..16], b"VP8L");
+        assert_ne!(&lossy[12..16], b"VP8L");
+        assert_ne!(lossless, lossy);
+    }
+
+    #[test]
+    fn rendered_cache_weight_covers_the_encoded_allocation() {
+        // #1052: the handlers cache `Bytes::from(render_tile(..))`, which keeps
+        // the whole Vec allocation, and `weigh_cached` counts the length. A
+        // sparse tile encodes to a small fraction of the encoders' worst-case
+        // reservations, so only an exact-length buffer keeps the weight honest.
+        let tile = RasterTile {
+            width: 256,
+            height: 256,
+            values: (0..256 * 256)
+                .map(|i| (i % 256 < 16 && i / 256 < 16).then_some(0.5))
+                .collect::<Vec<_>>()
+                .into(),
+        };
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::Viridis, 0.0, 1.0);
+        for format in [ImageFormat::Png, ImageFormat::JPEG, ImageFormat::WEBP] {
+            let encoded = render_tile(&tile, &cmap, format).unwrap();
+            let allocation = encoded.capacity() as u64;
+            let key = CacheKey {
+                layer: "radar".into(),
+                style: "default".into(),
+                format,
+                crs: "EPSG:3857".into(),
+                bbox: [0, 0, 1, 1],
+                width: 256,
+                height: 256,
+                time: None,
+                parameter: None,
+                z: None,
+                reference_time: None,
+                content_version: 0,
+                background: None,
+            };
+            let cached = CachedRendered::new(Bytes::from(encoded));
+            let weight = weigh_cached(&key, &cached);
+            assert!(
+                weight >= allocation,
+                "{format:?}: weight {weight} B under-counts a {allocation} B allocation"
+            );
+        }
     }
 
     #[test]

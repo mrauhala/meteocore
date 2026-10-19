@@ -1,0 +1,43 @@
+id = "gmgsi-global"
+title = "GMGSI global satellite mosaic"
+description = "NOAA/NESDIS Global Mosaic of Geostationary Satellite Imagery (GMGSI), hourly, about 8 km, 72°S to 72°N at every longitude: longwave IR and water vapour composited from GOES-East, GOES-West, Meteosat-10, Meteosat-9 and Himawari-9, from NOAA Open Data on AWS. The values are the mosaic's 8-bit display counts (0-255, brighter = colder or moister), not brightness temperatures: for display, not for measurement."
+engine_type = "satellite"
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["satellite", "GMGSI", "NOAA", "global", "mosaic", "infrared", "water vapour", "Europe"]
+
+[license]
+title = "NOAA Open Data Dissemination (NODD); unaltered NOAA data, attribution requested"
+url = "https://registry.opendata.aws/noaa-gmgsi/"
+
+# One global file per product per hour (longwave IR ~7.4 MB, water vapour
+# ~3.4 MB), published ~35-45 minutes after the hour, so the window must
+# reach back past the latest published hour. Startup ingests the whole
+# window. Shortwave IR (product = "SW", ~7.6 MB) and visible ("VIS",
+# ~8.9 MB) are published the same way.
+[satellite]
+provider = "gmgsi"
+endpoint = "https://s3.us-east-1.amazonaws.com"
+bucket = "noaa-gmgsi-pds"
+time_window = "-PT3H"
+poll_interval_secs = 300
+
+[[satellite.products]]
+parameter = "ir_longwave"
+title = "Longwave IR (display counts)"
+unit = "1"
+product = "LW"
+variable = "data"
+
+[[satellite.products]]
+parameter = "water_vapour"
+title = "Water vapour (display counts)"
+unit = "1"
+product = "WV"
+variable = "data"
+
+# Counts on a grey ramp: 0 black, 255 white, so cold cloud tops (IR) and
+# moist upper air (water vapour) are bright, as NOAA renders them.
+[wms]
+colormap = "grayscale"
+min = 0.0
+max = 255.0

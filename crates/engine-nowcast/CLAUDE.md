@@ -189,7 +189,8 @@ coasting, joins, or raw-byte forecast encoding. See
   WMS advertises), but an instance's `valid_times` is `[anchor]` — the
   product has one valid time, NOT the forecast leads the WMS layer renders.
   Selection: an instance pin resolves exactly or to the minute (the EDR id
-  is minute-precision; 404 otherwise) and a `datetime` excluding the
+  is the exact RFC 3339 anchor, but the compact id served before #947 was
+  minute-precision; 404 otherwise) and a `datetime` excluding the
   anchor is a 400; with no pin, `datetime` picks the NEWEST generation
   anchored INSIDE the interval (the #548 cell-history rule, start bound
   included); neither ⇒ latest. `Generation.interval_secs` is what turns
@@ -198,11 +199,15 @@ coasting, joins, or raw-byte forecast encoding. See
   field by the interval ratio before blending, so a skipped composite no
   longer biases the blended (and served) speed.
 - Block selection is by footprint overlap padded by one block each side
-  (a sub-block bbox still gets its block; edge bilinear sampling has both
-  neighbours — GRIB's enclosing-cell rule), a trailing partial block's
-  centre is clamped into the grid so served coordinates never leave the
-  spatial extent, and `y` ascends south→north like GRIB (ODIM/GeoTIFF are
-  north-first; a client must read `axes.y.values` either way).
+  (a sub-block bbox still gets its block — GRIB's enclosing-cell rule).
+  EDR returns nothing outside the area (#966): a rectangle keeps the
+  blocks whose footprint meets it, so the overlapping blocks a particle
+  client samples up to the edge keep their values and only the padding
+  is null; any other polygon keeps the blocks centred inside it (#671).
+  A trailing partial block's centre is clamped into the grid so served
+  coordinates never leave the spatial extent, and `y` ascends south→north
+  like GRIB (ODIM/GeoTIFF are north-first; a client must read
+  `axes.y.values` either way).
 - **`/preview` coupling:** `server/src/preview.rs` prefers the MAP time
   axis over EDR instants when both exist — because this collection's two
   surfaces are different products (anchors vs leads). Do not make
@@ -210,6 +215,15 @@ coasting, joins, or raw-byte forecast encoding. See
 - The whole-domain document is ~3k vectors (~30 KB before gzip) — no
   tiling; a client uploads it as one texture and bilinear-samples it, which
   reproduces the engine's own `MotionField::sample` field.
+- **Cells as EDR items (#970).** EDR `items` serves the tracked cells
+  (the `FeatureEngine`), and EDR GeoJSON requires each to name a query.
+  `item_radius` answers it from the served feature's own properties: a
+  radius query centred on the cell, `within` = `area_km2` as a disc,
+  `datetime` = `observed`. No floor: a circle narrower than a block still
+  gets the nearest block through the #671 mask fallback. Renaming
+  `area_km2` or `observed` silently drops a cell back to the collection
+  URL; `tests/integration.rs` `a_cell_item_names_a_radius_query_that_answers`
+  pins it.
 
 ## Lightning metrics (#616)
 

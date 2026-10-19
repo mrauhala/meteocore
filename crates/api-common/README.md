@@ -9,18 +9,22 @@ and API-specific fields.
 | Shared component | Responsibility |
 |---|---|
 | `CollectionRequest` | Decode controls, reject unsupported/duplicate names, validate values, negotiate representation before consulting engines |
-| `collections_response` | Sort by ID, filter before paging, counts, JSON/HTML, explicit-format self/next/prev and alternate links |
+| `JsonQuery` | axum's `Query` whose rejection, such as a parameter given twice, is the JSON 400 body instead of axum's plain text. Every struct-shaped query of the OGC API routes extracts with it: the `f` of each landing page, `/conformance` and `/collections/{id}` in Maps, Tiles, EDR, Features and the shared root, EDR's instance and data queries, and the Maps and Tiles render and legend routes |
+| `collections_response` | Filter, sort and page (JSON by id and up to 1,000 per page, HTML by title and 24 per page, unless `sortby` or `limit` says otherwise), counts, JSON/HTML, explicit-format self/next/prev links, and alternate links that spell out the page size and order |
 | `collection_metadata`, `collection_card` | Common descriptive fields, keywords, license and HTML alternate links; API fields may override defaults for EDR instances |
 | `collection_operation` | OpenAPI discovery operation, supported parameters, JSON/HTML responses and structured 400 errors |
 | `parameter_names`, `parameter_name_parameter` | Maps/Tiles parameter discovery: a multi-parameter raster's EDR-shaped `parameter_names` member, with label, unit and a parameter's own time axis, and the render routes' `parameter-name` OpenAPI component, one definition for every block. RGB composites (`MapEngine::composites`, #819) are entries too, with no unit and a `description` of their channels |
 | `legend_schema` | The Maps/Tiles legend routes' `legend` OpenAPI schema: a palette legend or an RGB composite's channel list, one definition for every block |
+| `subset` | The OGC 20-058 `subset` grammar (repeatable, comma-separated `axis(low:high)` / `axis(value)` expressions), axis assignment against a caller's axis table (aliases, case-insensitive; an unknown axis is an error), and `TimeSelection`: `datetime` instants and intervals, and time subsets with partial dates and `*`. `render_time` resolves a `RequestedTime` to the instant a map or map tile renders, one rule for both (Maps answers a selection with no time step 404, map tiles 204); `unknown_parameter` names a query parameter outside a route's list and `unknown_parameter_message` is the 400 that names the accepted ones, one wording for Maps and Tiles |
+| `map_frame` | Map output CRSs (`MapCrs`: codes, URIs, safe CURIEs, axis order, storage-CRS mapping), the frame a map covers and its `Content-Bbox`, the Scaling class' `scale-denominator` ↔ resolution conversion and default sizes, and the size rules Maps and map tiles share: `width`/`height` and `scale-denominator` parsing and the `MAX_MAP_DIMENSION`/`MAX_MAP_PIXELS` caps |
 | `CONFORMANCE_CLASSES` | One Common class inventory, combined with each API's own declarations |
 
 ## Shared OGC API root
 
 `shared` composes OGC API standards as building blocks under one root
 ([#789](https://github.com/mrauhala/meteocore/issues/789)), mounted by the server
-at `/`. A `BuildingBlock` contributes its conformance classes, landing links,
+at `/`. A `BuildingBlock` contributes its conformance classes (plus, through
+`shared_conformance`, classes that hold only in the shared layout), landing links,
 OpenAPI paths/components, data-access routes and, per collection, a
 `Contribution` of standard fields and access links. The composer serves the
 Common resources — landing page, `/api` (one merged OpenAPI 3.0 document),
@@ -32,7 +36,13 @@ per-style map tilesets to Maps' entries, and `crs` lists union in block order
 requires `/items` to accept exactly its collection's list. A block may *claim* a field it leaves
 out (`Contribution::claims`) so that no later block fills it: a raster block
 claims `storageCrs`, which it omits when the native CRS has no OGC URI, so a
-Features block's CRS84 cannot mislabel a projected radar grid. Common metadata routes get the
+Features block's CRS84 cannot mislabel a projected radar grid. A block serving
+feature items adds `Contribution::items`, an `ItemsOverview` (#1143): what one
+item is and the properties its items page filters and sorts by. It reaches the
+collection's HTML page only (`workbench::collection_page`), as a line under the
+description and "Filter by" / "Sort by" chip rows under Request data, each chip
+opening the items page with its builder at the property (`#filter=<name>`,
+`#sort=<name>`); the JSON description is unchanged. Common metadata routes get the
 conditional-GET middleware (`caching`); data routes keep their own ETags. Each
 block's responses carry an `ApiKind` for request logs and the `api` metrics
 label. Blocks reuse their per-API service's state, so reloads reach both.
@@ -41,6 +51,9 @@ The blocks are Maps, Tiles and Features, in that order — the order is field
 precedence. Tiles uses the Tiles Table 8 layout at the shared root: map tiles
 under `…/map/tiles`, styled map tiles under `…/styles/{styleId}/map/tiles`,
 vector tiles (MVT) under `…/tiles`, each list with its own tileset resources.
+Because map tiles sit under the map resource there, `{map}/tiles`, the Tiles
+block declares OGC API - Maps "Map Tilesets" at the shared root only
+(`shared_conformance`, #946); neither per-API service has that layout.
 Features serves `…/items[/{featureId}]` (with the conditional-GET middleware),
 adds `itemType: "feature"` and one `items` link per encoding to feature
 collections only, and namespaces its OpenAPI components (`features-bbox`, …)
@@ -71,13 +84,18 @@ the same inventory drives pair validation and OpenAPI generation.
 | `datetime` | RFC 3339 instant or interval overlap; unknown temporal extents remain eligible |
 | `q` | Case-insensitive title/description/keyword search; comma-separated OR; whole words and whitespace-normalized phrases |
 | `query` | The same text matching plus required (`+`) and excluded (`-`) terms/phrases within each OR alternative |
-| `limit` | Default/max 1,000; values above max clamp; invalid values and zero return 400 |
+| `sortby` | Draft §8: comma-separated `title` and `id`, each ascending or `-` descending; titles compare case-insensitively, ties by id. Any other property, or an empty key, returns 400. Without it JSON lists by id and HTML by title. No sortables resource |
+| `limit` | Default/max 1,000 for JSON, default 24 for an HTML page; values above max clamp; invalid values and zero return 400 |
 | `offset` | Nonnegative number of matching collections to skip; default zero |
 | `f` | `json` or `html`, overrides Accept; navigation retains the selected format |
 
-Unsupported controls (`sd`, `resolution`, `sortby`, CQL2 and hierarchy
+Unsupported controls (`sd`, `resolution`, CQL2 and hierarchy
 controls, for example) and repeated controls return JSON `{code, description}`
-with HTTP 400. This applies to collection lists; it does not change the parameter
+with HTTP 400. An HTML request (`f=html`, or `Accept` listing `text/html`
+without `f`) gets that 400 as the catalog page instead: `CollectionRequest`
+negotiates from the raw `f` and `Accept` before parsing anything else, and
+the search form comes back holding what was sent, the field at fault marked
+`aria-invalid` with the message beside it (#1132). This applies to collection lists; it does not change the parameter
 contracts on feature items, maps, tiles, EDR data queries or instance lists.
 
 ## Text search (draft 25-046 §7.6–7.7)
@@ -118,7 +136,12 @@ space by form query parsing. For example:
 ```
 
 Self/next/prev and JSON/HTML alternate links retain the query with its operators
-percent-encoded. Clients can also use `curl --get --data-urlencode
+percent-encoded. Self, next and prev leave out a `limit` or `sortby` the request
+left out, since following them gets the same defaults. An alternate link spells
+both out, because JSON and HTML default to different ones: an HTML page's JSON
+alternate is `?limit=24&f=json&sortby=title`, the same collections in the same
+order, and a JSON page's HTML alternate is `?limit=1000&f=html&sortby=id`
+(#1141). Clients can also use `curl --get --data-urlencode
 'query=canada +weather -extreme'` to construct the request.
 
 ## Extents and conformance
@@ -174,22 +197,141 @@ picks among them; a collection advertising only tiles still gets a preview.
 Style, time and level apply to Maps and map tiles; vector tiles are unstyled,
 and a vector-only collection shows no legend panel.
 
+The rest of a collection page shows every member of the collection JSON as
+tables, chips and anchors (#1140, `workbench/metadata.rs`): a Parameters table
+on the Overview, coverage facts formatted as in the catalog (one bbox and
+cadence formatter for both, `bbox_label` and `cadence_label`), and on the
+metadata tab the styles with legends and links, the extent, the parameters,
+the data queries and the CRS lists. Missing metadata reads "Not advertised";
+a JSON `null` in the nested member lists shows as `null`, and a data query
+without unit parameters shows a dash for its units.
+Numbers follow one display rule (`property_value_html`): an integral float
+without `.0`, a latitude or longitude property to 5 decimals with the exact
+value in the `title`. Both forms come from `ds_core::html`'s formatter
+(`display_number`, `display_coordinate`), which the EDR data pages use too
+(#1138). The map's quick look of a feature prints its numbers by the same
+rule (`map.js`). `i18n_text` and `unit_text` are shared with api-edr.
+The conformance page groups classes by standard and version
+(`workbench/conformance.rs`).
+
 The collection builder derives its fields from `CollectionParameter::ALL`.
-Search and paging use ordinary GET requests. Optional advanced controls omit
-empty values; literal `+` operators are form-encoded. Unsupported Common sorting,
+Search, sorting and paging use ordinary GET requests. Optional advanced controls omit
+empty values; literal `+` operators are form-encoded. Unsupported Common
 `sd`, `resolution` and hierarchy controls are not shown. Adding them requires the
 shared validator, metadata and OpenAPI contract to support them first.
+
+The catalog (#1141) shows 24 collections a page, by title, unless the request
+says otherwise. Its results bar heads the list with the match count (an `h2`)
+and offers the order (`sortby`: title or id, either way) and the page size;
+both are also fields of the search form, so they work without JavaScript. Each
+row's facts sit in fixed slots, so values line up from row to row: Time,
+Cadence, Area, Vertical, and Parameters (or Styles), a dash where the collection
+advertises nothing, then Items for a feature collection. The Parameters slot
+names parameters by label; with more than three it shows the first three and
+folds the full list, each label with its name, under a disclosure. Data
+queries are outlined action chips with an arrow, keywords filled chips under a
+"Keywords" label. The title is the row's only link to the collection page:
+the arrow repeats it for pointers and is skipped by the keyboard. The search hint says what `q` does: titles,
+descriptions and keywords, not ids; words as one exact phrase; commas between
+alternatives. A multi-word search that matches nothing offers the same search
+with its words as comma-separated alternatives. Placeholders are examples
+(`e.g. 18`), lighter and italic, and still at least 4.5:1 against the field.
+Grouping a radar network's per-site collections needs the network parents of
+#301.
 
 Light/dark/system themes persist in the browser. Body text and controls are
 16px; supporting text and code are at least 14px. Navigation, metadata, JSON links
 and paging work without JavaScript; basic collection text search also works.
 JavaScript enables optional query fields, clipboard buttons, view switching,
-property search and return links to the last filtered list. API validation errors
-retain the existing structured JSON error response.
+property search and return links to the last filtered list.
+
+Errors (#1132, `errors`): JSON stays the error contract, and a request that
+asked for HTML gets its error as a page. `errors::wanted` decides from the
+raw query before any parameter is parsed: the first `f` when given and not
+empty, else an `Accept` that ranks `text/html` first, above every other type
+it lists or equal and listed first, with `*/*`, `text/*` and the XML types
+not counted. A browser's header qualifies, while a client naming a data
+type above `text/html` keeps JSON errors. This is stricter than the success
+rule of the metadata pages, `ds_core::html::negotiate`, which serves HTML to
+any `Accept` listing `text/html`: `Accept: application/json, text/html`
+gets an HTML collection page but JSON errors. The catalog and Features items
+form re-renders follow their page's success rule. `errors::html_errors` wraps a whole
+router (the shared root, EDR, Features, Maps and Tiles): for such a request a
+JSON error response becomes `workbench::error_html` with the same status and
+headers, showing the message, the parameter at fault and its value, and links
+back to the collection (when the API serves it) and to Collections. A 5xx page
+shows a generic sentence, never the body. Handlers add what only they know as
+an `errors::ErrorDetail` response extension: the parameter, a heading, a
+replacement message, a hint and the accepted values, each a link re-running
+the request with it (EDR `parameter-name`). `JsonQuery` names the field its
+deserializer rejected. `errors::not_found` is the server's fallback: an HTML
+404 page in the workspace the path is under for a browser, the empty 404
+otherwise. Routes served only as JSON (styles, tilesets, tile matrix sets)
+use `errors::json_only_get`: an `f` other than JSON is the legend's 400
+naming the format, and `errors::declare_json_only` declares that `f` and
+400 in their OpenAPI. The catalog and Features items pages instead re-render
+their form on a 400, and every `datetime` field shows its accepted forms.
+A request with a bad `f` is no HTML request; with another bad parameter its
+JSON 400 names that parameter first, as it always has.
+
+Links that do not open an HTML page carry a media-type badge
+(`media_badge`) in `document_links` and `link_table`. The landing Resources
+panel opens the API reference (`service-doc`) and keeps the raw OpenAPI
+document as a secondary link.
 
 No engine queries run from the renderer. Metadata comes from the existing JSON
 builders. The workbench does not add HTML representations to map images, tiles,
-EDR data-query responses, or the WMS/3D Tiles viewers.
+or the WMS/3D Tiles viewers. EDR data-query pages (#971) are built by api-edr
+from the query response and wrapped in this shell (`Page`).
+
+Every EDR `data_queries` link is an anchor (`data_query_links`): on the
+collection and instance pages, in catalog rows and under each model run.
+Each links to its end point's HTML view (`data_query_target`, the one place
+that chooses it): instances, locations and items their lists, parameterised
+queries their query form, which api-edr answers when the request gives no
+coordinates (#1138); the API reference button stays beside them. In the
+collection page's data-queries table the title opens that view and the
+query's href, printed beneath it, is an anchor to itself, so every href of
+the collection JSON stays an anchor (#1140).
+
+Links are rendered in full (`link_table`, OGC API - EDR `/req/html/content`,
+#984): the landing page's "API definitions & resource links" and the collection
+page's metadata tab list every link with its relation, title and type, at its
+own href, `self` and `alternate` included. Links that differ only in relation
+(the short and the registered URI form of one) share a row listing every
+relation (#1131); the landing pages pass each link's type through. The table
+sizes its own columns (the link at least 24ch) and becomes one card per link
+below 600 px: the title as link text, relation and type beneath. Titles wrap
+between words. The link and type cells may break anywhere, and a long
+relation URI wraps inside its `code`, mid-word where it must, so no URI or
+media type widens the table: with only the link cell breaking anywhere, the
+registered relation URIs and the OpenAPI media type hold the table at least
+1184 px wide, wider than the content area at 1440 px. Only just above the
+800 px phone layout can the 24ch link column and the titles still scroll the
+table a little inside its own box. The
+collection overview's resource list stays a navigation aid, without the
+`rel=data` links of `data_queries` end points listed under "Request data". The
+collection list adds each collection's full metadata and links under its card,
+lists every keyword, and closes with the page's links; EDR model-run lists do
+the same per instance.
+
+Layout rules (#1131): only a key/value table's row headers (`property_table`,
+`th[scope=row]`) take a width, 28%; column headers size with their column, and
+every header cell is top-aligned. Below 600 px a key/value table stacks each
+key above its value. api-edr data tables use their own `data-table` class:
+auto layout inside a sideways scroll, words kept whole. Model runs are
+full-width cards with their valid-time span and step count, each shown only
+when the run advertises it. Long ids wrap in the heading, the last breadcrumb
+and the geometry summary. Below 800 px the request bar folds into its summary
+on every page, the top bar scrolls away and the workspace navigation wraps;
+wider, the sidebar stays in view. Every workbench page and the API reference
+declare the inline SVG icon `ds_core::html::FAVICON`, so none of them requests
+`/favicon.ico`. Only landing pages are titled without the " · MeteoCore"
+suffix, their titles already name the server; Features and EDR items pages are
+titled by their item range and whether a filter narrows it (`items_title`).
+The request summary shows the path and its query without `f`; the request note
+names the representation the JSON switch opens (JSON, GeoJSON or
+CoverageJSON).
 
 The HTML structure and theme styles follow the approved #744 mockup: API workspace
 selector and branded sidebar, grouped collection query controls, removable applied
@@ -212,34 +354,72 @@ not duplicate them.
 Maps collection overviews render the advertised map endpoint over the locator.
 The browser requests the visible CRS84 bbox as a Web Mercator PNG (at most
 1024 × 768), with advertised style links, an optional datetime instant, and a
-`z` selector when discrete vertical levels are advertised. The selected level is
-included in the rendered-image URL; collection default omits `z`. Pan/zoom
+level select when discrete vertical levels are advertised. The selected level is
+sent as `elevation`, also in the rendered-image URL; Default omits it. Pan/zoom
 requests are debounced and superseded fetches are cancelled. Loading/errors are
 explicit; failed requests hide the previous image. The rendered-image URL is
 separate from the collection metadata JSON link. No rendering occurs while
 assembling metadata on the server.
 
+What the map draws is shown, not left as "default" (#1136):
+
+- A collection with two or more `parameter_names` gets a Parameter select.
+  Its first choice, Default, sends no `parameter-name`; the map, the map
+  tiles, the legend and the rendered-image URL carry the one chosen.
+- After each image the status line names the instant from the response's
+  `Content-Datetime` ("Showing 2026-10-17 17:05 UTC"), the parameter and any
+  style or level chosen. The Default time and parameter options take the
+  resolved values as their text. The time arrows step from the instant
+  drawn, Default standing for the latest time until a map has named one,
+  and each is disabled at its end. A drawn instant newer than every listed
+  time, on a page left open while new frames arrive, stands past the last
+  one, so the previous arrow selects the last listed time.
+- A time axis that runs past the viewer's clock (a forecast, a nowcast)
+  opens at the time nearest now. The collection advertises no default time
+  of its own; Default still asks for the engine's.
+- Without a temporal extent there is no time row. A 404 or 500 for the
+  server's own choices reads "No data available for this collection right
+  now" and hides the time row. A 404 for a parameter, style or level the
+  viewer chose shows the server's description, such as a style that
+  parameter does not have; one for a chosen time only says that time has
+  no data. Map tiles word their 404s the same way.
+- The legend sits under the map: the style's legend JSON drawn as a colour
+  bar in the page's theme, titled with the parameter's label and unit, its
+  minimum and maximum always labelled, the PNG and JSON as links. The JSON
+  is fetched beside the map request, not after the image, and its
+  `parameter` names what Default draws.
+- An extent crossing the antimeridian is one unwrapped polygon, and a view
+  across it is requested in the Maps antimeridian form (west > east). A
+  map tileset for it is given no source bounds, which MapLibre would clamp
+  to ±180°.
+- When MapLibre or WebGL is unavailable the map and its controls are
+  hidden, and the status says where the page lists the same facts.
+
 Map refreshes retain the displayed image until its replacement has loaded in
 MapLibre, then swap the layers. Status, image-link and request-URL areas keep
 fixed dimensions to avoid shifting content during pan/zoom. Map controls use
-equal-height fields and an aligned action button, stacking on narrow screens.
+equal-height fields that wrap at a 170 px minimum column; Update map has its
+own row, and on a phone the time select has its own line with the arrows
+under it.
 
 Breadcrumb labels use available collection/item titles while preserving resource
 IDs in URLs, including parent collections on item and model-run pages. Maps time
 controls expand an advertised regular grid (`cellsCount` + ISO duration) or use
 its explicit irregular coordinates, with previous/next available-time buttons.
 An interval alone does not imply sample availability; absent/oversized grids use
-a native UTC date/time input (expansion is bounded at 10,000 choices). Advertised
-style legends load with the displayed image; unchanged legends stay visible on
-pan/zoom. Full nested metadata and license links remain in Metadata & links,
-with configured licenses and searchable keywords also in the overview. Missing
-storage CRS is labelled "Not advertised", never guessed from the coverage CRS.
+a native UTC date/time input (expansion is bounded at 10,000 choices). The
+selected style's legend JSON is fetched beside the map request, revalidated on
+selection, and kept across pan/zoom. Full nested metadata and license links
+remain in Metadata & links, with configured licenses and searchable keywords
+also in the overview. Missing storage CRS is labelled "Not advertised", never
+guessed from the coverage CRS.
 
 Collection advanced search starts collapsed and remembers its disclosure state
 per API path for the browser session, including after search submission. Applied
 filters remain visible while collapsed. Resource titles and their URLs form one
-clickable link; map endpoints retain their required-bbox hint. Country boundaries
-render above map imagery with a contrasting halo, including after pan/zoom.
+clickable link; a map endpoint notes that it covers the whole extent unless the
+request sets a bbox. Country boundaries render above map imagery with a
+contrasting halo, including after pan/zoom.
 
 Catalogs use a full-width search panel and result summaries. The applied request
 and draft search URL are separate disclosures; the draft opens on the first edit.

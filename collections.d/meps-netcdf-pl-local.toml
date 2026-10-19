@@ -1,0 +1,52 @@
+id = "meps-netcdf-pl-local"
+title = "MEPS Pressure Levels (CF-NetCDF, local sample)"
+description = "MetCoOp MEPS 2.5 km forecast on pressure levels, control member, read from MET Norway's per-lead CF-NetCDF files on their Lambert conformal conic grid. A committed sample: every 100th grid point at 1000, 850, 500 and 300 hPa of two runs (2026-10-15 06Z leads 0-2, 09Z leads 0-1)."
+engine_type = "netcdf"
+# The pressure levels are the collection's vertical axis (hPa, bottom first):
+# WMS ELEVATION, Maps/Tiles `elevation` and EDR `z` select them, and a map
+# without one draws the bottom level, 1000 hPa. EDR position, area and
+# radius, model runs as instances; the WMS layers answer GetFeatureInfo at
+# the level drawn. The wind speed on each level is derived from its
+# grid-relative x/y components (`wind_speed_pl`, no direction on this
+# Lambert grid).
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["forecast", "NWP", "MEPS", "NetCDF", "pressure levels"]
+
+[license]
+title = "CC-BY-4.0"
+
+[netcdf]
+# The per-lead files of one family (pl), as named on thredds.met.no: a
+# collection has one vertical axis, so the surface family (sfc) is a
+# collection of its own. Regenerate from the CDLs with `ncgen -k nc4`; see
+# testdata/meps-netcdf-pl/README.md.
+data_path = "testdata/meps-netcdf-pl"
+filename_template = "meps_pl_{lead}_%Y%m%dT{run}Z.nc"
+variables = [
+    "air_temperature_pl",
+    "x_wind_pl",
+    "y_wind_pl",
+    "geopotential_pl",
+    "relative_humidity_pl",
+]
+max_runs = 4
+poll_interval_secs = 60
+
+[netcdf.titles]
+air_temperature_pl = "Air temperature"
+x_wind_pl = "Wind along the grid's x axis"
+y_wind_pl = "Wind along the grid's y axis"
+geopotential_pl = "Geopotential"
+relative_humidity_pl = "Relative humidity"
+
+# Values are served in the files' own units: K, m/s, m^2/s^2 and fractions
+# (units "1"). Every layer takes the built-in default its name and unit
+# select, one range for every level: temperature over -90…50 °C in kelvin,
+# the x/y wind components over ±80 m/s and the derived speed over 0-80 m/s
+# (twice the surface scale, for the jet at 300-250 hPa), geopotential over
+# 0-206 000 m^2/s^2 and relative humidity over 0-1.
+[wms]
+# The parent layer's: the °C temperature palette over -90…50 °C in kelvin.
+colormap = "temperature"
+min = 183.15
+max = 323.15

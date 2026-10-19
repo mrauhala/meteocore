@@ -1,21 +1,29 @@
 mod area;
 pub mod cache;
 pub mod catalog;
+mod cube;
 mod diagnostics;
 mod discovery;
 pub mod index;
 mod message_cache;
 mod metadata;
+#[cfg(test)]
+mod parameter_times_tests;
 mod position;
 pub mod reader;
+#[cfg(test)]
+mod retained_runs_tests;
 mod runtime;
 #[cfg(test)]
 mod scan_tests;
 #[cfg(test)]
 mod test_support;
+mod trajectory;
 pub mod units;
 mod vertical;
 pub mod wgrib2_index;
+#[cfg(test)]
+mod wind_tests;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -31,6 +39,7 @@ use ds_core::error::DataServerError;
 use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::model::*;
+use ds_core::temp_files;
 
 use crate::cache::{DecodedGrid, GridCache};
 use crate::catalog::{Catalog, ForecastRun, ParameterKey, ParameterKeys, StepFile};
@@ -61,6 +70,11 @@ struct ParamMetadata {
     /// 101 MSL, 200 entire atmosphere).
     first_surface_value: Option<f64>,
     window_qualifier: Option<String>,
+    /// WMO `(discipline, category, number)` of the probed or decoded
+    /// message; `None` until one is read.
+    triple: Option<(u8, u8, u8)>,
+    /// The message's GRIB2 flag table 3.3 bit 5 (#897).
+    uv_frame: ds_core::wind::VectorFrame,
 }
 
 impl ParamMetadata {
@@ -79,6 +93,8 @@ impl ParamMetadata {
             first_surface_type: None,
             first_surface_value: None,
             window_qualifier: None,
+            triple: None,
+            uv_frame: ds_core::wind::VectorFrame::Unknown,
         }
     }
 
@@ -506,7 +522,15 @@ impl GribEngine {
                 Ok(objects) => {
                     for obj in objects {
                         let loc = obj.location.as_ref();
-                        if !loc.ends_with(index_suffix) {
+                        // A publisher's in-progress `.name.index` is not an
+                        // index yet: once parsed it would be marked known
+                        // under its temporary name (#1009). Nor is one in a
+                        // hidden folder below the prefix, where rsync
+                        // `--delay-updates` stages files under their final
+                        // names: the LIST is recursive (#1029).
+                        if !loc.ends_with(index_suffix)
+                            || temp_files::is_temporary_below(obj_prefix.as_ref(), loc)
+                        {
                             continue;
                         }
                         if let Some(needle) = filename_contains {
@@ -777,8 +801,8 @@ impl GribEngine {
         );
         self.publish_catalog(new_catalog);
 
-        // Probe one message per distinct short name in the newest run to
-        // populate the parameter metadata cache. Without this, the EDR
+        // Probe one message per advertised parameter, in the newest run that
+        // has it, to populate the parameter metadata cache. Without this, the EDR
         // /collections endpoint returns empty labels/units until the first
         // actual query is served.
         self.probe_new_parameters();
@@ -786,9 +810,9 @@ impl GribEngine {
         Ok(())
     }
 
-    /// For each distinct short name in the newest forecast run that has not
-    /// yet been seen, read the message headers via byte-range so the
-    /// WMO triple populates the parameter metadata cache.
+    /// For each advertised parameter whose key (that of the newest run that
+    /// has it) has not yet been seen, read the message headers via
+    /// byte-range so the WMO triple populates the parameter metadata cache.
     ///
     /// Any failures are logged and swallowed — the probe is best-effort and
     /// the metadata cache will eventually fill in as real queries land on
@@ -809,21 +833,29 @@ impl GribEngine {
             let cache = self.source.param_meta.read().unwrap();
             let mut todo = BTreeMap::new();
             for catalog in catalogs {
-                let Some(run) = catalog.latest_run() else {
-                    continue;
-                };
-                let Some(keys) = catalog.parameter_keys(&run.reference_time) else {
-                    continue;
-                };
-                for key in keys
-                    .values()
-                    .filter(|key| !cache.by_level.contains_key(*key))
+                // Each advertised parameter at the key of the newest run
+                // that has it: one only an older run still has needs its
+                // label and unit too (#1026).
+                for (name, key) in catalog
+                    .advertised_keys()
+                    .iter()
+                    .filter(|(_, key)| !cache.by_level.contains_key(*key))
                 {
-                    if let Some((sf, m)) = run
-                        .steps
+                    let found = catalog
+                        .runs
                         .values()
-                        .find_map(|sf| sf.messages.iter().find(|m| key.matches(m)).map(|m| (sf, m)))
-                    {
+                        .rev()
+                        .filter(|run| {
+                            catalog
+                                .parameter_keys(&run.reference_time)
+                                .and_then(|keys| keys.get(name))
+                                == Some(key)
+                        })
+                        .flat_map(|run| run.steps.values())
+                        .find_map(|sf| {
+                            sf.messages.iter().find(|m| key.matches(m)).map(|m| (sf, m))
+                        });
+                    if let Some((sf, m)) = found {
                         todo.insert(
                             format!("{}:{}:{:?}", key.param, key.levtype, key.level),
                             (sf, m),
@@ -961,21 +993,103 @@ impl GribEngine {
 
     /// Resolve the run's canonical level exactly; never substitute another
     /// level when that product is absent from an individual forecast step.
+    /// A parameter the run lacks is a bad request; a step without its field
+    /// (a level one step of a pressure view lacks) is missing data, a 404.
     fn fetch_grid(
         &self,
         step_file: &StepFile,
         param: &str,
         keys: &ParameterKeys,
     ) -> Result<Arc<DecodedGrid>, DataServerError> {
-        let entry = keys
-            .get(param)
-            .and_then(|key| step_file.messages.iter().find(|m| key.matches(m)))
+        let key = keys.get(param).ok_or_else(|| {
+            DataServerError::InvalidParameter(format!(
+                "Parameter '{param}' is unavailable in this collection and run"
+            ))
+        })?;
+        let entry = step_file
+            .messages
+            .iter()
+            .find(|m| key.matches(m))
             .ok_or_else(|| {
-                DataServerError::InvalidParameter(format!(
+                DataServerError::LocationNotFound(format!(
                     "Parameter '{param}' at its canonical level not found in forecast step"
                 ))
             })?;
         self.fetch_grid_by_entry(step_file.message_url(entry), entry)
+    }
+
+    /// The level a map field of `run` is drawn at: the requested `z`, which
+    /// the run must have, else the run's own first level; `None` on a view
+    /// without a vertical axis. `render_field` and `resolve_elevation`
+    /// share it, so WMS GetFeatureInfo queries the level GetMap draws
+    /// (#1064).
+    fn map_level(
+        &self,
+        catalog: &Catalog,
+        run: DateTime<Utc>,
+        z: Option<f64>,
+    ) -> Result<Option<f64>, DataServerError> {
+        let requested = z.map(|v| [v]);
+        let levels =
+            self.selected_levels(catalog, run, requested.as_ref().map(|a| a.as_slice()))?;
+        Ok(levels[0])
+    }
+
+    /// One map field of `run`'s `step_file`: `parameter` (else the step's
+    /// default product) at the requested or the run's first level,
+    /// resampled onto the request in display units.
+    fn render_field(
+        &self,
+        catalog: &Catalog,
+        run: &ForecastRun,
+        step_file: &StepFile,
+        parameter: Option<&str>,
+        field: &MapField<'_>,
+    ) -> Result<RasterTile, DataServerError> {
+        let keys = catalog
+            .parameter_keys(&run.reference_time)
+            .cloned()
+            .unwrap_or_default();
+        let level = self.map_level(catalog, run.reference_time, field.z)?;
+        let keys = Self::keys_at_level(&keys, level);
+
+        // Determine parameter to render
+        let param_name = parameter.unwrap_or_else(|| {
+            // Default to first near-surface parameter
+            step_file
+                .default_message()
+                .map(|m| m.param.as_str())
+                .unwrap_or("2t")
+        });
+
+        let grid = self.fetch_grid(step_file, param_name, &keys)?;
+
+        // Apply unit conversion so colormap ranges use display units.
+        // fetch_grid populates the metadata cache from the decoded message's
+        // WMO triple on first decode, so this lookup is safe here.
+        let meta = self.param_metadata_for(&keys, param_name);
+        let MapField {
+            bbox,
+            width,
+            height,
+            output_crs,
+            ..
+        } = *field;
+        // Compact f32 tile (#475): 4 B/px instead of a boxed Option<f64>;
+        // the conversion is fused into the sampling pass.
+        let data = if meta.display.has_conversion() {
+            grid.resample_f32(bbox, width, height, output_crs, |raw| {
+                meta.display.convert(raw)
+            })
+        } else {
+            grid.resample_f32(bbox, width, height, output_crs, |raw| raw)
+        };
+
+        Ok(RasterTile {
+            width,
+            height,
+            values: RasterValues::F32 { data, nodata: None },
+        })
     }
 
     fn fetch_grid_by_entry(
@@ -1045,6 +1159,8 @@ impl GribEngine {
                 first_surface_type: None,
                 first_surface_value: None,
                 window_qualifier: None,
+                triple: None,
+                uv_frame: ds_core::wind::VectorFrame::Unknown,
             },
             None => {
                 tracing::debug!(
@@ -1062,21 +1178,20 @@ impl GribEngine {
         meta.window_qualifier = step_kind.qualifier();
         meta.first_surface_type = Some(message.first_surface_type);
         meta.first_surface_value = message.first_surface_value;
+        meta.triple = Some(message.triple);
+        meta.uv_frame = message.uv_frame;
 
         let mut cache = self.source.param_meta.write().unwrap();
         cache.insert(key.clone(), meta);
         true
     }
 
-    /// Look up cached parameter metadata. Returns a placeholder (identity
+    /// Look up cached parameter metadata at the canonical key of the newest
+    /// run that has the parameter (#1026). Returns a placeholder (identity
     /// conversion, empty unit string) if the short name has not yet been
     /// populated — typically because its headers have not been read yet.
     fn param_metadata(&self, catalog: &Catalog, short_name: &str) -> ParamMetadata {
-        catalog
-            .latest_run()
-            .and_then(|run| catalog.parameter_keys(&run.reference_time))
-            .map(|keys| self.param_metadata_for(keys, short_name))
-            .unwrap_or_else(|| ParamMetadata::placeholder(short_name))
+        self.param_metadata_for(catalog.advertised_keys(), short_name)
     }
 
     fn param_metadata_for(&self, keys: &ParameterKeys, short_name: &str) -> ParamMetadata {
@@ -1096,18 +1211,137 @@ impl GribEngine {
     }
 }
 
-/// Borrowing run+step selection shared by reads and cache-key resolution.
-fn select_run_step(
+/// The request geometry of a map field: everything but the step and the
+/// parameter.
+#[derive(Clone, Copy)]
+struct MapField<'a> {
+    bbox: [f64; 4],
+    width: u32,
+    height: u32,
+    output_crs: &'a OutputCrs,
+    z: Option<f64>,
+}
+
+/// The run+step a map render (WMS/Maps/Tiles) of `parameters` reads at
+/// `time`. Shared by `get_raster_tile(s)` and every `resolve_*` override,
+/// so the #507/#521 cache keys name the step rendered. EDR queries match
+/// times exactly instead ([`resolve_run`], [`grid_steps`]).
+///
+/// With no parameters (the collection's default layer): the nearest step
+/// of [`covering_run`], so a map `TIME` snaps, or the run's last step for
+/// `None`.
+///
+/// With parameters, only the steps carrying all of them count (#1005): an
+/// hour-window aggregate exists at some steps of a run, never at its
+/// analysis. Of the pinned run, else of the runs newest first:
+/// 1. the first whose carrying steps span `time`, at its nearest such step,
+///    so a newer run lacking the parameter then does not hide an older one;
+/// 2. else, `time` within any run's steps, the carrying step nearest `time`
+///    of any of them, the newer run's on a tie: what a WMS
+///    `nearestValue` time dimension promises;
+/// 3. else `time` is outside the data: the no-parameter error.
+///
+/// A pinned run without the parameters is
+/// [`DataServerError::LocationNotFound`] (404), a parameter no run has
+/// [`DataServerError::InvalidParameter`]. `None` is the last carrying step
+/// of the pinned run, else of the newest run that has one.
+///
+/// Pinning the run this picks, as the API layers do, picks the same step
+/// at `time` and at that step's valid time: the cache key names it.
+fn select_run_step<'a>(
+    catalog: &'a Catalog,
+    parameters: &[&str],
+    reference_time: Option<DateTime<Utc>>,
+    time: Option<DateTime<Utc>>,
+) -> Result<(&'a ForecastRun, u32, &'a StepFile), DataServerError> {
+    if parameters.is_empty() {
+        return select_default_run_step(catalog, reference_time, time);
+    }
+    let pinned = pinned_run(catalog, reference_time)?;
+    if let Some(unknown) = parameters.iter().find(|&&p| !catalog.has_parameter(p)) {
+        return Err(DataServerError::InvalidParameter(format!(
+            "Parameter '{unknown}' is unavailable in this collection"
+        )));
+    }
+    let runs = || {
+        pinned.into_iter().chain(
+            catalog
+                .runs
+                .values()
+                .rev()
+                .filter(move |_| pinned.is_none()),
+        )
+    };
+    let carried = |run: &'a ForecastRun| catalog.carried_steps(run, parameters);
+    let missing = || {
+        DataServerError::LocationNotFound(format!(
+            "Parameter '{}' has no forecast step in the selected run",
+            parameters.join("', '")
+        ))
+    };
+    let Some(time) = time else {
+        return runs()
+            .find_map(|run| carried(run).last().map(|(step, file)| (run, step, file)))
+            .ok_or_else(missing);
+    };
+    let valid = |run: &ForecastRun, step: u32| {
+        run.reference_time + chrono::Duration::hours(i64::from(step))
+    };
+    let spanning = runs().find_map(|run| {
+        let steps = carried(run);
+        steps
+            .covers(time)
+            .then(|| steps.nearest(time))
+            .flatten()
+            .map(|(step, file)| (run, step, file))
+    });
+    if let Some(found) = spanning {
+        return Ok(found);
+    }
+    let within = |run: &ForecastRun| catalog::CarriedSteps::Every(run).covers(time);
+    let outside = match pinned {
+        None => !catalog.runs.values().any(within),
+        // A pinned run serves a time outside its own steps only where the
+        // unpinned selection chooses that run: the API layers resolve the
+        // run first and pin it (#521), so the pinned render must reproduce
+        // that choice. Any other pin keeps the default layer's error rather
+        // than snapping to a step of a run that cannot answer the time.
+        Some(pin) => {
+            !within(pin)
+                && !matches!(
+                    select_run_step(catalog, parameters, None, Some(time)),
+                    Ok((run, ..)) if run.reference_time == pin.reference_time
+                )
+        }
+    };
+    if outside {
+        // Outside the data: the default layer's errors.
+        return Err(DataServerError::InvalidParameter(match pinned {
+            Some(_) => format!("No forecast step for time {time}"),
+            None => format!("No forecast run covers time {time}"),
+        }));
+    }
+    // `min_by_key` keeps the first of equals: the newer run.
+    runs()
+        .filter_map(|run| {
+            carried(run)
+                .nearest(time)
+                .map(|(step, file)| (run, step, file))
+        })
+        .min_by_key(|&(run, step, _)| (valid(run, step) - time).abs())
+        .ok_or_else(missing)
+}
+
+/// [`select_run_step`] without parameters: the collection's default layer.
+fn select_default_run_step(
     catalog: &Catalog,
     reference_time: Option<DateTime<Utc>>,
-    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    time: Option<DateTime<Utc>>,
 ) -> Result<(&ForecastRun, u32, &StepFile), DataServerError> {
-    // Run selection is shared with `query_position` (see `resolve_run`); this
-    // path additionally narrows to a single step.
-    let run = resolve_run(catalog, reference_time, datetime)?;
-    let (step, sf) = match datetime {
-        Some((start, _end)) => run.find_step_for_time(start).ok_or_else(|| {
-            DataServerError::InvalidParameter(format!("No forecast step for time {start}"))
+    let run = covering_run(catalog, reference_time, time, &[])?;
+    let (step, sf) = match time {
+        Some(time) => run.find_step_for_time(time).ok_or_else(|| {
+            DataServerError::InvalidParameter(format!("No forecast step for time {time}"))
         })?,
         None => {
             let (&step, sf) =
@@ -1120,46 +1354,185 @@ fn select_run_step(
     Ok((run, step, sf))
 }
 
-/// Select the forecast run to serve, shared by `query_position` and
-/// `resolve_time` (the EDR and Maps paths) so run selection — and its
-/// error mapping — is identical everywhere.
-///
-/// `reference_time = Some(rt)` pins exactly that run (absent ⇒
-/// [`DataServerError::ReferenceTimeNotFound`] → 404); `None` falls back to the
-/// most recent run whose steps cover `datetime`, or the latest run. See
-/// [`instances::select_run`].
-fn resolve_run(
+/// The run `reference_time` pins: exactly that run (absent ⇒
+/// [`DataServerError::ReferenceTimeNotFound`] → 404), or `None` to let the
+/// caller choose. See [`instances::select_run`].
+fn pinned_run(
     catalog: &Catalog,
     reference_time: Option<DateTime<Utc>>,
-    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Result<&ForecastRun, DataServerError> {
+) -> Result<Option<&ForecastRun>, DataServerError> {
     if catalog.runs.is_empty() {
-        return Err(DataServerError::Engine(
-            "No forecast data available".to_string(),
-        ));
+        return Err(no_forecast_data());
     }
-    match reference_time {
-        Some(rt) => instances::select_run(&catalog.runs, Some(rt))
-            .map(|(_, r)| r)
-            .ok_or_else(|| {
-                DataServerError::ReferenceTimeNotFound(format!(
-                    "no forecast run for reference time {rt}"
-                ))
-            }),
-        None => match datetime {
-            Some((start, _)) => catalog
-                .runs
-                .values()
-                .rev()
-                .find(|r| r.find_step_for_time(start).is_some())
+    reference_time
+        .map(|rt| {
+            instances::select_run(&catalog.runs, Some(rt))
+                .map(|(_, r)| r)
                 .ok_or_else(|| {
-                    DataServerError::InvalidParameter(format!(
-                        "No forecast run covers time {start}"
+                    DataServerError::ReferenceTimeNotFound(format!(
+                        "no forecast run for reference time {rt}"
                     ))
-                }),
-            None => Ok(catalog.latest_run().expect("runs is non-empty")),
-        },
+                })
+        })
+        .transpose()
+}
+
+/// The run a map render of the default layer at `time`, or an M trajectory
+/// starting at `time`, reads: the pinned run, else the newest run whose
+/// published valid-time extent covers `time` (both snap to its nearest
+/// step), else the latest run for `None`. An incomplete newer run does not
+/// hide a covering older one. A trajectory naming `parameters` prefers the
+/// runs that have them all ([`preferring_runs_with`], #1026).
+fn covering_run<'a>(
+    catalog: &'a Catalog,
+    reference_time: Option<DateTime<Utc>>,
+    time: Option<DateTime<Utc>>,
+    parameters: &[&str],
+) -> Result<&'a ForecastRun, DataServerError> {
+    if let Some(run) = pinned_run(catalog, reference_time)? {
+        return Ok(run);
     }
+    preferring_runs_with(catalog, parameters, |eligible| {
+        let mut newest_first = catalog.runs.values().rev().filter(|run| eligible(run));
+        match time {
+            Some(time) => newest_first.find(|r| r.find_step_for_time(time).is_some()),
+            None => newest_first.next(),
+        }
+    })
+    .ok_or_else(|| match time {
+        Some(time) => {
+            DataServerError::InvalidParameter(format!("No forecast run covers time {time}"))
+        }
+        None => no_forecast_data(),
+    })
+}
+
+/// Select the forecast run an EDR query serves (position, area, radius,
+/// cube, 2-D and Z trajectories), so run selection and its error mapping
+/// are identical on every query.
+///
+/// The pinned run, else, for a `datetime` window, a run with a step valid
+/// inside it (`/req/core/datetime-response` A and F): the newest that also
+/// covers the window's start, else the newest with any step inside, which
+/// is how an open start (`../end`) or a window starting before a run finds
+/// one. An instant `(t, t)` needs a step valid at exactly `t`, never the
+/// nearest. No run with a step inside ⇒ [`no_step_within`] (404). No
+/// datetime: the latest run. Either way among the runs that have every
+/// named parameter first ([`preferring_runs_with`], #1026): a new run with
+/// only its analysis does not answer for its missing windows.
+fn resolve_run<'a>(
+    catalog: &'a Catalog,
+    reference_time: Option<DateTime<Utc>>,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    parameters: &[&str],
+) -> Result<&'a ForecastRun, DataServerError> {
+    if let Some(run) = pinned_run(catalog, reference_time)? {
+        return Ok(run);
+    }
+    preferring_runs_with(catalog, parameters, |eligible| {
+        let newest_first = || catalog.runs.values().rev().filter(|run| eligible(run));
+        let Some((start, end)) = datetime else {
+            return newest_first().next();
+        };
+        let intersects = |run: &&ForecastRun| run.steps_within(start, end).next().is_some();
+        newest_first()
+            .filter(intersects)
+            .find(|run| run.find_step_for_time(start).is_some())
+            .or_else(|| newest_first().find(intersects))
+    })
+    .ok_or_else(|| match datetime {
+        Some((start, end)) => no_step_within(start, end),
+        None => no_forecast_data(),
+    })
+}
+
+/// `select` over the runs that have every one of `parameters`, newest
+/// first (#1026); when it finds none there, over every run, as without
+/// parameters. A parameter only older runs still have (dropped from the
+/// newest, or one its analysis lacks) is then read from a run that has it,
+/// while a request no such run can answer keeps its answer from before.
+fn preferring_runs_with<'a>(
+    catalog: &'a Catalog,
+    parameters: &[&str],
+    select: impl Fn(&dyn Fn(&ForecastRun) -> bool) -> Option<&'a ForecastRun>,
+) -> Option<&'a ForecastRun> {
+    if !parameters.is_empty() {
+        if let Some(run) = select(&|run| catalog.run_has(run, parameters)) {
+            return Some(run);
+        }
+    }
+    select(&|_| true)
+}
+
+/// The catalog has no run: [`pinned_run`] answers this before any selection.
+fn no_forecast_data() -> DataServerError {
+    DataServerError::Engine("No forecast data available".to_string())
+}
+
+/// The names a query's `parameter-name` lists: the runs having them are
+/// preferred ([`preferring_runs_with`]).
+fn named(parameters: Option<&[String]>) -> Vec<&str> {
+    parameters
+        .unwrap_or_default()
+        .iter()
+        .map(String::as_str)
+        .collect()
+}
+
+/// The steps an area, radius or cube query reads from `run`: every step
+/// valid inside the `datetime` window (an instant: the step at exactly that
+/// time, never the nearest). None inside ⇒ [`no_step_within`] (404). No
+/// datetime: the last step carrying every named parameter, as a map
+/// without `TIME` renders (#1026): a window only some steps carry, such as
+/// `TCDC_avg_3h`, is not the 400 of a field the run's last step lacks.
+/// Without parameters, or when no step carries them all, the run's last
+/// step.
+fn grid_steps<'a>(
+    catalog: &'a Catalog,
+    run: &'a ForecastRun,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    parameters: &[&str],
+) -> Result<Vec<(DateTime<Utc>, &'a StepFile)>, DataServerError> {
+    let Some((start, end)) = datetime else {
+        let carried = if parameters.is_empty() {
+            None
+        } else {
+            catalog.carried_steps(run, parameters).last()
+        };
+        let (step, file) = carried
+            .or_else(|| {
+                run.steps
+                    .iter()
+                    .next_back()
+                    .map(|(&step, file)| (step, file))
+            })
+            .ok_or_else(|| DataServerError::Engine("forecast run has no steps".to_string()))?;
+        let time = run.reference_time + chrono::Duration::hours(i64::from(step));
+        return Ok(vec![(time, file)]);
+    };
+    let steps: Vec<_> = run.steps_within(start, end).collect();
+    if steps.is_empty() {
+        return Err(no_step_within(start, end));
+    }
+    Ok(steps)
+}
+
+/// No forecast step is valid inside the requested `datetime`: the 404 an
+/// instant without data gets, which a datetime list skips.
+fn no_step_within(start: DateTime<Utc>, end: DateTime<Utc>) -> DataServerError {
+    let bound = |time: DateTime<Utc>| {
+        if time == DateTime::<Utc>::MIN_UTC || time == DateTime::<Utc>::MAX_UTC {
+            "..".to_string()
+        } else {
+            time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        }
+    };
+    let datetime = if start == end {
+        bound(start)
+    } else {
+        format!("{}/{}", bound(start), bound(end))
+    };
+    DataServerError::LocationNotFound(format!("No forecast step matches datetime {datetime}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,9 +1540,9 @@ fn resolve_run(
 // ---------------------------------------------------------------------------
 
 impl EdrEngine for GribEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         // Gridded data has no discrete locations
-        Ok(Vec::new())
+        Ok(LocationSnapshot::empty())
     }
 
     /// Each forecast run is an EDR instance (latest last). Valid times are
@@ -1181,6 +1554,10 @@ impl EdrEngine for GribEngine {
 
     fn has_instances(&self) -> bool {
         !self.catalog().runs.is_empty()
+    }
+
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        self.catalog().runs.keys().copied().collect()
     }
 
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
@@ -1243,6 +1620,15 @@ impl EdrEngine for GribEngine {
         }
     }
 
+    /// A parameter some steps lack (an hour-window aggregate, #1005)
+    /// advertises the valid times of the steps that carry it: the map
+    /// layers' axis (`MapEngine::parameter_times`).
+    fn get_parameter_available_times(&self, parameter: &str) -> Option<Vec<DateTime<Utc>>> {
+        self.catalog()
+            .parameter_times(parameter)
+            .map(|times| times.to_vec())
+    }
+
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
         self.raster_info_shared().spatial_extent
     }
@@ -1251,12 +1637,32 @@ impl EdrEngine for GribEngine {
         self.vertical_extent(&self.catalog())
     }
 
+    /// Cube only on the pressure and model-level views: a cube is a
+    /// bbox × vertical levels query (#925).
     fn supported_query_types(&self) -> Vec<String> {
-        vec![
+        let mut types = vec![
             "position".to_string(),
             "area".to_string(),
             "radius".to_string(),
-        ]
+            "trajectory".to_string(),
+        ];
+        if self.vertical_kind().is_some() {
+            types.push("cube".to_string());
+        }
+        types
+    }
+
+    /// Values along a WKT `LINESTRING` / `Z` / `M` / `ZM` path (#926), each
+    /// field it crosses read once; see `trajectory.rs`.
+    fn query_trajectory(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        self.query_batched_trajectory(coords, datetime, parameters, z, reference_time)
     }
 
     fn query_position(
@@ -1304,6 +1710,18 @@ impl EdrEngine for GribEngine {
     ) -> Result<CoverageResponse, DataServerError> {
         self.query_batched_area(coords, datetime, parameters, z, reference_time)
     }
+
+    fn query_cube(
+        &self,
+        bbox: &ds_core::feature::Bbox,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        resolution: ds_core::cube::CubeResolution,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        self.query_batched_cube(bbox, datetime, parameters, z, resolution, reference_time)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,51 +1749,50 @@ impl MapEngine for GribEngine {
         z: Option<f64>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
-        let datetime = time.map(|t| (t, t));
         let catalog = self.catalog();
-        let (run, _, step_file) = select_run_step(&catalog, reference_time, datetime)?;
-        let keys = catalog
-            .parameter_keys(&run.reference_time)
-            .cloned()
-            .unwrap_or_default();
-        let requested = z.map(|v| [v]);
-        let levels = self.selected_levels(
-            &catalog,
-            run.reference_time,
-            requested.as_ref().map(|a| a.as_slice()),
-        )?;
-        let keys = Self::keys_at_level(&keys, levels[0]);
-
-        // Determine parameter to render
-        let param_name = parameter.unwrap_or_else(|| {
-            // Default to first near-surface parameter
-            step_file
-                .default_message()
-                .map(|m| m.param.as_str())
-                .unwrap_or("2t")
-        });
-
-        let grid = self.fetch_grid(step_file, param_name, &keys)?;
-
-        // Apply unit conversion so colormap ranges use display units.
-        // fetch_grid populates the metadata cache from the decoded message's
-        // WMO triple on first decode, so this lookup is safe here.
-        let meta = self.param_metadata_for(&keys, param_name);
-        // Compact f32 tile (#475): 4 B/px instead of a boxed Option<f64>;
-        // the conversion is fused into the sampling pass.
-        let data = if meta.display.has_conversion() {
-            grid.resample_f32(bbox, width, height, output_crs, |raw| {
-                meta.display.convert(raw)
-            })
-        } else {
-            grid.resample_f32(bbox, width, height, output_crs, |raw| raw)
-        };
-
-        Ok(RasterTile {
+        let (run, _, step_file) =
+            select_run_step(&catalog, parameter.as_slice(), reference_time, time)?;
+        let field = MapField {
+            bbox,
             width,
             height,
-            values: RasterValues::F32 { data, nodata: None },
-        })
+            output_crs,
+            z,
+        };
+        self.render_field(&catalog, run, step_file, parameter, &field)
+    }
+
+    /// Every band from the one step carrying them all that
+    /// `resolve_parameters_time` names (#507): never a band snapped to
+    /// another step.
+    #[allow(clippy::too_many_arguments)] // mirrors get_raster_tile
+    fn get_raster_tiles(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<DateTime<Utc>>,
+        output_crs: &OutputCrs,
+        parameters: &[&str],
+        z: Option<f64>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<Vec<RasterTile>, DataServerError> {
+        if parameters.is_empty() {
+            return Ok(Vec::new());
+        }
+        let catalog = self.catalog();
+        let (run, _, step_file) = select_run_step(&catalog, parameters, reference_time, time)?;
+        let field = MapField {
+            bbox,
+            width,
+            height,
+            output_crs,
+            z,
+        };
+        parameters
+            .iter()
+            .map(|&parameter| self.render_field(&catalog, run, step_file, Some(parameter), &field))
+            .collect()
     }
 
     fn resolve_time(
@@ -1383,17 +1800,7 @@ impl MapEngine for GribEngine {
         time: Option<DateTime<Utc>>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
-        // The cache-key authority (#507): the exact valid time
-        // `get_raster_tile` will render, via the SAME `select_run_step` the
-        // render/query paths use (one selection implementation — cannot
-        // drift). Borrowing form: no `StepFile` clone on the per-request
-        // resolve path. A missing run/step falls back to the requested time:
-        // the render will error and cache nothing, so the key value is moot.
-        let catalog = self.catalog();
-        select_run_step(&catalog, reference_time, time.map(|t| (t, t)))
-            .map(|(run, step, _)| run.reference_time + chrono::Duration::hours(i64::from(step)))
-            .ok()
-            .or(time)
+        self.resolve_parameter_time(None, time, reference_time)
     }
 
     fn resolve_reference_time(
@@ -1401,16 +1808,94 @@ impl MapEngine for GribEngine {
         time: Option<DateTime<Utc>>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
-        // The run-axis cache-key authority (#521): the exact run
-        // `get_raster_tile` will render, via the SAME `select_run_step` the
-        // render/query paths use — including the cross-run fallback, so a
-        // valid time the newest run doesn't cover keys the OLDER run
-        // actually rendered. Borrowing form: no `StepFile` clone. A failed
-        // resolution echoes the request: the render errors, nothing cached.
+        self.resolve_parameter_reference_time(None, time, reference_time)
+    }
+
+    /// The cache-key authority (#507): the exact valid time
+    /// `get_raster_tile` renders for `parameter`, through the SAME
+    /// `select_run_step`, so an aggregate keys the step that carries it
+    /// (#1005). Borrowing form: no `StepFile` clone on the per-request
+    /// resolve path. A failed selection echoes the requested time: the
+    /// render fails the same selection and caches nothing.
+    fn resolve_parameter_time(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        self.resolve_parameters_time(parameter.as_slice(), time, reference_time)
+    }
+
+    /// The run-axis cache-key authority (#521): the exact run
+    /// `get_raster_tile` renders for `parameter`, through the SAME
+    /// `select_run_step`, cross-run fallback included: a valid time the
+    /// newest run does not carry the parameter at keys the older run
+    /// rendered. A failed selection echoes the request, as above.
+    fn resolve_parameter_reference_time(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        self.resolve_parameters_reference_time(parameter.as_slice(), time, reference_time)
+    }
+
+    /// The run `get_raster_tiles` renders `parameters` from, through the
+    /// SAME `select_run_step`: the newest whose steps carry them all at
+    /// that time, so a wind component only an older run still has renders
+    /// with its partner from that run (#1026). A failed selection echoes
+    /// the request, as above.
+    fn resolve_parameters_reference_time(
+        &self,
+        parameters: &[&str],
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
         let catalog = self.catalog();
-        select_run_step(&catalog, reference_time, time.map(|t| (t, t)))
+        select_run_step(&catalog, parameters, reference_time, time)
             .map(|(run, _, _)| Some(run.reference_time))
             .unwrap_or(reference_time)
+    }
+
+    /// The step `get_raster_tiles` renders: the nearest carrying every one
+    /// of `parameters`, of the run `select_run_step` picks for them all.
+    /// GRIB's selection is not the default's latest-not-after over the
+    /// union axes, which ignores the run.
+    fn resolve_parameters_time(
+        &self,
+        parameters: &[&str],
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let catalog = self.catalog();
+        select_run_step(&catalog, parameters, reference_time, time)
+            .map(|(run, step, _)| run.reference_time + chrono::Duration::hours(i64::from(step)))
+            .ok()
+            .or(time)
+    }
+
+    /// The level `get_raster_tile` draws, through the SAME `select_run_step`
+    /// and `map_level`: without `z`, the selected run's own first level,
+    /// which need not be the first of the levels every run together
+    /// advertise. A failed selection echoes `z`: the render, and the
+    /// position query GetFeatureInfo runs at it, fail the same way.
+    fn resolve_elevation(
+        &self,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<f64> {
+        let catalog = self.catalog();
+        select_run_step(&catalog, parameter.as_slice(), reference_time, time)
+            .and_then(|(run, _, _)| self.map_level(&catalog, run.reference_time, z))
+            .unwrap_or(z)
+    }
+
+    /// The valid times of the steps carrying `parameter` (#1005), over
+    /// every retained run, where some steps lack it: from the snapshot.
+    fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+        self.catalog().parameter_times(parameter)
     }
 
     fn raster_info(&self) -> RasterInfo {
@@ -1424,6 +1909,19 @@ impl MapEngine for GribEngine {
             .get(&self.family)
             .unwrap_or(&discovery.empty)
             .clone()
+    }
+}
+
+/// Each view's wind components for `ds_core::wind::DerivedWind` (#897): an
+/// `Arc` clone of the snapshot rebuilt with the view's `RasterInfo`.
+impl ds_core::wind::WindSource for GribEngine {
+    fn wind_facts(&self) -> Arc<ds_core::wind::WindFacts> {
+        let discovery = self.source.discovery.read().unwrap();
+        discovery
+            .wind
+            .get(&self.family)
+            .cloned()
+            .unwrap_or_else(ds_core::wind::WindFacts::none)
     }
 }
 
@@ -1553,18 +2051,27 @@ mod tests {
             .unwrap();
         // Map tiles store f32 (#475): exact to f32 precision.
         assert_eq!(tile.values.value_at(0).unwrap() as f32, 6.85);
-        assert!(engine
+        // f001 lacks the canonical level: the map snaps to the nearest step
+        // that has it (#1005), never to the 2 hPa field, and keys that step.
+        let later = Some(reference + chrono::Duration::hours(1));
+        let tile = engine
             .get_raster_tile(
                 [0.0, 0.0, 1.0, 1.0],
                 1,
                 1,
-                Some(reference + chrono::Duration::hours(1)),
+                later,
                 &OutputCrs::Wgs84,
                 Some("TMP"),
                 None,
-                None
+                None,
             )
-            .is_err());
+            .unwrap();
+        assert_eq!(tile.values.value_at(0).unwrap() as f32, 6.85);
+        assert_eq!(
+            engine.resolve_parameter_time(Some("TMP"), later, None),
+            Some(reference)
+        );
+        assert_eq!(engine.resolve_time(later, None), later);
     }
 
     #[test]
@@ -1639,18 +2146,26 @@ mod tests {
                 .unwrap();
             // Map tiles store f32 (#475): exact to f32 precision.
             assert_eq!(tile.values.value_at(0).unwrap() as f32, 6.85);
-            assert!(engine
+            // f001 has only the tropopause: the map draws f000's surface
+            // field (#1005), never the tropopause, and keys f000.
+            let later = Some(reference + chrono::Duration::hours(1));
+            let tile = engine
                 .get_raster_tile(
                     [0.0, 0.0, 1.0, 1.0],
                     1,
                     1,
-                    Some(reference + chrono::Duration::hours(1)),
+                    later,
                     &OutputCrs::Wgs84,
                     Some("TMP"),
                     None,
                     None,
                 )
-                .is_err());
+                .unwrap();
+            assert_eq!(tile.values.value_at(0).unwrap() as f32, 6.85);
+            assert_eq!(
+                engine.resolve_parameter_time(Some("TMP"), later, None),
+                Some(reference)
+            );
         }
     }
 
@@ -1913,6 +2428,7 @@ mod tests {
                     centre: 7,
                     first_surface_type: 1,
                     first_surface_value: None,
+                    uv_frame: ds_core::wind::VectorFrame::Earth,
                 }),
             );
         }
@@ -2039,16 +2555,7 @@ mod tests {
         prefixes.iter().copied().collect()
     }
 
-    /// The #521 cross-run fallback contract: with no pinned run, `resolve_run`
-    /// serves the newest run that COVERS the valid time. Steps snap to the
-    /// nearest available (`find_step_for_time` is unbounded at-or-after the
-    /// reference time), so the fallback triggers for valid times BEFORE the
-    /// newest run's reference time — animating past frames after a new run
-    /// lands. `resolve_reference_time` returns this run via the same
-    /// `resolve_step` authority, so the API cache keys track the run actually
-    /// rendered.
-    #[test]
-    fn resolve_run_falls_back_across_runs_for_uncovered_times() {
+    fn two_runs() -> (Catalog, DateTime<Utc>, DateTime<Utc>) {
         fn step_file() -> StepFile {
             StepFile {
                 grib_url: "unused".into(),
@@ -2072,27 +2579,127 @@ mod tests {
                 steps: [(0, step_file())].into_iter().collect(),
             },
         );
+        (catalog, run_a, run_b)
+    }
 
-        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
-        let at = |s: &str| Some((t(s), t(s)));
+    /// The #521 cross-run fallback contract of the map path: with no pinned
+    /// run, `select_run_step` renders the newest run that COVERS the valid
+    /// time, at its nearest step, so the fallback triggers for valid times
+    /// BEFORE the newest run's reference time — animating past frames after
+    /// a new run lands. `resolve_reference_time` returns this run via the
+    /// same `select_run_step` authority, so the API cache keys track the run
+    /// actually rendered.
+    #[test]
+    fn map_run_falls_back_across_runs_for_uncovered_times() {
+        let (catalog, run_a, run_b) = two_runs();
+        let t = |s: &str| Some(s.parse::<DateTime<Utc>>().unwrap());
         // 09Z predates the newest run's reference → fall back to run A
         // (the past-frame-after-new-run-lands case).
-        let run = resolve_run(&catalog, None, at("2026-06-07T09:00:00Z")).unwrap();
+        let run = covering_run(&catalog, None, t("2026-06-07T09:00:00Z"), &[]).unwrap();
         assert_eq!(run.reference_time, run_a, "past valid time must fall back");
         // 15Z is beyond the newest run's published extent; the older run
         // actually has this forecast step and must serve it.
-        let run = resolve_run(&catalog, None, at("2026-06-07T15:00:00Z")).unwrap();
-        assert_eq!(run.reference_time, run_a);
-        let (run, step, _) = select_run_step(&catalog, None, at("2026-06-07T15:00:00Z")).unwrap();
+        let (run, step, _) =
+            select_run_step(&catalog, &[], None, t("2026-06-07T15:00:00Z")).unwrap();
         assert_eq!((run.reference_time, step), (run_a, 15));
-        assert!(select_run_step(&catalog, Some(run_b), at("2026-06-07T15:00:00Z")).is_err());
-        assert!(select_run_step(&catalog, None, at("2026-06-07T19:00:00Z")).is_err());
+        // A map TIME between steps snaps to the nearest one.
+        let (run, step, _) =
+            select_run_step(&catalog, &[], None, t("2026-06-07T10:00:00Z")).unwrap();
+        assert_eq!((run.reference_time, step), (run_a, 9));
+        assert!(select_run_step(&catalog, &[], Some(run_b), t("2026-06-07T15:00:00Z")).is_err());
+        assert!(select_run_step(&catalog, &[], None, t("2026-06-07T19:00:00Z")).is_err());
         // Explicit pin stays exact even when another run also covers.
-        let run = resolve_run(&catalog, Some(run_a), at("2026-06-07T15:00:00Z")).unwrap();
+        let run = covering_run(&catalog, Some(run_a), t("2026-06-07T15:00:00Z"), &[]).unwrap();
         assert_eq!(run.reference_time, run_a);
-        // No datetime: latest run wins.
-        let run = resolve_run(&catalog, None, None).unwrap();
+        // No time: latest run wins.
+        let run = covering_run(&catalog, None, None, &[]).unwrap();
         assert_eq!(run.reference_time, run_b);
+    }
+
+    /// EDR selection is by intersection (`/req/core/datetime-response` A and
+    /// F): an instant needs a step valid at exactly that time, never the
+    /// nearest, and a window selects a run with a step inside it, open ends
+    /// included. No step inside is a 404, which a datetime list skips.
+    #[test]
+    fn edr_run_and_steps_intersect_the_datetime() {
+        let (catalog, run_a, run_b) = two_runs();
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let (min, max) = (DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC);
+        let select = |reference_time, window: (DateTime<Utc>, DateTime<Utc>)| {
+            resolve_run(&catalog, reference_time, Some(window), &[]).and_then(|run| {
+                let steps = grid_steps(&catalog, run, Some(window), &[])?;
+                Ok((
+                    run.reference_time,
+                    steps.into_iter().map(|(time, _)| time).collect::<Vec<_>>(),
+                ))
+            })
+        };
+        let no_step = |result: Result<_, DataServerError>| match result {
+            Err(DataServerError::LocationNotFound(message)) => message,
+            other => panic!("expected a 404, got {:?}", other.map(drop)),
+        };
+
+        // An instant: the step valid at it, from the newest run having one.
+        let nine = t("2026-06-07T09:00:00Z");
+        assert_eq!(select(None, (nine, nine)).unwrap(), (run_a, vec![nine]));
+        let noon = t("2026-06-07T12:00:00Z");
+        assert_eq!(select(None, (noon, noon)).unwrap(), (run_b, vec![noon]));
+        // Between steps (the map path snaps 10Z to 09Z): no data.
+        let ten = t("2026-06-07T10:00:00Z");
+        let message = no_step(select(None, (ten, ten)));
+        assert!(message.contains("2026-06-07T10:00:00Z"), "{message}");
+
+        // A window: every step inside it, of the newest run covering its
+        // start, else of the newest with any step inside.
+        let steps = |hours: &[i64]| -> Vec<DateTime<Utc>> {
+            hours
+                .iter()
+                .map(|&h| run_a + chrono::Duration::hours(h))
+                .collect()
+        };
+        assert_eq!(
+            select(None, (ten, t("2026-06-07T13:00:00Z"))).unwrap(),
+            (run_a, steps(&[12]))
+        );
+        assert_eq!(
+            select(None, (t("2026-06-07T11:00:00Z"), max)).unwrap(),
+            (run_a, steps(&[12, 15, 18]))
+        );
+        // An open or early start covers no run: the newest intersecting.
+        assert_eq!(
+            select(None, (min, t("2026-06-07T11:00:00Z"))).unwrap(),
+            (run_a, steps(&[0, 3, 6, 9]))
+        );
+        assert_eq!(select(None, (min, max)).unwrap(), (run_b, vec![noon]));
+        assert_eq!(
+            select(None, (t("2026-06-06T00:00:00Z"), t("2026-06-07T01:00:00Z"))).unwrap(),
+            (run_a, steps(&[0]))
+        );
+        // A window between steps, or past every run: no data.
+        no_step(select(
+            None,
+            (t("2026-06-07T04:00:00Z"), t("2026-06-07T05:00:00Z")),
+        ));
+        let message = no_step(select(None, (t("2026-06-07T19:00:00Z"), max)));
+        assert!(message.contains("2026-06-07T19:00:00Z/.."), "{message}");
+        // A pinned run never falls back: its own steps or no data.
+        assert_eq!(
+            select(Some(run_a), (noon, noon)).unwrap(),
+            (run_a, vec![noon])
+        );
+        no_step(select(Some(run_b), (nine, nine)));
+        assert!(matches!(
+            select(Some(t("2026-06-06T00:00:00Z")), (nine, nine)),
+            Err(DataServerError::ReferenceTimeNotFound(_))
+        ));
+        // No datetime: the latest run, and an area its last step.
+        let run = resolve_run(&catalog, None, None, &[]).unwrap();
+        assert_eq!(run.reference_time, run_b);
+        let run = resolve_run(&catalog, Some(run_a), None, &[]).unwrap();
+        assert_eq!(
+            grid_steps(&catalog, run, None, &[]).unwrap()[0].0,
+            steps(&[18])[0]
+        );
     }
 
     #[test]

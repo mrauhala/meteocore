@@ -1848,6 +1848,7 @@ fn impact_context_lifts_a_populated_cell_above_a_stronger_one() {
                     holes: vec![],
                 }),
                 properties: Arc::new(props),
+                related: Vec::new(),
             };
             Ok(FeaturePage {
                 number_matched: 1,
@@ -2043,6 +2044,7 @@ fn wiring_a_source_adds_exactly_its_sortables() {
                         holes: vec![],
                     }),
                     properties: Arc::new(props),
+                    related: Vec::new(),
                 }],
                 number_matched: 1,
                 number_returned: 1,
@@ -2484,6 +2486,8 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
     assert_eq!(instances[0].reference_time, anchor);
     assert_eq!(instances[0].valid_times, vec![anchor]);
     assert!(engine.has_instances());
+    // The run axis without valid times names the same generations (#1006).
+    assert_eq!(engine.instance_reference_times(), vec![anchor]);
     assert_eq!(
         engine.find_instance(anchor).map(|r| r.valid_times),
         Some(vec![anchor])
@@ -2671,6 +2675,36 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
         "about half the bbox masked: {inside}/{}",
         tx.len() * ty.len()
     );
+
+    // #966: a rectangle keeps every block whose footprint meets it, a block
+    // centred just outside included; only the padding blocks wholly outside
+    // the bbox are on the axes without values.
+    let (w, s, e, n) = (2.5, 52.5, 7.5, 57.5);
+    let rect = format!("POLYGON(({w} {s},{e} {s},{e} {n},{w} {n},{w} {s}))");
+    let CoverageResponse::Single(rect_cov) = engine
+        .query_area(&rect, None, None, None, None)
+        .expect("rectangle area query")
+    else {
+        panic!("expected a single coverage");
+    };
+    let DomainDescription::Grid { x: rx, y: ry, .. } = &rect_cov.domain else {
+        panic!("expected a Grid domain");
+    };
+    assert!(rx[0] < w && rx[rx.len() - 1] > e, "padded x axis {rx:?}");
+    let (hx, hy) = ((rx[1] - rx[0]) / 2.0, (ry[1] - ry[0]) / 2.0);
+    let ru = &rect_cov.ranges["motion_u"].values;
+    let (mut valued_outside, mut null_padding) = (0, 0);
+    for (iy, &lat) in ry.iter().enumerate() {
+        for (ix, &lon) in rx.iter().enumerate() {
+            let meets = lon - hx <= e && lon + hx >= w && lat - hy <= n && lat + hy >= s;
+            let valued = ru[iy * rx.len() + ix].is_some();
+            assert_eq!(valued, meets, "block centred at ({lon}, {lat})");
+            let centre_in = (w..=e).contains(&lon) && (s..=n).contains(&lat);
+            valued_outside += usize::from(valued && !centre_in);
+            null_padding += usize::from(!valued);
+        }
+    }
+    assert!(valued_outside > 0 && null_padding > 0);
 }
 
 #[test]
@@ -2959,6 +2993,7 @@ impl ds_core::feature_engine::FeatureEngine for ReloadAreas {
                         .into_iter()
                         .collect(),
                 ),
+                related: Vec::new(),
             }],
             number_matched: 1,
             number_returned: 1,
@@ -3338,4 +3373,57 @@ fn reload_rejects_geometry_and_product_changes_even_with_the_same_source_arc() {
     engine.poll_once();
     *source.info.write().unwrap() = original;
     assert!(engine.prepare_dependency_update(&candidate()).is_none());
+}
+
+/// A tracked cell as an EDR item (#970): its radius query is the cell's
+/// area as a disc at the frame it was observed in, and the query answers
+/// motion vectors. A circle far narrower than a motion block answers too
+/// (the #671 mask fallback), which is why the radius has no floor.
+#[test]
+fn a_cell_item_names_a_radius_query_that_answers() {
+    use ds_core::edr_engine::EdrEngine;
+    use ds_core::feature::{FeatureQuery, Geometry, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    use ds_core::model::CoverageResponse;
+
+    let anchor = t0() + Duration::minutes(5);
+    let (_source, engine) = build("PT30M", &[t0(), anchor]);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let cell = &page.features[0];
+    let Some(&PropertyValue::Float(area)) = cell.properties.get("area_km2") else {
+        panic!("a cell has an area");
+    };
+    let Some(PropertyValue::String(observed)) = cell.properties.get("observed") else {
+        panic!("a cell has an observation time");
+    };
+    let radius = engine.item_radius(cell).expect("a cell has a radius query");
+    let disc = (area / std::f64::consts::PI).sqrt();
+    assert!(
+        (radius.within_km - disc).abs() < 1e-9,
+        "{radius:?} vs {disc}"
+    );
+    assert_eq!(radius.datetime, Some(observed.parse().unwrap()));
+
+    let Geometry::Point { x, y } = *cell.geometry else {
+        panic!("a cell is a point");
+    };
+    // The cell's circle and a 10 m one, far inside one motion block.
+    for within_m in [radius.within_km * 1000.0, 10.0] {
+        let CoverageResponse::Single(cov) = engine
+            .query_radius(&format!("POINT({x} {y})"), within_m, None, None, None, None)
+            .expect("the cell's radius query answers")
+        else {
+            panic!("expected a single coverage");
+        };
+        assert!(
+            cov.ranges["motion_u"].values.iter().any(Option::is_some),
+            "{within_m} m"
+        );
+    }
+
+    // Not a cell: no area, no radius query.
+    let mut plain = cell.clone();
+    plain.properties = Arc::new(Default::default());
+    assert!(engine.item_radius(&plain).is_none());
 }

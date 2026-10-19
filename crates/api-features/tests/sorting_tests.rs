@@ -64,6 +64,7 @@ fn feature(id: &str, score: Option<f64>, size: i64) -> Feature {
         id: id.into(),
         geometry: Arc::new(Geometry::Point { x: 24.0, y: 60.0 }),
         properties: Arc::new(m),
+        related: Vec::new(),
     }
 }
 
@@ -161,9 +162,12 @@ fn collection(id: &str) -> CollectionConfig {
         cap: None,
         postgis: None,
         nowcast: None,
+        station_grid: None,
         bufr: None,
         satellite: None,
+        netcdf: None,
         preview: None,
+        derive_wind: None,
     }
 }
 
@@ -180,6 +184,7 @@ fn build_router() -> axum::Router {
         base_url: "http://test".into(),
         trust_proxy_headers: false,
         vector_tileset_ids: Default::default(),
+        collection_pages: Default::default(),
     })))
 }
 

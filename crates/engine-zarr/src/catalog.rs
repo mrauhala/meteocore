@@ -19,11 +19,15 @@ use zarrs::array::{
 use zarrs::group::Group;
 use zarrs::storage::StorageError;
 
+use ds_core::cf::{
+    classify_axis, decode_times, is_standard_calendar, parse_duration_seconds, AxisRole,
+};
 use ds_core::error::DataServerError;
 use ds_core::instances;
 use ds_core::map_engine::RasterInfo;
+use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 
-use crate::cf::{self, AxisRole};
+use crate::cf;
 use crate::decoded::{DecodedArray, DecodedCache};
 use crate::read_budget::{self, Budget, Permit};
 use crate::store::EngineStore;
@@ -129,7 +133,9 @@ pub struct Catalog {
     /// Map-capabilities snapshot, built once here so `raster_info()` is O(1) and
     /// swaps **atomically** with the data (one `ArcSwap<Catalog>`), with no
     /// window where the advertised metadata and the served data disagree.
-    pub raster_info: RasterInfo,
+    pub raster_info: Arc<RasterInfo>,
+    /// The variables' wind components (#897), built with the catalog.
+    pub wind: Arc<WindFacts>,
 }
 
 impl Catalog {
@@ -146,7 +152,7 @@ impl Catalog {
         }
         // The shared selection rule (`None` ⇒ latest, `Some` ⇒ exact) — the
         // same call GRIB and QueryData make, so "latest" cannot drift from
-        // what `/instances` lists last.
+        // what `/instances` lists first.
         match instances::select_run(&self.runs, reference_time) {
             Some((_, &idx)) => Ok(Some(idx)),
             None => Err(DataServerError::ReferenceTimeNotFound(format!(
@@ -196,6 +202,20 @@ impl Catalog {
         Ok(self
             .read_window_span(var, run, time_idx..time_idx + 1, bbox)?
             .and_then(|mut w| w.pop()))
+    }
+
+    /// Mean native cell size in degrees, from the coordinate axes: the
+    /// spacing a trajectory densifies its path at (#926). A single-cell
+    /// axis borrows the other axis's spacing (1° when both are single).
+    pub fn native_spacing(&self) -> ds_core::trajectory::GridSpacing {
+        let step = |axis: &[f64]| {
+            (axis.len() > 1)
+                .then(|| (axis[axis.len() - 1] - axis[0]).abs() / (axis.len() - 1) as f64)
+                .filter(|s| s.is_finite() && *s > 0.0)
+        };
+        let (dx, dy) = (step(&self.lons), step(&self.lats));
+        ds_core::trajectory::GridSpacing::new(dx.or(dy).unwrap_or(1.0), dy.or(dx).unwrap_or(1.0))
+            .expect("finite positive spacing")
     }
 
     /// Native cells `(ncols, nrows)` a [`Self::read_window_span`] of `bbox`
@@ -634,7 +654,13 @@ fn build_with_codec_setup(
                 AxisRole::Time => time = Some(dn.clone()),
                 AxisRole::Reference => reference = Some(dn.clone()),
                 AxisRole::Lead => lead = Some(dn.clone()),
-                AxisRole::Other => {}
+                // Projected x/y are not geolocated here, so a projected store
+                // finds no lat/lon pair and is rejected below; an ensemble
+                // dimension is pinned to index 0 like any other.
+                AxisRole::ProjectionX
+                | AxisRole::ProjectionY
+                | AxisRole::Ensemble
+                | AxisRole::Other => {}
             }
         }
         if let (Some(la), Some(lo)) = (lat, lon) {
@@ -706,7 +732,7 @@ fn build_with_codec_setup(
         let units = str_attr(ref_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("reference-time coordinate '{rd}' has no 'units'"))
         })?;
-        if !cf::is_standard_calendar(str_attr(ref_arr, "calendar").as_deref()) {
+        if !is_standard_calendar(str_attr(ref_arr, "calendar").as_deref()) {
             tracing::warn!(
                 "collection '{collection_id}': non-standard CF calendar '{}' on reference-time \
                  axis '{rd}' approximated as proleptic Gregorian",
@@ -714,7 +740,7 @@ fn build_with_codec_setup(
             );
         }
         let decoded =
-            cf::decode_times(&read_coord_f64(ref_arr)?, &units).map_err(DataServerError::Engine)?;
+            decode_times(&read_coord_f64(ref_arr)?, &units).map_err(DataServerError::Engine)?;
         for (i, rt) in decoded.iter().enumerate() {
             // A duplicated reference time keeps its LAST axis position.
             runs.insert(*rt, i);
@@ -742,14 +768,14 @@ fn build_with_codec_setup(
         let units = str_attr(primary_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("lead coordinate '{primary_dim}' has no 'units'"))
         })?;
-        let secs = cf::parse_duration_seconds(&units).ok_or_else(|| {
+        let secs = parse_duration_seconds(&units).ok_or_else(|| {
             DataServerError::Engine(format!(
                 "lead coordinate '{primary_dim}' has unrecognised duration units '{units}'"
             ))
         })?;
         let base = latest_ref_time.expect("forecast sets latest_ref_time");
         // Guard non-finite leads: `NaN as i64` is 0, which would silently yield
-        // the run time (mirrors `cf::decode_times`'s finite check).
+        // the run time (mirrors `decode_times`'s finite check).
         leads = read_coord_f64(primary_arr)?
             .iter()
             .map(|&v| {
@@ -768,14 +794,14 @@ fn build_with_codec_setup(
         let units = str_attr(primary_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("time coordinate '{primary_dim}' has no 'units'"))
         })?;
-        if !cf::is_standard_calendar(str_attr(primary_arr, "calendar").as_deref()) {
+        if !is_standard_calendar(str_attr(primary_arr, "calendar").as_deref()) {
             tracing::warn!(
                 "collection '{collection_id}': non-standard CF calendar '{}' approximated as \
                  proleptic Gregorian",
                 str_attr(primary_arr, "calendar").unwrap_or_default()
             );
         }
-        cf::decode_times(&read_coord_f64(primary_arr)?, &units).map_err(DataServerError::Engine)?
+        decode_times(&read_coord_f64(primary_arr)?, &units).map_err(DataServerError::Engine)?
     };
     let time_dim = primary_dim;
 
@@ -940,13 +966,14 @@ fn build_with_codec_setup(
         .iter()
         .map(|base| leads.iter().map(|d| *base + *d).collect())
         .collect();
-    let raster_info = build_raster_info(
+    let raster_info = Arc::new(build_raster_info(
         &vars,
         &times,
         &reference_times,
         extent,
         [lons.len() as u32, lats.len() as u32],
-    );
+    ));
+    let wind = Arc::new(wind_facts(&vars));
 
     Ok(Catalog {
         read_budget: read_budget::BUDGET.clone(),
@@ -961,7 +988,31 @@ fn build_with_codec_setup(
         lons,
         extent,
         raster_info,
+        wind,
     })
+}
+
+/// What the variables state for wind derivation (#897): the CF
+/// `standard_name` gives both the component and its frame
+/// (`eastward_wind` earth-relative, `x_wind` grid-relative). The catalog
+/// reads only 1-D latitude/longitude coordinate axes, so the grid's x is
+/// east and y north.
+fn wind_facts(vars: &[Variable]) -> WindFacts {
+    WindFacts {
+        grid: GridAxes::NorthAligned,
+        parameters: vars
+            .iter()
+            .map(|v| ParameterFacts {
+                standard_name: v.standard_name.clone(),
+                frame: v
+                    .standard_name
+                    .as_deref()
+                    .map_or(VectorFrame::Unknown, VectorFrame::from_standard_name),
+                unit: v.units.clone(),
+                ..ParameterFacts::new(v.name.clone())
+            })
+            .collect(),
+    }
 }
 
 /// Build the map-capabilities snapshot (one layer per variable). Stored on the
@@ -1005,12 +1056,12 @@ fn build_raster_info(
 /// or its name.
 fn role_of(by_name: &HashMap<String, Array<Store>>, dim: &str) -> AxisRole {
     match by_name.get(dim) {
-        Some(a) => cf::classify_axis(
+        Some(a) => classify_axis(
             dim,
             str_attr(a, "standard_name").as_deref(),
             str_attr(a, "units").as_deref(),
         ),
-        None => cf::classify_axis(dim, None, None),
+        None => classify_axis(dim, None, None),
     }
 }
 
@@ -1566,5 +1617,87 @@ mod tests {
         assert_eq!(convert_sample(f64::INFINITY, 1.0, 0.0, &[]), None);
         assert_eq!(convert_sample(f64::NEG_INFINITY, 1.0, 0.0, &[]), None);
         assert_eq!(convert_sample(f64::MAX, 2.0, 0.0, &[]), None);
+    }
+
+    /// A MEPS-like projected store: 1-D x/y in metres placed by a
+    /// `grid_mapping`, with 2-D latitude/longitude auxiliaries. The engine
+    /// serves latitude/longitude grids only, so it rejects the store whether
+    /// x/y are named by `standard_name` or carry metre units alone.
+    #[test]
+    fn a_projected_store_is_rejected() {
+        use serde_json::json;
+        use zarrs::array::ArrayBuilder;
+        use zarrs::filesystem::FilesystemStore;
+        use zarrs::group::GroupBuilder;
+        for standard_names in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(FilesystemStore::new(dir.path()).unwrap());
+            GroupBuilder::new()
+                .build(store.clone(), "/")
+                .unwrap()
+                .store_metadata()
+                .unwrap();
+            let write = |name: &str, dims: &[&str], attributes: serde_json::Value| {
+                let shape: Vec<u64> = dims
+                    .iter()
+                    .map(|dim| if *dim == "time" { 1 } else { 2 })
+                    .collect();
+                let values = vec![0f64; shape.iter().product::<u64>() as usize];
+                let array = ArrayBuilder::new(shape.clone(), shape, data_type::float64(), f64::NAN)
+                    .dimension_names(Some(dims.to_vec()))
+                    .attributes(attributes.as_object().unwrap().clone())
+                    .build(store.clone(), &format!("/{name}"))
+                    .unwrap();
+                array.store_metadata().unwrap();
+                array.store_chunk(&vec![0; dims.len()], values).unwrap();
+            };
+            write(
+                "time",
+                &["time"],
+                json!({ "standard_name": "time", "units": "hours since 2026-01-01" }),
+            );
+            for (axis, standard_name) in [
+                ("x", "projection_x_coordinate"),
+                ("y", "projection_y_coordinate"),
+            ] {
+                let mut attributes = json!({ "units": "m" });
+                if standard_names {
+                    attributes["standard_name"] = standard_name.into();
+                }
+                write(axis, &[axis], attributes);
+            }
+            write(
+                "latitude",
+                &["y", "x"],
+                json!({ "standard_name": "latitude", "units": "degrees_north" }),
+            );
+            write(
+                "longitude",
+                &["y", "x"],
+                json!({ "standard_name": "longitude", "units": "degrees_east" }),
+            );
+            write(
+                "air_temperature_2m",
+                &["time", "y", "x"],
+                json!({ "units": "K", "grid_mapping": "projection_lambert" }),
+            );
+            let config =
+                ds_core::config::ZarrConfig::auto_local(dir.path().to_string_lossy().into());
+            let error = build(
+                Arc::new(EngineStore::plain(
+                    crate::build_store("projected", &config).unwrap(),
+                )),
+                "projected",
+                None,
+                Arc::new(DecodedCache::new(0)),
+            )
+            .err()
+            .expect("a projected store must be rejected");
+            assert!(
+                matches!(&error, DataServerError::Engine(message)
+                    if message.starts_with("no geographic (latitude/longitude) data variable")),
+                "standard_names={standard_names}: {error:?}"
+            );
+        }
     }
 }

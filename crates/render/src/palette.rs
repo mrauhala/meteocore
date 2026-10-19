@@ -447,6 +447,27 @@ static BUILTIN_DEFS: &[BuiltinDef] = &[
             (50.0, [255, 255, 255, 255]), // white (extreme)
         ],
     },
+    // Precipitation accumulated over a forecast run (#1067: MEPS
+    // `precipitation_amount_acc`, up to 66 hours): `precipitation`'s
+    // colours at four times its values, 0–200 mm. A range alone cannot
+    // widen `precipitation`: a data-valued palette clips at its last stop
+    // (#823).
+    BuiltinDef {
+        name: "precipitation_accumulation",
+        title: "Precipitation accumulated over a forecast run (mm)",
+        normalized: false,
+        stops: &[
+            (0.0, [0, 0, 0, 0]),           // transparent (no precip)
+            (0.4, [170, 220, 255, 255]),   // very light blue
+            (2.0, [100, 180, 255, 255]),   // light blue
+            (4.0, [50, 130, 255, 255]),    // blue
+            (8.0, [0, 80, 255, 255]),      // medium blue
+            (20.0, [0, 40, 200, 255]),     // dark blue
+            (40.0, [120, 0, 200, 255]),    // purple
+            (80.0, [200, 0, 150, 255]),    // magenta
+            (200.0, [255, 255, 255, 255]), // white (extreme)
+        ],
+    },
     BuiltinDef {
         name: "precipitation_rate",
         title: "Precipitation rate (mm/h)",
@@ -552,6 +573,23 @@ static BUILTIN_DEFS: &[BuiltinDef] = &[
             (100.0, [30, 120, 180, 255]), // saturated — blue
         ],
     },
+    // `humidity` for a fraction (CF unit 1): the same colours at a
+    // hundredth of the values. The percent palette over 0..1 overlaps its
+    // stops, so #823 would clip it to its bottom 1 % (#872), as the IR
+    // palettes are kelvin-valued for the same reason.
+    BuiltinDef {
+        name: "humidity_fraction",
+        title: "Relative humidity (fraction 0–1)",
+        normalized: false,
+        stops: &[
+            (0.0, [150, 100, 50, 255]),
+            (0.2, [200, 160, 110, 255]),
+            (0.4, [230, 220, 180, 255]),
+            (0.6, [170, 210, 160, 255]),
+            (0.8, [90, 180, 140, 255]),
+            (1.0, [30, 120, 180, 255]),
+        ],
+    },
     BuiltinDef {
         name: "cloud_cover",
         title: "Cloud cover (%)",
@@ -565,6 +603,21 @@ static BUILTIN_DEFS: &[BuiltinDef] = &[
             (50.0, [240, 240, 240, 170]),  // broken
             (75.0, [225, 225, 225, 215]),  // mostly overcast
             (100.0, [200, 200, 205, 255]), // overcast — light gray
+        ],
+    },
+    // `cloud_cover` for a fraction (CF unit 1: MEPS `cloud_area_fraction`,
+    // `fog_area_fraction`), as `humidity_fraction` is to `humidity`.
+    BuiltinDef {
+        name: "cloud_cover_fraction",
+        title: "Cloud cover (fraction 0–1)",
+        normalized: false,
+        stops: &[
+            (0.0, [255, 255, 255, 0]),
+            (0.125, [255, 255, 255, 64]),
+            (0.25, [250, 250, 250, 110]),
+            (0.5, [240, 240, 240, 170]),
+            (0.75, [225, 225, 225, 215]),
+            (1.0, [200, 200, 205, 255]),
         ],
     },
     // Satellite IR window brightness temperature (#819), in kelvin over
@@ -597,7 +650,9 @@ static BUILTIN_DEFS: &[BuiltinDef] = &[
     },
     // Signed fields — wind components, vertical velocity, vorticity (#763).
     // Normalized, so it spans any style range; a range symmetric about zero
-    // puts zero on the white midpoint. ColorBrewer RdBu, blue end low.
+    // puts zero on the white midpoint. ColorBrewer RdBu, blue end low; its
+    // licence notice ships in the third-party notices
+    // (third-party/colorbrewer.txt).
     BuiltinDef {
         name: "diverging",
         title: "Diverging (blue–white–red)",
@@ -809,6 +864,7 @@ mod tests {
             ("temperature", 38, -90.0, 50.0),
             ("temperature_classic", 10, -40.0, 50.0),
             ("precipitation", 9, 0.0, 50.0),
+            ("precipitation_accumulation", 9, 0.0, 200.0),
             ("precipitation_rate", 9, 0.0, 30.0),
             ("wind_speed", 9, 0.0, 50.0),
             ("cap_severity", 5, 0.0, 4.0),
@@ -816,7 +872,9 @@ mod tests {
             ("radial_velocity", 5, -48.0, 48.0),
             ("pressure", 8, 950.0, 1050.0),
             ("humidity", 6, 0.0, 100.0),
+            ("humidity_fraction", 6, 0.0, 1.0),
             ("cloud_cover", 6, 0.0, 100.0),
+            ("cloud_cover_fraction", 6, 0.0, 1.0),
             ("ir_bt_grey", 2, 180.0, 330.0),
             ("ir_bt_enhanced", 10, 180.0, 330.0),
             ("diverging", 11, 0.0, 1.0),
@@ -835,6 +893,34 @@ mod tests {
                 p.stops.windows(2).all(|w| w[0].value <= w[1].value),
                 "{name} stops not ascending"
             );
+        }
+    }
+
+    /// The scaled twins keep their base palette's colours at scaled values,
+    /// so an edit to one cannot drift from the other: the fraction palettes
+    /// are the percent ones ÷ 100 (#872), the run accumulation is
+    /// `precipitation` × 4 (#1067).
+    #[test]
+    fn scaled_twins_follow_their_base_palettes() {
+        for (twin, base, scale) in [
+            ("humidity_fraction", "humidity", 0.01),
+            ("cloud_cover_fraction", "cloud_cover", 0.01),
+            ("precipitation_accumulation", "precipitation", 4.0),
+        ] {
+            let (t, b) = (
+                builtin_palette(twin).unwrap(),
+                builtin_palette(base).unwrap(),
+            );
+            assert_eq!(t.stops.len(), b.stops.len(), "{twin}");
+            assert_eq!(t.normalized, b.normalized, "{twin}");
+            for (ts, bs) in t.stops.iter().zip(&b.stops) {
+                assert_eq!(ts.color, bs.color, "{twin} at {}", ts.value);
+                assert!(
+                    (ts.value - bs.value * scale).abs() < 1e-12,
+                    "{twin} at {}",
+                    ts.value
+                );
+            }
         }
     }
 

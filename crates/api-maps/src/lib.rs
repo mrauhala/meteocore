@@ -17,7 +17,7 @@ pub fn router(state: AppState) -> Router {
 /// The Maps router for a `mount` path below the external base URL. Every link
 /// the handlers emit is built from base URL + `mount`.
 pub fn router_at(state: AppState, mount: &'static str) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/", get(handlers::landing_page))
         .route("/api", get(handlers::api_definition))
         .route("/api/docs", get(handlers::api_docs))
@@ -26,7 +26,10 @@ pub fn router_at(state: AppState, mount: &'static str) -> Router {
         .route("/collections", get(handlers::collections))
         .route("/collections/{id}", get(handlers::collection))
         .route("/collections/{id}/map", get(handlers::get_map))
-        .route("/collections/{id}/styles", get(handlers::styles))
+        .route(
+            "/collections/{id}/styles",
+            api_common::errors::json_only_get(handlers::styles, "a style list"),
+        )
         .route(
             "/collections/{id}/styles/{styleId}/map",
             get(handlers::get_styled_map),
@@ -35,6 +38,13 @@ pub fn router_at(state: AppState, mount: &'static str) -> Router {
             "/collections/{id}/styles/{styleId}/legend",
             get(handlers::style_legend),
         )
-        .with_state(state)
+        .with_state(state.clone());
+    // A request that asked for HTML gets its error as a page (#1132).
+    let catalog = state.clone();
+    let pages = api_common::errors::pages(
+        move |headers| handlers::request_base_url(&state.load(), headers),
+        move |id| catalog.load().collections.contains_key(id),
+    );
+    api_common::errors::html_errors(router, "maps", mount, pages)
         .layer(Extension(api_common::Mount(mount)))
 }

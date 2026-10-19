@@ -91,6 +91,31 @@ fn feature_geometry_is_lat_lon_swapped_to_finland() {
     assert!((24.0..26.0).contains(&b[0]) && (59.0..62.0).contains(&b[1]));
 }
 
+/// #1143: an alert area is labelled by what and where, from its own
+/// `event` and `areaDesc`, not its sender-scoped id; its first columns say
+/// how severe and when.
+#[test]
+fn features_are_labelled_by_event_and_area() {
+    let eng = engine(None);
+    let mut f = eng.get_feature("urn:test:helsinki-flood-1.0.0").unwrap();
+    assert_eq!(
+        eng.label(&f).as_deref(),
+        Some("Flood Warning · Greater Helsinki")
+    );
+    // Only the parts the area has; none, no label.
+    let mut properties = (*f.properties).clone();
+    properties.remove("areaDesc");
+    f.properties = properties.clone().into();
+    assert_eq!(eng.label(&f).as_deref(), Some("Flood Warning"));
+    properties.remove("event");
+    f.properties = properties.into();
+    assert_eq!(eng.label(&f), None);
+    assert_eq!(
+        &eng.summary_properties()[..3],
+        ["severity", "onset", "active_until"]
+    );
+}
+
 #[test]
 fn feature_properties_carry_cap_metadata() {
     let eng = engine(None);
@@ -650,6 +675,32 @@ fn empty_source_is_loaded_but_has_no_records() {
         "a successful zero-record load is still 'loaded'"
     );
     assert_eq!(eng.feature_count(), 0);
+}
+
+/// #1001: before the first alert arrives, the standard CAP fields are still
+/// filterable — a query on them is an empty match, not an unknown property.
+#[test]
+fn empty_source_keeps_standard_cap_fields_filterable() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "cap-empty").unwrap();
+    let filterables = eng.filterables();
+    for name in [
+        "status", "msgType", "scope", "severity", "event", "areaDesc",
+    ] {
+        assert!(filterables.contains(name), "{name}");
+    }
+    let page = eng
+        .get_features(&FeatureQuery {
+            property_filters: vec![
+                ("status".into(), "Actual".into()),
+                ("scope".into(), "Public".into()),
+            ],
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(page.number_matched, 0);
+    assert_eq!(page.number_returned, 0);
 }
 
 fn instant(t: DateTime<Utc>) -> DatetimeInterval {

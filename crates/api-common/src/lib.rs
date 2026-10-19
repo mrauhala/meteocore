@@ -2,19 +2,23 @@
 //! and extent policy stays in ds-core; adapters supply metadata and engine facets.
 
 pub mod caching;
+pub mod errors;
+pub mod map_frame;
 pub mod shared;
+pub mod subset;
 pub mod workbench;
 
 use std::sync::Arc;
 
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{FromRequestParts, Query};
 use axum::http::{header, request::Parts, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use ds_core::collection_search::{
-    search, CollectionMatch, CollectionParameter, SearchParams, SearchQueryParams, DEFAULT_LIMIT,
-    MAX_LIMIT,
+    CollectionMatch, CollectionParameter, CollectionSortKey, CollectionSortProperty, SearchParams,
+    SearchQueryParams, DEFAULT_LIMIT, MAX_LIMIT,
 };
 use ds_core::config::CollectionConfig;
 use ds_core::html::{self, LinkView, Wanted};
@@ -137,10 +141,22 @@ pub fn conformance_classes(api_classes: &[&'static str]) -> Vec<&'static str> {
 
 /// Validated collection request. Reject unsupported/duplicate parameters before
 /// accessing engines and return the same structured 400 on every API surface.
+///
+/// The representation is negotiated first, from the raw `f` and `Accept`
+/// (#1132): a JSON request with a bad parameter is that 400, while an HTML
+/// one is extracted with the rejection, and [`collections_response`]
+/// answers it with the catalog form marking the field at fault. A request
+/// with a bad `f` is not HTML: its 400 names the first fault in the order it
+/// always has, the other parameters before the format.
 pub struct CollectionRequest {
-    query: SearchQueryParams,
-    search: SearchParams,
     wanted: Wanted,
+    parsed: Result<(SearchQueryParams, SearchParams), RejectedSearch>,
+}
+
+/// An HTML catalog search whose parameters failed validation.
+struct RejectedSearch {
+    pairs: Vec<(String, String)>,
+    error: ds_core::collection_search::SearchError,
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for CollectionRequest {
@@ -150,20 +166,64 @@ impl<S: Send + Sync> FromRequestParts<S> for CollectionRequest {
         let Query(pairs) = Query::<Vec<(String, String)>>::from_request_parts(parts, state)
             .await
             .map_err(|_| bad_request("Invalid collection query string"))?;
-        let query =
-            SearchQueryParams::from_pairs(pairs).map_err(|e| bad_request(&e.to_string()))?;
-        let search = query.parse().map_err(|e| bad_request(&e.to_string()))?;
         let accept = parts
             .headers
             .get(header::ACCEPT)
             .and_then(|v| v.to_str().ok());
-        let wanted =
-            html::negotiate(query.f.as_deref(), accept).map_err(|e| bad_request(&e.to_string()))?;
-        Ok(Self {
-            query,
-            search,
-            wanted,
-        })
+        let f = pairs
+            .iter()
+            .find(|(k, _)| k == "f")
+            .map(|(_, v)| v.as_str());
+        let wanted = html::negotiate(f, accept);
+        let parsed = SearchQueryParams::from_pairs(pairs.clone()).and_then(|query| {
+            let search = query.parse()?;
+            Ok((query, search))
+        });
+        match (parsed, wanted) {
+            (Err(error), Ok(Wanted::Json) | Err(_)) => Err(bad_request(&error.to_string())),
+            (_, Err(error)) => Err(bad_request(&error.to_string())),
+            (Ok(parsed), Ok(wanted)) => Ok(Self {
+                wanted,
+                parsed: Ok(parsed),
+            }),
+            (Err(error), Ok(Wanted::Html)) => Ok(Self {
+                wanted: Wanted::Html,
+                parsed: Err(RejectedSearch { pairs, error }),
+            }),
+        }
+    }
+}
+
+/// axum's [`Query`] whose rejection is the JSON 400 every other invalid
+/// parameter gets, not axum's plain-text one. A struct-shaped query fails
+/// before the handler runs on a parameter given twice (`width=1&width=2`);
+/// the description is axum's, which names it (#1073). Every struct-shaped
+/// query of the Maps, Tiles, EDR and Features routes and of the shared
+/// root's Common routes extracts with it, so none answers in plain text
+/// (#1121).
+pub struct JsonQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for JsonQuery<T>
+where
+    Query<T>: FromRequestParts<S, Rejection = QueryRejection>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(Self(value)),
+            Err(rejection) => {
+                let message = rejection.body_text();
+                // An HTML error page names the parameter (#1132); the JSON
+                // body is unchanged.
+                let detail = errors::ErrorDetail {
+                    parameter: errors::rejected_field(&message).map(str::to_owned),
+                    ..Default::default()
+                };
+                Err(detail.attach(bad_request(&message)))
+            }
+        }
     }
 }
 
@@ -185,19 +245,45 @@ pub struct CollectionEntry<'a> {
     pub time: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
-/// Filter, page and represent a collection list at `{surface.root}/collections`.
-/// The root is the externally resolved absolute API root (including any proxy
-/// prefix and the API mount).
+/// The order of a JSON collection list without `sortby`: by id.
+pub const JSON_DEFAULT_SORT: CollectionSortKey =
+    CollectionSortKey::ascending(CollectionSortProperty::Id);
+
+/// Filter, sort, page and represent a collection list at
+/// `{surface.root}/collections`. The root is the externally resolved absolute
+/// API root (including any proxy prefix and the API mount).
+///
+/// Without `limit` and `sortby`, JSON lists [`DEFAULT_LIMIT`] collections by
+/// id and an HTML page [`workbench::HTML_PAGE_SIZE`] by title (#1141). Links
+/// to the same representation leave them out, as the request did; a link to
+/// the other representation spells out the page size and order used, so it
+/// names the same page.
 pub fn collections_response(
     surface: workbench::Surface<'_>,
     request: CollectionRequest,
-    mut entries: Vec<CollectionEntry<'_>>,
+    entries: Vec<CollectionEntry<'_>>,
 ) -> Response {
     let url = &format!("{}/collections", surface.root);
-    entries.sort_by(|a, b| a.config.id.cmp(&b.config.id));
+    let (query, mut search) = match request.parsed {
+        Ok(parsed) => parsed,
+        Err(rejected) => return rejected_search(surface, rejected),
+    };
+    let html = request.wanted == Wanted::Html;
+    // An empty `limit`, as a cleared form field sends it, is no limit.
+    if html && query.limit.as_deref().is_none_or(|l| l.trim().is_empty()) {
+        search.limit = workbench::HTML_PAGE_SIZE;
+    }
+    if search.sortby.is_empty() {
+        search.sortby = vec![if html {
+            workbench::HTML_DEFAULT_SORT
+        } else {
+            JSON_DEFAULT_SORT
+        }];
+    }
     let facets: Vec<_> = entries
         .iter()
         .map(|entry| CollectionMatch {
+            id: &entry.config.id,
             title: &entry.config.title,
             description: &entry.config.description,
             keywords: &entry.config.keywords,
@@ -207,7 +293,7 @@ pub fn collections_response(
             time: entry.time,
         })
         .collect();
-    let result = search(&facets, &request.search);
+    let result = ds_core::collection_search::search(&facets, &search);
     // Explicit formats make both Accept-negotiated HTML and JSON links usable
     // without reproducing the original request headers.
     let (format, alternate, media_type, alternate_type) = match request.wanted {
@@ -217,13 +303,12 @@ pub fn collections_response(
     let href = |offset, f| {
         format!(
             "{url}{}",
-            request
-                .query
-                .query_string_with_format(request.search.limit, offset, f)
+            query.query_string_with_format(search.limit, offset, f)
         )
     };
+    let explicit = query.explicit_page(search.limit, &search.sortby);
     let mut nav = vec![LinkView::new(
-        href(request.search.offset, format),
+        href(search.offset, format),
         "self",
         Some("This page"),
     )];
@@ -242,27 +327,32 @@ pub fn collections_response(
         ));
     }
     nav.push(LinkView::new(
-        href(request.search.offset, alternate),
+        format!(
+            "{url}{}",
+            explicit.query_string_with_format(search.limit, search.offset, alternate)
+        ),
         "alternate",
         Some(&format!("This page as {}", alternate.to_uppercase())),
     ));
 
+    // One link list for both representations: the HTML page lists it too
+    // (OGC API - EDR `/req/html/content` A).
+    let links: Vec<_> = nav
+        .iter()
+        .map(|link| {
+            let media_type = if link.rel == "alternate" {
+                alternate_type
+            } else {
+                media_type
+            };
+            json!({
+                "href": link.href, "rel": link.rel, "title": link.title,
+                "type": media_type
+            })
+        })
+        .collect();
     let mut response = match request.wanted {
         Wanted::Json => {
-            let links: Vec<_> = nav
-                .iter()
-                .map(|link| {
-                    let media_type = if link.rel == "alternate" {
-                        alternate_type
-                    } else {
-                        media_type
-                    };
-                    json!({
-                        "href": link.href, "rel": link.rel, "title": link.title,
-                        "type": media_type
-                    })
-                })
-                .collect();
             let collections: Vec<_> = result.page.iter().map(|&i| &entries[i].metadata).collect();
             Json(json!({
                 "collections": collections, "numberMatched": result.number_matched,
@@ -281,15 +371,38 @@ pub fn collections_response(
                 .collect();
             Html(workbench::collections_html(
                 surface,
-                &request.query,
-                &request.search,
+                &query,
+                &search,
                 result.number_matched,
                 &metadata,
                 &nav,
+                &Value::Array(links),
             ))
             .into_response()
         }
     };
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("accept"));
+    response
+}
+
+/// The 400 of an HTML catalog search whose parameters failed: the catalog
+/// form holding what the request gave, the field at fault marked (#1132).
+fn rejected_search(surface: workbench::Surface<'_>, rejected: RejectedSearch) -> Response {
+    let message = rejected.error.to_string();
+    let html = workbench::rejected_collections_html(
+        surface,
+        &rejected.pairs,
+        rejected.error.parameter(),
+        &message,
+    );
+    let mut response = (StatusCode::BAD_REQUEST, Html(html)).into_response();
+    response
+        .extensions_mut()
+        .insert(ds_core::error::ErrorReason(format!(
+            "BadRequest: {message}"
+        )));
     response
         .headers_mut()
         .append(header::VARY, HeaderValue::from_static("accept"));
@@ -315,9 +428,14 @@ pub fn collection_metadata(
             json!({"href": format!("{href}?f=html"), "rel": "alternate", "type": "text/html", "title": "This collection as HTML"}),
         );
     }
-    if let Some((title, url)) = config.license.as_ref().and_then(|l| l.card_link()) {
-        // Operator-supplied URLs need not serve HTML; do not invent their type.
-        links.push(json!({"href": url, "rel": "license", "title": title}));
+    if let Some(license) = &config.license {
+        // Every link carries a `type` (EDR 1.2 `/req/core/rc-collection-info-
+        // links` B): `text/html` unless the operator says what the URL serves.
+        if let Some((title, url)) = license.card_link() {
+            links.push(
+                json!({"href": url, "rel": "license", "type": license.link_type(), "title": title}),
+            );
+        }
     }
     let mut metadata = json!({
         "id": config.id, "title": config.title, "description": config.description,
@@ -423,6 +541,18 @@ pub fn parameter_name_parameter() -> Value {
     })
 }
 
+/// The `quality` query parameter of the Maps and Tiles image routes, a
+/// MeteoCore extension; one definition so the blocks of the shared root
+/// declare one component. `jpeg_default` is `ds_render::DEFAULT_JPEG_QUALITY`
+/// (api-common does not depend on ds-render).
+pub fn quality_parameter(jpeg_default: u8) -> Value {
+    json!({
+        "name": "quality", "in": "query", "required": false,
+        "schema": {"type": "integer", "minimum": 1, "maximum": 100},
+        "description": format!("Encoder quality for `image/webp` and `image/jpeg`, an integer from 1 to 100 (MeteoCore extension). For WebP, 1–99 is lossy encoding at that quality and 100 is lossless; without it WebP uses the collection's default quality when the server configures one, else lossless. JPEG defaults to {jpeg_default}. Not accepted with `image/png`: 400.")
+    })
+}
+
 /// The `legend` schema of the Maps and Tiles legend routes: a parameter
 /// style's palette legend (`ds_render::legend_json`), or an RGB composite's
 /// channel list (`ds_render::composite_legend_json`, #819). One definition
@@ -496,26 +626,30 @@ pub fn legend_schema() -> Value {
 /// Pure bounds/defaults come from ds-core, not copies in each API crate.
 pub fn collection_parameters() -> Value {
     Value::Array(CollectionParameter::ALL.iter().map(|p| {
-        let (schema, description) = match p {
+        let (schema, description): (Value, String) = match p {
             CollectionParameter::Bbox => (json!({"type": "array", "minItems": 4, "maxItems": 6, "items": {"type": "number"}}),
-                "Filter collections by horizontal CRS84 extent intersection. Four or six comma-separated numbers; vertical bounds are ignored."),
+                "Filter collections by horizontal CRS84 extent intersection. Four or six comma-separated numbers; vertical bounds are ignored.".into()),
             CollectionParameter::BboxCrs => (json!({"type": "string", "default": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"}),
-                "CRS of bbox. Only CRS84 is supported."),
+                "CRS of bbox. Only CRS84 is supported.".into()),
             CollectionParameter::Datetime => (json!({"type": "string"}),
-                "Filter by temporal extent overlap with an RFC 3339 instant or interval (start/end, ../end, start/..). Unknown extents remain eligible."),
+                "Filter by temporal extent overlap with an RFC 3339 instant or interval (start/end, ../end, start/..). Unknown extents remain eligible.".into()),
             CollectionParameter::Q => (json!({"type": "array", "minItems": 1, "items": {"type": "string"}}),
-                "Case-insensitive text search over title, description and keywords. Comma-separated terms are OR; phrases match whole words with normalized whitespace within one property."),
+                "Case-insensitive text search over title, description and keywords. Comma-separated terms are OR; phrases match whole words with normalized whitespace within one property.".into()),
             CollectionParameter::Query => (json!({"type": "array", "minItems": 1, "items": {"type": "string"}}),
-                "Text search with comma-separated OR alternatives. Within each alternative, + requires and - excludes the following term or phrase; required terms may match different properties. Phrases match within one property with normalized whitespace. Operators only apply at the start or after whitespace; internal signs are literal. Encode + as %2B. Empty alternatives or operators without an attached term return 400. Combined with q and other filters using AND."),
+                "Text search with comma-separated OR alternatives. Within each alternative, + requires and - excludes the following term or phrase; required terms may match different properties. Phrases match within one property with normalized whitespace. Operators only apply at the start or after whitespace; internal signs are literal. Encode + as %2B. Empty alternatives or operators without an attached term return 400. Combined with q and other filters using AND.".into()),
+            // OGC API - Common - Part 4 `sortby`, schema verbatim from the
+            // pinned bundle (schemas/ogcapi-common-4.bundled.json).
+            CollectionParameter::Sortby => (json!({"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "[+|-]?[A-Za-z_].*", "example": "title"}}),
+                "Sort the collections by `title` or `id`: comma-separated property names, each ascending unless prefixed with `-` (an unescaped `+` decodes as a space, which is also ascending). Titles compare case-insensitively; ties are ordered by id. Any other property returns 400. Without sortby, JSON lists collections by id and an HTML page by title.".into()),
             CollectionParameter::Limit => (json!({"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": DEFAULT_LIMIT}),
-                "Maximum collections per page. Values above the maximum are clamped."),
+                format!("Maximum collections per page. Values above the maximum are clamped. The default is for JSON; an HTML page without limit shows {}.", workbench::HTML_PAGE_SIZE)),
             CollectionParameter::Offset => (json!({"type": "integer", "minimum": 0, "default": 0}),
-                "Number of matching collections to skip (offset pagination extension)."),
+                "Number of matching collections to skip (offset pagination extension).".into()),
             CollectionParameter::Format => (json!({"type": "string", "enum": ["json", "html"]}),
-                "Output representation; overrides Accept. Without f, Accept is used, defaulting to JSON."),
+                "Output representation; overrides Accept. Without f, Accept is used, defaulting to JSON.".into()),
         };
         let mut definition = json!({"name": p.name(), "in": "query", "required": false, "schema": schema, "description": description});
-        if matches!(p, CollectionParameter::Bbox | CollectionParameter::Q | CollectionParameter::Query) {
+        if matches!(p, CollectionParameter::Bbox | CollectionParameter::Q | CollectionParameter::Query | CollectionParameter::Sortby) {
             definition["style"] = json!("form");
             definition["explode"] = json!(false);
         }
@@ -545,10 +679,13 @@ pub fn collection_operation() -> Value {
                 }
             },
             "400": {
-                "description": "Unsupported, duplicate or invalid collection query parameter",
-                "content": {"application/json": {"schema": {"type": "object", "required": ["code", "description"], "properties": {
-                    "code": {"type": "string"}, "description": {"type": "string"}
-                }}}}
+                "description": "Unsupported, duplicate or invalid collection query parameter. An HTML request gets the catalog form again, with the field at fault marked.",
+                "content": {
+                    "application/json": {"schema": {"type": "object", "required": ["code", "description"], "properties": {
+                        "code": {"type": "string"}, "description": {"type": "string"}
+                    }}},
+                    "text/html": {"schema": {"type": "string"}}
+                }
             }
         }
     })
@@ -580,6 +717,46 @@ mod tests {
             layer_subtitle: None,
             reference_times: vec![],
         }
+    }
+
+    /// Every link of a collection document carries `rel` and `type` (EDR 1.2
+    /// `/req/core/rc-collection-info-links` B), the license link included:
+    /// `text/html` unless the license configures the `type` of its `url`.
+    #[test]
+    fn license_link_carries_a_type() {
+        let links = |license: Value| {
+            let config: CollectionConfig = serde_json::from_value(
+                json!({"id": "c", "title": "C", "description": "", "license": license}),
+            )
+            .unwrap();
+            let self_link =
+                json!({"href": "https://x/c", "rel": "self", "type": "application/json"});
+            collection_metadata(&config, json!({}), vec![self_link])["links"].clone()
+        };
+        let license = |links: &Value| {
+            let links = links.as_array().unwrap();
+            for link in links {
+                assert!(
+                    link["rel"].is_string() && link["type"].is_string(),
+                    "{link}"
+                );
+            }
+            links
+                .iter()
+                .find(|l| l["rel"] == "license")
+                .unwrap()
+                .clone()
+        };
+        let spdx = license(&links(json!({"title": "CC-BY-4.0"})));
+        assert_eq!(spdx["href"], "https://spdx.org/licenses/CC-BY-4.0.html");
+        assert_eq!(spdx["type"], "text/html");
+        let page = license(&links(json!({"title": "Terms", "url": "https://x/terms"})));
+        assert_eq!(page["type"], "text/html");
+        let pdf = license(&links(
+            json!({"title": "Terms", "url": "https://x/terms.pdf", "type": "application/pdf"}),
+        ));
+        assert_eq!(pdf["href"], "https://x/terms.pdf");
+        assert_eq!(pdf["type"], "application/pdf");
     }
 
     #[test]
@@ -688,6 +865,57 @@ mod tests {
             .get::<ErrorReason>()
             .expect("5xx must also attach ErrorReason");
         assert_eq!(reason.0, "ServerError: Internal server error");
+    }
+
+    /// The output of an extractor future that is ready at once, as
+    /// [`JsonQuery`]'s is: it does no I/O.
+    fn ready<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let waker = std::task::Waker::noop();
+        match future
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(waker))
+        {
+            std::task::Poll::Ready(output) => output,
+            std::task::Poll::Pending => panic!("the extractor did not complete"),
+        }
+    }
+
+    /// A query the target type cannot hold is the JSON 400 with axum's
+    /// description, not axum's plain text (#1073).
+    #[test]
+    fn json_query_rejection_is_the_json_400() {
+        type Values = std::collections::BTreeMap<String, u32>;
+        let extract = |uri: &str| {
+            let (mut parts, ()) = axum::http::Request::builder()
+                .uri(uri)
+                .body(())
+                .unwrap()
+                .into_parts();
+            ready(JsonQuery::<Values>::from_request_parts(&mut parts, &())).map_err(Box::new)
+        };
+
+        let Ok(JsonQuery(values)) = extract("/?width=8") else {
+            panic!("a well-formed query is extracted")
+        };
+        assert_eq!(values["width"], 8);
+
+        let Err(response) = extract("/?width=eight") else {
+            panic!("a malformed query is rejected")
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let reason = response
+            .extensions()
+            .get::<ErrorReason>()
+            .expect("attached");
+        assert!(
+            reason
+                .0
+                .starts_with("BadRequest: Failed to deserialize query string: "),
+            "{}",
+            reason.0
+        );
     }
 
     #[test]

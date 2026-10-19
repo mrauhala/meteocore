@@ -1,5 +1,6 @@
 //! Forecast catalog: maps (reference_time, step) → file + message offsets.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
@@ -235,6 +236,23 @@ impl ForecastRun {
             .collect()
     }
 
+    /// The steps valid inside `[start, end]`, ascending: for an instant
+    /// `(t, t)` only a step valid at exactly `t`. An open bound is chrono's
+    /// `MIN_UTC`/`MAX_UTC`, which compares like any other time.
+    pub fn steps_within(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> impl Iterator<Item = (DateTime<Utc>, &StepFile)> + '_ {
+        self.steps
+            .iter()
+            .map(|(&step, file)| {
+                let time = self.reference_time + chrono::Duration::hours(i64::from(step));
+                (time, file)
+            })
+            .filter(move |(time, _)| start <= *time && *time <= end)
+    }
+
     /// Find the closest step within this run's available valid-time extent.
     pub fn find_step_for_time(&self, valid_time: DateTime<Utc>) -> Option<(u32, &StepFile)> {
         let (&first, _) = self.steps.first_key_value()?;
@@ -264,6 +282,86 @@ impl ForecastRun {
     }
 }
 
+/// The steps of one run that carry a set of parameters (#1005), ascending:
+/// a map render of those parameters reads only these.
+#[derive(Debug, Clone)]
+pub enum CarriedSteps<'a> {
+    /// Every step of the run.
+    Every(&'a ForecastRun),
+    /// Only the listed steps, possibly none.
+    Listed(&'a ForecastRun, Cow<'a, [u32]>),
+}
+
+impl<'a> CarriedSteps<'a> {
+    fn run(&self) -> &'a ForecastRun {
+        match self {
+            Self::Every(run) | Self::Listed(run, _) => run,
+        }
+    }
+
+    fn valid(&self, step: u32) -> DateTime<Utc> {
+        self.run().reference_time + chrono::Duration::hours(i64::from(step))
+    }
+
+    fn file(&self, step: u32) -> Option<(u32, &'a StepFile)> {
+        self.run().steps.get(&step).map(|file| (step, file))
+    }
+
+    fn first(&self) -> Option<u32> {
+        match self {
+            Self::Every(run) => run.steps.keys().next().copied(),
+            Self::Listed(_, steps) => steps.first().copied(),
+        }
+    }
+
+    pub fn last(&self) -> Option<(u32, &'a StepFile)> {
+        match self {
+            Self::Every(run) => run.steps.iter().next_back().map(|(&s, f)| (s, f)),
+            Self::Listed(_, steps) => steps.last().and_then(|&s| self.file(s)),
+        }
+    }
+
+    /// Whether `time` lies within the first and last of these steps.
+    pub fn covers(&self, time: DateTime<Utc>) -> bool {
+        match (self.first(), self.last()) {
+            (Some(first), Some((last, _))) => self.valid(first) <= time && time <= self.valid(last),
+            _ => false,
+        }
+    }
+
+    /// The step closest to `time`, the earlier one on a tie, wherever
+    /// `time` lies. Only the steps either side of it can be closest, so this
+    /// is a range lookup, never a scan of the run.
+    pub fn nearest(&self, time: DateTime<Utc>) -> Option<(u32, &'a StepFile)> {
+        let reference = self.run().reference_time;
+        // Steps up to `hour` are valid at or before `time`; later ones after.
+        let hour = (time >= reference)
+            .then(|| u32::try_from((time - reference).num_hours()).unwrap_or(u32::MAX));
+        let (before, after) = match (self, hour) {
+            (Self::Every(run), None) => (None, run.steps.keys().next().copied()),
+            (Self::Every(run), Some(hour)) => (
+                run.steps.range(..=hour).next_back().map(|(&s, _)| s),
+                run.steps
+                    .range((std::ops::Bound::Excluded(hour), std::ops::Bound::Unbounded))
+                    .next()
+                    .map(|(&s, _)| s),
+            ),
+            (Self::Listed(_, steps), hour) => {
+                let split = hour.map_or(0, |hour| steps.partition_point(|&s| s <= hour));
+                (
+                    split.checked_sub(1).map(|i| steps[i]),
+                    steps.get(split).copied(),
+                )
+            }
+        };
+        before
+            .into_iter()
+            .chain(after)
+            .min_by_key(|&step| (self.valid(step) - time).abs())
+            .and_then(|step| self.file(step))
+    }
+}
+
 /// The full forecast catalog.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
@@ -272,11 +370,15 @@ pub struct Catalog {
     /// Fingerprint for rendered caches, computed on publication from the
     /// ordered message identities (including origins, offsets and levels).
     pub content_version: u64,
-    /// Latest-run parameter union, rebuilt on the poll path before publication.
+    /// Parameter union over every retained run, newest run first (#1026),
+    /// rebuilt on the poll path before publication.
     parameters: Vec<(String, String, Option<u32>)>,
     /// Canonical levels per run, selected once on publication. A missing
     /// canonical level in a step is missing data, not a switch to upper air.
     parameter_keys: BTreeMap<DateTime<Utc>, ParameterKeys>,
+    /// Each advertised parameter's canonical key in the newest run that has
+    /// it (#1026): what its label, unit and wind facts describe.
+    advertised_keys: ParameterKeys,
     /// Built once on the scan path. Child catalogs contain no further children.
     pub families: BTreeMap<GribLevelType, Arc<Catalog>>,
     /// Per-run level union, also precomputed for vertical query selection.
@@ -284,6 +386,17 @@ pub struct Catalog {
     pub vertical_levels: Vec<f64>,
     valid_times: Vec<DateTime<Utc>>,
     param_names: Vec<String>,
+    /// A pressure or model-level family: a parameter spans the family's
+    /// levels, so a step carries it at any of them. Elsewhere a step
+    /// carries a parameter only at its run's canonical level.
+    any_level: bool,
+    /// Per run, the steps carrying each parameter that some of the run's
+    /// steps lack (#1005): hour-window aggregates, `TMAX` at the analysis.
+    /// A parameter of the run that is not listed here is at every step.
+    partial_steps: BTreeMap<DateTime<Utc>, HashMap<String, Vec<u32>>>,
+    /// Each advertised parameter's valid times over every retained run,
+    /// kept only where they differ from `valid_times` (#1005).
+    parameter_times: HashMap<String, Arc<[DateTime<Utc>]>>,
 }
 
 impl Catalog {
@@ -321,7 +434,8 @@ impl Catalog {
             .zip(self.valid_times.last().copied())
     }
 
-    /// Parameters are unioned across the run: f000 commonly lacks aggregates.
+    /// Parameters are unioned across the steps of every retained run: f000
+    /// commonly lacks aggregates.
     pub fn surface_params(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         self.all_params_with_levels()
@@ -336,13 +450,133 @@ impl Catalog {
         self.param_names.clone()
     }
 
-    /// All unique parameters with level info from every step in the latest run.
+    /// All unique parameters with level info from every step of every
+    /// retained run, the newest run's first (#1026).
     pub fn all_params_with_levels(&self) -> Vec<(String, String, Option<u32>)> {
         self.parameters.clone()
     }
 
     pub fn parameter_keys(&self, reference_time: &DateTime<Utc>) -> Option<&ParameterKeys> {
         self.parameter_keys.get(reference_time)
+    }
+
+    /// Each advertised parameter's canonical key in the newest run that has
+    /// it: a parameter only an older run still has is described by that
+    /// run's key (#1026).
+    pub fn advertised_keys(&self) -> &ParameterKeys {
+        &self.advertised_keys
+    }
+
+    /// Whether `run` has every one of `parameters` (at some step).
+    pub fn run_has(&self, run: &ForecastRun, parameters: &[&str]) -> bool {
+        let keys = self.parameter_keys.get(&run.reference_time);
+        parameters
+            .iter()
+            .all(|name| keys.is_some_and(|keys| keys.contains_key(*name)))
+    }
+
+    /// `parameter`'s valid times over every retained run, when they are not
+    /// the collection's ([`Self::all_valid_times`]): an `Arc` clone from the
+    /// publication snapshot.
+    pub fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+        self.parameter_times.get(parameter).cloned()
+    }
+
+    /// Whether any retained run has `parameter`.
+    pub fn has_parameter(&self, parameter: &str) -> bool {
+        self.advertised_keys.contains_key(parameter)
+    }
+
+    /// The steps of `run` that carry every one of `parameters`; with none,
+    /// every step. A parameter the run lacks leaves none. From the
+    /// publication snapshot: the single-parameter case borrows its list.
+    pub fn carried_steps<'a>(
+        &'a self,
+        run: &'a ForecastRun,
+        parameters: &[&str],
+    ) -> CarriedSteps<'a> {
+        let keys = self.parameter_keys.get(&run.reference_time);
+        let partial = self.partial_steps.get(&run.reference_time);
+        let mut listed: Option<Cow<'a, [u32]>> = None;
+        for &name in parameters {
+            if !keys.is_some_and(|keys| keys.contains_key(name)) {
+                return CarriedSteps::Listed(run, Cow::Borrowed(&[]));
+            }
+            let Some(steps) = partial.and_then(|partial| partial.get(name)) else {
+                continue;
+            };
+            listed = Some(match listed {
+                None => Cow::Borrowed(steps.as_slice()),
+                Some(previous) => previous
+                    .iter()
+                    .copied()
+                    .filter(|step| steps.binary_search(step).is_ok())
+                    .collect(),
+            });
+        }
+        match listed {
+            Some(steps) => CarriedSteps::Listed(run, steps),
+            None => CarriedSteps::Every(run),
+        }
+    }
+
+    /// Per run, the steps carrying each of its parameters, for the
+    /// parameters some steps lack: one pass over each step's messages.
+    fn build_partial_steps(&self) -> BTreeMap<DateTime<Utc>, HashMap<String, Vec<u32>>> {
+        self.runs
+            .iter()
+            .map(|(reference_time, run)| {
+                let mut carried: HashMap<&str, Vec<u32>> = HashMap::new();
+                if let Some(keys) = self.parameter_keys.get(reference_time) {
+                    for (&step, file) in &run.steps {
+                        for message in &file.messages {
+                            let Some((name, key)) = keys.get_key_value(&message.param) else {
+                                continue;
+                            };
+                            if !(self.any_level || key.matches(message)) {
+                                continue;
+                            }
+                            let steps = carried.entry(name.as_str()).or_default();
+                            if steps.last() != Some(&step) {
+                                steps.push(step);
+                            }
+                        }
+                    }
+                }
+                let partial = carried
+                    .into_iter()
+                    .filter(|(_, steps)| steps.len() != run.steps.len())
+                    .map(|(name, steps)| (name.to_owned(), steps))
+                    .collect();
+                (*reference_time, partial)
+            })
+            .collect()
+    }
+
+    /// The advertised parameters' own valid-time axes: the union over runs
+    /// of the steps carrying each, kept where it is not `valid_times`.
+    fn build_parameter_times(&self) -> HashMap<String, Arc<[DateTime<Utc>]>> {
+        self.param_names
+            .iter()
+            .filter_map(|name| {
+                let mut times: Vec<DateTime<Utc>> = self
+                    .runs
+                    .values()
+                    .flat_map(|run| {
+                        let steps: Vec<u32> = match self.carried_steps(run, &[name]) {
+                            CarriedSteps::Every(run) => run.steps.keys().copied().collect(),
+                            CarriedSteps::Listed(_, steps) => steps.into_owned(),
+                        };
+                        steps.into_iter().map(move |step| {
+                            run.reference_time + chrono::Duration::hours(i64::from(step))
+                        })
+                    })
+                    .collect();
+                times.sort_unstable();
+                times.dedup();
+                (times != self.valid_times).then(|| (name.clone(), Arc::from(times)))
+            })
+            .collect()
     }
 
     /// Call after modifying runs, before publishing the immutable snapshot.
@@ -387,13 +621,29 @@ impl Catalog {
                 )
             })
             .collect();
-        let Some(run) = self.runs.values().next_back() else {
-            return;
-        };
-        let mut seen = HashMap::new();
-        for m in run.steps.values().flat_map(|sf| &sf.messages) {
-            let key = (&m.param, &m.levtype, m.level);
-            if seen.insert(key, ()).is_none() {
+        self.partial_steps = self.build_partial_steps();
+        // Every retained run's parameters, newest first (#1026): while a new
+        // run has only its analysis, its windows and maxima, and anything
+        // else only older runs still have, stay advertised, and in the same
+        // order once the new run has them.
+        let mut advertised = ParameterKeys::new();
+        for keys in self.parameter_keys.values().rev() {
+            for (name, key) in keys {
+                advertised
+                    .entry(name.clone())
+                    .or_insert_with(|| key.clone());
+            }
+        }
+        self.advertised_keys = advertised;
+        let mut seen = HashSet::new();
+        for m in self
+            .runs
+            .values()
+            .rev()
+            .flat_map(|run| run.steps.values())
+            .flat_map(|sf| &sf.messages)
+        {
+            if seen.insert((&m.param, &m.levtype, m.level)) {
                 self.parameters
                     .push((m.param.clone(), m.levtype.clone(), m.level));
             }
@@ -406,6 +656,7 @@ impl Catalog {
             .filter(|name| seen.insert(*name))
             .cloned()
             .collect();
+        self.parameter_times = self.build_parameter_times();
     }
 
     pub fn refresh_families(&mut self, enabled: &[GribLevelType]) {
@@ -456,6 +707,7 @@ impl Catalog {
                 .map(|&v| v as u32)
                 .collect();
             catalog.vertical_levels = levels.into_iter().rev().map(f64::from).collect();
+            catalog.any_level = family != GribLevelType::Single;
             catalog.refresh_metadata();
             self.families.insert(family, Arc::new(catalog));
         }

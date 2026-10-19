@@ -20,6 +20,12 @@ impl GribEngine {
 
     /// Exact discrete selection; unavailable levels never silently snap to a
     /// different surface. Missing fields at a valid level remain missing.
+    ///
+    /// A requested list (`z=850,700`, or the levels `Rn/min/step` expands
+    /// to) keeps the run's levels it names, in request order and each once,
+    /// as an interval keeps those inside it (`/req/edr/z-response` B, D, E):
+    /// a level the run lacks is dropped, and only a request naming none of
+    /// them is a 400.
     pub(crate) fn selected_levels(
         &self,
         catalog: &Catalog,
@@ -39,21 +45,17 @@ impl GribEngine {
             .get(&run)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let selected = z.unwrap_or(available);
-        if selected.is_empty()
-            || selected
-                .iter()
-                .any(|v| !v.is_finite() || !available.contains(v))
-        {
-            return Err(DataServerError::InvalidParameter(format!(
-                "Requested vertical level is unavailable in this run; available levels: {available:?}"
-            )));
-        }
         let mut levels = Vec::new();
-        for &value in selected {
-            if !levels.contains(&Some(value)) {
+        for &value in z.unwrap_or(available) {
+            if available.contains(&value) && !levels.contains(&Some(value)) {
                 levels.push(Some(value));
             }
+        }
+        if levels.is_empty() {
+            return Err(DataServerError::InvalidParameter(format!(
+                "The requested vertical levels select none of the levels available in this \
+                 run; available levels: {available:?}"
+            )));
         }
         Ok(levels)
     }
@@ -554,6 +556,64 @@ mod tests {
         assert!((area.ranges["TMP"].values[4].unwrap() + 23.15).abs() < 1e-9);
     }
 
+    /// `/req/edr/z-response` B, D, E: a `z` list, or the levels a recurring
+    /// interval expands to, keeps the run's levels it names, as an interval
+    /// does; only a list naming none of them is a 400.
+    #[test]
+    fn z_lists_keep_the_available_levels_and_reject_only_none() {
+        let source = TestSource::new();
+        source.write(
+            "f000",
+            &[
+                ("TMP", "850 mb", message(0, 270.0, [0; 4], 100, 85000)),
+                ("TMP", "500 mb", message(0, 250.0, [0; 4], 100, 50000)),
+            ],
+            0,
+        );
+        let engine = GribEngine::new("forecast", &split_config(&source)).unwrap();
+        let views = engine.level_collections();
+        let pressure = &views[0];
+        let tmp = ["TMP".to_string()];
+        let position =
+            |z: &[f64]| pressure.query_position("POINT(0.5 0.5)", None, Some(&tmp), Some(z), None);
+        let profile_levels = |z: &[f64]| match position(z).unwrap() {
+            CoverageResponse::Collection(profiles) => match &profiles[0].domain {
+                DomainDescription::VerticalProfile { z, .. } => z.values.clone(),
+                other => panic!("{other:?}"),
+            },
+            CoverageResponse::Single(series) => match &series.domain {
+                DomainDescription::PointSeries { z: Some(z), .. } => z.values.clone(),
+                other => panic!("{other:?}"),
+            },
+        };
+        // Unavailable members drop out; request order holds, repeats once.
+        assert_eq!(
+            profile_levels(&[500.0, 200.0, 850.0, 500.0]),
+            [500.0, 850.0]
+        );
+        // `R4/1000/-150` = 1000, 850, 700, 550: only 850 is in the run.
+        assert_eq!(profile_levels(&[1000.0, 850.0, 700.0, 550.0]), [850.0]);
+        let CoverageResponse::Single(area) = pressure
+            .query_area("0,0,1,1", None, Some(&tmp), Some(&[925.0, 500.0]), None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let DomainDescription::Grid { z: Some(z), .. } = &area.domain else {
+            panic!()
+        };
+        assert_eq!(z.values, [500.0]);
+        // Naming none of the run's levels is a 400 listing the ones there are.
+        for z in [&[925.0][..], &[925.0, 200.0]] {
+            match position(z) {
+                Err(DataServerError::InvalidParameter(m)) => {
+                    assert!(m.contains("[850.0, 500.0]"), "{m}")
+                }
+                other => panic!("{z:?}: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn family_instances_and_run_selection_follow_only_that_familys_files() {
         let source = TestSource::new();
@@ -584,6 +644,16 @@ mod tests {
         let valid = old + chrono::Duration::hours(12);
         assert_eq!(single.get_instances()[0].reference_time, new);
         assert_eq!(pressure.get_instances()[0].reference_time, old);
+        // The run axis read without valid times is each view's own (#1006).
+        for view in [single, pressure] {
+            let runs: Vec<_> = view
+                .get_instances()
+                .iter()
+                .map(|r| r.reference_time)
+                .collect();
+            assert_eq!(view.instance_reference_times(), runs);
+        }
+        assert_eq!(single.instance_reference_times()[0], new);
         assert_eq!(pressure.get_temporal_extent(), Some((old, valid)));
         assert_eq!(
             pressure.resolve_reference_time(Some(valid), None),
@@ -640,5 +710,102 @@ mod tests {
             .unwrap()
             .level_collections()
             .is_empty());
+    }
+
+    /// The newest run lacks the first level the runs together advertise.
+    /// Without `z`, a map draws the run's own first level, and
+    /// `resolve_elevation` names that level, so WMS GetFeatureInfo asks the
+    /// position query for a level the run has and reads the drawn value
+    /// (#1064). The advertised first level would be a 400.
+    #[test]
+    fn resolve_elevation_is_the_selected_runs_own_first_level() {
+        let source = TestSource::new();
+        let tmp = |kelvin: f32, hpa: u32| message(0, kelvin, [0; 4], 100, hpa * 100);
+        source.write_run(
+            "old",
+            "2026040500",
+            &[
+                ("TMP", "850 mb", "anl", tmp(270.0, 850)),
+                ("TMP", "500 mb", "anl", tmp(250.0, 500)),
+            ],
+        );
+        source.write_run(
+            "new",
+            "2026040506",
+            &[("TMP", "500 mb", "anl", tmp(240.0, 500))],
+        );
+        let engine = GribEngine::new("forecast", &split_config(&source)).unwrap();
+        let views = engine.level_collections();
+        let [pressure] = views.as_slice() else {
+            panic!()
+        };
+        let levels = pressure
+            .raster_info_shared()
+            .vertical
+            .clone()
+            .unwrap()
+            .levels;
+        assert_eq!(levels, [850.0, 500.0]);
+
+        let old: DateTime<Utc> = "2026-04-05T00:00:00Z".parse().unwrap();
+        let new = old + chrono::Duration::hours(6);
+        let run = pressure.resolve_parameter_reference_time(Some("TMP"), None, None);
+        let time = pressure.resolve_parameter_time(Some("TMP"), None, run);
+        assert_eq!((time, run), (Some(new), Some(new)));
+        let drawn = pressure
+            .get_raster_tile(
+                [0.0, 0.0, 1.0, 1.0],
+                1,
+                1,
+                time,
+                &OutputCrs::Wgs84,
+                Some("TMP"),
+                None,
+                run,
+            )
+            .unwrap()
+            .values
+            .value_at(0)
+            .unwrap();
+        // 240 K at 500 hPa; map tiles store f32 (#475).
+        assert_eq!(drawn as f32, -33.15);
+        let level = pressure.resolve_elevation(Some("TMP"), None, time, run);
+        assert_eq!(level, Some(500.0));
+
+        let tmp = ["TMP".to_string()];
+        let position = |z: f64| {
+            pressure.query_position(
+                "POINT(0.5 0.5)",
+                time.map(|t| (t, t)),
+                Some(&tmp),
+                Some(std::slice::from_ref(&z)),
+                run,
+            )
+        };
+        let Ok(CoverageResponse::Single(series)) = position(500.0) else {
+            panic!("expected one series")
+        };
+        let value = series.ranges["TMP"].values[0].unwrap();
+        assert_eq!(value as f32, drawn as f32);
+        assert!(matches!(
+            position(levels[0]),
+            Err(DataServerError::InvalidParameter(_))
+        ));
+
+        // The older run has both and draws its own first; a level the run
+        // has stays itself, and one it lacks is echoed, failing the render
+        // and the query alike.
+        assert_eq!(
+            pressure.resolve_elevation(Some("TMP"), None, Some(old), Some(old)),
+            Some(850.0)
+        );
+        assert_eq!(
+            pressure.resolve_elevation(Some("TMP"), Some(500.0), Some(old), Some(old)),
+            Some(500.0)
+        );
+        assert_eq!(
+            pressure.resolve_elevation(Some("TMP"), Some(850.0), time, run),
+            Some(850.0)
+        );
     }
 }

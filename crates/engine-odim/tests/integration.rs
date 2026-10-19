@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use ds_core::config::OdimConfig;
-use ds_core::edr_engine::EdrEngine;
+use ds_core::edr_engine::{EdrEngine, TrajectoryShape};
 use ds_core::feature::{Bbox, FeatureQuery, Geometry, PropertyValue};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs};
@@ -1602,6 +1602,20 @@ fn pvol_edr_query_area_collects_sites() {
 // PolarVolumeEngine — EdrEngine (M4: trajectory cross-sections)
 // ---------------------------------------------------------------------------
 
+/// The view's advertised sweep angles in `lo..=hi`, as the API layer
+/// resolves a `z=lo/hi` interval: a cross-section `z` names sweeps, and an
+/// angle between them selects none (EDR 1.2 `/req/edr/z-response` B).
+fn sweeps_between(view: &engine_odim::PolarVolumeSiteView, lo: f64, hi: f64) -> Vec<f64> {
+    let vertical = EdrEngine::get_vertical_extent(view).expect("PVOL has a vertical extent");
+    let band: Vec<f64> = vertical
+        .levels
+        .into_iter()
+        .filter(|l| (lo..=hi).contains(l))
+        .collect();
+    assert!(!band.is_empty(), "the fixture has sweeps in {lo}..={hi}");
+    band
+}
+
 /// A trajectory query returns a `Section` coverage whose composite axis
 /// has one `(t, lon, lat)` triple per along-path node and whose `z`
 /// axis is height above antenna in metres. The range ndarray is
@@ -1613,17 +1627,23 @@ fn pvol_edr_query_trajectory_returns_section() {
         eprintln!("skipping pvol_edr_query_trajectory_returns_section: fixture absent");
         return;
     };
+    // A radar volume answers with a cross-section, not the gridded
+    // engines' along-path sampling (#926): the API layer keeps its 2-D
+    // LINESTRING, PNG heatmap and blocking-pool dispatch on this.
+    assert_eq!(view.trajectory_shape(), TrajectoryShape::CrossSection);
     // A ~65 km north-bound leg through Vihti (~24.50°E, 60.56°N), so the
     // path crosses the radar's lowest sweep coverage along its length.
-    // `z` here selects the 0.5°–5° elevation angle band (the
+    // `z` here selects the sweeps from 0.5° to 5°, as the API layer
+    // expands `z=0.5/5` into the advertised angles in range (the
     // cross-section's vertical axis is derived height).
     let coords = "LINESTRING(24.5 60.3, 24.5 60.9)";
+    let band = sweeps_between(&view, 0.5, 5.0);
     let response = EdrEngine::query_trajectory(
         &view,
         coords,
         None,
         Some(&["DBZH".to_string()]),
-        Some(&[0.5, 5.0]),
+        Some(&band),
         None,
     )
     .expect("trajectory query inside radar coverage");
@@ -1688,14 +1708,15 @@ fn pvol_edr_query_trajectory_out_of_coverage_yields_empty_cells() {
         return;
     };
     // A line near the antipode of FMI radars — every sample is out of
-    // range. `z` selects a low elevation-angle band.
+    // range. `z` selects the low sweeps.
     let coords = "LINESTRING(-150 -30, -150 -29)";
+    let band = sweeps_between(&view, 0.5, 3.0);
     match EdrEngine::query_trajectory(
         &view,
         coords,
         None,
         Some(&["DBZH".to_string()]),
-        Some(&[0.5, 3.0]),
+        Some(&band),
         None,
     ) {
         Ok(response) => {
@@ -1882,21 +1903,21 @@ fn comp_template_discovery_probes_present_slots_only() {
     .expect("DataStore over the tempdir");
 
     // Empty base prefix → probe the store root, where the files live.
-    let catalog = engine_odim::OdimEngine::discover_template_for_test(
-        now,
-        store,
+    let mut prober = engine_odim::OdimEngine::template_prober_for_test(
         "",
         template,
         cadence_secs,
         Some("-PT30M"),
         None,
-        &[], // cold scan — no prior catalog
     )
-    .expect("template probe succeeds");
+    .expect("template prober builds");
+    let report = prober.poll(&store, now).expect("template probe succeeds");
+    assert_eq!(report.heads, 7, "one HEAD per slot of the -PT30M window");
 
     // Exactly the four present dated slots, ascending; the 11:45 gap and the
     // empty 11:30/11:35 slots are excluded, and `LATEST` is never probed.
-    let times: Vec<String> = catalog.iter().map(|e| e.time.to_rfc3339()).collect();
+    let files = prober.files();
+    let times: Vec<String> = files.iter().map(|f| f.time.to_rfc3339()).collect();
     assert_eq!(
         times,
         [
@@ -1908,32 +1929,32 @@ fn comp_template_discovery_probes_present_slots_only() {
         "probe must discover exactly the present dated slots"
     );
     // Keys are the template-rendered names under the (empty) base prefix.
-    assert!(catalog
-        .iter()
-        .all(|e| e.location.id().starts_with("composite_hx_")));
+    assert!(files.iter().all(|f| f.key.starts_with("composite_hx_")));
 }
 
-/// #287 — incremental polling: a slot already in `known` is carried
-/// forward WITHOUT being re-probed (radar files are immutable), so only
+/// #287 — incremental polling: a slot already found is carried forward
+/// WITHOUT being re-probed (radar files are immutable), so only
 /// genuinely-new slots cost a `HEAD`.
 ///
-/// Proven by making the known slots' files **absent from disk**: if the
-/// probe re-`HEAD`-ed them they'd 404 and drop out; their survival proves
-/// they were carried forward, not re-probed. Meanwhile a new slot that
-/// *does* exist on disk is discovered.
+/// Proven by deleting the found slots' files from disk: if the probe
+/// re-`HEAD`-ed them they'd 404 and drop out; their survival proves they
+/// were carried forward, not re-probed. Meanwhile a new slot that *does*
+/// exist on disk is discovered.
 #[test]
 fn comp_template_discovery_carries_forward_known_without_reprobe() {
     use chrono::{TimeZone, Utc};
-    use engine_odim::catalog::{CatalogEntry, Location};
 
     let dir = tempfile::tempdir().expect("create tempdir");
     let template = "composite_hx_%Y%m%d_%H%M-hd5";
     let now = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
-
-    // On disk: ONLY the freshest slot (now). The two older slots are NOT
-    // written — they exist only in `known`.
-    let now_name = now.format(template).to_string();
-    std::fs::write(dir.path().join(&now_name), b"x").unwrap();
+    let slot = |back: i64| {
+        (now - chrono::Duration::minutes(back))
+            .format(template)
+            .to_string()
+    };
+    for back in [5, 10] {
+        std::fs::write(dir.path().join(slot(back)), b"x").unwrap();
+    }
 
     let (store, _base) = ds_storage::build_store(
         dir.path()
@@ -1943,37 +1964,31 @@ fn comp_template_discovery_carries_forward_known_without_reprobe() {
             .expect("utf8 path"),
     )
     .unwrap();
+    let mut prober =
+        engine_odim::OdimEngine::template_prober_for_test("", template, 300, Some("-PT30M"), None)
+            .unwrap();
+    // Five minutes ago: 11:50 and 11:55 are found.
+    prober
+        .poll(&store, now - chrono::Duration::minutes(5))
+        .expect("first probe succeeds");
+    assert_eq!(prober.files().len(), 2);
 
-    // `known` carries the two older slots (11:55, 11:50) whose files are absent.
-    let known: Vec<CatalogEntry> = [5i64, 10]
-        .iter()
-        .map(|&back| {
-            let t = now - chrono::Duration::minutes(back);
-            CatalogEntry {
-                time: t,
-                location: Location::Remote {
-                    store: store.clone(),
-                    key: t.format(template).to_string(),
-                },
-            }
-        })
-        .collect();
+    // Both files vanish from disk; the freshest slot (now) arrives.
+    for back in [5, 10] {
+        std::fs::remove_file(dir.path().join(slot(back))).unwrap();
+    }
+    std::fs::write(dir.path().join(slot(0)), b"x").unwrap();
 
-    let catalog = engine_odim::OdimEngine::discover_template_for_test(
-        now,
-        store,
-        "",
-        template,
-        300,
-        Some("-PT30M"),
-        None,
-        &known,
-    )
-    .expect("incremental probe succeeds");
-
+    let report = prober
+        .poll(&store, now)
+        .expect("incremental probe succeeds");
+    assert_eq!(
+        report.heads, 5,
+        "the 7 slots of the window less the 2 already found"
+    );
     // All three present: the two carried-forward (file-less) known slots and
     // the one freshly-probed slot — proving known slots were NOT re-HEADed.
-    let times: Vec<String> = catalog.iter().map(|e| e.time.to_rfc3339()).collect();
+    let times: Vec<String> = prober.files().iter().map(|f| f.time.to_rfc3339()).collect();
     assert_eq!(
         times,
         [

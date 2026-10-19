@@ -6,18 +6,20 @@
 # on macOS every freshly linked test binary is scanned, which makes local runs
 # slow. Run NEW tests that pin reference values yourself before pushing.
 #
-# Every worktree shares the main checkout's target dir, so cargo runs
-# serialize on its lock: run lints one after another, not in parallel.
-# Cargo records workspace sources relative to each crate, so a crate this
-# worktree didn't edit could otherwise reuse ANOTHER worktree's build of it
-# (its files are older than that artifact). The script touches this tree's
-# sources first so the lint reflects this tree only.
+# Each worktree builds in its own target dir, `<repo>/target-<worktree name>`,
+# unless CARGO_TARGET_DIR says otherwise. A shared dir serialized every cargo
+# run on one lock (a pre-ship lint once queued for over an hour behind agents'
+# test runs) and let a crate this worktree didn't edit reuse ANOTHER
+# worktree's build of it. The first build in a fresh dir is cold, and each dir
+# grows to roughly 6-11 GB: `cleanup.sh --apply` removes it with its worktree.
+# The script still touches this tree's sources first, so an explicitly shared
+# CARGO_TARGET_DIR also lints this tree only.
 #
 # Prints "LINT OK <name>" or "LINT FAILED <name>" plus the first diagnostics.
 set -u
 wt=${1:A}; shift
 main=$(cd "$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)
-export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$main/target}
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$main/target-${wt:t}}
 name=${wt:t}
 cd "$wt" || exit 1
 cargo fmt || { echo "FMT FAILED $name"; exit 1; }

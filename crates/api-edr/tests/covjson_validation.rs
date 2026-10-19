@@ -736,6 +736,52 @@ fn grid_with_z_validates() {
     validate(&json, &schema);
 }
 
+/// The `[t, z, y, x]` Grid a cube query returns (#925): several steps and
+/// levels, with missing cells, validates.
+#[test]
+fn cube_grid_with_t_and_z_validates() {
+    let schema = load_schema();
+    let mut parameters = HashMap::new();
+    parameters.insert(
+        "t".to_string(),
+        ParameterDescription {
+            label: "Temperature".to_string(),
+            unit: "°C".to_string(),
+            observed_property: "t".to_string(),
+            standard_name: None,
+        },
+    );
+    let mut ranges = HashMap::new();
+    // shape [t, z, y, x] = [2, 3, 2, 4] = 48 values.
+    ranges.insert(
+        "t".to_string(),
+        NdArray {
+            shape: vec![2, 3, 2, 4],
+            axis_names: vec!["t".into(), "z".into(), "y".into(), "x".into()],
+            values: (0..48).map(|i| (i % 5 != 0).then_some(i as f64)).collect(),
+        },
+    );
+    let result = QueryResult {
+        domain: DomainDescription::Grid {
+            x: vec![-1.0, 0.0, 1.0, 2.0],
+            y: vec![0.0, 1.0],
+            t: Some(vec![make_time(0), make_time(6)]),
+            z: Some(VerticalCoord {
+                kind: VerticalKind::Pressure,
+                values: vec![1000.0, 850.0, 500.0],
+            }),
+        },
+        parameters,
+        ranges,
+    };
+    let json = query_result_to_coverage_json(&result);
+    assert_eq!(
+        json["ranges"]["t"]["axisNames"],
+        serde_json::json!(["t", "z", "y", "x"])
+    );
+    validate(&json, &schema);
+}
+
 // --- Section domain (#198 — radar cross-section / trajectory) ---
 
 #[test]
@@ -989,7 +1035,13 @@ fn coverage_parameters_follow_metocean_profile() {
             ("t2m", "K", vec![Some(271.5), None]),
             ("wind_speed", "m s-1", vec![Some(4.2), Some(5.0)]),
             ("DBZH", "dBZ", vec![Some(12.5), None]),
+            ("KDP", "deg/km", vec![Some(0.4), None]),
             ("RHOHV", "", vec![Some(0.98), Some(0.97)]),
+            (
+                "precipitation_amount_acc",
+                "kg/m^2",
+                vec![Some(0.2), Some(1.4)],
+            ),
         ],
     );
     let t2m = result.parameters.get_mut("t2m").unwrap();
@@ -1029,15 +1081,226 @@ fn coverage_parameters_follow_metocean_profile() {
         "wind speed, in m/s"
     );
 
-    // QUDT has no radar-reflectivity unit: the UCUM form is kept.
+    // QUDT has no radar-reflectivity unit and `dBZ` is not UCUM: a
+    // plain-string symbol (EDR 1.2 `/req/edr/rc-parameters` G).
+    assert_eq!(params["DBZH"]["unit"]["symbol"], "dBZ");
+    // UCUM QUDT does not know: G's https UCUM type.
     assert_eq!(
-        params["DBZH"]["unit"]["symbol"],
-        serde_json::json!({"value": "dBZ", "type": "http://www.opengis.net/def/uom/UCUM/"})
+        params["KDP"]["unit"]["symbol"],
+        serde_json::json!({"value": "deg/km", "type": "https://www.opengis.net/def/uom/UCUM/"})
     );
 
     let rhohv = &params["RHOHV"];
     assert!(rhohv.get("unit").is_none());
     assert_eq!(rhohv["description"]["en"], "RHOHV (unit not specified)");
 
+    // A UDUNITS spelling QUDT's table does not list as written
+    // (`ds_core::units::canonical_unit`, #1067): typed by QUDT, labelled as
+    // the engine spells it.
+    let acc = &params["precipitation_amount_acc"];
+    assert_eq!(
+        acc["unit"],
+        serde_json::json!({
+            "label": {"en": "kg/m^2"},
+            "symbol": {"value": "kg/m²", "type": "https://qudt.org/vocab/unit/KiloGM-PER-M2"}
+        })
+    );
+
     validate(&json, &schema);
+}
+
+// --- Trajectory domain (#926 — along-path sampling on gridded engines) ---
+
+/// Plan a trajectory through the shared ds-core machinery, fill every
+/// sample with a value, and serialise it — the exact path an engine's
+/// response takes.
+fn trajectory_json(
+    coords: &str,
+    times: &[DateTime<Utc>],
+    vertical: Option<&ds_core::vertical::VerticalDimension>,
+    z: Option<&[f64]>,
+) -> Value {
+    use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
+    let path = TrajectoryPath::parse(coords).unwrap();
+    let plan = TrajectoryPlan::new(
+        &path,
+        GridSpacing::new(0.5, 0.5).unwrap(),
+        TrajectoryAxes { times, vertical, z },
+        1,
+    )
+    .unwrap();
+    let values: Vec<Vec<Vec<Option<f64>>>> = vec![plan
+        .fields()
+        .iter()
+        .map(|f| {
+            f.points
+                .iter()
+                .map(|&p| (p % 3 != 0).then_some(p as f64))
+                .collect()
+        })
+        .collect()];
+    let parameters = [(
+        "TMP".to_string(),
+        ParameterDescription {
+            label: "Temperature".into(),
+            unit: "°C".into(),
+            observed_property: "TMP".into(),
+            standard_name: None,
+        },
+    )];
+    coverage_response_to_json(&plan.into_response(&parameters, &values).unwrap())
+}
+
+fn pressure_levels() -> ds_core::vertical::VerticalDimension {
+    ds_core::vertical::VerticalDimension::new(VerticalKind::Pressure, vec![1000.0, 850.0, 500.0])
+}
+
+#[test]
+fn trajectory_2d_per_timestep_collection_validates() {
+    let schema = load_schema();
+    let json = trajectory_json(
+        "LINESTRING(24 60, 25 61, 26 61)",
+        &[make_time(0), make_time(6)],
+        None,
+        None,
+    );
+    assert_eq!(json["type"], "CoverageCollection");
+    assert_eq!(json["domainType"], "Trajectory");
+    let domain = &json["coverages"][1]["domain"];
+    assert_eq!(domain["domainType"], "Trajectory");
+    let composite = &domain["axes"]["composite"];
+    assert_eq!(composite["dataType"], "tuple");
+    assert_eq!(composite["coordinates"], serde_json::json!(["t", "x", "y"]));
+    assert_eq!(composite["values"][0][0], "2024-01-01T06:00:00+00:00");
+    assert!(domain["axes"].get("z").is_none());
+    let range = &json["coverages"][1]["ranges"]["TMP"];
+    assert_eq!(range["axisNames"], serde_json::json!(["composite"]));
+    assert_eq!(
+        range["shape"][0].as_u64().unwrap() as usize,
+        composite["values"].as_array().unwrap().len()
+    );
+    validate(&json, &schema);
+}
+
+#[test]
+fn trajectory_z_levels_in_the_tuples_validate() {
+    let schema = load_schema();
+    let levels = pressure_levels();
+    let json = trajectory_json(
+        "LINESTRING Z(24 60 1000, 25 61 700, 26 61 500)",
+        &[make_time(0)],
+        Some(&levels),
+        None,
+    );
+    assert_eq!(json["type"], "Coverage");
+    let domain = &json["domain"];
+    let composite = &domain["axes"]["composite"];
+    assert_eq!(
+        composite["coordinates"],
+        serde_json::json!(["t", "x", "y", "z"])
+    );
+    assert_eq!(composite["values"][0].as_array().unwrap().len(), 4);
+    assert_eq!(composite["values"][0][3], 1000.0);
+    // The vertical CRS is referenced for the `z` inside the tuples.
+    let referenced: Vec<&Value> = domain["referencing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|r| r["coordinates"].as_array().unwrap())
+        .collect();
+    assert!(referenced.contains(&&Value::from("z")), "{referenced:?}");
+    validate(&json, &schema);
+}
+
+#[test]
+fn trajectory_m_path_on_one_level_validates() {
+    let schema = load_schema();
+    let levels = pressure_levels();
+    let (t0, t1) = (make_time(0).timestamp(), make_time(12).timestamp());
+    let json = trajectory_json(
+        &format!("LINESTRING M(24 60 {t0}, 26 61 {t1})"),
+        &[make_time(0), make_time(6), make_time(12)],
+        Some(&levels),
+        Some(&[850.0]),
+    );
+    assert_eq!(json["type"], "Coverage");
+    let axes = &json["domain"]["axes"];
+    assert_eq!(axes["z"]["values"], serde_json::json!([850.0]));
+    let times: Vec<&str> = axes["composite"]["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v[0].as_str().unwrap())
+        .collect();
+    assert_eq!(times.first(), Some(&"2024-01-01T00:00:00+00:00"));
+    assert_eq!(times.last(), Some(&"2024-01-01T12:00:00+00:00"));
+    validate(&json, &schema);
+}
+
+#[test]
+fn trajectory_zm_and_closed_loop_validate() {
+    let schema = load_schema();
+    let levels = pressure_levels();
+    let (t0, t1) = (make_time(0).timestamp(), make_time(6).timestamp());
+    let json = trajectory_json(
+        &format!("LINESTRING ZM(24 60 1000 {t0}, 25 60.5 850 {t1})"),
+        &[make_time(0), make_time(6)],
+        Some(&levels),
+        None,
+    );
+    validate(&json, &schema);
+    // A loop back to its start would repeat a tuple; axis values are
+    // `uniqueItems`, so the repeat is dropped and the document validates.
+    let json = trajectory_json(
+        "LINESTRING(24 60, 25 60, 25 61, 24 60)",
+        &[make_time(0)],
+        None,
+        None,
+    );
+    validate(&json, &schema);
+}
+
+/// Why the plan drops repeated nodes: the schema rejects a trajectory
+/// whose composite axis repeats a tuple, and accepts the same document
+/// without the repeat.
+#[test]
+fn trajectory_schema_rejects_repeated_tuples() {
+    let schema = load_schema();
+    let t = make_time(0);
+    let result = |last: f64| {
+        let mut parameters = HashMap::new();
+        parameters.insert(
+            "TMP".to_string(),
+            ParameterDescription {
+                label: "Temperature".into(),
+                unit: "°C".into(),
+                observed_property: "TMP".into(),
+                standard_name: None,
+            },
+        );
+        let mut ranges = HashMap::new();
+        ranges.insert(
+            "TMP".to_string(),
+            NdArray {
+                shape: vec![3],
+                axis_names: vec!["composite".into()],
+                values: vec![Some(1.0), None, Some(3.0)],
+            },
+        );
+        QueryResult {
+            domain: DomainDescription::Trajectory {
+                nodes: vec![(t, 24.0, 60.0), (t, 25.0, 60.0), (t, last, 60.0)],
+                node_z: None,
+                z: None,
+            },
+            parameters,
+            ranges,
+        }
+    };
+    validate(&query_result_to_coverage_json(&result(26.0)), &schema);
+    let validator = Validator::new(&schema).unwrap();
+    assert!(
+        !validator.is_valid(&query_result_to_coverage_json(&result(24.0))),
+        "repeated tuples must not validate"
+    );
 }

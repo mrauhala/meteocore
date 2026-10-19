@@ -10,8 +10,9 @@ pub enum WmsError {
     LayerNotDefined(String),
     /// Style does not exist.
     StyleNotDefined(String),
-    /// CRS is not supported.
-    CrsNotDefined(String),
+    /// CRS is not offered for the requested layer: WMS 1.3.0 Table E.1's
+    /// `InvalidCRS`.
+    InvalidCrs(String),
     /// Invalid dimension value (e.g., TIME).
     InvalidDimensionValue(String),
     /// Missing required parameter.
@@ -22,6 +23,12 @@ pub enum WmsError {
     InvalidParameterValue(String),
     /// Operation not supported.
     OperationNotSupported(String),
+    /// A GetFeatureInfo `QUERY_LAYERS` layer is not queryable: WMS 1.3.0
+    /// Table E.1's `LayerNotQueryable`.
+    LayerNotQueryable(String),
+    /// A GetFeatureInfo `I` or `J` that is no pixel of the map: Table E.1's
+    /// `InvalidPoint`.
+    InvalidPoint(String),
     /// Internal server error.
     Internal(String),
     /// Server too busy (render semaphore exhausted).
@@ -38,13 +45,22 @@ impl WmsError {
     }
 
     pub fn invalid_crs(crs: &str) -> Self {
-        WmsError::CrsNotDefined(format!("CRS '{crs}' is not supported"))
+        WmsError::InvalidCrs(format!("CRS '{crs}' is not supported"))
     }
 
     pub fn invalid_format(format: &str) -> Self {
         WmsError::InvalidFormat(format!(
             "Format '{format}' is not supported. Use {}.",
             crate::params::SUPPORTED_FORMATS.join(", ")
+        ))
+    }
+
+    /// An `INFO_FORMAT` GetFeatureInfo does not answer in: `InvalidFormat`,
+    /// naming the formats it does.
+    pub fn invalid_info_format(format: &str) -> Self {
+        WmsError::InvalidFormat(format!(
+            "INFO_FORMAT '{format}' is not supported. Use {}.",
+            crate::params::INFO_FORMATS.join(", ")
         ))
     }
 
@@ -60,12 +76,14 @@ impl WmsError {
         match self {
             WmsError::LayerNotDefined(_) => "LayerNotDefined",
             WmsError::StyleNotDefined(_) => "StyleNotDefined",
-            WmsError::CrsNotDefined(_) => "CRSNotDefined",
+            WmsError::InvalidCrs(_) => "InvalidCRS",
             WmsError::InvalidDimensionValue(_) => "InvalidDimensionValue",
             WmsError::MissingParameterValue(_) => "MissingParameterValue",
             WmsError::InvalidFormat(_) => "InvalidFormat",
             WmsError::InvalidParameterValue(_) => "InvalidParameterValue",
             WmsError::OperationNotSupported(_) => "OperationNotSupported",
+            WmsError::LayerNotQueryable(_) => "LayerNotQueryable",
+            WmsError::InvalidPoint(_) => "InvalidPoint",
             WmsError::Internal(_) => "Internal",
             WmsError::ServiceUnavailable(_) => "Internal",
         }
@@ -84,12 +102,14 @@ impl WmsError {
         match self {
             WmsError::LayerNotDefined(m)
             | WmsError::StyleNotDefined(m)
-            | WmsError::CrsNotDefined(m)
+            | WmsError::InvalidCrs(m)
             | WmsError::InvalidDimensionValue(m)
             | WmsError::MissingParameterValue(m)
             | WmsError::InvalidFormat(m)
             | WmsError::InvalidParameterValue(m)
-            | WmsError::OperationNotSupported(m) => m,
+            | WmsError::OperationNotSupported(m)
+            | WmsError::LayerNotQueryable(m)
+            | WmsError::InvalidPoint(m) => m,
             WmsError::Internal(_) => "Internal server error",
             WmsError::ServiceUnavailable(_) => "Server busy, try again later",
         }
@@ -132,10 +152,13 @@ impl IntoResponse for WmsError {
         let reason =
             ds_core::error::ErrorReason(format!("{}: {}", self.error_code(), self.message()));
         let xml = self.to_xml();
+        // WMS 1.3.0's MIME type for the `XML` exception format. WMS 1.1.1's
+        // `application/vnd.ogc.se_xml` is not a 1.3.0 type: the OGC test
+        // suite fails it (#1065).
         let mut response = (
             status,
             [
-                (header::CONTENT_TYPE, "application/vnd.ogc.se_xml"),
+                (header::CONTENT_TYPE, "text/xml"),
                 (
                     header::HeaderName::from_static("x-content-type-options"),
                     "nosniff",
@@ -223,6 +246,53 @@ mod tests {
             !xml_str.contains("10.0.0.5"),
             "body must not echo internal connection detail, got {xml_str}"
         );
+    }
+
+    /// The codes WMS 1.3.0 Table E.1 defines go out spelled as it spells
+    /// them: clients and the OGC test suite match them exactly. An
+    /// unsupported CRS was `CRSNotDefined`, which ets-wms13's
+    /// `getmap:invalid-crs` fails (#1065).
+    #[test]
+    fn table_e1_codes_are_spelled_as_the_spec_spells_them() {
+        for (err, code) in [
+            (WmsError::invalid_crs("UndefinedCRS"), "InvalidCRS"),
+            (WmsError::invalid_format("image/gif"), "InvalidFormat"),
+            (WmsError::layer_not_found("NonExistant"), "LayerNotDefined"),
+            (WmsError::StyleNotDefined("x".into()), "StyleNotDefined"),
+            (
+                WmsError::InvalidDimensionValue("x".into()),
+                "InvalidDimensionValue",
+            ),
+            (
+                WmsError::operation_not_supported("DescribeLayer"),
+                "OperationNotSupported",
+            ),
+            (WmsError::LayerNotQueryable("x".into()), "LayerNotQueryable"),
+            (WmsError::InvalidPoint("x".into()), "InvalidPoint"),
+            (WmsError::invalid_info_format("text/xml"), "InvalidFormat"),
+        ] {
+            let xml = String::from_utf8(err.to_xml()).expect("valid utf-8");
+            assert_eq!(service_exception_code(&xml).as_deref(), Some(code), "{xml}");
+        }
+    }
+
+    /// The `code` attribute of the report's `<ServiceException>`, read with
+    /// quick-xml rather than matched as text (check_geo_safety.sh).
+    fn service_exception_code(xml: &str) -> Option<String> {
+        use quick_xml::events::Event;
+        let mut reader = quick_xml::Reader::from_str(xml);
+        loop {
+            match reader.read_event().ok()? {
+                Event::Start(e) | Event::Empty(e)
+                    if e.local_name().as_ref() == "ServiceException" =>
+                {
+                    let attr = e.try_get_attribute("code").ok()??;
+                    return Some(attr.value.into_owned());
+                }
+                Event::Eof => return None,
+                _ => {}
+            }
+        }
     }
 
     /// Lock the `InvalidFormat` message to `params::SUPPORTED_FORMATS` so a

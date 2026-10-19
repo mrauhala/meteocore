@@ -2,6 +2,7 @@
 name = "engine-geotiff"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [features]
 fuzz = []
@@ -21,12 +22,16 @@ futures = "0.3"
 flate2 = "1"
 weezl = "0.1"
 ds-cache = { path = "../ds-cache" }
+# The fail-fast byte budget behind `decode_budget`.
+ds-executor = { path = "../ds-executor" }
 rayon = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
 url = "2"
 
 [dev-dependencies]
+# The flaky object store behind the remote header-read tests.
+async-trait = "0.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 axum = "0.8"
 tower-http = { version = "0.7", features = ["fs"] }

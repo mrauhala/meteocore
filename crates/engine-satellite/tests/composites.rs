@@ -301,46 +301,165 @@ fn a_composite_is_not_a_band() {
     }
 }
 
-/// The Airmass example in the README and `collections.d/goes19-fd.toml`
-/// validates and builds: four ABI bands, two differences, one band read
-/// twice.
+/// A `[[products]]` entry for an ABI CMIPF band.
+fn cmip_product(parameter: &str, band: u8) -> String {
+    format!(
+        "[[products]]\nparameter = \"{parameter}\"\ntitle = \"{parameter}\"\nunit = \"K\"\n\
+         product = \"ABI-L2-CMIPF\"\nband = {band}\nvariable = \"CMI\"\n"
+    )
+}
+
+/// The Airmass examples in the README and `collections.d/goes19-fd.toml`
+/// validate and build: the recipe, and EUMETSAT's SEVIRI ranges written
+/// out. Four ABI bands, two differences, one band read twice.
 #[test]
-fn the_documented_airmass_example_builds() {
+fn the_documented_airmass_examples_build() {
     let dir = tempfile::tempdir().unwrap();
-    let product = |parameter: &str, band: u8| {
-        format!(
-            "[[products]]\nparameter = \"{parameter}\"\ntitle = \"{parameter}\"\nunit = \"K\"\n\
-             product = \"ABI-L2-CMIPF\"\nband = {band}\nvariable = \"CMI\"\n"
-        )
-    };
     let config: SatelliteConfig = toml::from_str(&format!(
         r#"
         data_path = '{}'
         {}{}{}{}
         [[composites]]
         name = "airmass"
-        title = "Airmass RGB"
+        recipe = "airmass"
+
+        [[composites]]
+        name = "airmass_eum"
+        title = "Airmass RGB, EUMETSAT ranges"
         red = {{ parameter = "wv_6_2", minus = "wv_7_3", min = -25.0, max = 0.0 }}
         green = {{ parameter = "ir_9_6", minus = "ir_10_3", min = -40.0, max = 5.0 }}
         blue = {{ parameter = "wv_6_2", min = 243.0, max = 208.0 }}
         "#,
         dir.path().display(),
-        product("wv_6_2", 8),
-        product("wv_7_3", 10),
-        product("ir_9_6", 12),
-        product("ir_10_3", 13),
+        cmip_product("wv_6_2", 8),
+        cmip_product("wv_7_3", 10),
+        cmip_product("ir_9_6", 12),
+        cmip_product("ir_10_3", 13),
     ))
     .unwrap();
     let engine = SatelliteEngine::new("goes19-airmass", &config).unwrap();
     let composites = engine.composites();
-    assert_eq!(
-        composites[0].parameters(),
-        ["wv_6_2", "wv_7_3", "ir_9_6", "ir_10_3"]
-    );
+    for composite in composites.iter() {
+        assert_eq!(
+            composite.parameters(),
+            ["wv_6_2", "wv_7_3", "ir_9_6", "ir_10_3"]
+        );
+    }
+    assert_eq!(composites[0].title, "Airmass RGB");
     // Nothing is polled yet: an empty axis, and no time to resolve.
     assert!(times(&engine, "airmass").is_empty());
     assert_eq!(
         engine.resolve_parameter_time(Some("airmass"), None, None),
         None
     );
+}
+
+/// The six ABI bands both recipes read, named by wavelength and listed out
+/// of band order: a recipe finds each by its `band`.
+fn rgb_products() -> String {
+    [
+        ("ir_10_3", 13),
+        ("ir_3_9", 7),
+        ("wv_6_2", 8),
+        ("ir_12_3", 15),
+        ("wv_7_3", 10),
+        ("ir_9_6", 12),
+    ]
+    .into_iter()
+    .map(|(parameter, band)| cmip_product(parameter, band))
+    .collect()
+}
+
+/// A recipe builds exactly the layer its channels written out build, with
+/// satpy's ABI values and the recipe's title.
+#[test]
+fn a_recipe_builds_the_layer_its_channels_spell_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = |composites: &str| {
+        let config: SatelliteConfig = toml::from_str(&format!(
+            "data_path = '{}'\n{}\n{composites}",
+            dir.path().display(),
+            rgb_products()
+        ))
+        .unwrap();
+        SatelliteEngine::new("goes19-rgb", &config).unwrap()
+    };
+    let recipes = engine(
+        r#"
+        [[composites]]
+        name = "airmass"
+        recipe = "airmass"
+
+        [[composites]]
+        name = "night_microphysics"
+        recipe = "night_microphysics"
+        "#,
+    );
+    let written = engine(
+        r#"
+        [[composites]]
+        name = "airmass"
+        title = "Airmass RGB"
+        red = { parameter = "wv_6_2", minus = "wv_7_3", min = -26.2, max = 0.6 }
+        green = { parameter = "ir_9_6", minus = "ir_10_3", min = -43.2, max = 6.7 }
+        blue = { parameter = "wv_6_2", min = 243.9, max = 208.5 }
+
+        [[composites]]
+        name = "night_microphysics"
+        title = "Night Microphysics RGB"
+        red = { parameter = "ir_12_3", minus = "ir_10_3", min = -6.7, max = 2.6 }
+        green = { parameter = "ir_10_3", minus = "ir_3_9", min = -3.1, max = 5.2 }
+        blue = { parameter = "ir_10_3", min = 243.55, max = 292.65 }
+        "#,
+    );
+    assert_eq!(*recipes.composites(), *written.composites());
+    let composites = recipes.composites();
+    assert_eq!(
+        composites[0].parameters(),
+        ["wv_6_2", "wv_7_3", "ir_9_6", "ir_10_3"]
+    );
+    assert_eq!(composites[1].parameters(), ["ir_12_3", "ir_10_3", "ir_3_9"]);
+    // The recipe composites are layers like any other: not parameters.
+    assert_eq!(recipes.raster_info().parameters.len(), 6);
+    assert_eq!(recipes.get_parameter_available_times("airmass"), None);
+}
+
+/// The shipped RGB example collection parses, validates and builds an
+/// engine with both recipe composites (construction does no I/O; the first
+/// poll would download six bands).
+#[test]
+fn the_rgb_example_collection_builds_both_recipes() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../collections.d/goes19-fd-rgb.toml");
+    let collection: ds_core::config::CollectionConfig =
+        toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(collection.id, "goes19-fd-rgb");
+    assert_eq!(collection.engine_type, "satellite");
+    let satellite = collection.satellite.as_ref().unwrap();
+    ds_core::config::validate_satellite(&collection.id, satellite).unwrap();
+    let engine = SatelliteEngine::new(&collection.id, satellite).unwrap();
+
+    let composites = engine.composites();
+    let layers: Vec<(&str, &str)> = composites
+        .iter()
+        .map(|c| (c.name.as_str(), c.title.as_str()))
+        .collect();
+    assert_eq!(
+        layers,
+        [
+            ("airmass", "Airmass RGB"),
+            ("night_microphysics", "Night Microphysics RGB")
+        ]
+    );
+    assert_eq!(
+        composites[0].parameters(),
+        ["wv_6_2", "wv_7_3", "ir_9_6", "ir_10_3"]
+    );
+    assert_eq!(composites[1].parameters(), ["ir_12_3", "ir_10_3", "ir_3_9"]);
+    let info = engine.raster_info();
+    assert_eq!(info.parameters.len(), 6);
+    assert!(
+        info.times.is_empty(),
+        "nothing is fetched before the first poll"
+    );
+    assert!(times(&engine, "airmass").is_empty());
 }

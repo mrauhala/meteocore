@@ -64,6 +64,9 @@ pub struct DecodedGrid {
     /// Units depend on `first_surface_type` (see WMO Code Table 4.5):
     /// 100 → Pa, 103 → m, 107 → K, etc.
     pub first_surface_value: Option<f64>,
+    /// Which way the message's vector components point: GRIB2 flag table
+    /// 3.3 bit 5 of Section 3 (#897).
+    pub uv_frame: ds_core::wind::VectorFrame,
 }
 
 /// Native grid selection without allocating its values. Area queries validate
@@ -367,6 +370,41 @@ impl DecodedGrid {
         values
     }
 
+    /// Values of the subset at `(ys[j], xs[i])`, indices into its ascending
+    /// `y`/`x` axes, row-major `[y][x]` — the nearest-neighbour resampling of
+    /// a cube query (#925); identity maps reproduce [`Self::subset_values`].
+    /// Reads the decoded grid in place, so a resampled request never
+    /// allocates the native subset. `None` indices and NaN are missing.
+    pub(crate) fn sample_subset(
+        &self,
+        subset: &GridSubset,
+        ys: &[Option<usize>],
+        xs: &[Option<usize>],
+    ) -> Vec<Option<f64>> {
+        let mut values = Vec::with_capacity(ys.len() * xs.len());
+        for iy in ys {
+            // Storage rows run north to south when `lat_inc < 0`; the axis
+            // (like `subset_values`) ascends south to north.
+            let row = iy.filter(|&iy| iy < subset.rows.len()).map(|iy| {
+                if self.lat_inc < 0.0 {
+                    subset.rows.end - 1 - iy
+                } else {
+                    subset.rows.start + iy
+                }
+            });
+            for ix in xs {
+                let column = ix.and_then(|ix| subset.cols.get(ix));
+                values.push(match (row, column) {
+                    (Some(row), Some(&column)) => {
+                        Some(f64::from(self.values[row * self.ni + column])).filter(|v| !v.is_nan())
+                    }
+                    _ => None,
+                });
+            }
+        }
+        values
+    }
+
     /// Resample grid to output dimensions for map rendering.
     ///
     /// `bbox` is the WGS84 bounding box `[west, south, east, north]`. Each output
@@ -384,7 +422,17 @@ impl DecodedGrid {
     ///   longitude cut or around a pole — both inside any projected view of
     ///   the Arctic — stay registered (#323).
     ///
+    /// This is not the shared [`SourceGrid`] sampler, which would change
+    /// pixels (#1172): it maps EPSG:3857 through a projection grid, not
+    /// exactly per pixel; it draws a regional grid half a cell past its
+    /// first node and row, where this draws nothing; it reads the nearest
+    /// cell where a neighbour is NaN, where this reads the first valid
+    /// corner; and it narrows before [`Self::resample_f32`]'s display
+    /// conversion could run. `cache/sampler_tests.rs` pins the two equal
+    /// where they agree: a global grid on CRS84 and projected output.
+    ///
     /// [`ProjectionGrid`]: ds_core::resample::ProjectionGrid
+    /// [`SourceGrid`]: ds_core::resample::SourceGrid
     pub fn resample(
         &self,
         bbox: [f64; 4],
@@ -545,6 +593,9 @@ impl GridCache {
 }
 
 #[cfg(test)]
+mod sampler_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -703,6 +754,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         };
         let row = |grid: &DecodedGrid, bbox: [f64; 4]| {
             grid.resample(bbox, 20, 1, &OutputCrs::Wgs84)
@@ -745,6 +797,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         }
     }
 
@@ -813,6 +866,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         };
         let crs = ds_core::geo::projected_output_crs("EPSG:3035").unwrap();
         // Western Europe, straddling the Greenwich meridian.
@@ -856,6 +910,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         };
         let crs = ds_core::geo::projected_output_crs("EPSG:3035").unwrap();
         let bbox = [4_096_000.0, 7_168_000.0, 5_120_000.0, 8_192_000.0];
@@ -951,6 +1006,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         }
     }
 
@@ -1059,6 +1115,7 @@ mod tests {
             centre: 0,
             first_surface_type: 1,
             first_surface_value: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
         };
         let (x, _, v) = g.extract_bbox([359.75, 0.0, 360.25, 0.0]).expect("seam");
         assert_eq!(x, vec![359.75, 360.0, 360.25]);

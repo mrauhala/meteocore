@@ -1,7 +1,8 @@
 [package]
 name = "server"
-version = "0.9.0"
+version = "0.12.0"
 edition = "2021"
+license.workspace = true
 
 [features]
 # Read Icechunk repositories in the Zarr engine (#335). Off by default (heavy
@@ -20,11 +21,13 @@ engine-querydata = { path = "../engine-querydata" }
 engine-grib = { path = "../engine-grib" }
 engine-zarr = { path = "../engine-zarr" }
 engine-satellite = { path = "../engine-satellite" }
+engine-netcdf = { path = "../engine-netcdf" }
 engine-odim = { path = "../engine-odim" }
 engine-cap = { path = "../engine-cap" }
 engine-bufr = { path = "../engine-bufr" }
 engine-postgis = { path = "../engine-postgis" }
 engine-nowcast = { path = "../engine-nowcast" }
+engine-station-grid = { path = "../engine-station-grid" }
 api-common = { path = "../api-common" }
 api-edr = { path = "../api-edr" }
 api-features = { path = "../api-features" }
@@ -37,6 +40,8 @@ ds-render = { path = "../render" }
 ds-executor = { path = "../ds-executor" }
 ds-mvt = { path = "../ds-mvt" }
 ds-cache = { path = "../ds-cache" }
+# The per-host request gauges of `/metrics` (`ds_storage::host_requests`).
+ds-storage = { path = "../storage" }
 arc-swap = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
@@ -61,7 +66,8 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
-jsonschema = { version = "0.50", default-features = false }
+jsonschema = { version = "0.58", default-features = false }
+robotstxt = "0.3"
 tempfile = "3"
 toml = "1.1"
 tower = { version = "0.5", features = ["util"] }

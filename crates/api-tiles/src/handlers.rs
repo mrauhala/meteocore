@@ -2,16 +2,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Extension;
 use axum::Json;
 use serde_json::json;
 
+use api_common::map_frame;
+use api_common::subset::{self, RequestedTime, TimeSelection};
 use api_common::workbench::Surface;
-use api_common::{rel, Mount};
+use api_common::{rel, JsonQuery, Mount};
 use ds_core::config::CollectionConfig;
+use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, FeatureQuery};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::{MapEngine, RasterInfo};
@@ -20,24 +23,30 @@ use ds_mvt::{
     encode_tile, properties_hash, CachedTile, PropertyAllowlist, TileEncodeOptions, TmsKind,
     VectorTileCache, VectorTileKey,
 };
-use ds_render::{CacheKey, ColorMap, CompositeSpec, RenderedCache, StyleInfo};
+use ds_render::{CacheKey, CachedRendered, ColorMap, CompositeSpec, RenderedCache, StyleInfo};
 
 use crate::error::TilesError;
 use crate::params::{self, LegendFormat, LegendQueryParams, TileQueryParams};
 use crate::tilematrixset::{self, SUPPORTED_TILE_MATRIX_SETS};
 
-/// Pre-generated 256×256 fully transparent `CachedRendered` for empty
+/// Pre-generated 256×256 fully transparent PNG `CachedRendered` for empty
 /// (all-nodata) tiles — the bytes and their FNV-1a ETag are computed once per
 /// process instead of on every empty-tile response, and the colorization +
 /// encoding pipeline is skipped when a tile has no data.
 ///
 /// Sourced from the shared [`ds_render::empty_tile`] cache, which WMS and Maps
-/// now use too (#171) — so all three raster APIs share one mechanism rather than
-/// each rolling their own. Tiles is always 256×256, so a process-once `LazyLock`
-/// keeps cloning per request essentially free (`Bytes` is `Arc`-backed).
+/// use too (#171) — so all three raster APIs share one mechanism rather than
+/// each rolling their own. A default-size PNG tile is by far the common empty
+/// response, so a process-once `LazyLock` keeps cloning it per request
+/// essentially free (`Bytes` is `Arc`-backed). Any other size or format is
+/// read from the shared cache, which keys on both (#1091).
 static EMPTY_TILE_CACHED: LazyLock<ds_render::CachedRendered> = LazyLock::new(|| {
-    ds_render::empty_tile(params::TILE_SIZE, params::TILE_SIZE)
-        .expect("encoding empty tile PNG must not fail")
+    ds_render::empty_tile(
+        params::TILE_SIZE,
+        params::TILE_SIZE,
+        ds_render::ImageFormat::Png,
+    )
+    .expect("encoding empty tile PNG must not fail")
 });
 
 /// Shared state for the OGC API Tiles service.
@@ -90,30 +99,30 @@ fn lookup_engine<'a>(
     Ok((engine, config))
 }
 
-/// Resolve the style map a request should be styled from.
-///
-/// Multi-parameter collections register one style map per parameter under
-/// `"{collection}/{param}"` alongside the collection-level map, and only the
-/// per-parameter map carries that parameter's colormap (from
-/// `[[wms.parameters]]`, a bundle parameter entry, or a built-in parameter
-/// default). A request that names a parameter must therefore resolve its
-/// style there first, falling back to the collection map when the collection
-/// has no such layer (single-parameter engines, unknown parameter names that
-/// the engine ignores). Mirrors how WMS GetMap resolves `LAYERS=coll/param`.
-fn layer_style_map<'a>(
+/// The style `style` a request on `collection_id` draws with, and the
+/// parameter it draws: [`ds_render::resolve_layer_style`], the resolution
+/// WMS and Maps share, with this API's errors. A `parameter-name` styles
+/// from that parameter's own layer, and a request without one on a
+/// multi-parameter collection from the default parameter's (#1133), so the
+/// default parameter draws as it does when named.
+fn layer_style<'a>(
     styles: &'a HashMap<String, HashMap<String, StyleInfo>>,
     collection_id: &str,
-    parameter: Option<&str>,
-) -> Option<(String, &'a HashMap<String, StyleInfo>)> {
-    if let Some(p) = parameter {
-        let key = format!("{collection_id}/{p}");
-        if let Some(m) = styles.get(&key) {
-            return Some((key, m));
-        }
-    }
-    styles
-        .get(collection_id)
-        .map(|m| (collection_id.to_string(), m))
+    parameter: Option<&'a str>,
+    info: &'a RasterInfo,
+    style: &str,
+) -> Result<ds_render::LayerStyle<'a>, TilesError> {
+    ds_render::resolve_layer_style(styles, collection_id, parameter, Some(info), style).map_err(
+        |error| match error {
+            ds_render::LayerStyleError::UnknownLayer => {
+                TilesError::NotFound(format!("Collection '{collection_id}' not found"))
+            }
+            ds_render::LayerStyleError::UnknownStyle(offered) => TilesError::NotFound(format!(
+                "Style '{style}' not found for collection '{collection_id}'. Available: {}",
+                offered.keys().cloned().collect::<Vec<_>>().join(", ")
+            )),
+        },
+    )
 }
 
 /// How a tile render turns engine output into pixels.
@@ -182,13 +191,15 @@ fn composite_style_not_found(collection_id: &str, composite: &str, style: &str) 
     ))
 }
 
-/// `immutable` (24 h) only for an explicit timestamp over content the engine
-/// never revises (`content_version == 0`): a tile at fixed z/x/y + time is
-/// then truly immutable. "Latest" and in-place-revised content (a push-fed
-/// alert set) get 60 s + revalidation so a browser/CDN holding a
-/// pre-revision tile asks again.
-fn cache_control_value(has_explicit_time: bool, content_version: u64) -> &'static str {
-    if has_explicit_time && content_version == 0 {
+/// `immutable` (24 h) only for an explicit timestamp that resolved to a
+/// timestep, over content the engine never revises (`content_version == 0`):
+/// a tile at fixed z/x/y + time is then truly immutable. "Latest", a
+/// timestamp the engine has nothing to render for yet (resolved to `None`:
+/// its catalog is still empty after a start or reload) and in-place-revised
+/// content (a push-fed alert set) get 60 s + revalidation so a browser/CDN
+/// holding a pre-revision tile asks again.
+fn cache_control_value(pinned_time: bool, content_version: u64) -> &'static str {
+    if pinned_time && content_version == 0 {
         "public, max-age=86400, immutable"
     } else {
         "public, max-age=60, must-revalidate"
@@ -478,7 +489,7 @@ fn build_extent(
 pub async fn landing_page(
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
     use ds_core::html::{LinkView, Wanted};
@@ -551,15 +562,18 @@ pub async fn landing_page(
         Wanted::Html => {
             let mut views: Vec<LinkView> = links
                 .iter()
-                .map(|(h, r, _, ti)| LinkView::new(h.clone(), *r, Some(ti)))
+                .map(|(h, r, t, ti)| LinkView::new(h.clone(), *r, Some(ti)).with_type(*t))
                 .collect();
             // rel="alternate" to the JSON representation (parity with the
             // collection-detail HTML page).
-            views.push(LinkView::new(
-                format!("{root}/?f=json"),
-                "alternate",
-                Some("This document as JSON"),
-            ));
+            views.push(
+                LinkView::new(
+                    format!("{root}/?f=json"),
+                    "alternate",
+                    Some("This document as JSON"),
+                )
+                .with_type("application/json"),
+            );
             Html(api_common::workbench::landing_html(
                 Surface {
                     base,
@@ -620,7 +634,8 @@ pub(crate) fn collection_openapi_paths(
             }
         });
 
-        collection_paths[format!("{m}/collections/{id}/tiles")] = json!({
+        let tilesets = format!("{m}/collections/{id}/tiles");
+        collection_paths[&tilesets] = json!({
             "get": {
                 "summary": format!("List tilesets for {}", config.title),
                 "operationId": format!("getTilesets_{id}"),
@@ -630,8 +645,10 @@ pub(crate) fn collection_openapi_paths(
                 }
             }
         });
+        api_common::errors::declare_json_only(&mut collection_paths[&tilesets]);
 
-        collection_paths[format!("{m}/collections/{id}/tiles/{{tileMatrixSetId}}")] = json!({
+        let tileset = format!("{m}/collections/{id}/tiles/{{tileMatrixSetId}}");
+        collection_paths[&tileset] = json!({
             "get": {
                 "summary": format!("Get tileset metadata for {}", config.title),
                 "operationId": format!("getTileset_{id}"),
@@ -649,6 +666,7 @@ pub(crate) fn collection_openapi_paths(
                 }
             }
         });
+        api_common::errors::declare_json_only(&mut collection_paths[&tileset]);
 
         let mut content = serde_json::Map::new();
         if has_raster {
@@ -710,6 +728,7 @@ pub(crate) fn collection_openapi_paths(
                         "description": "Column index"
                     },
                     {"$ref": "#/components/parameters/datetime"},
+                    {"$ref": "#/components/parameters/tile-subset"},
                     {"$ref": "#/components/parameters/f"},
                     {"$ref": "#/components/parameters/elevation"}
                 ],
@@ -718,6 +737,7 @@ pub(crate) fn collection_openapi_paths(
                         "description": "Tile image or vector tile",
                         "content": content
                     },
+                    "204": {"description": "Empty tile: a map tile's time selects no time step, or a time subset lies outside the collection's temporal extent"},
                     "400": {"description": "Bad request"},
                     "404": {"description": "Tile not found"},
                     "422": {"description": "Tile too dense (feature count exceeds per-tile cap)"},
@@ -725,12 +745,14 @@ pub(crate) fn collection_openapi_paths(
                 }
             }
         });
-        // Only map tiles render a selected parameter.
+        // Only map tiles render a selected parameter at an encoder quality.
         if has_raster {
             if let Some(parameters) =
                 collection_paths[&tile_path]["get"]["parameters"].as_array_mut()
             {
-                parameters.push(json!({"$ref": "#/components/parameters/parameter-name"}));
+                for name in MAP_TILE_COMPONENTS {
+                    parameters.push(json!({"$ref": format!("#/components/parameters/{name}")}));
+                }
             }
         }
 
@@ -782,6 +804,11 @@ pub(crate) fn collection_openapi_paths(
                         {"$ref": "#/components/parameters/datetime"},
                         {"$ref": "#/components/parameters/elevation"},
                         {"$ref": "#/components/parameters/parameter-name"},
+                        {"$ref": "#/components/parameters/quality"},
+                        {"$ref": "#/components/parameters/tile-subset"},
+                        {"$ref": "#/components/parameters/tile-width"},
+                        {"$ref": "#/components/parameters/tile-height"},
+                        {"$ref": "#/components/parameters/tile-scale-denominator"},
                         {
                             "name": "f",
                             "in": "query",
@@ -799,6 +826,7 @@ pub(crate) fn collection_openapi_paths(
                                 "image/webp": {"schema": {"type": "string", "format": "binary"}}
                             }
                         },
+                        "204": {"description": "Empty map tile: the requested time selects no time step"},
                         "400": {"description": "Bad request"},
                         "404": {"description": "Collection, style or tile not found"},
                         "500": {"description": "Server error"}
@@ -860,9 +888,10 @@ pub(crate) fn collection_openapi_paths(
     }
 }
 
-/// Tiling-scheme paths, keyed below the mount.
+/// Tiling-scheme paths, keyed below the mount. Both are served only as
+/// JSON (#1132).
 pub(crate) fn tile_matrix_set_openapi_paths(m: &str) -> serde_json::Map<String, serde_json::Value> {
-    match json!({
+    let mut paths = match json!({
         format!("{m}/tileMatrixSets"): {
             "get": {
                 "summary": "List supported tile matrix sets",
@@ -892,19 +921,80 @@ pub(crate) fn tile_matrix_set_openapi_paths(m: &str) -> serde_json::Map<String, 
     }) {
         serde_json::Value::Object(paths) => paths,
         _ => serde_json::Map::new(),
+    };
+    for item in paths.values_mut() {
+        api_common::errors::declare_json_only(item);
     }
+    paths
 }
+
+/// Map-tile-only parameter components, after `datetime`, `tile-subset`
+/// and `elevation`, which the per-API mixed tile path lists for both kinds.
+pub(crate) const MAP_TILE_COMPONENTS: [&str; 5] = [
+    "parameter-name",
+    "quality",
+    "tile-width",
+    "tile-height",
+    "tile-scale-denominator",
+];
 
 /// OpenAPI components referenced by the per-API layout's paths.
 pub(crate) fn openapi_components() -> serde_json::Value {
     json!({
         "parameters": {
+            // OGC API - Tiles `/req/collections/rc-datetime-definition`, the
+            // Tiles OpenAPI fragment's text and this server's rules.
             "datetime": {
                 "name": "datetime",
                 "in": "query",
+                "description": "Either a date-time or an interval, half-bounded or bounded. Date and time expressions adhere to RFC 3339. Half-bounded intervals are expressed using double-dots.\n\nExamples:\n\n* A date-time: \"2018-02-12T23:20:50Z\"\n* A bounded interval: \"2018-02-12T00:00:00Z/2018-03-18T12:31:12Z\"\n* Half-bounded intervals: \"2018-02-12T00:00:00Z/..\" or \"../2018-03-18T12:31:12Z\"\n\nOn map tiles: an instant is snapped to an available time step (the last one at or before it); an interval renders the latest time step inside it, and is an empty tile (204) when it holds none. Without `datetime` or a `datetime` subset the tile shows the collection's default (normally latest) time. `OGCAPI-datetime` reports the instant rendered. Not with `subset=datetime(…)` (400).\n\nOn vector tiles: only features whose temporal geometry intersects the instant or interval, as Features' `datetime` selects them; features without a time always match. Without a time the tile holds the collection's default features.",
                 "required": false,
                 "schema": {"type": "string"},
-                "description": "ISO 8601 timestamp"
+                "style": "form",
+                "explode": false
+            },
+            // The Tiles OpenAPI `subset` fragment; map and vector tiles take
+            // the `datetime` axis (`/req/datetime/axis`).
+            "tile-subset": {
+                "name": "subset",
+                "in": "query",
+                "description": "Retrieve only part of the data by slicing or trimming along one or more axis\nFor trimming: {axisAbbrev}({low}:{high}) (preserves dimensionality)\n   An asterisk (`*`) can be used instead of {low} or {high} to indicate the minimum/maximum value.\nFor slicing:  {axisAbbrev}({value})      (reduces dimensionality)\n\nTiles take one axis, `datetime`, with double-quoted RFC 3339 values or the partial forms `yyyy`, `yyyy-mm`, `yyyy-mm-dd`, `yyyy-mm-ddThhZ` and `yyyy-mm-ddThh:mmZ`, and `*` for the first or last time step. On map tiles an instant is snapped like `datetime`, and an interval or a partial value renders the latest time step inside it. On vector tiles it selects features as `datetime` does. A value entirely outside the time axis (a vector collection's temporal extent), or a map tile interval holding no time step, is an empty tile (204). Any other axis is a 400. Not with `datetime` (400). Example: `subset=datetime(\"2018-02-12T00:00:00Z\":*)`.",
+                "style": "form",
+                "explode": false,
+                "required": false,
+                "schema": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            },
+            // OGC API - Maps Scaling on map tiles (Map Tilesets
+            // `/req/tilesets/tiles-parameters`): the requirement texts'
+            // fragments with this server's rules. Named apart from Maps'
+            // `width`/`height`/`scale-denominator`, whose rules differ, so
+            // the shared root keeps one definition per name.
+            "tile-width": {
+                "name": "width",
+                "in": "query",
+                "description": "Width of the viewport in pixel units to present the response (the map subset).\n\nOn a map tile it overrides the tile matrix's tileWidth; the tile matrix still sets the tile's area. A positive integer up to 8000, and `width` × `height` up to 64000000. Omitted with `height` given: the width that keeps pixels square; both omitted: the tile matrix's tileWidth and tileHeight. Not with `scale-denominator` (400).",
+                "required": false,
+                "style": "form",
+                "schema": {"type": "number", "maximum": map_frame::MAX_MAP_DIMENSION}
+            },
+            "tile-height": {
+                "name": "height",
+                "in": "query",
+                "description": "Height of the viewport in pixel units to present the response (the map subset).\n\nOn a map tile it overrides the tile matrix's tileHeight; the tile matrix still sets the tile's area. A positive integer up to 8000, and `width` × `height` up to 64000000. Omitted with `width` given: the height that keeps pixels square; both omitted: the tile matrix's tileWidth and tileHeight. Not with `scale-denominator` (400).",
+                "required": false,
+                "style": "form",
+                "schema": {"type": "number", "maximum": map_frame::MAX_MAP_DIMENSION}
+            },
+            "tile-scale-denominator": {
+                "name": "scale-denominator",
+                "in": "query",
+                "description": "Number of units in the real-world corresponding to one such unit on the display.\n\nA positive number, on the standard 0.28 mm pixel. On a map tile it sets the image's size over the tile's area: one pixel spans `scale-denominator` × 0.28 mm on the ground at the tile's centre (ground metres, not CRS units), within the 8000 and 64000000 caps. Not with `width` or `height` (400).",
+                "required": false,
+                "style": "form",
+                "schema": {"type": "number"}
             },
             "f": {
                 "name": "f",
@@ -930,7 +1020,8 @@ pub(crate) fn openapi_components() -> serde_json::Value {
                 "schema": {"type": "number"},
                 "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."
             },
-            "parameter-name": api_common::parameter_name_parameter()
+            "parameter-name": api_common::parameter_name_parameter(),
+            "quality": api_common::quality_parameter(ds_render::DEFAULT_JPEG_QUALITY)
         },
         "schemas": {
             "legend": api_common::legend_schema()
@@ -1031,12 +1122,30 @@ pub async fn api_docs_asset(Path(asset): Path<String>) -> Response {
     }
 }
 
+/// OGC API - Tiles DateTime: map and vector tiles take `datetime` instants
+/// and intervals (`/req/collections/rc-datetime-definition`) and
+/// `subset=datetime(…)` (`/req/datetime/axis`), on both surfaces.
+pub(crate) const TILES_DATETIME: &str =
+    "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/datetime";
+
 /// OGC API - Tiles and 2D TMS classes declared on either surface.
+///
+/// - DateTime ([`TILES_DATETIME`]) holds for every tile. A map tile snaps an
+///   instant as `/per/datetime/closest` allows, renders an interval's latest
+///   time step, and is an empty tile (204) when a selection holds none. A
+///   vector tile holds only the features whose temporal geometry intersects
+///   the selection, and those without one
+///   (`/req/collections/rc-datetime-response` A and B, #794). A time subset
+///   entirely outside the time axis is a 204 on either.
+/// - OGC API - Maps "Map Tilesets" is a Maps class and only holds where map
+///   tiles sit under the map resource, `{map}/tiles`: at the shared root,
+///   where this block declares it through [`SHARED_CONFORMANCE`], never here.
 pub(crate) const CONFORMANCE: &[&str] = &[
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tileset",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tilesets-list",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/geodata-tilesets",
+    TILES_DATETIME,
     "http://www.opengis.net/spec/tms/2.0/conf/tilematrixset",
     "http://www.opengis.net/spec/tms/2.0/conf/json-tilematrixset",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/png",
@@ -1044,11 +1153,32 @@ pub(crate) const CONFORMANCE: &[&str] = &[
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/mvt",
 ];
 
+/// OGC API - Maps "Map Tilesets" (`/req/tilesets`).
+pub const MAPS_TILESETS: &str = "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets";
+
+/// Classes the Tiles block adds at the shared root, where it serves map
+/// tiles under the Maps block's map resources (#789, Tiles Table 8):
+///
+/// - Map Tilesets ([`MAPS_TILESETS`]): every map collection links
+///   `{root}/collections/{id}/map/tiles` with `tilesets-map`
+///   (`/req/tilesets/desc-links`), and each style its
+///   `…/styles/{styleId}/map/tiles`. Map tiles honour the parameters of
+///   every declared Maps class that `/req/tilesets/tiles-parameters` lists:
+///   Scaling's `width`, `height` and `scale-denominator`. Spatial
+///   Subsetting asks only for a vertical `h`/`z` subset, and only where the
+///   spatial extent is three-dimensional, which none is here; Background,
+///   Display Resolution and General Subsetting are not declared.
+///
+/// The per-API `/maps` service has no `{map}/tiles` (its `tilesets-map`
+/// link points into `/tiles`), and `/tiles` serves no map resource, so
+/// neither declares it (#259, #946).
+pub(crate) const SHARED_CONFORMANCE: &[&str] = &[MAPS_TILESETS];
+
 /// GET {mount}/conformance
 pub async fn conformance(
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
     use ds_core::html::{LinkView, Wanted};
@@ -1169,7 +1299,7 @@ pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
-    Query(fp): Query<ds_core::html::FormatParams>,
+    JsonQuery(fp): JsonQuery<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
     use ds_core::html::Wanted;
@@ -1647,7 +1777,8 @@ pub async fn vector_tileset(
 pub async fn map_tile(
     headers: HeaderMap,
     Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
-    Query(params): Query<TileQueryParams>,
+    JsonQuery(params): JsonQuery<TileQueryParams>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Response, TilesError> {
     if params.is_mvt() {
@@ -1655,6 +1786,8 @@ pub async fn map_tile(
             "Map tiles are images; vector tiles are served at /collections/{id}/tiles/…"
         )));
     }
+    params::reject_unknown_parameters(query.as_deref(), params::MAP_TILE_PARAMETERS)?;
+    let subsets = subset::query_values(query.as_deref(), "subset");
     render_tile(
         &id,
         "default",
@@ -1663,11 +1796,11 @@ pub async fn map_tile(
         tile_row,
         tile_col,
         params,
+        &subsets,
         headers,
         state,
     )
     .await
-    .map(|r| r.into_response())
 }
 
 /// GET /collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
@@ -1675,7 +1808,8 @@ pub async fn map_tile(
 pub async fn vector_tile(
     headers: HeaderMap,
     Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
-    Query(params): Query<TileQueryParams>,
+    JsonQuery(params): JsonQuery<TileQueryParams>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Response, TilesError> {
     if params.format.is_some() && !params.is_mvt() {
@@ -1683,19 +1817,10 @@ pub async fn vector_tile(
             "Vector tiles are served as {MVT_CONTENT_TYPE}; map tiles are at /collections/{id}/map/tiles/…"
         )));
     }
-    // Vector tiles encode every feature the engine returns; reject the raster
-    // selectors rather than ignore them (#605).
-    for (name, value) in [
-        ("datetime", &params.datetime),
-        ("elevation", &params.elevation),
-        ("parameter-name", &params.parameter_name),
-    ] {
-        if value.is_some() {
-            return Err(TilesError::BadRequest(format!(
-                "'{name}' is not supported for vector tiles"
-            )));
-        }
-    }
+    // Vector tiles take a time and nothing else: the map tile parameters
+    // and unknown ones are 400s, never ignored (#605).
+    let subsets = subset::query_values(query.as_deref(), "subset");
+    let time = params.validate_vector(query.as_deref(), &subsets)?;
     render_vector_tile(
         headers,
         &id,
@@ -1703,6 +1828,7 @@ pub async fn vector_tile(
         tile_matrix,
         tile_row,
         tile_col,
+        time,
         state,
     )
     .await
@@ -1718,6 +1844,12 @@ pub(crate) const MVT_CONTENT_TYPE: &str = "application/vnd.mapbox-vector-tile";
 /// Validation order mirrors `render_tile` (TMS → zoom → coords → engine
 /// lookup) so error responses stay consistent across raster and vector
 /// tile routes.
+///
+/// `time` filters the features (OGC API - Tiles DateTime): only those whose
+/// temporal geometry intersects it, as the engine applies Features'
+/// `datetime` (`/req/collections/rc-datetime-response` A); features without
+/// one always match (B). `None` keeps the engine's default selection.
+#[allow(clippy::too_many_arguments)]
 async fn render_vector_tile(
     headers: HeaderMap,
     id: &str,
@@ -1725,6 +1857,7 @@ async fn render_vector_tile(
     zoom: u32,
     row: u64,
     col: u64,
+    time: Option<RequestedTime>,
     state: AppState,
 ) -> Result<axum::response::Response, TilesError> {
     let state = state.load_full();
@@ -1762,6 +1895,36 @@ async fn render_vector_tile(
         .tile_bbox(zoom, row, col)
         .ok_or_else(|| TilesError::Internal("Failed to compute tile bbox".into()))?;
 
+    // A time subset entirely outside the collection's temporal extent, the
+    // `datetime` axis' valid values, is a 204
+    // (`/req/collections/rc-subset-definition` C). Any other selection
+    // filters: no matching feature is the usual empty tile.
+    if let (
+        Some(RequestedTime {
+            selection,
+            from_subset: true,
+        }),
+        Some((first, last)),
+    ) = (&time, engine.temporal_extent())
+    {
+        if selection.outside(first, last) {
+            return Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(header::CACHE_CONTROL, "public, max-age=300")
+                .body(axum::body::Body::empty())
+                .unwrap());
+        }
+    }
+    // The interval the engine filters by, and the cache keys on: equal
+    // selections (`datetime=t`, `subset=datetime("t")`) share an entry. A
+    // collection without a time dimension has no temporal geometry to
+    // filter, so every feature matches (`/req/collections/rc-datetime-response`
+    // B): it gets no filter and shares the timeless tile, where Features
+    // would answer 400.
+    let datetime = time
+        .filter(|_| engine.has_time_dimension())
+        .map(|t| t.selection.interval());
+
     let allowlist = PropertyAllowlist::All;
     let props_hash = properties_hash(&allowlist);
     let cache_key = VectorTileKey {
@@ -1774,6 +1937,7 @@ async fn render_vector_tile(
         // Engines bump their data version on reload/refresh; folding it into
         // the ETag forces a fresh fetch instead of an infinite `304` loop.
         data_version: engine.data_version(),
+        time: datetime.clone(),
     };
     let cache_control = "public, max-age=300";
     let if_none_match = headers
@@ -1822,7 +1986,7 @@ async fn render_vector_tile(
         bbox: Some(query_bbox),
         limit: params::MAX_FEATURES_PER_TILE + 1,
         offset: 0,
-        datetime: None,
+        datetime,
         // Vector tiles carry the whole tile's features and are rendered by
         // the client; a server-side order would cost a sort per tile and
         // change nothing the client can observe.
@@ -1908,10 +2072,15 @@ async fn render_vector_tile(
 pub async fn get_tile(
     headers: HeaderMap,
     Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
-    Query(params): Query<TileQueryParams>,
+    JsonQuery(params): JsonQuery<TileQueryParams>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, TilesError> {
     if params.is_mvt() {
+        // As the shared root's vector route: a time, and no map tile
+        // parameter (`quality`, sizes, …) or unknown one (#605).
+        let subsets = subset::query_values(query.as_deref(), "subset");
+        let time = params.validate_vector(query.as_deref(), &subsets)?;
         return render_vector_tile(
             headers,
             &id,
@@ -1919,10 +2088,13 @@ pub async fn get_tile(
             tile_matrix,
             tile_row,
             tile_col,
+            time,
             state,
         )
         .await;
     }
+    params::reject_unknown_parameters(query.as_deref(), params::MAP_TILE_PARAMETERS)?;
+    let subsets = subset::query_values(query.as_deref(), "subset");
     render_tile(
         &id,
         "default",
@@ -1931,11 +2103,11 @@ pub async fn get_tile(
         tile_row,
         tile_col,
         params,
+        &subsets,
         headers,
         state,
     )
     .await
-    .map(|r| r.into_response())
 }
 
 /// GET {mount}/collections/{id}/styles/{styleId}/legend
@@ -1946,9 +2118,13 @@ pub async fn get_tile(
 /// immutable: palettes are hot-reloadable.
 pub async fn style_legend(
     Path((id, style_id)): Path<(String, String)>,
-    Query(params): Query<LegendQueryParams>,
+    JsonQuery(params): JsonQuery<LegendQueryParams>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Response, TilesError> {
+    // As on the tile routes, a parameter the legend does not take is a 400,
+    // never dropped (#1073).
+    params::reject_unknown_parameters(query.as_deref(), params::LEGEND_PARAMETERS)?;
     let state = state.load_full();
     let (engine, _config) = lookup_engine(&state, &id)?;
     let format = params.validate()?;
@@ -1961,20 +2137,20 @@ pub async fn style_legend(
         return composite_legend(engine.as_ref(), spec, format).await;
     }
 
-    // `?parameter-name=` selects the per-parameter style layer, so the legend
-    // a client draws matches the pixels the tile routes render for that same
-    // parameter.
-    let (_, layer_styles) =
-        layer_style_map(&state.styles, &id, params.parameter_name.as_deref())
-            .ok_or_else(|| TilesError::NotFound(format!("Collection '{id}' not found")))?;
-    let style_info = layer_styles.get(&style_id).ok_or_else(|| {
-        TilesError::NotFound(format!(
-            "Style '{style_id}' not found for collection '{id}'. Available: {}",
-            layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
-        ))
-    })?;
-
+    // The style resolves as on the tile routes: `?parameter-name=` selects
+    // the per-parameter style layer, and without it, on a multi-parameter
+    // collection, the default parameter's (#1133), so the legend a client draws matches the pixels the tile
+    // routes render for that same request.
     let info = engine.raster_info_shared();
+    let resolved = layer_style(
+        &state.styles,
+        &id,
+        params.parameter_name.as_deref(),
+        &info,
+        &style_id,
+    )?;
+    let style_info = resolved.style;
+
     // Mirror the render path's validation: an unknown `parameter-name` must
     // 400 with the available list, not fall back to the collection style and
     // emit a legend labelled with a parameter that doesn't exist.
@@ -1984,8 +2160,7 @@ pub async fn style_legend(
         &id,
         params.parameter_name.as_deref(),
     )?;
-    let (parameter, unit) =
-        ds_render::legend_parameter_unit(style_info, &info, params.parameter_name.as_deref());
+    let (parameter, unit) = ds_render::legend_parameter_unit(style_info, &info, resolved.parameter);
 
     match format {
         LegendFormat::Json => {
@@ -2106,7 +2281,8 @@ pub async fn get_styled_tile(
         u64,
         u64,
     )>,
-    Query(params): Query<TileQueryParams>,
+    JsonQuery(params): JsonQuery<TileQueryParams>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, TilesError> {
     if params.is_mvt() {
@@ -2114,6 +2290,8 @@ pub async fn get_styled_tile(
             "Vector tiles (?f=mvt) are not styled — request via /collections/{id}/tiles/...".into(),
         ));
     }
+    params::reject_unknown_parameters(query.as_deref(), params::MAP_TILE_PARAMETERS)?;
+    let subsets = subset::query_values(query.as_deref(), "subset");
     render_tile(
         &id,
         &style_id,
@@ -2122,14 +2300,51 @@ pub async fn get_styled_tile(
         tile_row,
         tile_col,
         params,
+        &subsets,
         headers,
         state,
     )
     .await
-    .map(|r| r.into_response())
 }
 
-/// Shared tile rendering logic.
+/// A map tile render's outcome: the encoded image, `None` for an all-nodata
+/// tile, and the phases it ran.
+type Rendered = Result<(Option<Vec<u8>>, RenderPhases), DataServerError>;
+
+/// What a map tile render job hands back: the image to serve, already
+/// encoded on the render worker that held the CPU slot (#1093), never on the
+/// async request worker after it.
+enum Finished {
+    /// A populated tile, served `MISS` and inserted in the rendered cache.
+    Image(CachedRendered),
+    /// An all-nodata tile, served `EMPTY`: its memoized empty image, or the
+    /// encoder's error.
+    Empty(Result<CachedRendered, DataServerError>),
+}
+
+/// The work a map tile's `RenderJob` runs: `render`, then the image it
+/// serves, on the same blocking worker, which holds the output-memory
+/// reservation `memory` until both are done. An all-nodata tile takes
+/// `empty`'s image, so a memo miss encodes it there too, like every
+/// populated tile (#1093).
+fn render_job(
+    memory: Arc<ds_executor::budget::RenderPermit>,
+    empty: impl FnOnce() -> Result<CachedRendered, DataServerError> + Send + 'static,
+    render: impl FnOnce() -> Rendered + Send + 'static,
+) -> impl FnOnce() -> Result<(Finished, RenderPhases), DataServerError> + Send + 'static {
+    move || {
+        let _memory = memory;
+        let (bytes, phases) = render()?;
+        let finished = match bytes {
+            Some(bytes) => Finished::Image(CachedRendered::new(bytes::Bytes::from(bytes))),
+            None => Finished::Empty(empty()),
+        };
+        Ok((finished, phases))
+    }
+}
+
+/// Shared tile rendering logic. `subsets` are the `subset` values in request
+/// order.
 #[allow(clippy::too_many_arguments)]
 async fn render_tile(
     collection_id: &str,
@@ -2139,11 +2354,12 @@ async fn render_tile(
     row: u64,
     col: u64,
     params: TileQueryParams,
+    subsets: &[String],
     headers: HeaderMap,
     state: AppState,
-) -> Result<impl IntoResponse, TilesError> {
+) -> Result<Response, TilesError> {
     let state = state.load_full();
-    let (engine, _config) = lookup_engine(&state, collection_id)?;
+    let (engine, config) = lookup_engine(&state, collection_id)?;
 
     // Validate TileMatrixSet
     let tms = tilematrixset::get_tile_matrix_set(tms_id).ok_or_else(|| {
@@ -2174,17 +2390,41 @@ async fn render_tile(
         .ok_or_else(|| TilesError::Internal("Failed to compute tile bbox".into()))?;
 
     // Validate query params
-    let validated = params.validate()?;
+    let validated = params.validate(subsets)?;
+    // The image's size: the tile matrix's tileWidth × tileHeight unless the
+    // Maps Scaling parameters set it over the tile's area (Map Tilesets
+    // `/req/tilesets/tiles-parameters`).
+    let frame = tms
+        .frame(bbox)
+        .ok_or_else(|| TilesError::Internal("Failed to compute tile frame".into()))?;
+    let (width, height) = validated.size(&frame, (tms.tile_width, tms.tile_height))?;
+    // The format as encoded: an explicit `quality`, else for WebP the
+    // collection's `[wms] webp_quality`, else the format default (JPEG 85,
+    // lossless WebP). It keys the rendered cache, so a lossy and a lossless
+    // tile never alias.
+    let format = validated
+        .format
+        .with_quality(validated.quality, config.webp_quality());
 
     // An RGB composite (#819) has no style map: its colours come from its
     // channels, and its one style is `default`.
     let composite = composite_parameter(engine.as_ref(), validated.parameter_name.as_deref());
 
-    // Look up style. A `?parameter-name=` request styles from that
-    // parameter's own layer when the collection registers one — otherwise a
-    // per-parameter colormap would be unreachable through Tiles and every
-    // parameter would render with the collection-level default.
-    let (style_layer_key, paint, style_parameter) = match &composite {
+    // Single `raster_info_shared()` call covers style resolution,
+    // default-time resolution and parameter-name validation. Trait contract
+    // is O(1) but we still avoid the redundant call.
+    let raster_info = engine.raster_info_shared();
+
+    // Look up style, and the parameter it draws. A `?parameter-name=`
+    // request styles from that parameter's own layer when the collection
+    // registers one — otherwise a per-parameter colormap would be
+    // unreachable through Tiles and every parameter would render with the
+    // collection-level default. Without one, on a multi-parameter
+    // collection, the default parameter's layer styles it (#1133), as when
+    // the request names it. For a composite, the
+    // parameter is its name: the engine resolves its time axis, the scans
+    // every band has, like a parameter's.
+    let (style_layer_key, paint, effective_parameter) = match &composite {
         Some(spec) => {
             if style_name != ds_render::COMPOSITE_STYLE {
                 return Err(composite_style_not_found(
@@ -2196,35 +2436,34 @@ async fn render_tile(
             (
                 format!("{collection_id}/{}", spec.name),
                 Paint::Composite(spec.clone()),
-                None,
+                validated.parameter_name.clone(),
             )
         }
         None => {
-            let (style_layer_key, layer_styles) = layer_style_map(
+            let resolved = layer_style(
                 &state.styles,
                 collection_id,
                 validated.parameter_name.as_deref(),
-            )
-            .ok_or_else(|| {
-                TilesError::NotFound(format!("Collection '{collection_id}' not found"))
-            })?;
-
-            let style_info = layer_styles.get(style_name).ok_or_else(|| {
-                TilesError::NotFound(format!(
-                    "Style '{style_name}' not found for collection '{collection_id}'. Available: {}",
-                    layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
-                ))
-            })?;
+                &raster_info,
+                style_name,
+            )?;
             (
-                style_layer_key,
-                Paint::Colormap(style_info.colormap.clone()),
-                style_info.parameter.clone(),
+                resolved.layer.to_string(),
+                Paint::Colormap(resolved.style.colormap.clone()),
+                resolved.parameter.map(str::to_string),
             )
         }
     };
 
-    let content_type = validated.format.content_type();
-    let has_explicit_time = validated.time.is_some();
+    let content_type = format.content_type();
+    // Only an instant pins the tile: intervals and `*` follow new data.
+    let has_explicit_time = matches!(
+        validated.time,
+        Some(RequestedTime {
+            selection: TimeSelection::Instant(_),
+            ..
+        })
+    );
 
     // Determine output CRS from TileMatrixSet
     let output_crs = match tms_id {
@@ -2235,13 +2474,6 @@ async fn render_tile(
         "WebMercatorQuad" => crs_to_uri("EPSG:3857"),
         _ => crs_to_uri("CRS:84"),
     };
-
-    // Single `raster_info_shared()` call covers both default-time resolution and
-    // parameter-name validation. Trait contract is O(1) but we still avoid
-    // the redundant call.
-    let raster_info = engine.raster_info_shared();
-
-    let tile_size = params::TILE_SIZE;
 
     // Parameter selection: ?parameter-name= wins over style.parameter. Mirror
     // the precedence and validation used by api-maps + api-wms so the SPA
@@ -2254,31 +2486,6 @@ async fn render_tile(
         collection_id,
         validated.parameter_name.as_deref(),
     )?;
-    // For a composite, its name: the engine resolves its time axis, the
-    // scans every band has, like a parameter's.
-    let effective_parameter = validated.parameter_name.clone().or(style_parameter);
-
-    // Omitted `datetime`: the engine's default, else the parameter's (else
-    // the collection's) latest time.
-    let time = validated.time.or_else(|| {
-        ds_core::map_engine::default_request_time(
-            engine.as_ref(),
-            &raster_info,
-            effective_parameter.as_deref(),
-        )
-    });
-    // #521: resolve the run axis to the CONCRETE run the engine will render
-    // before the cache key is built (see api-maps for the full rationale —
-    // the no-TTL rendered cache keyed on `None` would keep serving the
-    // first-rendered run's pixels after a newer run re-covers the same valid
-    // times; asking the engine preserves GRIB's cross-run fallback). Engines
-    // without runs keep the identity default (`None` stays `None`).
-    let reference_time = engine.resolve_reference_time(time, None);
-    // #507: snap to the exact timestep the engine will render before the
-    // cache key is built — a not-yet-ingested datetime must cache the
-    // previous timestep's pixels under the PREVIOUS timestep's key. A
-    // parameter with its own time axis snaps on that axis.
-    let time = engine.resolve_parameter_time(effective_parameter.as_deref(), time, reference_time);
 
     // Reject an `elevation` against a collection with no vertical axis.
     if validated.z.is_some() && raster_info.vertical.is_none() {
@@ -2288,21 +2495,72 @@ async fn render_tile(
         )));
     }
 
+    // The instant to render, shared with Maps ([`subset::render_time`]):
+    // omitted, the engine's default, else the parameter's (else the
+    // collection's) latest time; an instant as given, snapped below; an
+    // interval, a partial date or `*` the latest time step inside it. One
+    // that selects no time step is an empty tile, 204: a subset entirely
+    // outside the time axis (`/req/collections/rc-subset-definition` C), or
+    // an interval holding no data (`/req/core/tc-error` B).
+    let time = match subset::render_time(
+        validated.time.as_ref(),
+        engine.as_ref(),
+        &raster_info,
+        effective_parameter.as_deref(),
+    ) {
+        Ok(time) => time,
+        Err(none) => {
+            tracing::debug!(
+                "Tiles: no time step for collection '{collection_id}': {}",
+                none.0
+            );
+            return Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(header::CACHE_CONTROL, cache_control_value(false, 0))
+                .body(axum::body::Body::empty())
+                .unwrap());
+        }
+    };
+    // #521: resolve the run axis to the CONCRETE run the engine will render
+    // before the cache key is built (see api-maps for the full rationale —
+    // the no-TTL rendered cache keyed on `None` would keep serving the
+    // first-rendered run's pixels after a newer run re-covers the same valid
+    // times; asking the engine preserves GRIB's cross-run fallback). Engines
+    // without runs keep the identity default (`None` stays `None`). The run
+    // is the parameter's (#1005), as in api-maps.
+    let reference_time =
+        engine.resolve_parameter_reference_time(effective_parameter.as_deref(), time, None);
+    // #507: snap to the exact timestep the engine will render before the
+    // cache key is built — a not-yet-ingested datetime must cache the
+    // previous timestep's pixels under the PREVIOUS timestep's key. A
+    // parameter with its own time axis snaps on that axis.
+    let time = engine.resolve_parameter_time(effective_parameter.as_deref(), time, reference_time);
+    // `OGCAPI-datetime` (`/rec/datetime/actual-datetime`) on a collection with
+    // a temporal extent: the instant rendered, not the one requested.
+    let actual_datetime = time
+        .filter(|_| !raster_info.times.is_empty())
+        .map(subset::rfc3339);
+    let with_datetime = |builder: axum::http::response::Builder| match &actual_datetime {
+        Some(value) => builder.header(
+            header::HeaderName::from_static("ogcapi-datetime"),
+            value.as_str(),
+        ),
+        None => builder,
+    };
+
     // Build cache key
     let cache_key = CacheKey {
         // The RESOLVED style-layer key — see api-maps render_map: prevents a
-        // parameter-layer style aliasing a same-named collection style.
+        // parameter-layer style aliasing a same-named collection style, and
+        // keys a tile without `parameter-name` that resolved to its default
+        // parameter's layer like one naming that parameter (#1133).
         layer: style_layer_key,
         style: style_name.to_string(),
-        format: match validated.format {
-            ds_render::ImageFormat::Png => 0,
-            ds_render::ImageFormat::Jpeg => 1,
-            ds_render::ImageFormat::Webp => 2,
-        },
+        format,
         crs: tms_id.to_string(),
         bbox: ds_render::quantize_bbox(&bbox),
-        width: tile_size,
-        height: tile_size,
+        width,
+        height,
         time,
         parameter: effective_parameter.clone(),
         z: validated.z.map(ds_render::quantize_z),
@@ -2316,7 +2574,10 @@ async fn render_tile(
         background: None,
     };
 
-    let cache_control = cache_control_value(has_explicit_time, cache_key.content_version);
+    let cache_control = cache_control_value(
+        has_explicit_time && time.is_some(),
+        cache_key.content_version,
+    );
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|h| h.to_str().ok())
@@ -2338,7 +2599,7 @@ async fn render_tile(
                 // lets the regression test (and curious clients) distinguish
                 // this from a post-render MISS→304, which the handler also
                 // serves.
-                return Ok(axum::response::Response::builder()
+                return Ok(with_datetime(axum::response::Response::builder())
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, cached.etag())
                     .header(header::CACHE_CONTROL, cache_control)
@@ -2353,7 +2614,7 @@ async fn render_tile(
                     .into_response());
             }
         }
-        return Ok(axum::response::Response::builder()
+        return Ok(with_datetime(axum::response::Response::builder())
             .header(header::CONTENT_TYPE, content_type)
             .header(header::ETAG, cached.etag())
             .header(header::CACHE_CONTROL, cache_control)
@@ -2382,13 +2643,12 @@ async fn render_tile(
     };
     let (job, memory_permit) = ds_executor::RenderJob::acquire_raster_planes(
         state.render_semaphore.clone(),
-        tile_size,
-        tile_size,
+        width,
+        height,
         planes,
     )
     .await
     .map_err(TilesError::from)?;
-    let worker_memory = memory_permit.clone();
     // Where the render's time goes (#147): admission here, the engine read
     // and encode in the worker.
     let mut phases = RenderPhases::default();
@@ -2396,7 +2656,6 @@ async fn render_tile(
 
     // Render on a blocking thread
     let engine = engine.clone();
-    let format = validated.format;
     let rendered_cache = state.rendered_cache.clone();
 
     // The blocking closure returns Ok(None) for empty (all-nodata) tiles,
@@ -2404,9 +2663,24 @@ async fn render_tile(
     let render_parameter = effective_parameter;
     let render_z = validated.z;
 
+    // An all-nodata tile's image, in the requested format at its quality
+    // like a populated tile (#1091). A default-size PNG reuses the global
+    // `EMPTY_TILE_CACHED`, so its FNV-1a hash is computed once per process
+    // instead of per request; another format, or a tile the Scaling
+    // parameters sized, gets an empty image of its own format and size from
+    // the same shared memo. The job finishes it too (#1093), so the request
+    // worker only reads the result.
+    let empty = move || {
+        if format == ds_render::ImageFormat::Png
+            && (width, height) == (params::TILE_SIZE, params::TILE_SIZE)
+        {
+            Ok(EMPTY_TILE_CACHED.clone())
+        } else {
+            ds_render::empty_tile(width, height, format)
+        }
+    };
     let render_result = job
-        .run(move || {
-            let _memory_permit = worker_memory;
+        .run(render_job(memory_permit, empty, move || {
             let mut phases = phases;
 
             let colormap = match &paint {
@@ -2423,8 +2697,8 @@ async fn render_tile(
                     let engine_start = std::time::Instant::now();
                     let tiles = engine.get_raster_tiles(
                         bbox,
-                        tile_size,
-                        tile_size,
+                        width,
+                        height,
                         time,
                         &output_crs,
                         &bands,
@@ -2444,8 +2718,8 @@ async fn render_tile(
             let engine_start = std::time::Instant::now();
             let tile = engine.get_raster_tile(
                 bbox,
-                tile_size,
-                tile_size,
+                width,
+                height,
                 time,
                 &output_crs,
                 render_parameter.as_deref(),
@@ -2465,12 +2739,12 @@ async fn render_tile(
             let encode_start = std::time::Instant::now();
             let bytes = ds_render::render_tile(&tile, colormap.as_ref(), format)?;
             phases.add(RenderPhase::Encode, encode_start.elapsed());
-            Ok::<_, ds_core::error::DataServerError>((Some(bytes), phases))
-        })
+            Ok((Some(bytes), phases))
+        }))
         .await
         .map_err(TilesError::from)?;
 
-    let (maybe_bytes, phases) = render_result.map_err(|e| {
+    let (finished, phases) = render_result.map_err(|e| {
         use ds_core::error::DataServerError as DSE;
         // A client mistake (multi-parameter collection rendered without a
         // parameter, bad bbox/datetime) is a 400 with the engine's message,
@@ -2510,24 +2784,26 @@ async fn render_tile(
         }
     })?;
 
-    // Empty tiles return the pre-generated transparent PNG without caching;
-    // populated tiles get cached. Wrap both in `CachedRendered` so the
-    // response ETag is FNV-1a over the actual bytes — different pixels
-    // produce different ETags (#145). Track the actual Content-Type per
-    // branch so the header never lies about the payload (#162). Empty
-    // tiles reuse the global `EMPTY_TILE_CACHED` so the FNV-1a hash is
-    // computed once per process instead of per request.
-    // Each arm produces a `CachedRendered` ready to serve. Only the
-    // populated `Some(_)` path inserts into the rendered cache; the
-    // EMPTY fast-path intentionally doesn't (the global
-    // `EMPTY_TILE_CACHED` already serves as the deterministic empty
-    // response).
-    let (cached, x_cache, response_content_type) = match maybe_bytes {
-        None => (EMPTY_TILE_CACHED.clone(), "EMPTY", "image/png"),
-        Some(bytes) => {
-            let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
+    // Empty tiles return a memoized empty image in the requested format
+    // without caching; populated tiles get cached. Both are a
+    // `CachedRendered`, so the response ETag is FNV-1a over the actual
+    // bytes — different pixels produce different ETags (#145). The empty
+    // image is encoded in the requested format at its quality like a
+    // populated tile (#1091), so the Content-Type is the requested one on
+    // every exit and never lies about the payload (#162). The job finished
+    // both (`render_job`, #1093); this only labels them. Only the populated
+    // tile inserts into the rendered cache; the EMPTY fast-path
+    // intentionally doesn't (the shared empty-tile cache already serves the
+    // deterministic empty response).
+    let (cached, x_cache) = match finished {
+        Finished::Empty(tile) => {
+            let empty = tile
+                .map_err(|e| TilesError::Internal(format!("Failed to encode empty tile: {e}")))?;
+            (empty, "EMPTY")
+        }
+        Finished::Image(cached) => {
             rendered_cache.insert(cache_key, cached.clone());
-            (cached, "MISS", content_type)
+            (cached, "MISS")
         }
     };
 
@@ -2536,12 +2812,12 @@ async fn render_tile(
     // encode. Forward the same `x_cache` label the 200 response would
     // carry (`"MISS"` or `"EMPTY"`) so revalidations look the same
     // on dashboards as initial fetches — a client revalidating a
-    // cached transparent-tile response sees `304 x-cache: EMPTY`,
+    // cached empty-image response sees `304 x-cache: EMPTY`,
     // not a misleading `MISS`. This matters for any tile viewer
     // panning over out-of-coverage areas.
     if let Some(ref inm) = if_none_match {
         if ds_render::etag_matches(inm, cached.etag()) {
-            return Ok(axum::response::Response::builder()
+            return Ok(with_datetime(axum::response::Response::builder())
                 .status(StatusCode::NOT_MODIFIED)
                 .header(header::ETAG, cached.etag())
                 .header(header::CACHE_CONTROL, cache_control)
@@ -2556,8 +2832,8 @@ async fn render_tile(
         }
     }
 
-    Ok(axum::response::Response::builder()
-        .header(header::CONTENT_TYPE, response_content_type)
+    Ok(with_datetime(axum::response::Response::builder())
+        .header(header::CONTENT_TYPE, content_type)
         .header(header::ETAG, cached.etag())
         .header(header::CACHE_CONTROL, cache_control)
         .header(header::HeaderName::from_static("content-crs"), content_crs)

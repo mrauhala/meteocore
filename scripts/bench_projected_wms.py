@@ -79,6 +79,7 @@ colormap = "radar_dbz"
                         "LAYERS": "radar", "CRS": args.crs,
                         "BBOX": f"{west},{south},{west + 512000},{south + 384000}",
                         "WIDTH": 1024, "HEIGHT": 768, "FORMAT": "image/png",
+                        "TRANSPARENT": "TRUE",
                     })
                     start = time.perf_counter()
                     body = request("/wms?" + query)

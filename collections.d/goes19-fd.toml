@@ -36,8 +36,9 @@ product = "ABI-L2-ACHTF"
 variable = "TEMP"
 
 # An RGB composite is a layer of its own, on the scans every band it reads
-# has. EUMETSAT's Airmass reads three more full-disk bands, each another
-# whole download per scan, so it stays commented out here:
+# has. The built-in Airmass recipe reads three more full-disk bands, each
+# another whole download per scan (~20 MB), so it stays commented out here.
+# goes19-fd-rgb.toml serves Airmass and Night Microphysics on their own.
 #
 # [[satellite.products]]
 # parameter = "wv_6_2"
@@ -47,14 +48,12 @@ variable = "TEMP"
 # band = 8
 # variable = "CMI"
 #
-# (wv_7_3 = band 10 and ir_9_6 = band 12 likewise)
+# (wv_7_3 = band 10 and ir_9_6 = band 12 likewise: the recipe finds each
+# band by its number)
 #
 # [[satellite.composites]]
 # name = "airmass"
-# title = "Airmass RGB"
-# red = { parameter = "wv_6_2", minus = "wv_7_3", min = -25.0, max = 0.0 }
-# green = { parameter = "ir_9_6", minus = "ir_10_3", min = -40.0, max = 5.0 }
-# blue = { parameter = "wv_6_2", min = 243.0, max = 208.0 }
+# recipe = "airmass"
 
 # Both parameters take the enhanced-IR palette over 180–330 K from the
 # built-in parameter defaults; the classic grey IR is a named style.

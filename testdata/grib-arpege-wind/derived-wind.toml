@@ -1,0 +1,38 @@
+# Run from the repository root:
+# cargo run -p server -- --config testdata/grib-arpege-wind/derived-wind.toml
+# The same ARPEGE analysis twice (see README.md): with Météo-France's native
+# 10 m wind speed and direction, and as u/v components only, from which the
+# server derives `10si` (all APIs) and `10wdir` (EDR) (#897).
+[server]
+host = "127.0.0.1"
+port = 8089
+
+[[collections]]
+id = "arpege"
+title = "ARPEGE 10 m wind, as published"
+description = "Native 10 m wind speed and direction with the u/v components"
+engine_type = "grib"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.license]
+title = "Licence Ouverte / Open Licence Etalab 2.0"
+url = "https://www.etalab.gouv.fr/licence-ouverte-open-licence/"
+
+[collections.grib]
+data_path = "testdata/grib-arpege-wind"
+
+[[collections]]
+id = "arpege-uv"
+title = "ARPEGE 10 m wind, components only"
+description = "Wind speed and direction derived from the u/v components"
+engine_type = "grib"
+apis = ["edr", "wms", "maps", "tiles"]
+# derive_wind = false   # serve the components only
+
+[collections.license]
+title = "Licence Ouverte / Open Licence Etalab 2.0"
+url = "https://www.etalab.gouv.fr/licence-ouverte-open-licence/"
+
+[collections.grib]
+data_path = "testdata/grib-arpege-wind"
+parameters = ["10u", "10v"]

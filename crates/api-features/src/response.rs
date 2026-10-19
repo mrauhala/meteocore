@@ -1,9 +1,56 @@
+use std::collections::HashMap;
+
 use ds_core::feature::{
-    Bbox, DatetimeInterval, Feature, FeaturePage, Geometry, PropertyValue, SortDirection, SortKey,
+    Bbox, DatetimeInterval, Feature, FeaturePage, Geometry, PropertyValue, Related, RelatedTarget,
+    SortDirection, SortKey,
 };
+use ds_core::feature_engine::FeatureEngine;
 use serde_json::{json, Value};
 
 use crate::crs::ResponseCrs;
+use crate::html::path_segment;
+
+/// What a feature's encoding adds to its engine's properties (#1143): the
+/// engine's [`FeatureEngine::label`] as the `title` property, and its
+/// [`Related`] resources as `related` links. The default adds neither.
+#[derive(Clone, Copy, Default)]
+pub struct Annotations<'a> {
+    /// The collection's engine, which labels each feature.
+    pub engine: Option<&'a dyn FeatureEngine>,
+    /// The external base URL every related link is below.
+    pub base: &'a str,
+    /// Pages of the collections a [`RelatedTarget::Collection`] may name, as
+    /// paths below `base`. A collection missing here gets no link.
+    pub collection_pages: Option<&'a HashMap<String, String>>,
+    /// Whether OGC API - EDR serves the feature's own collection, whose
+    /// locations a [`RelatedTarget::EdrLocation`] names.
+    pub edr: bool,
+}
+
+impl Annotations<'_> {
+    /// The link to `related` from a feature of `collection_id`, or `None`
+    /// when no API here serves it.
+    fn link(&self, collection_id: &str, related: &Related) -> Option<Value> {
+        let (href, media) = match &related.target {
+            RelatedTarget::Collection(id) => (
+                format!("{}{}", self.base, self.collection_pages?.get(id)?),
+                "application/json",
+            ),
+            RelatedTarget::EdrLocation(id) if self.edr => (
+                format!(
+                    "{}{}/collections/{}/locations/{}",
+                    self.base,
+                    api_common::mounts::EDR,
+                    path_segment(collection_id),
+                    path_segment(id)
+                ),
+                "application/prs.coverage+json",
+            ),
+            RelatedTarget::EdrLocation(_) => return None,
+        };
+        Some(json!({"href": href, "rel": "related", "type": media, "title": related.title}))
+    }
+}
 
 fn property_value_to_json(v: &PropertyValue) -> Value {
     match v {
@@ -82,36 +129,51 @@ pub fn feature_to_geojson(
     collection_id: &str,
     root: &str,
     crs: &ResponseCrs,
+    annotations: &Annotations<'_>,
 ) -> Value {
-    // Sorted iteration: serde_json's workspace-enabled `preserve_order` makes
+    let mut entries: Vec<(String, Value)> = feature
+        .properties
+        .iter()
+        .map(|(k, v)| (k.clone(), property_value_to_json(v)))
+        .collect();
+    // The engine's label, unless the feature has a title of its own.
+    if !feature.properties.contains_key("title") {
+        if let Some(label) = annotations.engine.and_then(|e| e.label(feature)) {
+            entries.push(("title".into(), Value::String(label)));
+        }
+    }
+    // Sorted: serde_json's workspace-enabled `preserve_order` makes
     // insertion order the wire order, and engines build each feature's
     // property HashMap fresh per request — unsorted, byte-identical requests
     // would serialize differently and the content-derived ETag would never
     // revalidate (#499).
-    let mut entries: Vec<_> = feature.properties.iter().collect();
-    entries.sort_by_key(|(k, _)| *k);
-    let properties: serde_json::Map<String, Value> = entries
-        .into_iter()
-        .map(|(k, v)| (k.clone(), property_value_to_json(v)))
-        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let properties: serde_json::Map<String, Value> = entries.into_iter().collect();
 
+    let mut links = vec![
+        json!({
+            "href": with_crs(format!("{root}/collections/{}/items/{}", collection_id, path_segment(&feature.id)), crs),
+            "rel": "self",
+            "type": "application/geo+json"
+        }),
+        json!({
+            "href": format!("{root}/collections/{}", collection_id),
+            "rel": "collection",
+            "type": "application/json"
+        }),
+    ];
+    links.extend(
+        feature
+            .related
+            .iter()
+            .filter_map(|related| annotations.link(collection_id, related)),
+    );
     json!({
         "type": "Feature",
         "id": feature.id,
         "geometry": geometry_to_json(&feature.geometry, crs),
         "properties": properties,
-        "links": [
-            {
-                "href": with_crs(format!("{root}/collections/{}/items/{}", collection_id, crate::html::path_segment(&feature.id)), crs),
-                "rel": "self",
-                "type": "application/geo+json"
-            },
-            {
-                "href": format!("{root}/collections/{}", collection_id),
-                "rel": "collection",
-                "type": "application/json"
-            }
-        ]
+        "links": links
     })
 }
 
@@ -191,11 +253,12 @@ pub fn feature_page_to_geojson(
     timestamp: &str,
     root: &str,
     crs: &ResponseCrs,
+    annotations: &Annotations<'_>,
 ) -> Value {
     let features: Vec<Value> = page
         .features
         .iter()
-        .map(|f| feature_to_geojson(f, collection_id, root, crs))
+        .map(|f| feature_to_geojson(f, collection_id, root, crs, annotations))
         .collect();
     // The CRS rides along with the filters: a `next` page in another CRS
     // would mix coordinate systems in one result set.
@@ -219,7 +282,10 @@ pub fn feature_page_to_geojson(
     }
 
     if offset > 0 {
-        let prev_offset = offset.saturating_sub(limit);
+        // Past the end, `prev` is the last page that has features, not the
+        // empty one before this (#1143).
+        let last_page = page.number_matched.saturating_sub(1) / limit.max(1) * limit;
+        let prev_offset = offset.saturating_sub(limit).min(last_page);
         links.push(json!({
             "href": format!("{root}/collections/{}/items?offset={}&limit={}{}", collection_id, prev_offset, limit, filters),
             "rel": "prev",
@@ -270,13 +336,20 @@ mod tests {
                 y: 60.1699,
             }),
             properties: std::sync::Arc::new(properties),
+            related: Vec::new(),
         }
     }
 
     #[test]
     fn feature_geojson_structure() {
         let f = sample_feature();
-        let json = feature_to_geojson(&f, "weather", "", &ResponseCrs::default());
+        let json = feature_to_geojson(
+            &f,
+            "weather",
+            "",
+            &ResponseCrs::default(),
+            &Annotations::default(),
+        );
 
         assert_eq!(json["type"], "Feature");
         assert_eq!(json["id"], "Helsinki");
@@ -317,6 +390,7 @@ mod tests {
             "2024-01-01T00:00:00Z",
             "",
             &ResponseCrs::default(),
+            &Annotations::default(),
         );
 
         assert_eq!(json["type"], "FeatureCollection");
@@ -347,6 +421,7 @@ mod tests {
             "2024-01-01T00:00:00Z",
             "",
             &ResponseCrs::default(),
+            &Annotations::default(),
         );
 
         let links = json["links"].as_array().unwrap();
@@ -371,6 +446,7 @@ mod tests {
             "2024-01-01T00:00:00Z",
             "",
             &ResponseCrs::default(),
+            &Annotations::default(),
         );
 
         let links = json["links"].as_array().unwrap();
@@ -440,7 +516,17 @@ mod tests {
             number_returned: 1,
             next_offset: Some(1),
         };
-        let json = feature_page_to_geojson(&page, "weather", 1, 0, "&bbox=1,2,3,4", "", "", &crs);
+        let json = feature_page_to_geojson(
+            &page,
+            "weather",
+            1,
+            0,
+            "&bbox=1,2,3,4",
+            "",
+            "",
+            &crs,
+            &Annotations::default(),
+        );
         let encoded = "crs=http%3A%2F%2Fwww.opengis.net%2Fdef%2Fcrs%2FEPSG%2F0%2F4326";
         for link in json["links"].as_array().unwrap() {
             let href = link["href"].as_str().unwrap();
@@ -476,10 +562,123 @@ mod tests {
             "2024-01-01T00:00:00Z",
             "",
             &ResponseCrs::default(),
+            &Annotations::default(),
         );
 
         assert_eq!(json["type"], "FeatureCollection");
         assert_eq!(json["numberMatched"], 0);
         assert!(json["features"].as_array().unwrap().is_empty());
+    }
+
+    /// #1143: past the end, `prev` is the last page with features, not the
+    /// empty page before; inside the results it steps back one page.
+    #[test]
+    fn prev_past_the_end_is_the_last_page() {
+        let prev = |matched, limit, offset| {
+            let page = FeaturePage {
+                features: vec![],
+                number_matched: matched,
+                number_returned: 0,
+                next_offset: None,
+            };
+            let json = feature_page_to_geojson(
+                &page,
+                "w",
+                limit,
+                offset,
+                "",
+                "",
+                "",
+                &ResponseCrs::default(),
+                &Annotations::default(),
+            );
+            json["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|l| l["rel"] == "prev")
+                .map(|l| l["href"].as_str().unwrap().to_owned())
+        };
+        assert_eq!(
+            prev(23, 10, 1000).as_deref(),
+            Some("/collections/w/items?offset=20&limit=10")
+        );
+        assert_eq!(
+            prev(30, 10, 30).as_deref(),
+            Some("/collections/w/items?offset=20&limit=10")
+        );
+        assert_eq!(
+            prev(23, 10, 15).as_deref(),
+            Some("/collections/w/items?offset=5&limit=10")
+        );
+        assert_eq!(
+            prev(0, 10, 50).as_deref(),
+            Some("/collections/w/items?offset=0&limit=10")
+        );
+        assert_eq!(prev(23, 10, 0), None);
+    }
+
+    /// #1143: related resources become `related` links where an API here
+    /// serves them; the rest are left out.
+    #[test]
+    fn related_resources_resolve_against_the_base_url() {
+        let mut feature = sample_feature();
+        feature.related = vec![
+            Related {
+                target: RelatedTarget::Collection("radar-fivih".into()),
+                title: "Radar site collection".into(),
+            },
+            Related {
+                target: RelatedTarget::Collection("elsewhere".into()),
+                title: "Unserved".into(),
+            },
+            Related::edr_location("Helsinki/1"),
+        ];
+        let pages = HashMap::from([(
+            "radar-fivih".to_owned(),
+            "/collections/radar-fivih".to_owned(),
+        )]);
+        let annotations = |edr| Annotations {
+            base: "https://x.test",
+            collection_pages: Some(&pages),
+            edr,
+            ..Default::default()
+        };
+        let related = |edr| {
+            feature_to_geojson(
+                &feature,
+                "weather",
+                "https://x.test/features",
+                &ResponseCrs::default(),
+                &annotations(edr),
+            )["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|l| l["rel"] == "related")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            related(true),
+            [
+                json!({"href": "https://x.test/collections/radar-fivih", "rel": "related",
+                    "type": "application/json", "title": "Radar site collection"}),
+                json!({"href": "https://x.test/edr/collections/weather/locations/Helsinki%2F1",
+                    "rel": "related", "type": "application/prs.coverage+json",
+                    "title": "Station data (EDR location)"}),
+            ]
+        );
+        // A collection EDR does not serve has no locations to link.
+        assert_eq!(related(false).len(), 1);
+        // Without annotations nothing is added.
+        let plain = feature_to_geojson(
+            &feature,
+            "weather",
+            "",
+            &ResponseCrs::default(),
+            &Annotations::default(),
+        );
+        assert_eq!(plain["links"].as_array().unwrap().len(), 2);
     }
 }

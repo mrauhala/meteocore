@@ -4,6 +4,8 @@
 /// methods to compute bounding boxes from tile coordinates.
 use std::f64::consts::PI;
 
+use api_common::map_frame::{Frame, MapCrs};
+
 /// A tiling scheme definition (OGC TileMatrixSet).
 pub struct TileMatrixSetDef {
     pub id: &'static str,
@@ -98,6 +100,17 @@ impl TileMatrixSetDef {
         match self.id {
             "WebMercatorQuad" => web_mercator_tile_bbox(zoom, row, col),
             "WorldCRS84Quad" => crs84_tile_bbox(zoom, row, col),
+            _ => None,
+        }
+    }
+
+    /// The map frame of a tile's WGS84 `bbox` ([`Self::tile_bbox`]) in this
+    /// set's CRS: what `width`, `height` and `scale-denominator` size a map
+    /// tile over (Maps `/req/tilesets/tiles-parameters`).
+    pub fn frame(&self, bbox: [f64; 4]) -> Option<Frame> {
+        match self.id {
+            "WebMercatorQuad" => Frame::from_box(MapCrs::Crs84, bbox, MapCrs::Epsg3857).ok(),
+            "WorldCRS84Quad" => Some(Frame::from_plane(MapCrs::Crs84, bbox)),
             _ => None,
         }
     }

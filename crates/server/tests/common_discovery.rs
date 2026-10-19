@@ -16,7 +16,7 @@ use ds_core::{
     feature::{Feature, FeaturePage, FeatureQuery},
     feature_engine::FeatureEngine,
     map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile},
-    model::{CoverageResponse, Location},
+    model::{CoverageResponse, LocationSnapshot},
     vertical::{VerticalDimension, VerticalKind},
 };
 use http_body_util::BodyExt;
@@ -40,10 +40,13 @@ struct Fixture {
     vertical: Option<VerticalDimension>,
     /// Render parameters, each with its own time axis if it has one (#819).
     parameters: Vec<(ParameterInfo, Option<Vec<DateTime<Utc>>>)>,
+    /// `RasterInfo.native_crs`: `"CRS:84"`, or `"projected"` as engine-netcdf
+    /// and engine-querydata label a CF projected grid.
+    native_crs: &'static str,
 }
 
 impl EdrEngine for Fixture {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         panic!("metadata must not query data")
     }
     fn query_location(
@@ -83,6 +86,7 @@ fn fixture_feature() -> Feature {
             "name".to_owned(),
             ds_core::feature::PropertyValue::String("Fixture".into()),
         )])),
+        related: Vec::new(),
     }
 }
 
@@ -127,7 +131,7 @@ impl MapEngine for Fixture {
     }
     fn raster_info(&self) -> RasterInfo {
         RasterInfo {
-            native_crs: "CRS:84".into(),
+            native_crs: self.native_crs.into(),
             spatial_extent: self.bbox,
             times: self.times.clone(),
             parameter: "rain".into(),
@@ -223,6 +227,7 @@ fn catalog() -> Catalog {
             times,
             vertical,
             parameters,
+            native_crs: "CRS:84",
         });
         edr.insert(id.into(), fixture.clone());
         maps.insert(id.into(), fixture.clone());
@@ -236,6 +241,34 @@ fn catalog() -> Catalog {
         configs.insert(id.into(), config);
     }
     (configs, edr, maps, features)
+}
+
+/// `n` collections `c-00`, `c-01`, … titled in the reverse order of their
+/// ids (`c-00` is "Collection 29" of 30), so title and id order differ.
+fn numbered_catalog(n: usize) -> Catalog {
+    let mut catalog: Catalog = Default::default();
+    let (configs, edr, maps, features) = &mut catalog;
+    for i in 0..n {
+        let id = format!("c-{i:02}");
+        let fixture = Arc::new(Fixture {
+            bbox: Some([21.0, 61.0, 29.0, 69.0]),
+            time: None,
+            times: vec![],
+            vertical: None,
+            parameters: vec![],
+            native_crs: "CRS:84",
+        });
+        edr.insert(id.clone(), fixture.clone());
+        maps.insert(id.clone(), fixture.clone());
+        features.insert(id.clone(), fixture);
+        let config: CollectionConfig = serde_json::from_value(json!({
+            "id": id, "title": format!("Collection {:02}", n - 1 - i),
+            "description": "Paging fixture", "apis": ["edr", "maps", "tiles", "features"]
+        }))
+        .unwrap();
+        configs.insert(id, config);
+    }
+    catalog
 }
 
 fn maps_state(
@@ -289,6 +322,7 @@ fn features_state(
         engines: features,
         // The Tiles fixture encodes every collection as vector tiles.
         vector_tileset_ids: configs.keys().cloned().collect(),
+        collection_pages: Default::default(),
         collections: configs,
         base_url: BASE.into(),
         trust_proxy_headers: false,
@@ -328,16 +362,26 @@ fn app(surface: &str) -> (Router, String) {
         let router = api_common::shared::router(shared_api());
         return (Router::new().nest("/base", router), "/base".into());
     }
+    app_over(surface, catalog())
+}
+
+/// [`app`] over another catalog.
+fn app_over(surface: &str, catalog: Catalog) -> (Router, String) {
+    if surface == "shared" {
+        let router = api_common::shared::router(shared_api_over(catalog));
+        return (Router::new().nest("/base", router), "/base".into());
+    }
     let api = if surface == "vector-tiles" {
         "tiles"
     } else {
         surface
     };
-    let (configs, edr, maps, features) = catalog();
+    let (configs, edr, maps, features) = catalog;
     let router = match surface {
         "edr" => api_edr::router(Arc::new(ArcSwap::from_pointee(
             api_edr::handlers::EdrState {
                 engines: edr,
+                feature_engines: HashMap::new(),
                 collections: configs,
                 styles: HashMap::new(),
                 base_url: BASE.into(),
@@ -607,7 +651,10 @@ async fn unsupported_duplicate_and_invalid_parameters_return_structured_400() {
         for query in [
             "parent=x",
             "descendants=immediate",
-            "sortby=-id",
+            // `sortby` sorts by title or id only; nothing says when a
+            // collection's data last changed (#1141).
+            "sortby=-updated",
+            "sortby=title,",
             "filter=true",
             "query=radar&query=wind",
             "query=radar&%71uery=wind",
@@ -638,6 +685,176 @@ async fn unsupported_duplicate_and_invalid_parameters_return_structured_400() {
             assert_eq!(error["code"], "BadRequest");
             assert!(!error["description"].as_str().unwrap().is_empty());
         }
+    }
+}
+
+/// A request that asked for HTML, with `f=html` or a browser's `Accept`,
+/// gets each error as a page with the same status on every API; any other
+/// request gets the JSON body (#1132).
+#[tokio::test]
+async fn html_requests_get_errors_as_pages_on_every_surface() {
+    let media = |headers: &HeaderMap| headers[header::CONTENT_TYPE].to_str().unwrap().to_owned();
+    for surface in SURFACES {
+        let (app, prefix) = app(surface);
+        let catalog = format!("href=\"https://example.test{prefix}/collections?f=html\"");
+        // 400: the catalog form again, holding the value, the field marked.
+        for (url, accept) in [
+            (
+                format!("{prefix}/collections?datetime=yesterday&f=html"),
+                None,
+            ),
+            (
+                format!("{prefix}/collections?datetime=yesterday"),
+                Some("text/html,*/*;q=0.8"),
+            ),
+        ] {
+            let (status, headers, html) = get(&app, &url, accept).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{surface} {url}");
+            assert!(media(&headers).starts_with("text/html"), "{surface} {url}");
+            assert!(
+                html.contains("aria-errormessage=\"datetime-error\""),
+                "{surface}: {html}"
+            );
+            assert!(html.contains("value=\"yesterday\""), "{surface}");
+        }
+        // The same 400 without `f` or a browser's Accept: the JSON body.
+        let url = format!("{prefix}/collections?datetime=yesterday");
+        for accept in [None, Some("application/json")] {
+            let (status, headers, body) = get(&app, &url, accept).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{surface} {accept:?}");
+            assert!(
+                media(&headers).starts_with("application/json"),
+                "{surface} {accept:?}"
+            );
+            let error: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(error["code"], "BadRequest", "{surface}");
+        }
+        // A bad `f` is no HTML request: the JSON 400 names the first fault
+        // in the order it always has, the parameters before the format.
+        let (status, _, body) =
+            get(&app, &format!("{prefix}/collections?f=xml&typo=1"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{surface}");
+        assert!(body.contains("'typo'"), "{surface}: {body}");
+        // 404: a page with a way back to the catalog, for `f=html` and for
+        // a browser's Accept with no `f`; JSON otherwise.
+        let url = format!("{prefix}/collections/nope");
+        for (url, accept) in [
+            (format!("{url}?f=html"), None),
+            (
+                url.clone(),
+                Some("text/html,application/xhtml+xml,*/*;q=0.8"),
+            ),
+        ] {
+            let (status, headers, html) = get(&app, &url, accept).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{surface} {accept:?}");
+            assert!(
+                media(&headers).starts_with("text/html"),
+                "{surface} {accept:?}"
+            );
+            assert!(html.contains("HTTP 404"), "{surface}");
+            assert!(html.contains(&catalog), "{surface}: {html}");
+        }
+        let (status, headers, body) = get(&app, &url, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{surface}");
+        assert!(media(&headers).starts_with("application/json"), "{surface}");
+        let error: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["code"], "NotFound", "{surface}");
+    }
+
+    // Features items: the data request form again, the field marked; a
+    // feature that is not there links back to its collection.
+    for surface in ["features", "shared"] {
+        let (app, prefix) = app(surface);
+        let items = format!("{prefix}/collections/c-match/items");
+        let (status, headers, html) = get(&app, &format!("{items}?bbox=1,2,3&f=html"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{surface}");
+        assert!(media(&headers).starts_with("text/html"));
+        assert!(
+            html.contains("aria-errormessage=\"bbox-error\""),
+            "{surface}: {html}"
+        );
+        assert!(html.contains("value=\"1,2,3\""), "{surface}");
+        assert!(html.contains("This request could not run."), "{surface}");
+        // No response to date or page.
+        assert!(!html.contains("Response generated"), "{surface}");
+        assert!(!html.contains("Next page"), "{surface}");
+        let (status, headers, _) = get(&app, &format!("{items}?bbox=1,2,3"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(media(&headers).starts_with("application/json"));
+        // A bad `f` with a bad parameter: that parameter's JSON 400 first.
+        for url in [
+            format!("{items}?f=xml&limit=x"),
+            format!("{items}/missing?f=xml&typo=1"),
+        ] {
+            let (status, headers, body) = get(&app, &url, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{surface} {url}");
+            assert!(media(&headers).starts_with("application/json"));
+            assert!(!body.contains("xml"), "{surface} {url}: {body}");
+        }
+        let (status, _, html) = get(&app, &format!("{items}/missing?f=html"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{surface}");
+        assert!(
+            html.contains(&format!(
+                "href=\"https://example.test{prefix}/collections/c-match?f=html\">← Back to c-match"
+            )),
+            "{surface}: {html}"
+        );
+    }
+
+    // Resources served only as JSON answer `f=html` with the 400 naming
+    // JSON, as the legend does, and serve JSON to everyone else. Their
+    // OpenAPI declares that `f` and that 400.
+    let tms = "/tileMatrixSets/{tileMatrixSetId}";
+    for (surface, path, template) in [
+        ("tiles", "/tileMatrixSets", None),
+        ("tiles", "/collections/c-match/tiles", None),
+        (
+            "tiles",
+            "/collections/c-match/tiles/WebMercatorQuad",
+            Some("/collections/c-match/tiles/{tileMatrixSetId}"),
+        ),
+        ("vector-tiles", "/tileMatrixSets/WebMercatorQuad", Some(tms)),
+        ("maps", "/collections/c-match/styles", None),
+        ("shared", "/tileMatrixSets", None),
+        ("shared", "/tileMatrixSets/WebMercatorQuad", Some(tms)),
+        ("shared", "/collections/c-match/styles", None),
+        ("shared", "/collections/c-match/map/tiles", None),
+        (
+            "shared",
+            "/collections/c-match/map/tiles/WebMercatorQuad",
+            Some("/collections/c-match/map/tiles/{tileMatrixSetId}"),
+        ),
+    ] {
+        let (app, prefix) = app(surface);
+        let api = get_json(&app, &format!("{prefix}/api")).await;
+        let key = format!(
+            "{}{}",
+            prefix.strip_prefix("/base").unwrap(),
+            template.unwrap_or(path)
+        );
+        let operation = &api["paths"][&key]["get"];
+        let f = operation["parameters"]
+            .as_array()
+            .and_then(|parameters| parameters.iter().find(|p| p["name"] == "f"));
+        assert_eq!(
+            f.map(|f| f["schema"]["enum"].clone()),
+            Some(json!(["json", "application/json"])),
+            "{surface} {key}"
+        );
+        let rejected = &operation["responses"]["400"]["content"];
+        assert!(rejected["application/json"].is_object(), "{surface} {key}");
+        assert!(rejected["text/html"].is_object(), "{surface} {key}");
+        let url = format!("{prefix}{path}");
+        let (status, headers, html) = get(&app, &format!("{url}?f=html"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{surface} {path}: {html}");
+        assert!(media(&headers).starts_with("text/html"), "{surface} {path}");
+        assert!(html.contains("Supported: json"), "{surface} {path}: {html}");
+        let (status, headers, body) = get(&app, &url, Some("text/html")).await;
+        assert_eq!(status, StatusCode::OK, "{surface} {path}: {body}");
+        assert!(
+            media(&headers).starts_with("application/json"),
+            "{surface} {path}"
+        );
     }
 }
 
@@ -677,6 +894,132 @@ async fn accept_negotiated_html_has_explicit_format_navigation() {
         let doc = get_json(&app, json_link).await;
         assert_eq!(doc["numberMatched"], 3);
         assert_eq!(doc["collections"][0]["id"], "c-match");
+    }
+}
+
+/// The ids of an HTML catalog page's rows, in order.
+fn row_ids(html: &str) -> Vec<String> {
+    html.split("<article class=\"collection-row\">")
+        .skip(1)
+        .map(|row| {
+            row.split("<span class=\"mono\">")
+                .nth(1)
+                .unwrap()
+                .split('<')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// An HTML catalog without `limit` is a page of 24 collections by title,
+/// with a next link; JSON still lists every collection, by id. The HTML
+/// page's JSON switch spells out its size and order, so it names the same
+/// 24 collections in the same order (#1141).
+#[tokio::test]
+async fn html_catalog_pages_24_by_title_while_json_lists_all_by_id() {
+    for surface in SURFACES {
+        let (app, prefix) = app_over(surface, numbered_catalog(30));
+        let (status, _, html) = get(&app, &format!("{prefix}/collections?f=html"), None).await;
+        assert_eq!(status, StatusCode::OK, "{surface}");
+        let rows = row_ids(&html);
+        // Titles run opposite to ids: "Collection 00" is c-29.
+        let by_title: Vec<String> = (6..30).rev().map(|i| format!("c-{i:02}")).collect();
+        assert_eq!(rows, by_title, "{surface}");
+        assert!(html.contains("<h2 id=\"results-count\">30 matching collections</h2>"));
+        let next = html
+            .split("rel=\"next\" href=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a next link")
+            .replace("&amp;", "&");
+        assert!(next.contains("offset=24"), "{surface}: {next}");
+        assert!(!next.contains("limit="), "{surface}: {next}");
+        assert!(!next.contains("sortby="), "{surface}: {next}");
+        let (_, _, rest) = get(&app, &next, None).await;
+        assert_eq!(
+            row_ids(&rest),
+            ["c-05", "c-04", "c-03", "c-02", "c-01", "c-00"]
+        );
+        // A cleared page-size field is no limit either.
+        let (_, _, cleared) = get(&app, &format!("{prefix}/collections?limit=&f=html"), None).await;
+        assert_eq!(row_ids(&cleared).len(), 24, "{surface}");
+        // A browser negotiates HTML with no `f`: the same defaults, and its
+        // next link adds neither a page size nor an order.
+        let (status, headers, browser) = get(
+            &app,
+            &format!("{prefix}/collections"),
+            Some("text/html,application/xhtml+xml,*/*;q=0.8"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{surface}");
+        assert!(headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        assert_eq!(row_ids(&browser), by_title, "{surface}");
+        let browser_next = browser
+            .split("rel=\"next\" href=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a next link")
+            .replace("&amp;", "&");
+        assert!(
+            browser_next.contains("offset=24"),
+            "{surface}: {browser_next}"
+        );
+        assert!(
+            !browser_next.contains("limit="),
+            "{surface}: {browser_next}"
+        );
+        assert!(
+            !browser_next.contains("sortby="),
+            "{surface}: {browser_next}"
+        );
+
+        let json_link = html
+            .split("id=\"json-link\" href=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap()
+            .replace("&amp;", "&");
+        assert!(json_link.contains("limit=24"), "{surface}: {json_link}");
+        assert!(json_link.contains("sortby=title"), "{surface}: {json_link}");
+        let ids = |doc: &Value| -> Vec<String> {
+            doc["collections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            ids(&get_json(&app, &json_link).await),
+            by_title,
+            "{surface}"
+        );
+
+        let all = get_json(&app, &format!("{prefix}/collections")).await;
+        assert_eq!(all["numberReturned"], 30, "{surface}");
+        let by_id: Vec<String> = (0..30).map(|i| format!("c-{i:02}")).collect();
+        assert_eq!(ids(&all), by_id, "{surface}");
+        // JSON's HTML alternate is the same 30, by id.
+        let (_, _, alternate) = get(&app, link(&all, "alternate"), None).await;
+        assert_eq!(row_ids(&alternate), by_id, "{surface}");
+
+        // sortby orders either representation.
+        let sorted = get_json(&app, &format!("{prefix}/collections?sortby=-title&limit=2")).await;
+        assert_eq!(ids(&sorted), ["c-00", "c-01"], "{surface}");
+        assert!(link(&sorted, "next").contains("sortby=-title"), "{surface}");
+        let (_, _, html) = get(
+            &app,
+            &format!("{prefix}/collections?sortby=id&f=html"),
+            None,
+        )
+        .await;
+        assert_eq!(row_ids(&html), by_id[..24], "{surface}");
+        assert!(html.contains("<option value=\"id\" selected>ID A–Z</option>"));
     }
 }
 
@@ -723,6 +1066,20 @@ async fn metadata_and_search_use_the_same_temporal_extent() {
             link(&detail, "license"),
             "https://spdx.org/licenses/CC-BY-4.0.html"
         );
+        // The shared license link has a `type` on every surface (EDR 1.2
+        // `/req/core/rc-collection-info-links` B: all links do).
+        let license = detail["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "license")
+            .unwrap();
+        assert_eq!(license["type"], "text/html", "{surface}");
+        if *surface == "edr" {
+            for l in detail["links"].as_array().unwrap() {
+                assert!(l["type"].is_string(), "{l}");
+            }
+        }
         let (status, headers, _) = get(&app, link(&detail, "alternate"), None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(headers[header::CONTENT_TYPE]
@@ -750,11 +1107,11 @@ async fn openapi_and_conformance_are_consistent_across_surfaces() {
         );
         let params = &operation["parameters"];
         let parameters = params.as_array().unwrap();
-        assert_eq!(parameters.len(), 8);
+        assert_eq!(parameters.len(), 9);
         let limit = parameters.iter().find(|p| p["name"] == "limit").unwrap();
         assert_eq!(limit["schema"]["default"], 1000);
         assert_eq!(limit["schema"]["maximum"], 1000);
-        for name in ["bbox", "q", "query"] {
+        for name in ["bbox", "q", "query", "sortby"] {
             let p = parameters.iter().find(|p| p["name"] == name).unwrap();
             assert_eq!(p["schema"]["type"], "array");
             assert_eq!(p["style"], "form");
@@ -765,20 +1122,35 @@ async fn openapi_and_conformance_are_consistent_across_surfaces() {
         }
         baseline = Some(params.clone());
         let conformance = get_json(&app, &format!("{prefix}/conformance")).await;
-        let common: Vec<_> = conformance["conformsTo"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|s| s.contains("ogcapi-common-"))
-            .map(str::to_owned)
-            .collect();
-        assert_eq!(common.len(), 6);
-        assert!(!common.iter().any(|c| c.contains("common-4")));
+        let common = |scheme: &str| -> Vec<String> {
+            let prefix = format!("{scheme}://www.opengis.net/spec/ogcapi-common-");
+            conformance["conformsTo"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|s| s.starts_with(&prefix))
+                .map(str::to_owned)
+                .collect()
+        };
+        let shared = common("http");
+        assert_eq!(shared.len(), 6);
+        assert!(!shared.iter().any(|c| c.contains("common-4")));
         if let Some(ref baseline) = classes_baseline {
-            assert_eq!(&common, baseline);
+            assert_eq!(&shared, baseline);
         }
-        classes_baseline = Some(common);
+        classes_baseline = Some(shared);
+        // EDR 1.2's `/req/core/conformance` A names two of them with
+        // `https://`, so EDR alone adds those forms (#979).
+        let https: &[&str] = if *surface == "edr" {
+            &[
+                "https://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
+                "https://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
+            ]
+        } else {
+            &[]
+        };
+        assert_eq!(common("https"), https, "{surface}");
         let doc = get_json(&app, &format!("{prefix}/collections?limit=9999")).await;
         assert!(link(&doc, "self").contains("limit=1000"));
         assert_eq!(doc["numberReturned"], 6);
@@ -799,14 +1171,16 @@ async fn workbench_exposes_supported_queries_and_same_resource_json_on_every_sur
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        for control in ["q", "query", "bbox", "datetime", "limit", "offset"] {
+        for control in [
+            "q", "query", "bbox", "datetime", "sortby", "limit", "offset",
+        ] {
             assert!(
                 html.contains(&format!("name=\"{control}\""))
                     || html.contains(&format!("data-param=\"{control}\"")),
                 "{surface}: {control}"
             );
         }
-        for unsupported in ["sortby", "sd", "resolution", "parent", "depth"] {
+        for unsupported in ["sd", "resolution", "parent", "depth"] {
             assert!(!html.contains(&format!("name=\"{unsupported}\"")));
             assert!(!html.contains(&format!("data-param=\"{unsupported}\"")));
         }
@@ -832,17 +1206,44 @@ async fn workbench_exposes_supported_queries_and_same_resource_json_on_every_sur
 
 /// Common Part 1 Req 13 names the registered conformance relation; Features
 /// and EDR (and their test suites) require the short `conformance`/`data`.
-/// Every landing page carries both, pointing at the same resources.
+/// Every landing page carries both, pointing at the same resources. Its
+/// HTML link table lists the two forms in one row and every link's type
+/// (#1131: the landings once dropped the type, leaving the column empty).
 #[tokio::test]
 async fn landing_pages_advertise_short_and_registered_relations() {
     for surface in SURFACES {
         let (app, prefix) = app(surface);
         let doc = get_json(&app, &prefix).await;
+        let (status, _, html) = get(&app, &format!("{prefix}?f=html"), None).await;
+        assert_eq!(status, StatusCode::OK, "{surface}: {html}");
         for (short, registered) in [
             ("conformance", api_common::rel::CONFORMANCE),
             ("data", api_common::rel::DATA),
         ] {
-            assert_eq!(link(&doc, short), link(&doc, registered), "{surface}");
+            let href = link(&doc, short);
+            assert_eq!(href, link(&doc, registered), "{surface}");
+            assert_eq!(
+                html.matches(&format!("href=\"{href}\"")).count(),
+                1,
+                "{surface}: one row for {href}"
+            );
+            assert!(
+                html.contains(&format!(
+                    "<td><code>{short}</code><code>{registered}</code></td>"
+                )),
+                "{surface}: {html}"
+            );
+        }
+        for media_type in doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l["type"].as_str())
+        {
+            assert!(
+                html.contains(&format!("<td>{}</td>", ds_core::html::escape(media_type))),
+                "{surface}: {media_type}"
+            );
         }
     }
 }
@@ -1352,6 +1753,7 @@ async fn shared_root_extent_precedence_matches_discovery() {
             times: vec![],
             vertical: None,
             parameters: vec![],
+            native_crs: "CRS:84",
         }),
     );
     // `f-wind` is served by Features alone: no map, no tiles.
@@ -1425,6 +1827,73 @@ async fn shared_root_extent_precedence_matches_discovery() {
         .iter()
         .any(|l| l["rel"] == api_common::rel::MAP));
     assert_eq!(start(&features_only), instant("2024-01-01T00:00:00Z"));
+}
+
+/// A map collection on a projected grid (engine-netcdf's MEPS, #1067:
+/// `native_crs = "projected"`, 949 × 1069 cells) advertises neither a
+/// `storageCrs` nor a `grid` of degrees, which only a CRS84 grid has, and
+/// its description still validates, on every map surface.
+#[tokio::test]
+async fn a_projected_grid_advertises_no_storage_crs_or_degree_grid() {
+    let (mut configs, _, mut maps, features) = catalog();
+    let mut config = configs["c-match"].clone();
+    config.id = "g-projected".into();
+    configs.insert(config.id.clone(), config);
+    maps.insert(
+        "g-projected".into(),
+        Arc::new(Fixture {
+            bbox: Some([-18.1, 49.8, 54.2, 75.2]),
+            time: Some((
+                instant("2024-01-01T00:00:00Z"),
+                instant("2024-01-01T01:00:00Z"),
+            )),
+            times: vec![
+                instant("2024-01-01T00:00:00Z"),
+                instant("2024-01-01T01:00:00Z"),
+            ],
+            vertical: None,
+            parameters: vec![],
+            native_crs: "projected",
+        }),
+    );
+    let surfaces = [
+        (
+            api_maps::router(maps_state(configs.clone(), maps.clone())),
+            "/base/maps",
+        ),
+        (
+            api_tiles::router(tiles_state(
+                configs.clone(),
+                maps.clone(),
+                features.clone(),
+                false,
+            )),
+            "/base/tiles",
+        ),
+        (
+            api_common::shared::router(shared_api_over((configs, HashMap::new(), maps, features))),
+            "/base",
+        ),
+    ];
+    for (router, prefix) in surfaces {
+        let app = Router::new().nest(prefix, router);
+        let url = format!("{prefix}/collections/g-projected");
+        let projected = get_json(&app, &url).await;
+        schema::assert_valid("/collections/{collectionId}", &projected, &url);
+        assert!(projected.get("storageCrs").is_none(), "{url}: {projected}");
+        assert!(
+            projected["extent"]["spatial"].get("grid").is_none(),
+            "{url}: {projected}"
+        );
+        assert!(projected["extent"]["spatial"]["bbox"].is_array(), "{url}");
+        // The same fields on a CRS84 grid, so the absence above means something.
+        let crs84 = get_json(&app, &format!("{prefix}/collections/c-match")).await;
+        assert!(crs84["storageCrs"].is_string(), "{prefix}: {crs84}");
+        assert!(
+            crs84["extent"]["spatial"]["grid"].is_array(),
+            "{prefix}: {crs84}"
+        );
+    }
 }
 
 /// ets-ogcapi-features10 reads the `limit`, `bbox` and `datetime` definitions
@@ -1682,6 +2151,220 @@ async fn render_parameters_are_advertised_and_declared_on_every_raster_surface()
                 })
                 .any(|p| p["name"] == "parameter-name" && p["in"] == "query");
             assert!(declared, "{surface}: {path} lacks parameter-name");
+        }
+    }
+}
+
+const MAPS_TILESETS: &str = "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets";
+const TILES_DATETIME: &str = "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/datetime";
+
+/// [`app`] for a raster surface ("maps", "tiles" or "shared"), every
+/// collection with a `default` and a `grayscale` style.
+fn styled_app(surface: &str) -> (Router, String) {
+    let (configs, _, engines, features) = catalog();
+    let style = |name: &str| ds_render::StyleInfo {
+        name: name.into(),
+        title: name.into(),
+        palette: ds_render::builtin_palette_arc("viridis").unwrap(),
+        colormap: Arc::new(ds_render::LutColorMap::from_builtin(
+            ds_render::BuiltinColormap::Viridis,
+            0.0,
+            1.0,
+        )),
+        min: 0.0,
+        max: 1.0,
+        parameter: None,
+    };
+    let styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = configs
+        .keys()
+        .map(|id| {
+            let named = ["default", "grayscale"].map(|name| (name.to_string(), style(name)));
+            (id.clone(), named.into_iter().collect())
+        })
+        .collect();
+    let mut maps = (**maps_state(configs.clone(), engines.clone()).load()).clone();
+    maps.styles = styles.clone();
+    let maps = Arc::new(ArcSwap::from_pointee(maps));
+    let mut tiles =
+        (**tiles_state(configs.clone(), engines, features.clone(), false).load()).clone();
+    tiles.styles = styles;
+    let tiles = Arc::new(ArcSwap::from_pointee(tiles));
+    match surface {
+        "shared" => {
+            let api = api_common::shared::SharedApi::new(
+                "",
+                vec![
+                    Arc::new(api_maps::MapsBlock::new(maps)),
+                    Arc::new(api_tiles::TilesBlock::new(tiles)),
+                    Arc::new(api_features::FeaturesBlock::new(features_state(
+                        configs, features,
+                    ))),
+                ],
+                vec![],
+            );
+            let router = api_common::shared::router(api);
+            (Router::new().nest("/base", router), "/base".into())
+        }
+        "maps" => (
+            Router::new().nest("/base/maps", api_maps::router(maps)),
+            "/base/maps".into(),
+        ),
+        "tiles" => (
+            Router::new().nest("/base/tiles", api_tiles::router(tiles)),
+            "/base/tiles".into(),
+        ),
+        _ => unreachable!(),
+    }
+}
+
+/// Map Tilesets `/req/tilesets/desc-links` on one surface: beside every map
+/// resource a collection links (its `map`, and each style's), a
+/// `tilesets-map` link to that map's own tiles, `{map}/tiles`, which
+/// resolves to a tileset list. The number of map resources checked, or the
+/// first that fails.
+async fn map_tiles_beside_every_map(app: &Router, prefix: &str) -> Result<usize, String> {
+    let link = |links: &Value, rel: &str| {
+        links.as_array().and_then(|links| {
+            links
+                .iter()
+                .find(|l| l["rel"] == rel)
+                .and_then(|l| l["href"].as_str())
+                .map(str::to_owned)
+        })
+    };
+    let list = get_json(app, &format!("{prefix}/collections?limit=1000")).await;
+    let mut maps = 0;
+    for entry in list["collections"].as_array().unwrap() {
+        let doc = get_json(app, &link(&entry["links"], "self").unwrap()).await;
+        let id = doc["id"].as_str().unwrap().to_owned();
+        let mut resources = vec![(id.clone(), doc["links"].clone())];
+        for style in doc["styles"].as_array().into_iter().flatten() {
+            resources.push((
+                format!("{id} style {}", style["id"]),
+                style["links"].clone(),
+            ));
+        }
+        for (what, links) in resources {
+            let Some(map) = link(&links, api_common::rel::MAP) else {
+                continue;
+            };
+            maps += 1;
+            let expected = format!("{map}/tiles");
+            match link(&links, api_common::rel::TILESETS_MAP) {
+                Some(tiles) if tiles == expected => {}
+                other => return Err(format!("{what}: tilesets-map {other:?}, not {expected}")),
+            }
+            let tilesets = get_json(app, &expected).await;
+            if tilesets["tilesets"].as_array().is_none_or(Vec::is_empty) {
+                return Err(format!("{what}: {expected} lists no tileset"));
+            }
+        }
+    }
+    Ok(maps)
+}
+
+/// #946: a declared class and the resources it requires cannot drift apart.
+///
+/// - OGC API - Maps "Map Tilesets": declared, every map resource links its
+///   own map tiles beside it (the one valid direction; the converse fails on
+///   purpose, since Tiles' geodata-tilesets class links `tilesets-map` on
+///   `/tiles` without being a Maps class). Only the shared root has
+///   `{map}/tiles`: the per-API `/maps` service links map tilesets in
+///   `/tiles`, which is why it must not declare the class (#259).
+/// - Both classes: the tile operations declare the parameters the class
+///   requires, Tiles DateTime `datetime` and `subset` with the standard's
+///   schemas on every tile, map and vector (#794), and Map Tilesets Maps'
+///   Scaling parameters on map tiles (`/req/tilesets/tiles-parameters`), and
+///   the per-API Tiles document stays valid OpenAPI.
+#[tokio::test]
+async fn declared_map_tile_classes_match_what_each_surface_serves() {
+    let schema: Value =
+        serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
+    let validator = jsonschema::Validator::new(&schema).unwrap();
+    for surface in ["shared", "maps", "tiles"] {
+        let (app, prefix) = styled_app(surface);
+        let conformance = get_json(&app, &format!("{prefix}/conformance")).await;
+        let declares = |class: &str| {
+            conformance["conformsTo"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == class)
+        };
+        assert_eq!(declares(MAPS_TILESETS), surface == "shared", "{surface}");
+        assert_eq!(declares(TILES_DATETIME), surface != "maps", "{surface}");
+
+        let beside = map_tiles_beside_every_map(&app, &prefix).await;
+        if declares(MAPS_TILESETS) {
+            // Six collections, each with its map and two styled maps.
+            assert_eq!(beside, Ok(18), "{surface}");
+        }
+        if surface == "maps" {
+            let error = beside.unwrap_err();
+            assert!(error.contains("/tiles/collections/"), "{error}");
+        }
+
+        let api = get_json(&app, &format!("{prefix}/api")).await;
+        let errors: Vec<_> = validator
+            .iter_errors(&api)
+            .map(|e| format!("{e} at {}", e.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "{surface}: {}", errors.join("\n"));
+        // Every tile operation, map and vector: the shared root's map,
+        // styled map and vector tiles, the per-API mixed and styled tiles.
+        let tile = "/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}";
+        let tiles: Vec<_> = api["paths"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.ends_with(&format!("/tiles{tile}")))
+            .collect();
+        assert_eq!(
+            tiles.len(),
+            match surface {
+                "maps" => 0,
+                "shared" => 18,
+                _ => 12,
+            },
+            "{surface}"
+        );
+        for (path, item) in tiles {
+            let map_tile = surface == "tiles" || path.contains("/map/tiles/");
+            let operation = &item["get"];
+            let parameter = |name: &str| {
+                operation["parameters"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| match p["$ref"].as_str() {
+                        Some(r) => api.pointer(r.strip_prefix('#').unwrap()).unwrap(),
+                        None => p,
+                    })
+                    .find(|p| p["name"] == name && p["in"] == "query")
+                    .cloned()
+            };
+            if declares(TILES_DATETIME) {
+                // `/req/collections/rc-datetime-definition` A and the Tiles
+                // OpenAPI `subset` fragment.
+                let datetime = parameter("datetime").unwrap_or_else(|| panic!("{path}"));
+                assert_eq!(datetime["schema"], json!({"type": "string"}), "{path}");
+                assert_eq!(datetime["style"], "form", "{path}");
+                assert_eq!(datetime["explode"], false, "{path}");
+                let subset = parameter("subset").unwrap_or_else(|| panic!("{path}"));
+                assert_eq!(
+                    subset["schema"],
+                    json!({"type": "array", "items": {"type": "string"}}),
+                    "{path}"
+                );
+                assert_eq!(subset["style"], "form", "{path}");
+                assert_eq!(subset["explode"], false, "{path}");
+                assert!(operation["responses"].get("204").is_some(), "{path}");
+            }
+            if declares(MAPS_TILESETS) && map_tile {
+                for name in ["width", "height", "scale-denominator"] {
+                    assert!(parameter(name).is_some(), "{path} lacks {name}");
+                }
+            }
         }
     }
 }

@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use ds_core::error::DataServerError;
+use ds_core::temp_files;
 use ds_storage::object_store::path::Path as ObjectPath;
 use ds_storage::{build_store, DataStore};
 
@@ -80,7 +81,13 @@ impl LocalSource {
         for m in listed {
             let name = m.location.as_ref();
             let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-            if !EXTENSIONS.contains(&ext.as_str()) {
+            // A publisher's in-progress `.name.bufr` would decode truncated
+            // and be fetched again under its final name (#1009). So would a
+            // file in a hidden folder below the base, where rsync
+            // `--delay-updates` stages it: the listing is recursive (#1029).
+            if !EXTENSIONS.contains(&ext.as_str())
+                || temp_files::is_temporary_below(self.base.as_ref(), name)
+            {
                 continue;
             }
             if m.size > MAX_FILE_BYTES {
@@ -195,5 +202,45 @@ mod tests {
         let n2 = src.scan(|f| refetched.push(f.path)).unwrap();
         assert_eq!(n2, 1);
         assert!(refetched[0].ends_with("m000.bufr"));
+    }
+
+    /// A publisher's in-progress `.name.bufr`, truncated, next to a
+    /// finished file is never fetched (#1009).
+    #[test]
+    fn scan_skips_in_progress_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let smhi = fixture("synop_se-smhi_20260912T0800Z.bufr");
+        std::fs::write(dir.path().join("m000.bufr"), &smhi).unwrap();
+        std::fs::write(dir.path().join(".m001.bufr"), &smhi[..smhi.len() / 2]).unwrap();
+        let mut src = LocalSource::new(dir.path().to_str().unwrap()).unwrap();
+
+        let mut got: Vec<String> = Vec::new();
+        assert_eq!(src.scan(|f| got.push(f.path)).unwrap(), 1);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].ends_with("m000.bufr"), "{got:?}");
+    }
+
+    /// rsync `--delay-updates` stages files under their final names in a
+    /// `.~tmp~/` folder, and the listing walks subfolders: a truncated file
+    /// there, at any depth, is never fetched, while a normal subfolder's
+    /// file is (#1029).
+    #[test]
+    fn scan_skips_files_in_hidden_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let smhi = fixture("synop_se-smhi_20260912T0800Z.bufr");
+        let half = &smhi[..smhi.len() / 2];
+        for sub in [".~tmp~", "2026/.~tmp~", "2026"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(dir.path().join("m000.bufr"), &smhi).unwrap();
+        std::fs::write(dir.path().join("2026/m001.bufr"), &smhi).unwrap();
+        std::fs::write(dir.path().join(".~tmp~/m002.bufr"), half).unwrap();
+        std::fs::write(dir.path().join("2026/.~tmp~/m003.bufr"), half).unwrap();
+        let mut src = LocalSource::new(dir.path().to_str().unwrap()).unwrap();
+
+        let mut got: Vec<String> = Vec::new();
+        assert_eq!(src.scan(|f| got.push(f.path)).unwrap(), 2);
+        got.sort();
+        assert_eq!(got, ["2026/m001.bufr", "m000.bufr"]);
     }
 }

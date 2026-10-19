@@ -20,6 +20,8 @@ html, body {
     margin: 0;
     padding: 0;
     height: 100%;
+    /* A full-viewport map: nothing may scroll the page itself sideways. */
+    overflow: hidden;
     font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto,
         Helvetica, Arial, sans-serif;
     color: var(--text);
@@ -41,7 +43,9 @@ html, body {
     position: absolute;
     top: 16px;
     left: 16px;
+    box-sizing: border-box;
     width: 360px;
+    max-width: calc(100vw - 32px);
     max-height: calc(100vh - 32px);
     display: flex;
     flex-direction: column;
@@ -68,6 +72,32 @@ html, body {
     font-weight: 600;
     letter-spacing: -0.01em;
     color: var(--text);
+}
+
+.sidebar-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+/* Folds the bottom sheet on phones; the desktop sidebar has room. */
+#sheet-toggle {
+    display: none;
+    padding: 4px 10px;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--accent);
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid rgba(148, 163, 184, 0.3);
+    border-radius: 999px;
+    cursor: pointer;
+}
+
+#sheet-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }
 
 #sidebar #status {
@@ -242,6 +272,7 @@ li.collection:last-child { margin-bottom: 4px; }
 .badge-maps     { background: rgba(168, 85, 247, 0.12); color: #c4b5fd; border-color: rgba(168, 85, 247, 0.25); }
 .badge-tiles    { background: rgba(245, 158, 11, 0.12); color: #fcd34d; border-color: rgba(245, 158, 11, 0.25); }
 .badge-wms      { background: rgba(244, 114, 182, 0.12); color: #f9a8d4; border-color: rgba(244, 114, 182, 0.25); }
+.badge-3dtiles  { background: rgba(45, 212, 191, 0.12); color: #5eead4; border-color: rgba(45, 212, 191, 0.25); }
 
 /* ------------------------------------------------------------------ */
 /* Metadata                                                            */
@@ -304,6 +335,10 @@ li.collection:last-child { margin-bottom: 4px; }
 
 .controls select {
     flex: 1;
+    /* Shrink with the card: a long option must not widen the select. */
+    min-width: 0;
+    max-width: 100%;
+    text-overflow: ellipsis;
     padding: 4px 8px;
     font-size: 12px;
     color: var(--text);
@@ -412,7 +447,15 @@ li.collection:last-child { margin-bottom: 4px; }
     padding-top: 8px;
     border-top: 1px solid var(--divider);
     display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
     gap: 12px;
+}
+
+/* An entry without map tiles: nothing to switch on in this viewer. */
+.no-layer {
+    font-size: 11px;
+    color: var(--text-faint);
 }
 
 .link {
@@ -424,6 +467,7 @@ li.collection:last-child { margin-bottom: 4px; }
     font-weight: 500;
     cursor: pointer;
     letter-spacing: 0.01em;
+    text-decoration: none;
 }
 
 .link:hover { text-decoration: underline; }
@@ -506,4 +550,57 @@ li.collection:last-child { margin-bottom: 4px; }
     font-size: 12px;
     color: var(--text-faint);
     font-style: italic;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phones: the sidebar becomes a bottom sheet                          */
+/* ------------------------------------------------------------------ */
+
+/* Below 640 px a 360 px sidebar leaves no map. The list moves to a sheet
+   along the bottom edge, at most 45% of the height, that its header button
+   folds away. `app.js` publishes the sheet's height as `--sheet-offset`, so
+   MapLibre's bottom controls sit above it and "Zoom to extent" pads the fit
+   by it. The navigation control stays top right, clear of the sheet. */
+@media (max-width: 639px) {
+    #sidebar {
+        top: auto;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        width: auto;
+        max-width: none;
+        max-height: 45vh;
+        max-height: 45dvh;
+        padding: 10px 14px 0;
+        border-bottom: 0;
+        border-radius: var(--radius) var(--radius) 0 0;
+    }
+
+    #sidebar header {
+        padding-bottom: 8px;
+        margin-bottom: 8px;
+    }
+
+    #sidebar ul {
+        padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+    }
+
+    #sheet-toggle {
+        display: inline-block;
+    }
+
+    #sidebar.folded header {
+        padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+        margin-bottom: 0;
+        border-bottom: 0;
+    }
+
+    #sidebar.folded #collections {
+        display: none;
+    }
+
+    .maplibregl-ctrl-bottom-left,
+    .maplibregl-ctrl-bottom-right {
+        bottom: var(--sheet-offset, 0px);
+    }
 }

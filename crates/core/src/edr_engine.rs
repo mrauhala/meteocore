@@ -1,17 +1,61 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
+use crate::cube::CubeResolution;
 use crate::error::DataServerError;
+use crate::feature::{Bbox, DatetimeInterval, Feature};
 use crate::instances::RunInfo;
-use crate::model::{CoverageResponse, Location, ParameterDescription};
+use crate::model::{CoverageResponse, Location, LocationSnapshot, ParameterDescription};
 use crate::vertical::VerticalDimension;
 
+/// A predicate over [`EdrEngine::get_locations`] entries: `true` keeps the
+/// location in a `/locations?datetime=` list (#932). It may hold a read
+/// guard on the engine's index for as long as it lives.
+pub type LocationFilter<'a> = Box<dyn Fn(&Location) -> bool + 'a>;
+
 pub trait EdrEngine: Send + Sync {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError>;
+    /// The locations this engine serves, in its inventory order: the
+    /// `/locations` list, and the ids [`Self::query_location`] answers.
+    ///
+    /// **O(1)** (Critical Rule 10, #1083): return a clone of the `Arc` the
+    /// engine built when it loaded or last refreshed its data, never a list
+    /// built per call. The API reads it on every `/locations` and `items`
+    /// request, every station GeoJSON or CSV query, and an unknown id of a
+    /// location list, and borrows from it: pages are slices, ids are looked
+    /// up with [`LocationSnapshot::by_id`]. An engine whose locations change
+    /// at runtime builds a new snapshot when they change and swaps it in; a
+    /// request holding the old one keeps it alive until it finishes. An
+    /// engine without locations returns [`LocationSnapshot::empty`].
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError>;
+
+    /// The `datetime` filter of the `/locations` list (#932): a predicate
+    /// that is `true` for a location with at least one observation inside
+    /// one of `intervals`, both ends included and an open end unbounded.
+    /// That is the rule station `FeatureEngine`s apply to `datetime` (#682),
+    /// so share their code: `/locations` and `/items` must list the same
+    /// stations. A `datetime` list arrives as one instant interval
+    /// (`start == end`) per element, each matched exactly; no interval is
+    /// reversed.
+    ///
+    /// The API builds it once per request on the EDR query executor, after
+    /// [`Self::get_locations`], and calls it for every listed location: read
+    /// in-memory indexes only, no storage or database I/O.
+    ///
+    /// Default `None`: the engine cannot tell when a location has data, and
+    /// the API answers `datetime` with a 400 rather than an unfiltered list.
+    fn location_time_filter<'a>(
+        &'a self,
+        _intervals: &'a [DatetimeInterval],
+    ) -> Option<LocationFilter<'a>> {
+        None
+    }
 
     /// The forecast model runs this engine exposes as OGC API - EDR
-    /// *instances*, ascending by reference time (latest last).
+    /// *instances*, ascending by reference time (latest last). The EDR
+    /// `/instances` list sorts them newest first itself; engines keep this
+    /// order.
     ///
     /// Default: empty — the engine has no model-run concept and exposes only a
     /// single time axis (observations, analyses, a single forecast). Forecast
@@ -55,12 +99,31 @@ pub trait EdrEngine: Send + Sync {
             .find(|r| r.reference_time == reference_time)
     }
 
+    /// The reference times of [`Self::get_instances`], ascending: the run
+    /// axis without any run's valid times (#1006). The instances list sorts
+    /// them newest first before paging.
+    ///
+    /// Only the instances list reads it, to count and page the runs
+    /// ([`crate::time_axis::is_long`]), then builds just the page's runs
+    /// with [`Self::find_instance`]; collection metadata never does. An
+    /// archive can keep thousands of runs, so forecast engines override this
+    /// with the keys of their run map: one timestamp copied per run, never a
+    /// run's valid times. The default derives it from `get_instances`, which
+    /// costs nothing on the non-forecast engines that take it.
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        self.get_instances()
+            .into_iter()
+            .map(|r| r.reference_time)
+            .collect()
+    }
+
     /// Execute a query for a named location.
     ///
     /// `z` selects vertical levels: `None` returns every level (a profile),
     /// `Some([v])` pins one level, `Some([v1, v2, …])` selects several.
-    /// Engines with no vertical dimension ignore it (the API layer rejects
-    /// a `z` against a collection that has no vertical extent).
+    /// Engines with no vertical dimension never see one: the EDR layer
+    /// ignores a `z` sent to a collection without a vertical extent (EDR 1.2
+    /// `/req/edr/z-response` A).
     ///
     /// `reference_time` selects a forecast model run (see [`Self::get_instances`]):
     /// `None` ⇒ the latest run (the default and only behaviour for non-forecast
@@ -126,6 +189,34 @@ pub trait EdrEngine: Send + Sync {
     /// Default: `["locations"]`. Override for engines that support position, area, etc.
     fn supported_query_types(&self) -> Vec<String> {
         vec!["locations".to_string()]
+    }
+
+    /// Whether this engine's results are time series at its named locations
+    /// (stations): every `locations`, `position`, `radius` and `area` result
+    /// is a `PointSeries`, or a collection of them, with no `z`, at the
+    /// coordinates of a location [`Self::get_locations`] lists. The EDR layer
+    /// then also encodes the point queries as EDR GeoJSON, one feature per
+    /// location (#929), and those and `area` as CSV, one row per location,
+    /// time and parameter (#1066). **O(1)**: it is read per metadata request.
+    ///
+    /// Default `false`: gridded and polar results are coverages, not
+    /// features, and keep CoverageJSON only.
+    fn serves_station_series(&self) -> bool {
+        false
+    }
+
+    /// The radius query that answers an EDR item which is not one of
+    /// [`Self::get_locations`], such as a tracked storm cell (#970): its
+    /// EDR GeoJSON `edrqueryendpoint` is this circle around the item's
+    /// point, and its `datetime` the instant given here. `feature` is the
+    /// item as this collection's `FeatureEngine` served it. Only a
+    /// collection that advertises `"radius"` uses it.
+    ///
+    /// Default `None`: such an item names a position query at its point
+    /// where the collection answers one, else the collection.
+    fn item_radius(&self, feature: &Feature) -> Option<ItemRadius> {
+        let _ = feature;
+        None
     }
 
     /// Execute an area query within the given bounding box / polygon.
@@ -208,12 +299,58 @@ pub trait EdrEngine: Send + Sync {
         Ok(())
     }
 
-    /// Execute a trajectory (vertical cross-section) query along a WKT
-    /// `LINESTRING`. The result is a CoverageJSON `Section` domain (or a
-    /// collection of them, one per timestep): a 2-D field over an
-    /// along-path composite axis and a vertical `z` axis. `z`, when set,
-    /// pins the height range — engines free to interpret as a discrete
-    /// list, a `[min, max]` interval, or both.
+    /// Execute a cube query (OGC API - EDR `cube`, #925): every selected
+    /// parameter over the CRS84 `bbox` (`west > east` crosses the
+    /// antimeridian), at the `z` levels (`None` ⇒ every level; the API has
+    /// already expanded an interval against [`Self::get_vertical_extent`]),
+    /// over the `datetime` window, sampled per `resolution`
+    /// ([`CubeResolution`]: native, or `n` evenly spaced positions per axis
+    /// taking their nearest native value). `reference_time` selects a model
+    /// run like the other query methods.
+    ///
+    /// The result is a CoverageJSON `Grid` with `x`, `y`, `z` and `t` axes.
+    /// Check [`crate::cube::check_cube_budget`] before reading or allocating.
+    /// Advertise `"cube"` in [`Self::supported_query_types`] only where this
+    /// is overridden: the API answers 404 for a collection that does not.
+    /// Default implementation returns an error.
+    fn query_cube(
+        &self,
+        bbox: &Bbox,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        resolution: CubeResolution,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let _ = (bbox, datetime, parameters, z, resolution, reference_time);
+        Err(DataServerError::InvalidParameter(
+            "Cube query not supported by this engine".into(),
+        ))
+    }
+
+    /// How this engine answers `trajectory` queries; see [`TrajectoryShape`].
+    /// Read by the API layer before dispatch (accepted geometries, `f=PNG`,
+    /// execution context), so it must agree with [`Self::query_trajectory`].
+    /// Default [`TrajectoryShape::AlongPath`], the OGC API - EDR meaning.
+    fn trajectory_shape(&self) -> TrajectoryShape {
+        TrajectoryShape::AlongPath
+    }
+
+    /// Execute a trajectory query along a WKT `LINESTRING`, in the form
+    /// [`Self::trajectory_shape`] declares:
+    ///
+    /// - [`TrajectoryShape::AlongPath`] (gridded engines, #926): values
+    ///   sampled along the path, a CoverageJSON `Trajectory` domain built
+    ///   with [`crate::trajectory`]. `coords` may also be `LINESTRING Z`,
+    ///   `M` or `ZM`; `z` is the request's level list (never set together
+    ///   with a Z path), `datetime` its time window (never set together with
+    ///   an M path).
+    /// - [`TrajectoryShape::CrossSection`] (radar polar volumes): a
+    ///   `Section` domain (or a collection of them, one per timestep), a 2-D
+    ///   field over an along-path composite axis and a vertical `z` axis.
+    ///   `z`, when set, pins the height range — engines free to interpret
+    ///   as a discrete list, a `[min, max]` interval, or both.
+    ///
     /// Default implementation returns an error.
     fn query_trajectory(
         &self,
@@ -228,6 +365,33 @@ pub trait EdrEngine: Send + Sync {
             "Trajectory query not supported by this engine".into(),
         ))
     }
+}
+
+/// The radius query of an EDR item that is not a location
+/// ([`EdrEngine::item_radius`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ItemRadius {
+    /// The circle's radius in kilometres: the item's own size, but wide
+    /// enough that the query answers data rather than an empty circle.
+    pub within_km: f64,
+    /// The instant the item describes, its EDR `datetime`; `None` keeps
+    /// the collection's temporal extent.
+    pub datetime: Option<DateTime<Utc>>,
+}
+
+/// What an engine's `trajectory` query returns ([`EdrEngine::trajectory_shape`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrajectoryShape {
+    /// Values sampled along the path (OGC API - EDR trajectory): a
+    /// CoverageJSON `Trajectory` domain. Accepts `LINESTRING`,
+    /// `LINESTRING Z`, `M` and `ZM`; CoverageJSON output only. Runs on the
+    /// shared query runtime's workers, like position and area.
+    AlongPath,
+    /// A vertical cross-section under a 2-D `LINESTRING` (radar polar
+    /// volumes): a CoverageJSON `Section` domain, also as a PNG heatmap.
+    /// Runs on the query runtime's blocking pool, because the engine drives
+    /// its remote reads through an explicit runtime handle.
+    CrossSection,
 }
 
 /// Resolve an EDR `parameter-name` selection against the parameters a

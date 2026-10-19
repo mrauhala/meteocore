@@ -71,8 +71,7 @@ impl<'a> ResolvedDescriptor<'a> {
             0 => {
                 let Some(b) = tables.table_b.get(&desc.xy()) else {
                     return Err(Error::Table(format!(
-                        "Table B entry not found for xy: {:?}",
-                        desc.xy()
+                        "Table B entry not found for {desc:?}"
                     )));
                 };
                 ResolvedDescriptor::Data(b)
@@ -82,18 +81,14 @@ impl<'a> ResolvedDescriptor<'a> {
             3 => {
                 let Some(d) = tables.table_d.get(&desc.xy()) else {
                     return Err(Error::Table(format!(
-                        "Table D entry not found for xy: {:?}",
-                        desc.xy()
+                        "Table D entry not found for {desc:?}"
                     )));
                 };
                 let resolved_elements = resolve_descriptors(tables, d.elements)?;
                 ResolvedDescriptor::Sequence(d, resolved_elements)
             }
             _ => {
-                return Err(Error::Table(format!(
-                    "Table B entry not found for xy: {:?}",
-                    desc.xy()
-                )));
+                return Err(Error::Table(format!("Invalid descriptor {desc:?}")));
             }
         })
     }
@@ -121,7 +116,7 @@ pub(crate) fn resolve_descriptors<'a>(
                             Descriptor { f: 0, x: 31, y: 3 } => 8, // Note: JMA-local?
                             desc => {
                                 return Err(Error::NotSupported(format!(
-                                    "Unsupported delayed descriptor replication factor: {desc:#?}",
+                                    "Unsupported delayed descriptor replication factor: {desc:?}",
                                 )));
                             }
                         }

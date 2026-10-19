@@ -3,7 +3,8 @@ use std::ops::Range;
 
 const MAX_SPAN: usize = 1024 * 1024;
 const MAX_GAP: usize = 4096;
-const MAX_TILES: usize = 16;
+/// Most tiles in one batch; the poll-cycle pre-warm (#1004) plans with it.
+pub(crate) const MAX_TILES: usize = 16;
 
 /// Opt-in: current OPERA measurements do not justify enabling it universally.
 pub(crate) fn limit() -> usize {

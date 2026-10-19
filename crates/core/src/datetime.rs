@@ -5,6 +5,12 @@ use crate::error::DataServerError;
 /// Parse an ISO 8601 positive duration (e.g. `"PT12H"`, `"P1D"`, `"P1DT6H"`)
 /// into a `chrono::Duration`. Rejects zero-length and signed durations —
 /// callers that need signed offsets should layer on top of this.
+///
+/// Units are weeks or days, then hours, minutes and whole seconds. Calendar
+/// years and months are rejected: their length depends on the date they
+/// are added to, which a fixed `Duration` cannot express. A duration too
+/// long for `Duration` is an error, never a panic or a wrapped value: EDR's
+/// repeating `datetime` interval (#933) passes request input here.
 pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
     let rest = s.strip_prefix('P').ok_or_else(|| {
         DataServerError::Config(format!(
@@ -31,9 +37,18 @@ pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
     }
 
     if !date_part.is_empty() {
+        // Years and months have no fixed length (`P1M` from 31 January), so
+        // name them rather than falling into the days branch's "Invalid
+        // days" / "supported units" messages below.
+        if date_part.contains('Y') || date_part.contains('M') {
+            return Err(DataServerError::Config(format!(
+                "Invalid ISO 8601 duration '{s}': calendar years ('Y') and months ('M') are not \
+                 supported, since their length varies; use days ('D') or weeks ('W')"
+            )));
+        }
         // Mixed week-and-day forms (`P1W2D`) are unsupported. Catch them
         // explicitly here — otherwise the parser falls into the days branch
-        // below, fails on `"1W2".parse::<i64>()`, and surfaces a misleading
+        // below, fails on `"1W2".parse::<u64>()`, and surfaces a misleading
         // "Invalid days" message that hides the real issue.
         if date_part.contains('W') && date_part.contains('D') {
             return Err(DataServerError::Config(format!(
@@ -42,10 +57,10 @@ pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
         }
         // Weeks (`P1W`) — natural unit for meteorological archives.
         if let Some(stripped) = date_part.strip_suffix('W') {
-            let weeks: i64 = stripped.parse().map_err(|_| {
+            let weeks: u64 = stripped.parse().map_err(|_| {
                 DataServerError::Config(format!("Invalid weeks in ISO 8601 duration '{s}'"))
             })?;
-            total_seconds += weeks * 7 * 86_400;
+            total_seconds = add_component(total_seconds, weeks, 7 * 86_400, s)?;
         } else {
             let stripped = date_part.strip_suffix('D').ok_or_else(|| {
                 DataServerError::Config(format!(
@@ -53,10 +68,10 @@ pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
                      (days) and 'W' (weeks)"
                 ))
             })?;
-            let days: i64 = stripped.parse().map_err(|_| {
+            let days: u64 = stripped.parse().map_err(|_| {
                 DataServerError::Config(format!("Invalid days in ISO 8601 duration '{s}'"))
             })?;
-            total_seconds += days * 86_400;
+            total_seconds = add_component(total_seconds, days, 86_400, s)?;
         }
     }
 
@@ -75,21 +90,21 @@ pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
             let v: u64 = remaining[..pos].parse().map_err(|_| {
                 DataServerError::Config(format!("Invalid hours in ISO 8601 duration '{s}'"))
             })?;
-            total_seconds += (v as i64) * 3600;
+            total_seconds = add_component(total_seconds, v, 3600, s)?;
             remaining = &remaining[pos + 1..];
         }
         if let Some(pos) = remaining.find('M') {
             let v: u64 = remaining[..pos].parse().map_err(|_| {
                 DataServerError::Config(format!("Invalid minutes in ISO 8601 duration '{s}'"))
             })?;
-            total_seconds += (v as i64) * 60;
+            total_seconds = add_component(total_seconds, v, 60, s)?;
             remaining = &remaining[pos + 1..];
         }
         if let Some(pos) = remaining.find('S') {
             let v: u64 = remaining[..pos].parse().map_err(|_| {
                 DataServerError::Config(format!("Invalid seconds in ISO 8601 duration '{s}'"))
             })?;
-            total_seconds += v as i64;
+            total_seconds = add_component(total_seconds, v, 1, s)?;
             remaining = &remaining[pos + 1..];
         }
         // Anything left in `remaining` is unparsed — a trailing number with
@@ -109,7 +124,28 @@ pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
         )));
     }
 
-    Ok(Duration::seconds(total_seconds))
+    Duration::try_seconds(total_seconds).ok_or_else(|| too_long(s))
+}
+
+/// `total + value × unit_seconds`, or the "too long" error when that leaves
+/// the `i64` range (`Duration::try_seconds` then bounds the result).
+fn add_component(
+    total: i64,
+    value: u64,
+    unit_seconds: i64,
+    s: &str,
+) -> Result<i64, DataServerError> {
+    i64::try_from(value)
+        .ok()
+        .and_then(|v| v.checked_mul(unit_seconds))
+        .and_then(|seconds| total.checked_add(seconds))
+        .ok_or_else(|| too_long(s))
+}
+
+fn too_long(s: &str) -> DataServerError {
+    DataServerError::Config(format!(
+        "Invalid ISO 8601 duration '{s}': too long to represent"
+    ))
 }
 
 /// Format a strictly-positive whole-second duration as a canonical ISO 8601
@@ -347,6 +383,47 @@ mod tests {
         assert!(
             err.contains("cannot mix 'W'"),
             "Expected 'cannot mix W' message, got: {err}"
+        );
+    }
+
+    /// Years and months are named, not reported as "Invalid days" (#933).
+    #[test]
+    fn iso8601_duration_rejects_calendar_years_and_months() {
+        for s in ["P1M", "P1Y", "P1Y2M3D", "P2MT6H"] {
+            let err = parse_iso8601_duration(s).unwrap_err().to_string();
+            assert!(err.contains("years ('Y') and months ('M')"), "{s}: {err}");
+        }
+        // `M` after `T` is minutes.
+        assert_eq!(
+            parse_iso8601_duration("P1DT1M").unwrap(),
+            Duration::seconds(86_400 + 60)
+        );
+    }
+
+    /// Request input reaches this parser since EDR's repeating `datetime`
+    /// (#933): a huge component is an error, never an overflow panic in a
+    /// debug build, a wrapped value in a release one, or the
+    /// `Duration::seconds` out-of-range panic.
+    #[test]
+    fn iso8601_duration_too_long_is_an_error_not_a_panic() {
+        for s in [
+            "P9999999999999999999D",               // u64, past i64
+            "P999999999999999D",                   // × 86 400 past i64
+            "P200000000000W",                      // × 604 800 past i64
+            "PT9223372036854775807S",              // i64::MAX s, past `Duration`
+            "PT9300000000000000S",                 // past `Duration`, inside i64
+            "P100000000000000DT1000000000000000H", // each fits, the sum overflows
+        ] {
+            let err = parse_iso8601_duration(s).unwrap_err().to_string();
+            assert!(err.contains("too long"), "{s}: {err}");
+        }
+        // Past `u64`, the component is not a number at all.
+        assert!(parse_iso8601_duration("P99999999999999999999D").is_err());
+        // The largest whole-second `Duration` still parses.
+        let max = i64::MAX / 1000;
+        assert_eq!(
+            parse_iso8601_duration(&format!("PT{max}S")).unwrap(),
+            Duration::seconds(max)
         );
     }
 

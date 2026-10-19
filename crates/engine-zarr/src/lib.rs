@@ -27,6 +27,7 @@ mod retrieval;
 mod runtime;
 mod source;
 mod store;
+mod trajectory;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,7 +49,8 @@ use ds_core::instances::{self, RunInfo};
 const MAX_AREA_VARIABLES: usize = 8;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
 use ds_core::resample::ProjectionGrid;
 
@@ -203,8 +205,9 @@ fn select_vars<'a>(
 }
 
 /// The time-axis indices an EDR query addresses: every step when
-/// `datetime` is absent, else the closed interval; none → 400. Shared by
-/// position and area so the window semantics cannot drift.
+/// `datetime` is absent, else the closed interval; none has no data → 404,
+/// so a datetime list skips that instant. Shared by position, area and
+/// trajectory so the window semantics cannot drift.
 /// Returns `(indices, valid times of the run)`.
 fn select_time_idx(
     cat: &Catalog,
@@ -222,7 +225,7 @@ fn select_time_idx(
             .collect(),
     };
     if time_idx.is_empty() {
-        return Err(DataServerError::InvalidParameter(
+        return Err(DataServerError::LocationNotFound(
             "No data available for the requested time range".into(),
         ));
     }
@@ -242,6 +245,10 @@ impl EdrEngine for ZarrEngine {
         !self.catalog.load().runs.is_empty()
     }
 
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        self.catalog.load().runs.keys().copied().collect()
+    }
+
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
         let cat = self.catalog.load();
         cat.runs.get(&reference_time).map(|&idx| RunInfo {
@@ -250,8 +257,8 @@ impl EdrEngine for ZarrEngine {
         })
     }
 
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![])
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     fn query_location(
@@ -318,7 +325,28 @@ impl EdrEngine for ZarrEngine {
             "position".to_string(),
             "area".to_string(),
             "radius".to_string(),
+            "trajectory".to_string(),
         ]
+    }
+
+    /// Values along a WKT `LINESTRING` / `Z` / `M` / `ZM` path (#926),
+    /// bilinear like position, read as bounded windows per path segment
+    /// (see `trajectory.rs`). No vertical axis: a Z coordinate is ignored.
+    fn query_trajectory(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        trajectory::query(
+            &self.catalog.load(),
+            coords,
+            datetime,
+            parameters,
+            reference_time,
+        )
     }
 
     /// Area query: a CRS84 `Grid` over the polygon's bbox at the store's
@@ -596,6 +624,14 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, Data
     ))
 }
 
+/// The catalog's wind components for `ds_core::wind::DerivedWind` (#897):
+/// an `Arc` clone of the snapshot built with the catalog.
+impl ds_core::wind::WindSource for ZarrEngine {
+    fn wind_facts(&self) -> Arc<ds_core::wind::WindFacts> {
+        self.catalog.load().wind.clone()
+    }
+}
+
 impl MapEngine for ZarrEngine {
     #[allow(clippy::too_many_arguments)]
     fn get_raster_tile(
@@ -708,6 +744,10 @@ impl MapEngine for ZarrEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
+        (*self.catalog.load().raster_info).clone()
+    }
+
+    fn raster_info_shared(&self) -> Arc<RasterInfo> {
         self.catalog.load().raster_info.clone()
     }
 
@@ -829,3 +869,5 @@ mod tests {
 
 #[cfg(test)]
 mod refresh_tests;
+#[cfg(test)]
+mod wind_tests;

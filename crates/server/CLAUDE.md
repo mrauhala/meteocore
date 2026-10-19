@@ -121,6 +121,19 @@ disk, no TOML needed.
   the asymmetry explicit, naming the watched dirs. Keep them writable only by
   trusted principals; avoid shared/NFS mounts for them.
 
+## Derived wind (#897)
+
+`wind_wrapped` registers grib/querydata/zarr engines (each GRIB level view
+too) wrapped in `ds_core::wind::DerivedWind` unless the collection sets
+`derive_wind = false`; styles are resolved from the wrapper's `RasterInfo`,
+so a derived speed layer gets the built-in `wind_speed` default. The
+wrapper logs one INFO line per u/v pair (`Collection 'x': wind u/v: …`) at
+load and when a pair's outcome changes. Wrappers live in
+`LoadResult::wind_by_id` / `ServerState::wind_handles` (configured id →
+registered id): a reused engine keeps its wrappers through `EngineReuse::wind`,
+so the registered `Arc` is the same after an incremental reload (a nowcast
+compares its source by identity) and the load log is not repeated.
+
 ## Reverse-proxy base URL (`trust_proxy_headers`, #12)
 
 Absolute self-links (landing pages, `collections`, GeoJSON `links`, WMS
@@ -148,6 +161,18 @@ through to the next source. Enable only when a trusted proxy sets/overwrites
 these headers, the proxy strips `Forwarded`/`X-Forwarded-*` on untrusted
 client requests, and clients cannot reach the backend directly — otherwise a
 client could spoof the emitted self-links (open-redirect risk downstream).
+
+## Request log (`request_logging_middleware`)
+
+One INFO `request` line per HTTP request (`admin::request_logging_middleware`;
+fields listed in its doc comment and the README's Structured Logging section).
+`user_agent` and `referer` (#995) are client-controlled: each is decoded
+lossily, cut to `MAX_LOGGED_HEADER_LEN` (256) bytes on a char boundary, and
+logged as `""` when absent, like `query`. The referer drops everything from
+the first `?` or `#`, since the query and fragment can carry tokens. Both stay
+log-body fields: `docker/alloy/config.alloy` must never promote them to Loki
+labels (unbounded cardinality). The client IP is deliberately not logged
+pending a privacy decision (#995).
 
 ## Render admission and deadlines
 
@@ -183,6 +208,32 @@ served render ran. No `collection` label: queue wait belongs to the shared
 slots, the per-collection tail is `render_duration_seconds`, and fixed labels
 need no reload pruning.
 
+## Health: data age and poll age (#1007)
+
+- `/health` `data_age_secs` and the `/metrics` gauge
+  `collection_data_age_seconds{collection}` are one number from one source,
+  `admin::collection_data_ages`: now minus the newest data the collection
+  serves, in whole seconds. GeoTIFF: the newest catalog timestep. QueryData:
+  the newest run's origin time, the header's reference time that keys the
+  run and is its instance id. An analysis file's origin time is its analysis
+  time, and a forecast's newest valid time lies in the future. BUFR: the
+  newest report. Satellite: the newest scan start. NetCDF: the newest run's
+  reference time, or the newest valid time of files without runs. Nowcast:
+  the latest generation's anchor frame. Other engines report none. Negative when the
+  newest data lies in the future.
+- Never the time since a poll. A stalled feeder leaves its files in place,
+  every poll still finds them, and a poll-stamped age stayed near the poll
+  interval while the served latest got minutes older. An engine gaining a
+  data age adds it to `collection_data_ages`; `/health` and the gauge follow.
+- `poll_age_secs` (GeoTIFF, QueryData): time since the engine loaded or a
+  poll last found data. It grows while the source is unreachable, empty or
+  unloadable, the old data kept. Both growing: the source fails. Only
+  `data_age_secs` growing: the feeder delivers nothing new.
+- The gauge is set each scrape by `refresh_data_age_gauge`, which removes
+  only the series of a collection that stopped reporting an age (reloaded
+  away, data gone), never the family. Alert per collection: a 5-minute radar
+  and a 6-hourly model run need different thresholds.
+
 ## Operational notes
 
 - A brief "no images" period right after a deploy is the expected readiness
@@ -201,7 +252,9 @@ need no reload pruning.
   It deliberately survives reloads so old and new render tasks share one limit.
   The 32-byte/output-pixel estimate covers output buffers/scratch, not source
   decoding or resident caches. An RGB composite render adds 16 bytes per
-  output pixel for each band past the first (`acquire_raster_planes`). At the
+  output pixel for each band past the first (`acquire_raster_planes`). A WMS
+  GetMap of several layers adds 4 bytes per output pixel for the image of
+  the layers below, once (`acquire_layered_raster`). At the
   default, the 8000×8000 format limit exceeds the memory budget and returns
   503; operators can raise the budget explicitly.
   Temporary memory exhaustion queues within the same deadline instead of failing
@@ -221,11 +274,94 @@ need no reload pruning.
   `"composite": true`, an empty unit and their own `temporal_extent`. The SPA
   requests them on the unstyled tile route: a composite has only the
   `default` style.
+- The manifest describes what is served, never the configured `apis`
+  (#1134): an entry's `apis` are the registries holding its engine (a radar
+  network's base id lists every API but serves Features only; its sites
+  inherit `features` and serve everything else), `page_url` is its HTML
+  page (shared root, else EDR; none for WMS only), and
+  `parameters[].default` marks `raster_info().parameter`, which Maps and
+  WMS render without `parameter-name` (QueryData names it by the full
+  descriptor, its entry's title). The parameter list stays
+  alphabetical; the SPA opens on the marked entry. An entry without a
+  `tiles` block gets no layer switch, only "No map layer" and that link.
 - First enabling a preview collection fits its extent without animation,
   before setting its layers visible. Keep that order: a visible source during
   the initial flight requests intermediate zoom levels and can exhaust cold
   Icechunk read admission. Re-enabling preserves the current view; the explicit
   "Zoom to extent" action remains animated.
+- `GET /robots.txt` (`src/robots.rs`) lets crawlers reach the landing pages,
+  `/api`, `/conformance`, the collection lists and each collection's page, at
+  `/` and under `/edr`, and nothing below a collection or anywhere else. A new crawlable root or
+  catalog needs its rules there; the tests check each path with Google's
+  matcher (the `robotstxt` crate).
+
+## Engine state store (`[server] state_dir`, #1000, #1002)
+
+Engines that accumulate state from a push feed snapshot it into the
+server's state store and restore it when the collection is built: the WIS2
+CAP accumulator under `<collection id>.cap` (see
+`crates/engine-cap/CLAUDE.md`) and the WIS2 BUFR report store under
+`<collection id>.bufr` (gzip-compressed JSON, ~7.7 MB for a global 270k-
+report store; see `crates/engine-bufr/CLAUDE.md`). File-fed collections
+re-read their source and ignore the store. The plumbing is
+`ds_core::state` (std only):
+
+- `StateStore`, the object-safe backend trait: `load(key)`, `save(key,
+  bytes)` (an atomic whole-blob replace), `describe(key)` for log lines.
+  Engines receive an `Option<Arc<dyn StateStore>>` and form their key with
+  `state::collection_key(id, kind)` = `<collection id>.<kind>` (`cap`,
+  `bufr`); they never see a path. **Snapshots are whole blobs per
+  collection key**: loaded once at build, rewritten whole, never appended
+  to or patched — a backend needs nothing beyond get/set of one value.
+- `FileStateStore`, the only backend: `<state_dir>/<escaped key>.state`
+  (key bytes outside `[A-Za-z0-9_-]` percent-encoded, a leading `.`
+  too, so no key escapes the directory or hides a file), saved through a
+  temp file in the same directory + fsync + rename + directory fsync.
+  `prepare()` creates the directory and sweeps temps a crash left behind
+  (older than an hour) at boot.
+- `StateWriter`, the write policy, backend-independent: write when the
+  engine's revision moved, at most every `min_interval` (CAP and BUFR:
+  5 min); rewrite an unchanged state every `refresh_interval` (both: a
+  quarter of `warmup`, 5 min–1 h) so the snapshot's own timestamp says when
+  the server was last alive; always write when forced (the shutdown flush);
+  report failures at most every `warn_interval` (15 min).
+- **Adding a backend** (Redis, …): implement `StateStore` and select it in
+  `admin::init_state_store` by a NEW `[server]` key (e.g. a backend name
+  plus its URL), keeping `state_dir` as the file backend. Engines and the
+  write policy do not change. The backend must keep `save` atomic per key
+  and must not be shared by two servers that serve the same collection ids.
+
+Wiring:
+
+- `state_dir` is resolved against the config file's directory
+  (`ServerSettings::state_dir_path`); `admin::init_state_store` builds the
+  store in `main` BEFORE the first `load_collections` (engines restore while
+  being built); it creates the directory and only WARNs when it cannot.
+  Engines get it through `admin::state_store()` — a process-global
+  `OnceLock`, like the render slots, so the 20-odd `load_collections`
+  callers need no new argument and tests (which never set it) run without
+  persistence.
+- A reload re-reads the key but cannot replace the store: a changed value
+  logs `state_dir_reload_warning` ("restart to apply"). A reload that
+  rebuilds a collection restores from the snapshot the replaced engine last
+  wrote (at most five minutes old); the replaced engine's `shutdown()` then
+  writes its final state, which the new engine overwrites at its next
+  write. An unchanged collection keeps its live engine and state.
+- Graceful shutdown: `shutdown()` on each CAP and BUFR engine (the block at
+  the end of `main`) flushes the snapshot, so a redeploy loses nothing and
+  the snapshot records when the server went down. A crash loses at most
+  the last five minutes.
+- Deployment: the directory needs a writable mount (the image's `/data` is
+  the config mount, often read-only). The image creates
+  `/var/lib/meteocore` owned by its non-root `dataserver` user, so a named
+  volume mounted there is writable as is; a bind mount needs a host
+  directory that user can write. Unwritable ⇒ every write fails with a
+  WARN at most every 15 min and the server serves on, exactly as without
+  persistence. A removed collection's snapshot stays on disk; delete it by
+  hand. Never point two replicas at one `state_dir`.
+- In the server's unit tests the state store is process-global: a test
+  that needs it runs in a child process (`state_dir_reaches_wis2_engines`,
+  which covers both engines).
 
 ## Remote radar startup recovery (#190)
 
@@ -247,6 +383,20 @@ permanent endpoint/bucket mistakes, so repeated failed health needs operator
 attention. The all-failed startup exception requires every configured collection to be
 remote radar; mixed local/remote failures still exit. Local missing files and structurally missing source config retain
 startup fail-fast behavior. Runtime scan errors still retain the good catalog.
+
+## NetCDF layer registration (#1067)
+
+A NetCDF collection's layers are its files' variables. `NetcdfEngine::new`
+scans its directory once, as engine-grib does, so they and their styles
+exist at load; a collection whose directory was empty or unreadable then
+loads with none. `LoadResult::netcdf_parameters` records the parameters each
+collection's styles were resolved for; the recovery loop's
+`netcdf_registration_changed`, like `grib_registration_changed`, registers
+the collection again (accepted config, engine reused) once they differ,
+within 30 s of the poll that reads its first files, and `apply_load` evicts
+that collection's rendered and meta-tile entries, drawn meanwhile with the
+collection's style. The layout is fixed for an engine's life, so this
+happens at most once per engine.
 
 ## GRIB level collections
 

@@ -10,15 +10,17 @@
 //! - `GET /collections/{id}/tileset.json` (`?representation=points|isosurface`)
 //! - `GET /collections/{id}/content.pnts` — point-cloud content
 //! - `GET /collections/{id}/content.glb` — isosurface-mesh content
-//! - `GET /` · `/collections` · `/collections/{id}` · `/viewer`
+//! - `GET /` · `/collections` · `/collections/{id}` · `/viewer` (+ `/viewer.js`)
 
 pub mod cache;
 pub mod error;
 pub mod handlers;
+pub mod quantity;
 
 pub use cache::content_cache_metrics;
 pub use error::Tiles3dError;
-pub use handlers::{default_point_colormap, AppState, TilesState3d, CONTENT_SLOTS};
+pub use handlers::{AppState, TilesState3d, CONTENT_SLOTS};
+pub use quantity::{default_point_colormap, quantity_styles, QuantityStyle, QuantityStyles};
 
 use axum::routing::get;
 use axum::Router;
@@ -28,6 +30,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(handlers::landing_page))
         .route("/viewer", get(handlers::get_viewer))
+        .route("/viewer.js", get(handlers::get_viewer_js))
+        .route("/viewer/viewer.js", get(handlers::get_viewer_js))
         .route("/collections", get(handlers::collections))
         .route("/collections/{id}", get(handlers::collection))
         .route("/collections/{id}/tileset.json", get(handlers::get_tileset))

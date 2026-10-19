@@ -73,12 +73,29 @@ impl OutputCrs {
                 )
             }
             OutputCrs::Projected { crs, bbox } => {
-                let [min_e, min_n, max_e, max_n] = bbox;
-                let e = min_e + fx * (max_e - min_e);
-                let n = max_n - fy * (max_n - min_n);
+                let (e, n) = projected_point(bbox, fx, fy);
                 crs.inverse(e, n).unwrap_or((f64::NAN, f64::NAN))
             }
         }
+    }
+
+    /// The WGS84 `(lon, lat)` of the output position `(fx, fy)`, mapped as
+    /// [`Self::project_node`] maps it, when that point lies on the Earth;
+    /// `None` when it does not. For a single point, such as the pixel
+    /// centre a WMS GetFeatureInfo reads (#1064), never per output pixel.
+    ///
+    /// Off the Earth are a geographic point past a pole, and a projected
+    /// point outside its projection's valid area
+    /// ([`crate::geo::outside_projection_domain`], #1089), where its inverse
+    /// is `None` and `project_node` NaN: past the LAEA disk, and past a pole
+    /// or Transverse Mercator's eastings where its series stops being exact
+    /// ([`crate::geo::Crs::TransverseMercator`], #1113). Every point of a
+    /// projected box wholly outside its projection is outside. The
+    /// `Projected` variant ignores `wgs84_bbox`, as `project_node` does, so
+    /// a box with no WGS84 envelope may pass NaN.
+    pub fn position_on_earth(&self, wgs84_bbox: [f64; 4], fx: f64, fy: f64) -> Option<(f64, f64)> {
+        let (lon, lat) = self.project_node(wgs84_bbox, fx, fy);
+        (lon.is_finite() && lat.is_finite() && (-90.0..=90.0).contains(&lat)).then_some((lon, lat))
     }
 
     /// Inverse of [`Self::project_node`]: map a WGS84 `(lon, lat)` to the
@@ -166,6 +183,56 @@ impl OutputCrs {
         width: u32,
         height: u32,
     ) -> (u32, u32, u32, u32) {
+        match self.footprint_fractions(wgs84_bbox, src_env_wgs84) {
+            Some(fractions) => footprint_pixels(fractions, width, height),
+            None => (0, width.saturating_sub(1), 0, height.saturating_sub(1)),
+        }
+    }
+
+    /// [`Self::footprint_pixel_window`], or `None` when the footprint lies
+    /// wholly outside the `width`×`height` image, or the image is empty.
+    ///
+    /// The window clamps to the image, so a footprint off its right edge
+    /// still gives the edge column, and every pixel of that column lies
+    /// outside the footprint and its margin: the guard leaves nothing to
+    /// draw there. A caller can then skip the render entirely, with no
+    /// source read and no [`crate::resample::ProjectionGrid`]. Over a
+    /// projected source whose forward folds far from its meridian (the
+    /// Transverse Mercator series at hundreds of degrees of longitude, in a
+    /// Web Mercator tile past ±180°), refining a grid for such a tile ran
+    /// to its cell cap (#1129). Otherwise the window is
+    /// [`Self::footprint_pixel_window`]'s, with the full image when no
+    /// perimeter sample maps.
+    pub fn footprint_window_in_image(
+        &self,
+        wgs84_bbox: [f64; 4],
+        src_env_wgs84: [f64; 4],
+        width: u32,
+        height: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        match self.footprint_fractions(wgs84_bbox, src_env_wgs84) {
+            Some([x_lo, x_hi, y_lo, y_hi])
+                if x_hi < 0.0 || x_lo >= 1.0 || y_hi < 0.0 || y_lo >= 1.0 =>
+            {
+                None
+            }
+            Some(fractions) => Some(footprint_pixels(fractions, width, height)),
+            None => Some((0, width - 1, 0, height - 1)),
+        }
+    }
+
+    /// The fractional output box `[x_lo, x_hi, y_lo, y_hi]` a source's
+    /// WGS84 envelope occupies, with its margin, unclamped; `None` when no
+    /// perimeter sample maps to a finite position. See
+    /// [`Self::footprint_pixel_window`].
+    fn footprint_fractions(
+        &self,
+        wgs84_bbox: [f64; 4],
+        src_env_wgs84: [f64; 4],
+    ) -> Option<[f64; 4]> {
         let [w, s, e, n] = src_env_wgs84;
         let (mut fx_lo, mut fx_hi, mut fy_lo, mut fy_hi) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
         let mut any = false;
@@ -187,34 +254,138 @@ impl OutputCrs {
             }
         }
         if !any {
-            return (0, width.saturating_sub(1), 0, height.saturating_sub(1));
+            return None;
         }
         // Margin: a fraction of the footprint's own output span, with a small
         // floor, so edge-sampling gaps and sub-pixel rounding never clip boundary
         // data. Far-away ghosts sit far outside, so the margin never readmits them.
         let mx = ((fx_hi - fx_lo) * 0.02).max(0.005);
         let my = ((fy_hi - fy_lo) * 0.02).max(0.005);
-        fx_lo -= mx;
-        fx_hi += mx;
-        fy_lo -= my;
-        fy_hi += my;
-        let to_px = |f: f64, dim: u32| {
-            // If dim == 0, `clamp(0.0, dim as f64 - 1.0)` panics (min > max) in
-            // both debug and release; the assert below fires first in debug with
-            // a clearer message. Callers always pass positive output dimensions.
-            debug_assert!(
-                dim > 0,
-                "footprint_pixel_window: output dimension must be > 0"
-            );
-            (f * dim as f64).floor().clamp(0.0, dim as f64 - 1.0) as u32
-        };
-        (
-            to_px(fx_lo, width),
-            to_px(fx_hi, width),
-            to_px(fy_lo, height),
-            to_px(fy_hi, height),
-        )
+        Some([fx_lo - mx, fx_hi + mx, fy_lo - my, fy_hi + my])
     }
+
+    /// The rows of a `height`-row output image over `wgs84_bbox` whose pixel
+    /// centres lie inside this output CRS's domain, with the WGS84 box those
+    /// rows span; `None` when no row does.
+    ///
+    /// Geographic output is cut row by row: CRS:84 and EPSG:4326 define
+    /// latitude on [-90°, 90°], and a request box may reach past a pole.
+    /// WMS 1.3.0 §7.3.3.6 wants empty content there, but an engine sampling
+    /// such a row can draw: a grid's edge cell extends past a pole, and a
+    /// projected source's forward maps latitude 95° to 85° on the far
+    /// meridian (#1065). Latitude falls row by row, so the rows inside form
+    /// one run.
+    ///
+    /// Web Mercator answers all rows: its latitudes stay inside (−90°, 90°).
+    /// So does a projected output, except when its box lies wholly outside
+    /// the projection's valid area
+    /// ([`crate::geo::outside_projection_domain`]): then no pixel maps to the
+    /// Earth, and the answer is `None` (#1089). That test reads the projected
+    /// box only, so `wgs84_bbox` may be anything for such a box, which has no
+    /// meaningful WGS84 envelope. In a box partly outside, the pixels past
+    /// the LAEA disk, and past TM's poles or its area's east and west edges
+    /// (#1113), are non-finite in [`Self::project_node`] and stay empty.
+    ///
+    /// The box is the request box cut at the outer edges of the first and
+    /// last row, so a render of it at `rows.len()` rows samples the full
+    /// image's pixel centres of those rows ([`get_raster_tile_in_domain`]).
+    /// It cuts the image at the CRS's edge; it never clamps a coordinate
+    /// (root CLAUDE.md Critical Rule 4). When every row is inside, `bbox` is
+    /// `wgs84_bbox` unchanged.
+    pub fn domain_rows(&self, wgs84_bbox: [f64; 4], height: u32) -> Option<DomainRows> {
+        if height == 0 {
+            return None;
+        }
+        if let OutputCrs::Projected { crs, bbox } = self {
+            if crate::geo::outside_projection_domain(crs, *bbox) {
+                return None;
+            }
+        }
+        let [west, south, east, north] = wgs84_bbox;
+        let geographic = (-90.0..=90.0).contains(&south) && (-90.0..=90.0).contains(&north);
+        if !matches!(self, OutputCrs::Wgs84) || geographic {
+            return Some(DomainRows {
+                rows: 0..height,
+                bbox: wgs84_bbox,
+            });
+        }
+        // The centre latitude the engines sample for `row`.
+        let lat = |row: u32| {
+            let fy = (f64::from(row) + 0.5) / f64::from(height);
+            self.project_node(wgs84_bbox, 0.5, fy).1
+        };
+        // Rows north of the domain come first, then those inside, then those
+        // south of it.
+        let top = first_row(height, |row| lat(row) <= 90.0);
+        let end = first_row(height, |row| lat(row) < -90.0);
+        if top >= end {
+            return None;
+        }
+        let edge = |row: u32| north - f64::from(row) / f64::from(height) * (north - south);
+        Some(DomainRows {
+            rows: top..end,
+            bbox: [west, edge(end), east, edge(top)],
+        })
+    }
+}
+
+/// The projected metres `(e, n)` of the output position `(fx, fy)` in the
+/// request rectangle `bbox` `[min_e, min_n, max_e, max_n]`: a projected
+/// output lays its pixels out linearly in its metres.
+fn projected_point(bbox: &[f64; 4], fx: f64, fy: f64) -> (f64, f64) {
+    let [min_e, min_n, max_e, max_n] = *bbox;
+    (min_e + fx * (max_e - min_e), max_n - fy * (max_n - min_n))
+}
+
+/// The inclusive pixels `(px_lo, px_hi, py_lo, py_hi)` of the fractional
+/// footprint box `[x_lo, x_hi, y_lo, y_hi]` in a `width`×`height` image,
+/// clamped to the image.
+fn footprint_pixels(
+    [x_lo, x_hi, y_lo, y_hi]: [f64; 4],
+    width: u32,
+    height: u32,
+) -> (u32, u32, u32, u32) {
+    let to_px = |f: f64, dim: u32| {
+        // If dim == 0, `clamp(0.0, dim as f64 - 1.0)` panics (min > max) in
+        // both debug and release; the assert below fires first in debug with
+        // a clearer message. Callers always pass positive output dimensions.
+        debug_assert!(
+            dim > 0,
+            "footprint_pixel_window: output dimension must be > 0"
+        );
+        (f * dim as f64).floor().clamp(0.0, dim as f64 - 1.0) as u32
+    };
+    (
+        to_px(x_lo, width),
+        to_px(x_hi, width),
+        to_px(y_lo, height),
+        to_px(y_hi, height),
+    )
+}
+
+/// The first of `0..height` for which `pred` holds, `height` when none
+/// does; `pred` must be false for a prefix of the rows and true after it.
+fn first_row(height: u32, pred: impl Fn(u32) -> bool) -> u32 {
+    let (mut lo, mut hi) = (0, height);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// The part of an output image inside its CRS's domain:
+/// [`OutputCrs::domain_rows`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DomainRows {
+    /// The output rows inside the domain, north first.
+    pub rows: std::ops::Range<u32>,
+    /// The WGS84 box `[west, south, east, north]` those rows cover.
+    pub bbox: [f64; 4],
 }
 
 /// A raster tile that can be colorized and served as a map image.
@@ -349,6 +520,59 @@ impl RasterTile {
     /// Returns true if all pixel values are nodata.
     pub fn is_empty(&self) -> bool {
         self.values.is_all_nodata()
+    }
+
+    /// This tile as rows `top..top + self.height` of a `height`-row tile
+    /// whose other rows are nodata: the full image of a render asked only
+    /// for its [`OutputCrs::domain_rows`]. Every variant keeps its pixels'
+    /// values; `U8` without a nodata sentinel, which has no raw value for
+    /// the added rows, becomes the boxed `F64` of the same values.
+    pub fn placed_in_rows(self, top: u32, height: u32) -> RasterTile {
+        debug_assert!(
+            top.checked_add(self.height)
+                .is_some_and(|end| end <= height),
+            "rows {top}..+{} do not fit in {height}",
+            self.height
+        );
+        if top == 0 && self.height == height {
+            return self;
+        }
+        let width = self.width as usize;
+        let above = top as usize * width;
+        let below = height.saturating_sub(top.saturating_add(self.height)) as usize * width;
+        fn pad<T: Copy>(data: Vec<T>, nodata: T, above: usize, below: usize) -> Vec<T> {
+            let mut padded = Vec::with_capacity(above + data.len() + below);
+            padded.resize(above, nodata);
+            padded.extend(data);
+            padded.resize(padded.len() + below, nodata);
+            padded
+        }
+        let values = match self.values {
+            RasterValues::F64(values) => RasterValues::F64(pad(values, None, above, below)),
+            RasterValues::F32 { data, nodata } => RasterValues::F32 {
+                data: pad(data, f32::NAN, above, below),
+                nodata,
+            },
+            RasterValues::U8 {
+                data,
+                nodata: Some(nodata),
+                gain,
+                offset,
+            } => RasterValues::U8 {
+                data: pad(data, nodata, above, below),
+                nodata: Some(nodata),
+                gain,
+                offset,
+            },
+            values @ RasterValues::U8 { nodata: None, .. } => {
+                RasterValues::F64(pad(values.iter_values().collect(), None, above, below))
+            }
+        };
+        RasterTile {
+            width: self.width,
+            height,
+            values,
+        }
     }
 }
 
@@ -510,6 +734,12 @@ pub trait MapEngine: Send + Sync {
     /// [`crate::instances`].
     ///
     /// The engine handles CRS reprojection to source data internally.
+    ///
+    /// An API layer rendering a client-chosen bbox directly calls this through
+    /// [`get_raster_tile_in_domain`] (bands: [`get_raster_tiles_in_domain`]),
+    /// never on its own: a `Wgs84` bbox may reach past a pole, and the helper
+    /// asks only for the rows inside ±90° and leaves the rest empty, without
+    /// clamping the bbox (WMS 1.3.0 §7.3.3.6, #1065).
     #[allow(clippy::too_many_arguments)] // bbox/size/time/crs/parameter/z/reference_time are all genuine selectors
     fn get_raster_tile(
         &self,
@@ -603,6 +833,15 @@ pub trait MapEngine: Send + Sync {
     /// actually renders under T−1's key — never under T's. `None` input
     /// means "whatever the engine treats as latest"; the override should
     /// return that concrete timestep so caches pin it too.
+    ///
+    /// With nothing to render yet (the catalog is still empty after a start
+    /// or reload), falling back to the requested time is safe only when the
+    /// render then *errors*, since errors are never cached. An engine that
+    /// renders an empty tile instead MUST return `None`: an empty render
+    /// keyed on T is served blank from the no-TTL meta-tile cache once T's
+    /// data lands. The API layers also send an explicit `time` that resolves
+    /// to `None` with a short, revalidating `Cache-Control` rather than
+    /// `immutable`.
     ///
     /// `reference_time` selects a forecast model run, mirroring
     /// [`Self::get_raster_tile`]; non-forecast engines ignore it.
@@ -713,6 +952,48 @@ pub trait MapEngine: Send + Sync {
         self.resolve_time(time, reference_time)
     }
 
+    /// [`Self::resolve_reference_time`] for one parameter: the exact model
+    /// run this engine would render `parameter` from at `time`, the run
+    /// that must key the rendered caches (#521). `None` parameter means the
+    /// one `get_raster_tile` renders by default. The API layers resolve the
+    /// run with this first, then pass it to
+    /// [`Self::resolve_parameter_time`] and the render.
+    ///
+    /// An engine that retains runs and whose run selection depends on the
+    /// parameter MUST override this with the selection `get_raster_tile`
+    /// uses. GRIB does (#1005): an hour-window aggregate missing from the
+    /// newest run's first steps renders from an older run that has it at
+    /// that time, so the parameter-blind run would key the wrong pixels.
+    /// Default: [`Self::resolve_reference_time`]. **O(log n) from a
+    /// snapshot**, before the cache lookup.
+    fn resolve_parameter_reference_time(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let _ = parameter;
+        self.resolve_reference_time(time, reference_time)
+    }
+
+    /// [`Self::resolve_parameter_reference_time`] for parameters rendered
+    /// together from one run, such as the u and v components a derived
+    /// wind speed combines: the run that has them all, which
+    /// [`Self::resolve_parameters_time`] then selects their one timestep in.
+    ///
+    /// An engine whose run selection depends on the parameter MUST override
+    /// this with the selection its render uses. GRIB does (#1026): a
+    /// component only an older run still has renders, with its partner,
+    /// from that run. Default: the first parameter's run.
+    fn resolve_parameters_reference_time(
+        &self,
+        parameters: &[&str],
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        self.resolve_parameter_reference_time(parameters.first().copied(), time, reference_time)
+    }
+
     /// [`Self::resolve_parameter_time`] for parameters rendered together,
     /// such as an RGB composite's bands: the one timestep
     /// [`Self::get_raster_tiles`] renders them all from. The API layer must
@@ -770,6 +1051,54 @@ pub trait MapEngine: Send + Sync {
             std::sync::LazyLock::new(|| Arc::from([]));
         NONE.clone()
     }
+
+    /// Whether the layer of `parameter`, one of [`RasterInfo::parameters`],
+    /// shows that parameter's own values: the values a position query of
+    /// the same collection answers at a point. `false` for an overlay drawn
+    /// from other data, such as a radar site's storm-cell outlines, which
+    /// no point query answers.
+    ///
+    /// WMS GetFeatureInfo reads a layer's value with the collection's EDR
+    /// position query (#1064), so it answers only for such layers: an
+    /// overlay layer is `queryable="0"` and answers `LayerNotQueryable`.
+    /// Default `true`. **O(1)**, no I/O: GetCapabilities reads it for every
+    /// layer (Critical Rule 10).
+    fn layer_shows_values(&self, parameter: &str) -> bool {
+        let _ = parameter;
+        true
+    }
+
+    /// The vertical level [`Self::get_raster_tile`] draws `parameter` at
+    /// when it is passed `z` (WMS `ELEVATION`, `None` when omitted), at the
+    /// `time` and `reference_time` the render is passed, those
+    /// [`Self::resolve_parameter_time`] and
+    /// [`Self::resolve_parameter_reference_time`] resolved. One of
+    /// [`RasterInfo::vertical`]'s levels; `None` for a layer without one.
+    ///
+    /// WMS GetFeatureInfo passes this level to the collection's position
+    /// query and reports it (#1064), so the value it answers is one the map
+    /// shows. An engine whose render draws another level than `z`, or than
+    /// the first advertised level when `z` is `None`, MUST override this
+    /// with the selection `get_raster_tile` uses, through a shared helper so
+    /// the two cannot drift. GRIB draws the selected run's own first level;
+    /// a radar volume draws the sweep nearest `z`, or the lowest, among
+    /// those carrying the quantity. Default: `z`, else the first advertised
+    /// level. From a snapshot, no I/O.
+    fn resolve_elevation(
+        &self,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<f64> {
+        let _ = (parameter, time, reference_time);
+        z.or_else(|| {
+            self.raster_info_shared()
+                .vertical
+                .as_ref()
+                .and_then(|vertical| vertical.levels.first().copied())
+        })
+    }
 }
 
 /// The timestep a multi-parameter render uses, chosen among the times
@@ -818,6 +1147,78 @@ pub fn default_request_time(
             .and_then(|p| engine.parameter_times(p))
             .map_or_else(|| info.times.last().copied(), |times| times.last().copied())
     })
+}
+
+/// [`MapEngine::get_raster_tile`] for a map request, asking the engine only
+/// for the output rows inside the output CRS ([`OutputCrs::domain_rows`]):
+/// the others stay nodata, the empty content WMS 1.3.0 §7.3.3.6 wants
+/// outside a CRS's range. `Ok(None)` when no row is inside: there is nothing
+/// to draw, and the engine is not called. The API layers' direct renders go
+/// through this, so no engine is asked for a latitude past a pole (#1065)
+/// or for a projected box wholly outside its projection (#1089).
+#[allow(clippy::too_many_arguments)] // mirrors get_raster_tile
+pub fn get_raster_tile_in_domain(
+    engine: &dyn MapEngine,
+    bbox: [f64; 4],
+    width: u32,
+    height: u32,
+    time: Option<DateTime<Utc>>,
+    output_crs: &OutputCrs,
+    parameter: Option<&str>,
+    z: Option<f64>,
+    reference_time: Option<DateTime<Utc>>,
+) -> Result<Option<RasterTile>, DataServerError> {
+    let Some(domain) = output_crs.domain_rows(bbox, height) else {
+        return Ok(None);
+    };
+    let rows = domain.rows.end - domain.rows.start;
+    let tile = engine.get_raster_tile(
+        domain.bbox,
+        width,
+        rows,
+        time,
+        output_crs,
+        parameter,
+        z,
+        reference_time,
+    )?;
+    Ok(Some(tile.placed_in_rows(domain.rows.start, height)))
+}
+
+/// [`MapEngine::get_raster_tiles`] (a composite's bands) through
+/// [`OutputCrs::domain_rows`], as [`get_raster_tile_in_domain`].
+#[allow(clippy::too_many_arguments)] // mirrors get_raster_tiles
+pub fn get_raster_tiles_in_domain(
+    engine: &dyn MapEngine,
+    bbox: [f64; 4],
+    width: u32,
+    height: u32,
+    time: Option<DateTime<Utc>>,
+    output_crs: &OutputCrs,
+    parameters: &[&str],
+    z: Option<f64>,
+    reference_time: Option<DateTime<Utc>>,
+) -> Result<Option<Vec<RasterTile>>, DataServerError> {
+    let Some(domain) = output_crs.domain_rows(bbox, height) else {
+        return Ok(None);
+    };
+    let rows = domain.rows.end - domain.rows.start;
+    let tiles = engine.get_raster_tiles(
+        domain.bbox,
+        width,
+        rows,
+        time,
+        output_crs,
+        parameters,
+        z,
+        reference_time,
+    )?;
+    Ok(Some(
+        tiles
+            .into_iter()
+            .map(|tile| tile.placed_in_rows(domain.rows.start, height))
+            .collect(),
+    ))
 }
 
 #[cfg(test)]
@@ -882,10 +1283,19 @@ mod tests {
             default_request_time(&Engine(Some(at(5))), &info, Some("late")),
             Some(at(5))
         );
-        // The default resolution is `resolve_time`'s identity.
+        // The default resolution is `resolve_time`'s identity, and the run
+        // `resolve_reference_time`'s.
         assert_eq!(
             plain.resolve_parameter_time(Some("late"), Some(at(2)), None),
             Some(at(2))
+        );
+        assert_eq!(
+            plain.resolve_parameter_reference_time(Some("late"), Some(at(2)), Some(at(1))),
+            Some(at(1))
+        );
+        assert_eq!(
+            plain.resolve_parameters_reference_time(&["late", "other"], Some(at(2)), Some(at(1))),
+            Some(at(1))
         );
     }
 
@@ -1096,6 +1506,54 @@ mod tests {
         assert!(Plain.composites().is_empty());
         assert!(Arc::ptr_eq(&Plain.composites(), &Plain.composites()));
     }
+
+    /// By default a map draws the requested level, else the first
+    /// advertised one; a collection without levels has none.
+    #[test]
+    fn default_resolve_elevation_is_z_else_the_first_level() {
+        struct Levels(Option<Vec<f64>>);
+        impl MapEngine for Levels {
+            fn get_raster_tile(
+                &self,
+                _: [f64; 4],
+                _: u32,
+                _: u32,
+                _: Option<DateTime<Utc>>,
+                _: &OutputCrs,
+                _: Option<&str>,
+                _: Option<f64>,
+                _: Option<DateTime<Utc>>,
+            ) -> Result<RasterTile, DataServerError> {
+                unreachable!()
+            }
+            fn raster_info(&self) -> RasterInfo {
+                RasterInfo {
+                    native_crs: "CRS:84".into(),
+                    spatial_extent: None,
+                    times: Vec::new(),
+                    parameter: "t".into(),
+                    unit: "K".into(),
+                    parameters: Vec::new(),
+                    vertical: self.0.clone().map(|levels| {
+                        VerticalDimension::new(crate::vertical::VerticalKind::Pressure, levels)
+                    }),
+                    grid_size: None,
+                    layer_subtitle: None,
+                    reference_times: Vec::new(),
+                }
+            }
+        }
+        let pressure = Levels(Some(vec![850.0, 500.0]));
+        assert_eq!(
+            pressure.resolve_elevation(None, None, None, None),
+            Some(850.0)
+        );
+        assert_eq!(
+            pressure.resolve_elevation(Some("t"), Some(500.0), None, None),
+            Some(500.0)
+        );
+        assert_eq!(Levels(None).resolve_elevation(None, None, None, None), None);
+    }
     use crate::geo::projected_output_crs;
 
     const FINLAND_WGS84: [f64; 4] = [19.0, 59.0, 32.0, 70.0]; // [w, s, e, n]
@@ -1252,6 +1710,106 @@ mod tests {
         assert_eq!((px_lo, px_hi, py_lo, py_hi), (0, w - 1, 0, h - 1));
     }
 
+    /// The WGS84 box of a Web Mercator meta-tile on the half-octave ladder,
+    /// `2^(level/2)` tiles a world, with longitudes unwrapped past ±180° as
+    /// the meta-tiling passes them.
+    fn merc_tile(level: i32, col: i64, row: i64) -> [f64; 4] {
+        use crate::web_mercator::{x_to_lon, y_to_lat, EARTH_RADIUS};
+        let origin = std::f64::consts::PI * EARTH_RADIUS;
+        let span = 2.0 * origin / 2f64.powf(f64::from(level) / 2.0);
+        let (x0, top) = (-origin + col as f64 * span, origin - row as f64 * span);
+        [
+            x_to_lon(x0),
+            y_to_lat(top - span),
+            x_to_lon(x0 + span),
+            y_to_lat(top),
+        ]
+    }
+
+    /// `footprint_window_in_image` against `footprint_pixel_window`: the same
+    /// window, or `None` when every pixel of the clamped window lies outside
+    /// the footprint and its margin, so the guard would draw none of them.
+    fn assert_in_image_agrees(crs: &OutputCrs, bbox: [f64; 4], env: [f64; 4], size: u32) -> bool {
+        let window = crs.footprint_pixel_window(bbox, env, size, size);
+        let Some(fractions) = crs.footprint_fractions(bbox, env) else {
+            let full = Some((0, size - 1, 0, size - 1));
+            assert_eq!(crs.footprint_window_in_image(bbox, env, size, size), full);
+            return true;
+        };
+        let [x_lo, x_hi, y_lo, y_hi] = fractions;
+        let s = f64::from(size);
+        let meets = |p: u32, lo: f64, hi: f64| f64::from(p) / s <= hi && f64::from(p + 1) / s > lo;
+        let (px_lo, px_hi, py_lo, py_hi) = window;
+        let drawn = (px_lo..=px_hi).any(|px| meets(px, x_lo, x_hi))
+            && (py_lo..=py_hi).any(|py| meets(py, y_lo, y_hi));
+        assert_eq!(
+            crs.footprint_window_in_image(bbox, env, size, size),
+            drawn.then_some(window),
+            "{crs:?} {bbox:?} over {env:?}"
+        );
+        drawn
+    }
+
+    /// #1129: a footprint wholly off the image has no window, and only then.
+    /// The issue's off-world Web Mercator meta-tiles, either side of the
+    /// world, hold no Finland; nor does the seam, where a source that
+    /// crosses it keeps its window, whether its envelope comes unwrapped or
+    /// spans the turn. Every tile of the ladder's first levels, a turn either
+    /// side of the world, and the EPSG:3035 tiles around Europe agree with
+    /// `footprint_pixel_window`.
+    #[test]
+    fn footprint_window_in_image_is_none_only_off_the_image() {
+        let merc = OutputCrs::WebMercator;
+        let seam = [170.0, 10.0, 190.0, 20.0];
+        for (bbox, env, drawn) in [
+            (merc_tile(3, 3, 2), FINLAND_WGS84, false),
+            (merc_tile(3, -1, 2), FINLAND_WGS84, false),
+            (merc_tile(2, 2, 0), FINLAND_WGS84, false),
+            (merc_tile(4, 5, 3), FINLAND_WGS84, false),
+            (merc_tile(3, 1, 0), FINLAND_WGS84, true),
+            (merc_tile(3, 1, 1), FINLAND_WGS84, false),
+            (seam, FINLAND_WGS84, false),
+            (seam, [175.0, 12.0, 185.0, 18.0], true),
+            (seam, [-180.0, 12.0, 180.0, 18.0], true),
+            (
+                [170.0, 10.0, -170.0, 20.0],
+                [175.0, 12.0, 185.0, 18.0],
+                false,
+            ),
+        ] {
+            assert_eq!(
+                assert_in_image_agrees(&merc, bbox, env, 256),
+                drawn,
+                "{bbox:?} over {env:?}"
+            );
+        }
+        for level in 0..=8 {
+            let n = 2f64.powf(f64::from(level) / 2.0).ceil() as i64;
+            for row in 0..n {
+                for col in -n..2 * n {
+                    assert_in_image_agrees(&merc, merc_tile(level, col, row), FINLAND_WGS84, 256);
+                }
+            }
+        }
+        let laea = projected_output_crs("EPSG:3035").unwrap();
+        let side = 1_024_000.0;
+        for i in 0..8 {
+            for j in 0..8 {
+                let (e, n) = (f64::from(i) * side, f64::from(j) * side);
+                let out = OutputCrs::Projected {
+                    crs: laea.clone(),
+                    bbox: [e, n, e + side, n + side],
+                };
+                assert_in_image_agrees(&out, [0.0; 4], FINLAND_WGS84, 256);
+            }
+        }
+        assert_eq!(
+            merc.footprint_window_in_image(merc_tile(3, 1, 0), FINLAND_WGS84, 0, 256),
+            None,
+            "an empty image has no pixel to draw"
+        );
+    }
+
     /// #475: the `F32` boxed view — sentinel and every non-finite sample are
     /// nodata, everything else widens exactly.
     #[test]
@@ -1287,5 +1845,404 @@ mod tests {
         };
         assert!(!real.is_all_nodata());
         assert_eq!(real.value_at(1), Some(-9999.0));
+    }
+
+    /// The centre latitude of `row` of a `height`-row geographic image.
+    fn row_lat(bbox: [f64; 4], row: u32, height: u32) -> f64 {
+        let fy = (f64::from(row) + 0.5) / f64::from(height);
+        OutputCrs::Wgs84.project_node(bbox, 0.5, fy).1
+    }
+
+    /// #1065: a geographic box past a pole keeps the rows whose centres lie
+    /// on [-90°, 90°], and the box it hands the engine puts those rows'
+    /// centres exactly where the full image has them.
+    #[test]
+    fn domain_rows_cut_a_geographic_image_at_the_poles() {
+        let wgs84 = OutputCrs::Wgs84;
+        // Inside the CRS, the poles included: every row, the box untouched.
+        for bbox in [FINLAND_WGS84, [-180.0, -90.0, 180.0, 90.0]] {
+            assert_eq!(
+                wgs84.domain_rows(bbox, 100),
+                Some(DomainRows { rows: 0..100, bbox })
+            );
+        }
+        // Entirely past a pole, as ets-wms13's getmap:bbox-outside-crs asks
+        // (row 0's centre is 90.1° north / 90.1° south): nothing.
+        assert_eq!(wgs84.domain_rows([-10.0, 90.0, 10.0, 110.0], 100), None);
+        assert_eq!(wgs84.domain_rows([-10.0, -110.0, 10.0, -90.0], 100), None);
+        assert_eq!(wgs84.domain_rows(FINLAND_WGS84, 0), None);
+
+        for (bbox, height, rows, inside) in [
+            // Half past the north pole: the southern half.
+            (
+                [-10.0, 80.0, 10.0, 100.0],
+                100,
+                50..100,
+                [-10.0, 80.0, 10.0, 90.0],
+            ),
+            // 0.1° rows: row 299 is centred at 89.95°S, row 300 at 90.05°S.
+            (
+                [-180.0, -120.0, 180.0, -60.0],
+                600,
+                0..300,
+                [-180.0, -90.0, 180.0, -60.0],
+            ),
+            // Past both poles.
+            (
+                [-180.0, -100.0, 180.0, 100.0],
+                200,
+                10..190,
+                [-180.0, -90.0, 180.0, 90.0],
+            ),
+            // The pole inside the first row: its centre (89.99°) is inside,
+            // so the row stays whole, its top edge past the pole with it.
+            (
+                [0.0, 80.04, 10.0, 90.04],
+                100,
+                0..100,
+                [0.0, 80.04, 10.0, 90.04],
+            ),
+        ] {
+            let domain = wgs84.domain_rows(bbox, height).unwrap();
+            assert_eq!(domain.rows, rows, "{bbox:?}");
+            for (got, want) in domain.bbox.iter().zip(inside) {
+                assert!((got - want).abs() < 1e-9, "{bbox:?}: {:?}", domain.bbox);
+            }
+            for row in 0..height {
+                let lat = row_lat(bbox, row, height);
+                assert_eq!(
+                    domain.rows.contains(&row),
+                    (-90.0..=90.0).contains(&lat),
+                    "{bbox:?} row {row} at {lat}"
+                );
+            }
+            let n = domain.rows.end - domain.rows.start;
+            for k in 0..n {
+                let full = row_lat(bbox, domain.rows.start + k, height);
+                let part = row_lat(domain.bbox, k, n);
+                assert!((full - part).abs() < 1e-9, "{bbox:?} row {k}");
+            }
+        }
+    }
+
+    /// Only geographic output is cut: a Web Mercator or projected output's
+    /// latitudes cannot leave the CRS this way.
+    #[test]
+    fn domain_rows_leave_other_output_crs_whole() {
+        let proj = projected_output_crs("EPSG:3067").unwrap();
+        let past_pole = [-10.0, 80.0, 10.0, 100.0];
+        for out in [
+            OutputCrs::WebMercator,
+            OutputCrs::Projected {
+                crs: proj,
+                bbox: [0.0, 0.0, 1.0, 1.0],
+            },
+        ] {
+            assert_eq!(
+                out.domain_rows(past_pole, 64),
+                Some(DomainRows {
+                    rows: 0..64,
+                    bbox: past_pole
+                }),
+                "{out:?}"
+            );
+        }
+    }
+
+    /// A projected box wholly outside its projection's valid area has no row
+    /// inside (#1089): an EPSG:3035 box past the LAEA disk, an EPSG:3067 one
+    /// past a pole, past the eastings where its series stops being exact
+    /// (#1113, #1130), or so far east that the TM inverse has no finite
+    /// result. A box reaching into the area, or enclosing it, keeps every
+    /// row.
+    #[test]
+    fn domain_rows_of_a_projected_box_outside_its_projection_are_none() {
+        let laea = projected_output_crs("EPSG:3035").unwrap();
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        // The WGS84 box does not enter the test; such a box has none.
+        let wgs84 = [0.0; 4];
+        let projected = |crs: &Crs, bbox| OutputCrs::Projected {
+            crs: crs.clone(),
+            bbox,
+        };
+        for (crs, bbox) in [
+            (&laea, [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
+            (&tm, [0.0, 1.5e7, 1.0e6, 1.6e7]),
+            (&tm, [0.0, 2.1e7, 1.0e6, 2.2e7]),
+            (&tm, [0.0, -2.2e7, 1.0e6, -2.1e7]),
+            (&tm, [1.1e7, 6.5e6, 1.2e7, 7.0e6]),
+            (&tm, [1.0e20, 6.5e6, 2.0e20, 7.0e6]),
+        ] {
+            assert_eq!(
+                projected(crs, bbox).domain_rows(wgs84, 64),
+                None,
+                "{bbox:?}"
+            );
+        }
+        for (crs, bbox) in [
+            (&laea, [4.0e6, 3.0e6, 4.5e6, 3.5e6]),
+            // Across the disk's rim.
+            (&laea, [1.6e7, 2.2e6, 1.8e7, 4.2e6]),
+            // Wider than the disk.
+            (&laea, [-3.0e7, -3.0e7, 3.0e7, 3.0e7]),
+            (&tm, [-1.2e5, 6.3e6, 8.8e5, 7.9e6]),
+            // Across the North Pole, past the Snyder series' 50° east of the
+            // meridian (#1113), and across the area's east edge.
+            (&tm, [0.0, 9.0e6, 1.0e6, 1.1e7]),
+            (&tm, [1_448_154.7, 7_240_773.4, 2_896_309.4, 8_688_928.1]),
+            (&tm, [5.0e6, 6.5e6, 6.0e6, 7.0e6]),
+            (&tm, [1.0e7, -1.0e6, 1.1e7, 1.0e6]),
+            // Wider than the TM area.
+            (&tm, [-3.0e7, -3.0e7, 3.0e7, 3.0e7]),
+        ] {
+            assert_eq!(
+                projected(crs, bbox).domain_rows(wgs84, 64),
+                Some(DomainRows {
+                    rows: 0..64,
+                    bbox: wgs84
+                }),
+                "{bbox:?}"
+            );
+        }
+    }
+
+    /// A point's position is `project_node`'s when the point lies on the
+    /// Earth, and `None` past a pole of a geographic box, past the LAEA
+    /// disk, and past a pole or Transverse Mercator's eastings where its
+    /// series stops being exact (#1064, #1089, #1113, #1130). A projected
+    /// output reads its own metres, so a NaN WGS84 box does not matter.
+    #[test]
+    fn position_on_earth_is_none_off_the_earth() {
+        let laea = projected_output_crs("EPSG:3035").unwrap();
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        let projected = |crs: &Crs, bbox| OutputCrs::Projected {
+            crs: crs.clone(),
+            bbox,
+        };
+        let nan = [f64::NAN; 4];
+
+        // On the Earth: exactly `project_node`.
+        for (out, wgs84) in [
+            (OutputCrs::Wgs84, FINLAND_WGS84),
+            (OutputCrs::WebMercator, FINLAND_WGS84),
+            (projected(&tm, [4.905e5, 6.64e6, 5.105e5, 6.66e6]), nan),
+            (projected(&laea, [4.0e6, 3.0e6, 4.5e6, 3.5e6]), nan),
+        ] {
+            for (fx, fy) in [(0.5, 0.5), (0.0, 1.0), (0.25, 0.75)] {
+                let node = out.project_node(wgs84, fx, fy);
+                assert_eq!(out.position_on_earth(wgs84, fx, fy), Some(node), "{out:?}");
+            }
+        }
+
+        // Past a pole of a geographic box: row 0 of 80–100°N.
+        assert_eq!(
+            OutputCrs::Wgs84.position_on_earth([-10.0, 80.0, 10.0, 100.0], 0.5, 0.05),
+            None
+        );
+        // Every point of a box wholly outside its projection: past the LAEA
+        // disk, past TM's poles, north and south, and past its area's east
+        // edge.
+        for (crs, bbox) in [
+            (&laea, [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
+            (&tm, [0.0, 1.5e7, 1.0e6, 1.6e7]),
+            (&tm, [0.0, 2.1e7, 1.0e6, 2.2e7]),
+            (&tm, [0.0, -2.2e7, 1.0e6, -2.1e7]),
+            (&tm, [1.1e7, 6.5e6, 1.2e7, 7.0e6]),
+        ] {
+            let out = projected(crs, bbox);
+            for (fx, fy) in [(0.0, 0.0), (0.5, 0.5), (1.0, 1.0)] {
+                assert_eq!(out.position_on_earth(nan, fx, fy), None, "{bbox:?}");
+            }
+        }
+        // A TM box from 81°N across the pole: past it, the top and middle
+        // points name no place, and `project_node` is NaN there as past the
+        // LAEA disk; the bottom is on the Earth.
+        let across = projected(&tm, [0.0, 9.0e6, 1.0e6, 2.1e7]);
+        for fy in [0.0, 0.5] {
+            let (lon, lat) = across.project_node(nan, 0.5, fy);
+            assert!(lon.is_nan() && lat.is_nan(), "past the pole: {lon}, {lat}");
+            assert_eq!(across.position_on_earth(nan, 0.5, fy), None);
+        }
+        let (_, lat) = across.position_on_earth(nan, 0.5, 1.0).unwrap();
+        assert!((80.0..90.0).contains(&lat), "{lat}");
+
+        // The top row of the #1110 meta-tile, 256 px, runs from 36° to 62°
+        // east of the meridian. Past about 56° the Snyder series answered
+        // with a place anywhere, (296.1°, 84.5°) at column 195 with macOS's
+        // libm, and this passed it on (#1113). Krüger's names every column's
+        // place (#1130), eastward and southward column by column, from
+        // PROJ's 63.230 520 390°E 75.537 891 261°N at column 0 to
+        // 88.996 950 258°E 66.092 962 685°N at column 255 (`cs2cs -f %.9f
+        // +proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0
+        // +datum=WGS84 +to +proj=longlat +datum=WGS84` of their centres).
+        let tile = projected(&tm, [1_448_154.7, 7_240_773.4, 2_896_309.4, 8_688_928.1]);
+        let top = |i: u32| tile.position_on_earth(nan, (f64::from(i) + 0.5) / 256.0, 0.5 / 256.0);
+        let mut last = (f64::MIN, f64::MAX);
+        for i in 0..256 {
+            let (lon, lat) = top(i).unwrap_or_else(|| panic!("column {i}"));
+            assert!(lon > last.0 && lat < last.1, "column {i}: {lon}, {lat}");
+            last = (lon, lat);
+        }
+        for (i, lon, lat) in [
+            (0, 63.230_520_390, 75.537_891_261),
+            (255, 88.996_950_258, 66.092_962_685),
+        ] {
+            let (got_lon, got_lat) = top(i).unwrap();
+            assert!(
+                (got_lon - lon).abs() < 1e-8 && (got_lat - lat).abs() < 1e-8,
+                "column {i}: {got_lon}, {got_lat}"
+            );
+        }
+    }
+
+    /// Placing a tile's rows in a taller tile keeps every pixel's value and
+    /// makes the added rows nodata, for every `RasterValues` variant.
+    #[test]
+    fn placed_in_rows_pads_with_nodata_and_keeps_values() {
+        let tiles = [
+            RasterValues::F64(vec![Some(1.0), None, Some(3.0), Some(4.0)]),
+            RasterValues::F32 {
+                data: vec![1.0, -9999.0, 3.0, 4.0],
+                nodata: Some(-9999.0),
+            },
+            RasterValues::U8 {
+                data: vec![10, 255, 30, 40],
+                nodata: Some(255),
+                gain: 0.5,
+                offset: -1.0,
+            },
+            // No sentinel: every sample is a value, so it is boxed.
+            RasterValues::U8 {
+                data: vec![0, 255, 30, 40],
+                nodata: None,
+                gain: 0.5,
+                offset: -1.0,
+            },
+        ];
+        for values in tiles {
+            let before: Vec<Option<f64>> = values.iter_values().collect();
+            let tile = RasterTile {
+                width: 2,
+                height: 2,
+                values,
+            };
+            let placed = tile.placed_in_rows(1, 5);
+            assert_eq!((placed.width, placed.height), (2, 5));
+            let after: Vec<Option<f64>> = placed.values.iter_values().collect();
+            let mut want = vec![None, None];
+            want.extend(&before);
+            want.extend([None; 4]);
+            assert_eq!(after, want);
+        }
+        // Every row already in place: the same tile.
+        let whole = RasterTile {
+            width: 1,
+            height: 2,
+            values: RasterValues::U8 {
+                data: vec![7, 8],
+                nodata: None,
+                gain: 1.0,
+                offset: 0.0,
+            },
+        }
+        .placed_in_rows(0, 2);
+        assert!(matches!(
+            whole.values,
+            RasterValues::U8 { nodata: None, .. }
+        ));
+    }
+
+    /// The engine is asked only for the rows inside the CRS, and not at all
+    /// when there are none; the returned image has the requested size.
+    #[test]
+    fn rendering_in_the_domain_asks_the_engine_only_for_rows_inside_it() {
+        /// Draws a value on every pixel it is asked for, and records the box
+        /// and height of each request.
+        #[derive(Default)]
+        struct Everywhere(std::sync::Mutex<Vec<([f64; 4], u32)>>);
+        impl MapEngine for Everywhere {
+            fn get_raster_tile(
+                &self,
+                bbox: [f64; 4],
+                width: u32,
+                height: u32,
+                _: Option<DateTime<Utc>>,
+                _: &OutputCrs,
+                _: Option<&str>,
+                _: Option<f64>,
+                _: Option<DateTime<Utc>>,
+            ) -> Result<RasterTile, DataServerError> {
+                self.0.lock().unwrap().push((bbox, height));
+                Ok(RasterTile {
+                    width,
+                    height,
+                    values: vec![Some(1.0); (width * height) as usize].into(),
+                })
+            }
+            fn raster_info(&self) -> RasterInfo {
+                unreachable!()
+            }
+        }
+        let engine = Everywhere::default();
+        let render = |bbox| {
+            get_raster_tile_in_domain(
+                &engine,
+                bbox,
+                4,
+                10,
+                None,
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        assert!(render([-10.0, 90.0, 10.0, 110.0]).is_none());
+        assert!(engine.0.lock().unwrap().is_empty(), "engine called");
+        // Nor for a projected box wholly outside its projection (#1089): past
+        // the LAEA disk, or past TM's pole or its area's east edge (#1113,
+        // #1130). None of them has a read window.
+        for (code, bbox) in [
+            ("EPSG:3035", [2.0e7, 2.0e7, 2.1e7, 2.1e7]),
+            ("EPSG:3067", [0.0, 2.1e7, 1.0e6, 2.2e7]),
+            ("EPSG:3067", [1.1e7, 6.5e6, 1.2e7, 7.0e6]),
+        ] {
+            let crs = projected_output_crs(code).unwrap();
+            let read = crate::geo::wgs84_envelope(&crs, bbox).unwrap_or([0.0; 4]);
+            let outside = OutputCrs::Projected { crs, bbox };
+            let tile =
+                get_raster_tile_in_domain(&engine, read, 4, 10, None, &outside, None, None, None);
+            assert!(tile.unwrap().is_none(), "{code}");
+            assert!(engine.0.lock().unwrap().is_empty(), "{code}: engine called");
+        }
+
+        let tile = render([-10.0, 80.0, 10.0, 100.0]).unwrap();
+        assert_eq!((tile.width, tile.height), (4, 10));
+        let drawn: Vec<bool> = tile.values.iter_values().map(|v| v.is_some()).collect();
+        assert_eq!(drawn, [[false; 20], [true; 20]].concat());
+        let (bbox, rows) = engine.0.lock().unwrap()[0];
+        assert_eq!(rows, 5);
+        assert_eq!(bbox, [-10.0, 80.0, 10.0, 90.0]);
+
+        let bands = get_raster_tiles_in_domain(
+            &engine,
+            [-10.0, -100.0, 10.0, -80.0],
+            4,
+            10,
+            None,
+            &OutputCrs::Wgs84,
+            &["a", "b"],
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bands.len(), 2);
+        for band in bands {
+            let drawn: Vec<bool> = band.values.iter_values().map(|v| v.is_some()).collect();
+            assert_eq!(drawn, [[true; 20], [false; 20]].concat());
+        }
     }
 }

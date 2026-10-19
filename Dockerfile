@@ -13,7 +13,10 @@
 # glibc-2.38 symbol (icechunk 2.1, #578) and then broke production. Pin
 # the distro in BOTH stages' tags so a base-image rebase can never split
 # the pair again.
-FROM rust:1.94-slim-trixie AS chef
+# Keep the Rust version current with the stable toolchain CI and local
+# builds use, at the newest `rust:<x.y>-slim-trixie` tag published. The
+# `notices` stage below uses the same tag and cargo-chef version.
+FROM rust:1.99-slim-trixie AS chef
 WORKDIR /build
 RUN cargo install cargo-chef --locked --version 0.1.71
 
@@ -94,14 +97,49 @@ RUN find crates -type f -exec touch {} +
 RUN cargo build --release --locked -p server \
         ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
+# Stage 1d: third-party notices (#1081)
+#
+# The licences of everything compiled into the server, generated from
+# Cargo.lock at build time instead of committed, so a dependency bump cannot
+# leave them stale (scripts/third_party_notices.sh, about.toml). They cover
+# every release target and the `icechunk` build, so they are the same for
+# each image platform: the stage runs once, natively, on the build platform
+# rather than under emulation, in parallel with the builder.
+#
+# Only the last two lines see the sources. The pinned tool installs cache
+# until their lines or the base image change. The crates of every release
+# target are fetched into the image from the planner's recipe.json, the
+# manifests and Cargo.lock that `cargo chef cook --no-build` lays out as a
+# skeleton without compiling, so that layer caches like the builder's cook
+# and crates.io is contacted again only when a dependency changes. The
+# script's own `cargo fetch` then finds every crate already present.
+FROM --platform=$BUILDPLATFORM rust:1.99-slim-trixie AS notices
+WORKDIR /build
+RUN cargo install cargo-chef --locked --version 0.1.71
+RUN cargo install cargo-about --locked --version 0.9.2 --features cli
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --no-build --recipe-path recipe.json && cargo fetch --locked
+COPY . .
+RUN scripts/third_party_notices.sh THIRD-PARTY-NOTICES.txt
+
 # Stage 2: Runtime
 FROM debian:trixie-slim
+
+# The image is licensed MIT OR Apache-2.0 (#1081). The CI workflows set the
+# same value through docker/metadata-action, whose labels override this one.
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -r dataserver && useradd -r -g dataserver dataserver
+# Where `[server] state_dir` points in the documented examples (#1000). A
+# named volume mounted here starts with this ownership, so the non-root
+# runtime user can write its snapshots.
+RUN mkdir -p /var/lib/meteocore && chown dataserver:dataserver /var/lib/meteocore
 
 COPY --from=builder /build/target/release/server /usr/local/bin/dataserver
+COPY LICENSE-MIT LICENSE-APACHE /usr/share/doc/meteocore/
+COPY --from=notices /build/THIRD-PARTY-NOTICES.txt /usr/share/doc/meteocore/
 
 WORKDIR /data
 COPY config.toml ./

@@ -2,11 +2,12 @@
 name = "ds-executor"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 ds-core = { path = "../core" }
 ds-cache = { path = "../ds-cache" }
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
 thiserror = "2"
 
 [dev-dependencies]

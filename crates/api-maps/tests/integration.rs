@@ -117,6 +117,24 @@ fn build_router() -> axum::Router {
 /// Build a Maps router backed by a caller-supplied engine (otherwise
 /// identical to `build_router`), for exercising engine error paths.
 fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
+    build_router_with_engine_and_wms(engine, None)
+}
+
+/// [`build_router_with_engine`] with the collection's `[wms]` config, for
+/// the per-collection settings the handler reads (e.g. `webp_quality`).
+fn build_router_with_engine_and_wms(
+    engine: Arc<dyn MapEngine>,
+    wms: Option<ds_core::config::WmsConfig>,
+) -> axum::Router {
+    api_maps::router(build_state_with_engine_and_wms(engine, wms))
+}
+
+/// The state behind [`build_router_with_engine_and_wms`], for mounting the
+/// same collection on another surface (the shared root's Maps block).
+fn build_state_with_engine_and_wms(
+    engine: Arc<dyn MapEngine>,
+    wms: Option<ds_core::config::WmsConfig>,
+) -> api_maps::AppState {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     let mut styles_map = HashMap::new();
@@ -134,16 +152,19 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
             license: None,
             geotiff: None,
             querydata: None,
-            wms: None,
+            wms,
             grib: None,
             zarr: None,
             odim: None,
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
     let cmap = Arc::new(LutColorMap::from_builtin(
@@ -165,7 +186,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
         },
     );
     styles_map.insert("radar".to_string(), layer_styles);
-    let state = Arc::new(ArcSwap::from_pointee(MapsState {
+    Arc::new(ArcSwap::from_pointee(MapsState {
         engines,
         collections,
         styles: styles_map,
@@ -174,8 +195,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
         base_url: String::new(),
         trust_proxy_headers: false,
         map_tileset_ids: Default::default(),
-    }));
-    api_maps::router(state)
+    }))
 }
 
 /// `apis` is the collection config; the Tiles service registers the
@@ -212,9 +232,12 @@ fn build_router_with_tilesets(apis: Vec<String>, map_tilesets: bool) -> axum::Ro
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -330,9 +353,12 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
     let state = Arc::new(ArcSwap::from_pointee(MapsState {
@@ -381,9 +407,12 @@ fn router_with(
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
     let state = Arc::new(ArcSwap::from_pointee(MapsState {
@@ -455,6 +484,7 @@ mod metadata_extras {
         let lic = ds_core::config::LicenseConfig {
             title: "All rights reserved".into(),
             url: None,
+            media_type: None,
         };
         let html = fetch_collection_html_with(Some(lic.clone())).await;
         assert!(html.contains("License: All rights reserved"));
@@ -479,6 +509,7 @@ mod metadata_extras {
         let lic = ds_core::config::LicenseConfig {
             title: "CC-BY 4.0".into(),
             url: Some("https://example/lic".into()),
+            media_type: None,
         };
         let json = fetch_collection_json_with(Vec::new(), Some(lic)).await;
         let link = json["links"]
@@ -496,6 +527,7 @@ mod metadata_extras {
         let lic = ds_core::config::LicenseConfig {
             title: "Apache-2.0".into(),
             url: None,
+            media_type: None,
         };
         let json = fetch_collection_json_with(Vec::new(), Some(lic)).await;
         let link = json["links"]
@@ -604,10 +636,12 @@ mod conformance {
 
     #[tokio::test]
     async fn omits_map_tilesets_conformance_class() {
-        // We link to map tilesets (tilesets-map rel) but do NOT implement the
-        // Map Tilesets class's /map/tiles endpoints, so the class must not be
-        // declared — that would be a false conformance claim. (Tiles are
-        // served by the standalone OGC API Tiles service.)
+        // The per-API Maps service links map tilesets (tilesets-map rel) in
+        // the separate /tiles service but has no `{map}/tiles` of its own,
+        // which Map Tilesets requires (its tiles-parameters must reach the
+        // map's tiles), so declaring the class here would be a false claim.
+        // The shared OGC API root serves `/collections/{id}/map/tiles` and
+        // declares it there (#946; pinned in server's common_discovery).
         let (_, json) = get("/conformance").await;
         let classes = json["conformsTo"].as_array().unwrap();
         assert!(!classes
@@ -1080,11 +1114,14 @@ mod get_map {
         assert!(body[0] == 0xFF && body[1] == 0xD8);
     }
 
+    /// `bbox` is optional (#945): a bare `/map` is the default map, the
+    /// collection's whole extent (see `mod part1`).
     #[tokio::test]
-    async fn missing_bbox_returns_400() {
-        let (status, json) = get("/collections/radar/map").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(json["code"].is_string());
+    async fn missing_bbox_renders_the_default_map() {
+        let (status, headers, body) = get_raw("/collections/radar/map").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-bbox").unwrap(), "10,55,30,70");
+        assert!(body.starts_with(&[0x89, b'P', b'N', b'G']));
     }
 
     #[tokio::test]
@@ -1375,51 +1412,53 @@ mod get_map {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// Regression for #162: when the engine produces an all-nodata tile,
-    /// the fast path emits PNG bytes without going through the
-    /// format-aware encoder. Before this fix the response carried the
-    /// *requested* Content-Type (e.g. image/jpeg) over PNG bytes,
-    /// breaking decoders that trust the header. Both header and body
-    /// must agree.
+    /// #1091 (and #162 before it): an all-nodata map is encoded in the
+    /// requested `f` at its `quality`, with that Content-Type — never a PNG
+    /// under a JPEG or WebP request. Maps has no background option, so
+    /// JPEG, which has no alpha, is white and WebP stays transparent.
     #[tokio::test]
-    async fn empty_tile_forces_png_content_type_even_when_jpeg_requested() {
+    async fn empty_map_is_encoded_in_the_requested_format() {
+        use ds_render::{encode_jpeg, encode_png, encode_webp};
         let app = build_empty_router();
-        let req = Request::builder()
-            .uri("/collections/empty/map?bbox=10,55,30,70&f=image/jpeg")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let headers = resp.headers().clone();
-        assert_eq!(
-            headers.get("content-type").unwrap(),
-            "image/png",
-            "empty-tile response must self-declare PNG, not the requested image/jpeg"
-        );
-        assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert!(
-            body.starts_with(&[0x89, b'P', b'N', b'G']),
-            "body must be a real PNG, got first bytes {:?}",
-            &body[..4.min(body.len())]
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_tile_forces_png_content_type_even_when_webp_requested() {
-        // Same regression as above, second format for symmetry — WebP
-        // takes a different `ImageFormat::Webp` branch in the cache
-        // key, so this exercises a distinct code path.
-        let app = build_empty_router();
-        let req = Request::builder()
-            .uri("/collections/empty/map?bbox=10,55,30,70&f=image/webp")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let headers = resp.headers().clone();
-        assert_eq!(headers.get("content-type").unwrap(), "image/png");
-        assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
+        let transparent = [0u8, 0, 0, 0].repeat(64 * 48);
+        for (format, quality, expected) in [
+            ("image/jpeg", "", encode_jpeg(&transparent, 64, 48, 85)),
+            (
+                "image/jpeg",
+                "&quality=40",
+                encode_jpeg(&transparent, 64, 48, 40),
+            ),
+            ("image/webp", "", encode_webp(&transparent, 64, 48, 100)),
+            (
+                "image/webp",
+                "&quality=60",
+                encode_webp(&transparent, 64, 48, 60),
+            ),
+            ("image/png", "", encode_png(&transparent, 64, 48)),
+        ] {
+            let uri = format!(
+                "/collections/empty/map?bbox=10,55,30,70&width=64&height=48&f={format}{quality}"
+            );
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let headers = resp.headers().clone();
+            assert_eq!(headers.get("content-type").unwrap(), format, "{uri}");
+            assert_eq!(headers.get("x-cache").unwrap(), "EMPTY", "{uri}");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            match format {
+                "image/jpeg" => assert!(body.starts_with(&[0xFF, 0xD8, 0xFF]), "{uri}"),
+                "image/webp" => {
+                    assert_eq!(&body[..4], b"RIFF", "{uri}");
+                    assert_eq!(&body[8..12], b"WEBP", "{uri}");
+                }
+                _ => assert!(body.starts_with(&[0x89, b'P', b'N', b'G']), "{uri}"),
+            }
+            assert_eq!(body, expected.unwrap(), "{uri}");
+        }
     }
 
     /// Revalidating a cached empty-tile response must round-trip the
@@ -1469,9 +1508,8 @@ mod get_map {
 }
 
 /// Mock engine that returns an all-`None` (all-nodata) `RasterTile`.
-/// Used to exercise the empty-tile fast path that bypasses the
-/// format-aware encoder. The regression test for #162 lives in
-/// `mod get_map` above.
+/// Used to exercise the empty-image fast path that skips colorization.
+/// The regression test for #162 / #1091 lives in `mod get_map` above.
 struct EmptyMockMapEngine;
 
 impl MapEngine for EmptyMockMapEngine {
@@ -1526,9 +1564,12 @@ fn build_empty_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -1657,9 +1698,12 @@ fn build_multi_param_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -2178,9 +2222,12 @@ mod searchable {
                     cap: None,
                     postgis: None,
                     nowcast: None,
+                    station_grid: None,
                     bufr: None,
                     satellite: None,
+                    netcdf: None,
                     preview: None,
+                    derive_wind: None,
                 },
             );
         }
@@ -2626,7 +2673,13 @@ fn param_layer_styles() -> HashMap<String, HashMap<String, StyleInfo>> {
 }
 
 fn build_router_with_styles(styles: HashMap<String, HashMap<String, StyleInfo>>) -> axum::Router {
-    let engine: Arc<dyn MapEngine> = Arc::new(MultiParamMockMapEngine);
+    build_router_with_engine_and_styles(Arc::new(MultiParamMockMapEngine), styles)
+}
+
+fn build_router_with_engine_and_styles(
+    engine: Arc<dyn MapEngine>,
+    styles: HashMap<String, HashMap<String, StyleInfo>>,
+) -> axum::Router {
     let mut engines = HashMap::new();
     engines.insert("radar".to_string(), engine);
 
@@ -2651,9 +2704,12 @@ fn build_router_with_styles(styles: HashMap<String, HashMap<String, StyleInfo>>)
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -2838,6 +2894,293 @@ mod parameter_styles {
             params.iter().any(|p| p["name"] == "parameter-name"),
             "legend must advertise parameter-name; got {params:?}"
         );
+    }
+}
+
+/// #1133: a request without `parameter-name` draws the engine's default
+/// parameter, so it must draw it with that parameter's own style, exactly
+/// as a request naming it, never with the collection-level palette.
+mod default_parameter_styles {
+    use super::*;
+
+    const SIZE: (u32, u32) = (32, 16);
+    const MAP: &str = "/collections/radar/map?bbox=10,55,30,70&width=32&height=16";
+
+    /// [`MultiParamMockMapEngine`] whose default parameter is `T`, the
+    /// parameter [`param_layer_styles`] gives a style layer of its own
+    /// (grayscale over the collection's viridis).
+    struct DefaultTMockMapEngine;
+
+    impl MapEngine for DefaultTMockMapEngine {
+        fn get_raster_tile(
+            &self,
+            bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<chrono::DateTime<chrono::Utc>>,
+            output_crs: &OutputCrs,
+            parameter: Option<&str>,
+            z: Option<f64>,
+            reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            MultiParamMockMapEngine.get_raster_tile(
+                bbox,
+                width,
+                height,
+                time,
+                output_crs,
+                parameter,
+                z,
+                reference_time,
+            )
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                parameter: "T".to_string(),
+                unit: "°C".to_string(),
+                ..MultiParamMockMapEngine.raster_info()
+            }
+        }
+    }
+
+    fn app_with(styles: HashMap<String, HashMap<String, StyleInfo>>) -> axum::Router {
+        build_router_with_engine_and_styles(Arc::new(DefaultTMockMapEngine), styles)
+    }
+
+    fn app() -> axum::Router {
+        app_with(param_layer_styles())
+    }
+
+    /// Status, `x-cache` and body of one request.
+    async fn fetch(app: &axum::Router, uri: &str) -> (StatusCode, String, Vec<u8>) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let x_cache = resp
+            .headers()
+            .get("x-cache")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, x_cache, body)
+    }
+
+    /// The bug: the default `T` drew with the collection's viridis. It now
+    /// draws with its own grayscale, the same image as `parameter-name=T`.
+    #[tokio::test]
+    async fn map_without_parameter_name_draws_the_default_parameter_style() {
+        let (status, _, unnamed) = fetch(&app(), MAP).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, named) = fetch(&app(), &format!("{MAP}&parameter-name=T")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(unnamed, named, "the default parameter draws as when named");
+        assert_eq!(unnamed, reference_png(SIZE.0, SIZE.1, "grayscale"));
+        assert_ne!(unnamed, reference_png(SIZE.0, SIZE.1, "viridis"));
+    }
+
+    /// A named style without `parameter-name` is the default parameter's
+    /// copy of it too.
+    #[tokio::test]
+    async fn styled_map_without_parameter_name_draws_the_default_parameter_style() {
+        let styled = "/collections/radar/styles/alt/map?bbox=10,55,30,70&width=32&height=16";
+        let (status, _, unnamed) = fetch(&app(), styled).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, named) = fetch(&app(), &format!("{styled}&parameter-name=T")).await;
+        assert_eq!(unnamed, named);
+        assert_eq!(unnamed, reference_png(SIZE.0, SIZE.1, "temperature"));
+    }
+
+    /// The rendered cache keys on the resolved style layer and parameter,
+    /// so the two requests share one entry: the second is a hit.
+    #[tokio::test]
+    async fn map_without_parameter_name_shares_the_cache_entry_of_the_named_parameter() {
+        let app = app();
+        let (_, x_cache, unnamed) = fetch(&app, MAP).await;
+        assert_eq!(x_cache, "MISS");
+        let (_, x_cache, named) = fetch(&app, &format!("{MAP}&parameter-name=T")).await;
+        assert_eq!(
+            x_cache, "HIT",
+            "parameter-name=T keys as the unnamed request"
+        );
+        assert_eq!(unnamed, named);
+    }
+
+    /// A style only the collection layer offers stays reachable without
+    /// `parameter-name`, on the collection's palette.
+    #[tokio::test]
+    async fn style_missing_from_the_default_parameter_layer_keeps_the_collection_style() {
+        let mut styles = param_layer_styles();
+        styles.get_mut("radar/T").unwrap().remove("alt");
+        let (status, _, body) = fetch(
+            &app_with(styles),
+            "/collections/radar/styles/alt/map?bbox=10,55,30,70&width=32&height=16",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, reference_png(SIZE.0, SIZE.1, "radar_dbz"));
+    }
+
+    /// The legend without `parameter-name` is the default parameter's
+    /// legend: the palette drawn, not the collection's under its label.
+    #[tokio::test]
+    async fn legend_without_parameter_name_is_the_default_parameter_legend() {
+        let legend = "/collections/radar/styles/default/legend";
+        let (status, _, unnamed) = fetch(&app(), legend).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, named) = fetch(&app(), &format!("{legend}?parameter-name=T")).await;
+        let unnamed: Value = serde_json::from_slice(&unnamed).unwrap();
+        let named: Value = serde_json::from_slice(&named).unwrap();
+        assert_eq!(unnamed, named);
+        assert_eq!(unnamed["parameter"], "T");
+        assert_eq!(unnamed["unit"], "°C");
+        assert_eq!(unnamed["stops"][0]["color"], "#000000", "grayscale");
+
+        let png = format!("{legend}?f=png");
+        let (status, _, unnamed) = fetch(&app(), &png).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, named) = fetch(&app(), &format!("{png}&parameter-name=T")).await;
+        assert_eq!(unnamed, named);
+    }
+
+    /// [`DefaultTMockMapEngine`] with `T` its only parameter.
+    struct SingleTMockMapEngine;
+
+    impl MapEngine for SingleTMockMapEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(ramp_tile(width, height))
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            let mut info = DefaultTMockMapEngine.raster_info();
+            info.parameters.truncate(1);
+            info
+        }
+    }
+
+    /// A single-parameter collection is unchanged: its one layer is the
+    /// collection's, so a request without `parameter-name` draws the
+    /// collection's palette even though the server registered a style
+    /// layer for its parameter, as it does when that parameter matches a
+    /// built-in parameter default.
+    #[tokio::test]
+    async fn single_parameter_collection_keeps_the_collection_style() {
+        let app = build_router_with_engine_and_styles(
+            Arc::new(SingleTMockMapEngine),
+            param_layer_styles(),
+        );
+        let (status, _, body) = fetch(&app, MAP).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, reference_png(SIZE.0, SIZE.1, "viridis"));
+
+        let (status, _, legend) = fetch(&app, "/collections/radar/styles/default/legend").await;
+        assert_eq!(status, StatusCode::OK);
+        let legend: Value = serde_json::from_slice(&legend).unwrap();
+        assert_eq!(legend["stops"][0]["color"], "#440154", "viridis");
+    }
+
+    const T0: &str = "2024-01-01T00:00:00Z";
+    const T1: &str = "2024-01-01T01:00:00Z";
+
+    /// [`DefaultTMockMapEngine`] whose default `T` has a time axis of its
+    /// own, `T0` only, inside the collection's `T0, T1`: `RH` has both.
+    struct DefaultTAxisMockMapEngine;
+
+    impl MapEngine for DefaultTAxisMockMapEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(ramp_tile(width, height))
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            DefaultTMockMapEngine.raster_info()
+        }
+
+        fn parameter_times(&self, parameter: &str) -> Option<Arc<[chrono::DateTime<chrono::Utc>]>> {
+            let times: &[&str] = match parameter {
+                "T" => &[T0],
+                "RH" => &[T0, T1],
+                _ => return None,
+            };
+            Some(times.iter().map(|t| t.parse().unwrap()).collect())
+        }
+
+        /// Latest-not-after on the parameter's own axis; `None` is the
+        /// default `T`, as `get_raster_tile` draws it.
+        fn resolve_parameter_time(
+            &self,
+            parameter: Option<&str>,
+            time: Option<chrono::DateTime<chrono::Utc>>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Option<chrono::DateTime<chrono::Utc>> {
+            let axis = self.parameter_times(parameter.unwrap_or("T"))?;
+            let time = time?;
+            axis.iter().rev().find(|t| **t <= time).copied()
+        }
+    }
+
+    /// Status and `Content-Datetime` of one request.
+    async fn fetch_time(app: &axum::Router, uri: &str) -> (StatusCode, Option<String>) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let datetime = resp
+            .headers()
+            .get("content-datetime")
+            .map(|v| v.to_str().unwrap().to_string());
+        (resp.status(), datetime)
+    }
+
+    /// Without `parameter-name` the time resolves on the default
+    /// parameter's own axis, as with `parameter-name=T`: an omitted
+    /// `datetime` draws `T`'s latest step, and an interval holding only a
+    /// step `T` lacks is the 404 naming `T` gives. It used to select `T1`
+    /// on the collection's axis and draw `T0`, outside the interval.
+    #[tokio::test]
+    async fn map_without_parameter_name_resolves_time_on_the_default_parameter_axis() {
+        let app = build_router_with_engine_and_styles(
+            Arc::new(DefaultTAxisMockMapEngine),
+            param_layer_styles(),
+        );
+        let named = format!("{MAP}&parameter-name=T");
+        assert_eq!(
+            fetch_time(&app, MAP).await,
+            (StatusCode::OK, Some(T0.into()))
+        );
+        assert_eq!(
+            fetch_time(&app, &named).await,
+            (StatusCode::OK, Some(T0.into()))
+        );
+
+        let interval = "&datetime=2024-01-01T00:30:00Z/..";
+        let (named_status, _) = fetch_time(&app, &format!("{named}{interval}")).await;
+        assert_eq!(named_status, StatusCode::NOT_FOUND);
+        let (unnamed_status, _) = fetch_time(&app, &format!("{MAP}{interval}")).await;
+        assert_eq!(unnamed_status, named_status);
     }
 }
 
@@ -3048,6 +3391,35 @@ mod per_parameter_times {
         assert_eq!(status(&app, &URI("b", 1, Some(T2))).await, StatusCode::OK);
         assert!(renders(&engine).len() > rendered);
         assert_eq!(last(&engine), (Some("b".into()), Some(t(T1))));
+    }
+
+    /// A datetime the parameter has nothing for yet resolves to `None` (a
+    /// satellite product before its first scan): the response is revalidated
+    /// rather than pinned `immutable` for a day. A resolved one stays pinned.
+    #[tokio::test]
+    async fn unresolved_datetime_is_not_immutable() {
+        let app = build_router_with_engine(Arc::new(Engine::default()));
+        let cache_control = |uri: String| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                resp.headers()["cache-control"]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let cc = cache_control(URI("a", 0, Some(T1))).await;
+        assert!(cc.contains("immutable"), "{cc}");
+        let cc = cache_control(URI("a", 0, Some("2026-09-25T18:50:00Z"))).await;
+        assert!(
+            cc.contains("must-revalidate") && !cc.contains("immutable"),
+            "{cc}"
+        );
     }
 
     /// Each parameter advertises its own time axis next to the collection's
@@ -3477,9 +3849,12 @@ mod composites {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         };
         let state = Arc::new(ArcSwap::from_pointee(MapsState {
             engines: HashMap::from([("radar".to_string(), engine)]),
@@ -3660,4 +4035,1185 @@ mod composites {
             .unwrap()
             .contains(&serde_json::json!("channels")));
     }
+}
+
+// ---------------------------------------------------------------------------
+// `quality` parameter and `[wms] webp_quality`
+// ---------------------------------------------------------------------------
+
+mod quality {
+    use super::*;
+
+    /// The first RIFF chunk of a WebP body: `VP8L` is lossless.
+    fn webp_chunk(body: &[u8]) -> &[u8] {
+        assert_eq!(&body[..4], b"RIFF", "not a WebP body");
+        &body[12..16]
+    }
+
+    struct Fetched {
+        status: StatusCode,
+        x_cache: String,
+        etag: String,
+        body: Vec<u8>,
+    }
+
+    async fn fetch(app: &axum::Router, query: &str) -> Fetched {
+        let uri = format!(
+            "/collections/radar/map?bbox=10,55,30,70&width=64&height=64\
+             &datetime=2024-01-01T00:00:00Z{query}"
+        );
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default()
+        };
+        let (status, x_cache, etag) = (resp.status(), header("x-cache"), header("etag"));
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        Fetched {
+            status,
+            x_cache,
+            etag,
+            body,
+        }
+    }
+
+    fn app() -> axum::Router {
+        build_router_with_engine(Arc::new(MockMapEngine::new()))
+    }
+
+    #[tokio::test]
+    async fn lossy_and_lossless_webp_never_alias_in_the_cache() {
+        let app = app();
+        let lossless = fetch(&app, "&f=image/webp").await;
+        assert_eq!(lossless.status, StatusCode::OK);
+        assert_eq!(lossless.x_cache, "MISS");
+        assert_eq!(webp_chunk(&lossless.body), b"VP8L", "default is lossless");
+
+        let lossy = fetch(&app, "&f=image/webp&quality=80").await;
+        assert_eq!(lossy.status, StatusCode::OK);
+        assert_eq!(
+            lossy.x_cache, "MISS",
+            "a lossless entry must not serve lossy"
+        );
+        assert_ne!(webp_chunk(&lossy.body), b"VP8L");
+        assert_ne!(lossy.etag, lossless.etag);
+
+        let explicit = fetch(&app, "&f=image/webp&quality=100").await;
+        assert_eq!(explicit.x_cache, "HIT", "100 is the lossless request");
+        assert_eq!(explicit.body, lossless.body);
+        assert_eq!(fetch(&app, "&f=image/webp&quality=80").await.x_cache, "HIT");
+        assert_eq!(
+            fetch(&app, "&f=image/webp&quality=60").await.x_cache,
+            "MISS"
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_webp_quality_is_the_default_and_quality_overrides_it() {
+        let wms: ds_core::config::WmsConfig =
+            serde_json::from_value(serde_json::json!({ "webp_quality": 70 })).unwrap();
+        let configured =
+            build_router_with_engine_and_wms(Arc::new(MockMapEngine::new()), Some(wms));
+        let plain = app();
+        let default = fetch(&configured, "&f=image/webp").await;
+        assert_eq!(default.status, StatusCode::OK);
+        assert_ne!(
+            webp_chunk(&default.body),
+            b"VP8L",
+            "collection default is lossy"
+        );
+        let seventy = fetch(&configured, "&f=image/webp&quality=70").await;
+        assert_eq!(seventy.x_cache, "HIT", "the default is quality 70");
+        let lossless = fetch(&configured, "&f=image/webp&quality=100").await;
+        assert_eq!(lossless.x_cache, "MISS");
+        assert_eq!(
+            webp_chunk(&lossless.body),
+            b"VP8L",
+            "explicit 100 is lossless"
+        );
+        assert_eq!(lossless.body, fetch(&plain, "&f=image/webp").await.body);
+        // JPEG keeps its own default.
+        assert_eq!(
+            fetch(&configured, "&f=image/jpeg").await.body,
+            fetch(&plain, "&f=image/jpeg").await.body
+        );
+    }
+
+    #[tokio::test]
+    async fn quality_sets_the_jpeg_quality() {
+        let app = app();
+        let default = fetch(&app, "&f=image/jpeg").await;
+        assert_eq!(fetch(&app, "&f=image/jpeg&quality=85").await.x_cache, "HIT");
+        let low = fetch(&app, "&f=image/jpeg&quality=20").await;
+        assert_eq!(low.x_cache, "MISS");
+        assert!(low.body.len() < default.body.len());
+    }
+
+    #[tokio::test]
+    async fn bad_quality_is_400_naming_the_range_or_formats() {
+        let app = app();
+        for (query, description) in [
+            (
+                "&f=image/webp&quality=0",
+                "quality '0' must be an integer from 1 to 100",
+            ),
+            (
+                "&f=image/webp&quality=101",
+                "quality '101' must be an integer from 1 to 100",
+            ),
+            (
+                "&f=image/jpeg&quality=4.5",
+                "quality '4.5' must be an integer from 1 to 100",
+            ),
+            (
+                "&f=image/png&quality=80",
+                "quality applies only to image/jpeg and image/webp, not image/png",
+            ),
+            (
+                "&quality=80",
+                "quality applies only to image/jpeg and image/webp, not image/png",
+            ),
+        ] {
+            let resp = fetch(&app, query).await;
+            assert_eq!(resp.status, StatusCode::BAD_REQUEST, "{query}");
+            let json: Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(json["description"], description, "{query}");
+        }
+        // The styled route validates the same way.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/collections/radar/styles/default/map?bbox=10,55,30,70\
+                         &f=image/png&quality=50",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Both map routes declare `quality` (repo rule: every new parameter
+    /// updates `api_definition()`), as a bounded integer.
+    #[tokio::test]
+    async fn quality_is_in_the_api_definition() {
+        let (_, api) = get_on(app(), "/api").await;
+        for path in [
+            "/maps/collections/radar/map",
+            "/maps/collections/radar/styles/{styleId}/map",
+        ] {
+            let parameters = api["paths"][path]["get"]["parameters"].as_array().unwrap();
+            assert!(
+                parameters
+                    .contains(&serde_json::json!({"$ref": "#/components/parameters/quality"})),
+                "{path}"
+            );
+        }
+        let quality = &api["components"]["parameters"]["quality"];
+        assert_eq!(quality["in"], "query");
+        assert_eq!(
+            quality["schema"],
+            serde_json::json!({"type": "integer", "minimum": 1, "maximum": 100})
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OGC API - Maps Part 1 (#945): the default map, `subset`, `center`,
+// `scale-denominator`, CRS parameters and the map response headers
+// ---------------------------------------------------------------------------
+
+mod part1 {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use std::sync::Mutex;
+
+    const T0: &str = "2024-01-01T00:00:00Z";
+    const T1: &str = "2024-01-01T01:00:00Z";
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// What one `get_raster_tile` call was asked for.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Render {
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        output_crs: OutputCrs,
+        time: Option<DateTime<Utc>>,
+    }
+
+    /// Records every render, and snaps a requested time to the latest
+    /// timestep at or before it (the earliest before them all), as the
+    /// radar engines do.
+    struct Recorder {
+        info: RasterInfo,
+        renders: Mutex<Vec<Render>>,
+    }
+
+    impl Recorder {
+        fn new(info: RasterInfo) -> Arc<Self> {
+            Arc::new(Self {
+                info,
+                renders: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn renders(&self) -> Vec<Render> {
+            self.renders.lock().unwrap().clone()
+        }
+
+        fn last(&self) -> Render {
+            self.renders().last().cloned().expect("a render")
+        }
+    }
+
+    impl MapEngine for Recorder {
+        fn get_raster_tile(
+            &self,
+            bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            self.renders.lock().unwrap().push(Render {
+                bbox,
+                width,
+                height,
+                output_crs: output_crs.clone(),
+                time,
+            });
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![Some(0.5); (width * height) as usize].into(),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            self.info.clone()
+        }
+
+        fn resolve_time(
+            &self,
+            time: Option<DateTime<Utc>>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Option<DateTime<Utc>> {
+            let times = &self.info.times;
+            let time = time?;
+            times
+                .iter()
+                .rev()
+                .find(|t| **t <= time)
+                .or(times.first())
+                .copied()
+        }
+    }
+
+    /// The mock collection: extent 10,55,30,70 on a 0.01° grid, two hours.
+    fn radar() -> Arc<Recorder> {
+        Recorder::new(MockMapEngine::make_info())
+    }
+
+    async fn fetch(app: &axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    fn header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name).map(|v| v.to_str().unwrap())
+    }
+
+    /// The width and height in a PNG's IHDR chunk.
+    fn png_size(body: &[u8]) -> (u32, u32) {
+        let be = |b: &[u8]| u32::from_be_bytes(b.try_into().unwrap());
+        (be(&body[16..20]), be(&body[20..24]))
+    }
+
+    fn close(a: [f64; 4], b: [f64; 4]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9)
+    }
+
+    /// A bare `/map`, on both routes: the whole extent, longer side 1024 at
+    /// square pixels, in the storage CRS, at the latest time — and the
+    /// headers saying so (`/req/core/map-op`, `/rec/core/map-op`,
+    /// `/req/core/map-response`).
+    #[tokio::test]
+    async fn bare_map_is_the_default_map() {
+        let app = build_router();
+        for uri in [
+            "/collections/radar/map",
+            "/collections/radar/styles/default/map",
+            "/collections/radar/styles/grayscale/map",
+        ] {
+            let (status, headers, body) = fetch(&app, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(png_size(&body), (1024, 768), "{uri}");
+            assert_eq!(
+                header(&headers, "content-bbox"),
+                Some("10,55,30,70"),
+                "{uri}"
+            );
+            assert_eq!(
+                header(&headers, "content-crs"),
+                Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84"),
+                "{uri}"
+            );
+            assert_eq!(header(&headers, "content-datetime"), Some(T1), "{uri}");
+        }
+    }
+
+    /// One side given: the other keeps square pixels over the area.
+    #[tokio::test]
+    async fn an_omitted_side_keeps_square_pixels() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        let (status, _, _) = fetch(&app, "/collections/radar/map?bbox=10,55,30,60&width=400").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!((engine.last().width, engine.last().height), (400, 100));
+        let (status, _, _) = fetch(&app, "/collections/radar/map?height=300").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!((engine.last().width, engine.last().height), (400, 300));
+    }
+
+    /// `Content-Bbox`, `Content-Crs` and `Content-Datetime` are the same on
+    /// the render, its cache hit and an empty map.
+    #[tokio::test]
+    async fn headers_are_identical_on_a_cache_hit() {
+        let app = build_router();
+        let uri = "/collections/radar/map?bbox=12,56,20,60&datetime=2024-01-01T00:00:00Z&width=64";
+        let (_, miss, _) = fetch(&app, uri).await;
+        let (_, hit, _) = fetch(&app, uri).await;
+        assert_eq!(header(&miss, "x-cache"), Some("MISS"));
+        assert_eq!(header(&hit, "x-cache"), Some("HIT"));
+        for name in ["content-bbox", "content-crs", "content-datetime"] {
+            assert!(miss.get(name).is_some(), "{name}");
+            assert_eq!(miss.get(name), hit.get(name), "{name}");
+        }
+        assert_eq!(header(&miss, "content-bbox"), Some("12,56,20,60"));
+        assert_eq!(header(&miss, "content-datetime"), Some(T0));
+
+        let (status, empty, _) = fetch(
+            &build_empty_router(),
+            "/collections/empty/map?bbox=12,56,20,60",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header(&empty, "x-cache"), Some("EMPTY"));
+        assert_eq!(header(&empty, "content-bbox"), Some("12,56,20,60"));
+    }
+
+    /// `Content-Datetime` is the instant rendered, not the one requested, on
+    /// the render and on the cache hit; a collection without a temporal
+    /// extent sends none.
+    #[tokio::test]
+    async fn content_datetime_is_the_instant_rendered() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        let uri = "/collections/radar/map?bbox=12,56,20,60&width=8&datetime=2024-01-01T00:30:00Z";
+        for x_cache in ["MISS", "HIT"] {
+            let (status, headers, _) = fetch(&app, uri).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(header(&headers, "x-cache"), Some(x_cache));
+            assert_eq!(header(&headers, "content-datetime"), Some(T0), "{x_cache}");
+        }
+        assert_eq!(engine.renders().len(), 1);
+        assert_eq!(engine.last().time, Some(at(T0)));
+
+        let timeless = Recorder::new(RasterInfo {
+            times: Vec::new(),
+            ..MockMapEngine::make_info()
+        });
+        let (status, headers, _) = fetch(
+            &build_router_with_engine(timeless),
+            "/collections/radar/map?width=8",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.get("content-datetime").is_none());
+        assert_eq!(header(&headers, "content-bbox"), Some("10,55,30,70"));
+    }
+
+    /// A spatial `subset` sets the area (repeated or comma-separated), and
+    /// a `time` subset the time.
+    #[tokio::test]
+    async fn subset_selects_the_area_and_time() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        let (status, headers, _) = fetch(
+            &app,
+            "/collections/radar/map?subset=Lon(12:20),Lat(60:65)\
+             &subset=time(%222024-01-01T00:00:00Z%22)",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let render = engine.last();
+        assert_eq!(render.bbox, [12.0, 60.0, 20.0, 65.0]);
+        assert_eq!((render.width, render.height), (1024, 640));
+        assert_eq!(render.time, Some(at(T0)));
+        assert_eq!(header(&headers, "content-bbox"), Some("12,60,20,65"));
+        assert_eq!(header(&headers, "content-datetime"), Some(T0));
+
+        // One axis: the extent on the other; `*` is the extent's edge.
+        let (status, _, _) = fetch(&app, "/collections/radar/map?subset=Lat(60:*)&width=8").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(engine.last().bbox, [10.0, 60.0, 30.0, 70.0]);
+        // The seam test box, crossing the antimeridian.
+        let (status, headers, _) = fetch(
+            &app,
+            "/collections/radar/map?subset=Lon(170:-170)&subset=Lat(10:20)&width=8",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(engine.last().bbox, [170.0, 10.0, 190.0, 20.0]);
+        assert_eq!(header(&headers, "content-bbox"), Some("170,10,-170,20"));
+    }
+
+    /// Time subsets and `datetime` intervals render the latest time inside
+    /// them; nothing inside, or an instant off the axis, is a 404.
+    #[tokio::test]
+    async fn time_intervals_render_their_latest_time() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        for (i, (query, expected)) in [
+            ("subset=time(%222024-01-01%22)", T1),
+            ("subset=time(*)", T1),
+            ("subset=t(*:%222024-01-01T00:59:00Z%22)", T0),
+            (
+                "subset=time(%222024-01-01T00:00:00Z%22:%222024-01-01T00:59:00Z%22)",
+                T0,
+            ),
+            ("datetime=2024-01-01T00:00:00Z/2024-01-01T00:30:00Z", T0),
+            ("datetime=../2024-01-01T00:30:00Z", T0),
+            ("datetime=2024-01-01T00:30:00Z/..", T1),
+            // An instant snaps, as `datetime` always has.
+            ("subset=time(%222024-01-01T00:30:00Z%22)", T0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // A width of its own: a render, never another case's cache hit.
+            let width = 8 + i;
+            let (status, headers, _) = fetch(
+                &app,
+                &format!("/collections/radar/map?width={width}&{query}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            assert_eq!(engine.last().width, width as u32, "{query}");
+            assert_eq!(engine.last().time, Some(at(expected)), "{query}");
+            assert_eq!(
+                header(&headers, "content-datetime"),
+                Some(expected),
+                "{query}"
+            );
+        }
+        let before = engine.renders().len();
+        for query in [
+            "subset=time(%222025-01-01T00:00:00Z%22)",
+            "subset=time(%222024-01-01T00:10:00Z%22:%222024-01-01T00:20:00Z%22)",
+            "subset=time(%222023%22)",
+            "datetime=2024-01-01T00:10:00Z/2024-01-01T00:20:00Z",
+            "subset=Lat(91:95)",
+        ] {
+            let (status, _, _) = fetch(&app, &format!("/collections/radar/map?{query}")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{query}");
+        }
+        assert_eq!(engine.renders().len(), before);
+    }
+
+    /// An axis the routes do not know is a 400 naming the valid ones, not
+    /// ignored (`/req/spatial-subsetting/subset-definition` D,
+    /// `/req/datetime/subset-definition` C).
+    #[tokio::test]
+    async fn unknown_subset_axis_is_400() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        for uri in [
+            "/collections/radar/map?subset=foo(1)",
+            "/collections/radar/styles/default/map?subset=foo(1)",
+            "/collections/radar/map?subset=h(0:100)",
+            "/collections/radar/map?subset=Lat(60:65),foo(1:2)",
+        ] {
+            let (status, json) = get_on(app.clone(), uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert!(
+                json["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("valid axes: Lon, Lat, E, N, time"),
+                "{uri}: {json}"
+            );
+        }
+        assert!(engine.renders().is_empty());
+    }
+
+    /// `center` with `width`/`height` maps that many pixels around it at
+    /// the native resolution (0.01° here), in any `center-crs`.
+    #[tokio::test]
+    async fn center_with_width_and_height() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        let (status, headers, _) = fetch(
+            &app,
+            "/collections/radar/map?center=20,60&width=200&height=100",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let render = engine.last();
+        assert!(
+            close(render.bbox, [19.0, 59.5, 21.0, 60.5]),
+            "{:?}",
+            render.bbox
+        );
+        assert_eq!((render.width, render.height), (200, 100));
+        assert!(header(&headers, "content-bbox").is_some());
+
+        let x = ds_core::web_mercator::lon_to_x(20.0);
+        let y = ds_core::web_mercator::lat_to_y(60.0);
+        let (status, _, _) = fetch(
+            &app,
+            &format!(
+                "/collections/radar/map?center={x},{y}&center-crs=EPSG:3857&width=200&height=100"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            close(engine.last().bbox, [19.0, 59.5, 21.0, 60.5]),
+            "{:?}",
+            engine.last().bbox
+        );
+    }
+
+    /// `scale-denominator` (`/req/scaling/scale-denominator-definition`):
+    /// with an area it sets the size; without one it sets the area around
+    /// `center` or the extent's centre; with an area and a size it is a 400.
+    #[tokio::test]
+    async fn scale_denominator_sets_size_or_area() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        // 1:1 000 000 is 280 m a pixel: 1° of latitude ≈ 397 pixels, 2° of
+        // longitude at 60.5°N ≈ 391.
+        let (status, _, _) = fetch(
+            &app,
+            "/collections/radar/map?bbox=20,60,22,61&scale-denominator=1000000",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let render = engine.last();
+        assert_eq!(render.bbox, [20.0, 60.0, 22.0, 61.0]);
+        assert_eq!(render.height, 397);
+        assert!(render.width.abs_diff(391) <= 1, "{}", render.width);
+
+        // No area: 1024 × 1024 around the extent's centre (20°E, 62.5°N).
+        let (status, headers, _) =
+            fetch(&app, "/collections/radar/map?scale-denominator=1000000").await;
+        assert_eq!(status, StatusCode::OK);
+        let render = engine.last();
+        assert_eq!((render.width, render.height), (1024, 1024));
+        let [w, s, e, n] = render.bbox;
+        assert!(((w + e) / 2.0 - 20.0).abs() < 1e-9 && ((s + n) / 2.0 - 62.5).abs() < 1e-9);
+        assert!(((n - s) - 2.5785).abs() < 1e-3, "{}", n - s);
+        assert!(header(&headers, "content-bbox").is_some());
+
+        // With center and a size: that many pixels at the scale.
+        let (status, _, _) = fetch(
+            &app,
+            "/collections/radar/map?center=20,60&width=100&height=100&scale-denominator=1000000",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let [_, s, _, n] = engine.last().bbox;
+        assert!(((n - s) - 0.2518).abs() < 1e-3, "{}", n - s);
+
+        // A time subset is not an area: it goes with bbox and a size.
+        let (status, _, _) = fetch(
+            &app,
+            "/collections/radar/map?bbox=20,60,22,61&scale-denominator=1000000&subset=time(*)",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let before = engine.renders().len();
+        for uri in [
+            "/collections/radar/map?bbox=20,60,22,61&scale-denominator=1000000&width=100",
+            "/collections/radar/map?subset=Lat(60:61)&scale-denominator=1000000&height=100",
+            // Too fine for the area: the derived size exceeds the cap.
+            "/collections/radar/map?bbox=10,55,30,70&scale-denominator=1000",
+            "/collections/radar/map?scale-denominator=0",
+            "/collections/radar/map?scale-denominator=abc",
+        ] {
+            let (status, _, _) = fetch(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert_eq!(engine.renders().len(), before);
+    }
+
+    /// The combinations Spatial Subsetting and Scaling forbid, and invalid
+    /// values, are 400s that never reach the engine.
+    #[tokio::test]
+    async fn invalid_combinations_are_400() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        for query in [
+            "bbox=10,55,30,70&center=20,60",
+            "bbox=10,55,30,70&subset=Lat(60:65)",
+            "center=20,60&subset=Lon(10:20)",
+            "datetime=2024-01-01T00:00:00Z&subset=time(*)",
+            "subset=Lat(60)",
+            "subset=Lat(65:60)",
+            "subset=Lat(60:65)&subset=Latitude(61:62)",
+            "subset=E(1:2)",
+            "subset=Lat(60:65)&subset-crs=EPSG:9999",
+            "bbox=10,55,30,70&bbox-crs=EPSG:9999",
+            "bbox=10,55,0,30,70,100",
+            "center=20",
+            "center=20,95",
+            "crs=EPSG:9999",
+            "width=0",
+            "width=1.5",
+            "height=9000",
+            "datetime=2024-01-01T02:00:00Z/2024-01-01T01:00:00Z",
+        ] {
+            let (status, json) =
+                get_on(app.clone(), &format!("/collections/radar/map?{query}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {json}");
+            assert_eq!(json["code"], "BadRequest", "{query}");
+        }
+        assert!(engine.renders().is_empty());
+        // Each CRS parameter is ignored without its parameter.
+        for query in [
+            "bbox-crs=EPSG:9999",
+            "center-crs=nope",
+            "subset-crs=nope&subset=time(*)",
+        ] {
+            let (status, _, _) =
+                fetch(&app, &format!("/collections/radar/map?width=8&{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+        }
+    }
+
+    /// CRS parameters take URIs and CURIEs (`/req/crs/crs-definition` D),
+    /// and the output defaults to the storage CRS (`/req/core/map-response`
+    /// B).
+    #[tokio::test]
+    async fn crs_uris_and_the_storage_crs_default() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        let (status, headers, _) = fetch(
+            &app,
+            "/collections/radar/map?bbox=10,55,30,70&width=8\
+             &crs=http://www.opengis.net/def/crs/EPSG/0/3857",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(engine.last().output_crs, OutputCrs::WebMercator);
+        assert_eq!(
+            header(&headers, "content-crs"),
+            Some("http://www.opengis.net/def/crs/EPSG/0/3857")
+        );
+        // Web Mercator metres, easting first.
+        let values: Vec<f64> = header(&headers, "content-bbox")
+            .unwrap()
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        assert!((values[0] - ds_core::web_mercator::lon_to_x(10.0)).abs() < 1e-6);
+        assert!((values[3] - ds_core::web_mercator::lat_to_y(70.0)).abs() < 1e-6);
+
+        // EPSG:4326 renders the same image, its box latitude first.
+        let (status, headers, _) = fetch(
+            &app,
+            "/collections/radar/map?bbox=170,10,-170,20&width=8&crs=[EPSG:4326]",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(engine.last().output_crs, OutputCrs::Wgs84);
+        assert_eq!(header(&headers, "content-bbox"), Some("10,170,20,-170"));
+
+        // A bbox in Web Mercator metres.
+        let (x0, y0) = (
+            ds_core::web_mercator::lon_to_x(12.0),
+            ds_core::web_mercator::lat_to_y(60.0),
+        );
+        let (x1, y1) = (
+            ds_core::web_mercator::lon_to_x(20.0),
+            ds_core::web_mercator::lat_to_y(65.0),
+        );
+        let (status, _, _) = fetch(
+            &app,
+            &format!("/collections/radar/map?bbox={x0},{y0},{x1},{y1}&bbox-crs=EPSG:3857&width=8"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            close(engine.last().bbox, [12.0, 60.0, 20.0, 65.0]),
+            "{:?}",
+            engine.last().bbox
+        );
+
+        // A TM35FIN collection renders in TM35FIN unless asked otherwise.
+        let tm = Recorder::new(RasterInfo {
+            native_crs: "EPSG:3067".into(),
+            ..MockMapEngine::make_info()
+        });
+        let app = build_router_with_engine(tm.clone());
+        let (status, headers, _) = fetch(&app, "/collections/radar/map?width=8").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(matches!(tm.last().output_crs, OutputCrs::Projected { .. }));
+        assert_eq!(
+            header(&headers, "content-crs"),
+            Some("http://www.opengis.net/def/crs/EPSG/0/3067")
+        );
+        let (status, headers, _) = fetch(&app, "/collections/radar/map?width=8&crs=CRS:84").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tm.last().output_crs, OutputCrs::Wgs84);
+        assert_eq!(header(&headers, "content-bbox"), Some("10,55,30,70"));
+    }
+
+    /// The default map of a collection crossing the antimeridian is its
+    /// unwrapped extent, reported back in the crossing form.
+    #[tokio::test]
+    async fn default_map_across_the_antimeridian() {
+        let engine = Recorder::new(RasterInfo {
+            spatial_extent: Some([173.9, 11.2, -174.8, 16.3]),
+            grid_size: None,
+            ..MockMapEngine::make_info()
+        });
+        let app = build_router_with_engine(engine.clone());
+        let (status, headers, _) = fetch(&app, "/collections/radar/map").await;
+        assert_eq!(status, StatusCode::OK);
+        let [w, s, e, n] = engine.last().bbox;
+        assert_eq!([w, s, n], [173.9, 11.2, 16.3]);
+        assert!((e - 185.2).abs() < 1e-9, "{e}");
+        let reported: Vec<f64> = header(&headers, "content-bbox")
+            .unwrap()
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        assert!(close(
+            reported.try_into().unwrap(),
+            [173.9, 11.2, -174.8, 16.3]
+        ));
+        // No extent yet: the default map has no area.
+        let empty = Recorder::new(RasterInfo {
+            spatial_extent: None,
+            ..MockMapEngine::make_info()
+        });
+        let (status, _, _) =
+            fetch(&build_router_with_engine(empty), "/collections/radar/map").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The OpenAPI document is valid OpenAPI 3.0, `bbox` is no longer
+    /// required, and the Spatial Subsetting and Scaling parameters are the
+    /// standard's (#945).
+    #[tokio::test]
+    async fn openapi_declares_the_part1_parameters() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
+        let validator = jsonschema::Validator::new(&schema).unwrap();
+        let (status, doc) = get("/api").await;
+        assert_eq!(status, StatusCode::OK);
+        let errors: Vec<String> = validator
+            .iter_errors(&doc)
+            .map(|e| format!("{e} at {}", e.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        let parameters = &doc["components"]["parameters"];
+        assert_eq!(parameters["bbox"]["required"], false);
+        assert_eq!(parameters["bbox"]["style"], "form");
+        assert_eq!(parameters["bbox"]["explode"], false);
+        assert_eq!(parameters["subset"]["schema"]["type"], "array");
+        assert_eq!(parameters["center"]["schema"]["maxItems"], 2);
+        assert_eq!(parameters["scale-denominator"]["schema"]["type"], "number");
+        assert_eq!(parameters["map-datetime"]["name"], "datetime");
+        for name in ["bbox-crs", "subset-crs", "center-crs", "crs"] {
+            assert_eq!(parameters[name]["schema"]["type"], "string", "{name}");
+        }
+        for path in [
+            "/maps/collections/radar/map",
+            "/maps/collections/radar/styles/{styleId}/map",
+        ] {
+            let operation = &doc["paths"][path]["get"];
+            for name in [
+                "bbox",
+                "subset",
+                "center",
+                "scale-denominator",
+                "map-datetime",
+            ] {
+                assert!(
+                    operation["parameters"].as_array().unwrap().contains(
+                        &serde_json::json!({"$ref": format!("#/components/parameters/{name}")})
+                    ),
+                    "{path}: {name}"
+                );
+            }
+            let headers = &operation["responses"]["200"]["headers"];
+            for name in ["Content-Bbox", "Content-Crs", "Content-Datetime"] {
+                assert!(headers[name].is_object(), "{path}: {name}");
+            }
+        }
+    }
+
+    /// Every surface that serves the Maps routes: the per-API service and
+    /// the shared OGC API root (#789), composed by
+    /// `api_common::shared::router` as the server composes it, whose Maps
+    /// block reuses the same handlers.
+    fn surfaces(engine: Arc<Recorder>) -> [axum::Router; 2] {
+        let state = build_state_with_engine_and_wms(engine, None);
+        let per_api = api_maps::router(state.clone());
+        let shared = api_common::shared::router(api_common::shared::SharedApi::new(
+            "",
+            vec![Arc::new(api_maps::MapsBlock::new(state))],
+            vec![],
+        ));
+        [per_api, shared]
+    }
+
+    /// The map routes on every [`surfaces`] entry, each with the collection
+    /// and a styled map.
+    fn map_surfaces(engine: Arc<Recorder>) -> Vec<(axum::Router, &'static str)> {
+        let mut surfaces = Vec::new();
+        for app in self::surfaces(engine) {
+            for path in [
+                "/collections/radar/map",
+                "/collections/radar/styles/default/map",
+            ] {
+                surfaces.push((app.clone(), path));
+            }
+        }
+        surfaces
+    }
+
+    /// A query parameter the map routes do not take is a 400 naming the
+    /// ones they do, never silently ignored: a misspelt `parameter_name` or
+    /// `heigth` used to render the default map (root CLAUDE.md, #605,
+    /// #954). Cache-busters such as `_` are not tolerated either.
+    #[tokio::test]
+    async fn unknown_parameters_are_400_naming_the_accepted_ones() {
+        let engine = radar();
+        let supported = api_maps::params::MAP_PARAMETERS.join(", ");
+        for (query, name) in [
+            ("parameter_name=t", "parameter_name"),
+            ("width=8&heigth=512", "heigth"),
+            ("_=1700000000000", "_"),
+            ("BBOX=10,55,30,70", "BBOX"),
+            ("reference_time=2024-01-01T00:00:00Z", "reference_time"),
+            ("styles=default&width=8", "styles"),
+        ] {
+            for (app, path) in map_surfaces(engine.clone()) {
+                let uri = format!("{path}?{query}");
+                let (status, json) = get_on(app, &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+                assert_eq!(json["code"], "BadRequest", "{uri}");
+                assert_eq!(
+                    json["description"],
+                    format!("Unknown query parameter '{name}'. Supported: {supported}"),
+                    "{uri}"
+                );
+            }
+        }
+        assert!(engine.renders().is_empty());
+    }
+
+    const LEGEND: &str = "/collections/radar/styles/default/legend";
+
+    /// The legend takes `f` and `parameter-name`; any other parameter is
+    /// the map routes' 400 naming those two, never silently ignored
+    /// (#1073), on the per-API service and the shared root alike.
+    #[tokio::test]
+    async fn legend_unknown_parameters_are_400_naming_the_accepted_ones() {
+        for app in surfaces(radar()) {
+            for (query, name) in [
+                ("width=100", "width"),
+                ("f=png&parameter_name=t", "parameter_name"),
+                ("_=1700000000000", "_"),
+                ("F=png", "F"),
+            ] {
+                let uri = format!("{LEGEND}?{query}");
+                let (status, json) = get_on(app.clone(), &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+                assert_eq!(json["code"], "BadRequest", "{uri}");
+                assert_eq!(
+                    json["description"],
+                    format!("Unknown query parameter '{name}'. Supported: f, parameter-name"),
+                    "{uri}"
+                );
+            }
+            for query in [
+                "",
+                "f=json",
+                "f=png",
+                "parameter-name=reflectivity&f=image/png",
+            ] {
+                let uri = format!("{LEGEND}?{query}");
+                let (status, _, body) = fetch(&app, &uri).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{uri}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        }
+    }
+
+    /// A parameter given twice fails the query extractor before the handler
+    /// runs. It is the JSON 400 every other bad parameter gets, not axum's
+    /// plain text (#1073), on the map and legend routes of every surface.
+    #[tokio::test]
+    async fn repeated_parameters_are_the_json_400() {
+        let engine = radar();
+        let mut requests: Vec<(axum::Router, String, &str)> = map_surfaces(engine.clone())
+            .into_iter()
+            .map(|(app, path)| (app, format!("{path}?width=8&height=8&width=16"), "width"))
+            .collect();
+        for app in surfaces(engine.clone()) {
+            requests.push((app, format!("{LEGEND}?f=png&f=json"), "f"));
+        }
+        for (app, uri, name) in requests {
+            let (status, headers, body) = fetch(&app, &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                header(&headers, "content-type"),
+                Some("application/json"),
+                "{uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["code"], "BadRequest", "{uri}");
+            let description = json["description"].as_str().unwrap();
+            assert!(
+                description.contains(&format!("duplicate field `{name}`")),
+                "{uri}: {description}"
+            );
+        }
+        assert!(engine.renders().is_empty());
+    }
+
+    /// An `f` given twice on a metadata route is the same JSON 400 naming
+    /// it, not axum's plain text (#1121): the landing page, conformance and
+    /// collection of the per-API service, and the shared root's own Common
+    /// routes. `/collections` already rejected it through
+    /// `CollectionRequest`. A single `f` still negotiates.
+    #[tokio::test]
+    async fn repeated_format_on_metadata_routes_is_the_json_400() {
+        for app in surfaces(radar()) {
+            for path in ["/", "/conformance", "/collections", "/collections/radar"] {
+                let uri = format!("{path}?f=json&f=html");
+                let (status, headers, body) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+                assert_eq!(
+                    header(&headers, "content-type"),
+                    Some("application/json"),
+                    "{uri}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["code"], "BadRequest", "{uri}");
+                let description = json["description"].as_str().unwrap();
+                assert!(
+                    description.contains("duplicate field `f`")
+                        || description.contains("Duplicate collection query parameter 'f'"),
+                    "{uri}: {description}"
+                );
+                for f in ["json", "html"] {
+                    let uri = format!("{path}?f={f}");
+                    assert_eq!(fetch(&app, &uri).await.0, StatusCode::OK, "{uri}");
+                }
+            }
+        }
+    }
+
+    /// Every accepted parameter still renders, the workbench's map request
+    /// among them, and `elevation` reaches its own validation rather than
+    /// the unknown-parameter 400.
+    #[tokio::test]
+    async fn known_parameters_still_render() {
+        let engine = radar();
+        for query in [
+            // The workbench's Maps request (api-common workbench/map.js).
+            "bbox=10,55,30,70&bbox-crs=CRS:84&crs=EPSG:3857&width=64&height=48\
+             &f=image/png&transparent=true&datetime=2024-01-01T00:00:00Z",
+            "subset=Lat(60:65)&subset=time(*)&subset-crs=CRS:84&width=8",
+            "center=20,60&center-crs=CRS:84&width=8&height=8&scale-denominator=1000000",
+            "f=image/webp&quality=80&parameter-name=reflectivity&width=8",
+            "",
+        ] {
+            for (app, path) in map_surfaces(engine.clone()) {
+                let uri = format!("{path}?{query}");
+                let (status, _, body) = fetch(&app, &uri).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{uri}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        }
+        for (app, path) in map_surfaces(engine.clone()) {
+            let uri = format!("{path}?elevation=0.5");
+            let (status, json) = get_on(app, &uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            let description = json["description"].as_str().unwrap();
+            assert!(
+                description.contains("no vertical dimension"),
+                "{description}"
+            );
+        }
+    }
+
+    /// The parameters each map and legend operation documents are exactly
+    /// the ones the routes accept.
+    #[tokio::test]
+    async fn openapi_documents_exactly_the_accepted_parameters() {
+        let (status, doc) = get("/api").await;
+        assert_eq!(status, StatusCode::OK);
+        for (path, accepted) in [
+            (
+                "/maps/collections/radar/map",
+                api_maps::params::MAP_PARAMETERS,
+            ),
+            (
+                "/maps/collections/radar/styles/{styleId}/map",
+                api_maps::params::MAP_PARAMETERS,
+            ),
+            (
+                "/maps/collections/radar/styles/{styleId}/legend",
+                api_maps::params::LEGEND_PARAMETERS,
+            ),
+        ] {
+            let query: Vec<&str> = doc["paths"][path]["get"]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|parameter| match parameter["$ref"].as_str() {
+                    Some(r) => {
+                        let id = r.trim_start_matches("#/components/parameters/");
+                        &doc["components"]["parameters"][id]
+                    }
+                    None => parameter,
+                })
+                .filter(|parameter| parameter["in"] == "query")
+                .map(|parameter| parameter["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(query, accepted, "{path}");
+        }
+    }
+}
+
+/// The box and height of each `get_raster_tile` call.
+type RasterRequests = Arc<std::sync::Mutex<Vec<([f64; 4], u32)>>>;
+
+/// Records the box and height of every `get_raster_tile` call, and draws
+/// on every pixel it is asked for, as [`MockMapEngine`] does.
+struct RecordingMapEngine(RasterRequests);
+
+impl MapEngine for RecordingMapEngine {
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        output_crs: &OutputCrs,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        self.0.lock().unwrap().push((bbox, height));
+        MockMapEngine.get_raster_tile(
+            bbox,
+            width,
+            height,
+            time,
+            output_crs,
+            parameter,
+            z,
+            reference_time,
+        )
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        MockMapEngine::make_info()
+    }
+}
+
+/// A CRS84 map reaching past a pole asks the engine only for the rows
+/// whose centres lie inside the CRS, so no engine draws past a pole, and a
+/// map wholly past one is the empty image without an engine read (#1065).
+#[tokio::test]
+async fn map_past_a_pole_asks_the_engine_only_for_rows_inside_the_crs() {
+    let asked = RasterRequests::default();
+    let app = build_router_with_engine(Arc::new(RecordingMapEngine(asked.clone())));
+    let map = |bbox: &str| {
+        let app = app.clone();
+        let uri = format!("/collections/radar/map?bbox={bbox}&width=100&height=100");
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let x_cache = resp
+                .headers()
+                .get("x-cache")
+                .map(|v| v.to_str().unwrap().to_string());
+            (resp.status(), x_cache)
+        }
+    };
+
+    let (status, x_cache) = map("-10,90,10,110").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(x_cache.as_deref(), Some("EMPTY"));
+    assert!(
+        asked.lock().unwrap().is_empty(),
+        "engine asked past the pole"
+    );
+
+    // Rows centred at 99.9°N … 80.1°N: only the southern half is asked for.
+    let (status, x_cache) = map("-10,80,10,100").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(x_cache.as_deref(), Some("MISS"));
+    assert_eq!(
+        asked.lock().unwrap().as_slice(),
+        [([-10.0, 80.0, 10.0, 90.0], 50)]
+    );
 }

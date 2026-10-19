@@ -5,7 +5,8 @@ Internal BUFR decoder derived from [tinybufr 0.1.3](https://crates.io/crates/tin
 MIT OR Apache-2.0 licenses retained here. Source copied from the published
 0.1.3 crate; its `.cargo_vcs_info.json` records commit
 `9108eada5c73c866efaabf794c8da390966bc8c0` with `dirty: true`, so the published
-crate archive is the authoritative baseline. Generated WMO tables are unchanged.
+crate archive is the authoritative baseline. Generated WMO tables are unchanged;
+`src/tables/corrections.rs` overlays the Table D entries they got wrong (#1008).
 Unused Arrow integration/examples and upstream development dependencies are omitted.
 The upstream JMA local-table module is retained behind the optional `jma` feature
 for provenance; no workspace crate enables it or installs those tables. It does
@@ -25,8 +26,29 @@ Local changes for #693:
 - Bound reads to section 4; reject truncated delayed replication descriptors.
 - Clone master tables for engine-owned centre/version-specific local registries.
 
+Local changes for #1008, each found in live WIS2 SYNOP messages:
+
+- Compressed delayed replication factors are compressed like elements: read
+  the six-bit increment width after the factor (and require zero increments,
+  one shared structure). Reading only the factor shifted the rest by six bits.
+- Operator 204 (associated fields): every element except class 31 is preceded
+  by the summed associated width; compressed like a numeric element. The value
+  is consumed, not surfaced.
+- Operator 203 (change reference values) in uncompressed data: element
+  descriptors between `203YYY` and `203255` read YYY-bit sign-and-magnitude
+  references applied until `203000`. Compressed 203 stays unsupported.
+- Strings: all-ones up to a NUL padding is missing (as ecCodes reads it);
+  bytes that are not UTF-8 become U+FFFD instead of failing the message.
+- Table D: 307083 had lost its leading `301090 302031` and 307082 was absent;
+  `tables/corrections.rs` restores both as ecCodes defines them for master
+  versions 7–45. Other WMO sequences absent from the generated table
+  (304035, 306020, 306024, 309030, 310027 and those added after it) are not
+  SYNOP and remain absent.
+- Descriptor errors name the descriptor as `FXXYYY` on one line.
+
 The engine-facing boundary remains `engine-bufr/src/decode.rs`. This is not a
-complete BUFR implementation: operators 203/204/207/22x remain unsupported.
+complete BUFR implementation: operators 207/22x and 203 in compressed data
+remain unsupported.
 Operator 206 is accepted only when the following local descriptor has a known
 Table B entry: decoding uses that entry's width. Skipping unknown local fields
 using the 206 width is unsupported; descriptor resolution rejects them before

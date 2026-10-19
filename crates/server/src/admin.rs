@@ -376,6 +376,15 @@ static COLLECTIONS_FAILED: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+// Freshness per collection (#1007): `/health`'s `data_age_secs`, set each
+// scrape by `refresh_data_age_gauge` from the same `collection_data_ages`.
+static COLLECTION_DATA_AGE_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "collection_data_age_seconds",
+        "Seconds since the newest data a collection serves (its /health data_age_secs)",
+    )
+});
+
 static HTTP_RESPONSE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
@@ -466,6 +475,38 @@ static SATELLITE_FRAME_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|
     )
 });
 
+// Whether each satellite collection's time window is held in the scan cache:
+// the poll keeps it resident while every window fits
+// MC_SATELLITE_FRAME_CACHE_MB, so resident below window means requests
+// download scans. Set per scrape from the live engines, reset first so a
+// removed collection's series goes too.
+fn collection_gauge(name: &str, help: &str) -> IntGaugeVec {
+    let gauge = IntGaugeVec::new(Opts::new(name, help), &["collection"]).unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+}
+
+static SATELLITE_FRAME_WINDOW_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "satellite_frame_window_bytes",
+        "Bytes of the scans in a satellite collection's time window",
+    )
+});
+
+static SATELLITE_FRAME_WINDOW_RESIDENT_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "satellite_frame_window_resident_bytes",
+        "Bytes of the scans in a satellite collection's time window held in the scan cache",
+    )
+});
+
+static SATELLITE_FRAME_REINGESTS: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "satellite_frame_reingests_total",
+        "Satellite scans downloaded again by a poll after the scan cache evicted them",
+    )
+});
+
 static SATELLITE_STRIP_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
     CacheMetricSet::new(
         "satellite_strip_cache",
@@ -505,6 +546,99 @@ static GEOTIFF_DECODE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
     )
 });
 
+// NetCDF decoded-field cache and field-read admission (#1067), process-global
+// like the GeoTIFF ones.
+static NETCDF_FIELD_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "netcdf_field_cache",
+        "NetCDF decoded-field cache",
+        None,
+        Some("field reads"),
+        false,
+    )
+});
+static NETCDF_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "netcdf_read_reserved_bytes",
+        "Reserved transient NetCDF field-read memory",
+    )
+});
+static NETCDF_READ_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "netcdf_read_capacity_bytes",
+        "Transient NetCDF field-read memory capacity",
+    )
+});
+static NETCDF_READ_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "netcdf_read_rejected_total",
+        "NetCDF field reads rejected by memory admission",
+    )
+});
+// Remote NetCDF files read by HTTP range (#1067 PR 5): the metadata-block and
+// compressed-chunk caches under the reader, the field fills detached from
+// the requests that started them, and the per-host request limit.
+static NETCDF_BLOCK_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "netcdf_block_cache",
+        "NetCDF remote metadata-block cache",
+        None,
+        Some("block GETs"),
+        false,
+    )
+});
+static NETCDF_CHUNK_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "netcdf_chunk_cache",
+        "NetCDF remote compressed-chunk cache",
+        None,
+        Some("chunk GETs"),
+        false,
+    )
+});
+static NETCDF_DETACHED_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "netcdf_detached_fills_pending",
+        "Remote NetCDF field fills running detached from the request that started them",
+    )
+});
+static NETCDF_DETACHED_TOTAL: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "netcdf_detached_fills_total",
+        "Remote NetCDF field fills detached from their request",
+    )
+});
+static NETCDF_DETACHED_INLINE: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "netcdf_detached_fills_inline_total",
+        "Remote NetCDF field fills run inline because the detached ones were at their cap",
+    )
+});
+// One series per configured remote host: a bounded label set.
+fn host_gauge(name: &str, help: &str) -> IntGaugeVec {
+    let gauge = IntGaugeVec::new(Opts::new(name, help), &["host"]).unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+}
+static STORAGE_HOST_REQUESTS_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    host_gauge(
+        "storage_host_requests_in_flight",
+        "Requests holding one of a remote host's request permits",
+    )
+});
+static STORAGE_HOST_REQUESTS_QUEUED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    host_gauge(
+        "storage_host_requests_queued",
+        "Requests waiting for one of a remote host's request permits",
+    )
+});
+static STORAGE_HOST_REQUEST_LIMIT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    host_gauge(
+        "storage_host_request_limit",
+        "Requests a remote host allows in flight at once",
+    )
+});
+
 // Lightning strike-window cache (#504) — process-global, byte-bounded LRU of
 // decoded event windows for the events-shape map layer, so the ~50-190
 // meta-tile renders tiling one frame share ONE DB fetch.
@@ -514,6 +648,19 @@ static LIGHTNING_STRIKE_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(
         "Lightning strike-window cache",
         Some("events map layers"),
         Some("window DB fetches"),
+        false,
+    )
+});
+
+// Station-frame cache (#1063) — process-global, byte-bounded LRU of the
+// station map layers' decoded frames, so the meta-tiles of one frame share
+// ONE DB fetch.
+static STATION_FRAME_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "station_frame_cache",
+        "Station map frame cache",
+        Some("station map layers"),
+        Some("frame DB fetches"),
         false,
     )
 });
@@ -536,6 +683,14 @@ static POSTGIS_UP: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     pg_int_gauge(
         "postgis_up",
         "1 if the PostGIS collection's DB is reachable (latest 30s SELECT 1 ping), else 0",
+        &["collection"],
+    )
+});
+static POSTGIS_LOCATIONS_TRUNCATED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "postgis_locations_truncated",
+        "1 if [postgis] max_locations cut the PostGIS collection's cached station list, or in \
+         mode B the station registry it is enriched from (/health degraded), else 0",
         &["collection"],
     )
 });
@@ -766,8 +921,9 @@ static BUFR_REPORTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 static BUFR_DECODE_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     pg_int_counter(
         "bufr_decode_failures_total",
-        "BUFR payloads that could not be decoded, by reason (error, unsupported)",
-        &["collection", "reason"],
+        "BUFR messages that could not be decoded, by reason (error, unsupported) and kind \
+         (not_bufr, truncated, unknown_descriptor, invalid, unsupported)",
+        &["collection", "reason", "kind"],
     )
 });
 
@@ -877,7 +1033,7 @@ static PVOL_PIXEL_CACHE_INSERTS: LazyLock<DeltaCounter> = LazyLock::new(|| {
 static PVOL_PIXEL_READ_FAILURES: LazyLock<DeltaCounter> = LazyLock::new(|| {
     DeltaCounter::new(
         "pvol_pixel_read_failures_total",
-        "PVOL lazy pixel reads that failed (I/O or decode) and degraded to nodata",
+        "PVOL lazy pixel reads that found no usable data (missing file, decode failure) and degraded to nodata; deadline and transient storage failures fail the request instead and are not counted",
     )
 });
 
@@ -1136,8 +1292,92 @@ struct CacheCounterState {
     /// evicted valid).
     cap: HashMap<String, [u64; 8]>,
     /// BUFR engine counters per collection (`Health::counters` order).
-    bufr: HashMap<String, [u64; 9]>,
+    bufr: HashMap<String, [u64; engine_bufr::health::COUNTERS]>,
+    /// Station-grid per-collection `[analyses, failures]` (#1082).
+    station_grid: HashMap<String, [u64; 2]>,
 }
+
+// Station grids (#1082): the stations behind the latest analysis is the
+// first thing to check when one looks wrong.
+static STATION_GRID_STATIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "station_grid_stations",
+            "Stations the latest analysis of a station-grid parameter was computed from",
+        ),
+        &["collection", "parameter"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static STATION_GRID_ANALYSES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "station_grid_analyses_total",
+            "Station-grid analyses computed (request misses and pre-computes)",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static STATION_GRID_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "station_grid_failures_total",
+            "Station-grid analyses and source reads that failed",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static STATION_GRID_LAST_ANALYSIS_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "station_grid_last_analysis_ms",
+            "Wall-clock duration of the most recent station-grid analysis",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static STATION_GRID_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "station_grid_cache",
+        "station-grid analysis cache",
+        None,
+        None,
+        false,
+    )
+});
+static STATION_GRID_COMPUTE_USED: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "station_grid_compute_reserved_bytes",
+        "Bytes reserved by station-grid analyses being computed",
+    )
+});
+static STATION_GRID_COMPUTE_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "station_grid_compute_capacity_bytes",
+        "Station-grid computation admission capacity",
+    )
+});
+static STATION_GRID_COMPUTE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "station_grid_compute_rejected_total",
+        "Station-grid analyses rejected by computation memory admission",
+    )
+});
 
 static NOWCAST_CELL_BIRTHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -1448,12 +1688,17 @@ pub struct ServerState {
     pub grib_engines: RwLock<Vec<Arc<engine_grib::GribEngine>>>,
     pub zarr_engines: RwLock<Vec<Arc<engine_zarr::ZarrEngine>>>,
     pub satellite_engines: RwLock<Vec<Arc<engine_satellite::SatelliteEngine>>>,
+    pub netcdf_engines: RwLock<Vec<Arc<engine_netcdf::NetcdfEngine>>>,
+    /// The parameters each NetCDF collection's layer styles were resolved
+    /// for ([`LoadResult::netcdf_parameters`]).
+    pub netcdf_parameters: RwLock<NetcdfParameters>,
     pub odim_engines: RwLock<Vec<Arc<engine_odim::OdimEngine>>>,
     pub odim_volume_engines: RwLock<Vec<Arc<engine_odim::PolarVolumeEngine>>>,
     pub cap_engines: RwLock<Vec<Arc<engine_cap::CapEngine>>>,
     pub bufr_engines: RwLock<Vec<Arc<engine_bufr::BufrEngine>>>,
     pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
     pub nowcast_engines: RwLock<Vec<Arc<engine_nowcast::NowcastEngine>>>,
+    pub station_grid_engines: RwLock<Vec<Arc<engine_station_grid::StationGridEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
     pub reload_lock: tokio::sync::Mutex<()>,
     /// Bearer token for admin endpoint authentication.
@@ -1479,6 +1724,9 @@ pub struct ServerState {
     /// Live poll-loop engines by collection id — the reuse pool the next
     /// incremental reload draws from (#574).
     pub engine_handles: RwLock<HashMap<String, EngineHandle>>,
+    /// Live derived-wind wrappers (#897), keyed like
+    /// [`LoadResult::wind_by_id`]: a reused engine keeps its wrapper.
+    pub wind_handles: RwLock<WindHandles>,
 }
 
 pub type AdminState = Arc<ServerState>;
@@ -1500,6 +1748,13 @@ pub struct LoadResult {
     pub grib_engines: Vec<Arc<engine_grib::GribEngine>>,
     pub zarr_engines: Vec<Arc<engine_zarr::ZarrEngine>>,
     pub satellite_engines: Vec<Arc<engine_satellite::SatelliteEngine>>,
+    pub netcdf_engines: Vec<Arc<engine_netcdf::NetcdfEngine>>,
+    /// The parameters each NetCDF collection's layer styles were resolved
+    /// for, by collection id. Its layers come from its files, which only
+    /// the poll reads, so a fresh engine has none at load; the recovery loop
+    /// registers the collection again once they differ
+    /// ([`netcdf_registration_changed`]).
+    pub netcdf_parameters: NetcdfParameters,
     pub odim_engines: Vec<Arc<engine_odim::OdimEngine>>,
     pub odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>>,
     pub cap_engines: Vec<Arc<engine_cap::CapEngine>>,
@@ -1507,10 +1762,20 @@ pub struct LoadResult {
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
     pub nowcast_engines: Vec<Arc<engine_nowcast::NowcastEngine>>,
     nowcast_dependency_updates: Vec<engine_nowcast::engine::DependencyUpdate>,
+    pub station_grid_engines: Vec<Arc<engine_station_grid::StationGridEngine>>,
     /// Every successfully built (or reused) poll-loop engine, keyed by
     /// collection id — the reuse pool for the NEXT incremental reload (#574).
     pub engines_by_id: HashMap<String, EngineHandle>,
+    /// Every derived-wind wrapper (#897) by configured collection id, then
+    /// by registered id (a GRIB source registers one per level family).
+    pub wind_by_id: WindHandles,
 }
+
+/// Derived-wind wrappers by configured collection id, then registered id.
+pub type WindHandles = HashMap<String, HashMap<String, Arc<ds_core::wind::DerivedWind>>>;
+
+/// Parameters by NetCDF collection id ([`LoadResult::netcdf_parameters`]).
+pub type NetcdfParameters = HashMap<String, Vec<ds_core::map_engine::ParameterInfo>>;
 
 impl LoadResult {
     /// Staging a load must not mutate live engines: call only after the reload
@@ -1551,12 +1816,56 @@ pub enum EngineHandle {
     Grib(Arc<engine_grib::GribEngine>),
     Zarr(Arc<engine_zarr::ZarrEngine>),
     Satellite(Arc<engine_satellite::SatelliteEngine>),
+    Netcdf(Arc<engine_netcdf::NetcdfEngine>),
     Odim(Arc<engine_odim::OdimEngine>),
     OdimVolume(Arc<engine_odim::PolarVolumeEngine>),
     Cap(Arc<engine_cap::CapEngine>),
     Bufr(Arc<engine_bufr::BufrEngine>),
     Postgis(Arc<engine_postgis::PostgisEngine>),
     Nowcast(Arc<engine_nowcast::NowcastEngine>),
+    StationGrid(Arc<engine_station_grid::StationGridEngine>),
+}
+
+impl EngineHandle {
+    /// The station collection a station-grid collection may grid (#1082):
+    /// the `EdrEngine` of a CSV, BUFR or PostGIS stations collection,
+    /// whichever APIs it lists. `None` for every other engine.
+    fn station_source(&self) -> Option<Arc<dyn ds_core::edr_engine::EdrEngine>> {
+        match self {
+            Self::Csv(e) => Some(e.clone()),
+            Self::Bufr(e) => Some(e.clone()),
+            Self::Postgis(e) if e.config().events().is_none() => Some(e.clone()),
+            _ => None,
+        }
+    }
+
+    /// The `FeatureEngine` that serves this collection's EDR `items` query
+    /// (#928): the engine behind its `EdrEngine`, for the engines that
+    /// implement both over one collection. `None` for engines without
+    /// features or without EDR, and where the features are another resource:
+    /// a PVOL network's site inventory (its EDR collections are per-site
+    /// views) and the PostGIS events shape, whose events are not features
+    /// yet (#503).
+    fn edr_items_engine(&self) -> Option<Arc<dyn ds_core::feature_engine::FeatureEngine>> {
+        match self {
+            Self::Csv(e) => Some(e.clone()),
+            Self::Bufr(e) => Some(e.clone()),
+            Self::Nowcast(e) => Some(e.clone()),
+            Self::Postgis(e) if e.config().events().is_none() => Some(e.clone()),
+            Self::Postgis(_)
+            | Self::OdimVolume(_)
+            | Self::Cap(_)
+            | Self::Geojson(_)
+            | Self::Geotiff(_)
+            | Self::QueryData(_)
+            | Self::Grib(_)
+            | Self::Zarr(_)
+            | Self::Satellite(_)
+            | Self::Netcdf(_)
+            | Self::Odim(_)
+            | Self::StationGrid(_) => None,
+        }
+    }
 }
 
 /// Live engines an incremental reload may reuse, keyed by collection id.
@@ -1567,6 +1876,10 @@ pub enum EngineHandle {
 #[derive(Default)]
 pub struct EngineReuse {
     pub engines: HashMap<String, EngineHandle>,
+    /// The derived-wind wrappers of those engines (#897). A reused engine
+    /// keeps them: the registered `Arc` stays the same (a nowcast's source
+    /// identity), and the once-per-pair load log is not repeated.
+    pub wind: WindHandles,
 }
 
 macro_rules! reuse_take {
@@ -1590,12 +1903,18 @@ impl EngineReuse {
     reuse_take!(take_grib, Grib, engine_grib::GribEngine);
     reuse_take!(take_zarr, Zarr, engine_zarr::ZarrEngine);
     reuse_take!(take_satellite, Satellite, engine_satellite::SatelliteEngine);
+    reuse_take!(take_netcdf, Netcdf, engine_netcdf::NetcdfEngine);
     reuse_take!(take_odim, Odim, engine_odim::OdimEngine);
     reuse_take!(take_odim_volume, OdimVolume, engine_odim::PolarVolumeEngine);
     reuse_take!(take_cap, Cap, engine_cap::CapEngine);
     reuse_take!(take_bufr, Bufr, engine_bufr::BufrEngine);
     reuse_take!(take_postgis, Postgis, engine_postgis::PostgisEngine);
     reuse_take!(take_nowcast, Nowcast, engine_nowcast::NowcastEngine);
+    reuse_take!(
+        take_station_grid,
+        StationGrid,
+        engine_station_grid::StationGridEngine
+    );
 }
 
 /// Decide which collections of the NEW config may reuse their live engine
@@ -1626,7 +1945,12 @@ pub(crate) fn reusable_collections(
         |c: &CollectionConfig| old.get(&c.id).is_some_and(|o| o == c) && live.contains_key(&c.id);
     let base: std::collections::HashSet<String> = new
         .iter()
-        .filter(|c| !matches!(c.engine_type.as_str(), "nowcast" | "csv" | "geojson"))
+        .filter(|c| {
+            !matches!(
+                c.engine_type.as_str(),
+                "nowcast" | "csv" | "geojson" | "station-grid"
+            )
+        })
         .filter(|c| unchanged(c))
         .map(|c| c.id.clone())
         .collect();
@@ -1641,6 +1965,17 @@ pub(crate) fn reusable_collections(
         // Only raster provenance gates reuse. Auxiliary references are staged
         // after validating ALL named dependencies against the new base registries.
         if base.contains(&nc.source) {
+            out.insert(c.id.clone());
+        }
+    }
+    // A station grid keeps its engine only with its station source's: a
+    // rebuilt source (a CSV always is) is a new `Arc` the grid must read.
+    for c in new.iter().filter(|c| c.engine_type == "station-grid") {
+        if unchanged(c)
+            && c.station_grid
+                .as_ref()
+                .is_some_and(|g| base.contains(&g.source))
+        {
             out.insert(c.id.clone());
         }
     }
@@ -1698,6 +2033,101 @@ fn render_concurrency_reload_warning(configured: Option<usize>) -> Option<String
     })
 }
 
+/// The engine state store (#1000), fixed at boot by [`init_state_store`]:
+/// the `[server] state_dir` it was built from and the store itself. Unset
+/// (tests, a config without it) means no engine persistence.
+struct StateBackend {
+    dir: Option<std::path::PathBuf>,
+    store: Option<Arc<dyn ds_core::state::StateStore>>,
+}
+
+static STATE: std::sync::OnceLock<StateBackend> = std::sync::OnceLock::new();
+
+/// Temp files a crash mid-save left in the state directory are removed at
+/// boot once they are this old (a live save never is).
+const STATE_STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Build the process-wide engine state store (#1000): today the file
+/// backend over `[server] state_dir`. Another backend would be chosen here,
+/// by a `[server]` key of its own; engines only ever see the
+/// `Arc<dyn StateStore>` that [`state_store`] hands out. Boot calls this
+/// before the first [`load_collections`]; a reload cannot replace it (the
+/// engines it would rebuild could not restore what the live ones wrote
+/// elsewhere). A directory that cannot be created is a WARN, not a boot
+/// failure: persistence is best effort, and each failed write warns again
+/// (rate-limited).
+pub fn init_state_store(dir: Option<std::path::PathBuf>) {
+    let store = dir.as_ref().map(|d| {
+        let file = ds_core::state::FileStateStore::new(d);
+        match file.prepare(STATE_STALE_TEMP_AGE) {
+            Ok(removed) => info!(
+                "State directory: {} (engine snapshots; restart to change){}",
+                d.display(),
+                if removed > 0 {
+                    format!(", removed {removed} stale temp file(s)")
+                } else {
+                    String::new()
+                }
+            ),
+            Err(e) => tracing::warn!(
+                "[server] state_dir '{}' cannot be created: {e} — snapshot writes will \
+                 fail until it is writable",
+                d.display()
+            ),
+        }
+        Arc::new(file) as Arc<dyn ds_core::state::StateStore>
+    });
+    if STATE.set(StateBackend { dir, store }).is_err() {
+        tracing::warn!("[server] state store was already initialised; keeping the first one");
+    }
+}
+
+/// The boot-time engine state store, if any.
+pub(crate) fn state_store() -> Option<Arc<dyn ds_core::state::StateStore>> {
+    STATE.get().and_then(|s| s.store.clone())
+}
+
+/// The boot-time `[server] state_dir`, if any.
+fn state_dir() -> Option<&'static std::path::Path> {
+    STATE.get().and_then(|s| s.dir.as_deref())
+}
+
+/// A reload re-reads `[server] state_dir` but cannot move it: the restart
+/// warning to log when the reloaded value differs from the live one.
+fn state_dir_reload_warning(
+    live: Option<&std::path::Path>,
+    wanted: Option<&std::path::Path>,
+) -> Option<String> {
+    (live != wanted).then(|| {
+        let show = |d: Option<&std::path::Path>| {
+            d.map_or_else(|| "unset".to_string(), |d| format!("'{}'", d.display()))
+        };
+        format!(
+            "[server] state_dir now resolves to {}, but a reload cannot move the live state \
+             directory ({}); restart to apply",
+            show(wanted),
+            show(live)
+        )
+    })
+}
+
+/// The page of a per-site radar collection, as a path below the base URL:
+/// for its 3D Tiles collection (#1137) and for the site's feature in the
+/// network's site inventory (#1143). On the shared OGC API root (mounted at
+/// the server root, `SharedApi::new("")` in `main.rs`) when Maps or Tiles
+/// serve the collection, else EDR's. `None` when neither does: WMS has no
+/// collection page, and a PVOL site never enters the Features registry.
+fn volume_collection_page(id: &str, shared_root: bool, edr: bool) -> Option<String> {
+    let mount = if shared_root {
+        ""
+    } else if edr {
+        api_common::mounts::EDR
+    } else {
+        return None;
+    };
+    Some(format!("{mount}/collections/{id}"))
+}
+
 #[allow(clippy::too_many_arguments)] // config + style inputs + the two reload reuse pools are all distinct concerns
 pub fn load_collections(
     style_ctx: &ds_render::StyleContext,
@@ -1724,6 +2154,11 @@ pub fn load_collections(
         HashMap::new();
     let mut feature_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut map_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> = HashMap::new();
+    // The EDR engines answering WMS GetFeatureInfo (#1064), for every WMS
+    // collection whose engine answers position queries, whether or not it
+    // lists `edr`.
+    let mut wms_point_engines: HashMap<String, Arc<dyn ds_core::edr_engine::EdrEngine>> =
+        HashMap::new();
     let mut map_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut map_styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = HashMap::new();
     let mut maps_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> = HashMap::new();
@@ -1747,11 +2182,20 @@ pub fn load_collections(
     let mut volume_engines: HashMap<String, Arc<dyn ds_core::volume::VolumeEngine>> =
         HashMap::new();
     let mut volume_collections: HashMap<String, CollectionConfig> = HashMap::new();
+    // How each 3D Tiles quantity is drawn: its parameter layer's default
+    // style, keyed by collection id (#1137).
+    let mut volume_quantity_styles: HashMap<String, api_3dtiles::QuantityStyles> = HashMap::new();
+    // Each 3D Tiles collection's HTML page in another API (#1137).
+    let mut volume_collection_pages: HashMap<String, String> = HashMap::new();
+    // Pages of the collections a feature links to as related (#1143).
+    let mut feature_collection_pages: HashMap<String, String> = HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
     let mut zarr_engines: Vec<Arc<engine_zarr::ZarrEngine>> = Vec::new();
     let mut satellite_engines: Vec<Arc<engine_satellite::SatelliteEngine>> = Vec::new();
+    let mut netcdf_engines: Vec<Arc<engine_netcdf::NetcdfEngine>> = Vec::new();
+    let mut netcdf_parameters: NetcdfParameters = HashMap::new();
     let mut odim_engines: Vec<Arc<engine_odim::OdimEngine>> = Vec::new();
     let mut odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>> = Vec::new();
     let mut cap_engines: Vec<Arc<engine_cap::CapEngine>> = Vec::new();
@@ -1765,6 +2209,8 @@ pub fn load_collections(
     // Derived collections wire in a second pass, after every base engine
     // exists (#522). Collected here during the main loop.
     let mut nowcast_pending: Vec<&CollectionConfig> = Vec::new();
+    let mut station_grid_pending: Vec<&CollectionConfig> = Vec::new();
+    let mut station_grid_engines: Vec<Arc<engine_station_grid::StationGridEngine>> = Vec::new();
     // Pool registry is local to this load: collections sharing a DSN share a
     // pool via Arc<Pool>. Seed it with the pools of every REUSED postgis
     // engine (#574) so a rebuilt collection on a shared DSN joins the live
@@ -1788,6 +2234,7 @@ pub fn load_collections(
     // Reuse pool for the NEXT reload: every poll-loop engine that made it
     // into this load, whether freshly built or taken from `engine_reuse`.
     let mut engines_by_id: HashMap<String, EngineHandle> = HashMap::new();
+    let mut wind_by_id: WindHandles = HashMap::new();
     let mut nowcast_dependency_updates = Vec::new();
 
     for collection in collections {
@@ -1809,12 +2256,14 @@ pub fn load_collections(
             "grib" => &["edr", "wms", "maps", "tiles"],
             "zarr" => &["edr", "wms", "maps", "tiles"],
             "satellite" => &["edr", "wms", "maps", "tiles"],
+            "netcdf" => &["edr", "wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
             "bufr" => &["edr", "features"],
             "postgis" => &["edr", "features", "tiles", "wms", "maps"],
             "nowcast" => &["wms", "maps", "tiles", "features", "edr"],
+            "station-grid" => &["wms", "maps", "tiles", "edr"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -2062,6 +2511,11 @@ pub fn load_collections(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                    );
                     map_collections.insert(collection.id.clone(), collection.clone());
 
                     map_styles.extend(collection_layer_styles(
@@ -2151,8 +2605,10 @@ pub fn load_collections(
                 let poll_secs = qd_config.map_or(30, |c| c.poll_interval_secs);
                 let max_runs = qd_config.map_or(4, |c| c.max_runs);
 
+                let mut reused_engine = false;
                 let engine = match engine_reuse.take_querydata(&collection.id) {
                     Some(e) => {
+                        reused_engine = true;
                         info!(
                             "Collection '{}': config unchanged — reusing live engine",
                             collection.id
@@ -2190,15 +2646,21 @@ pub fn load_collections(
 
                 querydata_engines.push(engine.clone());
 
+                let (map_engine, edr_engine) = wind_wrapped(
+                    &collection.id,
+                    collection,
+                    &engine,
+                    reused_engine,
+                    &mut engine_reuse,
+                    &mut wind_by_id,
+                );
+
                 // Get parameter list for per-parameter-layer styles
-                let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                let raster_info = map_engine.raster_info();
                 let raster_params = raster_info.parameters;
 
                 if collection.apis.contains(&"edr".to_string()) {
-                    edr_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
-                    );
+                    edr_engines.insert(collection.id.clone(), edr_engine.clone());
                     edr_collections.insert(collection.id.clone(), collection.clone());
                     edr_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2210,9 +2672,11 @@ pub fn load_collections(
                 }
 
                 if collection.apis.contains(&"wms".to_string()) {
-                    map_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    map_engines.insert(collection.id.clone(), map_engine.clone());
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        edr_engine.clone(),
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
@@ -2225,10 +2689,7 @@ pub fn load_collections(
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
                 if collection.apis.contains(&"maps".to_string()) {
-                    maps_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
+                    maps_engines.insert(collection.id.clone(), map_engine.clone());
                     maps_collections.insert(collection.id.clone(), collection.clone());
                     maps_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2240,10 +2701,7 @@ pub fn load_collections(
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
-                    tiles_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
+                    tiles_engines.insert(collection.id.clone(), map_engine.clone());
                     tiles_collections.insert(collection.id.clone(), collection.clone());
                     tiles_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2289,8 +2747,10 @@ pub fn load_collections(
                     }
                 };
 
+                let mut reused_engine = false;
                 let engine = match engine_reuse.take_grib(&collection.id) {
                     Some(e) => {
+                        reused_engine = true;
                         info!(
                             "Collection '{}': config unchanged — reusing live engine",
                             collection.id
@@ -2347,6 +2807,7 @@ pub fn load_collections(
                         ),
                     });
                 }
+                let source_id = collection.id.clone();
                 for engine in views {
                     let mut view_config = collection.clone();
                     if let Some(family) = engine.level_type() {
@@ -2356,15 +2817,20 @@ pub fn load_collections(
                             format!("{} ({})", collection.description, family.label());
                     }
                     let collection = &view_config;
+                    let (map_engine, edr_engine) = wind_wrapped(
+                        &source_id,
+                        collection,
+                        &engine,
+                        reused_engine,
+                        &mut engine_reuse,
+                        &mut wind_by_id,
+                    );
                     // Get parameter list for per-parameter-layer styles
-                    let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                    let raster_info = map_engine.raster_info();
                     let raster_params = raster_info.parameters;
 
                     if collection.apis.contains(&"edr".to_string()) {
-                        edr_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
-                        );
+                        edr_engines.insert(collection.id.clone(), edr_engine.clone());
                         edr_collections.insert(collection.id.clone(), collection.clone());
                         edr_styles.extend(collection_layer_styles(
                             style_ctx,
@@ -2376,9 +2842,11 @@ pub fn load_collections(
                     }
 
                     if collection.apis.contains(&"wms".to_string()) {
-                        map_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        map_engines.insert(collection.id.clone(), map_engine.clone());
+                        register_point_engine(
+                            &mut wms_point_engines,
+                            &collection.id,
+                            edr_engine.clone(),
                         );
                         map_collections.insert(collection.id.clone(), collection.clone());
                         map_styles.extend(collection_layer_styles(
@@ -2391,10 +2859,7 @@ pub fn load_collections(
                         info!("Collection '{}': wired to WMS API", collection.id);
                     }
                     if collection.apis.contains(&"maps".to_string()) {
-                        maps_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                        );
+                        maps_engines.insert(collection.id.clone(), map_engine.clone());
                         maps_collections.insert(collection.id.clone(), collection.clone());
                         maps_styles.extend(collection_layer_styles(
                             style_ctx,
@@ -2406,10 +2871,7 @@ pub fn load_collections(
                         info!("Collection '{}': wired to Maps API", collection.id);
                     }
                     if collection.apis.contains(&"tiles".to_string()) {
-                        tiles_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                        );
+                        tiles_engines.insert(collection.id.clone(), map_engine.clone());
                         tiles_collections.insert(collection.id.clone(), collection.clone());
                         tiles_styles.extend(collection_layer_styles(
                             style_ctx,
@@ -2458,8 +2920,10 @@ pub fn load_collections(
                     }
                 };
 
+                let mut reused_engine = false;
                 let engine = match engine_reuse.take_zarr(&collection.id) {
                     Some(e) => {
+                        reused_engine = true;
                         info!(
                             "Collection '{}': config unchanged — reusing live engine",
                             collection.id
@@ -2497,16 +2961,22 @@ pub fn load_collections(
 
                 zarr_engines.push(engine.clone());
 
+                let (map_engine, edr_engine) = wind_wrapped(
+                    &collection.id,
+                    collection,
+                    &engine,
+                    reused_engine,
+                    &mut engine_reuse,
+                    &mut wind_by_id,
+                );
+
                 // Per-parameter-layer styles (one WMS/Maps/Tiles layer per Zarr
-                // variable).
-                let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                // variable, and per derived wind speed).
+                let raster_info = map_engine.raster_info();
                 let raster_params = raster_info.parameters;
 
                 if collection.apis.contains(&"edr".to_string()) {
-                    edr_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
-                    );
+                    edr_engines.insert(collection.id.clone(), edr_engine.clone());
                     edr_collections.insert(collection.id.clone(), collection.clone());
                     edr_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2519,9 +2989,11 @@ pub fn load_collections(
                 }
 
                 if collection.apis.contains(&"wms".to_string()) {
-                    map_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    map_engines.insert(collection.id.clone(), map_engine.clone());
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        edr_engine.clone(),
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
@@ -2534,10 +3006,7 @@ pub fn load_collections(
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
                 if collection.apis.contains(&"maps".to_string()) {
-                    maps_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
+                    maps_engines.insert(collection.id.clone(), map_engine.clone());
                     maps_collections.insert(collection.id.clone(), collection.clone());
                     maps_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2549,10 +3018,7 @@ pub fn load_collections(
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
-                    tiles_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
+                    tiles_engines.insert(collection.id.clone(), map_engine.clone());
                     tiles_collections.insert(collection.id.clone(), collection.clone());
                     tiles_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2657,6 +3123,11 @@ pub fn load_collections(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                    );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
                         style_ctx,
@@ -2702,14 +3173,147 @@ pub fn load_collections(
                 // first poll has not run yet.
                 let (status, error) = match engine.live_health() {
                     Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
-                    Some(ds_core::health::LiveStatus::Degraded { reason }) => {
-                        (CollectionStatus::Degraded, Some(reason.to_string()))
-                    }
+                    Some(live) => (CollectionStatus::Degraded, live.degraded_reason()),
                     None => (CollectionStatus::Degraded, None),
                 };
                 health.push(CollectionHealth {
                     id: collection.id.clone(),
                     engine_type: "satellite".into(),
+                    status,
+                    error,
+                });
+            }
+            "netcdf" => {
+                let netcdf_config = match collection.netcdf.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'netcdf' but missing [collections.netcdf] config, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "netcdf".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing [collections.netcdf] config".into()),
+                        });
+                        continue;
+                    }
+                };
+
+                let mut reused_engine = false;
+                let engine = match engine_reuse.take_netcdf(&collection.id) {
+                    Some(e) => {
+                        reused_engine = true;
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
+                        );
+                        e
+                    }
+                    None => match engine_netcdf::NetcdfEngine::new(&collection.id, netcdf_config) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to initialize NetCDF engine: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "netcdf".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
+                };
+                engines_by_id.insert(collection.id.clone(), EngineHandle::Netcdf(engine.clone()));
+                netcdf_engines.push(engine.clone());
+
+                // One WMS/Maps/Tiles layer per variable, and the wind speed
+                // derived from u/v components (#897). The layers come from
+                // the files, so a fresh engine has none until the immediate
+                // first tick of its poll loop; the recovery loop then
+                // registers the collection again with their styles. It
+                // compares the engine's own variables, so those are kept.
+                let (map_engine, edr_engine) = wind_wrapped(
+                    &collection.id,
+                    collection,
+                    &engine,
+                    reused_engine,
+                    &mut engine_reuse,
+                    &mut wind_by_id,
+                );
+                netcdf_parameters.insert(
+                    collection.id.clone(),
+                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters,
+                );
+                let raster_params = map_engine.raster_info().parameters;
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(collection.id.clone(), edr_engine.clone());
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                    edr_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to EDR API", collection.id);
+                }
+                if collection.apis.contains(&"wms".to_string()) {
+                    map_engines.insert(collection.id.clone(), map_engine.clone());
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        edr_engine.clone(),
+                    );
+                    map_collections.insert(collection.id.clone(), collection.clone());
+                    map_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to WMS API", collection.id);
+                }
+                if collection.apis.contains(&"maps".to_string()) {
+                    maps_engines.insert(collection.id.clone(), map_engine.clone());
+                    maps_collections.insert(collection.id.clone(), collection.clone());
+                    maps_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to Maps API", collection.id);
+                }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_engines.insert(collection.id.clone(), map_engine.clone());
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    tiles_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
+                    info!("Collection '{}': wired to Tiles API", collection.id);
+                }
+
+                // Live status comes from `/health` (`live_health`).
+                let (status, error) = match engine.live_health() {
+                    Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
+                    Some(live) => (CollectionStatus::Degraded, live.degraded_reason()),
+                    None => (CollectionStatus::Degraded, None),
+                };
+                health.push(CollectionHealth {
+                    id: collection.id.clone(),
+                    engine_type: "netcdf".into(),
                     status,
                     error,
                 });
@@ -2788,6 +3392,11 @@ pub fn load_collections(
                     map_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    register_point_engine(
+                        &mut wms_point_engines,
+                        &collection.id,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
@@ -3002,6 +3611,11 @@ pub fn load_collections(
                             site_id.clone(),
                             view.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                         );
+                        register_point_engine(
+                            &mut wms_point_engines,
+                            &site_id,
+                            view.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                        );
                         map_collections.insert(site_id.clone(), site_cfg.clone());
                         map_styles.extend(collection_layer_styles(
                             style_ctx,
@@ -3039,12 +3653,41 @@ pub fn load_collections(
                             &bundle_index,
                         ));
                     }
+                    // From the registries this site entered above, not from
+                    // `apis`: "features" registers the network inventory
+                    // under the source id, never the site.
+                    let site_page = volume_collection_page(
+                        &site_id,
+                        maps_collections.contains_key(&site_id)
+                            || tiles_collections.contains_key(&site_id),
+                        edr_collections.contains_key(&site_id),
+                    );
+                    if let Some(page) = &site_page {
+                        feature_collection_pages.insert(site_id.clone(), page.clone());
+                    }
                     if collection.apis.contains(&"3dtiles".to_string()) {
                         volume_engines.insert(
                             site_id.clone(),
                             view.clone() as Arc<dyn ds_core::volume::VolumeEngine>,
                         );
                         volume_collections.insert(site_id.clone(), site_cfg.clone());
+                        // Paint each quantity as its WMS/Maps/Tiles layer does
+                        // (the same cached resolution), so the 3D legend and
+                        // filter speak the quantity's own unit (#1137).
+                        let layer_styles = collection_layer_styles(
+                            style_ctx,
+                            &mut styles_cache,
+                            &site_cfg,
+                            &raster_params,
+                            &bundle_index,
+                        );
+                        volume_quantity_styles.insert(
+                            site_id.clone(),
+                            api_3dtiles::quantity_styles(&site_id, &raster_params, &layer_styles),
+                        );
+                        if let Some(page) = site_page {
+                            volume_collection_pages.insert(site_id.clone(), page);
+                        }
                     }
 
                     info!(
@@ -3149,7 +3792,11 @@ pub fn load_collections(
                         );
                         e
                     }
-                    None => match engine_cap::CapEngine::new(cap_config, &collection.id) {
+                    None => match engine_cap::CapEngine::new_with_state(
+                        cap_config,
+                        &collection.id,
+                        state_store(),
+                    ) {
                         Ok(e) => Arc::new(e),
                         Err(e) => {
                             tracing::error!(
@@ -3237,9 +3884,7 @@ pub fn load_collections(
                 // overriding the boot snapshot at runtime.
                 let (status, error) = match engine.live_health() {
                     Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
-                    Some(ds_core::health::LiveStatus::Degraded { reason }) => {
-                        (CollectionStatus::Degraded, Some(reason.to_string()))
-                    }
+                    Some(live) => (CollectionStatus::Degraded, live.degraded_reason()),
                     None if engine.is_loaded() => (CollectionStatus::Ready, None),
                     None => (
                         CollectionStatus::Degraded,
@@ -3279,7 +3924,11 @@ pub fn load_collections(
                         );
                         e
                     }
-                    None => match engine_bufr::BufrEngine::new(bufr_config, &collection.id) {
+                    None => match engine_bufr::BufrEngine::new_with_state(
+                        bufr_config,
+                        &collection.id,
+                        state_store(),
+                    ) {
                         Ok(e) => Arc::new(e),
                         Err(e) => {
                             tracing::error!(
@@ -3322,9 +3971,7 @@ pub fn load_collections(
                 // source); `health_handler` keeps the live status current.
                 let (status, error) = match engine.live_health() {
                     Some(ds_core::health::LiveStatus::Ready) => (CollectionStatus::Ready, None),
-                    Some(ds_core::health::LiveStatus::Degraded { reason }) => {
-                        (CollectionStatus::Degraded, Some(reason.to_string()))
-                    }
+                    Some(live) => (CollectionStatus::Degraded, live.degraded_reason()),
                     None if engine.is_loaded() => (CollectionStatus::Ready, None),
                     None => (
                         CollectionStatus::Degraded,
@@ -3371,13 +4018,7 @@ pub fn load_collections(
                         // ping owns liveness. `None` (no ping completed yet)
                         // keeps the optimistic seed — the engine was accepted
                         // by a previous load.
-                        let (status, err) = match engine.live_health() {
-                            Some(engine_postgis::HealthStatus::Degraded) => (
-                                CollectionStatus::Degraded,
-                                Some("database unreachable (live health)".to_string()),
-                            ),
-                            _ => (CollectionStatus::Ready, None),
-                        };
+                        let (status, err) = postgis_load_status(engine.live_health());
                         (engine, status, err)
                     }
                     None => {
@@ -3467,7 +4108,10 @@ pub fn load_collections(
                                     engine.get_locations().map(|l| l.len()).unwrap_or(0),
                                     engine.get_parameters().len()
                                 );
-                                (CollectionStatus::Ready, None)
+                                // No ping has run yet: the only live verdict
+                                // here is a cut station list, which stays out
+                                // of the load snapshot (`postgis_load_status`).
+                                postgis_load_status(engine.live_health())
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -3489,11 +4133,34 @@ pub fn load_collections(
                     );
                 }
 
-                // The events shape has a raster surface (#504: the
-                // age-colored lightning layer) — wire the MapEngine into the
-                // raster APIs. Station shapes keep the MVT feature-tile
-                // path; config validation rejects wms/maps for them.
+                // Raster surfaces: the events shape's age-colored lightning
+                // layer (#504), and a station shape's symbol layers (#1063)
+                // when opted in (`postgis_map_wiring`). Station shapes keep
+                // the MVT feature-tile path.
                 let is_events = engine.config().events().is_some();
+                let wiring = postgis_map_wiring(collection);
+                let layer_params = if wiring.station_layers {
+                    use ds_core::map_engine::MapEngine as _;
+                    engine.raster_info_shared().parameters.clone()
+                } else {
+                    Vec::new()
+                };
+                if wiring.station_layers {
+                    // Every load, built or reused: a reload can change the
+                    // styles without changing the collection.
+                    let styles = collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &layer_params,
+                        &bundle_index,
+                    );
+                    engine.set_station_symbols(postgis_station_symbols(
+                        &styles,
+                        &collection.id,
+                        &layer_params,
+                    ));
+                }
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
@@ -3517,22 +4184,32 @@ pub fn load_collections(
                     );
                     feature_collections.insert(collection.id.clone(), collection.clone());
                 }
-                if collection.apis.contains(&"wms".to_string()) && is_events {
+                if wiring.raster_apis.contains(&"wms") {
                     map_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
+                    // A station marker shows the latest value within
+                    // max_age, which the EDR position query does not
+                    // answer: station layers are not queryable (#1063).
+                    if is_events {
+                        register_point_engine(
+                            &mut wms_point_engines,
+                            &collection.id,
+                            engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                        );
+                    }
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
                         style_ctx,
                         &mut styles_cache,
                         collection,
-                        &[],
+                        &layer_params,
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
-                if collection.apis.contains(&"maps".to_string()) && is_events {
+                if wiring.raster_apis.contains(&"maps") {
                     maps_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
@@ -3542,36 +4219,35 @@ pub fn load_collections(
                         style_ctx,
                         &mut styles_cache,
                         collection,
-                        &[],
+                        &layer_params,
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
-                if collection.apis.contains(&"tiles".to_string()) {
-                    if is_events {
-                        tiles_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                        );
-                        tiles_collections.insert(collection.id.clone(), collection.clone());
-                        tiles_styles.extend(collection_layer_styles(
-                            style_ctx,
-                            &mut styles_cache,
-                            collection,
-                            &[],
-                            &bundle_index,
-                        ));
-                        info!(
-                            "Collection '{}': wired to Tiles API (raster)",
-                            collection.id
-                        );
-                    } else {
-                        tiles_feature_engines.insert(
-                            collection.id.clone(),
-                            engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
-                        );
-                        tiles_feature_collections.insert(collection.id.clone(), collection.clone());
-                    }
+                if wiring.raster_apis.contains(&"tiles") {
+                    tiles_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    tiles_styles.extend(collection_layer_styles(
+                        style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &layer_params,
+                        &bundle_index,
+                    ));
+                    info!(
+                        "Collection '{}': wired to Tiles API (raster)",
+                        collection.id
+                    );
+                }
+                if wiring.vector_tiles {
+                    tiles_feature_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                    );
+                    tiles_feature_collections.insert(collection.id.clone(), collection.clone());
                 }
                 postgis_engines.push(engine);
                 health.push(CollectionHealth {
@@ -3585,6 +4261,9 @@ pub fn load_collections(
             // base engines exist (#522).
             "nowcast" => {
                 nowcast_pending.push(collection);
+            }
+            "station-grid" => {
+                station_grid_pending.push(collection);
             }
             other => {
                 tracing::error!(
@@ -3792,6 +4471,11 @@ pub fn load_collections(
                 collection.id.clone(),
                 engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
             );
+            register_point_engine(
+                &mut wms_point_engines,
+                &collection.id,
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
             map_collections.insert(collection.id.clone(), collection.clone());
             map_styles.extend(collection_layer_styles(
                 style_ctx,
@@ -3866,14 +4550,148 @@ pub fn load_collections(
         );
     }
 
-    // Determine rendered cache size from first WMS collection config, or default
+    // ------------------------------------------------------------------
+    // Third pass: station grids (#1082), over the station collections the
+    // passes above built. Only a CSV, BUFR or PostGIS stations engine is a
+    // source, so a grid never grids a derived collection.
+    // ------------------------------------------------------------------
+    for collection in station_grid_pending {
+        let mut fail = |error: String| {
+            tracing::error!("Collection '{}': {error}, skipping", collection.id);
+            health.push(CollectionHealth {
+                id: collection.id.clone(),
+                engine_type: "station-grid".into(),
+                status: CollectionStatus::Failed,
+                error: Some(error),
+            });
+        };
+        let Some(grid_config) = collection.station_grid.as_ref() else {
+            fail("missing [collections.station_grid] config".into());
+            continue;
+        };
+        let Some(source) = engines_by_id
+            .get(&grid_config.source)
+            .and_then(EngineHandle::station_source)
+        else {
+            fail(format!(
+                "station_grid source '{}' not found or not a station collection (csv, bufr \
+                 or postgis stations defined in the same config)",
+                grid_config.source
+            ));
+            continue;
+        };
+        let engine = match engine_reuse.take_station_grid(&collection.id) {
+            Some(live) => live,
+            None => match engine_station_grid::StationGridEngine::new(
+                &collection.id,
+                &grid_config.source,
+                source,
+                grid_config,
+            ) {
+                Ok(engine) => Arc::new(engine),
+                Err(e) => {
+                    fail(format!("failed to initialize station-grid engine: {e}"));
+                    continue;
+                }
+            },
+        };
+        engines_by_id.insert(
+            collection.id.clone(),
+            EngineHandle::StationGrid(engine.clone()),
+        );
+        station_grid_engines.push(engine.clone());
+
+        // Every API's collection description says how the grids are made.
+        let mut described = collection.clone();
+        described.description = match described.description.trim() {
+            "" => engine.provenance().to_string(),
+            own => format!("{own} {}", engine.provenance()),
+        };
+        let parameters = ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+        let mut styles = || {
+            collection_layer_styles(
+                style_ctx,
+                &mut styles_cache,
+                collection,
+                &parameters,
+                &bundle_index,
+            )
+        };
+        if collection.apis.contains(&"edr".to_string()) {
+            edr_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
+            edr_collections.insert(collection.id.clone(), described.clone());
+            edr_styles.extend(styles());
+            info!("Collection '{}': wired to EDR API", collection.id);
+        }
+        if collection.apis.contains(&"wms".to_string()) {
+            map_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            register_point_engine(
+                &mut wms_point_engines,
+                &collection.id,
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
+            map_collections.insert(collection.id.clone(), described.clone());
+            map_styles.extend(styles());
+            info!("Collection '{}': wired to WMS API", collection.id);
+        }
+        if collection.apis.contains(&"maps".to_string()) {
+            maps_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            maps_collections.insert(collection.id.clone(), described.clone());
+            maps_styles.extend(styles());
+            info!("Collection '{}': wired to Maps API", collection.id);
+        }
+        if collection.apis.contains(&"tiles".to_string()) {
+            tiles_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            tiles_collections.insert(collection.id.clone(), described.clone());
+            tiles_styles.extend(styles());
+            info!("Collection '{}': wired to Tiles API", collection.id);
+        }
+
+        // Without an analysis time yet (a WIS2 source that has heard
+        // nothing) the collection is degraded until the poll finds one.
+        let has_data = engine.has_data();
+        health.push(CollectionHealth {
+            id: collection.id.clone(),
+            engine_type: "station-grid".into(),
+            status: if has_data {
+                CollectionStatus::Ready
+            } else {
+                CollectionStatus::Degraded
+            },
+            error: (!has_data).then(|| {
+                format!(
+                    "waiting for the first observations of '{}'",
+                    grid_config.source
+                )
+            }),
+        });
+        info!(
+            "Collection '{}': station grid over '{}'",
+            collection.id, grid_config.source
+        );
+    }
+
+    // Determine rendered cache size from first WMS collection config, or the
+    // same default a `[wms]` block without `rendered_cache_mb` gets (#1010).
     let rendered_cache_mb = map_collections
         .values()
         .chain(maps_collections.values())
         .filter_map(|c| c.wms.as_ref())
         .map(|w| w.rendered_cache_mb)
         .next()
-        .unwrap_or(128);
+        .unwrap_or(ds_core::config::DEFAULT_RENDERED_CACHE_MB);
 
     // Meta-tile pixel cache size (#202) is a server-wide setting
     // (`[server] metatile_cache_mb`) — the cache is global to all WMS
@@ -3921,10 +4739,21 @@ pub fn load_collections(
     // polar-volume network registers per-site ids (#789).
     let map_tileset_ids = tiles_engines.keys().cloned().collect();
     let vector_tileset_ids = tiles_feature_engines.keys().cloned().collect();
+    // EDR `items` (#928) is the collection's own FeatureEngine, for every EDR
+    // collection whose engine has one: listing `edr` enables the query,
+    // whether or not the collection also lists `features`.
+    let edr_feature_engines = edr_engines
+        .keys()
+        .filter_map(|id| {
+            let engine = engines_by_id.get(id)?.edr_items_engine()?;
+            Some((id.clone(), engine))
+        })
+        .collect();
 
     LoadResult {
         edr_state: EdrState {
             engines: edr_engines,
+            feature_engines: edr_feature_engines,
             collections: edr_collections,
             styles: edr_styles,
             base_url: base_url.to_string(),
@@ -3936,9 +4765,11 @@ pub fn load_collections(
             base_url: base_url.to_string(),
             trust_proxy_headers,
             vector_tileset_ids,
+            collection_pages: feature_collection_pages,
         },
         wms_state: WmsState {
             engines: map_engines,
+            point_engines: wms_point_engines,
             collections: map_collections,
             styles: map_styles,
             render_semaphore: render_semaphore.clone(),
@@ -3972,10 +4803,11 @@ pub fn load_collections(
         tiles_3d_state: api_3dtiles::TilesState3d {
             volume_engines,
             collections: volume_collections,
-            // v1: one shared reflectivity ramp for all 3D-Tiles collections (the
-            // legend the API advertises samples this same source). Per-collection
-            // /per-quantity colormaps from config are a follow-up (#350).
+            // Only for a quantity a poll brings in after these styles were
+            // resolved (until the next reload, like its WMS layer).
             colormap: api_3dtiles::default_point_colormap(),
+            quantity_styles: volume_quantity_styles,
+            collection_pages: volume_collection_pages,
             // Its own process-lifetime pool, NOT `render_semaphore`: a cold
             // 3D preload must not occupy WMS/Maps/Tiles render slots (#380).
             content_semaphore: api_3dtiles::CONTENT_SLOTS.clone(),
@@ -3988,6 +4820,8 @@ pub fn load_collections(
         grib_engines,
         zarr_engines,
         satellite_engines,
+        netcdf_engines,
+        netcdf_parameters,
         odim_engines,
         odim_volume_engines,
         cap_engines,
@@ -3995,8 +4829,85 @@ pub fn load_collections(
         postgis_engines,
         nowcast_engines,
         nowcast_dependency_updates,
+        station_grid_engines,
         engines_by_id,
+        wind_by_id,
     }
+}
+
+/// Register a WMS collection's EDR engine for GetFeatureInfo (#1064) when it
+/// answers position queries (`api_wms::feature_info::answers_position`),
+/// whether or not the collection lists `edr`: the WMS reads a layer's value
+/// with it, and listing `edr` only decides whether EDR routes are published.
+/// The capability is read here, once per load, never per request.
+fn register_point_engine(
+    point_engines: &mut HashMap<String, Arc<dyn ds_core::edr_engine::EdrEngine>>,
+    id: &str,
+    engine: Arc<dyn ds_core::edr_engine::EdrEngine>,
+) {
+    if api_wms::feature_info::answers_position(engine.as_ref()) {
+        point_engines.insert(id.to_string(), engine);
+    }
+}
+
+/// The `MapEngine` and `EdrEngine` a collection registers (#897): its engine
+/// wrapped in [`ds_core::wind::DerivedWind`], which adds wind speed and
+/// direction derived from u/v components, or the engine itself when the
+/// collection opts out (`derive_wind = false`).
+///
+/// A reused engine (`reused_engine`) keeps its wrapper: the registered `Arc`
+/// then survives an incremental reload like the engine does (a nowcast
+/// checks its source's identity), and the per-pair load log is not
+/// repeated. A GRIB source registers one wrapper per level family, all
+/// under its configured collection id (`source_id`) in `built`.
+fn wind_wrapped<E>(
+    source_id: &str,
+    collection: &CollectionConfig,
+    engine: &Arc<E>,
+    reused_engine: bool,
+    reuse: &mut EngineReuse,
+    built: &mut WindHandles,
+) -> (
+    Arc<dyn ds_core::map_engine::MapEngine>,
+    Arc<dyn ds_core::edr_engine::EdrEngine>,
+)
+where
+    E: ds_core::map_engine::MapEngine
+        + ds_core::edr_engine::EdrEngine
+        + ds_core::wind::WindSource
+        + 'static,
+{
+    if !collection.derives_wind() {
+        return (engine.clone(), engine.clone());
+    }
+    let reused = reused_engine
+        .then(|| {
+            reuse
+                .wind
+                .get_mut(source_id)
+                .and_then(|views| views.remove(&collection.id))
+        })
+        .flatten();
+    let wind = reused.unwrap_or_else(|| {
+        Arc::new(ds_core::wind::DerivedWind::new(
+            collection.id.clone(),
+            engine.clone(),
+            wind_log(),
+        ))
+    });
+    built
+        .entry(source_id.to_string())
+        .or_default()
+        .insert(collection.id.clone(), wind.clone());
+    (wind.clone(), wind)
+}
+
+/// The derived-wind load log (#897): one line per u/v pair, saying what was
+/// derived, or what was not and why.
+fn wind_log() -> ds_core::wind::OutcomeLog {
+    Arc::new(|collection: &str, outcome: &ds_core::wind::PairOutcome| {
+        info!("Collection '{collection}': wind {outcome}");
+    })
 }
 
 /// Legacy-behavior fallback when style resolution fails despite config
@@ -4113,8 +5024,92 @@ fn collection_layer_styles(
             ),
         }
     }
+    if is_postgis_station_collection(collection) {
+        // Station symbol layers (#1063): every style of the collection, so
+        // no path draws the transparent ground in an opaque nodata colour
+        // or a nodata marker as a value.
+        for styles in layers.values_mut() {
+            for style in styles.values_mut() {
+                style.colormap = Arc::new(ds_render::SymbolColorMap::new(
+                    style.colormap.clone(),
+                    engine_postgis::NODATA_MARKER,
+                ));
+            }
+        }
+    }
     cache.insert(collection.id.clone(), layers.clone());
     layers
+}
+
+/// Which map surfaces a PostGIS collection is wired to.
+#[derive(Debug, PartialEq, Eq)]
+struct PostgisMapWiring {
+    /// The raster map APIs it is registered with, of `wms`, `maps`, `tiles`.
+    raster_apis: Vec<&'static str>,
+    /// A station shape's symbol layers (#1063): styles resolved, midpoints
+    /// handed to the engine, and the per-refresh frame fingerprint on.
+    station_layers: bool,
+    /// The station inventory as vector tiles (MVT).
+    vector_tiles: bool,
+}
+
+/// The map wiring of a PostGIS collection. The events shape's strike layer
+/// (#504) serves every raster API listed. A station shape's symbol layers
+/// (#1063) are opt-in: a `[postgis.map]` section, or `wms`/`maps` in
+/// `apis`. A station collection listing only `tiles` without the section
+/// keeps its vector tiles alone, as before the layers existed: no raster
+/// tileset, no fingerprint statement per refresh, no style resolution and
+/// so no generic-colormap warning.
+fn postgis_map_wiring(collection: &CollectionConfig) -> PostgisMapWiring {
+    let lists = |api: &str| collection.apis.iter().any(|a| a == api);
+    let events = collection
+        .postgis
+        .as_ref()
+        .is_some_and(|p| p.observations.shape == "events");
+    let station_layers = !events
+        && (collection.postgis.as_ref().is_some_and(|p| p.map.is_some())
+            || lists("wms")
+            || lists("maps"));
+    PostgisMapWiring {
+        raster_apis: ["wms", "maps", "tiles"]
+            .into_iter()
+            .filter(|api| lists(api) && (events || station_layers))
+            .collect(),
+        station_layers,
+        vector_tiles: !events && lists("tiles"),
+    }
+}
+
+/// A PostGIS collection of a station shape: its map layers draw station
+/// symbols (#1063), not a raster.
+fn is_postgis_station_collection(collection: &CollectionConfig) -> bool {
+    collection.engine_type == "postgis"
+        && collection
+            .postgis
+            .as_ref()
+            .is_some_and(|p| p.observations.shape != "events")
+}
+
+/// The station layers' overlap order (#1063): each parameter layer's
+/// midpoint, the middle of its default style's value range. That range is
+/// the style's `min`/`max`, which fall back to the palette's first and last
+/// stops, so markers draw in ascending distance from it and the most
+/// extreme value lands on top.
+fn postgis_station_symbols(
+    layers: &HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+    collection_id: &str,
+    params: &[ds_core::map_engine::ParameterInfo],
+) -> engine_postgis::StationSymbols {
+    let midpoints = params
+        .iter()
+        .filter_map(|p| {
+            let style = layers
+                .get(&format!("{collection_id}/{}", p.name))?
+                .get("default")?;
+            Some((p.name.clone(), (style.min + style.max) / 2.0))
+        })
+        .collect();
+    engine_postgis::StationSymbols::new(midpoints)
 }
 
 /// Resolve a collection's bound bundle; None if unset (validation rejects unresolved refs).
@@ -4213,26 +5208,35 @@ pub fn validate_style_colormaps(
     Ok(())
 }
 
-/// Update the health gauges from the current health vector.
-pub fn update_health_gauges(health: &[CollectionHealth]) {
-    let total = health.len() as i64;
-    let healthy = health
-        .iter()
-        .filter(|h| h.status == CollectionStatus::Ready)
-        .count() as i64;
-    let degraded = health
-        .iter()
-        .filter(|h| h.status == CollectionStatus::Degraded)
-        .count() as i64;
-    let failed = health
-        .iter()
-        .filter(|h| h.status == CollectionStatus::Failed)
-        .count() as i64;
+/// Per-status collection counts — what the `collections_*` gauges report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthCounts {
+    pub total: i64,
+    pub healthy: i64,
+    pub degraded: i64,
+    pub failed: i64,
+}
 
-    COLLECTIONS_TOTAL.set(total);
-    COLLECTIONS_HEALTHY.set(healthy);
-    COLLECTIONS_DEGRADED.set(degraded);
-    COLLECTIONS_FAILED.set(failed);
+impl HealthCounts {
+    pub fn of(health: &[CollectionHealth]) -> Self {
+        let count = |status| health.iter().filter(|h| h.status == status).count() as i64;
+        HealthCounts {
+            total: health.len() as i64,
+            healthy: count(CollectionStatus::Ready),
+            degraded: count(CollectionStatus::Degraded),
+            failed: count(CollectionStatus::Failed),
+        }
+    }
+}
+
+/// Update the health gauges from a health vector, returning what was set.
+pub fn update_health_gauges(health: &[CollectionHealth]) -> HealthCounts {
+    let counts = HealthCounts::of(health);
+    COLLECTIONS_TOTAL.set(counts.total);
+    COLLECTIONS_HEALTHY.set(counts.healthy);
+    COLLECTIONS_DEGRADED.set(counts.degraded);
+    COLLECTIONS_FAILED.set(counts.failed);
+    counts
 }
 
 // ---------------------------------------------------------------------------
@@ -4378,6 +5382,15 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         tracing::warn!("{warning}");
     }
     if let Some(warning) = render_concurrency_reload_warning(config.server.render_concurrency) {
+        tracing::warn!("{warning}");
+    }
+    if let Some(warning) = state_dir_reload_warning(
+        state_dir(),
+        config
+            .server
+            .state_dir_path(std::path::Path::new(&state.config_path))
+            .as_deref(),
+    ) {
         tracing::warn!("{warning}");
     }
 
@@ -4565,6 +5578,7 @@ pub(crate) fn recover_radar_once(state: &AdminState) -> Result<RecoveryOutcome, 
         &inputs.collections,
         &state.health.read().unwrap_or_else(|e| e.into_inner()),
     ) && !grib_registration_changed(state, &inputs.collections)
+        && !netcdf_registration_changed(state)
     {
         return Ok(RecoveryOutcome::Idle);
     }
@@ -4603,6 +5617,29 @@ fn grib_registration_changed(state: &AdminState, collections: &[CollectionConfig
             .filter(|id| health.iter().any(|h| &h.id == id))
             .collect();
         expected != actual
+    })
+}
+
+/// Polls read a NetCDF collection's variables from its files (#1067): once
+/// they differ from the parameters its layer styles were resolved for (a
+/// fresh engine has none at load), the collection is registered again with
+/// the accepted config, as GRIB level families are.
+fn netcdf_registration_changed(state: &AdminState) -> bool {
+    let engines = state
+        .netcdf_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let registered = state
+        .netcdf_parameters
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    engines.iter().any(|engine| {
+        registered
+            .get(engine.collection_id())
+            .is_some_and(|params| {
+                use ds_core::map_engine::MapEngine;
+                *params != engine.raster_info_shared().parameters
+            })
     })
 }
 
@@ -4656,6 +5693,14 @@ fn apply_load(
             .iter()
             .filter(|(id, _)| reusable.contains(id.as_str()))
             .map(|(id, e)| (id.clone(), e.clone()))
+            .collect(),
+        wind: state
+            .wind_handles
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(id, _)| reusable.contains(id.as_str()))
+            .map(|(id, w)| (id.clone(), w.clone()))
             .collect(),
     };
     info!(
@@ -4814,12 +5859,14 @@ fn apply_load(
     rotate_poll_loops!(grib_engines);
     rotate_poll_loops!(zarr_engines);
     rotate_poll_loops!(satellite_engines);
+    rotate_poll_loops!(netcdf_engines);
     rotate_poll_loops!(odim_engines);
     rotate_poll_loops!(odim_volume_engines);
     rotate_poll_loops!(cap_engines);
     rotate_poll_loops!(bufr_engines);
     rotate_poll_loops!(postgis_engines);
     rotate_poll_loops!(nowcast_engines);
+    rotate_poll_loops!(station_grid_engines);
     info!(
         "Incremental reload: {shut_down} old poll engine(s) shut down, {spawned} new spawned, \
          {} reused",
@@ -4886,10 +5933,27 @@ fn apply_load(
     // sweep and its completion — the same narrow window the previous
     // drop-everything behavior had; closing it would need config-versioned
     // cache keys.)
+    // A reused NetCDF collection whose layers changed (its first poll found
+    // its variables) has new styles: its tiles drawn before are stale too.
+    let restyled: Vec<String> = {
+        let mut registered = state
+            .netcdf_parameters
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let restyled = result
+            .netcdf_parameters
+            .iter()
+            .filter(|(id, params)| registered.get(*id).is_some_and(|old| old != *params))
+            .map(|(id, _)| id.clone())
+            .collect();
+        *registered = std::mem::take(&mut result.netcdf_parameters);
+        restyled
+    };
     let stale: Vec<&str> = old_collections
         .keys()
         .filter(|id| !reusable.contains(id.as_str()))
         .map(String::as_str)
+        .chain(restyled.iter().map(String::as_str))
         .collect();
     // Batch form: `retain` visits every cache entry, so one combined pass
     // per cache instead of one pass per stale collection.
@@ -4898,7 +5962,7 @@ fn apply_load(
     vector_cache.evict_collections(&stale);
     if !stale.is_empty() {
         info!(
-            "Evicted cached tiles for {} rebuilt/removed collection(s)",
+            "Evicted cached tiles for {} rebuilt, removed or restyled collection(s)",
             stale.len()
         );
     }
@@ -4922,6 +5986,10 @@ fn apply_load(
         .engine_handles
         .write()
         .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut result.engines_by_id);
+    *state
+        .wind_handles
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut result.wind_by_id);
 
     *state
         .accepted_load
@@ -4954,6 +6022,10 @@ fn apply_load(
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.satellite_engines;
     *state
+        .netcdf_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.netcdf_engines;
+    *state
         .odim_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.odim_engines;
@@ -4974,6 +6046,10 @@ fn apply_load(
         .nowcast_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.nowcast_engines;
+    *state
+        .station_grid_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.station_grid_engines;
 
     // Recount from the final `result.health` — the vanished-site block above
     // appends `Degraded` entries after the guard's `ready` was computed, so
@@ -5003,8 +6079,15 @@ fn apply_load(
     })
 }
 
-/// GET /health — per-collection health status with data staleness info.
-pub async fn health_handler(State(state): State<AdminState>) -> impl IntoResponse {
+/// The health `/health` reports and the `collections_*` gauges count: the
+/// load/reload snapshot with every live signal applied on top (#990). One
+/// function so the endpoint and the gauges cannot drift — the gauges used to
+/// keep the boot snapshot until the next reload.
+///
+/// Cheap enough for every `/metrics` scrape: one clone of the snapshot plus
+/// O(collections) atomic/`ArcSwap` reads, no I/O. Each lock is taken and
+/// released on its own, never nested.
+pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
     let mut health = state
         .health
         .read()
@@ -5013,34 +6096,25 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
 
     // Reflect LIVE postgis health (the 30s SELECT 1 ping) over the boot snapshot,
     // so a DB that went down after startup flips to `degraded` and one that
-    // recovered flips back (#110). A `Failed` collection has no engine (couldn't
-    // construct), so it's absent from the live map and keeps its boot status.
-    // `live_health()` is `None` until the first ping completes — so a
-    // boot-degraded collection keeps that boot status instead of the optimistic
-    // `ready` seed during the load→first-ping window.
+    // recovered flips back (#110), and a station list cut at `max_locations`
+    // degrades a reachable collection (#1061). A `Failed` collection has no
+    // engine (couldn't construct), so it's absent from the live map and keeps
+    // its boot status. `live_health()` is `None` until the first ping completes
+    // (unless the list is cut) — so a boot-degraded collection keeps that boot
+    // status instead of the optimistic `ready` seed during the load→first-ping
+    // window.
     {
         let engines = state
             .postgis_engines
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        let live: HashMap<&str, engine_postgis::HealthStatus> = engines
+        let live: HashMap<&str, engine_postgis::LiveHealth> = engines
             .iter()
             .filter_map(|e| Some((e.collection_id(), e.live_health()?)))
             .collect();
         for h in health.iter_mut().filter(|h| h.engine_type == "postgis") {
             if let Some(&s) = live.get(h.id.as_str()) {
-                match s {
-                    engine_postgis::HealthStatus::Ready => {
-                        h.status = CollectionStatus::Ready;
-                        h.error = None;
-                    }
-                    engine_postgis::HealthStatus::Degraded => {
-                        h.status = CollectionStatus::Degraded;
-                        h.error.get_or_insert_with(|| {
-                            "database unreachable (health ping failed)".into()
-                        });
-                    }
-                }
+                apply_postgis_live_health(h, s);
             }
         }
     }
@@ -5079,26 +6153,249 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
                 live.insert(e.collection_id().to_string(), s);
             }
         }
+        for e in state
+            .netcdf_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if let Some(s) = e.live_health() {
+                live.insert(e.collection_id().to_string(), s);
+            }
+        }
         for h in health.iter_mut().filter(|h| {
-            h.engine_type == "cap" || h.engine_type == "bufr" || h.engine_type == "satellite"
+            matches!(
+                h.engine_type.as_str(),
+                "cap" | "bufr" | "satellite" | "netcdf"
+            )
         }) {
             match live.get(h.id.as_str()) {
                 Some(ds_core::health::LiveStatus::Ready) => {
                     h.status = CollectionStatus::Ready;
                     h.error = None;
                 }
-                Some(ds_core::health::LiveStatus::Degraded { reason }) => {
+                Some(&live) => {
                     h.status = CollectionStatus::Degraded;
-                    h.error = Some(reason.to_string());
+                    h.error = live.degraded_reason();
                 }
                 None => {}
             }
         }
     }
 
+    // Nowcast: the boot `Degraded ("waiting for first nowcast generation")`
+    // flips to `Ready` once a generation exists.
+    {
+        let engines = state
+            .nowcast_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let has_data: HashMap<&str, bool> = engines
+            .iter()
+            .map(|e| (e.collection_id(), e.has_data()))
+            .collect();
+        for h in health.iter_mut().filter(|h| h.engine_type == "nowcast") {
+            if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
+                h.status = CollectionStatus::Ready;
+                h.error = None;
+            }
+        }
+    }
+
+    // Station grid: the boot `Degraded` ("waiting for the first
+    // observations") flips to `Ready` once the source has an analysis time.
+    {
+        let engines = state
+            .station_grid_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let has_data: HashMap<&str, bool> = engines
+            .iter()
+            .map(|e| (e.collection_id(), e.has_data()))
+            .collect();
+        for h in health
+            .iter_mut()
+            .filter(|h| h.engine_type == "station-grid")
+        {
+            if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
+                h.status = CollectionStatus::Ready;
+                h.error = None;
+            }
+        }
+    }
+
+    health
+}
+
+/// A postgis collection's entry in the load/reload snapshot: degraded only
+/// for an unreachable database or pending/invalid schema validation. A station
+/// list cut at `max_locations` (#1061) is still served, so it stays `Ready`
+/// here and `effective_health`
+/// reports it live: kept out of the snapshot, it cannot mask a later
+/// database outage (an `Unreachable` verdict keeps a recorded error), and a
+/// reload of cut collections still passes the zero-`Ready` guard.
+fn postgis_load_status(
+    live: Option<engine_postgis::LiveHealth>,
+) -> (CollectionStatus, Option<String>) {
+    match live {
+        Some(
+            live @ (engine_postgis::LiveHealth::Unreachable
+            | engine_postgis::LiveHealth::ValidationPending
+            | engine_postgis::LiveHealth::SchemaInvalid),
+        ) => (CollectionStatus::Degraded, live.degraded_reason()),
+        _ => (CollectionStatus::Ready, None),
+    }
+}
+
+/// One postgis collection's live verdict over its boot/reload entry. An
+/// unreachable database keeps a boot error already recorded (the boot
+/// refresh's failure says more); a station list cut at `max_locations`
+/// (#1061) names the cap, replacing any boot error, since the refresh that
+/// cut it succeeded.
+fn apply_postgis_live_health(h: &mut CollectionHealth, live: engine_postgis::LiveHealth) {
+    match live {
+        engine_postgis::LiveHealth::Ready => {
+            h.status = CollectionStatus::Ready;
+            h.error = None;
+        }
+        engine_postgis::LiveHealth::Unreachable => {
+            h.status = CollectionStatus::Degraded;
+            if h.error.is_none() {
+                h.error = live.degraded_reason();
+            }
+        }
+        engine_postgis::LiveHealth::LocationsTruncated { .. }
+        | engine_postgis::LiveHealth::ValidationPending
+        | engine_postgis::LiveHealth::SchemaInvalid => {
+            h.status = CollectionStatus::Degraded;
+            h.error = live.degraded_reason();
+        }
+    }
+}
+
+/// Set the `collections_*` gauges from [`effective_health`] — the same live
+/// view `/health` reports, so a collection degraded at boot leaves the count
+/// once it recovers rather than at the next reload (#990). Every `/metrics`
+/// scrape calls this.
+pub(crate) fn refresh_health_gauges(state: &ServerState) -> HealthCounts {
+    update_health_gauges(&effective_health(state))
+}
+
+/// What `/health` reports as `data_age_secs` and `/metrics` as
+/// `collection_data_age_seconds`, per collection id (#1007): now minus the
+/// newest data the collection serves, in whole seconds. Never the time since
+/// a poll: a stalled feeder leaves its files in place, and a poll that finds
+/// them again says nothing about how old they are. Per engine:
+///
+/// - GeoTIFF: the newest timestep in the catalog.
+/// - QueryData: the newest run's origin (reference) time.
+/// - BUFR: the newest report held.
+/// - Satellite: the newest scan start.
+/// - NetCDF: the newest run's reference time, or the newest valid time of
+///   files without runs.
+/// - Nowcast: the latest generation's anchor frame.
+///
+/// Other engines, and one with no data yet, are absent. An age is negative
+/// when the newest data lies in the future. One function so the endpoint and
+/// the gauge cannot drift: O(collections) snapshot reads, no I/O, each lock
+/// taken and released on its own.
+pub(crate) fn collection_data_ages(state: &ServerState) -> Vec<(String, i64)> {
+    let now = chrono::Utc::now();
+    let mut ages = Vec::new();
+    let mut push = |id: &str, age: Option<chrono::Duration>| {
+        if let Some(age) = age {
+            ages.push((id.to_owned(), age.num_seconds()));
+        }
+    };
+    for e in state
+        .geotiff_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.data_age());
+    }
+    for e in state
+        .querydata_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.data_age());
+    }
+    for e in state
+        .bufr_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.latest_report().map(|t| now - t));
+    }
+    for e in state
+        .satellite_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.data_age());
+    }
+    for e in state
+        .netcdf_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.data_age());
+    }
+    for e in state
+        .nowcast_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push(e.collection_id(), e.catalog_age());
+    }
+    ages
+}
+
+/// Set `collection_data_age_seconds` from [`collection_data_ages`], the
+/// `/health` source, and drop the series of every collection that stopped
+/// reporting an age (removed by a reload, or its data gone). Only those are
+/// removed, never the whole family, so a concurrent scrape cannot gather it
+/// half filled. Every `/metrics` scrape calls this; returns what it set.
+pub(crate) fn refresh_data_age_gauge(state: &ServerState) -> Vec<(String, i64)> {
+    static REPORTED: Mutex<std::collections::BTreeSet<String>> =
+        Mutex::new(std::collections::BTreeSet::new());
+    // Read the ages under the lock: two scrapes racing a reload must not let
+    // the older read set a removed collection's series again after the newer
+    // one dropped it.
+    let mut reported = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+    let ages = collection_data_ages(state);
+    let live: std::collections::BTreeSet<String> = ages.iter().map(|(id, _)| id.clone()).collect();
+    for gone in reported.difference(&live) {
+        // Err = no such series.
+        let _ = COLLECTION_DATA_AGE_SECONDS.remove_label_values(&[gone.as_str()]);
+    }
+    for (id, age) in &ages {
+        COLLECTION_DATA_AGE_SECONDS
+            .with_label_values(&[id.as_str()])
+            .set(*age);
+    }
+    *reported = live;
+    ages
+}
+
+/// GET /health — per-collection health status with data staleness info.
+pub async fn health_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    let health = effective_health(&state);
+
     // Build per-collection metadata from concrete engine types.
     // Uses EDR-style temporal extent format: { interval, values? }
-    let mut data_ages: HashMap<String, i64> = HashMap::new();
+    // `data_age_secs` comes from the source the `/metrics` gauge reads;
+    // `poll_age_secs` is the time since the last poll that found data, for
+    // the engines that track it (GeoTIFF, QueryData; #1007).
+    let data_ages: HashMap<String, i64> = collection_data_ages(&state).into_iter().collect();
+    let mut poll_ages: HashMap<String, i64> = HashMap::new();
     let mut temporal_info: HashMap<String, serde_json::Value> = HashMap::new();
 
     // Helper: build temporal extent { interval, values? } from a sorted
@@ -5138,8 +6435,8 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
-            if let Some(age) = engine.catalog_age() {
-                data_ages.insert(id.clone(), age.num_seconds());
+            if let Some(age) = engine.poll_age() {
+                poll_ages.insert(id.clone(), age.num_seconds());
             }
             if let Some(temporal) = build_temporal(engine.as_ref()) {
                 temporal_info.insert(id, temporal);
@@ -5153,8 +6450,8 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
-            if let Some(age) = engine.data_age() {
-                data_ages.insert(id.clone(), age.num_seconds());
+            if let Some(age) = engine.poll_age() {
+                poll_ages.insert(id.clone(), age.num_seconds());
             }
             if let Some(temporal) = build_temporal(engine.as_ref()) {
                 temporal_info.insert(id, temporal);
@@ -5162,13 +6459,10 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         }
     }
     {
-        // BUFR: data age = newest report held; temporal extent from the store.
+        // BUFR: temporal extent from the store.
         let engines = state.bufr_engines.read().unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
-            if let Some(latest) = engine.latest_report() {
-                data_ages.insert(id.clone(), (chrono::Utc::now() - latest).num_seconds());
-            }
             if let Some(temporal) = build_temporal(engine.as_ref()) {
                 temporal_info.insert(id, temporal);
             }
@@ -5208,9 +6502,18 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
-            if let Some(age) = engine.data_age() {
-                data_ages.insert(id.clone(), age.num_seconds());
+            if let Some(temporal) = temporal_from_times(&engine.times()) {
+                temporal_info.insert(id, temporal);
             }
+        }
+    }
+    {
+        let engines = state
+            .netcdf_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
             if let Some(temporal) = temporal_from_times(&engine.times()) {
                 temporal_info.insert(id, temporal);
             }
@@ -5238,29 +6541,16 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     }
 
     {
-        // Nowcast engines: `data_age_secs` is the age of the latest
-        // generation's anchor frame; the boot `Degraded ("waiting for first
-        // nowcast generation")` flips to `Ready` once a generation exists.
+        // Nowcast engines (the Ready flip is in `effective_health`).
         let engines = state
             .nowcast_engines
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        let mut has_data: HashMap<&str, bool> = HashMap::new();
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
-            has_data.insert(engine.collection_id(), engine.has_data());
-            if let Some(age) = engine.catalog_age() {
-                data_ages.insert(id.clone(), age.num_seconds());
-            }
             let times = ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).times;
             if let Some(temporal) = temporal_from_times(&times) {
                 temporal_info.insert(id, temporal);
-            }
-        }
-        for h in health.iter_mut().filter(|h| h.engine_type == "nowcast") {
-            if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
-                h.status = CollectionStatus::Ready;
-                h.error = None;
             }
         }
     }
@@ -5272,6 +6562,9 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             let mut entry = serde_json::to_value(h).unwrap_or_default();
             if let Some(age_secs) = data_ages.get(&h.id) {
                 entry["data_age_secs"] = json!(*age_secs);
+            }
+            if let Some(age_secs) = poll_ages.get(&h.id) {
+                entry["poll_age_secs"] = json!(*age_secs);
             }
             if let Some(temporal) = temporal_info.get(&h.id) {
                 entry["extent"] = json!({ "temporal": temporal });
@@ -5314,6 +6607,10 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
 /// Updates gauge-style metrics from engine/cache state before gathering,
 /// so Prometheus always gets a fresh snapshot.
 pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    // First, before any metrics lock.
+    refresh_health_gauges(&state);
+    refresh_data_age_gauge(&state);
+
     // Read from current WMS state (survives reloads via ArcSwap)
     let wms = state.wms.load();
     RENDER_SEMAPHORE_AVAILABLE.set(wms.render_semaphore.available_permits() as i64);
@@ -5402,24 +6699,70 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         .is_empty();
     if has_geotiff {
         let (used, limit, rejected) = engine_geotiff::decode_budget::metrics();
-        GEOTIFF_DECODE_USED.set(used.min(i64::MAX as usize) as i64);
-        GEOTIFF_DECODE_LIMIT.set(limit.min(i64::MAX as usize) as i64);
-        GEOTIFF_DECODE_REJECTED.feed(rejected as u64);
+        GEOTIFF_DECODE_USED.set(used.min(i64::MAX as u64) as i64);
+        GEOTIFF_DECODE_LIMIT.set(limit.min(i64::MAX as u64) as i64);
+        GEOTIFF_DECODE_REJECTED.feed(rejected);
         GEOTIFF_DECODED_CHUNK_CACHE_METRICS
             .update(engine_geotiff::decoded_chunk_cache_metrics(), None);
     }
-    if !state
+    let has_netcdf = !state
+        .netcdf_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty();
+    if has_netcdf {
+        let (used, limit, rejected) = engine_netcdf::decode_budget::metrics();
+        NETCDF_READ_USED.set(used.min(i64::MAX as u64) as i64);
+        NETCDF_READ_LIMIT.set(limit.min(i64::MAX as u64) as i64);
+        NETCDF_READ_REJECTED.feed(rejected);
+        NETCDF_FIELD_CACHE_METRICS.update(engine_netcdf::field_cache_metrics(), None);
+        NETCDF_BLOCK_CACHE_METRICS.update(engine_netcdf::block_cache_metrics(), None);
+        NETCDF_CHUNK_CACHE_METRICS.update(engine_netcdf::chunk_cache_metrics(), None);
+        let (pending, detached, inline) = engine_netcdf::detached_fill_metrics();
+        NETCDF_DETACHED_PENDING.set(pending.min(i64::MAX as usize) as i64);
+        NETCDF_DETACHED_TOTAL.feed(detached);
+        NETCDF_DETACHED_INLINE.feed(inline);
+    }
+    // Hosts behind `ds_storage::build_http_store_limited`: today the remote
+    // NetCDF sources.
+    for host in ds_storage::host_requests() {
+        let label = [host.host.as_str()];
+        STORAGE_HOST_REQUESTS_IN_FLIGHT
+            .with_label_values(&label)
+            .set(host.in_flight.min(i64::MAX as usize) as i64);
+        STORAGE_HOST_REQUESTS_QUEUED
+            .with_label_values(&label)
+            .set(host.queued.min(i64::MAX as usize) as i64);
+        STORAGE_HOST_REQUEST_LIMIT
+            .with_label_values(&label)
+            .set(host.limit.min(i64::MAX as usize) as i64);
+    }
+    let satellite_engines = state
         .satellite_engines
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .is_empty()
-    {
+        .clone();
+    SATELLITE_FRAME_WINDOW_BYTES.reset();
+    SATELLITE_FRAME_WINDOW_RESIDENT_BYTES.reset();
+    if !satellite_engines.is_empty() {
         SATELLITE_FRAME_CACHE_METRICS.update(engine_satellite::frame_metrics(), None);
         SATELLITE_STRIP_CACHE_METRICS.update(engine_satellite::strip_metrics(), None);
+        SATELLITE_FRAME_REINGESTS.feed(engine_satellite::frame_reingests());
+        for engine in &satellite_engines {
+            let window = engine.frame_window();
+            let collection = [engine.collection_id()];
+            SATELLITE_FRAME_WINDOW_BYTES
+                .with_label_values(&collection)
+                .set(window.bytes.min(i64::MAX as u64) as i64);
+            SATELLITE_FRAME_WINDOW_RESIDENT_BYTES
+                .with_label_values(&collection)
+                .set(window.resident_bytes.min(i64::MAX as u64) as i64);
+        }
     }
 
-    // Lightning strike-window cache (#504): only meaningful once a postgis
-    // events collection has rendered, but the family is cheap either way.
+    // Lightning strike-window (#504) and station-frame (#1063) caches: only
+    // meaningful once a postgis map layer has rendered, but the families are
+    // cheap either way.
     if !state
         .postgis_engines
         .read()
@@ -5427,6 +6770,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         .is_empty()
     {
         LIGHTNING_STRIKE_CACHE_METRICS.update(engine_postgis::strike_window_cache_metrics(), None);
+        STATION_FRAME_CACHE_METRICS.update(engine_postgis::station_frame_cache_metrics(), None);
     }
 
     // Tile cache: per-collection
@@ -5566,8 +6910,16 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             .postgis_engines
             .read()
             .unwrap_or_else(|e| e.into_inner());
+        // Rebuilt every scrape so a collection removed on reload leaves no
+        // stale `1` behind. The gather below runs after the counter-state
+        // lock is released, so a scrape that overlaps another's reset can
+        // briefly miss the series, like the satellite gauges.
+        POSTGIS_LOCATIONS_TRUNCATED.reset();
         for engine in engines.iter() {
             let cid = engine.collection_id();
+            POSTGIS_LOCATIONS_TRUNCATED
+                .with_label_values(&[cid])
+                .set(i64::from(engine.locations_truncated()));
             let snap = engine.health_snapshot();
             // Only emit postgis_up once the first ping has run — before that the
             // status is the optimistic seed, and emitting `1` would disagree with
@@ -5707,6 +7059,45 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         }
     }
 
+    // Station grids (#1082): per collection and parameter, rebuilt each
+    // scrape so a removed collection's series go; the shared cache and
+    // computation budget once.
+    if let Ok(engines) = state.station_grid_engines.read() {
+        STATION_GRID_STATIONS.reset();
+        for engine in engines.iter() {
+            let collection = engine.collection_id();
+            for (parameter, stations) in engine.station_counts() {
+                if let Some(stations) = stations {
+                    STATION_GRID_STATIONS
+                        .with_label_values(&[collection, &parameter])
+                        .set(stations as i64);
+                }
+            }
+            let (analyses, failures, last_ms) = engine.metrics();
+            let d = delta_counts(
+                &mut counter_state.station_grid,
+                collection,
+                [analyses, failures],
+            );
+            STATION_GRID_ANALYSES_TOTAL
+                .with_label_values(&[collection])
+                .inc_by(d[0]);
+            STATION_GRID_FAILURES_TOTAL
+                .with_label_values(&[collection])
+                .inc_by(d[1]);
+            STATION_GRID_LAST_ANALYSIS_MS
+                .with_label_values(&[collection])
+                .set(last_ms as i64);
+        }
+        if !engines.is_empty() {
+            STATION_GRID_CACHE_METRICS.update(engine_station_grid::cache_metrics(), None);
+            let (used, limit, rejected) = engine_station_grid::budget_metrics();
+            STATION_GRID_COMPUTE_USED.set(used.min(i64::MAX as u64) as i64);
+            STATION_GRID_COMPUTE_LIMIT.set(limit.min(i64::MAX as u64) as i64);
+            STATION_GRID_COMPUTE_REJECTED.feed(rejected);
+        }
+    }
+
     // CAP engines: catalog gauges + supersede counter for every mode, and the
     // WIS2 pipeline / accumulator series for WIS2-mode collections.
     if let Ok(engines) = state.cap_engines.read() {
@@ -5789,12 +7180,11 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             BUFR_REPORTS_TOTAL
                 .with_label_values(&[cid, "skipped"])
                 .inc_by(d[6]);
-            BUFR_DECODE_FAILURES_TOTAL
-                .with_label_values(&[cid, "error"])
-                .inc_by(d[7]);
-            BUFR_DECODE_FAILURES_TOTAL
-                .with_label_values(&[cid, "unsupported"])
-                .inc_by(d[8]);
+            for (kind, n) in engine_bufr::decode::FailureKind::ALL.iter().zip(&d[7..]) {
+                BUFR_DECODE_FAILURES_TOTAL
+                    .with_label_values(&[cid, kind.reason(), kind.label()])
+                    .inc_by(*n);
+            }
             if let Some(snap) = engine.wis2_status() {
                 scrape_wis2_status(&mut counter_state.wis2, cid, &snap);
             }
@@ -6004,11 +7394,49 @@ pub async fn correlation_id_middleware(
     response
 }
 
+/// Longest `User-Agent` / `Referer` value the request log keeps, in bytes,
+/// cut back to a char boundary. Both are client-controlled, so the bound
+/// keeps one client from inflating every log line it causes.
+const MAX_LOGGED_HEADER_LEN: usize = 256;
+
+/// `s` cut to at most `max` bytes, never inside a multi-byte character.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// A `Referer` without its query string and fragment: both can carry
+/// session tokens or other secrets of the referring page.
+fn strip_referer_query(referer: &str) -> &str {
+    referer
+        .find(['?', '#'])
+        .map_or(referer, |cut| &referer[..cut])
+}
+
+/// The value of request header `name` as the request log records it:
+/// decoded lossily (a byte that is not UTF-8 becomes U+FFFD), passed
+/// through `clean`, then truncated to [`MAX_LOGGED_HEADER_LEN`] bytes. An
+/// absent header is an empty string, like the line's other optional strings.
+fn logged_header(headers: &HeaderMap, name: header::HeaderName, clean: fn(&str) -> &str) -> String {
+    headers.get(name).map_or_else(String::new, |value| {
+        let decoded = String::from_utf8_lossy(value.as_bytes());
+        truncate_on_char_boundary(clean(&decoded), MAX_LOGGED_HEADER_LEN).to_string()
+    })
+}
+
 /// Middleware that emits one structured INFO log line per HTTP request.
 ///
 /// Fields: request_id, method, path, route (template), api, collection,
-/// query_type, query (raw query string), status, duration_ms, result_size
-/// (bytes from Content-Length header if present).
+/// query_type, query (raw query string), user_agent, referer (without its
+/// query string and fragment), status, duration_ms, result_size (bytes from
+/// Content-Length header if present). `user_agent` and `referer` are cut to
+/// [`MAX_LOGGED_HEADER_LEN`] bytes and are empty when the header is absent.
 pub async fn request_logging_middleware(
     matched_path: Option<MatchedPath>,
     req: axum::extract::Request,
@@ -6018,6 +7446,8 @@ pub async fn request_logging_middleware(
     let method = req.method().to_string();
     let uri_path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| q.to_string());
+    let user_agent = logged_header(req.headers(), header::USER_AGENT, |ua| ua);
+    let referer = logged_header(req.headers(), header::REFERER, strip_referer_query);
     let matched = matched_path.as_ref().map(|p| p.as_str().to_string());
     let request_id = req
         .extensions()
@@ -6056,7 +7486,7 @@ pub async fn request_logging_middleware(
     let query_str = query.as_deref().unwrap_or("");
 
     // Local macro keeps the field list in one place: future fields like
-    // `user_agent` or `cache_hit` get added once and apply to both arms.
+    // `cache_hit` get added once and apply to both arms.
     // tracing's macro requires the field list at the call site, so we splice
     // an optional `error = …,` token tree depending on whether a reason was
     // attached.
@@ -6071,6 +7501,8 @@ pub async fn request_logging_middleware(
                 collection = collection_str,
                 query_type = query_type,
                 query = query_str,
+                user_agent = user_agent.as_str(),
+                referer = referer.as_str(),
                 status = status,
                 duration_ms = duration_str,
                 result_size = result_size,
@@ -6177,6 +7609,7 @@ mod tests {
             postgis: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             nowcast: source.map(|s| ds_core::config::NowcastConfig {
                 source: s.to_string(),
                 horizon: "PT1H".to_string(),
@@ -6194,7 +7627,9 @@ mod tests {
                 impact_weight_property: None,
                 radar_source: None,
             }),
+            station_grid: None,
             preview: None,
+            derive_wind: None,
         }
     }
 
@@ -6279,6 +7714,179 @@ mod tests {
         }
     }
 
+    /// #897: u/v components give a derived speed on every API, styled with
+    /// the built-in `wind_speed` default; a collection opts out with
+    /// `derive_wind = false`; a reused engine keeps its wrapper. The
+    /// direction is EDR only. No committed `.sqd` carries wind: the Kenya
+    /// (lat/lon) fixture's msl and 2t become FMI's u and v (newbase
+    /// `kFmiWindUMS = 23`, `kFmiWindVMS = 24`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn derived_wind_is_registered_styled_reused_and_opted_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "202604042019_202604040600_ecmwf_kenya_surface.sqd";
+        let mut bytes = std::fs::read(format!("../../testdata/ecmwf-kenya/{name}")).unwrap();
+        for (from, to) in [
+            (
+                &b"\n1\n29 Mean Sea Level Pressure (msl)\n"[..],
+                &b"\n23\n7 WindUMS\n"[..],
+            ),
+            (b"\n4\n24 2 Metre Temperature (2t)\n", b"\n24\n7 WindVMS\n"),
+        ] {
+            let at = bytes.windows(from.len()).position(|w| w == from).unwrap();
+            bytes.splice(at..at + from.len(), to.iter().copied());
+        }
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+        let collection = |derive_wind: Option<bool>| -> CollectionConfig {
+            serde_json::from_value(serde_json::json!({
+                "id": "kenya", "title": "Kenya", "description": "u/v",
+                "engine_type": "querydata", "apis": ["edr", "wms", "maps", "tiles"],
+                "data_path": dir.path(), "derive_wind": derive_wind,
+            }))
+            .unwrap()
+        };
+        let load = |collection: CollectionConfig, reuse| {
+            super::load_collections(
+                &ds_render::StyleContext::with_builtins(),
+                &[collection],
+                &[],
+                "http://x",
+                false,
+                0,
+                super::ReusableCaches::default(),
+                reuse,
+            )
+        };
+        let has = |engine: &Arc<dyn ds_core::map_engine::MapEngine>, name: &str| {
+            engine
+                .raster_info()
+                .parameters
+                .iter()
+                .any(|p| p.name == name)
+        };
+
+        let result = load(collection(None), super::EngineReuse::default());
+        for engines in [
+            &result.wms_state.engines,
+            &result.maps_state.engines,
+            &result.tiles_state.map_engines,
+        ] {
+            assert!(has(&engines["kenya"], "WindSpeedMS"));
+            assert!(!has(&engines["kenya"], "WindDirection"));
+        }
+        let speed = &result.wms_state.styles["kenya/WindSpeedMS"]["default"];
+        assert_eq!(speed.palette.name, "wind_speed");
+        assert_eq!((speed.min, speed.max), (0.0, 40.0));
+        let edr = result.edr_state.engines["kenya"].get_parameters();
+        assert!(edr.contains(&"WindSpeedMS".to_string()));
+        assert!(edr.contains(&"WindDirection".to_string()));
+        assert_eq!(result.wind_by_id["kenya"].len(), 1);
+
+        // A reused engine keeps its wrapper: one registered Arc throughout.
+        let reused = load(
+            collection(None),
+            super::EngineReuse {
+                engines: result.engines_by_id.clone(),
+                wind: result.wind_by_id.clone(),
+            },
+        );
+        let ptr = |e: &Arc<dyn ds_core::map_engine::MapEngine>| Arc::as_ptr(e) as *const ();
+        assert_eq!(
+            ptr(&reused.wms_state.engines["kenya"]),
+            ptr(&result.wms_state.engines["kenya"])
+        );
+
+        // Opted out: the components only, and no wrapper.
+        let off = load(collection(Some(false)), super::EngineReuse::default());
+        assert!(!has(&off.wms_state.engines["kenya"], "WindSpeedMS"));
+        assert!(!off.edr_state.engines["kenya"]
+            .get_parameters()
+            .contains(&"WindSpeedMS".to_string()));
+        assert!(!off.wms_state.styles.contains_key("kenya/WindSpeedMS"));
+        assert!(off.wind_by_id.is_empty());
+    }
+
+    /// WMS GetFeatureInfo (#1064): a WMS collection whose engine answers
+    /// position queries registers its EDR side for the WMS whether or not it
+    /// lists `edr`, which only decides the EDR routes. A GRIB collection
+    /// registers its derived-wind wrapper, so a derived speed is queryable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wms_collections_register_their_position_engine_without_edr() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let geotiff = serde_json::json!({
+            "filename_template": "radar_%Y%m%dT%H%MZ.tif",
+            "parameter": "reflectivity", "unit": "dBZ",
+        });
+        let collections: Vec<CollectionConfig> = [
+            serde_json::json!({
+                "id": "radar", "title": "Radar", "description": "GeoTIFF",
+                "engine_type": "geotiff", "apis": ["wms"],
+                "data_path": "../../testdata/radar", "geotiff": geotiff,
+            }),
+            serde_json::json!({
+                "id": "arpege-uv", "title": "ARPEGE", "description": "u/v",
+                "engine_type": "grib", "apis": ["wms"],
+                "grib": {"data_path": "../../testdata/grib-arpege-wind", "parameters": ["10u", "10v"]},
+            }),
+            serde_json::json!({
+                "id": "radar-edr", "title": "Radar", "description": "EDR only",
+                "engine_type": "geotiff", "apis": ["edr"],
+                "data_path": "../../testdata/radar", "geotiff": geotiff,
+            }),
+        ]
+        .into_iter()
+        .map(|c| serde_json::from_value(c).unwrap())
+        .collect();
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &collections,
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let ids = |keys: Vec<&String>| {
+            let mut ids: Vec<String> = keys.into_iter().cloned().collect();
+            ids.sort();
+            ids
+        };
+        let point = &result.wms_state.point_engines;
+        assert_eq!(ids(point.keys().collect()), ["arpege-uv", "radar"]);
+        assert_eq!(
+            ids(result.edr_state.engines.keys().collect()),
+            ["radar-edr"]
+        );
+        assert!(point["arpege-uv"]
+            .get_parameters()
+            .contains(&"10si".to_string()));
+
+        // Through the WMS: the derived speed's value at a point.
+        let app = api_wms::router(Arc::new(arc_swap::ArcSwap::from_pointee(result.wms_state)));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo\
+                         &LAYERS=arpege-uv/10si&QUERY_LAYERS=arpege-uv/10si&STYLES=\
+                         &CRS=CRS:84&BBOX=10,46,12,48&WIDTH=2&HEIGHT=2&I=0&J=0\
+                         &INFO_FORMAT=application/json",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let properties = &body["features"][0]["properties"];
+        assert_eq!(properties["parameter"], "10si", "{body}");
+        assert!(properties["value"].is_number(), "{body}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn grib_level_collections_register_metadata_queries_and_reuse_one_owner() {
         use axum::{
@@ -6331,6 +7939,7 @@ mod tests {
         }
         let reused = load(super::EngineReuse {
             engines: result.engines_by_id.clone(),
+            wind: result.wind_by_id.clone(),
         });
         assert!(Arc::ptr_eq(
             &reused.grib_engines[0],
@@ -6553,6 +8162,143 @@ mod tests {
         assert!(!result.wms_state.engines.contains_key("nc"));
     }
 
+    /// A CSV station collection and a station grid over it (#1082).
+    fn station_grid_collections(source: &str) -> Vec<CollectionConfig> {
+        let mut csv = nowcast_test_collection("weather", "csv", None);
+        csv.data_path = Some("../../testdata/weather.csv".to_string());
+        csv.apis = vec!["features".to_string()];
+        let mut grid = nowcast_test_collection("t2m", "station-grid", None);
+        grid.description = "Analysed temperature.".to_string();
+        grid.apis = ["edr", "wms", "maps", "tiles"].map(String::from).to_vec();
+        grid.station_grid = Some(ds_core::config::StationGridConfig {
+            source: source.to_string(),
+            parameters: vec!["temperature".to_string()],
+            grid: ds_core::config::StationGridGeometry {
+                crs: "EPSG:4326".to_string(),
+                bbox: [19.0, 59.0, 32.0, 71.0],
+                resolution: 0.1,
+            },
+            method: "adw".to_string(),
+            power: None,
+            correlation_length_km: None,
+            max_neighbours: 8,
+            search_radius_km: 150.0,
+            max_age: "PT1H".to_string(),
+            cadence: Some("PT1H".to_string()),
+            poll_interval_secs: 60,
+            precompute: 2,
+        });
+        vec![csv, grid]
+    }
+
+    /// A station grid over a CSV collection that lists no EDR: wired into
+    /// every map API and EDR, with one styled layer per parameter, its
+    /// provenance in every description, and GetFeatureInfo through its
+    /// position query.
+    #[test]
+    fn station_grid_wires_maps_and_edr_over_a_station_source() {
+        let result = load_with_reuse(
+            &station_grid_collections("weather"),
+            super::EngineReuse::default(),
+        );
+        let h = health_of(&result, "t2m");
+        assert_eq!(h.status, super::CollectionStatus::Ready, "{:?}", h.error);
+        assert_eq!(result.station_grid_engines.len(), 1);
+        assert!(matches!(
+            result.engines_by_id.get("t2m"),
+            Some(super::EngineHandle::StationGrid(_))
+        ));
+        assert!(result.edr_state.engines.contains_key("t2m"));
+        assert!(result.wms_state.engines.contains_key("t2m"));
+        assert!(result.wms_state.point_engines.contains_key("t2m"));
+        assert!(result.maps_state.engines.contains_key("t2m"));
+        assert!(result.tiles_state.map_engines.contains_key("t2m"));
+        assert!(result.wms_state.styles.contains_key("t2m/temperature"));
+        let description = &result.edr_state.collections["t2m"].description;
+        assert!(
+            description.starts_with(
+                "Analysed temperature. Gridded on the fly from station \
+                 collection 'weather' (temperature) by angular distance weighting"
+            ),
+            "{description}"
+        );
+        assert_eq!(
+            &result.maps_state.collections["t2m"].description,
+            description
+        );
+    }
+
+    #[test]
+    fn station_grid_needs_a_station_source() {
+        let result = load_with_reuse(
+            &station_grid_collections("no-such"),
+            super::EngineReuse::default(),
+        );
+        let h = health_of(&result, "t2m");
+        assert_eq!(h.status, super::CollectionStatus::Failed);
+        assert!(h.error.as_deref().unwrap_or("").contains("not found"));
+        assert!(!result.wms_state.engines.contains_key("t2m"));
+        // The CSV source itself still loads.
+        assert_eq!(
+            health_of(&result, "weather").status,
+            super::CollectionStatus::Ready
+        );
+    }
+
+    /// A station grid keeps its engine across a reload only with its
+    /// source's: never over a CSV, which every reload rebuilds.
+    #[test]
+    fn station_grid_reuse_follows_its_source() {
+        let collections = station_grid_collections("weather");
+        let built = load_with_reuse(&collections, super::EngineReuse::default());
+        let old: HashMap<String, CollectionConfig> = collections
+            .iter()
+            .map(|c| (c.id.clone(), c.clone()))
+            .collect();
+        let live = built.engines_by_id.clone();
+        let r = super::reusable_collections(&old, &collections, &live);
+        assert!(
+            r.is_empty(),
+            "a CSV source is rebuilt, so is its grid: {r:?}"
+        );
+
+        // Over a source that is itself reused, an unchanged grid is too.
+        let radar = tm35_source_collection("radar");
+        let mut grid = collections[1].clone();
+        grid.station_grid.as_mut().unwrap().source = "radar".to_string();
+        let old: HashMap<String, CollectionConfig> = [
+            ("radar".to_string(), radar.clone()),
+            ("t2m".to_string(), grid.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let new = vec![radar, grid.clone()];
+        let r = super::reusable_collections(&old, &new, &live_of_any(&built, &["radar", "t2m"]));
+        assert!(r.contains("t2m") && r.contains("radar"), "{r:?}");
+        let mut changed = grid;
+        changed.station_grid.as_mut().unwrap().max_neighbours = 4;
+        let new = vec![new[0].clone(), changed];
+        let r = super::reusable_collections(&old, &new, &live_of_any(&built, &["radar", "t2m"]));
+        assert!(!r.contains("t2m"), "a changed grid is rebuilt");
+    }
+
+    /// Live handles for `ids`, all the same engine: `reusable_collections`
+    /// asks only whether one is live.
+    fn live_of_any(
+        built: &super::LoadResult,
+        ids: &[&str],
+    ) -> HashMap<String, super::EngineHandle> {
+        let handle = built
+            .engines_by_id
+            .values()
+            .next()
+            .expect("an engine")
+            .clone();
+        ids.iter()
+            .map(|id| (id.to_string(), handle.clone()))
+            .collect()
+    }
+
     #[test]
     fn nowcast_missing_lightning_source_fails_that_collection() {
         // The #549 safety property: a lightning_source that names no
@@ -6706,6 +8452,26 @@ mod tests {
 
     // --- reload preserves the warm render caches (ReusableCaches) ---
 
+    /// #1010: with no `[wms]` block to size it, the rendered-image cache gets
+    /// the same default as a `[wms]` block that omits `rendered_cache_mb`.
+    #[test]
+    fn rendered_cache_defaults_without_a_wms_block() {
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[],
+            &[],
+            "http://x",
+            false,
+            64,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        assert_eq!(
+            result.wms_state.rendered_cache.capacity(),
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB * 1024 * 1024
+        );
+    }
+
     #[test]
     fn reload_reuses_render_caches_when_size_unchanged() {
         // Startup-equivalent: fresh caches (empty collections is fine — the
@@ -6819,6 +8585,7 @@ mod tests {
                 .filter(|(id, _)| eligible.contains(id.as_str()))
                 .map(|(id, e)| (id.clone(), e.clone()))
                 .collect(),
+            wind: HashMap::new(),
         }
     }
 
@@ -6906,6 +8673,233 @@ mod tests {
             !Arc::ptr_eq(&second.nowcast_engines[0], &third.nowcast_engines[0]),
             "nowcast must rebuild when its source engine was rebuilt"
         );
+    }
+
+    /// A reload that keeps a satellite collection's config keeps its engine
+    /// and so the scans it holds in memory. A changed config gets a new
+    /// engine, and dropping the old one does not take the new one's scans.
+    #[test]
+    fn satellite_reload_keeps_the_scans_of_the_engine_it_keeps() {
+        const C13: &str =
+            "OR_ABI-L2-CMIPF-M6C13_G19_s20262681900199_e20262681909519_c20262681909592.nc";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/goes19-abi")
+                .join(C13),
+            dir.path().join(C13),
+        )
+        .unwrap();
+        let mut collection = nowcast_test_collection("goes19-reload", "satellite", None);
+        collection.satellite = Some(ds_core::config::SatelliteConfig {
+            provider: "goes-r".into(),
+            data_path: Some(dir.path().to_string_lossy().into_owned()),
+            endpoint: None,
+            bucket: None,
+            time_window: None,
+            poll_interval_secs: 60,
+            composites: Vec::new(),
+            products: vec![ds_core::config::SatelliteProductConfig {
+                parameter: "ir_10_3".into(),
+                title: "IR 10.3 µm brightness temperature".into(),
+                unit: "K".into(),
+                product: "ABI-L2-CMIPF".into(),
+                band: Some(13),
+                variable: "CMI".into(),
+            }],
+        });
+        let configs = vec![collection];
+        let first = load_with_reuse(&configs, super::EngineReuse::default());
+        let live = first.satellite_engines[0].clone();
+        live.poll_once();
+        let held = live.frame_window();
+        assert!(held.bytes > 0);
+        assert_eq!(held.resident_bytes, held.bytes);
+
+        // Unchanged: the same engine, and its scans stay in memory once the
+        // previous load's handles go.
+        let second = load_with_reuse(
+            &configs,
+            reuse_pool(&configs, &configs, &first.engines_by_id),
+        );
+        assert!(Arc::ptr_eq(&live, &second.satellite_engines[0]));
+        drop(first);
+        assert_eq!(live.frame_window(), held);
+
+        // Changed: a new engine ingests its own scans, and dropping the old
+        // engine leaves them.
+        let mut changed = configs.clone();
+        changed[0].title = "renamed".to_string();
+        let third = load_with_reuse(
+            &changed,
+            reuse_pool(&configs, &changed, &second.engines_by_id),
+        );
+        let rebuilt = third.satellite_engines[0].clone();
+        assert!(!Arc::ptr_eq(&live, &rebuilt));
+        rebuilt.poll_once();
+        drop(second);
+        drop(live);
+        assert_eq!(rebuilt.frame_window(), held);
+    }
+
+    /// A NetCDF collection serves EDR (#1067), its default `apis` included,
+    /// and its WMS layers answer GetFeatureInfo whether or not it lists
+    /// `edr`; every API serves the wind speed derived from its grid-relative
+    /// 10 m components, and no direction. A reload keeping its config keeps
+    /// its engine, open files and wrapper; a changed config builds anew.
+    #[test]
+    fn netcdf_serves_edr_and_derived_wind_and_is_reused_across_reloads() {
+        let meps = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/meps-netcdf")
+            .to_string_lossy()
+            .into_owned();
+        let mut collection = nowcast_test_collection("meps-reload", "netcdf", None);
+        collection.apis = vec!["wms".into(), "maps".into(), "tiles".into()];
+        collection.netcdf = Some(
+            toml::from_str(&format!(
+                "data_path = {meps:?}\n\
+                 variables = [\"air_temperature_2m\", \"x_wind_10m\", \"y_wind_10m\"]"
+            ))
+            .unwrap(),
+        );
+        let mut with_edr = collection.clone();
+        with_edr.id = "meps-edr".into();
+        // The default: `apis` left out of the config.
+        with_edr.apis = vec!["edr".into()];
+        let configs = vec![collection, with_edr];
+        let first = load_with_reuse(&configs, super::EngineReuse::default());
+        assert_eq!(first.netcdf_engines.len(), 2);
+        for id in ["meps-reload", "meps-edr"] {
+            let health = first.health.iter().find(|h| h.id == id).unwrap();
+            assert_eq!(health.status, super::CollectionStatus::Ready, "{id}");
+        }
+        let edr = &first.edr_state.engines;
+        assert!(edr.contains_key("meps-edr") && !edr.contains_key("meps-reload"));
+        let parameters = edr["meps-edr"].get_parameters();
+        assert!(parameters.contains(&"wind_speed_10m".to_string()));
+        assert!(!parameters.iter().any(|p| p.contains("direction")));
+        assert!(first.wms_state.point_engines.contains_key("meps-reload"));
+        assert!(!first.wms_state.point_engines.contains_key("meps-edr"));
+        let speed = &first.wms_state.styles["meps-reload/wind_speed_10m"]["default"];
+        assert_eq!(speed.palette.name, "wind_speed");
+        assert!(first.maps_state.engines.contains_key("meps-reload"));
+        assert!(first.tiles_state.map_engines.contains_key("meps-reload"));
+        // The recovery loop compares the engine's own variables.
+        assert_eq!(first.netcdf_parameters["meps-reload"].len(), 3);
+        let live = first.netcdf_engines[0].clone();
+        live.poll_once();
+        assert_eq!(live.times().len(), 6);
+
+        let second = load_with_reuse(
+            &configs,
+            super::EngineReuse {
+                wind: first.wind_by_id.clone(),
+                ..reuse_pool(&configs, &configs, &first.engines_by_id)
+            },
+        );
+        assert!(Arc::ptr_eq(&live, &second.netcdf_engines[0]));
+        let ptr = |e: &Arc<dyn ds_core::map_engine::MapEngine>| Arc::as_ptr(e) as *const ();
+        assert_eq!(
+            ptr(&second.wms_state.engines["meps-reload"]),
+            ptr(&first.wms_state.engines["meps-reload"]),
+            "the reused engine keeps its wrapper"
+        );
+
+        let mut changed = configs.clone();
+        changed[0].title = "renamed".to_string();
+        let third = load_with_reuse(
+            &changed,
+            reuse_pool(&configs, &changed, &second.engines_by_id),
+        );
+        assert!(!Arc::ptr_eq(&live, &third.netcdf_engines[0]));
+    }
+
+    /// #1067 PR 6: the shipped local MEPS example, loaded over its
+    /// committed sample. Every layer has its style at load: the layers the
+    /// example no longer configures take the built-in default their name
+    /// and the file's unit select (the gusts, MSLP in pascals, the run-start
+    /// accumulation in `kg/m^2`), the rest keep their entries.
+    #[test]
+    fn meps_netcdf_example_layers_get_default_styles() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text =
+            std::fs::read_to_string(root.join("collections.d/meps-netcdf-local.toml")).unwrap();
+        let mut collection: CollectionConfig = toml::from_str(&text).unwrap();
+        collection.netcdf.as_mut().unwrap().data_path = Some(
+            root.join("testdata/meps-netcdf")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let loaded = load_with_reuse(&[collection], super::EngineReuse::default());
+        let styles = &loaded.wms_state.styles;
+        let style = |name: &str| {
+            let s = &styles[&format!("meps-netcdf-local/{name}")]["default"];
+            (s.palette.name.as_str(), s.min, s.max)
+        };
+        for (name, expected) in [
+            ("air_temperature_2m", ("temperature", 183.15, 323.15)),
+            ("wind_speed_of_gust", ("wind_speed", 0.0, 40.0)),
+            (
+                "air_pressure_at_sea_level",
+                ("pressure", 95_000.0, 105_000.0),
+            ),
+            (
+                "precipitation_amount_acc",
+                ("precipitation_accumulation", 0.0, 200.0),
+            ),
+            // Configured by the example.
+            ("relative_humidity_2m", ("viridis", 0.0, 1.0)),
+            ("x_wind_10m", ("diverging", -20.0, 20.0)),
+            ("y_wind_10m", ("diverging", -20.0, 20.0)),
+            ("cloud_area_fraction", ("grayscale", 0.0, 1.0)),
+        ] {
+            assert_eq!(style(name), expected, "{name}");
+        }
+    }
+
+    /// #1067 PR 8: the shipped local MEPS pressure-level example, loaded
+    /// over its committed sample. The layers advertise the pressure axis
+    /// (WMS ELEVATION, EDR `z`), and every layer, the derived
+    /// `wind_speed_pl` included, takes the built-in default its name and
+    /// unit select: the wind on twice the surface scale, for the jet.
+    #[test]
+    fn meps_netcdf_pressure_level_example_serves_its_levels_and_styles() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text =
+            std::fs::read_to_string(root.join("collections.d/meps-netcdf-pl-local.toml")).unwrap();
+        let mut collection: CollectionConfig = toml::from_str(&text).unwrap();
+        collection.netcdf.as_mut().unwrap().data_path = Some(
+            root.join("testdata/meps-netcdf-pl")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let id = "meps-netcdf-pl-local";
+        let loaded = load_with_reuse(&[collection], super::EngineReuse::default());
+        let levels = ds_core::vertical::VerticalDimension::new(
+            ds_core::vertical::VerticalKind::Pressure,
+            vec![1000.0, 850.0, 500.0, 300.0],
+        );
+        let info = loaded.wms_state.engines[id].raster_info();
+        assert_eq!(info.vertical.as_ref(), Some(&levels));
+        assert_eq!(
+            loaded.edr_state.engines[id].get_vertical_extent(),
+            Some(levels)
+        );
+        let styles = &loaded.wms_state.styles;
+        let style = |name: &str| {
+            let s = &styles[&format!("{id}/{name}")]["default"];
+            (s.palette.name.as_str(), s.min, s.max)
+        };
+        for (name, expected) in [
+            ("air_temperature_pl", ("temperature", 183.15, 323.15)),
+            ("x_wind_pl", ("diverging", -80.0, 80.0)),
+            ("y_wind_pl", ("diverging", -80.0, 80.0)),
+            ("wind_speed_pl", ("wind_speed", 0.0, 80.0)),
+            ("geopotential_pl", ("viridis", 0.0, 206_000.0)),
+            ("relative_humidity_pl", ("humidity_fraction", 0.0, 1.0)),
+        ] {
+            assert_eq!(style(name), expected, "{name}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7287,6 +9281,143 @@ mod tests {
         assert!(!is_safe_request_id(&huge));
     }
 
+    // --- request log: user_agent / referer (#995) ---
+
+    /// An in-memory log sink for a JSON `fmt` subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// The `request` log line `request_logging_middleware` writes for
+    /// `headers`, as the JSON object production's `LOG_FORMAT=json` emits.
+    /// The subscriber is the thread's default, and the current-thread test
+    /// runtime keeps the whole request on this thread.
+    async fn request_log_line(headers: &[(&str, &[u8])]) -> serde_json::Value {
+        use tower::ServiceExt;
+        let logs = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let app = axum::Router::new()
+            .route(
+                "/edr/collections/{id}/position",
+                axum::routing::get(|| async { "ok" }),
+            )
+            .layer(axum::middleware::from_fn(super::request_logging_middleware));
+        let mut request = axum::http::Request::builder().uri("/edr/collections/obs/position");
+        for (name, value) in headers {
+            request = request.header(*name, axum::http::HeaderValue::from_bytes(value).unwrap());
+        }
+        let request = request.body(axum::body::Body::empty()).unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = logs.0.lock().unwrap().clone();
+        let lines: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|line: &serde_json::Value| line["message"] == "request")
+            .collect();
+        assert_eq!(lines.len(), 1, "one request line: {lines:?}");
+        lines.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_log_records_user_agent_and_referer() {
+        let line = request_log_line(&[
+            ("user-agent", b"Mozilla/5.0 (X11; Linux x86_64) test/1.0"),
+            ("referer", b"https://example.org/preview/map"),
+        ])
+        .await;
+        assert_eq!(
+            line["user_agent"],
+            "Mozilla/5.0 (X11; Linux x86_64) test/1.0"
+        );
+        assert_eq!(line["referer"], "https://example.org/preview/map");
+        assert_eq!(line["collection"], "obs");
+    }
+
+    /// The query string and fragment of the referring page can carry
+    /// tokens: the log keeps the referer up to the first `?` or `#`.
+    #[tokio::test]
+    async fn request_log_strips_the_referer_query_and_fragment() {
+        let line = request_log_line(&[(
+            "referer",
+            b"https://example.org/view?access_token=s3cret&x=1#state=abc",
+        )])
+        .await;
+        assert_eq!(line["referer"], "https://example.org/view");
+        let line = request_log_line(&[("referer", b"https://example.org/view#token=abc?x")]).await;
+        assert_eq!(line["referer"], "https://example.org/view");
+    }
+
+    #[tokio::test]
+    async fn request_log_truncates_long_header_values() {
+        let long_ua = "a".repeat(1000);
+        let long_referer = format!("https://example.org/{}?token=s3cret", "p".repeat(1000));
+        let line = request_log_line(&[
+            ("user-agent", long_ua.as_bytes()),
+            ("referer", long_referer.as_bytes()),
+        ])
+        .await;
+        assert_eq!(line["user_agent"], "a".repeat(super::MAX_LOGGED_HEADER_LEN));
+        let referer = line["referer"].as_str().unwrap();
+        assert_eq!(referer.len(), super::MAX_LOGGED_HEADER_LEN);
+        assert!(referer.starts_with("https://example.org/ppp"), "{referer}");
+
+        // A two-byte character straddling the limit is dropped whole, and
+        // a byte that is not UTF-8 is logged as U+FFFD, not dropped.
+        let mut ua = "a".repeat(super::MAX_LOGGED_HEADER_LEN - 1).into_bytes();
+        ua.extend_from_slice("äbc".as_bytes());
+        let line = request_log_line(&[("user-agent", &ua), ("referer", b"https://x/\xe4")]).await;
+        assert_eq!(
+            line["user_agent"],
+            "a".repeat(super::MAX_LOGGED_HEADER_LEN - 1)
+        );
+        assert_eq!(line["referer"], "https://x/\u{FFFD}");
+    }
+
+    /// Absent headers log as empty strings, like `query` and `collection`
+    /// when a request has none.
+    #[tokio::test]
+    async fn request_log_records_absent_headers_as_empty() {
+        let line = request_log_line(&[]).await;
+        assert_eq!(line["user_agent"], "");
+        assert_eq!(line["referer"], "");
+        assert_eq!(line["query"], "");
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        use super::truncate_on_char_boundary as cut;
+        assert_eq!(cut("abc", 3), "abc");
+        assert_eq!(cut("abcd", 3), "abc");
+        // "€" is three bytes: a cut at byte 2 or 3 drops it whole.
+        assert_eq!(cut("a€b", 2), "a");
+        assert_eq!(cut("a€b", 3), "a");
+        assert_eq!(cut("a€b", 4), "a€");
+        assert_eq!(cut("", 0), "");
+    }
+
     #[test]
     fn classifies_edr_position_query() {
         let (api, coll, qt) = classify_route(
@@ -7655,6 +9786,169 @@ colormap = "radar_fmi"
         assert_eq!(styles["radar_fmi"].title, "FMI Radar");
     }
 
+    /// #1063: station symbol layers are opt-in. A station collection that
+    /// lists only `tiles` and has no `[postgis.map]` keeps exactly its vector
+    /// tiles: no raster tileset, no station layers (so no fingerprint
+    /// statement and no style resolution). `wms`/`maps` or the section turn
+    /// them on; the events shape is unchanged.
+    #[test]
+    fn postgis_station_map_layers_are_opt_in() {
+        let station = |apis: &[&str], map: bool| {
+            let mut c = nowcast_test_collection("obs", "postgis", None);
+            c.apis = apis.iter().map(|a| a.to_string()).collect();
+            let mut toml =
+                String::from("dsn_env = \"OBS_DSN\"\n[observations]\nshape = \"long\"\n");
+            if map {
+                toml.push_str("[map]\nmax_age = \"PT1H\"\n");
+            }
+            c.postgis = Some(toml::from_str(&toml).unwrap());
+            c
+        };
+        let wiring = |c: &CollectionConfig| super::postgis_map_wiring(c);
+
+        assert_eq!(
+            wiring(&station(&["edr", "features", "tiles"], false)),
+            super::PostgisMapWiring {
+                raster_apis: vec![],
+                station_layers: false,
+                vector_tiles: true,
+            },
+            "tiles alone: today's vector tiles only"
+        );
+        assert_eq!(
+            wiring(&station(&["edr", "tiles"], true)),
+            super::PostgisMapWiring {
+                raster_apis: vec!["tiles"],
+                station_layers: true,
+                vector_tiles: true,
+            }
+        );
+        assert_eq!(
+            wiring(&station(&["wms", "tiles"], false)),
+            super::PostgisMapWiring {
+                raster_apis: vec!["wms", "tiles"],
+                station_layers: true,
+                vector_tiles: true,
+            }
+        );
+        assert_eq!(wiring(&station(&["maps"], false)).raster_apis, vec!["maps"]);
+        assert!(!wiring(&station(&["edr", "features"], false)).station_layers);
+
+        let mut events = station(&["edr", "wms", "tiles"], false);
+        events.postgis.as_mut().unwrap().observations.shape = "events".into();
+        assert_eq!(
+            wiring(&events),
+            super::PostgisMapWiring {
+                raster_apis: vec!["wms", "tiles"],
+                station_layers: false,
+                vector_tiles: false,
+            }
+        );
+    }
+
+    /// #1063: a PostGIS station collection's styles draw station symbols —
+    /// the ground transparent and the nodata marker in the palette's nodata
+    /// colour, on every layer and style — and each parameter layer's
+    /// midpoint is the middle of its default style's range.
+    #[test]
+    fn postgis_station_styles_draw_symbols_and_carry_midpoints() {
+        let collection: CollectionConfig = toml::from_str(
+            r#"
+id = "surface-obs"
+title = "Surface observations"
+description = "Station observations"
+engine_type = "postgis"
+apis = ["edr", "wms"]
+
+[postgis]
+dsn_env = "OBS_DSN"
+
+[postgis.stations]
+table = "public.stations"
+id_col = "station_id"
+label_col = "name"
+geom_col = "geom"
+
+[postgis.observations]
+shape = "long"
+table = "public.observations"
+station_fk_col = "station_id"
+time_col = "time"
+param_col = "parameter"
+value_col = "value"
+
+[[postgis.parameters]]
+name = "t2m"
+label = "Air temperature"
+unit = "degC"
+
+[[postgis.parameters]]
+name = "rh"
+label = "Relative humidity"
+unit = "%"
+
+[wms]
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "t2m"
+min = -30.0
+max = 20.0
+
+[[wms.styles]]
+name = "grey"
+title = "Grey"
+colormap = "grayscale"
+"#,
+        )
+        .unwrap();
+        let params = vec![
+            ds_core::map_engine::ParameterInfo {
+                name: "t2m".into(),
+                title: "Air temperature".into(),
+                unit: "degC".into(),
+            },
+            ds_core::map_engine::ParameterInfo {
+                name: "rh".into(),
+                title: "Relative humidity".into(),
+                unit: "%".into(),
+            },
+        ];
+        let index: HashMap<&str, &StyleBundle> = HashMap::new();
+        let layers = layer_styles(&collection, &params, &index);
+        for (layer, styles) in &layers {
+            for (name, style) in styles {
+                assert_eq!(style.colormap.color(None), [0, 0, 0, 0], "{layer} {name}");
+                // The palette's nodata colour (transparent here), not the
+                // underflow colour the bare palette gives `f64::MIN`.
+                assert_eq!(
+                    style.colormap.color(Some(engine_postgis::NODATA_MARKER)),
+                    [0, 0, 0, 0],
+                    "{layer} {name}"
+                );
+                assert_ne!(
+                    style.colormap.color(Some(style.min))[3],
+                    0,
+                    "{layer} {name}"
+                );
+            }
+        }
+        let symbols = super::postgis_station_symbols(&layers, "surface-obs", &params);
+        assert_eq!(symbols.midpoint("t2m"), -5.0);
+        let rh = &layers["surface-obs/rh"]["default"];
+        assert_eq!(symbols.midpoint("rh"), (rh.min + rh.max) / 2.0);
+
+        // Without the wrap the same palette paints `f64::MIN` opaque.
+        let mut raster = collection.clone();
+        raster.engine_type = "querydata".into();
+        raster.postgis = None;
+        let style = &layer_styles(&raster, &params, &index)["surface-obs/t2m"]["default"];
+        assert_ne!(
+            style.colormap.color(Some(engine_postgis::NODATA_MARKER))[3],
+            0
+        );
+    }
+
     #[test]
     fn collection_styles_fall_back_to_inline_when_no_bundle_referenced() {
         let collection: CollectionConfig = toml::from_str(
@@ -7887,6 +10181,226 @@ colormap = "radar_dbz"
         assert_eq!(edr["default"].max, wms["default"].max);
     }
 
+    /// A PVOL site's 3D Tiles document (#1137): each quantity is drawn with
+    /// the default style of its parameter layer, the one `[wms]` gives it,
+    /// and the collection page comes from the registries the site entered.
+    /// A site is in no Features registry, whatever `apis` says (the network
+    /// inventory is, under the source id), so without Maps or Tiles its page
+    /// is EDR's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pvol_sites_draw_each_quantity_in_its_style_and_link_their_page_in_3d_tiles() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        // One volume of site `test` with DBZH and VRAD.
+        std::fs::write(
+            dir.path().join("pvol.h5"),
+            include_bytes!("../../../testdata/pvol-cold-batch.h5"),
+        )
+        .unwrap();
+        let volume = |id: &str, apis: &str| -> CollectionConfig {
+            toml::from_str(&format!(
+                r#"
+id = "{id}"
+title = "Volumes"
+description = "test"
+engine_type = "odim-volume"
+apis = {apis}
+data_path = {path:?}
+
+[odim]
+prewarm_sweeps = 0
+
+[wms]
+colormap = "radar_dbz"
+
+[[wms.parameters]]
+name = "VRAD"
+colormap = "viridis"
+min = -30.0
+max = 30.0
+"#,
+                path = dir.path().to_str().unwrap()
+            ))
+            .unwrap()
+        };
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[
+                volume("pvol-edr", r#"["edr", "features", "3dtiles"]"#),
+                volume("pvol-maps", r#"["edr", "maps", "3dtiles"]"#),
+            ],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        for site in ["pvol-edr-test", "pvol-maps-test"] {
+            assert_eq!(
+                health_of(&result, site).status,
+                super::CollectionStatus::Ready
+            );
+        }
+        let state = &result.tiles_3d_state;
+        let page = |id: &str| state.collection_pages.get(id).map(String::as_str);
+        assert_eq!(
+            page("pvol-edr-test"),
+            Some("/edr/collections/pvol-edr-test")
+        );
+        assert_eq!(page("pvol-maps-test"), Some("/collections/pvol-maps-test"));
+        assert_eq!(state.quantity_styles["pvol-edr-test"]["VRAD"].unit(), "m/s");
+
+        let app = api_3dtiles::router(Arc::new(arc_swap::ArcSwap::from_pointee(
+            result.tiles_3d_state,
+        )));
+        let get = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{uri}");
+                let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        let related = |doc: &serde_json::Value| {
+            doc["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|l| l["rel"] == "related" && l["type"] == "text/html")
+                .map(|l| l["href"].as_str().unwrap().to_string())
+        };
+        let doc = get("/collections/pvol-edr-test").await;
+        assert_eq!(
+            related(&doc).as_deref(),
+            Some("http://x/edr/collections/pvol-edr-test?f=html")
+        );
+        let quantity = |id: &str| {
+            doc["quantities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["id"] == id)
+                .unwrap_or_else(|| panic!("{id} in {doc}"))
+                .clone()
+        };
+        // Velocity in m/s over its configured range, no floor; reflectivity
+        // keeps dBZ and its 5 dBZ floor.
+        let vrad = quantity("VRAD");
+        assert_eq!(vrad["unit"], "m/s");
+        assert!(vrad["min_value"].is_null());
+        assert_eq!(vrad["legend"]["unit"], "m/s");
+        assert_eq!(vrad["legend"]["min"], -30.0);
+        assert_eq!(vrad["legend"]["max"], 30.0);
+        let dbzh = quantity("DBZH");
+        assert_eq!(dbzh["unit"], "dBZ");
+        assert_eq!(dbzh["min_value"], 5.0);
+        let doc = get("/collections/pvol-maps-test").await;
+        assert_eq!(
+            related(&doc).as_deref(),
+            Some("http://x/collections/pvol-maps-test?f=html")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edr_items_serve_the_collections_own_feature_engine() {
+        // #928: an EDR collection whose engine also implements FeatureEngine
+        // gets `items` from that same engine. Listing `edr` enables it (the
+        // Features API stays off without `features`); a raster EDR
+        // collection gets none.
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("obs.csv");
+        std::fs::write(
+            &csv_path,
+            "location,latitude,longitude,time,temperature\n\
+             Helsinki,60.17,24.94,2026-01-01T00:00:00Z,-3.0\n\
+             Tampere,61.50,23.76,2026-01-01T00:00:00Z,-5.0\n\
+             Oulu,65.01,25.47,2026-01-01T00:00:00Z,-9.0\n",
+        )
+        .unwrap();
+        let csv: CollectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "obs", "title": "Obs", "description": "CSV stations",
+            "engine_type": "csv", "apis": ["edr"],
+            "data_path": csv_path.to_str().unwrap()
+        }))
+        .unwrap();
+        let mut radar = tm35_source_collection("radar");
+        radar.apis = vec!["edr".to_string(), "wms".to_string()];
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.apis = vec!["edr".to_string()];
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[csv, radar, nc],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let items = &result.edr_state.feature_engines;
+        assert!(items.contains_key("obs"));
+        assert!(items.contains_key("nc"), "nowcast cells are items too");
+        assert!(!items.contains_key("radar"), "a raster engine has no items");
+        assert!(!result.features_state.engines.contains_key("obs"));
+        for id in ["obs", "nc"] {
+            assert_eq!(
+                Arc::as_ptr(&result.edr_state.engines[id]) as *const (),
+                Arc::as_ptr(&items[id]) as *const (),
+                "{id}: items come from the collection's own engine"
+            );
+        }
+
+        let app = api_edr::router(Arc::new(arc_swap::ArcSwap::from_pointee(result.edr_state)));
+        let get = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                )
+            }
+        };
+        let (status, page) = get("/collections/obs/items?limit=2").await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["numberMatched"], 3);
+        assert_eq!(page["numberReturned"], 2);
+        let (status, _) = get("/collections/obs/items/Helsinki").await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, metadata) = get("/collections/obs").await;
+        assert_eq!(
+            metadata["data_queries"]["items"]["link"]["variables"]["query_type"],
+            "items"
+        );
+        let (status, _) = get("/collections/radar/items").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, metadata) = get("/collections/radar").await;
+        assert!(metadata["data_queries"].get("items").is_none());
+    }
+
     #[test]
     fn validate_style_colormaps_rejects_unknown_names() {
         // A typo'd colormap name is a config error at load, not a silent
@@ -8011,5 +10525,490 @@ colormap = "no_such_map"
             assert!(warning.contains("restart to apply"), "{warning}");
         }
         assert!(super::init_render_concurrency(Some(4)).is_err());
+    }
+
+    /// #1000, #1002: `[server] state_dir` reaches the CAP and BUFR engines
+    /// `load_collections` builds — a WIS2 collection snapshots into it.
+    /// Runs in a child process: the state directory is process-global and
+    /// fixed at boot.
+    #[test]
+    fn state_dir_reaches_wis2_engines() {
+        const CHILD: &str = "MC_TEST_SERVER_STATE_DIR_CHILD";
+        const NAME: &str = "admin::tests::state_dir_reaches_wis2_engines";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{NAME} failed in its child process");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nhost = \"127.0.0.1\"\nport = 8000\nstate_dir = \"var/state\"\n\
+             [[collections]]\nid = \"cap-wis2\"\ntitle = \"t\"\ndescription = \"d\"\n\
+             engine_type = \"cap\"\napis = [\"features\"]\n\
+             [collections.cap]\n[collections.cap.wis2]\n\
+             topics = [\"cache/a/wis2/test/data/core/weather/advisories-warnings\"]\n\
+             [[collections]]\nid = \"obs-wis2\"\ntitle = \"t\"\ndescription = \"d\"\n\
+             engine_type = \"bufr\"\napis = [\"edr\", \"features\"]\n\
+             [collections.bufr]\nretention = \"P36500D\"\n[collections.bufr.wis2]\n\
+             topics = [\"cache/a/wis2/test/data/core/weather/surface-based-observations/synop\"]\n",
+        )
+        .unwrap();
+        let (config, _) =
+            ds_core::config::ServerConfig::from_file(config_path.to_str().unwrap()).unwrap();
+        let dir = tmp.path().join("var/state");
+        super::init_state_store(config.server.state_dir_path(&config_path));
+        assert!(dir.is_dir(), "state_dir is created at boot");
+        assert_eq!(super::state_dir(), Some(dir.as_path()));
+        assert!(super::state_store().is_some());
+
+        let load = || {
+            super::load_collections(
+                &ds_render::StyleContext::with_builtins(),
+                &config.collections,
+                &[],
+                "http://x",
+                false,
+                0,
+                super::ReusableCaches::default(),
+                super::EngineReuse::default(),
+            )
+        };
+        let result = load();
+        assert_eq!(result.cap_engines.len(), 1);
+        // A WIS2 engine flushes its accumulator on shutdown, under the
+        // collection's key: `<state_dir>/cap-wis2.cap.state`.
+        let filling_since = "2020-01-01T00:00:00Z";
+        result.cap_engines[0]
+            .wis2_source()
+            .unwrap()
+            .mark_filling(filling_since.parse().unwrap());
+        result.cap_engines[0].shutdown();
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(dir.join("cap-wis2.cap.state")).unwrap()).unwrap()
+        };
+        assert_eq!(read()["collection"], "cap-wis2");
+        assert_eq!(read()["filling_since"], filling_since);
+        // The next build restores it — a fresh snapshot keeps its warm-up
+        // clock, which a cold start would have lost — and flushes it back.
+        load().cap_engines[0].shutdown();
+        assert_eq!(read()["filling_since"], filling_since);
+
+        // A WIS2 BUFR store likewise, under `<state_dir>/obs-wis2.bufr.state`
+        // (gzip-compressed): the next build serves its reports at once.
+        assert_eq!(result.bufr_engines.len(), 1);
+        let fixture = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/bufr-synop/synop_se-smhi_20260912T0800Z.bufr"
+        ))
+        .unwrap();
+        let bufr = &result.bufr_engines[0];
+        let ingested = bufr.ingest_bytes(&fixture, "fixture", chrono::Utc::now());
+        assert!(ingested > 0);
+        bufr.shutdown();
+        let file = dir.join("obs-wis2.bufr.state");
+        assert!(std::fs::read(&file).unwrap().starts_with(&[0x1f, 0x8b]));
+        let restored = load();
+        assert_eq!(restored.bufr_engines[0].gauges(), (1, ingested));
+        restored.bufr_engines[0].shutdown();
+    }
+
+    #[test]
+    fn state_dir_reload_warning_asks_for_a_restart_only_on_change() {
+        use std::path::Path;
+        let a = Some(Path::new("/var/lib/mc"));
+        assert_eq!(super::state_dir_reload_warning(a, a), None);
+        assert_eq!(super::state_dir_reload_warning(None, None), None);
+        for (live, wanted) in [(a, Some(Path::new("/srv/mc"))), (a, None), (None, a)] {
+            let warning = super::state_dir_reload_warning(live, wanted).unwrap();
+            assert!(warning.contains("restart to apply"), "{warning}");
+        }
+    }
+
+    /// #1061: a postgis station list cut at `max_locations` stays `Ready` in
+    /// the load snapshot and is degraded live, in `/health`, with the cap
+    /// named. Since every `effective_health` call starts from that snapshot,
+    /// a database outage afterwards reports itself instead of the cut, and
+    /// recovery returns to the cut's reason. An unreachable database keeps a
+    /// recorded boot error; `Ready` clears it.
+    #[test]
+    fn postgis_live_health_degrades_a_truncated_station_list() {
+        use super::{
+            apply_postgis_live_health, postgis_load_status, CollectionHealth, CollectionStatus,
+        };
+        use engine_postgis::{LiveHealth, LocationsCut};
+        let entry = |(status, error): (CollectionStatus, Option<String>)| CollectionHealth {
+            id: "obs".into(),
+            engine_type: "postgis".into(),
+            status,
+            error,
+        };
+        let live = |snapshot: &CollectionHealth, verdict| {
+            let mut h = snapshot.clone();
+            apply_postgis_live_health(&mut h, verdict);
+            (h.status, h.error)
+        };
+        let unreachable = (
+            CollectionStatus::Degraded,
+            Some("database unreachable (health ping failed)".to_string()),
+        );
+
+        for cut in [LocationsCut::Stations, LocationsCut::Registry] {
+            let verdict = LiveHealth::LocationsTruncated {
+                max_locations: 200_000,
+                cut,
+            };
+            let reason = cut.reason(200_000);
+            assert!(reason.contains("max_locations = 200000"), "{reason}");
+            // Load and reload: still served, so `Ready` in the snapshot.
+            let snapshot = entry(postgis_load_status(Some(verdict)));
+            assert_eq!(snapshot.status, CollectionStatus::Ready);
+            assert_eq!(snapshot.error, None);
+            assert_eq!(
+                live(&snapshot, verdict),
+                (CollectionStatus::Degraded, Some(reason.clone()))
+            );
+            // The database goes down: the outage is the reason shown.
+            assert_eq!(live(&snapshot, LiveHealth::Unreachable), unreachable);
+            // It comes back with the list still cut.
+            assert_eq!(
+                live(&snapshot, verdict),
+                (CollectionStatus::Degraded, Some(reason.clone()))
+            );
+            // A boot refresh error is replaced: the refresh that cut the
+            // list succeeded later.
+            let failed_boot = entry((
+                CollectionStatus::Degraded,
+                Some("metadata refresh failed".to_string()),
+            ));
+            assert_eq!(
+                live(&failed_boot, verdict),
+                (CollectionStatus::Degraded, Some(reason))
+            );
+        }
+
+        assert_eq!(
+            postgis_load_status(Some(LiveHealth::Unreachable)),
+            unreachable
+        );
+        for verdict in [None, Some(LiveHealth::Ready)] {
+            assert_eq!(
+                postgis_load_status(verdict),
+                (CollectionStatus::Ready, None)
+            );
+        }
+
+        for verdict in [LiveHealth::ValidationPending, LiveHealth::SchemaInvalid] {
+            let expected = (CollectionStatus::Degraded, verdict.degraded_reason());
+            assert_eq!(postgis_load_status(Some(verdict)), expected);
+            let snapshot = entry((CollectionStatus::Ready, None));
+            assert_eq!(live(&snapshot, verdict), expected);
+        }
+
+        let failed_boot = entry((
+            CollectionStatus::Degraded,
+            Some("metadata refresh failed".to_string()),
+        ));
+        assert_eq!(
+            live(&failed_boot, LiveHealth::Unreachable),
+            (
+                CollectionStatus::Degraded,
+                Some("metadata refresh failed".to_string())
+            )
+        );
+        assert_eq!(
+            live(&failed_boot, LiveHealth::Ready),
+            (CollectionStatus::Ready, None)
+        );
+    }
+
+    /// #990 harness: one file-fed CAP collection (live `Ready` once its
+    /// source loaded) and one WIS2-fed one (live `Degraded` while no broker
+    /// session exists; tests run no poll loop).
+    fn live_health_state() -> (tempfile::TempDir, super::AdminState) {
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/cap");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                 [[collections]]\nid = \"cap-file\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 engine_type = \"cap\"\napis = [\"features\"]\n\
+                 [collections.cap]\ndata_path = \"{fixture}\"\n\
+                 [[collections]]\nid = \"cap-wis2\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 engine_type = \"cap\"\napis = [\"features\"]\n\
+                 [collections.cap]\n[collections.cap.wis2]\n\
+                 topics = [\"cache/a/wis2/test/data/core/weather/advisories-warnings\"]\n"
+            ),
+        )
+        .unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+        (dir, state)
+    }
+
+    /// Overwrite one entry of the load/reload snapshot — what the boot
+    /// recorded before the engine's live status moved on.
+    fn set_snapshot(
+        state: &super::AdminState,
+        id: &str,
+        status: super::CollectionStatus,
+        error: Option<&str>,
+    ) {
+        let mut health = state.health.write().unwrap();
+        let h = health.iter_mut().find(|h| h.id == id).unwrap();
+        h.status = status;
+        h.error = error.map(str::to_string);
+    }
+
+    async fn health_json(state: &super::AdminState) -> serde_json::Value {
+        use axum::response::IntoResponse;
+        let response = super::health_handler(axum::extract::State(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn health_status<'a>(json: &'a serde_json::Value, id: &str) -> &'a str {
+        json["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap_or_else(|| panic!("no /health entry for {id}"))["status"]
+            .as_str()
+            .unwrap()
+    }
+
+    fn counts(total: i64, healthy: i64, degraded: i64, failed: i64) -> super::HealthCounts {
+        super::HealthCounts {
+            total,
+            healthy,
+            degraded,
+            failed,
+        }
+    }
+
+    /// `/health` serializes exactly the [`super::effective_health`] entries.
+    fn assert_health_matches(json: &serde_json::Value, effective: &[super::CollectionHealth]) {
+        let entries = json["collections"].as_array().unwrap();
+        assert_eq!(entries.len(), effective.len());
+        for (entry, h) in entries.iter().zip(effective) {
+            assert_eq!(entry["id"], h.id.as_str());
+            assert_eq!(entry["status"], serde_json::to_value(h.status).unwrap());
+            assert_eq!(
+                entry.get("error").and_then(|e| e.as_str()),
+                h.error.as_deref()
+            );
+        }
+    }
+
+    /// #990: a collection degraded in the boot snapshot whose engine now
+    /// reports live `Ready` is counted healthy by the `/metrics` gauges, and
+    /// `/health` agrees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_gauges_count_boot_degraded_collection_live_ready() {
+        use super::{CollectionStatus, HealthCounts};
+        let (_dir, state) = live_health_state();
+        assert_eq!(state.cap_engines.read().unwrap().len(), 2);
+        // The WIS2 collection is degraded at load (no broker session yet);
+        // the file-fed one is recorded degraded as if its first load failed.
+        set_snapshot(
+            &state,
+            "cap-file",
+            CollectionStatus::Degraded,
+            Some("initial load failed (will retry on poll)"),
+        );
+        // What the gauges reported before #990: the snapshot alone.
+        assert_eq!(
+            HealthCounts::of(&state.health.read().unwrap()),
+            counts(2, 0, 2, 0)
+        );
+
+        let effective = super::effective_health(&state);
+        let file = effective.iter().find(|h| h.id == "cap-file").unwrap();
+        assert_eq!(
+            (file.status, file.error.as_deref()),
+            (CollectionStatus::Ready, None)
+        );
+        assert_eq!(super::refresh_health_gauges(&state), counts(2, 1, 1, 0));
+
+        let json = health_json(&state).await;
+        assert_eq!(health_status(&json, "cap-file"), "ready");
+        assert_health_matches(&json, &effective);
+        // The overlay never writes back into the recorded snapshot.
+        let snapshot = state.health.read().unwrap();
+        let file = snapshot.iter().find(|h| h.id == "cap-file").unwrap();
+        assert_eq!(file.status, CollectionStatus::Degraded);
+    }
+
+    /// #990: a collection recorded ready whose engine now reports live
+    /// `Degraded` is counted degraded by the gauges, and `/health` agrees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_gauges_count_live_degraded_collection() {
+        use super::{CollectionStatus, HealthCounts};
+        let (_dir, state) = live_health_state();
+        set_snapshot(&state, "cap-wis2", CollectionStatus::Ready, None);
+        assert_eq!(
+            HealthCounts::of(&state.health.read().unwrap()),
+            counts(2, 2, 0, 0)
+        );
+
+        let effective = super::effective_health(&state);
+        let wis2 = effective.iter().find(|h| h.id == "cap-wis2").unwrap();
+        assert_eq!(
+            (wis2.status, wis2.error.as_deref()),
+            (
+                CollectionStatus::Degraded,
+                Some("connecting to WIS2 broker")
+            )
+        );
+        assert_eq!(super::refresh_health_gauges(&state), counts(2, 1, 1, 0));
+
+        let json = health_json(&state).await;
+        assert_eq!(health_status(&json, "cap-wis2"), "degraded");
+        assert_eq!(json["status"], "degraded");
+        assert_health_matches(&json, &effective);
+    }
+
+    /// #990: a collection without a live engine (failed at load) keeps its
+    /// snapshot status in both views — the overlay only replaces what an
+    /// engine reports.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_gauges_keep_snapshot_without_live_engine() {
+        use super::{CollectionHealth, CollectionStatus};
+        let (_dir, state) = live_health_state();
+        state.health.write().unwrap().push(CollectionHealth {
+            id: "gone".into(),
+            engine_type: "cap".into(),
+            status: CollectionStatus::Failed,
+            error: Some("config error".into()),
+        });
+        assert_eq!(super::refresh_health_gauges(&state), counts(3, 1, 1, 1));
+        let json = health_json(&state).await;
+        assert_eq!(health_status(&json, "gone"), "failed");
+        assert_eq!(health_status(&json, "cap-file"), "ready");
+        assert_eq!(health_status(&json, "cap-wis2"), "degraded");
+    }
+
+    /// #1007 harness: a local GeoTIFF and a QueryData collection over the
+    /// committed fixtures, with the time of the newest data each serves:
+    /// the GeoTIFF's newest timestep and the QueryData run's origin time.
+    fn data_age_state() -> (
+        tempfile::TempDir,
+        super::AdminState,
+        [(&'static str, chrono::DateTime<chrono::Utc>); 2],
+    ) {
+        let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                 [[collections]]\nid = \"age-geotiff\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 data_path = \"{testdata}/radar-tm35fin\"\nengine_type = \"geotiff\"\n\
+                 apis = [\"wms\"]\n\
+                 [collections.geotiff]\nfilename_template = \"radar_tm35_%Y%m%dT%H%MZ.tif\"\n\
+                 parameter = \"reflectivity\"\nunit = \"dBZ\"\n\
+                 [[collections]]\nid = \"age-querydata\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 data_path = \"{testdata}/ecmwf-kenya\"\nengine_type = \"querydata\"\n\
+                 apis = [\"edr\"]\n"
+            ),
+        )
+        .unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+        let utc = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let newest = [
+            ("age-geotiff", utc("2026-04-06T06:40:00Z")),
+            ("age-querydata", utc("2026-04-04T06:00:00Z")),
+        ];
+        (dir, state, newest)
+    }
+
+    /// The `collection_data_age_seconds` series of `/metrics`, by collection.
+    fn data_age_series() -> HashMap<String, i64> {
+        use super::Encoder as _;
+        let mut text = Vec::new();
+        super::TextEncoder::new()
+            .encode(&super::REGISTRY.gather(), &mut text)
+            .unwrap();
+        String::from_utf8(text)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("collection_data_age_seconds{collection=\"")?;
+                let (id, value) = rest.split_once("\"} ")?;
+                Some((id.to_owned(), value.parse().unwrap()))
+            })
+            .collect()
+    }
+
+    /// #1007: `/health` `data_age_secs` and the `collection_data_age_seconds`
+    /// gauge are now minus the newest data the collection serves, not the
+    /// time since its last poll, which `poll_age_secs` reports; a
+    /// collection that leaves the registry drops its series.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn data_age_is_the_newest_data_in_health_and_the_gauge() {
+        let (_dir, state, newest) = data_age_state();
+        assert_eq!(state.geotiff_engines.read().unwrap().len(), 1);
+        assert_eq!(state.querydata_engines.read().unwrap().len(), 1);
+
+        let before = chrono::Utc::now();
+        let json = health_json(&state).await;
+        let set = super::refresh_data_age_gauge(&state);
+        let series = data_age_series();
+        let after = chrono::Utc::now();
+
+        for (id, time) in newest {
+            // Read between `before` and `after`, so within these bounds.
+            let ages = (before - time).num_seconds()..=(after - time).num_seconds();
+            let entry = json["collections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id)
+                .unwrap_or_else(|| panic!("no /health entry for {id}"));
+            let data_age = entry["data_age_secs"].as_i64().unwrap();
+            assert!(ages.contains(&data_age), "{id}: data_age_secs {data_age}");
+            // Both engines loaded moments ago: that is the poll age.
+            let poll_age = entry["poll_age_secs"].as_i64().unwrap();
+            assert!(
+                (0..60).contains(&poll_age),
+                "{id}: poll_age_secs {poll_age}"
+            );
+
+            let gauge = set.iter().find(|(c, _)| c == id).map(|(_, age)| *age);
+            assert!(
+                gauge.is_some_and(|age| ages.contains(&age)),
+                "{id}: {gauge:?}"
+            );
+            assert_eq!(series.get(id).copied(), gauge, "{id} in /metrics");
+        }
+
+        // A reload removes the GeoTIFF collection: its series goes with it,
+        // the other stays.
+        state.geotiff_engines.write().unwrap().clear();
+        let set = super::refresh_data_age_gauge(&state);
+        assert_eq!(
+            set.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["age-querydata"]
+        );
+        let series = data_age_series();
+        assert!(!series.contains_key("age-geotiff"), "{series:?}");
+        assert!(series.contains_key("age-querydata"), "{series:?}");
     }
 }

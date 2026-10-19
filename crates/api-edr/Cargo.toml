@@ -2,13 +2,22 @@
 name = "api-edr"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 api-common = { path = "../api-common" }
+# The `items` query (#928) serves the collection's FeatureEngine through the
+# Features API's own bbox/datetime parsing, GeoJSON encoding and paging links.
+api-features = { path = "../api-features" }
 ds-core = { path = "../core" }
+# The shared query runtime (#1103); EDR keeps its own admission and deadline.
+ds-executor = { path = "../ds-executor" }
 ds-render = { path = "../render" }
 arc-swap = "1"
 axum = "0.8"
+# Splits a `{locationId}` list on the segment as sent: a literal comma
+# separates ids, `%2C` belongs to one (#923). The decoder axum's `Path` uses.
+percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -21,7 +30,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
 # read the schema from disk and it has only internal `#/definitions` $refs. This
 # stops the whole async/HTTP stack (tokio/hyper/axum/tower) from being built a
 # second time with divergent features on a scoped `cargo test -p api-edr`.
-jsonschema = { version = "0.50", default-features = false }
+jsonschema = { version = "0.58", default-features = false }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }

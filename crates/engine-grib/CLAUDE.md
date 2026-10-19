@@ -11,7 +11,11 @@ unlike GeoTIFF's one band per collection.
 
 - Discovers data via **index sidecar files** on S3/HTTP or a local
   directory; fetches messages via byte-range reads. The engine NEVER builds
-  indexes itself.
+  indexes itself. A listed index with a temporary name (e.g. a
+  publisher's `.name.index`, #1009) or in a hidden folder below the listed
+  prefix (the LIST is recursive; rsync `--delay-updates` stages files in
+  `.~tmp~/`, #1029) is never fetched or marked known:
+  `ds_core::temp_files::is_temporary_below`.
 - **Data source (mutually exclusive):** remote
   `endpoint`+`bucket`+`prefix_pattern` (S3 with strftime/run-hour date
   templating), or local `data_path` (a directory of `.grib2` + index
@@ -45,7 +49,8 @@ unlike GeoTIFF's one band per collection.
   eight concurrent reads over 120 indexes with 150 ms simulated GET latency.
   Run with `--ignored --nocapture`; timings are measurements, not CI gates.
 - Parameter metadata populates lazily: `scan_once` probes ≤32 messages per
-  scan, at most eight concurrently, across the newest run's step files.
+  scan, at most eight concurrently, each advertised parameter in the step
+  files of the newest run that has it (#1026).
   Read headers with 4 KiB read-ahead, skip local-use/unsupported grid bodies, and cap each
   fetched metadata section at 64 KiB. Use the GRIB indicator's length for tail
   probes without HEAD. Never unpack values or fill the grid cache for discovery.
@@ -94,6 +99,11 @@ unlike GeoTIFF's one band per collection.
   Missing parameter/level pairs are null in EDR and errors in Maps. Pressure/
   model labels omit a fixed-level qualifier. The shared vertical descriptor
   feeds both EDR and Maps; single-level fields retain their label qualifiers.
+- A map draws the requested level, else the selected run's own first level
+  (`map_level`), which need not be the first of the advertised union.
+  `render_field` and `MapEngine::resolve_elevation` share `map_level` and
+  `select_run_step`, so WMS GetFeatureInfo asks the position query for the
+  level the map shows (#1064).
 - New families register through the server's background registration/recovery
   loop using the accepted config. Config reserves all enabled derived IDs.
 
@@ -106,8 +116,17 @@ unlike GeoTIFF's one band per collection.
   192–254.
 - Display conversions are mechanical: K→°C, Pa→hPa, kg m⁻²→mm, m² s⁻²→gpm,
   proportion→%. Colormap ranges use display units. The string-keyed twin
-  of this table lives in `ds_core::units` (used by engine-bufr); keep the
-  two rule for rule.
+  of this table lives in `ds_core::units::display_conversion` (used by
+  engine-bufr); keep the two rule for rule. The units test
+  `every_spelled_variant_has_ds_core_rule` checks each `SourceUnit` through
+  its WMO spelling, and `display_rules_agree_with_ds_core_for_every_spelling`
+  each spelling `parse_source_unit` reads (through
+  `ds_core::units::canonical_unit`, as the twin; only tests call it). Two
+  rules are GRIB-only, since no unit string identifies them: the code
+  tables assign `KelvinDifference` (stays K) and ECMWF's `MetresOfWater`
+  (× 1000 to mm) from the parameter. Served units come from the code table,
+  already canonical (`m s-1`, `kg m-2 s-1`, `J kg-1`), so unit
+  normalisation (#1067 PR 6) changes no GRIB output.
 - Distinguish absolute temperature from temperature differences using the
   WMO parameter semantics: dewpoint depression uses `KelvinDifference` and
   stays in K, with no Celsius zero-point offset.
@@ -119,14 +138,33 @@ unlike GeoTIFF's one band per collection.
 
 Catalog keeps a `runs` map (`BTreeMap` keyed by reference time) and
 implements the shared `ds_core::instances` contract (see root CLAUDE.md).
-Nearest-step selection is limited to a run's published valid-time extent.
+Two selections, never mixed (#967):
+- **Maps** (`select_run_step`): without a parameter (the default layer;
+  M trajectories use its `covering_run`) the newest run whose published
+  valid-time extent covers the time, at its nearest step; with one, only
+  the steps carrying it (#1005, below). `get_raster_tile(s)` and every
+  `resolve_*` override go through it: they key the #507/#521 caches, so it
+  must stay the render's own selection.
+- **EDR** (`resolve_run`, `grid_steps`; position, area, radius, cube, 2-D
+  and Z trajectories): by intersection (`/req/core/datetime-response` A, F).
+  An instant takes only the step valid at exactly that time, never the
+  nearest; a window every step inside it, open ends (`MIN_UTC`/`MAX_UTC`)
+  included. The run: the newest covering the window's start with a step
+  inside, else the newest with any step inside (`../end`). None inside is
+  `LocationNotFound` (404), which a datetime list skips. A request naming
+  parameters chooses among the runs that have them all first (#1026, below).
+
 An incomplete newest run does not hide a covering older run; explicit run
-pins do not fall back. No requested datetime still selects the latest run.
+pins do not fall back. No requested datetime selects the latest run, among
+those with every named parameter first (#1026); an area, radius or cube
+then reads its last step carrying them all (`grid_steps`), else its last
+step.
 
 Each run also has canonical `(parameter, level type, level)` selectors,
 rebuilt with `Catalog::refresh_metadata` before publication. Metadata
 probes and all query paths share these selectors. A missing canonical level
-is null in a position series and an error in a map/area request; never
+is null in a position series and an error in a map request or an area that
+names the parameter (a defaulted area parameter is null); never
 silently substitute an upper-air field. Metadata is cached by that full
 identity, so historical runs with different selected levels keep their labels.
 Pressure/model views may reuse metadata from a probed or decoded level of the same
@@ -160,8 +198,8 @@ on the request path. Single-level and legacy views require exact metadata.
   by window length. Precipitation kg/m² displays as mm; already-averaged flux
   W/m² stays W/m², and energy in J/m² stays energy. ECMWF JSON sidecars retain
   their existing naming/semantics; this change does not infer missing windows.
-- Parameter discovery and bounded metadata probes include every step in the
-  newest run: the analysis step commonly has no aggregates. An aggregate
+- Parameter discovery and bounded metadata probes include every step of
+  every retained run: the analysis step commonly has no aggregates. An aggregate
   absent from a time step is a null in a position series, never a zero.
   A wgrib2 index with mixed window-end times is rejected rather than assigning
   all its records the first record's time.
@@ -180,6 +218,15 @@ on the request path. Single-level and legacy views require exact metadata.
   4 B/px instead of a boxed 16. Values are exactly the old f64 ones `as f32`
   (`tests/local_source.rs` pins this on the fixture for all three CRS paths);
   keep `resample` returning f64 for the bench fingerprint.
+- This sampler is not `ds_core::resample::SourceGrid` (#1172), and moving to
+  it changes pixels: EPSG:3857 maps each pixel exactly here, SourceGrid
+  through its projection grid; a regional grid draws nothing west or north
+  of its first node here, half a cell more there; a NaN neighbour falls back
+  to the first valid corner here, the nearest cell there; and the display
+  conversion runs before narrowing here. `cache/sampler_tests.rs` pins the
+  two bit-equal where they agree on the committed global field: CRS84 and
+  projected output, both forms of the seam box, the #323 Arctic tile. A
+  sampler change that breaks it is a drift from the shared rules.
 - Cache weights include allocated value capacity and key/structure overhead.
   Keep the entry-size estimate aligned with the 4 MiB typical global field.
 - Run `cargo run --release -p engine-grib --example bench_grid_cache` for a
@@ -213,11 +260,97 @@ on the request path. Single-level and legacy views require exact metadata.
   128 MiB message cache. It checks identical samples and reports timings/read
   bytes; no wall-clock thresholds belong in CI.
 
-Default Maps/area parameter selection preserves the first previously supported
+Default Maps parameter selection preserves the first previously supported
 near-surface product before considering acc/ave records, regardless of index
 ordering. Aggregate-only collections fall back to their first aggregate;
 upper-air-only collections to their first message. Raster metadata and actual
 rendering share `StepFile::default_message` so default labels/units agree.
+EDR queries without `parameter-name` (position, trajectory, area/radius,
+cube) return `default_parameters` instead, every parameter of the view
+(EDR 1.2 `/req/edr/parameter-name-response` A, #966): every key of a
+pressure/model view, else the products of the selected steps, near-surface
+ones only in the legacy layout.
+
+## Per-parameter time axes (#1005)
+
+- Hour-window aggregates (`PRATE_avg_6h`) and maxima absent from the
+  analysis (`TMAX`) exist at some steps only. `Catalog::refresh_metadata`
+  records per run the steps carrying each parameter some steps lack
+  (`partial_steps`, one pass over the messages) and each advertised
+  parameter's valid times over the retained runs, kept where they differ
+  from the collection's (`parameter_times`). A step carries a parameter at
+  its run's canonical key; in a pressure/model family at any level.
+- `MapEngine::parameter_times` and `EdrEngine::get_parameter_available_times`
+  read that snapshot (an `Arc` clone). The API layers then give the WMS
+  child layer its own `time` dimension and default, and Maps/Tiles/EDR
+  `parameter_names` its own `extent.temporal`. `RasterInfo.times` stays the
+  union. The advertised parameters are every retained run's (#1026, below).
+- Map selection of a parameter (`select_run_step`, `CarriedSteps`), over
+  the pinned run, else the runs newest first:
+  1. the first whose carrying steps span the time, at the nearest of them;
+  2. else, the time inside any run's steps, the carrying step nearest it
+     in any of them, the newer run's on a tie (WMS `nearestValue`);
+  3. else the time is outside the data: the default layer's 400.
+
+  No carrying step is `LocationNotFound` (404); `None` is the newest
+  carrying run's last carrying step. Several parameters
+  (`get_raster_tiles`, `resolve_parameters_time`, DerivedWind's u/v) use
+  the steps carrying all of them.
+- The run depends on the parameter: an aggregate the newest run lacks at
+  that time renders from an older run. Hence
+  `MapEngine::resolve_parameter_reference_time`, which the API layers call
+  instead of `resolve_reference_time`. Pinning the run it returns must
+  re-select the same step at the request and at that step's time:
+  `resolved_keys_render_the_same_pixels_as_the_request` sweeps it. So with
+  a pin, rule 2 accepts a time outside the pinned run's own steps only when
+  the unpinned selection chooses that run; any other pin outside its steps
+  is the default layer's 400, never the pinned run's edge step.
+- `fetch_grid`: a parameter the run lacks is `InvalidParameter`; a step
+  without its field at the requested level (a pressure view's `z`) is
+  `LocationNotFound`.
+- Tests: `parameter_times_tests.rs` (two synthetic runs, and the real GFS
+  2026-04-08 f000/f003/f006 sidecars in `testdata/gfs`), and
+  `server/tests/grib_parameter_times.rs` (WMS capabilities and GetMap cache
+  keys, Maps, EDR metadata, through `DerivedWind`; with two runs, the run
+  WMS, Maps and Tiles render and key where the newest lacks the window).
+
+## Parameters over retained runs (#1026)
+
+- A new run's analysis, typically one scan cycle on its own, lacks every
+  window and maximum, and a run may drop a parameter altogether.
+  `Catalog::refresh_metadata` therefore advertises the union over every
+  retained run, newest run first (its index order, then each older run's
+  other names), so the order holds once the new run has them all.
+  `refresh_families` calls it for each level view: the views union alike.
+  WMS layers, Maps/Tiles and EDR `parameter_names` all read that list.
+- `Catalog::advertised_keys`: each name's canonical key in the newest run
+  that has it. Labels and units (`param_metadata`), the metadata probes and
+  the wind facts read it, so an older run's parameter is never a bare name
+  with an empty unit. `has_parameter` reads it too (O(log n)).
+- Maps need no other change: `select_run_step` already walks every run, so a
+  parameter the newest run lacks renders, and keys (#507/#521), an older
+  run's step, `None` that run's last carrying step. Several parameters'
+  run is `resolve_parameters_reference_time`, the same selection.
+- EDR (`resolve_run`) and an M trajectory (`covering_run`) take the runs
+  that have every named parameter first (`preferring_runs_with`), then,
+  when none of those qualifies, every run as before. Without
+  `parameter-name`, or naming only what the newest run has, nothing
+  changes; an explicit run pin never falls back. Without a datetime, an
+  area, radius or cube reads the last step of that run carrying every
+  named parameter (`grid_steps`, as a map without `TIME` renders), so
+  `TCDC_avg_3h` is not the 400 of a last step that lacks it.
+- `DerivedWind::speed_tile` resolves an unpinned render's run over u and v
+  (`resolve_parameters_reference_time`) before reading either component:
+  `get_raster_tile` with `None` per component would pick each one's own
+  run, the new run's u with the old run's v, unlike the keyed render.
+- A parameter dropped from the newer runs stays advertised until
+  `max_runs` (or the `time_window`) evicts the last run that has it.
+- Tests: `retained_runs_tests.rs` (a complete 00Z run next to a 06Z run
+  with only its analysis: advertisement and order, labels and units, map
+  selection and the cache-key sweep, EDR position and area, an area of a
+  window the last step lacks, an M trajectory, eviction, a pressure view's
+  position and cube, and a v component only the older run has, with the
+  derived speed's direct-versus-keyed sweep).
 
 ## Position queries
 
@@ -238,6 +371,24 @@ rendering share `StepFile::default_message` so default labels/units agree.
   with 150 ms simulated per-read latency and the grid cache disabled. It checks
   equal samples and prints timings/bytes; wall-clock times are not CI gates.
 
+## Trajectory queries (#926)
+
+- `trajectory.rs` selects the run (an M path's samples snap to the nearest
+  step, so its run is `covering_run` of its first time, as a map's is,
+  among the runs with the named parameters first, #1026),
+  steps, levels and parameters with the position
+  query's helpers (`resolve_run`, `position_parameters`, `selected_levels`)
+  and leaves the path, time/level rules and layout to
+  `ds_core::trajectory::TrajectoryPlan`. Densify at the published
+  representative geometry's spacing (`RasterInfo` extent / grid cells;
+  0.1° before the probe has run).
+- One `run_field_jobs` job per (parameter, planned field = step × level):
+  fetch/decode once, sample every point that reads it with the position
+  query's `bilinear_value` + display conversion. Missing or unreadable
+  fields stay null; deadlines stay fatal. Never a job per sample.
+- Z snaps to the run's available levels (`catalog.levels`), so a Z path
+  never asks for a level the run lacks; `z` stays exact, like position.
+
 ## Area and radius queries
 
 - Reuse the first geometry field's values even when the decoded cache is
@@ -245,17 +396,99 @@ rendering share `StepFile::default_message` so default labels/units agree.
   output and mask budgets, then sample and release the grid before loading
   remaining fields.
 - Use `runtime::run_field_jobs`, shared with positions, for at most four
-  parameter/level jobs per admitted query. Keep deadline propagation, blocking
-  cache waits and drain-on-error behavior in that scheduler. Area read failures
+  parameter/level jobs per admitted query. It is a thin wrapper over
+  `ds_executor::field_jobs::run_field_jobs` (moved there for engine-netcdf,
+  #1067) with the GRIB I/O runtime as the off-runtime fallback. Keep deadline
+  propagation, blocking cache waits and drain-on-error behavior in that
+  shared scheduler. Area read failures
   are fatal; ordinary position field failures remain null samples.
-- Workers return small masked/converted subsets into fixed parameter/level
-  slots. Preserve requested level order and missing upper-air nulls regardless
+- Workers return small masked/converted subsets into fixed
+  step/parameter/level slots. Preserve requested level order and missing upper-air nulls regardless
   of completion order. Validate grid axes before extracting each subset.
 - Radius delegates to the same area path via the default EDR trait method.
+- `bbox_subset` rounds out to the nodes enclosing the polygon's bbox; the
+  shared `QueryPolygon::mask_native_cells` nulls the nodes outside the
+  polygon: for a rectangle those whose cell, half a spacing either side,
+  misses it (#966), for any other polygon those centred outside it (#671).
+  Pass the native spacing: a bbox clamped at a regional grid's edge leaves
+  a lone node, whose cell only the spacing sizes. A rectangle no cell meets
+  is a 404; the vertex fallback never applies to it. Keep
+  `bbox_subset` enclosing (and `extract_bbox` with it): the cube trims its
+  own axes from it instead.
+- Steps come from `grid_steps`: no datetime is the run's last step and an
+  instant its exact step, both a t-less `[z,]y,x` Grid; an interval every
+  step inside it on a `t` axis (`[t, z, y, x]` like cube), even one step.
+  The values budget counts steps × levels. A parameter some steps lack
+  (an aggregate at the analysis step) is null there; one no step has is
+  the canonical-level 400 when named, null when defaulted.
 - Run `cargo test -p engine-grib area::tests::area_latency_replay -- --ignored
   --nocapture` for a 32-field replay with simulated 150 ms GET latency and no
   decoded cache. It compares serial storage with four concurrent reads, checks
   equal outputs/bytes and prints timings without CI timing thresholds.
+
+## Cube queries
+
+- `query_cube` (#925, `cube.rs`) is offered only by the pressure and
+  model-level views (`supported_query_types` adds `cube` when
+  `vertical_kind()` is set). Output shape is always `[t, z, y, x]`.
+- Steps: `resolve_run` + `grid_steps`, the area query's: no datetime the
+  run's last step, an instant its exact step, an interval every step of
+  the run inside it. Levels are
+  `selected_levels` (exact); parameters default to every key of the view.
+- Check `check_cube_budget` before I/O with the known dimensions (both
+  horizontal resolutions given ⇒ the full check), then again after the
+  first field supplies the geometry, before allocating output or fetching
+  another field. The first field's values are reused, like area.
+- Remaining fields go through `runtime::run_field_jobs` (four in flight);
+  workers return the resampled `ny × nx` plane only. Skip levels no
+  `resolution-z` position samples. Every field must have the first field's
+  native subset axes, else the "different grid" 400.
+- Resampling is `DecodedGrid::sample_subset` over nearest-index maps from
+  `ds_core::cube::nearest_indices` (half a native cell of tolerance, so a
+  position off a regional grid is null), reading the decoded grid in place.
+  On a 360° grid an x position that misses retries one turn away, so the
+  180° column of a global bbox samples −180°.
+- At the native resolution the axes keep only the subset's nodes whose
+  cell, half a spacing either side, intersects the bbox (`axis_map`; EDR
+  1.2 `/req/edr/rc-bbox-response-cube` A, #966), the same rule as the area
+  rectangle mask. The cells tile the grid, so a bbox between two nodes
+  keeps the cell it lies in; none is a bbox off the grid.
+- `west > east` bboxes are a 400 before any I/O (#667); a bbox off the grid
+  is `LocationNotFound` (404).
+
+## Wind components (#897)
+
+- `ds_core::wind::DerivedWind` (wired in `server/src/admin.rs`) derives
+  speed and direction from u/v pairs; this engine only reports facts
+  (`WindSource`). Never compute a derived field here.
+- Read GRIB2 flag table 3.3 bit 5 (`0x08`, Section 3 octet 55) from **every**
+  message, in both the header probe (`metadata::read_metadata`) and the
+  decode (`reader::uv_frame`), into `MessageMetadata::uv_frame` /
+  `DecodedGrid::uv_frame` and the per-key `ParamMetadata` (with the triple).
+  A key not yet probed reports `VectorFrame::Unknown`: speed only until its
+  header is read, then direction too.
+- `discovery::build_wind_facts` builds each view's `WindFacts` with its
+  `RasterInfo` (`refresh_discovery`), so `wind_facts()` is an `Arc` clone.
+  Single-level views give each parameter its canonical level identity
+  (`hag:10`, `sfc`) and label; pressure/model views none (a request's `z`
+  reads both components at that level). The canonical level of the newest
+  run that has the parameter (`Catalog::advertised_keys`) is the pairing
+  basis, so a component only an older run still has pairs (#1026). A
+  derived speed's run is `resolve_parameters_reference_time` over u and v,
+  through `select_run_step`: the run whose steps carry both, never the new
+  run's u with the old run's v.
+- The grid is reported `GridAxes::NorthAligned` because only Template 3.0
+  decodes. A rotated or projected template must report its own axes there,
+  or grid-relative components would silently pass as earth-relative.
+- GRIB1 (code table 7, same bit) is not read: the engine is GRIB2 only.
+- `wind_tests::derived_matches_native_arpege_speed_and_direction_over_the_domain`
+  is the frame check against real data: `testdata/grib-arpege-wind` (13 KB,
+  Météo-France ARPEGE 10 m u/v plus native 10si/10wdir, every 20th node of
+  the 0.1° Europe grid; provenance in its README) served once as published
+  and once as components only (`parameters = ["10u", "10v"]`). Derived and
+  native agree within 0.02 m/s and 0.5° over the domain.
+- Code Table 4.2 now has 0/2/0 wind direction (`°`) and 0/2/1 wind speed
+  (`m s-1`), so native speeds and directions carry units.
 
 ## Discovery snapshots
 

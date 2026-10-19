@@ -15,6 +15,10 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
+#[path = "support/edr_schema.rs"]
+mod edr_schema;
+use edr_schema::{GEOJSON, JSON};
+
 // ---------------------------------------------------------------------------
 // Mock engine
 // ---------------------------------------------------------------------------
@@ -83,8 +87,8 @@ impl MockEngine {
 }
 
 impl EdrEngine for MockEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(Self::sample_locations())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(Self::sample_locations())))
     }
 
     fn query_location(
@@ -210,13 +214,17 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
     Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
+        feature_engines: HashMap::new(),
         collections,
         styles: HashMap::new(),
         base_url: String::new(),
@@ -265,6 +273,7 @@ mod proxy_headers {
         let cur = state.load();
         state.store(Arc::new(EdrState {
             engines: cur.engines.clone(),
+            feature_engines: cur.feature_engines.clone(),
             collections: cur.collections.clone(),
             styles: cur.styles.clone(),
             base_url: base_url.to_string(),
@@ -421,6 +430,12 @@ mod landing_page {
             "Landing page should include a 'data' link relation for collections"
         );
     }
+
+    #[tokio::test]
+    async fn validates_against_edr_bundles() {
+        let (_, json) = get("/").await;
+        edr_schema::assert_valid("/", JSON, &json, "landing page");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +489,12 @@ mod conformance {
             .iter()
             .any(|v| v.as_str().unwrap().contains("covjson"));
         assert!(has_covjson, "Must declare CoverageJSON conformance class");
+    }
+
+    #[tokio::test]
+    async fn validates_against_edr_bundles() {
+        let (_, json) = get("/conformance").await;
+        edr_schema::assert_valid("/conformance", JSON, &json, "conformance");
     }
 }
 
@@ -531,8 +552,8 @@ mod collections {
         }
     }
 
-    /// `/collections` validates against the OGC EDR 1.1 bundled OpenAPI
-    /// schema for `GET /collections` 200 `application/json`. The
+    /// `/collections` validates against the OGC EDR 1.1 and 1.2 bundled
+    /// OpenAPI schemas for `GET /collections` 200 `application/json`. The
     /// `extent.vertical` block in particular requires `vrs` and typed
     /// strings for `interval` / `values` — this test guards against the
     /// regressions that broke a real radar collection. A dedicated
@@ -545,7 +566,7 @@ mod collections {
         // (locations, parameters, etc.) is exercised identically.
         struct VerticalMockEngine(MockEngine);
         impl EdrEngine for VerticalMockEngine {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
                 self.0.get_locations()
             }
             fn query_location(
@@ -589,42 +610,18 @@ mod collections {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
-        let schema_str = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../schemas/ogcapi-edr-1.1-bundled.json"
-        ))
-        .expect("read bundled OGC EDR schema");
-        let bundle: Value = serde_json::from_str(&schema_str).expect("parse schema");
-        let collections_schema = &bundle["paths"]["/collections"]["get"]["responses"]["200"]
-            ["content"]["application/json"]["schema"];
-        assert!(
-            !collections_schema.is_null(),
-            "Schema path /collections.get.responses.200 must resolve in the bundled spec"
-        );
-
-        let validator =
-            jsonschema::Validator::new(collections_schema).expect("compile collections schema");
-        let errors: Vec<String> = validator
-            .iter_errors(&json)
-            .map(|e| format!("- {} (at {})", e, e.instance_path()))
-            .collect();
-        assert!(
-            errors.is_empty(),
-            "OGC EDR /collections schema violations:\n{}\n\nResponse:\n{}",
-            errors.join("\n"),
-            serde_json::to_string_pretty(&json).unwrap()
-        );
+        edr_schema::assert_valid("/collections", JSON, &json, "vertical collection listing");
     }
 
     /// A parameter on its own time axis (a satellite product, #819) carries
     /// its own `extent.temporal` in `parameter_names`; the collection keeps
-    /// the union. Both documents still validate against EDR 1.1, whose
-    /// parameter schema allows an `extent`.
+    /// the union. Both documents still validate against EDR 1.1 and 1.2,
+    /// whose parameter schemas allow an `extent`.
     #[tokio::test]
     async fn per_parameter_temporal_extent_validates() {
         struct OwnTimesEngine(MockEngine);
         impl EdrEngine for OwnTimesEngine {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
                 self.0.get_locations()
             }
             fn query_location(
@@ -661,14 +658,6 @@ mod collections {
         }
 
         let engine: Arc<dyn EdrEngine> = Arc::new(OwnTimesEngine(MockEngine));
-        let schema: Value = serde_json::from_str(
-            &std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../schemas/ogcapi-edr-1.1-bundled.json"
-            ))
-            .unwrap(),
-        )
-        .unwrap();
         for (uri, path) in [
             ("/collections", "/collections"),
             ("/collections/weather", "/collections/{collectionId}"),
@@ -699,16 +688,7 @@ mod collections {
                     .map(Vec::len),
                 Some(2)
             );
-            let validator = jsonschema::Validator::new(
-                &schema["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
-                    ["schema"],
-            )
-            .unwrap();
-            let errors: Vec<String> = validator
-                .iter_errors(&json)
-                .map(|e| format!("- {} (at {})", e, e.instance_path()))
-                .collect();
-            assert!(errors.is_empty(), "{uri}:\n{}", errors.join("\n"));
+            edr_schema::assert_valid(path, JSON, &json, uri);
         }
     }
 
@@ -716,12 +696,13 @@ mod collections {
     /// (#273) as far as the engine's metadata goes: a `label` of at most 50
     /// characters, a `description` that is not just the label, a QUDT
     /// `unit.symbol` for units QUDT has, and the CF standard name URI as
-    /// `observedProperty.id` when the engine knows one. Still EDR 1.1-valid.
+    /// `observedProperty.id` when the engine knows one, else the engine's
+    /// observed-property name. Still EDR 1.1- and 1.2-valid.
     #[tokio::test]
     async fn parameter_names_follow_metocean_profile() {
         struct DescribedEngine(MockEngine);
         impl EdrEngine for DescribedEngine {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
                 self.0.get_locations()
             }
             fn query_location(
@@ -750,6 +731,7 @@ mod collections {
                 HashMap::from([
                     desc("2 metre temperature", "K", "t2m", Some("air_temperature")),
                     desc("DBZH — Reflectivity (horizontal)", "dBZ", "DBZH", None),
+                    desc("Specific differential phase", "deg/km", "KDP", None),
                     desc(
                         "Water equivalent of accumulated snow depth (2 m above ground)",
                         "kg m-2",
@@ -778,14 +760,6 @@ mod collections {
         }
 
         let engine: Arc<dyn EdrEngine> = Arc::new(DescribedEngine(MockEngine));
-        let schema: Value = serde_json::from_str(
-            &std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../schemas/ogcapi-edr-1.1-bundled.json"
-            ))
-            .unwrap(),
-        )
-        .unwrap();
         for (uri, path) in [
             ("/collections", "/collections"),
             ("/collections/weather", "/collections/{collectionId}"),
@@ -804,7 +778,7 @@ mod collections {
                 None => &json,
             };
             let names = collection["parameter_names"].as_object().unwrap();
-            assert_eq!(names.len(), 5, "{uri}");
+            assert_eq!(names.len(), 6, "{uri}");
             for (name, param) in names {
                 let label = param["label"].as_str().unwrap();
                 let description = param["description"].as_str().unwrap();
@@ -826,14 +800,22 @@ mod collections {
             );
             assert!(t2m["observedProperty"].get("description").is_none());
 
-            // No QUDT unit for radar reflectivity: the UCUM form stays. No CF
-            // name: the property is described instead of identified.
+            // No QUDT unit for radar reflectivity, and `dBZ` is not UCUM
+            // either: a plain-string symbol, never typed as UCUM (EDR 1.2
+            // `/req/edr/rc-parameters` G). No CF name: the engine's
+            // observed-property name identifies the property (F requires an
+            // id), as in CoverageJSON, and the description says what it is.
             let dbzh = &names["DBZH"];
+            assert_eq!(dbzh["unit"]["symbol"], "dBZ");
+            // A UCUM unit QUDT does not know carries G's https UCUM type.
             assert_eq!(
-                dbzh["unit"]["symbol"],
-                serde_json::json!({"value": "dBZ", "type": "http://www.opengis.net/def/uom/UCUM/"})
+                names["KDP"]["unit"]["symbol"],
+                serde_json::json!({
+                    "value": "deg/km",
+                    "type": "https://www.opengis.net/def/uom/UCUM/"
+                })
             );
-            assert!(dbzh["observedProperty"].get("id").is_none());
+            assert_eq!(dbzh["observedProperty"]["id"], "DBZH");
             assert_eq!(
                 dbzh["observedProperty"]["description"],
                 "DBZH — Reflectivity (horizontal), in dBZ"
@@ -862,18 +844,15 @@ mod collections {
                 names["RHOHV"]["description"],
                 "Correlation coefficient (unit not specified)"
             );
-            assert!(names["t_err"]["observedProperty"].get("id").is_none());
+            assert_eq!(names["t_err"]["observedProperty"]["id"], "t_err");
+            // Every parameter's observedProperty has a string `id` and `label`.
+            for (name, param) in names {
+                let observed = &param["observedProperty"];
+                assert!(observed["id"].is_string(), "{uri} {name}: {observed}");
+                assert!(observed["label"].is_object(), "{uri} {name}: {observed}");
+            }
 
-            let validator = jsonschema::Validator::new(
-                &schema["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]
-                    ["schema"],
-            )
-            .unwrap();
-            let errors: Vec<String> = validator
-                .iter_errors(&json)
-                .map(|e| format!("- {} (at {})", e, e.instance_path()))
-                .collect();
-            assert!(errors.is_empty(), "{uri}:\n{}", errors.join("\n"));
+            edr_schema::assert_valid(path, JSON, &json, uri);
         }
     }
 
@@ -901,6 +880,56 @@ mod collections {
             assert!(link.get("href").is_some());
             assert!(link.get("rel").is_some());
         }
+    }
+
+    /// EDR 1.2 `/req/core/rc-collection-info-links` and
+    /// `/req/core/rc-md-query-links`: every link of a collection carries
+    /// `rel` and `type`, and its `links` name each query end point as
+    /// `rel=data`, with the href and type of its `data_queries` link. The
+    /// radius link brings a collection-level `within_units`
+    /// (`/req/edr/rc-collection-info` J).
+    #[tokio::test]
+    async fn collection_links_name_every_query_end_point() {
+        let (_, list) = get("/collections").await;
+        let (_, detail) = get("/collections/weather").await;
+        for (what, doc) in [("listing", &list["collections"][0]), ("detail", &detail)] {
+            let links = doc["links"].as_array().unwrap();
+            for link in links {
+                assert!(link["rel"].is_string(), "{what}: {link}");
+                assert!(link["type"].is_string(), "{what}: {link}");
+            }
+            let data: Vec<&Value> = links.iter().filter(|l| l["rel"] == "data").collect();
+            let queries = doc["data_queries"].as_object().unwrap();
+            assert_eq!(data.len(), queries.len(), "{what}: {data:?}");
+            for (query_type, query) in queries {
+                let link = &query["link"];
+                let data_link = data
+                    .iter()
+                    .find(|l| l["href"] == link["href"])
+                    .unwrap_or_else(|| panic!("{what}: no data link to {query_type}"));
+                assert_eq!(data_link["type"], link["type"], "{what} {query_type}");
+                assert_eq!(
+                    data_link["title"], link["variables"]["title"],
+                    "{what} {query_type}"
+                );
+            }
+            let media_type = |query_type: &str| &doc["data_queries"][query_type]["link"]["type"];
+            assert_eq!(media_type("locations"), "application/geo+json", "{what}");
+            for query_type in ["position", "area", "radius"] {
+                assert_eq!(
+                    media_type(query_type),
+                    "application/vnd.cov+json",
+                    "{what} {query_type}"
+                );
+            }
+            assert_eq!(
+                doc["within_units"],
+                serde_json::json!(["km", "m", "mi"]),
+                "{what}"
+            );
+        }
+        edr_schema::assert_valid("/collections", JSON, &list, "listing");
+        edr_schema::assert_valid("/collections/{collectionId}", JSON, &detail, "detail");
     }
 
     #[tokio::test]
@@ -1026,6 +1055,74 @@ mod collections {
             dq["locations"]["link"].get("href").is_some(),
             "locations link should have 'href'"
         );
+    }
+
+    /// The collection document, with locations, position, area and radius
+    /// queries, validates against EDR 1.1 and 1.2. 1.2 requires each data
+    /// query link's `variables` to carry a title, description, output
+    /// formats and CRS details (#918).
+    #[tokio::test]
+    async fn detail_validates_against_edr_bundles() {
+        let (_, json) = get("/collections/weather").await;
+        let mut query_types: Vec<&str> = json["data_queries"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        query_types.sort_unstable();
+        assert_eq!(query_types, ["area", "locations", "position", "radius"]);
+        edr_schema::assert_valid("/collections/{collectionId}", JSON, &json, "collection");
+    }
+
+    /// Negative control, so the 1.2 check is not vacuous: a data query link
+    /// whose `variables` lack the `title` passes EDR 1.1, which does not
+    /// require it, and fails EDR 1.2.
+    #[tokio::test]
+    async fn detail_without_a_link_variable_title_fails_edr_1_2() {
+        use edr_schema::Edr;
+
+        let path = "/collections/{collectionId}";
+        let (_, mut json) = get("/collections/weather").await;
+        assert!(edr_schema::errors(Edr::V1_2, path, JSON, &json).is_empty());
+        let variables = json["data_queries"]["radius"]["link"]["variables"]
+            .as_object_mut()
+            .unwrap();
+        assert!(variables.remove("title").is_some());
+
+        assert!(edr_schema::errors(Edr::V1_1, path, JSON, &json).is_empty());
+        let errors = edr_schema::errors(Edr::V1_2, path, JSON, &json);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("\"title\" is a required property")),
+            "{errors:#?}"
+        );
+    }
+
+    /// Negative control for the `parameter_names` entry check: the bundles'
+    /// own `parameter_names` schema constrains no entry, so the helper checks
+    /// each entry against the parameter schema the bundles intend. An entry
+    /// without its required `observedProperty` fails both versions.
+    #[tokio::test]
+    async fn detail_with_a_parameter_without_observed_property_fails() {
+        let path = "/collections/{collectionId}";
+        let (_, mut json) = get("/collections/weather").await;
+        let parameter = json["parameter_names"]["temperature"]
+            .as_object_mut()
+            .unwrap();
+        assert!(parameter.remove("observedProperty").is_some());
+
+        for version in edr_schema::VERSIONS {
+            let errors = edr_schema::errors(version, path, JSON, &json);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.starts_with("- parameter_names.temperature:")
+                        && e.contains("\"observedProperty\" is a required property")),
+                "{version:?}: {errors:#?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1173,6 +1270,17 @@ mod locations {
                 serde_json::to_string_pretty(&json).unwrap()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn validates_against_edr_bundles() {
+        let (_, json) = get("/collections/weather/locations").await;
+        edr_schema::assert_valid(
+            "/collections/{collectionId}/locations",
+            GEOJSON,
+            &json,
+            "locations",
+        );
     }
 }
 
@@ -1400,12 +1508,16 @@ mod error_responses {
     }
 
     /// A `z` selector against a collection with no vertical extent
-    /// (`MockEngine` does not override `get_vertical_extent`) is a 400 —
-    /// guards the `reject_z_without_vertical` check from a silent
-    /// refactor regression.
+    /// (`MockEngine` does not override `get_vertical_extent`) is ignored:
+    /// EDR 1.2 `/req/edr/z-response` A says it SHALL be. A malformed `z` is
+    /// still a 400.
     #[tokio::test]
-    async fn z_against_non_vertical_collection_returns_400() {
+    async fn z_against_non_vertical_collection_is_ignored() {
         let (status, json) = get("/collections/weather/locations/helsinki?z=0.5").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["type"], "Coverage");
+
+        let (status, json) = get("/collections/weather/locations/helsinki?z=low").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(json.get("code").is_some(), "400 error must have 'code'");
         assert!(json.get("description").is_some());
@@ -1672,8 +1784,8 @@ mod unimplemented_queries {
 
         struct TrajectoryMock;
         impl EdrEngine for TrajectoryMock {
-            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-                Ok(vec![])
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+                Ok(LocationSnapshot::empty())
             }
             fn query_location(
                 &self,
@@ -1696,6 +1808,9 @@ mod unimplemented_queries {
             }
             fn supported_query_types(&self) -> Vec<String> {
                 vec!["trajectory".into()]
+            }
+            fn trajectory_shape(&self) -> ds_core::edr_engine::TrajectoryShape {
+                ds_core::edr_engine::TrajectoryShape::CrossSection
             }
             fn query_trajectory(
                 &self,
@@ -1762,7 +1877,7 @@ mod unimplemented_queries {
             resp.headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok()),
-            Some("application/prs.coverage+json")
+            Some("application/vnd.cov+json")
         );
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: Value = serde_json::from_slice(&body).unwrap();
@@ -1773,7 +1888,7 @@ mod unimplemented_queries {
             .uri("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)&f=PNG")
             .body(Body::empty())
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -1783,6 +1898,244 @@ mod unimplemented_queries {
         );
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[0..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+
+        // `Accept: image/png` chooses the heatmap among the two offered
+        // formats, so the response varies on Accept.
+        let req = Request::builder()
+            .uri("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)")
+            .header("accept", "image/png")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "image/png");
+        assert!(resp
+            .headers()
+            .get_all("vary")
+            .iter()
+            .any(|v| v.to_str().unwrap().eq_ignore_ascii_case("accept")));
+
+        // A trajectory is never GeoJSON (#929).
+        let req = Request::builder()
+            .uri("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)&f=GeoJSON")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An along-path (gridded) engine, #926: the handler validates the
+    /// whole path and the EDR 1.2 Z/`z` and M/`datetime` exclusions before
+    /// dispatch, refuses PNG, and serves the `Trajectory` domain; metadata
+    /// and `/api` advertise CoverageJSON only and the Z/M/ZM `coords`.
+    #[tokio::test]
+    async fn along_path_trajectory_validates_before_dispatch() {
+        use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
+        use ds_core::vertical::{VerticalDimension, VerticalKind};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AlongPathMock(Arc<AtomicUsize>);
+        fn levels() -> VerticalDimension {
+            VerticalDimension::new(VerticalKind::Pressure, vec![1000.0, 850.0, 500.0])
+        }
+        impl EdrEngine for AlongPathMock {
+            fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+                Ok(LocationSnapshot::empty())
+            }
+            fn query_location(
+                &self,
+                _id: &str,
+                _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _p: Option<&[String]>,
+                _z: Option<&[f64]>,
+                _rt: Option<DateTime<Utc>>,
+            ) -> Result<CoverageResponse, DataServerError> {
+                Err(DataServerError::LocationNotFound("n/a".into()))
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                vec!["TMP".into()]
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                Some((
+                    "2024-01-01T00:00:00Z".parse().unwrap(),
+                    "2024-01-01T06:00:00Z".parse().unwrap(),
+                ))
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                Some([20.0, 55.0, 30.0, 65.0])
+            }
+            fn get_vertical_extent(&self) -> Option<VerticalDimension> {
+                Some(levels())
+            }
+            fn supported_query_types(&self) -> Vec<String> {
+                vec!["trajectory".into()]
+            }
+            fn query_trajectory(
+                &self,
+                coords: &str,
+                datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _p: Option<&[String]>,
+                z: Option<&[f64]>,
+                _rt: Option<DateTime<Utc>>,
+            ) -> Result<CoverageResponse, DataServerError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let path = TrajectoryPath::parse(coords)?;
+                // The position-style step selection: every step, or those
+                // inside the window (an instant matches exactly).
+                let times: Vec<DateTime<Utc>> = [
+                    "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+                    "2024-01-01T06:00:00Z".parse().unwrap(),
+                ]
+                .into_iter()
+                .filter(|t| datetime.is_none_or(|(start, end)| *t >= start && *t <= end))
+                .collect();
+                let vertical = levels();
+                let plan = TrajectoryPlan::new(
+                    &path,
+                    GridSpacing::new(0.5, 0.5).unwrap(),
+                    TrajectoryAxes {
+                        times: &times,
+                        vertical: Some(&vertical),
+                        z,
+                    },
+                    1,
+                )?;
+                let values = vec![plan
+                    .fields()
+                    .iter()
+                    .map(|f| vec![Some(1.0); f.points.len()])
+                    .collect()];
+                let parameters = [(
+                    "TMP".to_string(),
+                    ParameterDescription {
+                        label: "Temperature".into(),
+                        unit: "°C".into(),
+                        observed_property: "TMP".into(),
+                        standard_name: None,
+                    },
+                )];
+                plan.into_response(&parameters, &values)
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine: Arc<dyn EdrEngine> = Arc::new(AlongPathMock(calls.clone()));
+        let router = api_edr::router(make_edr_state(engine));
+        let fetch = |uri: String| {
+            let router = router.clone();
+            async move {
+                let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+                let resp = router.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let body = resp.into_body().collect().await.unwrap().to_bytes();
+                (status, serde_json::from_slice::<Value>(&body).unwrap())
+            }
+        };
+        let base = "/collections/weather/trajectory?coords=";
+
+        for query in [
+            // A Z path carries its levels: `z` too is an error (EDR 1.2).
+            "LINESTRING%20Z(24%2060%20850,25%2061%20500)&z=850",
+            "LINESTRING%20ZM(24%2060%20850%201704067200,25%2061%20500%201704088800)&z=850",
+            // An M path carries its times: `datetime` too is an error.
+            "LINESTRINGM(24%2060%201704067200,25%2061%201704088800)&datetime=2024-01-01T00:00:00Z",
+            "LINESTRING%20ZM(24%2060%20850%201704067200,25%2061%20500%201704088800)&datetime=2024-01-01T00:00:00Z",
+            // A `datetime` list is a `datetime` too.
+            "LINESTRINGM(24%2060%201704067200,25%2061%201704088800)&datetime=2024-01-01T00:00:00Z,2024-01-01T06:00:00Z",
+            // Malformed paths never reach the engine.
+            "LINESTRING(24%2060)",
+            "LINESTRING%20Z(24%2060,25%2061)",
+            "MULTILINESTRING((24%2060,25%2061))",
+            // Only a radar cross-section renders as a PNG; no trajectory is
+            // GeoJSON.
+            "LINESTRING(24%2060,25%2061)&f=PNG",
+            "LINESTRING(24%2060,25%2061)&f=GeoJSON",
+        ] {
+            let (status, json) = fetch(format!("{base}{query}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {json}");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "rejected before dispatch");
+
+        let (status, json) = fetch(format!(
+            "{base}LINESTRING%20Z(24%2060%201000,25%2061%20500)"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["domainType"], "Trajectory");
+        let domain = &json["coverages"][0]["domain"];
+        assert_eq!(
+            domain["axes"]["composite"]["coordinates"],
+            serde_json::json!(["t", "x", "y", "z"])
+        );
+        // An M path on one level: a single coverage with a `z` axis.
+        let (status, json) = fetch(format!(
+            "{base}LINESTRING%20M(24%2060%201704067200,25%2061%201704088800)&z=850"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["type"], "Coverage");
+        assert_eq!(
+            json["domain"]["axes"]["z"]["values"],
+            serde_json::json!([850.0])
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // A 2-D path with a `datetime` list: one engine query per instant,
+        // one coverage per instant (EDR 1.2 /req/core/datetime-response D).
+        let (status, json) = fetch(format!(
+            "{base}LINESTRING(24%2060,25%2061)&z=850\
+             &datetime=2024-01-01T00:00:00Z,2024-01-01T06:00:00Z"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["type"], "CoverageCollection");
+        let steps: Vec<&str> = json["coverages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                c["domain"]["axes"]["composite"]["values"][0][0]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            ["2024-01-01T00:00:00+00:00", "2024-01-01T06:00:00+00:00"]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        // `Accept: image/png` is not a failure: CoverageJSON, the default
+        // along a path. HTML is offered too, so the response varies on Accept.
+        let req = Request::builder()
+            .uri(format!("{base}LINESTRING(24%2060,25%2061)&z=850"))
+            .header("accept", "image/png")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "application/vnd.cov+json");
+        assert!(resp.headers().get("vary").is_some_and(|v| v
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("accept")));
+
+        let (_, meta) = fetch("/collections/weather".into()).await;
+        assert_eq!(
+            meta["data_queries"]["trajectory"]["link"]["variables"]["output_formats"],
+            serde_json::json!(["CoverageJSON", "HTML"])
+        );
+        let (_, api) = fetch("/api".into()).await;
+        let op = &api["paths"]["/edr/collections/weather/trajectory"]["get"];
+        assert_eq!(
+            op["parameters"][0]["$ref"],
+            "#/components/parameters/coords-trajectory"
+        );
+        let coords_doc = api["components"]["parameters"]["coords-trajectory"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(coords_doc.contains("Unix epoch"), "{coords_doc}");
     }
 
     #[tokio::test]
@@ -1860,13 +2213,17 @@ mod metadata_extras {
                 cap: None,
                 postgis: None,
                 nowcast: None,
+                station_grid: None,
                 bufr: None,
                 satellite: None,
+                netcdf: None,
                 preview: None,
+                derive_wind: None,
             },
         );
         Arc::new(ArcSwap::from_pointee(EdrState {
             engines,
+            feature_engines: HashMap::new(),
             collections,
             styles: HashMap::new(),
             base_url: String::new(),
@@ -1910,6 +2267,7 @@ mod metadata_extras {
         let lic = ds_core::config::LicenseConfig {
             title: "CC-BY-4.0".into(),
             url: None,
+            media_type: None,
         };
         let json = collection_json(vec!["radar".into(), "weather".into()], Some(lic)).await;
         assert_eq!(json["keywords"], serde_json::json!(["radar", "weather"]));
@@ -1921,6 +2279,8 @@ mod metadata_extras {
             .expect("a rel=license link");
         assert_eq!(link["href"], "https://spdx.org/licenses/CC-BY-4.0.html");
         assert_eq!(link["title"], "CC-BY-4.0");
+        // Every link has a `type` (EDR 1.2 `/req/core/rc-collection-info-links` B).
+        assert_eq!(link["type"], "text/html");
     }
 
     #[tokio::test]
@@ -1944,7 +2304,7 @@ mod request_budget {
         values_per_point: usize,
     }
     impl EdrEngine for CountingEngine {
-        fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
             MockEngine.get_locations()
         }
         fn get_parameters(&self) -> Vec<String> {
@@ -1994,7 +2354,7 @@ mod request_budget {
     }
 
     impl EdrEngine for BatchEngine {
-        fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
             MockEngine.get_locations()
         }
         fn get_parameters(&self) -> Vec<String> {

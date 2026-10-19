@@ -8,9 +8,11 @@
 //
 // Labels are deliberately kept low-cardinality: `level`, `api`, `query_type`,
 // and a derived `status_class` (2xx / 4xx / 5xx). High-cardinality fields
-// like `collection`, `path`, `request_id`, and the raw `query` string stay
-// in the log line body — queryable via `| json` in LogQL without blowing up
-// Loki's index.
+// like `collection`, `path`, `request_id`, the raw `query` string,
+// `user_agent` and `referer` stay in the log line body — queryable via
+// `| json` in LogQL without blowing up Loki's index. Never promote the
+// client-controlled `user_agent` / `referer`: every distinct value would
+// be a new stream.
 
 discovery.docker "containers" {
     host             = "unix:///var/run/docker.sock"

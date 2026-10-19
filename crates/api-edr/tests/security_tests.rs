@@ -21,13 +21,13 @@ use ds_core::model::*;
 struct MockEngine;
 
 impl EdrEngine for MockEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![Location {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(vec![Location {
             id: "helsinki".to_string(),
             label: "Helsinki".to_string(),
             latitude: 60.1699,
             longitude: 24.9384,
-        }])
+        }])))
     }
 
     fn query_location(
@@ -118,13 +118,17 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
     Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
+        feature_engines: HashMap::new(),
         collections,
         styles: HashMap::new(),
         base_url: String::new(),
@@ -620,7 +624,7 @@ struct FailingEngine;
 const INTERNAL_DETAIL: &str = "connection refused at 10.0.0.5:5432";
 
 impl EdrEngine for FailingEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         Err(DataServerError::Engine(INTERNAL_DETAIL.into()))
     }
 
@@ -680,7 +684,7 @@ async fn content_type_is_set_for_success_responses() {
         ("/collections/weather/locations", "application/geo+json"),
         (
             "/collections/weather/locations/helsinki",
-            "application/prs.coverage+json",
+            "application/vnd.cov+json",
         ),
     ];
     for (uri, expected_ct) in &uris_and_types {

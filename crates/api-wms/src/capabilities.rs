@@ -3,14 +3,43 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ds_core::config::{CollectionConfig, LicenseConfig};
+use ds_core::edr_engine::EdrEngine;
 use ds_core::map_engine::{default_request_time, MapEngine, RasterInfo};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
+use crate::feature_info::layer_is_queryable;
 use crate::params;
 use ds_render::{CompositeSpec, StyleInfo};
 
+/// The SLD namespace, which `GetLegendGraphic` belongs to: the WMS 1.3.0
+/// schema's `<Request>` holds GetCapabilities, GetMap and GetFeatureInfo,
+/// then only extended operations, and SLD 1.1.0 declares
+/// `sld:GetLegendGraphic` as one.
+const SLD_NAMESPACE: &str = "http://www.opengis.net/sld";
+
+/// Each namespace the document uses with the schema that defines it, as the
+/// root's `xsi:schemaLocation` pairs them, so a validator can find both:
+/// WMS 1.3.0's capabilities schema, and SLD 1.1.0's, which declares
+/// `sld:GetLegendGraphic`. Without the second pair the document is invalid.
+const SCHEMA_LOCATION: &str = "http://www.opengis.net/wms \
+     http://schemas.opengis.net/wms/1.3.0/capabilities_1_3_0.xsd \
+     http://www.opengis.net/sld \
+     http://schemas.opengis.net/sld/1.1.0/sld_capabilities.xsd";
+
+/// Every format a request error comes in, for the `<Exception>` element:
+/// `XML`, the ServiceExceptionReport. The `EXCEPTIONS` parameter is not
+/// honoured, so `INIMAGE` and `BLANK` are not offered (#1027).
+const EXCEPTION_FORMATS: &[&str] = &["XML"];
+
+/// The image format every LegendURL links to and names in its `<Format>`.
+const LEGEND_URL_FORMAT: &str = "image/png";
+
 /// Generate WMS 1.3.0 GetCapabilities XML.
+///
+/// `point_engines` are the collections whose engine answers position
+/// queries ([`crate::handlers::WmsState::point_engines`]): their layers that
+/// show a parameter's own values are `queryable="1"` (#1064).
 ///
 /// Uses quick-xml Writer to ensure all text content is properly escaped.
 /// Never builds XML via format!() or string concatenation (XML injection risk).
@@ -18,6 +47,7 @@ pub fn get_capabilities_xml(
     engines: &HashMap<String, Arc<dyn MapEngine>>,
     collections: &HashMap<String, CollectionConfig>,
     styles: &HashMap<String, HashMap<String, StyleInfo>>,
+    point_engines: &HashMap<String, Arc<dyn EdrEngine>>,
     base_url: &str,
 ) -> Vec<u8> {
     let mut writer = Writer::new(Vec::new());
@@ -30,14 +60,19 @@ pub fn get_capabilities_xml(
     root.push_attribute(("version", "1.3.0"));
     root.push_attribute(("xmlns", "http://www.opengis.net/wms"));
     root.push_attribute(("xmlns:xlink", "http://www.w3.org/1999/xlink"));
+    root.push_attribute(("xmlns:sld", SLD_NAMESPACE));
+    root.push_attribute(("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance"));
+    root.push_attribute(("xsi:schemaLocation", SCHEMA_LOCATION));
     let _ = writer.write_event(Event::Start(root));
 
     // Service section
-    write_service(&mut writer);
+    write_service(&mut writer, base_url);
 
-    // Capability section
+    // Capability section: Request, then Exception, then the layers, in the
+    // order of the schema's `Capability` sequence.
     let _ = writer.write_event(Event::Start(BytesStart::new("Capability")));
     write_request(&mut writer, base_url);
+    write_exception(&mut writer);
 
     // Root Layer (container for all layers)
     let _ = writer.write_event(Event::Start(BytesStart::new("Layer")));
@@ -48,8 +83,14 @@ pub fn get_capabilities_xml(
         write_text_element(&mut writer, "CRS", crs);
     }
 
-    // Individual layers (one per collection)
-    for (id, config) in collections {
+    // Individual layers (one per collection), in collection-id order, as the
+    // OGC API `/collections` list. The registry is a HashMap, whose order
+    // changes with every process: clients saw the layers reshuffled at each
+    // restart, and the OGC test suite, which picks the first or last named
+    // layer, picked a different one each run (#1102).
+    let mut ordered: Vec<(&String, &CollectionConfig)> = collections.iter().collect();
+    ordered.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for (id, config) in ordered {
         if let Some(engine) = engines.get(id) {
             let info = engine.raster_info_shared();
 
@@ -64,11 +105,18 @@ pub fn get_capabilities_xml(
                     config,
                     &info,
                     styles,
+                    point_engines,
                     base_url,
                     engine.as_ref(),
                 );
             } else {
-                // Single-parameter engine: one requestable layer
+                // Single-parameter engine: one requestable layer, drawing
+                // its one parameter.
+                let parameter = info
+                    .parameters
+                    .first()
+                    .map(|p| p.name.as_str())
+                    .or(Some(info.parameter.as_str()).filter(|p| !p.is_empty()));
                 write_layer(
                     &mut writer,
                     id,
@@ -79,6 +127,7 @@ pub fn get_capabilities_xml(
                     None,
                     engine.default_time(),
                     None,
+                    layer_is_queryable(point_engines, id, engine.as_ref(), parameter),
                 );
             }
         }
@@ -91,11 +140,27 @@ pub fn get_capabilities_xml(
     writer.into_inner()
 }
 
-fn write_service(writer: &mut Writer<Vec<u8>>) {
+/// Write the `<Service>` section in WMS 1.3.0 schema order: `Name`, `Title`,
+/// `Abstract`, the mandatory `OnlineResource`, then the limits GetMap
+/// enforces — `LayerLimit`, `MaxWidth`, `MaxHeight` — read from the same
+/// constants as [`params::WmsQuery::validate_get_map`], so the advertised
+/// limits cannot drift from the ones GetMap applies (#1012).
+fn write_service(writer: &mut Writer<Vec<u8>>, base_url: &str) {
     let _ = writer.write_event(Event::Start(BytesStart::new("Service")));
     write_text_element(writer, "Name", "WMS");
     write_text_element(writer, "Title", "MeteoCore - WMS");
     write_text_element(writer, "Abstract", "Metocean Data Server — OGC WMS 1.3.0");
+
+    let service_url = format!("{base_url}/wms");
+    let mut or = BytesStart::new("OnlineResource");
+    or.push_attribute(("xlink:type", "simple"));
+    or.push_attribute(("xlink:href", service_url.as_str()));
+    let _ = writer.write_event(Event::Empty(or));
+
+    write_text_element(writer, "LayerLimit", &params::LAYER_LIMIT.to_string());
+    let max_dimension = params::MAX_MAP_DIMENSION.to_string();
+    write_text_element(writer, "MaxWidth", &max_dimension);
+    write_text_element(writer, "MaxHeight", &max_dimension);
     let _ = writer.write_event(Event::End(BytesEnd::new("Service")));
 }
 
@@ -110,10 +175,18 @@ fn write_request(writer: &mut Writer<Vec<u8>>, base_url: &str) {
 
     // GetMap and GetLegendGraphic accept the same image formats — iterate
     // SUPPORTED_FORMATS so the advertised list can't drift from what the
-    // handlers actually serve.
-    for op in ["GetMap", "GetLegendGraphic"] {
+    // handlers actually serve. GetFeatureInfo answers in INFO_FORMATS, and
+    // the schema's sequence puts it right after GetMap. GetLegendGraphic is
+    // SLD's operation, written `sld:GetLegendGraphic` (see `SLD_NAMESPACE`)
+    // after them; its children stay WMS elements, of the WMS schema's
+    // `OperationType`.
+    for (op, formats) in [
+        ("GetMap", params::SUPPORTED_FORMATS),
+        ("GetFeatureInfo", params::INFO_FORMATS),
+        ("sld:GetLegendGraphic", params::SUPPORTED_FORMATS),
+    ] {
         let _ = writer.write_event(Event::Start(BytesStart::new(op)));
-        for format in params::SUPPORTED_FORMATS {
+        for format in formats {
             write_format(writer, format);
         }
         write_dcp_type(writer, base_url);
@@ -121,6 +194,16 @@ fn write_request(writer: &mut Writer<Vec<u8>>, base_url: &str) {
     }
 
     let _ = writer.write_event(Event::End(BytesEnd::new("Request")));
+}
+
+/// Write `<Exception>`: the formats request errors come in, which the WMS
+/// 1.3.0 schema requires right after `<Request>`.
+fn write_exception(writer: &mut Writer<Vec<u8>>) {
+    let _ = writer.write_event(Event::Start(BytesStart::new("Exception")));
+    for format in EXCEPTION_FORMATS {
+        write_format(writer, format);
+    }
+    let _ = writer.write_event(Event::End(BytesEnd::new("Exception")));
 }
 
 fn write_format(writer: &mut Writer<Vec<u8>>, format: &str) {
@@ -151,12 +234,14 @@ fn write_dcp_type(writer: &mut Writer<Vec<u8>>, base_url: &str) {
 /// registers one. Reusing the collection map for every child advertised
 /// parameter-scoped styles on layers that would reject them at GetMap time
 /// (and hid the ones that layer really has).
+#[allow(clippy::too_many_arguments)]
 fn write_parent_layer(
     writer: &mut Writer<Vec<u8>>,
     id: &str,
     config: &CollectionConfig,
     info: &RasterInfo,
     styles: &HashMap<String, HashMap<String, StyleInfo>>,
+    point_engines: &HashMap<String, Arc<dyn EdrEngine>>,
     base_url: &str,
     engine: &dyn MapEngine,
 ) {
@@ -210,6 +295,7 @@ fn write_parent_layer(
             own_times
                 .as_ref()
                 .map(|(times, default)| (&times[..], *default)),
+            layer_is_queryable(point_engines, id, engine, Some(short_name)),
         );
     }
 
@@ -243,7 +329,8 @@ fn write_parent_layer(
 
 /// Write an RGB composite's child layer: its name and title, an abstract
 /// naming what each channel reads, its own `time` dimension and its one
-/// style, `default`, with a LegendURL to the channel-list legend.
+/// style, `default`, with a LegendURL to the channel-list legend. Never
+/// queryable: no position query answers a composite (#1064).
 fn write_composite_layer(
     writer: &mut Writer<Vec<u8>>,
     layer_name: &str,
@@ -290,7 +377,8 @@ type OwnTimes<'a> = (&'a [DateTime<Utc>], Option<DateTime<Utc>>);
 /// If `param_title` is Some, this is a child of a multi-param parent and we
 /// skip inherited metadata (CRS, bbox, time) since the parent already has it —
 /// except a `time` dimension of the child's own, `own_times` (its values and
-/// default), which replaces the inherited one.
+/// default), which replaces the inherited one. `queryable`: GetFeatureInfo
+/// answers for the layer ([`layer_is_queryable`]).
 #[allow(clippy::too_many_arguments)]
 fn write_layer(
     writer: &mut Writer<Vec<u8>>,
@@ -302,9 +390,10 @@ fn write_layer(
     param_title: Option<&str>,
     default_time: Option<DateTime<Utc>>,
     own_times: Option<OwnTimes<'_>>,
+    queryable: bool,
 ) {
     let mut layer = BytesStart::new("Layer");
-    layer.push_attribute(("queryable", "0"));
+    layer.push_attribute(("queryable", if queryable { "1" } else { "0" }));
     layer.push_attribute(("opaque", "1"));
     let _ = writer.write_event(Event::Start(layer));
 
@@ -336,8 +425,9 @@ fn write_layer(
     let _ = writer.write_event(Event::End(BytesEnd::new("Layer")));
 }
 
-/// Write a `time` dimension listing `times` (nothing when empty), with
-/// `default` as its default value.
+/// Write a `time` dimension for `times` (nothing when empty), with `default`
+/// as its default value. A long axis is written as Annex C ranges
+/// ([`ds_core::time_axis::wms_extent`], #1006); a short one stays the list.
 fn write_time_dimension(
     writer: &mut Writer<Vec<u8>>,
     times: &[DateTime<Utc>],
@@ -354,8 +444,8 @@ fn write_time_dimension(
     }
     dim.push_attribute(("nearestValue", "1"));
     let _ = writer.write_event(Event::Start(dim));
-    let time_values: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
-    let _ = writer.write_event(Event::Text(BytesText::new(&time_values.join(","))));
+    let extent = ds_core::time_axis::wms_extent(times);
+    let _ = writer.write_event(Event::Text(BytesText::new(&extent)));
     let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
 }
 
@@ -433,6 +523,8 @@ fn write_layer_metadata(
     // requested as `DIM_REFERENCE_TIME`). Default = latest run. No
     // `nearestValue` — the run must match an advertised value exactly (the
     // handler validates membership and the engine requires an exact match).
+    // An archive's long run axis is written as Annex C ranges (#1006): every
+    // value a range names is a run, so it validates as it did listed.
     if !info.reference_times.is_empty() {
         let mut dim = BytesStart::new("Dimension");
         dim.push_attribute(("name", "reference_time"));
@@ -442,12 +534,8 @@ fn write_layer_metadata(
         }
         let _ = writer.write_event(Event::Start(dim));
 
-        let run_values: Vec<String> = info
-            .reference_times
-            .iter()
-            .map(|t| t.to_rfc3339())
-            .collect();
-        let _ = writer.write_event(Event::Text(BytesText::new(&run_values.join(","))));
+        let extent = ds_core::time_axis::wms_extent(&info.reference_times);
+        let _ = writer.write_event(Event::Text(BytesText::new(&extent)));
 
         let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
     }
@@ -501,9 +589,19 @@ fn write_style(
     // layer advertises; using the bare collection id would hand back the
     // collection default's legend for a parameter layer rendered with its own
     // palette.
-    let _ = writer.write_event(Event::Start(BytesStart::new("LegendURL")));
+    //
+    // The schema's LegendURL is a `<Format>` then the `<OnlineResource>`,
+    // with `width` and `height` attributes for the image size. The link names
+    // no WIDTH or HEIGHT, so it returns the size `params::legend_size` gives
+    // for none: the same function GetLegendGraphic reads.
+    let (width, height) = params::legend_size(None, None);
+    let mut legend = BytesStart::new("LegendURL");
+    legend.push_attribute(("width", width.to_string().as_str()));
+    legend.push_attribute(("height", height.to_string().as_str()));
+    let _ = writer.write_event(Event::Start(legend));
+    write_format(writer, LEGEND_URL_FORMAT);
     let legend_url = format!(
-        "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={layer_name}&STYLE={name}&FORMAT=image/png"
+        "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={layer_name}&STYLE={name}&FORMAT={LEGEND_URL_FORMAT}"
     );
     let mut or = BytesStart::new("OnlineResource");
     or.push_attribute(("xlink:type", "simple"));

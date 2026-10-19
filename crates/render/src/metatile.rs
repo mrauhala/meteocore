@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use ds_core::error::DataServerError;
-use ds_core::geo::{projected_output_crs, wgs84_envelope};
+use ds_core::geo::{outside_projection_domain, projected_output_crs, wgs84_envelope};
 use ds_core::map_engine::{OutputCrs, RasterTile};
 
 use crate::colorize;
@@ -312,10 +312,51 @@ pub enum MetaTile {
     /// existing all-nodata fast path). `stats` still carries the tile-loop
     /// timing (assemble/encode are skipped, so 0).
     Empty { stats: MetaTileStats },
-    /// Meta-tiling declined (degenerate bbox, over-zoom past the ladder, or a
-    /// covering tile count above [`tile_budget`]); the caller should fall back
-    /// to a direct single-shot render.
+    /// Meta-tiling declined (degenerate bbox, over-zoom past the ladder, a
+    /// covering tile count above [`tile_budget`], or a projected tile whose
+    /// edges miss the valid area reaching into it); the caller should fall
+    /// back to a direct single-shot render.
     Fallback,
+}
+
+/// Outcome of a meta-tiled view before encoding, from [`assemble_metatiled`]
+/// and [`assemble_metatiled_composite`]: what [`MetaTile`] is made of. A WMS
+/// GetMap of several layers draws each layer's assembled pixels over the
+/// last and encodes the result once (#1181).
+pub enum MetaTilePixels {
+    /// The assembled `width × height` RGBA view, with no background, and
+    /// the phase timing (`encode` is 0: nothing is encoded yet).
+    Image { rgba: Vec<u8>, stats: MetaTileStats },
+    /// Every covered pixel is nodata, as [`MetaTile::Empty`].
+    Empty { stats: MetaTileStats },
+    /// Meta-tiling declined, as [`MetaTile::Fallback`].
+    Fallback,
+}
+
+impl MetaTilePixels {
+    /// The view encoded in `format`, first composited over `background`
+    /// when one is given, its encode time in the stats.
+    fn encode(
+        self,
+        width: u32,
+        height: u32,
+        format: ImageFormat,
+        background: Option<[u8; 3]>,
+    ) -> Result<MetaTile, DataServerError> {
+        Ok(match self {
+            MetaTilePixels::Image {
+                mut rgba,
+                mut stats,
+            } => {
+                let t_encode = Instant::now();
+                let bytes = crate::encode_rgba(&mut rgba, width, height, format, background)?;
+                stats.encode = t_encode.elapsed();
+                MetaTile::Image { bytes, stats }
+            }
+            MetaTilePixels::Empty { stats } => MetaTile::Empty { stats },
+            MetaTilePixels::Fallback => MetaTile::Fallback,
+        })
+    }
 }
 
 /// Render a supported projected GetMap as cached 256×256 tiles, assembled
@@ -323,7 +364,9 @@ pub enum MetaTile {
 ///
 /// `bbox_deg` is the WGS84 source-read envelope; projected viewport metres
 /// come from `output_crs`. Each closure call receives its OWN projected tile
-/// bounds plus their WGS84 envelope, never the original viewport's bounds.
+/// bounds plus their WGS84 envelope, never the original viewport's bounds. A
+/// covering tile wholly outside the projection's valid area is all nodata,
+/// with no closure call (`ds_core::geo::outside_projection_domain`).
 ///
 /// `background` (`Some` = opaque output, WMS `TRANSPARENT=FALSE`) is applied
 /// only when encoding the assembled view: the cached tiles stay RGBA, so
@@ -344,14 +387,41 @@ pub fn render_metatiled<F>(
 where
     F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<RasterTile, DataServerError>,
 {
+    assemble_metatiled(
+        bbox_deg,
+        output_crs,
+        width,
+        height,
+        prefix,
+        colormap,
+        cache,
+        render_tile,
+    )?
+    .encode(width, height, format, background)
+}
+
+/// [`render_metatiled`]'s view before encoding: the assembled RGBA pixels,
+/// with no background, from the same cached tiles.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_metatiled<F>(
+    bbox_deg: [f64; 4],
+    output_crs: &OutputCrs,
+    width: u32,
+    height: u32,
+    prefix: &TileKeyPrefix,
+    colormap: &dyn ColorMap,
+    cache: &TilePixelCache,
+    render_tile: F,
+) -> Result<MetaTilePixels, DataServerError>
+where
+    F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<RasterTile, DataServerError>,
+{
     render_metatiled_with(
         bbox_deg,
         output_crs,
         width,
         height,
         prefix,
-        format,
-        background,
         cache,
         |tbbox, tw, th, tile_output, times| {
             let t_engine = Instant::now();
@@ -390,14 +460,41 @@ pub fn render_metatiled_composite<F>(
 where
     F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<Vec<RasterTile>, DataServerError>,
 {
+    assemble_metatiled_composite(
+        bbox_deg,
+        output_crs,
+        width,
+        height,
+        prefix,
+        spec,
+        cache,
+        render_bands,
+    )?
+    .encode(width, height, format, background)
+}
+
+/// [`render_metatiled_composite`]'s view before encoding: the assembled
+/// RGBA pixels, with no background, from the same cached tiles.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_metatiled_composite<F>(
+    bbox_deg: [f64; 4],
+    output_crs: &OutputCrs,
+    width: u32,
+    height: u32,
+    prefix: &TileKeyPrefix,
+    spec: &CompositeSpec,
+    cache: &TilePixelCache,
+    render_bands: F,
+) -> Result<MetaTilePixels, DataServerError>
+where
+    F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<Vec<RasterTile>, DataServerError>,
+{
     render_metatiled_with(
         bbox_deg,
         output_crs,
         width,
         height,
         prefix,
-        format,
-        background,
         cache,
         |tbbox, tw, th, tile_output, times| {
             let t_engine = Instant::now();
@@ -419,22 +516,19 @@ struct TileTimes {
     colorize: Duration,
 }
 
-/// The meta-tiling behind [`render_metatiled`] and
-/// [`render_metatiled_composite`]. `tile_pixels` renders one uncached tile
+/// The meta-tiling behind [`assemble_metatiled`] and
+/// [`assemble_metatiled_composite`]. `tile_pixels` renders one uncached tile
 /// to its `TILE_PX × TILE_PX` RGBA pixels, or `None` when all of them are
 /// nodata, adding its engine and colorize time to the [`TileTimes`].
-#[allow(clippy::too_many_arguments)]
 fn render_metatiled_with<F>(
     bbox_deg: [f64; 4],
     output_crs: &OutputCrs,
     width: u32,
     height: u32,
     prefix: &TileKeyPrefix,
-    format: ImageFormat,
-    background: Option<[u8; 3]>,
     cache: &TilePixelCache,
     tile_pixels: F,
-) -> Result<MetaTile, DataServerError>
+) -> Result<MetaTilePixels, DataServerError>
 where
     F: Fn(
         [f64; 4],
@@ -449,11 +543,11 @@ where
         || height == 0
         || !(w.is_finite() && s.is_finite() && e.is_finite() && n.is_finite())
     {
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
 
     let Some(grid) = Grid::for_output(output_crs) else {
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     };
     let (origin_x, origin_y) = grid.origin();
     // Keep the viewport exact. Only Web Mercator tile selection is clamped
@@ -466,11 +560,11 @@ where
         .iter()
         .all(|v| v.is_finite())
     {
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
     if !(east_m > west_m && north_m > south_m) {
         // Antimeridian crossing or degenerate extent — let the caller render directly.
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
 
     // Snap to the ladder using the finer of the two axis resolutions (so neither
@@ -481,7 +575,7 @@ where
         // Requested resolution is finer than the deepest ladder step (~9 mm/px —
         // an absurd over-zoom). Meta-tiling would have to upscale; render
         // directly at the exact requested resolution instead.
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
     let span = TILE_PX as f64 * grid.level_res(level); // tile edge length in metres
 
@@ -506,14 +600,14 @@ where
         .iter()
         .any(|v| !v.is_finite() || v.abs() > (i64::MAX / (2 * TILE_PX as i64)) as f64)
     {
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
     let [col0, col1, row0, row1] = indices.map(|v| v as i64);
     let ncols = (col1 - col0 + 1).max(1) as usize;
     let nrows = (row1 - row0 + 1).max(1) as usize;
     if ncols.saturating_mul(nrows) > tile_budget(width, height) {
         BUDGET_DECLINES.fetch_add(1, Ordering::Relaxed);
-        return Ok(MetaTile::Fallback);
+        return Ok(MetaTilePixels::Fallback);
     }
 
     // Render or fetch each covering tile's RGBA pixels. `None` = an all-nodata
@@ -559,36 +653,45 @@ where
                 let tx1 = tx0 + span;
                 let ty_top = origin_y - row as f64 * span;
                 let ty_bot = ty_top - span;
-                let (tbbox, tile_output) = match output_crs {
+                let pixels = match output_crs {
                     OutputCrs::Projected { crs, .. } => {
                         let bbox = [tx0, ty_bot, tx1, ty_top];
-                        let Some(envelope) = wgs84_envelope(crs, bbox) else {
-                            // An edge tile can extend outside a projection's
-                            // domain. Preserve the direct path's handling.
-                            return Ok(MetaTile::Fallback);
-                        };
-                        (
-                            envelope,
-                            OutputCrs::Projected {
+                        if outside_projection_domain(crs, bbox) {
+                            // Wholly past the projection's valid area, as a
+                            // cover's tiles past a pole, past the LAEA disk
+                            // or past TM's east and west edges are: no pixel
+                            // has a place to read, all nodata (#1113).
+                            None
+                        } else {
+                            let Some(envelope) = wgs84_envelope(crs, bbox) else {
+                                // The tile's edges miss the valid area
+                                // reaching into it. Preserve the direct
+                                // path's handling.
+                                return Ok(MetaTilePixels::Fallback);
+                            };
+                            let tile_output = OutputCrs::Projected {
                                 crs: crs.clone(),
                                 bbox,
-                            },
-                        )
+                            };
+                            tile_pixels(envelope, TILE_PX, TILE_PX, &tile_output, &mut times)?
+                        }
                     }
-                    _ => (
+                    _ => tile_pixels(
                         [
                             x_to_lon(tx0),
                             y_to_lat(ty_bot),
                             x_to_lon(tx1),
                             y_to_lat(ty_top),
                         ],
-                        OutputCrs::WebMercator,
-                    ),
+                        TILE_PX,
+                        TILE_PX,
+                        &OutputCrs::WebMercator,
+                        &mut times,
+                    )?,
                 };
                 // All-nodata tiles are cached as a `None` marker: cheap to store
                 // (no 256 KB buffer) yet still a cache hit, so a sparse extent is
                 // not re-decoded every request nor crowds out real-data tiles.
-                let pixels = tile_pixels(tbbox, TILE_PX, TILE_PX, &tile_output, &mut times)?;
                 let entry: Option<Arc<[u8]>> = match pixels {
                     None => None,
                     Some(rgba) => {
@@ -619,7 +722,7 @@ where
     let tile_loop = t_loop.elapsed();
 
     if !any_data {
-        return Ok(MetaTile::Empty {
+        return Ok(MetaTilePixels::Empty {
             stats: MetaTileStats {
                 tiles: tiles_count,
                 misses,
@@ -658,11 +761,8 @@ where
     }
     let assemble = t_assemble.elapsed();
 
-    let t_encode = Instant::now();
-    let bytes = crate::encode_rgba(&mut out, width, height, format, background)?;
-    let encode = t_encode.elapsed();
-    Ok(MetaTile::Image {
-        bytes,
+    Ok(MetaTilePixels::Image {
+        rgba: out,
         stats: MetaTileStats {
             tiles: tiles_count,
             misses,
@@ -670,7 +770,7 @@ where
             engine: times.engine,
             colorize: times.colorize,
             assemble,
-            encode,
+            encode: Duration::ZERO,
         },
     })
 }
@@ -979,6 +1079,102 @@ mod tests {
         .unwrap();
         let (hits, _) = cache.stats();
         assert!(hits > 0, "overlapping viewport should hit cached tiles");
+    }
+
+    /// `render_metatiled` is `assemble_metatiled` encoded: the assembled
+    /// pixels, from the same cached tiles, encode to the same bytes, with
+    /// and without a background (#1181).
+    #[test]
+    fn assembled_pixels_encode_to_the_rendered_view() {
+        let cache = TilePixelCache::new(64);
+        let prefix = TileKeyPrefix {
+            layer: "l".into(),
+            parameter: None,
+            style: "default".into(),
+            time: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+        };
+        let bbox = [20.0, 58.0, 30.0, 64.0];
+        for background in [None, Some([0x33, 0x66, 0x99])] {
+            let MetaTile::Image { bytes, .. } = render_metatiled(
+                bbox,
+                &OutputCrs::WebMercator,
+                300,
+                200,
+                &prefix,
+                &SolidRed,
+                ImageFormat::Png,
+                background,
+                &cache,
+                solid_tile,
+            )
+            .unwrap() else {
+                panic!("expected an image");
+            };
+            let MetaTilePixels::Image { mut rgba, stats } = assemble_metatiled(
+                bbox,
+                &OutputCrs::WebMercator,
+                300,
+                200,
+                &prefix,
+                &SolidRed,
+                &cache,
+                |_, _, _, _| panic!("every tile is cached"),
+            )
+            .unwrap() else {
+                panic!("expected pixels");
+            };
+            assert_eq!(rgba.len(), 300 * 200 * 4);
+            assert_eq!(stats.encode, Duration::ZERO, "nothing encoded yet");
+            assert_eq!(
+                crate::encode_rgba(&mut rgba, 300, 200, ImageFormat::Png, background).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    /// #993: an engine error (a deadline, a transient read) fails the
+    /// render and caches nothing, so the retry renders the tiles. Only a tile
+    /// the engine returned as all-nodata becomes the no-TTL empty marker.
+    #[test]
+    fn engine_error_caches_no_tile_and_retry_renders() {
+        let cache = TilePixelCache::new(64);
+        let prefix = TileKeyPrefix {
+            layer: "l".into(),
+            parameter: None,
+            style: "default".into(),
+            time: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+        };
+        let bbox = [20.0, 58.0, 30.0, 64.0];
+        type TileFn<'a> =
+            &'a dyn Fn([f64; 4], u32, u32, &OutputCrs) -> Result<RasterTile, DataServerError>;
+        let render = |tile: TileFn| {
+            render_metatiled(
+                bbox,
+                &OutputCrs::WebMercator,
+                512,
+                512,
+                &prefix,
+                &SolidRed,
+                ImageFormat::Png,
+                None,
+                &cache,
+                tile,
+            )
+        };
+        let failed = render(&|_, _, _, _| Err(DataServerError::DeadlineExceeded));
+        assert!(matches!(failed, Err(DataServerError::DeadlineExceeded)));
+        assert!(cache.is_empty(), "a failed tile must not be cached");
+        let retry = render(&solid_tile).unwrap();
+        assert!(
+            matches!(retry, MetaTile::Image { .. }),
+            "the retry renders data, not a cached empty frame"
+        );
     }
 
     #[test]
@@ -1795,6 +1991,60 @@ mod tests {
             }
         }
         assert_eq!(cache.stats(), (0, 0));
+    }
+
+    /// Zoomed-out EPSG:3067 views have covering tiles past the pole or the
+    /// area's east edge, where no pixel has a place (#1113, #1130).
+    /// They are all-nodata tiles, never read, and the view stays meta-tiled
+    /// instead of falling back to an uncached direct render.
+    #[test]
+    fn projected_tiles_wholly_outside_the_area_are_empty_without_a_read() {
+        let crs = projected_output_crs("EPSG:3067").unwrap();
+        for (bbox, width, height) in [
+            ([7.0e6, 5.0e6, 1.2e7, 9.5e6], 1000, 900),
+            ([-1.0e6, 6.0e6, 2.0e6, 1.05e7], 1000, 1500),
+        ] {
+            let cache = TilePixelCache::new(64);
+            let read = std::sync::Mutex::new(Vec::new());
+            let output = OutputCrs::Projected {
+                crs: crs.clone(),
+                bbox,
+            };
+            let result = render_metatiled(
+                wgs84_envelope(&crs, bbox).unwrap(),
+                &output,
+                width,
+                height,
+                &projected_prefix(),
+                &SolidRed,
+                ImageFormat::Png,
+                None,
+                &cache,
+                |b, w, h, tile: &OutputCrs| {
+                    let OutputCrs::Projected { bbox, .. } = tile else {
+                        panic!("projected tile must retain its CRS");
+                    };
+                    read.lock().unwrap().push(*bbox);
+                    solid_tile(b, w, h, tile)
+                },
+            )
+            .unwrap();
+            let MetaTile::Image { stats, .. } = result else {
+                panic!("{bbox:?}: expected meta-tiles");
+            };
+            let read = read.into_inner().unwrap();
+            assert!(
+                read.iter().all(|t| !outside_projection_domain(&crs, *t)),
+                "{bbox:?}: a tile wholly outside was read"
+            );
+            let skipped = stats.tiles as usize - read.len();
+            assert!(
+                skipped >= 2,
+                "{bbox:?}: {skipped} of {} tiles skipped",
+                stats.tiles
+            );
+            assert_eq!(stats.misses, stats.tiles, "{bbox:?}");
+        }
     }
 
     /// A composite layer's meta-tiles hold the composed RGBA: the view shows

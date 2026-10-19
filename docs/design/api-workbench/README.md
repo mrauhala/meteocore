@@ -8,9 +8,11 @@ Open `/?f=html` or any of `/edr/`, `/features/`, `/maps/`, `/tiles/` with
 selects the same resource as JSON. These are server-rendered API resources with
 ordinary URLs, not a separate client-side application.
 
-- Collection lists offer Common `q`, `query`, `bbox`, `datetime`, `limit` and
-  `offset`. Existing `bbox-crs` values remain editable. Results and navigation
-  come from the shared server discovery pipeline.
+- Collection lists offer Common `q`, `query`, `bbox`, `datetime`, `sortby`,
+  `limit` and `offset`. Existing `bbox-crs` values remain editable. Results and
+  navigation come from the shared server discovery pipeline. Without `limit`
+  and `sortby`, the HTML catalog lists 24 collections a page by title; JSON
+  keeps up to 1000 by id (#1141).
 - Feature items expose the collection's supported property/sort/time controls,
   response counts, paging, typed properties and geometry. The map contains only
   the returned page over locally bundled Natural Earth outlines; overlapping shapes
@@ -26,8 +28,14 @@ ordinary URLs, not a separate client-side application.
   quality callouts when the corresponding properties exist.
 - Collection details retain full API metadata, keywords and license labels,
   including free-text licenses without a URL. EDR model-run pages share the shell.
-- Common sorting, hierarchy, `sd` and `resolution` remain unsupported and have
-  no active controls. Existing API validation errors remain structured JSON.
+- Collection lists sort by `title` or `id`, ascending or descending. Sortables,
+  hierarchy, `sd` and `resolution` remain unsupported and have no active
+  controls.
+- A request that asks for HTML (`f=html`, or no `f` and an `Accept` that ranks
+  `text/html` first) gets its errors as workbench pages with the same status:
+  the message, the parameter at fault and links back. JSON clients keep the
+  structured JSON body. A repeated `f` whose first value is `html` gets its
+  400 as a page too.
 - Without JavaScript, metadata, navigation, paging, JSON switching and basic
   collection text search work. Advanced/item-query editing and map interaction
   require JavaScript.
@@ -129,8 +137,9 @@ The default now uses the built-in 950–1050 hPa pressure palette; named tempera
 and wind-gust styles explicitly bind their data parameter. NOAA license metadata
 links to the [NWS use conditions](https://www.weather.gov/disclaimer).
 
-The selected style's advertised legend appears beside the map. Its link opens
-the machine-readable legend, including parameter and units. Map endpoint links are clickable and state the required `bbox`; the map
+The selected style's advertised legend appears under the map, drawn from its
+legend JSON as a colour bar titled with the parameter and unit (#1136); its
+links open the PNG and the machine-readable JSON. Map endpoint links are clickable and state the required `bbox`; the map
 controls provide a complete image request. The duplicate resource list and unscoped global-preview button were
 removed from the Maps request section. Breadcrumbs prefer collection/item titles.
 
@@ -140,12 +149,15 @@ An absent storage CRS is explicitly unknown. Rich-metadata regression fixtures
 cover license text/links, keywords, vertical values/units and nested false values.
 
 Remaining limits: this is a map preview and image request builder, not the full
-Maps parameter editor. Arbitrary `parameter-name`, elevation, output CRS/size and
-model-run selection are not UI controls. Named styles can bind a parameter; the
-API reference and exact rendered URL expose the rest. Time axes describe the
-collection and do not guarantee every parameter exists at every step. Browser
-requests do not select a historical forecast run. Revisit these controls when
-adding a complete data-request workspace, rather than borrowing EDR-only metadata.
+Maps parameter editor. A collection with several `parameter_names` offers them
+in a Parameter select (#1136); discrete vertical levels have a level select.
+Output CRS/size and model-run selection are not UI controls. Named styles can
+bind a parameter; the API reference and exact rendered URL expose the rest.
+The time options are the collection's axis, not each parameter's own. Time
+axes describe the collection and do not guarantee every parameter exists at
+every step. Browser requests do not select a historical forecast run. Revisit
+these controls when adding a complete data-request workspace, rather than
+borrowing EDR-only metadata.
 
 The GFS engine currently selects the first indexed level for an explicit TMP
 parameter (0.01 hPa in the checked NOAA product), rather than guaranteeing 2 m
@@ -160,10 +172,10 @@ remained 46 px high and aligned; the page height (2115 px) and coverage position
 horizontal page overflow. Light/dark themes and explicit time/style changes
 were checked against the real S3-backed collection.
 
-Legend initialization waits for the full document so a fast/cached map cannot
-race sidebar parsing. Legend images revalidate when selected, avoiding old
-palette images after a configuration reload; unchanged legends stay visible
-through viewport refreshes.
+The legend sits in the map panel, so nothing waits on a sidebar. Its JSON is
+fetched beside the map request with `cache: 'no-cache'`, revalidated on each
+selection so an old palette cannot label new pixels after a configuration
+reload; an unchanged legend stays visible through viewport refreshes.
 
 ## Navigation and map-overlay follow-up
 
@@ -240,7 +252,8 @@ disclosure states survive submission. Primary query controls align at 46 px.
 The listing has no per-feature raw-geometry disclosures. Following layout review,
 the result table grows to the requested limit and scrolls with the document;
 it has no height cap or separate vertical scrolling. On wide screens the map
-sits to the right, as on item details. On narrow screens it follows the table.
+sits to the right, as on item details. Below 1100 px it comes before the table,
+240 px tall (#1135).
 Page-size labels and controls share an explicit flex row with a 12 px gap in
 both catalogs and item lists.
 
@@ -250,7 +263,8 @@ Screenshots: [items desktop](screenshots/items-light.png),
 
 Layout follow-up verification: the 1,000-row table's client height equals its
 scroll height on both desktop and 390 px mobile, confirming no internal vertical
-scroll area. The map lies to the right on desktop and below results on mobile.
+scroll area. The map lay to the right on desktop and below results on mobile;
+#1135 has since moved it above the results below 1100 px.
 Page-size label/select gaps measure 12 px in both item controls and the catalog;
 mobile pages have no horizontal document overflow. All 654 API tests, seven
 cross-API contracts, clippy, formatting and HTTP smoke checks passed again.

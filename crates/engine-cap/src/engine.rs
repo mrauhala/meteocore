@@ -2,8 +2,8 @@
 //! `MapEngine` (severity-shaded polygon fills) over a poll-and-swap catalog.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
@@ -13,14 +13,18 @@ use futures::stream::{FuturesOrdered, StreamExt};
 use ds_core::config::{CapConfig, Wis2Config, CAP_WIS2_MIN_POLL_INTERVAL_SECS};
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
-use ds_core::feature::{Bbox, Feature, FeaturePage, FeatureQuery};
-use ds_core::health::LiveStatus;
+use ds_core::feature::{Bbox, Feature, FeaturePage, FeatureQuery, PropertyValue};
+use ds_core::health::{LiveStatus, WarmupCause};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
+use ds_core::state::{
+    collection_key, StateError, StateStore, StateWriter, WriteOutcome, WritePolicy,
+};
 use ds_render::rasterize::{fill_polygon, Combine};
 use ds_wis2::{Fetcher, Resolved, Status as Wis2Status, StatusSnapshot as Wis2StatusSnapshot};
 
 use crate::catalog::{BuildConfig, Catalog, CatalogStore};
 use crate::parser::CapAreaHint;
+use crate::persist;
 use crate::source::{Source, SourceLoad};
 use crate::supersede::{accepts_status, resolve_references, MessageKey};
 use crate::wis2::{Wis2CapSource, Wis2SourceConfig};
@@ -51,6 +55,20 @@ const WIS2_DIRTY_REBUILD: Duration = Duration::from_secs(CAP_WIS2_MIN_POLL_INTER
 /// fetcher's own concurrency cap), applied in arrival order; beyond it the
 /// pipeline channel backs up and the broker queues, as before.
 const WIS2_HINT_INFLIGHT: usize = 8;
+/// WIS2 mode with a state store (#1000): a changed accumulator is
+/// snapshotted at most this often. Checked on every [`WIS2_DIRTY_REBUILD`]
+/// tick; `shutdown()` flushes the rest.
+const SNAPSHOT_WRITE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// An unchanged accumulator is rewritten at least this often — or every
+/// quarter of a shorter `warmup`, never more often than
+/// [`SNAPSHOT_WRITE_INTERVAL`] — so a restore can tell from the snapshot's
+/// `written_at` how long the server was down ([`snapshot_policy`]).
+const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+/// A failing snapshot write (read-only or full disk) is retried every
+/// [`SNAPSHOT_WRITE_INTERVAL`] but WARNs at most this often.
+const SNAPSHOT_WARN_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// What `LiveStatus::WarmingUp` counts.
+const WARMUP_ITEMS: &str = "alerts";
 
 /// CAP alert engine. Polls a local directory or web feed, parses CAP v1.2
 /// documents into a [`Catalog`], and swaps it atomically.
@@ -79,6 +97,9 @@ pub struct CapEngine {
     /// every rebuild.
     superseded: std::sync::atomic::AtomicU64,
     superseded_ids: std::sync::Mutex<std::collections::HashSet<MessageKey>>,
+    /// WIS2 mode with a state store: the accumulator snapshot's key and its
+    /// write policy (#1000). `None` = no persistence.
+    snapshots: Option<Mutex<StateWriter>>,
 }
 
 /// WIS2-mode state shared between `poll_loop` and the health/metrics readers.
@@ -88,6 +109,9 @@ struct Wis2Runtime {
     /// exists (`None` until then ⇒ "connecting").
     status: ArcSwap<Option<Arc<Wis2Status>>>,
     degrade_after: Duration,
+    /// `[cap.wis2] warmup`: how long after the accumulator began filling
+    /// from empty `live_health` reports `WarmingUp` (#1000).
+    warmup: chrono::Duration,
 }
 
 impl CapEngine {
@@ -96,6 +120,22 @@ impl CapEngine {
     /// (degraded) and the poll loop fills it in, matching the file-backed
     /// raster engines.
     pub fn new(config: &CapConfig, collection_id: &str) -> Result<Self, DataServerError> {
+        Self::new_with_state(config, collection_id, None)
+    }
+
+    /// [`Self::new`] with the server's state store (`[server] state_dir`,
+    /// #1000). In WIS2 mode the accumulator is restored from the store's
+    /// `<collection_id>.cap` snapshot before the first catalog build —
+    /// alerts that expired meanwhile dropped, the warm-up restarted when the
+    /// snapshot is older than `warmup` — and snapshotted back while the poll
+    /// loop runs. A missing, unreadable or corrupt snapshot is a cold start
+    /// (logged), never an error. Directory/feed sources re-read their source
+    /// and ignore the store.
+    pub fn new_with_state(
+        config: &CapConfig,
+        collection_id: &str,
+        state: Option<Arc<dyn StateStore>>,
+    ) -> Result<Self, DataServerError> {
         let default_ttl = match &config.default_ttl {
             Some(s) => Some(parse_iso8601_duration(s)?),
             None => None,
@@ -120,6 +160,7 @@ impl CapEngine {
                         config: w.clone(),
                         status: ArcSwap::from_pointee(None),
                         degrade_after: Duration::from_secs(w.degrade_after_secs.max(1)),
+                        warmup: w.warmup_duration()?,
                     }),
                 )
             }
@@ -166,6 +207,26 @@ impl CapEngine {
             CAP_PARAMETER,
             Utc::now(),
         )));
+        let mut restored = false;
+        let snapshots = match (state, source.wis2(), &wis2) {
+            (Some(store), Some(src), Some(w)) => {
+                let mut writer = StateWriter::new(
+                    store,
+                    collection_key(collection_id, persist::KIND),
+                    snapshot_policy(w.warmup),
+                );
+                restored = restore_snapshot(
+                    src,
+                    &mut writer,
+                    collection_id,
+                    w.warmup,
+                    Utc::now(),
+                    Instant::now(),
+                );
+                Some(Mutex::new(writer))
+            }
+            _ => None,
+        };
         let engine = CapEngine {
             catalog,
             source: Arc::new(source),
@@ -178,12 +239,19 @@ impl CapEngine {
             wis2,
             superseded: std::sync::atomic::AtomicU64::new(0),
             superseded_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
+            snapshots,
         };
 
         // Best-effort initial load (so local fixtures populate immediately).
-        // WIS2 mode has nothing to load until the broker delivers: it stays
-        // `Degraded("waiting for broker")` until the first rebuild after
-        // subscribing (see `poll_loop`).
+        // WIS2 mode has nothing to load until the broker delivers — unless a
+        // snapshot was restored, which is served right away. Either way it
+        // stays `Degraded("connecting to WIS2 broker")` until the session is
+        // up (see `poll_loop`).
+        if restored {
+            if let Err(e) = engine.refresh() {
+                tracing::warn!("[{collection_id}] cap/wis2: restored catalog build failed: {e}");
+            }
+        }
         if engine.wis2.is_none() {
             if let Err(e) = engine.refresh() {
                 tracing::warn!(
@@ -210,7 +278,14 @@ impl CapEngine {
     /// or broker session readiness in WIS2 mode.
     /// A disconnect shorter than `degrade_after_secs` is not reported — the
     /// last catalog keeps serving and the session resumes with its backlog.
+    /// A WIS2 accumulator that began filling from empty less than
+    /// `[cap.wis2] warmup` ago is `WarmingUp` (#1000): the standing
+    /// warnings return only as the producers republish them.
     pub fn live_health(&self) -> Option<LiveStatus> {
+        self.live_health_at(Utc::now())
+    }
+
+    fn live_health_at(&self, now: DateTime<Utc>) -> Option<LiveStatus> {
         let Some(w) = self.wis2.as_ref() else {
             return Some(
                 if self.refresh_failed.load(Ordering::Relaxed) || !self.is_loaded() {
@@ -235,9 +310,10 @@ impl CapEngine {
                     reason: "WIS2 broker disconnected",
                 },
                 // Never connected yet, or a short blip inside the grace period.
+                // A blip does not end a warm-up: it stays `WarmingUp`.
                 Some(_) => {
                     if self.is_loaded() {
-                        LiveStatus::Ready
+                        self.warming_up(w, now).unwrap_or(LiveStatus::Ready)
                     } else {
                         LiveStatus::Degraded {
                             reason: "connecting to WIS2 broker",
@@ -265,12 +341,29 @@ impl CapEngine {
                 reason: "over max_alerts: valid warnings evicted",
             });
         }
-        Some(if self.is_loaded() {
-            LiveStatus::Ready
-        } else {
-            LiveStatus::Degraded {
+        if !self.is_loaded() {
+            return Some(LiveStatus::Degraded {
                 reason: "waiting for first WIS2 catalog build",
-            }
+            });
+        }
+        Some(self.warming_up(w, now).unwrap_or(LiveStatus::Ready))
+    }
+
+    /// `WarmingUp` while the accumulator is inside `[cap.wis2] warmup` of
+    /// an empty start or of a restore after a long outage (#1000), else
+    /// `None`. The clock starts when the subscription first comes up and
+    /// survives restarts through the snapshot; a recent snapshot whose fill
+    /// began long ago is ready at once.
+    fn warming_up(&self, w: &Wis2Runtime, now: DateTime<Utc>) -> Option<LiveStatus> {
+        let src = self.source.wis2()?;
+        let warm = src
+            .filling_since()
+            .and_then(|t| t.checked_add_signed(w.warmup))
+            .is_some_and(|end| now >= end);
+        (!warm).then(|| LiveStatus::WarmingUp {
+            received: src.len() as u64,
+            items: WARMUP_ITEMS,
+            cause: src.warmup_cause(),
         })
     }
 
@@ -490,6 +583,10 @@ impl CapEngine {
                     }
                     _ = dirty_ticker.tick() => {
                         let subscribed = pipeline.status.is_subscribed();
+                        if subscribed {
+                            // Starts the warm-up clock of an empty start.
+                            source.mark_filling(Utc::now());
+                        }
                         if source.take_dirty() || rebuild_due || (first_build_pending && subscribed) {
                             first_build_pending = false;
                             rebuild_due = false;
@@ -497,6 +594,10 @@ impl CapEngine {
                                 tracing::warn!("[{}] cap: rebuild failed: {e}", self.collection_id);
                             }
                         }
+                        // At most every five minutes (see `snapshot_policy`);
+                        // a blocking store call is fine on the poll runtime,
+                        // which is the only place this loop runs.
+                        self.write_snapshot(false);
                     }
                     _ = forced_ticker.tick() => {
                         // Folded into the dirty cadence so two rebuilds can
@@ -549,14 +650,157 @@ impl CapEngine {
         self.superseded.load(Ordering::Relaxed) + at_ingest
     }
 
-    /// Signal the poll loop to stop.
+    /// Signal the poll loop to stop. With a state store, also flush the
+    /// snapshot (#1000): a graceful restart loses nothing, and the
+    /// snapshot's `written_at` records when the server went down.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
+        self.write_snapshot(true);
+    }
+
+    /// Write the accumulator snapshot when its write policy says so
+    /// ([`snapshot_policy`]; `force` always writes). Never fails the caller:
+    /// a failed write keeps the previous snapshot and is logged, as a WARN
+    /// at most every [`SNAPSHOT_WARN_INTERVAL`].
+    fn write_snapshot(&self, force: bool) {
+        let (Some(writer), Some(src)) = (&self.snapshots, self.source.wis2()) else {
+            return;
+        };
+        let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut alerts = 0;
+        let outcome = writer.write_if_due(src.revision(), Instant::now(), force, || {
+            let state = src.export();
+            alerts = state.entries.len();
+            persist::encode(&self.collection_id, state, Utc::now())
+                .map_err(|e| StateError::Encode(e.to_string()))
+        });
+        match outcome {
+            WriteOutcome::NotDue => {}
+            WriteOutcome::Written { bytes } => tracing::debug!(
+                "[{}] cap/wis2: state snapshot written: {alerts} alert(s), {bytes} bytes to {}",
+                self.collection_id,
+                writer.describe()
+            ),
+            WriteOutcome::Failed { error, warn: true } => tracing::warn!(
+                "[{}] cap/wis2: cannot write state snapshot {}: {error} — the previous one \
+                 stays; retrying every {} min, this warning repeats at most every {} min",
+                self.collection_id,
+                writer.describe(),
+                SNAPSHOT_WRITE_INTERVAL.as_secs() / 60,
+                SNAPSHOT_WARN_INTERVAL.as_secs() / 60
+            ),
+            WriteOutcome::Failed { error, warn: false } => tracing::debug!(
+                "[{}] cap/wis2: state snapshot write failed again: {error}",
+                self.collection_id
+            ),
+        }
     }
 
     fn snapshot(&self) -> arc_swap::Guard<Arc<Catalog>> {
         self.catalog.load()
     }
+}
+
+/// The snapshot write policy of a collection with `[cap.wis2] warmup`
+/// (#1000): a changed accumulator at most every
+/// [`SNAPSHOT_WRITE_INTERVAL`], an unchanged one at least every quarter of
+/// the warm-up, clamped to [`SNAPSHOT_WRITE_INTERVAL`] ..=
+/// [`SNAPSHOT_REFRESH_INTERVAL`]. The refresh keeps `written_at` close to
+/// the server's last breath even when the feed is quiet, so the
+/// long-outage check in [`restore_snapshot`] errs by at most that much.
+fn snapshot_policy(warmup: chrono::Duration) -> WritePolicy {
+    let quarter = warmup.to_std().unwrap_or(Duration::ZERO) / 4;
+    WritePolicy {
+        min_interval: SNAPSHOT_WRITE_INTERVAL,
+        refresh_interval: quarter.clamp(SNAPSHOT_WRITE_INTERVAL, SNAPSHOT_REFRESH_INTERVAL),
+        warn_interval: SNAPSHOT_WARN_INTERVAL,
+    }
+}
+
+/// Restore `src` from the snapshot `writer` manages (#1000). `true` when a
+/// snapshot was restored; a missing, unreadable or rejected one is a cold
+/// start, logged, never an error.
+///
+/// A snapshot written longer than `warmup` before `now` means the server
+/// was down that long: whatever the feed published meanwhile is missing
+/// until it is republished. Its alerts are restored, but the warm-up
+/// restarts — the clock is cleared, so it starts again when the
+/// subscription comes up, and `/health` says "warming up after a long
+/// outage" until it ends.
+fn restore_snapshot(
+    src: &Wis2CapSource,
+    writer: &mut StateWriter,
+    collection_id: &str,
+    warmup: chrono::Duration,
+    now: DateTime<Utc>,
+    now_instant: Instant,
+) -> bool {
+    let at = writer.describe();
+    let bytes = match writer.load() {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            tracing::info!("[{collection_id}] cap/wis2: no state snapshot at {at} — cold start");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[{collection_id}] cap/wis2: cannot read state snapshot {at}: {e} — cold start"
+            );
+            return false;
+        }
+    };
+    let mut decoded = match persist::decode(&bytes, collection_id) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                "[{collection_id}] cap/wis2: state snapshot {at} rejected ({e}) — cold start; \
+                 the next write replaces it"
+            );
+            return false;
+        }
+    };
+    let age = now - decoded.written_at;
+    let long_outage = age > warmup;
+    if long_outage {
+        decoded.state.filling_since = None;
+        decoded.state.warmup_cause = WarmupCause::LongOutage;
+    }
+    let s = src.restore(decoded.state, now);
+    if !long_outage {
+        // The store holds what was restored: no rewrite until it changes
+        // or the refresh interval runs out. After a long outage the
+        // restarted warm-up is not in the store yet: write it at once.
+        writer.mark_restored(
+            src.revision(),
+            age.to_std().unwrap_or(Duration::ZERO),
+            now_instant,
+        );
+    }
+    tracing::info!(
+        "[{collection_id}] cap/wis2: restored {} alert(s) from state snapshot {at} written {} \
+         ago ({} expired meanwhile, {} filtered, {} hint(s) dropped by config, {} tombstone(s))",
+        s.alerts,
+        hours_minutes(age),
+        s.expired,
+        s.filtered,
+        s.hints_dropped,
+        s.tombstones
+    );
+    if long_outage {
+        tracing::warn!(
+            "[{collection_id}] cap/wis2: the state snapshot is older than warmup ({}): \
+             alerts published during the outage are missing until republished — the \
+             warm-up restarts and /health reports degraded until it ends",
+            hours_minutes(warmup)
+        );
+    }
+    true
+}
+
+/// `26h05m` (negative ⇒ `0h00m`).
+fn hours_minutes(d: chrono::Duration) -> String {
+    let minutes = d.num_minutes().max(0);
+    format!("{}h{:02}m", minutes / 60, minutes % 60)
 }
 
 /// The network half of one WIS2 notification (hint download), paired with
@@ -631,6 +875,33 @@ impl ds_core::feature_engine::FeatureEngine for CapEngine {
         self.snapshot().records.len()
     }
 
+    /// `event · areaDesc`, the parts the alert area has (#1143): what and
+    /// where, which an alert's sender-scoped id does not say.
+    fn label(&self, feature: &Feature) -> Option<String> {
+        let part = |key: &str| {
+            feature
+                .properties
+                .get(key)
+                .and_then(PropertyValue::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        };
+        let parts: Vec<&str> = ["event", "areaDesc"].into_iter().filter_map(part).collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// How severe, from when, until when; MeteoAlarm's awareness level, or
+    /// the urgency, where the alerts carry them (#1143).
+    fn summary_properties(&self) -> &[&'static str] {
+        &[
+            "severity",
+            "onset",
+            "active_until",
+            "awareness_level",
+            "urgency",
+        ]
+    }
+
     fn spatial_extent(&self) -> Option<[f64; 4]> {
         self.snapshot().spatial_extent
     }
@@ -651,6 +922,7 @@ fn to_feature(rec: &crate::catalog::AreaRecord) -> Feature {
         id: rec.id.clone(),
         geometry: Arc::clone(&rec.geometry),
         properties: Arc::clone(&rec.properties),
+        related: Vec::new(),
     }
 }
 
@@ -699,6 +971,28 @@ impl MapEngine for CapEngine {
         _z: Option<f64>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
+        Ok(self.render(bbox, width, height, time, output_crs, MAX_RENDER_RECORDS))
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        // Cheap clone of the prebuilt snapshot — no recomputation (#211); the
+        // cost is O(times), bounded by the 256-entry TIME cap.
+        (*self.snapshot().info).clone()
+    }
+}
+
+impl CapEngine {
+    /// [`MapEngine::get_raster_tile`] with the per-render area cap as a
+    /// parameter, so a test can exceed it with a handful of alerts.
+    fn render(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<DateTime<Utc>>,
+        output_crs: &OutputCrs,
+        max_records: usize,
+    ) -> RasterTile {
         let cat = self.snapshot();
         // None ⇒ "now" (the snapshot's as_of); an explicit TIME selects that instant.
         let t = time.unwrap_or(cat.as_of);
@@ -714,13 +1008,21 @@ impl MapEngine for CapEngine {
         let candidates: Vec<usize> = match Bbox::new(query_west, bbox[1], query_east, bbox[3]) {
             Ok(b) => cat.query_bbox(&b),
             Err(_) => {
-                return Ok(RasterTile {
+                return RasterTile {
                     width,
                     height,
                     values: values.into(),
-                })
+                }
             }
         };
+        let (selected, undrawn) = select_for_render(&cat.records, candidates, t, max_records);
+        if undrawn > 0 {
+            tracing::warn!(
+                "[{}] cap: render capped at {max_records} areas: {undrawn} less severe active \
+                 area(s) left undrawn",
+                self.collection_id
+            );
+        }
 
         // A viewport reaching past ±180° (a Maps bbox crossing the
         // antimeridian arrives unwrapped, #828) shows an area at −175° at
@@ -733,12 +1035,8 @@ impl MapEngine for CapEngine {
             _ => &[0.0, 360.0, -360.0],
         };
 
-        let mut rendered = 0usize;
-        for &i in &candidates {
+        for &i in &selected {
             let rec = &cat.records[i];
-            if !rec.window.active_at(t) {
-                continue;
-            }
             for &k in shifts {
                 let in_view = |[w, _, e, _]: [f64; 4]| w + k <= bbox[2] && e + k >= bbox[0];
                 if k != 0.0 && !rec.bbox.is_some_and(in_view) {
@@ -764,28 +1062,41 @@ impl MapEngine for CapEngine {
                     );
                 }
             }
-            rendered += 1;
-            if rendered >= MAX_RENDER_RECORDS {
-                tracing::warn!(
-                    "[{}] cap: render capped at {MAX_RENDER_RECORDS} areas",
-                    self.collection_id
-                );
-                break;
-            }
         }
 
-        Ok(RasterTile {
+        RasterTile {
             width,
             height,
             values: values.into(),
-        })
+        }
     }
+}
 
-    fn raster_info(&self) -> RasterInfo {
-        // Cheap clone of the prebuilt snapshot — no recomputation (#211); the
-        // cost is O(times), bounded by the 256-entry TIME cap.
-        (*self.snapshot().info).clone()
+/// The `candidates` active at `t` that one render draws: all of them up to
+/// `max`, else the `max` most severe (#805). Fills combine with
+/// [`Combine::Max`], so the drawing order never changes the output; what the
+/// cap decides is which areas are left out, and that must be the least
+/// severe, never a valid Severe or Extreme warning that happens to sit late
+/// in storage order. The sort is stable (equal severities keep record order)
+/// and runs only over the cap, so the normal path never pays for it.
+/// Returns the selection and how many active areas it leaves out.
+fn select_for_render(
+    records: &[crate::catalog::AreaRecord],
+    mut candidates: Vec<usize>,
+    t: DateTime<Utc>,
+    max: usize,
+) -> (Vec<usize>, usize) {
+    candidates.retain(|&i| records[i].window.active_at(t));
+    let undrawn = candidates.len().saturating_sub(max);
+    if undrawn > 0 {
+        candidates.sort_by(|&a, &b| {
+            records[b]
+                .severity_code
+                .total_cmp(&records[a].severity_code)
+        });
+        candidates.truncate(max);
     }
+    (candidates, undrawn)
 }
 
 /// The CRS84 `[west, east]` the catalog is queried with for a request
@@ -808,6 +1119,359 @@ fn crs84_query_lons(west: f64, east: f64) -> [f64; 2] {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::parser::HintPart;
+    use crate::wis2::test_support::resolved;
+    use ds_core::feature_engine::FeatureEngine;
+    use ds_core::state::FileStateStore;
+
+    fn store(dir: &std::path::Path) -> Option<Arc<dyn StateStore>> {
+        Some(Arc::new(FileStateStore::new(dir)))
+    }
+
+    fn wis2_config(warmup: Option<&str>) -> CapConfig {
+        let cfg: CapConfig = serde_json::from_value(serde_json::json!({"data_path": "."})).unwrap();
+        CapConfig {
+            data_path: None,
+            wis2: Some(Wis2Config {
+                warmup: warmup.map(String::from),
+                ..Wis2Config::default()
+            }),
+            ..cfg
+        }
+    }
+
+    /// A broker session that is connected and subscribed (tests run no
+    /// poll loop).
+    fn subscribe(engine: &CapEngine) {
+        let status = Arc::new(Wis2Status::new());
+        status.set_connected();
+        status.set_subscribed();
+        engine
+            .wis2
+            .as_ref()
+            .unwrap()
+            .status
+            .store(Arc::new(Some(status)));
+    }
+
+    /// A Severe alert valid until 2099 (so a wall-clock restore keeps it).
+    fn alert(identifier: &str) -> String {
+        include_str!("../tests/fixtures/helsinki-flood.xml")
+            .replace("urn:test:helsinki-flood-1", identifier)
+            .replace(
+                "<severity>Severe</severity>",
+                "<severity>Severe</severity><expires>2099-01-01T00:00:00+00:00</expires>",
+            )
+    }
+
+    fn push(engine: &CapEngine, identifier: &str, now: DateTime<Utc>) {
+        let hint = CapAreaHint::single(
+            HintPart::Feature(0),
+            ds_core::feature::Geometry::Polygon {
+                exterior: vec![[24.8, 60.1], [25.2, 60.1], [25.0, 60.3], [24.8, 60.1]],
+                holes: Vec::new(),
+            },
+            "notification",
+        );
+        engine.wis2_source().unwrap().apply_with_hint(
+            resolved(&format!("d-{identifier}"), 0, Some(alert(identifier))),
+            Some((0, 0, hint)),
+            "test",
+            now,
+        );
+    }
+
+    fn warming(received: u64) -> Option<LiveStatus> {
+        Some(LiveStatus::WarmingUp {
+            received,
+            items: WARMUP_ITEMS,
+            cause: WarmupCause::ColdStart,
+        })
+    }
+
+    fn warming_after_outage(received: u64) -> Option<LiveStatus> {
+        Some(LiveStatus::WarmingUp {
+            received,
+            items: WARMUP_ITEMS,
+            cause: WarmupCause::LongOutage,
+        })
+    }
+
+    #[test]
+    fn cold_start_reports_warming_up_until_the_warmup_after_subscription() {
+        let engine = CapEngine::new(&wis2_config(Some("PT2H")), "cap-wis2").unwrap();
+        let t0 = Utc::now();
+        assert_eq!(
+            engine.live_health_at(t0),
+            Some(LiveStatus::Degraded {
+                reason: "connecting to WIS2 broker"
+            })
+        );
+        subscribe(&engine);
+        assert_eq!(
+            engine.live_health_at(t0),
+            Some(LiveStatus::Degraded {
+                reason: "waiting for first WIS2 catalog build"
+            })
+        );
+        push(&engine, "a", t0);
+        push(&engine, "b", t0);
+        engine.refresh_with(|| t0).unwrap();
+        // Subscribed and built, but the poll loop has not started the clock
+        // yet: still warming, never a premature `Ready`.
+        assert_eq!(engine.live_health_at(t0), warming(2));
+        engine.wis2_source().unwrap().mark_filling(t0);
+        // A later reconnect does not restart the clock.
+        engine
+            .wis2_source()
+            .unwrap()
+            .mark_filling(t0 + chrono::Duration::hours(1));
+        assert_eq!(
+            engine.live_health_at(t0 + chrono::Duration::minutes(119)),
+            warming(2)
+        );
+        assert_eq!(
+            engine.live_health_at(t0 + chrono::Duration::hours(2)),
+            Some(LiveStatus::Ready)
+        );
+        assert_eq!(
+            engine
+                .live_health_at(t0)
+                .and_then(|s| s.degraded_reason())
+                .as_deref(),
+            Some("warming up after cold start: 2 alerts received")
+        );
+        // A broker blip inside `degrade_after_secs` keeps serving, but does
+        // not end the warm-up: it stays warming, then ready once warm.
+        let status = engine.wis2.as_ref().unwrap().status.load_full();
+        (*status).as_ref().unwrap().set_disconnected();
+        assert_eq!(
+            engine.live_health_at(t0 + chrono::Duration::minutes(30)),
+            warming(2)
+        );
+        assert_eq!(
+            engine.live_health_at(t0 + chrono::Duration::hours(3)),
+            Some(LiveStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trips_through_shutdown_and_the_constructor() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wis2_config(None);
+        let now = Utc::now();
+        let a = CapEngine::new_with_state(&cfg, "cap-wis2", store(dir.path())).unwrap();
+        assert!(!a.is_loaded(), "nothing to restore: a cold start");
+        push(&a, "a", now);
+        push(&a, "b", now);
+        // The fill began three days ago: past the default 24 h warm-up.
+        a.wis2_source()
+            .unwrap()
+            .mark_filling(now - chrono::Duration::days(3));
+        a.refresh_with(|| now).unwrap();
+        a.shutdown();
+        let file = dir.path().join("cap-wis2.cap.state");
+        assert!(file.is_file());
+
+        // Rebuilt (restart or reload): served at once, same content.
+        let b = CapEngine::new_with_state(&cfg, "cap-wis2", store(dir.path())).unwrap();
+        assert!(b.is_loaded(), "a restored catalog is published at build");
+        assert_eq!(b.feature_count(), 2);
+        assert_eq!(b.data_version(), a.data_version());
+        let geometry = |e: &CapEngine| {
+            let page = e.get_features(&FeatureQuery::default()).unwrap();
+            page.features
+                .iter()
+                .map(|f| {
+                    (
+                        f.id.clone(),
+                        f.geometry.bbox(),
+                        f.properties
+                            .get("geometry_source")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(geometry(&b), geometry(&a));
+        subscribe(&b);
+        assert_eq!(b.live_health(), Some(LiveStatus::Ready), "restored ⇒ ready");
+
+        // A snapshot taken mid warm-up keeps warming after the restart.
+        a.wis2_source().unwrap().restore(
+            crate::wis2::AccumulatorState {
+                filling_since: Some(now - chrono::Duration::hours(1)),
+                ..a.wis2_source().unwrap().export()
+            },
+            now,
+        );
+        a.write_snapshot(true);
+        let c = CapEngine::new_with_state(&cfg, "cap-wis2", store(dir.path())).unwrap();
+        subscribe(&c);
+        assert_eq!(c.live_health(), warming(2));
+    }
+
+    /// The server was down longer than `warmup`: the restored alerts are
+    /// served, but the warm-up restarts — what the feed published meanwhile
+    /// is missing until it is republished.
+    #[test]
+    fn a_snapshot_older_than_the_warmup_keeps_its_alerts_but_restarts_the_warm_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wis2_config(Some("PT24H"));
+        let now = Utc::now();
+        let a = CapEngine::new(&cfg, "cap-wis2").unwrap();
+        push(&a, "a", now);
+        push(&a, "b", now);
+        // Warm long ago.
+        a.wis2_source()
+            .unwrap()
+            .mark_filling(now - chrono::Duration::days(3));
+        let save_written = |written_at: DateTime<Utc>| {
+            let bytes =
+                persist::encode("cap-wis2", a.wis2_source().unwrap().export(), written_at).unwrap();
+            FileStateStore::new(dir.path())
+                .save("cap-wis2.cap", &bytes)
+                .unwrap();
+        };
+
+        // Last written 23 h ago: inside the warm-up, the clock is kept.
+        save_written(now - chrono::Duration::hours(23));
+        let fresh = CapEngine::new_with_state(&cfg, "cap-wis2", store(dir.path())).unwrap();
+        subscribe(&fresh);
+        assert_eq!(fresh.live_health(), Some(LiveStatus::Ready));
+
+        // Last written 25 h ago: alerts kept, warm-up restarted.
+        save_written(now - chrono::Duration::hours(25));
+        let b = CapEngine::new_with_state(&cfg, "cap-wis2", store(dir.path())).unwrap();
+        assert!(b.is_loaded(), "the restored alerts are served at once");
+        assert_eq!(b.feature_count(), 2);
+        let src = b.wis2_source().unwrap();
+        assert_eq!(
+            src.filling_since(),
+            None,
+            "the clock restarts at subscription"
+        );
+        assert_eq!(src.warmup_cause(), WarmupCause::LongOutage);
+        subscribe(&b);
+        assert_eq!(b.live_health_at(now), warming_after_outage(2));
+        assert_eq!(
+            b.live_health_at(now)
+                .and_then(|s| s.degraded_reason())
+                .as_deref(),
+            Some("warming up after a long outage: 2 alerts received")
+        );
+        // The poll loop starts the clock when the subscription is up.
+        src.mark_filling(now);
+        assert_eq!(
+            b.live_health_at(now + chrono::Duration::hours(23)),
+            warming_after_outage(2)
+        );
+        assert_eq!(
+            b.live_health_at(now + chrono::Duration::hours(24)),
+            Some(LiveStatus::Ready)
+        );
+
+        // The restarted warm-up is written at once, not left to the next
+        // change, so a restart right after it keeps warming for the same
+        // reason instead of reading the old snapshot again.
+        b.write_snapshot(false);
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("cap-wis2.cap.state")).unwrap())
+                .unwrap();
+        assert_eq!(written["warmup_cause"], "long_outage");
+        let c = CapEngine::new_with_state(&cfg, "cap-wis2", store(dir.path())).unwrap();
+        subscribe(&c);
+        assert_eq!(c.live_health_at(now), warming_after_outage(2));
+    }
+
+    #[test]
+    fn snapshot_policy_refreshes_within_a_quarter_of_the_warmup() {
+        let policy = |iso: &str| snapshot_policy(parse_iso8601_duration(iso).unwrap());
+        assert_eq!(policy("PT24H").min_interval, SNAPSHOT_WRITE_INTERVAL);
+        assert_eq!(
+            policy("PT24H").refresh_interval,
+            SNAPSHOT_REFRESH_INTERVAL,
+            "capped at an hour"
+        );
+        assert_eq!(
+            policy("PT2H").refresh_interval,
+            Duration::from_secs(30 * 60)
+        );
+        assert_eq!(
+            policy("PT10M").refresh_interval,
+            SNAPSHOT_WRITE_INTERVAL,
+            "never more often than the write interval"
+        );
+    }
+
+    #[test]
+    fn alerts_that_expired_while_down_are_not_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wis2_config(None);
+        let a = CapEngine::new_with_state(&cfg, "cap-wis2", store(dir.path())).unwrap();
+        let received = "2026-09-13T10:00:00Z".parse().unwrap();
+        push(&a, "kept", received);
+        let short = alert("gone").replace("2099-01-01", "2026-09-13");
+        a.wis2_source().unwrap().apply_with_hint(
+            resolved("d-gone", 0, Some(short)),
+            None,
+            "test",
+            received,
+        );
+        assert_eq!(a.wis2_source().unwrap().len(), 2);
+        a.shutdown();
+        let b = CapEngine::new_with_state(&cfg, "cap-wis2", store(dir.path())).unwrap();
+        assert_eq!(b.wis2_source().unwrap().len(), 1);
+        assert_eq!(b.feature_count(), 1);
+        let page = b.get_features(&FeatureQuery::default()).unwrap();
+        assert_eq!(
+            page.features[0].properties["identifier"].as_str(),
+            Some("kept")
+        );
+    }
+
+    #[test]
+    fn corrupt_snapshot_is_a_cold_start_and_gets_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cap-wis2.cap.state");
+        std::fs::write(&file, b"{\"format\": \"meteocore/cap-wis2-acc").unwrap();
+        let cfg = wis2_config(None);
+        let e = CapEngine::new_with_state(&cfg, "cap-wis2", store(dir.path())).unwrap();
+        assert!(!e.is_loaded());
+        assert_eq!(e.wis2_source().unwrap().len(), 0);
+        subscribe(&e);
+        e.refresh().unwrap();
+        e.wis2_source().unwrap().mark_filling(Utc::now());
+        assert_eq!(e.live_health(), warming(0));
+        // The next write replaces the corrupt file with a valid snapshot.
+        e.shutdown();
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(persist::decode(&bytes, "cap-wis2").is_ok());
+    }
+
+    #[test]
+    fn unwritable_state_dir_never_fails_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the state directory should be.
+        let blocker = dir.path().join("state");
+        std::fs::write(&blocker, b"").unwrap();
+        let e = CapEngine::new_with_state(&wis2_config(None), "cap-wis2", store(&blocker)).unwrap();
+        push(&e, "a", Utc::now());
+        e.refresh().unwrap();
+        e.shutdown();
+        assert_eq!(e.feature_count(), 1);
+        // Directory/feed sources ignore state_dir entirely.
+        let cfg: CapConfig = serde_json::from_value(serde_json::json!({
+            "data_path": concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")
+        }))
+        .unwrap();
+        let local = CapEngine::new_with_state(&cfg, "local", store(dir.path())).unwrap();
+        local.shutdown();
+        assert!(!dir.path().join("local.cap.state").exists());
+    }
+
     #[test]
     fn failed_acquisition_advances_expiry_and_cache_time_without_changing_content() {
         use super::*;
@@ -866,5 +1530,151 @@ mod tests {
             1,
             "Features keeps the retained warning history"
         );
+    }
+
+    /// A `severity` alert over the 0.5° square east of `lon` at 60–61°N,
+    /// from 2020-01-01 until `expires`. Records sort by feature id, so the
+    /// identifier sets an area's place in storage order.
+    fn area_alert(identifier: &str, severity: &str, lon: f64, expires: &str) -> String {
+        let (w, e) = (lon, lon + 0.5);
+        include_str!("../tests/fixtures/helsinki-flood.xml")
+            .replace("urn:test:helsinki-flood-1", identifier)
+            .replace(
+                "<severity>Severe</severity>",
+                &format!("<severity>{severity}</severity><expires>{expires}</expires>"),
+            )
+            .replace(
+                "60.10,24.90 60.10,25.10 60.30,25.10 60.30,24.90 60.10,24.90",
+                &format!("60.0,{w} 60.0,{e} 61.0,{e} 61.0,{w} 60.0,{w}"),
+            )
+    }
+
+    const VALID: &str = "2099-01-01T00:00:00+00:00";
+    const ENDED: &str = "2020-01-02T00:00:00+00:00";
+
+    fn render_time() -> DateTime<Utc> {
+        "2020-06-01T00:00:00Z".parse().unwrap()
+    }
+
+    /// A network-free WIS2 engine holding `alerts` (identifier, severity,
+    /// west longitude, expires).
+    fn area_engine(alerts: &[(&str, &str, f64, &str)]) -> CapEngine {
+        let engine = CapEngine::new(&wis2_config(None), "cap-render").unwrap();
+        let alerts = alerts
+            .iter()
+            .flat_map(|&(id, severity, lon, expires)| {
+                crate::parser::parse_document(&area_alert(id, severity, lon, expires)).unwrap()
+            })
+            .collect();
+        engine
+            .publish_load(
+                Ok(SourceLoad {
+                    alerts,
+                    failed_documents: 0,
+                }),
+                render_time(),
+            )
+            .unwrap();
+        engine
+    }
+
+    /// The severity code drawn at the centre of each area of
+    /// [`render_cap_leaves_out_the_least_severe_active_areas`], west to east.
+    fn drawn(tile: &RasterTile) -> Vec<Option<f64>> {
+        // 0.1° pixels over 20…25.5°E × 59.5…61.5°N; row 10 is 60.4–60.5°N.
+        [20.5, 21.5, 22.5, 23.5, 24.5]
+            .iter()
+            .map(|lon| {
+                let col = ((lon + 0.25 - 20.0) / 0.1) as usize;
+                tile.values.value_at(10 * 55 + col)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn render_cap_leaves_out_the_least_severe_active_areas() {
+        // Storage order puts the least severe first and an ended Extreme
+        // warning ahead of all of them: drawing in record order up to the
+        // cap left out the Severe and Extreme areas.
+        let engine = area_engine(&[
+            ("urn:test:0-ended-extreme", "Extreme", 24.5, ENDED),
+            ("urn:test:a-minor", "Minor", 20.5, VALID),
+            ("urn:test:b-moderate", "Moderate", 21.5, VALID),
+            ("urn:test:c-severe", "Severe", 22.5, VALID),
+            ("urn:test:d-extreme", "Extreme", 23.5, VALID),
+        ]);
+        let bbox = [20.0, 59.5, 25.5, 61.5];
+        let render = |cap| engine.render(bbox, 55, 20, Some(render_time()), &OutputCrs::Wgs84, cap);
+
+        // Over the cap: the two most severe ACTIVE areas, never the ended one.
+        assert_eq!(
+            drawn(&render(2)),
+            [None, None, Some(3.0), Some(4.0), None],
+            "minor, moderate, severe, extreme, ended extreme"
+        );
+        assert_eq!(
+            drawn(&render(3)),
+            [None, Some(2.0), Some(3.0), Some(4.0), None]
+        );
+        // At the cap and under it every active area is drawn.
+        let all = [Some(1.0), Some(2.0), Some(3.0), Some(4.0), None];
+        assert_eq!(drawn(&render(4)), all);
+        let tile = engine
+            .get_raster_tile(
+                bbox,
+                55,
+                20,
+                Some(render_time()),
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(drawn(&tile), all);
+    }
+
+    #[test]
+    fn render_selection_is_stable_and_sorts_only_over_the_cap() {
+        let engine = area_engine(&[
+            ("urn:test:a-minor", "Minor", 20.5, VALID),
+            ("urn:test:b-severe", "Severe", 21.5, VALID),
+            ("urn:test:c-ended", "Extreme", 22.5, ENDED),
+            ("urn:test:d-severe", "Severe", 23.5, VALID),
+        ]);
+        let cat = engine.snapshot();
+        let ids = |selected: &[usize]| -> Vec<String> {
+            selected
+                .iter()
+                .map(|&i| cat.records[i].id.rsplit(':').next().unwrap().to_string())
+                .collect()
+        };
+        let select = |max| {
+            let (selected, undrawn) = select_for_render(
+                &cat.records,
+                (0..cat.records.len()).collect(),
+                render_time(),
+                max,
+            );
+            (ids(&selected), undrawn)
+        };
+        // Within the cap: the active areas in record order, unsorted.
+        assert_eq!(
+            select(3),
+            (
+                vec![
+                    "a-minor.0.0".into(),
+                    "b-severe.0.0".into(),
+                    "d-severe.0.0".into()
+                ],
+                0
+            )
+        );
+        // Over it: most severe first, equal severities in record order.
+        assert_eq!(
+            select(2),
+            (vec!["b-severe.0.0".into(), "d-severe.0.0".into()], 1)
+        );
+        assert_eq!(select(1), (vec!["b-severe.0.0".into()], 2));
     }
 }

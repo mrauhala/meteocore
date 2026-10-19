@@ -32,6 +32,11 @@ topics = ["cache/a/wis2/eu-eumetnet-warnings/data/core/weather/advisories-warnin
 # username = "everyone"                          # default (public account)
 # password = "everyone"                          # default; or password_env = "..."
 # download_allowlist = []                        # default policy: https + public DNS host
+# warmup = "PT24H"   # default: after a cold start (no [server] state_dir snapshot)
+                     # /health reports "warming up after cold start: N alerts
+                     # received" this long — standing warnings only return as
+                     # the hub republishes them. A snapshot older than this
+                     # (a long outage) is restored but restarts the warm-up.
 
 [wms]
 colormap = "cap_severity"

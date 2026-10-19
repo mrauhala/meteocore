@@ -2,6 +2,7 @@
 name = "api-3dtiles"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 # Inherits ds-3dtiles's floor: a crate cannot support an older toolchain
 # than its dependency.
 rust-version = "1.88"

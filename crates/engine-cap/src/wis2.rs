@@ -31,12 +31,14 @@
 //! references after ingestion, since a newer publication may have reissued them.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, Utc};
 use ds_core::feature::Geometry;
+use ds_core::health::WarmupCause;
 use ds_wis2::{Fetcher, Notification, Payload, Resolved};
+use serde::{Deserialize, Serialize};
 
 use crate::catalog::{build_window, geometry_fingerprint};
 use crate::parser::{parse_document, CapAlert, CapAreaHint, HintPart};
@@ -66,27 +68,60 @@ pub struct Wis2SourceConfig {
 }
 
 #[derive(Debug, Clone)]
-struct Entry {
-    alert: CapAlert,
+pub(crate) struct Entry {
+    pub(crate) alert: CapAlert,
     /// When the *current* content arrived — refreshed by every in-place
     /// revision, so the 7-day fallback lifetime and the `max_alerts` age
     /// order follow the source's latest affirmation, not first sighting.
-    received: DateTime<Utc>,
-    pubtime: DateTime<Utc>,
+    pub(crate) received: DateTime<Utc>,
+    pub(crate) pubtime: DateTime<Utc>,
     /// The `data_id` whose document currently holds this alert's content. A
     /// `rel=deletion` withdraws the alert only when it names this one — a
     /// deletion of an older revision (superseded in place by a newer
     /// `data_id`) must not remove the newer content.
-    current_data_id: String,
+    pub(crate) current_data_id: String,
 }
 
 /// Ordering uses source publication time; retention uses receipt time so a
 /// broker backlog does not immediately expire freshly received tombstones.
-#[derive(Debug)]
-struct Tombstone {
-    pubtime: DateTime<Utc>,
-    received: DateTime<Utc>,
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Tombstone {
+    pub(crate) pubtime: DateTime<Utc>,
+    pub(crate) received: DateTime<Utc>,
 }
+
+/// Everything the accumulator carries across a restart (#1000): the held
+/// alerts with their hints, both tombstone maps, and when and why this
+/// accumulator's fill began. The `data_id` index is derived from the
+/// alerts, so it is rebuilt rather than stored. `crate::persist` encodes
+/// it; [`Wis2CapSource::export`] / [`Wis2CapSource::restore`] move it in
+/// and out under the accumulator lock.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AccumulatorState {
+    pub(crate) entries: Vec<Entry>,
+    pub(crate) tombstones: Vec<(MessageKey, Tombstone)>,
+    pub(crate) data_tombstones: Vec<(String, Tombstone)>,
+    /// See [`Wis2CapSource::filling_since`].
+    pub(crate) filling_since: Option<DateTime<Utc>>,
+    /// See [`Wis2CapSource::warmup_cause`].
+    pub(crate) warmup_cause: WarmupCause,
+}
+
+/// What [`Wis2CapSource::restore`] kept and dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RestoreSummary {
+    pub(crate) alerts: usize,
+    /// Past validity end + `retention_grace` at restore time.
+    pub(crate) expired: usize,
+    /// Rejected by the current `status_filter`.
+    pub(crate) filtered: usize,
+    /// Hints the current `geometry_links` / `bbox_fallback` no longer allow.
+    pub(crate) hints_dropped: usize,
+    pub(crate) tombstones: usize,
+}
+
+/// `filling_since` sentinel: the subscription has not come up yet.
+const NOT_FILLING: i64 = i64::MIN;
 
 fn remember<K: Eq + std::hash::Hash>(
     map: &mut HashMap<K, Tombstone>,
@@ -181,6 +216,13 @@ pub struct Wis2CapSource {
     cfg: Wis2SourceConfig,
     acc: Mutex<Accumulator>,
     dirty: AtomicBool,
+    /// Bumped by every change to the accumulator, including evictions — the
+    /// state snapshot (#1000) is rewritten only when it moved.
+    revision: AtomicU64,
+    /// Unix millis of [`Self::filling_since`], or [`NOT_FILLING`].
+    filling_since: AtomicI64,
+    /// [`Self::warmup_cause`] is [`WarmupCause::LongOutage`].
+    after_outage: AtomicBool,
     pub stats: Wis2SourceStats,
 }
 
@@ -190,6 +232,9 @@ impl Wis2CapSource {
             cfg,
             acc: Mutex::new(Accumulator::default()),
             dirty: AtomicBool::new(false),
+            revision: AtomicU64::new(0),
+            filling_since: AtomicI64::new(NOT_FILLING),
+            after_outage: AtomicBool::new(false),
             stats: Wis2SourceStats::default(),
         }
     }
@@ -197,6 +242,162 @@ impl Wis2CapSource {
     /// Whether anything changed since the last [`Self::take_dirty`].
     pub fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// Something changed: rebuild the catalog, rewrite the snapshot.
+    fn touch(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// The accumulator's change counter (see [`Self::touch`]).
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// When this accumulator began filling: the first time the broker
+    /// subscription was up after a cold start, or after a restore that
+    /// restarted the warm-up (a snapshot older than the warm-up). Carried
+    /// across restarts by the snapshot, so a restart while still warming up
+    /// does not reset — or skip — the warm-up (`CapEngine::live_health`).
+    /// `None` until the subscription first comes up.
+    pub fn filling_since(&self) -> Option<DateTime<Utc>> {
+        match self.filling_since.load(Ordering::Acquire) {
+            NOT_FILLING => None,
+            millis => DateTime::from_timestamp_millis(millis),
+        }
+    }
+
+    /// Why the current warm-up runs (see [`Self::filling_since`]): an empty
+    /// start, or a restore after the server was down longer than the
+    /// warm-up. Carried in the snapshot with the clock.
+    pub fn warmup_cause(&self) -> WarmupCause {
+        if self.after_outage.load(Ordering::Acquire) {
+            WarmupCause::LongOutage
+        } else {
+            WarmupCause::ColdStart
+        }
+    }
+
+    /// The subscription is up: start the warm-up clock unless it already
+    /// runs (a later reconnect does not restart it).
+    pub fn mark_filling(&self, now: DateTime<Utc>) {
+        if self
+            .filling_since
+            .compare_exchange(
+                NOT_FILLING,
+                now.timestamp_millis(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            // Persist the clock even if nothing else arrives.
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Whether `e` is past its validity end (else receipt +
+    /// [`FALLBACK_LIFETIME`]) plus `retention_grace` at `now`.
+    fn is_expired(&self, e: &Entry, now: DateTime<Utc>) -> bool {
+        let end =
+            validity_end(&e.alert, self.cfg.default_ttl).unwrap_or(e.received + FALLBACK_LIFETIME);
+        end + self.cfg.retention_grace < now
+    }
+
+    /// A copy of everything a snapshot holds (#1000). Clones under the
+    /// accumulator lock — geometry is `Arc`-shared — so the encoding and the
+    /// file write happen outside it.
+    pub(crate) fn export(&self) -> AccumulatorState {
+        let acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
+        AccumulatorState {
+            entries: acc.alerts.values().cloned().collect(),
+            tombstones: acc
+                .tombstones
+                .iter()
+                .map(|(k, t)| (k.clone(), *t))
+                .collect(),
+            data_tombstones: acc
+                .data_tombstones
+                .iter()
+                .map(|(k, t)| (k.clone(), *t))
+                .collect(),
+            filling_since: self.filling_since(),
+            warmup_cause: self.warmup_cause(),
+        }
+    }
+
+    /// Replace the accumulator with a restored snapshot (#1000), applying
+    /// the current config to it: alerts past validity + grace at `now`
+    /// (expired while the server was down) and those the `status_filter`
+    /// rejects are dropped, so are hints `geometry_links` / `bbox_fallback`
+    /// no longer allow; tombstones are pruned like on every rebuild. The
+    /// `data_id` index is rebuilt from the alerts. `max_alerts` applies at
+    /// the next rebuild, as always. The warm-up clock and its cause are
+    /// taken as given: the caller decides whether the warm-up restarts.
+    pub(crate) fn restore(&self, state: AccumulatorState, now: DateTime<Utc>) -> RestoreSummary {
+        let mut summary = RestoreSummary::default();
+        let mut acc = Accumulator::default();
+        for mut entry in state.entries {
+            if !accepts_status(&entry.alert, &self.cfg.status_filter) {
+                summary.filtered += 1;
+                continue;
+            }
+            if self.is_expired(&entry, now) {
+                summary.expired += 1;
+                continue;
+            }
+            for area in entry
+                .alert
+                .infos
+                .iter_mut()
+                .flat_map(|info| info.areas.iter_mut())
+            {
+                let allowed = area.hint_geometry.as_ref().map(|h| match h.source {
+                    "bbox" => self.cfg.bbox_fallback,
+                    _ => self.cfg.geometry_links,
+                });
+                if allowed == Some(false) {
+                    area.hint_geometry = None;
+                    summary.hints_dropped += 1;
+                }
+            }
+            let key = AlertKey::of(&entry.alert);
+            match acc.alerts.get(&key) {
+                Some(held) if held.pubtime >= entry.pubtime => {}
+                _ => {
+                    acc.alerts.insert(key, entry);
+                }
+            }
+        }
+        for (key, entry) in &acc.alerts {
+            acc.data_id_index
+                .entry(entry.current_data_id.clone())
+                .or_default()
+                .push(key.clone());
+        }
+        acc.tombstones = state.tombstones.into_iter().collect();
+        acc.data_tombstones = state.data_tombstones.into_iter().collect();
+        prune_tombstones(&mut acc.tombstones, now, self.cfg.retention_grace);
+        prune_tombstones(&mut acc.data_tombstones, now, self.cfg.retention_grace);
+        summary.alerts = acc.alerts.len();
+        summary.tombstones = acc.tombstones.len() + acc.data_tombstones.len();
+        let mut held = self.acc.lock().unwrap_or_else(|e| e.into_inner());
+        *held = acc;
+        self.stats.held.store(held.alerts.len(), Ordering::Relaxed);
+        drop(held);
+        self.filling_since.store(
+            state
+                .filling_since
+                .map_or(NOT_FILLING, |t| t.timestamp_millis()),
+            Ordering::Release,
+        );
+        self.after_outage.store(
+            state.warmup_cause == WarmupCause::LongOutage,
+            Ordering::Release,
+        );
+        self.touch();
+        summary
     }
 
     /// Alerts currently held (before eviction). Lock-free: read from the
@@ -217,7 +418,7 @@ impl Wis2CapSource {
     /// Test oracle for the `data_id_index` invariant: the index holds exactly
     /// the `(current_data_id, identifier)` pairs of the held alerts.
     #[cfg(test)]
-    fn assert_index_consistent(&self) {
+    pub(crate) fn assert_index_consistent(&self) {
         let acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
         let mut expected: Vec<(String, AlertKey)> = acc
             .alerts
@@ -489,7 +690,7 @@ impl Wis2CapSource {
         }
         self.stats.held.store(acc.alerts.len(), Ordering::Relaxed);
         drop(acc);
-        self.dirty.store(true, Ordering::Release);
+        self.touch();
     }
 
     /// `rel=deletion`: withdraw the alerts this `data_id`'s document holds —
@@ -501,7 +702,7 @@ impl Wis2CapSource {
         // The resolver downloads concurrently: deletion may finish before the
         // document. Remember it even when no identifier has been indexed yet.
         remember(&mut acc.data_tombstones, data_id.to_owned(), pubtime, now);
-        self.dirty.store(true, Ordering::Release);
+        self.touch();
         let identifiers = acc.data_id_index.get(data_id).cloned().unwrap_or_default();
         let mut removed = 0;
         for identifier in identifiers {
@@ -523,7 +724,6 @@ impl Wis2CapSource {
         if removed > 0 {
             self.stats.deletions.fetch_add(removed, Ordering::Relaxed);
             self.stats.held.store(acc.alerts.len(), Ordering::Relaxed);
-            self.dirty.store(true, Ordering::Release);
         }
     }
 
@@ -571,11 +771,7 @@ impl Wis2CapSource {
         let mut expired: HashSet<AlertKey> = acc
             .alerts
             .iter()
-            .filter(|(_, e)| {
-                let end =
-                    validity_end(&e.alert, default_ttl).unwrap_or(e.received + FALLBACK_LIFETIME);
-                end + grace < now
-            })
+            .filter(|(_, e)| self.is_expired(e, now))
             .map(|(id, _)| id.clone())
             .collect();
         // Hard cap (#805): what matters least goes first — alerts whose
@@ -620,6 +816,9 @@ impl Wis2CapSource {
             self.stats
                 .evicted
                 .fetch_add(evicted as u64, Ordering::Relaxed);
+            // Not `touch()`: this rebuild already reflects the eviction; only
+            // the snapshot is behind.
+            self.revision.fetch_add(1, Ordering::AcqRel);
         }
         prune_tombstones(&mut acc.tombstones, now, grace);
         prune_tombstones(&mut acc.data_tombstones, now, grace);
@@ -789,61 +988,22 @@ fn bbox_polygon(b: [f64; 4]) -> Geometry {
     }
 }
 
+/// Notification builders shared by the crate's unit tests.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use chrono::TimeZone;
-    use ds_wis2::{DownloadPolicy, PayloadSource, Status};
-    use std::sync::Arc;
+    use ds_wis2::PayloadSource;
 
-    fn fetcher() -> Fetcher {
-        Fetcher::new(
-            DownloadPolicy::new(vec![]),
-            1 << 20,
-            Arc::new(Status::new()),
-        )
-        .unwrap()
-    }
-
-    fn cfg() -> Wis2SourceConfig {
-        Wis2SourceConfig {
-            label: "test".into(),
-            status_filter: vec!["Actual".into()],
-            retention_grace: Duration::hours(1),
-            max_alerts: 100,
-            geometry_links: false,
-            bbox_fallback: false,
-            default_ttl: None,
-        }
-    }
-
-    fn at(secs: i64) -> DateTime<Utc> {
+    /// `at(0)` = 2026-09-12T07:40:00Z.
+    pub(crate) fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_789_200_000 + secs, 0).unwrap()
     }
 
-    /// `expires = ""` omits `<expires>` (no computable validity end).
-    fn cap_xml(identifier: &str, msg_type: &str, refs: &str, expires: &str) -> String {
-        let refs = if refs.is_empty() {
-            String::new()
-        } else {
-            format!("<references>{refs}</references>")
-        };
-        let expires = if expires.is_empty() {
-            String::new()
-        } else {
-            format!("<expires>{expires}</expires>")
-        };
-        format!(
-            r#"<?xml version="1.0"?><alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
-<identifier>{identifier}</identifier><sender>t@x</sender><sent>2026-09-12T10:00:00+00:00</sent>
-<status>Actual</status><msgType>{msg_type}</msgType><scope>Public</scope>{refs}
-<info><language>en-GB</language><category>Met</category><event>Rain</event><urgency>Immediate</urgency>
-<severity>Moderate</severity><certainty>Likely</certainty>{expires}
-<area><areaDesc>Zone</areaDesc><geocode><valueName>NUTS3</valueName><value>MK006</value></geocode></area></info></alert>"#
-        )
-    }
-
-    fn resolved(data_id: &str, pub_secs: i64, xml: Option<String>) -> Resolved {
+    /// A MeteoAlarm-topic notification for `data_id` published at
+    /// `at(pub_secs)`, carrying `xml` inline — or, with `None`, a
+    /// `rel=deletion`.
+    pub(crate) fn resolved(data_id: &str, pub_secs: i64, xml: Option<String>) -> Resolved {
         let n = Notification {
             topic: "cache/a/wis2/eu-eumetnet-warnings/data/core/weather/advisories-warnings".into(),
             centre_id: Some("eu-eumetnet-warnings".into()),
@@ -880,6 +1040,58 @@ mod tests {
                 verified: None,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{at, resolved};
+    use super::*;
+    use chrono::TimeZone;
+    use ds_wis2::{DownloadPolicy, Status};
+    use std::sync::Arc;
+
+    fn fetcher() -> Fetcher {
+        Fetcher::new(
+            DownloadPolicy::new(vec![]),
+            1 << 20,
+            Arc::new(Status::new()),
+        )
+        .unwrap()
+    }
+
+    fn cfg() -> Wis2SourceConfig {
+        Wis2SourceConfig {
+            label: "test".into(),
+            status_filter: vec!["Actual".into()],
+            retention_grace: Duration::hours(1),
+            max_alerts: 100,
+            geometry_links: false,
+            bbox_fallback: false,
+            default_ttl: None,
+        }
+    }
+
+    /// `expires = ""` omits `<expires>` (no computable validity end).
+    fn cap_xml(identifier: &str, msg_type: &str, refs: &str, expires: &str) -> String {
+        let refs = if refs.is_empty() {
+            String::new()
+        } else {
+            format!("<references>{refs}</references>")
+        };
+        let expires = if expires.is_empty() {
+            String::new()
+        } else {
+            format!("<expires>{expires}</expires>")
+        };
+        format!(
+            r#"<?xml version="1.0"?><alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+<identifier>{identifier}</identifier><sender>t@x</sender><sent>2026-09-12T10:00:00+00:00</sent>
+<status>Actual</status><msgType>{msg_type}</msgType><scope>Public</scope>{refs}
+<info><language>en-GB</language><category>Met</category><event>Rain</event><urgency>Immediate</urgency>
+<severity>Moderate</severity><certainty>Likely</certainty>{expires}
+<area><areaDesc>Zone</areaDesc><geocode><valueName>NUTS3</valueName><value>MK006</value></geocode></area></info></alert>"#
+        )
     }
 
     #[tokio::test]

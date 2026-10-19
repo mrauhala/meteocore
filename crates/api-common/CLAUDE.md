@@ -11,8 +11,11 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   excluded query terms; phrases never span fields or keyword entries. q and query
   combine with AND. Keep operator encoding (`%2B`) intact through navigation.
   See README.md for explicit tokenizer and malformed-input choices.
-- Apply filters before paging. Navigation preserves supported filters and the
-  negotiated format, including requests that used Accept without an explicit f.
+- Apply filters, then `sortby`, before paging. Navigation preserves supported
+  filters and the negotiated format, including requests that used Accept without
+  an explicit f. JSON and HTML default differently (id and 1,000; title and 24,
+  #1141), so an alternate link must spell out `limit` and `sortby`
+  (`SearchQueryParams::explicit_page`) to name the same page.
 - Adapters supply metadata and extents from their registry snapshot. Time bounds
   and advertised collection metadata must agree. Preserve EDR's distinct extent
   representation. Do not infer a sampling grid from feature interval endpoints.
@@ -38,6 +41,24 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   fields may override id/title for instances; do not override shared links.
 - Conformance declarations are deliberate. Part 4 searchable-collections is absent
   until all mandatory requirements of the recorded draft are implemented/tested.
+  A class that holds only in the shared layout goes in the block's
+  `shared_conformance`, never in its per-API list: Maps "Map Tilesets" needs
+  `{map}/tiles`, which only the shared root has (Tiles declares it there, #946).
+  `common_discovery` pins each declaration against the links and OpenAPI
+  parameters it requires. Tiles DateTime covers map and vector tiles; both
+  parse time through `subset`, and vector tiles hand it to the engine as
+  `FeatureQuery::datetime`.
+- `workbench/map.js` prints a property number by the rule of
+  `metadata::number_text` (#1140); change both together. Its tests run the
+  shipped script on a stub DOM: `node --test crates/api-common/tests/map.test.cjs`
+  (CI). It also keeps the map's view as a CRS84 box in the map element's
+  `data-view`, which the items builder's "Use map view" reads (#1143).
+- The Overview's "Filter by" / "Sort by" chips (`ItemsOverview`, carried by
+  `Contribution::items`, rendered by `collection_page`) open the items
+  builder through the URL fragment (`#filter=<name>`, `#sort=<name>`), never
+  a query parameter: `/items` rejects unknown ones (#1143). The stylesheet
+  and scripts are inline, so a page test asserting an element's absence
+  matches its markup, not a bare class name.
 - Update README.md here, affected API READMEs and docs/ogc-api-common-matrix.md.
   Run cross-API contracts (`cargo test -p server --test common_discovery`) and the
   affected API suites. Do not require identical real production catalogs.

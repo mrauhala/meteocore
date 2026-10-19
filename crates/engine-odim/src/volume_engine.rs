@@ -55,7 +55,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_core::config::ResamplingMethod;
-use ds_core::edr_engine::EdrEngine;
+use ds_core::edr_engine::{EdrEngine, TrajectoryShape};
 use ds_core::error::DataServerError;
 use ds_core::feature::{
     parse_area_coords, parse_linestring_coords, parse_point_coords, Bbox, DatetimeInterval,
@@ -65,16 +65,18 @@ use ds_core::feature_engine::FeatureEngine;
 use ds_core::geo::geodetic_to_ecef;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
-    VerticalCoord,
+    CoverageResponse, DomainDescription, Location, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult, VerticalCoord,
 };
 use ds_core::resample::ProjectionGrid;
+use ds_core::temp_files;
 use ds_core::vertical::{VerticalDimension, VerticalKind};
 use ds_core::volume::{
     CellProduct, CellQuery, VolumeEngine, VolumeInfo, VolumePoint, VolumePointCloud, VoxelGrid,
 };
 use ds_poll::{FirstTick, Shutdown};
 
+use ds_storage::bytes::Bytes;
 use ds_storage::discovery::{
     expand_prefix_for_range, expand_prefix_pattern, list_prefixes, validate_prefix_pattern,
     TimeWindow,
@@ -91,7 +93,7 @@ use crate::reader::{PixelClass, RawPixels};
 /// unset. One shared budget bounds resident decoded pixels across every
 /// PVOL collection, so the engine scales to a full radar network without
 /// holding every sweep stack in RAM (#289).
-const DEFAULT_PIXEL_CACHE_MB: u64 = 1024;
+pub(crate) const DEFAULT_PIXEL_CACHE_MB: u64 = 1024;
 
 /// Read the configured lazy-pixel cache size from the environment, or the
 /// default. `0` disables caching (every sample re-reads — diagnostic only).
@@ -111,9 +113,10 @@ pub(crate) fn pixel_cache() -> &'static PixelCache {
     &PIXEL_CACHE
 }
 
-/// Cumulative count of lazy pixel reads that failed (remote/local I/O or
-/// HDF5 decode) and so degraded to a transparent / nodata sample instead of
-/// real data. Before lazy loading a decode failure was a hard catalog
+/// Cumulative count of lazy pixel reads that failed (missing file or object,
+/// HDF5 open or decode) and so degraded to a transparent / nodata sample
+/// instead of real data. A deadline or transient storage failure fails the
+/// request instead and is not counted here (#993). Before lazy loading a decode failure was a hard catalog
 /// rejection at scan time; now the failure is per-request and otherwise
 /// silent, so this counter (surfaced as `pvol_pixel_read_failures_total` in
 /// `/metrics`) makes the degradation observable (PR #290 review).
@@ -125,7 +128,8 @@ static PIXEL_READ_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 pub struct PixelCacheMetrics {
     /// Standard hits/misses/bytes/capacity snapshot.
     pub cache: ds_cache::CacheMetrics,
-    /// Cumulative inserts (request-time decodes + poll-time pre-warm).
+    /// Cumulative inserts (request-time decodes, their background sibling
+    /// decodes, and poll-time pre-warm).
     pub inserts: u64,
     /// Resident entry count.
     pub entries: u64,
@@ -523,37 +527,295 @@ pub(crate) fn blocking_pixel_handle() -> Option<tokio::runtime::Handle> {
     tokio::runtime::Handle::try_current().ok()
 }
 
-/// Re-fetch one volume file's raw bytes by its [`FileId`] — a local path
-/// read or an S3 `get`. Used by the lazy pixel reader on a cache miss.
-///
-/// `handle` picks the async→sync bridge for a remote fetch by the caller's
-/// runtime context (see [`Pixels::handle`]): `Some(handle)` drives the fetch
-/// via `handle.block_on` (valid on a `spawn_blocking` pool thread, where
-/// `block_in_place` *panics*); `None` uses the plain [`DataStore::get`],
-/// whose `block_in_place` is valid on a multi-thread runtime worker. A local read
-/// never touches a runtime, so the handle is irrelevant there.
-fn fetch_file_bytes(
-    source: &Source,
-    file_id: &str,
-    handle: Option<&tokio::runtime::Handle>,
-) -> Result<Vec<u8>, String> {
-    match source {
-        Source::Local { .. } => {
-            std::fs::read(file_id).map_err(|e| format!("read `{file_id}`: {e}"))
-        }
-        Source::Remote { store, .. } => {
-            use ds_storage::object_store::path::Path as ObjectPath;
-            let object = ObjectPath::from(file_id);
-            let bytes = match handle {
-                Some(h) => store.get_on(&object, h),
-                None => store.get(&object),
-            };
-            bytes
-                .map(|b| b.to_vec())
-                .map_err(|e| format!("get `{file_id}`: {e}"))
+/// Why a lazy pixel read produced no array (#993).
+#[derive(Debug)]
+enum PixelReadError {
+    /// The data itself is unusable: the file or object is gone, or its HDF5
+    /// does not open or decode. Negatively cached (`PixelCache::mark_bad`)
+    /// and sampled as nodata, so a per-cell loop does not storm the store.
+    Bad(String),
+    /// The request ran out of time, or the store failed in a way a retry can
+    /// heal (network, timeout, 5xx). Never negatively cached and never turned
+    /// into nodata: the request fails, so no cache keeps an empty tile for it
+    /// and the next request reads again. Always `DeadlineExceeded` or
+    /// `ResourceExhausted`, which every API answers with 503/504.
+    Abort(DataServerError),
+}
+
+impl PixelReadError {
+    /// Classify a storage-bridge error. A missing object never reaches here
+    /// (`get_opt*` returns it as `Ok(None)`), so every error is one a retry
+    /// can heal: the deadline stays itself, anything else is the transient
+    /// `ResourceExhausted` with the detail logged, not sent to the client.
+    fn from_storage(file_id: &str, e: DataServerError) -> Self {
+        match e {
+            e @ (DataServerError::DeadlineExceeded | DataServerError::ResourceExhausted) => {
+                PixelReadError::Abort(e)
+            }
+            e => {
+                tracing::warn!("PVOL pixel fetch of `{file_id}` failed, retryable: {e}");
+                PixelReadError::Abort(DataServerError::ResourceExhausted)
+            }
         }
     }
 }
+
+/// Per-file count of volume file downloads started: [`fetch_file_bytes`]
+/// reads of its own, and the shared remote reads a request starts rather
+/// than joins ([`RemoteRead::start`]); and of those a walk started ahead
+/// (`Pixels::start_read`). Tests pin with them how many times a volume file
+/// is downloaded (#994, #1127) and that a walk read it ahead (#999).
+#[cfg(test)]
+mod file_fetches {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    type Counts = Mutex<Option<HashMap<String, usize>>>;
+
+    static FETCHES: Counts = Mutex::new(None);
+    static AHEAD: Counts = Mutex::new(None);
+
+    fn bump(counts: &Counts, file_id: &str) {
+        let mut counts = counts.lock().unwrap_or_else(|e| e.into_inner());
+        *counts
+            .get_or_insert_with(HashMap::new)
+            .entry(file_id.to_owned())
+            .or_default() += 1;
+    }
+
+    fn get(counts: &Counts, file_id: &str) -> usize {
+        counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|counts| counts.get(file_id).copied())
+            .unwrap_or(0)
+    }
+
+    pub(super) fn record(file_id: &str) {
+        bump(&FETCHES, file_id);
+    }
+
+    /// A download a walk started ahead of reaching the file, already
+    /// counted as a fetch.
+    pub(super) fn record_ahead(file_id: &str) {
+        bump(&AHEAD, file_id);
+    }
+
+    pub(super) fn count(file_id: &str) -> usize {
+        get(&FETCHES, file_id)
+    }
+
+    pub(super) fn ahead(file_id: &str) -> usize {
+        get(&AHEAD, file_id)
+    }
+}
+
+/// Re-fetch one volume file's raw bytes by its [`FileId`] — a local path
+/// read or an S3 `get`. Used by the lazy pixel reader on a cache miss.
+///
+/// A remote file is read as a [`RemoteRead`] on the runtime
+/// [`shared_read_runtime`] picks, so the miss joins another request's
+/// download of the file, or registers its own for others to join (#1127).
+/// On a thread with no multi-thread runtime it is read in place, unshared,
+/// and `handle` picks the async→sync bridge by the caller's runtime context
+/// (see [`Pixels::handle`]): `Some(handle)` drives the fetch via
+/// `handle.block_on` (valid on a `spawn_blocking` pool thread, where
+/// `block_in_place` *panics*); `None` uses the plain `DataStore::get_opt`,
+/// whose `block_in_place` is valid on a multi-thread runtime worker. A local
+/// read never touches a runtime, so the handle is irrelevant there.
+///
+/// A missing file or object is [`PixelReadError::Bad`]; a deadline or any
+/// other storage failure is [`PixelReadError::Abort`] (#993).
+///
+/// The shared read comes back with the bytes: hold it until they are
+/// decoded, so that a request needing the file meanwhile joins it.
+fn fetch_file_bytes<'a>(
+    source: &'a Source,
+    file_id: &'a str,
+    handle: Option<&tokio::runtime::Handle>,
+) -> Result<(Bytes, Option<RemoteRead<'a>>), PixelReadError> {
+    match source {
+        Source::Local { .. } => {
+            #[cfg(test)]
+            file_fetches::record(file_id);
+            let bytes = std::fs::read(file_id).map(Bytes::from).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    PixelReadError::Bad(format!("read `{file_id}`: {e}"))
+                } else {
+                    PixelReadError::from_storage(file_id, DataServerError::Io(e))
+                }
+            })?;
+            Ok((bytes, None))
+        }
+        Source::Remote { store, .. } => {
+            if let Some(runtime) = shared_read_runtime(handle) {
+                let cache_id = pixel_cache_id(source, file_id).into_owned();
+                let mut read = RemoteRead::start(store, cache_id, file_id, runtime);
+                return Ok((read.wait(handle)?, Some(read)));
+            }
+            #[cfg(test)]
+            file_fetches::record(file_id);
+            use ds_storage::object_store::path::Path as ObjectPath;
+            let object = ObjectPath::from(file_id);
+            let bytes = match handle {
+                Some(h) => store.get_opt_on(&object, h),
+                None => store.get_opt(&object),
+            };
+            Ok((classify_remote_read(file_id, bytes)?, None))
+        }
+    }
+}
+
+/// The runtime a remote volume read runs on as a task, so that other
+/// requests can join it (#1127): the explicit handle on a blocking-pool
+/// worker, else the runtime whose worker runs the caller (the query
+/// runtime for EDR). `None` on a thread with no multi-thread runtime: a
+/// current-thread runtime would not drive the read while its requests wait.
+fn shared_read_runtime(handle: Option<&tokio::runtime::Handle>) -> Option<tokio::runtime::Handle> {
+    handle
+        .cloned()
+        .or_else(|| tokio::runtime::Handle::try_current().ok())
+        .filter(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+}
+
+/// A remote volume file download that a request waits on (#1127): one it
+/// started, or another request's that it joined through [`PixelCache`]'s
+/// registry, so requests that need one file at once share one GET: walks
+/// reading ahead ([`walk_volumes`]) and misses inside the per-file lock
+/// ([`fetch_file_bytes`]) alike. Holding it keeps the read joinable, so
+/// each holds it until the file's moments are decoded.
+struct RemoteRead<'a> {
+    store: &'a ds_storage::DataStore,
+    file_id: &'a str,
+    cache_id: String,
+    runtime: tokio::runtime::Handle,
+    read: crate::pixel_cache::VolumeRead,
+}
+
+impl<'a> RemoteRead<'a> {
+    /// Join the download of `file_id` another request holds, or start one
+    /// on `runtime` that later requests join. `cache_id` is the file's
+    /// [`pixel_cache_id`], which keys the registry.
+    fn start(
+        store: &'a ds_storage::DataStore,
+        cache_id: String,
+        file_id: &'a str,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        let read =
+            PIXEL_CACHE.join_or_start_read(&cache_id, || start_get(store, file_id, &runtime));
+        RemoteRead {
+            store,
+            file_id,
+            cache_id,
+            runtime,
+            read,
+        }
+    }
+
+    /// Wait for the download, within this thread's request deadline, and
+    /// classify it as [`fetch_file_bytes`] classifies its own (#993). A
+    /// joined read that failed is the failure of the request that started
+    /// it: this one reads once more, starting its own read or joining one
+    /// started since, as a miss inside the per-file lock reads again after
+    /// another's failed load.
+    fn wait(&mut self, handle: Option<&tokio::runtime::Handle>) -> Result<Bytes, PixelReadError> {
+        let mut bytes = self.read.read.wait(handle);
+        if self.read.joined && matches!(bytes, Err(DataServerError::Storage(_))) {
+            tracing::debug!(
+                "PVOL download of `{}` this request joined failed; reading again",
+                self.file_id
+            );
+            let (store, file_id, runtime) = (self.store, self.file_id, &self.runtime);
+            self.read = PIXEL_CACHE
+                .join_or_start_read(&self.cache_id, || start_get(store, file_id, runtime));
+            bytes = self.read.read.wait(handle);
+        }
+        classify_remote_read(self.file_id, bytes)
+    }
+}
+
+/// Start downloading the remote `file_id` on `runtime` for a [`RemoteRead`].
+fn start_get(
+    store: &ds_storage::DataStore,
+    file_id: &str,
+    runtime: &tokio::runtime::Handle,
+) -> ds_storage::PendingGet {
+    #[cfg(test)]
+    file_fetches::record(file_id);
+    let object = ds_storage::object_store::path::Path::from(file_id);
+    store.start_get_opt(&object, runtime)
+}
+
+/// A remote whole-file read as the pixel reader sees it (#993): a missing
+/// object is unusable data, any other failure the request's. Shared by
+/// [`fetch_file_bytes`]'s unshared read and [`RemoteRead::wait`], so both
+/// classify alike.
+fn classify_remote_read(
+    file_id: &str,
+    read: Result<Option<Bytes>, DataServerError>,
+) -> Result<Bytes, PixelReadError> {
+    match read {
+        Ok(Some(b)) => Ok(b),
+        Ok(None) => Err(PixelReadError::Bad(format!(
+            "get `{file_id}`: object not found"
+        ))),
+        Err(e) => Err(PixelReadError::from_storage(file_id, e)),
+    }
+}
+
+/// Read whole volume files for a background build off the request path
+/// (the `CELLS` warm-up, #1155): remote files concurrently, all of
+/// `file_ids` at once under the background fetch budget, local files in
+/// turn. Only on the background poll runtime (root CLAUDE.md Critical Rules
+/// 6–7); the caller bounds how many files it passes.
+pub(crate) fn read_volume_files(
+    source: &Source,
+    file_ids: &[&str],
+) -> Vec<Result<Bytes, DataServerError>> {
+    match source {
+        Source::Local { .. } => file_ids
+            .iter()
+            .map(|id| std::fs::read(id).map(Bytes::from).map_err(Into::into))
+            .collect(),
+        Source::Remote { store, .. } => {
+            let paths: Vec<_> = file_ids
+                .iter()
+                .map(|id| ds_storage::object_store::path::Path::from(*id))
+                .collect();
+            match store.get_many_with_budget(
+                &paths,
+                paths.len().max(1),
+                Some(MAX_REMOTE_FILE_SIZE),
+                ds_storage::FetchBudget::Background,
+            ) {
+                Ok(files) => files,
+                Err(e) => {
+                    let e = e.to_string();
+                    file_ids
+                        .iter()
+                        .map(|_| Err(DataServerError::Storage(e.clone())))
+                        .collect()
+                }
+            }
+        }
+    }
+}
+
+/// Most volume files an EDR walk over several volumes downloads at once,
+/// and so the most volumes it holds fetched or decoded (#999): the volume it
+/// samples plus the reads running ahead of it. A cold hour of 5-minute S3
+/// volumes then costs three rounds of whole-file GETs instead of twelve in
+/// turn (root CLAUDE.md Critical Rule 9), and a walk's peak memory stays at
+/// four volumes however long its window: at most 4 × `MAX_REMOTE_FILE_SIZE`
+/// (64 MiB) of downloaded bytes per query, times the EDR queries admitted at
+/// once (`ds_executor::query_workers()`), plus a cross-section's cell
+/// geometry per volume (`SectionPlan`, up to 1024 nodes × 100 levels × 32 B
+/// ≈ 3.3 MB).
+const MAX_WALK_VOLUMES_IN_FLIGHT: usize = 4;
+// The cap is a maintainer decision bounding per-request memory (#999).
+const _: () = assert!(MAX_WALK_VOLUMES_IN_FLIGHT == 4);
 
 /// Lazy-pixel access context threaded through the samplers: just the file
 /// source, used to re-fetch a volume's bytes on a [`PIXEL_CACHE`] miss.
@@ -566,87 +828,375 @@ struct Pixels<'a> {
     /// `Some(handle)` when the caller runs inside `spawn_blocking`
     /// (`get_raster_tile` / `query_trajectory`) — the fetch then uses
     /// `handle.block_on` because `block_in_place` panics on a `spawn_blocking`
-    /// pool thread. `None` on a dedicated EDR runtime worker (position / area /
-    /// locations), where the fetch must use `block_in_place` via the plain
-    /// `DataStore::get`. Irrelevant for a `Local` source.
+    /// pool thread. `None` on a dedicated query runtime worker (EDR position /
+    /// area / locations, and WMS GetFeatureInfo's position query through
+    /// `RenderJob::run_query`), where the fetch must use `block_in_place` via
+    /// the plain `DataStore::get`. Irrelevant for a `Local` source.
     handle: Option<&'a tokio::runtime::Handle>,
     /// Complete requested quantity for a 3D render, retained across LRU eviction.
     moments: Option<&'a MomentPixels>,
 }
 
-/// Requested moment first, then uncached siblings (same quantity first).
-/// Speculative decodes consume at most a quarter of the pixel-cache capacity,
-/// preventing a large cold volume from evicting the entire warm working set.
-/// Pixel storage uses at most four bytes/sample (floats are downcast to f32).
-fn cold_batch_requests<'a>(
-    volume: &'a PolarVolume,
-    requested: &'a PolarMoment,
+/// Most volume files whose downloaded bytes background sibling decodes may
+/// hold at once (#994). Each file is up to `MAX_REMOTE_FILE_SIZE`; a burst of
+/// cold misses beyond this skips the speculation, never the requested moment.
+const MAX_BACKGROUND_SIBLING_DECODES: usize = 4;
+
+/// The background (poll) runtime that cold-miss sibling decodes run on
+/// (#994). [`PolarVolumeEngine::poll_loop`], which the server always runs on
+/// that runtime, registers it. Until a poll loop has started there is none,
+/// and a cold miss decodes only the moment it was asked for.
+static SIBLING_DECODE_RUNTIME: std::sync::RwLock<Option<tokio::runtime::Handle>> =
+    std::sync::RwLock::new(None);
+
+fn set_sibling_decode_runtime(handle: tokio::runtime::Handle) {
+    *SIBLING_DECODE_RUNTIME
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+}
+
+fn sibling_decode_runtime() -> Option<tokio::runtime::Handle> {
+    SIBLING_DECODE_RUNTIME
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Decoded size of an `nrays × nbins` array at a conservative four bytes a
+/// sample (floats are stored as f32).
+fn sweep_bytes(nrays: usize, nbins: usize) -> u64 {
+    (nrays as u64)
+        .checked_mul(nbins as u64)
+        .and_then(|n| n.checked_mul(4))
+        .unwrap_or(u64::MAX)
+}
+
+/// Most sweeps a cold miss decodes ahead (#994): the neighbours a map viewer
+/// stepping `ELEVATION` reads next.
+const MAX_SIBLING_SWEEPS: usize = 2;
+
+/// The moments a cold single-moment miss decodes after the requested one, off
+/// the request path (#994): the requested quantity at the
+/// [`MAX_SIBLING_SWEEPS`] nearest other sweeps, skipping resident and
+/// known-bad ones, within one sweep's worth of decoded bytes.
+///
+/// Only a map render reads one moment at a time (`Pixels::moment` cold):
+/// every multi-moment walk (EDR profiles, level series, cross-sections, the
+/// point cloud and voxel grid) prefetches exactly what it reads with one GET
+/// per file (`Pixels::prefetch` / `volume_moments`). What follows a map
+/// render of one moment *of the same file* is a viewer stepping `ELEVATION`;
+/// an animation moves on to another file, and another quantity of the same
+/// sweep is wanted only when a viewer switches layer, so neither is decoded
+/// ahead. The budget is the requested sweep's moment count times its array
+/// size, and at most a sixteenth of the cache: a miss used to decode the
+/// whole volume, which flooded the cache's insert ring and evicted pre-warmed
+/// sweeps. A fixed-`ELEVATION` animation never reads the siblings — at most
+/// [`MAX_SIBLING_SWEEPS`] inserts per cold frame is that trade-off's price.
+fn sibling_requests(
+    volume: &PolarVolume,
+    requested: &PolarMoment,
     nrays: usize,
     nbins: usize,
     cache_id: &str,
-) -> Vec<(&'a str, usize, usize)> {
-    let mut requests = vec![(requested.dataset_path.as_str(), nrays, nbins)];
-    let mut remaining = PIXEL_CACHE.capacity() / 4;
+) -> Vec<(String, usize, usize)> {
+    let capacity = PIXEL_CACHE.capacity();
+    if capacity == 0 {
+        return Vec::new();
+    }
+    let home = volume.sweeps.iter().find(|sweep| {
+        sweep
+            .moments
+            .iter()
+            .any(|m| m.dataset_path == requested.dataset_path)
+    });
+    let per_sweep = home.map_or(1, |sweep| sweep.moments.len().max(1)) as u64;
+    let mut remaining = sweep_bytes(nrays, nbins)
+        .saturating_mul(per_sweep)
+        .min(capacity / 16);
     let mut siblings: Vec<_> = volume
         .sweeps
         .iter()
         .flat_map(|sweep| sweep.moments.iter().map(move |moment| (sweep, moment)))
         .filter(|(_, moment)| {
-            moment.dataset_path != requested.dataset_path
+            moment.quantity == requested.quantity
+                && moment.dataset_path != requested.dataset_path
                 && !PIXEL_CACHE.contains(cache_id, &moment.dataset_path)
+                && !PIXEL_CACHE.is_known_bad(cache_id, &moment.dataset_path)
         })
         .collect();
-    siblings.sort_by_key(|(_, moment)| moment.quantity != requested.quantity);
+    if let Some(home) = home {
+        siblings.sort_by(|(a, _), (b, _)| {
+            let da = (a.elangle - home.elangle).abs();
+            let db = (b.elangle - home.elangle).abs();
+            da.total_cmp(&db)
+        });
+    }
+    let mut requests = Vec::new();
     for (sweep, moment) in siblings {
-        let bytes = (sweep.nrays as u64)
-            .checked_mul(sweep.nbins as u64)
-            .and_then(|n| n.checked_mul(4))
-            .unwrap_or(u64::MAX);
+        let bytes = sweep_bytes(sweep.nrays, sweep.nbins);
+        if requests.len() == MAX_SIBLING_SWEEPS {
+            break;
+        }
         if bytes <= remaining {
             remaining -= bytes;
-            requests.push((moment.dataset_path.as_str(), sweep.nrays, sweep.nbins));
+            requests.push((moment.dataset_path.clone(), sweep.nrays, sweep.nbins));
         }
     }
     requests
 }
 
-impl Pixels<'_> {
+/// Decode `siblings` from a volume file's `bytes` into the pixel cache,
+/// skipping any a request decoded meanwhile. Speculative: a sibling that does
+/// not decode is skipped and marks nothing bad; its own read decides that.
+/// Returns the number of arrays inserted.
+fn decode_siblings(cache_id: &str, bytes: &[u8], siblings: &[(String, usize, usize)]) -> usize {
+    let pending = siblings
+        .iter()
+        .filter(|(path, _, _)| !PIXEL_CACHE.contains(cache_id, path))
+        .map(|(path, nrays, nbins)| (path.as_str(), *nrays, *nbins));
+    let mut inserted = 0;
+    let visited = crate::pvol::visit_moments_pixels(bytes, pending, |path, result| match result {
+        Ok(raw) => {
+            PIXEL_CACHE.insert(cache_id, path, Arc::new(raw));
+            inserted += 1;
+        }
+        Err(e) => tracing::debug!("PVOL sibling decode skipped `{path}`: {e}"),
+    });
+    if let Err(e) = visited {
+        tracing::debug!("PVOL sibling decode of `{cache_id}` skipped: {e}");
+    }
+    inserted
+}
+
+/// Hand a cold miss's sibling decode to the background runtime (#994): never
+/// on the request worker, never under the request deadline. The file's bytes
+/// stay registered in [`PixelCache::held_bytes`] until the decode's last
+/// insert, so a miss on the same file meanwhile reads them instead of
+/// downloading the file again. One decode per file and at most
+/// [`MAX_BACKGROUND_SIBLING_DECODES`] at once; past that, or with no runtime,
+/// nothing is decoded ahead. Returns whether a decode was spawned.
+fn spawn_sibling_decode(
+    background: Option<&tokio::runtime::Handle>,
+    cache_id: &str,
+    bytes: &Bytes,
+    siblings: Vec<(String, usize, usize)>,
+) -> bool {
+    let Some(runtime) = background else {
+        return false;
+    };
+    if siblings.is_empty() {
+        return false;
+    }
+    let Some(held) =
+        PIXEL_CACHE.hold_bytes(cache_id, bytes.clone(), MAX_BACKGROUND_SIBLING_DECODES)
+    else {
+        return false;
+    };
+    let cache_id = cache_id.to_owned();
+    let bytes = bytes.clone();
+    // A runtime that has shut down drops the closure, which releases `held`.
+    drop(runtime.spawn_blocking(move || {
+        decode_siblings(&cache_id, &bytes, &siblings);
+        drop(held);
+    }));
+    true
+}
+
+impl<'a> Pixels<'a> {
     /// All sweeps of the selected quantity share one file fetch and HDF5 open.
-    fn volume_moments(&self, volume: &PolarVolume, file_id: &str, quantity: &str) -> MomentPixels {
-        let cache_id = pixel_cache_id(self.source, file_id);
-        let requests: Vec<_> = volume
-            .sweeps
-            .iter()
-            .flat_map(|sweep| {
+    /// A deadline or transient storage failure is the request's error and
+    /// marks nothing bad (#993): an empty grid built from it would be cached.
+    fn volume_moments(
+        &self,
+        volume: &PolarVolume,
+        file_id: &str,
+        quantity: &str,
+    ) -> Result<MomentPixels, DataServerError> {
+        self.load_moments(
+            file_id,
+            volume.sweeps.iter().flat_map(|sweep| {
                 sweep
                     .moments
                     .iter()
                     .filter(move |m| m.quantity == quantity)
-                    .map(move |m| (m.dataset_path.as_str(), sweep.nrays, sweep.nbins))
-            })
+                    .map(move |m| (sweep, m))
+            }),
+        )
+    }
+
+    /// Resolve exactly `targets` — moments of the one volume file `file_id`
+    /// — as one batch: cached arrays are reused, and every missing one is
+    /// decoded from a single GET and HDF5 open of the file (#994), or from
+    /// the bytes a background sibling decode still holds. The returned Arcs
+    /// outlive LRU eviction for the rest of the request.
+    ///
+    /// A deadline or transient storage failure is the request's error and
+    /// marks nothing bad (#993). Unusable data (missing file, HDF5 open or
+    /// decode failure) leaves those moments out of the batch and marks them
+    /// bad, so a sampler reads them as nodata.
+    fn load_moments<'v>(
+        &self,
+        file_id: &str,
+        targets: impl IntoIterator<Item = (&'v Sweep, &'v PolarMoment)>,
+    ) -> Result<MomentPixels, DataServerError> {
+        self.load_moments_from(file_id, targets, None)
+    }
+
+    /// [`Self::load_moments`], decoding any missing moment from `fetched`
+    /// when the file was already downloaded ahead of this call (#999):
+    /// bytes a background sibling decode holds come first, then `fetched`,
+    /// and only with neither is the file downloaded here. Unused when every
+    /// moment turns out resident or known bad by now, a failed read
+    /// included: the batch then needs no bytes, as it would not have
+    /// fetched any.
+    fn load_moments_from<'v>(
+        &self,
+        file_id: &str,
+        targets: impl IntoIterator<Item = (&'v Sweep, &'v PolarMoment)>,
+        fetched: Option<Result<Bytes, PixelReadError>>,
+    ) -> Result<MomentPixels, DataServerError> {
+        let cache_id = pixel_cache_id(self.source, file_id);
+        let requests: Vec<_> = targets
+            .into_iter()
+            .map(|(sweep, m)| (m.dataset_path.as_str(), sweep.nrays, sweep.nbins))
             .collect();
-        let (pixels, failures) = PIXEL_CACHE.load_many(&cache_id, &requests, |missing| {
-            fetch_file_bytes(self.source, file_id, self.handle)
-                .and_then(|bytes| {
-                    crate::pvol::read_moments_pixels(&bytes, missing.iter().copied())
-                        .map_err(|e| e.to_string())
-                })
-                .unwrap_or_else(|e| {
+        if requests.is_empty() {
+            return Ok(MomentPixels::new());
+        }
+        let (pixels, failures) = PIXEL_CACHE.load_many(&cache_id, &requests, |missing, held| {
+            // Held until the moments are decoded (#1127).
+            let mut download = None;
+            let bytes = match (held, fetched) {
+                (Some(bytes), _) => Ok(bytes),
+                (None, Some(fetched)) => fetched,
+                (None, None) => {
+                    fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
+                        download = read;
+                        bytes
+                    })
+                }
+            };
+            let decoded = bytes.and_then(|bytes| {
+                crate::pvol::read_moments_pixels(&bytes, missing.iter().copied())
+                    .map_err(|e| PixelReadError::Bad(e.to_string()))
+            });
+            match decoded {
+                Ok(pixels) => Ok(pixels),
+                Err(PixelReadError::Abort(e)) => Err(e),
+                Err(PixelReadError::Bad(e)) => {
                     tracing::warn!("PVOL batch pixel read failed for `{file_id}`: {e}");
-                    Vec::new()
-                })
-        });
+                    Ok(Vec::new())
+                }
+            }
+        })?;
         if failures > 0 {
             PIXEL_READ_FAILURES.fetch_add(failures as u64, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!("PVOL batch pixel read for `{file_id}`: {failures} missing moment(s)");
         }
-        pixels
+        Ok(pixels)
     }
 
-    /// Fetch a decoded moment, batching bounded uncached siblings from the
-    /// same file on a cold miss. Concurrent sibling misses share a file lock. `None` on any I/O / decode error (the caller treats a
-    /// missing array as nodata, so a single corrupt file degrades to
-    /// transparent rather than failing the whole request).
+    /// Request-scoped prefetch for a walk over several moments of one volume
+    /// file (#994): EDR profiles, level series and cross-sections read
+    /// quantities × sweeps of each file, and moment-by-moment cold misses
+    /// would download the file once per quantity. `None` when this context
+    /// already carries a batch (it then answers every read itself).
+    /// Sample through [`Self::batched`] with the result.
+    ///
+    /// `fetched` is the file's download when the walk started it ahead
+    /// ([`Self::start_read`], collected by [`RemoteRead::wait`]; #999), else
+    /// `None` and the batch downloads it if it needs it.
+    fn prefetch<'v>(
+        &self,
+        file_id: &str,
+        targets: impl IntoIterator<Item = (&'v Sweep, &'v PolarMoment)>,
+        fetched: Option<Result<Bytes, PixelReadError>>,
+    ) -> Result<Option<MomentPixels>, DataServerError> {
+        if self.moments.is_some() {
+            return Ok(None);
+        }
+        self.load_moments_from(file_id, targets, fetched).map(Some)
+    }
+
+    /// The runtime a walk over `volumes` volumes starts its downloads on
+    /// (#999): the explicit handle on a blocking-pool worker (a
+    /// cross-section), else the runtime whose worker runs the query (EDR
+    /// position, area and locations, GetFeatureInfo: the query runtime).
+    /// `None` reads each file as the walk reaches it, inside the per-file
+    /// lock as before: a local source (no round trip to overlap), a context
+    /// that already carries its batch, a thread with no runtime, or a walk
+    /// of one volume, which has nothing to overlap and keeps that lock's
+    /// coalescing of concurrent cold reads of one file. A current-thread
+    /// runtime is `None` too: nothing would drive the downloads while the
+    /// walk waits.
+    fn read_ahead_runtime(&self, volumes: usize) -> Option<tokio::runtime::Handle> {
+        if volumes < 2 || self.moments.is_some() || !matches!(self.source, Source::Remote { .. }) {
+            return None;
+        }
+        shared_read_runtime(self.handle)
+    }
+
+    /// Download the remote `file_id` on `runtime` when the batch for
+    /// `targets` will read it: some target is neither resident nor known
+    /// bad, and no background sibling decode holds the file's bytes. Another
+    /// request's download of the file is joined, not repeated (#1127).
+    /// `None` when nothing needs downloading, and for a local source.
+    fn start_read<'r>(
+        &self,
+        file_id: &'r str,
+        targets: &[(&Sweep, &PolarMoment)],
+        runtime: &tokio::runtime::Handle,
+    ) -> Option<RemoteRead<'r>>
+    where
+        'a: 'r,
+    {
+        let Source::Remote { store, .. } = self.source else {
+            return None;
+        };
+        let cache_id = pixel_cache_id(self.source, file_id);
+        let cold = targets.iter().any(|(_, m)| {
+            !PIXEL_CACHE.contains(&cache_id, &m.dataset_path)
+                && !PIXEL_CACHE.is_known_bad(&cache_id, &m.dataset_path)
+        });
+        if !cold || PIXEL_CACHE.held_bytes(&cache_id).is_some() {
+            return None;
+        }
+        let read = RemoteRead::start(store, cache_id.into_owned(), file_id, runtime.clone());
+        #[cfg(test)]
+        if !read.read.joined {
+            file_fetches::record_ahead(file_id);
+        }
+        Some(read)
+    }
+
+    /// This context reading from `batch` (a [`Self::prefetch`] result) when
+    /// there is one: every `moment` read is then a lookup, never a fetch.
+    fn batched<'b>(&self, batch: &'b Option<MomentPixels>) -> Pixels<'b>
+    where
+        'a: 'b,
+    {
+        Pixels {
+            moments: batch.as_ref().or(self.moments),
+            source: self.source,
+            handle: self.handle,
+        }
+    }
+
+    /// Fetch a decoded moment. A cold miss downloads the file once, decodes
+    /// only the requested moment on the caller's thread and returns it; a
+    /// bounded set of siblings (`sibling_requests`) is decoded afterwards on
+    /// the background runtime (#994). Concurrent misses on one file share a
+    /// file lock, and a miss while a sibling decode still holds the file's
+    /// bytes decodes from them instead of downloading again.
+    ///
+    /// `Ok(None)` when the data itself is unusable (missing file, HDF5 open or
+    /// decode failure): the caller samples nodata, so one corrupt file degrades
+    /// to transparent rather than failing the whole request, and the key is
+    /// negatively cached. `Err` when the read was cut off by the request
+    /// deadline (`DeadlineExceeded`) or the store failed transiently
+    /// (`ResourceExhausted`): nothing is negatively cached and the caller must
+    /// fail the request, so no tile cache keeps an empty frame for it and a
+    /// retry reads again (#993).
     fn moment(
         &self,
         file_id: &str,
@@ -654,60 +1204,100 @@ impl Pixels<'_> {
         moment: &PolarMoment,
         nrays: usize,
         nbins: usize,
-    ) -> Option<Arc<RawPixels>> {
+    ) -> Result<Option<Arc<RawPixels>>, DataServerError> {
+        // A batched walk samples prefetched moments once per cell: answer it
+        // before touching the process-wide runtime registration, which only
+        // the cold path needs (Critical Rule 10).
         if let Some(moments) = self.moments {
-            return moments.get(&moment.dataset_path).cloned();
+            return Ok(moments.get(&moment.dataset_path).cloned());
+        }
+        let background = sibling_decode_runtime();
+        self.moment_with(file_id, volume, moment, nrays, nbins, background.as_ref())
+    }
+
+    /// [`Self::moment`] with the runtime for the sibling decode passed in,
+    /// so tests do not depend on the process-wide registration.
+    fn moment_with(
+        &self,
+        file_id: &str,
+        volume: &PolarVolume,
+        moment: &PolarMoment,
+        nrays: usize,
+        nbins: usize,
+        background: Option<&tokio::runtime::Handle>,
+    ) -> Result<Option<Arc<RawPixels>>, DataServerError> {
+        if let Some(moments) = self.moments {
+            return Ok(moments.get(&moment.dataset_path).cloned());
         }
         // Source-qualified key so two S3 sources can't collide in the global
         // cache (PR #290 review); the bare `file_id` stays the fetch path.
         let cache_id = pixel_cache_id(self.source, file_id);
         if let Some(p) = PIXEL_CACHE.get(&cache_id, &moment.dataset_path) {
-            return Some(p);
+            return Ok(Some(p));
         }
         // A previously-failed read degrades straight to nodata without
-        // re-fetching — a per-cell sampler loop (e.g. `volume_section`) must
+        // re-fetching — a per-cell sampler loop (e.g. `sample_section`) must
         // not storm the store, nor re-inflate the failure metric, on one bad
         // moment (PR #290 review).
         if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
-            return None;
+            return Ok(None);
         }
         PIXEL_CACHE.with_file_load(&cache_id, || {
+            // Held bytes before the cache recheck: a sibling decode releases
+            // them only after its last insert, so when none are held the
+            // recheck below already sees everything it decoded.
+            let held = PIXEL_CACHE.held_bytes(&cache_id);
             if let Some(p) = PIXEL_CACHE.get(&cache_id, &moment.dataset_path) {
-                return Some(p);
+                return Ok(Some(p));
             }
             if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
-                return None;
+                return Ok(None);
             }
             PIXEL_CACHE.record_miss();
-            let decoded = fetch_file_bytes(self.source, file_id, self.handle).and_then(|bytes| {
-                let requests = cold_batch_requests(volume, moment, nrays, nbins, &cache_id);
-                let mut requested = None;
-                crate::pvol::visit_moments_pixels(&bytes, requests, |path, result| match result {
-                    Ok(raw) => {
-                        let pixels = Arc::new(raw);
-                        if path == moment.dataset_path {
-                            requested = Some(pixels.clone());
-                        }
-                        PIXEL_CACHE.insert(&cache_id, path, pixels);
-                    }
-                    Err(e) => tracing::debug!("PVOL cold batch skipped `{path}`: {e}"),
+            // Held until the moment is decoded and cached (#1127).
+            let mut download = None;
+            let bytes = match held {
+                Some(bytes) => Ok(bytes),
+                None => fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
+                    download = read;
+                    bytes
+                }),
+            };
+            let decoded = bytes.and_then(|bytes| {
+                let path = moment.dataset_path.as_str();
+                let mut result = None;
+                crate::pvol::visit_moments_pixels(&bytes, [(path, nrays, nbins)], |_, r| {
+                    result = Some(r);
                 })
-                .map_err(|e| format!("open volume: {e}"))?;
-                requested.ok_or_else(|| format!("decode `{}` failed", moment.dataset_path))
+                .map_err(|e| PixelReadError::Bad(format!("open volume: {e}")))?;
+                let raw = match result {
+                    Some(Ok(raw)) => raw,
+                    Some(Err(e)) => {
+                        return Err(PixelReadError::Bad(format!("decode `{path}`: {e}")));
+                    }
+                    None => return Err(PixelReadError::Bad(format!("decode `{path}` failed"))),
+                };
+                let pixels = Arc::new(raw);
+                PIXEL_CACHE.insert(&cache_id, path, pixels.clone());
+                let siblings = sibling_requests(volume, moment, nrays, nbins, &cache_id);
+                spawn_sibling_decode(background, &cache_id, &bytes, siblings);
+                Ok(pixels)
             });
             match decoded {
-                Ok(pixels) => Some(pixels),
-                Err(e) => {
+                Ok(pixels) => Ok(Some(pixels)),
+                // Not the data's fault: fail this request, remember nothing.
+                Err(PixelReadError::Abort(e)) => Err(e),
+                Err(PixelReadError::Bad(e)) => {
                     // Count + log once per key; subsequent cells short-circuit on
                     // `is_known_bad` above.
                     if PIXEL_CACHE.mark_bad(&cache_id, &moment.dataset_path) {
                         PIXEL_READ_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!("PVOL lazy pixel read failed for `{file_id}`: {e}");
                     }
-                    None
+                    Ok(None)
                 }
             }
-        })
+        })?
     }
 }
 
@@ -777,6 +1367,10 @@ pub(crate) struct SiteMeta {
     /// is an O(1) `Arc` clone on the request path (no per-call `Vec` clone),
     /// per the `RasterInfo` rule (#211). Rebuilt on each catalog swap.
     volume_info: Arc<VolumeInfo>,
+    /// The site's one EDR location (id = NOD, label = PLC or the NOD, the
+    /// antenna point), pre-built so `EdrEngine::get_locations` is an `Arc`
+    /// clone (#1083). Rebuilt on each catalog swap.
+    location: Arc<LocationSnapshot>,
 }
 
 /// The engine's catalog: per-site time-sorted volume lists, plus the
@@ -796,12 +1390,16 @@ pub(crate) struct Catalog {
     pub(crate) by_site_meta: HashMap<String, SiteMeta>,
     /// `by_site_meta` keys pre-sorted at build time, so the network-inventory
     /// `FeatureEngine` never sorts per request (CLAUDE.md hot-path rule).
-    sorted_nods: Vec<String>,
+    pub(crate) sorted_nods: Vec<String>,
     /// Antenna-point bounding box `[w,s,e,n]` over all sites — the Features
     /// collection's spatial extent, precomputed so `spatial_extent()` is an
     /// O(1) snapshot read. Bounds the Feature *points* (what `bbox` filters
     /// on), not the wider radar coverage bboxes.
     features_extent: Option<[f64; 4]>,
+    /// Earliest and latest volume time over all sites — the Features
+    /// collection's temporal extent (#1143), the span its `datetime` filter
+    /// selects within, precomputed for an O(1) `temporal_extent()`.
+    features_time: Option<(DateTime<Utc>, DateTime<Utc>)>,
     /// Precomputed `data_version` content hash of the site inventory — a pure
     /// function of this snapshot, computed once at swap time instead of per
     /// (future) vector-tile render.
@@ -879,6 +1477,10 @@ const FETCH_CONCURRENCY: usize = 12;
 /// reusing already-parsed volumes from `cache` (keyed by file identity)
 /// so a poll cycle doesn't re-download / re-parse unchanged files.
 ///
+/// `cells_after` is the catalog a poll replaces: a downloaded volume newer
+/// than every volume it holds for the site gets its `CELLS` cell set built
+/// from the bytes in hand (#1155). `None` at construction.
+///
 /// Blocking — remote scans bridge async object-store I/O internally.
 fn scan_source(
     collection_id: &str,
@@ -887,6 +1489,7 @@ fn scan_source(
     max_files: Option<usize>,
     depth: ScanDepth,
     prewarm_sweeps: usize,
+    cells_after: Option<&Catalog>,
 ) -> Result<Catalog, EngineError> {
     match source {
         // A local directory is small and cheap to enumerate; the
@@ -910,7 +1513,14 @@ fn scan_source(
             // file whose name carries no parseable timestamp falls through
             // to the post-parse volume-time filter.
             pending.retain(|p| within_window_by_name(&p.id, time_filter));
-            let mut by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
+            let mut by_site = build_catalog(
+                collection_id,
+                pending,
+                source,
+                cache,
+                prewarm_sweeps,
+                cells_after,
+            );
             retain_within(&mut by_site, time_filter);
             Ok(derive_catalog(by_site, cache, max_files))
         }
@@ -922,7 +1532,14 @@ fn scan_source(
         } => {
             let (pending, time_filter) =
                 enumerate_remote(collection_id, store, prefix_pattern, time_window, depth)?;
-            let mut by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
+            let mut by_site = build_catalog(
+                collection_id,
+                pending,
+                source,
+                cache,
+                prewarm_sweeps,
+                cells_after,
+            );
             // A `time_window` also bounds the timestamps kept: the
             // object listing can include volumes just outside the
             // window (the prefix is a whole UTC day).
@@ -957,7 +1574,20 @@ fn within_window_by_name(id: &str, filter: Option<TimeRange>) -> bool {
     }
 }
 
-/// Enumerate `.h5` files directly in a local directory. Non-recursive.
+/// Whether `basename` names a polar volume a scan reads: a `.h5` file
+/// (any case) that is not a publisher's temporary name. A volume written
+/// as a hidden `.name.h5` and renamed once complete would otherwise be
+/// HDF5-parsed truncated (#1009). Shared by [`enumerate_local`] and
+/// [`enumerate_remote`].
+fn is_volume_name(basename: &str) -> bool {
+    let bytes = basename.as_bytes();
+    bytes.len() >= 3
+        && bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".h5")
+        && !temp_files::is_temporary(basename)
+}
+
+/// Enumerate `.h5` files directly in a local directory, skipping
+/// temporary names ([`is_volume_name`]). Non-recursive.
 fn enumerate_local(
     collection_id: &str,
     data_dir: &std::path::Path,
@@ -972,11 +1602,10 @@ fn enumerate_local(
     let mut pending = Vec::new();
     for entry in read_dir.flatten() {
         let path = entry.path();
-        let is_h5 = path
-            .extension()
-            .map(|e| e.eq_ignore_ascii_case("h5"))
-            .unwrap_or(false);
-        if !is_h5 || !path.is_file() {
+        let is_volume = path
+            .file_name()
+            .is_some_and(|name| is_volume_name(&name.to_string_lossy()));
+        if !is_volume || !path.is_file() {
             continue;
         }
         let id = path.display().to_string();
@@ -1108,7 +1737,7 @@ fn enumerate_remote(
     let mut candidates: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    for (prefix, listed) in prefixes.iter().zip(listings) {
+    for ((prefix, object_prefix), listed) in prefixes.iter().zip(&object_prefixes).zip(listings) {
         let listed = match listed {
             Ok(objects) => objects,
             Err(e) => {
@@ -1118,7 +1747,12 @@ fn enumerate_remote(
         };
         for obj in listed {
             let key = obj.location.to_string();
-            if !key.to_ascii_lowercase().ends_with(".h5") {
+            // The LIST is recursive: a volume staged in a hidden folder
+            // below the prefix (rsync `--delay-updates`' `.~tmp~/`) is
+            // still being written under its final name (#1029).
+            if !is_volume_name(key.rsplit('/').next().unwrap_or(&key))
+                || temp_files::in_hidden_folder(object_prefix.as_ref(), &key)
+            {
                 continue;
             }
             let ts = parse_key_timestamp(&key);
@@ -1212,6 +1846,7 @@ fn build_catalog(
     source: &Source,
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
     prewarm_sweeps: usize,
+    cells_after: Option<&Catalog>,
 ) -> HashMap<String, Vec<VolumeEntry>> {
     use ds_storage::object_store::path::Path as ObjectPath;
 
@@ -1258,6 +1893,9 @@ fn build_catalog(
                         // cache ids (bare paths) are reload-stable, so the
                         // `contains` skip inside `prewarm_pixels` no-ops it.
                         prewarm_pixels(source, &id, &v, &bytes, prewarm_sweeps);
+                        if newest_of_site(cells_after, &v) {
+                            crate::cells::warm_from_bytes(source, &id, &v, &bytes);
+                        }
                         insert_volume(collection_id, &mut by_site, id, v);
                     }
                 }
@@ -1290,10 +1928,18 @@ fn build_catalog(
     // parsed into compact `PolarVolume`s and the chunk's bytes freed before
     // the next chunk is fetched. This parallelises the dominant scan cost —
     // the per-file S3 download — turning a sequential ~N×RTT stall into
-    // ~N/concurrency.
+    // ~N/concurrency. The scan runs on the poll runtime or at engine
+    // construction, never for a request, so each file gets the background
+    // budget: a stalled attempt is retried instead of dropping the volume
+    // until the next poll (#1011).
     for chunk in remote_fetch.chunks(FETCH_CONCURRENCY) {
         let paths: Vec<ObjectPath> = chunk.iter().map(|(_, p)| p.clone()).collect();
-        let results = match store.get_many(&paths, FETCH_CONCURRENCY, Some(MAX_REMOTE_FILE_SIZE)) {
+        let results = match store.get_many_with_budget(
+            &paths,
+            FETCH_CONCURRENCY,
+            Some(MAX_REMOTE_FILE_SIZE),
+            ds_storage::FetchBudget::Background,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("[{collection_id}] PVOL batch fetch failed: {e}");
@@ -1310,6 +1956,9 @@ fn build_catalog(
                         // of a cold whole-`.h5` S3 re-download on a render
                         // permit (#461; the local arm does the same — #472).
                         prewarm_pixels(source, id, &v, &bytes, prewarm_sweeps);
+                        if newest_of_site(cells_after, &v) {
+                            crate::cells::warm_from_bytes(source, id, &v, &bytes);
+                        }
                         insert_volume(collection_id, &mut by_site, id.clone(), v);
                     }
                 }
@@ -1321,6 +1970,19 @@ fn build_catalog(
     }
 
     by_site
+}
+
+/// Whether a poll's freshly downloaded `volume` is newer than every volume
+/// the catalog it replaces (`previous`) holds for its site: in steady state
+/// the one new scan per site and poll, which the `CELLS` layer's next tiles
+/// all track (#1155). Older downloads (a first poll backfilling history
+/// after the bootstrap scan) and new sites are left to
+/// [`crate::cells::warm_windows`], which goes newest first and is bounded.
+fn newest_of_site(previous: Option<&Catalog>, volume: &PolarVolume) -> bool {
+    previous
+        .zip(volume.site.nod.as_ref())
+        .and_then(|(catalog, nod)| catalog.by_site.get(nod)?.last())
+        .is_some_and(|newest| volume.time > newest.volume.time)
 }
 
 /// Parse `bytes` into a `PolarVolume`, insert into the shared parse cache
@@ -1375,10 +2037,8 @@ fn parse_and_cache(
 /// transient background decode hiccup must not blacklist a moment for
 /// requests) and skips any moment already resident (a beyond-`max_files`
 /// volume re-fetched on a later poll keeps its primed pixels — see
-/// [`PixelCache::contains`]). Sweeps are stored elevation-ascending, so the
-/// first `n_sweeps` are the lowest tilts — the standard base-reflectivity
-/// animation view, all of their quantities. Overflow of the byte-bounded
-/// cache evicts by LRU like any other entry.
+/// [`PixelCache::contains`]). Which moments: see [`prewarm_requests`].
+/// Overflow of the byte-bounded cache evicts like any other entry.
 fn prewarm_pixels(
     source: &Source,
     file_id: &str,
@@ -1390,15 +2050,8 @@ fn prewarm_pixels(
         return;
     }
     let cache_id = pixel_cache_id(source, file_id);
-    let requests: Vec<(&str, usize, usize)> = volume
-        .sweeps
-        .iter()
-        .take(n_sweeps)
-        .flat_map(|s| {
-            s.moments
-                .iter()
-                .map(move |m| (m.dataset_path.as_str(), s.nrays, s.nbins))
-        })
+    let requests: Vec<(&str, usize, usize)> = prewarm_requests(volume, n_sweeps)
+        .into_iter()
         // Skip moments a request (or an earlier poll) already cached, so a
         // re-fetched trimmed volume doesn't re-decode every poll. Advisory, not
         // a hard guard: a concurrent insert between this `contains` and the
@@ -1422,6 +2075,56 @@ fn prewarm_pixels(
         // the lazy request path; only the warm-ahead is lost.
         Err(e) => tracing::warn!("[pvol] pixel pre-warm skipped for `{file_id}`: {e}"),
     }
+}
+
+/// The moments [`prewarm_pixels`] decodes: the lowest `n_sweeps` sweeps
+/// (sweeps are stored elevation-ascending), and of those only the volume's
+/// default quantity ([`default_quantity_of`]), which is what an unqualified
+/// WMS/Maps/Tiles layer renders: the base-reflectivity animation view.
+///
+/// Not every moment of the base sweep (#992): an FMI base sweep carries
+/// about a dozen, so warming them all wrote several times the bytes any
+/// animation reads and pushed the reflectivity frames out of the pixel
+/// cache. Other quantities, other WMS layers and EDR read lazily on first
+/// use and are cached from then on.
+fn prewarm_requests(volume: &PolarVolume, n_sweeps: usize) -> Vec<(&str, usize, usize)> {
+    let mut quantities: Vec<&str> = volume
+        .sweeps
+        .iter()
+        .flat_map(|s| s.moments.iter().map(|m| m.quantity.as_str()))
+        .collect();
+    quantities.sort_unstable();
+    quantities.dedup();
+    let Some(quantity) = default_quantity_of(&quantities) else {
+        return Vec::new();
+    };
+    volume
+        .sweeps
+        .iter()
+        .take(n_sweeps)
+        .flat_map(|s| {
+            s.moments
+                .iter()
+                .filter(move |m| m.quantity == quantity)
+                .map(move |m| (m.dataset_path.as_str(), s.nrays, s.nbins))
+        })
+        .collect()
+}
+
+/// The quantity an unqualified request renders, from a site's or volume's
+/// alphabetically sorted quantity list: corrected reflectivity `DBZH`, then
+/// total `TH`, else the first. One home for the rule, so the advertised
+/// default, the bare-layer render and the poll-time pre-warm cannot drift.
+fn default_quantity_of<Q: AsRef<str>>(sorted_quantities: &[Q]) -> Option<&str> {
+    ["DBZH", "TH"]
+        .into_iter()
+        .find_map(|preferred| {
+            sorted_quantities
+                .iter()
+                .map(AsRef::as_ref)
+                .find(|q| *q == preferred)
+        })
+        .or_else(|| sorted_quantities.first().map(AsRef::as_ref))
 }
 
 /// Group one parsed volume under its radar `nod`, applying the
@@ -1513,7 +2216,7 @@ fn derive_catalog(
     // own radar without re-deriving from sweeps per request.
     let by_site_meta: HashMap<String, SiteMeta> = by_site
         .iter()
-        .filter_map(|(nod, list)| Some((nod.clone(), derive_site_meta(list)?)))
+        .filter_map(|(nod, list)| Some((nod.clone(), derive_site_meta(nod, list)?)))
         .collect();
 
     // Precompute the network-inventory FeatureEngine's per-request answers once
@@ -1521,6 +2224,7 @@ fn derive_catalog(
     let mut sorted_nods: Vec<String> = by_site_meta.keys().cloned().collect();
     sorted_nods.sort();
     let features_extent = features_extent_of(&by_site_meta);
+    let features_time = features_time_of(&by_site_meta);
     let feature_version = feature_version_of(&sorted_nods, &by_site_meta);
 
     Catalog {
@@ -1528,6 +2232,7 @@ fn derive_catalog(
         by_site_meta,
         sorted_nods,
         features_extent,
+        features_time,
         feature_version,
     }
 }
@@ -1537,7 +2242,7 @@ fn derive_catalog(
 /// Returns `None` for a site whose most-recent volume has no sweeps or no
 /// moment datasets (an entirely malformed file) — such a site is dropped
 /// from `by_site_meta` and is never registered as a collection.
-fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
+fn derive_site_meta(nod: &str, list: &[VolumeEntry]) -> Option<SiteMeta> {
     let latest = list.last()?;
     let site = &latest.volume.site;
 
@@ -1642,11 +2347,8 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
     // clutter-correction quality field: defined across the *whole* volume
     // ("full cones") with near-zero values that wash out to white on the dBZ
     // colormap. Every quantity stays selectable; only the default changes.
-    let default_quantity = ["DBZH", "TH"]
-        .into_iter()
-        .find(|q| quantities.iter().any(|x| x == q))
+    let default_quantity = default_quantity_of(&quantities)
         .map(str::to_string)
-        .or_else(|| quantities.first().cloned())
         .unwrap_or_default();
     let default_unit = quantities::quantity_unit(&default_quantity).to_string();
     // 3D Tiles coverage region: the WGS84 coverage bbox (→ radians) plus a
@@ -1705,6 +2407,12 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         });
     }
 
+    let location = Arc::new(LocationSnapshot::new(vec![Location {
+        id: nod.to_owned(),
+        label: site.plc.clone().unwrap_or_else(|| nod.to_owned()),
+        latitude: site.lat,
+        longitude: site.lon,
+    }]));
     Some(SiteMeta {
         lon: site.lon,
         lat: site.lat,
@@ -1719,6 +2427,7 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         lowest_sweep_range_m,
         vertical,
         volume_info,
+        location,
     })
 }
 
@@ -1736,12 +2445,12 @@ pub struct PolarVolumeEngine {
     /// Local directory or S3/HTTP object store, re-scanned by the poll loop.
     /// Behind an `Arc` so per-site views can hold it cheaply for lazy pixel
     /// re-fetches.
-    source: Arc<Source>,
+    pub(crate) source: Arc<Source>,
     /// Per-site cap on retained volumes (`OdimConfig.max_files`) — keeps
     /// an archive source from loading every file into the catalog.
     max_files: Option<usize>,
     /// Lock-free catalog snapshot for `raster_info()` + `get_raster_tile`.
-    catalog: Arc<ArcSwap<Catalog>>,
+    pub(crate) catalog: Arc<ArcSwap<Catalog>>,
     /// Parse cache of **metadata-only** [`PolarVolume`]s keyed by file
     /// identity (local path string or S3 object key — see [`FileId`]) so a
     /// poll doesn't re-parse unchanged files' structure. Tiny now that
@@ -1820,6 +2529,7 @@ impl PolarVolumeEngine {
             config.max_files,
             ScanDepth::Bootstrap,
             config.prewarm_sweeps,
+            None,
         )?;
         if catalog.by_site.is_empty() {
             // With a `time_window`, an empty catalog can also mean every file
@@ -1862,6 +2572,12 @@ impl PolarVolumeEngine {
     /// when [`shutdown`](Self::shutdown) is called. Mirrors
     /// `OdimEngine::poll_loop` — the shared [`ds_poll::Shutdown`] ticker.
     pub async fn poll_loop(&self) {
+        // This loop runs on the background runtime: cold pixel misses hand
+        // their sibling decodes to it (#994).
+        set_sibling_decode_runtime(tokio::runtime::Handle::current());
+        // The construction scan built no cell sets: warm the newest `CELLS`
+        // windows now rather than one poll interval later (#1155).
+        self.warm_cells();
         let mut ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
         while ticker.tick().await {
             self.poll_once().await;
@@ -1901,6 +2617,7 @@ impl PolarVolumeEngine {
             None,
             ScanDepth::Full,
             1,
+            None,
         )?;
         Ok(Self {
             collection_id: collection_id.to_string(),
@@ -1934,11 +2651,12 @@ impl PolarVolumeEngine {
     /// volumes are dropped until an admin reload). Mirrors the GRIB /
     /// GeoTIFF / QueryData poll loops, which also call their blocking scan
     /// directly on the poll runtime.
-    async fn poll_once(&self) {
+    pub(crate) async fn poll_once(&self) {
         // Full scan: the poll runs on the background runtime, so downloading
         // and parsing the whole `time_window` here is off the request path
         // and off the startup path. This is what backfills the history the
         // bootstrap scan in `new` deliberately skipped.
+        let prev = self.catalog.load_full();
         match scan_source(
             &self.collection_id,
             &self.source,
@@ -1946,9 +2664,9 @@ impl PolarVolumeEngine {
             self.max_files,
             ScanDepth::Full,
             self.prewarm_sweeps,
+            Some(&prev),
         ) {
             Ok(catalog) => {
-                let prev = self.catalog.load();
                 // Aggregate signals across sites for change detection: site
                 // count, newest volume time, and total volume count.
                 let latest = |c: &Catalog| {
@@ -1978,6 +2696,22 @@ impl PolarVolumeEngine {
                 tracing::warn!("[{}] PVOL catalog refresh failed: {e}", self.collection_id);
             }
         }
+        self.warm_cells();
+    }
+
+    /// Build the `CELLS` cell sets the newest windows still lack, bounded
+    /// per call ([`crate::cells::warm_windows`], #1155). Blocking: on the
+    /// background poll runtime worker, like the scan.
+    fn warm_cells(&self) {
+        let started = std::time::Instant::now();
+        let built = crate::cells::warm_windows(&self.source, &self.catalog.load());
+        if built > 0 {
+            tracing::debug!(
+                "[{}] built {built} PVOL cell set(s) ahead of the CELLS layer in {:?}",
+                self.collection_id,
+                started.elapsed()
+            );
+        }
     }
 }
 
@@ -2005,7 +2739,7 @@ fn sample_sweep_moment(
 /// Like [`sample_sweep_moment`] but **classifying** the gate (#360): an
 /// out-of-range / malformed target is `Masked` (genuinely unmeasured),
 /// while a sampled gate that is clear air returns `Undetect`. The
-/// ground-range analog of [`sample_polar_slant_class`] — the z-pinned EDR
+/// ground-range analog of [`slant_cell`] + [`sample_slant_cell`] — the z-pinned EDR
 /// series uses it to tell "the radar looked and saw nothing" (a valid
 /// null observation) from "the radar never measured here" (drop → 404).
 fn sample_sweep_moment_class(
@@ -2162,11 +2896,46 @@ fn sample_sweep_moment_bilinear(
 /// The sweep whose elevation angle is nearest `target` degrees. `None`
 /// only when the volume has no sweeps.
 fn nearest_sweep(volume: &PolarVolume, target: f64) -> Option<&Sweep> {
-    volume.sweeps.iter().min_by(|a, b| {
-        (a.elangle - target)
-            .abs()
-            .total_cmp(&(b.elangle - target).abs())
-    })
+    nearest_sweep_index(volume, target).map(|i| &volume.sweeps[i])
+}
+
+/// The index in `volume.sweeps` of [`nearest_sweep`].
+fn nearest_sweep_index(volume: &PolarVolume, target: f64) -> Option<usize> {
+    volume
+        .sweeps
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (a.elangle - target)
+                .abs()
+                .total_cmp(&(b.elangle - target).abs())
+        })
+        .map(|(i, _)| i)
+}
+
+/// The sweep a map of `quantity` draws for `z`: among the sweeps that
+/// carry the moment, the one nearest `z`, else the lowest. `None` when no
+/// sweep carries it. A blind lowest or nearest pick would 400 on a quantity
+/// only higher sweeps carry (split-cut scan strategies), though it is
+/// advertised: the parameter list unions across sweeps. `sweeps` is sorted
+/// ascending by elangle (M1), so the first candidate is the lowest.
+///
+/// Shared by [`polar_sample`] and the site view's
+/// `MapEngine::resolve_elevation`, so WMS GetFeatureInfo asks the position
+/// query for the sweep GetMap draws (#1064).
+fn drawn_sweep<'v>(volume: &'v PolarVolume, quantity: &str, z: Option<f64>) -> Option<&'v Sweep> {
+    let mut candidates = volume
+        .sweeps
+        .iter()
+        .filter(|s| s.moments.iter().any(|m| m.quantity == quantity));
+    match z {
+        Some(target) => candidates.min_by(|a, b| {
+            (a.elangle - target)
+                .abs()
+                .total_cmp(&(b.elangle - target).abs())
+        }),
+        None => candidates.next(),
+    }
 }
 
 /// Resample one polar moment of a sweep into a Cartesian output grid.
@@ -2197,8 +2966,9 @@ fn nearest_sweep(volume: &PolarVolume, target: f64) -> Option<&Sweep> {
 /// elevation sweep this M2 interim, the near-horizon geometry keeps the
 /// slant-vs-ground discrepancy small.
 ///
-/// `z` selects the elevation sweep: `Some(angle)` renders the sweep
-/// nearest that angle, `None` renders the lowest sweep.
+/// `z` selects the elevation sweep through [`drawn_sweep`]: `Some(angle)`
+/// renders the sweep nearest that angle, `None` the lowest, among the
+/// sweeps carrying `quantity`.
 #[allow(clippy::too_many_arguments)]
 fn polar_sample(
     volume: &PolarVolume,
@@ -2212,33 +2982,12 @@ fn polar_sample(
     z: Option<f64>,
     resampling: ResamplingMethod,
 ) -> Result<RasterTile, DataServerError> {
-    // Pick the sweep that actually carries `quantity`: nearest to `z` (or
-    // the lowest when `z` is absent) *among the sweeps that contain the
-    // moment*. A blind lowest/nearest pick would 400 on a quantity that is
-    // only present on higher sweeps (split-cut scan strategies), even
-    // though it is advertised (the parameter list unions across sweeps).
-    // `sweeps` is sorted ascending by elangle (M1), so the first matching
-    // candidate is the lowest sweep that has the quantity.
-    let mut candidates = volume
-        .sweeps
-        .iter()
-        .filter(|s| s.moments.iter().any(|m| m.quantity == quantity))
-        .peekable();
-    if candidates.peek().is_none() {
-        return Err(DataServerError::InvalidParameter(format!(
+    let sweep = drawn_sweep(volume, quantity, z).ok_or_else(|| {
+        DataServerError::InvalidParameter(format!(
             "quantity `{quantity}` is not present in any sweep of PVOL site `{}`",
             volume.site.nod.as_deref().unwrap_or("?")
-        )));
-    }
-    let sweep = match z {
-        Some(target) => candidates.min_by(|a, b| {
-            (a.elangle - target)
-                .abs()
-                .total_cmp(&(b.elangle - target).abs())
-        }),
-        None => candidates.next(),
-    }
-    .expect("non-empty candidate set checked above");
+        ))
+    })?;
 
     let moment = sweep
         .moments
@@ -2255,10 +3004,11 @@ fn polar_sample(
 
     // Lazily fetch this one moment's pixel array (cache hit, or read the
     // single dataset from the re-fetched file bytes) — once, before the
-    // per-pixel loop. A read failure yields an all-transparent tile rather
+    // per-pixel loop. Unusable data yields an all-transparent tile rather
     // than a 500: the file may have rotated out from under us, and the next
-    // poll/request recovers.
-    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
+    // poll/request recovers. A deadline or transient fetch failure is the
+    // render's error instead, so no tile cache keeps the frame empty (#993).
+    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins)? else {
         return Ok(RasterTile {
             width,
             height,
@@ -2401,7 +3151,7 @@ fn quantity_description(quantity: &str) -> ParameterDescription {
 /// dual-PRF `VRADH`/`WRADH`), and a quantity may drop out of the newest
 /// scan (firmware change / reduced strategy) while earlier volumes in the
 /// window still carry it — intersected with the optional `parameters`
-/// filter. `volume_profile`/`level_series` map a missing moment in any one
+/// filter. `sample_profile`/`level_series` map a missing moment in any one
 /// timestep to `None`, so unioning here never fabricates data; it only
 /// keeps a quantity queryable for the timesteps that actually have it.
 fn resolve_quantities(
@@ -2434,13 +3184,34 @@ fn resolve_quantities(
     Ok(quantities)
 }
 
-/// Snap requested elevation angles to the catalog's canonical sweep-angle
-/// set, dropping duplicates while preserving request order.
+/// How far (degrees) a requested elevation angle may lie from an advertised
+/// sweep angle and still select that sweep: half the 0.1° step
+/// [`round_elevation`] publishes sweep angles at. An advertised angle
+/// already stands for every raw sweep angle within ±0.05° of it, so a
+/// requested angle in the same band names the same sweep (`z=0.30001`
+/// selects 0.3°), and one outside every band names none (`z=50` on a
+/// 0.3–9° volume). EDR 1.2 `/req/edr/z-response` B: only sweeps whose
+/// angle intersects `z` may be returned.
+const SWEEP_MATCH_TOLERANCE_DEG: f64 = 0.05;
+
+/// Whether the advertised sweep angle `level` matches the requested
+/// `want`, per [`SWEEP_MATCH_TOLERANCE_DEG`]. The band is inclusive; the
+/// `1e-9` absorbs binary rounding of decimal angles, so `1.55` lies
+/// within it of both 1.5° and 1.6°.
+fn sweep_matches(level: f64, want: f64) -> bool {
+    (level - want).abs() <= SWEEP_MATCH_TOLERANCE_DEG + 1e-9
+}
+
+/// Match requested elevation angles to the catalog's canonical sweep-angle
+/// set: each keeps the nearest sweep within [`SWEEP_MATCH_TOLERANCE_DEG`],
+/// and one with no sweep that close drops out. Duplicates collapse while
+/// request order holds.
 fn snap_levels(requested: &[f64], canonical: &[f64]) -> Vec<f64> {
     let mut out: Vec<f64> = Vec::new();
     for &want in requested {
         if let Some(&lvl) = canonical
             .iter()
+            .filter(|lvl| sweep_matches(**lvl, want))
             .min_by(|a, b| (**a - want).abs().total_cmp(&(**b - want).abs()))
         {
             if !out.contains(&lvl) {
@@ -2451,16 +3222,95 @@ fn snap_levels(requested: &[f64], canonical: &[f64]) -> Vec<f64> {
     out
 }
 
-/// One `VerticalProfile` coverage: every elevation sweep of `entry`'s
-/// volume sampled at WGS84 `(lon, lat)`, with the sweep angles as the
-/// `z` axis.
-fn volume_profile(
-    entry: &VolumeEntry,
+/// The sweep and moment a point query reads for `quantity` at the
+/// advertised elevation angle `level`. For a split cut (two sweeps at the
+/// same nominal angle, e.g. a surveillance and a Doppler cut), the *first*
+/// sweep that carries the quantity is authoritative — its sample stands
+/// even when nodata, so a genuine no-echo is not silently replaced by the
+/// sibling's measurement. Shared by the samplers and their prefetch (#994),
+/// so a batch holds exactly the moments the walk reads.
+fn level_target<'v>(
+    volume: &'v PolarVolume,
+    level: f64,
+    quantity: &str,
+) -> Option<(&'v Sweep, &'v PolarMoment)> {
+    volume.sweeps.iter().find_map(|s| {
+        if round_elevation(s.elangle) != level {
+            return None;
+        }
+        s.moments
+            .iter()
+            .find(|m| m.quantity == quantity)
+            .map(|m| (s, m))
+    })
+}
+
+/// Walk `entries` in time order, one volume file at a time, and return what
+/// `sample` makes of each (#999). `prepare` names the moments a volume's
+/// sampler reads, plus whatever geometry the sampler keeps, and `sample`
+/// reads exactly those from the volume's batch ([`Pixels::prefetch`]: one
+/// GET and one HDF5 open per file, #994).
+///
+/// Up to [`MAX_WALK_VOLUMES_IN_FLIGHT`] volumes are prepared ahead, and the
+/// remote files among them that the batch will read are downloaded
+/// concurrently on the runtime ([`Pixels::read_ahead_runtime`]) through
+/// `ds_storage`'s started reads — async tasks, never a thread per file
+/// (root CLAUDE.md Critical Rules 7 and 9). A file another request is
+/// downloading is joined instead ([`RemoteRead`], #1127). Each volume is
+/// still decoded and sampled on the caller's thread, in order, from the same
+/// batch as a sequential walk reads, and dropped before the next download
+/// starts, so the results are the sequential walk's and at most that many
+/// volumes are fetched or decoded at once.
+///
+/// The first error ends the walk and is its result, as before (#993): the
+/// request deadline, checked before each volume and bounding every wait for
+/// a download, or a transient read failure. Downloads still running are
+/// dropped, which aborts those no other request holds, and no volume after
+/// the failing one is decoded or marked bad. A missing object stays
+/// unusable data: nodata, negatively cached (#996).
+fn walk_volumes<'v, S, T>(
     pix: Pixels,
-    lon: f64,
-    lat: f64,
-    quantities: &[String],
-) -> Option<QueryResult> {
+    entries: &[&'v VolumeEntry],
+    mut prepare: impl FnMut(&'v VolumeEntry) -> (Vec<(&'v Sweep, &'v PolarMoment)>, S),
+    mut sample: impl FnMut(&'v VolumeEntry, S, Pixels) -> Result<T, DataServerError>,
+) -> Result<Vec<T>, DataServerError> {
+    let runtime = pix.read_ahead_runtime(entries.len());
+    let mut rest = entries.iter().copied();
+    let mut ahead = std::collections::VecDeque::with_capacity(MAX_WALK_VOLUMES_IN_FLIGHT);
+    let mut out = Vec::with_capacity(entries.len());
+    while !ahead.is_empty() || rest.len() > 0 {
+        // A deadline stops the walk at the volume it reached (#993), before
+        // another download starts.
+        ds_core::deadline::check()?;
+        // Top up to the cap, counting the volume about to be sampled: the
+        // previous one, and its batch, are dropped by now.
+        while ahead.len() < MAX_WALK_VOLUMES_IN_FLIGHT {
+            let Some(entry) = rest.next() else {
+                break;
+            };
+            let (targets, state) = prepare(entry);
+            let read = runtime
+                .as_ref()
+                .and_then(|runtime| pix.start_read(&entry.id, &targets, runtime));
+            ahead.push_back((entry, targets, state, read));
+        }
+        let Some((entry, targets, state, mut read)) = ahead.pop_front() else {
+            break;
+        };
+        // The download stays joinable until its moments are decoded, so a
+        // request that needs the file meanwhile does not download it again
+        // (#1127).
+        let fetched = read.as_mut().map(|read| read.wait(pix.handle));
+        let batch = pix.prefetch(&entry.id, targets, fetched)?;
+        drop(read);
+        out.push(sample(entry, state, pix.batched(&batch))?);
+    }
+    Ok(out)
+}
+
+/// The `z` axis of a profile of `volume`: its sweeps' distinct advertised
+/// elevation angles, ascending.
+fn profile_levels(volume: &PolarVolume) -> Vec<f64> {
     // A radar may run split cuts — two sweeps at the same nominal
     // elevation angle (e.g. separate surveillance and Doppler scans),
     // so the raw per-sweep angles can repeat (FMI volumes carry two
@@ -2468,8 +3318,7 @@ fn volume_profile(
     // (`uniqueItems`), so collapse to distinct angles — matching the
     // catalog's deduped vertical extent — and sample each quantity from
     // whichever sweep at that angle carries it.
-    let mut levels: Vec<f64> = entry
-        .volume
+    let mut levels: Vec<f64> = volume
         .sweeps
         .iter()
         .map(|s| round_elevation(s.elangle))
@@ -2481,42 +3330,86 @@ fn volume_profile(
     levels.retain(|v| v.is_finite());
     levels.sort_by(f64::total_cmp);
     levels.dedup();
+    levels
+}
+
+/// Every (quantity × level) moment a profile of `volume` reads, fetched with
+/// one GET of the file (#994), not one per quantity.
+fn profile_targets<'v>(
+    volume: &'v PolarVolume,
+    levels: &[f64],
+    quantities: &[String],
+) -> Vec<(&'v Sweep, &'v PolarMoment)> {
+    quantities
+        .iter()
+        .flat_map(|quantity| {
+            levels
+                .iter()
+                .filter_map(move |&level| level_target(volume, level, quantity))
+        })
+        .collect()
+}
+
+/// One `VerticalProfile` coverage, as [`site_coverages`] builds it for each
+/// volume of its walk: a one-volume walk, for tests.
+#[cfg(test)]
+fn volume_profile(
+    entry: &VolumeEntry,
+    pix: Pixels,
+    lon: f64,
+    lat: f64,
+    quantities: &[String],
+) -> Result<Option<QueryResult>, DataServerError> {
+    let profiles = walk_volumes(
+        pix,
+        &[entry],
+        |e| {
+            let levels = profile_levels(&e.volume);
+            (profile_targets(&e.volume, &levels, quantities), levels)
+        },
+        |e, levels, pix| sample_profile(e, pix, lon, lat, quantities, levels),
+    )?;
+    Ok(profiles.into_iter().flatten().next())
+}
+
+/// One `VerticalProfile` coverage: every elevation sweep of `entry`'s
+/// volume sampled at WGS84 `(lon, lat)`, with the sweep angles as the
+/// `z` axis. `pix` holds the volume's batch for `levels`
+/// ([`profile_levels`], [`profile_targets`]).
+fn sample_profile(
+    entry: &VolumeEntry,
+    pix: Pixels,
+    lon: f64,
+    lat: f64,
+    quantities: &[String],
+    levels: Vec<f64>,
+) -> Result<Option<QueryResult>, DataServerError> {
     // No usable sweep (a severely malformed volume where every elangle was
     // non-finite) — skip this coverage rather than emit a `VerticalProfile`
     // with an empty z axis, which the CoverageJSON schema rejects
-    // (`numericValuesAxis.values` has `minItems: 1`).
+    // (`numericValuesAxis.values` has `minItems: 1`). Its batch is empty:
+    // nothing was fetched for it.
     if levels.is_empty() {
-        return None;
+        return Ok(None);
     }
     let (site_lon, site_lat) = (entry.volume.site.lon, entry.volume.site.lat);
 
     let mut ranges = HashMap::new();
     let mut param_descs = HashMap::new();
     for quantity in quantities {
-        let values: Vec<Option<f64>> = levels
-            .iter()
-            .map(|&level| {
-                // For a split cut (two sweeps at the same nominal angle, e.g.
-                // a surveillance and a Doppler cut), the *first* sweep that
-                // carries the quantity is authoritative — its sample stands
-                // even when nodata, so a genuine no-echo is not silently
-                // replaced by the sibling's measurement.
-                entry
-                    .volume
-                    .sweeps
-                    .iter()
-                    .find(|s| {
-                        round_elevation(s.elangle) == level
-                            && s.moments.iter().any(|m| m.quantity == *quantity)
-                    })
-                    .and_then(|sweep| {
-                        let moment = sweep.moments.iter().find(|m| m.quantity == *quantity)?;
-                        let pixels =
-                            pix.moment(&entry.id, &entry.volume, moment, sweep.nrays, sweep.nbins)?;
+        let mut values: Vec<Option<f64>> = Vec::with_capacity(levels.len());
+        for &level in &levels {
+            let target = level_target(&entry.volume, level, quantity);
+            let value = match target {
+                Some((sweep, moment)) => pix
+                    .moment(&entry.id, &entry.volume, moment, sweep.nrays, sweep.nbins)?
+                    .and_then(|pixels| {
                         sample_sweep_moment(sweep, moment, &pixels, site_lon, site_lat, lon, lat)
-                    })
-            })
-            .collect();
+                    }),
+                None => None,
+            };
+            values.push(value);
+        }
         ranges.insert(
             quantity.clone(),
             NdArray {
@@ -2528,7 +3421,7 @@ fn volume_profile(
         param_descs.insert(quantity.clone(), quantity_description(quantity));
     }
 
-    Some(QueryResult {
+    Ok(Some(QueryResult {
         domain: DomainDescription::VerticalProfile {
             x: lon,
             y: lat,
@@ -2540,89 +3433,130 @@ fn volume_profile(
         },
         parameters: param_descs,
         ranges,
-    })
+    }))
 }
 
-/// One `PointSeries` coverage pinned to elevation angle `level`: the
-/// sweep nearest `level` in each selected volume, sampled at `(lon, lat)`.
+/// One `PointSeries` coverage per advertised elevation angle in `levels`:
+/// in each selected volume, the sweep at that angle, sampled at
+/// `(lon, lat)`. As in [`sample_profile`], a split cut's first sweep that
+/// carries the quantity is authoritative ([`level_target`]). A volume
+/// without a sweep at a level (an older scan strategy in the window) has
+/// no sample there, never a neighbouring sweep's (`/req/edr/z-response` B).
 ///
-/// The returned flag is "this level ever *measured* the point": at least
+/// The walk is volume-major ([`walk_volumes`]): each volume file's
+/// (quantity × level) moments are prefetched with one GET (#994), the next
+/// few files downloading meanwhile (#999), and released before the next
+/// volume, so a series over several levels and quantities never fetches a
+/// file twice nor holds more than one volume's batch.
+///
+/// Each result's flag is "this level ever *measured* the point": at least
 /// one sample classified `Value` or `Undetect` across every quantity and
 /// timestep. Clear air (`Undetect`) is a measurement — the radar looked
 /// and saw nothing — and serialises as CoverageJSON `null`; only `Masked`
-/// (out of the nearest sweep's range, sweep lacks the quantity, unreadable
-/// pixels) means the point was never observed. The caller drops the level
-/// when the flag is false.
-fn level_series(
-    selected: &[&VolumeEntry],
+/// (out of the sweep's range, no sweep at the level carries the quantity,
+/// unreadable pixels) means the point was never observed. The caller
+/// drops a level whose flag is false.
+fn level_series<'v>(
+    selected: &[&'v VolumeEntry],
     pix: Pixels,
     lon: f64,
     lat: f64,
-    level: f64,
+    levels: &[f64],
     quantities: &[String],
     times: &[DateTime<Utc>],
-) -> (QueryResult, bool) {
-    let mut ranges = HashMap::new();
-    let mut param_descs = HashMap::new();
-    let mut measured = false;
-    for quantity in quantities {
-        let values: Vec<Option<f64>> = selected
+) -> Result<Vec<(QueryResult, bool)>, DataServerError> {
+    // values[level][quantity][volume]
+    let mut values: Vec<Vec<Vec<Option<f64>>>> = levels
+        .iter()
+        .map(|_| {
+            quantities
+                .iter()
+                .map(|_| Vec::with_capacity(selected.len()))
+                .collect()
+        })
+        .collect();
+    let mut measured = vec![false; levels.len()];
+    let targets = |e: &'v VolumeEntry| {
+        let targets = levels
             .iter()
-            .map(|e| {
-                let class = nearest_sweep(&e.volume, level)
-                    .and_then(|sweep| {
-                        let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
-                        let pixels =
-                            pix.moment(&e.id, &e.volume, moment, sweep.nrays, sweep.nbins)?;
-                        Some(sample_sweep_moment_class(
-                            sweep,
-                            moment,
-                            &pixels,
-                            e.volume.site.lon,
-                            e.volume.site.lat,
-                            lon,
-                            lat,
-                        ))
-                    })
-                    .unwrap_or(PixelClass::Masked);
-                match class {
+            .flat_map(|&level| {
+                quantities
+                    .iter()
+                    .filter_map(move |quantity| level_target(&e.volume, level, quantity))
+            })
+            .collect();
+        (targets, ())
+    };
+    walk_volumes(pix, selected, targets, |e, (), pix| {
+        for (li, &level) in levels.iter().enumerate() {
+            for (qi, quantity) in quantities.iter().enumerate() {
+                let class = match level_target(&e.volume, level, quantity) {
+                    Some((sweep, moment)) => pix
+                        .moment(&e.id, &e.volume, moment, sweep.nrays, sweep.nbins)?
+                        .map(|pixels| {
+                            sample_sweep_moment_class(
+                                sweep,
+                                moment,
+                                &pixels,
+                                e.volume.site.lon,
+                                e.volume.site.lat,
+                                lon,
+                                lat,
+                            )
+                        })
+                        .unwrap_or(PixelClass::Masked),
+                    None => PixelClass::Masked,
+                };
+                values[li][qi].push(match class {
                     PixelClass::Value(v) => {
-                        measured = true;
+                        measured[li] = true;
                         Some(v)
                     }
                     PixelClass::Undetect => {
-                        measured = true;
+                        measured[li] = true;
                         None
                     }
                     PixelClass::Masked => None,
-                }
-            })
-            .collect();
-        ranges.insert(
-            quantity.clone(),
-            NdArray {
-                shape: vec![times.len()],
-                axis_names: vec!["t".to_string()],
-                values,
-            },
-        );
-        param_descs.insert(quantity.clone(), quantity_description(quantity));
-    }
+                });
+            }
+        }
+        Ok(())
+    })?;
 
-    let result = QueryResult {
-        domain: DomainDescription::PointSeries {
-            x: lon,
-            y: lat,
-            t: times.to_vec(),
-            z: Some(VerticalCoord {
-                kind: VerticalKind::ElevationAngle,
-                values: vec![level],
-            }),
-        },
-        parameters: param_descs,
-        ranges,
-    };
-    (result, measured)
+    Ok(levels
+        .iter()
+        .zip(values)
+        .zip(measured)
+        .map(|((&level, per_quantity), measured)| {
+            let mut ranges = HashMap::new();
+            let mut param_descs = HashMap::new();
+            for (quantity, values) in quantities.iter().zip(per_quantity) {
+                ranges.insert(
+                    quantity.clone(),
+                    NdArray {
+                        shape: vec![times.len()],
+                        axis_names: vec!["t".to_string()],
+                        values,
+                    },
+                );
+                param_descs.insert(quantity.clone(), quantity_description(quantity));
+            }
+            let result = QueryResult {
+                domain: DomainDescription::PointSeries {
+                    x: lon,
+                    y: lat,
+                    t: times.to_vec(),
+                    z: Some(VerticalCoord {
+                        kind: VerticalKind::ElevationAngle,
+                        values: vec![level],
+                    }),
+                },
+                parameters: param_descs,
+                ranges,
+            };
+            (result, measured)
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -2704,9 +3638,8 @@ fn resample_path(vertices: &[(f64, f64)]) -> Vec<(f64, f64)> {
 
 /// The elevation-angle window `[lo, hi]` (degrees) for a cross-section.
 ///
-/// `z` carries the requested elevation angles (resolved by the API layer
-/// against the collection's advertised extent — an interval `0.3/15`
-/// arrives as the angles in range). `None`/empty selects the volume's
+/// `z` carries the selected sweep angles (`site_trajectory` matches the
+/// requested ones with [`resolve_levels`] first). `None`/empty selects the volume's
 /// full sweep span. The window is clamped to the volume's actual sweep
 /// range so a heterogeneous fleet (a site missing an advertised angle)
 /// degrades to nodata rather than fabricating data.
@@ -2716,9 +3649,10 @@ fn resample_path(vertices: &[(f64, f64)]) -> Vec<(f64, f64)> {
 /// - `InvalidParameter` when an explicit `z` list falls **entirely**
 ///   outside the surveyed range, e.g. `z=40,50` on a 0.5–25° radar — the
 ///   clamp would otherwise invert to `(40, 25)` and silently produce an
-///   all-nodata Section. (The interval form is already rejected earlier
-///   by `resolve_z_levels`; this guards the comma-list form, which the
-///   API layer passes through unvalidated.)
+///   all-nodata Section. `site_trajectory` passes the sweep angles
+///   `resolve_levels` matched in the site's catalog, so this trips only
+///   when the newest volume surveys none of them (an older scan
+///   strategy's angles).
 fn angle_window(z: Option<&[f64]>, volume: &PolarVolume) -> Result<(f64, f64), DataServerError> {
     let (smin, smax) = sweep_envelope(volume)
         .ok_or_else(|| DataServerError::Engine("PVOL volume has no finite sweep angles".into()))?;
@@ -2778,7 +3712,7 @@ fn height_axis(hi_angle_deg: f64, max_ground_dist_m: f64) -> Vec<f64> {
 ///
 /// The angle is deliberately NOT clamped to `>= 0` (unlike `height_axis`,
 /// whose clamp only sizes the axis ceiling): the sampling mask
-/// (`sample_polar_slant_class`) compares raw angles against the envelope,
+/// ([`slant_cell`]) compares raw angles against the envelope,
 /// and real networks run a slightly negative lowest tilt from
 /// terrain-elevated sites — clamping here would draw the floor above
 /// cells the volume actually observed. A negative-tilt floor correctly
@@ -2812,72 +3746,47 @@ fn sweep_envelope(volume: &PolarVolume) -> Option<(f64, f64)> {
     lo.is_finite().then_some((lo, hi))
 }
 
-/// Sample one moment of a polar volume at *slant-range, azimuth* — the
-/// cross-section variant of `sample_sweep_moment`. Picks the sweep
-/// nearest `elangle_deg`, then maps `slant_range` to a range bin and
-/// `azimuth_deg` to an azimuth ray. `None` when the point is outside
-/// the sweep's range or the bin is nodata/undetect.
+/// The `(sweep index, ray, bin)` gate a polar volume's *slant-range,
+/// azimuth* target lands in — the cross-section variant of
+/// `sample_sweep_moment`'s lookup. Picks the sweep nearest `elangle_deg`,
+/// then maps `slant_range` to a range bin and `azimuth_deg` to an azimuth
+/// ray. `None` when the target is unmeasured whatever the quantity: outside
+/// the sweep envelope or range (the cone of silence, beyond max range,
+/// below the lowest beam) or a malformed sweep. Pure geometry, no pixel
+/// read: a cross-section computes it once per cell, prefetches the sweeps
+/// the cells hit (#994), then samples every quantity with
+/// [`sample_slant_cell`].
 ///
 /// `envelope` is the volume's `(min_el, max_el)` precomputed by the
 /// caller — required, not recomputed per call. With up to
-/// `nodes × z_levels × quantities ≈ 5e5` calls per volume and ~20
-/// sweeps each, an in-function fold would burn ~10 M iterations per
-/// request on a serving worker, breaking the CLAUDE.md hot-path rule.
+/// `nodes × z_levels ≈ 4e4` calls per volume and ~20 sweeps each, an
+/// in-function fold would burn millions of iterations per request on a
+/// serving worker, breaking the CLAUDE.md hot-path rule.
 ///
 /// Distinct from `sample_sweep_moment` so the existing ground-range
 /// interim (used by position/area/Map paths) is untouched: the slant
-/// range here comes from the 4/3-Earth inversion in `volume_section`,
+/// range here comes from the 4/3-Earth inversion in `section_plan`,
 /// not from a ground-range fixup.
-#[allow(clippy::too_many_arguments)]
-fn sample_polar_slant(
+///
+/// `keep`, when given, is one flag per `volume.sweeps` entry: the sweeps a
+/// `z` selected (EDR 1.2 `/req/edr/z-response` B). A cell whose nearest
+/// sweep is not kept is `None` — never the nearest *kept* sweep, which
+/// would show one sweep's data at another sweep's beam angle.
+fn slant_cell(
     volume: &PolarVolume,
-    file_id: &str,
-    pix: Pixels,
     envelope: (f64, f64),
-    quantity: &str,
+    keep: Option<&[bool]>,
     slant_range_m: f64,
     azimuth_deg: f64,
     elangle_deg: f64,
-) -> Option<f64> {
-    // Point-cloud / EDR path: only real values; clear-air `Undetect` and
-    // `Masked` both collapse to `None` (no point), unchanged from before #360.
-    match sample_polar_slant_class(
-        volume,
-        file_id,
-        pix,
-        envelope,
-        quantity,
-        slant_range_m,
-        azimuth_deg,
-        elangle_deg,
-    ) {
-        PixelClass::Value(v) => Some(v),
-        PixelClass::Undetect | PixelClass::Masked => None,
+) -> Option<(usize, usize, usize)> {
+    let index = nearest_sweep_index(volume, elangle_deg)?;
+    if keep.is_some_and(|keep| !keep.get(index).copied().unwrap_or(false)) {
+        return None;
     }
-}
-
-/// Like [`sample_polar_slant`] but **classifies** the cell (#360): an out-of-
-/// envelope / out-of-range / malformed target is `Masked` (genuinely
-/// unmeasured — the cone of silence, beyond max range, below the lowest beam),
-/// while a sampled gate that is clear air returns `Undetect`. The voxel-grid
-/// sampler uses this to fill clear air with a finite "no echo" floor (so an
-/// isosurface seals against it) while leaving `Masked` cells `NaN`.
-#[allow(clippy::too_many_arguments)]
-fn sample_polar_slant_class(
-    volume: &PolarVolume,
-    file_id: &str,
-    pix: Pixels,
-    envelope: (f64, f64),
-    quantity: &str,
-    slant_range_m: f64,
-    azimuth_deg: f64,
-    elangle_deg: f64,
-) -> PixelClass {
-    let Some(sweep) = nearest_sweep(volume, elangle_deg) else {
-        return PixelClass::Masked;
-    };
+    let sweep = &volume.sweeps[index];
     if sweep.nrays == 0 || sweep.nbins == 0 {
-        return PixelClass::Masked;
+        return None;
     }
     // Reject targets outside the sweep envelope (see the constant's doc
     // for the rationale). Pre-computed envelope keeps this O(1) per cell.
@@ -2886,7 +3795,7 @@ fn sample_polar_slant_class(
         || elangle_deg < min_el - SWEEP_ENVELOPE_TOL_DEG
         || elangle_deg > max_el + SWEEP_ENVELOPE_TOL_DEG
     {
-        return PixelClass::Masked;
+        return None;
     }
     // A malformed sweep with `rscale <= 0` would silently mis-sample:
     // `rscale = 0` makes the divisor zero (a NaN cast to `i64` becomes
@@ -2896,33 +3805,128 @@ fn sample_polar_slant_class(
     // defensive guard here is cheap and keeps a corrupted file from
     // ever surfacing fabricated values.
     if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
-        return PixelClass::Masked;
+        return None;
     }
-    let Some(moment) = sweep.moments.iter().find(|m| m.quantity == *quantity) else {
-        return PixelClass::Masked;
-    };
     let bin = ((slant_range_m - sweep.rstart) / sweep.rscale).floor() as i64;
     if bin < 0 || bin >= sweep.nbins as i64 {
-        return PixelClass::Masked;
+        return None;
     }
     let ray = (azimuth_deg / (360.0 / sweep.nrays as f64)).floor() as usize % sweep.nrays;
-    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
-        return PixelClass::Masked;
+    Some((index, ray, bin as usize))
+}
+
+/// One cross-section cell's value: [`slant_cell`] then
+/// [`sample_slant_cell`], with clear-air `Undetect` and `Masked` both
+/// `None`, as `sample_section` emits them.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn sample_polar_slant(
+    volume: &PolarVolume,
+    file_id: &str,
+    pix: Pixels,
+    envelope: (f64, f64),
+    keep: Option<&[bool]>,
+    quantity: &str,
+    slant_range_m: f64,
+    azimuth_deg: f64,
+    elangle_deg: f64,
+) -> Result<Option<f64>, DataServerError> {
+    let class = match slant_cell(
+        volume,
+        envelope,
+        keep,
+        slant_range_m,
+        azimuth_deg,
+        elangle_deg,
+    ) {
+        Some(cell) => sample_slant_cell(volume, file_id, pix, quantity, cell)?,
+        None => PixelClass::Masked,
     };
-    pixels.sample_class(
+    Ok(match class {
+        PixelClass::Value(v) => Some(v),
+        PixelClass::Undetect | PixelClass::Masked => None,
+    })
+}
+
+/// The moment of `cell`'s sweep that carries `quantity`, if any.
+fn slant_cell_moment<'v>(
+    volume: &'v PolarVolume,
+    quantity: &str,
+    (index, _, _): (usize, usize, usize),
+) -> Option<(&'v Sweep, &'v PolarMoment)> {
+    let sweep = &volume.sweeps[index];
+    let moment = sweep.moments.iter().find(|m| m.quantity == quantity)?;
+    Some((sweep, moment))
+}
+
+/// Classify `quantity` at a [`slant_cell`] gate: `Masked` when the sweep
+/// does not carry the quantity or its pixels are unusable.
+fn sample_slant_cell(
+    volume: &PolarVolume,
+    file_id: &str,
+    pix: Pixels,
+    quantity: &str,
+    cell: (usize, usize, usize),
+) -> Result<PixelClass, DataServerError> {
+    let Some((sweep, moment)) = slant_cell_moment(volume, quantity, cell) else {
+        return Ok(PixelClass::Masked);
+    };
+    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins)? else {
+        return Ok(PixelClass::Masked);
+    };
+    let (_, ray, bin) = cell;
+    Ok(pixels.sample_class(
         ray,
-        bin as usize,
+        bin,
         moment.gain,
         moment.offset,
         moment.nodata,
         Some(moment.undetect),
-    )
+    ))
 }
 
-/// Build one `Section` coverage: the volume's polar field resampled on
-/// `(along-path-distance, height-above-antenna)` and exposed via the
-/// CoverageJSON composite axis `[t, lon, lat]` plus a numeric `z` axis
-/// in metres. `window` is the caller's selected elevation-angle band
+/// One `Section` coverage of `entry`'s volume, as [`site_trajectory`]
+/// builds it for each volume of its walk ([`section_plan`], then
+/// [`sample_section`]): a one-volume walk, for tests.
+#[cfg(test)]
+fn volume_section(
+    entry: &VolumeEntry,
+    pix: Pixels,
+    path: &[(f64, f64)],
+    heights_m: &[f64],
+    quantities: &[String],
+    window: (f64, f64),
+    levels: Option<&[f64]>,
+) -> Result<Option<QueryResult>, DataServerError> {
+    let sections = walk_volumes(
+        pix,
+        &[entry],
+        |e| match section_plan(e, path, heights_m, quantities, window, levels) {
+            Some((plan, targets)) => (targets, Some(plan)),
+            None => (Vec::new(), None),
+        },
+        |e, plan, pix| {
+            plan.map(|plan| sample_section(e, plan, pix, path, heights_m, quantities))
+                .transpose()
+        },
+    )?;
+    Ok(sections.into_iter().flatten().next())
+}
+
+/// A section's geometry in one volume, computed before its file is read, so
+/// a walk can name the moments it reads ahead of reading them (#999).
+struct SectionPlan {
+    /// Lowest-beam coverage floor per node (#514).
+    coverage_floor: Vec<f64>,
+    /// Each cell's gate, row-major `[node][height]` — shared by every
+    /// quantity.
+    cells: Vec<Option<(usize, usize, usize)>>,
+}
+
+/// Plan one `Section` coverage of `entry`'s volume ([`sample_section`]):
+/// the volume's polar field resampled on `(along-path-distance,
+/// height-above-antenna)`, each cell's gate computed here, before the file
+/// is read. `window` is the caller's selected elevation-angle band
 /// `[lo, hi]` (from `z`) — cells whose 4/3-Earth-inverted beam angle
 /// falls outside it become nodata.
 ///
@@ -2932,14 +3936,25 @@ fn sample_polar_slant_class(
 /// lower ceiling must not have a cell that inverts to (say) 20° matched
 /// to its 10° top sweep — intersecting per entry keeps each timestep
 /// honest about the angles it actually surveyed.
-fn volume_section(
-    entry: &VolumeEntry,
-    pix: Pixels,
+///
+/// `levels` are the advertised sweep angles a `z` selected (`None`: every
+/// sweep). A cell then samples only when its nearest sweep is one of them
+/// (matched as position matches a level, by [`round_elevation`]), so the
+/// section shows exactly the selected sweeps' cells of the unfiltered
+/// section and nothing of the sweeps between them (EDR 1.2
+/// `/req/edr/z-response` B).
+///
+/// Returns the plan and the moments the section reads: every quantity at
+/// each sweep a cell lands in (#994). `None` when the volume has no
+/// section to show.
+fn section_plan<'v>(
+    entry: &'v VolumeEntry,
     path: &[(f64, f64)],
     heights_m: &[f64],
     quantities: &[String],
     window: (f64, f64),
-) -> Option<QueryResult> {
+    levels: Option<&[f64]>,
+) -> Option<(SectionPlan, Vec<(&'v Sweep, &'v PolarMoment)>)> {
     if path.len() < 2 || heights_m.is_empty() || quantities.is_empty() {
         return None;
     }
@@ -2949,10 +3964,16 @@ fn volume_section(
     // (an inverted envelope rejects every beam angle).
     let entry_env = sweep_envelope(&entry.volume)?;
     let envelope = (window.0.max(entry_env.0), window.1.min(entry_env.1));
+    // One flag per sweep, built once per entry so the per-cell check is O(1).
+    let keep: Option<Vec<bool>> = levels.map(|levels| {
+        entry
+            .volume
+            .sweeps
+            .iter()
+            .map(|s| levels.contains(&round_elevation(s.elangle)))
+            .collect()
+    });
     let site = &entry.volume.site;
-    let t = entry.volume.time;
-    let nodes: Vec<(DateTime<Utc>, f64, f64)> =
-        path.iter().map(|&(lon, lat)| (t, lon, lat)).collect();
 
     // Per-node geometry from the radar antenna — computed once and shared
     // across every quantity and every z level.
@@ -2972,6 +3993,57 @@ fn volume_section(
         .map(|&(d, _)| beam_height_at_ground(envelope.0, d))
         .collect();
 
+    // Each cell's gate, row-major [node][height] — geometry only, shared by
+    // every quantity. The sweeps the cells land in name exactly the moments
+    // the section reads, prefetched with one GET of the file (#994).
+    let cells: Vec<Option<(usize, usize, usize)>> = geom
+        .iter()
+        .flat_map(|&(d, bearing)| {
+            let keep = keep.as_deref();
+            heights_m.iter().map(move |&h| {
+                let (r, el) = ground_height_to_slant(d, h);
+                slant_cell(&entry.volume, envelope, keep, r, bearing, el)
+            })
+        })
+        .collect();
+    let mut hit = vec![false; entry.volume.sweeps.len()];
+    for &(index, _, _) in cells.iter().flatten() {
+        hit[index] = true;
+    }
+    let volume: &'v PolarVolume = &entry.volume;
+    let targets = quantities
+        .iter()
+        .flat_map(|quantity| {
+            let hit = &hit;
+            (0..volume.sweeps.len())
+                .filter(move |&index| hit[index])
+                .filter_map(move |index| slant_cell_moment(volume, quantity, (index, 0, 0)))
+        })
+        .collect();
+    Some((
+        SectionPlan {
+            coverage_floor,
+            cells,
+        },
+        targets,
+    ))
+}
+
+/// One `Section` coverage from `plan` ([`section_plan`]): exposed via the
+/// CoverageJSON composite axis `[t, lon, lat]` plus a numeric `z` axis in
+/// metres, sampled from `pix`, which holds the volume's batch for the
+/// plan's moments.
+fn sample_section(
+    entry: &VolumeEntry,
+    plan: SectionPlan,
+    pix: Pixels,
+    path: &[(f64, f64)],
+    heights_m: &[f64],
+    quantities: &[String],
+) -> Result<QueryResult, DataServerError> {
+    let t = entry.volume.time;
+    let nodes: Vec<(DateTime<Utc>, f64, f64)> =
+        path.iter().map(|&(lon, lat)| (t, lon, lat)).collect();
     let mut ranges = HashMap::new();
     let mut param_descs = HashMap::new();
     let nz = heights_m.len();
@@ -2979,20 +4051,17 @@ fn volume_section(
 
     for quantity in quantities {
         let mut values: Vec<Option<f64>> = Vec::with_capacity(nn * nz);
-        for &(d, bearing) in &geom {
-            for &h in heights_m {
-                let (r, el) = ground_height_to_slant(d, h);
-                values.push(sample_polar_slant(
-                    &entry.volume,
-                    &entry.id,
-                    pix,
-                    envelope,
-                    quantity,
-                    r,
-                    bearing,
-                    el,
-                ));
-            }
+        for cell in &plan.cells {
+            let class = match *cell {
+                Some(cell) => sample_slant_cell(&entry.volume, &entry.id, pix, quantity, cell)?,
+                None => PixelClass::Masked,
+            };
+            // Only real values: clear-air `Undetect` and `Masked` are both
+            // `None` (no point), unchanged from before #360.
+            values.push(match class {
+                PixelClass::Value(v) => Some(v),
+                PixelClass::Undetect | PixelClass::Masked => None,
+            });
         }
         ranges.insert(
             quantity.clone(),
@@ -3005,14 +4074,14 @@ fn volume_section(
         param_descs.insert(quantity.clone(), quantity_description(quantity));
     }
 
-    Some(QueryResult {
+    Ok(QueryResult {
         domain: DomainDescription::Section {
             nodes,
             z: VerticalCoord {
                 kind: VerticalKind::HeightAboveAntenna,
                 values: heights_m.to_vec(),
             },
-            coverage_floor: Some(coverage_floor),
+            coverage_floor: Some(plan.coverage_floor),
         },
         parameters: param_descs,
         ranges,
@@ -3053,31 +4122,38 @@ fn site_coverages(
     let quantities = resolve_quantities(&selected, parameters)?;
 
     match levels {
-        None => Ok(selected
-            .iter()
-            // `filter_map` drops volumes that produced no plottable profile
-            // (every elangle non-finite — `volume_profile` returns `None`).
-            .filter_map(|e| volume_profile(e, pix, lon, lat, &quantities))
-            .collect()),
+        // `flatten` drops volumes that produced no plottable profile (every
+        // elangle non-finite — `sample_profile` returns `Ok(None)`); the
+        // walk stops at the first deadline or transient read error and
+        // returns it (#993).
+        None => {
+            let profiles = walk_volumes(
+                pix,
+                &selected,
+                |e| {
+                    let levels = profile_levels(&e.volume);
+                    (profile_targets(&e.volume, &levels, &quantities), levels)
+                },
+                |e, levels, pix| sample_profile(e, pix, lon, lat, &quantities, levels),
+            )?;
+            Ok(profiles.into_iter().flatten().collect())
+        }
         Some(lvls) => {
             let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
-            Ok(lvls
-                .iter()
-                // Drop a level only when the point was never *measured*
-                // there — every sample `Masked` (out of the nearest sweep's
-                // range, or the sweep carries no data for the quantity).
-                // Clear air (`undetect`) IS a measurement — the radar looked
-                // and saw nothing — so an all-clear-air series is kept and
-                // serves HTTP 200 with null values; collapsing it into the
-                // 404 made "no rain at this point for an hour" an error.
-                // With every level dropped, `finalize_single_site` turns the
-                // empty result into a 404.
-                .filter_map(|&lvl| {
-                    let (qr, measured) =
-                        level_series(&selected, pix, lon, lat, lvl, &quantities, &times);
-                    measured.then_some(qr)
-                })
-                .collect())
+            // Drop a level only when the point was never *measured* there —
+            // every sample `Masked` (out of the sweep's range, or no sweep at
+            // the level carries the quantity). Clear air (`undetect`) IS a
+            // measurement — the radar looked and saw nothing — so an
+            // all-clear-air series is kept and serves HTTP 200 with null
+            // values; collapsing it into the 404 made "no rain at this point
+            // for an hour" an error. With every level dropped,
+            // `finalize_single_site` turns the empty result into a 404.
+            Ok(
+                level_series(&selected, pix, lon, lat, lvls, &quantities, &times)?
+                    .into_iter()
+                    .filter_map(|(qr, measured)| measured.then_some(qr))
+                    .collect(),
+            )
         }
     }
 }
@@ -3086,7 +4162,9 @@ fn site_coverages(
 /// advertised sweep angles. `None` (or an empty selector) means "every
 /// level — a profile". `canonical` is the collection's (or site's)
 /// advertised vertical axis; `None` there means the collection exposes no
-/// sweeps to select with `z` (a 400).
+/// sweeps to select with `z` (a 400). A requested angle keeps a sweep only
+/// within [`SWEEP_MATCH_TOLERANCE_DEG`] of it; when none does, the request
+/// is a 400 like a `z` interval that selects no level.
 fn resolve_levels(
     canonical: Option<&[f64]>,
     z: Option<&[f64]>,
@@ -3100,7 +4178,14 @@ fn resolve_levels(
         )
     })?;
     let snapped = snap_levels(zs, canonical);
-    Ok((!snapped.is_empty()).then_some(snapped))
+    if snapped.is_empty() {
+        return Err(DataServerError::InvalidParameter(format!(
+            "`z` selects none of the collection's available levels: no elevation sweep \
+             lies within {SWEEP_MATCH_TOLERANCE_DEG}° of a requested angle \
+             (sweeps: {canonical:?})"
+        )));
+    }
+    Ok(Some(snapped))
 }
 
 /// Run a point-style EDR query (position / single-site location) against
@@ -3152,6 +4237,12 @@ fn resample_section_path(coords: &str) -> Result<Vec<(f64, f64)>, DataServerErro
 /// the path's farthest reach, and emits one `Section` per timestep
 /// (`Single` for one step, `Collection` otherwise). Shared by the network
 /// engine (after it picks the nearest site) and each per-site view.
+///
+/// `z` selects sweeps as on position and area ([`resolve_levels`] against
+/// the site's `canonical` sweep angles, within
+/// [`SWEEP_MATCH_TOLERANCE_DEG`]): a `z` matching no sweep is the same
+/// 400, and the section keeps only the matched sweeps' cells.
+#[allow(clippy::too_many_arguments)]
 fn site_trajectory(
     volumes: &[VolumeEntry],
     pix: Pixels,
@@ -3159,7 +4250,11 @@ fn site_trajectory(
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     parameters: Option<&[String]>,
     z: Option<&[f64]>,
+    canonical: Option<&[f64]>,
 ) -> Result<CoverageResponse, DataServerError> {
+    // EDR 1.2 `/req/edr/z-response` B: only sweeps whose angle intersects
+    // `z`. Validated before the time filter, as position does.
+    let levels = resolve_levels(canonical, z)?;
     let selected: Vec<&VolumeEntry> = match datetime {
         Some((start, end)) => volumes
             .iter()
@@ -3175,13 +4270,12 @@ fn site_trajectory(
 
     let quantities = resolve_quantities(&selected, parameters)?;
 
-    // `z` carries the requested elevation angles (resolved by the API
-    // layer against the advertised extent). Derive the angle window and
-    // the matching height axis from the most recent volume. An
-    // out-of-range `z` list surfaces as `InvalidParameter` (400) rather
-    // than a silently empty Section.
+    // The selected sweep angles bound the angle window; derive it and the
+    // matching height axis from the most recent volume. Selected angles
+    // the newest volume does not survey (an older scan strategy's) surface
+    // as `InvalidParameter` (400) rather than a silently empty Section.
     let ref_volume = &selected.last().unwrap().volume;
-    let window = angle_window(z, ref_volume)?;
+    let window = angle_window(levels.as_deref(), ref_volume)?;
     // The path's farthest ground distance from the radar sizes the
     // height-axis ceiling for the selected top angle.
     let max_ground_dist = path
@@ -3197,10 +4291,24 @@ fn site_trajectory(
         ));
     }
 
-    let coverages: Vec<QueryResult> = selected
-        .iter()
-        .filter_map(|e| volume_section(e, pix, path, &heights, &quantities, window))
-        .collect();
+    // The first deadline or transient read error ends the walk and is the
+    // response (504/503): the volumes after it are never decoded, let alone
+    // marked bad (#993).
+    let coverages: Vec<QueryResult> = walk_volumes(
+        pix,
+        &selected,
+        |e| match section_plan(e, path, &heights, &quantities, window, levels.as_deref()) {
+            Some((plan, targets)) => (targets, Some(plan)),
+            None => (Vec::new(), None),
+        },
+        |e, plan, pix| {
+            plan.map(|plan| sample_section(e, plan, pix, path, &heights, &quantities))
+                .transpose()
+        },
+    )?
+    .into_iter()
+    .flatten()
+    .collect();
     if coverages.is_empty() {
         return Err(DataServerError::LocationNotFound(
             "No PVOL volumes produced a section for the requested path".into(),
@@ -3409,9 +4517,10 @@ impl PolarVolumeEngine {
             "volume_count".into(),
             PropertyValue::Integer(meta.times.len() as i64),
         );
+        let site_collection = format!("{}-{}", self.collection_id, nod);
         props.insert(
             "collection".into(),
-            PropertyValue::String(format!("{}-{}", self.collection_id, nod)),
+            PropertyValue::String(site_collection.clone()),
         );
         Feature {
             id: nod.to_string(),
@@ -3420,6 +4529,11 @@ impl PolarVolumeEngine {
                 y: meta.lat,
             }),
             properties: Arc::new(props),
+            // The site's own collection, its volumes (#1143).
+            related: vec![ds_core::feature::Related {
+                target: ds_core::feature::RelatedTarget::Collection(site_collection),
+                title: "Radar site collection".into(),
+            }],
         }
     }
 }
@@ -3460,6 +4574,19 @@ fn features_extent_of(by_site_meta: &HashMap<String, SiteMeta>) -> Option<[f64; 
         });
     }
     acc
+}
+
+/// Earliest and latest volume time over all sites, or `None` without a
+/// volume. Computed once at catalog-build time.
+fn features_time_of(
+    by_site_meta: &HashMap<String, SiteMeta>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let first = by_site_meta
+        .values()
+        .filter_map(|m| m.times.first())
+        .min()?;
+    let last = by_site_meta.values().filter_map(|m| m.times.last()).max()?;
+    Some((*first, *last))
 }
 
 /// Opaque content hash of the whole site inventory — the FeatureEngine
@@ -3634,6 +4761,18 @@ impl FeatureEngine for PolarVolumeEngine {
         self.catalog.load().features_extent
     }
 
+    /// The retained volumes' span, which `datetime` selects sites within
+    /// (#1143). O(1) snapshot read — precomputed in `derive_catalog`.
+    fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.catalog.load().features_time
+    }
+
+    /// The collection's description is the network's, shared with its
+    /// per-site collections of volumes; its items are the sites (#1143).
+    fn items_description(&self) -> Option<&'static str> {
+        Some("Radar site inventory: one point per radar. Each site's volumes are in its own collection.")
+    }
+
     fn data_version(&self) -> u64 {
         // O(1) snapshot read — precomputed in `derive_catalog`.
         self.catalog.load().feature_version
@@ -3712,16 +4851,16 @@ impl MapEngine for PolarVolumeSiteView {
         // radar quantity (the bare quantity, no `<site>:` prefix). When no
         // quantity is named (a bare `LAYERS={site}` WMS request, or a Maps /
         // Tiles request with no `?parameter-name=`), default to the site's
-        // primary (first advertised) quantity — the same as
-        // `raster_info().parameter` — instead of erroring, matching the GRIB
-        // engine's default-parameter behaviour.
+        // advertised default quantity — the same as `raster_info().parameter`
+        // and what the poll-time pre-warm decodes — instead of erroring,
+        // matching the GRIB engine's default-parameter behaviour.
         let quantity = match parameter {
             Some(q) => q,
             None => catalog
                 .by_site_meta
                 .get(&self.nod)
-                .and_then(|m| m.quantities.first())
-                .map(|s| s.as_str())
+                .map(|m| m.volume_info.default_quantity.as_str())
+                .filter(|q| !q.is_empty())
                 .ok_or_else(|| {
                     DataServerError::InvalidParameter(format!(
                         "[{}] PVOL collection has no quantities to render",
@@ -3816,6 +4955,49 @@ impl MapEngine for PolarVolumeSiteView {
             .map(|e| e.volume.time)
             .or(time)
     }
+
+    /// The CELLS overlay (#367) draws tracked storm cells, not a moment: no
+    /// position query answers it, so WMS GetFeatureInfo does not (#1064).
+    fn layer_shows_values(&self, parameter: &str) -> bool {
+        parameter != crate::cells::CELLS_PARAMETER
+    }
+
+    /// The sweep angle `get_raster_tile` draws, through the SAME
+    /// `select_volume_entry` and `drawn_sweep`, rounded as the advertised
+    /// angles are: the sweep nearest `z`, else the lowest, among those that
+    /// carry the quantity. WMS GetFeatureInfo asks the position query for
+    /// it (#1064). The position query matches `z` to a sweep exactly and
+    /// reads only that one: on a split-cut scan whose lowest sweep lacks
+    /// the quantity, the advertised first angle has no value where the map
+    /// shows one, and an `ELEVATION` between sweeps would be a 400. CELLS
+    /// ignores `z`; a site without volumes echoes it.
+    fn resolve_elevation(
+        &self,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        time: Option<DateTime<Utc>>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Option<f64> {
+        if parameter == Some(crate::cells::CELLS_PARAMETER) {
+            return z;
+        }
+        let catalog = self.catalog.load();
+        let quantity = parameter.or_else(|| {
+            catalog
+                .by_site_meta
+                .get(&self.nod)
+                .map(|m| m.volume_info.default_quantity.as_str())
+        });
+        quantity
+            .zip(catalog.by_site.get(&self.nod))
+            .and_then(|(quantity, volumes)| {
+                let entry = select_volume_entry(volumes, time)?;
+                drawn_sweep(&entry.volume, quantity, z)
+            })
+            .map(|sweep| round_elevation(sweep.elangle))
+            .filter(|angle| angle.is_finite())
+            .or(z)
+    }
 }
 
 /// Build a 3-D point cloud from one polar volume: every valid cell of every
@@ -3823,7 +5005,7 @@ impl MapEngine for PolarVolumeSiteView {
 /// 4/3-Earth beam model (slant range → ground distance + height above the
 /// antenna), then offset from the antenna's ECEF position.
 ///
-/// This is the cross-section sampler ([`volume_section`]) generalized from a
+/// This is the cross-section sampler ([`section_plan`]) generalized from a
 /// 1-D path to the full `(sweep, ray, bin)` lattice. It uses real slant→ground
 /// geometry — unlike the 2-D [`polar_sample`], which renders with the
 /// ground-range interim. Azimuth is uniform `360/nrays` spacing (north-first,
@@ -3875,7 +5057,10 @@ fn volume_point_cloud(
         let Some(moment) = sweep.moments.iter().find(|m| m.quantity == quantity) else {
             continue;
         };
-        let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
+        // A 3D render resolves its quantity up front (`volume_moments`, which
+        // fails the request on a deadline or transient read), so this lookup
+        // never fetches; an absent moment is unusable data.
+        let Ok(Some(pixels)) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
             continue;
         };
         let deg_per_ray = 360.0 / sweep.nrays as f64;
@@ -3967,7 +5152,7 @@ const NO_ECHO_FLOOR: f32 = ds_core::volume::NO_ECHO_FLOOR_DBZ;
 /// Resample one polar volume into a regular cylindrical [`VoxelGrid`]: for each
 /// `(radius, azimuth, height)` cell centre, invert to `(slant_range, elevation)`
 /// via the 4/3-Earth beam model and classify the volume sample
-/// (`sample_polar_slant_class`, with its sweep-envelope guard). Three outcomes
+/// ([`slant_cell`], with its sweep-envelope guard). Three outcomes
 /// (#360): an echo → its value; **clear air** (`undetect`) → the finite
 /// [`NO_ECHO_FLOOR`] (so an isosurface seals against it); **unmeasured**
 /// (outside the beam fan — cone of silence, beyond range, below the lowest
@@ -3978,7 +5163,7 @@ const NO_ECHO_FLOOR: f32 = ds_core::volume::NO_ECHO_FLOOR_DBZ;
 /// not counted) — counted during the fill so the caller needn't re-scan up to
 /// `MAX_VOXELS` cells.
 /// One `(radius, height)` column of the voxel grid, resolved once and reused
-/// across all azimuths. Everything `sample_polar_slant_class` derives from the
+/// across all azimuths. Everything [`slant_cell`] + [`sample_slant_cell`] derive from the
 /// cell target *except* the ray index — the nearest sweep, the envelope/range
 /// guards, the moment, the range bin, and the decoded pixels — depends only on
 /// `(ground, height)`, never azimuth. Resolving per column turns the per-cell
@@ -4001,7 +5186,7 @@ enum ColumnTarget {
 }
 
 /// Resolve one `(slant_range, elevation)` target to its [`ColumnTarget`] —
-/// the azimuth-independent prefix of [`sample_polar_slant_class`], guard for
+/// the azimuth-independent prefix of [`slant_cell`] + [`sample_slant_cell`], guard for
 /// guard, so the two stay behaviourally identical.
 fn resolve_column(
     volume: &PolarVolume,
@@ -4035,7 +5220,8 @@ fn resolve_column(
     if bin < 0 || bin >= sweep.nbins as i64 {
         return ColumnTarget::Masked;
     }
-    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
+    // Prefetched by `volume_moments` like the point cloud's: never a fetch.
+    let Ok(Some(pixels)) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
         return ColumnTarget::Masked;
     };
     ColumnTarget::Gate {
@@ -4281,7 +5467,7 @@ impl PolarVolumeSiteView {
                 source: &self.source,
                 handle,
             };
-            let moments = pix.volume_moments(&entry.volume, &entry.id, quantity);
+            let moments = pix.volume_moments(&entry.volume, &entry.id, quantity)?;
             let pix = Pixels {
                 moments: Some(&moments),
                 ..pix
@@ -4292,6 +5478,40 @@ impl PolarVolumeSiteView {
         })?;
         Ok(result)
     }
+}
+
+/// [`voxel_grid_from_volume`] for a volume whose file's `bytes` are in hand:
+/// the background `CELLS` warm-up (#1155). Every sweep of `quantity` is
+/// decoded from them into memory of this call's own, never the pixel or
+/// voxel-grid caches, so warming a network's windows evicts no pre-warmed
+/// sweep (#992). A moment that does not decode is sampled as nodata, as a
+/// request's batch read leaves it.
+pub(crate) fn voxel_grid_from_bytes(
+    source: &Source,
+    file_id: &str,
+    volume: &PolarVolume,
+    quantity: &str,
+    dims: [usize; 3],
+    bytes: &[u8],
+) -> Result<(VoxelGrid, usize), DataServerError> {
+    let requests = volume.sweeps.iter().flat_map(|sweep| {
+        sweep
+            .moments
+            .iter()
+            .filter(|m| m.quantity == quantity)
+            .map(move |m| (m.dataset_path.as_str(), sweep.nrays, sweep.nbins))
+    });
+    let moments: MomentPixels = crate::pvol::read_moments_pixels(bytes, requests)
+        .map_err(|e| DataServerError::Engine(format!("open volume `{file_id}`: {e}")))?
+        .into_iter()
+        .map(|(path, pixels)| (path, Arc::new(pixels)))
+        .collect();
+    let pix = Pixels {
+        moments: Some(&moments),
+        source,
+        handle: None,
+    };
+    voxel_grid_from_volume(volume, file_id, pix, quantity, Some(dims))
 }
 
 impl VolumeEngine for PolarVolumeSiteView {
@@ -4311,7 +5531,7 @@ impl VolumeEngine for PolarVolumeSiteView {
             source: &self.source,
             handle: handle.as_ref(),
         };
-        let moments = pix.volume_moments(&entry.volume, &entry.id, &quantity);
+        let moments = pix.volume_moments(&entry.volume, &entry.id, &quantity)?;
         let pix = Pixels {
             moments: Some(&moments),
             ..pix
@@ -4386,18 +5606,34 @@ impl EdrEngine for PolarVolumeSiteView {
     /// and the point geometry is the antenna position. A 404 (not an empty
     /// list) when the site has dropped from `by_site_meta`, so the locations
     /// list and `query_location` agree on the same data condition.
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         let catalog = self.catalog.load();
         let m = catalog
             .by_site_meta
             .get(&self.nod)
             .ok_or_else(|| DataServerError::LocationNotFound(self.nod.clone()))?;
-        Ok(vec![Location {
-            id: self.nod.clone(),
-            label: m.plc.clone().unwrap_or_else(|| self.nod.clone()),
-            latitude: m.lat,
-            longitude: m.lon,
-        }])
+        Ok(Arc::clone(&m.location))
+    }
+
+    /// `/locations?datetime=` (#932): the site when one of its volumes falls
+    /// inside one of the intervals. The network's Features `datetime` rule
+    /// (`any_time_in_interval`, #285/#682) over the same volume times that
+    /// span the collection's temporal extent, and the volumes
+    /// `query_location` would answer with: a window between two volumes
+    /// matches nothing, as `/locations/{nod}` would answer 404 there.
+    fn location_time_filter<'a>(
+        &'a self,
+        intervals: &'a [DatetimeInterval],
+    ) -> Option<ds_core::edr_engine::LocationFilter<'a>> {
+        let catalog = self.catalog.load();
+        let has_volume = catalog.by_site_meta.get(&self.nod).is_some_and(|m| {
+            intervals
+                .iter()
+                .any(|interval| any_time_in_interval(&m.times, interval))
+        });
+        Some(Box::new(move |location| {
+            has_volume && location.id == self.nod
+        }))
     }
 
     /// Query this radar site by NOD code. The only valid `location_id` is
@@ -4632,6 +5868,13 @@ impl EdrEngine for PolarVolumeSiteView {
         Ok(CoverageResponse::Collection(covs))
     }
 
+    /// A radar volume answers a trajectory with the vertical cross-section
+    /// under a 2-D path (a `Section`), not the along-path sampling of the
+    /// gridded engines.
+    fn trajectory_shape(&self) -> TrajectoryShape {
+        TrajectoryShape::CrossSection
+    }
+
     /// Trajectory cross-section along a WKT `LINESTRING`, always against
     /// this one site (no nearest-radar pick). Same `Section` output shape
     /// as the network engine's [`query_trajectory`](PolarVolumeEngine).
@@ -4670,7 +5913,12 @@ impl EdrEngine for PolarVolumeSiteView {
             source: &self.source,
             handle: handle.as_ref(),
         };
-        site_trajectory(volumes, pix, &path, datetime, parameters, z)
+        let canonical = catalog
+            .by_site_meta
+            .get(&self.nod)
+            .and_then(|meta| meta.vertical.as_ref())
+            .map(|v| v.levels.as_slice());
+        site_trajectory(volumes, pix, &path, datetime, parameters, z, canonical)
     }
 }
 
@@ -4907,11 +6155,13 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
             elangle,
-        );
+        )
+        .unwrap();
         assert!(v.is_some(), "well-formed sweep must sample");
 
         for bad in [0.0_f64, -1_000.0, f64::NAN, f64::INFINITY] {
@@ -4922,11 +6172,13 @@ mod tests {
                     TEST_FILE,
                     test_pixels(),
                     env,
+                    None,
                     "DBZH",
                     range_m,
                     azimuth,
                     elangle
                 )
+                .unwrap()
                 .is_none(),
                 "rscale={bad} must yield None, not fabricated data"
             );
@@ -4958,33 +6210,39 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
             0.5
         )
+        .unwrap()
         .is_some());
         assert!(sample_polar_slant(
             &vol,
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
             1.4
         )
+        .unwrap()
         .is_some());
         assert!(sample_polar_slant(
             &vol,
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
             -0.4
         )
+        .unwrap()
         .is_some());
 
         // Just outside the window — None.
@@ -4993,22 +6251,26 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
             1.6
         )
+        .unwrap()
         .is_none());
         assert!(sample_polar_slant(
             &vol,
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
             -0.6
         )
+        .unwrap()
         .is_none());
 
         // Far outside — None (the 90° overhead case that bit the
@@ -5018,11 +6280,13 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
             90.0
         )
+        .unwrap()
         .is_none());
 
         // Non-finite el — None.
@@ -5031,11 +6295,13 @@ mod tests {
             TEST_FILE,
             test_pixels(),
             env,
+            None,
             "DBZH",
             range_m,
             azimuth,
             f64::NAN
         )
+        .unwrap()
         .is_none());
     }
 
@@ -5073,6 +6339,191 @@ mod tests {
             Err(DataServerError::InvalidParameter(_)) => {}
             other => panic!("expected InvalidParameter for out-of-range z, got {other:?}"),
         }
+    }
+
+    /// EDR 1.2 `/req/edr/z-response` B: a requested elevation angle keeps
+    /// a sweep only within `SWEEP_MATCH_TOLERANCE_DEG` of it, never the
+    /// nearest sweep at any distance; a `z` keeping none is a 400.
+    #[test]
+    fn resolve_levels_keeps_only_sweeps_within_tolerance() {
+        let canonical = [0.3, 0.4, 0.7, 1.5, 2.0, 3.0, 4.0, 5.0, 9.0];
+        let resolve = |z: &[f64]| resolve_levels(Some(&canonical), Some(z));
+        for (z, kept) in [
+            (&[0.3][..], &[0.3][..]),
+            (&[0.30001], &[0.3]),
+            // A list keeps its matching angles only.
+            (&[0.3, 50.0], &[0.3]),
+            // Both ends of the band are inclusive; one sweep is kept once.
+            (&[8.95, 9.05], &[9.0]),
+            (&[1.55, 0.4], &[1.5, 0.4]),
+        ] {
+            assert_eq!(resolve(z).unwrap().as_deref(), Some(kept), "{z:?}");
+        }
+        // Above, below and between the sweeps: no sweep's angle intersects.
+        for z in [&[50.0][..], &[-3.0], &[6.9], &[9.1], &[50.0, -3.0]] {
+            match resolve(z) {
+                Err(DataServerError::InvalidParameter(m)) => {
+                    assert!(m.contains("selects none"), "{m}")
+                }
+                other => panic!("{z:?}: expected InvalidParameter, got {other:?}"),
+            }
+        }
+        // No `z` is every sweep: a profile.
+        assert_eq!(resolve_levels(Some(&canonical), None).unwrap(), None);
+    }
+
+    /// The per-site position, location and area queries apply the
+    /// tolerance: `z=50` or `z=-3` on a 0.5° volume is a 400 (it used to
+    /// return the 0.5° sweep), and a list keeps its matching angle only.
+    #[test]
+    fn site_view_z_outside_every_sweep_is_400() {
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "v")],
+        );
+        let view = site_view_for(by_site, "fivih");
+        let dbzh = ["DBZH".to_string()];
+        let point = "POINT(25.0 60.1)";
+        for z in [&[50.0][..], &[-3.0]] {
+            for result in [
+                EdrEngine::query_position(&view, point, None, Some(&dbzh), Some(z), None),
+                EdrEngine::query_location(&view, "fivih", None, Some(&dbzh), Some(z), None),
+                EdrEngine::query_area(
+                    &view,
+                    "24.0,59.0,26.0,61.0",
+                    None,
+                    Some(&dbzh),
+                    Some(z),
+                    None,
+                ),
+            ] {
+                assert!(
+                    matches!(result, Err(DataServerError::InvalidParameter(_))),
+                    "{z:?}: {result:?}"
+                );
+            }
+        }
+        let response =
+            EdrEngine::query_position(&view, point, None, Some(&dbzh), Some(&[0.5, 50.0]), None)
+                .unwrap();
+        let CoverageResponse::Single(cov) = response else {
+            panic!("one matching angle is a single PointSeries, got {response:?}");
+        };
+        let DomainDescription::PointSeries { z: Some(z), .. } = &cov.domain else {
+            panic!("expected a PointSeries, got {:?}", cov.domain);
+        };
+        assert_eq!(z.values, vec![0.5]);
+    }
+
+    /// EDR 1.2 `/req/edr/z-response` B on the cross-section trajectory: a
+    /// `z` selects sweeps within `SWEEP_MATCH_TOLERANCE_DEG` as position
+    /// does (one between sweeps is the same 400), and the section shows
+    /// only the selected sweeps' cells. It used to treat `z` as an angle
+    /// band widened by ±1° and sample the nearest of *every* sweep, so
+    /// `z=0.7` returned 0.3°/0.4°/1.5° data and `z=1.1` a 200.
+    #[test]
+    fn site_view_trajectory_z_keeps_only_matching_sweeps() {
+        // Sweeps 0.3/0.4/0.7/1.5°, each a constant 3/4/7/15 so a cell
+        // tells which sweep it came from.
+        let base = synthetic_volume(25.0, 60.0);
+        let id = unique_file_id();
+        let mut vol = base.clone();
+        vol.sweeps = [(0.3, 3u16), (0.4, 4), (0.7, 7), (1.5, 15)]
+            .into_iter()
+            .map(|(el, value)| {
+                let mut sweep = base.sweeps[0].clone();
+                sweep.elangle = el;
+                let ds = format!("/dataset{value}/data1/data");
+                sweep.moments[0].dataset_path = ds.clone();
+                pixel_cache().insert(
+                    &id,
+                    &ds,
+                    Arc::new(RawPixels::U16(Array2::from_elem(
+                        (sweep.nrays, sweep.nbins),
+                        value,
+                    ))),
+                );
+                sweep
+            })
+            .collect();
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![VolumeEntry {
+                id,
+                volume: Arc::new(vol),
+            }],
+        );
+        let view = site_view_for(by_site, "fivih");
+        // Due north, 22–89 km: inside the 100 km range, low beams included.
+        let line = "LINESTRING(25.0 60.2, 25.0 60.8)";
+        let sources = |z: Option<&[f64]>| -> std::collections::BTreeSet<u64> {
+            let response = EdrEngine::query_trajectory(&view, line, None, None, z, None).unwrap();
+            let CoverageResponse::Single(cov) = response else {
+                panic!("one volume is one Section, got {response:?}");
+            };
+            cov.ranges["DBZH"]
+                .values
+                .iter()
+                .flatten()
+                .map(|v| *v as u64)
+                .collect()
+        };
+
+        let all = sources(None);
+        assert!(all.len() >= 3, "no z draws every sweep in range: {all:?}");
+        assert_eq!(
+            sources(Some(&[0.7])),
+            [7].into(),
+            "z=0.7 is that sweep only"
+        );
+        assert_eq!(
+            sources(Some(&[0.70001])),
+            [7].into(),
+            "within the tolerance names the same sweep"
+        );
+        let pair = sources(Some(&[0.3, 1.5]));
+        assert!(
+            !pair.is_empty() && pair.is_subset(&[3, 15].into()),
+            "a list keeps its sweeps and none between them: {pair:?}"
+        );
+        // Between sweeps, and outside every sweep: the position wording.
+        for z in [&[1.1][..], &[0.55], &[50.0]] {
+            match EdrEngine::query_trajectory(&view, line, None, None, Some(z), None) {
+                Err(DataServerError::InvalidParameter(m)) => {
+                    assert!(m.contains("selects none"), "{z:?}: {m}")
+                }
+                other => panic!("{z:?}: expected InvalidParameter, got {other:?}"),
+            }
+        }
+    }
+
+    /// A volume in the window without a sweep at the pinned angle (an older
+    /// scan strategy) has no sample there, never its nearest sweep's.
+    #[test]
+    fn site_coverages_level_never_samples_another_sweep() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let latest = synthetic_volume(site_lon, site_lat);
+        let mut older = synthetic_volume(site_lon, site_lat);
+        older.sweeps[0].elangle = 0.7;
+        older.time = latest.time - chrono::Duration::minutes(5);
+        let volumes = vec![entry(older, "level-older"), entry(latest, "level-latest")];
+        // 10.5 km due east, mid-bin 10, as in the single-volume test above.
+        let dlon = 10_500.0 / (EARTH_RADIUS_M * site_lat.to_radians().cos()) * 180.0
+            / std::f64::consts::PI;
+        let covs = site_coverages(
+            &volumes,
+            test_pixels(),
+            site_lon + dlon,
+            site_lat,
+            None,
+            None,
+            Some(&[0.5]),
+        )
+        .unwrap();
+        assert_eq!(covs.len(), 1);
+        assert_eq!(covs[0].ranges["DBZH"].values, vec![None, Some(10.0)]);
     }
 
     /// `height_axis` builds a monotonic 0..top grid whose ceiling tracks
@@ -5150,7 +6601,9 @@ mod tests {
             &heights,
             &["DBZH".to_string()],
             window,
+            None,
         )
+        .unwrap()
         .expect("section produced");
         let nd = qr.ranges.get("DBZH").expect("DBZH range");
         // Layout is row-major [node][height]; the far node is index 1, so
@@ -5256,11 +6709,23 @@ mod tests {
         let file_id = "prewarm-461/202605191050_fivih_PVOL.h5";
         let cid = pixel_cache_id(&source, file_id);
 
-        let lowest = volume.sweeps[0].moments[0].dataset_path.clone();
-        let highest = volume.sweeps.last().unwrap().moments[0]
-            .dataset_path
-            .clone();
+        let dbzh_path = |s: &Sweep| {
+            s.moments
+                .iter()
+                .find(|m| m.quantity == "DBZH")
+                .map(|m| m.dataset_path.clone())
+                .expect("fivih sweeps carry DBZH")
+        };
+        let lowest = dbzh_path(&volume.sweeps[0]);
+        let highest = dbzh_path(volume.sweeps.last().unwrap());
         assert_ne!(lowest, highest, "sweeps must have distinct dataset paths");
+        // #992: only the default quantity is pre-warmed.
+        let other = volume.sweeps[0]
+            .moments
+            .iter()
+            .find(|m| m.quantity != "DBZH")
+            .map(|m| m.dataset_path.clone())
+            .expect("the base sweep carries more than DBZH");
 
         assert!(
             !pixel_cache().contains(&cid, &lowest),
@@ -5276,6 +6741,10 @@ mod tests {
         assert!(
             !pixel_cache().contains(&cid, &highest),
             "a sweep above n_sweeps must stay cold (pre-warm is bounded)"
+        );
+        assert!(
+            !pixel_cache().contains(&cid, &other),
+            "a non-default quantity of the base sweep must stay cold (#992)"
         );
 
         // n_sweeps = 0 is the disable switch: a fresh id warms nothing.
@@ -5305,6 +6774,122 @@ mod tests {
         );
     }
 
+    /// A synthetic volume with SMHI-like moment order: `CCORH` sorts before
+    /// `DBZH`, so an alphabetical default would pick the clutter field.
+    /// Two sweeps, each with `CCORH` (`/datasetN/data1/data`) and `DBZH`
+    /// (`/datasetN/data2/data`).
+    fn two_quantity_volume(lon: f64, lat: f64) -> PolarVolume {
+        let mut volume = synthetic_volume(lon, lat);
+        let base = volume.sweeps[0].clone();
+        volume.sweeps = (1..=2)
+            .map(|n| {
+                let mut sweep = base.clone();
+                sweep.elangle = if n == 1 { 0.5 } else { 1.5 };
+                let dbzh = sweep.moments[0].clone();
+                sweep.moments = vec![
+                    PolarMoment {
+                        quantity: "CCORH".to_string(),
+                        dataset_path: format!("/dataset{n}/data1/data"),
+                        ..dbzh.clone()
+                    },
+                    PolarMoment {
+                        dataset_path: format!("/dataset{n}/data2/data"),
+                        ..dbzh
+                    },
+                ];
+                sweep
+            })
+            .collect();
+        volume
+    }
+
+    /// #992: the pre-warm decodes only the default quantity of the lowest
+    /// `n_sweeps` sweeps, not every moment of them.
+    #[test]
+    fn prewarm_requests_take_only_the_default_quantity() {
+        let volume = two_quantity_volume(25.0, 60.0);
+        let paths = |n| -> Vec<&str> {
+            prewarm_requests(&volume, n)
+                .into_iter()
+                .map(|(path, _, _)| path)
+                .collect()
+        };
+        assert_eq!(paths(1), vec!["/dataset1/data2/data"]);
+        assert_eq!(
+            paths(2),
+            vec!["/dataset1/data2/data", "/dataset2/data2/data"]
+        );
+        assert!(paths(0).is_empty());
+
+        // Without DBZH, total reflectivity TH, else the first quantity.
+        let mut th = volume.clone();
+        th.sweeps[0].moments[1].quantity = "TH".to_string();
+        th.sweeps[1].moments[1].quantity = "TH".to_string();
+        let th_paths: Vec<&str> = prewarm_requests(&th, 1)
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect();
+        assert_eq!(th_paths, vec!["/dataset1/data2/data"]);
+        assert_eq!(default_quantity_of(&["CCORH", "VRADH"]), Some("CCORH"));
+        assert_eq!(default_quantity_of::<&str>(&[]), None);
+    }
+
+    /// The bare-layer render (no parameter) draws the advertised default
+    /// quantity, which is what the pre-warm decodes, not the alphabetically
+    /// first one.
+    #[test]
+    fn bare_render_draws_the_advertised_default_quantity() {
+        let id = unique_file_id();
+        let volume = two_quantity_volume(25.0, 60.0);
+        for sweep in &volume.sweeps {
+            // CCORH: all zeros. DBZH: the bin index (see `synthetic_raw`).
+            pixel_cache().insert(
+                &id,
+                &sweep.moments[0].dataset_path,
+                Arc::new(RawPixels::U16(Array2::zeros((sweep.nrays, sweep.nbins)))),
+            );
+            pixel_cache().insert(
+                &id,
+                &sweep.moments[1].dataset_path,
+                Arc::new(synthetic_raw()),
+            );
+        }
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "test".to_string(),
+            vec![VolumeEntry {
+                id: id.clone(),
+                volume: Arc::new(volume),
+            }],
+        );
+        let view = site_view_for(by_site, "test");
+        assert_eq!(view.raster_info().parameter, "DBZH");
+
+        let dlon =
+            50_000.0 / (EARTH_RADIUS_M * 60f64.to_radians().cos()) * 180.0 / std::f64::consts::PI;
+        let bbox = [25.0, 59.999, 25.0 + dlon, 60.001];
+        let render = |parameter: Option<&str>| -> Vec<Option<f64>> {
+            MapEngine::get_raster_tile(
+                &view,
+                bbox,
+                32,
+                4,
+                None,
+                &OutputCrs::Wgs84,
+                parameter,
+                None,
+                None,
+            )
+            .expect("render")
+            .values
+            .iter_values()
+            .collect()
+        };
+        let bare = render(None);
+        assert_eq!(bare, render(Some("DBZH")));
+        assert_ne!(bare, render(Some("CCORH")));
+    }
+
     #[test]
     fn pixel_cache_id_local_is_bare_path() {
         let local = Source::Local {
@@ -5330,44 +6915,289 @@ mod tests {
         assert_eq!(pixel_cache_id(&a, key), pixel_cache_id(&a, key));
     }
 
-    #[test]
-    fn cold_miss_primes_siblings_without_another_file_read() {
+    /// The cold-batch fixture written to a fresh temp file, its parsed volume
+    /// and its path (the local file id).
+    fn local_fixture() -> (tempfile::TempDir, PolarVolume, String) {
         let bytes = include_bytes!("../../../testdata/pvol-cold-batch.h5");
         let volume = crate::pvol::read_polar_volume(bytes).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("volume.h5");
         std::fs::write(&path, bytes).unwrap();
-        let id = path.to_str().unwrap();
+        let id = path.to_str().unwrap().to_owned();
+        (dir, volume, id)
+    }
+
+    /// Every moment of `volume` except `requested`, split into the requested
+    /// quantity's (the sibling set) and the other quantities'.
+    fn split_moments<'v>(
+        volume: &'v PolarVolume,
+        requested: &PolarMoment,
+    ) -> (Vec<&'v PolarMoment>, Vec<&'v PolarMoment>) {
+        volume
+            .sweeps
+            .iter()
+            .flat_map(|s| &s.moments)
+            .filter(|m| m.dataset_path != requested.dataset_path)
+            .partition(|m| m.quantity == requested.quantity)
+    }
+
+    /// A background runtime for sibling-decode tests that outlives them all.
+    fn test_background_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
+            std::sync::LazyLock::new(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .build()
+                    .unwrap()
+            });
+        &RUNTIME
+    }
+
+    /// #994: a cold miss returns the requested moment having decoded only
+    /// that moment. With no background runtime nothing else is decoded, so
+    /// one miss inserts exactly one array.
+    #[test]
+    fn cold_miss_decodes_only_the_requested_moment() {
+        let (_dir, volume, id) = local_fixture();
         let pixels = test_pixels();
-        let first = &volume.sweeps[0];
-        let raw = pixels.moment(id, &volume, &first.moments[0], 4, 8).unwrap();
+        let requested = &volume.sweeps[0].moments[0];
+        let (same, other) = split_moments(&volume, requested);
+        assert!(!same.is_empty() && !other.is_empty(), "fixture shape");
+        let raw = pixels
+            .moment_with(&id, &volume, requested, 4, 8, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(raw.shape(), (4, 8));
-        // The source disappears: every sibling must still be available from
-        // the single cold load, including the higher sweep.
-        std::fs::remove_file(&path).unwrap();
-        for sweep in &volume.sweeps {
-            for moment in &sweep.moments {
-                assert!(pixels.moment(id, &volume, moment, 4, 8).is_some());
-            }
+        assert!(pixel_cache().contains(&id, &requested.dataset_path));
+        assert!(pixel_cache().held_bytes(&id).is_none());
+        for m in same.iter().chain(&other) {
+            assert!(
+                !pixel_cache().contains(&id, &m.dataset_path),
+                "`{}` must not be decoded on the request path",
+                m.dataset_path
+            );
         }
     }
 
+    /// #994: the background decode later fills the requested quantity's other
+    /// sweeps, and nothing of the other quantities.
     #[test]
-    fn cold_batch_skips_oversize_siblings_but_always_requests_target() {
-        let mut volume = synthetic_volume(24.5, 60.3);
-        let mut sibling = volume.sweeps[0].clone();
-        sibling.nrays = usize::MAX;
-        sibling.nbins = usize::MAX;
-        sibling.moments[0].dataset_path = "/huge".into();
-        volume.sweeps.push(sibling);
-        let requests = cold_batch_requests(
-            &volume,
-            &volume.sweeps[0].moments[0],
-            360,
-            100,
-            &unique_file_id(),
+    fn cold_miss_decodes_same_quantity_sweeps_in_the_background() {
+        let (dir, volume, id) = local_fixture();
+        let pixels = test_pixels();
+        let requested = &volume.sweeps[0].moments[0];
+        let (same, other) = split_moments(&volume, requested);
+        let runtime = test_background_runtime().handle();
+        assert!(pixels
+            .moment_with(&id, &volume, requested, 4, 8, Some(runtime))
+            .unwrap()
+            .is_some());
+        // The decode reads the downloaded bytes, never the file again.
+        drop(dir);
+        let start = std::time::Instant::now();
+        while pixel_cache().held_bytes(&id).is_some() {
+            assert!(start.elapsed() < Duration::from_secs(10), "decode stuck");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for m in &same {
+            assert!(
+                pixel_cache().contains(&id, &m.dataset_path),
+                "sibling `{}` decoded in the background",
+                m.dataset_path
+            );
+        }
+        for m in &other {
+            assert!(
+                !pixel_cache().contains(&id, &m.dataset_path),
+                "`{}` is another quantity, not decoded ahead",
+                m.dataset_path
+            );
+        }
+    }
+
+    /// Two copies of the cold-batch fixture (sweeps at 0.5° and 1.0°, each
+    /// with DBZH and VRAD) as catalog entries, with their temp dirs.
+    fn fixture_entries(n: usize) -> (Vec<tempfile::TempDir>, Vec<VolumeEntry>) {
+        (0..n)
+            .map(|_| {
+                let (dir, volume, id) = local_fixture();
+                let entry = VolumeEntry {
+                    id,
+                    volume: Arc::new(volume),
+                };
+                (dir, entry)
+            })
+            .unzip()
+    }
+
+    /// `metres` due east of the fixture's site (24.5°E, 60.3°N).
+    fn east_of_fixture_site(metres: f64) -> (f64, f64) {
+        let lat: f64 = 60.3;
+        let dlon =
+            metres / (EARTH_RADIUS_M * lat.to_radians().cos()) * 180.0 / std::f64::consts::PI;
+        (24.5 + dlon, lat)
+    }
+
+    /// `entry`'s file was fetched once, and every moment of its first
+    /// `sweeps` sweeps (all quantities) is resident.
+    fn assert_one_fetch_all_resident(entry: &VolumeEntry, sweeps: usize) {
+        assert_eq!(
+            file_fetches::count(&entry.id),
+            1,
+            "`{}` must be downloaded once per request",
+            entry.id
         );
-        assert_eq!(requests, vec![(SYNTHETIC_DS, 360, 100)]);
+        let read = entry.volume.sweeps.iter().take(sweeps);
+        for moment in read.flat_map(|s| &s.moments) {
+            assert!(
+                pixel_cache().contains(&entry.id, &moment.dataset_path),
+                "`{}` read by the walk",
+                moment.dataset_path
+            );
+        }
+    }
+
+    /// #994: a profile over two quantities downloads its volume file once —
+    /// moment-by-moment cold misses fetched it once per quantity and sweep.
+    #[test]
+    fn multi_quantity_profile_fetches_the_volume_file_once() {
+        let (_dirs, entries) = fixture_entries(1);
+        let quantities = ["DBZH".to_string(), "VRAD".to_string()];
+        let (lon, lat) = east_of_fixture_site(2_500.0);
+        let profile = volume_profile(&entries[0], test_pixels(), lon, lat, &quantities)
+            .unwrap()
+            .expect("profile");
+        for q in &quantities {
+            assert_eq!(profile.ranges[q].values.len(), 2, "{q}: both sweeps");
+        }
+        assert_one_fetch_all_resident(&entries[0], 2);
+    }
+
+    /// #994: a level series over several levels, quantities and volumes
+    /// downloads each volume file once.
+    #[test]
+    fn multi_level_series_fetches_each_volume_file_once() {
+        let (_dirs, entries) = fixture_entries(2);
+        let (lon, lat) = east_of_fixture_site(2_500.0);
+        let covs = site_coverages(
+            &entries,
+            test_pixels(),
+            lon,
+            lat,
+            None,
+            None,
+            Some(&[0.5, 1.0]),
+        );
+        // The point may be clear air; only the reads are pinned here.
+        drop(covs);
+        for entry in &entries {
+            assert_one_fetch_all_resident(entry, 2);
+        }
+    }
+
+    /// #994: a cross-section over two quantities and two volumes downloads
+    /// each volume file once.
+    #[test]
+    fn cross_section_fetches_each_volume_file_once() {
+        let (_dirs, entries) = fixture_entries(2);
+        let path = [(24.5, 60.3), east_of_fixture_site(6_000.0)];
+        let section = site_trajectory(&entries, test_pixels(), &path, None, None, None, None)
+            .expect("section");
+        assert!(matches!(section, CoverageResponse::Collection(ref c) if c.len() == 2));
+        // The low path only reaches the 0.5° sweep: both of its quantities.
+        for entry in &entries {
+            assert_one_fetch_all_resident(entry, 1);
+        }
+    }
+
+    /// #994: a miss on a file whose bytes a sibling decode still holds reads
+    /// them instead of fetching the file again.
+    #[test]
+    fn cold_miss_reads_held_bytes_instead_of_fetching() {
+        let bytes = include_bytes!("../../../testdata/pvol-cold-batch.h5");
+        let volume = crate::pvol::read_polar_volume(bytes).unwrap();
+        // No such file: a fetch would fail and mark the moment bad.
+        let id = unique_file_id();
+        let held = pixel_cache()
+            .hold_bytes(&id, Bytes::from_static(bytes), usize::MAX)
+            .unwrap();
+        let moment = &volume.sweeps[1].moments[0];
+        let raw = test_pixels()
+            .moment_with(&id, &volume, moment, 4, 8, None)
+            .unwrap()
+            .expect("decoded from the held bytes");
+        assert_eq!(raw.shape(), (4, 8));
+        drop(held);
+        let other = &volume.sweeps[1].moments[1];
+        assert!(test_pixels()
+            .moment_with(&id, &volume, other, 4, 8, None)
+            .unwrap()
+            .is_none());
+    }
+
+    /// #994: the sibling set is the requested quantity at other sweeps,
+    /// nearest elevation first, within one sweep's worth of bytes.
+    #[test]
+    fn sibling_requests_take_one_quantity_nearest_first_within_one_sweep() {
+        let mut volume = synthetic_volume(24.5, 60.3);
+        let base = volume.sweeps[0].clone();
+        let sweep_at = |elangle: f64, tag: &str| {
+            let mut sweep = base.clone();
+            sweep.elangle = elangle;
+            sweep.moments[0].dataset_path = format!("/{tag}/DBZH");
+            let mut vrad = sweep.moments[0].clone();
+            vrad.quantity = "VRADH".into();
+            vrad.dataset_path = format!("/{tag}/VRADH");
+            sweep.moments.push(vrad);
+            sweep
+        };
+        let requested_sweep = sweep_at(1.5, "s1");
+        volume.sweeps = vec![
+            sweep_at(0.3, "s0"),
+            requested_sweep.clone(),
+            sweep_at(15.0, "s4"),
+            sweep_at(3.0, "s2"),
+            sweep_at(5.0, "s3"),
+        ];
+        let mut huge = sweep_at(2.0, "huge");
+        huge.nrays = usize::MAX;
+        huge.nbins = usize::MAX;
+        volume.sweeps.push(huge);
+        let requested = &requested_sweep.moments[0];
+        let cache_id = unique_file_id();
+        let paths = |requests: Vec<(String, usize, usize)>| {
+            requests.into_iter().map(|(p, _, _)| p).collect::<Vec<_>>()
+        };
+        // Two moments per sweep ⇒ a budget of two sweeps' arrays: the two
+        // nearest DBZH sweeps; the oversize one never fits.
+        assert_eq!(
+            paths(sibling_requests(&volume, requested, 360, 100, &cache_id)),
+            vec!["/s0/DBZH", "/s2/DBZH"]
+        );
+        // A resident sibling is skipped and frees its share of the budget.
+        pixel_cache().insert(&cache_id, "/s0/DBZH", Arc::new(synthetic_raw()));
+        assert_eq!(
+            paths(sibling_requests(&volume, requested, 360, 100, &cache_id)),
+            vec!["/s2/DBZH", "/s3/DBZH"]
+        );
+        // A sweep with many moments buys a larger byte budget, but never
+        // more than `MAX_SIBLING_SWEEPS` sweeps.
+        for i in 0..6 {
+            let mut extra = volume.sweeps[1].moments[0].clone();
+            extra.quantity = format!("Q{i}");
+            extra.dataset_path = format!("/s1/Q{i}");
+            volume.sweeps[1].moments.push(extra);
+        }
+        assert_eq!(
+            paths(sibling_requests(
+                &volume,
+                requested,
+                360,
+                100,
+                &unique_file_id()
+            )),
+            vec!["/s0/DBZH", "/s2/DBZH"]
+        );
     }
 
     #[test]
@@ -5387,6 +7217,7 @@ mod tests {
         let pix = test_pixels();
         assert!(pix
             .moment(&file_id, &synthetic_volume(24.5, 60.3), &mom, 360, 100)
+            .unwrap()
             .is_none());
         assert!(
             pixel_cache().is_known_bad(&file_id, &mom.dataset_path),
@@ -5395,7 +7226,901 @@ mod tests {
         // Repeat returns None via the negative-cache short-circuit.
         assert!(pix
             .moment(&file_id, &synthetic_volume(24.5, 60.3), &mom, 360, 100)
+            .unwrap()
             .is_none());
+    }
+
+    /// A remote source over an in-memory store holding the cold-batch fixture
+    /// under a fresh key, plus that key and the parsed volume (#993).
+    fn remote_fixture() -> (Source, String, PolarVolume) {
+        use ds_storage::object_store::{ObjectStoreExt, PutPayload};
+        let bytes: &'static [u8] = include_bytes!("../../../testdata/pvol-cold-batch.h5");
+        let volume = crate::pvol::read_polar_volume(bytes).unwrap();
+        let key = unique_file_id();
+        let inner = ds_storage::object_store::memory::InMemory::new();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(inner.put(
+                &ds_storage::object_store::path::Path::from(key.as_str()),
+                PutPayload::from_static(bytes),
+            ))
+            .unwrap();
+        let source = Source::Remote {
+            store: ds_storage::DataStore::new(Arc::new(inner)),
+            endpoint: "https://s3.example.com".to_string(),
+            bucket: "deadline-test".to_string(),
+            prefix_pattern: "%Y/".to_string(),
+            time_window: None,
+        };
+        (source, key, volume)
+    }
+
+    /// A request deadline that already passed: every storage read fails with
+    /// `DeadlineExceeded` before it is sent.
+    fn expired_deadline() -> ds_core::deadline::Guard {
+        ds_core::deadline::enter(Some(std::time::Instant::now()))
+    }
+
+    /// #993: a cold read cut off by the request deadline is the request's
+    /// error, not unusable data. It marks nothing bad, so the next request
+    /// fetches again and serves the moment.
+    #[test]
+    fn moment_deadline_is_an_error_and_a_retry_reads() {
+        let (source, key, volume) = remote_fixture();
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let cache_id = pixel_cache_id(&source, &key).into_owned();
+        let sweep = &volume.sweeps[0];
+        let moment = &sweep.moments[0];
+        {
+            let _deadline = expired_deadline();
+            let result = pix.moment(&key, &volume, moment, sweep.nrays, sweep.nbins);
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "a deadline must fail the read, got {result:?}"
+            );
+        }
+        for s in &volume.sweeps {
+            for m in &s.moments {
+                assert!(
+                    !pixel_cache().is_known_bad(&cache_id, &m.dataset_path),
+                    "a deadline must not mark `{}` bad",
+                    m.dataset_path
+                );
+            }
+        }
+        let raw = pix
+            .moment(&key, &volume, moment, sweep.nrays, sweep.nbins)
+            .unwrap()
+            .expect("the retry reads the moment");
+        assert_eq!(raw.shape(), (sweep.nrays, sweep.nbins));
+    }
+
+    /// #993: the 3D batch read fails the request on a deadline instead of
+    /// returning an empty set (which the voxel-grid cache would keep).
+    #[test]
+    fn volume_moments_deadline_is_an_error_and_a_retry_reads() {
+        let (source, key, volume) = remote_fixture();
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let quantity = volume.sweeps[0].moments[0].quantity.clone();
+        {
+            let _deadline = expired_deadline();
+            assert!(matches!(
+                pix.volume_moments(&volume, &key, &quantity),
+                Err(DataServerError::DeadlineExceeded)
+            ));
+        }
+        let moments = pix.volume_moments(&volume, &key, &quantity).unwrap();
+        assert!(!moments.is_empty(), "the retry reads the quantity's sweeps");
+    }
+
+    /// #993: a missing object is unusable data (nodata, negatively cached),
+    /// unlike a deadline.
+    #[test]
+    fn moment_missing_object_is_known_bad_nodata() {
+        let (source, _, volume) = remote_fixture();
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let missing = unique_file_id();
+        let sweep = &volume.sweeps[0];
+        let moment = &sweep.moments[0];
+        assert!(pix
+            .moment(&missing, &volume, moment, sweep.nrays, sweep.nbins)
+            .unwrap()
+            .is_none());
+        let cache_id = pixel_cache_id(&source, &missing);
+        assert!(pixel_cache().is_known_bad(&cache_id, &moment.dataset_path));
+    }
+
+    /// #993: any storage failure other than a missing object is retryable:
+    /// it surfaces as 503 (`ResourceExhausted`), never as nodata, and the
+    /// detail stays in the log.
+    #[test]
+    fn storage_failures_classify_as_retryable() {
+        for (err, want_deadline) in [
+            (DataServerError::DeadlineExceeded, true),
+            (DataServerError::ResourceExhausted, false),
+            (DataServerError::Storage("HTTP 503 SlowDown".into()), false),
+            (
+                DataServerError::Io(std::io::Error::other("connection reset")),
+                false,
+            ),
+        ] {
+            match PixelReadError::from_storage("k", err) {
+                PixelReadError::Abort(DataServerError::DeadlineExceeded) => assert!(want_deadline),
+                PixelReadError::Abort(DataServerError::ResourceExhausted) => {
+                    assert!(!want_deadline)
+                }
+                other => panic!("expected a retryable abort, got {other:?}"),
+            }
+        }
+    }
+
+    /// #993: a map render whose pixel read hits the deadline fails (503)
+    /// instead of returning an empty tile the tile caches would keep.
+    #[test]
+    fn polar_sample_deadline_fails_the_render() {
+        let (source, key, volume) = remote_fixture();
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let quantity = volume.sweeps[0].moments[0].quantity.clone();
+        let (lon, lat) = (volume.site.lon, volume.site.lat);
+        let bbox = [lon - 0.5, lat - 0.5, lon + 0.5, lat + 0.5];
+        let render = || {
+            polar_sample(
+                &volume,
+                &key,
+                pix,
+                &quantity,
+                bbox,
+                8,
+                8,
+                &OutputCrs::Wgs84,
+                None,
+                ResamplingMethod::Nearest,
+            )
+        };
+        {
+            let _deadline = expired_deadline();
+            assert!(matches!(render(), Err(DataServerError::DeadlineExceeded)));
+        }
+        let cache_id = pixel_cache_id(&source, &key);
+        let path = &volume.sweeps[0].moments[0].dataset_path;
+        assert!(!pixel_cache().is_known_bad(&cache_id, path));
+        render().expect("the retry renders");
+        assert!(
+            pixel_cache().capacity() == 0 || pixel_cache().contains(&cache_id, path),
+            "the retry read the moment"
+        );
+    }
+
+    /// Remote site volumes nothing has read yet: each sample is a fetch.
+    fn unread_remote_volumes(n: usize) -> (Source, Vec<VolumeEntry>) {
+        let source = dummy_remote("deadline-walk");
+        let volumes = (0..n)
+            .map(|i| {
+                let mut volume = synthetic_volume(25.0, 60.0);
+                volume.time = Utc::now() - chrono::Duration::minutes(5 * (n - i) as i64);
+                VolumeEntry {
+                    id: unique_file_id(),
+                    volume: Arc::new(volume),
+                }
+            })
+            .collect();
+        (source, volumes)
+    }
+
+    fn assert_none_marked_bad(source: &Source, volumes: &[VolumeEntry]) {
+        for e in volumes {
+            let cache_id = pixel_cache_id(source, &e.id);
+            for s in &e.volume.sweeps {
+                for m in &s.moments {
+                    assert!(
+                        !pixel_cache().is_known_bad(&cache_id, &m.dataset_path),
+                        "`{}` of `{}` was marked bad",
+                        m.dataset_path,
+                        e.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// #993: the cross-section walk returns the deadline (504) instead of
+    /// answering empty sections and marking every remaining sweep bad.
+    #[test]
+    fn trajectory_deadline_stops_the_walk_without_marking_sweeps_bad() {
+        let (source, volumes) = unread_remote_volumes(3);
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let path = vec![(25.0, 60.0), (25.2, 60.0)];
+        {
+            let _deadline = expired_deadline();
+            let result = site_trajectory(&volumes, pix, &path, None, None, None, None);
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "got {:?}",
+                result.map(|_| ())
+            );
+            // The section itself propagates a read cut off by the deadline.
+            let section = volume_section(
+                &volumes[0],
+                pix,
+                &path,
+                &[0.0, 500.0],
+                &["DBZH".to_string()],
+                (0.0, 1.0),
+                None,
+            );
+            assert!(matches!(section, Err(DataServerError::DeadlineExceeded)));
+        }
+        assert_none_marked_bad(&source, &volumes);
+    }
+
+    /// #993: position queries (time series at a level, and profiles) return
+    /// the deadline instead of nulls with the sweeps marked bad.
+    #[test]
+    fn position_deadline_is_an_error_without_marking_sweeps_bad() {
+        let (source, volumes) = unread_remote_volumes(3);
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let (lon, lat) = (25.1, 60.0);
+        let _deadline = expired_deadline();
+        for levels in [Some(&[0.5][..]), None] {
+            let result = site_coverages(&volumes, pix, lon, lat, None, None, levels);
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "levels {levels:?}: got {:?}",
+                result.map(|c| c.len())
+            );
+        }
+        let series = level_series(
+            &volumes.iter().collect::<Vec<_>>(),
+            pix,
+            lon,
+            lat,
+            &[0.5],
+            &["DBZH".to_string()],
+            &volumes.iter().map(|e| e.volume.time).collect::<Vec<_>>(),
+        );
+        assert!(matches!(series, Err(DataServerError::DeadlineExceeded)));
+        let profile = volume_profile(&volumes[0], pix, lon, lat, &["DBZH".to_string()]);
+        assert!(matches!(profile, Err(DataServerError::DeadlineExceeded)));
+        assert_none_marked_bad(&source, &volumes);
+    }
+
+    /// Per-GET delay of the read-ahead tests (#999): what makes a walk's
+    /// round trips visible in its wall time.
+    const READ_DELAY: Duration = Duration::from_millis(200);
+
+    /// The cold-batch fixture (sweeps at 0.5° and 1.0°, each with DBZH and
+    /// VRAD; every gate a value out to 8 km).
+    const COLD_BATCH: &[u8] = include_bytes!("../../../testdata/pvol-cold-batch.h5");
+
+    /// [`counted_remote_volumes`] without the store's counts.
+    fn throttled_remote_volumes(
+        n: usize,
+        delay: Duration,
+        missing: Option<usize>,
+    ) -> (Arc<Source>, Arc<Vec<VolumeEntry>>) {
+        let (source, volumes, _) = counted_remote_volumes(n, delay, missing);
+        (source, volumes)
+    }
+
+    /// An object store that counts the GETs of each key it is asked for
+    /// (#1127), and fails the first GET of each key in `fail_first` once
+    /// the store under it has answered: the read then takes its full time.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: Arc<dyn ds_storage::object_store::ObjectStore>,
+        gets: Mutex<HashMap<String, usize>>,
+        fail_first: Mutex<std::collections::HashSet<String>>,
+    }
+
+    impl CountingStore {
+        /// The GETs of the volume file `file_id` so far.
+        fn gets(&self, file_id: &str) -> usize {
+            let key = ds_storage::object_store::path::Path::from(file_id).to_string();
+            self.gets.lock().unwrap().get(&key).copied().unwrap_or(0)
+        }
+
+        /// Fail the next GET of the volume file `file_id`.
+        fn fail_next(&self, file_id: &str) {
+            let key = ds_storage::object_store::path::Path::from(file_id).to_string();
+            self.fail_first.lock().unwrap().insert(key);
+        }
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ds_storage::object_store::ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &ds_storage::object_store::path::Path,
+            payload: ds_storage::object_store::PutPayload,
+            options: ds_storage::object_store::PutOptions,
+        ) -> ds_storage::object_store::Result<ds_storage::object_store::PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ds_storage::object_store::path::Path,
+            options: ds_storage::object_store::PutMultipartOptions,
+        ) -> ds_storage::object_store::Result<Box<dyn ds_storage::object_store::MultipartUpload>>
+        {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ds_storage::object_store::path::Path,
+            options: ds_storage::object_store::GetOptions,
+        ) -> ds_storage::object_store::Result<ds_storage::object_store::GetResult> {
+            let key = location.to_string();
+            *self.gets.lock().unwrap().entry(key.clone()).or_default() += 1;
+            let result = self.inner.get_opts(location, options).await;
+            if self.fail_first.lock().unwrap().remove(&key) {
+                return Err(ds_storage::object_store::Error::Generic {
+                    store: "CountingStore",
+                    source: "server unavailable".into(),
+                });
+            }
+            result
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                ds_storage::object_store::Result<ds_storage::object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<
+            'static,
+            ds_storage::object_store::Result<ds_storage::object_store::path::Path>,
+        > {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ds_storage::object_store::path::Path>,
+        ) -> futures::stream::BoxStream<
+            'static,
+            ds_storage::object_store::Result<ds_storage::object_store::ObjectMeta>,
+        > {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ds_storage::object_store::path::Path>,
+        ) -> ds_storage::object_store::Result<ds_storage::object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ds_storage::object_store::path::Path,
+            to: &ds_storage::object_store::path::Path,
+            options: ds_storage::object_store::CopyOptions,
+        ) -> ds_storage::object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A remote source whose every GET first waits `delay` (object_store's
+    /// `ThrottledStore` over an in-memory store) and is counted above that
+    /// ([`CountingStore`]), and `n` catalog entries five minutes apart, each
+    /// the cold-batch fixture under a key of its own. The entry at `missing`
+    /// is catalogued but absent from the store.
+    fn counted_remote_volumes(
+        n: usize,
+        delay: Duration,
+        missing: Option<usize>,
+    ) -> (Arc<Source>, Arc<Vec<VolumeEntry>>, Arc<CountingStore>) {
+        use ds_storage::object_store::throttle::{ThrottleConfig, ThrottledStore};
+        use ds_storage::object_store::{ObjectStoreExt, PutPayload};
+        let volume = crate::pvol::read_polar_volume(COLD_BATCH).unwrap();
+        let inner = ds_storage::object_store::memory::InMemory::new();
+        let put = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let volumes = (0..n)
+            .map(|i| {
+                let id = unique_file_id();
+                if missing != Some(i) {
+                    let key = ds_storage::object_store::path::Path::from(id.as_str());
+                    put.block_on(inner.put(&key, PutPayload::from_static(COLD_BATCH)))
+                        .unwrap();
+                }
+                let mut volume = volume.clone();
+                volume.time += chrono::Duration::minutes(5 * i as i64);
+                VolumeEntry {
+                    id,
+                    volume: Arc::new(volume),
+                }
+            })
+            .collect();
+        let config = ThrottleConfig {
+            wait_get_per_call: delay,
+            ..ThrottleConfig::default()
+        };
+        let counted = Arc::new(CountingStore {
+            inner: Arc::new(ThrottledStore::new(inner, config)),
+            gets: Mutex::default(),
+            fail_first: Mutex::default(),
+        });
+        let source = Source::Remote {
+            store: ds_storage::DataStore::new(counted.clone()),
+            endpoint: "https://s3.example.com".to_string(),
+            bucket: "read-ahead-test".to_string(),
+            prefix_pattern: "%Y/".to_string(),
+            time_window: None,
+        };
+        (Arc::new(source), Arc::new(volumes), counted)
+    }
+
+    /// A multi-thread runtime standing in for the query runtime (#1103).
+    fn query_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
+            std::sync::LazyLock::new(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+            });
+        &RUNTIME
+    }
+
+    /// The EDR walks over several volumes (#999).
+    #[derive(Debug, Clone, Copy)]
+    enum Walk {
+        /// Position at two levels: `level_series`.
+        Series,
+        /// Position without `z`: a profile per volume.
+        Profiles,
+        /// A trajectory: a cross-section per volume.
+        Section,
+    }
+
+    /// Run `walk` over `volumes` under `deadline` as the per-site view runs
+    /// it: series and profiles (position, area, locations) on a query
+    /// runtime worker with no handle, the section (trajectory) on the
+    /// runtime's blocking pool with the explicit one. With no `runtime` it
+    /// runs on this thread, outside any runtime: the sequential walk.
+    fn run_walk(
+        walk: Walk,
+        source: Arc<Source>,
+        volumes: Arc<Vec<VolumeEntry>>,
+        runtime: Option<&tokio::runtime::Runtime>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<QueryResult>, DataServerError> {
+        let run = move |handle: Option<&tokio::runtime::Handle>| {
+            let _deadline = ds_core::deadline::enter(deadline);
+            let pix = Pixels {
+                moments: None,
+                source: &source,
+                handle,
+            };
+            let (lon, lat) = east_of_fixture_site(2_500.0);
+            match walk {
+                Walk::Series => {
+                    site_coverages(&volumes, pix, lon, lat, None, None, Some(&[0.5, 1.0]))
+                }
+                Walk::Profiles => site_coverages(&volumes, pix, lon, lat, None, None, None),
+                Walk::Section => {
+                    let path = [(24.5, 60.3), east_of_fixture_site(6_000.0)];
+                    site_trajectory(&volumes, pix, &path, None, None, None, None).map(|section| {
+                        match section {
+                            CoverageResponse::Single(coverage) => vec![coverage],
+                            CoverageResponse::Collection(coverages) => coverages,
+                        }
+                    })
+                }
+            }
+        };
+        match (runtime, walk) {
+            (None, _) => run(None),
+            (Some(runtime), Walk::Section) => runtime
+                .block_on(
+                    runtime.spawn_blocking(move || run(Some(&tokio::runtime::Handle::current()))),
+                )
+                .unwrap(),
+            (Some(runtime), _) => runtime
+                .block_on(runtime.spawn(async move { run(None) }))
+                .unwrap(),
+        }
+    }
+
+    /// `results` in a form two walks can be compared by: each coverage's
+    /// domain, ranges and parameters, the maps sorted.
+    fn fingerprint(results: &[QueryResult]) -> Vec<String> {
+        results
+            .iter()
+            .map(|r| {
+                let ranges: std::collections::BTreeMap<_, _> = r.ranges.iter().collect();
+                let parameters: std::collections::BTreeMap<_, _> = r
+                    .parameters
+                    .iter()
+                    .map(|(k, v)| (k, format!("{v:?}")))
+                    .collect();
+                format!("{:?} {ranges:?} {parameters:?}", r.domain)
+            })
+            .collect()
+    }
+
+    /// #999: a walk over V cold remote volumes downloads them concurrently,
+    /// at most `MAX_WALK_VOLUMES_IN_FLIGHT` (four) at a time: its wall time
+    /// scales with ceil(V / 4) round trips, not V, and each file is
+    /// downloaded exactly once, ahead of the walk reaching it. For level
+    /// series and profiles on a query runtime worker and cross-sections on
+    /// its blocking pool. 17 volumes are five rounds at four in flight but
+    /// four at five, so the lower bound pins the cap; the upper bound is
+    /// half the sequential walk's time, 0.7 s above the lower one for a
+    /// loaded runner.
+    #[test]
+    fn walks_download_volumes_concurrently_at_most_four_at_once() {
+        let n: usize = 17;
+        let rounds = n.div_ceil(MAX_WALK_VOLUMES_IN_FLIGHT) as u32;
+        let sequential = READ_DELAY * n as u32;
+        for walk in [Walk::Series, Walk::Profiles, Walk::Section] {
+            let (source, volumes) = throttled_remote_volumes(n, READ_DELAY, None);
+            let started = std::time::Instant::now();
+            let results = run_walk(
+                walk,
+                source.clone(),
+                volumes.clone(),
+                Some(query_runtime()),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+            let elapsed = started.elapsed();
+            let coverages = match walk {
+                Walk::Series => 2,
+                Walk::Profiles | Walk::Section => n,
+            };
+            assert_eq!(results.len(), coverages, "{walk:?}");
+            assert!(
+                elapsed >= READ_DELAY * rounds,
+                "{walk:?}: {elapsed:?} for {n} volumes: more than \
+                 {MAX_WALK_VOLUMES_IN_FLIGHT} downloads overlapped"
+            );
+            assert!(
+                elapsed < sequential / 2,
+                "{walk:?}: {elapsed:?} is not well under the sequential {sequential:?}"
+            );
+            for e in volumes.iter() {
+                assert_eq!(file_fetches::count(&e.id), 1, "{walk:?}: `{}`", e.id);
+                assert_eq!(file_fetches::ahead(&e.id), 1, "{walk:?}: `{}`", e.id);
+            }
+            let Source::Remote { store, .. } = &*source else {
+                unreachable!("a remote source")
+            };
+            assert_eq!(
+                store.bytes_read(),
+                (n * COLD_BATCH.len()) as u64,
+                "{walk:?}: one whole-file GET per volume at the store"
+            );
+        }
+    }
+
+    /// #999: a walk that reads ahead answers exactly what the sequential
+    /// walk answers, a volume whose object is missing included: nodata
+    /// there, and its moments negatively cached, as before (#993/#996).
+    #[test]
+    fn read_ahead_walks_answer_as_the_sequential_walk() {
+        let n = 6;
+        let missing = 2;
+        for walk in [Walk::Series, Walk::Profiles, Walk::Section] {
+            let run = |runtime| {
+                let (source, volumes) = throttled_remote_volumes(n, Duration::ZERO, Some(missing));
+                let results = run_walk(walk, source.clone(), volumes.clone(), runtime, None)
+                    .unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+                let gone = &volumes[missing];
+                let cache_id = pixel_cache_id(&source, &gone.id);
+                let path = &gone.volume.sweeps[0].moments[0].dataset_path;
+                assert!(
+                    pixel_cache().is_known_bad(&cache_id, path),
+                    "{walk:?}: the missing volume is unusable data"
+                );
+                let ahead: Vec<_> = volumes.iter().map(|e| file_fetches::ahead(&e.id)).collect();
+                (fingerprint(&results), ahead)
+            };
+            let (sequential, sequential_ahead) = run(None);
+            let (concurrent, concurrent_ahead) = run(Some(query_runtime()));
+            assert_eq!(sequential_ahead, vec![0; n], "{walk:?}: read as it went");
+            assert_eq!(
+                concurrent_ahead,
+                vec![1; n],
+                "{walk:?}: every file read ahead"
+            );
+            assert_eq!(concurrent, sequential, "{walk:?}");
+        }
+    }
+
+    /// #999: the request deadline still stops a walk that reads ahead, both
+    /// one already past and one that passes while downloads are in flight.
+    /// The walk returns the deadline, starts no download after it and marks
+    /// nothing bad.
+    #[test]
+    fn read_ahead_walk_stops_at_the_deadline() {
+        for walk in [Walk::Series, Walk::Profiles, Walk::Section] {
+            let (source, volumes) = throttled_remote_volumes(12, READ_DELAY, None);
+            let result = run_walk(
+                walk,
+                source.clone(),
+                volumes.clone(),
+                Some(query_runtime()),
+                Some(std::time::Instant::now()),
+            );
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "{walk:?}: got {:?}",
+                result.map(|r| r.len())
+            );
+            assert!(volumes.iter().all(|e| file_fetches::count(&e.id) == 0));
+
+            // Halfway through the second round of downloads: the third
+            // round would start only after the second's first download.
+            let deadline = std::time::Instant::now() + READ_DELAY * 3 / 2;
+            let result = run_walk(
+                walk,
+                source.clone(),
+                volumes.clone(),
+                Some(query_runtime()),
+                Some(deadline),
+            );
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "{walk:?}: got {:?}",
+                result.map(|r| r.len())
+            );
+            for e in &volumes[8..] {
+                assert_eq!(file_fetches::count(&e.id), 0, "{walk:?}: `{}`", e.id);
+            }
+            assert_none_marked_bad(&source, &volumes);
+        }
+    }
+
+    /// #1127: concurrent cold walks over the same remote volumes download
+    /// each file once at the store: two walks reading ahead, which join each
+    /// other's downloads, and a one-volume walk, whose miss inside the
+    /// per-file lock joins theirs or is joined. For level series and
+    /// profiles on query runtime workers and cross-sections on the blocking
+    /// pool. Both full walks answer as a sequential walk alone.
+    #[test]
+    fn concurrent_cold_walks_download_each_volume_once() {
+        let n = 6;
+        for walk in [Walk::Series, Walk::Profiles, Walk::Section] {
+            let (source, volumes) = throttled_remote_volumes(n, Duration::ZERO, None);
+            let alone = run_walk(walk, source, volumes, None, None)
+                .unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+
+            let (source, volumes, store) = counted_remote_volumes(n, READ_DELAY, None);
+            let first = Arc::new(vec![volumes[0].clone()]);
+            let start = std::sync::Barrier::new(3);
+            let [a, b, single] = std::thread::scope(|scope| {
+                [volumes.clone(), volumes.clone(), first]
+                    .map(|volumes| {
+                        let (source, start) = (source.clone(), &start);
+                        scope.spawn(move || {
+                            start.wait();
+                            run_walk(walk, source, volumes, Some(query_runtime()), None)
+                        })
+                    })
+                    .map(|walk| walk.join().unwrap())
+            });
+            for result in [&a, &b] {
+                let result = result.as_ref().unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+                assert_eq!(fingerprint(result), fingerprint(&alone), "{walk:?}");
+            }
+            single.unwrap_or_else(|e| panic!("{walk:?}, one volume: {e}"));
+            for e in volumes.iter() {
+                assert_eq!(store.gets(&e.id), 1, "{walk:?}: GETs of `{}`", e.id);
+                assert_eq!(file_fetches::count(&e.id), 1, "{walk:?}: `{}`", e.id);
+            }
+            let Source::Remote { store, .. } = &*source else {
+                unreachable!("a remote source")
+            };
+            assert_eq!(
+                store.bytes_read(),
+                (n * COLD_BATCH.len()) as u64,
+                "{walk:?}: one whole-file GET per volume at the store"
+            );
+        }
+    }
+
+    /// #1127: a download that fails is the failure of the request that
+    /// started it. A walk that joined it reads the file once more and
+    /// answers in full, starting a read of its own, since a failed read is
+    /// not joined; the request that started it gets its error; and nothing
+    /// is marked bad.
+    #[test]
+    fn a_joined_download_that_fails_is_read_again() {
+        let n = 2;
+        let (source, volumes) = throttled_remote_volumes(n, Duration::ZERO, None);
+        let alone = run_walk(Walk::Profiles, source, volumes, None, None).unwrap();
+
+        let (source, volumes, counted) = counted_remote_volumes(n, READ_DELAY, None);
+        let Source::Remote { store, .. } = &*source else {
+            unreachable!("a remote source")
+        };
+        let failing = &volumes[0].id;
+        counted.fail_next(failing);
+        let runtime = query_runtime().handle();
+        let cache_id = pixel_cache_id(&source, failing).into_owned();
+        let mut other = RemoteRead::start(store, cache_id, failing, runtime.clone());
+        assert!(!other.read.joined);
+
+        let results = run_walk(
+            Walk::Profiles,
+            source.clone(),
+            volumes.clone(),
+            Some(query_runtime()),
+            None,
+        )
+        .expect("the joiner reads again");
+        assert_eq!(fingerprint(&results), fingerprint(&alone));
+        assert_eq!(file_fetches::ahead(failing), 0, "the walk joined the read");
+        assert_eq!(
+            counted.gets(failing),
+            2,
+            "the failed GET and the walk's own"
+        );
+        assert_eq!(file_fetches::count(failing), 2);
+        assert_eq!(counted.gets(&volumes[1].id), 1);
+        assert!(matches!(
+            other.wait(Some(runtime)),
+            Err(PixelReadError::Abort(DataServerError::ResourceExhausted))
+        ));
+        assert_none_marked_bad(&source, &volumes);
+    }
+
+    /// A runtime of `workers` workers that is never dropped (#1200): a test
+    /// whose tasks stall it then fails at its watchdog, where dropping it
+    /// would wait on them for good.
+    fn leaked_runtime(workers: usize) -> &'static tokio::runtime::Runtime {
+        Box::leak(Box::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .enable_all()
+                .build()
+                .unwrap(),
+        ))
+    }
+
+    /// Run `walk` over `volumes` on `runtime` under `deadline` on a thread of
+    /// its own, sending its result and wall time to `done`.
+    fn spawn_walk(
+        runtime: &'static tokio::runtime::Runtime,
+        source: &Arc<Source>,
+        volumes: &Arc<Vec<VolumeEntry>>,
+        deadline: Option<Duration>,
+        start: Option<Arc<std::sync::Barrier>>,
+        done: &std::sync::mpsc::Sender<(Result<Vec<QueryResult>, DataServerError>, Duration)>,
+    ) {
+        let (source, volumes, done) = (source.clone(), volumes.clone(), done.clone());
+        std::thread::spawn(move || {
+            if let Some(start) = start {
+                start.wait();
+            }
+            let started = std::time::Instant::now();
+            let deadline = deadline.map(|deadline| started + deadline);
+            let result = run_walk(Walk::Profiles, source, volumes, Some(runtime), deadline);
+            let _ = done.send((result, started.elapsed()));
+        });
+    }
+
+    /// How long a #1200 test waits for a walk before it calls the runtime
+    /// stalled.
+    const STALL_WATCHDOG: Duration = Duration::from_secs(20);
+
+    /// #1200: more concurrent one-volume walks on one cold remote file than
+    /// the runtime has workers all answer, and the file is downloaded once.
+    /// The first takes the per-file lock and downloads the file as a task on
+    /// the runtime; the rest wait for the lock without holding a worker, so
+    /// that task runs. Waiting on the workers would park both of them and
+    /// stall the runtime for good, every deadline timer with it.
+    #[test]
+    fn one_volume_walks_waiting_on_a_cold_file_leave_the_runtime_running() {
+        let workers = 2;
+        let walks = workers + 2;
+        let (source, volumes) = throttled_remote_volumes(1, Duration::ZERO, None);
+        let alone = run_walk(Walk::Profiles, source, volumes, None, None).unwrap();
+
+        let runtime = leaked_runtime(workers);
+        let (source, volumes, store) = counted_remote_volumes(1, READ_DELAY, None);
+        let start = Arc::new(std::sync::Barrier::new(walks));
+        let (done, finished) = std::sync::mpsc::channel();
+        for _ in 0..walks {
+            let deadline = Some(Duration::from_secs(10));
+            spawn_walk(
+                runtime,
+                &source,
+                &volumes,
+                deadline,
+                Some(start.clone()),
+                &done,
+            );
+        }
+        for _ in 0..walks {
+            let (result, _) = finished
+                .recv_timeout(STALL_WATCHDOG)
+                .expect("the runtime stalled");
+            assert_eq!(fingerprint(&result.unwrap()), fingerprint(&alone));
+        }
+        assert_eq!(store.gets(&volumes[0].id), 1, "one download, read by all");
+    }
+
+    /// #1200: walks waiting for another request's load of a cold file give
+    /// up at their own deadline, not when that load ends, and download
+    /// nothing. More of them than the runtime has workers.
+    #[test]
+    fn walks_waiting_on_a_cold_file_stop_at_their_deadline() {
+        let workers = 2;
+        let download = Duration::from_secs(2);
+        let deadline = Duration::from_millis(300);
+        let runtime = leaked_runtime(workers);
+        let (source, volumes, store) = counted_remote_volumes(1, download, None);
+        let (done, finished) = std::sync::mpsc::channel();
+        spawn_walk(runtime, &source, &volumes, None, None, &done);
+        // The walk takes the lock before it asks the store for the file.
+        let asked = std::time::Instant::now();
+        while store.gets(&volumes[0].id) == 0 {
+            assert!(
+                asked.elapsed() < STALL_WATCHDOG,
+                "the first walk never read"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (waited, waits) = std::sync::mpsc::channel();
+        for _ in 0..workers + 1 {
+            spawn_walk(runtime, &source, &volumes, Some(deadline), None, &waited);
+        }
+        for _ in 0..workers + 1 {
+            let (result, took) = waits
+                .recv_timeout(STALL_WATCHDOG)
+                .expect("the runtime stalled");
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "got {:?}",
+                result.map(|r| r.len())
+            );
+            assert!(took < download / 2, "a waiter took {took:?}");
+        }
+        let (first, _) = finished
+            .recv_timeout(STALL_WATCHDOG)
+            .expect("the runtime stalled");
+        first.expect("the first walk downloads and answers");
+        assert_eq!(store.gets(&volumes[0].id), 1);
+        assert_none_marked_bad(&source, &volumes);
     }
 
     /// A dummy file source for the lazy-pixel context; never actually read,
@@ -6288,6 +9013,81 @@ mod tests {
         );
     }
 
+    /// A publisher's in-progress volume (`.name.h5`, truncated) and
+    /// temp-suffixed copies next to a finished volume: both enumerations
+    /// return only the finished one, so the partial file is never fetched
+    /// or HDF5-parsed (#1009).
+    #[test]
+    fn enumerations_skip_in_progress_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "202605150000_fivih_PVOL.h5",
+            ".202605150005_fivih_PVOL.h5",
+            "202605150010_fivih_PVOL.h5.part",
+            "202605150010_fivih_PVOL.H5.tmp",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let root = dir.path().canonicalize().unwrap();
+        let basename = |id: &str| id.rsplit('/').next().unwrap().to_string();
+
+        let local = enumerate_local("t", &root).unwrap();
+        let local: Vec<String> = local.iter().map(|p| basename(&p.id)).collect();
+        assert_eq!(local, ["202605150000_fivih_PVOL.h5"]);
+
+        let (store, _) = ds_storage::build_store(root.to_str().unwrap()).unwrap();
+        let (remote, _) = enumerate_remote("t", &store, "", &None, ScanDepth::Full).unwrap();
+        let remote: Vec<String> = remote.iter().map(|p| basename(&p.id)).collect();
+        assert_eq!(remote, ["202605150000_fivih_PVOL.h5"]);
+    }
+
+    /// rsync `--delay-updates` stages volumes under their final names in a
+    /// `.~tmp~/` folder, and the remote LIST is recursive: a volume there,
+    /// at any depth below the prefix, is never fetched. The prefix's own dot
+    /// folder and a normal subfolder hide nothing; the local enumeration
+    /// never descends (#1029).
+    #[test]
+    fn enumerations_skip_volumes_in_hidden_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let base = root.join(".archive/pvol");
+        for name in [
+            "202605150000_fivih_PVOL.h5",
+            "fivih/202605150005_fivih_PVOL.h5",
+            ".~tmp~/202605150010_fivih_PVOL.h5",
+            "fivih/.~tmp~/202605150015_fivih_PVOL.h5",
+        ] {
+            let path = base.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+        let basename = |id: &str| id.rsplit('/').next().unwrap().to_string();
+
+        let (store, _) = ds_storage::build_store(root.to_str().unwrap()).unwrap();
+        let (remote, _) =
+            enumerate_remote("t", &store, ".archive/pvol", &None, ScanDepth::Full).unwrap();
+        let mut remote: Vec<String> = remote.iter().map(|p| basename(&p.id)).collect();
+        remote.sort();
+        assert_eq!(
+            remote,
+            ["202605150000_fivih_PVOL.h5", "202605150005_fivih_PVOL.h5"]
+        );
+
+        let local = enumerate_local("t", &base).unwrap();
+        let local: Vec<String> = local.iter().map(|p| basename(&p.id)).collect();
+        assert_eq!(local, ["202605150000_fivih_PVOL.h5"]);
+    }
+
+    #[test]
+    fn volume_names_are_h5_files_that_are_not_temporary() {
+        assert!(is_volume_name("202605150000_fivih_PVOL.h5"));
+        assert!(is_volume_name("dkste_202512150405.vol.H5"));
+        assert!(!is_volume_name(".202605150000_fivih_PVOL.h5"));
+        assert!(!is_volume_name("202605150000_fivih_PVOL.h5.part"));
+        assert!(!is_volume_name("202605150000_fivih_PVOL.hdf"));
+        assert!(!is_volume_name("h5"));
+    }
+
     /// The pre-fetch window filter hinges on reading a timestamp from
     /// the object key — for both the FMI (timestamp-leading) and DMI
     /// (timestamp-trailing) filename layouts.
@@ -6422,6 +9222,7 @@ mod tests {
             site_lat,
             &["DBZH".to_string(), "VRADH".to_string()],
         )
+        .unwrap()
         .expect("finite sweeps must produce a coverage");
         match &profile.domain {
             DomainDescription::VerticalProfile { z, .. } => {
@@ -6475,6 +9276,7 @@ mod tests {
             site_lat,
             &["DBZH".to_string()],
         )
+        .unwrap()
         .expect("one finite sweep remains, so a coverage is produced");
         match &profile.domain {
             DomainDescription::VerticalProfile { z, .. } => {
@@ -6506,7 +9308,8 @@ mod tests {
             site_lon,
             site_lat,
             &["DBZH".to_string()],
-        );
+        )
+        .unwrap();
         assert!(result.is_none(), "expected None, got {result:?}");
     }
 
@@ -6610,12 +9413,90 @@ mod tests {
             vec!["DBZH".to_string()],
             "EDR parameter list is the bare quantity"
         );
+        // Every map layer the position query answers shows its values; the
+        // CELLS overlay, which it does not, is no WMS GetFeatureInfo layer
+        // (#1064).
+        for name in names {
+            assert_eq!(
+                MapEngine::layer_shows_values(&view, name),
+                EdrEngine::get_parameters(&view).iter().any(|p| p == name),
+                "{name}"
+            );
+        }
 
         // Exactly one EDR location — this radar.
         let locs = EdrEngine::get_locations(&view).expect("locations");
         assert_eq!(locs.len(), 1, "a per-site collection has one location");
         assert_eq!(locs[0].id, "fivih");
         assert_eq!(locs[0].label, "Test Site");
+        // Pre-built with the catalog: requests share it (#1083).
+        assert!(Arc::ptr_eq(
+            &locs,
+            &EdrEngine::get_locations(&view).expect("locations")
+        ));
+        assert_eq!(
+            locs.by_id("fivih").map(|l| l.label.as_str()),
+            Some("Test Site")
+        );
+    }
+
+    /// `/locations?datetime=` on a per-site view (#932): the site is listed
+    /// when one of its volumes falls inside an interval — inside the
+    /// collection's temporal extent alone is not enough — and each instant of
+    /// a list must be a volume time.
+    #[test]
+    fn site_view_location_time_filter_matches_volume_times() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let mut early = synthetic_volume(25.0, 60.0);
+        early.time = t("2026-07-05T00:00:00Z");
+        let mut late = synthetic_volume(25.0, 60.0);
+        late.time = t("2026-07-05T06:00:00Z");
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(early, "e"), entry(late, "l")],
+        );
+        let view = site_view_for(by_site, "fivih");
+        assert_eq!(
+            EdrEngine::get_temporal_extent(&view),
+            Some((t("2026-07-05T00:00:00Z"), t("2026-07-05T06:00:00Z")))
+        );
+        let site = EdrEngine::get_locations(&view).unwrap()[0].clone();
+        let other = Location {
+            id: "fianj".into(),
+            ..site.clone()
+        };
+        let window = |start: Option<&str>, end: Option<&str>| DatetimeInterval {
+            start: start.map(t),
+            end: end.map(t),
+        };
+        let at = |s: &str| window(Some(s), Some(s));
+        let listed = |intervals: &[DatetimeInterval]| {
+            let keep = EdrEngine::location_time_filter(&view, intervals).expect("a site has times");
+            assert!(!keep(&other), "only the view's own site");
+            keep(&site)
+        };
+        assert!(listed(&[at("2026-07-05T06:00:00Z")]));
+        assert!(!listed(&[at("2026-07-05T03:00:00Z")]), "between volumes");
+        assert!(listed(&[window(
+            Some("2026-07-05T05:00:00Z"),
+            Some("2026-07-05T07:00:00Z")
+        )]));
+        assert!(!listed(&[window(
+            Some("2026-07-05T01:00:00Z"),
+            Some("2026-07-05T05:00:00Z")
+        )]));
+        assert!(listed(&[window(None, Some("2026-07-05T00:00:00Z"))]));
+        assert!(!listed(&[window(Some("2026-07-05T06:00:01Z"), None)]));
+        assert!(listed(&[window(None, None)]));
+        assert!(listed(&[
+            at("2026-07-05T03:00:00Z"),
+            at("2026-07-05T00:00:00Z")
+        ]));
+        assert!(!listed(&[
+            at("2026-07-05T03:00:00Z"),
+            at("2026-07-05T09:00:00Z")
+        ]));
     }
 
     /// The per-site view renders with a bare-quantity parameter, and
@@ -6806,7 +9687,7 @@ mod tests {
         momentless.sweeps[0].moments.clear();
         let list = vec![entry(momentless, "m")];
         assert!(
-            derive_site_meta(&list).is_none(),
+            derive_site_meta("fivih", &list).is_none(),
             "a site whose sweeps carry no moments must yield no SiteMeta"
         );
     }
@@ -6962,6 +9843,57 @@ mod tests {
         assert_eq!(tile.values.len(), 16 * 4);
     }
 
+    /// `resolve_elevation` names the sweep `get_raster_tile` draws, so WMS
+    /// GetFeatureInfo asks the position query for the sweep the map shows
+    /// (#1064). A quantity only the 1.5° sweep carries is drawn from it
+    /// without `ELEVATION`, and for an `ELEVATION` nearer 0.5°. At the
+    /// advertised first angle, 0.5°, the position query has no VRADH.
+    #[test]
+    fn site_view_resolve_elevation_is_the_sweep_get_map_draws() {
+        let mut vol = synthetic_volume(25.0, 60.0);
+        let mut sweep1 = vol.sweeps[0].clone();
+        sweep1.elangle = 1.5;
+        sweep1.moments[0].quantity = "VRADH".to_string();
+        vol.sweeps.push(sweep1);
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(vol, "resolve-elevation")]);
+        let view = site_view_for(by_site, "fivih");
+        let levels = MapEngine::raster_info(&view).vertical.unwrap().levels;
+        assert_eq!(levels, [0.5, 1.5]);
+
+        let time = MapEngine::resolve_time(&view, None, None);
+        let resolve = |parameter, z| MapEngine::resolve_elevation(&view, parameter, z, time, None);
+        assert_eq!(resolve(Some("VRADH"), None), Some(1.5));
+        assert_eq!(resolve(Some("VRADH"), Some(0.5)), Some(1.5));
+        assert_eq!(resolve(Some("DBZH"), None), Some(0.5));
+        // Between the sweeps: the nearest one, as GetMap draws it.
+        assert_eq!(resolve(Some("DBZH"), Some(1.2)), Some(0.5));
+        // The default quantity, DBZH.
+        assert_eq!(resolve(None, None), Some(0.5));
+        // CELLS ignores `z`.
+        assert_eq!(
+            resolve(Some(crate::cells::CELLS_PARAMETER), Some(1.2)),
+            Some(1.2)
+        );
+
+        let vradh = ["VRADH".to_string()];
+        let position = |z: f64| {
+            EdrEngine::query_position(
+                &view,
+                "POINT(25.0 60.1)",
+                None,
+                Some(&vradh),
+                Some(std::slice::from_ref(&z)),
+                None,
+            )
+        };
+        assert!(position(1.5).is_ok());
+        assert!(matches!(
+            position(levels[0]),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+    }
+
     /// `resolve_quantities` unions moments across **all** selected volumes,
     /// so a quantity that drops out of the newest scan is still queryable
     /// for the earlier timesteps that carry it.
@@ -7045,9 +9977,9 @@ mod tests {
         ));
     }
 
-    /// A z-pinned query whose level never *measured* the point (the nearest
-    /// sweep carries no data for the requested quantity — every sample
-    /// `Masked`) is a 404, not an HTTP 200 all-null `PointSeries`.
+    /// A z-pinned query whose level never *measured* the point (the sweep
+    /// at that angle carries no data for the requested quantity — every
+    /// sample `Masked`) is a 404, not an HTTP 200 all-null `PointSeries`.
     #[test]
     fn site_view_z_level_all_null_is_404() {
         // sweep0 @0.5° has DBZH; an added 15° sweep has VRADH only.
@@ -7285,6 +10217,52 @@ mod tests {
         );
     }
 
+    /// #1143: the inventory's temporal extent spans its volumes, the
+    /// times `datetime` selects sites by; each site links to its own
+    /// collection; the collection says its items are sites.
+    #[test]
+    fn inventory_spans_its_volumes_and_links_each_site() {
+        let at = |t: &str| DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc);
+        let stamped = |lon, lat, t: &str| {
+            let mut volume = synthetic_volume(lon, lat);
+            volume.time = at(t);
+            volume
+        };
+        let mut by_site = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![
+                entry(stamped(24.5, 60.3, "2026-10-16T06:05:00Z"), "span-a"),
+                entry(stamped(24.5, 60.3, "2026-10-16T06:10:00Z"), "span-b"),
+            ],
+        );
+        by_site.insert(
+            "fikor".to_string(),
+            vec![entry(stamped(21.0, 60.0, "2026-10-16T06:00:00Z"), "span-c")],
+        );
+        let engine = engine_for(by_site, "radar");
+        assert_eq!(
+            FeatureEngine::temporal_extent(&engine),
+            Some((at("2026-10-16T06:00:00Z"), at("2026-10-16T06:10:00Z")))
+        );
+        let site = FeatureEngine::get_feature(&engine, "fivih").unwrap();
+        assert_eq!(
+            site.related,
+            [ds_core::feature::Related {
+                target: ds_core::feature::RelatedTarget::Collection("radar-fivih".into()),
+                title: "Radar site collection".into(),
+            }]
+        );
+        assert!(FeatureEngine::items_description(&engine)
+            .unwrap()
+            .starts_with("Radar site inventory: one point per radar."));
+        assert_eq!(
+            features_time_of(&HashMap::new()),
+            None,
+            "no volume, no span"
+        );
+    }
+
     #[test]
     fn get_feature_hit_and_miss() {
         let engine = two_site_engine();
@@ -7456,6 +10434,7 @@ mod tests {
                 lowest_sweep_range_m: None,
                 vertical: None,
                 volume_info: Arc::default(),
+                location: Arc::default(),
             }
         }
         let nods = vec!["fivih".to_string()];

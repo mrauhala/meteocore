@@ -7,43 +7,71 @@
 //! engine never calls `block_on` from an async context without first
 //! entering `block_in_place`.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::{StreamExt, TryStreamExt};
 
+use arc_swap::ArcSwapOption;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{check_mask_budget, parse_area_coords, QueryPolygon};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, Location, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
 use ds_poll::Shutdown;
 use tokio_postgres::Row;
 
 use crate::config::PostgisEngineConfig;
-use crate::health::{Health, HealthSnapshot, HealthStatus};
-use crate::metadata::{CollectionMeta, MetadataCache};
+use crate::health::{Health, HealthSnapshot, HealthStatus, LiveHealth};
+use crate::metadata::{CollectionMeta, LocationsCut, MetadataCache};
 use crate::query::{
-    build_events_area, build_events_window, build_location, build_position,
-    build_stations_in_polygon, params_as_refs, BuiltQuery, WindowAttrs, DEFAULT_POSITION_RADIUS_M,
-    MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON,
+    build_area_set, build_events_area, build_events_window, build_location, build_position,
+    build_stations_in_polygon, first_observation_column, params_as_refs, BuiltQuery, WindowAttrs,
+    DEFAULT_POSITION_RADIUS_M, MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES,
+    MAX_STATIONS_IN_POLYGON, SET_BASED_MAX_WINDOW,
 };
 use crate::schema::{EventsShape, ObservationSchema};
+use crate::station_map::StationSymbols;
 
 /// Time-ordered observation values for a single parameter. Exists to
 /// keep the Clippy `type_complexity` lint happy without papering over
 /// the intent.
 type ParamSeries = Vec<(DateTime<Utc>, Option<f64>)>;
 
+/// How an area query reads its stations' observations (#1062). Not part of
+/// the engine contract: [`PostgisEngine::query_area_on`] takes it so the
+/// database tests can run both paths on one dataset.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AreaPath {
+    /// One statement per observation table (`long` and `wide` one,
+    /// `per_parameter` one per requested parameter) for every station in the
+    /// polygon at once, rows ordered by station and time and charged against
+    /// [`MAX_RESPONSE_VALUES`] as they stream in. For short windows: a single
+    /// instant over a whole network is one statement, not one per station.
+    SetBased,
+    /// One statement per station (per station and parameter for
+    /// `per_parameter`), at most 16 in flight, each capped at
+    /// [`MAX_OBSERVATION_ROWS`] rows and the whole fan-out at
+    /// [`MAX_AREA_QUERIES`] statements. For long windows, where each
+    /// station's `(station, time)` index range scan is the cheap unit.
+    FanOut,
+}
+
 /// `SELECT 1` health-ping cadence — the `/health` reachability probe (#110).
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// Per-ping deadline; a slower response counts as unreachable.
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
+
+const SCHEMA_PENDING: u8 = 0;
+const SCHEMA_VALID: u8 = 1;
+const SCHEMA_INVALID: u8 = 2;
 
 /// Collection-scoped engine. Cheap to clone (Arcs inside); axum handlers
 /// hold it behind `Arc<dyn EdrEngine>` as is done for every engine.
@@ -52,15 +80,32 @@ pub struct PostgisEngine {
     config: Arc<PostgisEngineConfig>,
     pool: Arc<Pool>,
     cache: Arc<MetadataCache>,
-    /// Live health (DB-reachability) + metrics counters; updated by `poll_loop`.
+    /// DB reachability and metrics counters, independent of schema validity.
     health: Health,
+    schema_state: AtomicU8,
+    refresh_lock: tokio::sync::Mutex<()>,
+    privileges: crate::privileges::PrivilegeAudit,
+    indexes: crate::indexes::IndexAudit,
     /// `<user>@<host>:<port>/<db>` (or `pool_label`) — the `/metrics` pool label.
     pool_key_label: String,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481);
     /// a `shutdown()` that fires before the spawned loop began (rapid-reload
     /// race) is still observed.
     shutdown: Shutdown,
+    /// Process-unique id of this engine: the station-frame cache keys on it,
+    /// so a rebuilt engine never reads its predecessor's frames (#1063).
+    instance_id: u64,
+    /// The station layers' style facts, set by the server when it wires them
+    /// (#1063); `None` while no map API serves them, which also skips the
+    /// per-refresh frame fingerprint.
+    station_symbols: ArcSwapOption<StationSymbols>,
+    /// The station layers' `content_version` (#1063): odd, so never `0`;
+    /// refreshed with the metadata ([`crate::station_map::frame_version`]).
+    frame_version: AtomicU64,
 }
+
+/// Source of [`PostgisEngine`]'s `instance_id`.
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 impl std::fmt::Debug for PostgisEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -86,14 +131,27 @@ impl PostgisEngine {
                 .map(|(_, key, _)| key.to_string())
                 .unwrap_or_else(|_| "unknown".to_string())
         });
+        // Seeded with what the config alone determines, so the parameter
+        // descriptions (#1072) and a property filter on a configured station
+        // column (#1024) are served before the first refresh lands.
+        let cache = Arc::new(MetadataCache::new(&config));
+        let privileges = crate::privileges::PrivilegeAudit::new(&config, &pool);
+        let indexes = crate::indexes::IndexAudit::new(&config, &pool);
         Self {
             collection_id,
             config,
             pool,
-            cache: Arc::new(MetadataCache::new_empty()),
+            cache,
             health: Health::new(),
+            schema_state: AtomicU8::new(SCHEMA_PENDING),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            privileges,
+            indexes,
             pool_key_label,
             shutdown: Shutdown::new(),
+            instance_id: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            station_symbols: ArcSwapOption::empty(),
+            frame_version: AtomicU64::new(1),
         }
     }
 
@@ -113,11 +171,30 @@ impl PostgisEngine {
         &self.cache
     }
 
-    /// Authoritative live `/health` status — `None` until the first ping has
-    /// run (so the caller keeps the boot snapshot rather than the optimistic
-    /// seed), then `Some(Ready/Degraded)`.
-    pub fn live_health(&self) -> Option<HealthStatus> {
-        self.health.live_status()
+    /// O(1) live health: schema validity, then reachability and inventory caps.
+    /// A successful ping cannot clear a pending or invalid schema.
+    pub fn live_health(&self) -> Option<LiveHealth> {
+        match self.schema_state.load(Ordering::Acquire) {
+            SCHEMA_INVALID => return Some(LiveHealth::SchemaInvalid),
+            SCHEMA_PENDING => return Some(LiveHealth::ValidationPending),
+            _ => {}
+        }
+        LiveHealth::from_parts(
+            self.health.live_status(),
+            self.locations_cut(),
+            self.config.max_locations,
+        )
+    }
+
+    /// Which read `max_locations` cut in the cached snapshot, if any (#1061).
+    pub fn locations_cut(&self) -> Option<LocationsCut> {
+        self.cache.load().locations_cut
+    }
+
+    /// Whether `max_locations` cut the cached snapshot (#1061): the
+    /// `postgis_locations_truncated` gauge.
+    pub fn locations_truncated(&self) -> bool {
+        self.locations_cut().is_some()
     }
 
     /// Health + metrics-counter snapshot for the `/metrics` scrape.
@@ -130,32 +207,177 @@ impl PostgisEngine {
         &self.pool_key_label
     }
 
+    /// Hand the station layers their style facts (#1063). The server calls
+    /// this on every load that wires a station collection to a map API,
+    /// whether the engine was built or reused, since a reload can change the
+    /// styles without changing the collection. From the next metadata
+    /// refresh on, each refresh also fingerprints the frames' rows.
+    pub fn set_station_symbols(&self, symbols: StationSymbols) {
+        self.station_symbols.store(Some(Arc::new(symbols)));
+    }
+
+    pub(crate) fn station_symbols(&self) -> Option<Arc<StationSymbols>> {
+        self.station_symbols.load_full()
+    }
+
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// The station layers' content version (#1063): moves when a metadata
+    /// refresh finds the advertised frames' rows or the station list
+    /// changed. Odd, never `0`.
+    pub fn frame_version(&self) -> u64 {
+        self.frame_version.load(Ordering::Acquire)
+    }
+
+    /// Re-fingerprint the station frames after a successful metadata refresh
+    /// (#1063). A failure keeps no stale promise: it moves the version, so
+    /// the frames are read again rather than served from a fingerprint that
+    /// could not be checked.
+    async fn refresh_frame_version(&self) {
+        if self.config.events().is_some() || self.station_symbols.load().is_none() {
+            return;
+        }
+        let meta = self.cache.load();
+        match crate::station_map::frame_version(&self.config, &self.pool, &meta).await {
+            Ok(version) => self.frame_version.store(version, Ordering::Release),
+            Err(e) => {
+                tracing::warn!(
+                    collection = %self.collection_id, error = %e,
+                    "postgis: station map fingerprint failed — station frames will be read again"
+                );
+                let next = self.frame_version().wrapping_add(2) | 1;
+                self.frame_version.store(next, Ordering::Release);
+            }
+        }
+    }
+
     /// Run a one-shot metadata refresh. Used at construction and by the
-    /// `/admin/collections/reload` path. Records the duration + outcome for
-    /// `/metrics` (a failure does NOT flip `/health` — the ping owns that).
+    /// `/admin/collections/reload` path. Validates the schema before publishing
+    /// metadata; transient failures retain the previous snapshot, while a
+    /// confirmed mismatch blocks data access and degrades health.
     pub async fn refresh_metadata(&self) -> Result<(), DataServerError> {
         let start = Instant::now();
-        let result = self
-            .cache
-            .refresh(&self.config, &self.pool)
-            .await
-            .map_err(|e| {
-                // Full detail (including the underlying Postgres error) goes to
-                // the log only. The returned error's Display is stored on
-                // CollectionHealth.error at boot (admin.rs) and served verbatim
-                // by the public /health endpoint, so it must stay generic — the
-                // "no internal error details to clients" rule.
-                tracing::warn!(
-                    collection = %self.collection_id,
-                    error = %e,
-                    "postgis: metadata refresh failed"
-                );
-                DataServerError::Engine(
-                    "metadata refresh failed (database error; see server logs)".to_string(),
-                )
-            });
+        let was_cut = self.locations_cut();
+        let _refresh = self.refresh_lock.lock().await;
+        let had_future = self.cache.load().future_latest.is_some();
+        let result = self.refresh_metadata_checked().await;
+        if result.is_ok() {
+            self.refresh_frame_version().await;
+        }
+        // Advisory and independent of schema/metadata success. Completed audits
+        // do no further I/O; unchecked audits retry without changing health.
+        self.check_advisories().await;
         self.health.record_refresh(result.is_ok(), start.elapsed());
+        let now_cut = self.locations_cut();
+        if result.is_ok() && now_cut != was_cut {
+            // Log the transitions only: `/health` and the gauge carry the
+            // state while it lasts.
+            match now_cut {
+                Some(cut) => tracing::warn!(
+                    collection = %self.collection_id,
+                    max_locations = self.config.max_locations,
+                    "postgis: {} (collection degraded)",
+                    cut.reason(self.config.max_locations)
+                ),
+                None => tracing::info!(
+                    collection = %self.collection_id,
+                    max_locations = self.config.max_locations,
+                    "postgis: station list fits max_locations again"
+                ),
+            }
+        }
+        let future = self.cache.load().future_latest;
+        if result.is_ok() && future.is_some() != had_future {
+            // Transitions only (#1139), like the cut above: every refresh
+            // meanwhile serves the extent that ends at now.
+            match future {
+                Some(latest) => tracing::warn!(
+                    collection = %self.collection_id,
+                    %latest,
+                    "postgis: observations are dated in the future: the advertised temporal \
+                     extent ends at the latest observation not after now"
+                ),
+                None => tracing::info!(
+                    collection = %self.collection_id,
+                    "postgis: no observations are dated in the future any more"
+                ),
+            }
+        }
         result
+    }
+
+    async fn check_advisories(&self) {
+        tokio::join!(
+            self.privileges.check(&self.collection_id, &self.pool),
+            self.indexes.check(&self.collection_id, &self.pool),
+        );
+    }
+
+    // These errors reach public /health at boot: diagnostics belong in logs.
+    async fn refresh_metadata_checked(&self) -> Result<(), DataServerError> {
+        if let Err(e) = crate::validation::validate(&self.config).await {
+            tracing::warn!(
+                collection = %self.collection_id, error = ?e,
+                "postgis: schema validation failed"
+            );
+            if matches!(e, crate::validation::ValidationError::Mismatch(_)) {
+                self.schema_state.store(SCHEMA_INVALID, Ordering::Release);
+            }
+            self.reject_invalid_schema()?;
+            return Err(DataServerError::Engine(
+                "database schema validation unavailable (see server logs)".into(),
+            ));
+        }
+        if let Err(e) = self.cache.refresh(&self.config, &self.pool).await {
+            tracing::warn!(
+                collection = %self.collection_id, error = %e,
+                "postgis: metadata refresh failed"
+            );
+            if matches!(e, crate::metadata::MetadataError::GeometryMismatch) {
+                self.schema_state.store(SCHEMA_INVALID, Ordering::Release);
+                return Err(DataServerError::Engine(
+                    crate::validation::SCHEMA_ERROR.into(),
+                ));
+            }
+            return Err(DataServerError::Engine(
+                "metadata refresh failed (database error; see server logs)".into(),
+            ));
+        }
+        self.schema_state.store(SCHEMA_VALID, Ordering::Release);
+        Ok(())
+    }
+
+    /// Requests only consult this atomic state; database validation runs on refresh.
+    pub(crate) fn require_validated(&self) -> Result<(), DataServerError> {
+        match self.schema_state.load(Ordering::Acquire) {
+            SCHEMA_VALID => Ok(()),
+            SCHEMA_INVALID => Err(DataServerError::Engine(
+                crate::validation::SCHEMA_ERROR.into(),
+            )),
+            _ => Err(DataServerError::Engine(
+                crate::validation::PENDING_ERROR.into(),
+            )),
+        }
+    }
+
+    /// A pending engine may still expose its empty, config-seeded inventory.
+    pub(crate) fn reject_invalid_schema(&self) -> Result<(), DataServerError> {
+        if self.schema_state.load(Ordering::Acquire) == SCHEMA_INVALID {
+            return Err(DataServerError::Engine(
+                crate::validation::SCHEMA_ERROR.into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_geometry_row(&self, row: &Row) -> Result<(), DataServerError> {
+        if !crate::validation::geometry_row_valid(row) {
+            self.schema_state.store(SCHEMA_INVALID, Ordering::Release);
+            tracing::warn!(collection = %self.collection_id, "postgis: returned geometry is not a Point with SRID 4326");
+        }
+        self.reject_invalid_schema()
     }
 
     /// `SELECT 1` with a 2 s deadline — the `/health` reachability probe.
@@ -194,7 +416,7 @@ impl PostgisEngine {
     }
 
     /// Background loop: a `SELECT 1` ping every [`PING_INTERVAL`] (the `/health`
-    /// authority — flips `Ready`/`Degraded` on DB reachability) and a metadata
+    /// reachability probe) and a metadata
     /// refresh every `metadata_refresh_secs` (keeps the location list / extents /
     /// `locations_window` set current — a failed refresh keeps the previous
     /// snapshot, so a blip never empties the cache). Spawned on the dedicated
@@ -223,16 +445,24 @@ impl PostgisEngine {
                 _ = ping_iv.tick() => {
                     // Log only on a transition (not every tick) so log-based
                     // alerting sees DB down/recovery without spam.
-                    match self.health.record_ping(self.ping().await) {
+                    let reachable = self.ping().await;
+                    match self.health.record_ping(reachable) {
                         Some(HealthStatus::Degraded) => tracing::warn!(
                             collection = %self.collection_id,
                             "postgis: DB unreachable (health ping failed) — collection degraded"
                         ),
                         Some(HealthStatus::Ready) => tracing::info!(
                             collection = %self.collection_id,
-                            "postgis: DB reachable again — collection recovered"
+                            "postgis: DB reachable again"
                         ),
                         None => {}
+                    }
+                    if reachable {
+                        if self.schema_state.load(Ordering::Acquire) != SCHEMA_VALID {
+                            let _ = self.refresh_metadata().await;
+                        } else {
+                            self.check_advisories().await;
+                        }
                     }
                 }
                 _ = refresh_iv.tick() => {
@@ -296,6 +526,9 @@ impl PostgisEngine {
             .map_err(|e| DataServerError::Engine(format!("build_events_area: {e}")))?;
 
         let rows = run_single_query_sync(&self.pool, built)?;
+        for row in &rows {
+            self.check_geometry_row(row)?;
+        }
         if rows.len() * per_row > MAX_RESPONSE_VALUES {
             return Err(events_budget_exceeded());
         }
@@ -328,6 +561,7 @@ impl ds_core::events::EventSource for PostgisEngine {
         end: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<ds_core::events::EventPoint>, DataServerError> {
+        self.require_validated()?;
         let Some(shape) = self.config.events() else {
             return Err(DataServerError::Engine(
                 "recent_events requires an events-shape postgis collection".into(),
@@ -336,6 +570,9 @@ impl ds_core::events::EventSource for PostgisEngine {
         let built = build_events_window(shape, (start, end), limit, WindowAttrs::Include)
             .map_err(|e| DataServerError::Engine(format!("build_events_window: {e}")))?;
         let rows = run_single_query_sync(&self.pool, built)?;
+        for row in &rows {
+            self.check_geometry_row(row)?;
+        }
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let time: DateTime<Utc> = row
@@ -379,8 +616,9 @@ impl ds_core::events::EventSource for PostgisEngine {
 // ─── Engine trait ────────────────────────────────────────────────────────────
 
 impl EdrEngine for PostgisEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok((*self.load_meta().locations).clone())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        self.reject_invalid_schema()?;
+        Ok(Arc::clone(&self.load_meta().locations))
     }
 
     fn get_parameters(&self) -> Vec<String> {
@@ -417,6 +655,13 @@ impl EdrEngine for PostgisEngine {
         ]
     }
 
+    /// Station shapes answer one `PointSeries` per station, at the cached
+    /// location's coordinates: EDR GeoJSON names each (#929). Events are
+    /// `Point` coverages with no station, so they stay CoverageJSON only.
+    fn serves_station_series(&self) -> bool {
+        self.config.events().is_none()
+    }
+
     fn query_location(
         &self,
         location_id: &str,
@@ -426,6 +671,7 @@ impl EdrEngine for PostgisEngine {
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         reject_station_query_on_events(&self.config)?;
+        self.require_validated()?;
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
 
@@ -442,9 +688,10 @@ impl EdrEngine for PostgisEngine {
         .map_err(|e| DataServerError::Engine(format!("build_location: {e}")))?;
 
         let (lon, lat) = lookup_station_coords(&self.load_meta(), location_id)?;
+        let decoder = RowDecoder::new(&self.config, &key_refs, false)?;
         let rows_per_query = run_queries_budgeted_sync(&self.pool, queries.clone())?;
-        Ok(CoverageResponse::Single(assemble_query_result(
-            &self.config,
+        Ok(CoverageResponse::Single(assemble_station(
+            &decoder,
             location_id,
             lon,
             lat,
@@ -462,6 +709,7 @@ impl EdrEngine for PostgisEngine {
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         reject_station_query_on_events(&self.config)?;
+        self.require_validated()?;
         let (lon, lat) = parse_coords(coords)?;
         // Observations-derived modes (A/B) resolve the nearest station in-memory
         // from the cached location set — a scan over a few thousand points is
@@ -477,7 +725,7 @@ impl EdrEngine for PostgisEngine {
                 },
             )?
         } else {
-            resolve_nearest_station(&self.pool, &self.config, lon, lat)?
+            resolve_nearest_station(self, &self.config, lon, lat)?
         };
         self.query_location(&station_id, datetime, parameters, z, reference_time)
     }
@@ -490,6 +738,33 @@ impl EdrEngine for PostgisEngine {
         _z: Option<&[f64]>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
+        self.query_area_on(None, coords, datetime, parameters)
+    }
+}
+
+impl PostgisEngine {
+    /// The EDR area query on `path`, or, with `None`, on the path
+    /// [`EdrEngine::query_area`] takes: set-based for a `datetime` window of at
+    /// most [`SET_BASED_MAX_WINDOW`] and for one the fan-out could not run
+    /// (more than [`MAX_AREA_QUERIES`] statements), the per-station fan-out
+    /// otherwise and without `datetime` (#1062). Both paths answer the same
+    /// coverages in the same order on the same data, with the exceptions
+    /// [`run_area_set`] lists; the choice is otherwise cost only.
+    ///
+    /// Not part of the engine contract: public only so the database tests
+    /// can run both paths on one dataset. A forced path skips `area_path`'s
+    /// rules, so a forced `SetBased` also reads a request without
+    /// `datetime` in one statement. Events collections ignore `path`: they
+    /// always run one statement.
+    #[doc(hidden)]
+    pub fn query_area_on(
+        &self,
+        path: Option<AreaPath>,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        self.require_validated()?;
         if let ObservationSchema::Events(ev) = &self.config.observations {
             // Clone the shape so the borrow on `self.config` ends here —
             // `query_area_events` needs `&self` too.
@@ -513,25 +788,37 @@ impl EdrEngine for PostgisEngine {
             stations_in_polygon(&meta.locations, &polygon)
         } else {
             let polygon_wkt = normalize_area_wkt(coords)?;
-            run_stations_in_polygon_sync(&self.pool, &self.config, &polygon_wkt)?
+            run_stations_in_polygon_sync(self, &self.config, &polygon_wkt)?
         };
         if stations.is_empty() {
             return Ok(CoverageResponse::Collection(vec![]));
         }
-        let stations = enforce_station_cap(stations)?;
-        enforce_area_query_count(
-            stations.len(),
-            area_queries_per_station(&self.config, &key_refs),
-        )?;
+        check_station_count(stations.len())?;
+        let stations = distinct_stations(stations);
+        let per_station = area_queries_per_station(&self.config, &key_refs);
+        let path = path.unwrap_or_else(|| area_path(datetime, stations.len(), per_station));
 
-        let results = run_area_fanout(
-            &self.pool,
-            &self.pool_key_label,
-            &self.config,
-            &stations,
-            datetime,
-            &key_refs,
-        )?;
+        let results = match path {
+            AreaPath::SetBased => run_area_set(
+                &self.pool,
+                &self.pool_key_label,
+                &self.config,
+                &stations,
+                datetime,
+                &key_refs,
+            )?,
+            AreaPath::FanOut => {
+                enforce_area_query_count(stations.len(), per_station)?;
+                run_area_fanout(
+                    &self.pool,
+                    &self.pool_key_label,
+                    &self.config,
+                    &stations,
+                    datetime,
+                    &key_refs,
+                )?
+            }
+        };
         Ok(CoverageResponse::Collection(results))
     }
 }
@@ -552,19 +839,67 @@ fn stations_in_polygon(locations: &[Location], polygon: &QueryPolygon) -> Vec<Lo
         .collect()
 }
 
-/// Both area prefilters (SQL `LIMIT 10001`, in-memory `.take(10001)`) fetch
-/// one row past the ceiling; a full batch means the polygon matched more
-/// stations than the sanity ceiling. The real per-request gates are the
-/// response-value budget and the fan-out query count — this only bounds the
-/// prefilter buffer. `QueryTooLarge` → HTTP 400.
-fn enforce_station_cap(stations: Vec<Location>) -> Result<Vec<Location>, DataServerError> {
-    if stations.len() >= MAX_STATIONS_IN_POLYGON {
+/// The prefilter's stations with each id once, at its first place. A
+/// stations view without a unique id can list one station twice; both area
+/// paths then read it once, so they answer the same coverages (#1062).
+fn distinct_stations(mut stations: Vec<Location>) -> Vec<Location> {
+    let keep: Vec<bool> = {
+        let mut seen = HashSet::with_capacity(stations.len());
+        stations
+            .iter()
+            .map(|s| seen.insert(s.id.as_str()))
+            .collect()
+    };
+    if keep.iter().all(|&k| k) {
+        return stations;
+    }
+    // `retain` visits every element once, in order.
+    let mut keep = keep.into_iter();
+    stations.retain(|_| keep.next().unwrap_or(true));
+    stations
+}
+
+/// Both area prefilters (SQL `LIMIT`, in-memory `.take`) fetch one station
+/// past the [`MAX_STATIONS_IN_POLYGON`] memory guard; a full batch means the
+/// polygon matched more stations than it allows. The gate on a request's
+/// size is the response-value budget (#1062): this only bounds the
+/// prefilter buffer and the station id list. `QueryTooLarge` → HTTP 400.
+fn check_station_count(matched: usize) -> Result<(), DataServerError> {
+    if matched >= MAX_STATIONS_IN_POLYGON {
         return Err(DataServerError::QueryTooLarge(format!(
             "area query matched more than the {} station ceiling — narrow the polygon",
             MAX_STATIONS_IN_POLYGON - 1
         )));
     }
-    Ok(stations)
+    Ok(())
+}
+
+/// The path an area query takes when the caller does not force one (#1062).
+///
+/// - No `datetime`: the fan-out. Every station's whole history is read, and
+///   the per-station statements keep their row cap.
+/// - A window of at most [`SET_BASED_MAX_WINDOW`] (an instant, each instant
+///   of a `datetime` list): set-based, one statement per observation table.
+/// - A longer window the fan-out could not run (more than
+///   [`MAX_AREA_QUERIES`] statements): set-based, so the value budget decides
+///   rather than the statement count.
+/// - Any other window: the fan-out, whose parallel `(station, time)` index
+///   scans win on long series.
+fn area_path(
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    stations: usize,
+    queries_per_station: usize,
+) -> AreaPath {
+    let Some((start, end)) = datetime else {
+        return AreaPath::FanOut;
+    };
+    if end.signed_duration_since(start) <= SET_BASED_MAX_WINDOW
+        || stations.saturating_mul(queries_per_station) > MAX_AREA_QUERIES
+    {
+        AreaPath::SetBased
+    } else {
+        AreaPath::FanOut
+    }
 }
 
 /// SQL queries one station contributes to an area fan-out: the
@@ -577,9 +912,10 @@ fn area_queries_per_station(cfg: &PostgisEngineConfig, source_keys: &[&str]) -> 
     }
 }
 
-/// Bound total DB work before any of it runs: stations × per-station
-/// queries. This is the dimension the station count and the parameter list
-/// multiply into — 8k stations × 1 parameter passes, 8k × 6 does not.
+/// Bound a fan-out's statements before any of them runs: stations ×
+/// per-station queries. This is the dimension the station count and the
+/// parameter list multiply into — 8k stations × 1 parameter passes, 8k × 6
+/// does not. The set-based path is not bound by it (#1062).
 fn enforce_area_query_count(
     stations: usize,
     queries_per_station: usize,
@@ -719,7 +1055,7 @@ static FANOUT_LIMITERS: std::sync::OnceLock<
     std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
 > = std::sync::OnceLock::new();
 
-fn fanout_limiter(pool_key: &str, width: usize) -> Arc<tokio::sync::Semaphore> {
+pub(crate) fn fanout_limiter(pool_key: &str, width: usize) -> Arc<tokio::sync::Semaphore> {
     let map = FANOUT_LIMITERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     map.lock()
         .expect("fanout limiter mutex poisoned")
@@ -758,8 +1094,10 @@ fn run_area_fanout(
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
 ) -> Result<Vec<QueryResult>, DataServerError> {
-    let width = (pool.status().max_size.saturating_sub(2)).clamp(1, 16);
+    let width = fanout_width(pool);
     let limiter = fanout_limiter(pool_key, width);
+    let decoder = RowDecoder::new(config, source_keys, false)?;
+    let decoder = &decoder;
     let spent = AtomicUsize::new(0);
     let pool = pool.clone();
     let results: Vec<Option<QueryResult>> = block_on_async(async {
@@ -817,8 +1155,8 @@ fn run_area_fanout(
                 // (sparse stations, retired sensors, missing parameter for
                 // that station). Skip it rather than 404'ing the whole
                 // request. Real errors still propagate.
-                match assemble_query_result(
-                    &config,
+                match assemble_station(
+                    decoder,
                     &station.id,
                     station.longitude,
                     station.latitude,
@@ -836,6 +1174,130 @@ fn run_area_fanout(
         .await
     })?;
     Ok(results.into_iter().flatten().collect())
+}
+
+/// Area connections one pool key may hold at once: the pool size minus a
+/// two-connection headroom, between 1 and 16.
+pub(crate) fn fanout_width(pool: &Pool) -> usize {
+    (pool.status().max_size.saturating_sub(2)).clamp(1, 16)
+}
+
+/// The set-based area path (#1062): every station in `stations` read by one
+/// statement per observation table (`long`/`wide` one, `per_parameter` one
+/// per parameter), run in turn on one pooled connection that holds one of the
+/// pool key's [`fanout_limiter`] permits, so area requests together keep the
+/// pool's headroom whichever path they take.
+///
+/// Rows stream in ordered by station and time and are charged against
+/// [`MAX_RESPONSE_VALUES`] as they arrive: each statement's `LIMIT` is the
+/// remaining budget in rows plus a sentinel row, so the server stops one row
+/// past it, and the row that crosses the budget is the 400. Each row is
+/// decoded into its station's series at once (no `Row` is kept), by the
+/// same [`RowDecoder`] the fan-out uses, and the coverages are assembled in
+/// `stations` order, so both paths answer the same coverages in the same
+/// order. A station with no row in the window is left out, as in the
+/// fan-out.
+///
+/// Where the two paths differ:
+/// - No per-station row cap: that bounds the fan-out's concurrent buffers,
+///   and here the budget bounds the whole response. A station with more
+///   than [`MAX_OBSERVATION_ROWS`] rows in the window is served here and is
+///   the fan-out's 400.
+/// - Rows are matched to stations by `<fk>::text`. A foreign key whose
+///   comparison ignores what its text keeps (`citext` ignores case) can
+///   match `= ANY` under a spelling other than the requested id's; such
+///   rows are skipped with a WARN, while the fan-out keeps them under the
+///   requested id.
+///
+/// `stations` holds each id once (`distinct_stations`); a repeated id would
+/// keep its first place.
+///
+/// Memory: besides the rows' series, a station costs about 200 bytes here
+/// (the id list, the id index and a series slot), on top of the
+/// prefilter's `Location` (see [`MAX_STATIONS_IN_POLYGON`]).
+fn run_area_set(
+    pool: &Pool,
+    pool_key: &str,
+    config: &PostgisEngineConfig,
+    stations: &[Location],
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    source_keys: &[&str],
+) -> Result<Vec<QueryResult>, DataServerError> {
+    let ids: Arc<Vec<String>> = Arc::new(stations.iter().map(|s| s.id.clone()).collect());
+    let mut queries = build_area_set(config, &ids, datetime, source_keys, MAX_RESPONSE_VALUES)
+        .map_err(|e| DataServerError::Engine(format!("build_area_set: {e}")))?;
+    let decoder = RowDecoder::new(config, source_keys, true)?;
+    // Position of each station id in `stations`, so the coverages come out
+    // in the prefilter's order whatever order the database sorts ids in.
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(stations.len());
+    for (i, station) in stations.iter().enumerate() {
+        index.entry(station.id.as_str()).or_insert(i);
+    }
+    let mut series: Vec<Option<StationRows>> = std::iter::repeat_with(|| None)
+        .take(stations.len())
+        .collect();
+    let limiter = fanout_limiter(pool_key, fanout_width(pool));
+    let pool = pool.clone();
+    let unmatched = block_on_async(async {
+        let _permit = limiter
+            .acquire()
+            .await
+            .map_err(|_| DataServerError::Engine("fanout limiter closed".into()))?;
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
+        let mut remaining = MAX_RESPONSE_VALUES;
+        let mut unmatched = 0usize;
+        for i in 0..queries.len() {
+            let per_row = queries[i].values_per_row.max(1);
+            queries[i].set_row_limit(remaining / per_row + 1);
+            let q = &queries[i];
+            let rows = client
+                .query_raw(&q.sql, params_as_refs(&q.params))
+                .await
+                .map_err(|e| map_pg_error(e, q))?;
+            futures::pin_mut!(rows);
+            while let Some(row) = rows.try_next().await.map_err(|e| map_pg_error(e, q))? {
+                if per_row > remaining {
+                    return Err(budget_exceeded());
+                }
+                remaining -= per_row;
+                let id: &str = row
+                    .try_get(0)
+                    .map_err(|e| DataServerError::Engine(format!("decode station: {e}")))?;
+                let Some(&at) = index.get(id) else {
+                    unmatched += 1;
+                    continue;
+                };
+                let station = series[at].get_or_insert_with(|| decoder.station(&queries));
+                decoder.push(station, q, &row)?;
+            }
+        }
+        Ok::<_, DataServerError>(unmatched)
+    })?;
+    if unmatched > 0 {
+        // `<fk>::text` of a row did not spell any requested id, as a column
+        // type whose text form differs from its comparison (citext) would.
+        tracing::warn!(
+            pool_key,
+            unmatched,
+            "postgis: set-based area rows whose station id matched no requested station were skipped"
+        );
+    }
+
+    let mut out = Vec::new();
+    for (station, rows) in stations.iter().zip(series) {
+        let Some(rows) = rows else {
+            continue;
+        };
+        match decoder.finish(&station.id, station.longitude, station.latitude, rows) {
+            Ok(qr) => out.push(qr),
+            Err(DataServerError::LocationNotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
 }
 
 /// Run one built query on a pooled connection (sync bridge). Used by the
@@ -857,13 +1319,13 @@ fn run_single_query_sync(pool: &Pool, built: BuiltQuery) -> Result<Vec<Row>, Dat
 }
 
 fn run_stations_in_polygon_sync(
-    pool: &Pool,
+    engine: &PostgisEngine,
     cfg: &PostgisEngineConfig,
     polygon_wkt: &str,
 ) -> Result<Vec<Location>, DataServerError> {
     let built = build_stations_in_polygon(cfg, polygon_wkt)
         .map_err(|e| DataServerError::Engine(format!("build_stations_in_polygon: {e}")))?;
-    let pool = pool.clone();
+    let pool = engine.pool.clone();
     let sql = built.sql;
     let params = built.params;
     block_on_async(async move {
@@ -879,6 +1341,7 @@ fn run_stations_in_polygon_sync(
 
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
+            engine.check_geometry_row(row)?;
             let id: String = row
                 .try_get("id")
                 .map_err(|e| DataServerError::Engine(format!("decode station id: {e}")))?;
@@ -903,14 +1366,14 @@ fn run_stations_in_polygon_sync(
 }
 
 fn resolve_nearest_station(
-    pool: &Pool,
+    engine: &PostgisEngine,
     cfg: &PostgisEngineConfig,
     lon: f64,
     lat: f64,
 ) -> Result<String, DataServerError> {
     let built = build_position(cfg, lon, lat, DEFAULT_POSITION_RADIUS_M)
         .map_err(|e| DataServerError::Engine(format!("build_position: {e}")))?;
-    let pool = pool.clone();
+    let pool = engine.pool.clone();
     let sql = built.sql;
     let params = built.params;
     block_on_async(async move {
@@ -928,6 +1391,7 @@ fn resolve_nearest_station(
                 "no station within {DEFAULT_POSITION_RADIUS_M:.0} m of ({lon}, {lat})"
             )));
         };
+        engine.check_geometry_row(&row)?;
         let id: String = row
             .try_get("id")
             .map_err(|e| DataServerError::Engine(format!("decode station id: {e}")))?;
@@ -978,41 +1442,195 @@ pub(crate) fn map_pg_error(e: tokio_postgres::Error, q: &BuiltQuery) -> DataServ
 
 // ─── row assembly ──────────────────────────────────────────────────────────
 
-fn assemble_query_result(
-    cfg: &PostgisEngineConfig,
+/// One station's observations decoded from its rows, before they become a
+/// coverage. Rows are decoded as they arrive, so no `Row` outlives its
+/// decoding.
+#[derive(Debug, Default)]
+struct StationRows {
+    rows: usize,
+    /// `long` and `per_parameter`: one `(time, value)` series per source key,
+    /// in row order.
+    series: HashMap<String, ParamSeries>,
+    /// `wide`: the row times, and one value column per selected source key.
+    times: Vec<DateTime<Utc>>,
+    columns: Vec<Vec<Option<f64>>>,
+}
+
+/// Decodes observation rows into a station's series and assembles its
+/// coverage. The single-station, fan-out and set-based statements select the
+/// same columns in the same order, a set-based row led by the station id
+/// (#1062), so every path fills a station through these same steps and the
+/// same rows give the same coverage whichever path fetched them.
+struct RowDecoder<'a> {
+    cfg: &'a PostgisEngineConfig,
+    /// The selected source keys in projection order: the `wide` value
+    /// columns.
+    keys: &'a [&'a str],
+    /// Column index of the time, the first observation column.
+    first: usize,
+}
+
+impl<'a> RowDecoder<'a> {
+    fn new(
+        cfg: &'a PostgisEngineConfig,
+        keys: &'a [&'a str],
+        set_based: bool,
+    ) -> Result<Self, DataServerError> {
+        if matches!(cfg.observations, ObservationSchema::Events(_)) {
+            // Events never reach the station assembly path — their area
+            // query assembles Point coverages via `assemble_event_coverages`.
+            return Err(DataServerError::Engine(
+                "events shape has no station-keyed assembly".into(),
+            ));
+        }
+        Ok(Self {
+            cfg,
+            keys,
+            first: first_observation_column(set_based),
+        })
+    }
+
+    /// An empty station. `per_parameter` starts with a series per query, so a
+    /// parameter whose table has no row in the window is a range of nulls;
+    /// `wide` with a column per selected key.
+    fn station(&self, queries: &[BuiltQuery]) -> StationRows {
+        let mut station = StationRows::default();
+        match &self.cfg.observations {
+            ObservationSchema::PerParameter(_) => {
+                for key in queries.iter().filter_map(|q| q.parameter.as_ref()) {
+                    station.series.entry(key.clone()).or_default();
+                }
+            }
+            ObservationSchema::Wide(_) => station.columns = vec![Vec::new(); self.keys.len()],
+            ObservationSchema::Long(_) | ObservationSchema::Events(_) => {}
+        }
+        station
+    }
+
+    /// Decode one row of `query` into `station`.
+    fn push(
+        &self,
+        station: &mut StationRows,
+        query: &BuiltQuery,
+        row: &Row,
+    ) -> Result<(), DataServerError> {
+        let i = self.first;
+        let time: DateTime<Utc> = row
+            .try_get(i)
+            .map_err(|e| DataServerError::Engine(format!("decode time: {e}")))?;
+        match &self.cfg.observations {
+            ObservationSchema::Long(_) => {
+                let key: String = row
+                    .try_get(i + 1)
+                    .map_err(|e| DataServerError::Engine(format!("decode parameter: {e}")))?;
+                let value: Option<f64> = row
+                    .try_get(i + 2)
+                    .map_err(|e| DataServerError::Engine(format!("decode value: {e}")))?;
+                station.series.entry(key).or_default().push((time, value));
+            }
+            ObservationSchema::Wide(_) => {
+                station.times.push(time);
+                for (k, column) in station.columns.iter_mut().enumerate() {
+                    let value: Option<f64> = row.try_get(i + 1 + k).map_err(|e| {
+                        DataServerError::Engine(format!("decode {}: {e}", self.keys[k]))
+                    })?;
+                    column.push(value);
+                }
+            }
+            ObservationSchema::PerParameter(_) => {
+                let Some(key) = query.parameter.as_deref() else {
+                    return Err(DataServerError::Engine(
+                        "per_parameter query missing parameter tag".into(),
+                    ));
+                };
+                let value: Option<f64> = row
+                    .try_get(i + 1)
+                    .map_err(|e| DataServerError::Engine(format!("decode value: {e}")))?;
+                match station.series.get_mut(key) {
+                    Some(series) => series.push((time, value)),
+                    None => {
+                        station.series.insert(key.to_string(), vec![(time, value)]);
+                    }
+                }
+            }
+            ObservationSchema::Events(_) => {
+                return Err(DataServerError::Engine(
+                    "events shape has no station-keyed assembly".into(),
+                ))
+            }
+        }
+        station.rows += 1;
+        Ok(())
+    }
+
+    /// The station's `PointSeries` coverage. No row in the window is a
+    /// `LocationNotFound`: the single-station path's 404, a station the area
+    /// paths leave out.
+    fn finish(
+        &self,
+        station_id: &str,
+        lon: f64,
+        lat: f64,
+        station: StationRows,
+    ) -> Result<QueryResult, DataServerError> {
+        if station.rows == 0 {
+            // Match CsvEngine: station exists but has no data in the queried
+            // window ⇒ 404. Better than emitting an empty PointSeries (which
+            // fails CoverageJSON schema validation).
+            return Err(DataServerError::LocationNotFound(format!(
+                "{station_id} (no data in time range)"
+            )));
+        }
+        match &self.cfg.observations {
+            ObservationSchema::Wide(_) => Ok(wide_coverage(
+                self.cfg,
+                lon,
+                lat,
+                self.keys,
+                station.times,
+                station.columns,
+            )),
+            _ => Ok(series_coverage(self.cfg, lon, lat, station.series)),
+        }
+    }
+}
+
+/// Decode one station's rows, query by query, and assemble its coverage:
+/// the single-station and fan-out paths.
+fn assemble_station(
+    decoder: &RowDecoder<'_>,
     station_id: &str,
     lon: f64,
     lat: f64,
     queries: &[BuiltQuery],
     rows_per_query: Vec<Vec<Row>>,
 ) -> Result<QueryResult, DataServerError> {
-    let total_rows: usize = rows_per_query.iter().map(|r| r.len()).sum();
-    if total_rows == 0 {
-        // Match CsvEngine: station exists but has no data in the queried
-        // window ⇒ 404. Better than emitting an empty PointSeries (which
-        // fails CoverageJSON schema validation).
-        return Err(DataServerError::LocationNotFound(format!(
-            "{station_id} (no data in time range)"
-        )));
+    let mut station = decoder.station(queries);
+    for (query, rows) in queries.iter().zip(&rows_per_query) {
+        for row in rows {
+            decoder.push(&mut station, query, row)?;
+        }
     }
-    match &cfg.observations {
-        ObservationSchema::Long(_) => {
-            let rows = rows_per_query.into_iter().next().unwrap_or_default();
-            assemble_long(cfg, station_id, lon, lat, rows)
-        }
-        ObservationSchema::Wide(_) => {
-            let rows = rows_per_query.into_iter().next().unwrap_or_default();
-            assemble_wide(cfg, lon, lat, rows)
-        }
-        ObservationSchema::PerParameter(_) => {
-            assemble_per_parameter(cfg, lon, lat, queries, rows_per_query)
-        }
-        // Events never reach the station assembly path — their area query
-        // assembles Point coverages via `assemble_event_coverages`.
-        ObservationSchema::Events(_) => Err(DataServerError::Engine(
-            "events shape has no station-keyed assembly".into(),
-        )),
-    }
+    decoder.finish(station_id, lon, lat, station)
+}
+
+/// The descriptor of a configured parameter, or a bare one named after it.
+fn parameter_description(cfg: &PostgisEngineConfig, pname: &str) -> ParameterDescription {
+    cfg.parameters
+        .iter()
+        .find(|p| p.name == pname)
+        .map(|p| ParameterDescription {
+            label: p.label.clone(),
+            unit: p.unit.clone(),
+            observed_property: p.observed_property.clone(),
+            standard_name: None,
+        })
+        .unwrap_or_else(|| ParameterDescription {
+            label: pname.to_string(),
+            unit: String::new(),
+            observed_property: pname.to_string(),
+            standard_name: None,
+        })
 }
 
 // ─── event row assembly (events shape) ──────────────────────────────────────
@@ -1075,22 +1693,7 @@ fn assemble_event_coverages(
         .iter()
         .map(|key| {
             let pname = source_key_to_param_name(cfg, key);
-            let desc = cfg
-                .parameters
-                .iter()
-                .find(|p| p.name == pname)
-                .map(|p| ParameterDescription {
-                    label: p.label.clone(),
-                    unit: p.unit.clone(),
-                    observed_property: p.observed_property.clone(),
-                    standard_name: None,
-                })
-                .unwrap_or_else(|| ParameterDescription {
-                    label: pname.clone(),
-                    unit: String::new(),
-                    observed_property: pname.clone(),
-                    standard_name: None,
-                });
+            let desc = parameter_description(cfg, &pname);
             (pname, desc)
         })
         .collect();
@@ -1125,30 +1728,15 @@ fn assemble_event_coverages(
         .collect()
 }
 
-fn assemble_long(
+/// `long` and `per_parameter`: one series per source key on the union of
+/// their times, sorted; a key without a value at a time is null there, and of
+/// two values at one time the later row wins.
+fn series_coverage(
     cfg: &PostgisEngineConfig,
-    _station_id: &str,
     lon: f64,
     lat: f64,
-    rows: Vec<Row>,
-) -> Result<QueryResult, DataServerError> {
-    // Long rows: (time, parameter, value). Group by param, collect times,
-    // build per-param NdArray.
-    let mut per_param: HashMap<String, ParamSeries> = HashMap::new();
-    for row in &rows {
-        let t: DateTime<Utc> = row
-            .try_get("time")
-            .map_err(|e| DataServerError::Engine(format!("decode time: {e}")))?;
-        let p: String = row
-            .try_get("parameter")
-            .map_err(|e| DataServerError::Engine(format!("decode parameter: {e}")))?;
-        let v: Option<f64> = row
-            .try_get("value")
-            .map_err(|e| DataServerError::Engine(format!("decode value: {e}")))?;
-        per_param.entry(p).or_default().push((t, v));
-    }
-
-    // Union of all times across all parameters, sorted.
+    per_param: HashMap<String, ParamSeries>,
+) -> QueryResult {
     let mut all_times: Vec<DateTime<Utc>> = per_param
         .values()
         .flat_map(|rows| rows.iter().map(|(t, _)| *t))
@@ -1156,33 +1744,11 @@ fn assemble_long(
     all_times.sort_unstable();
     all_times.dedup();
 
-    let domain = DomainDescription::PointSeries {
-        x: lon,
-        y: lat,
-        t: all_times.clone(),
-        z: None,
-    };
-
     let mut param_descs = HashMap::new();
     let mut ranges = HashMap::new();
     for (source_key, rows) in per_param {
         let pname = source_key_to_param_name(cfg, &source_key);
-        let desc = cfg
-            .parameters
-            .iter()
-            .find(|p| p.name == pname)
-            .map(|p| ParameterDescription {
-                label: p.label.clone(),
-                unit: p.unit.clone(),
-                observed_property: p.observed_property.clone(),
-                standard_name: None,
-            })
-            .unwrap_or_else(|| ParameterDescription {
-                label: pname.clone(),
-                unit: String::new(),
-                observed_property: pname.clone(),
-                standard_name: None,
-            });
+        let desc = parameter_description(cfg, &pname);
         let row_map: HashMap<DateTime<Utc>, Option<f64>> = rows.into_iter().collect();
         let values: Vec<Option<f64>> = all_times
             .iter()
@@ -1200,95 +1766,33 @@ fn assemble_long(
         param_descs.insert(pname, desc);
     }
 
-    Ok(QueryResult {
-        domain,
+    QueryResult {
+        domain: DomainDescription::PointSeries {
+            x: lon,
+            y: lat,
+            t: all_times,
+            z: None,
+        },
         parameters: param_descs,
         ranges,
-    })
+    }
 }
 
-fn assemble_wide(
+/// `wide`: the row times as they came (ordered by time in SQL), and one
+/// range per selected key.
+fn wide_coverage(
     cfg: &PostgisEngineConfig,
     lon: f64,
     lat: f64,
-    rows: Vec<Row>,
-) -> Result<QueryResult, DataServerError> {
-    // Wide rows: (time, <param_alias_1>::float8, <param_alias_2>::float8, ...).
-    // The BuiltQuery SELECT projected each requested source_key as an alias
-    // named after that source_key — walk `cfg.parameters` in order for the
-    // column list, but we only know which were requested via the row's own
-    // column schema. Iterate row columns to discover the set.
-    // Empty rows are caught upstream by assemble_query_result and turned
-    // into LocationNotFound — by the time we get here, `rows` is non-empty.
-    let first = rows.first().expect("upstream guarantees non-empty rows");
-
-    let time_col_idx = first
-        .columns()
-        .iter()
-        .position(|c| c.name() == "time")
-        .ok_or_else(|| DataServerError::Engine("wide row missing 'time' column".into()))?;
-
-    // Other columns are parameter aliases.
-    let param_keys: Vec<String> = first
-        .columns()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| {
-            if i == time_col_idx {
-                None
-            } else {
-                Some(c.name().to_string())
-            }
-        })
-        .collect();
-
-    let mut times: Vec<DateTime<Utc>> = Vec::with_capacity(rows.len());
-    let mut per_param: HashMap<String, Vec<Option<f64>>> = param_keys
-        .iter()
-        .map(|k| (k.clone(), Vec::with_capacity(rows.len())))
-        .collect();
-
-    for row in &rows {
-        let t: DateTime<Utc> = row
-            .try_get::<_, DateTime<Utc>>(time_col_idx)
-            .map_err(|e| DataServerError::Engine(format!("decode time: {e}")))?;
-        times.push(t);
-        for key in &param_keys {
-            let v: Option<f64> = row
-                .try_get(key.as_str())
-                .map_err(|e| DataServerError::Engine(format!("decode {key}: {e}")))?;
-            per_param.get_mut(key).unwrap().push(v);
-        }
-    }
-
-    let domain = DomainDescription::PointSeries {
-        x: lon,
-        y: lat,
-        t: times.clone(),
-        z: None,
-    };
-
+    keys: &[&str],
+    times: Vec<DateTime<Utc>>,
+    columns: Vec<Vec<Option<f64>>>,
+) -> QueryResult {
     let mut param_descs = HashMap::new();
     let mut ranges = HashMap::new();
-    for key in &param_keys {
+    for (key, values) in keys.iter().zip(columns) {
         let pname = source_key_to_param_name(cfg, key);
-        let desc = cfg
-            .parameters
-            .iter()
-            .find(|p| p.name == pname)
-            .map(|p| ParameterDescription {
-                label: p.label.clone(),
-                unit: p.unit.clone(),
-                observed_property: p.observed_property.clone(),
-                standard_name: None,
-            })
-            .unwrap_or_else(|| ParameterDescription {
-                label: pname.clone(),
-                unit: String::new(),
-                observed_property: pname.clone(),
-                standard_name: None,
-            });
-        let values = per_param.remove(key).unwrap();
+        let desc = parameter_description(cfg, &pname);
         let n = values.len();
         ranges.insert(
             pname.clone(),
@@ -1301,101 +1805,16 @@ fn assemble_wide(
         param_descs.insert(pname, desc);
     }
 
-    Ok(QueryResult {
-        domain,
+    QueryResult {
+        domain: DomainDescription::PointSeries {
+            x: lon,
+            y: lat,
+            t: times,
+            z: None,
+        },
         parameters: param_descs,
         ranges,
-    })
-}
-
-fn assemble_per_parameter(
-    cfg: &PostgisEngineConfig,
-    lon: f64,
-    lat: f64,
-    queries: &[BuiltQuery],
-    rows_per_query: Vec<Vec<Row>>,
-) -> Result<QueryResult, DataServerError> {
-    // Each query carries a `parameter` (source_key) tag. Each row is (time,
-    // value). Union times across all queries.
-    let mut per_param: HashMap<String, ParamSeries> = HashMap::new();
-    for (q, rows) in queries.iter().zip(rows_per_query) {
-        let Some(source_key) = q.parameter.as_ref() else {
-            return Err(DataServerError::Engine(
-                "per_parameter query missing parameter tag".into(),
-            ));
-        };
-        let mut entries = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let t: DateTime<Utc> = row
-                .try_get("time")
-                .map_err(|e| DataServerError::Engine(format!("decode time: {e}")))?;
-            let v: Option<f64> = row
-                .try_get("value")
-                .map_err(|e| DataServerError::Engine(format!("decode value: {e}")))?;
-            entries.push((t, v));
-        }
-        per_param.insert(source_key.clone(), entries);
     }
-
-    let mut all_times: Vec<DateTime<Utc>> = per_param
-        .values()
-        .flat_map(|rows| rows.iter().map(|(t, _)| *t))
-        .collect();
-    all_times.sort_unstable();
-    all_times.dedup();
-
-    // Same invariant as wide: empty rows turned into LocationNotFound upstream.
-    debug_assert!(!all_times.is_empty(), "upstream guarantees non-empty rows");
-
-    let domain = DomainDescription::PointSeries {
-        x: lon,
-        y: lat,
-        t: all_times.clone(),
-        z: None,
-    };
-
-    let mut param_descs = HashMap::new();
-    let mut ranges = HashMap::new();
-    for (source_key, rows) in per_param {
-        let pname = source_key_to_param_name(cfg, &source_key);
-        let desc = cfg
-            .parameters
-            .iter()
-            .find(|p| p.name == pname)
-            .map(|p| ParameterDescription {
-                label: p.label.clone(),
-                unit: p.unit.clone(),
-                observed_property: p.observed_property.clone(),
-                standard_name: None,
-            })
-            .unwrap_or_else(|| ParameterDescription {
-                label: pname.clone(),
-                unit: String::new(),
-                observed_property: pname.clone(),
-                standard_name: None,
-            });
-        let row_map: HashMap<DateTime<Utc>, Option<f64>> = rows.into_iter().collect();
-        let values: Vec<Option<f64>> = all_times
-            .iter()
-            .map(|t| row_map.get(t).copied().unwrap_or(None))
-            .collect();
-        let n = values.len();
-        ranges.insert(
-            pname.clone(),
-            NdArray {
-                shape: vec![n],
-                axis_names: vec!["t".into()],
-                values,
-            },
-        );
-        param_descs.insert(pname, desc);
-    }
-
-    Ok(QueryResult {
-        domain,
-        parameters: param_descs,
-        ranges,
-    })
 }
 
 // ─── sync ↔ async bridge ───────────────────────────────────────────────────
@@ -1525,6 +1944,7 @@ mod tests {
             pool_size: 4,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: crate::schema::LocationSource::Stations(dummy_stations()),
             observations: dummy_long_obs(),
             parameters: vec![
@@ -1546,6 +1966,7 @@ mod tests {
             locations_window: None,
             events_default_window: None,
             events_extent_bbox: None,
+            station_map: Default::default(),
         };
         let keys = resolve_source_keys(&cfg, None).unwrap();
         assert_eq!(keys, vec!["TEMP", "WIND"]);
@@ -1579,6 +2000,7 @@ mod tests {
             pool_size: 2,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: crate::schema::LocationSource::None,
             observations: ObservationSchema::Events(EventsShape {
                 coverage_bbox: None,
@@ -1603,6 +2025,7 @@ mod tests {
             locations_window: None,
             events_default_window: Some(chrono::Duration::hours(1)),
             events_extent_bbox: Some([4.0, 54.0, 42.0, 72.0]),
+            station_map: Default::default(),
         }
     }
 
@@ -1613,6 +2036,36 @@ mod tests {
             engine.supported_query_types(),
             vec!["area".to_string(), "radius".to_string()]
         );
+    }
+
+    /// EDR GeoJSON (#929) is offered for station series only: an events
+    /// collection answers `Point` coverages with no station to name.
+    #[test]
+    fn only_station_shapes_serve_station_series() {
+        use crate::config::ValidatedParameter;
+        let stations = PostgisEngineConfig {
+            dsn: "postgres://user:pw@127.0.0.1:1/db".into(),
+            dsn_was_literal: false,
+            pool_size: 2,
+            pool_label: None,
+            metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
+            location_source: crate::schema::LocationSource::Stations(dummy_stations()),
+            observations: dummy_long_obs(),
+            parameters: vec![ValidatedParameter {
+                name: "t2m".into(),
+                label: "Air temperature".into(),
+                unit: "°C".into(),
+                observed_property: "air_temperature".into(),
+                source_key: "TEMP".into(),
+            }],
+            locations_window: None,
+            events_default_window: None,
+            events_extent_bbox: None,
+            station_map: Default::default(),
+        };
+        assert!(engine_with(stations).serves_station_series());
+        assert!(!engine_with(events_engine_config()).serves_station_series());
     }
 
     #[test]
@@ -1644,6 +2097,7 @@ mod tests {
             pool_size: 4,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: crate::schema::LocationSource::None,
             observations: ObservationSchema::Events(EventsShape {
                 coverage_bbox: None,
@@ -1668,6 +2122,7 @@ mod tests {
             locations_window: None,
             events_default_window: Some(chrono::Duration::hours(1)),
             events_extent_bbox: None,
+            station_map: Default::default(),
         };
         let t0: DateTime<Utc> = "2026-07-11T17:00:00Z".parse().unwrap();
         let t1: DateTime<Utc> = "2026-07-11T17:05:00Z".parse().unwrap();
@@ -1732,12 +2187,19 @@ mod tests {
                     .map(|s: &crate::metadata::FeatureStation| s.properties.as_ref()),
             ),
             feature_stations: std::sync::Arc::new(stations),
-            locations: std::sync::Arc::new(locations),
+            locations: std::sync::Arc::new(LocationSnapshot::new(locations)),
             station_idx: std::sync::Arc::new(station_idx),
             parameters: std::sync::Arc::new(HashMap::new()),
             temporal_extent: None,
+            future_latest: None,
             spatial_extent: None,
             wms_times: std::sync::Arc::new(Vec::new()),
+            raster_info: std::sync::Arc::new(crate::maps::build_raster_info(
+                &stations_engine_config(&[]),
+                None,
+                &[],
+            )),
+            locations_cut: None,
             version: 1,
         }
     }
@@ -1772,27 +2234,94 @@ mod tests {
 
     #[test]
     fn station_cap_maps_to_query_too_large_not_engine_error() {
+        // The guard sits at 200 000 stations (#1062), far above the old
+        // 10 000 ceiling a 20 000-station network used to hit.
+        const { assert!(MAX_STATIONS_IN_POLYGON > 20_000) };
+        assert!(check_station_count(20_000).is_ok());
         // A full-ceiling batch stays under the limit untouched.
-        let under: Vec<Location> = (0..MAX_STATIONS_IN_POLYGON - 1)
-            .map(|i| loc(&format!("s{i}"), 24.0, 60.0))
-            .collect();
-        assert_eq!(
-            enforce_station_cap(under).unwrap().len(),
-            MAX_STATIONS_IN_POLYGON - 1
-        );
+        assert!(check_station_count(MAX_STATIONS_IN_POLYGON - 1).is_ok());
 
         // A full sentinel batch signals the ceiling was breached →
         // QueryTooLarge (HTTP 400 with the message), never Engine
         // (opaque HTTP 500).
-        let over: Vec<Location> = (0..MAX_STATIONS_IN_POLYGON)
-            .map(|i| loc(&format!("s{i}"), 24.0, 60.0))
-            .collect();
-        match enforce_station_cap(over).unwrap_err() {
+        match check_station_count(MAX_STATIONS_IN_POLYGON).unwrap_err() {
             DataServerError::QueryTooLarge(msg) => {
                 assert!(msg.contains("narrow the polygon"), "message: {msg}")
             }
             other => panic!("expected QueryTooLarge, got: {other:?}"),
         }
+    }
+
+    /// #1062: a stations view without a unique id lists a station twice.
+    /// The area paths read it once, at its first place, so the fan-out
+    /// cannot answer it twice where the set-based path answers it once.
+    #[test]
+    fn area_stations_hold_each_id_once_at_its_first_place() {
+        let stations = vec![
+            loc("b", 1.0, 1.0),
+            loc("a", 2.0, 2.0),
+            loc("b", 3.0, 3.0),
+            loc("c", 4.0, 4.0),
+            loc("a", 5.0, 5.0),
+        ];
+        let kept: Vec<(String, f64)> = distinct_stations(stations)
+            .into_iter()
+            .map(|l| (l.id, l.longitude))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("b".into(), 1.0), ("a".into(), 2.0), ("c".into(), 4.0)]
+        );
+
+        // Without a repeat the list is untouched.
+        let unique = vec![loc("x", 1.0, 1.0), loc("y", 2.0, 2.0)];
+        let ids: Vec<String> = distinct_stations(unique)
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(ids, vec!["x", "y"]);
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// #1062: an instant or a short window runs set-based whatever the
+    /// station count; a long window keeps the fan-out while it can run it.
+    #[test]
+    fn short_windows_run_set_based() {
+        let t0 = at("2026-01-01T06:00:00Z");
+        let instant = Some((t0, t0));
+        let hour = Some((t0, t0 + SET_BASED_MAX_WINDOW));
+        let week = Some((t0, t0 + chrono::Duration::days(7)));
+        for stations in [1, 50, 20_000, 30_000] {
+            for per_station in [1, 2, 8] {
+                assert_eq!(
+                    area_path(instant, stations, per_station),
+                    AreaPath::SetBased
+                );
+                assert_eq!(area_path(hour, stations, per_station), AreaPath::SetBased);
+            }
+        }
+        // Just past the threshold, the fan-out takes what it can run.
+        let longer = Some((t0, t0 + SET_BASED_MAX_WINDOW + chrono::Duration::seconds(1)));
+        assert_eq!(area_path(longer, 100, 1), AreaPath::FanOut);
+        assert_eq!(area_path(week, 8_000, 2), AreaPath::FanOut);
+        assert_eq!(area_path(week, MAX_AREA_QUERIES, 1), AreaPath::FanOut);
+    }
+
+    /// #1062: a long window the fan-out cannot run goes set-based, so the
+    /// value budget decides; without `datetime` the fan-out keeps its
+    /// statement cap.
+    #[test]
+    fn long_windows_past_the_fan_out_cap_run_set_based() {
+        let t0 = at("2026-01-01T06:00:00Z");
+        let week = Some((t0, t0 + chrono::Duration::days(7)));
+        assert_eq!(area_path(week, MAX_AREA_QUERIES + 1, 1), AreaPath::SetBased);
+        assert_eq!(area_path(week, 20_000, 2), AreaPath::SetBased);
+        assert_eq!(area_path(week, 2_501, 8), AreaPath::SetBased);
+        assert_eq!(area_path(None, 1, 1), AreaPath::FanOut);
+        assert_eq!(area_path(None, 30_000, 8), AreaPath::FanOut);
     }
 
     #[test]
@@ -1857,6 +2386,427 @@ mod tests {
         assert_eq!(page.number_matched, 2);
         assert_eq!(page.features[0].id, "c");
         assert_eq!(page.next_offset, None);
+    }
+
+    /// A stations-only engine whose stations table maps `property_cols`.
+    fn stations_engine_config(property_cols: &[&str]) -> PostgisEngineConfig {
+        PostgisEngineConfig {
+            dsn: "postgres://user:pw@127.0.0.1:1/db".into(),
+            dsn_was_literal: false,
+            pool_size: 2,
+            pool_label: None,
+            metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
+            location_source: crate::schema::LocationSource::Stations(
+                crate::schema::StationsMapping {
+                    property_cols: property_cols.iter().map(|c| (*c).to_string()).collect(),
+                    ..dummy_stations()
+                },
+            ),
+            observations: dummy_long_obs(),
+            parameters: vec![],
+            locations_window: None,
+            events_default_window: None,
+            events_extent_bbox: None,
+            station_map: Default::default(),
+        }
+    }
+
+    /// What the Features API needs for `?territory=FI` to answer 200 with
+    /// zero features: the name is filterable and the engine pages an empty
+    /// match set without error.
+    fn assert_territory_filter_matches_nothing(engine: &PostgisEngine) {
+        use ds_core::feature::FeatureQuery;
+        use ds_core::feature_engine::FeatureEngine;
+        assert!(
+            engine.filterables().contains("territory"),
+            "filterables: {:?}",
+            engine.filterables()
+        );
+        let query = FeatureQuery {
+            property_filters: vec![("territory".into(), "FI".into())],
+            ..Default::default()
+        };
+        let page = engine.get_features(&query).unwrap();
+        assert_eq!(page.number_matched, 0);
+        assert_eq!(page.number_returned, 0);
+        assert!(page.features.is_empty());
+    }
+
+    /// #1024: a configured station property is a valid filter before the
+    /// first metadata refresh and after one that failed because the database
+    /// was unreachable at boot, not a 400 until the first row arrives.
+    #[tokio::test]
+    async fn configured_property_filter_survives_a_failed_first_refresh() {
+        let engine = engine_with(stations_engine_config(&["territory"]));
+        assert_territory_filter_matches_nothing(&engine);
+
+        // Nothing listens on port 1: the refresh fails and the seeded
+        // snapshot stays in place.
+        let refreshed =
+            tokio::time::timeout(Duration::from_secs(30), engine.refresh_metadata()).await;
+        assert!(
+            matches!(refreshed, Ok(Err(_))),
+            "a refresh against port 1 must fail, not succeed or hang"
+        );
+        assert_eq!(engine.health_snapshot().refresh_failures, 1);
+        assert_eq!(engine.cache().load().version, 0);
+        assert_territory_filter_matches_nothing(&engine);
+    }
+
+    /// #1024: a refresh that reads an empty stations table keeps the
+    /// configured property columns filterable.
+    #[test]
+    fn configured_property_filter_is_valid_on_an_empty_stations_table() {
+        let engine = engine_with(stations_engine_config(&["territory"]));
+        let refreshed = CollectionMeta::build(
+            engine.config(),
+            crate::metadata::LocationSet::default(),
+            crate::metadata::TemporalRead::default(),
+            1,
+        );
+        engine.cache().store(refreshed);
+        assert_eq!(engine.cache().load().version, 1);
+        assert_territory_filter_matches_nothing(&engine);
+    }
+
+    /// The EDR descriptions of `t2m` (labelled) and `ws` (no label, so the
+    /// name stands in), as configured.
+    fn assert_configured_parameters_described(engine: &PostgisEngine) {
+        let params = engine.get_parameter_descriptions();
+        assert_eq!(params.len(), 2, "descriptions: {params:?}");
+        let t2m = &params["t2m"];
+        assert_eq!(t2m.label, "Air temperature");
+        assert_eq!(t2m.unit, "°C");
+        assert_eq!(t2m.observed_property, "air_temperature");
+        let ws = &params["ws"];
+        assert_eq!(ws.label, "ws");
+        assert_eq!(ws.unit, "m/s");
+        assert_eq!(ws.observed_property, "wind_speed");
+    }
+
+    /// #1072: the parameter descriptions come from config alone, so they are
+    /// served before the first metadata refresh and after one that failed
+    /// because the database was unreachable at boot.
+    #[tokio::test]
+    async fn configured_parameters_are_described_before_any_refresh() {
+        use crate::config::ValidatedParameter;
+        let engine = engine_with(PostgisEngineConfig {
+            parameters: vec![
+                ValidatedParameter {
+                    name: "t2m".into(),
+                    label: "Air temperature".into(),
+                    unit: "°C".into(),
+                    observed_property: "air_temperature".into(),
+                    source_key: "TEMP".into(),
+                },
+                ValidatedParameter {
+                    name: "ws".into(),
+                    label: "".into(),
+                    unit: "m/s".into(),
+                    observed_property: "wind_speed".into(),
+                    source_key: "WIND".into(),
+                },
+            ],
+            ..stations_engine_config(&[])
+        });
+        assert_configured_parameters_described(&engine);
+
+        // Nothing listens on port 1: the refresh fails and the seeded
+        // snapshot stays in place.
+        let refreshed =
+            tokio::time::timeout(Duration::from_secs(30), engine.refresh_metadata()).await;
+        assert!(
+            matches!(refreshed, Ok(Err(_))),
+            "a refresh against port 1 must fail, not succeed or hang"
+        );
+        assert_eq!(engine.cache().load().version, 0);
+        assert_configured_parameters_described(&engine);
+    }
+
+    /// #1072: the events shape's spatial extent is its configured
+    /// `extent_bbox`, never read from the database, so it too is served
+    /// before the first refresh.
+    #[test]
+    fn events_extent_is_served_before_any_refresh() {
+        let engine = engine_with(events_engine_config());
+        assert_eq!(engine.cache().load().version, 0);
+        assert_eq!(engine.get_spatial_extent(), Some([4.0, 54.0, 42.0, 72.0]));
+        assert_eq!(
+            engine.get_parameter_descriptions()["peak_current"].unit,
+            "kA"
+        );
+    }
+
+    /// #1063: a station collection's map surface — a layer per parameter on
+    /// one time axis, a content version that is never `0`, layers
+    /// GetFeatureInfo does not read — while the events layer keeps its own.
+    #[test]
+    fn station_shapes_serve_a_symbol_layer_per_parameter() {
+        use ds_core::map_engine::MapEngine;
+        let engine = engine_with(crate::station_map::tests::station_config());
+        let info = engine.raster_info_shared();
+        assert_eq!(info.parameter, "t2m");
+        assert_eq!(info.unit, "°C");
+        let layers: Vec<(&str, &str, &str)> = info
+            .parameters
+            .iter()
+            .map(|p| (p.name.as_str(), p.title.as_str(), p.unit.as_str()))
+            .collect();
+        assert_eq!(
+            layers,
+            vec![("t2m", "Air temperature", "°C"), ("rh", "Humidity", "%")]
+        );
+        assert!(!engine.layer_shows_values("t2m"));
+        assert_ne!(engine.content_version(), 0);
+
+        let events = engine_with(events_engine_config());
+        let info = events.raster_info();
+        assert_eq!(info.parameter, crate::maps::LIGHTNING_AGE_PARAMETER);
+        assert!(info.parameters.is_empty());
+        assert_eq!(info.spatial_extent, Some([4.0, 54.0, 42.0, 72.0]));
+        assert_eq!(events.content_version(), 0);
+        assert!(events.layer_shows_values(crate::maps::LIGHTNING_AGE_PARAMETER));
+    }
+
+    /// #1063, #507: a station layer renders the instant `resolve_time` and
+    /// `resolve_parameter_time` key the caches on — the latest advertised
+    /// step without `TIME`, the `[postgis.map] time_step` an explicit one
+    /// falls in — and a frame with no cached station needs no database.
+    #[test]
+    fn station_layers_render_the_instant_they_resolve() {
+        use ds_core::map_engine::{MapEngine, OutputCrs};
+        let at = |s: &str| -> DateTime<Utc> { s.parse().unwrap() };
+        let latest = at("2026-10-18T06:08:40Z");
+        let explicit = at("2026-10-18T05:42:59Z");
+        let engine_stepping = |minutes: i64| {
+            let mut cfg = crate::station_map::tests::station_config();
+            cfg.station_map.time_step = chrono::Duration::minutes(minutes);
+            let engine = engine_with(cfg.clone());
+            engine.cache().store(CollectionMeta::build(
+                &cfg,
+                crate::metadata::LocationSet::default(),
+                crate::metadata::TemporalRead {
+                    extent: Some((latest - chrono::Duration::hours(2), latest)),
+                    future_latest: None,
+                },
+                1,
+            ));
+            engine
+        };
+        // A configured 15-minute step.
+        let quarter = engine_stepping(15);
+        assert_eq!(
+            quarter.resolve_time(None, None),
+            Some(at("2026-10-18T06:00:00Z"))
+        );
+        assert_eq!(
+            quarter.resolve_parameter_time(Some("t2m"), Some(explicit), None),
+            Some(at("2026-10-18T05:30:00Z"))
+        );
+        let times = quarter.raster_info().times;
+        assert!(times
+            .windows(2)
+            .all(|w| w[1] - w[0] == chrono::Duration::minutes(15)));
+
+        // The default 10-minute step, rendered.
+        let engine = engine_stepping(10);
+        let step = at("2026-10-18T06:00:00Z");
+        assert_eq!(engine.resolve_time(None, None), Some(step));
+        assert_eq!(
+            engine.resolve_parameter_time(Some("rh"), Some(explicit), None),
+            Some(at("2026-10-18T05:40:00Z"))
+        );
+        assert_eq!(engine.raster_info().times.last(), Some(&step));
+
+        let render = |parameter: Option<&str>| {
+            engine.get_raster_tile(
+                [0.0, 0.0, 10.0, 10.0],
+                8,
+                8,
+                Some(explicit),
+                &OutputCrs::Wgs84,
+                parameter,
+                None,
+                None,
+            )
+        };
+        // Pending validation blocks the database path, as for EDR.
+        assert!(render(Some("rh")).is_err());
+        engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
+        assert!(render(Some("rh")).unwrap().is_empty());
+        assert!(render(None).unwrap().is_empty());
+        assert!(matches!(
+            render(Some("nope")),
+            Err(DataServerError::InvalidParameter(_))
+        ));
+    }
+
+    // ---- #1061: a station list cut at max_locations ------------------------
+
+    fn station(id: &str) -> crate::metadata::FeatureStation {
+        crate::metadata::FeatureStation {
+            id: id.into(),
+            label: format!("Station {id}"),
+            lat: 60.0,
+            lon: 25.0,
+            properties: Arc::new(HashMap::from([(
+                "territory".to_string(),
+                ds_core::feature::PropertyValue::String("FI".into()),
+            )])),
+        }
+    }
+
+    fn served_ids(engine: &PostgisEngine) -> Vec<String> {
+        use ds_core::feature::FeatureQuery;
+        use ds_core::feature_engine::FeatureEngine;
+        let edr: Vec<String> = engine
+            .get_locations()
+            .unwrap()
+            .iter()
+            .map(|l| l.id.clone())
+            .collect();
+        let features: Vec<String> = engine
+            .get_features(&FeatureQuery::default())
+            .unwrap()
+            .features
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(edr, features, "/locations and Features serve one list");
+        assert_eq!(engine.feature_count(), edr.len());
+        edr
+    }
+
+    /// Stations-only mode: `build_locations` fetches `max_locations + 1`
+    /// rows, and `fetch_station_rows` caps them with `of_station_rows`; a
+    /// fourth row with a cap of three keeps the first three in query order,
+    /// flags the list and degrades `/health`, before the first ping and with
+    /// the database reachable.
+    #[test]
+    fn stations_only_list_past_the_cap_is_truncated_and_degraded() {
+        let mut cfg = stations_engine_config(&["territory"]);
+        cfg.max_locations = 3;
+        let engine = engine_with(cfg);
+        assert!(matches!(
+            engine.config().location_source,
+            crate::schema::LocationSource::Stations(_)
+        ));
+
+        let rows = ["a", "b", "c", "d"].map(station).to_vec();
+        let set = crate::metadata::LocationSet::of_station_rows(engine.config(), rows);
+        engine.cache().store(CollectionMeta::build(
+            engine.config(),
+            set,
+            crate::metadata::TemporalRead::default(),
+            1,
+        ));
+        engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
+
+        assert!(engine.locations_truncated());
+        assert_eq!(engine.locations_cut(), Some(LocationsCut::Stations));
+        assert_eq!(served_ids(&engine), ["a", "b", "c"]);
+        let cut = LiveHealth::LocationsTruncated {
+            max_locations: 3,
+            cut: LocationsCut::Stations,
+        };
+        assert_eq!(engine.live_health(), Some(cut));
+        engine.health.record_ping(true);
+        assert_eq!(engine.live_health(), Some(cut));
+        // An unreachable database is the more urgent reason.
+        engine.health.record_ping(false);
+        assert_eq!(engine.live_health(), Some(LiveHealth::Unreachable));
+    }
+
+    /// Stations-only mode at and under the cap: no flag, and `/health`
+    /// follows the ping alone.
+    #[test]
+    fn stations_only_list_within_the_cap_is_complete() {
+        let mut cfg = stations_engine_config(&["territory"]);
+        cfg.max_locations = 3;
+        let engine = engine_with(cfg);
+        for rows in [vec!["a", "b"], vec!["a", "b", "c"]] {
+            let rows: Vec<_> = rows.into_iter().map(station).collect();
+            let n = rows.len();
+            let set = crate::metadata::LocationSet::of_station_rows(engine.config(), rows);
+            engine.cache().store(CollectionMeta::build(
+                engine.config(),
+                set,
+                crate::metadata::TemporalRead::default(),
+                1,
+            ));
+            engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
+            assert!(!engine.locations_truncated());
+            assert_eq!(served_ids(&engine).len(), n);
+            assert_eq!(
+                engine.live_health(),
+                None,
+                "boot snapshot until the first ping"
+            );
+        }
+        engine.health.record_ping(true);
+        assert_eq!(engine.live_health(), Some(LiveHealth::Ready));
+    }
+
+    /// The observations-only mode (A), merged by the `merge_table` that
+    /// `fetch_observation_rows` runs per table: two per-table result sets,
+    /// ids deduplicated across them (first geometry wins), four distinct
+    /// reporters against a cap of three. The first three are kept in query
+    /// order and the in-memory position query no longer finds the fourth.
+    #[test]
+    fn observations_only_list_past_the_cap_is_truncated_and_degraded() {
+        let mut cfg = stations_engine_config(&[]);
+        cfg.location_source = crate::schema::LocationSource::Observations;
+        cfg.max_locations = 3;
+        let engine = engine_with(cfg);
+
+        let tables = [
+            vec![("a", 24.0, 60.0), ("b", 25.0, 61.0)],
+            vec![("a", 0.0, 0.0), ("c", 26.0, 62.0), ("d", 27.0, 63.0)],
+        ];
+        let mut merged = crate::metadata::DerivedLocations::new(engine.config().max_locations);
+        let mut stopped = false;
+        for rows in &tables {
+            let more = merged
+                .merge_table(rows, |r| Ok(r.0.to_string()), |r| Ok((r.2, r.1)))
+                .unwrap();
+            if !more {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped, "reading stops at the first station past the cap");
+        let set = merged.finish();
+        engine.cache().store(CollectionMeta::build(
+            engine.config(),
+            set,
+            crate::metadata::TemporalRead::default(),
+            1,
+        ));
+        engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
+
+        assert!(engine.locations_truncated());
+        assert_eq!(served_ids(&engine), ["a", "b", "c"]);
+        // "a" keeps its first table's geometry.
+        let locations = engine.get_locations().unwrap();
+        assert_eq!(locations[0].longitude, 24.0);
+        assert_eq!(locations.by_id("c").unwrap().latitude, 62.0);
+        let meta = engine.load_meta();
+        // Requests share the refresh's snapshot, never a copy (#1083).
+        assert!(Arc::ptr_eq(&locations, &meta.locations));
+        assert_eq!(
+            nearest_in_memory(&meta, 26.0, 62.0, 1_000.0).as_deref(),
+            Some("c")
+        );
+        assert_eq!(nearest_in_memory(&meta, 27.0, 63.0, 1_000.0), None);
+        engine.health.record_ping(true);
+        assert_eq!(
+            engine.live_health(),
+            Some(LiveHealth::LocationsTruncated {
+                max_locations: 3,
+                cut: LocationsCut::Stations,
+            })
+        );
     }
 
     #[test]

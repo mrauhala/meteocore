@@ -2,6 +2,7 @@
 name = "ds-render"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 # Uses `slice::as_chunks` (stable 1.88), a clippy-preferred idiom it lints
 # for. Declared so an older toolchain fails clearly.
 rust-version = "1.88"
@@ -11,7 +12,6 @@ ds-core = { path = "../core" }
 png = "0.18"
 jpeg-encoder = "0.7"
 webp = { version = "0.3", default-features = false }
-quick_cache = "0.6"
 ds-cache = { path = "../ds-cache" }
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }

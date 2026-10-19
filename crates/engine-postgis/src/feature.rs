@@ -31,6 +31,7 @@ impl FeatureEngine for PostgisEngine {
     }
 
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        self.reject_invalid_schema()?;
         let meta = self.cache().load();
         let filtered: Vec<&FeatureStation> = meta
             .feature_stations
@@ -68,6 +69,7 @@ impl FeatureEngine for PostgisEngine {
     }
 
     fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
+        self.reject_invalid_schema()?;
         let meta = self.cache().load();
         let i = *meta
             .station_idx
@@ -103,6 +105,8 @@ fn station_to_feature(s: &FeatureStation) -> Feature {
         id: s.id.clone(),
         geometry: Arc::new(Geometry::Point { x: s.lon, y: s.lat }),
         properties: s.properties.clone(),
+        // The station is the EDR location of its id (#1143).
+        related: vec![ds_core::feature::Related::edr_location(&s.id)],
     }
 }
 
@@ -150,6 +154,8 @@ mod tests {
             f.properties.get("territory"),
             Some(&PropertyValue::String("Finland".into()))
         );
+        // The station is the EDR location of its id (#1143).
+        assert_eq!(f.related, [ds_core::feature::Related::edr_location("s1")]);
     }
 
     #[test]

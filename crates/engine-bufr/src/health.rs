@@ -4,6 +4,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ds_core::health::LiveStatus;
 
+use crate::decode::FailureKind;
+
+/// Length of [`Health::counters`]: seven ingest counters, then one decode
+/// failure counter per [`FailureKind::ALL`] entry.
+pub const COUNTERS: usize = 7 + FailureKind::ALL.len();
+
 #[derive(Debug, Default)]
 pub struct Health {
     /// Set once the first scan / first ingested report has happened, so
@@ -18,8 +24,9 @@ pub struct Health {
     pub reports_replaced_total: AtomicU64,
     pub reports_out_of_window_total: AtomicU64,
     pub subsets_skipped_total: AtomicU64,
-    pub decode_failures_total: AtomicU64,
-    pub decode_unsupported_total: AtomicU64,
+    /// Messages (or whole payloads without a BUFR message) that failed,
+    /// indexed by [`FailureKind`] in [`FailureKind::ALL`] order.
+    decode_failures: [AtomicU64; FailureKind::ALL.len()],
 }
 
 /// Consecutive scan failures before a `Local` collection degrades.
@@ -39,6 +46,22 @@ impl Health {
             self.scan_failures_in_a_row.fetch_add(1, Ordering::Relaxed);
         }
         self.probed.store(true, Ordering::Release);
+    }
+
+    pub fn record_decode_failure(&self, kind: FailureKind) {
+        self.decode_failures[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn decode_failures(&self, kind: FailureKind) -> u64 {
+        self.decode_failures[kind as usize].load(Ordering::Relaxed)
+    }
+
+    /// Decode failures of every kind.
+    pub fn decode_failures_total(&self) -> u64 {
+        FailureKind::ALL
+            .iter()
+            .map(|&k| self.decode_failures(k))
+            .sum()
     }
 
     pub fn mark_probed(&self) {
@@ -67,9 +90,10 @@ impl Health {
 
     /// Monotonic counters in a fixed order (see `admin.rs` metrics):
     /// scans, scan failures, files, ingested, replaced, out of window,
-    /// subsets skipped, decode failures, decode unsupported.
-    pub fn counters(&self) -> [u64; 9] {
-        [
+    /// subsets skipped, then decode failures per [`FailureKind::ALL`].
+    pub fn counters(&self) -> [u64; COUNTERS] {
+        let mut out = [0; COUNTERS];
+        out[..7].copy_from_slice(&[
             self.scans_total.load(Ordering::Relaxed),
             self.scan_failures_total.load(Ordering::Relaxed),
             self.files_total.load(Ordering::Relaxed),
@@ -77,8 +101,10 @@ impl Health {
             self.reports_replaced_total.load(Ordering::Relaxed),
             self.reports_out_of_window_total.load(Ordering::Relaxed),
             self.subsets_skipped_total.load(Ordering::Relaxed),
-            self.decode_failures_total.load(Ordering::Relaxed),
-            self.decode_unsupported_total.load(Ordering::Relaxed),
-        ]
+        ]);
+        for (slot, kind) in out[7..].iter_mut().zip(FailureKind::ALL) {
+            *slot = self.decode_failures(kind);
+        }
+        out
     }
 }

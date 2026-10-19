@@ -118,9 +118,12 @@ fn collection(dir: &Path, apis: &[&str]) -> CollectionConfig {
         cap: None,
         postgis: None,
         nowcast: None,
+        station_grid: None,
         bufr: None,
         satellite: Some(satellite_config(dir)),
+        netcdf: None,
         preview: None,
+        derive_wind: None,
     }
 }
 
@@ -150,6 +153,7 @@ fn wms(engine: Arc<SatelliteEngine>, dir: &Path) -> axum::Router {
         engines: HashMap::from([(ID.to_string(), engine as Arc<dyn MapEngine>)]),
         collections: HashMap::from([(ID.to_string(), collection(dir, &["wms"]))]),
         styles: styles(),
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(64)),
@@ -273,10 +277,12 @@ async fn wms_serves_composite_layers() {
     );
     assert!(ir_grey.contains("<Name>default</Name>"), "{ir_grey}");
 
+    // Transparent, as `expected_png` composes: without TRANSPARENT the image
+    // is opaque over white, WMS 1.3.0's default.
     let map = |layer: &str, crs: &str, bbox: &str| {
         format!(
             "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={ID}/{layer}&STYLES=\
-             &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64"
+             &FORMAT=image/png&TRANSPARENT=TRUE&CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64"
         )
     };
     let [w, s, e, n] = IR_BBOX;

@@ -1,0 +1,46 @@
+# cargo-about configuration for the third-party notices (#1081).
+#
+# scripts/third_party_notices.sh renders THIRD-PARTY-NOTICES.txt from
+# Cargo.lock with this file and third-party/notices.hbs. The Docker image and
+# every release archive generate it at build time; it is never committed, so
+# a dependency bump cannot leave it stale.
+#
+# `accepted` mirrors the licence allow-list in deny.toml, which is the CI
+# gate. Order matters here: where a crate offers a choice, the first listed
+# licence is used. MIT comes first because its text carries each crate's own
+# copyright line.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# The release targets (.github/workflows/build-binaries.yml). The Docker
+# image is built for a subset of them, so one notices file covers every
+# artifact.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Build-time-only and test-only crates are not distributed.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Accepted for this crate only, as in deny.toml. The IJG licence asks binary
+# distributions to say in their documentation that the software is based in
+# part on the work of the Independent JPEG Group; the notices header and the
+# README's License section say so.
+[jpeg-encoder]
+accepted = ["IJG"]

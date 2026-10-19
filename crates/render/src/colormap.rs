@@ -340,6 +340,46 @@ impl ColorMap for OverlayColorMap {
     }
 }
 
+/// Wraps an inner colormap for a **point-symbol** layer, whose pixels are
+/// either ground between the symbols or a symbol (#1063): `None` is the
+/// ground and always transparent, while the reserved `sentinel` is a symbol
+/// without a value, drawn in the inner palette's nodata colour. Every other
+/// value delegates to the inner colormap.
+///
+/// A raster layer paints its nodata in the palette's `nodata_color`; a symbol
+/// layer cannot, or an opaque `nodata_color` would fill the whole map around
+/// the symbols. The sentinel is matched by exact `f64` equality, like
+/// [`OverlayColorMap`]'s, so the producer must paint the identical constant.
+pub struct SymbolColorMap {
+    inner: std::sync::Arc<dyn ColorMap>,
+    sentinel: f64,
+}
+
+impl SymbolColorMap {
+    pub fn new(inner: std::sync::Arc<dyn ColorMap>, sentinel: f64) -> Self {
+        debug_assert!(
+            sentinel.is_finite(),
+            "SymbolColorMap sentinel must be finite; NaN/±inf never match"
+        );
+        Self { inner, sentinel }
+    }
+}
+
+impl ColorMap for SymbolColorMap {
+    /// The ground: transparent whatever the inner palette's nodata colour.
+    fn nodata_color(&self) -> [u8; 4] {
+        [0, 0, 0, 0]
+    }
+
+    fn color(&self, value: Option<f64>) -> [u8; 4] {
+        match value {
+            None => [0, 0, 0, 0],
+            Some(v) if v == self.sentinel => self.inner.nodata_color(),
+            other => self.inner.color(other),
+        }
+    }
+}
+
 /// Linear interpolation colormap for continuous data.
 pub struct LinearColorMap {
     stops: Vec<ColorStop>,
@@ -554,6 +594,25 @@ mod tests {
         let inner = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 100.0);
         assert_eq!(overlay.color(Some(-9998.0)), inner.color(Some(-9998.0)));
         assert_ne!(overlay.color(Some(-9998.0)), [60, 60, 60, 255]);
+    }
+
+    /// #1063: a symbol layer's ground stays transparent under an opaque
+    /// palette `nodata_color`, which only the no-value sentinel takes.
+    #[test]
+    fn symbol_colormap_keeps_the_ground_transparent_and_draws_the_sentinel_as_nodata() {
+        let mut palette = crate::palette::builtin_palette("grayscale")
+            .unwrap()
+            .clone();
+        palette.nodata_color = Some([200, 0, 200, 255]);
+        let inner = std::sync::Arc::new(LutColorMap::from_palette(&palette, 0.0, 100.0));
+        // The inner colormap alone paints every nodata pixel opaque.
+        assert_eq!(inner.color(None), [200, 0, 200, 255]);
+        let symbols = SymbolColorMap::new(inner, f64::MIN);
+        assert_eq!(symbols.color(None), [0, 0, 0, 0]);
+        assert_eq!(symbols.nodata_color(), [0, 0, 0, 0]);
+        assert_eq!(symbols.color(Some(f64::MIN)), [200, 0, 200, 255]);
+        assert_eq!(symbols.color(Some(0.0)), [0, 0, 0, 255]);
+        assert_eq!(symbols.color(Some(100.0)), [255, 255, 255, 255]);
     }
 
     #[test]

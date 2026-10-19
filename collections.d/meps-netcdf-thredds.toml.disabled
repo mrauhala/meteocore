@@ -1,0 +1,132 @@
+# MetCoOp MEPS 2.5 km surface forecast, control member, read in place from
+# MET Norway's thredds.met.no by HTTP range (#1067). CC-BY-4.0, MET Norway.
+#
+# DISABLED by default: it reads from thredds.met.no, a public server. To run:
+#   1. rename to drop `.disabled`
+#   2. cargo run -p server -- --collections=meps-netcdf-thredds
+# `meps-netcdf-local` serves the same family from the committed sample.
+#
+# MEPS publishes each run as 67 per-lead files (leads 00-66, one valid time
+# each, 170-200 MB, 221 variables) about 1.9 h after the run time, every 3 h.
+# The fileServer cannot be listed, so the files are found by name: each poll
+# HEADs the sentinel (lead 00) of every run in `time_window` not seen yet,
+# and the other leads once it appears. A file is read in place, never
+# downloaded whole: its first 1 MiB holds all the metadata, and one field is
+# one ~1.5 MB compressed chunk. At most 8 requests go to the host at once,
+# over every collection on it; polls take 2 of them. Should the fileServer
+# change or go away, mirror the files and point `data_path` at the directory.
+#
+# Traffic (measured 2026-10-17 over a laptop link; to be re-measured from a
+# server's network):
+#   - probing: one HEAD per poll for each run not yet out, 66 when it
+#     appears, then one every 30 min per run served (to catch a replaced
+#     file). HEADs carry no body.
+#   - metadata, per file: its 1 MiB first read and 64 KiB blocks of the
+#     variables' chunk indexes, about 4 GETs: 1.24 MB serving one variable,
+#     1.31 MB serving two (measured); about 1.9 MB serving the eight below
+#     (extrapolated): some 125 MB per run, 1 GB a day at 8 runs.
+#   - per field drawn: one ~1.5 MB GET the first time any request draws it.
+#     Fields stay cached: 512 MB of compressed chunks (MC_NETCDF_CHUNK_CACHE_MB,
+#     about 340 fields) and 256 MB decoded (MC_NETCDF_FIELD_CACHE_MB).
+#   - per prewarm variable: about 100 MB per run (67 fields), 0.8 GB a day,
+#     fetched by the poll whether or not anyone draws them. Off here.
+#   - per EDR query: the same ~1.5 MB GET for each field not yet cached, so
+#     a position series over a whole run is up to 67 GETs, ~100 MB, and a
+#     wind_speed_10m series, which reads both wind components, up to 134
+#     GETs, ~200 MB. A query decodes at most MC_NETCDF_EDR_QUERY_MB (544 MiB:
+#     one parameter over one run as the client sees it, including
+#     wind_speed_10m); name the variables with `parameter-name`.
+
+id = "meps-netcdf-thredds"
+title = "MEPS Surface (CF-NetCDF, thredds.met.no)"
+description = "MetCoOp MEPS 2.5 km surface forecast, control member, read in place by HTTP range from MET Norway's per-lead CF-NetCDF files on thredds.met.no, on their Lambert conformal conic grid."
+engine_type = "netcdf"
+# EDR position, area and radius, model runs as instances; the WMS layers
+# answer GetFeatureInfo. The 10 m wind's speed is derived from its
+# grid-relative x/y components (`wind_speed_10m`, no direction on this
+# Lambert grid).
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["forecast", "NWP", "MEPS", "NetCDF"]
+
+[license]
+title = "CC-BY-4.0"
+
+[netcdf]
+data_path = "https://thredds.met.no/thredds/fileServer/meps25epsarchive/"
+# Run directories by date and run hour, then the member: `{run}` is the hour.
+prefix_pattern = "%Y/%m/%d/{run}/member_00/"
+filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"
+run_hours = [0, 3, 6, 9, 12, 15, 18, 21]
+# Lead 00 is the sentinel: a run is probed by it alone until it appears.
+leads = [
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16,
+    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+    34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+    51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66,
+]
+# Runs started in the last 9 h: the newest two published (about 1.9 h after
+# their run time) are always in it, for `max_runs = 2`.
+time_window = "-PT9H"
+variables = [
+    "air_temperature_2m",
+    "relative_humidity_2m",
+    "x_wind_10m",
+    "y_wind_10m",
+    "wind_speed_of_gust",
+    "air_pressure_at_sea_level",
+    "precipitation_amount_acc",
+    "cloud_area_fraction",
+]
+# Each kept file holds its parsed metadata, about 820 KB (measured): 67 leads
+# x 2 runs is some 110 MB of heap, 67 x max_runs x 820 KB in general.
+max_runs = 2
+poll_interval_secs = 300
+# A file is used once two polls see it unchanged, or once it is 10 min old;
+# a run missing leads is served without them 30 min after it appeared.
+# min_age = "PT10M"
+# run_grace = "PT30M"
+# Fetch the newest run's fields of these variables before anyone asks:
+# about 100 MB per variable and run.
+# prewarm_variables = ["air_temperature_2m"]
+
+[netcdf.titles]
+# Accumulated from the run's start, served as it is stored.
+precipitation_amount_acc = "Precipitation accumulated since run start"
+x_wind_10m = "10 m wind along the grid's x axis"
+y_wind_10m = "10 m wind along the grid's y axis"
+
+# Values are served in the files' own units: K, Pa, m/s, kg/m^2 and
+# fractions (units "1"). Each layer without an entry below takes the
+# built-in default its name and unit select: temperature over -90…50 °C in
+# kelvin, pressure over 950…1050 hPa in pascals, wind speed for the gusts,
+# 0-200 mm for the accumulated precipitation.
+[wms]
+# The °C temperature palette over -90…50 °C in kelvin.
+colormap = "temperature"
+min = 183.15
+max = 323.15
+
+[[wms.parameters]]
+name = "relative_humidity_2m"
+colormap = "viridis"
+min = 0.0
+max = 1.0
+
+# Narrower than the default's ±40 m/s for wind components.
+[[wms.parameters]]
+name = "x_wind_10m"
+colormap = "diverging"
+min = -20.0
+max = 20.0
+
+[[wms.parameters]]
+name = "y_wind_10m"
+colormap = "diverging"
+min = -20.0
+max = 20.0
+
+[[wms.parameters]]
+name = "cloud_area_fraction"
+colormap = "grayscale"
+min = 0.0
+max = 1.0

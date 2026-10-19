@@ -58,6 +58,7 @@ impl CellEngine {
             id: id.into(),
             geometry: Arc::new(Geometry::Point { x: 24.9, y: 60.2 }),
             properties: Arc::new(m),
+            related: Vec::new(),
         }
     }
 }
@@ -209,9 +210,12 @@ fn collection(id: &str, engine_type: &str) -> CollectionConfig {
         cap: None,
         postgis: None,
         nowcast: None,
+        station_grid: None,
         bufr: None,
         satellite: None,
+        netcdf: None,
         preview: None,
+        derive_wind: None,
     }
 }
 

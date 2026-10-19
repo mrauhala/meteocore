@@ -31,8 +31,8 @@ use ds_core::model::*;
 struct MockEngine;
 
 impl EdrEngine for MockEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(vec![
             Location {
                 id: "station1".to_string(),
                 label: "Helsinki".to_string(),
@@ -45,7 +45,7 @@ impl EdrEngine for MockEngine {
                 latitude: 61.4978,
                 longitude: 23.7610,
             },
-        ])
+        ])))
     }
 
     fn query_location(
@@ -133,13 +133,17 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
     Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
+        feature_engines: HashMap::new(),
         collections,
         styles: HashMap::new(),
         base_url: String::new(),
@@ -347,7 +351,8 @@ async fn f_accepts_media_type_aliases() {
 // Spec: Responses should include appropriate Content-Type headers:
 //   - application/json for JSON
 //   - application/geo+json for GeoJSON (locations)
-//   - application/prs.coverage+json for CoverageJSON
+//   - application/vnd.cov+json for CoverageJSON (EDR 1.2; 1.1 used
+//     application/prs.coverage+json, #920)
 // Implementation: axum's Json() extractor sets application/json for ALL
 //   responses, even GeoJSON and CoverageJSON.
 // Impact: Clients expecting proper media type detection fail.
@@ -399,8 +404,8 @@ async fn finding_07b_coverage_returns_covjson_content_type() {
         .unwrap_or("");
 
     assert!(
-        content_type.contains("application/prs.coverage+json"),
-        "CoverageJSON response should have Content-Type: application/prs.coverage+json, got: {content_type}"
+        content_type == "application/vnd.cov+json",
+        "CoverageJSON response should have Content-Type: application/vnd.cov+json, got: {content_type}"
     );
 }
 
@@ -433,7 +438,7 @@ async fn finding_08_locations_geojson_has_links() {
 // Implementation: Features have no "links" in properties.
 // Fix: Add to each feature properties:
 //   "links": [{ "href": "/edr/collections/weather/locations/{id}",
-//               "rel": "data", "type": "application/prs.coverage+json" }]
+//               "rel": "data", "type": "application/vnd.cov+json" }]
 
 #[tokio::test]
 async fn finding_09_location_features_have_data_links() {
@@ -629,6 +634,9 @@ async fn finding_16_data_queries_link_structure() {
     let vars = &link["variables"];
     assert_eq!(vars["query_type"], "locations");
     let formats = vars["output_formats"].as_array().expect("output_formats");
+    // The mock does not declare `serves_station_series`, so it keeps
+    // CoverageJSON and PNG (#929; tests/geojson_output_tests.rs covers the
+    // station engines that serve GeoJSON).
     assert!(
         !formats.iter().any(|v| v == "GeoJSON"),
         "GeoJSON must not appear in locations output_formats — f=GeoJSON returns HTTP 400"
@@ -640,7 +648,7 @@ async fn finding_16_data_queries_link_structure() {
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "f=GeoJSON must be rejected on the locations data endpoint"
+        "f=GeoJSON must be rejected where the engine serves no station series"
     );
 }
 
@@ -648,8 +656,8 @@ async fn finding_16_data_queries_link_structure() {
 async fn data_queries_default_output_format_set_for_all_query_types() {
     struct AllQueriesEngine;
     impl EdrEngine for AllQueriesEngine {
-        fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-            Ok(vec![])
+        fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+            Ok(LocationSnapshot::empty())
         }
         fn query_location(
             &self,
@@ -695,6 +703,191 @@ async fn data_queries_default_output_format_set_for_all_query_types() {
         assert_eq!(
             vars["default_output_format"], "CoverageJSON",
             "data_queries[{qt}].link.variables.default_output_format must be \"CoverageJSON\""
+        );
+    }
+}
+
+// ===========================================================================
+// EDR 1.2: every data query link carries the required variables (#918)
+// ===========================================================================
+// EDR 1.2's `*DataQuery` schemas require `title`, `description`,
+// `query_type`, `output_formats`, `default_output_format` and `crs_details`
+// (an array of `{crs, wkt}`) in every `data_queries.<type>.link.variables`;
+// 1.1 left all of them optional. The `instances` link has its own schema
+// (`instancesDataQuery`, nothing required) and is left as it is.
+
+/// An engine advertising a chosen set of query types, with two model runs
+/// when `runs`, so every document the metadata builder serves is reachable.
+struct QueryTypesEngine {
+    types: &'static [&'static str],
+    runs: bool,
+}
+
+impl EdrEngine for QueryTypesEngine {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
+    }
+    fn query_location(
+        &self,
+        location_id: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::LocationNotFound(location_id.into()))
+    }
+    fn get_parameters(&self) -> Vec<String> {
+        vec!["t".to_string()]
+    }
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        Some((
+            "2024-01-01T12:00:00Z".parse().unwrap(),
+            "2024-01-01T14:00:00Z".parse().unwrap(),
+        ))
+    }
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        Some([19.0, 59.0, 32.0, 71.0])
+    }
+    fn supported_query_types(&self) -> Vec<String> {
+        self.types.iter().map(|t| t.to_string()).collect()
+    }
+    fn get_instances(&self) -> Vec<ds_core::instances::RunInfo> {
+        if !self.runs {
+            return Vec::new();
+        }
+        ["2024-01-01T00:00:00Z", "2024-01-01T12:00:00Z"]
+            .into_iter()
+            .map(|rt| {
+                let reference_time: DateTime<Utc> = rt.parse().unwrap();
+                ds_core::instances::RunInfo {
+                    reference_time,
+                    valid_times: (0..3)
+                        .map(|h| reference_time + chrono::Duration::hours(h))
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+}
+
+async fn get_json_from(engine: Arc<dyn EdrEngine>, uri: &str) -> Value {
+    let resp = api_edr::router(make_edr_state(engine))
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+    serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+}
+
+/// Checks every data query link of one collection or instance document
+/// against EDR 1.2's required variables, and returns the query types it
+/// advertises (sorted, `instances` left out).
+fn checked_data_query_types(doc: &Value, what: &str) -> Vec<String> {
+    let queries = doc["data_queries"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{what}: no data_queries"));
+    let mut titles = Vec::new();
+    let mut types = Vec::new();
+    for (qt, query) in queries {
+        if qt == "instances" {
+            continue;
+        }
+        let vars = &query["link"]["variables"];
+        for field in ["title", "description"] {
+            let text = vars[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{what} {qt}: {field} must be a string: {vars}"));
+            assert!(!text.trim().is_empty(), "{what} {qt}: empty {field}");
+        }
+        titles.push(vars["title"].as_str().unwrap().to_string());
+        assert_eq!(vars["query_type"], qt.as_str(), "{what} {qt}: query_type");
+        let formats: Vec<&str> = vars["output_formats"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{what} {qt}: output_formats must be an array"))
+            .iter()
+            .map(|f| f.as_str().expect("output format strings"))
+            .collect();
+        let default = vars["default_output_format"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what} {qt}: default_output_format must be a string"));
+        assert!(
+            formats.contains(&default),
+            "{what} {qt}: default_output_format {default} not in {formats:?}"
+        );
+        assert_eq!(
+            vars["crs_details"],
+            serde_json::json!([{ "crs": "CRS84", "wkt": api_edr::params::CRS84_WKT }]),
+            "{what} {qt}: crs_details"
+        );
+        types.push(qt.clone());
+    }
+    titles.sort();
+    titles.dedup();
+    assert_eq!(
+        titles.len(),
+        types.len(),
+        "{what}: one title per query type"
+    );
+    types.sort();
+    types
+}
+
+#[tokio::test]
+async fn data_query_links_carry_edr_1_2_required_variables() {
+    let cases: [(&'static [&'static str], bool); 4] = [
+        (
+            &["locations", "position", "area", "radius", "trajectory"],
+            true,
+        ),
+        // A forecast grid (GRIB, Zarr, QueryData).
+        (&["position", "area", "radius"], true),
+        // A station network (CSV).
+        (&["locations", "area", "radius"], false),
+        // The trait default.
+        (&["locations"], false),
+    ];
+    for (types, runs) in cases {
+        let engine: Arc<dyn EdrEngine> = Arc::new(QueryTypesEngine { types, runs });
+        let mut want: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        want.sort();
+
+        let list = get_json_from(engine.clone(), "/collections").await;
+        let listed = checked_data_query_types(&list["collections"][0], "/collections");
+        assert_eq!(listed, want, "/collections {types:?}");
+        let doc = get_json_from(engine.clone(), "/collections/weather").await;
+        assert_eq!(
+            checked_data_query_types(&doc, "/collections/weather"),
+            want,
+            "/collections/weather {types:?}"
+        );
+        assert_eq!(doc["data_queries"].get("instances").is_some(), runs);
+
+        if !runs {
+            continue;
+        }
+        // An instance serves only the run-queryable types.
+        let want_run: Vec<String> = want
+            .iter()
+            .filter(|t| matches!(t.as_str(), "area" | "position" | "radius"))
+            .cloned()
+            .collect();
+        let list = get_json_from(engine.clone(), "/collections/weather/instances").await;
+        let instances = list["instances"].as_array().expect("instances array");
+        assert_eq!(instances.len(), 2);
+        for instance in instances {
+            let what = format!("/instances item {}", instance["id"]);
+            assert_eq!(checked_data_query_types(instance, &what), want_run);
+        }
+        let doc = get_json_from(
+            engine,
+            "/collections/weather/instances/2024-01-01T00:00:00Z",
+        )
+        .await;
+        assert_eq!(
+            checked_data_query_types(&doc, "/instances/2024-01-01T00:00:00Z"),
+            want_run,
+            "{types:?}"
         );
     }
 }
@@ -801,8 +994,8 @@ async fn finding_20_instances_endpoint_present() {
 // ===========================================================================
 // Spec: EDR query endpoints should accept "crs" parameter to specify the
 //   CRS of the response data.
-// Implementation: LocationQueryParams only has datetime and parameter_name.
-// Fix: Add "crs" (and "f") to LocationQueryParams.
+// RESOLVED (#965): every data query, location queries included, reads
+//   `crs` and accepts CRS84, the one CRS its `crs_details` lists.
 
 #[tokio::test]
 async fn finding_21_location_query_params_incomplete() {
@@ -816,10 +1009,12 @@ async fn finding_21_location_query_params_incomplete() {
         get_json("/collections/weather/locations/station1?parameter-name=temperature").await;
     assert_eq!(status, StatusCode::OK);
 
-    // "crs" param is not supported but should be accepted without error
-    // (axum by default ignores unknown query params, so this passes)
+    // `crs` names CRS84, the one CRS served; any other is a 400 (#965).
     let (status, _) = get_json("/collections/weather/locations/station1?crs=CRS84").await;
     assert_eq!(status, StatusCode::OK);
+    let (status, json) = get_json("/collections/weather/locations/station1?crs=EPSG:3067").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "BadRequest");
 }
 
 // ===========================================================================
@@ -858,7 +1053,7 @@ async fn finding_22b_collection_self_link_has_title() {
 // ===========================================================================
 // Spec: The EDR /locations endpoint returns GeoJSON by default.
 //   The response should have Content-Type: application/geo+json.
-//   When CoverageJSON is requested, Content-Type: application/prs.coverage+json.
+//   When CoverageJSON is requested, Content-Type: application/vnd.cov+json.
 // Implementation: Always returns application/json regardless of content.
 // (See also Finding 7 - duplicated here for emphasis on the /locations endpoint)
 
@@ -929,17 +1124,12 @@ async fn finding_27_conformance_valid() {
     for item in conforms_to {
         assert!(item.is_string(), "each conformsTo entry must be a string");
     }
-    assert!(
-        !conforms_to.iter().any(|v| v
-            .as_str()
-            .is_some_and(|s| s.ends_with("/conf/edr-geojson"))),
-        "edr-geojson conformance class must not be advertised — data queries return HTTP 400 for f=GeoJSON"
-    );
 }
 
 // EDR 1.1 (19-086r6) declares one `queries` class for every query type,
 // plus `html` and `oas30` for the representations the server actually
-// serves. The two GeoJSON classes stay out (see finding 27).
+// serves, and the two GeoJSON classes: feature content (the /locations
+// list, station collections' point queries) is GeoJSON (#929).
 #[tokio::test]
 async fn declares_edr_queries_html_oas30_classes() {
     let (_status, json) = get_json("/conformance").await;
@@ -950,6 +1140,8 @@ async fn declares_edr_queries_html_oas30_classes() {
         "collections",
         "queries",
         "json",
+        "geojson",
+        "edr-geojson",
         "covjson",
         "html",
         "oas30",
@@ -957,10 +1149,45 @@ async fn declares_edr_queries_html_oas30_classes() {
         let uri = format!("http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/{class}");
         assert!(uris.contains(&uri.as_str()), "must declare {uri}");
     }
-    assert!(
-        !uris.iter().any(|u| u.ends_with("/conf/geojson")),
-        "geojson class must not be advertised — data queries cannot return GeoJSON"
-    );
+}
+
+// EDR 1.2 (19-086r9) adds `instances` to the same classes, declared next to
+// the 1.1 ones (#979). Its `/req/core/conformance` A names Common Part 1
+// core and Part 2 collections with `https://`; the `http://` forms the other
+// APIs share stay too. Every class is declared once.
+#[tokio::test]
+async fn declares_edr_1_2_classes_and_https_common_classes() {
+    let (_status, json) = get_json("/conformance").await;
+    let conforms_to = json["conformsTo"].as_array().unwrap();
+    let uris: Vec<&str> = conforms_to.iter().filter_map(|v| v.as_str()).collect();
+    for class in [
+        "core",
+        "collections",
+        "queries",
+        "instances",
+        "json",
+        "geojson",
+        "edr-geojson",
+        "covjson",
+        "html",
+        "oas30",
+    ] {
+        let uri = format!("https://www.opengis.net/spec/ogcapi-edr-1/1.2/conf/{class}");
+        assert!(uris.contains(&uri.as_str()), "must declare {uri}");
+    }
+    for class in [
+        "ogcapi-common-1/1.0/conf/core",
+        "ogcapi-common-2/1.0/conf/collections",
+    ] {
+        for scheme in ["https", "http"] {
+            let uri = format!("{scheme}://www.opengis.net/spec/{class}");
+            assert!(uris.contains(&uri.as_str()), "must declare {uri}");
+        }
+    }
+    let mut unique = uris.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), uris.len(), "a class declared twice: {uris:?}");
 }
 
 // ===========================================================================

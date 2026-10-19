@@ -77,13 +77,13 @@ impl MockEngine {
 }
 
 impl EdrEngine for MockEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![Location {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(vec![Location {
             id: "helsinki".into(),
             label: "Helsinki".into(),
             latitude: 60.1699,
             longitude: 24.9384,
-        }])
+        }])))
     }
 
     fn query_location(
@@ -165,13 +165,17 @@ fn build_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
     api_edr::router(Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
+        feature_engines: HashMap::new(),
         collections,
         styles: HashMap::new(),
         base_url: String::new(),

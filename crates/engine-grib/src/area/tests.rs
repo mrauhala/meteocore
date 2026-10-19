@@ -209,6 +209,177 @@ fn area_preserves_requested_level_order_missing_fields_units_and_polygon_holes()
     }
 }
 
+fn time(hours: i64) -> DateTime<Utc> {
+    "2026-04-05T00:00:00Z".parse::<DateTime<Utc>>().unwrap() + chrono::Duration::hours(hours)
+}
+
+/// `P0` (K, served in °C) at steps 0, 6 and 12 of the 2026-04-05T00Z run,
+/// `P1` (%) at step 6 only.
+fn stepped_fixture() -> (TestSource, GribEngine) {
+    let source = TestSource::new();
+    for step in [0u32, 6, 12] {
+        let mut records = vec![(
+            "P0",
+            "2 m above ground",
+            message(0, 280.0 + step as f32, [0, 2, 4, 6], 103, 2),
+        )];
+        if step == 6 {
+            let mut rh = message(0, 50.0, [0, 2, 4, 6], 103, 2);
+            rh[118] = 1;
+            rh[119] = 1;
+            records.push(("P1", "2 m above ground", rh));
+        }
+        // Explicit length for the selected fields: avoid tail HEADs.
+        records.push(("TAIL", "surface", message(0, 0.0, [0; 4], 1, 0)));
+        source.write(&format!("s{step:02}"), &records, step);
+    }
+    let mut config = source.config();
+    config.parameters = Some(vec![parameter(0), parameter(1)]);
+    let engine = GribEngine::new("stepped", &config).unwrap();
+    (source, engine)
+}
+
+/// `/req/core/datetime-response` A: an interval reads every step valid
+/// inside it and reports them on a `t` axis; an instant is the step valid at
+/// it, never the nearest one.
+#[test]
+fn area_and_radius_read_the_steps_inside_the_datetime() {
+    let (_source, engine) = stepped_fixture();
+    let both = [parameter(0), parameter(1)];
+    let area = |datetime, params: &[String]| {
+        engine.query_area("0,0,1,1", datetime, Some(params), None, None)
+    };
+    let celsius = |hours: f64, cell: f64| Some(280.0 + hours + cell - 273.15);
+    // Row-major cells of the ascending y axis (see `message`).
+    const CELLS: [f64; 4] = [4.0, 6.0, 0.0, 2.0];
+
+    let result = single(area(Some((time(0), time(12))), &both).unwrap());
+    let DomainDescription::Grid {
+        t: Some(t),
+        z: None,
+        ..
+    } = &result.domain
+    else {
+        panic!("expected a t axis")
+    };
+    assert_eq!(t, &[time(0), time(6), time(12)]);
+    let p0 = &result.ranges["P0"];
+    assert_eq!(p0.axis_names, ["t", "y", "x"]);
+    assert_eq!(p0.shape, [3, 2, 2]);
+    for (step, hours) in [0.0, 6.0, 12.0].into_iter().enumerate() {
+        for (cell, offset) in CELLS.into_iter().enumerate() {
+            assert_value(p0.values[step * 4 + cell], celsius(hours, offset));
+        }
+    }
+    // A field a step lacks is null there, as in a position series.
+    let p1 = &result.ranges["P1"];
+    assert_eq!(p1.shape, [3, 2, 2]);
+    assert!(p1.values[..4]
+        .iter()
+        .chain(&p1.values[8..])
+        .all(Option::is_none));
+    for (cell, offset) in CELLS.into_iter().enumerate() {
+        assert_value(p1.values[4 + cell], Some(50.0 + offset));
+    }
+
+    // Open ends: every step on their side, still on a `t` axis.
+    let times = |datetime| match single(area(datetime, &both[..1]).unwrap()).domain {
+        DomainDescription::Grid { t, .. } => t,
+        _ => panic!("expected a grid"),
+    };
+    let (min, max) = (DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC);
+    assert_eq!(times(Some((min, time(5)))), Some(vec![time(0)]));
+    assert_eq!(times(Some((time(1), max))), Some(vec![time(6), time(12)]));
+
+    // An instant: its own step, a t-less Grid as before.
+    let result = single(area(Some((time(6), time(6))), &both).unwrap());
+    assert!(matches!(
+        result.domain,
+        DomainDescription::Grid { t: None, .. }
+    ));
+    assert_eq!(result.ranges["P0"].shape, [2, 2]);
+    assert_value(result.ranges["P0"].values[0], celsius(6.0, 4.0));
+    // Between steps, or a window with none inside: no data (a 404), where
+    // the nearest step used to answer.
+    for datetime in [(time(3), time(3)), (time(7), time(7)), (time(1), time(5))] {
+        assert!(
+            matches!(
+                area(Some(datetime), &both[..1]),
+                Err(DataServerError::LocationNotFound(_))
+            ),
+            "{datetime:?}"
+        );
+    }
+
+    // Radius is the area query over the circle's polygon.
+    let result = single(
+        engine
+            .query_radius(
+                "POINT(0 0)",
+                20_000.0,
+                Some((time(0), time(12))),
+                Some(&both[..1]),
+                None,
+                None,
+            )
+            .unwrap(),
+    );
+    let range = &result.ranges["P0"];
+    assert_eq!(range.shape, [3, 2, 2]);
+    for (step, hours) in [0.0, 6.0, 12.0].into_iter().enumerate() {
+        assert_value(range.values[step * 4], celsius(hours, 4.0));
+        assert_eq!(&range.values[step * 4 + 1..step * 4 + 4], &[None; 3]);
+    }
+}
+
+/// The audit's reproduction (`/req/core/datetime-response` A and F): a
+/// collection with a single step answered a closed interval around it, and
+/// an open start before it, with "No forecast run covers time" on every
+/// query but the cube.
+#[test]
+fn a_window_around_the_only_step_selects_it_on_every_query() {
+    let (_source, engine) = fixture(None, 1, 1, &[]);
+    let params = [parameter(0)];
+    let windows = [
+        (time(-24), time(24)),
+        (DateTime::<Utc>::MIN_UTC, time(6)),
+        (time(-6), DateTime::<Utc>::MAX_UTC),
+    ];
+    for datetime in windows.map(Some) {
+        let position = single(
+            engine
+                .query_position("POINT(0.5 0.5)", datetime, Some(&params), None, None)
+                .unwrap(),
+        );
+        let DomainDescription::PointSeries { t, .. } = &position.domain else {
+            panic!("expected a point series")
+        };
+        assert_eq!(t, &[time(0)], "{datetime:?}");
+        for result in [
+            engine.query_area("0,0,1,1", datetime, Some(&params), None, None),
+            engine.query_radius("POINT(0 0)", 20_000.0, datetime, Some(&params), None, None),
+        ] {
+            let DomainDescription::Grid { t, .. } = single(result.unwrap()).domain else {
+                panic!("expected a grid")
+            };
+            assert_eq!(t, Some(vec![time(0)]), "{datetime:?}");
+        }
+        let trajectory = engine
+            .query_trajectory(
+                "LINESTRING(0.1 0.2, 0.9 0.8)",
+                datetime,
+                Some(&params),
+                None,
+                None,
+            )
+            .unwrap();
+        let DomainDescription::Trajectory { nodes, .. } = &single(trajectory).domain else {
+            panic!("expected a trajectory")
+        };
+        assert!(nodes.iter().all(|node| node.0 == time(0)), "{datetime:?}");
+    }
+}
+
 #[test]
 fn single_and_legacy_radius_queries_fetch_each_field_once() {
     for kind in [None, Some(GribLevelType::Single)] {
@@ -242,6 +413,166 @@ fn single_and_legacy_radius_queries_fetch_each_field_once() {
         assert_eq!(store.reads.lock().unwrap().attempts.len(), 9);
         assert!((2..=FIELD_CONCURRENCY).contains(&store.peak.load(Ordering::SeqCst)));
     }
+}
+
+#[test]
+fn rectangle_nodes_whose_cell_misses_an_unaligned_bbox_are_null() {
+    // #966: the native subset encloses the bbox with the nodes around it;
+    // a rectangle keeps the nodes whose cell (half a spacing either side)
+    // meets it, and nulls the rest.
+    let (_source, engine) = fixture(None, 1, 1, &[]);
+    let p0 = |offset: f64| Some(f64::from(base_value(0, 0)) + offset - 273.15);
+    for (coords, expected) in [
+        // Only the (1, 1) cell meets the bbox, in either form.
+        ("0.6,0.6,1.5,1.5", [None, None, None, p0(2.0)]),
+        (
+            "POLYGON((0.6 0.6,1.5 0.6,1.5 1.5,0.6 1.5,0.6 0.6))",
+            [None, None, None, p0(2.0)],
+        ),
+        // Centres outside, cells reaching in: every node keeps its value.
+        ("0.2,0.2,1.5,1.5", [p0(4.0), p0(6.0), p0(0.0), p0(2.0)]),
+        // On the nodes: every one.
+        ("0,0,1,1", [p0(4.0), p0(6.0), p0(0.0), p0(2.0)]),
+        // Between nodes: the cell it lies in.
+        ("0.3,0.3,0.4,0.4", [p0(4.0), None, None, None]),
+    ] {
+        let result = single(
+            engine
+                .query_area(coords, None, Some(&[parameter(0)]), None, None)
+                .unwrap(),
+        );
+        let DomainDescription::Grid { x, y, .. } = &result.domain else {
+            panic!("expected a grid")
+        };
+        assert_eq!(
+            (x.as_slice(), y.as_slice()),
+            (&[0.0, 1.0][..], &[0.0, 1.0][..])
+        );
+        let values = &result.ranges["P0"].values;
+        assert_eq!(values.len(), 4, "{coords}");
+        for (&actual, expected) in values.iter().zip(expected) {
+            assert_value(actual, expected);
+        }
+    }
+    // GRIB areas still never cross the antimeridian (#667).
+    assert!(matches!(
+        engine.query_area("170,10,-170,20", None, Some(&[parameter(0)]), None, None),
+        Err(DataServerError::InvalidParameter(_))
+    ));
+}
+
+#[test]
+fn rectangle_past_a_regional_grid_edge_is_404_beyond_half_a_cell() {
+    // #977 review: a bbox past the last node is clamped to that lone node,
+    // whose native cell (half a spacing either side) decides. Within half a
+    // cell it is served; past it, no cell meets the bbox: 404, never the
+    // edge node put back by the vertex fallback.
+    let (_source, engine) = fixture(None, 1, 1, &[]);
+    let p0 = |offset: f64| Some(f64::from(base_value(0, 0)) + offset - 273.15);
+    let area = |coords: &str| engine.query_area(coords, None, Some(&[parameter(0)]), None, None);
+    let result = single(area("1.2,0,1.4,1").unwrap());
+    let DomainDescription::Grid { x, y, .. } = &result.domain else {
+        panic!("expected a grid")
+    };
+    assert_eq!((x.as_slice(), y.as_slice()), (&[1.0][..], &[0.0, 1.0][..]));
+    for (&actual, expected) in result.ranges["P0"].values.iter().zip([p0(6.0), p0(2.0)]) {
+        assert_value(actual, expected);
+    }
+    // 0.6 past the last node: the vertex fallback's tolerance (the 0.8
+    // bbox span of a lone node) would have reached it.
+    for coords in ["1.6,0,2.4,1", "0,1.6,1,2.4"] {
+        assert!(
+            matches!(area(coords), Err(DataServerError::LocationNotFound(_))),
+            "{coords}"
+        );
+    }
+}
+
+#[test]
+fn area_and_radius_default_to_every_parameter_of_the_view() {
+    // /req/edr/parameter-name-response A (#966): without `parameter-name`,
+    // every parameter, as position and cube answer, not one default.
+    for kind in [
+        None,
+        Some(GribLevelType::Single),
+        Some(GribLevelType::Pressure),
+    ] {
+        let levels = if kind == Some(GribLevelType::Pressure) {
+            2
+        } else {
+            1
+        };
+        let (_source, owner) = fixture(kind, 3, levels, &[]);
+        let engine = view(&owner);
+        let names: Vec<_> = (0..3).map(parameter).collect();
+        for result in [
+            engine.query_area("0,0,1,1", None, None, None, None),
+            engine.query_radius("POINT(0 0)", 20_000.0, None, None, None, None),
+        ] {
+            let result = single(result.unwrap());
+            let mut returned: Vec<_> = result.ranges.keys().cloned().collect();
+            returned.sort();
+            assert_eq!(returned, names, "{kind:?}");
+            let mut described: Vec<_> = result.parameters.keys().cloned().collect();
+            described.sort();
+            assert_eq!(described, names, "{kind:?}");
+            for (param, name) in names.iter().enumerate() {
+                let values = &result.ranges[name].values;
+                assert_eq!(values.len(), levels * 4, "{kind:?} {name}");
+                // The south-west node of the first level (the bottom, highest
+                // pressure, of a pressure view), from its own field.
+                assert_value(
+                    values[0],
+                    Some(
+                        f64::from(base_value(param, levels - 1)) + 4.0
+                            - if param.is_multiple_of(2) { 273.15 } else { 0.0 },
+                    ),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_defaulted_parameter_missing_at_its_canonical_level_is_null() {
+    // Legacy layout: `T` is canonical at 2 m (step 1) but step 0 carries it
+    // only at the surface. Named, that is a 400 (never a substitute level);
+    // defaulted, it is null beside the parameters that are there.
+    let source = TestSource::new();
+    source.write(
+        "f000",
+        &[
+            ("T", "surface", message(0, 280.0, [0, 2, 4, 6], 1, 0)),
+            (
+                "Q",
+                "2 m above ground",
+                message(0, 270.0, [0, 2, 4, 6], 103, 2),
+            ),
+        ],
+        0,
+    );
+    source.write(
+        "f001",
+        &[
+            ("T", "2 m above ground", message(0, 290.0, [0; 4], 103, 2)),
+            ("Q", "2 m above ground", message(0, 275.0, [0; 4], 103, 2)),
+        ],
+        1,
+    );
+    let engine = GribEngine::new("canonical", &source.config()).unwrap();
+    let step0: DateTime<Utc> = "2026-04-05T00:00:00Z".parse().unwrap();
+    let datetime = Some((step0, step0));
+    assert!(matches!(
+        engine.query_area("0,0,1,1", datetime, Some(&["T".into()]), None, None),
+        Err(DataServerError::InvalidParameter(_))
+    ));
+    let result = single(
+        engine
+            .query_area("0,0,1,1", datetime, None, None, None)
+            .unwrap(),
+    );
+    assert_eq!(result.ranges["T"].values, vec![None; 4]);
+    assert_value(result.ranges["Q"].values[0], Some(274.0 - 273.15));
 }
 
 #[test]
@@ -284,6 +615,11 @@ fn invalid_requests_and_oversized_areas_stop_before_loading_other_fields() {
     ));
     assert_eq!(store.reads.lock().unwrap().attempts.len(), 1);
     assert_eq!(engine.storage_bytes_read(), global.len() as u64);
+    // Every parameter by default (#966) is held to the same budget.
+    assert!(matches!(
+        engine.query_area("-180,-90,180,90", None, None, None, None),
+        Err(DataServerError::QueryTooLarge(_))
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

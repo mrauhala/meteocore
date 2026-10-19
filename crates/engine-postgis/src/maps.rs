@@ -1,4 +1,7 @@
 //! `MapEngine` for the events shape (#504): the age-colored lightning layer.
+//! The station shapes' symbol layers (#1063) live in `station_map.rs`; they
+//! share this module's advertised steps and TIME resolution, on their own
+//! `[postgis.map] time_step` ([`time_step`]).
 //!
 //! Each WMS/Maps/Tiles frame renders the strikes of a sliding window ending
 //! at the (quantized) requested TIME, splatted as fixed-size discs whose
@@ -34,9 +37,10 @@ use std::sync::{Arc, OnceLock};
 use chrono::{DateTime, Duration, Utc};
 use ds_cache::ByteBoundedCache;
 use ds_core::error::DataServerError;
-use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
+use ds_core::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile};
 use tokio_postgres::Row;
 
+use crate::config::PostgisEngineConfig;
 use crate::engine::PostgisEngine;
 use crate::metadata::CollectionMeta;
 use crate::query::{build_events_window, params_as_refs, BuiltQuery, WindowAttrs};
@@ -50,15 +54,17 @@ pub struct Strike {
     pub lat: f64,
 }
 
-/// WMS TIME quantum: requested instants floor to the minute, so cache keys
-/// stay bounded and animation frames are deterministic. The live frame's
-/// staleness is bounded by this quantum plus ingest lag.
-pub(crate) const WMS_TIME_STEP_SECS: i64 = 60;
+/// The events layer's TIME quantum: requested instants floor to the minute,
+/// so cache keys stay bounded and animation frames are deterministic. The
+/// live frame's staleness is bounded by this quantum plus ingest lag. The
+/// station layers step on `[postgis.map] time_step` instead (#1063).
+pub(crate) const EVENTS_TIME_STEP: Duration = Duration::minutes(1);
 
-/// Advertised TIME dimension depth: 1-minute steps over the most recent 6 h
-/// (361 entries for a full window — both endpoints inclusive). Older frames still render via an
-/// explicit TIME — membership in the advertised list is not required.
-pub(crate) const WMS_TIME_DEPTH: Duration = Duration::hours(6);
+/// Advertised TIME dimension depth: steps over the most recent 6 h (361
+/// one-minute entries for a full events window, both endpoints inclusive).
+/// Older frames still render via an explicit TIME — membership in the
+/// advertised list is not required.
+pub(crate) const WMS_TIME_DEPTH: Duration = ds_core::config::POSTGIS_MAP_TIME_WINDOW;
 
 /// Fixed splat radius in output pixels. Constant across zoom — classic
 /// lightning markers stay marker-sized rather than scaling with the map
@@ -73,42 +79,105 @@ const MAX_WINDOW_STRIKES: usize = 200_000;
 /// The advertised parameter id of the derived age layer.
 pub const LIGHTNING_AGE_PARAMETER: &str = "lightning_age";
 
-/// Floor a requested instant to the TIME quantum.
-pub(crate) fn quantize_wms_time(t: DateTime<Utc>) -> DateTime<Utc> {
+/// The map metadata of a refreshed snapshot (#1063): the events shape's one
+/// age layer, or a station collection's layer per configured parameter, the
+/// first the default. Built per metadata refresh so `raster_info_shared` is
+/// an `Arc` clone.
+pub(crate) fn build_raster_info(
+    cfg: &PostgisEngineConfig,
+    spatial_extent: Option<[f64; 4]>,
+    wms_times: &[DateTime<Utc>],
+) -> RasterInfo {
+    let (parameter, unit, parameters) = if cfg.events().is_some() {
+        (
+            LIGHTNING_AGE_PARAMETER.to_string(),
+            "min".to_string(),
+            vec![],
+        )
+    } else {
+        let first = cfg.parameters.first();
+        (
+            first.map(|p| p.name.clone()).unwrap_or_default(),
+            first.map(|p| p.unit.clone()).unwrap_or_default(),
+            cfg.parameters
+                .iter()
+                .map(|p| ParameterInfo {
+                    name: p.name.clone(),
+                    title: if p.label.is_empty() {
+                        p.name.clone()
+                    } else {
+                        p.label.clone()
+                    },
+                    unit: p.unit.clone(),
+                })
+                .collect(),
+        )
+    };
+    RasterInfo {
+        native_crs: "CRS:84".to_string(),
+        spatial_extent,
+        times: wms_times.to_vec(),
+        parameter,
+        unit,
+        parameters,
+        vertical: None,
+        grid_size: None,
+        layer_subtitle: None,
+        reference_times: Vec::new(),
+    }
+}
+
+/// The collection's TIME step: one minute for the events layer, the
+/// configured `[postgis.map] time_step` (default 10 minutes) for the station
+/// layers (#1063). Whole seconds, at least one minute (validated at load).
+pub(crate) fn time_step(cfg: &PostgisEngineConfig) -> Duration {
+    if cfg.events().is_some() {
+        EVENTS_TIME_STEP
+    } else {
+        cfg.station_map.time_step
+    }
+}
+
+/// Floor a requested instant to a multiple of `step` since the epoch.
+pub(crate) fn quantize_time(t: DateTime<Utc>, step: Duration) -> DateTime<Utc> {
+    let step = step.num_seconds().max(1);
     let secs = t.timestamp();
-    DateTime::from_timestamp(secs - secs.rem_euclid(WMS_TIME_STEP_SECS), 0).unwrap_or(t)
+    DateTime::from_timestamp(secs - secs.rem_euclid(step), 0).unwrap_or(t)
 }
 
 /// The window end `get_raster_tile` renders for a requested time — the
 /// #507 cache-key authority for this engine: explicit TIME floors to the
-/// quantum; no TIME ⇒ the latest advertised step. `None` only when the
-/// collection has no data yet.
+/// step ([`time_step`]); no TIME ⇒ the latest advertised step. `None` only
+/// when the collection has no data yet.
 pub(crate) fn resolve_window_end(
     meta: &CollectionMeta,
     time: Option<DateTime<Utc>>,
+    step: Duration,
 ) -> Option<DateTime<Utc>> {
     match time {
-        Some(t) => Some(quantize_wms_time(t)),
+        Some(t) => Some(quantize_time(t, step)),
         None => meta.wms_times.last().copied(),
     }
 }
 
-/// The advertised TIME steps for the collection metadata: quantized,
+/// The advertised TIME steps for the collection metadata: on `step`,
 /// ascending, newest last, clamped to [`WMS_TIME_DEPTH`] below the newest
-/// event. Rebuilt per metadata refresh (never per request).
+/// observation. Rebuilt per metadata refresh (never per request).
 pub(crate) fn build_wms_times(
     temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    step: Duration,
 ) -> Vec<DateTime<Utc>> {
     let Some((first, last)) = temporal_extent else {
         return Vec::new();
     };
-    let newest = quantize_wms_time(last);
-    let floor = quantize_wms_time((last - WMS_TIME_DEPTH).max(first));
+    let newest = quantize_time(last, step);
+    let floor = quantize_time((last - WMS_TIME_DEPTH).max(first), step);
+    let step = Duration::seconds(step.num_seconds().max(1));
     let mut steps = Vec::new();
     let mut t = floor;
     while t <= newest {
         steps.push(t);
-        t += Duration::seconds(WMS_TIME_STEP_SECS);
+        t += step;
     }
     steps
 }
@@ -118,7 +187,7 @@ pub(crate) fn build_wms_times(
 /// sharing the process AND invalidates naturally when a reload repoints a
 /// collection id at a different table or database — the collection id alone
 /// would keep serving the old table's cached windows until eviction.
-/// Weight = key + one `Strike` per row.
+/// Weight: see [`strike_window_weight`].
 type WindowKey = (String, DateTime<Utc>, DateTime<Utc>);
 
 /// The cache-key source component: collection id + qualified table + pool
@@ -133,12 +202,23 @@ fn window_key_source(engine: &PostgisEngine, shape: &EventsShape) -> String {
     )
 }
 
+/// Cache weight of one strike window: the key, the `Arc` header, and one
+/// `Strike` per slot the `Vec` **allocated** (#1052). The window reserves
+/// one slot per returned row and skips rows with an empty geometry, so the
+/// length can fall short of what the entry holds.
+fn strike_window_weight(k: &WindowKey, v: &Arc<Vec<Strike>>) -> u64 {
+    (k.0.len() + 32 + v.capacity() * std::mem::size_of::<Strike>()) as u64
+}
+
 pub fn strike_window_cache() -> &'static ByteBoundedCache<WindowKey, Arc<Vec<Strike>>> {
     static CACHE: OnceLock<ByteBoundedCache<WindowKey, Arc<Vec<Strike>>>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        ByteBoundedCache::from_env("MC_LIGHTNING_STRIKE_CACHE_MB", 32, 64 * 1024, |k, v| {
-            (k.0.len() + 32 + v.len() * std::mem::size_of::<Strike>()) as u64
-        })
+        ByteBoundedCache::from_env(
+            "MC_LIGHTNING_STRIKE_CACHE_MB",
+            32,
+            64 * 1024,
+            strike_window_weight,
+        )
     })
 }
 
@@ -155,7 +235,7 @@ fn run_query_from_blocking(
     pool: &deadpool_postgres::Pool,
     built: &BuiltQuery,
 ) -> Result<Vec<Row>, DataServerError> {
-    let fut = async {
+    block_on_from_blocking(async {
         let client = pool
             .get()
             .await
@@ -165,14 +245,22 @@ fn run_query_from_blocking(
             .query(&built.sql, &refs)
             .await
             .map_err(|e| crate::engine::map_pg_error(e, built))
-    };
+    })?
+}
+
+/// Drive `fut` to completion from a `spawn_blocking` thread, the bridge
+/// [`run_query_from_blocking`] and the station-map frame fetch (#1063)
+/// share. `Err` only when no runtime exists and none can be built.
+pub(crate) fn block_on_from_blocking<F: std::future::Future>(
+    fut: F,
+) -> Result<F::Output, DataServerError> {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle.block_on(fut),
-        Err(_) => tokio::runtime::Builder::new_current_thread()
+        Ok(handle) => Ok(handle.block_on(fut)),
+        Err(_) => Ok(tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| DataServerError::Engine(format!("runtime build failed: {e}")))?
-            .block_on(fut),
+            .block_on(fut)),
     }
 }
 
@@ -185,6 +273,7 @@ fn fetch_window(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Arc<Vec<Strike>>, DataServerError> {
+    engine.require_validated()?;
     let key: WindowKey = (window_key_source(engine, shape), start, end);
     strike_window_cache().get_or_insert_with(&key, || {
         let built = build_events_window(
@@ -200,6 +289,7 @@ fn fetch_window(
         // Rows arrive newest-first (truncation keeps the newest); take the
         // cap then reverse to ascending so the splat paints newest LAST.
         for row in rows.iter().take(MAX_WINDOW_STRIKES) {
+            engine.check_geometry_row(row)?;
             let time: DateTime<Utc> = row
                 .try_get("time")
                 .map_err(|e| DataServerError::Engine(format!("decode strike time: {e}")))?;
@@ -328,20 +418,20 @@ impl MapEngine for PostgisEngine {
         height: u32,
         time: Option<DateTime<Utc>>,
         output_crs: &OutputCrs,
-        _parameter: Option<&str>,
+        parameter: Option<&str>,
         _z: Option<f64>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
+        self.require_validated()?;
         let Some(shape) = self.config().events() else {
-            // Station shapes have no raster surface; config validation and
-            // the admin allowlist keep them out of the map registries.
-            return Err(DataServerError::InvalidParameter(
-                "map rendering requires the events shape".into(),
-            ));
+            // Station shapes: one symbol layer per parameter (#1063).
+            return crate::station_map::render(
+                self, bbox, width, height, time, output_crs, parameter,
+            );
         };
         let shape = shape.clone();
         let meta = self.cache().load();
-        let end = resolve_window_end(&meta, time).ok_or_else(|| {
+        let end = resolve_window_end(&meta, time, EVENTS_TIME_STEP).ok_or_else(|| {
             DataServerError::Engine("no event data available for the requested time".into())
         })?;
         let window = self
@@ -355,21 +445,12 @@ impl MapEngine for PostgisEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
-        // O(1): every field is a snapshot clone (wms_times is rebuilt per
-        // metadata refresh, #211).
-        let meta = self.cache().load();
-        RasterInfo {
-            native_crs: "CRS:84".to_string(),
-            spatial_extent: self.config().events_extent_bbox,
-            times: (*meta.wms_times).clone(),
-            parameter: LIGHTNING_AGE_PARAMETER.to_string(),
-            unit: "min".to_string(),
-            parameters: vec![],
-            vertical: None,
-            grid_size: None,
-            layer_subtitle: None,
-            reference_times: Vec::new(),
-        }
+        (*self.cache().load().raster_info).clone()
+    }
+
+    /// O(1): the snapshot's `Arc`, rebuilt per metadata refresh (#211).
+    fn raster_info_shared(&self) -> Arc<RasterInfo> {
+        Arc::clone(&self.cache().load().raster_info)
     }
 
     fn resolve_time(
@@ -378,10 +459,40 @@ impl MapEngine for PostgisEngine {
         _reference_time: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
         // The #507 cache-key authority: the SAME `resolve_window_end` the
-        // render path uses (quantized TIME / latest advertised step). Falls
-        // back to the requested time when there is no data yet — the render
-        // errors and caches nothing.
-        resolve_window_end(&self.cache().load(), time).or(time)
+        // render path uses (TIME floored to the collection's step / latest
+        // advertised step), for the events layer and the station layers
+        // alike. Falls back to the requested time when there is no data
+        // yet — the render errors and caches nothing.
+        resolve_window_end(&self.cache().load(), time, time_step(self.config())).or(time)
+    }
+
+    /// Every station layer shares one time axis and frame selection
+    /// (#1063): [`Self::resolve_time`] for any parameter.
+    fn resolve_parameter_time(
+        &self,
+        _parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        self.resolve_time(time, reference_time)
+    }
+
+    /// Strikes are immutable (`0`); a station frame can change under its
+    /// instant when rows arrive late or are corrected, so the station layers
+    /// report the fingerprint the metadata refresh keeps (#1063).
+    fn content_version(&self) -> u64 {
+        if self.config().events().is_some() {
+            0
+        } else {
+            self.frame_version()
+        }
+    }
+
+    /// A station marker shows the latest value within `max_age`, which the
+    /// EDR position query (an exact instant at the nearest station) does
+    /// not answer, so GetFeatureInfo must not read it there (#1063).
+    fn layer_shows_values(&self, _parameter: &str) -> bool {
+        self.config().events().is_some()
     }
 }
 
@@ -393,37 +504,92 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// #1052: the weight counts the slots the window reserved, not only
+    /// the strikes left after empty-geometry rows were skipped.
+    #[test]
+    fn strike_window_weight_counts_reserved_slots() {
+        let key: WindowKey = (
+            "lightning|public.strikes|pool".into(),
+            ts("2026-07-11T20:00:00Z"),
+            ts("2026-07-11T20:20:00Z"),
+        );
+        // Reserved for 100 rows; 40 had an empty geometry and were skipped.
+        let mut strikes = Vec::with_capacity(100);
+        for _ in 0..60 {
+            strikes.push(Strike {
+                time: ts("2026-07-11T20:10:00Z"),
+                lon: 25.0,
+                lat: 60.0,
+            });
+        }
+        let window = Arc::new(strikes);
+        let allocated = (window.capacity() * std::mem::size_of::<Strike>()) as u64;
+        let weight = strike_window_weight(&key, &window);
+        assert!(
+            weight >= allocated,
+            "weight {weight} B under-counts a {allocated} B allocation"
+        );
+    }
+
     #[test]
     fn quantize_floors_to_the_minute() {
         assert_eq!(
-            quantize_wms_time(ts("2026-07-11T20:20:37Z")),
+            quantize_time(ts("2026-07-11T20:20:37Z"), EVENTS_TIME_STEP),
             ts("2026-07-11T20:20:00Z")
         );
         assert_eq!(
-            quantize_wms_time(ts("2026-07-11T20:20:00Z")),
+            quantize_time(ts("2026-07-11T20:20:00Z"), EVENTS_TIME_STEP),
             ts("2026-07-11T20:20:00Z")
         );
     }
 
     #[test]
     fn wms_times_are_bounded_quantized_ascending() {
-        let times = build_wms_times(Some((
-            ts("2026-07-01T00:00:00Z"),
-            ts("2026-07-11T20:20:37Z"),
-        )));
+        let times = build_wms_times(
+            Some((ts("2026-07-01T00:00:00Z"), ts("2026-07-11T20:20:37Z"))),
+            EVENTS_TIME_STEP,
+        );
         assert_eq!(*times.last().unwrap(), ts("2026-07-11T20:20:00Z"));
         // 6 h of 1-min steps + the endpoint.
         assert_eq!(times.len(), 361);
         assert!(times.windows(2).all(|w| w[0] < w[1]));
 
         // A short extent clamps to its start.
-        let times = build_wms_times(Some((
-            ts("2026-07-11T20:00:30Z"),
-            ts("2026-07-11T20:10:00Z"),
-        )));
+        let times = build_wms_times(
+            Some((ts("2026-07-11T20:00:30Z"), ts("2026-07-11T20:10:00Z"))),
+            EVENTS_TIME_STEP,
+        );
         assert_eq!(*times.first().unwrap(), ts("2026-07-11T20:00:00Z"));
         assert_eq!(*times.last().unwrap(), ts("2026-07-11T20:10:00Z"));
-        assert!(build_wms_times(None).is_empty());
+        assert!(build_wms_times(None, EVENTS_TIME_STEP).is_empty());
+    }
+
+    /// #1063: the station layers step on `[postgis.map] time_step`: the
+    /// default 10 minutes advertises 37 steps over the 6 h window, and a TIME
+    /// floors to its step, the same instant `resolve_window_end` resolves.
+    #[test]
+    fn station_times_step_on_the_configured_time_step() {
+        let step = Duration::minutes(10);
+        let times = build_wms_times(
+            Some((ts("2026-07-01T00:00:00Z"), ts("2026-07-11T20:27:37Z"))),
+            step,
+        );
+        assert_eq!(times.first(), Some(&ts("2026-07-11T14:20:00Z")));
+        assert_eq!(times.last(), Some(&ts("2026-07-11T20:20:00Z")));
+        assert_eq!(times.len(), 37);
+        assert!(times.windows(2).all(|w| w[1] - w[0] == step));
+        assert_eq!(
+            quantize_time(ts("2026-07-11T20:29:59Z"), step),
+            ts("2026-07-11T20:20:00Z")
+        );
+        assert_eq!(
+            quantize_time(ts("2026-07-11T20:29:59Z"), Duration::minutes(15)),
+            ts("2026-07-11T20:15:00Z")
+        );
+        let mut cfg = crate::station_map::tests::station_config();
+        assert_eq!(time_step(&cfg), step, "the default");
+        cfg.station_map.time_step = Duration::minutes(30);
+        assert_eq!(time_step(&cfg), Duration::minutes(30));
     }
 
     #[test]

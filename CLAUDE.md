@@ -7,11 +7,20 @@ weather data (radar, NWP models, observations, alerts).
 Crates: `ds-core` (traits + types + shared utilities, directory `crates/core`),
 `ds-storage` (S3/HTTP/local object store, directory `crates/storage`; its
 `discovery` module is the one home for time windows, strftime prefix
-expansion, the filename → timestamp matcher and the catalog scan with
-bounded concurrent prefix LISTs, #816/#817),
+expansion, the filename → timestamp (and `{lead}`) matcher, the catalog scan
+with bounded concurrent prefix LISTs (#816/#817), listing-free template
+probing (`TemplateProber`: `{run}`/`{lead}` keys, sentinel HEADs, settling,
+per-run publication) and the shared `PendingFile` settling rule (#1067);
+`DataStore` adds budgeted and `If-Unmodified-Since` range reads and
+per-host request limits for files read in place),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
-`ds-executor` (shared Tokio render admission/deadline execution; API-facing infrastructure),
+`ds-executor` (shared Tokio render admission/deadline execution and the one
+query runtime EDR and WMS GetFeatureInfo share; API-facing infrastructure,
+plus `budget::ByteBudget`, the fail-fast byte budget each engine's source-read
+admission is an instance of — never another copy, #1067 — and
+`field_jobs::run_field_jobs`, the bounded field-read scheduler of an EDR
+query that GRIB and NetCDF share),
 `ds-poll` (shared poll-loop lifecycle: the `Shutdown` handle + `PollTicker`
 every engine's background poll loop uses — never hand-roll a
 `tokio::select!` shutdown signal, #481),
@@ -23,7 +32,10 @@ with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
 `ds-mvt` (Mapbox Vector Tile encoder + LRU tile cache), `ds-3dtiles`
 (OGC 3D Tiles encoder), engines (`engine-csv`, `engine-geojson`,
 `engine-geotiff`, `engine-grib`, `engine-odim`, `engine-querydata`,
-`engine-zarr`, `engine-postgis`, `engine-cap`, `engine-bufr`, `engine-satellite`), API layers (`api-common` shared HTTP plumbing, `api-edr`,
+`engine-zarr`, `engine-postgis`, `engine-cap`, `engine-bufr`, `engine-satellite`,
+`engine-netcdf`, `engine-station-grid` — station observations gridded on the
+fly, a derived collection over a station collection), API layers
+(`api-common` shared HTTP plumbing, `api-edr`,
 `api-features`, `api-maps`, `api-tiles`, `api-wms`, `api-3dtiles`,
 `api-mcp` — Model Context Protocol tools over the storm-cell surface), and
 `server` (the binary).
@@ -31,7 +43,8 @@ with a `[….wis2]` source; see `crates/ds-wis2/CLAUDE.md`),
 **Per-crate notes live in `crates/<crate>/CLAUDE.md`.** Before working on one
 of these crates, read its file — it holds that crate's rules and gotchas:
 
-- `crates/ds-executor/CLAUDE.md` — bounded render queue, deadlines, worker permit ownership.
+- `crates/ds-executor/CLAUDE.md` — bounded render queue, deadlines, worker permit ownership,
+  the shared query runtime, the engines' fail-fast `ByteBudget`.
 - `crates/server/CLAUDE.md` — CLI flags, no-config boot, auto-collections,
   reload/watcher trust model, proxy headers.
 - `crates/api-common/CLAUDE.md` — shared discovery validation, metadata/navigation, OpenAPI and conformance.
@@ -62,7 +75,8 @@ of these crates, read its file — it holds that crate's rules and gotchas:
 - `crates/engine-geotiff/CLAUDE.md`, `crates/engine-grib/CLAUDE.md`,
   `crates/engine-querydata/CLAUDE.md`, `crates/engine-zarr/CLAUDE.md`,
   `crates/engine-cap/CLAUDE.md`, `crates/engine-postgis/CLAUDE.md`,
-  `crates/engine-nowcast/CLAUDE.md`, `crates/engine-satellite/CLAUDE.md` —
+  `crates/engine-nowcast/CLAUDE.md`, `crates/engine-satellite/CLAUDE.md`,
+  `crates/engine-netcdf/CLAUDE.md`, `crates/engine-station-grid/CLAUDE.md` —
   one file per engine.
 
 This root file holds only workspace-wide rules.
@@ -88,6 +102,15 @@ Violating these has caused production incidents. Never break them.
      requests legitimately reach past ±85°, and the client maps the returned
      image over the full requested extent.
    - Clamp to `LAT_LIMIT_DEG` only when selecting tile-grid indices.
+   - Geographic (`OutputCrs::Wgs84`) direct renders of a client-chosen bbox go
+     through `ds_core::map_engine::get_raster_tile_in_domain` /
+     `get_raster_tiles_in_domain`, which cut the output rows centred past ±90°
+     (nodata there) and never clamp. An engine asked for those rows samples its
+     edge cells instead (#1065). For a projected box wholly outside its
+     projection (`ds_core::geo::outside_projection_domain`) they return
+     `None` without calling the engine (#1089). A single point, such as a
+     WMS GetFeatureInfo pixel centre, goes through
+     `OutputCrs::position_on_earth`, which tests the point itself (#1064).
 5. **Never project per output pixel in a render path.** The CRS forward
    transform dominates render cost; per-pixel projection was a ~10×
    regression (#203). Evaluate the projection on a coarse `ProjectionGrid`
@@ -101,9 +124,20 @@ Violating these has caused production incidents. Never break them.
    (`block_in_place(|| handle.block_on(..))`). Keep its runtime context
    explicit:
    - Call it from the background poll runtime (or another dedicated runtime).
+     A request's engine *query* runs as a task on the one shared query
+     runtime, `ds_executor::query_runtime()` (threads `mc-query`, #1103):
+     api-edr's executor, and `ds_executor::RenderJob::run_query` for WMS
+     GetFeatureInfo (#1064). Each keeps its own admission and deadline.
    - Never from a request-handler task — it parks a request worker.
    - On `spawn_blocking` workers, use its explicit-runtime APIs (`get_on`,
-     `get_range_on`). Do not rely on an ambient runtime handle.
+     `get_range_on`, `get_range_on_with_budget`,
+     `get_range_if_unmodified_on`). Do not rely on an ambient runtime handle.
+     To overlap whole-object reads from synchronous code, start them with
+     `DataStore::start_get_opt` and collect each with
+     `PendingGet::wait(Some(handle))`, bounding how many you start (#999).
+     Several threads may wait for one read behind an `Arc` (#1127): each
+     wait is bounded by its own thread's deadline, and the last holder
+     dropping the read aborts it.
      The plain-Zarr adapter is a tested exception: the same synchronous
      `get_opt`/cache-fill path serves EDR async workers and `RenderJob` blocking
      workers. Its `block_in_place` bridge releases an async worker and runs
@@ -112,6 +146,17 @@ Violating these has caused production incidents. Never break them.
      in `crates/engine-zarr/src/store/coalescing_tests.rs` and `refresh_tests.rs`.
      engine-satellite's evicted-scan fetch is the same exception (EDR on
      async workers, renders on blocking ones): `tests/refetch.rs`.
+     So are engine-netcdf's remote files (#1067): hdf5-reader's synchronous
+     storage callback crosses into the engine's persistent I/O runtime
+     (`crates/engine-netcdf/src/io.rs`: `block_in_place` on a worker,
+     directly on a blocking or plain thread, a scoped thread on a
+     current-thread runtime), with the deadline captured on the calling
+     thread. Ingest on a poll-runtime worker, renders on `RenderJob` blocking
+     workers and on async workers are covered by
+     `remote::tests::reads_run_on_the_poll_runtime_render_jobs_and_async_workers`
+     and `io::tests::every_calling_thread_reaches_the_runtime`; EDR queries
+     on the query runtime's workers and GetFeatureInfo's `run_query` by
+     `remote::tests::queries_read_on_the_query_runtime_for_edr_and_get_feature_info`.
    - Never from a non-Tokio thread such as a rayon pool — that hits a
      construct-a-new-`Runtime`-per-call fallback (#222). For parallel remote
      fetches, use async concurrency (`join_all`) on the runtime, or pass a
@@ -121,6 +166,20 @@ Violating these has caused production incidents. Never break them.
      Icechunk uses its own persistent I/O runtime and supports `RenderJob`
      blocking workers; concurrent shard reads through that executor are
      covered in `crates/engine-zarr/src/icechunk/tests.rs`.
+   - A whole-object download on the poll runtime passes
+     `FetchBudget::Background` (`get_with_budget` / `get_many_with_budget`,
+     120 s), so object_store's own retry of a stalled 30 s attempt can run.
+     Anything a request can wait on, a single-flight cache fill included,
+     keeps `FetchBudget::Request` (30 s or the render deadline). See
+     `crates/storage/README.md` (#1011).
+   - Never wait on a runtime worker for work that needs that runtime: a
+     `std` lock or condvar, or a single-flight cache wait (`quick_cache`
+     placeholders park the thread), whose holder downloads through this
+     bridge or a task on the same runtime. Waiters parked on every worker
+     leave nothing to run that task or drive its I/O and the deadline
+     timers, and the runtime stalls for good (#1200). Take the lock if it is
+     free, else wait inside `block_in_place`, until the request deadline:
+     engine-odim's `PixelCache::with_file_load`, GRIB's field jobs.
 8. **SQL safety:** every identifier goes through `quote_ident`, every value
    is a `$N` bind, no SQL text inside `format!()`.
    `scripts/check_sql_safety.sh` enforces this in CI.
@@ -187,6 +246,28 @@ cargo audit                          # exactly what CI enforces
   crates and for GitHub Actions; purely transitive crates are refreshed by
   `cargo update`, prompted by the scheduled audit run.
 
+### Licences (#1081)
+
+MeteoCore is `MIT OR Apache-2.0` (`LICENSE-MIT`, `LICENSE-APACHE`). Every
+member inherits `[workspace.package] license` with `license.workspace = true`;
+a new crate without it fails CI. `crates/ds-bufr` keeps its own tinybufr
+declaration and licence files.
+
+- `deny.toml` is the dependency licence allow-list. The `licenses` CI job runs
+  `cargo deny --locked check licenses` and gates the Docker publish like
+  `audit`; advisories stay with `cargo audit`.
+- `THIRD-PARTY-NOTICES.txt` is generated, never committed:
+  `scripts/third_party_notices.sh` (cargo-about 0.9.2, `about.toml`,
+  `third-party/notices.hbs`) runs in the Dockerfile's `notices` stage and in
+  `build-binaries.yml`. A licence added to `deny.toml` usually belongs in
+  `about.toml`'s `accepted` too.
+- The script fails the build when a crate that compiles C/C++ with `cc` or
+  `cmake` is not classified in its `bundled_licences`, or a listed licence
+  file has moved. Add the bundled library's own licence file there; the
+  crate's declared licence covers only its Rust code. blosc-src ships no
+  licence files, so `third-party/c-blosc.txt` holds C-Blosc's, copied from
+  the release blosc-src bundles; the script fails when that release changes.
+
 ### CodeQL scanning
 
 `.github/workflows/codeql.yml` scans Rust, Actions, JavaScript/TypeScript, and
@@ -247,12 +328,22 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   defaults. Don't hand-roll a `quick_cache` byte-weighted cache — before
   extraction the same ~40 lines were copy-pasted 12×. In `server/src/
   admin.rs`, a global cache's `/metrics` family is one `CacheMetricSet`
-  static + one `update()` call in `metrics_handler`.
+  static + one `update()` call in `metrics_handler`. The budget is split
+  into equal per-shard slices, so entries that fit the total can still be
+  evicted: a caller that plans what stays resident uses
+  `new_single_shard` / `from_env_single_shard` (engine-satellite's scans).
+  quick_cache keeps 97 % of a shard for entries inserted first or read, so
+  unread fresh inserts share 3 %: a cache filled ahead of reads (a
+  pre-warm) uses `new_with_hot_allocation` (engine-odim's `PIXEL_CACHE`,
+  0.5, #992). The hot share also caps the largest entry a shard admits.
 - **API crates depend on ds-core and api-common** (shared Common HTTP glue),
-  plus ds-executor for bounded render execution,
+  plus ds-executor for bounded render execution and the shared query runtime,
   ds-render for
   api-wms/api-maps, and api-edr for its `f=png` time-series plots — never on
-  engine crates. API state is a registry of engines keyed by collection ID.
+  engine crates. The one API-to-API edge is api-edr → api-features: EDR
+  `items` is the Features encoding and paging over the collection's
+  `FeatureEngine` (#928). API state is a registry of engines keyed by
+  collection ID.
 - **The shared OGC API root at `/` (#789)** composes OGC API standards as
   `api_common::shared::BuildingBlock`s — Maps, Tiles and Features — over one
   landing page, conformance, OpenAPI document and collection catalog. Blocks
@@ -281,7 +372,8 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
 
 ### Adding a new engine
 
-1. Create `crates/engine-<name>/` with a `Cargo.toml` depending on `ds-core`.
+1. Create `crates/engine-<name>/` with a `Cargo.toml` depending on `ds-core`,
+   with `license.workspace = true` in its `[package]`.
 2. Implement `EdrEngine`, `FeatureEngine`, `MapEngine`, and/or `VolumeEngine`.
 3. Add the crate to workspace members in root `Cargo.toml`.
 4. Add it as a dependency of `crates/server/Cargo.toml`.
@@ -291,6 +383,16 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
 6. Wire it into the appropriate registries per the collection's `apis`.
 7. Obey the Performance & Concurrency rules — especially: spawn the poll loop
    on the background runtime, and never project per output pixel.
+   **A `MapEngine` returns `Err` for a deadline or a failed read** —
+   `DeadlineExceeded`, or `ResourceExhausted` (503) for a storage failure
+   that outlived its retries, with the detail logged — never an `Ok` tile
+   with nodata in its place: the rendered and meta-tile caches keep every
+   `Ok` tile with no TTL, so a gap from a short outage would outlive it
+   (#993, #1051). Only a tile or field the source itself declares empty
+   (a COG tile with `byte_count == 0`) or bytes that do not decode are
+   nodata. A missing object is engine-specific: engine-odim draws a typed
+   `NotFound` as nodata (#993/#996), GeoTIFF answers 503 until the next scan
+   drops the entry.
    **If the engine snaps a requested time to an available timestep**
    (latest-not-after, nearest, …) instead of exact-matching, it MUST
    override `MapEngine::resolve_time` with the SAME selection logic
@@ -326,15 +428,24 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    legend. They key every cache on the composite's name and its resolved
    time, pass that same time to `get_raster_tiles`, compose with
    `ds_render::render_composite_tiles` (meta-tiles:
-   `render_metatiled_composite`), and render nothing when it is `None`
-   (no shared scan).
+   `render_metatiled_composite`; WMS draws their RGBA forms,
+   `render_composite_tiles_rgba` and `assemble_metatiled_composite`, and
+   encodes once with the other layers), and render nothing when it is
+   `None` (no shared scan).
    **If the engine retains model runs** (non-empty
    `RasterInfo.reference_times`), it MUST likewise override
    `MapEngine::resolve_reference_time` with the SAME run selection
    `get_raster_tile` uses (`None` ⇒ the concrete run it would render,
    including any cross-run fallback) — the caches key the run axis on it
    (#521). Skipping this freezes the first-rendered run's pixels when a
-   newer run re-covers the same valid times.
+   newer run re-covers the same valid times. If the run also depends on
+   the parameter (GRIB: an hour-window aggregate the newest run lacks at
+   that time renders from an older run, #1005), override
+   `resolve_parameter_reference_time` with that selection too: the API
+   layers resolve the run with it, then pass that run to
+   `resolve_parameter_time` and the render. Likewise
+   `resolve_parameters_reference_time`, the run several parameters render
+   together from (`DerivedWind`'s u and v; GRIB, #1026).
    **If the engine's content for a fixed `(time, reference_time)` can be
    revised in place** (a push-fed alert set: a warning published later is
    active at instants already rendered), it MUST override
@@ -343,6 +454,37 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    meta-tile caches key on it, and explicit-`TIME` responses then carry a
    short, revalidating `Cache-Control` instead of `immutable`.
    Immutable-timestep engines keep the default `0`.
+   **If the engine's map layers have levels** (`RasterInfo.vertical`) and
+   it draws another level than the requested `z`, or than the first
+   advertised level without one, it MUST override
+   `MapEngine::resolve_elevation` with the SAME selection
+   `get_raster_tile` uses (GRIB: the run's own first level; ODIM PVOL: the
+   nearest sweep carrying the quantity). WMS GetFeatureInfo passes that
+   level to the position query as `z` (#1064).
+   **If a map layer is an overlay** whose values the engine's EDR position
+   query does not answer (ODIM `CELLS`), override
+   `MapEngine::layer_shows_values` (O(1)) to return `false` for it.
+   Otherwise WMS advertises it `queryable="1"` and answers with nodata or
+   a 400 (#1064).
+   **If a `FeatureEngine`'s features carry time**, apply
+   `FeatureQuery::datetime` as OGC `datetime`: keep the features whose
+   temporal geometry intersects the interval (an instant is `start == end`,
+   ends inclusive) and those without one. Features `/items` and vector tiles
+   (Tiles DateTime, #946) both pass it; the vector tile cache keys on it.
+   Without time, return `false` from `has_time_dimension`: the HTML builder
+   shows its time controls exactly when that is `true` (#1143).
+   **If a `FeatureEngine`'s ids are opaque** (alert identifiers, track
+   numbers), implement `label` from the feature's own values and
+   `summary_properties`; a station whose EDR location has its id, or a site
+   with its own collection, names it in `Feature::related` (#1143).
+   **If the engine's parameters can be wind components** (u/v), implement
+   `ds_core::wind::WindSource`: an O(1) `Arc<WindFacts>` snapshot, built at
+   load/poll refresh, of what the source states per parameter (GRIB triple,
+   CF `standard_name`, FMI number, the u/v frame, the level) and how the
+   grid's axes lie (`GridAxes`). Report a frame only from source metadata,
+   never assumed. Add the engine type to `config::DERIVE_WIND_ENGINES` and
+   register it through `wind_wrapped` in `server/src/admin.rs`; the shared
+   `DerivedWind` wrapper does the rest (#897).
 8. Ship a runnable (enabled) example collection config AND do an end-to-end
    server + curl smoke test against real data. Unit tests alone miss
    integration and unit-conversion bugs.
@@ -372,6 +514,9 @@ Same pattern for api-edr, api-features, api-maps, api-tiles:
    returns 200 having done nothing — indistinguishable from success at the
    call site. That was the `sortby` bug (#605): validate against what the
    engine actually supports and return 400 naming the valid options.
+   Extract a struct-shaped query with `api_common::JsonQuery`, never axum's
+   `Query`, so a malformed or repeated parameter is the JSON 400, not
+   axum's plain text (#1121).
 4. **When a parameter comes from a standard, copy its schema verbatim** into
    `api_definition()` — including `style`/`explode` for array parameters,
    which is what makes the comma-separated form normative rather than
@@ -438,7 +583,29 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   `ProjectionGrid::build_2d_periodic` (its column period) and wraps the
   sampled column: EPSG:3035's inverse cuts longitude at 170°W and every
   longitude meets at the pole, so plain `build_2d` interpolates straight
-  through both in any Arctic view (#323; engine-grib does this).
+  through both in any Arctic view (#323; engine-grib does this, and
+  `SourceGrid` does it for engine-netcdf and engine-querydata, #1188).
+- **A new gridded engine renders through `ds_core::resample::SourceGrid`**
+  (#1067), not a sampler of its own: decode the field to a row-major
+  `&[f32]`, north row first, on its `GeoTransform`, and call `render_f32`
+  (or `output_map` once, then `sample_f32` per field). It is querydata's
+  projected path, pinned to it on the MEPS fixture
+  (`engine-querydata/src/engine/sampler_tests.rs`): half-pixel convention,
+  bilinear with a nearest fallback, `RasterValues::F32`. Lat/lon and Web
+  Mercator sources get the periodic map; any other gets the longitude
+  within half a turn of the grid's centre and the
+  `footprint_window_in_image` guard (#449/#453), and a footprint wholly
+  off the image builds no grid at all (#1129). Build the `SourceGrid` once
+  per grid, not per request: `new` inverse-projects the envelope. Its point
+  queries (an EDR position, an area's cell centre) project each point once
+  with `position` and sample every field there with `value_at`, the map's
+  own sampling, so GetFeatureInfo answers what GetMap drew (engine-netcdf).
+  An engine that cannot afford a decoded field shares the map alone:
+  `output_map_quiet` (it logs `OutputMap::capped_error` itself), then
+  `OutputMap::position` per pixel and its own read of its storage by the
+  same rules, wrapping a global grid's columns (`global_period`) and
+  checking the deadline per row (engine-querydata, #1190). grib and
+  satellite keep their own samplers (#1172).
 - **Before blaming a mechanism for a latency spike, check the magnitude adds
   up.** A 2.3 MB local read from page cache is tens of ms, not seconds.
   Multi-second stalls at low load almost always mean blocking/contention
@@ -456,15 +623,25 @@ one never implies the other.
 
 | Budget (home) | Bounds | Value | When it trips |
 |---|---|---|---|
-| `MAX_MAP_DIMENSION` / `MAX_MAP_PIXELS` (api-wms, api-maps `params.rs`) | output px per side / `width × height` | 8000 / 64 M | 400 at validation (WMS `InvalidParameterValue`, Maps `BadRequest`): "… must not exceed 8000" |
-| `api_tiles::params::TILE_SIZE` | output, fixed | 256 × 256 | never |
-| `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss; an RGB composite adds 16 B per band plane past the first (`acquire_raster_planes`) | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
+| `MAX_MAP_DIMENSION` / `MAX_MAP_PIXELS` (api-wms `params.rs`; `api_common::map_frame` for Maps and map tiles) | output px per side / `width × height` | 8000 / 64 M | 400 at validation (WMS `InvalidParameterValue`, Maps/Tiles `BadRequest`): "… must not exceed 8000" |
+| `api_tiles::params::TILE_SIZE` | output, a map tile's default (`width`/`height`/`scale-denominator` resize it within the caps above) | 256 × 256 | never |
+| `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss; an RGB composite adds 16 B per band plane past the first (`acquire_raster_planes`); a WMS GetMap of several layers adds 4 B for the image below, once (`acquire_layered_raster`) | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
 | `engine_geotiff::reader::MAX_MAP_PIXELS` | native source px of one full-resolution map read | 64 M | Maps/Tiles 400 "Invalid parameter: Map render source area N pixels exceeds maximum 64000000."; WMS red error tile, HTTP 200 `x-cache: ERROR` |
-| `engine_geotiff::decode_budget::BUDGET` | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
-| engine-zarr `read_budget::BUDGET` | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
+| `engine_geotiff::decode_budget::BUDGET` (a `ByteBudget`) | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
+| engine-zarr `read_budget::BUDGET` (over a `ByteBudget`) | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
+| engine-netcdf `decode_budget::BUDGET` (a `ByteBudget`) | bytes of one field read in progress: 3 × decoded + 3 × compressed, the decoded chunk bounding the compressed one (~24 MB per MEPS field); cache waiters and hits reserve nothing; a remote fill detached from its request and a poll's prewarm reserve it too | `MC_NETCDF_READ_MEMORY_MB`, 1024 MiB | 503 |
+| engine-netcdf `edr::QUERY_BYTES` | decoded bytes of the fields one EDR query reads: steps × levels × variables read × one field (`FieldRead::decoded_bytes`, 4.06 MB for MEPS), from the file metadata | `MC_NETCDF_EDR_QUERY_MB`, 544 MiB: one parameter over one MEPS run (67 leads) as the client sees it, including a derived wind speed, which reads both components (134 fields); not three variables over a run, nor one over a run at all 13 MEPS pressure levels (871 fields: name the levels with `z`) | 400 "Query too large: Query would decode N fields …", before any read |
 | `ds_core::feature::MAX_AREA_DIM` / `MAX_AREA_VALUES` | EDR area output cells per axis / values per response | 256 / 1 M | coarsened / 400 "Query too large: …" |
+| `engine_geotiff::STAC_REQUEST_MAX_COLD_ITEMS` | STAC items whose header one EDR query reads (items in its window with no metadata yet; without `datetime`, in the whole catalog) | 400 (a closed day of 5-minute frames is 289) | 400 "Query too large: …", counted from the STAC response before it is installed or anything loads (#889) |
 | EDR `f=png` plot, WMS `GetLegendGraphic` | output px | 160–2000 × 120–2000 / ≤ 512 × 1024 | never: clamped silently |
 
+- The engines' source byte budgets are each their own instance of
+  `ds_executor::budget::ByteBudget`, with their own env var and static; a new
+  engine's is one more instance, never a copy (#1067). Unlike
+  `RENDER_MEMORY`, a waiting `RenderBudget`, they fail at once. A refused
+  batch probe (`try_reserve`) or background reservation
+  (`try_reserve_background`, at most half the budget) is not a counted
+  rejection.
 - At the default `MC_RENDER_MEMORY_MB` the API caps' full 64 M px is
   unreachable: anything over 33 554 432 output px (e.g. 5793 × 5793) is a 503
   on every retry. To serve larger images, raise the budget (README "Sizing
@@ -476,7 +653,9 @@ one never implies the other.
   `MAX_AREA_DIM` coarsening): `query_bbox` checks `MAX_AREA_VALUES` over
   `timesteps × ny × nx` before allocating the result or reading a file, so
   an over-budget area is the 400. Only a file that cannot be read becomes a
-  logged timestep of nulls; client errors fail the query (#858).
+  logged timestep of nulls; client errors fail the query (#858). Its
+  polygon mask has the shared `check_mask_budget` (#889). Both run before
+  any data read; on a STAC source, after the window's metadata loads.
 - A new source cap must name the pixel space it counts and fail with
   `InvalidParameter`/`QueryTooLarge` (400 with its message in Maps/Tiles/EDR).
   `Engine(..)` is an opaque 500 there, and WMS GetMap turns every engine
@@ -485,47 +664,137 @@ one never implies the other.
 ## Shared Domain Machinery (ds-core, `crates/core/`)
 
 - **`ds_core::web_mercator`** — the ONLY EPSG:3857↔WGS84 implementation
-  (Critical Rule 4).
+  (Critical Rule 4). `Crs::WebMercator` is its `Crs` form for a source grid
+  (GMGSI): forward keeps longitude unwrapped, and a global grid wraps its
+  own columns.
 - **`ds_core::geo`** — CRS transforms (WGS84, TM, LAEA, LCC, Stereographic,
-  Geostationary), `GeoTransform`, `geometry_to_pixels`, `destination_point`,
+  Geostationary, WebMercator), `GeoTransform`, `geometry_to_pixels`, `destination_point`,
   `geodetic_to_ecef`, `OutputCrs::footprint_pixel_window` (low-zoom ghost
-  guard, #453). `Crs::Geostationary` is the one **partial** transform:
+  guard, #453). `Crs::WebMercator`'s northing is unbounded at the poles.
+  `Crs::Geostationary` is the one **partial** transform both ways:
   `forward` is NaN on the far side of the Earth and `inverse` `None` off the
   disk, so code mapping many points must skip non-finite results; its
   `GeoTransform::bbox` comes from the limb and may be `west > east` (#819).
-- **`ds_core::cf`** — CF grid mapping → `Crs` and coordinate-unit scale,
-  shared by NetCDF readers. Unsupported mappings and missing earth figures
-  are errors, never a WGS84 guess.
+  `Crs::TransverseMercator` is Krüger's series to sixth order in Karney's
+  2011 form, as PROJ's `tmerc` (#1130). Its **inverse** is partial too:
+  `None` outside a square in projected metres, past a pole's northing or
+  an easting k₀ times a quarter meridian (9 997 965 m for EPSG:3067) from
+  the central meridian, where the series stops being exact (#1113; inside,
+  under 1 mm off the exact projection). That spans the hemisphere within
+  90° of the meridian except near the equator, where it ends 66.3° out.
+  Its `forward` stays total: exact inside the area, unbounded near the
+  equator 90° out. Edge samples miss the area's edge between them, so
+  `wgs84_envelope` adds `area_edge_points` (where those edges enter and
+  leave the box, and the equator or pole between) and a pole the box holds
+  (`holds_pole`, projected from the central meridian). A source grid's
+  `GeoTransform::bbox` misses a pole its cells hold, such as a polar
+  stereographic Arctic grid's: `bbox_with_poles` adds it at every
+  longitude, for advertised extents and `SourceGrid`'s envelope (#1167).
+  `polar_stereographic_k0` is the one conversion of a polar standard
+  parallel (PROJ `+lat_ts`, CF `standard_parallel`) to the ellipsoidal
+  `k0` of `Crs::Stereographic` (engine-odim, `ds_core::cf`); LAEA's polar
+  aspect (EASE-Grid 2.0) takes its limit `β₀ = ±90°`, `D = 1`.
+- **`ds_core::cf`** — CF semantics shared by NetCDF and Zarr readers,
+  which pass plain values or an attribute lookup (no reader library here):
+  - time units and `decode_times` (`… since 1970-01-01 00:00:00 +00:00`,
+    `… UTC`, `…Z`, offsets moved to UTC);
+  - `classify_axis` → `AxisRole`, including projected x/y (by
+    `standard_name`) and ensemble (`realization` / `ensemble_member`);
+  - `crs_from_grid_mapping`: `latitude_longitude`, `geostationary`,
+    `lambert_conformal_conic` (one or two parallels, a sphere or WGS84),
+    `polar_stereographic` (`standard_parallel` through
+    `geo::polar_stereographic_k0`, or `scale_factor_at_projection_origin`;
+    both must agree), `lambert_azimuthal_equal_area` and
+    `transverse_mercator` (WGS84 only: their `Crs` variants have no
+    sphere), each pinned to PROJ `cs2cs`. Unsupported mappings, ellipsoids,
+    scale factors and missing earth figures are errors, never a WGS84
+    guess;
+  - `CfAttr::Numbers` keeps a multi-element attribute whole, and a
+    one-number parameter rejects it rather than reading its first element;
+  - `grid(crs, &x, &y)` over `RegularAxis` values: units through
+    `coordinate_scale`, a north-up `GeoTransform`, and `flipped` for an
+    ascending `y` (row 0 south, as MEPS), which the reader reverses once at
+    decode;
+  - `PressureUnit`: a pressure vertical coordinate, known by its units
+    (CF §4.3: `Pa`, `hPa`, `mbar`, …) once the reader has ruled out a
+    parametric coordinate (`formula_terms`, a hybrid `standard_name`), and
+    its levels in hPa to six significant digits (85000 Pa is exactly 850
+    hPa; a `float` 0.85 bar is 850, not 850.0000238).
+- **`ds_core::units`** — unit spellings, display conversions and vocabularies
+  (#1067 PR 6). `canonical_unit` reduces every spelling of a product of
+  powers to one (`kg/m^2`, `kg m**-2`, `kg.m-2` → `kg m-2`; `m/s` → `m s-1`;
+  `degC` → `°C`); a scale factor or free text stays as written. Every
+  unit-keyed match goes through it — `display_conversion` (engine-bufr;
+  engine-grib's enum-keyed `default_display` is its twin, rule for rule),
+  `qudt_unit` (EDR), ds-render's defaults table and `[[parameter_defaults]]`
+  unit ranges, `same_unit` (wind u/v pairing, engine-netcdf's per-file
+  check, the satellite recipes' K check) — never a raw string compare. The
+  canonical spelling is a matching key and is never served: engines serve
+  units as their source spells them, or as a display conversion names them.
+- **`ds_core::temp_files`** — the names a data scan never reads (#1009): a
+  hidden `.name` (written, then renamed into place) or a `PARTIAL_SUFFIXES`
+  ending (`.tmp` / `.part`, the default `exclude_patterns`). An engine that
+  enumerates a directory or prefix itself filters with `is_temporary` /
+  `is_temporary_key`; the shared `ds_storage::discovery` scan skips hidden
+  names always and leaves the suffixes to `ScanSpec.exclude`
+  (`exclude_patterns`, or `partial_exclude_patterns()` for an engine
+  without that setting). A listing that reaches below its base — every
+  object-store `list`, including a local `data_path` through `ds-storage`,
+  is recursive — also skips files in a hidden folder below that base
+  (#1029; rsync `--delay-updates` stages files under their final names in
+  `.~tmp~/`): `in_hidden_folder(base, key)`, or `is_temporary_below(base,
+  key)` for both rules. The base's own segments are never judged, so a
+  dot folder in the configured path or prefix is fine; the suffixes are
+  file rules only. `discovery::scan_remote` applies the folder rule;
+  `list_prefixes` and `DataStore::list` callers apply it themselves. A new
+  engine's file listing does the same. A store-internal listing (Zarr v2's
+  `.zarray`) is not a data scan.
 - **`ds_core::instances`** — model-run (forecast reference time) machinery
   shared by ALL forecast engines (#337), so run selection, instance lists and
   instance-id encoding are identical everywhere:
-  - `RunInfo { reference_time, valid_times }`; `instance_id()` = compact
-    `%Y%m%dT%H%MZ` stamp.
+  - `RunInfo { reference_time, valid_times }`; `instance_id()` = the RFC 3339
+    UTC timestamp `2026-06-07T06:00:00Z` (MetOcean EDR profile, #947).
   - `format_instance_id` / `parse_instance_id` — URL ↔ reference-time codec
-    (parse also accepts RFC 3339). The API layer owns the string form;
+    (parse also accepts any RFC 3339 offset and the pre-#947 compact
+    `20260607T0600Z` stamp, so old links resolve). Links carry the id's
+    colons unencoded (RFC 3986 `pchar`). The API layer owns the string form;
     engines only see `Option<DateTime<Utc>>`.
   - `select_run(&BTreeMap<..>, Option<DateTime<Utc>>)` — `None` ⇒ latest,
     `Some(rt)` ⇒ exact run, absent ⇒ `None` → 404.
   - `build_instances(&runs, |rt, run| valid_times)`.
   - Engine contract: store runs in `BTreeMap<DateTime<Utc>, _>` keyed by
     reference time; implement `EdrEngine::get_instances()` (default empty =
-    non-forecast); honour the trailing `reference_time` parameter on query
+    non-forecast), with `has_instances`, `find_instance` and
+    `instance_reference_times` (the map's keys, #1006) from the same
+    snapshot; honour the trailing `reference_time` parameter on query
     methods and `MapEngine::get_raster_tile` (`None` ⇒ latest); populate
-    `RasterInfo.reference_times`. GRIB, QueryData, Zarr (forecast stores)
-    and Nowcast (generations = runs, #661) implement this; other engines
-    accept-and-ignore.
-  - API surface: EDR `/instances`, `/instances/{id}`,
+    `RasterInfo.reference_times`. GRIB, QueryData, Zarr (forecast stores),
+    NetCDF (`forecast_reference_time`) and Nowcast (generations = runs,
+    #661) implement this; other engines accept-and-ignore.
+  - API surface: EDR `/instances` (listed newest first: the handler sorts
+    it, engines and `build_instances` stay ascending), `/instances/{id}`,
     `/instances/{id}/{position,area}` — gated on `get_instances()` being
     non-empty; no-instance routes default to the latest run. WMS exposes
     `DIM_REFERENCE_TIME` (see `crates/api-wms/CLAUDE.md`). Maps/Tiles still
     pass `reference_time: None` (follow-up).
+- **`ds_core::time_axis`** — the one rule for long time axes (#1006): up to
+  `MAX_LISTED_VALUES` (500) values a list, WMS byte-identical to before; past it,
+  ranges of equally spaced values, lossless. WMS writes them as Annex C
+  `min/max/res` (`time`, `reference_time`); EDR pages `/instances` past the
+  same threshold and keeps the run axis out of collection metadata. See
+  `crates/api-wms/CLAUDE.md` and `crates/api-edr/CLAUDE.md`.
 - **Vertical dimension** — `ds_core::vertical::VerticalDimension`, surfaced
   on `RasterInfo.vertical` and `EdrEngine::get_vertical_extent`.
   `MapEngine::get_raster_tile` takes `z: Option<f64>` (one rendered layer);
   EDR query methods take `z: Option<&[f64]>` (one or more levels). WMS
-  exposes it as `ELEVATION`, Maps/Tiles as `elevation`, EDR as `z`. The API
-  layer rejects z/elevation against a collection with no vertical extent
-  (HTTP 400). The ODIM PVOL engine uses it for radar elevation angle.
+  exposes it as `ELEVATION`, Maps/Tiles as `elevation`, EDR as `z`. Against
+  a collection with no vertical extent the rule is per API: EDR ignores a
+  well-formed `z` (EDR 1.2 `/req/edr/z-response` A makes that a SHALL;
+  a malformed one is still a 400), while WMS `ELEVATION` and Maps/Tiles
+  `elevation` reject it with HTTP 400. The ODIM PVOL engine uses it for
+  radar elevation angle, GRIB's level views for pressure and model levels,
+  and engine-netcdf for a CF pressure axis (#1067: hPa, bottom first, a map
+  without `z` drawing the bottom level, EDR without `z` every level).
 - **`ds_core::radar_sites`** — `RadarSiteInfo` + the data-only
   `RadarSiteSource` trait (one catalog snapshot per call, never I/O) that a
   polar-volume engine implements and the nowcast's per-cell beam-geometry
@@ -533,6 +802,14 @@ one never implies the other.
   (`geo::{slant_to_ground_height, beam_height_at_ground,
   FOUR_THIRDS_EARTH_M}`) and `geo::great_circle_distance_m` live in
   `ds_core::geo` — one home; engine-odim re-exports them.
+- **`ds_core::trajectory`** — the EDR along-path trajectory (#926): WKT
+  `LINESTRING` / `Z` / `M` / `ZM` parsing, great-circle densification at the
+  source grid spacing (≤ 2000 samples), the M-time and Z-level snapping and
+  range rules, and the CoverageJSON `Trajectory` layout (`TrajectoryPlan`).
+  A gridded engine selects its run/steps/levels like its position query and
+  samples `plan.fields()` grouped per field or window — never re-implement
+  these rules per engine, never read per sample. A radar volume instead
+  declares `TrajectoryShape::CrossSection` (see `crates/api-edr/CLAUDE.md`).
 - **`ds_core::cells`** — storm-cell segmentation and tracking over
   `VoxelGrid` (see `crates/engine-odim/CLAUDE.md`).
 - **`ds_core::significance`** — domain-agnostic scoring/ranking: normalized
@@ -555,12 +832,49 @@ one never implies the other.
   ranking and any narrative cannot drift) and `DEFAULT_CELL_WEIGHTS`. Built
   once per generation; read by feature properties, ranking, narratives and
   the #541 V2.4 model feature row.
+- **`ds_core::simplify`** — the one Douglas–Peucker implementation, for
+  closed rings and open lines, iterative so no input can deepen a worker's
+  stack; the tolerance is in the caller's metric plane. Storm-cell
+  footprints and the Features items map preview (#1135) use it; ds-mvt and
+  any other simplifier should too, rather than add a `geo` dependency.
 - **`ds_render::rasterize::fill_polygon`** — the shared vector→raster fill
   primitive (#397), fed by `ds_core::geo::geometry_to_pixels` (vertices
   projected via `OutputCrs::world_to_fraction`, never per pixel). Vector
   `MapEngine`s (engine-cap today) may depend on ds-render for it — an
   approved exception; engines still return `RasterTile` domain types and
   colorization stays in the API layer.
+- **`ds_render::resolve_layer_style`** — the one style lookup for WMS GetMap
+  and GetLegendGraphic, and the Maps and Tiles map, tile and legend routes
+  (#1133). A named parameter styles from `"{collection}/{param}"`, else the
+  collection; on a multi-parameter collection (`RasterInfo.parameters`
+  longer than one) a request naming none draws the engine's default
+  parameter with its own layer's style, so `LAYERS=coll` and Maps/Tiles
+  without `parameter-name` match `coll/<default>`. A single-parameter
+  collection keeps its collection style, the one WMS advertises for its
+  one layer. The rendered and meta-tile caches key on the `LayerStyle` it
+  returns (layer, style, parameter), never the raw request. Never resolve
+  the style a map, tile or legend is drawn with by hand; the capability
+  and collection-metadata style listings read the style maps directly.
+- **`ds_core::wind`** — wind speed and direction derived from u/v
+  components (#897), the one home for the formulas (`hypot(u, v)`; the
+  direction the wind blows **from**, `atan2(-u, -v)`, calm → null), the frame
+  rules (`derivable`: unknown frame → no direction, speed only where the
+  grid's axes are orthogonal; mixed frames → nothing; grid-relative →
+  direction only on a north-aligned grid until rotation by the convergence
+  angle exists) and the pairing in each source's own vocabulary
+  (`WindPlan`: `10u`/`10v` → `10si`/`10wdir`, `u`/`v` → `ws`/`wdir`,
+  `UGRD`/`VGRD` → `WIND`/`WDIR`, FMI → `WindSpeedMS`/`WindDirection`, CF
+  stores by `standard_name`; skipped when the collection already has the
+  quantity at that level). `DerivedWind` wraps an engine's `MapEngine` +
+  `EdrEngine` in the server's registry wiring (`admin::wind_wrapped`, like
+  the nowcast wraps its source): speed on every API, direction in EDR only
+  (no cyclic palette). It derives **after sampling** — two component reads
+  with identical bbox/size/time/z/run, combined per value, never a derived
+  field interpolated — and resolves time/run/content as the components do
+  (`resolve_parameters_time` and `resolve_parameters_reference_time` over
+  u and v, intersected axes; #507/#521/#1026).
+  Per collection `derive_wind = false` opts out. Engines report facts
+  (`WindSource`); they never compute derived fields themselves.
 
 ## Engine Capabilities
 
@@ -570,15 +884,17 @@ one never implies the other.
 | CSV | `EdrEngine` + `FeatureEngine` | EDR (locations, area, radius), Features |
 | GeoJSON | `FeatureEngine` | Features, Tiles (MVT) |
 | GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
-| GRIB | `EdrEngine` + `MapEngine` | EDR, WMS, Maps, Tiles |
+| GRIB | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM), WMS, Maps, Tiles; derived wind speed + direction from u/v (`ds_core::wind`); hour-window aggregates on their own time axes (#1005) |
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
-| QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles |
-| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius), WMS, Maps, Tiles; local + S3/HTTP |
+| QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; derived wind speed from u/v, direction on lat/lon areas (newbase's grid-relative convention) |
+| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP; derived wind speed + direction from CF-identified u/v |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
-| PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
-| Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles and GK2A AMI L1B on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819); RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
-| BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`) |
+| PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (position, locations, area), Features; station shapes also WMS/Maps/Tiles when opted in (`[postgis.map]`, or `wms`/`maps` in `apis`): one symbol layer per parameter, each station a marker coloured by its latest value within `max_age` on `time_step` frames, most extreme on top (#1063); events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
+| Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles, GK2A AMI L1B and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
+| NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields, or fields on one pressure axis (`RasterInfo.vertical`: hPa, bottom first; WMS `ELEVATION`, Maps/Tiles `elevation`, EDR `z`; a map without one draws the bottom level, EDR without `z` reads every level; the MEPS `pl` family is a collection of its own). EDR samples each point or area cell as the map draws it (one projection per point, a CRS84 area grid), runs as instances, GetFeatureInfo through position at the level drawn; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (steps × levels × variables); derived wind speed from CF `x_wind`/`y_wind`, per pressure level (no direction on MEPS's Lambert grid) |
+| BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
+| Station grid | `MapEngine` + `EdrEngine` (derived: wraps a CSV, BUFR or PostGIS stations collection's `EdrEngine`) | WMS, Maps, Tiles (one layer per parameter), EDR (position, area, radius, cube without `z`) — one time slice of the source's observations (latest per station within `max_age`, one area query) interpolated by IDW, ADW or nearest onto a CRS84 analysis grid (#1082); great-circle neighbours via a 3-D k-d tree (seam and poles); grids cached per (parameter, time, content version) in `MC_STATION_GRID_CACHE_MB`, computed on a dedicated pool under the request deadline (503, never partial); `cadence` axis; content_version moves with revised input fingerprints; EDR samples the grid the maps draw |
 
 ## Config Format
 
@@ -599,6 +915,18 @@ port = 8000
                                  # .toml (ColormapDef), GMT .cpt, GRLevelX .pal,
                                  # GDAL color-relief .txt/.clr, SLD .sld (ColorMap). Re-read on reload;
                                  # missing dir = hard error; other extensions skipped.
+# state_dir = "/var/lib/meteocore"  # optional, engine state snapshots (#1000, #1002): a WIS2
+                                 # CAP collection keeps its alert set in <state_dir>/<id>.cap.state,
+                                 # a WIS2 BUFR collection its report store in <id>.bufr.state
+                                 # (gzip JSON, ~8 MB global), across restarts. File-fed sources
+                                 # re-read their files instead. Relative = to the config file's dir;
+                                 # created at boot; needs a WRITABLE mount (a failed write is
+                                 # a rate-limited WARN, never a load error). Unset = no
+                                 # persistence. Fixed at boot (reload WARNs, restart to change).
+                                 # Shared plumbing: ds_core::state — engines get an
+                                 # Arc<dyn StateStore> + key "<id>.<kind>", never a path; the
+                                 # StateWriter write policy is backend-independent — reuse
+                                 # both, never hand-roll a writer (crates/server/CLAUDE.md).
 
 # Optional Model Context Protocol endpoint at /mcp (off unless present and
 # enabled). Top-level config.toml only. There is deliberately no default
@@ -643,14 +971,16 @@ color_stops = [
 # with no explicit style match built-in defaults — temperature palette for
 # t2m/2t/TMP/dew point by unit K|C over one all-levels range, −90…50 °C =
 # 183.15…323.15 K, pressure for msl by unit Pa|hPa, radar_dbz for
-# DBZH, etc. — BEFORE the collection-level colormap; opt out per collection
-# with `[wms] parameter_defaults = false`). Top-level config.toml only.
+# DBZH, fraction twins of the humidity/cloud palettes for unit 1, etc. —
+# BEFORE the collection-level colormap; opt out per collection with
+# `[wms] parameter_defaults = false`). Top-level config.toml only.
 [[parameter_defaults]]
 names = ["td", "dewpoint_2m"]   # exact matches (normalized: lowercase alnum)
 contains = ["dew_point"]        # substring matches vs name and title
 colormap = "temperature"
 [[parameter_defaults.unit_ranges]]
-unit = "K"
+unit = "K"                      # any spelling (ds_core::units::canonical_unit):
+                                # "kelvin" matches too, "m/s" matches "m s-1"
 min = 183.15
 max = 323.15
 
@@ -677,6 +1007,7 @@ keywords = ["weather", "observations", "Finland"]   # optional discovery metadat
 title = "CC-BY-4.0"   # required; an SPDX id (no spaces). With no `url`, the
                       # link auto-resolves to https://spdx.org/licenses/<id>.html
 # url = "https://creativecommons.org/licenses/by/4.0/"   # optional explicit override
+# type = "application/pdf"   # optional media type of `url` (default text/html)
 
 [[collections]]
 id = "radar"
@@ -700,12 +1031,26 @@ max_files = 24
 # source, min, max; named styles union with inline winning name clashes).
 style_bundle = "radar_multi"
 # colormap = "radar_dbz"
+# webp_quality = 80      # default WebP quality for WMS/Maps/Tiles, 1-100:
+                         # 1-99 lossy, 100 (= unset) lossless. A request's
+                         # QUALITY / quality wins. For continuous-tone layers
+                         # (satellite IR); keep discrete radar classes lossless.
 
 # Optional /preview SPA tuning: cap the time slider's `values[]` to the most
 # recent ISO 8601 duration before the latest timestep. Manifest-only; does
 # NOT constrain the underlying engine.
 [collections.preview]
 time_window = "PT12H"
+
+# grib / querydata / zarr / netcdf collections derive wind speed (and, where the
+# source states the u/v frame, direction) from u/v components (#897).
+[[collections]]
+id = "nwp"
+engine_type = "grib"
+apis = ["edr", "wms", "maps", "tiles"]
+derive_wind = false     # opt out (default on); a load error on other engines
+[collections.grib]
+data_path = "testdata/grib-local"
 
 # Derived nowcast collection (#519): motion-extrapolates another collection's
 # frames into the future. `source` must be a non-derived collection in the
@@ -748,6 +1093,34 @@ lightning_jump = 0.9
 [collections.wms]
 colormap = "radar_dbz"
 
+# CF-NetCDF gridded data (#1067): one file family, in a local directory or,
+# with an http(s) data_path, read in place by HTTP range from a server found
+# by template probing (collections.d/meps-netcdf-thredds.toml.disabled). Valid
+# times come from each file's `time`, runs from `forecast_reference_time`. A
+# family on pressure levels (MEPS `pl`, collections.d/meps-netcdf-pl-local.toml)
+# is a collection of its own: its levels are the vertical axis.
+# See crates/engine-netcdf/CLAUDE.md.
+[[collections]]
+id = "meps-netcdf-local"
+engine_type = "netcdf"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.netcdf]
+data_path = "testdata/meps-netcdf"
+filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"  # default: *.nc
+variables = ["air_temperature_2m", "precipitation_amount_acc"]  # default: all on the grid
+max_runs = 4                      # newest runs kept
+# max_files = 1024                # most files kept open; member = 0 (ensemble axis)
+# Remote instead: data_path = "https://thredds.met.no/thredds/fileServer/meps25epsarchive/"
+# prefix_pattern = "%Y/%m/%d/{run}/member_00/"   # {run}: the run hour
+# run_hours = [0, 3, 6, 9, 12, 15, 18, 21]       # required
+# leads = [0, 1, 2]                              # {lead}; the first is the sentinel
+# time_window = "-PT12H"                         # required
+# min_age = "PT10M"; run_grace = "PT30M"         # settling (defaults)
+# prewarm_variables = []                         # newest run fetched ahead, ~100 MB/variable
+[collections.netcdf.titles]
+precipitation_amount_acc = "Precipitation accumulated since run start"
+
 # BUFR surface observations (SYNOP/SHIP station reports) — polled directory or
 # object-store prefix of *.bufr files; a WIS2 subscription ([bufr.wis2]) is
 # the alternative source. See crates/engine-bufr/CLAUDE.md.
@@ -768,6 +1141,13 @@ position_radius_km = 25.0      # EDR position → nearest station within this
 #                              # ["013011"], unit, period_hours for accumulations)
 # [collections.bufr.wis2]      # push instead of poll; most SYNOP arrives inline
 # topics = ["cache/a/wis2/se-smhi/data/core/weather/surface-based-observations/synop"]
+# warmup = "PT24H"             # default = the shorter of retention and PT24H: after a
+#                              # cold start /health says "warming up after cold start:
+#                              # N reports received" this long (a longer retention is
+#                              # still filling its older part after it); with [server]
+#                              # state_dir the store survives restarts (a snapshot older
+#                              # than warmup keeps the rows still inside retention but
+#                              # restarts the warm-up)
 
 # CAP warnings pushed over WMO WIS2 (third cap source mode, XOR with
 # data_path / feed_url). `[….wis2]` is the shared ds-wis2 subscription
@@ -790,6 +1170,13 @@ topics = ["cache/a/wis2/eu-eumetnet-warnings/data/core/weather/advisories-warnin
 # broker = "mqtts://globalbroker.meteo.fr:8883"   # default
 # username = "everyone"; password = "everyone"   # defaults (public); or password_env
 # download_allowlist = ["https://…/"]            # strict mode (recommended for origin/ topics)
+# warmup = "PT24H"   # default; after a cold start (no state_dir snapshot restored)
+                     # /health says "warming up after cold start: N alerts received"
+                     # (degraded) this long after the subscription first comes up;
+                     # a snapshot older than this restores its alerts but restarts
+                     # the warm-up ("warming up after a long outage").
+                     # [bufr.wis2] has it too, defaulting to the shorter of the
+                     # collection's retention and PT24H.
 ```
 
 See config struct definitions in each engine crate and `ds-core/src/config.rs`
@@ -859,10 +1246,13 @@ every API from the shared `CollectionConfig`:
   `https://spdx.org/licenses/<id>.html`. Rendered as a `rel="license"` JSON
   link, `<Attribution>` in WMS (after `<Dimension>` elements), and an HTML
   link. A free-text title with no `url` shows its name but produces no JSON
-  link (a link object requires an `href`).
+  link (a link object requires an `href`). The JSON link's `type` is
+  `text/html` or the optional `type` of a configured `url` (EDR 1.2 requires
+  a `type` on every link, #964).
 
-Both validated at config load: empty keyword entries, empty license title, or
-a non-http(s) license URL are rejected.
+Both validated at config load: empty keyword entries, empty license title, a
+non-http(s) license URL, or a license `type` that is not a media type or has
+no `url` are rejected.
 
 ## Admin & Operations
 
@@ -874,7 +1264,10 @@ a non-http(s) license URL are rejected.
   rebuild, and their cached tiles are evicted per collection. See
   `crates/server/CLAUDE.md` for the rules.
 - **Health:** `GET /health` — per-collection ready/degraded/failed status.
-  HTTP 503 only when all collections failed.
+  HTTP 503 only when all collections failed. `data_age_secs` (and the
+  `collection_data_age_seconds` gauge) is now minus the newest data a
+  collection serves, never the time since its last poll (#1007); see
+  `crates/server/CLAUDE.md`.
 - **Metrics:** `GET /metrics` — Prometheus format. Path labels use route
   patterns, never raw URLs (cardinality explosion).
 - **Grafana dashboards live in this repo:**

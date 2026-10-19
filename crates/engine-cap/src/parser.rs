@@ -16,6 +16,7 @@
 use chrono::{DateTime, Utc};
 use quick_xml::events::{BytesRef, Event};
 use quick_xml::Reader;
+use serde::{Deserialize, Serialize};
 
 use ds_core::error::DataServerError;
 
@@ -25,7 +26,14 @@ const MAX_POLYGON_VERTICES: usize = 50_000;
 const MAX_ALERTS_PER_DOC: usize = 10_000;
 
 /// A parsed CAP `<alert>` (one emergency message).
-#[derive(Debug, Clone, Default)]
+///
+/// The serde derives (here and on [`CapInfo`], [`CapArea`], [`CapCircle`])
+/// are the WIS2 accumulator snapshot format (`crate::persist`, #1000):
+/// renaming a field changes that format — bump `persist::VERSION` so old
+/// snapshots are a cold start instead of silently losing the field.
+/// `#[serde(default)]` keeps added fields compatible.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CapAlert {
     pub identifier: String,
     pub sender: Option<String>,
@@ -38,7 +46,8 @@ pub struct CapAlert {
 }
 
 /// A parsed `<info>` block (one language variant of an alert).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CapInfo {
     pub language: Option<String>,
     pub categories: Vec<String>,
@@ -67,7 +76,8 @@ pub struct CapInfo {
 }
 
 /// A parsed `<area>` (one affected region of an info block).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CapArea {
     pub area_desc: Option<String>,
     /// Each polygon is a closed ring of `[lon, lat]` (swapped from CAP `lat,lon`).
@@ -78,7 +88,9 @@ pub struct CapArea {
     /// Geometry attached *after* parsing by the source (WIS2 mode: the
     /// notification's `rel=geometry` GeoJSON, or its bbox). Used only when
     /// the area has no inline polygon/circle and no geocode resolves; see
-    /// `catalog::build_geometry`.
+    /// `catalog::build_geometry`. Snapshots carry it separately, with the
+    /// polygons deduplicated (`crate::persist`).
+    #[serde(skip)]
     pub hint_geometry: Option<CapAreaHint>,
 }
 
@@ -165,7 +177,7 @@ impl CapAreaHint {
 }
 
 /// A parsed `<circle>`: centre (`[lon, lat]`) + radius in kilometres.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CapCircle {
     pub lon: f64,
     pub lat: f64,

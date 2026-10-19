@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use ds_core::error::DataServerError;
+use ds_core::wind::VectorFrame;
 use ds_storage::DataStore;
 use grib::{Grib2SubmessageDecoder, GridDefinitionTemplateValues, GridPointIndex};
 
@@ -118,6 +119,7 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
 
     let metadata =
         crate::metadata::MessageMetadata::from_product(discipline, centre, submessage.prod_def())?;
+    let uv_frame = layout.uv_frame;
 
     // Decode values using Grib2SubmessageDecoder
     let decoder = Grib2SubmessageDecoder::from(submessage).map_err(|e| {
@@ -176,6 +178,7 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
         centre: metadata.centre,
         first_surface_type: metadata.first_surface_type,
         first_surface_value: metadata.first_surface_value,
+        uv_frame,
     })
 }
 
@@ -190,6 +193,21 @@ struct GridLayout {
     reverse_i: bool,
     reverse_j: bool,
     canonical_scan: bool,
+    uv_frame: VectorFrame,
+}
+
+/// The frame of the grid's vector components: GRIB2 flag table 3.3 bit 5
+/// in the resolution-and-component flags. Read for every message, so a later
+/// rotated or projected template cannot inherit the earth-relative
+/// assumption; [`VectorFrame::Unknown`] for a template this engine cannot
+/// read.
+pub(crate) fn uv_frame(grid_def: &grib::GridDefinition) -> VectorFrame {
+    match GridDefinitionTemplateValues::try_from(grid_def) {
+        Ok(GridDefinitionTemplateValues::Template0(template)) => {
+            VectorFrame::from_grib_flags(template.lat_lon.grid.resolution_and_component_flags.0)
+        }
+        _ => VectorFrame::Unknown,
+    }
 }
 
 pub(crate) fn grid_geometry(
@@ -265,6 +283,7 @@ fn extract_grid_params(grid_def: &grib::GridDefinition) -> Result<GridLayout, St
         reverse_i,
         reverse_j,
         canonical_scan: ll.scanning_mode.0 == 0,
+        uv_frame: VectorFrame::from_grib_flags(grid.resolution_and_component_flags.0),
     })
 }
 

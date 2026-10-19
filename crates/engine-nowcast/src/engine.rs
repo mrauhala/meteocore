@@ -35,7 +35,7 @@ use ds_poll::{FirstTick, Shutdown};
 use ds_core::cell_facts::{CellFactSheet, LightningFacts, ScoredCell, Trend, DEFAULT_CELL_WEIGHTS};
 use ds_core::config::NowcastConfig;
 use ds_core::datetime::parse_iso8601_duration;
-use ds_core::edr_engine::EdrEngine;
+use ds_core::edr_engine::{EdrEngine, ItemRadius};
 use ds_core::error::DataServerError;
 use ds_core::feature::{
     DatetimeInterval, Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue,
@@ -44,7 +44,8 @@ use ds_core::feature_engine::FeatureEngine;
 use ds_core::instances::{build_instances, format_instance_id, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
 use ds_core::resample::ProjectionGrid;
 use ds_core::significance::WeightedScorer;
@@ -2183,6 +2184,7 @@ fn cell_feature(
             id: t.id.to_string(),
             geometry: Arc::new(Geometry::Point { x: lon, y: lat }),
             properties: Arc::new(props),
+            related: Vec::new(),
         },
     )
 }
@@ -2235,9 +2237,8 @@ impl NowcastEngine {
                 let anchor = generation.reference_time;
                 if anchor < start || anchor > end {
                     return Err(DataServerError::InvalidDatetime(format!(
-                        "instance {} has a single valid time, {}, outside the requested {} / {}",
+                        "instance {} is valid only at that instant, outside the requested {} / {}",
                         format_instance_id(anchor),
-                        anchor.to_rfc3339(),
                         start.to_rfc3339(),
                         end.to_rfc3339()
                     )));
@@ -2272,10 +2273,11 @@ impl NowcastEngine {
         })
     }
 
-    /// Instance lookup: exact, then to the minute. The EDR instance id is
-    /// minute-precision (`ds_core::instances::format_instance_id`), so a
-    /// generation anchored on a source frame with a seconds component would
-    /// otherwise be advertised under an id that can never be resolved.
+    /// Instance lookup: exact, then to the minute. The EDR instance id
+    /// (`ds_core::instances::format_instance_id`) is exact since #947, but
+    /// the compact id served before it is minute-precision: without the
+    /// fallback, a link to a generation anchored on a source frame with a
+    /// seconds component would no longer resolve.
     fn generation_by_instance(state: &NowcastState, rt: DateTime<Utc>) -> Option<Arc<Generation>> {
         if let Some(g) = state.generations.get(&rt) {
             return Some(g.clone());
@@ -2290,8 +2292,8 @@ impl NowcastEngine {
 }
 
 impl EdrEngine for NowcastEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(Vec::new())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     /// Every retained generation is an instance, exactly as WMS advertises
@@ -2305,6 +2307,10 @@ impl EdrEngine for NowcastEngine {
 
     fn has_instances(&self) -> bool {
         !self.state.load().generations.is_empty()
+    }
+
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        self.state.load().generations.keys().copied().collect()
     }
 
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
@@ -2360,6 +2366,27 @@ impl EdrEngine for NowcastEngine {
 
     fn supported_query_types(&self) -> Vec<String> {
         vec!["area".to_string(), "radius".to_string()]
+    }
+
+    /// A tracked cell as an EDR item (#970): the radius query over the
+    /// motion field centred on it, as wide as the cell (its `area_km2` as a
+    /// disc), at the frame the cell was `observed` in. A circle narrower than
+    /// a motion block still answers: the area mask then keeps the block
+    /// nearest its vertices (#671), so no floor is needed.
+    fn item_radius(&self, feature: &Feature) -> Option<ItemRadius> {
+        let &PropertyValue::Float(area_km2) = feature.properties.get("area_km2")? else {
+            return None;
+        };
+        let datetime = match feature.properties.get("observed") {
+            Some(PropertyValue::String(observed)) => DateTime::parse_from_rfc3339(observed)
+                .ok()
+                .map(|t| t.with_timezone(&Utc)),
+            _ => None,
+        };
+        (area_km2 > 0.0).then(|| ItemRadius {
+            within_km: (area_km2 / std::f64::consts::PI).sqrt(),
+            datetime,
+        })
     }
 
     /// The block-centre motion field inside the query polygon's bbox as a
@@ -2500,6 +2527,25 @@ impl NowcastEngine {
     }
 }
 
+/// A tracked cell's label from its feature properties (see
+/// [`FeatureEngine::label`]); `None` when it carries none of them.
+fn cell_label(properties: &HashMap<String, PropertyValue>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(PropertyValue::Integer(rank)) = properties.get("significance_rank") {
+        parts.push(format!("Rank {rank}"));
+    }
+    if let Some(severity) = properties.get("severity").and_then(PropertyValue::as_str) {
+        parts.push(severity.replace('_', " "));
+    }
+    if let Some(dbz) = properties.get("max_dbz").and_then(PropertyValue::as_f64) {
+        parts.push(format!("max {} dBZ", ds_core::html::display_number(dbz, 1)));
+    }
+    if properties.get("likely_clutter") == Some(&PropertyValue::Bool(true)) {
+        parts.push("likely clutter".into());
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 impl FeatureEngine for NowcastEngine {
     fn filterables(&self) -> ds_core::feature::FilterableProperties {
         self.filterables.clone()
@@ -2572,6 +2618,19 @@ impl FeatureEngine for NowcastEngine {
     /// puts the weakest cells last. `significance` already incorporates it.
     fn sortables(&self) -> &[&'static str] {
         &self.sortables
+    }
+
+    /// The cell's rank, severity class and peak reflectivity, from its own
+    /// properties (#1143): `Rank 2 · very severe · max 52 dBZ`. Each part is
+    /// a value the cell carries, worded as data: the rank orders a heuristic
+    /// significance and the class is this engine's, neither a warning.
+    fn label(&self, feature: &Feature) -> Option<String> {
+        cell_label(&feature.properties)
+    }
+
+    /// Significance first, then what it rests on (#1143).
+    fn summary_properties(&self) -> &[&'static str] {
+        &["significance", "severity", "max_dbz", "area_km2"]
     }
 
     /// O(1) from the snapshot — the default would build every feature just
@@ -2687,6 +2746,25 @@ mod tests {
         };
         let (_, _, feature) = cell_feature(&cell, wired.0, wired.1, wired.2);
         feature.properties.as_ref().clone()
+    }
+
+    /// #1143: a cell is labelled by its rank, severity class and peak
+    /// reflectivity, the values it carries; a likely-clutter echo says so.
+    #[test]
+    fn cells_are_labelled_from_their_own_values() {
+        let mut f = facts();
+        f.max_dbz = 52.0;
+        f.severity = Severity::VerySevere;
+        assert_eq!(
+            cell_label(&served(f, (false, false, false))).as_deref(),
+            Some("Rank 1 · very severe · max 52 dBZ")
+        );
+        let mut clutter = facts();
+        clutter.max_dbz = 41.5;
+        clutter.likely_clutter = true;
+        let label = cell_label(&served(clutter, (false, false, false))).unwrap();
+        assert!(label.ends_with("max 41.5 dBZ · likely clutter"), "{label}");
+        assert_eq!(cell_label(&HashMap::new()), None);
     }
 
     #[test]

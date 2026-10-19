@@ -158,3 +158,64 @@ async fn index_scan_latency_replay() {
         );
     }
 }
+
+/// A publisher's in-progress index (`.name.idx`) is never fetched or
+/// marked known (#1009): parsed before its rename, it would point at a
+/// data file that does not exist under that name yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hidden_indexes_are_never_fetched() {
+    let (_source, engine, store) = engine_with_indexes(2, "wgrib2", Duration::ZERO).await;
+    store
+        .inner
+        .put(&Path::from(".f002.idx"), index_body("wgrib2", 2).into())
+        .await
+        .unwrap();
+    engine.scan_once().unwrap();
+
+    let attempts = store.reads.lock().unwrap().attempts.clone();
+    assert!(!attempts.contains_key(".f002.idx"), "{attempts:?}");
+    assert_eq!(engine.source.known_indexes.lock().unwrap().len(), 2);
+    assert_eq!(
+        origins(&engine),
+        [
+            ("f000.grib2".to_string(), 0),
+            ("f001.grib2".to_string(), 200)
+        ]
+    );
+}
+
+/// rsync `--delay-updates` stages files under their final names in a
+/// `.~tmp~/` folder next to their destination, and the LIST is recursive:
+/// an index there, at any depth below the prefix, is never fetched or
+/// marked known (#1029).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexes_in_hidden_folders_are_never_fetched() {
+    let (_source, engine, store) = engine_with_indexes(2, "wgrib2", Duration::ZERO).await;
+    for (key, file) in [(".~tmp~/f002.idx", 2), ("run/.~tmp~/f003.idx", 3)] {
+        // `parse` keeps `~` as a listing returns it.
+        store
+            .inner
+            .put(
+                &Path::parse(key).unwrap(),
+                index_body("wgrib2", file).into(),
+            )
+            .await
+            .unwrap();
+    }
+    engine.scan_once().unwrap();
+
+    let attempts = store.reads.lock().unwrap().attempts.clone();
+    assert_eq!(
+        attempts.keys().collect::<Vec<_>>(),
+        ["f000.idx", "f001.idx"],
+        "{attempts:?}"
+    );
+    assert_eq!(engine.source.known_indexes.lock().unwrap().len(), 2);
+    assert_eq!(
+        origins(&engine),
+        [
+            ("f000.grib2".to_string(), 0),
+            ("f001.grib2".to_string(), 200)
+        ]
+    );
+}

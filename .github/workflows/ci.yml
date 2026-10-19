@@ -59,6 +59,9 @@ jobs:
     - name: Viewer loading and state tests
       run: node --test crates/api-3dtiles/tests/viewer.test.cjs
 
+    - name: Workbench map script tests
+      run: node --test crates/api-common/tests/map.test.cjs
+
     - name: Check formatting
       run: cargo fmt -- --check
 
@@ -123,7 +126,7 @@ jobs:
       # Composite action (no Node runtime): fetches a prebuilt cargo-audit
       # binary in seconds rather than `cargo install`-ing it from source.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-audit
 
@@ -140,6 +143,31 @@ jobs:
       # reachability analysis in that file.
       - name: cargo audit
         run: cargo audit
+
+  # Dependency licence policy (#1081). `deny.toml` holds the allow-list, so a
+  # copyleft-only or unlicensed crate, a workspace member included, fails
+  # here. Only the `licenses` check runs: advisories belong to the `audit`
+  # job above. Like it, this reads manifests and Cargo.lock without
+  # compiling, runs on the weekly schedule too, and gates the `docker`
+  # publish.
+  licenses:
+    name: Licence policy (cargo-deny)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      # Same composite action as cargo-audit above, with the version pinned.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: cargo deny check licenses
+        run: cargo deny --locked check licenses
 
   docker-check:
     name: Docker Build (PR)
@@ -171,15 +199,17 @@ jobs:
 
   docker:
     name: Docker
-    needs: [check, audit]
+    needs: [check, audit, licenses]
     # Only push Docker on main, tags, and scheduled runs — skip on PRs.
     # `audit` is a hard gate on *publishing*: the weekly run exists to pick up
     # base-image security patches, so it must not republish `:main` while the
-    # Rust dependency tree has a known advisory (#584).
+    # Rust dependency tree has a known advisory (#584). `licenses` gates it
+    # the same way: no image ships a dependency outside deny.toml (#1081).
     if: >-
       always() &&
       (needs.check.result == 'success' || github.event_name == 'schedule') &&
       needs.audit.result == 'success' &&
+      needs.licenses.result == 'success' &&
       github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -217,6 +247,11 @@ jobs:
           # commit without colliding with the stable channel.
           flavor: |
             latest=false
+          # The action fills this label from GitHub's licence detection,
+          # which cannot express the dual licence, and its labels override
+          # the Dockerfile's LABEL (#1081).
+          labels: |
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
 
       # Gate BEFORE publish: build into the local daemon and boot it.
       # The push step below reuses the buildx cache, so the double build

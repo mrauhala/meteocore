@@ -1,10 +1,12 @@
 use std::fs::File;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use bytes::Bytes;
 use ds_core::error::DataServerError;
+use ds_storage::{RangeAnswer, RangeRefusal};
 use memmap2::Mmap;
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
@@ -124,6 +126,57 @@ impl AsRef<[u8]> for SharedBytes {
 /// so the file is mmaped once per catalog entry and reused on every render.
 type MmapCache = Arc<OnceLock<Result<(Arc<Mmap>, crate::decoded_cache::FileIdentity), String>>>;
 
+/// What tile reads learned about a remote object after the scan catalogued
+/// it (#1074): whether the store refused one of its ranges for good. Clones
+/// of a [`DataSource`] share it, as every clone of its catalog entry shares
+/// the source, so the engine sees what any read found.
+#[derive(Debug, Clone, Default)]
+pub struct ObjectHealth(Arc<HealthState>);
+
+#[derive(Debug, Default)]
+struct HealthState {
+    /// The refusal that showed the object gone: a 404, or a range past its
+    /// end. Set once; a gone object is never read again.
+    gone: OnceLock<RangeRefusal>,
+    /// Whether the engine has taken `gone` ([`ObjectHealth::take_gone`]).
+    reported: AtomicBool,
+    /// 401/403 refusals since the engine last took the count.
+    forbidden: AtomicU64,
+}
+
+impl ObjectHealth {
+    /// The refusal that showed the object gone, once a read found it gone.
+    pub(crate) fn gone(&self) -> Option<RangeRefusal> {
+        self.0.gone.get().copied()
+    }
+
+    /// Record a refusal a range read met. A 404 or a range past the end
+    /// means the object is gone; a 401/403 says nothing about the object, so
+    /// it is only counted, for the engine's warning.
+    pub(crate) fn refused(&self, refusal: RangeRefusal) {
+        match refusal {
+            RangeRefusal::Forbidden => {
+                self.0.forbidden.fetch_add(1, Ordering::Relaxed);
+            }
+            gone => {
+                let _ = self.0.gone.set(gone);
+            }
+        }
+    }
+
+    /// The refusal that showed the object gone, for the first caller only,
+    /// so the engine acts on it once.
+    pub(crate) fn take_gone(&self) -> Option<RangeRefusal> {
+        let gone = self.gone()?;
+        (!self.0.reported.swap(true, Ordering::AcqRel)).then_some(gone)
+    }
+
+    /// The 401/403 refusals since the last call.
+    pub(crate) fn take_forbidden(&self) -> u64 {
+        self.0.forbidden.swap(0, Ordering::Relaxed)
+    }
+}
+
 /// Data source for reading GeoTIFF data.
 #[derive(Debug, Clone)]
 pub enum DataSource {
@@ -143,6 +196,7 @@ pub enum DataSource {
         store: ds_storage::DataStore,
         path: ds_storage::object_store::path::Path,
         tile_info: RemoteTileInfo,
+        health: ObjectHealth,
     },
     /// Remote file accessed via raw HTTP range reads (reqwest).
     /// Used for STAC assets where object_store URL-encodes path components.
@@ -150,10 +204,46 @@ pub enum DataSource {
         url: String,
         http: Arc<reqwest::Client>,
         tile_info: RemoteTileInfo,
+        health: ObjectHealth,
     },
 }
 
 impl DataSource {
+    /// An object-store COG read by byte range.
+    pub fn remote(
+        store: ds_storage::DataStore,
+        path: ds_storage::object_store::path::Path,
+        tile_info: RemoteTileInfo,
+    ) -> Self {
+        DataSource::Remote {
+            store,
+            path,
+            tile_info,
+            health: ObjectHealth::default(),
+        }
+    }
+
+    /// A COG at a URL read by direct HTTP range requests.
+    pub fn http(url: String, http: Arc<reqwest::Client>, tile_info: RemoteTileInfo) -> Self {
+        DataSource::HttpDirect {
+            url,
+            http,
+            tile_info,
+            health: ObjectHealth::default(),
+        }
+    }
+
+    /// What tile reads learned about a remote object (#1074); `None` for a
+    /// local or in-memory source, which has no range to refuse.
+    pub(crate) fn health(&self) -> Option<&ObjectHealth> {
+        match self {
+            DataSource::Remote { health, .. } | DataSource::HttpDirect { health, .. } => {
+                Some(health)
+            }
+            DataSource::LocalFile { .. } | DataSource::InMemory(_) => None,
+        }
+    }
+
     pub fn from_path(path: &Path) -> Self {
         DataSource::LocalFile {
             path: path.to_path_buf(),
@@ -277,10 +367,11 @@ fn decode_limits() -> tiff::decoder::Limits {
 
 /// One remote source tile, ready for the window copy: the engine's band as
 /// native samples, padded to the full tile width, shared with the
-/// decoded-chunk cache (#468). `chunk` is `None` for an all-nodata tile (an
-/// empty tile, or a read that failed its retries). A decode keeps its
-/// reservation until parallel tile assembly drops the tile, not merely until
-/// decompression returns; a decoded-cache hit holds none, like a local hit.
+/// decoded-chunk cache (#468). `chunk` is `None` for an all-nodata tile: an
+/// empty tile, or bytes that arrived but do not decode. A fetch that fails
+/// is never one (#1051). A decode keeps its reservation until parallel tile
+/// assembly drops the tile, not merely until decompression returns; a
+/// decoded-cache hit holds none, like a local hit.
 struct RemoteTile {
     chunk: Option<Arc<DecodingResult>>,
     _permit: Option<Permit>,
@@ -291,6 +382,80 @@ impl RemoteTile {
         chunk: None,
         _permit: None,
     };
+}
+
+/// How one remote tile read failed. The class, never the message, decides
+/// what [`read_remote_chunk_with_retry`] does with it (#1051).
+#[derive(Debug)]
+enum TileReadError {
+    /// The encoded bytes did not arrive: a storage or transport error, or a
+    /// short body. Retried; one that still fails fails the read with
+    /// `ResourceExhausted`, so no cache keeps a gap in its place.
+    Fetch(DataServerError),
+    /// The bytes arrived but do not decode. A retry would decode the same
+    /// bytes, which the compressed cache already holds, so the tile is a
+    /// nodata gap and is not retried.
+    Decode(DataServerError),
+    /// Decode admission, the request deadline, or an invalid tile layout:
+    /// fails the read at once, never retried. Admission and the deadline
+    /// fail the request in every API; an invalid layout (`Engine`) fails a
+    /// map render, but on EDR it is the #858 unreadable-file null.
+    Fatal(DataServerError),
+    /// The store refused the range for good (#1074): the object is gone
+    /// (404), shorter than the range (416), or forbidden (401/403). A retry
+    /// would meet the same answer, so it is not retried: a gone object's
+    /// tile is nodata, a forbidden one fails the read. The object's
+    /// [`ObjectHealth`] holds the refusal for the engine.
+    Refused(RangeRefusal),
+}
+
+impl TileReadError {
+    /// A failed range read. Admission and the deadline keep their own class;
+    /// everything else is a fetch failure.
+    fn fetch(e: DataServerError) -> Self {
+        match e {
+            DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded => {
+                Self::Fatal(e)
+            }
+            e => Self::Fetch(e),
+        }
+    }
+}
+
+/// A range fetch's error is classed by [`TileReadError::fetch`].
+impl From<DataServerError> for TileReadError {
+    fn from(e: DataServerError) -> Self {
+        Self::fetch(e)
+    }
+}
+
+/// One encoded range of a remote object, through what reads learned about
+/// it (#1074). Once a read found the object gone, no further I/O. A refusal
+/// is recorded in `health` and is [`TileReadError::Refused`]; any other
+/// failure is classed by [`TileReadError::fetch`].
+fn fetch_tile_range(
+    health: &ObjectHealth,
+    read: impl FnOnce() -> Result<RangeAnswer, DataServerError>,
+) -> Result<Bytes, TileReadError> {
+    if let Some(gone) = health.gone() {
+        return Err(TileReadError::Refused(gone));
+    }
+    match read()? {
+        RangeAnswer::Read(bytes) => Ok(bytes),
+        RangeAnswer::Refused(refusal) => {
+            health.refused(refusal);
+            Err(TileReadError::Refused(refusal))
+        }
+    }
+}
+
+/// Context for a failed object-store range read. The deadline and admission
+/// pass through unchanged, so a retry loop still stops on them.
+fn range_read_error(e: DataServerError) -> DataServerError {
+    match e {
+        DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded => e,
+        e => DataServerError::Storage(format!("Failed to read tile range: {e}")),
+    }
 }
 
 /// `(raw, reservation)`: the decompressed size of one tile (all bands), and
@@ -318,7 +483,9 @@ fn remote_decode_size(
 
 /// Validate attacker-controlled encoded byte counts before admission or I/O.
 /// The encoded input coexists with decompressed and boxed output buffers.
-fn remote_chunk_layout(
+/// `(raw, reservation, offset, encoded length)`; the poll-cycle pre-warm
+/// (#1004) plans its reads through it too.
+pub(crate) fn remote_chunk_layout(
     info: &RemoteTileInfo,
     samples: u32,
     index: usize,
@@ -381,7 +548,7 @@ fn read_chunk_cached(
         }
         // The decoder's intermediate buffer is separately capped at 64 MiB.
         // Cached native chunks subsequently belong to the decoded-cache budget.
-        let _permit = BUDGET.reserve(size + MAX_DECODED_TILE_BYTES)?;
+        let _permit = BUDGET.reserve((size + MAX_DECODED_TILE_BYTES) as u64)?;
         decoder
             .read_chunk(chunk_index)
             .map_err(|e| DataServerError::Engine(format!("Failed to read tile: {e}")))
@@ -618,22 +785,41 @@ impl TiffMetadata {
     /// parses the IFD. Also extracts tile offsets, byte counts, compression,
     /// and sample type for on-demand tile reading.
     ///
-    /// Returns `None` if parsing fails (caller should fall back to full download).
+    /// The two failures mean different things (#1003):
+    /// - `Err`: the range read itself failed: a timeout, a body cut short,
+    ///   an object gone since the listing. That says nothing about the
+    ///   file's layout, and a full download would go to the same storage,
+    ///   so the caller retries the header read later.
+    /// - `Ok(None)`: the bytes arrived but are not a COG header this reader
+    ///   handles: the IFD lies past the first `HEADER_READ_SIZE` bytes, the
+    ///   compression is unsupported, or the object is empty. The caller
+    ///   falls back to a full download.
     pub fn from_header_read(
         store: &ds_storage::DataStore,
         path: &ds_storage::object_store::path::Path,
         file_size: u64,
-    ) -> Option<(Self, RemoteTileInfo)> {
+    ) -> Result<Option<(Self, RemoteTileInfo)>, DataServerError> {
         let read_size = HEADER_READ_SIZE.min(file_size as usize);
-        let header_bytes = store.get_range(path, 0..read_size).ok()?;
+        if read_size == 0 {
+            return Ok(None);
+        }
+        // Only the poll scan reads headers before cataloguing, so a stalled
+        // attempt may retry under the background budget (#1011).
+        let header_bytes =
+            store.get_range_with_budget(path, 0..read_size, ds_storage::FetchBudget::Background)?;
+        Ok(Self::parse_header(
+            header_bytes,
+            format!("<remote:{}>", path),
+        ))
+    }
+
+    /// Parse the metadata and tile layout from the first bytes of a COG, or
+    /// `None` when they are not a COG header this reader handles.
+    fn parse_header(header_bytes: Bytes, source_name: String) -> Option<(Self, RemoteTileInfo)> {
         let cursor = Cursor::new(SharedBytes::Heap(header_bytes));
         let mut decoder = DecoderWrapper(Decoder::new(cursor).ok()?);
-
-        let metadata =
-            Self::from_decoder_wrapper(&mut decoder, format!("<remote:{}>", path)).ok()?;
-
+        let metadata = Self::from_decoder_wrapper(&mut decoder, source_name).ok()?;
         let tile_info = extract_tile_info(&mut decoder, &metadata)?;
-
         Some((metadata, tile_info))
     }
 
@@ -667,11 +853,7 @@ impl TiffMetadata {
             return None;
         }
         let header_bytes = resp.bytes().await.ok()?;
-        let cursor = Cursor::new(SharedBytes::Heap(header_bytes));
-        let mut decoder = DecoderWrapper(Decoder::new(cursor).ok()?);
-        let metadata = Self::from_decoder_wrapper(&mut decoder, format!("<http:{}>", url)).ok()?;
-        let tile_info = extract_tile_info(&mut decoder, &metadata)?;
-        Some((metadata, tile_info))
+        Self::parse_header(header_bytes, format!("<http:{}>", url))
     }
 
     /// Apply scale/offset to convert raw value to physical value.
@@ -1168,7 +1350,8 @@ fn read_remote_chunk(
     // Runtime handle to drive the fetch on when called from a non-Tokio
     // (rayon) thread; `None` for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
-) -> Result<RemoteTile, DataServerError> {
+    health: &ObjectHealth,
+) -> Result<RemoteTile, TileReadError> {
     read_encoded_chunk(
         tile_info,
         metadata,
@@ -1178,19 +1361,32 @@ fn read_remote_chunk(
         file_path,
         band_index,
         ifd_index,
-        &|range| {
-            match handle {
-                Some(h) => store.get_range_on(obj_path, range, h),
-                None => store.get_range(obj_path, range),
-            }
-            .map_err(|e| DataServerError::Engine(format!("Failed to read tile range: {e}")))
-        },
+        &|range| fetch_tile_range(health, || read_object_range(store, obj_path, range, handle)),
     )
+}
+
+/// One range of an object-store object, a refusal no retry can change
+/// answered as such (#1074).
+fn read_object_range(
+    store: &ds_storage::DataStore,
+    obj_path: &ds_storage::object_store::path::Path,
+    range: std::ops::Range<usize>,
+    handle: Option<&tokio::runtime::Handle>,
+) -> Result<RangeAnswer, DataServerError> {
+    match handle {
+        Some(h) => store.get_range_or_refusal_on(obj_path, range, h),
+        None => store.get_range_or_refusal(obj_path, range),
+    }
+    .map_err(range_read_error)
 }
 
 /// Shared decoder/cache path for individual and coalesced remote ranges.
 /// `cache` is the compressed cache this function checks itself (`None` when
 /// the caller's `fetch_range` does); `decoded` is the decoded-chunk scope.
+/// `fetch_range` classes its own failures (a failed read is a
+/// [`TileReadError::Fetch`], a refused one [`TileReadError::Refused`]); a
+/// short body is a fetch failure too, and bytes that arrived but do not
+/// decode are a [`TileReadError::Decode`] (#1051).
 #[allow(clippy::too_many_arguments)]
 fn read_encoded_chunk(
     tile_info: &RemoteTileInfo,
@@ -1201,11 +1397,12 @@ fn read_encoded_chunk(
     file_path: &Path,
     band_index: usize,
     ifd_index: u16,
-    fetch_range: &impl Fn(std::ops::Range<usize>) -> Result<Bytes, DataServerError>,
-) -> Result<RemoteTile, DataServerError> {
+    fetch_range: &impl Fn(std::ops::Range<usize>) -> Result<Bytes, TileReadError>,
+) -> Result<RemoteTile, TileReadError> {
     let idx = chunk_index as usize;
     let (raw_size, bytes, offset, byte_count) =
-        remote_chunk_layout(tile_info, metadata.samples_per_pixel, idx)?;
+        remote_chunk_layout(tile_info, metadata.samples_per_pixel, idx)
+            .map_err(TileReadError::Fatal)?;
 
     if byte_count == 0 {
         // Empty tile — return all nodata.
@@ -1228,7 +1425,7 @@ fn read_encoded_chunk(
             _permit: None,
         });
     }
-    let permit = BUDGET.reserve(bytes)?;
+    let permit = BUDGET.reserve(bytes as u64).map_err(TileReadError::Fatal)?;
 
     // Sanity check: offset 0 for a non-first tile is suspicious (likely truncated header)
     if offset == 0 && idx > 0 {
@@ -1240,44 +1437,35 @@ fn read_encoded_chunk(
 
     // Validate range doesn't overflow
     let end = offset.checked_add(byte_count).ok_or_else(|| {
-        DataServerError::Engine(format!(
+        TileReadError::Fatal(DataServerError::Engine(format!(
             "Tile {} byte range overflow: offset={} + count={}",
             idx, offset, byte_count
-        ))
+        )))
     })?;
 
     // Check cache for compressed bytes (keyed by file + chunk + IFD level)
-    let compressed = if let Some(c) = cache {
-        if let Some(cached) = c.get(file_path, chunk_index, ifd_index) {
-            cached
-        } else {
+    let compressed = match cache.and_then(|c| c.get(file_path, chunk_index, ifd_index)) {
+        Some(cached) => cached,
+        None => {
             let fetched = fetch_range(offset..end)?;
-            // Validate response length matches request
+            // A short body is bytes that did not arrive: a fetch failure.
             if fetched.len() != byte_count {
-                return Err(DataServerError::Engine(format!(
+                return Err(TileReadError::Fetch(DataServerError::Engine(format!(
                     "Tile {} truncated: requested {} bytes, got {}",
                     idx,
                     byte_count,
                     fetched.len()
-                )));
+                ))));
             }
-            c.insert(file_path, chunk_index, ifd_index, fetched.clone());
+            if let Some(c) = cache {
+                c.insert(file_path, chunk_index, ifd_index, fetched.clone());
+            }
             fetched
         }
-    } else {
-        let fetched = fetch_range(offset..end)?;
-        if fetched.len() != byte_count {
-            return Err(DataServerError::Engine(format!(
-                "Tile {} truncated: requested {} bytes, got {}",
-                idx,
-                byte_count,
-                fetched.len()
-            )));
-        }
-        fetched
     };
 
-    let mut raw = decompress_tile(&compressed, tile_info.compression, raw_size)?;
+    let mut raw = decompress_tile(&compressed, tile_info.compression, raw_size)
+        .map_err(TileReadError::Decode)?;
 
     if tile_info.predictor == 2 {
         undo_horizontal_predictor(
@@ -1287,12 +1475,15 @@ fn read_encoded_chunk(
         );
     }
 
-    let chunk = Arc::new(decode_raw_band(
-        &raw,
-        tile_info.sample_type,
-        metadata.samples_per_pixel as usize,
-        band_index,
-    )?);
+    let chunk = Arc::new(
+        decode_raw_band(
+            &raw,
+            tile_info.sample_type,
+            metadata.samples_per_pixel as usize,
+            band_index,
+        )
+        .map_err(TileReadError::Decode)?,
+    );
     if let Some(decoded) = decoded {
         crate::decoded_cache::insert(decoded, ifd_index, chunk_index, Arc::clone(&chunk));
     }
@@ -1302,7 +1493,8 @@ fn read_encoded_chunk(
     })
 }
 
-/// Fetch a byte range from an HTTP URL using reqwest.
+/// Fetch a byte range from an HTTP URL using reqwest. A refusal no retry
+/// can change is an error here; [`read_http_range_answer`] answers it.
 fn read_http_range(
     http: &reqwest::Client,
     url: &str,
@@ -1311,6 +1503,25 @@ fn read_http_range(
     // (rayon) thread; `None` for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
 ) -> Result<Bytes, DataServerError> {
+    match read_http_range_answer(http, url, range, handle)? {
+        RangeAnswer::Read(bytes) => Ok(bytes),
+        RangeAnswer::Refused(refusal) => Err(DataServerError::Engine(format!(
+            "HTTP range read refused: {refusal}"
+        ))),
+    }
+}
+
+/// Fetch a byte range from an HTTP URL using reqwest, typed as the object
+/// store's [`ds_storage::DataStore::get_range_or_refusal`] is (#1074): a 404,
+/// a 401/403 and a 416 are refusals, and so is a 206 whose `Content-Range`
+/// names a total size that ends before the range. Any other failure is an
+/// `Err`.
+fn read_http_range_answer(
+    http: &reqwest::Client,
+    url: &str,
+    range: std::ops::Range<usize>,
+    handle: Option<&tokio::runtime::Handle>,
+) -> Result<RangeAnswer, DataServerError> {
     ds_core::deadline::check()?;
     let deadline = ds_core::deadline::current();
     let range_header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
@@ -1322,6 +1533,22 @@ fn read_http_range(
             .send()
             .await
             .map_err(|e| DataServerError::Engine(format!("HTTP range read failed: {e}")))?;
+        let refusal = match resp.status() {
+            reqwest::StatusCode::NOT_FOUND => Some(RangeRefusal::NotFound),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                Some(RangeRefusal::Forbidden)
+            }
+            reqwest::StatusCode::RANGE_NOT_SATISFIABLE => Some(RangeRefusal::Truncated),
+            reqwest::StatusCode::PARTIAL_CONTENT
+                if content_range_total(resp.headers()).is_some_and(|n| n < range.end as u64) =>
+            {
+                Some(RangeRefusal::Truncated)
+            }
+            _ => None,
+        };
+        if let Some(refusal) = refusal {
+            return Ok(RangeAnswer::Refused(refusal));
+        }
         if !resp.status().is_success() {
             return Err(DataServerError::Engine(format!(
                 "HTTP range read returned {}",
@@ -1347,7 +1574,7 @@ fn read_http_range(
             }
             data.extend_from_slice(&chunk);
         }
-        Ok(Bytes::from(data))
+        Ok(RangeAnswer::Read(Bytes::from(data)))
     };
     let fut = async {
         if let Some(deadline) = deadline {
@@ -1361,6 +1588,38 @@ fn read_http_range(
     match handle {
         Some(h) => h.block_on(fut),
         None => block_on_async(fut),
+    }
+}
+
+/// The object's total size a `Content-Range: bytes a-b/total` header names.
+fn content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    value
+        .trim()
+        .strip_prefix("bytes ")?
+        .split_once('/')?
+        .1
+        .parse()
+        .ok()
+}
+
+/// Fetch an encoded byte range of a remote COG for the poll-cycle pre-warm
+/// (#1004), on a blocking-pool thread of the runtime `handle` belongs to:
+/// the explicit-handle storage bridge for an object store, the direct HTTP
+/// range read for a STAC asset. No request deadline is in scope there, so the
+/// background timeouts apply (the store's own, the STAC client's). Local and
+/// in-memory sources have nothing to fetch.
+pub(crate) fn fetch_encoded_range(
+    source: &DataSource,
+    range: std::ops::Range<usize>,
+    handle: &tokio::runtime::Handle,
+) -> Result<Bytes, DataServerError> {
+    match source {
+        DataSource::Remote { store, path, .. } => store.get_range_on(path, range, handle),
+        DataSource::HttpDirect { url, http, .. } => read_http_range(http, url, range, Some(handle)),
+        DataSource::LocalFile { .. } | DataSource::InMemory(_) => Err(DataServerError::Engine(
+            "Encoded range reads need a remote source".into(),
+        )),
     }
 }
 
@@ -1380,7 +1639,8 @@ fn read_http_chunk(
     // Runtime handle for the fetch when on a non-Tokio (rayon) thread; `None`
     // for callers already on a runtime worker. See #222.
     handle: Option<&tokio::runtime::Handle>,
-) -> Result<RemoteTile, DataServerError> {
+    health: &ObjectHealth,
+) -> Result<RemoteTile, TileReadError> {
     read_encoded_chunk(
         tile_info,
         metadata,
@@ -1390,13 +1650,16 @@ fn read_http_chunk(
         file_path,
         band_index,
         ifd_index,
-        &|range| read_http_range(http, url, range, handle),
+        &|range| fetch_tile_range(health, || read_http_range_answer(http, url, range, handle)),
     )
 }
 
 /// Read a single pixel value from a GeoTIFF at a given pixel coordinate.
 /// For remote sources, `cache` enables compressed tile caching and `file_path`
-/// identifies the file in the cache.
+/// identifies the file in the cache. A remote tile read follows the map
+/// path's policy ([`read_remote_chunk_with_retry`], #1051): a fetch that still
+/// fails after its retries is `ResourceExhausted`, never a `None` value; so is
+/// a forbidden range, and a gone object's range is `None` (#1074).
 /// `band_index` selects which band (0-based) for multi-band files.
 pub fn read_pixel(
     source: &DataSource,
@@ -1424,33 +1687,51 @@ pub fn read_pixel(
             store,
             path,
             tile_info,
-        } => read_remote_chunk(
-            store,
-            path,
-            tile_info,
-            metadata,
+            health,
+        } => read_remote_chunk_with_retry(
+            || {
+                read_remote_chunk(
+                    store,
+                    path,
+                    tile_info,
+                    metadata,
+                    chunk_index,
+                    cache,
+                    file_path,
+                    band_index,
+                    0,    // full resolution IFD
+                    None, // single-pixel read: caller is already on a runtime worker
+                    health,
+                )
+            },
+            tile_row,
+            tile_col,
             chunk_index,
-            cache,
-            file_path,
-            band_index,
-            0,    // full resolution IFD
-            None, // single-pixel read: caller is already on a runtime worker
         )?,
         DataSource::HttpDirect {
             url,
             http,
             tile_info,
-        } => read_http_chunk(
-            http,
-            url,
-            tile_info,
-            metadata,
+            health,
+        } => read_remote_chunk_with_retry(
+            || {
+                read_http_chunk(
+                    http,
+                    url,
+                    tile_info,
+                    metadata,
+                    chunk_index,
+                    cache,
+                    file_path,
+                    band_index,
+                    0,    // full resolution IFD
+                    None, // single-pixel read: caller is already on a runtime worker
+                    health,
+                )
+            },
+            tile_row,
+            tile_col,
             chunk_index,
-            cache,
-            file_path,
-            band_index,
-            0,    // full resolution IFD
-            None, // single-pixel read: caller is already on a runtime worker
         )?,
         _ => {
             // Local/in-memory: read the decoded chunk (memoized for local
@@ -1607,7 +1888,13 @@ pub fn read_bbox_overview(
     let tile_row_start = row_start / overview.tile_height;
     let tile_row_end = (row_end - 1) / overview.tile_height + 1;
 
-    if let DataSource::Remote { store, path, .. } = source {
+    if let DataSource::Remote {
+        store,
+        path,
+        health,
+        ..
+    } = source
+    {
         let ov_tile_info = overview.tile_info.as_ref().ok_or_else(|| {
             DataServerError::Engine(format!(
                 "Overview IFD {} has no tile info for remote source (header too small?)",
@@ -1617,6 +1904,7 @@ pub fn read_bbox_overview(
         return read_bbox_parallel(
             store,
             path,
+            health,
             ov_tile_info,
             &ov_metadata,
             col_start,
@@ -1637,9 +1925,7 @@ pub fn read_bbox_overview(
     }
 
     if let DataSource::HttpDirect {
-        url,
-        http,
-        tile_info: _,
+        url, http, health, ..
     } = source
     {
         let ov_tile_info = overview.tile_info.as_ref().ok_or_else(|| {
@@ -1651,6 +1937,7 @@ pub fn read_bbox_overview(
         return read_bbox_parallel_http(
             http,
             url,
+            health,
             ov_tile_info,
             &ov_metadata,
             col_start,
@@ -1996,11 +2283,13 @@ fn read_bbox_inner(
         store,
         path,
         tile_info,
+        health,
     } = source
     {
         return read_bbox_parallel(
             store,
             path,
+            health,
             tile_info,
             metadata,
             col_start,
@@ -2024,11 +2313,13 @@ fn read_bbox_inner(
         url,
         http,
         tile_info,
+        health,
     } = source
     {
         return read_bbox_parallel_http(
             http,
             url,
+            health,
             tile_info,
             metadata,
             col_start,
@@ -2082,17 +2373,36 @@ fn read_bbox_inner(
     Ok(result)
 }
 
-/// Result of a parallel tile fetch: (row, col, pixel data).
-/// Fetch/decode failures are logged and replaced with all-nodata. Admission
-/// failures and invalid tile-index arithmetic are fatal for the whole request.
-/// Other failed tile reads are replaced with all-nodata
-/// to allow partial rendering — a map with gaps is better than a 500 error.
+/// Result of a parallel tile fetch: (row, col, pixel data). What a failed
+/// tile read becomes is [`read_remote_chunk_with_retry`]'s policy.
 type TileFetchResult = (u32, u32, RemoteTile);
 
-/// Retry a remote tile read up to 2 times with brief backoff.
-/// On final failure, logs at error level and returns all-nodata pixels.
-/// Map rendering tolerates partial failures (gaps) — a 500 error is worse
-/// than a tile with transparent holes that will be retried on next request.
+/// Retries after a failed remote tile fetch, each after a brief backoff.
+pub(crate) const TILE_FETCH_RETRIES: u64 = 2;
+
+/// Read one remote tile, retrying a failed fetch up to [`TILE_FETCH_RETRIES`]
+/// times within the request deadline. The failure's class decides the rest
+/// (#1051):
+///
+/// - A fetch that still fails after the last retry fails the read with
+///   `ResourceExhausted` (HTTP 503) and logs the detail. It is never a nodata
+///   tile: the rendered and meta-tile caches keep every `Ok` tile with no
+///   TTL, and an explicit-time response is browser-cached for a day, so a gap
+///   from a short storage outage would outlive the outage. The client's
+///   retry renders the tile.
+/// - Bytes that arrived but do not decode are a logged nodata gap at once,
+///   since a retry would decode the same bytes.
+/// - A range the store refused for good is not retried (#1074), and the
+///   object's [`ObjectHealth`] holds the refusal. A gone object (404, 416
+///   or a shorter object) is nodata at once, and the engine drops its
+///   timestep. A forbidden one (401/403) fails the read with
+///   `ResourceExhausted`, like a fetch out of retries: it is the server's
+///   credentials, not the data, so no cache may keep a gap for it. The
+///   engine keeps the timestep and warns.
+/// - Decode admission, the deadline and an invalid layout fail the read at
+///   once ([`TileReadError::Fatal`]).
+///
+/// An empty tile (`byte_count == 0`) is no failure: it reads as nodata.
 fn read_remote_chunk_with_retry<F>(
     read_fn: F,
     tile_row: u32,
@@ -2100,53 +2410,67 @@ fn read_remote_chunk_with_retry<F>(
     chunk_index: u32,
 ) -> Result<RemoteTile, DataServerError>
 where
-    F: Fn() -> Result<RemoteTile, DataServerError>,
+    F: Fn() -> Result<RemoteTile, TileReadError>,
 {
     ds_core::deadline::check()?;
-    match read_fn() {
-        Ok(data) => Ok(data),
-        Err(e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded)) => Err(e),
-        Err(first_err) => {
-            let mut last_err = first_err;
-            for attempt in 1..=2 {
+    let mut attempt = 0;
+    loop {
+        match read_fn() {
+            Ok(tile) => {
+                if attempt > 0 {
+                    tracing::debug!(
+                        "Tile ({tile_row}, {tile_col}), chunk {chunk_index} succeeded on retry {attempt}"
+                    );
+                }
+                return Ok(tile);
+            }
+            Err(TileReadError::Fatal(e)) => return Err(e),
+            Err(TileReadError::Decode(e)) => {
+                tracing::error!(
+                    "Tile ({tile_row}, {tile_col}), chunk {chunk_index} does not decode: {e}. \
+                     Reading it as nodata."
+                );
+                return Ok(RemoteTile::NODATA);
+            }
+            // The server's credentials, not the data: a 503 the caches keep
+            // nothing of, so the frame reads again once they are fixed.
+            Err(TileReadError::Refused(RangeRefusal::Forbidden)) => {
                 tracing::debug!(
-                    "Tile ({}, {}), chunk {} failed (attempt {}), retrying: {last_err}",
-                    tile_row,
-                    tile_col,
-                    chunk_index,
-                    attempt
+                    "Tile ({tile_row}, {tile_col}), chunk {chunk_index}: the store forbids \
+                     its range. Failing the read."
+                );
+                return Err(DataServerError::ResourceExhausted);
+            }
+            Err(TileReadError::Refused(refusal)) => {
+                tracing::debug!(
+                    "Tile ({tile_row}, {tile_col}), chunk {chunk_index}: the object is gone \
+                     ({refusal}). Reading it as nodata."
+                );
+                return Ok(RemoteTile::NODATA);
+            }
+            Err(TileReadError::Fetch(e)) if attempt == TILE_FETCH_RETRIES => {
+                // Past the deadline the request ran out of time; the store
+                // did not necessarily fail.
+                ds_core::deadline::check()?;
+                tracing::error!(
+                    "Tile ({tile_row}, {tile_col}), chunk {chunk_index} fetch failed after {} \
+                     attempts: {e}. Failing the read.",
+                    attempt + 1
+                );
+                return Err(DataServerError::ResourceExhausted);
+            }
+            Err(TileReadError::Fetch(e)) => {
+                attempt += 1;
+                tracing::debug!(
+                    "Tile ({tile_row}, {tile_col}), chunk {chunk_index} fetch failed \
+                     (attempt {attempt}), retrying: {e}"
                 );
                 let backoff = std::time::Duration::from_millis(50 * attempt);
                 let remaining = ds_core::deadline::current()
                     .map(|d| d.saturating_duration_since(std::time::Instant::now()));
                 std::thread::sleep(remaining.map_or(backoff, |r| r.min(backoff)));
                 ds_core::deadline::check()?;
-                match read_fn() {
-                    Ok(data) => {
-                        tracing::debug!(
-                            "Tile ({}, {}), chunk {} succeeded on retry {}",
-                            tile_row,
-                            tile_col,
-                            chunk_index,
-                            attempt
-                        );
-                        return Ok(data);
-                    }
-                    Err(
-                        e
-                        @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded),
-                    ) => return Err(e),
-                    Err(e) => last_err = e,
-                }
             }
-            tracing::error!(
-                "Tile ({}, {}), chunk {} failed after 3 attempts: {last_err}. \
-                 Rendering with transparent gap.",
-                tile_row,
-                tile_col,
-                chunk_index
-            );
-            Ok(RemoteTile::NODATA)
         }
     }
 }
@@ -2165,7 +2489,7 @@ fn read_bbox_tiles(
     ifd_index: u16,
     deadline: Option<std::time::Instant>,
     batch_limit: usize,
-    fetch: &(impl Fn(std::ops::Range<usize>) -> Result<Bytes, DataServerError> + Sync),
+    fetch: &(impl Fn(std::ops::Range<usize>) -> Result<Bytes, TileReadError> + Sync),
 ) -> Result<Vec<TileFetchResult>, DataServerError> {
     use rayon::prelude::*;
     ds_core::deadline::check()?;
@@ -2236,7 +2560,9 @@ fn read_bbox_tiles(
                             fetch(range.clone())?
                         };
                         if bytes.len() != range.len() {
-                            return Err(DataServerError::Engine("Truncated tile range".into()));
+                            return Err(TileReadError::Fetch(DataServerError::Engine(
+                                "Truncated tile range".into(),
+                            )));
                         }
                         if let Some(cache) = cache {
                             cache.insert(file_path, chunk, ifd_index, bytes.clone());
@@ -2262,13 +2588,10 @@ fn read_bbox_tiles(
                         // Account for the merged input in addition to each tile's
                         // compressed copy + decoder/output allocations. It lives
                         // until the whole batch is decoded; failures unwind it.
-                        let permit = BUDGET.reserve(batch.range.len())?;
+                        let permit = BUDGET.reserve(batch.range.len() as u64)?;
                         let bytes = match fetch(batch.range.clone()) {
                             Ok(bytes) if bytes.len() == batch.range.len() => Some(bytes),
-                            Err(
-                                e @ (DataServerError::ResourceExhausted
-                                | DataServerError::DeadlineExceeded),
-                            ) => return Err(e),
+                            Err(TileReadError::Fatal(e)) => return Err(e),
                             _ => None,
                         };
                         if bytes.is_none() {
@@ -2277,8 +2600,10 @@ fn read_bbox_tiles(
                             drop(permit);
                         }
                         // An origin may reject a larger range or return a short
-                        // body. Fall back to the established per-tile retry/nodata
-                        // policy, sharing the same absolute deadline.
+                        // body. Fall back to per-tile reads and their retry policy
+                        // (`read_remote_chunk_with_retry`), sharing the same
+                        // absolute deadline. After a refusal that showed the
+                        // object gone, those reads make no I/O.
                         batch
                             .tiles
                             .iter()
@@ -2299,6 +2624,7 @@ fn read_bbox_tiles(
 fn read_bbox_parallel(
     store: &ds_storage::DataStore,
     obj_path: &ds_storage::object_store::path::Path,
+    health: &ObjectHealth,
     tile_info: &RemoteTileInfo,
     metadata: &TiffMetadata,
     col_start: u32,
@@ -2342,11 +2668,9 @@ fn read_bbox_parallel(
         deadline,
         crate::range_batch::limit(),
         &|range| {
-            match &rt_handle {
-                Some(h) => store.get_range_on(obj_path, range, h),
-                None => store.get_range(obj_path, range),
-            }
-            .map_err(|e| DataServerError::Engine(format!("Failed to read tile range: {e}")))
+            fetch_tile_range(health, || {
+                read_object_range(store, obj_path, range, rt_handle.as_ref())
+            })
         },
     )?;
 
@@ -2397,6 +2721,7 @@ fn assemble_remote_tiles(
 fn read_bbox_parallel_http(
     http: &Arc<reqwest::Client>,
     url: &str,
+    health: &ObjectHealth,
     tile_info: &RemoteTileInfo,
     metadata: &TiffMetadata,
     col_start: u32,
@@ -2431,7 +2756,11 @@ fn read_bbox_parallel_http(
         ifd_index,
         deadline,
         crate::range_batch::limit(),
-        &|range| read_http_range(http, url, range, rt_handle.as_ref()),
+        &|range| {
+            fetch_tile_range(health, || {
+                read_http_range_answer(http, url, range, rt_handle.as_ref())
+            })
+        },
     )?;
 
     assemble_remote_tiles(
@@ -3033,6 +3362,7 @@ mod tests {
                     0,
                     0,
                     None,
+                    &ObjectHealth::default(),
                 ),
                 read_http_chunk(
                     &http,
@@ -3045,10 +3375,11 @@ mod tests {
                     0,
                     0,
                     None,
+                    &ObjectHealth::default(),
                 ),
             ] {
                 assert!(
-                    matches!(result, Err(DataServerError::Engine(ref message)) if message == "Invalid or oversized encoded tile range")
+                    matches!(result, Err(TileReadError::Fatal(DataServerError::Engine(ref message))) if message == "Invalid or oversized encoded tile range")
                 );
             }
         }
@@ -3084,13 +3415,17 @@ mod tests {
         }
     }
 
+    /// A fetch that answers `ResourceExhausted` (admission, not a failed
+    /// store) keeps that class through `TileReadError::fetch`, so it ends the
+    /// read at once: no retry, no transparent gap. Decode admission itself is
+    /// pinned by `zero_decode_budget_rejects_real_local_and_remote_chunks`.
     #[test]
-    fn exhausted_decode_is_not_retried_or_converted_to_transparency() {
+    fn a_fetch_answering_resource_exhausted_is_not_retried_or_converted_to_transparency() {
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let result = read_remote_chunk_with_retry(
             || {
                 calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Err(DataServerError::ResourceExhausted)
+                Err(TileReadError::fetch(DataServerError::ResourceExhausted))
             },
             0,
             0,
@@ -3098,6 +3433,182 @@ mod tests {
         );
         assert!(matches!(result, Err(DataServerError::ResourceExhausted)));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// A storage-side deadline keeps its class through the range-read
+    /// context, so it ends the read at once instead of being retried as a
+    /// failed fetch and then reported as one (#1051).
+    #[test]
+    fn a_storage_deadline_is_not_retried_as_a_failed_fetch() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = read_remote_chunk_with_retry(
+            || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(TileReadError::fetch(range_read_error(
+                    DataServerError::DeadlineExceeded,
+                )))
+            },
+            0,
+            0,
+            0,
+        );
+        assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(matches!(
+            TileReadError::fetch(range_read_error(DataServerError::Engine("503".into()))),
+            TileReadError::Fetch(DataServerError::Storage(_))
+        ));
+    }
+
+    /// #1051: a tile whose fetch fails on every attempt fails the whole read,
+    /// with or without range coalescing, after its retries. It used to be an
+    /// `Ok` nodata tile, which the no-TTL meta-tile and rendered caches kept
+    /// as a transparent gap.
+    #[test]
+    fn a_fetch_failing_every_attempt_fails_the_read_and_caches_nothing() {
+        let (meta, info, bytes) = batch_fixture();
+        let coords = [(0, 0), (0, 1), (0, 2), (0, 3)];
+        let failing = 136..200; // tile 2
+        for batch_limit in [1, 4] {
+            let cache = crate::cache::TileCache::new(4096);
+            let file = Path::new("failing-fixture");
+            let attempts = std::sync::atomic::AtomicUsize::new(0);
+            let fetch = |range: std::ops::Range<usize>| {
+                if range == failing {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                if range.start <= failing.start && failing.end <= range.end {
+                    return Err(DataServerError::Storage("503 Slow Down".into()).into());
+                }
+                Ok(Bytes::copy_from_slice(&bytes[range]))
+            };
+            let result = read_bbox_tiles(
+                &coords,
+                &info,
+                &meta,
+                Some(&cache),
+                None,
+                file,
+                0,
+                0,
+                None,
+                batch_limit,
+                &fetch,
+            );
+            assert!(
+                matches!(result, Err(DataServerError::ResourceExhausted)),
+                "batch limit {batch_limit}: the failed tile fails the read"
+            );
+            assert_eq!(
+                attempts.load(std::sync::atomic::Ordering::SeqCst),
+                1 + TILE_FETCH_RETRIES as usize,
+                "batch limit {batch_limit}: retried before failing"
+            );
+            assert!(
+                !cache.contains_untracked(file, 2, 0),
+                "nothing is cached for the failed tile"
+            );
+        }
+    }
+
+    /// A fetch that fails once and then succeeds reads the tile's data.
+    #[test]
+    fn a_fetch_that_fails_once_reads_the_data_on_retry() {
+        let (meta, info, bytes) = batch_fixture();
+        let coords = [(0, 0), (0, 1), (0, 2), (0, 3)];
+        let failing = 136..200; // tile 2
+        let failures = std::sync::atomic::AtomicUsize::new(1);
+        let fetch = |range: std::ops::Range<usize>| {
+            if range == failing && failures.swap(0, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return Err(DataServerError::Storage("connection reset".into()).into());
+            }
+            Ok(Bytes::copy_from_slice(&bytes[range]))
+        };
+        let tiles = read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            None,
+            None,
+            Path::new("flaky-fixture"),
+            0,
+            0,
+            None,
+            1,
+            &fetch,
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 4);
+        for (_, col, tile) in tiles {
+            assert_eq!(tile_samples(&tile), Some(vec![col as f64 + 1.0; 64]));
+        }
+    }
+
+    /// Bytes that arrive but do not decode stay a nodata gap, read once: a
+    /// retry would decode the same bytes (#1051). Tile 1's byte count says 63
+    /// bytes for a 64-byte uncompressed tile.
+    #[test]
+    fn bytes_that_do_not_decode_are_a_gap_without_retry() {
+        let (meta, mut info, bytes) = batch_fixture();
+        info.tile_byte_counts[1] = 63;
+        let coords = [(0, 0), (0, 1), (0, 2), (0, 3)];
+        let calls = std::sync::Mutex::new(Vec::new());
+        let fetch = |range: std::ops::Range<usize>| {
+            calls.lock().unwrap().push(range.clone());
+            Ok(Bytes::copy_from_slice(&bytes[range]))
+        };
+        let tiles = read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            None,
+            None,
+            Path::new("corrupt-fixture"),
+            0,
+            0,
+            None,
+            1,
+            &fetch,
+        )
+        .expect("an undecodable tile does not fail the read");
+        for (_, col, tile) in tiles {
+            let expected = (col != 1).then(|| vec![col as f64 + 1.0; 64]);
+            assert_eq!(tile_samples(&tile), expected, "tile {col}");
+        }
+        let mut ranges = calls.lock().unwrap().clone();
+        ranges.sort_by_key(|r| r.start);
+        assert_eq!(ranges, [0..64, 68..131, 136..200, 204..268], "no retry");
+    }
+
+    /// A tile that does not exist (`byte_count == 0`) reads as nodata without
+    /// any I/O.
+    #[test]
+    fn an_empty_tile_reads_as_nodata_without_io() {
+        let (meta, mut info, bytes) = batch_fixture();
+        info.tile_byte_counts[1] = 0;
+        let coords = [(0, 0), (0, 1), (0, 2), (0, 3)];
+        let fetch = |range: std::ops::Range<usize>| {
+            assert_ne!(range.start, 68, "the empty tile is never fetched");
+            Ok(Bytes::copy_from_slice(&bytes[range]))
+        };
+        let tiles = read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            None,
+            None,
+            Path::new("sparse-fixture"),
+            0,
+            0,
+            None,
+            1,
+            &fetch,
+        )
+        .unwrap();
+        for (_, col, tile) in tiles {
+            let expected = (col != 1).then(|| vec![col as f64 + 1.0; 64]);
+            assert_eq!(tile_samples(&tile), expected, "tile {col}");
+        }
     }
 
     #[test]
@@ -3148,9 +3659,10 @@ mod tests {
                 &path,
                 0,
                 0,
-                None
+                None,
+                &ObjectHealth::default(),
             ),
-            Err(DataServerError::ResourceExhausted)
+            Err(TileReadError::Fatal(DataServerError::ResourceExhausted))
         ));
         assert_eq!(crate::decode_budget::metrics(), (0, 0, 2));
         let config: ds_core::config::GeoTiffConfig = serde_json::from_value(serde_json::json!({
@@ -3236,6 +3748,7 @@ mod tests {
         let file_size = std::fs::metadata(&tif_path).unwrap().len();
 
         let (header_meta, tile_info) = TiffMetadata::from_header_read(&store, &obj_path, file_size)
+            .expect("the header range read succeeds")
             .expect("from_header_read should succeed on test COG");
 
         // Metadata should match
@@ -3270,14 +3783,11 @@ mod tests {
         let obj_path = ds_storage::object_store::path::Path::from(filename);
         let file_size = std::fs::metadata(&tif_path).unwrap().len();
 
-        let (header_meta, tile_info) =
-            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
+        let (header_meta, tile_info) = TiffMetadata::from_header_read(&store, &obj_path, file_size)
+            .unwrap()
+            .unwrap();
 
-        let remote_source = DataSource::Remote {
-            store: store.clone(),
-            path: obj_path,
-            tile_info,
-        };
+        let remote_source = DataSource::remote(store.clone(), obj_path, tile_info);
 
         // Compare several pixel values
         let test_coords = [
@@ -3310,14 +3820,11 @@ mod tests {
         let obj_path = ds_storage::object_store::path::Path::from(filename);
         let file_size = std::fs::metadata(&tif_path).unwrap().len();
 
-        let (meta, tile_info) =
-            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
+        let (meta, tile_info) = TiffMetadata::from_header_read(&store, &obj_path, file_size)
+            .unwrap()
+            .unwrap();
 
-        let remote_source = DataSource::Remote {
-            store: store.clone(),
-            path: obj_path,
-            tile_info,
-        };
+        let remote_source = DataSource::remote(store.clone(), obj_path, tile_info);
 
         let cache = crate::cache::TileCache::new(64 * 1024 * 1024);
         let pseudo_path = PathBuf::from(filename);
@@ -3372,18 +3879,15 @@ mod tests {
             &obj_path,
             std::fs::metadata(&tif_path).unwrap().len(),
         )
+        .unwrap()
         .unwrap();
         let read_before = store.bytes_read();
-        let remote = DataSource::Remote {
-            store: store.clone(),
-            path: obj_path,
-            tile_info: tile_info.clone(),
-        };
-        let http = DataSource::HttpDirect {
-            http: Arc::new(reqwest::Client::new()),
-            url: "http://127.0.0.1:9/unreachable".into(),
+        let remote = DataSource::remote(store.clone(), obj_path, tile_info.clone());
+        let http = DataSource::http(
+            "http://127.0.0.1:9/unreachable".into(),
+            Arc::new(reqwest::Client::new()),
             tile_info,
-        };
+        );
         let _scope = ds_core::deadline::enter(Some(std::time::Instant::now()));
         for source in [remote, http] {
             let result = read_bbox(
@@ -3669,6 +4173,85 @@ mod tests {
         assert_eq!(calls.lock().unwrap()[0], 0..268);
     }
 
+    /// #1004: a render cut off by its deadline keeps the tiles it already
+    /// fetched, so the client's retry fetches only the rest.
+    #[test]
+    fn a_deadline_cut_read_keeps_fetched_tiles_for_the_retry() {
+        let (meta, info, bytes) = batch_fixture();
+        let cache = crate::cache::TileCache::new(4096);
+        let file = Path::new("deadline-fixture");
+        let coords = [(0, 0), (0, 1), (0, 2), (0, 3)];
+        let slow = 204..268; // tile 3
+        let calls = std::sync::Mutex::new(Vec::new());
+        let cut = |range: std::ops::Range<usize>| {
+            calls.lock().unwrap().push(range.clone());
+            if range == slow {
+                // This read outlives the deadline: the others land first, as
+                // on a store, then the storage bridge reports the deadline.
+                let waited = std::time::Instant::now();
+                while (0..3).any(|chunk| !cache.contains_untracked(file, chunk, 0))
+                    && waited.elapsed() < std::time::Duration::from_secs(10)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                return Err(DataServerError::DeadlineExceeded.into());
+            }
+            Ok(Bytes::copy_from_slice(&bytes[range]))
+        };
+        let result = read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            Some(&cache),
+            None,
+            file,
+            0,
+            0,
+            None,
+            1,
+            &cut,
+        );
+        assert!(
+            matches!(result, Err(DataServerError::DeadlineExceeded)),
+            "the deadline fails the read"
+        );
+        for chunk in 0..3 {
+            assert!(
+                cache.contains_untracked(file, chunk, 0),
+                "tile {chunk} kept"
+            );
+        }
+        assert!(!cache.contains_untracked(file, 3, 0));
+
+        calls.lock().unwrap().clear();
+        let retry = |range: std::ops::Range<usize>| {
+            calls.lock().unwrap().push(range.clone());
+            Ok(Bytes::copy_from_slice(&bytes[range]))
+        };
+        let tiles = read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            Some(&cache),
+            None,
+            file,
+            0,
+            0,
+            None,
+            1,
+            &retry,
+        )
+        .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [slow],
+            "the retry fetches the rest only"
+        );
+        for (_, col, tile) in tiles {
+            assert_eq!(tile_samples(&tile), Some(vec![col as f64 + 1.0; 64]));
+        }
+    }
+
     #[test]
     fn batch_short_reads_fall_back_but_deadlines_and_bad_metadata_fail() {
         // Isolate the process-wide budget so the assertion inside the first
@@ -3694,7 +4277,7 @@ mod tests {
                     if call == 1 {
                         assert_eq!(
                         crate::decode_budget::metrics().0,
-                        remote_chunk_layout(&info, meta.samples_per_pixel, 0).unwrap().1,
+                        remote_chunk_layout(&info, meta.samples_per_pixel, 0).unwrap().1 as u64,
                         "first fallback read owns only its tile reservation, not the failed batch"
                     );
                     }
@@ -3737,9 +4320,9 @@ mod tests {
                 4,
                 &|_| {
                     if deadline_error {
-                        Err(DataServerError::DeadlineExceeded)
+                        Err(DataServerError::DeadlineExceeded.into())
                     } else {
-                        Err(DataServerError::ResourceExhausted)
+                        Err(DataServerError::ResourceExhausted.into())
                     }
                 },
             );
@@ -3790,11 +4373,7 @@ mod tests {
             .await
             .unwrap();
         let store = ds_storage::DataStore::new(objects);
-        let remote = DataSource::Remote {
-            store: store.clone(),
-            path: "tiles".into(),
-            tile_info: info.clone(),
-        };
+        let remote = DataSource::remote(store.clone(), "tiles".into(), info.clone());
         let expected = read_bbox(&remote, &meta, 0, 0, 32, 8, None, Path::new("tiles"), 0).unwrap();
         assert_eq!(
             store.bytes_read(),
@@ -3821,11 +4400,7 @@ mod tests {
             stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 268\r\nConnection: close\r\n\r\n").unwrap();
             stream.write_all(&bytes).unwrap();
         });
-        let http = DataSource::HttpDirect {
-            http: Arc::new(reqwest::Client::new()),
-            url,
-            tile_info: info,
-        };
+        let http = DataSource::http(url, Arc::new(reqwest::Client::new()), info);
         let result = read_bbox(&http, &meta, 0, 0, 32, 8, None, Path::new("tiles"), 0).unwrap();
         assert_eq!(result, expected);
         server.join().unwrap();
@@ -3867,14 +4442,11 @@ mod tests {
         let obj_path = ds_storage::object_store::path::Path::from(filename);
         let file_size = std::fs::metadata(&tif_path).unwrap().len();
 
-        let (header_meta, tile_info) =
-            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
+        let (header_meta, tile_info) = TiffMetadata::from_header_read(&store, &obj_path, file_size)
+            .unwrap()
+            .unwrap();
 
-        let remote_source = DataSource::Remote {
-            store: store.clone(),
-            path: obj_path,
-            tile_info,
-        };
+        let remote_source = DataSource::remote(store.clone(), obj_path, tile_info);
 
         let cache = crate::cache::TileCache::new(64 * 1024 * 1024);
         let pseudo_path = PathBuf::from(filename);
@@ -4462,13 +5034,10 @@ mod tests {
         let filename = tif_path.file_name().unwrap().to_str().unwrap();
         let obj_path = ds_storage::object_store::path::Path::from(filename);
         let file_size = std::fs::metadata(&tif_path).unwrap().len();
-        let (meta, tile_info) =
-            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
-        let source = DataSource::Remote {
-            store: store.clone(),
-            path: obj_path,
-            tile_info,
-        };
+        let (meta, tile_info) = TiffMetadata::from_header_read(&store, &obj_path, file_size)
+            .unwrap()
+            .unwrap();
+        let source = DataSource::remote(store.clone(), obj_path, tile_info);
         (store, source, meta, PathBuf::from(filename))
     }
 

@@ -18,6 +18,33 @@ use ds_render::{ColorMap, Heatmap, Panel, Series};
 
 /// Build one panel per parameter from an EDR coverage response.
 pub fn coverage_response_to_panels(resp: &CoverageResponse) -> Result<Vec<Panel>, DataServerError> {
+    let coverages = plotted_coverages(resp)?;
+
+    // Stable, de-duplicated parameter order across every coverage.
+    let mut params: Vec<String> = Vec::new();
+    for q in coverages {
+        let mut keys: Vec<&String> = q.ranges.keys().collect();
+        keys.sort();
+        for k in keys {
+            if !params.iter().any(|p| p == k) {
+                params.push(k.clone());
+            }
+        }
+    }
+
+    params.iter().map(|p| build_panel(p, coverages)).collect()
+}
+
+/// Whether [`coverage_response_to_panels`] plots `resp`, from the same
+/// checks and without building a panel: an HTML data page asks before it
+/// embeds the query's PNG (#1138).
+pub fn is_plottable(resp: &CoverageResponse) -> bool {
+    plotted_coverages(resp).is_ok()
+}
+
+/// The coverages of `resp` when they plot, else why not: at least one, one
+/// domain type, a parameter, and a domain a panel draws.
+fn plotted_coverages(resp: &CoverageResponse) -> Result<&[QueryResult], DataServerError> {
     let coverages: &[QueryResult] = match resp {
         CoverageResponse::Single(q) => std::slice::from_ref(q),
         CoverageResponse::Collection(v) => v.as_slice(),
@@ -40,25 +67,35 @@ pub fn coverage_response_to_panels(resp: &CoverageResponse) -> Result<Vec<Panel>
             "PNG output requires every coverage to share a domain type".into(),
         ));
     }
-
-    // Stable, de-duplicated parameter order across every coverage.
-    let mut params: Vec<String> = Vec::new();
-    for q in coverages {
-        let mut keys: Vec<&String> = q.ranges.keys().collect();
-        keys.sort();
-        for k in keys {
-            if !params.iter().any(|p| p == k) {
-                params.push(k.clone());
-            }
-        }
-    }
-    if params.is_empty() {
+    if coverages.iter().all(|q| q.ranges.is_empty()) {
         return Err(DataServerError::InvalidParameter(
             "no parameters to plot".into(),
         ));
     }
+    match unplottable(&coverages[0].domain) {
+        Some(reason) => Err(reason),
+        None => Ok(coverages),
+    }
+}
 
-    params.iter().map(|p| build_panel(p, coverages)).collect()
+/// Why a domain has no panel; `None` for the two that do.
+fn unplottable(domain: &DomainDescription) -> Option<DataServerError> {
+    let reason = match domain {
+        DomainDescription::VerticalProfile { .. } | DomainDescription::PointSeries { .. } => {
+            return None
+        }
+        DomainDescription::Grid { .. } => {
+            "PNG output is not available for gridded (area) responses"
+        }
+        DomainDescription::Section { .. } => {
+            "PNG output is not available for cross-section (trajectory) responses"
+        }
+        DomainDescription::Point { .. } => "PNG output is not available for point-event responses",
+        DomainDescription::Trajectory { .. } => {
+            "PNG output is not available for along-path trajectory responses"
+        }
+    };
+    Some(DataServerError::InvalidParameter(reason.into()))
 }
 
 fn build_panel(param: &str, coverages: &[QueryResult]) -> Result<Panel, DataServerError> {
@@ -129,15 +166,9 @@ fn build_panel(param: &str, coverages: &[QueryResult]) -> Result<Panel, DataServ
                 series,
             })
         }
-        DomainDescription::Grid { .. } => Err(DataServerError::InvalidParameter(
-            "PNG output is not available for gridded (area) responses".into(),
-        )),
-        DomainDescription::Section { .. } => Err(DataServerError::InvalidParameter(
-            "PNG output is not available for cross-section (trajectory) responses".into(),
-        )),
-        DomainDescription::Point { .. } => Err(DataServerError::InvalidParameter(
-            "PNG output is not available for point-event responses".into(),
-        )),
+        // `plotted_coverages` has already turned these away.
+        other => Err(unplottable(other)
+            .unwrap_or_else(|| DataServerError::InvalidParameter("no data to plot".into()))),
     }
 }
 
@@ -149,6 +180,7 @@ fn domain_kind(d: &DomainDescription) -> &'static str {
         DomainDescription::Grid { .. } => "Grid",
         DomainDescription::Section { .. } => "Section",
         DomainDescription::Point { .. } => "Point",
+        DomainDescription::Trajectory { .. } => "Trajectory",
     }
 }
 
@@ -566,6 +598,62 @@ mod tests {
             ranges,
         };
         assert!(coverage_response_to_panels(&CoverageResponse::Collection(vec![p, ts])).is_err());
+    }
+
+    /// #1138: `is_plottable` answers what building the panels would, for
+    /// each way a response plots or does not.
+    #[test]
+    fn is_plottable_agrees_with_the_panels() {
+        let one_profile = || profile(VerticalKind::ElevationAngle, vec![0.5], vec![Some(1.0)]);
+        let with_domain = |domain| QueryResult {
+            domain,
+            ..one_profile()
+        };
+        let series = || {
+            with_domain(DomainDescription::PointSeries {
+                x: 25.0,
+                y: 60.0,
+                t: vec![DateTime::from_timestamp(1_778_889_600, 0).unwrap()],
+                z: None,
+            })
+        };
+        let grid = with_domain(DomainDescription::Grid {
+            x: vec![1.0],
+            y: vec![1.0],
+            t: None,
+            z: None,
+        });
+        let mut no_parameters = one_profile();
+        no_parameters.ranges.clear();
+        let cases = [
+            ("profile", CoverageResponse::Single(one_profile()), true),
+            ("series", CoverageResponse::Single(series()), true),
+            (
+                "profiles",
+                CoverageResponse::Collection(vec![one_profile(), one_profile()]),
+                true,
+            ),
+            ("nothing", CoverageResponse::Collection(Vec::new()), false),
+            (
+                "no parameters",
+                CoverageResponse::Single(no_parameters),
+                false,
+            ),
+            ("grid", CoverageResponse::Single(grid), false),
+            (
+                "mixed",
+                CoverageResponse::Collection(vec![one_profile(), series()]),
+                false,
+            ),
+        ];
+        for (name, response, plots) in &cases {
+            assert_eq!(is_plottable(response), *plots, "{name}");
+            assert_eq!(
+                coverage_response_to_panels(response).is_ok(),
+                *plots,
+                "{name}"
+            );
+        }
     }
 
     // -- Section → heatmap --

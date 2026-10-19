@@ -59,6 +59,14 @@ serde data); everything with a socket lives here.
   built-in cache-host allowlist**: the Global Cache hostnames vary per cache
   and change without notice. DNS-rebinding TOCTOU is accepted and
   documented in the module.
+- **No replay across restarts.** A new process is a new session (random
+  client id), so whatever an engine accumulated is gone unless it persists
+  it: engines snapshot through the server's `ds_core::state::StateStore`
+  (`[server] state_dir`, #1000; engine-cap is the reference, engine-bufr
+  the second, #1002) and report `LiveStatus::WarmingUp` after a cold start
+  or a long outage (`[….wis2] warmup`, parsed here in `Wis2Config`; its
+  default is the engine's: PT24H for CAP, the shorter of the collection's
+  `retention` and PT24H for BUFR).
 - **Backpressure, not drops:** the subscriber→resolver and resolver→engine
   channels are bounded (1024); a slow consumer stops the MQTT read loop and
   the broker queues (2000/client) rather than us losing messages.

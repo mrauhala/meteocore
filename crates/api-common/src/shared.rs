@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -31,7 +31,9 @@ use ds_core::html::{FormatParams, LinkView, Wanted};
 use serde_json::{json, map::Entry, Map, Value};
 
 use crate::workbench::{self, Surface};
-use crate::{caching, openapi_tags, rel, tag_api_kind, CollectionEntry, CollectionRequest, Mount};
+use crate::{
+    caching, openapi_tags, rel, tag_api_kind, CollectionEntry, CollectionRequest, JsonQuery, Mount,
+};
 
 /// API kind of the shared root's own Common resources in logs and metrics.
 pub const COMMON: &str = "common";
@@ -53,6 +55,9 @@ pub struct Contribution {
     /// because it omits a native CRS with no OGC URI rather than mislabel it,
     /// and a later Features block's CRS84 must not stand in for it.
     pub claims: &'static [&'static str],
+    /// What the collection's HTML overview says of its feature items
+    /// (#1143), from the block serving them.
+    pub items: Option<workbench::ItemsOverview>,
 }
 
 /// OpenAPI paths and components a block adds to the shared definition.
@@ -68,8 +73,17 @@ pub struct OpenApiFragment {
 pub trait BuildingBlock: Send + Sync + 'static {
     /// API kind reported in request logs and metrics.
     fn kind(&self) -> &'static str;
-    /// Conformance classes this block implements at the shared root.
+    /// Conformance classes this block implements on its per-API service and
+    /// at the shared root alike.
     fn conformance(&self) -> &'static [&'static str];
+    /// Classes this block implements only in the shared root's layout, where
+    /// it composes with the other blocks: Tiles serves map tiles under Maps'
+    /// map resources there (`{map}/tiles`), which OGC API - Maps "Map
+    /// Tilesets" requires and neither per-API service has. Declared once at
+    /// the shared root, after [`conformance`](Self::conformance).
+    fn shared_conformance(&self) -> &'static [&'static str] {
+        &[]
+    }
     /// Landing-page links beyond the Common ones, for the absolute API root.
     fn landing_links(&self, _root: &str) -> Vec<Value> {
         Vec::new()
@@ -80,6 +94,12 @@ pub trait BuildingBlock: Send + Sync + 'static {
     fn collections(&self, root: &str) -> Vec<Contribution>;
     /// One collection, or `None` when this block does not serve it.
     fn collection(&self, id: &str, root: &str) -> Option<Contribution>;
+    /// Whether this block serves collection `id`, without assembling its
+    /// description (an error page's link back, #1132). The default builds
+    /// the contribution; a block with a registry overrides it with a lookup.
+    fn serves(&self, id: &str) -> bool {
+        self.collection(id, "").is_some()
+    }
     /// OpenAPI paths (keys prefixed with `mount`) and components.
     fn openapi(&self, mount: &str) -> OpenApiFragment;
     /// Data-access routes, relative to the shared root.
@@ -101,7 +121,8 @@ pub struct SharedApi {
     mount: &'static str,
     blocks: Vec<Arc<dyn BuildingBlock>>,
     related: Vec<RelatedLink>,
-    /// Common classes plus every block's, de-duplicated once.
+    /// Common classes plus every block's (its per-API classes, then its
+    /// shared-root ones), de-duplicated once.
     conformance: Vec<&'static str>,
 }
 
@@ -114,7 +135,9 @@ impl SharedApi {
     ) -> Self {
         assert!(!blocks.is_empty(), "a shared OGC API root needs a block");
         let mut conformance: Vec<&'static str> = crate::CONFORMANCE_CLASSES.to_vec();
-        for class in blocks.iter().flat_map(|b| b.conformance()) {
+        let classes = blocks.iter().flat_map(|b| b.conformance());
+        let shared_only = blocks.iter().flat_map(|b| b.shared_conformance());
+        for class in classes.chain(shared_only) {
             if !conformance.contains(class) {
                 conformance.push(class);
             }
@@ -154,7 +177,22 @@ pub fn router(api: SharedApi) -> Router {
     for block in &api.blocks {
         router = router.merge(tag_api_kind(block.routes(), block.kind()));
     }
+    // Every block's errors, too, are pages for a browser (#1132).
+    let router = crate::errors::html_errors(router, WORKSPACE, mount, Arc::new(Pages(api)));
     router.layer(Extension(Mount(mount)))
+}
+
+/// What the shared root's error pages know: its base URL and catalog.
+struct Pages(AppState);
+
+impl crate::errors::ErrorPages for Pages {
+    fn base_url(&self, headers: &HeaderMap) -> String {
+        self.0.base(headers)
+    }
+
+    fn has_collection(&self, id: &str) -> bool {
+        self.0.blocks.iter().any(|block| block.serves(id))
+    }
 }
 
 fn error(status: StatusCode, code: &str, description: &str) -> Response {
@@ -186,7 +224,7 @@ fn link(href: String, rel: &str, media_type: &str, title: &str) -> Value {
 /// GET {mount}/ — Landing page
 async fn landing_page(
     State(api): State<AppState>,
-    Query(format): Query<FormatParams>,
+    JsonQuery(format): JsonQuery<FormatParams>,
     headers: HeaderMap,
 ) -> Response {
     let wanted = match negotiate(&format, &headers) {
@@ -246,18 +284,25 @@ async fn landing_page(
             let mut views: Vec<LinkView> = links
                 .iter()
                 .map(|l| {
-                    LinkView::new(
+                    let view = LinkView::new(
                         l["href"].as_str().unwrap_or_default(),
                         l["rel"].as_str().unwrap_or_default(),
                         l["title"].as_str(),
-                    )
+                    );
+                    match l["type"].as_str() {
+                        Some(media_type) => view.with_type(media_type),
+                        None => view,
+                    }
                 })
                 .collect();
-            views.push(LinkView::new(
-                format!("{root}/?f=json"),
-                "alternate",
-                Some("This document as JSON"),
-            ));
+            views.push(
+                LinkView::new(
+                    format!("{root}/?f=json"),
+                    "alternate",
+                    Some("This document as JSON"),
+                )
+                .with_type(json),
+            );
             Html(workbench::landing_html(
                 Surface {
                     base,
@@ -276,7 +321,7 @@ async fn landing_page(
 /// GET {mount}/conformance — the union of the blocks' classes
 async fn conformance(
     State(api): State<AppState>,
-    Query(format): Query<FormatParams>,
+    JsonQuery(format): JsonQuery<FormatParams>,
     headers: HeaderMap,
 ) -> Response {
     let wanted = match negotiate(&format, &headers) {
@@ -480,6 +525,7 @@ async fn api_docs_asset(Path(asset): Path<String>) -> Response {
 struct Merged {
     config: CollectionConfig,
     metadata: Value,
+    items: Option<workbench::ItemsOverview>,
     bbox: Option<[f64; 4]>,
     time: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
@@ -488,12 +534,13 @@ struct Merged {
 fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
     let mut contributions = contributions.into_iter();
     let first = contributions.next()?;
-    let (config, mut fields, mut links, mut bbox, mut time) = (
+    let (config, mut fields, mut links, mut bbox, mut time, mut items) = (
         first.config,
         first.fields,
         first.links,
         first.bbox,
         first.time,
+        first.items,
     );
     let mut claimed: Vec<&str> = first.claims.to_vec();
     // Discovery bounds follow the advertised extent: they come from the block
@@ -526,6 +573,7 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
         }
         links.extend(contribution.links);
         claimed.extend(contribution.claims);
+        items = items.or(contribution.items);
     }
     let mut all = vec![json!({
         "href": format!("{root}/collections/{}", config.id),
@@ -538,6 +586,7 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
     Some(Merged {
         config,
         metadata,
+        items,
         bbox,
         time,
     })
@@ -635,7 +684,7 @@ async fn collections(
 async fn collection(
     Path(id): Path<String>,
     State(api): State<AppState>,
-    Query(format): Query<FormatParams>,
+    JsonQuery(format): JsonQuery<FormatParams>,
     headers: HeaderMap,
 ) -> Response {
     let wanted = match negotiate(&format, &headers) {
@@ -658,7 +707,7 @@ async fn collection(
     };
     with_vary(match wanted {
         Wanted::Json => Json(merged.metadata).into_response(),
-        Wanted::Html => Html(workbench::collection_html(
+        Wanted::Html => Html(workbench::collection_page(
             Surface {
                 base,
                 root,
@@ -666,6 +715,7 @@ async fn collection(
             },
             &merged.metadata,
             merged.config.license.as_ref(),
+            merged.items.as_ref(),
         ))
         .into_response(),
     })
@@ -684,6 +734,7 @@ mod tests {
             bbox: None,
             time: None,
             claims: &[],
+            items: None,
         }
     }
 
@@ -730,6 +781,26 @@ mod tests {
             .unwrap()
             .metadata;
         assert_eq!(merged["storageCrs"], crs84);
+    }
+
+    /// The items overview comes from the block that serves the items
+    /// (#1143), whatever its place in block order.
+    #[test]
+    fn merge_keeps_the_items_overview_of_the_block_serving_items() {
+        let overview = workbench::ItemsOverview {
+            filterables: vec!["name".into()],
+            ..Default::default()
+        };
+        let mut features = contribution("a", json!({}), vec![]);
+        features.items = Some(overview.clone());
+        let merged = merge(
+            vec![contribution("a", json!({}), vec![]), features],
+            "https://x",
+        )
+        .unwrap();
+        assert_eq!(merged.items, Some(overview));
+        let merged = merge(vec![contribution("a", json!({}), vec![])], "https://x").unwrap();
+        assert_eq!(merged.items, None);
     }
 
     #[test]

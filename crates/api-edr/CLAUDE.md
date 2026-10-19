@@ -49,7 +49,8 @@ Key schema rules:
    requirements.
 4. Add a validation test in `tests/covjson_validation.rs`.
 
-Currently implemented: `PointSeries`, `Grid`, `VerticalProfile`.
+Currently implemented: `Point`, `PointSeries`, `Grid`, `VerticalProfile`,
+`Section`, `Trajectory`.
 
 ## Instances (forecast model runs, #337)
 
@@ -57,12 +58,100 @@ The shared machinery is `ds_core::instances` (see root CLAUDE.md). This crate
 owns the instance-id string form:
 
 - Routes: `GET /collections/{id}/instances`, `/instances/{instanceId}`,
-  `/instances/{instanceId}/{position,area}`. No-instance routes default to
-  the latest run.
+  `/instances/{instanceId}/{position,area,radius,cube}`
+  (`handlers::INSTANCE_QUERY_TYPES`). No-instance routes default to the
+  latest run.
 - Collection metadata gains an `instances` data_query, and the OpenAPI spec
   advertises the instance paths — both gated on `get_instances()` being
   non-empty.
 - Unknown instance id → 404 (`select_run` returns `None`).
+- `/instances` lists runs **newest first** (descending reference time,
+  #1054: on an archive the latest run was on the last page).
+  Engines keep answering ascending (`get_instances`,
+  `instance_reference_times`, `build_instances`), and WMS `reference_time`
+  (`RasterInfo.reference_times`) stays ascending; run selection
+  (`select_run`, `None` ⇒ latest) picks by key and has no order. Only the `instances` handler sorts
+  descending, before paging, so `offset` 0 is the latest run and `next`
+  walks toward the oldest. Never reverse it in an engine or in
+  `build_instances`. Pinned by `instances_tests`
+  `instances_pages_run_newest_first_across_page_boundaries`.
+- The id is `ds_core::instances::format_instance_id`: RFC 3339 UTC,
+  `2026-06-07T06:00:00Z` (MetOcean EDR profile, #947). Links carry its
+  colons unencoded (RFC 3986 `pchar`): never pass it through
+  `encode_path_segment`, which encodes `:`. A link echoing a request's id
+  re-emits the canonical form (`handlers::instance_path_segment`), since
+  `{instanceId}` also accepts other RFC 3339 offsets and the pre-#947
+  compact `20260607T0600Z` stamp.
+
+### Long run axes (#1006)
+
+An archive can keep thousands of runs; its instances list was once 95 MB.
+`ds_core::time_axis` decides what is long (`MAX_LISTED_VALUES`, 500, shared
+with WMS):
+
+- `/instances` never builds every run of a long axis: it reads
+  `EdrEngine::instance_reference_times` (keys only), pages it
+  (`INSTANCES_PAGE_SIZE` 100 without `limit`, `limit` clamped to 500,
+  `offset`, `page_window`, `numberMatched`/`numberReturned`, `next`/`prev`)
+  and builds the page's runs with `find_instance`, newest first. Without
+  `limit` a list of at most 500 runs is answered whole via `get_instances`,
+  sorted newest first like a page. `params::parse_instances_query` 400s
+  anything but `f`, `limit`, `offset`, and `offset` without `limit`.
+- What every run's document shares is read from the engine once per request:
+  `CollectionMetadata::new`, then `build(Some(run))` per run. Never call
+  `build_collection_metadata` in a per-run loop.
+- Collection metadata never describes the run axis: no `extent.custom`, and
+  nothing in `CollectionMetadata` reads `instance_reference_times` or
+  `get_instances` (`instances_tests`' `archive-doc` mock panics on either), so a
+  collection document stays O(1) in the run count. EDR makes a custom
+  dimension's `id` a data-query parameter
+  (`/req/edr/custom-dimension-response`), and the data queries do not take
+  `reference_time`: advertising the run axis as a custom dimension waits for
+  that parameter. Repeating intervals in `extent.temporal.values` fail the
+  EDR 1.1 bundle, which types its items as date-times, while 1.1 is declared.
+- A forecast engine overriding `get_instances` overrides
+  `instance_reference_times` too, from its run map's keys; the default clones
+  every run's valid times.
+
+## Output formats, GeoJSON (#929) and CSV (#1066)
+
+- `params::query_formats(query_type, engine.serves_station_series())` is
+  the one list of formats a data query offers: the handler negotiates over
+  it (`f`, else `Accept` by q-value, else the default), and
+  `data_query_variables` (`output_formats`) and `api_definition()` print
+  it. Never hard-code a format list elsewhere. When `Accept` chose among
+  several formats the response carries `Vary: Accept`.
+- EDR GeoJSON (`src/geojson.rs`) is one feature per coverage (per station),
+  the series as `time` + per-parameter arrays in `properties`. It names each
+  coverage by the one `get_locations()` entry at its exact coordinates: that
+  is what `EdrEngine::serves_station_series` promises. An engine opting in
+  must pin it with a test (`station_series_sit_at_listed_locations`).
+  `/locations/{id}` names its coverages by the requested id instead, and a
+  list by each coverage's own id: `query_location_list` returns the owner
+  of every coverage (`GeoJsonRequest::location_ids`).
+- GeoJSON rendering reads `get_locations()`, so it runs inside the query
+  executor with the query, never on an HTTP worker.
+- `get_locations()` is the engine's shared `Arc<LocationSnapshot>` (#1083).
+  Every path borrows from it: `/locations` pages are slices
+  (`response::LocationRows`), and `items`, GeoJSON and CSV naming and the
+  unknown-id check of a location list look ids up with
+  `LocationSnapshot::by_id`; GeoJSON and CSV name a coverage by its point
+  through `LocationSnapshot::at`, an index built once per snapshot. Never
+  copy the list, or build a set or index of it, per request: at 200 000
+  stations a copy is about 20 MB.
+- CSV (#1066, `src/csv.rs`) is offered where GeoJSON is and on a station
+  collection's `area`: one long-form row per location, time and parameter,
+  named through the same `StationNames` and `geojson::station_series_axes`,
+  so it also renders on the executor. Numbers go through
+  `serde_json::Number` (the JSON's own text); text cells keep RFC 4180
+  quoting and the OWASP formula guard (a `'` before `= + - @`, tab, CR or
+  `'` at a cell's start, and before those or `"` right after a `;`, so it
+  undoes exactly). A row is 10 to 20 times a CoverageJSON value's bytes,
+  so the body has its own cap, `csv::MAX_BYTES` (64 MiB, a 400 over it):
+  one writer runs twice, into a counting sink that stops at the cap, then
+  into a buffer of exactly the counted size. Keep both passes on the same
+  code, and never reserve per series.
+  Never offer it for a gridded result without a decided layout.
 
 ## Radius queries (#513)
 
@@ -82,21 +171,129 @@ The radius is capped at 1000 km (`params::MAX_WITHIN_M`); a circle
 containing a pole or crossing the antimeridian is a 400 (#667). Engine
 errors from all data-query handlers map through `map_query_error`.
 
+## Trajectory (#926)
+
+`EdrEngine::trajectory_shape` decides what `/trajectory` is for a
+collection, and the handler, `data_queries` and `api_definition()` all read
+it:
+
+- `AlongPath` (default; GRIB, QueryData, Zarr): the handler parses the
+  whole WKT with `ds_core::trajectory::TrajectoryPath` before dispatch and
+  enforces EDR 1.2's exclusions (Z/ZM + `z`, M/ZM + `datetime` → 400);
+  CoverageJSON (and HTML) only — `params::query_formats` takes the shape, so the
+  handler's negotiation (`f=PNG`/`GeoJSON` → 400 before the query runs) and
+  `data_queries.trajectory` `output_formats` cannot disagree; runs on the
+  query runtime's workers like position. Engines build the response with
+  `ds_core::trajectory::TrajectoryPlan` — never a per-engine copy of the
+  parse/densify/snap/layout rules — and sample per field, chunk or window,
+  never per sample.
+- `CrossSection` (ODIM PVOL sites): the coords go to the engine unparsed
+  (its own 2-D parser), PNG heatmaps are offered, and it runs on the
+  blocking pool (`blocking_pixel_handle` needs a blocking thread).
+
+The `Trajectory` domain's composite tuples must be unique (`uniqueItems`):
+the plan drops a repeated node, which reads the same field at the same place.
+
+## Cube queries (#925)
+
+`GET /collections/{id}/cube` (and the `/instances/{id}/cube` twin) calls
+`EdrEngine::query_cube` with a parsed `ds_core::feature::Bbox`, the resolved
+`z` levels and a `ds_core::cube::CubeResolution`. The handler reads the raw
+query pairs through `params::CubeQueryParams::from_pairs`, so an unknown or
+repeated parameter is a 400 listing `params::CUBE_PARAMETERS` — keep that
+list, the OpenAPI operation (`cube_operation`) and the README in step. It
+404s a collection that does not advertise `cube` before validating anything,
+rejects `PNG` and any `crs` but CRS84 (`params::check_crs`), requires `bbox`
+(four numbers, or six whose vertical pair is a `z` interval an explicit `z`
+overrides), and maps `resolution-*=0` to `None` (native). On a
+collection without a vertical axis `z` and a six-number bbox's vertical pair
+are ignored (EDR 1.2 `/req/edr/z-response` A, via `resolve_z_selector`) but
+`resolution-z` is a 400. A `datetime` list goes through `datetime_list::run`
+like the other data queries: each instant's `[t, z, y, x]` grid shares x, y
+and z, so the merge joins them along `t`. `data_queries.cube.link.variables.height_units` (required by EDR 1.2)
+is the vertical axis unit. The OpenAPI parameters are the EDR 1.2
+`cube-bbox`, `cube-z`, `resolution-x/-y/-z` and `crs` components, copied
+verbatim (`crs` adds its requirement's `style`/`explode`, says it accepts
+CRS84 only and gives CRS84 as its example instead of `native`).
+`ds_core::cube` holds the shared pieces engines use: `axis_positions`
+(both ends included), `nearest_indices` (half-cell tolerance, a position off
+the grid is missing) and `check_cube_budget` (`MAX_AREA_VALUES` across
+timesteps × levels × cells × parameters).
+
+## Items (#928)
+
+`GET /collections/{id}/items[/{itemId}]` (`src/items.rs`) delegates to the
+collection's `FeatureEngine`; there is no `EdrEngine` method for it. The
+server fills `EdrState::feature_engines` in `admin.rs`
+(`EngineHandle::edr_items_engine`) for every EDR collection whose engine
+implements both traits over the same collection (CSV, BUFR, PostGIS stations,
+nowcast) — `edr` in `apis` enables it, `features` is not required. Only those
+collections get `data_queries.items`, the `/api` paths and a non-404 route,
+and never under an instance.
+
+- Reuse, do not re-implement: bbox/datetime parsing, the GeoJSON encoding and
+  the paging links come from `api-features` (`params`, `response`) — the one
+  API-to-API dependency. A Features change to them changes EDR items too.
+- EDR's own parts: `limit` per `/req/edr/rc-limit-*` (default 10, max 10 000
+  clamped, anything but a positive integer 400), links under `/edr`, GeoJSON
+  only, execution on the EDR executor, ETag over the page with `timeStamp`
+  blanked.
+- Only `bbox`, `datetime`, `limit`, `offset`, `f` (item: `f`); anything else,
+  or a repeat, is a 400 naming them. Adding a Features extension (`sortby`,
+  property filters, `crs`) means validating it here and documenting it in
+  `openapi_parameters`.
+- No `itemType` or `rel=items` link on the collection: the workbench and
+  Features clients read those as a Features resource with an HTML view.
+- The body is EDR GeoJSON (`/req/edr-geojson/content` A, #970): `EdrMembers`
+  adds `datetime`, `parameter-name`, `label` and `edrqueryendpoint` to every
+  feature's properties, after the Features encoding and only here, never in
+  the Features API's `/items`. A station item is one of the collection's
+  locations and gets what its `/locations` feature says, from the same
+  sources (`get_locations`, `get_parameters`, `get_temporal_extent`), so the
+  two cannot disagree; `crates/server/tests/edr_geojson.rs` pins that on CSV
+  and BUFR and follows the endpoint. Location ids in links go through
+  `geojson::encode_path_segment`, on `/locations` too. An item that is no
+  location (a nowcast cell) names the radius query its engine sizes in
+  `EdrEngine::item_radius`, else a position query, else the collection;
+  the nowcast case is followed end to end in the same test file.
+
 ## Misc
 
+- **`data_queries` link variables (#918).** `data_query_variables` in
+  `src/handlers.rs` is the one table of what each query type advertises:
+  `title`, `description`, `output_formats`, `default_output_format` and
+  `crs_details` (`params::{DATA_QUERY_CRS, CRS84_WKT}`), all required by
+  EDR 1.2. A query type without an arm there is not advertised at all, so a
+  new query type needs one. Trajectory's arm depends on the engine's
+  `TrajectoryShape` (formats and description). When `crs` lands (#84), its CRSs join
+  `crs_details`; keep the WKT longitude-first (`crs84_wkt_is_longitude_first`).
 - Cross-section responses (`query_trajectory`, ODIM PVOL) are CoverageJSON
   `Section` with a composite `[t,x,y]` axis + numeric `z` axis. When the
   domain carries `coverage_floor` (#514), the JSON emits it as the
   `meteocore:beamCoverage` **foreign member** on the domain (raw metres,
   one per node) — NOT an axis (the schema forbids extra axes) and NOT a
   parameter (naive clients would plot it as data); the `f=png` heatmap
-  draws it as a hatched-below "lowest beam" overlay line.
+  draws it as a hatched-below "lowest beam" overlay line. The PNG stacks one
+  panel per parameter; size it with `params::section_plot_dimensions`
+  (default height grows with the panels, a misfit is a 400 naming
+  `parameter-name`), never let `render_heatmap` fail it as a 500.
 - `f=png` time-series plots are why this crate (alone among API crates)
   depends on ds-render.
 - A location with no data in the requested window returns `LocationNotFound`
-  → 404 (an empty PointSeries would fail schema validation).
+  → 404 (an empty PointSeries would fail schema validation). In a list of
+  ids it contributes nothing instead; see "Location lists" below.
 - When adding endpoints or params, update `api_definition()` in
   `src/handlers.rs` (OpenAPI).
+- **`/api` lists every status a route answers (#965,
+  `/req/oas/completeness`).** Build an operation's `responses` with
+  `responses(ok, METADATA_ERRORS | QUERY_ERRORS)`;
+  `document_router_responses` adds 304 (`conditional_get`) and 500 to every
+  operation. A status a route newly answers joins `SHARED_RESPONSES` and the
+  operation's list: `tests/openapi_tests.rs` sends requests and fails on an
+  answered status the operation does not document. Every data query reads
+  and declares `crs` (`request_crs`, CRS84 only, #84) and `f`, whose `enum`
+  only `data_format_parameter` builds. `/api` is sent as
+  `application/vnd.oai.openapi+json;version=3.0`.
 - **Per-parameter time axes (#819).** When
   `EdrEngine::get_parameter_available_times(name)` is `Some`, that
   parameter's `parameter_names` entry carries its own `extent.temporal`
@@ -104,6 +301,33 @@ errors from all data-query handlers map through `map_query_error`.
   stays the union. Instances keep the run's axis. Built by
   `temporal_extent_json`, the same builder as the collection extent;
   `per_parameter_temporal_extent_validates` pins it against the schema.
+
+## `z` and `datetime` grammar (EDR 1.2, #921)
+
+- `z` is parsed by `params::parse_z` (level, list, closed and open
+  intervals, recurring `Rn/min/step` → a list) and resolved by the
+  handlers' `resolve_request_z`: a collection with no vertical extent
+  **ignores** a well-formed `z` (`/req/edr/z-response` A, a SHALL); a
+  malformed one is a 400. Do not reintroduce the old 400 — WMS/Maps/Tiles
+  `ELEVATION`/`elevation` keep theirs, EDR does not.
+- A `datetime` list `T1,T2,T3` (`params::parse_datetime`) is one engine
+  query per instant `(t, t)`, merged by `src/datetime_list.rs`. Every data
+  query handler calls the engine through `datetime_list::run`; a new one
+  must too, rather than converting the selector to one engine window itself.
+  The list skips an instant only on `LocationNotFound`, so an engine must
+  report "no step/row in the window" as that (404), never `InvalidParameter`,
+  which fails the whole list (#968). A `Grid` without `t` gets a one-step
+  `t` axis at its instant before the merge, so gridded areas join along `t`;
+  single-`datetime` responses keep the engine's shape.
+- A repeating interval `Rn/date-time/duration` (#933) expands inside
+  `parse_datetime` to the same `DatetimeSelector::Instants`, so handlers
+  never see it. `n` counts instants, like `z`'s `Rn` (the informative
+  annex's "repetitions" reading is the outlier); the duration goes through
+  `ds_core::datetime::parse_iso8601_duration`, which rejects years and
+  months and must stay overflow-safe, since request input reaches it.
+- An interval that ends before it starts is a 400 in `parse_datetime`, on
+  every route (#932), as in Features, Maps and Tiles. Before, it reached the
+  engines: CSV and BUFR `BTreeMap::range` panic on a reversed range.
 
 ## Caching headers (#499)
 
@@ -131,13 +355,18 @@ Features `items` handler).
 
 ## Query execution and limits (#178, #585)
 
-Every data query uses `executor`: normal engines run on a dedicated multi-thread
-runtime (storage sync bridges are valid there), trajectories use its blocking
-pool for their explicit-handle I/O. Never call synchronous engines directly on
+Every data query uses `executor`: normal engines run as tasks on ds-executor's
+shared query runtime, `ds_executor::query_runtime()` (storage sync bridges are
+valid there), cross-section trajectories on its blocking pool for their
+explicit-handle I/O. WMS GetFeatureInfo runs on the same runtime (#1103):
+never build a runtime of this crate's own again. The admission and the
+30-second `QUERY_TIMEOUT` stay this crate's, apart from GetFeatureInfo's
+render slots and deadline: `ds_executor::query_workers()` queries run at once
+(2–8, one per runtime worker). Never call synchronous engines directly on
 HTTP workers. The admission queue is bounded to 32 waiting requests; deadlines include queue
-time. Beyond the queue, admission fails fast. Permits live with the
+time and any wait for a runtime worker, which GetFeatureInfo queries share. Beyond the queue, admission fails fast. Permits live with the
 work, including after client timeout/disconnect. Check `QueryBudget::expired`
-between MULTIPOINT elements. Validate the whole coordinate list before dispatch;
+between MULTIPOINT elements and between listed location ids. Validate the whole coordinate list before dispatch;
 keep point, byte and combined-value limits and OpenAPI/README documentation aligned.
 
 Position handlers delegate the validated POINT list to `EdrEngine::query_positions`.
@@ -146,6 +375,73 @@ The response callback enforces the combined value limit and cancellation before
 accepting each point. Batch implementations must also check their full allocation
 budget before fetching. The executor installs `ds_core::deadline` for storage
 and engine loops; propagate it explicitly to field workers and map expiry to 504.
+
+## `limit` and locations paging (EDR 1.2, #922)
+
+`params::parse_limit` is the one parser: 1…`MAX_LIMIT` (10000), larger values
+clamp, anything else is a 400, absent means no limit. Every data-query handler
+that returns CoverageJSON passes its result through `limit_coverages` (top-level
+coverages only); position also truncates the point list before dispatch, which
+is safe because an answered point always yields at least one coverage. A new
+data-query route must do the same and list `#/components/parameters/limit` in
+`api_definition()`, trajectory and cube included: EDR 1.2
+`/req/edr/rc-core-query-parameters` L allows `limit` on every data query and
+has a format that cannot page ignore it (#983), so a valid `limit` is never a
+400. A single coverage passes `limit_coverages` unchanged; the cross-section
+PNG skips it (it plots the newest section). A malformed `limit` is still a 400
+everywhere, as a malformed `z` is. `/locations` without `limit` or a filter must stay byte-identical to
+the unpaged inventory (clients and ETags rely on it); with `limit` it pages
+through `ds_core::collection_search::page_window`, the `/collections`
+arithmetic, under the same `location_budget` writer. That rule is the
+GeoJSON's: the HTML page pages `handlers::LOCATIONS_HTML_PAGE` (100) by
+default (#1138), and its row links carry `location_view_datetime`, never
+the collection's last day on a station series (a station that stopped
+reporting 404s there).
+
+HTML data queries (#1138): `query_form::DATA_QUERIES` is the one list of
+coordinate-placed queries and their placing parameter (`coords`, a cube's
+`bbox`), read by `bare_query_form` (an HTML request without it is a 200
+form, JSON keeps the 400), `error_pages::error_detail` and the breadcrumbs,
+all from the matched route (`routed_query`), never the URL's last segment.
+A new data query route ends in its query name and is added to that list.
+Every field a form submits without JavaScript must parse: a blank `z` or
+`parameter-name` is absent (`parse_z`, `parse_parameter_names`), so parse
+any new form field through a helper that treats blank as absent.
+
+`params::parse_locations_query` is the one `/locations` parser (#932).
+`bbox` (`parse_cube_bbox`, heights dropped), then `datetime`, filter the
+`get_locations()` snapshot before paging, so `numberMatched` and the
+links count the filtered list; an unpaged filtered list gets a `self` link
+carrying its query. `datetime` is the engine's answer:
+`EdrEngine::location_time_filter` takes `DatetimeSelector::intervals()` (open
+ends unbounded, a list as one instant interval each) and returns a predicate,
+built on the executor after `get_locations` (it may hold a read guard) and
+called per location. Its rule is the Features one (#682): at least one
+observation in an interval, from the same engine code as `/items`, so the
+two list the same stations (CSV `has_rows_in`, BUFR `has_report_in`, ODIM
+PVOL site views the network's `any_time_in_interval` over volume times).
+The default `None` (PostGIS stations, every gridded engine) is a 400 naming
+the collection, never the unfiltered list. A new station engine implements
+it from in-memory indexes, never storage or SQL per request.
+
+## Location lists (EDR 1.2, #923)
+
+`/locations/{locationId}` takes a comma-delimited list
+(`params::split_location_ids`), split on the raw path segment from the `Uri`
+extractor: a literal comma separates, `%2C` belongs to an id. Never split the
+decoded `Path` value, which cannot tell them apart. One id, a repeat-only list
+included, keeps the single-id path byte for byte. A list goes through
+`query_location_list`: one engine `query_location` per id in request order,
+flattened into one CoverageCollection (or, on a station collection, one EDR
+GeoJSON FeatureCollection, never PNG), capped at
+`MAX_LOCATION_IDS` ids and `MAX_LOCATION_VALUES` values. A `datetime` list
+runs per id through `datetime_list::run`, and ids × instants is capped at
+`MAX_LOCATION_LOOKUPS` before any engine call. Engines return
+`LocationNotFound` for unknown ids and no-data ids alike, so the handler
+consults `get_locations()`, lazily and once, to answer 404 for an unknown id
+and 204 when every id is known and none has data. The fan-out is
+engine-independent, which is why `data_query_variables` advertises
+`multiple_locations: true` for every collection that serves locations.
 
 ## Shared Common discovery (#739)
 

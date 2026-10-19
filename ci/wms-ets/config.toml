@@ -1,0 +1,152 @@
+# Fixture server for the OGC WMS 1.3.0 executable test suite (ets-wms13),
+# started by .github/workflows/wms-ets.yml (#1065). Run from the repository
+# root:
+#
+#   cargo run -p server -- --config ci/wms-ets/config.toml
+#
+# Every data_path is a fixture committed to the repository: CI checks out
+# nothing else, and most testdata/ directories are untracked. Check with
+# `git ls-files testdata/<dir>` before pointing a collection at a new one.
+#
+# The collections cover the WMS layer shapes the suite should see:
+#
+# - ets-geotiff:        a plain raster, one GeoTIFF on a projected
+#                       (EPSG:3067) grid; its time axis has one value.
+# - ets-radar:          a time axis, five 5-minute radar frames.
+# - ets-grib-pressure:  an elevation axis (GRIB pressure levels) and a
+#                       model-run axis (`reference_time`). The committed
+#                       fixture holds one level (150 hPa) of one run, so
+#                       both axes have a single value.
+# - ets-multi:          a multi-parameter GRIB forecast (ARPEGE 10 m wind):
+#                       a parent layer with one child layer per parameter,
+#                       a model-run axis of one run, and an <Attribution>.
+# - ets-netcdf-levels:  several pressure levels and model runs (MEPS
+#                       CF-NetCDF): an elevation axis of four levels and a
+#                       model-run axis of two runs, declared on the parent
+#                       layer and inherited by its child layers.
+#
+# The ids decide which layer the suite tests. GetCapabilities lists the
+# layers in collection-id order, ets-geotiff, ets-grib-pressure,
+# ets-multi/<param>, ets-netcdf-levels/<param>, ets-radar, and several tests
+# take the first or the last named layer, so every run tests the same layers
+# (#1102). Give a new collection an id that sorts after ets-multi and before
+# ets-radar, the last. One with child layers must sort after ets-multi,
+# because getmap:bbox-inherited and the multi-style tests take the first
+# child layers. Keep a top-level layer without data at 0°N 0°E first:
+#
+# - On a child layer, getmap:layerlimit and getmap:transparent-opaque-layer
+#   fail on the suite's own request: the first encodes the name twice, the
+#   second sends an empty CRS for a layer that inherits its BoundingBox.
+# - getmap:transparent-default asks for a box around 0°N 0°E without
+#   TRANSPARENT. Over no data it tests the default itself, FALSE (#1065):
+#   the empty image is opaque BGCOLOR white. Over data, such as the global
+#   ets-grib-pressure, it passes whatever the default.
+
+[server]
+# The suite's container shares the runner's network (`--network host`), so
+# the capabilities' OnlineResource, http://127.0.0.1:8000/wms, is reachable
+# from it unchanged.
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "ets-geotiff"
+title = "Plain raster (GeoTIFF, EPSG:3067)"
+description = "One radar reflectivity GeoTIFF on the ETRS-TM35FIN grid"
+data_path = "testdata/radar-tm35fin"
+engine_type = "geotiff"
+apis = ["wms"]
+
+[collections.geotiff]
+filename_template = "radar_tm35_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 3600
+
+[collections.wms]
+colormap = "radar_dbz"
+
+[[collections]]
+id = "ets-radar"
+title = "Time axis (radar series)"
+description = "Five radar reflectivity frames five minutes apart"
+data_path = "testdata/radar"
+engine_type = "geotiff"
+apis = ["wms"]
+keywords = ["radar", "reflectivity"]
+
+[collections.geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 3600
+
+[collections.wms]
+colormap = "radar_dbz"
+
+[[collections]]
+# Registered as `ets-grib-pressure`: level_types expands the source into
+# one collection per level family present.
+id = "ets-grib"
+title = "Elevation axis (GRIB pressure levels)"
+description = "Specific humidity at 150 hPa from one forecast run"
+engine_type = "grib"
+apis = ["wms"]
+
+[collections.grib]
+data_path = "testdata/grib-local"
+level_types = ["pressure"]
+poll_interval_secs = 3600
+
+[collections.wms]
+colormap = "viridis"
+
+[[collections]]
+# Not `ets-arpege`, which would sort first and put a child layer first.
+id = "ets-multi"
+title = "Multi-parameter forecast (GRIB)"
+description = "ARPEGE 10 m wind components, speed and direction from one run"
+engine_type = "grib"
+apis = ["wms"]
+
+[collections.license]
+title = "Licence Ouverte / Open Licence Etalab 2.0"
+url = "https://www.etalab.gouv.fr/licence-ouverte-open-licence/"
+
+[collections.grib]
+data_path = "testdata/grib-arpege-wind"
+poll_interval_secs = 3600
+
+# Each parameter layer takes its built-in default style (wind speed,
+# direction, components); this is the collection-level fallback.
+[collections.wms]
+colormap = "wind_speed"
+
+[[collections]]
+# Sorts after ets-multi and before ets-radar, the last named layer.
+id = "ets-netcdf-levels"
+title = "Pressure levels and model runs (CF-NetCDF)"
+description = "MEPS air temperature and wind on four pressure levels from two forecast runs"
+engine_type = "netcdf"
+apis = ["wms"]
+
+[collections.license]
+title = "CC-BY-4.0"
+
+# The committed MEPS pressure-level sample (testdata/meps-netcdf-pl/README.md):
+# runs 2026-10-15 06Z (leads 0-2) and 09Z (leads 0-1) at 1000, 850, 500 and
+# 300 hPa. The layers are the variables listed here and the wind speed the
+# server derives from the x/y components, ets-netcdf-levels/wind_speed_pl.
+[collections.netcdf]
+data_path = "testdata/meps-netcdf-pl"
+filename_template = "meps_pl_{lead}_%Y%m%dT{run}Z.nc"
+variables = ["air_temperature_pl", "x_wind_pl", "y_wind_pl"]
+poll_interval_secs = 3600
+
+# Each parameter layer takes its built-in default style (temperature, wind
+# components, wind speed); this is the collection-level fallback, the
+# temperature palette over -90…50 °C in kelvin.
+[collections.wms]
+colormap = "temperature"
+min = 183.15
+max = 323.15

@@ -304,13 +304,24 @@ pub fn render_composite_tiles(
     format: ImageFormat,
     background: Option<[u8; 3]>,
 ) -> Result<Option<Vec<u8>>, DataServerError> {
-    ds_core::deadline::check()?;
-    let Some(mut rgba) = compose_tiles(tiles, spec)? else {
+    let Some(mut rgba) = render_composite_tiles_rgba(tiles, spec)? else {
         return Ok(None);
     };
     // `compose_tiles` composed, so `tiles[0]` exists and sets the size.
     let (width, height) = (tiles[0].width, tiles[0].height);
     encode_rgba(&mut rgba, width, height, format, background).map(Some)
+}
+
+/// The RGBA pixels [`render_composite_tiles`] encodes, with no background,
+/// or `None` when every pixel is nodata: [`compose_tiles`] under the
+/// render deadline. A WMS GetMap of several layers draws them over the
+/// layers below it (#1181).
+pub fn render_composite_tiles_rgba(
+    tiles: &[RasterTile],
+    spec: &CompositeSpec,
+) -> Result<Option<Vec<u8>>, DataServerError> {
+    ds_core::deadline::check()?;
+    compose_tiles(tiles, spec)
 }
 
 /// The unit of each of `spec`'s planes, from the engine's parameter

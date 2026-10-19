@@ -2,11 +2,23 @@ mod cache;
 mod catalog;
 pub mod decode_budget;
 mod decoded_cache;
+#[cfg(test)]
+mod footprint_tests;
+mod gone;
+#[cfg(test)]
+mod gone_object_tests;
 mod parse;
+mod prewarm;
+#[cfg(test)]
+mod prewarm_tests;
 mod range_batch;
 mod reader;
 #[cfg(test)]
+mod remote_header_tests;
+#[cfg(test)]
 mod stac_preload_tests;
+#[cfg(test)]
+mod tile_fetch_failure_tests;
 
 /// Snapshot of the process-global decoded-chunk cache (#463) for `/metrics`:
 /// `(hits, misses, bytes, capacity_bytes)`.
@@ -32,7 +44,7 @@ use chrono::{DateTime, Utc};
 use ds_poll::Shutdown;
 use ds_storage::discovery::{
     expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, FilenameMatcher,
-    ScanSpec, TimeWindow,
+    PendingFile, ScanSpec, TimeWindow,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -42,7 +54,7 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
-use crate::catalog::{scan_directory, scan_remote, Catalog, PendingFile};
+use crate::catalog::{scan_directory, scan_remote, Catalog};
 
 /// Tracks STAC entries currently being loaded, deduplicating concurrent
 /// loads: the first caller claims the path and loads, later callers park on
@@ -211,8 +223,15 @@ pub struct GeoTiffEngine {
     stac_consecutive_failures: AtomicU32,
     /// Circuit breaker: last STAC API attempt time.
     stac_last_attempt: Mutex<Option<std::time::Instant>>,
-    /// Tracks when the catalog was last successfully updated.
+    /// When the engine loaded or a poll last swapped in a catalog that
+    /// found files ([`Self::poll_age`]). Not the data's age: a poll that finds
+    /// the same files again stamps it too (#1007).
     catalog_updated_at: Mutex<Option<DateTime<Utc>>>,
+    /// Remote objects a tile read found gone after the scan, and the
+    /// `content_version` that moves when one's timestep comes back (#1074).
+    gone: gone::GoneObjects,
+    /// Rate limit for the WARN about forbidden tile ranges (#1074).
+    forbidden_warnings: gone::ForbiddenWarnings,
 }
 
 /// Most newly discovered STAC items whose metadata one poll cycle preloads
@@ -226,6 +245,130 @@ const STAC_PRELOAD_CONCURRENCY: usize = 4;
 /// delays the next catalog poll by at most this. Unfinished items are left to
 /// the request path.
 const STAC_PRELOAD_BUDGET: Duration = Duration::from_secs(60);
+/// Most STAC items without loaded metadata one EDR query may load (#889).
+/// A closed one-day window of five-minute frames holds 289 items; this
+/// leaves headroom for that. Each costs the asset host a header read (a
+/// HEAD when the item has no `file:size`, a 512 KB range read, a full
+/// download for a non-COG), `STAC_PRELOAD_CONCURRENCY` at a time: at most
+/// 100 rounds, which fit the 30 s EDR deadline on a responsive host.
+/// Counted from the STAC response before its items are installed and before
+/// any load; more is a 400 naming both counts. An on-demand listing stops
+/// paging once its window holds more (#1075).
+const STAC_REQUEST_MAX_COLD_ITEMS: usize = 400;
+
+/// One STAC stub to load: its timestamp, its single-flight path, its asset
+/// URL and its size from the STAC item (0 when unknown).
+type StacLoadTarget = (DateTime<Utc>, PathBuf, String, u64);
+
+/// The load target of a catalog entry that is still a STAC stub.
+fn stac_load_target(
+    (timestamp, entry): (&DateTime<Utc>, &catalog::FileEntry),
+) -> Option<StacLoadTarget> {
+    let stub = entry.stac_stub_info()?;
+    Some((
+        *timestamp,
+        entry.path.clone(),
+        stub.asset_url.clone(),
+        entry.file_size,
+    ))
+}
+
+/// What [`GeoTiffEngine::claim_and_load_stac_entry`] did with one STAC stub.
+#[derive(Debug, PartialEq, Eq)]
+enum StacLoad {
+    /// This call fetched and installed the metadata.
+    Loaded,
+    /// Nothing to do: the metadata was in already, or the entry is gone.
+    AlreadyLoaded,
+    /// Another loader held the item's claim and had not finished it.
+    HeldElsewhere,
+}
+
+/// The STAC stubs, entries without loaded metadata, a query over `datetime`
+/// would load: those in the window, or every one for a query without one.
+fn cold_stac_items(
+    catalog: &Catalog,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Vec<StacLoadTarget> {
+    filter_by_datetime(&catalog.entries, datetime)
+        .into_iter()
+        .rev()
+        .filter_map(stac_load_target)
+        .collect()
+}
+
+/// Enforce [`STAC_REQUEST_MAX_COLD_ITEMS`] for a query that would load the
+/// metadata of `cold` STAC items (#889). `windowed`: the query has a
+/// `datetime`; one without counts every stub in the catalog, so the remedy
+/// it is told is to add one.
+fn check_cold_stac_budget(cold: usize, windowed: bool) -> Result<(), DataServerError> {
+    if cold > STAC_REQUEST_MAX_COLD_ITEMS {
+        return Err(cold_stac_budget_exceeded(&cold.to_string(), windowed));
+    }
+    Ok(())
+}
+
+/// The 400 of [`check_cold_stac_budget`] for `count` cold items: the exact
+/// count, or "at least N" when the STAC listing stopped paging past the cap
+/// and the rest of the window was never counted (#1075).
+fn cold_stac_budget_exceeded(count: &str, windowed: bool) -> DataServerError {
+    let remedy = if windowed {
+        "narrow the datetime window"
+    } else {
+        "add a datetime window"
+    };
+    DataServerError::QueryTooLarge(format!(
+        "Query would load the metadata of {count} STAC items not read yet; one request may \
+         load at most {STAC_REQUEST_MAX_COLD_ITEMS} — {remedy}"
+    ))
+}
+
+/// What an area query checks on its window's grid before the window's cold
+/// STAC items load (#1075), given the grid's metadata and the window's entry
+/// count.
+type WindowCheck<'a> = &'a dyn Fn(&reader::TiffMetadata, usize) -> Result<(), DataServerError>;
+
+/// The metadata of the loaded catalog entry nearest `timestamp`: the latest
+/// before it, else the earliest after it. An estimate of a stub's grid,
+/// never its grid: entries can differ.
+fn nearest_loaded_metadata(
+    catalog: &Catalog,
+    timestamp: DateTime<Utc>,
+) -> Option<&reader::TiffMetadata> {
+    catalog
+        .entries
+        .range(..timestamp)
+        .rev()
+        .chain(catalog.entries.range(timestamp..))
+        .find_map(|(_, entry)| entry.metadata())
+        .map(Arc::as_ref)
+}
+
+/// The native pixel window `(col_start, row_start, col_end, row_end)` of an
+/// area query's bbox on `geo_transform`; a bbox that misses the raster is
+/// the 400.
+fn area_pixel_window(
+    geo_transform: &ds_core::geo::GeoTransform,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+) -> Result<(u32, u32, u32, u32), DataServerError> {
+    geo_transform
+        .bbox_to_pixels(west, south, east, north)
+        .ok_or_else(|| {
+            DataServerError::InvalidParameter("Requested bbox does not intersect the raster".into())
+        })
+}
+
+/// Most newly discovered remote frames one poll cycle pre-warms (#1004),
+/// newest first: the frames a client animates first. A cold start or a poll
+/// after an outage can discover a backlog; older frames load on first view.
+const PREWARM_MAX_FRAMES: usize = 4;
+/// Wall-clock cap on one poll cycle's pre-warm (#1004): a stalling store
+/// delays the next catalog poll by at most this. Unfinished reads are left
+/// to the request path.
+const PREWARM_BUDGET: Duration = Duration::from_secs(60);
 
 /// Circuit breaker threshold: number of consecutive failures before opening.
 const STAC_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
@@ -292,13 +435,78 @@ impl GeoTiffEngine {
         }
     }
 
-    /// Store a STAC catalog update, applying max_files eviction if configured.
-    fn store_stac_catalog(&self, mut catalog: Catalog) {
+    /// Apply the configured `max_files` eviction to a STAC catalog update.
+    fn trim_stac_catalog(&self, catalog: &mut Catalog) {
         if let Some(max) = self.max_files {
             catalog.trim_to_latest(max);
         }
+    }
+
+    /// Store a STAC catalog update, applying max_files eviction if configured.
+    /// The listing it merged may still name an item whose asset a tile read
+    /// found gone: [`gone::GoneObjects::screen`] keeps that item out (#1074).
+    fn store_stac_catalog(&self, mut catalog: Catalog) {
+        self.screen_gone(&mut catalog, false);
+        self.trim_stac_catalog(&mut catalog);
         self.catalog.store(Arc::new(catalog));
         self.refresh_raster_info();
+    }
+
+    /// Screen a catalog through the gone objects before it is stored (#1074),
+    /// logging what that did. `complete`: see [`gone::GoneObjects::screen`].
+    /// The removals are a debug line: a listing that still names a gone
+    /// object meets it at every poll, and its WARN was logged when a read
+    /// found it gone.
+    fn screen_gone(&self, catalog: &mut Catalog, complete: bool) {
+        let screened = self.gone.screen(catalog, complete);
+        if screened.removed > 0 {
+            tracing::debug!(
+                "[{}] {} catalog entr{} left out: a tile read found the object gone",
+                self.collection_id,
+                screened.removed,
+                if screened.removed == 1 { "y" } else { "ies" }
+            );
+        }
+        if screened.version_moved {
+            tracing::info!(
+                "[{}] A timestep dropped as gone holds a new object: renders cached before \
+                 are no longer served",
+                self.collection_id
+            );
+        }
+    }
+
+    /// Act on what a read of the entry at `timestamp` learned about its
+    /// remote object (#1074). A gone object's timestep has already left every
+    /// accessor ([`catalog::FileEntry::is_gone`]): refresh the `RasterInfo`
+    /// snapshot without it and say so, once. A forbidden range failed its
+    /// read with a 503 and keeps the timestep, since a 401/403 is the
+    /// server's credentials rather than the object; it is a WARN at most
+    /// once a minute per collection. Runs however the read ended.
+    fn note_object_health(&self, timestamp: &DateTime<Utc>, entry: &catalog::FileEntry) {
+        let Some(health) = entry.source().and_then(|source| source.health()) else {
+            return;
+        };
+        if let Some(refusal) = health.take_gone() {
+            tracing::warn!(
+                "[{}] Tile read of {}: {refusal}. Timestep {} leaves the catalog.",
+                self.collection_id,
+                entry.path.display(),
+                timestamp.to_rfc3339()
+            );
+            self.refresh_raster_info();
+        }
+        let forbidden = health.take_forbidden();
+        if forbidden > 0 {
+            if let Some(count) = self.forbidden_warnings.note(forbidden) {
+                tracing::warn!(
+                    "[{}] {count} tile range read(s) forbidden (401/403) since the last \
+                     warning, answered 503; latest {}. Check the storage credentials.",
+                    self.collection_id,
+                    entry.path.display()
+                );
+            }
+        }
     }
 
     /// Rebuild the cached [`RasterInfo`] from the current catalog and publish it.
@@ -323,21 +531,19 @@ impl GeoTiffEngine {
     fn build_raster_info(&self) -> ds_core::map_engine::RasterInfo {
         let catalog = self.catalog.load();
         let crs_name = catalog
-            .entries
-            .values()
-            .find_map(|entry| entry.metadata().map(|m| crs_label(&m.geo_transform.crs)))
+            .live()
+            .find_map(|(_, entry)| entry.metadata().map(|m| crs_label(&m.geo_transform.crs)))
             // No metadata could be read; the engine works internally in
             // lon-first geographic coordinates, so default to CRS:84.
             .unwrap_or_else(|| "CRS:84".to_string());
 
-        let times: Vec<DateTime<Utc>> = catalog.entries.keys().cloned().collect();
+        let times: Vec<DateTime<Utc>> = catalog.live().map(|(t, _)| *t).collect();
 
         // Native full-resolution grid dimensions, taken from the first loaded
         // entry (all entries in a collection share the same grid).
         let grid_size = catalog
-            .entries
-            .values()
-            .find_map(|entry| entry.metadata().map(|m| [m.width, m.height]));
+            .live()
+            .find_map(|(_, entry)| entry.metadata().map(|m| [m.width, m.height]));
 
         ds_core::map_engine::RasterInfo {
             native_crs: crs_name,
@@ -353,7 +559,6 @@ impl GeoTiffEngine {
         }
     }
 
-    /// How long ago the catalog was last successfully updated.
     /// The collection ID this engine serves.
     pub fn collection_id(&self) -> &str {
         &self.collection_id
@@ -383,8 +588,22 @@ impl GeoTiffEngine {
         }
     }
 
-    /// Returns `None` if the catalog has never been updated after initial load.
-    pub fn catalog_age(&self) -> Option<chrono::Duration> {
+    /// Age of the newest timestep, for `/health` `data_age_secs` and the
+    /// `collection_data_age_seconds` gauge (#1007): now minus the newest
+    /// timestamp in the catalog. It keeps growing while the feeder is
+    /// stalled, even though every poll still finds the old files. Negative
+    /// when the newest timestep lies in the future; `None` while the
+    /// catalog is empty.
+    pub fn data_age(&self) -> Option<chrono::Duration> {
+        let newest = *self.catalog.load().live().next_back()?.0;
+        Some(Utc::now() - newest)
+    }
+
+    /// Time since the engine loaded or a poll last found files, for
+    /// `/health` `poll_age_secs`. It grows while the scan fails or comes back
+    /// empty (the old catalog is kept), not while the files merely stop
+    /// changing: that is [`Self::data_age`].
+    pub fn poll_age(&self) -> Option<chrono::Duration> {
         let updated_at = self
             .catalog_updated_at
             .lock()
@@ -531,6 +750,8 @@ impl GeoTiffEngine {
             stac_consecutive_failures: AtomicU32::new(0),
             stac_last_attempt: Mutex::new(None),
             catalog_updated_at: Mutex::new(Some(Utc::now())),
+            gone: gone::GoneObjects::default(),
+            forbidden_warnings: gone::ForbiddenWarnings::default(),
         };
 
         // Initial scan — STAC mode fetches collection extent only (no items)
@@ -621,12 +842,19 @@ impl GeoTiffEngine {
     /// Applies max_files limit if configured.
     /// `current` is the previous catalog, used to reuse metadata for unchanged files.
     fn do_scan(&self, current: &Catalog) -> Result<Catalog, DataServerError> {
-        // Build path-based index from current catalog (references only, no cloning)
-        let path_index: HashMap<&Path, &catalog::FileEntry> = current
-            .entries
-            .values()
+        // Build path-based index from current catalog (references only, no
+        // cloning), and the entries removed as gone: a key still listed with
+        // the same size reuses one rather than reading its header, and the
+        // screen below removes it again (#1074).
+        let kept = self.gone.kept_entries();
+        let path_index: HashMap<&Path, &catalog::FileEntry> = kept
+            .iter()
+            .chain(current.entries.values())
             .map(|e| (e.path.as_path(), e))
             .collect();
+        // Whether the scan listed the whole source window, so that a gone
+        // object it did not list again is no longer named by the listing.
+        let mut complete = true;
 
         let mut catalog = match &self.store_mode {
             StoreMode::Local { directory, pending } => {
@@ -688,6 +916,7 @@ impl GeoTiffEngine {
                     ..self.scan_spec()?
                 };
                 let (catalog, failed) = scan_remote(store, &prefixes, &spec, &path_index)?;
+                complete = failed.is_empty();
                 if !failed.is_empty() {
                     tracing::warn!(
                         "[{}] {}/{} prefix scan(s) failed: {}",
@@ -704,6 +933,8 @@ impl GeoTiffEngine {
                 catalog
             }
             StoreMode::RemoteStac { client } => {
+                // A poll lists only the newest items.
+                complete = false;
                 let current_catalog = self.catalog.load();
                 catalog::poll_stac_latest(client, &current_catalog, &self.collection_id)?
             }
@@ -725,6 +956,8 @@ impl GeoTiffEngine {
             }
         }
 
+        // Before the trim, so a gone object holds no `max_files` slot.
+        self.screen_gone(&mut catalog, complete);
         if let Some(max) = self.max_files {
             catalog.trim_to_latest(max);
         }
@@ -732,9 +965,11 @@ impl GeoTiffEngine {
         Ok(catalog)
     }
 
-    /// Fetch GeoTIFF metadata for a STAC asset: the one loader behind both the
-    /// poll-cycle preload (#90, awaited on the poll runtime) and the lazy
-    /// request path (bridged by [`load_stac_entry_metadata`](Self::load_stac_entry_metadata)).
+    /// Fetch GeoTIFF metadata for a STAC asset: the one loader behind the
+    /// poll-cycle preload (#90, awaited on the poll runtime), a query's
+    /// concurrent cold loads (#889, [`load_cold_stac_entries`](Self::load_cold_stac_entries))
+    /// and the single-entry request path (bridged by
+    /// [`load_stac_entry_metadata`](Self::load_stac_entry_metadata)).
     ///
     /// Uses the StacClient's reqwest-based HTTP methods directly
     /// (bypassing object_store which URL-encodes path components and breaks
@@ -775,11 +1010,7 @@ impl GeoTiffEngine {
                     asset_url,
                     tile_info.tile_offsets.len()
                 );
-                let source = reader::DataSource::HttpDirect {
-                    url: asset_url.to_string(),
-                    http,
-                    tile_info,
-                };
+                let source = reader::DataSource::http(asset_url.to_string(), http, tile_info);
                 return Ok((metadata, source));
             }
         }
@@ -923,22 +1154,14 @@ impl GeoTiffEngine {
         let StoreMode::RemoteStac { client } = &self.store_mode else {
             return;
         };
-        let targets: Vec<(DateTime<Utc>, PathBuf, String, u64)> = {
+        let targets: Vec<StacLoadTarget> = {
             let catalog = self.catalog.load();
             catalog
                 .entries
                 .iter()
                 .rev()
                 .filter(|(ts, _)| !previous.entries.contains_key(*ts))
-                .filter_map(|(ts, entry)| {
-                    let stub = entry.stac_stub_info()?;
-                    Some((
-                        *ts,
-                        entry.path.clone(),
-                        stub.asset_url.clone(),
-                        entry.file_size,
-                    ))
-                })
+                .filter_map(stac_load_target)
                 .take(STAC_PRELOAD_MAX_ITEMS)
                 .collect()
         };
@@ -947,9 +1170,7 @@ impl GeoTiffEngine {
         }
         let attempted = targets.len();
         let preload = futures::stream::iter(targets)
-            .map(|(ts, path, asset_url, file_size)| {
-                self.preload_stac_entry(client, ts, path, asset_url, file_size)
-            })
+            .map(|target| self.preload_stac_entry(client, target))
             .buffer_unordered(STAC_PRELOAD_CONCURRENCY)
             .filter(|loaded| futures::future::ready(*loaded))
             .count();
@@ -974,29 +1195,10 @@ impl GeoTiffEngine {
     /// Claims the path like a request would, so a request for this item
     /// meanwhile waits for the preload instead of fetching it again; skips
     /// the item if a request already holds the claim. `true` if it loaded.
-    async fn preload_stac_entry(
-        &self,
-        client: &stac::StacClient,
-        timestamp: DateTime<Utc>,
-        path: PathBuf,
-        asset_url: String,
-        file_size: u64,
-    ) -> bool {
-        let Some(_guard) = self
-            .loading_in_flight
-            .try_claim(&path, || self.is_metadata_loaded(&timestamp))
-        else {
-            return false;
-        };
-        match self
-            .fetch_stac_entry_metadata(client, &asset_url, file_size)
-            .await
-        {
-            Ok((metadata, source)) => {
-                // Installed before the guard drops, so woken waiters see it.
-                self.install_stac_metadata(&timestamp, metadata, source);
-                true
-            }
+    async fn preload_stac_entry(&self, client: &stac::StacClient, target: StacLoadTarget) -> bool {
+        let asset_url = target.2.clone();
+        match self.claim_and_load_stac_entry(client, target).await {
+            Ok(load) => load == StacLoad::Loaded,
             Err(e) => {
                 tracing::warn!(
                     "[{}] STAC preload of '{}' failed, left to the request path: {e}",
@@ -1008,82 +1210,252 @@ impl GeoTiffEngine {
         }
     }
 
-    /// Ensure entries exist and have metadata loaded for the requested datetime range.
-    ///
-    /// For STAC mode: if the catalog has no entries for the requested range,
-    /// fetches items from the STAC API first (on-demand discovery), then
-    /// lazy-loads GeoTIFF metadata for the matching entries.
-    fn ensure_entries_loaded(
+    /// Claim one STAC stub without parking ([`InFlightLoads::try_claim`]),
+    /// then fetch and install its metadata: the one async load step behind
+    /// the poll-cycle preload (#90) and a query's cold loads (#889). An item
+    /// another loader holds is left to it ([`StacLoad::HeldElsewhere`]), so
+    /// a caller loading several items concurrently never blocks its other
+    /// loads on a condvar.
+    async fn claim_and_load_stac_entry(
+        &self,
+        client: &stac::StacClient,
+        (timestamp, path, asset_url, file_size): StacLoadTarget,
+    ) -> Result<StacLoad, DataServerError> {
+        let Some(_guard) = self
+            .loading_in_flight
+            .try_claim(&path, || self.is_metadata_loaded(&timestamp))
+        else {
+            return Ok(if self.is_metadata_loaded(&timestamp) {
+                StacLoad::AlreadyLoaded
+            } else {
+                StacLoad::HeldElsewhere
+            });
+        };
+        let (metadata, source) = self
+            .fetch_stac_entry_metadata(client, &asset_url, file_size)
+            .await?;
+        // Installed before the guard drops, so woken waiters see it.
+        self.install_stac_metadata(&timestamp, metadata, source);
+        Ok(StacLoad::Loaded)
+    }
+
+    /// Load the metadata of the STAC stubs in `datetime` for a query (#889).
+    /// The stubs are counted before any load: more than
+    /// `STAC_REQUEST_MAX_COLD_ITEMS` is a 400 naming both counts. The rest
+    /// load `STAC_PRELOAD_CONCURRENCY` at a time through the shared async
+    /// loader, under one `block_on` of the STAC bridge, never as N sequential
+    /// round trips (root Critical Rule 9). No load starts once the request's
+    /// deadline (`ds_core::deadline`) has passed: the query is then the
+    /// 504, and what loaded stays loaded for a retry. An item the poll
+    /// preload or another request is loading is waited for afterwards, when
+    /// this query holds no claim, so two loaders never wait on each other.
+    /// The first failed load fails the query, as the sequential loop did; the
+    /// loads still in flight are dropped and release their claims.
+    fn load_cold_stac_entries(
         &self,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> Result<(), DataServerError> {
-        // For STAC mode: fetch items on-demand if we don't have entries for this range
-        if let StoreMode::RemoteStac { ref client, .. } = self.store_mode {
-            self.check_stac_circuit_breaker()?;
-
-            if let Some(range) = datetime {
-                let catalog = self.catalog.load();
-                let existing = filter_by_datetime(&catalog.entries, Some(range));
-                if existing.is_empty() {
-                    // No entries for this range — fetch from STAC API
-                    drop(catalog);
-                    let current = self.catalog.load();
-                    match catalog::fetch_stac_range(client, &current, range, &self.collection_id) {
-                        Ok(updated) => {
-                            self.record_stac_success();
-                            self.store_stac_catalog(updated);
-                        }
-                        Err(e) => {
-                            self.record_stac_failure();
-                            return Err(e);
-                        }
-                    }
-                }
-            } else {
-                // No datetime filter (e.g., "latest") — fetch recent items if catalog is empty
-                let catalog = self.catalog.load();
-                if catalog.entries.is_empty() {
-                    drop(catalog);
-                    let now = Utc::now();
-                    let since = now - chrono::Duration::hours(1);
-                    let current = self.catalog.load();
-                    match catalog::fetch_stac_range(
-                        client,
-                        &current,
-                        (since, now),
-                        &self.collection_id,
-                    ) {
-                        Ok(updated) => {
-                            self.record_stac_success();
-                            self.store_stac_catalog(updated);
-                        }
-                        Err(e) => {
-                            self.record_stac_failure();
-                            return Err(e);
-                        }
-                    }
+        // Every entry of a scanned source is loaded at scan.
+        let StoreMode::RemoteStac { client } = &self.store_mode else {
+            return Ok(());
+        };
+        // Newest first, as the sequential loop before #889 loaded them.
+        let cold = cold_stac_items(&self.catalog.load(), datetime);
+        if cold.is_empty() {
+            return Ok(());
+        }
+        check_cold_stac_budget(cold.len(), datetime.is_some())?;
+        // Captured here, where the EDR executor installed it, rather than
+        // read inside the futures.
+        let deadline = ds_core::deadline::current();
+        let check_deadline = || match deadline {
+            Some(d) if std::time::Instant::now() >= d => Err(DataServerError::DeadlineExceeded),
+            _ => Ok(()),
+        };
+        let held_elsewhere = client.block_on(async {
+            let mut loads = futures::stream::iter(cold)
+                .map(|target| async move {
+                    check_deadline()?;
+                    let timestamp = target.0;
+                    let load = self.claim_and_load_stac_entry(client, target).await?;
+                    Ok::<_, DataServerError>((timestamp, load))
+                })
+                .buffer_unordered(STAC_PRELOAD_CONCURRENCY);
+            let mut held_elsewhere = Vec::new();
+            while let Some(load) = loads.next().await {
+                if let (timestamp, StacLoad::HeldElsewhere) = load? {
+                    held_elsewhere.push(timestamp);
                 }
             }
+            Ok(held_elsewhere)
+        })?;
+        // Each waits for its loader and loads the item itself only if that
+        // loader failed or dropped it. Bounded by the other loaders' claims
+        // on this window, not by the window: never loop `ensure_metadata`
+        // over the cold items themselves.
+        for timestamp in &held_elsewhere {
+            check_deadline()?;
+            self.ensure_metadata(timestamp)?;
         }
-
-        let catalog = self.catalog.load();
-        let entries = filter_by_datetime(&catalog.entries, datetime);
-
-        // Collect timestamps of unloaded entries (most recent first)
-        let unloaded: Vec<DateTime<Utc>> = entries
-            .iter()
-            .rev()
-            .filter(|(_, entry)| !entry.is_loaded())
-            .map(|(ts, _)| **ts)
-            .collect();
-
-        drop(catalog);
-
-        for ts in &unloaded {
-            self.ensure_metadata(ts)?;
-        }
-
         Ok(())
+    }
+
+    /// Ensure entries exist and have metadata loaded for the requested datetime range.
+    ///
+    /// For STAC mode: if the catalog has no entries for the requested range,
+    /// fetches items from the STAC API first (on-demand discovery,
+    /// [`list_stac_window`](Self::list_stac_window)), then loads the GeoTIFF
+    /// metadata of the matching stubs, bounded and concurrently
+    /// ([`load_cold_stac_entries`](Self::load_cold_stac_entries)).
+    /// The fetched items are counted against `STAC_REQUEST_MAX_COLD_ITEMS`
+    /// before they are installed (#889): a refused query leaves the catalog
+    /// as it was, so its stubs never count against later queries. Between
+    /// the count and the loads, an area query's `check` runs on the window's
+    /// grid ([`check_window`](Self::check_window), #1075).
+    fn ensure_entries_loaded(
+        &self,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        check: Option<WindowCheck<'_>>,
+    ) -> Result<(), DataServerError> {
+        let StoreMode::RemoteStac { client } = &self.store_mode else {
+            return Ok(());
+        };
+        self.check_stac_circuit_breaker()?;
+
+        // The window to fetch on demand: the query's, when the catalog has no
+        // entry in it; for a query without one ("latest"), the last hour,
+        // when the catalog is empty.
+        let fetch = {
+            let catalog = self.catalog.load();
+            match datetime {
+                Some(range) => filter_by_datetime(&catalog.entries, Some(range))
+                    .is_empty()
+                    .then_some(range),
+                None => catalog.entries.is_empty().then(|| {
+                    let now = Utc::now();
+                    (now - chrono::Duration::hours(1), now)
+                }),
+            }
+        };
+        if let Some(range) = fetch {
+            let current = self.catalog.load();
+            let mut updated = self.list_stac_window(client, &current, range, datetime)?;
+            // Count what the query would load from the catalog it would see,
+            // without the items whose asset is gone (#1074).
+            self.screen_gone(&mut updated, false);
+            self.trim_stac_catalog(&mut updated);
+            check_cold_stac_budget(
+                cold_stac_items(&updated, datetime).len(),
+                datetime.is_some(),
+            )?;
+            self.store_stac_catalog(updated);
+        }
+
+        if let Some(check) = check {
+            self.check_window(datetime, check)?;
+        }
+        self.load_cold_stac_entries(datetime)
+    }
+
+    /// List the STAC items of `range` on demand for a query over `datetime`
+    /// and merge them into `current` as stubs, for
+    /// [`ensure_entries_loaded`](Self::ensure_entries_loaded) to count and
+    /// install. The listing stops paging once the query's window holds more
+    /// than `STAC_REQUEST_MAX_COLD_ITEMS` cold items (#1075): the window's
+    /// stubs already in `current` plus each new timestamp the listing
+    /// returned in it. Later pages can only add to that, so the query is
+    /// then the 400 with the count so far as a lower bound, "at least N",
+    /// and nothing is installed. A `max_files` trim can drop window items
+    /// after the listing, so such a catalog lists the window in full and
+    /// the count after the trim decides.
+    fn list_stac_window(
+        &self,
+        client: &stac::StacClient,
+        current: &Catalog,
+        range: (DateTime<Utc>, DateTime<Utc>),
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<Catalog, DataServerError> {
+        let stubs = cold_stac_items(current, datetime).len();
+        let can_stop = self.max_files.is_none();
+        let mut listed = std::collections::HashSet::new();
+        let listing = client.fetch_items_until(Some(range), None, |page| {
+            listed.extend(page.iter().map(|item| item.datetime).filter(|t| {
+                datetime.is_none_or(|(start, end)| (start..=end).contains(t))
+                    && !current.entries.contains_key(t)
+            }));
+            can_stop && stubs + listed.len() > STAC_REQUEST_MAX_COLD_ITEMS
+        });
+        match listing {
+            Ok(stac::StacListing::Complete(items)) => {
+                self.record_stac_success();
+                Ok(catalog::merge_stac_range(
+                    current,
+                    &items,
+                    range,
+                    &self.collection_id,
+                ))
+            }
+            Ok(stac::StacListing::Stopped) => {
+                self.record_stac_success();
+                let counted = stubs + listed.len();
+                tracing::debug!(
+                    "[{}] STAC listing stopped after {counted} cold items in the query window",
+                    self.collection_id
+                );
+                Err(cold_stac_budget_exceeded(
+                    &format!("at least {counted}"),
+                    datetime.is_some(),
+                ))
+            }
+            Err(e) => {
+                self.record_stac_failure();
+                Err(e)
+            }
+        }
+    }
+
+    /// Run an area query's `check` on its window's grid before the window's
+    /// cold STAC items load (#1075). The query answers on the grid of the
+    /// window's first entry. When that entry is loaded, it is checked at
+    /// once and a refused query loads nothing. A stub's grid is unknown
+    /// until it loads, so the first entry then loads alone, one round trip,
+    /// and a refused query has loaded that one item. The grid of the loaded
+    /// entry nearest it only decides whether that round trip is worth it:
+    /// when it passes `check`, the first entry loads with the rest. Entries
+    /// can differ in grid, so this estimate never refuses a query. The
+    /// query's own checks still run after the loads.
+    fn check_window(
+        &self,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        check: WindowCheck<'_>,
+    ) -> Result<(), DataServerError> {
+        let (first, timesteps) = {
+            let catalog = self.catalog.load();
+            let window = filter_by_datetime(&catalog.entries, datetime);
+            let Some(&(&first, entry)) = window.first() else {
+                return Ok(());
+            };
+            if let Some(metadata) = entry.metadata() {
+                return check(metadata, window.len());
+            }
+            if nearest_loaded_metadata(&catalog, first)
+                .is_some_and(|estimate| check(estimate, window.len()).is_ok())
+            {
+                return Ok(());
+            }
+            (first, window.len())
+        };
+        ds_core::deadline::check()?;
+        self.ensure_metadata(&first)?;
+        let catalog = self.catalog.load();
+        match catalog
+            .entries
+            .get(&first)
+            .and_then(|entry| entry.metadata())
+        {
+            Some(metadata) => check(metadata, timesteps),
+            None => Ok(()),
+        }
     }
 
     /// Run the polling loop. Call this from a tokio::spawn task.
@@ -1094,6 +1466,9 @@ impl GeoTiffEngine {
     /// failing remote. Resets to base interval on first success.
     pub async fn poll_loop(&self) {
         let base = self.poll_interval;
+        // No poll has warmed what the startup scan catalogued: warm its
+        // newest frames before the first sleep (#1004).
+        self.prewarm_new_frames(&Catalog::empty()).await;
 
         loop {
             let failures = self.consecutive_poll_failures.load(Ordering::Relaxed);
@@ -1118,12 +1493,104 @@ impl GeoTiffEngine {
     }
 
     /// One poll cycle: rescan, then preload metadata for the STAC items the
-    /// scan discovered (#90). The preload is a no-op for other sources, whose
-    /// scan already parses every header.
+    /// scan discovered (#90), then pre-warm the tiles of the remote frames it
+    /// discovered (#1004). The preload is a no-op for other sources, whose
+    /// scan already parses every header; the pre-warm for local ones.
     async fn poll_cycle(&self) {
         let previous = self.catalog.load_full();
         self.poll_once();
         self.preload_stac_metadata(&previous).await;
+        self.prewarm_new_frames(&previous).await;
+    }
+
+    /// Read the encoded tiles of the newest remote frames absent from
+    /// `previous` into the tile cache (#1004), so the first view of a new
+    /// frame decodes from memory instead of paying a storage round trip per
+    /// meta-tile. At most `PREWARM_MAX_FRAMES` frames, within the per-frame
+    /// cap of [`prewarm::frame_cap`] and `PREWARM_BUDGET`; runs on the poll
+    /// runtime with bounded concurrency, see [`prewarm`]. Returns the paths
+    /// of the frames it had tiles to fetch for.
+    async fn prewarm_new_frames(&self, previous: &Catalog) -> Vec<PathBuf> {
+        if matches!(self.store_mode, StoreMode::Local { .. }) || self.shutdown.is_shutdown() {
+            return Vec::new();
+        }
+        let cap = prewarm::frame_cap(self.tile_cache.capacity());
+        if cap == 0 {
+            return Vec::new();
+        }
+        let plans: Vec<prewarm::FramePlan> = {
+            let catalog = self.catalog.load();
+            catalog
+                .entries
+                .iter()
+                .rev()
+                .filter(|(ts, _)| !previous.entries.contains_key(*ts))
+                .filter_map(|(_, entry)| {
+                    prewarm::plan_frame(
+                        &entry.path,
+                        entry.metadata()?,
+                        entry.source()?,
+                        &self.tile_cache,
+                        cap,
+                    )
+                })
+                .take(PREWARM_MAX_FRAMES)
+                .filter(|plan| !plan.is_empty())
+                .collect()
+        };
+        if plans.is_empty() {
+            return Vec::new();
+        }
+        let started = std::time::Instant::now();
+        let outcome = prewarm::warm(&plans, &self.tile_cache, PREWARM_BUDGET, || {
+            self.shutdown.is_shutdown()
+        })
+        .await;
+        let capped = if outcome.capped_levels > 0 {
+            format!(
+                "; {} finest level(s) over the {} per-frame cap left to requests",
+                outcome.capped_levels,
+                format_bytes(cap as u64)
+            )
+        } else {
+            String::new()
+        };
+        if outcome.reads > 0 {
+            tracing::info!(
+                "[{}] Pre-warmed {} new frame(s) for first views: {} tiles, {} in {} range reads, {} ms{}",
+                self.collection_id,
+                outcome.frames,
+                outcome.tiles,
+                format_bytes(outcome.bytes as u64),
+                outcome.reads,
+                started.elapsed().as_millis(),
+                capped
+            );
+        }
+        if outcome.failed > 0 || outcome.unfinished > 0 || outcome.busy > 0 {
+            tracing::warn!(
+                "[{}] Pre-warm left tiles to first views: {} range read(s) failed, {} cut off after {}s, \
+                 {} skipped while requests held over half the decode budget{}",
+                self.collection_id,
+                outcome.failed,
+                outcome.unfinished,
+                PREWARM_BUDGET.as_secs(),
+                outcome.busy,
+                outcome
+                    .first_error
+                    .as_deref()
+                    .map(|e| format!(" (first error: {e})"))
+                    .unwrap_or_default()
+            );
+        }
+        if outcome.deferred > 0 {
+            tracing::debug!(
+                "[{}] Pre-warm skipped {} range read(s): shutting down, or a read over half the decode budget",
+                self.collection_id,
+                outcome.deferred
+            );
+        }
+        plans.iter().map(|plan| plan.path().to_path_buf()).collect()
     }
 
     fn poll_once(&self) {
@@ -1180,11 +1647,15 @@ impl GeoTiffEngine {
                 self.catalog.store(Arc::new(new_catalog));
                 // Rebuild the cached RasterInfo off the request path (#211).
                 self.refresh_raster_info();
-                // Track successful catalog update time
-                *self
-                    .catalog_updated_at
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
+                // Stamp the poll age only when the scan found files: an
+                // empty scan over a catalog that was already empty must not
+                // reset it (#1007).
+                if count > 0 {
+                    *self
+                        .catalog_updated_at
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
+                }
                 let (hits, misses) = self.tile_cache.stats();
                 tracing::debug!(
                     "[{}] Poll: {} files ({}), tile cache: {} hits / {} misses",
@@ -1230,7 +1701,7 @@ impl GeoTiffEngine {
         ds_core::edr_engine::select_parameters(parameters, &[self.parameter.as_str()])?;
 
         // Lazily load STAC stubs for the requested time range
-        self.ensure_entries_loaded(datetime)?;
+        self.ensure_entries_loaded(datetime, None)?;
 
         let catalog = self.catalog.load();
         let entries = filter_by_datetime(&catalog.entries, datetime);
@@ -1258,7 +1729,7 @@ impl GeoTiffEngine {
             let pixel = metadata.geo_transform.world_to_pixel(lon, lat);
             let value = match pixel {
                 Some((col, row)) => {
-                    match reader::read_pixel(
+                    let read = reader::read_pixel(
                         source,
                         metadata,
                         col,
@@ -1266,7 +1737,9 @@ impl GeoTiffEngine {
                         Some(&self.tile_cache),
                         &entry.path,
                         self.band_index,
-                    ) {
+                    );
+                    self.note_object_health(timestamp, entry);
+                    match read {
                         Ok(v) => v,
                         Err(
                             e @ (DataServerError::ResourceExhausted
@@ -1333,8 +1806,9 @@ impl GeoTiffEngine {
     ) -> Result<QueryResult, DataServerError> {
         ds_core::edr_engine::select_parameters(parameters, &[self.parameter.as_str()])?;
 
-        // Lazily load STAC stubs for the requested time range
-        self.ensure_entries_loaded(datetime)?;
+        // Lazily load STAC stubs for the requested time range. `query_area`
+        // already did, with its checks on the window's grid first (#1075).
+        self.ensure_entries_loaded(datetime, None)?;
 
         let catalog = self.catalog.load();
         let entries = filter_by_datetime(&catalog.entries, datetime);
@@ -1350,14 +1824,8 @@ impl GeoTiffEngine {
         let first_metadata = first_entry
             .metadata()
             .ok_or_else(|| DataServerError::Engine("First entry has no metadata loaded".into()))?;
-        let (col_start, row_start, col_end, row_end) = first_metadata
-            .geo_transform
-            .bbox_to_pixels(west, south, east, north)
-            .ok_or_else(|| {
-                DataServerError::InvalidParameter(
-                    "Requested bbox does not intersect the raster".into(),
-                )
-            })?;
+        let (col_start, row_start, col_end, row_end) =
+            area_pixel_window(&first_metadata.geo_transform, west, south, east, north)?;
 
         let nx = (col_end - col_start) as usize;
         let ny = (row_end - row_start) as usize;
@@ -1395,7 +1863,7 @@ impl GeoTiffEngine {
                 }
             };
 
-            match reader::read_bbox(
+            let read = reader::read_bbox(
                 source,
                 metadata,
                 col_start,
@@ -1405,7 +1873,9 @@ impl GeoTiffEngine {
                 Some(&self.tile_cache),
                 &entry.path,
                 self.band_index,
-            ) {
+            );
+            self.note_object_health(timestamp, entry);
+            match read {
                 Ok(grid_values) => {
                     all_values.extend(grid_values);
                 }
@@ -1473,10 +1943,14 @@ impl GeoTiffEngine {
 }
 
 /// Whether an EDR area read error means the file itself could not be read
-/// (fetch, decode or I/O failure), which the query answers as a timestep of
-/// nulls. Every other error belongs to the request and fails it (#858):
-/// admission and deadline (503/504), and client errors such as
-/// `QueryTooLarge` / `InvalidParameter` (400) — never nulls with HTTP 200.
+/// (a local open, decode or I/O failure, an invalid remote tile layout),
+/// which the query answers as a timestep of nulls. Every other error belongs
+/// to the request and fails it (#858): admission and deadline (503/504),
+/// and client errors such as `QueryTooLarge` / `InvalidParameter` (400) —
+/// never nulls with HTTP 200. A remote tile fetch that still fails after its
+/// retries arrives here as `ResourceExhausted`, so it is a 503 as on the map
+/// path, not nulls; remote bytes that do not decode are already nulls in the
+/// grid (#1051).
 fn is_unreadable_file(e: &DataServerError) -> bool {
     matches!(
         e,
@@ -1485,14 +1959,16 @@ fn is_unreadable_file(e: &DataServerError) -> bool {
 }
 
 /// Filter catalog entries by an optional datetime range.
-/// Returns references to matching (timestamp, entry) pairs.
+/// Returns references to matching (timestamp, entry) pairs, without the
+/// entries whose object a tile read found gone (#1074).
 fn filter_by_datetime(
     entries: &BTreeMap<DateTime<Utc>, catalog::FileEntry>,
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Vec<(&DateTime<Utc>, &catalog::FileEntry)> {
+    let live = |(_, entry): &(&DateTime<Utc>, &catalog::FileEntry)| !entry.is_gone();
     match datetime {
-        Some((start, end)) => entries.range(start..=end).collect(),
-        None => entries.iter().collect(),
+        Some((start, end)) => entries.range(start..=end).filter(live).collect(),
+        None => entries.iter().filter(live).collect(),
     }
 }
 
@@ -1553,7 +2029,27 @@ fn crs_label(crs: &ds_core::geo::Crs) -> String {
         // Rotated lat/lon is NOT EPSG:4326 — it has no standard EPSG code.
         ds_core::geo::Crs::RotatedLatLon { .. } => "rotated_ll".to_string(),
         ds_core::geo::Crs::Geostationary { .. } => "geos".to_string(),
+        ds_core::geo::Crs::WebMercator => "EPSG:3857".to_string(),
     }
+}
+
+/// A map request's output CRS for a log line: its code, and for a projected
+/// one its request rectangle in metres (the logged `bbox` is the WGS84 read
+/// envelope).
+fn output_crs_label(output_crs: &ds_core::map_engine::OutputCrs) -> String {
+    use ds_core::map_engine::OutputCrs;
+    match output_crs {
+        OutputCrs::Wgs84 => "CRS:84".to_string(),
+        OutputCrs::WebMercator => "EPSG:3857".to_string(),
+        OutputCrs::Projected { crs, bbox } => format!("{} {bbox:?}", crs_label(crs)),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Source-pixel projections made by this thread's map renders, so a
+    /// test can pin what a render costs (#1129).
+    static SOURCE_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl ds_core::map_engine::MapEngine for GeoTiffEngine {
@@ -1605,9 +2101,12 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
 
         // Find the target timestamp first, then ensure it's loaded. The
         // selection lives on Catalog so resolve_time (the cache-key
-        // authority, #507) shares it verbatim.
+        // authority, #507) shares it verbatim. It finds none only in a
+        // catalog without a live file, before the first file or after every
+        // one went gone (#1074): a not-found with its message (404 in Maps
+        // and Tiles), never an opaque engine failure (500, #1136).
         let target_timestamp = self.catalog.load().select_timestamp(time).ok_or_else(|| {
-            DataServerError::Engine("No data available for the requested time".into())
+            DataServerError::LocationNotFound("No data available for this collection".into())
         })?;
 
         // Lazily load STAC stub if needed
@@ -1625,9 +2124,49 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         let source = entry
             .source()
             .ok_or_else(|| DataServerError::Engine("Entry source not loaded".into()))?;
+        // However the read below ends, act on what it learned about the
+        // object (#1074).
+        let _health = HealthNote {
+            engine: self,
+            timestamp: target_timestamp,
+            entry,
+        };
 
         let [west, south, east, north] = bbox;
         let total_pixels = (width as usize) * (height as usize);
+
+        // Domain guard against "ghost" echoes. The coarse projection grid
+        // only approximates the output→source mapping; at low zoom / extreme
+        // viewports (e.g. a whole-world Web Mercator view whose pixels wrap
+        // past ±180° or reach the poles) it — and the source projection's own
+        // out-of-domain forward — can map a far-away output pixel onto a valid
+        // source pixel, painting the radar far from where it belongs (ghosts
+        // in the Arctic/Antarctic, smear north of the data). An output pixel
+        // may only carry data if its TRUE geography lies within the source's
+        // footprint, so bound, in output-pixel space, the window the footprint
+        // can occupy and treat everything outside it as nodata. Computed once
+        // from the source's WGS84 envelope (no per-pixel projection).
+        //
+        // A footprint wholly off the image leaves nothing to draw, so answer
+        // before choosing a level: no source read and no projection grid
+        // (#1129). Far from its meridian a projected source's forward can
+        // fold back onto the raster (the TM series past ±180°), so such a
+        // tile would otherwise steer `select_overview`, decode that level
+        // and refine a grid to its cell cap, all for pixels the guard then
+        // empties. Every level shares the full-resolution extent, so its
+        // envelope serves whichever level is read.
+        let Some(footprint) = output_crs.footprint_window_in_image(
+            bbox,
+            metadata.geo_transform.bbox(),
+            width,
+            height,
+        ) else {
+            return Ok(ds_core::map_engine::RasterTile {
+                width,
+                height,
+                values: ds_core::map_engine::RasterValues::F64(vec![None; total_pixels]),
+            });
+        };
 
         // Select the best overview level for the output resolution.
         // This avoids reading millions of full-resolution pixels for zoomed-out views.
@@ -1712,28 +2251,36 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             // dominates render CPU for projected sources. The output→world axis
             // mapping (linear lon/lat, Mercator Y, or a projected output CRS) is
             // the shared `OutputCrs::project_node`, so EPSG:3067/3035 output is
-            // handled here without per-engine axis math (#160).
-            let grid = ds_core::resample::ProjectionGrid::build_2d(
+            // handled here without per-engine axis math (#160). Only the
+            // footprint's pixels are read, so only their error counts:
+            // outside it the forward folds and refining for it never
+            // converges (#1110, #1129).
+            let grid = ds_core::resample::ProjectionGrid::build_2d_within_quiet(
                 width,
                 height,
+                footprint,
                 gt.width,
                 gt.height,
                 |fx, fy| output_crs.project_node(bbox, fx, fy),
-                |lon, lat| gt.world_to_pixel_f64(lon, lat),
+                |lon, lat| {
+                    #[cfg(test)]
+                    SOURCE_PROJECTIONS.with(|n| n.set(n.get() + 1));
+                    gt.world_to_pixel_f64(lon, lat)
+                },
             );
-
-            // Domain guard against "ghost" echoes. The coarse projection grid
-            // only approximates the output→source mapping; at low zoom / extreme
-            // viewports (e.g. a whole-world Web Mercator view whose pixels wrap
-            // past ±180° or reach the poles) it — and the source projection's own
-            // out-of-domain forward — can map a far-away output pixel onto a valid
-            // source pixel, painting the radar far from where it belongs (ghosts
-            // in the Arctic/Antarctic, smear north of the data). An output pixel
-            // may only carry data if its TRUE geography lies within the source's
-            // footprint, so bound, in output-pixel space, the window the footprint
-            // can occupy and treat everything outside it as nodata. Computed once
-            // from the source's WGS84 envelope (no per-pixel projection).
-            let footprint = output_crs.footprint_pixel_window(bbox, gt.bbox(), width, height);
+            if let Some(error_px) = grid.capped_error() {
+                tracing::warn!(
+                    collection = %self.collection_id,
+                    ?bbox,
+                    width,
+                    height,
+                    crs = %output_crs_label(output_crs),
+                    source_level = ?(gt.width, gt.height),
+                    error_px,
+                    "Projection grid hit its cell cap over the interpolation budget; \
+                     this render may be slightly misregistered"
+                );
+            }
 
             // Native u8 fast path (#206): keep raw bytes end to end — window
             // read, nearest resample, and (in ds-render) a 256-entry-LUT
@@ -1847,6 +2394,28 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         // nothing, so the key value is moot.
         self.catalog.load().select_timestamp(time).or(time)
     }
+
+    fn content_version(&self) -> u64 {
+        // 0 until a timestep dropped because its object was gone holds a new
+        // object (#1074). Renders cached under that timestep before may show
+        // the gap the dropping request drew, or the timestep the time
+        // snapped to while it was gone.
+        self.gone.version()
+    }
+}
+
+/// Calls [`GeoTiffEngine::note_object_health`] when dropped, so a map render
+/// acts on what its read learned about the object however the read ended.
+struct HealthNote<'a> {
+    engine: &'a GeoTiffEngine,
+    timestamp: DateTime<Utc>,
+    entry: &'a catalog::FileEntry,
+}
+
+impl Drop for HealthNote<'_> {
+    fn drop(&mut self) {
+        self.engine.note_object_health(&self.timestamp, self.entry);
+    }
 }
 
 /// Nearest-neighbour resample of a source window into the output grid,
@@ -1898,8 +2467,8 @@ fn resample_nearest<T: Copy>(
 }
 
 impl EdrEngine for GeoTiffEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![])
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     fn query_location(
@@ -1940,12 +2509,32 @@ impl EdrEngine for GeoTiffEngine {
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let polygon = ds_core::feature::parse_area_coords(coords)?;
+        ds_core::edr_engine::select_parameters(parameters, &[self.parameter.as_str()])?;
+
+        // On a STAC source, the checks below and in `query_bbox` that need
+        // the window's grid run before its cold items load, in the same
+        // order (#1075): the bbox must meet the grid, then the mask and the
+        // response budgets over its native pixel window.
+        let ds_core::feature::Bbox {
+            west,
+            south,
+            east,
+            north,
+        } = polygon.bbox;
+        let check = |metadata: &reader::TiffMetadata, timesteps: usize| {
+            let (col_start, row_start, col_end, row_end) =
+                area_pixel_window(&metadata.geo_transform, west, south, east, north)?;
+            let nx = (col_end - col_start) as usize;
+            let ny = (row_end - row_start) as usize;
+            ds_core::feature::check_mask_budget(nx * ny, &polygon)?;
+            ds_core::feature::check_area_budget(timesteps, ny, nx, 1)
+        };
 
         // Get pixel range and geo_transform for accurate per-pixel coordinates.
         // For projected CRS (LCC, TM, etc.), the Grid x/y axes are approximations —
         // each pixel's true WGS84 position depends on both its column and row.
         // We must use pixel_to_world(col, row) for polygon containment tests.
-        self.ensure_entries_loaded(datetime)?;
+        self.ensure_entries_loaded(datetime, Some(&check))?;
         let catalog = self.catalog.load();
         let entries = filter_by_datetime(&catalog.entries, datetime);
         let geo_transform = entries
@@ -1960,6 +2549,13 @@ impl EdrEngine for GeoTiffEngine {
                 polygon.bbox.north,
             )
         });
+        // The mask below tests every cell of the native window against every
+        // ring vertex: the shared mask budget the other gridded engines apply
+        // (#889), checked before `query_bbox` reads a file.
+        if let Some((col_start, row_start, col_end, row_end)) = pixel_range {
+            let cells = (col_end - col_start) as usize * (row_end - row_start) as usize;
+            ds_core::feature::check_mask_budget(cells, &polygon)?;
+        }
 
         let mut result = self.query_bbox(
             polygon.bbox.west,
@@ -2778,6 +3374,73 @@ mod tests {
         assert_eq!(times, [utc("2026-03-24T23:15:00Z").unwrap()]);
     }
 
+    /// #1007: `data_age` is now minus the newest timestep, not the time
+    /// since the last poll. A stalled feeder leaves its files in place, so
+    /// every poll still finds them: that resets `poll_age` but not
+    /// `data_age`, which drops only once a newer file is catalogued.
+    #[test]
+    fn data_age_follows_the_newest_timestep_not_the_last_poll() {
+        let src = ["testdata/radar-tm35fin", "../../testdata/radar-tm35fin"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .expect("testdata/radar-tm35fin fixture")
+            .join("radar_tm35_20260406T0640Z.tif");
+        let dir = TempDir::new("data_age_test");
+        std::fs::copy(&src, dir.0.join("radar_tm35_20260406T0640Z.tif")).unwrap();
+        let engine = GeoTiffEngine::new("radar", dir.0.to_str(), &tm35fin_test_config()).unwrap();
+
+        // `data_age` is now minus `newest`, bracketed by clock reads.
+        let assert_data_age = |newest: &str| {
+            let newest = utc(newest).unwrap();
+            let before = Utc::now();
+            let age = engine.data_age().expect("a catalogued timestep");
+            let after = Utc::now();
+            assert!(
+                before - newest <= age && age <= after - newest,
+                "data age {age} is not now minus {newest}"
+            );
+        };
+        assert_data_age("2026-04-06T06:40:00Z");
+
+        // The feeder stalls: a poll finds the same file. It resets the poll
+        // age, set an hour back here, and leaves the data age growing.
+        *engine.catalog_updated_at.lock().unwrap() = Some(Utc::now() - chrono::Duration::hours(1));
+        engine.poll_once();
+        let poll_age = engine.poll_age().unwrap();
+        assert!(
+            poll_age < chrono::Duration::minutes(1),
+            "poll age {poll_age}"
+        );
+        assert_data_age("2026-04-06T06:40:00Z");
+
+        // A newer file arrives. The scan takes a new file once its size held
+        // for two more polls.
+        std::fs::copy(&src, dir.0.join("radar_tm35_20260406T0645Z.tif")).unwrap();
+        for _ in 0..3 {
+            engine.poll_once();
+        }
+        assert_data_age("2026-04-06T06:45:00Z");
+    }
+
+    /// #1007: a poll that finds no files leaves `poll_age` growing, also
+    /// when the catalog was empty already, and there is no data age.
+    #[test]
+    fn poll_age_grows_while_the_source_stays_empty() {
+        let dir = TempDir::new("poll_age_empty_test");
+        let engine = GeoTiffEngine::new("radar", dir.0.to_str(), &tm35fin_test_config()).unwrap();
+        assert!(engine.data_age().is_none());
+
+        *engine.catalog_updated_at.lock().unwrap() = Some(Utc::now() - chrono::Duration::hours(1));
+        engine.poll_once();
+        let poll_age = engine.poll_age().unwrap();
+        assert!(
+            poll_age >= chrono::Duration::hours(1),
+            "poll age {poll_age}"
+        );
+        assert!(engine.data_age().is_none());
+    }
+
     #[test]
     fn template_no_codes_rejected() {
         let config = GeoTiffConfig {
@@ -2880,6 +3543,64 @@ mod tests {
         assert_eq!(ndarray.values.len(), 5 * y.len() * x.len());
     }
 
+    /// A closed WKT ring of `n` vertices on a circle of `r` degrees around
+    /// (`lon`, `lat`).
+    fn ring_wkt(lon: f64, lat: f64, r: f64, n: usize) -> String {
+        let mut points: Vec<String> = (0..n)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                format!("{:.6} {:.6}", lon + r * a.cos(), lat + r * a.sin())
+            })
+            .collect();
+        points.push(points[0].clone());
+        format!("POLYGON(({}))", points.join(", "))
+    }
+
+    /// #889: the polygon mask has the shared budget of the other gridded
+    /// engines. A 5° × 5° window of this fixture is ~190 k native cells at
+    /// one timestep, well within the area budget; a 200-vertex polygon over
+    /// it would cost ~38 M edge tests, so it is the 400 naming the limit,
+    /// while a 64-vertex one over the same window is answered and masked.
+    #[test]
+    fn complex_polygon_over_a_large_window_is_query_too_large() {
+        use ds_core::feature::{parse_area_coords, MAX_MASK_EDGE_TESTS};
+        let engine = radar_engine();
+        let t0 = *engine.catalog.load().entries.keys().next().unwrap();
+        let one = Some((t0, t0));
+        let (complex, simple) = (
+            ring_wkt(22.5, 62.5, 2.5, 200),
+            ring_wkt(22.5, 62.5, 2.5, 64),
+        );
+        let vertices = |wkt: &str| parse_area_coords(wkt).unwrap().vertex_count();
+
+        let CoverageResponse::Single(answered) = engine
+            .query_area(&simple, one, None, None, None)
+            .expect("a 64-vertex polygon over the window is within the mask budget")
+        else {
+            panic!("expected one coverage");
+        };
+        let DomainDescription::Grid { x, y, .. } = &answered.domain else {
+            panic!("expected a Grid domain, got {:?}", answered.domain);
+        };
+        let cells = x.len() * y.len();
+        assert!(cells <= ds_core::feature::MAX_AREA_VALUES);
+        assert!(cells * vertices(&simple) <= MAX_MASK_EDGE_TESTS);
+        assert!(cells * vertices(&complex) > MAX_MASK_EDGE_TESTS);
+        // The window's corners lie outside the circle.
+        assert_eq!(area_values(&answered)[0], None);
+
+        match engine.query_area(&complex, one, None, None, None) {
+            Err(DataServerError::QueryTooLarge(msg)) => {
+                let polygon = format!("{}-vertex polygon", vertices(&complex));
+                assert!(msg.contains(&polygon), "{msg}");
+                let limit = MAX_MASK_EDGE_TESTS.to_string();
+                assert!(msg.contains(&limit), "names the limit: {msg}");
+            }
+            Err(e) => panic!("expected QueryTooLarge, got {e:?}"),
+            Ok(_) => panic!("expected QueryTooLarge, got a coverage"),
+        }
+    }
+
     /// The null fill stays for a file that cannot be read (#858): its
     /// timestep is nulls and the readable ones are answered.
     #[test]
@@ -2919,6 +3640,37 @@ mod tests {
         assert_eq!(values.len(), 2 * expected.len());
         assert_eq!(&values[..expected.len()], expected);
         assert!(values[expected.len()..].iter().all(Option::is_none));
+    }
+
+    /// A source with no files yet has nothing to draw: a not-found that
+    /// Maps and Tiles answer with a 404 and its message, not an engine
+    /// failure behind a 500 (#1136).
+    #[test]
+    fn empty_catalog_map_is_not_found() {
+        use ds_core::map_engine::MapEngine;
+        let engine = radar_engine();
+        engine
+            .catalog
+            .store(Arc::new(crate::catalog::Catalog::empty()));
+        for time in [None, Some(Utc::now())] {
+            let result = engine.get_raster_tile(
+                [20.0, 59.0, 32.0, 70.0],
+                64,
+                64,
+                time,
+                &ds_core::map_engine::OutputCrs::Wgs84,
+                None,
+                None,
+                None,
+            );
+            match result {
+                Err(DataServerError::LocationNotFound(message)) => {
+                    assert_eq!(message, "No data available for this collection");
+                }
+                Err(e) => panic!("expected LocationNotFound, got {e:?}"),
+                Ok(_) => panic!("expected LocationNotFound, got a tile"),
+            }
+        }
     }
 
     /// Only a file failure becomes nulls; request errors fail the query.

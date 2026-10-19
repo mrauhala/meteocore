@@ -78,7 +78,7 @@ impl Generation {
             .as_nanos()
             .min(u64::MAX as u128 - 1) as u64;
         let previous = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
                 previous.checked_add(1).map(|next| next.max(now))
             })
             .expect("Zarr generation counter exhausted");

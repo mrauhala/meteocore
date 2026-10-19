@@ -55,6 +55,13 @@ and used by the cross-API response tests. Regular temporal grids now include
 metadata does not expose sample registration or axis direction. These checks
 add no conformance classes and do not supersede the historical assessment above.
 
+Link type update (2026-10-05, [#964](https://github.com/mrauhala/meteocore/issues/964)):
+the shared license link now carries a `type`, `text/html` unless
+`[collections.license] type` names what its configured `url` serves, on every
+API. EDR 1.2 requires `rel` and `type` on every collection link; the license
+link was the one without. EDR collections also list their query end points as
+`rel=data` links. No Common class changes.
+
 Link relation update (2026-09-24, [#789](https://github.com/mrauhala/meteocore/issues/789)
 Phase 0): landing pages add the registered `…/rel/ogc/1.0/conformance` relation
 that Part 1 Req 13 B names, and `…/data`, next to the short `conformance`/`data`
@@ -110,6 +117,24 @@ unit, a `description` naming what each channel reads, and their own
 not list them: a composite has no numeric values. The Maps and Tiles `legend`
 schema is one of a palette legend or a composite's channel list.
 
+Map tile classes (2026-10-01, [#946](https://github.com/mrauhala/meteocore/issues/946)):
+`/conformance` at the shared root is the blocks' union plus the classes a
+block holds only in the shared layout. Tiles adds OGC API - Maps "Map
+Tilesets" there, where map tiles sit under the map resource
+(`…/map/tiles`, linked `tilesets-map`) and take the Maps Scaling parameters.
+The per-API Maps service, whose `tilesets-map` link points into `/tiles`, does
+not declare it. Tiles DateTime is declared on `/tiles` and at the shared root;
+it covers map and vector tiles, which select features as Features' `datetime`
+does ([#794](https://github.com/mrauhala/meteocore/issues/794)).
+The contract suite checks each declaration against the links and OpenAPI
+parameters it requires. No Common classes change.
+
+Map route parameters (2026-10-15, [#954](https://github.com/mrauhala/meteocore/issues/954)):
+Maps `…/map` and `…/styles/{styleId}/map`, per-API and at the shared root,
+reject a query parameter outside the list their OpenAPI operations document
+with a 400 naming that list, as map tiles already did. No Common classes
+change.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively;
 the shared root's are relative to `/`.
 Part 4 rows concern **collection discovery**, not querying the contents of a
@@ -136,10 +161,10 @@ collection.
 | Collection description `/collections/{id}` (§7.2) | Yes | Yes | Yes | Yes |
 | Collection identifier, title and description | Yes | Yes | Yes | Yes |
 | Collection keywords | Yes — configuration | Yes — configuration | Yes — configuration | Yes — configuration |
-| License links | Yes — when configured with a resolvable URL | Yes — same | Yes — same | Yes — same |
+| License links | Yes — when configured with a resolvable URL; `type` `text/html` or the configured `type` | Yes — same | Yes — same | Yes — same |
 | `attribution` / `attributionMediaType` | No | No | No | No |
 | `itemType` for individually accessible items | Omitted; EDR locations require applicability review | N/A — map access | N/A — tile access | Yes — `feature` |
-| Links to data access mechanisms | Yes — EDR `data_queries` | Yes — map/styles, tiles when enabled | Yes — tilesets | Yes — items, vector tiles when enabled |
+| Links to data access mechanisms | Yes — EDR `data_queries`, repeated as typed `rel=data` collection links | Yes — map/styles, tiles when enabled | Yes — tilesets | Yes — items, vector tiles when enabled |
 | `self` links on collection list/detail | Yes | Yes | Yes | Yes |
 | `alternate` links for every supported representation (§7.1.2, §7.2.2.3) | Yes [4] | Yes [4] | Yes [4] | Yes [4] |
 | Spatial extent in CRS84 | Yes — engine-dependent | Yes — engine-dependent | Yes — raster or feature extent | Yes — engine-dependent |
@@ -175,7 +200,7 @@ collection.
 | Collection `datetime`: instant, interval, open ends (§7.5) | Yes — engine extent [5] | Yes — raster extent [5] | Yes — raster or feature extent [5] | Yes — feature extent [5] |
 | Collection `q`: case-insensitive terms/phrases in title, description, keywords (§7.6) | Yes [10] | Yes [10] | Yes [10] | Yes [10] |
 | Collection `query`: required/excluded terms (§7.7) | Yes [10] | Yes [10] | Yes [10] | Yes [10] |
-| Collection page size `limit` (§7.8) | Yes — default/max 1,000 | Yes — same | Yes — same | Yes — same |
+| Collection page size `limit` (§7.8) | Yes — default/max 1,000; HTML default 24 [12] | Yes — same | Yes — same | Yes — same |
 | Collection `next` paging links (§7.8) | Yes | Yes | Yes | Yes |
 | Collection `prev` paging links (§7.8, optional) | Yes | Yes | Yes | Yes |
 | `offset` paging mechanism (MeteoCore extension) | Yes | Yes | Yes | Yes |
@@ -183,7 +208,7 @@ collection.
 | Combined filters before paging; links preserve supported filters | Yes | Yes | Yes | Yes |
 | Scale denominator filter `sd` (§7.9) | No — 400 | No — 400 | No — 400 | No — 400 |
 | Cell-size filter `resolution` (§7.9) | No — 400 | No — 400 | No — 400 | No — 400 |
-| Client-selected collection sorting `sortby` (§8) | No — fixed ID order | No — fixed ID order | No — fixed ID order | No — fixed ID order |
+| Client-selected collection sorting `sortby` (§8) | Partial — `title` and `id` [12] | Partial — same [12] | Partial — same [12] | Partial — same [12] |
 | Collection-list sortables discovery (§8) | No | No | No | No |
 | CQL2 collection filtering (§9) | No | No | No | No |
 | Collection-list queryables discovery (§9) | No | No | No | No |
@@ -197,11 +222,16 @@ collection.
 1. Metadata routes share `f=json/html` and Accept negotiation, but do not fully
    rank competing media types by quality values. Features item routes separately
    accept media-type aliases; that does not extend every Common metadata route.
+   An `f` given twice on the landing page, `/conformance` or `/collections/{id}`
+   is a JSON `BadRequest` naming it on every API and at the shared root (#1121).
 2. The shared extractor rejects unsupported and duplicate collection parameters
    with a JSON `BadRequest` response. Part 1 §8.3 permits some tolerance, but the
    project's stricter policy avoids misleading draft-testing clients. Unsupported
-   controls such as `sd`, `parent` and `sortby` now return 400 rather than
-   silently serving unfiltered results. `offset` and `f` remain supported extensions.
+   controls such as `sd` and `parent`, and a `sortby` property other than `title`
+   or `id`, return 400 rather than silently serving unfiltered or unsorted results. `offset` and `f` remain supported extensions.
+   An HTML request's 400 is the catalog page with the field at fault marked, and
+   every other error of an HTML request is an HTML page with the same status
+   (#1132); JSON requests keep the JSON body.
 3. Maps and Tiles cache rendered data responses; their Common metadata handlers
    lack the EDR/Features metadata caching middleware. This row is about metadata.
 4. Shared collection metadata now adds HTML alternate links to JSON list/detail
@@ -250,6 +280,16 @@ collection.
     class assessment are tracked in [#742](https://github.com/mrauhala/meteocore/issues/742);
     Searchable Collections remains undeclared. Sorting, CQL2 and hierarchy are
     separate classes; their absence does not itself invalidate Searchable Collections.
+12. `sortby` takes comma-separated `title` and `id` keys, each ascending or
+    `-` descending; titles compare case-insensitively and ties are ordered by
+    id. No collection description carries a member saying when its data last
+    changed, so there is no `updated` key; any other property, or a property
+    given twice, is a 400, and there is no sortables resource, so the
+    Sortable class stays undeclared.
+    Without `sortby`, JSON lists collections by id and the HTML catalog by
+    title; without `limit`, an HTML page holds 24 collections (#1141). A
+    JSON/HTML alternate link spells out `limit` and `sortby`, so both
+    representations of a page list the same collections in the same order.
 
 **Advertised conformance versus assessed behavior**
 
@@ -266,6 +306,9 @@ All four APIs currently return the same Common declarations:
 | Part 4 sorting, filtering, hierarchy | Not declared | Not declared | Not declared | Not declared |
 
 The emitted URIs use `http://www.opengis.net/spec/ogcapi-common-{part}/1.0/conf/…`.
+EDR also lists the `https://` forms of Part 1 `core` and Part 2 `collections`,
+the identifiers EDR 1.2's `/req/core/conformance` A requires (#979); the
+shared list, and with it every other API, keeps `http://`.
 Current draft documents use HTTPS in some identifiers; exact URI expectations
 should be recorded when running their conformance tests. JSON/HTML support and
 declarations in other API specifications do not substitute automatically for
@@ -399,6 +442,29 @@ and coverage; they do not become data-query predicates.
 
 HTML catalog headings use the shared request bar for URL/cURL copy actions.
 
+HTML list and detail pages hold their JSON's information (#984, for OGC API -
+EDR `/req/html/content`): each catalog card adds the collection's full metadata
+and links, keywords are not truncated, and landing, collection and list pages
+list every link with its relation, title and type at its own href. This is a
+presentation change in all four APIs; discovery and conformance are unchanged.
+
+A collection page holds every member of its JSON as tables and anchors, never
+as JSON text (#1140): styles with a legend thumbnail and each style's map,
+map-tile and legend links as `<a>`; the extent with the catalog's time, cadence,
+step and bounds formatting; `parameter_names` as a parameter table (the name a
+request gives `parameter-name`, label, unit or "unit not provided by source",
+and a parameter's own levels and times where it advertises them: no
+parameter builder sets a per-parameter vertical extent yet, so a collection's
+levels stay in its coverage facts); `data_queries` with formats, CRS and, where
+a query takes them, units; CRS lists as short names (`EPSG:3067`) with the URI
+as the title. A member without a layout of its own is a collapsed nested list,
+in which JSON `null` shows as `null`. Labels are
+plain words with the JSON member or link relation as secondary text, and the
+Overview lists each resource once. The conformance page groups the declared
+classes by standard and version and links each class URI, with a class
+declared in its `http` and `https` forms on one row. The JSON and the
+declared conformance classes are unchanged.
+
 Maps HTML collection overviews additionally preview actual data using the
 advertised map/style endpoints. This is API-specific data access; the page’s
 JSON representation remains collection metadata and Common discovery is unchanged.
@@ -415,7 +481,8 @@ vertical coverage, keywords and license links. Storage CRS is not inferred.
 Collection advanced search starts collapsed and remembers its disclosure state
 per API path for the browser session, including after search submission. Applied
 filters remain visible while collapsed. Resource titles and their URLs form one
-clickable link; map endpoints retain their required-bbox hint. Country boundaries
+clickable link; a map endpoint notes that it covers the whole extent unless
+the request sets a bbox. Country boundaries
 render above map imagery with a contrasting halo, including after pan/zoom.
 
 Catalog presentation now has compact request/search disclosures, persistent

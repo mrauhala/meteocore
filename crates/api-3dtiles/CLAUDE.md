@@ -42,7 +42,8 @@ drives the collection JSON's `representations` array → the viewer's toggle.
   (`?representation=&quantity=&datetime=&threshold=&resolution=`)
 - Voxel trio: `GET /collections/{id}/voxel/{tileset.json,subtrees/*,content/*}`
   (`?quantity=&datetime=&resolution=`)
-- Plus `/`, `/collections`, `/collections/{id}`, and `/viewer`.
+- Plus `/`, `/collections`, `/collections/{id}`, `/viewer`, and the viewer's
+  script at `/viewer.js` and `/viewer/viewer.js` (ETag, `no-cache`).
 
 The tileset's `content.uri` embeds the resolved quantity (+ pinned time +
 min_value/threshold + representation + resolution) so the content fetch is
@@ -71,18 +72,58 @@ deterministic.
 ## Viewer
 
 `GET /viewer` — a bundled CesiumJS page (`include_str!`-baked from
-`viewer/index.html`) with collection/quantity/representation/resolution
+`viewer/index.html`, its script from `viewer/viewer.js` at `/viewer.js` and
+`/viewer/viewer.js`) with collection/quantity/representation/resolution
 pickers and a time scrubber (shown when >1 volume). Same-origin API base by
 default; `?base=` selects another *path on the same origin* (a proxy-prefixed
 mount). Other origins are ignored, so a crafted link cannot make a served viewer
 render another server's data as ours (CodeQL `js/client-side-request-forgery`).
 Opened from disk, the viewer targets the public instance.
 
-- Point styling: `pointSize` by `${value}` (weak ~1 px → strong ~16 px);
-  the `min dBZ` field restyles `show` client-side (instant while ≥ the
-  fetched floor; going lower re-fetches).
-- The collection JSON carries a `legend` (point colormap sampled to
-  `#rrggbb` stops via `legend_stops`) rendered as a gradient bar.
+- **CSP** (`VIEWER_CSP`, #1137): scripts from `'self'` and the pinned CesiumJS
+  release prefix only, no inline script. `'unsafe-eval'` stays: CesiumJS 1.142
+  evaluates a string while loading (render-verified: without it `Cesium` is
+  never defined) and compiles WebAssembly. A CesiumJS version bump
+  changes three things together: the URLs in `viewer.js` (`CESIUM_SCRIPT`,
+  `CESIUM_STYLE`), the SRI hashes beside them
+  (`scripts/check-cesium-sri.sh` reads them there) and the CSP prefix
+  (`viewer_page_runs_under_a_csp_matching_its_cdn` pins the last).
+- **Guarded startup** (#1137): the page has no CDN tag. `viewer.js` inserts
+  CesiumJS and `widgets.css` (with SRI), so a host that silently drops
+  packets cannot hold the page blank, and gives it `CESIUM_TIMEOUT_MS`
+  (12 s). It also catches a failed `Cesium.Viewer` (no WebGL). Without a 3D
+  view it still fills the selects and shows a panel linking each
+  collection's 3D Tiles JSON and its HTML page (`rel=related`) — never a
+  blank page; a CesiumJS that arrives after the timeout still starts the
+  view. Self-hosting CesiumJS under `/3dtiles/vendor/` is the remaining fix
+  for blocked CDNs.
+- **Collection page link**: `TilesState3d.collection_pages`, resolved by the
+  server from the registries a site entered (shared root for Maps/Tiles,
+  else EDR's mount). Never derive it from `apis`: `"features"` registers the
+  PVOL network inventory under the source id, never a site.
+- **Per-quantity drawing** (`src/quantity.rs`, #1137): each quantity is
+  painted with the default style of its WMS/Maps/Tiles parameter layer, which
+  the server resolves at load (`collection_layer_styles`) into
+  `TilesState3d.quantity_styles`. `quantities[]` in the collection JSON carry
+  `unit`, `legend` (`{title, unit, min, max, stops}`, sampled once per load)
+  and `min_value` (5 for dBZ, `null` otherwise); the `/collections` list
+  leaves the per-quantity legends out. The top-level `legend` is the
+  default quantity's. A quantity a poll adds after load draws with the
+  fallback `TilesState3d.colormap` until a reload, like its WMS layer.
+- The viewer relabels the numeric field `min <unit>` per quantity, leaves it
+  empty for non-reflectivity (a quantity change in the same unit keeps the
+  value typed), and offers isosurface/echo-top/voxels for dBZ quantities only
+  (the server seals them at the −32 dBZ floor). The status line reads
+  quantity · view · filter · collection, so a narrow bar cuts the collection.
+- Point styling: reflectivity `pointSize` by `${value}` (weak ~1 px → strong
+  ~16 px), other quantities a fixed 2 px; the numeric field restyles `show`
+  client-side (instant while ≥ the fetched floor; going lower re-fetches).
+- View state lives in the URL (`collection`, `quantity`, `representation`,
+  `min_value`/`threshold`, `resolution`, `datetime` for a historical frame),
+  written with `history.replaceState`, restored on load; `?collection=` is the
+  link other pages use (the collection JSON's `alternate` text/html link).
+  The time slider writes on `change`, never per `input` step: Safari throws
+  after 100 `replaceState` calls in 30 s.
 - Voxels render via `Cesium3DTilesVoxelProvider` + `VoxelPrimitive` with a
   reflectivity transfer-function `CustomShader` (`fsInput.metadata.<q>`).
 
@@ -98,7 +139,8 @@ Opened from disk, the viewer targets the public instance.
   total 3D CPU whatever the mix.
 - **Content cache** (`src/cache.rs`): process-global byte-bounded LRU of
   encoded content bytes + ETag, keyed (collection, product, quantity,
-  datetime, params, dims) **plus a data-version hashed from
+  datetime, params, dims, the colour ramp's fingerprint — a reload that
+  restyles a quantity must miss) **plus a data-version hashed from
   `VolumeInfo.times`** (new volume ⇒ new version — "latest"/nearest-time
   invalidate without duplicating engine selection logic). Exact advertised
   times use a stable version so new arrivals retain archived frames. Per-key
@@ -119,8 +161,9 @@ Opened from disk, the viewer targets the public instance.
 ## Config
 
 Add `"3dtiles"` to a collection's `apis` (only `odim-volume` supports it).
-v1 uses one shared reflectivity colormap; per-collection/per-quantity
-colormaps are follow-ups.
+Quantities take their colours from the collection's `[wms]` styling
+(`[[wms.parameters]]`, bundles, built-in parameter defaults); per-quantity
+no-echo floors for the grid products are a follow-up (#350).
 
 Viewer regression tests: `node --test crates/api-3dtiles/tests/viewer.test.cjs`
 (delay metadata/content and check scheduling, failure, cancellation, refresh).

@@ -1,0 +1,23 @@
+[package]
+name = "engine-station-grid"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+# The interpolation modules (`geometry`, `interpolate`, `kdtree`) are
+# dependency-free pure functions; these serve the engine, cache and pool.
+ds-core = { path = "../core" }
+ds-cache = { path = "../ds-cache" }
+ds-executor = { path = "../ds-executor" }
+ds-poll = { path = "../ds-poll" }
+chrono = "0.4"
+arc-swap = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+# The integration test grids the repository's real station fixture
+# (`testdata/weather.csv`) through the public CSV engine, the same
+# `Arc<dyn EdrEngine>` the server hands the engine.
+engine-csv = { path = "../engine-csv" }

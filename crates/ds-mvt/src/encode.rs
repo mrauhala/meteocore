@@ -564,6 +564,7 @@ mod tests {
             id: id.into(),
             geometry: Arc::new(geom),
             properties: Arc::new(map),
+            related: Vec::new(),
         }
     }
 

@@ -1,0 +1,215 @@
+# Server binaries for every release platform: Linux x86_64 and arm64,
+# macOS Apple Silicon and Intel, Windows x86_64.
+#
+# release.yml's build-binary job calls this with the tag to build, and its
+# upload job attaches the archives to the GitHub release. Every other run
+# only uploads workflow artifacts (7-day retention, downloadable from the
+# run page): pull requests that change the release build or Cargo.lock, a
+# weekly schedule, and manual dispatch. CI (ci.yml) builds on Linux only,
+# so these runs are what show a macOS or Windows break, and a new native
+# dependency most often arrives through Cargo.lock, before a release
+# rather than at one.
+#
+# Not a required check: a path-filtered workflow that does not run would
+# leave its required check pending forever.
+
+name: build binaries
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to check out and name the archives after.
+        type: string
+        required: true
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/build-binaries.yml
+      - .github/workflows/release.yml
+      - scripts/binary_boot_smoke.sh
+      - scripts/third_party_notices.sh
+      - about.toml
+      - third-party/**
+      - Cargo.lock
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+# A called run carries the caller's github context, so its event is push or
+# workflow_dispatch and its group is unique to the run: it never queues
+# behind or cancels a release. A pull request cancels its own superseded
+# runs.
+concurrency:
+  group: build-binaries-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: binary ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-26
+          # Cross-compiled on Apple Silicon. cmake-rs sets
+          # CMAKE_OSX_ARCHITECTURES for libaec, aws-lc-sys builds with cc,
+          # and the boot smoke runs the binary under Rosetta. GitHub plans to
+          # retire its Intel macOS runners, so this leg does not use one.
+          - target: x86_64-apple-darwin
+            runner: macos-26
+          # MSVC links the VC++ runtime DLLs dynamically, as Rust does by
+          # default; the README says to install the redistributable. No
+          # jemalloc here: crates/server gates it off for MSVC.
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            exe: .exe
+    runs-on: ${{ matrix.runner }}
+    # Git Bash on Windows; it has tar, curl and sha256sum, and 7z is on PATH.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # An empty ref (every trigger but workflow_call) checks out the
+      # event's own commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+
+      # cmake/clang are needed by `libaec-sys` (GRIB CCSDS support). The macOS
+      # and Windows images already have CMake and LLVM.
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang pkg-config
+
+      # SHA-pinned like every third-party action in release.yml: a hijacked
+      # `@stable` tag could inject backdoored Rust into a release archive.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Restore always, save only outside pull requests: the repository's
+      # cache budget is already full, and each target's cache is about 0.5 GB.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        id: cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.target }}-cargo-
+
+      - name: Build release binary
+        # `--locked` enforces that the lockfile committed at the tag exactly
+        # matches Cargo.toml, so a release cannot silently pick up a new
+        # transitive dependency version. release.yml's "Propose release PR"
+        # step rewrites Cargo.lock alongside the version bump for this.
+        #
+        # `--features icechunk`: ship Icechunk Zarr support in release binaries
+        # (object_store S3 backend, about 8 MB more, no AWS SDK: #339). It
+        # reuses the object_store/rustls stack already in the base build.
+        #
+        # MACOSX_DEPLOYMENT_TARGET makes rustc, cc and CMake all target macOS
+        # 11, rustc's own arm64 minimum, instead of the C dependencies
+        # following the runner SDK. Other targets ignore it.
+        env:
+          TARGET: ${{ matrix.target }}
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: cargo build --release --locked --target "${TARGET}" -p server --features icechunk
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      # A binary that links is not one that runs: a missing shared library, a
+      # broken code signature or a too-new macOS minimum all surface only on
+      # exec.
+      - name: Boot smoke
+        env:
+          BIN: target/${{ matrix.target }}/release/server${{ matrix.exe }}
+        run: scripts/binary_boot_smoke.sh "${BIN}"
+
+      - name: Check the macOS minimum
+        if: runner.os == 'macOS'
+        env:
+          BIN: target/${{ matrix.target }}/release/server
+        run: |
+          minos=$(otool -l "${BIN}" | awk '/LC_BUILD_VERSION/ { found = 1 } found && $1 == "minos" { print $2; exit }')
+          echo "LC_BUILD_VERSION minos: ${minos}"
+          [ "${minos}" = "11.0" ]
+
+      # MIT, BSD and Apache-2.0 require their notices to travel with a binary
+      # (#1081). Generated from Cargo.lock here rather than committed, so a
+      # dependency bump cannot leave them stale. Composite action, no Node
+      # runtime; the version matches the Dockerfile's.
+      #
+      # A tag cut before #1081 has neither the script nor the licence files.
+      # release.yml's dispatch backfill builds such a tag with this file from
+      # main, so these steps and the licence files in Package are skipped
+      # there and its archives hold README.md only, as they did.
+      - name: Install cargo-about
+        if: hashFiles('scripts/third_party_notices.sh') != ''
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0  # v2
+        with:
+          tool: cargo-about@0.9.2
+
+      - name: Third-party notices
+        if: hashFiles('scripts/third_party_notices.sh') != ''
+        run: bash scripts/third_party_notices.sh THIRD-PARTY-NOTICES.txt
+
+      - name: Package
+        # All inputs flow through `env:` so the shell never sees an untrusted
+        # GitHub expression: `tag` comes from a workflow_dispatch input on
+        # release.yml's backfill path.
+        env:
+          VERSION: ${{ inputs.tag || (github.event_name == 'pull_request' && format('pr{0}', github.event.pull_request.number)) || github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          base="meteocore-${VERSION//\//-}-${TARGET}"
+          mkdir -p "dist/${base}"
+          # Match the Docker image's binary name.
+          cp "target/${TARGET}/release/server${EXE}" "dist/${base}/dataserver${EXE}"
+          cp README.md "dist/${base}/"
+          # The licences, for every tag that has the notices script (#1081).
+          if [ -f scripts/third_party_notices.sh ]; then
+            cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt "dist/${base}/"
+          fi
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            (cd dist && 7z a -tzip "${base}.zip" "${base}" > /dev/null)
+          else
+            # COPYFILE_DISABLE stops macOS tar adding AppleDouble `._` entries.
+            COPYFILE_DISABLE=1 tar -czf "dist/${base}.tar.gz" -C dist "${base}"
+          fi
+          rm -rf "dist/${base}"
+          ls -la dist/
+
+      # Upload v7 + download v8 (release.yml's upload job) is the intended
+      # pairing: both use the post-v4 artifact API. Artifacts uploaded here
+      # belong to the calling run, so that job can download them.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: meteocore-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7

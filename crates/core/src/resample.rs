@@ -28,6 +28,13 @@
 //! `engine-odim` (composite grid), and any future projected-grid engine.
 //! Keeping it here makes the CLAUDE.md "never project per output pixel" rule
 //! reusable rather than re-derived per engine (#203, #236).
+//!
+//! [`SourceGrid`] builds on it: the shared `f32` sampler a gridded engine
+//! renders a decoded field with (see [`sampler`]).
+
+pub mod sampler;
+
+pub use sampler::{OutputMap, SourceGrid};
 
 /// Initial node spacing, in output pixels. The adaptive refinement in
 /// [`ProjectionGrid::build`] only ever *increases* density from here, so this
@@ -112,6 +119,9 @@ pub struct ProjectionGrid {
     /// Whether `boundary` holds a pole cell — one with four finite corners,
     /// which [`Self::sample`] must still route to its sub-grid.
     pole_cells: bool,
+    /// The estimated interpolation error, in the budget's units, when
+    /// refinement stopped at [`MAX_CELLS`] above [`MAX_INTERP_ERROR_PX`].
+    capped: Option<f64>,
 }
 
 /// A boundary cell's nodes at [`BOUNDARY_STEP_PX`] spacing, row-major.
@@ -290,6 +300,121 @@ impl ProjectionGrid {
         out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) -> Self {
+        Self::refined(
+            out_width,
+            out_height,
+            src_cols,
+            src_rows,
+            col_period,
+            None,
+            out_to_world,
+            world_to_src_px,
+        )
+        .warn_if_capped()
+    }
+
+    /// Like [`build_2d`](Self::build_2d) for a caller that samples only the
+    /// output pixels of `read`, an inclusive window `(px_lo, px_hi, py_lo,
+    /// py_hi)` such as [`OutputCrs::footprint_pixel_window`] gives. Only the
+    /// cells holding one of its pixels count toward the error estimate and
+    /// get boundary sub-grids, so a pixel outside it is interpolated without
+    /// the error budget and must not be read.
+    ///
+    /// Outside a source's footprint the mapping need not be smooth, and
+    /// refining for it then never converges (#1110). A conic source's
+    /// forward transform jumps a cone's gap where longitude wraps, half a
+    /// turn from the source. Over the pole that drove a 256 px meta-tile to
+    /// [`MAX_CELLS`]: a million and a half projections for pixels the
+    /// footprint guard then left empty.
+    ///
+    /// [`OutputCrs::footprint_pixel_window`]: crate::map_engine::OutputCrs::footprint_pixel_window
+    pub fn build_2d_within(
+        out_width: u32,
+        out_height: u32,
+        read: (u32, u32, u32, u32),
+        src_cols: u32,
+        src_rows: u32,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
+        world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
+    ) -> Self {
+        Self::build_2d_within_quiet(
+            out_width,
+            out_height,
+            read,
+            src_cols,
+            src_rows,
+            out_to_world,
+            world_to_src_px,
+        )
+        .warn_if_capped()
+    }
+
+    /// [`Self::build_2d_within`] for a caller that reports a capped grid
+    /// itself: nothing goes to stderr, and [`Self::capped_error`] says
+    /// whether refinement stopped at [`MAX_CELLS`] over budget. ds-core has
+    /// no `tracing`, so an engine logs it with what only it knows, the
+    /// collection and the request (#1129).
+    pub fn build_2d_within_quiet(
+        out_width: u32,
+        out_height: u32,
+        read: (u32, u32, u32, u32),
+        src_cols: u32,
+        src_rows: u32,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
+        world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
+    ) -> Self {
+        Self::refined(
+            out_width,
+            out_height,
+            src_cols,
+            src_rows,
+            None,
+            Some(read),
+            out_to_world,
+            world_to_src_px,
+        )
+    }
+
+    /// The estimated interpolation error when refinement stopped at
+    /// [`MAX_CELLS`] above the [`MAX_INTERP_ERROR_PX`] budget, `None` when
+    /// the grid met it. In source pixels, or output pixels on a periodic
+    /// column axis ([`Self::build_2d_periodic`]).
+    pub fn capped_error(&self) -> Option<f64> {
+        self.capped
+    }
+
+    /// Report a capped grid on stderr, for every constructor but
+    /// [`Self::build_2d_within_quiet`]. ds-core is framework-free (no
+    /// `tracing`). It's a rare edge (only hit when a single render spans
+    /// tens of degrees) and the consequence is sub-pixel-ish
+    /// misregistration, not a failure.
+    fn warn_if_capped(self) -> Self {
+        if let Some(error) = self.capped {
+            eprintln!(
+                "WARN ds_core::resample: projection grid hit the MAX_CELLS \
+                 cap with interpolation error {error:.3} px > budget \
+                 {MAX_INTERP_ERROR_PX} px; rendered output may be slightly \
+                 misregistered for this viewport"
+            );
+        }
+        self
+    }
+
+    /// The adaptive build behind every constructor: `col_period` as
+    /// [`Self::build_2d_periodic`] takes it, `read` as
+    /// [`Self::build_2d_within`] does (`None` reads every pixel). A grid
+    /// that stops at the cap records its error ([`Self::capped_error`]).
+    #[allow(clippy::too_many_arguments)] // output dims + source dims + period + window + 2 mapping closures are all genuine inputs
+    fn refined(
+        out_width: u32,
+        out_height: u32,
+        src_cols: u32,
+        src_rows: u32,
+        col_period: Option<f64>,
+        read: Option<(u32, u32, u32, u32)>,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
+        world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
+    ) -> Self {
         let col_period = col_period.filter(|p| p.is_finite() && *p > 0.0);
         let mut cells_x = out_width.div_ceil(GRID_STEP_PX).clamp(MIN_CELLS, MAX_CELLS);
         let mut cells_y = out_height
@@ -305,97 +430,189 @@ impl ProjectionGrid {
                 &out_to_world,
                 &world_to_src_px,
             );
-            let error = grid.estimate_error(src_cols, src_rows, &out_to_world, &world_to_src_px);
+            let error =
+                grid.estimate_error(src_cols, src_rows, read, &out_to_world, &world_to_src_px);
             if error <= MAX_INTERP_ERROR_PX {
                 break grid;
             }
             if cells_x >= MAX_CELLS && cells_y >= MAX_CELLS {
                 // Extreme viewport: even the densest grid cannot meet the
-                // budget. Accept it, but make the degradation observable
-                // rather than letting it pass silently. ds-core is
-                // framework-free (no `tracing`), so this goes to stderr; it's
-                // a rare edge (only hit when a single render spans tens of
-                // degrees) and the consequence is sub-pixel-ish misregistration,
-                // not a failure.
-                eprintln!(
-                    "WARN ds_core::resample: projection grid hit the MAX_CELLS \
-                     cap with interpolation error {error:.3} px > budget \
-                     {MAX_INTERP_ERROR_PX} px; rendered output may be slightly \
-                     misregistered for this viewport"
-                );
-                break grid;
+                // budget. Accept it, but record the error, so the
+                // degradation is observable rather than passing silently.
+                break Self {
+                    capped: Some(error),
+                    ..grid
+                };
             }
             // Halving the cell size quarters the bilinear error.
             cells_x = (cells_x * 2).min(MAX_CELLS);
             cells_y = (cells_y * 2).min(MAX_CELLS);
         };
-        grid.refine_boundary(out_width, out_height, &out_to_world, &world_to_src_px);
+        grid.refine_boundary(out_width, out_height, read, &out_to_world, &world_to_src_px);
         grid
     }
 
-    /// Give every cell on a domain boundary — some corner nodes finite,
-    /// some not — a sub-grid at [`BOUNDARY_STEP_PX`] spacing, so the
-    /// boundary is resolved to that many pixels instead of blanking the
-    /// whole cell. A cell bracketing a pole of a periodic column axis gets
-    /// one too, confining the pole's singularity to one sub-cell.
+    /// Whether cell `(cx, cy)` holds a pixel of `read`, the inclusive output
+    /// window `(px_lo, px_hi, py_lo, py_hi)` the caller samples; every cell
+    /// does without one.
+    fn reads_cell(&self, read: Option<(u32, u32, u32, u32)>, cx: usize, cy: usize) -> bool {
+        let Some((x_lo, x_hi, y_lo, y_hi)) = read else {
+            return true;
+        };
+        let overlaps = |c: usize, size: f64, lo: u32, hi: u32| {
+            (c as f64 * size) < f64::from(hi) + 1.0 && ((c + 1) as f64 * size) > f64::from(lo)
+        };
+        overlaps(cx, self.cell_w, x_lo, x_hi) && overlaps(cy, self.cell_h, y_lo, y_hi)
+    }
+
+    /// Give every cell on a domain boundary a sub-grid at
+    /// [`BOUNDARY_STEP_PX`] spacing, so the boundary is resolved to that
+    /// many pixels instead of blanking the whole cell. A cell is on it when
+    /// some corner nodes are finite and some not, or when the domain
+    /// reaches in between corners that all miss it. The domain's edge does
+    /// that where it has a corner, such as a wedge's tip (#1113): low in a
+    /// 32 px cell, the tip misses every corner. The domain then reaches the cell across
+    /// a side, from a neighbour whose sub-grid has a finite node along it,
+    /// or from past the grid or the cells `read` holds, where the cell's
+    /// own side is probed at the sub-grid spacing. A cell bracketing a
+    /// pole of a periodic column axis gets a sub-grid too, confining the
+    /// pole's singularity to one sub-cell.
     ///
     /// This stays a coarse-grid mapping (Critical Rule 5): a boundary curve
     /// crosses O(perimeter / cell) cells, each costing
     /// `(cell / BOUNDARY_STEP_PX)²` projections, so a limb-sized curve costs
-    /// on the order of its perimeter in pixels times four. Total sub-grid
-    /// nodes are capped at a quarter of the per-pixel cost; a mapping with
-    /// scattered non-finite nodes stops refining there, and its remaining
-    /// boundary cells stay unfilled.
+    /// on the order of its perimeter in pixels times four. The probes cost
+    /// at most half the perimeter of the grid, or of the cells `read`
+    /// holds, in pixels. Total sub-grid nodes and probes are capped at a
+    /// quarter of the per-pixel cost; a mapping with scattered non-finite
+    /// nodes stops refining there, and its remaining boundary cells stay
+    /// unfilled. A cell holding no pixel of `read` is never sampled and
+    /// gets none.
     fn refine_boundary(
         &mut self,
         out_width: u32,
         out_height: u32,
+        read: Option<(u32, u32, u32, u32)>,
         out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) {
         let finite = |(c, r): (f64, f64)| c.is_finite() && r.is_finite();
+        let (cells_x, cells_y, stride) = (self.cells_x, self.cells_y, self.stride);
         let sub_x = (self.cell_w / BOUNDARY_STEP_PX).ceil().max(1.0) as usize;
         let sub_y = (self.cell_h / BOUNDARY_STEP_PX).ceil().max(1.0) as usize;
         let per_cell = (sub_x + 1) * (sub_y + 1);
         let mut budget = (out_width as usize * out_height as usize / 4).max(4096);
-        for cy in 0..self.cells_y {
-            for cx in 0..self.cells_x {
-                let n = cy * self.stride + cx;
-                let corners = [
-                    self.nodes[n],
-                    self.nodes[n + 1],
-                    self.nodes[n + self.stride],
-                    self.nodes[n + self.stride + 1],
-                ];
-                let valid = corners.iter().filter(|&&c| finite(c)).count();
-                let pole = valid == 4 && brackets_pole(&corners, self.col_period);
-                if valid == 0 || (valid == 4 && !pole) {
+        let corners = |cx: usize, cy: usize| {
+            let n = cy * stride + cx;
+            [
+                self.nodes[n],
+                self.nodes[n + 1],
+                self.nodes[n + stride],
+                self.nodes[n + stride + 1],
+            ]
+        };
+        // Sub-grid node (i, j) of cell (cx, cy).
+        let node = |cx: usize, cy: usize, i: usize, j: usize| {
+            let fx = (cx as f64 + i as f64 / sub_x as f64) / cells_x as f64;
+            let fy = (cy as f64 + j as f64 / sub_y as f64) / cells_y as f64;
+            let (lon, lat) = out_to_world(fx, fy);
+            world_to_src_px(lon, lat)
+        };
+        // A cell's sides, top, bottom, left and right: the sub-grid nodes
+        // between its corners, and the read cell across, if any.
+        let side = |s: usize| -> Vec<(usize, usize)> {
+            match s {
+                0 => (1..sub_x).map(|i| (i, 0)).collect(),
+                1 => (1..sub_x).map(|i| (i, sub_y)).collect(),
+                2 => (1..sub_y).map(|j| (0, j)).collect(),
+                _ => (1..sub_y).map(|j| (sub_x, j)).collect(),
+            }
+        };
+        let across = |cx: usize, cy: usize, s: usize| {
+            let (x, y) = match s {
+                0 => (Some(cx), cy.checked_sub(1)),
+                1 => (Some(cx), Some(cy + 1)),
+                2 => (cx.checked_sub(1), Some(cy)),
+                _ => (Some(cx + 1), Some(cy)),
+            };
+            let (x, y) = (x?, y?);
+            (x < cells_x && y < cells_y && self.reads_cell(read, x, y)).then_some((x, y))
+        };
+        let mut queued = vec![false; cells_x * cells_y];
+        let mut work = Vec::new();
+        for cy in 0..cells_y {
+            for cx in 0..cells_x {
+                if !self.reads_cell(read, cx, cy) {
                     continue;
                 }
-                if per_cell > budget {
-                    return;
+                let corners = corners(cx, cy);
+                let valid = corners.iter().filter(|&&c| finite(c)).count();
+                let pole = valid == 4 && brackets_pole(&corners, self.col_period);
+                let on_boundary = match valid {
+                    // The domain can reach in only across a side no other
+                    // cell's sub-grid runs along.
+                    0 => (0..4).filter(|&s| across(cx, cy, s).is_none()).any(|s| {
+                        let probes = side(s);
+                        if probes.len() > budget {
+                            return false;
+                        }
+                        budget -= probes.len();
+                        probes.into_iter().any(|(i, j)| finite(node(cx, cy, i, j)))
+                    }),
+                    4 => pole,
+                    _ => true,
+                };
+                if on_boundary {
+                    queued[cy * cells_x + cx] = true;
+                    work.push((cx, cy, pole));
                 }
-                budget -= per_cell;
-                self.pole_cells |= pole;
-                let mut nodes = Vec::with_capacity(per_cell);
-                for j in 0..=sub_y {
-                    let fy = (cy as f64 + j as f64 / sub_y as f64) / self.cells_y as f64;
-                    for i in 0..=sub_x {
-                        let fx = (cx as f64 + i as f64 / sub_x as f64) / self.cells_x as f64;
-                        let (lon, lat) = out_to_world(fx, fy);
-                        nodes.push(world_to_src_px(lon, lat));
-                    }
-                }
-                self.boundary.push((
-                    n,
-                    SubGrid {
-                        cells_x: sub_x,
-                        cells_y: sub_y,
-                        nodes,
-                    },
-                ));
             }
         }
+        let mut boundary = Vec::with_capacity(work.len());
+        let mut pole_cells = false;
+        let mut next = 0;
+        while let Some(&(cx, cy, pole)) = work.get(next) {
+            next += 1;
+            if per_cell > budget {
+                break;
+            }
+            budget -= per_cell;
+            pole_cells |= pole;
+            let mut nodes = Vec::with_capacity(per_cell);
+            for j in 0..=sub_y {
+                for i in 0..=sub_x {
+                    nodes.push(node(cx, cy, i, j));
+                }
+            }
+            // The domain reaching on across a side into a cell whose
+            // corners all miss it.
+            for s in 0..4 {
+                let Some((x, y)) = across(cx, cy, s) else {
+                    continue;
+                };
+                if queued[y * cells_x + x] || corners(x, y).into_iter().any(finite) {
+                    continue;
+                }
+                if side(s)
+                    .into_iter()
+                    .any(|(i, j)| finite(nodes[j * (sub_x + 1) + i]))
+                {
+                    queued[y * cells_x + x] = true;
+                    work.push((x, y, false));
+                }
+            }
+            boundary.push((
+                cy * stride + cx,
+                SubGrid {
+                    cells_x: sub_x,
+                    cells_y: sub_y,
+                    nodes,
+                },
+            ));
+        }
+        boundary.sort_unstable_by_key(|&(n, _)| n);
+        self.boundary = boundary;
+        self.pole_cells = pole_cells;
     }
 
     /// Build a grid with an explicit cell count (no refinement).
@@ -432,6 +649,7 @@ impl ProjectionGrid {
             boundary: Vec::new(),
             col_period,
             pole_cells: false,
+            capped: None,
         }
     }
 
@@ -457,10 +675,15 @@ impl ProjectionGrid {
     /// global grid's pixel is tens of kilometres, several output pixels of a
     /// regional view, so a fifth of a source pixel would still be visibly
     /// misregistered there.
+    ///
+    /// A cell holding no pixel of `read`, the output window the caller
+    /// samples, is skipped whole: no error there is ever seen (see
+    /// [`Self::build_2d_within`]).
     fn estimate_error(
         &self,
         src_cols: u32,
         src_rows: u32,
+        read: Option<(u32, u32, u32, u32)>,
         out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) -> f64 {
@@ -473,6 +696,9 @@ impl ProjectionGrid {
         let mut max = 0.0_f64;
         for j in 0..self.cells_y {
             for i in 0..self.cells_x {
+                if !self.reads_cell(read, i, j) {
+                    continue;
+                }
                 let n = j * self.stride + i;
                 let corners = unwrap_cols(
                     [
@@ -515,6 +741,17 @@ impl ProjectionGrid {
             }
         }
         max
+    }
+
+    /// Exact projections the grid holds: its nodes and its sub-grids'.
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
+            + self
+                .boundary
+                .iter()
+                .map(|(_, s)| s.nodes.len())
+                .sum::<usize>()
     }
 
     /// Interpolated source `(col, row)` for the centre of output pixel
@@ -944,6 +1181,80 @@ mod tests {
         );
     }
 
+    /// #1110: a caller that reads only part of the output gets a grid
+    /// refined for that part. Past the read window this mapping jumps 37
+    /// source columns, then is undefined: without the window the jump
+    /// alone refines to the cap, and the undefined part's edge would get
+    /// sub-grids. With it the grid stays at its starting 8 × 8 cells, exact
+    /// where it is read. A cell holding a single read pixel counts whole.
+    #[test]
+    fn a_read_window_refines_only_what_is_read() {
+        let map = |x: f64, y: f64| {
+            if x < 0.6 {
+                (x * 100.0, y * 100.0)
+            } else if x < 0.8 {
+                (x * 100.0 + 37.0, y * 100.0)
+            } else {
+                (f64::NAN, f64::NAN)
+            }
+        };
+        let size = 256;
+        let build =
+            |read| ProjectionGrid::build_2d_within(size, size, read, 100, 100, |x, y| (x, y), map);
+        let grid = build((0, 127, 0, 255));
+        assert_eq!((grid.cells_x, grid.cells_y, grid.node_count()), (8, 8, 81));
+        for oy in 0..size {
+            for ox in 0..=127 {
+                let (c, r) = grid.sample(ox, oy);
+                let (x, y) = ((ox as f64 + 0.5) / 256.0, (oy as f64 + 0.5) / 256.0);
+                assert!((c - x * 100.0).abs() < 1e-9 && (r - y * 100.0).abs() < 1e-9);
+            }
+        }
+        // Pixel 128 shares the 8 × 8 cell [128, 160) with the jump at 153.6.
+        let grid = build((0, 128, 0, 255));
+        assert_eq!(
+            (grid.cells_x, grid.cells_y, grid.node_count()),
+            (16, 16, 289)
+        );
+    }
+
+    /// #1129: a grid that stops at `MAX_CELLS` over budget records its
+    /// error, so a caller of the quiet constructor can report it with what
+    /// it knows of the request. Every other constructor caps the same way
+    /// and records the same error.
+    #[test]
+    fn a_capped_grid_records_its_error() {
+        // A jump 37 source columns wide at x = 0.6: no cell size
+        // interpolates across it.
+        let map = |x: f64, y: f64| {
+            let jump = if x < 0.6 { 0.0 } else { 37.0 };
+            (x * 100.0 + jump, y * 100.0)
+        };
+        let size = 256;
+        let node = |x: f64, y: f64| (x, y);
+        let all = (0, size - 1, 0, size - 1);
+        let quiet = ProjectionGrid::build_2d_within_quiet(size, size, all, 100, 100, node, map);
+        let cap = MAX_CELLS as usize;
+        assert_eq!((quiet.cells_x, quiet.cells_y), (cap, cap));
+        let error = quiet.capped_error().expect("the jump caps the grid");
+        assert!(error > MAX_INTERP_ERROR_PX, "capped at {error}");
+        let within = ProjectionGrid::build_2d_within(size, size, all, 100, 100, node, map);
+        let whole = ProjectionGrid::build_2d(size, size, 100, 100, node, map);
+        assert_eq!(within.capped_error(), Some(error));
+        assert_eq!(whole.capped_error(), Some(error));
+        // Read short of the jump, the grid meets the budget.
+        let short = ProjectionGrid::build_2d_within_quiet(
+            size,
+            size,
+            (0, 127, 0, size - 1),
+            100,
+            100,
+            node,
+            map,
+        );
+        assert_eq!(short.capped_error(), None);
+    }
+
     /// Great-circle distance in km (sphere) — the ground misregistration
     /// between a sampled and a reference position.
     fn ground_km((lon1, lat1): (f64, f64), (lon2, lat2): (f64, f64)) -> f64 {
@@ -974,7 +1285,7 @@ mod tests {
             ProjectionGrid::build_2d_periodic(size, size, 1440, 721, Some(1440.0), node, to_src);
         assert!(grid.pole_cells, "the pole cell gets a sub-grid");
         // Converged within budget: no MAX_CELLS warning for the pole tile.
-        let err = grid.estimate_error(1440, 721, node, to_src);
+        let err = grid.estimate_error(1440, 721, None, node, to_src);
         assert!(err <= MAX_INTERP_ERROR_PX, "estimate {err} over budget");
         let at = |ox: u32, oy: u32| {
             let (c, r) = grid.sample(ox, oy);
@@ -1023,6 +1334,81 @@ mod tests {
                 };
                 assert!(km < limit, "pixel ({ox}, {oy}) {km:.2} km off (texel 4 km)");
             }
+        }
+    }
+
+    /// A domain whose edge has a corner reaches into a cell between its
+    /// corner nodes: here a wedge 100° wide below its tip, the shape of
+    /// EPSG:3067's area at the North Pole under the meridians 50° either
+    /// side of 27°E that bounded it (#1113). In a 256 px tile, a tip 6 px
+    /// above a 32 px cell's bottom side lies 16 px from that side's
+    /// corners, and misses all four. Once with the cell below in the tile,
+    /// whose sub-grid reaches the tip along their shared side, and once with
+    /// the cell's bottom side the tile's own, where no node is in the domain
+    /// and only the side's probes find the tip. The map is the identity, so
+    /// the grid stays at its 32 px cells. Every pixel whose 2 px
+    /// surroundings, a sub-grid step, lie in the domain is drawn where it
+    /// lies, and no pixel past the domain.
+    #[test]
+    fn the_tip_of_a_domain_between_cell_corners_is_drawn() {
+        let size = 256_u32;
+        let half_angle = 50.0_f64.to_radians().tan();
+        for (col, row) in [(80.0, 26.0), (80.0, 250.0)] {
+            let place = |x: f64, y: f64| y >= row && (x - col).abs() <= (y - row) * half_angle;
+            let grid = ProjectionGrid::build_2d(
+                size,
+                size,
+                size,
+                size,
+                |fx, fy| {
+                    let (x, y) = (fx * f64::from(size), fy * f64::from(size));
+                    if place(x, y) {
+                        (x, y)
+                    } else {
+                        (f64::NAN, f64::NAN)
+                    }
+                },
+                |x, y| (x, y),
+            );
+            assert_eq!(
+                (grid.cells_x, grid.cells_y),
+                (8, 8),
+                "tip at ({col}, {row})"
+            );
+            // The tip's cell, from 64 px across and its row down.
+            let (cx, cy) = (2, (row / 32.0) as usize);
+            let n = cy * grid.stride + cx;
+            let corners = [n, n + 1, n + grid.stride, n + grid.stride + 1];
+            assert!(
+                corners.iter().all(|&k| !grid.nodes[k].0.is_finite()),
+                "tip at ({col}, {row}): a corner of its cell is in the domain"
+            );
+            let mut drawn = 0;
+            for oy in 0..size {
+                for ox in 0..size {
+                    let (x, y) = (f64::from(ox) + 0.5, f64::from(oy) + 0.5);
+                    let (c, r) = grid.sample(ox, oy);
+                    if !place(x, y) {
+                        assert!(c.is_nan() || r.is_nan(), "({ox}, {oy}) past the domain");
+                    } else if [(-2.0, -2.0), (2.0, -2.0), (-2.0, 2.0), (2.0, 2.0)]
+                        .iter()
+                        .all(|&(dx, dy)| place(x + dx, y + dy))
+                    {
+                        assert!(
+                            (c - x).abs() < 0.5 && (r - y).abs() < 0.5,
+                            "tip at ({col}, {row}): ({ox}, {oy}) drawn at ({c}, {r})"
+                        );
+                        drawn += usize::from(oy < 32 * (cy as u32 + 1));
+                    }
+                }
+            }
+            // Inside the tip's own cell row, 4 px below the tip.
+            let (c, r) = grid.sample(80, row as u32 + 4);
+            assert!(
+                c.is_finite() && r.is_finite(),
+                "tip at ({col}, {row}): the tip is empty"
+            );
+            assert!(drawn > 0, "tip at ({col}, {row})");
         }
     }
 

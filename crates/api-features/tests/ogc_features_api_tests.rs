@@ -39,6 +39,7 @@ impl MockFeatureEngine {
                     m.insert("population".into(), PropertyValue::Integer(658457));
                     m.into()
                 },
+                related: Vec::new(),
             },
             Feature {
                 id: "tampere".into(),
@@ -53,6 +54,7 @@ impl MockFeatureEngine {
                     m.insert("population".into(), PropertyValue::Integer(244315));
                     m.into()
                 },
+                related: Vec::new(),
             },
             Feature {
                 id: "no-location".into(),
@@ -62,6 +64,7 @@ impl MockFeatureEngine {
                     m.insert("name".into(), PropertyValue::String("Unknown".into()));
                     m.into()
                 },
+                related: Vec::new(),
             },
         ];
         Self {
@@ -173,9 +176,12 @@ fn build_router_with(engine: Arc<dyn FeatureEngine>) -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -185,6 +191,7 @@ fn build_router_with(engine: Arc<dyn FeatureEngine>) -> axum::Router {
         base_url: String::new(),
         trust_proxy_headers: false,
         vector_tileset_ids: Default::default(),
+        collection_pages: Default::default(),
     }));
     api_features::router(state)
 }
@@ -495,9 +502,12 @@ mod vector_tile_discovery {
                 cap: None,
                 postgis: None,
                 nowcast: None,
+                station_grid: None,
                 bufr: None,
                 satellite: None,
+                netcdf: None,
                 preview: None,
+                derive_wind: None,
             },
         );
         Arc::new(ArcSwap::from_pointee(FeaturesState {
@@ -506,6 +516,7 @@ mod vector_tile_discovery {
             base_url: String::new(),
             trust_proxy_headers: false,
             vector_tileset_ids: ["cities".to_string()].into(),
+            collection_pages: Default::default(),
         }))
     }
 
@@ -824,6 +835,38 @@ mod errors {
         assert!(json["description"].is_string());
     }
 
+    /// An `f` given twice on a metadata route is the JSON 400 every other
+    /// bad parameter gets, naming it, not axum's plain text (#1121).
+    /// `/collections` already rejected it through `CollectionRequest`. A
+    /// single `f` still negotiates.
+    #[tokio::test]
+    async fn repeated_format_on_metadata_routes_is_the_json_400() {
+        for path in ["/", "/conformance", "/collections", "/collections/cities"] {
+            let uri = format!("{path}?f=json&f=html");
+            let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
+            let resp = build_router().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(resp.headers()["content-type"], "application/json", "{uri}");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["code"], "BadRequest", "{uri}");
+            let description = json["description"].as_str().unwrap();
+            assert!(
+                description.contains("duplicate field `f`")
+                    || description.contains("Duplicate collection query parameter 'f'"),
+                "{uri}: {description}"
+            );
+            for f in ["json", "html"] {
+                let req = Request::builder()
+                    .uri(format!("{path}?f={f}"))
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = build_router().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{path}?f={f}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn bad_bbox_returns_400_with_error_body() {
         let (status, json) = get("/collections/cities/items?bbox=invalid").await;
@@ -1125,9 +1168,12 @@ mod metadata_extras {
                 cap: None,
                 postgis: None,
                 nowcast: None,
+                station_grid: None,
                 bufr: None,
                 satellite: None,
+                netcdf: None,
                 preview: None,
+                derive_wind: None,
             },
         );
         let state = Arc::new(ArcSwap::from_pointee(FeaturesState {
@@ -1136,6 +1182,7 @@ mod metadata_extras {
             base_url: String::new(),
             trust_proxy_headers: false,
             vector_tileset_ids: Default::default(),
+            collection_pages: Default::default(),
         }));
         api_features::router(state)
     }
@@ -1177,6 +1224,7 @@ mod metadata_extras {
         let lic = ds_core::config::LicenseConfig {
             title: "CC-BY-4.0".into(),
             url: None,
+            media_type: None,
         };
         let json = collection_json(vec!["cities".into(), "Finland".into()], Some(lic)).await;
         assert_eq!(json["keywords"], serde_json::json!(["cities", "Finland"]));
@@ -1322,6 +1370,107 @@ mod feature_html {
         assert!(!empty.contains("maplibre-gl.js"));
         let (_, _, collection) = request("/collections/cities?f=html", "*/*").await;
         assert!(collection.contains("/features/collections/cities/items?f=html"));
+    }
+
+    async fn request_from(app: axum::Router, uri: &str) -> (StatusCode, String) {
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// The mock with what #1143 adds: a label, summary columns, a line on
+    /// what an item is, and properties to filter and sort by.
+    struct Described(MockFeatureEngine);
+
+    impl FeatureEngine for Described {
+        fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+            self.0.get_features(query)
+        }
+        fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
+            self.0.get_feature(feature_id)
+        }
+        fn filterables(&self) -> FilterableProperties {
+            Arc::new(["name".to_owned(), "population".to_owned()].into())
+        }
+        fn sortables(&self) -> &[&'static str] {
+            &["population"]
+        }
+        fn label(&self, feature: &Feature) -> Option<String> {
+            let name = feature.properties.get("name")?.as_str()?;
+            Some(format!("City of {name}"))
+        }
+        fn summary_properties(&self) -> &[&'static str] {
+            &["population"]
+        }
+        fn items_description(&self) -> Option<&'static str> {
+            Some("One point per city.")
+        }
+    }
+
+    /// #1143: the datetime control is there whenever `/items` takes
+    /// `datetime`, whether or not the collection advertises a span.
+    #[tokio::test]
+    async fn datetime_control_follows_the_time_dimension() {
+        let uri = "/collections/cities/items?f=html";
+        let (_, timed) = request_from(build_router(), uri).await;
+        // The script on the page names the attribute too.
+        let picker = "<input type=\"datetime-local\" step=\"1\" data-datetime-start";
+        assert!(timed.contains(picker));
+        let timeless = build_router_with(Arc::new(TimelessEngine(MockFeatureEngine::new())));
+        let (_, timeless) = request_from(timeless, uri).await;
+        assert!(!timeless.contains(picker));
+    }
+
+    /// #1143: past the end, `prev` is the last page with features, in JSON
+    /// and HTML alike, and the map says the page is empty.
+    #[tokio::test]
+    async fn prev_past_the_end_points_at_the_last_page() {
+        let (_, doc) = get("/collections/cities/items?limit=2&offset=10").await;
+        let prev = doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "prev")
+            .unwrap();
+        assert_eq!(
+            prev["href"],
+            "/features/collections/cities/items?offset=2&limit=2&f=json"
+        );
+        let (_, _, html) =
+            request("/collections/cities/items?limit=2&offset=10&f=html", "*/*").await;
+        assert!(html.contains(
+            "href=\"/features/collections/cities/items?offset=2&amp;limit=2&amp;f=html\""
+        ));
+        assert!(html.contains("No features on this page."));
+    }
+
+    /// #1143: the engine's label is the feature's `title`; its summary
+    /// properties are the first columns; the collection overview says what
+    /// an item is and lists what it filters and sorts by, each opening the
+    /// builder at that property.
+    #[tokio::test]
+    async fn engine_labels_columns_and_overview() {
+        let app = || build_router_with(Arc::new(Described(MockFeatureEngine::new())));
+        let (_, json) = request_from(app(), "/collections/cities/items/helsinki").await;
+        let doc: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc["properties"]["title"], "City of Helsinki");
+        let (_, html) = request_from(app(), "/collections/cities/items?f=html").await;
+        assert!(html.contains("<th scope=\"col\" data-property-cell>population</th></tr>"));
+        let (_, overview) = request_from(app(), "/collections/cities?f=html").await;
+        assert!(overview.contains("<p class=\"items-note\">One point per city.</p>"));
+        let items = "/features/collections/cities/items?f=html";
+        assert!(overview.contains(&format!("<span class=\"row-label\">Filter by</span><span class=\"chip-row\"><a class=\"chip\" href=\"{items}#filter=name\">name</a><a class=\"chip\" href=\"{items}#filter=population\">population</a></span>")), "{overview}");
+        assert!(overview.contains(&format!(
+            "<span class=\"row-label\">Sort by</span><span class=\"chip-row\"><a class=\"chip\" href=\"{items}#sort=population\">population</a></span>"
+        )));
+        // A collection with neither has no rows.
+        let (_, plain) = request_from(build_router(), "/collections/cities?f=html").await;
+        assert!(!plain.contains("row-label\">Filter by"));
+        assert!(!plain.contains("class=\"items-note\""));
     }
 
     #[tokio::test]

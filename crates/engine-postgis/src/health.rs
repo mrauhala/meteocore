@@ -6,6 +6,11 @@
 //! (couldn't construct the engine at all) is NOT represented here — a failed
 //! collection has no engine; the server's boot health snapshot owns that case.
 //!
+//! [`LiveHealth`] is what `/health` reports: the ping's verdict with the
+//! schema validation and metadata snapshot state on top — a station list, or
+//! a mode-B station registry, cut at `max_locations` degrades a reachable
+//! collection (#1061).
+//!
 //! The same struct carries the cheap counters the `/metrics` endpoint scrapes
 //! (ping failures, metadata-refresh totals/failures, last-refresh duration).
 //! Reads are lock-free atomics so both the ping loop and the `/health` and
@@ -14,13 +19,72 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Live status of a PostGIS collection. Maps to `server::admin::CollectionStatus`
-/// (`Ready`/`Degraded`) at the handler boundary — engine-postgis can't depend on
-/// the server crate, so it keeps its own two-state enum.
+use crate::metadata::LocationsCut;
+
+/// Database reachability per the `SELECT 1` ping. [`LiveHealth`] adds the
+/// metadata snapshot's state and is what maps to
+/// `server::admin::CollectionStatus` at the handler boundary — engine-postgis
+/// can't depend on the server crate, so it keeps its own enums.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HealthStatus {
     Ready,
     Degraded,
+}
+
+/// The `/health` verdict of one postgis collection (#110, #1061), from
+/// [`crate::PostgisEngine::live_health`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LiveHealth {
+    Ready,
+    /// No successful validation/metadata publication yet.
+    ValidationPending,
+    /// A confirmed schema mismatch; reachability cannot clear this.
+    SchemaInvalid,
+    /// The latest `SELECT 1` ping failed.
+    Unreachable,
+    /// The database answers, but `max_locations` cut the cached station
+    /// list or, in mode B, the station registry it was enriched from.
+    LocationsTruncated {
+        max_locations: usize,
+        cut: LocationsCut,
+    },
+}
+
+impl LiveHealth {
+    /// Fold the ping's status (`None` until the first ping) and the metadata
+    /// snapshot's cut into the verdict. An unreachable database wins; a cut
+    /// is known from the refresh that read it, so it degrades the collection
+    /// even before the first ping. `None` = no live verdict yet: keep the
+    /// boot snapshot.
+    pub fn from_parts(
+        ping: Option<HealthStatus>,
+        cut: Option<LocationsCut>,
+        max_locations: usize,
+    ) -> Option<Self> {
+        match (ping, cut) {
+            (Some(HealthStatus::Degraded), _) => Some(Self::Unreachable),
+            (_, Some(cut)) => Some(Self::LocationsTruncated { max_locations, cut }),
+            (Some(HealthStatus::Ready), None) => Some(Self::Ready),
+            (None, None) => None,
+        }
+    }
+
+    pub fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// The operator-facing `/health` message of a degraded verdict: the one
+    /// home of each string. Names the configured cap, never a host or a
+    /// database error.
+    pub fn degraded_reason(self) -> Option<String> {
+        match self {
+            Self::Ready => None,
+            Self::ValidationPending => Some(crate::validation::PENDING_ERROR.into()),
+            Self::SchemaInvalid => Some(crate::validation::SCHEMA_ERROR.into()),
+            Self::Unreachable => Some("database unreachable (health ping failed)".to_string()),
+            Self::LocationsTruncated { max_locations, cut } => Some(cut.reason(max_locations)),
+        }
+    }
 }
 
 /// Lock-free live health + metrics counters for one collection.
@@ -179,6 +243,57 @@ mod tests {
         h.record_ping(true);
         assert_eq!(h.status(), HealthStatus::Ready);
         assert_eq!(h.snapshot().ping_failures, 2); // only failures counted
+    }
+
+    /// #1061: the ping and the snapshot's cut fold into one verdict; an
+    /// unreachable database outranks a cut list, and a cut list degrades a
+    /// reachable collection even before the first ping.
+    #[test]
+    fn live_health_folds_ping_and_truncation() {
+        use HealthStatus::{Degraded, Ready};
+        let stations = LiveHealth::LocationsTruncated {
+            max_locations: 3,
+            cut: LocationsCut::Stations,
+        };
+        assert_eq!(LiveHealth::from_parts(None, None, 3), None);
+        assert_eq!(
+            LiveHealth::from_parts(Some(Ready), None, 3),
+            Some(LiveHealth::Ready)
+        );
+        for ping in [None, Some(Ready)] {
+            assert_eq!(
+                LiveHealth::from_parts(ping, Some(LocationsCut::Stations), 3),
+                Some(stations)
+            );
+        }
+        for cut in [
+            None,
+            Some(LocationsCut::Stations),
+            Some(LocationsCut::Registry),
+        ] {
+            assert_eq!(
+                LiveHealth::from_parts(Some(Degraded), cut, 3),
+                Some(LiveHealth::Unreachable)
+            );
+        }
+
+        assert!(LiveHealth::Ready.is_ready());
+        assert_eq!(LiveHealth::Ready.degraded_reason(), None);
+        assert!(!stations.is_ready());
+        assert_eq!(
+            stations.degraded_reason(),
+            Some(LocationsCut::Stations.reason(3))
+        );
+        let registry =
+            LiveHealth::from_parts(Some(Ready), Some(LocationsCut::Registry), 3).unwrap();
+        assert_eq!(
+            registry.degraded_reason(),
+            Some(LocationsCut::Registry.reason(3))
+        );
+        assert_eq!(
+            LiveHealth::Unreachable.degraded_reason().as_deref(),
+            Some("database unreachable (health ping failed)")
+        );
     }
 
     #[test]

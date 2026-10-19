@@ -139,6 +139,31 @@ impl ObsStore {
         }
     }
 
+    /// Put back one station restored from a snapshot (#1002). Its
+    /// `first_report`/`last_report` follow `rows` (an empty `rows` is
+    /// ignored); a station of the same id is replaced. Call [`Self::prune`]
+    /// after the last one: it applies the CURRENT `retention` and
+    /// `max_stations`, as the restore must.
+    pub(crate) fn restore_station(
+        &mut self,
+        mut info: StationInfo,
+        rows: BTreeMap<DateTime<Utc>, Box<[f32]>>,
+    ) {
+        let (Some((&first, _)), Some((&last, _))) = (rows.first_key_value(), rows.last_key_value())
+        else {
+            return;
+        };
+        info.first_report = first;
+        info.last_report = last;
+        self.rows += rows.len();
+        if let Some(old) = self
+            .stations
+            .insert(info.id.clone(), StationSeries { info, rows })
+        {
+            self.rows -= old.rows.len();
+        }
+    }
+
     /// Drop rows older than `retention`, stations left with no rows, and —
     /// beyond `max_stations` — the least recently reporting stations.
     /// Returns `(rows_dropped, stations_dropped)`.

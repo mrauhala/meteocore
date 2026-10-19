@@ -77,10 +77,15 @@ pool: they do not use the Icechunk runtime bridge.
   plain generations never enable Icechunk decoded caching or worker fan-out.
 - **Catalog** (`catalog::build`): opens the root group, lists child arrays,
   treats 1-D arrays named after their dim as CF coordinate variables,
-  classifies dims via `cf::classify_axis` (coord-var
-  `standard_name`/`units` first, name heuristic second — projected metre
-  axes resolve to `Other`, not degrees), validates lat/lon monotonic,
-  exposes remaining geographic data variables as parameters. **A time axis
+  classifies dims via the shared `ds_core::cf::classify_axis` (coord-var
+  `standard_name`/`units` first, name heuristic second), validates lat/lon
+  monotonic, exposes remaining geographic data variables as parameters.
+  Only `Lat`/`Lon` are geolocated: `ProjectionX`/`ProjectionY` (and metre
+  axes, which are `Other`) never become degrees, so a projected store has
+  no lat/lon pair and `build` rejects it (pinned by
+  `catalog::tests::a_projected_store_is_rejected`); an `Ensemble` dim is
+  pinned to index 0 like any other. CF time units and `decode_times` are
+  `ds_core::cf`'s too. **A time axis
   is required** (PointSeries needs `t`). Unsupported-dtype variables are
   skipped at build with a WARN. Bounded-codec setup failures likewise warn and
   skip only the affected variable; never expose it with unbounded decoders as
@@ -98,6 +103,8 @@ pool: they do not use the Icechunk runtime bridge.
   (pre-scale) value; NaN/±inf map to nodata.
 - **Source memory admission:** `read_budget::BUDGET` is process-wide and
   survives reload/snapshot changes (`MC_ZARR_READ_MEMORY_MB`, default 1024 MiB).
+  `read_budget` keeps the planning and deadline checks; the accounting is
+  `ds_executor::budget::ByteBudget`, shared with engine-geotiff.
   Reserve before variable payload reads: native subset + typed conversion +
   raw/physical f64 buffers + axes/window overhead. Cold reads also reserve a
   four-buffer decode/index allowance. Use full stored chunk shapes, not clipped overlaps. Sharded reads
@@ -182,6 +189,35 @@ pool: they do not use the Icechunk runtime bridge.
   pathological for point queries; use effective inner shapes for sharded
   arrays. Startup also logs outer/inner shapes, native bytes, and time steps
   per chunk to expose temporal decode amplification in map reads.
+
+## Wind components (#897)
+
+`catalog::wind_facts` reports each variable's CF `standard_name`, the frame
+it states (`eastward_wind` earth-, `x_wind` grid-relative) and its units,
+built with the catalog (`Catalog::wind`, swapped with it). The grid is
+`GridAxes::NorthAligned`: the catalog reads only 1-D lat/lon axes.
+`ds_core::wind` pairs CF components and names the derived parameters in
+the store's own vocabulary: a known one (ECMWF `u10`/`v10` → `si10`/
+`wdir10`), else the u name with its component replaced (`wind_u_10m` →
+`wind_speed_10m`/`wind_direction_10m`, `10m_u_component_of_wind` →
+`10m_wind_speed`, `x_wind_10m` → `wind_speed_10m`). Without a
+`standard_name` a store's own names pair nothing. `Catalog::raster_info`
+is an `Arc`, so `raster_info_shared` is O(1) and the wrapper's extended
+snapshot stays cached.
+
+## Trajectory queries (#926)
+
+`src/trajectory.rs`: the run, steps and variables are selected like a
+position query (`select_time_idx`, `select_vars`), and the path, time rules
+and layout come from `ds_core::trajectory::TrajectoryPlan`, densified at
+`Catalog::native_spacing`. Reads are per **path segment**, never per sample:
+consecutive samples share one `read_window_span` per variable while the
+window stays ≤ 256 × 256 native cells per step and ≤ 1M values across its
+step span; an antimeridian jump starts a new segment. At most
+`MAX_TRAJECTORY_READS` (64) segment × variable reads → 400, since each is a
+sequential blocking subset retrieval. Sampling is `Window::sample`, the
+same bilinear + nearest fallback as `sample_series`. No vertical axis: a Z
+coordinate is ignored.
 
 ## APIs
 

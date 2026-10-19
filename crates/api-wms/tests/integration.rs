@@ -4,7 +4,8 @@
 //! `src/params.rs`. This file covers behaviours that only emerge once
 //! the router, mock engine, and full state are wired together — the
 //! seed test is the regression for #162 (empty-tile Content-Type
-//! mismatch when a non-PNG format is requested).
+//! mismatch when a non-PNG format is requested), now #1091 (the empty
+//! image is encoded in the requested format).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,9 +23,8 @@ use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 
 /// Mock engine that returns an all-`None` (all-nodata) `RasterTile`.
-/// Drives the empty-tile fast path that bypasses the format-aware
-/// encoder and emits PNG bytes directly — the code path that #162
-/// fixed.
+/// Drives the empty-image fast path that skips colorization and serves
+/// the memoized empty image — the code path #162 and #1091 fixed.
 struct EmptyMockMapEngine;
 
 impl MapEngine for EmptyMockMapEngine {
@@ -94,9 +94,12 @@ fn build_empty_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -143,6 +146,7 @@ fn build_empty_router() -> axum::Router {
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -152,65 +156,103 @@ fn build_empty_router() -> axum::Router {
     api_wms::router(state)
 }
 
-/// Regression for #162: when the engine produces an all-nodata tile,
-/// the WMS GetMap handler short-circuits to a freshly-encoded
-/// transparent PNG without going through the format-aware encoder.
-/// Before the fix the response carried the *requested* Content-Type
-/// (e.g. `image/jpeg`) over PNG bytes, breaking decoders that trust
-/// the header. Both header and body must agree.
-#[tokio::test]
-async fn empty_tile_forces_png_content_type_even_when_jpeg_requested() {
-    let app = build_empty_router();
-    let req = Request::builder()
-        .uri(
-            "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=empty\
-             &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
-             &FORMAT=image/jpeg",
-        )
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let headers = resp.headers().clone();
-    assert_eq!(
-        headers.get("content-type").unwrap(),
-        "image/png",
-        "empty-tile response must self-declare PNG, not the requested image/jpeg"
-    );
-    assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    assert!(
-        body.starts_with(&[0x89, b'P', b'N', b'G']),
-        "body must be a real PNG, got first bytes {:?}",
-        &body[..4.min(body.len())]
-    );
+/// A `width`×`height` image of one RGBA pixel value.
+fn solid(width: u32, height: u32, pixel: [u8; 4]) -> Vec<u8> {
+    pixel.repeat((width * height) as usize)
 }
 
+/// The body starts with `content_type`'s magic bytes.
+fn assert_magic(content_type: &str, body: &[u8], context: &str) {
+    match content_type {
+        "image/png" => assert!(body.starts_with(&[0x89, b'P', b'N', b'G']), "{context}"),
+        "image/jpeg" => assert!(body.starts_with(&[0xFF, 0xD8, 0xFF]), "{context}"),
+        "image/webp" => assert!(
+            body.len() > 12 && &body[..4] == b"RIFF" && &body[8..12] == b"WEBP",
+            "{context}"
+        ),
+        other => panic!("unexpected content type {other}"),
+    }
+}
+
+/// #1091 (and #162 before it): an all-nodata view is encoded in the
+/// requested FORMAT at its QUALITY, with that Content-Type — on the direct
+/// and the meta-tiled empty path. It is the background (BGCOLOR, default
+/// white) for TRANSPARENT=FALSE, the default (#1065), and for JPEG, which
+/// has no alpha; with TRANSPARENT=TRUE WebP keeps the alpha like PNG.
 #[tokio::test]
-async fn empty_tile_forces_png_content_type_even_when_webp_requested() {
-    // Second format for symmetry — WebP takes a distinct `ImageFormat`
-    // branch through the cache key, so this exercises a different code
-    // path than the JPEG case above.
+async fn empty_image_is_encoded_in_the_requested_format() {
+    use ds_render::{encode_jpeg, encode_png, encode_webp};
     let app = build_empty_router();
-    let req = Request::builder()
-        .uri(
-            "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=empty\
-             &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
-             &FORMAT=image/webp",
-        )
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let headers = resp.headers().clone();
-    assert_eq!(headers.get("content-type").unwrap(), "image/png");
-    assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
+    let transparent = solid(64, 64, [0, 0, 0, 0]);
+    let white = solid(64, 64, [255, 255, 255, 255]);
+    let bg = solid(64, 64, BG);
+    let cases = [
+        ("&FORMAT=image/jpeg", encode_jpeg(&white, 64, 64, 85)),
+        (
+            "&FORMAT=image/jpeg&QUALITY=40",
+            encode_jpeg(&white, 64, 64, 40),
+        ),
+        (
+            "&FORMAT=image/jpeg&BGCOLOR=0x336699",
+            encode_jpeg(&bg, 64, 64, 85),
+        ),
+        (
+            "&FORMAT=image/jpeg&TRANSPARENT=TRUE",
+            encode_jpeg(&white, 64, 64, 85),
+        ),
+        ("&FORMAT=image/webp", encode_webp(&white, 64, 64, 100)),
+        (
+            "&FORMAT=image/webp&QUALITY=60&BGCOLOR=0x336699",
+            encode_webp(&bg, 64, 64, 60),
+        ),
+        (
+            "&FORMAT=image/webp&TRANSPARENT=TRUE",
+            encode_webp(&transparent, 64, 64, 100),
+        ),
+        (
+            "&FORMAT=image/webp&QUALITY=60&TRANSPARENT=TRUE",
+            encode_webp(&transparent, 64, 64, 60),
+        ),
+        (
+            "&FORMAT=image/webp&TRANSPARENT=FALSE&BGCOLOR=0x336699",
+            encode_webp(&bg, 64, 64, 100),
+        ),
+        ("&FORMAT=image/png", encode_png(&white, 64, 64)),
+        (
+            "&FORMAT=image/png&BGCOLOR=0x336699",
+            encode_png(&bg, 64, 64),
+        ),
+        (
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+            encode_png(&transparent, 64, 64),
+        ),
+    ];
+    for (crs, bbox) in HALF_VIEWS {
+        for (extra, expected) in &cases {
+            let uri = format!(
+                "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=empty&STYLES=\
+                 &CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64{extra}"
+            );
+            let reply = fetch(&app, &uri).await;
+            let context = format!("{crs} {extra}");
+            assert_eq!(reply.status, StatusCode::OK, "{context}");
+            assert_eq!(reply.x_cache, "EMPTY", "{context}");
+            let requested = extra[8..].split('&').next().unwrap();
+            assert_eq!(reply.content_type, requested, "{context}");
+            assert_magic(requested, &reply.body, &context);
+            assert_eq!(
+                &reply.body,
+                expected.as_ref().unwrap(),
+                "{context}: the shared encoder's image at the requested quality"
+            );
+        }
+    }
 }
 
 /// Mock engine whose `get_raster_tile` always fails. Drives the WMS
-/// `Err(e)` branch that emits the red `render_error_tile` PNG with
-/// `X-Cache: ERROR`. WMS is the only handler that does this — Maps
-/// and Tiles propagate engine errors as JSON 500.
+/// `Err(e)` branch that serves the red `ds_render::error_tile`, in the
+/// requested format, with `X-Cache: ERROR`. WMS is the only handler
+/// that does this — Maps and Tiles propagate engine errors as JSON 500.
 struct FailingMockMapEngine;
 
 impl MapEngine for FailingMockMapEngine {
@@ -274,9 +316,12 @@ fn build_failing_router() -> axum::Router {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -304,6 +349,7 @@ fn build_failing_router() -> axum::Router {
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -313,40 +359,81 @@ fn build_failing_router() -> axum::Router {
     api_wms::router(state)
 }
 
-/// Regression for #162 (WMS error-tile branch): when the engine
-/// returns `Err`, the handler swallows it and serves a red
-/// `render_error_tile` PNG with `X-Cache: ERROR`. The PR also fixed
-/// this branch to emit `Content-Type: image/png` instead of the
-/// requested-but-misleading `image/jpeg`/`image/webp`.
+/// The red error tile follows FORMAT too (#1091): encoded at the request's
+/// QUALITY with the requested Content-Type. JPEG flattens it onto BGCOLOR
+/// (default white), and so do PNG and WebP unless TRANSPARENT=TRUE, which
+/// keeps its alpha (TRANSPARENT defaults to FALSE, #1065).
 #[tokio::test]
-async fn error_tile_forces_png_content_type_even_when_jpeg_requested() {
+async fn error_tile_is_encoded_in_the_requested_format() {
+    use ds_render::{encode_jpeg, encode_png, encode_webp};
+    let app = build_failing_router();
+    let red = solid(64, 64, [255, 0, 0, 100]);
+    // [255, 0, 0, 100] over white and over black.
+    let on_white = solid(64, 64, [255, 155, 155, 255]);
+    let on_black = solid(64, 64, [100, 0, 0, 255]);
+    for (extra, expected) in [
+        ("&FORMAT=image/jpeg", encode_jpeg(&on_white, 64, 64, 85)),
+        (
+            "&FORMAT=image/jpeg&QUALITY=30&BGCOLOR=0x000000",
+            encode_jpeg(&on_black, 64, 64, 30),
+        ),
+        (
+            "&FORMAT=image/webp&TRANSPARENT=TRUE",
+            encode_webp(&red, 64, 64, 100),
+        ),
+        (
+            "&FORMAT=image/webp&QUALITY=70&TRANSPARENT=TRUE",
+            encode_webp(&red, 64, 64, 70),
+        ),
+        (
+            "&FORMAT=image/webp&TRANSPARENT=FALSE",
+            encode_webp(&on_white, 64, 64, 100),
+        ),
+        ("&FORMAT=image/webp", encode_webp(&on_white, 64, 64, 100)),
+        (
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+            encode_png(&red, 64, 64),
+        ),
+        ("&FORMAT=image/png", encode_png(&on_white, 64, 64)),
+    ] {
+        let uri = format!(
+            "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=broken&STYLES=\
+             &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64{extra}"
+        );
+        let reply = fetch(&app, &uri).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "WMS swallows engine errors into a 200 + error-tile"
+        );
+        assert_eq!(reply.x_cache, "ERROR", "{extra}");
+        let requested = extra[8..].split('&').next().unwrap();
+        assert_eq!(reply.content_type, requested, "{extra}");
+        assert_magic(requested, &reply.body, extra);
+        assert_eq!(reply.body, expected.unwrap(), "{extra}");
+    }
+}
+
+/// A failed render is transient: its error tile under an explicit TIME must
+/// be revalidated, not pinned `immutable` in browsers for a day.
+#[tokio::test]
+async fn error_tile_is_never_immutable() {
     let app = build_failing_router();
     let req = Request::builder()
         .uri(
             "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=broken\
              &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
-             &FORMAT=image/jpeg",
+             &FORMAT=image/png&TIME=2024-01-01T00:00:00Z",
         )
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "WMS swallows engine errors into a 200 + error-tile"
-    );
-    let headers = resp.headers().clone();
-    assert_eq!(
-        headers.get("content-type").unwrap(),
-        "image/png",
-        "error-tile response must self-declare PNG, not the requested image/jpeg"
-    );
-    assert_eq!(headers.get("x-cache").unwrap(), "ERROR");
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-cache"], "ERROR");
+    let cc = resp.headers()["cache-control"].to_str().unwrap();
     assert!(
-        body.starts_with(&[0x89, b'P', b'N', b'G']),
-        "body must be a real PNG, got first bytes {:?}",
-        &body[..4.min(body.len())]
+        cc.contains("must-revalidate") && !cc.contains("immutable"),
+        "{cc}"
     );
 }
 
@@ -408,6 +495,15 @@ fn build_populated_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Route
 }
 
 fn build_populated_state(engine: Arc<dyn MapEngine>) -> Arc<ArcSwap<WmsState>> {
+    build_populated_state_with_wms(engine, None)
+}
+
+/// [`build_populated_state`] with the collection's `[wms]` config, for the
+/// per-collection settings the handler reads (e.g. `webp_quality`).
+fn build_populated_state_with_wms(
+    engine: Arc<dyn MapEngine>,
+    wms: Option<ds_core::config::WmsConfig>,
+) -> Arc<ArcSwap<WmsState>> {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     let mut styles_map = HashMap::new();
@@ -426,16 +522,19 @@ fn build_populated_state(engine: Arc<dyn MapEngine>) -> Arc<ArcSwap<WmsState>> {
             license: None,
             geotiff: None,
             querydata: None,
-            wms: None,
+            wms,
             grib: None,
             zarr: None,
             odim: None,
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -463,6 +562,7 @@ fn build_populated_state(engine: Arc<dyn MapEngine>) -> Arc<ArcSwap<WmsState>> {
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -476,16 +576,15 @@ const GETMAP_URI: &str = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=rada
                           &FORMAT=image/png";
 
 /// `ELEVATION` against a layer with no vertical dimension
-/// (`raster_info().vertical` is `None`) is a 400 ServiceException.
+/// (`raster_info().vertical` is `None`) is a 400 ServiceException with
+/// Table E.1's `InvalidDimensionValue`, as `DIM_REFERENCE_TIME` on a
+/// layer without runs is (#1065).
 #[tokio::test]
 async fn elevation_against_non_vertical_layer_returns_400() {
     let app = build_populated_router();
-    let req = Request::builder()
-        .uri(format!("{GETMAP_URI}&ELEVATION=0.5"))
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let reply = fetch(&app, &format!("{GETMAP_URI}&ELEVATION=0.5")).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(exception_code(&reply.text()), "InvalidDimensionValue");
 }
 
 /// Regression for #145: the WMS GetMap ETag must be FNV-1a over the
@@ -825,9 +924,12 @@ fn build_counting_router_versioned(
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -856,6 +958,7 @@ fn build_counting_router_versioned(
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: tile_cache.clone(),
@@ -958,6 +1061,9 @@ struct SnappingMockMapEngine {
     /// finishing ingestion between requests.
     catalog: Arc<std::sync::RwLock<Vec<chrono::DateTime<chrono::Utc>>>>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Satellite-style: an empty catalog renders an all-nodata tile instead
+    /// of failing, so `resolve_time` must then be `None`, not the request.
+    empty_renders_nothing: bool,
 }
 
 impl SnappingMockMapEngine {
@@ -992,9 +1098,16 @@ impl MapEngine for SnappingMockMapEngine {
     ) -> Result<RasterTile, DataServerError> {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let resolved = self
-            .select(time)
-            .ok_or_else(|| DataServerError::Engine("no data".into()))?;
+        let Some(resolved) = self.select(time) else {
+            if self.empty_renders_nothing {
+                return Ok(RasterTile {
+                    width,
+                    height,
+                    values: vec![None; (width * height) as usize].into(),
+                });
+            }
+            return Err(DataServerError::Engine("no data".into()));
+        };
         let cat = self.catalog.read().unwrap();
         let idx = cat.iter().position(|&ts| ts == resolved).unwrap_or(0);
         // Distinct pixel value per timestep so stale tiles are detectable.
@@ -1026,7 +1139,11 @@ impl MapEngine for SnappingMockMapEngine {
         time: Option<chrono::DateTime<chrono::Utc>>,
         _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.select(time).or(time)
+        if self.empty_renders_nothing {
+            self.select(time)
+        } else {
+            self.select(time).or(time)
+        }
     }
 }
 
@@ -1037,6 +1154,13 @@ type SnappingRouter = (
 );
 
 fn build_snapping_router(initial_times: &[&str]) -> SnappingRouter {
+    build_snapping_router_with(initial_times, false)
+}
+
+fn build_snapping_router_with(
+    initial_times: &[&str],
+    empty_renders_nothing: bool,
+) -> SnappingRouter {
     let catalog = Arc::new(std::sync::RwLock::new(
         initial_times
             .iter()
@@ -1047,6 +1171,7 @@ fn build_snapping_router(initial_times: &[&str]) -> SnappingRouter {
     let engine: Arc<dyn MapEngine> = Arc::new(SnappingMockMapEngine {
         catalog: catalog.clone(),
         calls: calls.clone(),
+        empty_renders_nothing,
     });
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
@@ -1073,9 +1198,12 @@ fn build_snapping_router(initial_times: &[&str]) -> SnappingRouter {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -1104,6 +1232,7 @@ fn build_snapping_router(initial_times: &[&str]) -> SnappingRouter {
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache,
@@ -1167,6 +1296,54 @@ async fn requested_time_ahead_of_catalog_does_not_poison_the_frame() {
         "post-ingest TIME=T must miss every cached T−5 tile and render fresh (got {} fresh renders, expected {})",
         calls_after - calls_cold,
         calls_cold
+    );
+}
+
+/// A satellite-style engine before its first scan (a start or reload still
+/// backfilling) renders nothing and resolves every TIME to `None`. A
+/// `TIME=T` request then must neither pin its empty image in browsers for a
+/// day nor leave empty meta-tiles under T's key: once T lands, the same
+/// request renders T. On nexus the tutka loop asked for the next scan during
+/// a reload's backfill and the frame stayed blank after it arrived.
+#[tokio::test]
+async fn time_requested_before_the_first_timestep_is_not_pinned() {
+    const T: &str = "2026-09-30T04:30:00Z";
+    const BBOX: &str = "2000000,8000000,3000000,9000000"; // meta-tiled
+    let (app, catalog, calls) = build_snapping_router_with(&[], true);
+    let uri = format!(
+        "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=data&STYLES=\
+         &FORMAT=image/png&CRS=EPSG:3857&BBOX={BBOX}&WIDTH=512&HEIGHT=512&TIME={T}"
+    );
+    // Returns (x-cache, cache-control).
+    let get = || async {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = |name: &str| resp.headers()[name].to_str().unwrap().to_string();
+        (h("x-cache"), h("cache-control"))
+    };
+
+    let (x, cc) = get().await;
+    assert_eq!(x, "EMPTY");
+    assert!(
+        cc.contains("must-revalidate") && !cc.contains("immutable"),
+        "nothing rendered for T yet: {cc}"
+    );
+    let calls_empty = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(calls_empty > 0);
+
+    catalog.write().unwrap().push(T.parse().unwrap());
+
+    let (x, cc) = get().await;
+    assert_eq!(x, "MISS", "T landed: its pixels, not the pre-scan empties");
+    assert!(cc.contains("immutable"), "{cc}");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed) - calls_empty,
+        calls_empty,
+        "every meta-tile renders fresh once T exists"
     );
 }
 
@@ -1480,9 +1657,12 @@ fn site_collection_config(id: &str) -> CollectionConfig {
         cap: None,
         postgis: None,
         nowcast: None,
+        station_grid: None,
         bufr: None,
         satellite: None,
+        netcdf: None,
         preview: None,
+        derive_wind: None,
     }
 }
 
@@ -1536,7 +1716,13 @@ fn capabilities_bbox_stays_in_the_crs84_domain() {
         engines.insert("grid".to_string(), Arc::new(ExtentMockMapEngine(extent)));
         let collections = HashMap::from([("grid".to_string(), site_collection_config("grid"))]);
         let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-        let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+        let xml = api_wms::capabilities::get_capabilities_xml(
+            &engines,
+            &collections,
+            &styles,
+            &HashMap::new(),
+            "",
+        );
         String::from_utf8(xml).expect("capabilities XML is UTF-8")
     };
 
@@ -1596,7 +1782,13 @@ fn child_layer_titles_are_site_prefixed_for_flat_clients() {
     );
 
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
     let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
 
     // Requestable child <Name> is unchanged (id/quantity).
@@ -1620,6 +1812,47 @@ fn child_layer_titles_are_site_prefixed_for_flat_clients() {
     );
 }
 
+/// Top-level layers come in collection-id order, whatever the registry's
+/// HashMap order, with a multi-parameter collection's child layers under its
+/// parent. The HashMap order changed with every process, and with it the
+/// layer the OGC test suite picks as the first or last named one (#1102).
+#[test]
+fn capabilities_list_layers_in_collection_id_order() {
+    let ids: Vec<String> = (0..16).rev().map(|n| format!("grid-{n:02}")).collect();
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    let mut collections = HashMap::new();
+    for id in &ids {
+        let engine: Arc<dyn MapEngine> = if id == "grid-07" {
+            Arc::new(SiteMockMapEngine)
+        } else {
+            Arc::new(ExtentMockMapEngine([20.0, 58.0, 28.0, 62.0]))
+        };
+        engines.insert(id.clone(), engine);
+        collections.insert(id.clone(), site_collection_config(id));
+    }
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &HashMap::new(),
+        &HashMap::new(),
+        "",
+    );
+    let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+
+    let names: Vec<&str> = xml
+        .split("<Name>")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("</Name>").map(|(name, _)| name))
+        .filter(|name| name.starts_with("grid-"))
+        .collect();
+    let mut expected: Vec<String> = (0..16).map(|n| format!("grid-{n:02}")).collect();
+    expected.splice(
+        7..8,
+        ["grid-07/DBZH".to_string(), "grid-07/VRADH".to_string()],
+    );
+    assert_eq!(names, expected, "layers must follow the collection ids");
+}
+
 /// Per-collection keywords surface as a `<KeywordList>` and the license as an
 /// `<Attribution>` in the capabilities XML (on the parent layer of a
 /// multi-param collection). Element order follows the WMS 1.3.0 schema.
@@ -1633,11 +1866,18 @@ fn capabilities_emit_keywords_and_attribution() {
     config.license = Some(ds_core::config::LicenseConfig {
         title: "CC-BY 4.0".into(),
         url: Some("https://example/lic".into()),
+        media_type: None,
     });
     collections.insert("radar-fivih".to_string(), config);
 
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
     let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
 
     assert!(
@@ -1701,6 +1941,7 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
             license: Some(ds_core::config::LicenseConfig {
                 title: "CC-BY 4.0".into(),
                 url: Some("https://example/lic".into()),
+                media_type: None,
             }),
             geotiff: None,
             querydata: None,
@@ -1711,14 +1952,23 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
     let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
 
     assert!(
@@ -1741,6 +1991,198 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
         xml.find("<Dimension").unwrap() < xml.find("<Attribution>").unwrap(),
         "Attribution must follow the Dimension elements; got:\n{xml}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `<Service>` request limits (#1012)
+// ---------------------------------------------------------------------------
+
+/// The children of the capabilities' `<Service>` element in document order:
+/// each element's name and its text, or for `<OnlineResource>` its
+/// `xlink:href`.
+fn service_children(xml: &str) -> Vec<(String, String)> {
+    element_children(xml, "Service")
+}
+
+/// The children of the first `<parent>` element in document order: each
+/// element's name and its text, or for an empty element its `xlink:href`.
+fn element_children(xml: &str, parent: &str) -> Vec<(String, String)> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    // Depth below `<parent>`: `Some(0)` = directly inside it.
+    let mut depth: Option<usize> = None;
+    let mut children: Vec<(String, String)> = Vec::new();
+    loop {
+        match reader.read_event().expect("capabilities XML parses") {
+            Event::Start(e) => {
+                let name = e.name().as_ref().to_owned();
+                match depth {
+                    None if name == parent => depth = Some(0),
+                    None => {}
+                    Some(d) => {
+                        if d == 0 {
+                            children.push((name, String::new()));
+                        }
+                        depth = Some(d + 1);
+                    }
+                }
+            }
+            Event::Empty(e) if depth == Some(0) => {
+                let name = e.name().as_ref().to_owned();
+                let href = e
+                    .try_get_attribute("xlink:href")
+                    .expect("attributes parse")
+                    .map(|a| a.value.into_owned())
+                    .unwrap_or_default();
+                children.push((name, href));
+            }
+            Event::Text(t) if depth == Some(1) => {
+                children.last_mut().unwrap().1.push_str(&t);
+            }
+            Event::End(_) => match depth {
+                Some(0) => break,
+                Some(d) => depth = Some(d - 1),
+                None => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    children
+}
+
+/// The value of the `<Service>` child `name`, parsed as an integer.
+fn service_limit(children: &[(String, String)], name: &str) -> usize {
+    let (_, value) = children
+        .iter()
+        .find(|(n, _)| n == name)
+        .unwrap_or_else(|| panic!("<Service> has no <{name}>; got {children:?}"));
+    value
+        .parse()
+        .unwrap_or_else(|_| panic!("<{name}> {value:?} is not an integer"))
+}
+
+/// One WMS request through `app`: its status and body.
+async fn wms_get(app: &axum::Router, query: &str) -> (StatusCode, String) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/?SERVICE=WMS&VERSION=1.3.0&{query}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// `<Service>` advertises the limits GetMap enforces — `LayerLimit`,
+/// `MaxWidth`, `MaxHeight` — and its mandatory `OnlineResource`, in the
+/// element order of the WMS 1.3.0 schema's `Service` sequence (Name, Title,
+/// Abstract, KeywordList, OnlineResource, ContactInformation, Fees,
+/// AccessConstraints, LayerLimit, MaxWidth, MaxHeight).
+#[test]
+fn capabilities_service_advertises_getmap_limits_in_schema_order() {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    engines.insert("radar".to_string(), Arc::new(PopulatedMockMapEngine));
+    let mut collections = HashMap::new();
+    collections.insert("radar".to_string(), site_collection_config("radar"));
+    let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "https://wms.example",
+    );
+    let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+
+    let children = service_children(&xml);
+    let names: Vec<&str> = children.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "Name",
+            "Title",
+            "Abstract",
+            "OnlineResource",
+            "LayerLimit",
+            "MaxWidth",
+            "MaxHeight"
+        ],
+        "<Service> children out of WMS 1.3.0 schema order; got:\n{xml}"
+    );
+    assert_eq!(children[0].1, "WMS");
+    assert_eq!(children[3].1, "https://wms.example/wms");
+    assert_eq!(service_limit(&children, "LayerLimit"), 5);
+    assert_eq!(
+        service_limit(&children, "LayerLimit"),
+        api_wms::params::LAYER_LIMIT
+    );
+    for side in ["MaxWidth", "MaxHeight"] {
+        assert_eq!(
+            service_limit(&children, side),
+            api_wms::params::MAX_MAP_DIMENSION as usize,
+            "<{side}>"
+        );
+    }
+}
+
+/// A client sizing GetMap from the advertised limits is served at them and
+/// refused one past them: the capabilities and the GetMap validation read
+/// the same constants.
+#[tokio::test]
+async fn getmap_is_served_at_the_advertised_limits_and_refused_past_them() {
+    let app = build_populated_router();
+    let (status, caps) = wms_get(&app, "REQUEST=GetCapabilities").await;
+    assert_eq!(status, StatusCode::OK);
+    let children = service_children(&caps);
+    let max_width = service_limit(&children, "MaxWidth");
+    let max_height = service_limit(&children, "MaxHeight");
+    let layer_limit = service_limit(&children, "LayerLimit");
+
+    let get_map = |layers: usize, width: usize, height: usize| {
+        let layers = vec!["radar"; layers].join(",");
+        format!(
+            "REQUEST=GetMap&LAYERS={layers}&STYLES=&CRS=CRS:84&BBOX=10,55,30,70\
+             &WIDTH={width}&HEIGHT={height}&FORMAT=image/png"
+        )
+    };
+    for (what, query, expected) in [
+        ("WIDTH = MaxWidth", get_map(1, max_width, 1), StatusCode::OK),
+        (
+            "WIDTH = MaxWidth + 1",
+            get_map(1, max_width + 1, 1),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "HEIGHT = MaxHeight",
+            get_map(1, 1, max_height),
+            StatusCode::OK,
+        ),
+        (
+            "HEIGHT = MaxHeight + 1",
+            get_map(1, 1, max_height + 1),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "LayerLimit layers",
+            get_map(layer_limit, 64, 64),
+            StatusCode::OK,
+        ),
+        (
+            "LayerLimit + 1 layers",
+            get_map(layer_limit + 1, 64, 64),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (status, body) = wms_get(&app, &query).await;
+        assert_eq!(status, expected, "{what}: {query}\n{body}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1865,9 +2307,12 @@ fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -1895,6 +2340,7 @@ fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -1942,14 +2388,23 @@ fn capabilities_emit_reference_time_dimension_for_forecast() {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
     let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
 
     // Both dimensions present: the valid-time axis and the run axis.
@@ -2007,14 +2462,23 @@ fn capabilities_omit_reference_time_dimension_for_non_forecast() {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
-    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
     let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
     assert!(
         !xml.contains("reference_time"),
@@ -2071,8 +2535,8 @@ async fn getmap_selects_pinned_reference_time() {
     );
 }
 
-/// The compact EDR instance-id form (`20260607T0000Z`) is also accepted as a
-/// `DIM_REFERENCE_TIME` value, resolving to the same run.
+/// The compact EDR instance-id form served before #947 (`20260607T0000Z`) is
+/// also accepted as a `DIM_REFERENCE_TIME` value, resolving to the same run.
 #[tokio::test]
 async fn getmap_accepts_compact_instance_id_reference_time() {
     let (app, calls) = build_forecast_router();
@@ -2332,9 +2796,12 @@ fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
     let cmap = Arc::new(LutColorMap::from_builtin(
@@ -2362,6 +2829,7 @@ fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache,
@@ -2518,9 +2986,12 @@ fn build_advancing_router() -> AdvancingFixture {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         },
     );
 
@@ -2548,6 +3019,7 @@ fn build_advancing_router() -> AdvancingFixture {
         engines,
         collections,
         styles: styles_map,
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -3062,6 +3534,7 @@ fn build_param_layer_router() -> axum::Router {
         engines,
         collections,
         styles: param_layer_styles(),
+        point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
@@ -3177,6 +3650,7 @@ fn param_layer_capabilities_xml() -> String {
         &engines,
         &collections,
         &param_layer_styles(),
+        &HashMap::new(),
         "",
     );
     String::from_utf8(xml).expect("capabilities XML is UTF-8")
@@ -3239,6 +3713,334 @@ fn capabilities_legend_url_carries_the_full_layer_name() {
         "LegendURL must keep the /param segment (the key GetLegendGraphic \
          resolves); got:\n{vradh}"
     );
+}
+
+/// #1133: the root layer of a multi-parameter collection draws the engine's
+/// default parameter, so it must draw it with that parameter's own style,
+/// exactly as `collection/<default>` does, never with the collection-level
+/// palette. Its legend and its cache entries follow.
+mod default_parameter_styles {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A multi-parameter collection whose default parameter `T` has a style
+    /// layer of its own: grayscale over the collection's viridis, and an
+    /// `alt` style on both layers.
+    struct DefaultTEngine {
+        calls: Arc<AtomicUsize>,
+        /// `T` is the only parameter: a single-parameter collection.
+        single: bool,
+    }
+
+    impl MapEngine for DefaultTEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let pixel_count = (width * height) as usize;
+            let values: Vec<Option<f64>> = (0..pixel_count)
+                .map(|i| Some(i as f64 / pixel_count as f64))
+                .collect();
+            Ok(RasterTile {
+                width,
+                height,
+                values: values.into(),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            let parameter = |name: &str, unit: &str| ds_core::map_engine::ParameterInfo {
+                name: name.to_string(),
+                title: format!("Parameter {name}"),
+                unit: unit.to_string(),
+            };
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some([-20.0, 30.0, 40.0, 80.0]),
+                times: vec![chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)],
+                parameter: "T".into(),
+                unit: "°C".into(),
+                parameters: if self.single {
+                    vec![parameter("T", "°C")]
+                } else {
+                    vec![parameter("T", "°C"), parameter("RH", "%")]
+                },
+                vertical: None,
+                grid_size: None,
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
+    fn styles() -> HashMap<String, HashMap<String, StyleInfo>> {
+        HashMap::from([
+            (
+                "nwp".to_string(),
+                HashMap::from([
+                    (
+                        "default".to_string(),
+                        param_palette_style("default", "viridis", None),
+                    ),
+                    (
+                        "alt".to_string(),
+                        param_palette_style("alt", "radar_dbz", None),
+                    ),
+                ]),
+            ),
+            (
+                "nwp/T".to_string(),
+                HashMap::from([
+                    (
+                        "default".to_string(),
+                        param_palette_style("default", "grayscale", Some("T")),
+                    ),
+                    (
+                        "alt".to_string(),
+                        param_palette_style("alt", "temperature", Some("T")),
+                    ),
+                ]),
+            ),
+        ])
+    }
+
+    struct Fixture {
+        app: axum::Router,
+        calls: Arc<AtomicUsize>,
+        tile_cache: Arc<ds_render::TilePixelCache>,
+    }
+
+    fn fixture() -> Fixture {
+        fixture_with(false)
+    }
+
+    fn fixture_with(single: bool) -> Fixture {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine: Arc<dyn MapEngine> = Arc::new(DefaultTEngine {
+            calls: calls.clone(),
+            single,
+        });
+        let mut config = site_collection_config("nwp");
+        config.title = "Forecast".to_string();
+        config.engine_type = "grib".to_string();
+        let tile_cache = Arc::new(ds_render::TilePixelCache::new(64));
+        let state = Arc::new(ArcSwap::from_pointee(WmsState {
+            engines: HashMap::from([("nwp".to_string(), engine)]),
+            collections: HashMap::from([("nwp".to_string(), config)]),
+            styles: styles(),
+            point_engines: HashMap::new(),
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            tile_cache: tile_cache.clone(),
+            base_url: String::new(),
+            trust_proxy_headers: false,
+        }));
+        Fixture {
+            app: api_wms::router(state),
+            calls,
+            tile_cache,
+        }
+    }
+
+    /// Status, `x-cache` and body of one WMS request.
+    async fn fetch(app: &axum::Router, query: &str) -> (StatusCode, String, Vec<u8>) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/?SERVICE=WMS&VERSION=1.3.0&{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let x_cache = resp
+            .headers()
+            .get("x-cache")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, x_cache, body.to_vec())
+    }
+
+    fn get_map(layer: &str, style: &str, crs: &str, bbox: &str, size: u32) -> String {
+        format!(
+            "REQUEST=GetMap&LAYERS={layer}&STYLES={style}&FORMAT=image/png\
+             &CRS={crs}&BBOX={bbox}&WIDTH={size}&HEIGHT={size}\
+             &TIME=2024-01-01T00:00:00Z"
+        )
+    }
+
+    /// The direct path and the meta-tiled one.
+    const VIEWS: [(&str, &str); 2] = [
+        ("CRS:84", "10,55,30,70"),
+        ("EPSG:3857", "2000000,8000000,3000000,9000000"),
+    ];
+
+    /// The bug: `LAYERS=nwp` drew the default `T` with the collection's
+    /// viridis. It now draws with `T`'s grayscale, the image `LAYERS=nwp/T`
+    /// draws, on both render paths. Each request has a router of its own, so
+    /// the images are each a render, not a cache entry the other filled.
+    #[tokio::test]
+    async fn root_layer_draws_the_default_parameter_with_its_own_style() {
+        for (crs, bbox) in VIEWS {
+            let (status, _, root) = fetch(&fixture().app, &get_map("nwp", "", crs, bbox, 64)).await;
+            assert_eq!(status, StatusCode::OK, "{crs}");
+            let (status, _, child) =
+                fetch(&fixture().app, &get_map("nwp/T", "", crs, bbox, 64)).await;
+            assert_eq!(status, StatusCode::OK, "{crs}");
+            assert_eq!(root, child, "{crs}: the root layer draws as nwp/T");
+            let pixels = png_pixels(&root);
+            assert!(
+                pixels
+                    .iter()
+                    .any(|&[r, g, b, a]| a > 0 && (r, g) != (0, 0) && r == g && g == b),
+                "{crs}: drawn"
+            );
+            assert!(
+                pixels
+                    .iter()
+                    .all(|&[r, g, b, a]| a == 0 || (r == g && g == b)),
+                "{crs}: grayscale, not the collection's viridis"
+            );
+
+            // A named style the default parameter's layer also has is that
+            // layer's copy of it.
+            let (_, _, root_alt) =
+                fetch(&fixture().app, &get_map("nwp", "alt", crs, bbox, 64)).await;
+            let (_, _, child_alt) =
+                fetch(&fixture().app, &get_map("nwp/T", "alt", crs, bbox, 64)).await;
+            assert_eq!(root_alt, child_alt, "{crs}: STYLES=alt");
+            assert_ne!(root_alt, root, "{crs}: alt is its own palette");
+        }
+    }
+
+    /// The rendered cache keys on the resolved style layer and parameter:
+    /// `LAYERS=nwp/T` after `LAYERS=nwp` is a hit, with no engine call.
+    #[tokio::test]
+    async fn root_layer_shares_the_rendered_cache_entry_of_its_default_parameter() {
+        for (crs, bbox) in VIEWS {
+            let Fixture { app, calls, .. } = fixture();
+            let (_, x_cache, root) = fetch(&app, &get_map("nwp", "", crs, bbox, 64)).await;
+            assert_eq!(x_cache, "MISS", "{crs}");
+            let rendered = calls.load(Ordering::Relaxed);
+            assert!(rendered > 0, "{crs}");
+            let (_, x_cache, child) = fetch(&app, &get_map("nwp/T", "", crs, bbox, 64)).await;
+            assert_eq!(x_cache, "HIT", "{crs}: nwp/T keys as the root layer");
+            assert_eq!(root, child, "{crs}");
+            assert_eq!(calls.load(Ordering::Relaxed), rendered, "{crs}");
+        }
+    }
+
+    /// The meta-tile key does too: a view inside one the root layer drew,
+    /// at the same resolution, is a rendered-cache miss whose every tile
+    /// is cached, so `LAYERS=nwp/T` calls no engine.
+    #[tokio::test]
+    async fn root_layer_shares_the_meta_tiles_of_its_default_parameter() {
+        let Fixture {
+            app,
+            calls,
+            tile_cache,
+        } = fixture();
+        let (status, x_cache, _) = fetch(
+            &app,
+            &get_map(
+                "nwp",
+                "",
+                "EPSG:3857",
+                "2000000,8000000,3000000,9000000",
+                512,
+            ),
+        )
+        .await;
+        assert_eq!((status, x_cache.as_str()), (StatusCode::OK, "MISS"));
+        let rendered = calls.load(Ordering::Relaxed);
+        assert!(rendered > 0);
+        let (hits_before, _) = tile_cache.stats();
+
+        let (status, x_cache, _) = fetch(
+            &app,
+            &get_map(
+                "nwp/T",
+                "",
+                "EPSG:3857",
+                "2000000,8000000,2500000,8500000",
+                256,
+            ),
+        )
+        .await;
+        assert_eq!((status, x_cache.as_str()), (StatusCode::OK, "MISS"));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            rendered,
+            "every tile of nwp/T was cached by the root layer"
+        );
+        assert!(tile_cache.stats().0 > hits_before);
+    }
+
+    /// GetLegendGraphic on the root layer is `nwp/T`'s legend: the palette
+    /// the root layer draws, under the default parameter's name and unit.
+    #[tokio::test]
+    async fn root_layer_legend_is_the_default_parameter_legend() {
+        let app = fixture().app;
+        let legend = |layer: &str, format: &str| {
+            format!("REQUEST=GetLegendGraphic&LAYER={layer}&STYLE=default&FORMAT={format}")
+        };
+        let json = |body: &[u8]| serde_json::from_slice::<serde_json::Value>(body).unwrap();
+
+        let (status, _, root) = fetch(&app, &legend("nwp", "application/json")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, child) = fetch(&app, &legend("nwp/T", "application/json")).await;
+        let (root, child) = (json(&root), json(&child));
+        assert_eq!(root, child);
+        assert_eq!(root["parameter"], "T");
+        assert_eq!(root["unit"], "°C");
+        assert_eq!(root["stops"][0]["color"], "#000000", "grayscale");
+
+        let (status, _, root) = fetch(&app, &legend("nwp", "image/png")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, child) = fetch(&app, &legend("nwp/T", "image/png")).await;
+        assert_eq!(root, child);
+    }
+
+    /// A single-parameter collection is unchanged: GetCapabilities
+    /// advertises its one layer with the collection's styles, and that
+    /// layer draws them, though the server registered a style layer for its
+    /// parameter, as it does when that parameter matches a built-in
+    /// parameter default. Its legend is the collection's too.
+    #[tokio::test]
+    async fn single_parameter_layer_keeps_the_collection_style() {
+        for (crs, bbox) in VIEWS {
+            let app = fixture_with(true).app;
+            let (status, _, body) = fetch(&app, &get_map("nwp", "", crs, bbox, 64)).await;
+            assert_eq!(status, StatusCode::OK, "{crs}");
+            assert!(
+                png_pixels(&body)
+                    .iter()
+                    .any(|&[r, g, b, a]| a > 0 && !(r == g && g == b)),
+                "{crs}: the collection's viridis, not T's grayscale"
+            );
+        }
+        let (status, _, legend) = fetch(
+            &fixture_with(true).app,
+            "REQUEST=GetLegendGraphic&LAYER=nwp&STYLE=default&FORMAT=application/json",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let legend: serde_json::Value = serde_json::from_slice(&legend).unwrap();
+        assert_eq!(legend["stops"][0]["color"], "#440154", "viridis");
+    }
 }
 
 #[tokio::test]
@@ -3577,9 +4379,12 @@ mod per_parameter_times {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         };
         let style = StyleInfo {
             name: "default".to_string(),
@@ -3601,6 +4406,7 @@ mod per_parameter_times {
                 "sat".to_string(),
                 HashMap::from([("default".to_string(), style)]),
             )]),
+            point_engines: HashMap::new(),
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             rendered_cache: Arc::new(RenderedCache::new(16)),
             tile_cache: Arc::new(ds_render::TilePixelCache::new(64)),
@@ -3825,19 +4631,68 @@ fn png_pixels(bytes: &[u8]) -> Vec<[u8; 4]> {
     }
 }
 
+/// #1010: a meta-tiled EPSG:3857 viewport is cached on its first render,
+/// though its bbox and size match no tile grid. Such viewports are the views
+/// a live deployment saw repeated (a fixed display cycling its frames, a
+/// client's default view), so admitting only tile-aligned views, or only a
+/// view's second render, would forfeit the hits this cache earns.
+#[tokio::test]
+async fn meta_tiled_viewport_is_cached_on_its_first_render() {
+    use std::sync::atomic::Ordering;
+    let (app, calls) = build_half_data_router();
+    let view = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar&STYLES=\
+                &CRS=EPSG:3857&BBOX=1113194,7361866,3339584,11068715\
+                &WIDTH=96&HEIGHT=160&FORMAT=image/png";
+    let get = |uri: String| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let x_cache = resp.headers()["x-cache"].to_str().unwrap().to_string();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (x_cache, body)
+        }
+    };
+
+    let (x, first) = get(view.to_string()).await;
+    assert_eq!(x, "MISS");
+    let rendered = calls.load(Ordering::Relaxed);
+    assert!(rendered > 0);
+
+    // Meta-tiled: a transparent copy of the view is another rendered-cache
+    // key, yet it is assembled from the meta-tiles cached above.
+    let (x, _) = get(format!("{view}&TRANSPARENT=TRUE")).await;
+    assert_eq!(x, "MISS");
+    assert_eq!(calls.load(Ordering::Relaxed), rendered, "meta-tiled view");
+
+    let (x, second) = get(view.to_string()).await;
+    assert_eq!(x, "HIT", "cached on its first render");
+    assert_eq!(second, first);
+}
+
 /// TRANSPARENT=FALSE paints nodata with BGCOLOR and returns an opaque image;
-/// the default keeps nodata transparent — on both render paths.
+/// TRANSPARENT=TRUE keeps nodata transparent — on both render paths.
 #[tokio::test]
 async fn transparent_false_composites_nodata_over_bgcolor() {
     for (crs, bbox) in HALF_VIEWS {
         let (app, _) = build_half_data_router();
 
-        let (status, _, body) = get_map_with(&app, "radar", crs, bbox, "&FORMAT=image/png").await;
+        let (status, _, body) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let default = png_pixels(&body);
         assert!(
             default.iter().any(|p| p[3] == 0),
-            "{crs}: default output keeps nodata transparent"
+            "{crs}: TRANSPARENT=TRUE keeps nodata transparent"
         );
         assert!(default.iter().any(|p| p[3] == 255), "{crs}: data is drawn");
 
@@ -3881,6 +4736,88 @@ async fn transparent_false_composites_nodata_over_bgcolor() {
     }
 }
 
+/// WMS 1.3.0 §7.3.3.9: TRANSPARENT defaults to FALSE (#1065). A GetMap that
+/// omits it is opaque: nodata takes BGCOLOR, default white, and the data is
+/// drawn over it, pixel for pixel the TRANSPARENT=TRUE image flattened, on
+/// both render paths. It shares the TRANSPARENT=FALSE request's cache entry,
+/// never the transparent one's.
+#[tokio::test]
+async fn getmap_without_transparent_is_opaque_over_bgcolor() {
+    use std::sync::atomic::Ordering;
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+    for (crs, bbox) in HALF_VIEWS {
+        let (app, calls) = build_half_data_router();
+        let (status, x, body) = get_map_with(&app, "radar", crs, bbox, "&FORMAT=image/png").await;
+        assert_eq!(status, StatusCode::OK, "{crs}");
+        assert_eq!(x, "MISS", "{crs}");
+        let opaque = png_pixels(&body);
+        assert!(opaque.iter().all(|p| p[3] == 255), "{crs}: opaque");
+        let rendered = calls.load(Ordering::Relaxed);
+
+        // The transparent image of the same view is another entry.
+        let (_, x, transparent_body) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+        )
+        .await;
+        assert_eq!(x, "MISS", "{crs}: never the opaque image's entry");
+        let transparent = png_pixels(&transparent_body);
+        assert!(transparent.iter().any(|p| p[3] == 0), "{crs}: nodata");
+        assert!(transparent.iter().any(|p| p[3] == 255), "{crs}: data");
+        for (t, o) in transparent.iter().zip(&opaque) {
+            let expected = if t[3] == 0 { WHITE } else { *t };
+            assert_eq!(*o, expected, "{crs}: the data over white");
+        }
+        if crs == "EPSG:3857" {
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                rendered,
+                "meta-tiled: both are assembled from the same RGBA tiles"
+            );
+        }
+
+        // An explicit FALSE is the same request, and so the same entry.
+        let (_, x, explicit) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=FALSE",
+        )
+        .await;
+        assert_eq!(x, "HIT", "{crs}");
+        assert_eq!(explicit, body, "{crs}");
+        let (_, x, again) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+        )
+        .await;
+        assert_eq!(x, "HIT", "{crs}");
+        assert_eq!(again, transparent_body, "{crs}");
+
+        // BGCOLOR alone: the data over BGCOLOR.
+        let (_, x, body) = get_map_with(
+            &app,
+            "radar",
+            crs,
+            bbox,
+            "&FORMAT=image/png&BGCOLOR=0x336699",
+        )
+        .await;
+        assert_eq!(x, "MISS", "{crs}");
+        for (t, o) in transparent.iter().zip(&png_pixels(&body)) {
+            let expected = if t[3] == 0 { BG } else { *t };
+            assert_eq!(*o, expected, "{crs}: the data over BGCOLOR");
+        }
+    }
+}
+
 /// The rendered-image cache must never serve a transparent image to an opaque
 /// request (or vice versa), while the meta-tile cache — plain RGBA — is shared
 /// by both.
@@ -3889,7 +4826,7 @@ async fn opaque_request_is_not_served_a_cached_transparent_image() {
     use std::sync::atomic::Ordering;
     for (crs, bbox) in HALF_VIEWS {
         let (app, calls) = build_half_data_router();
-        let png = "&FORMAT=image/png";
+        let png = "&FORMAT=image/png&TRANSPARENT=TRUE";
         let opaque = "&FORMAT=image/png&TRANSPARENT=FALSE&BGCOLOR=0x336699";
 
         let (_, x, transparent_body) = get_map_with(&app, "radar", crs, bbox, png).await;
@@ -3931,7 +4868,8 @@ async fn opaque_request_is_not_served_a_cached_transparent_image() {
 }
 
 /// An all-nodata view with TRANSPARENT=FALSE is a solid BGCOLOR image, on the
-/// direct and the meta-tiled empty path; the default stays transparent.
+/// direct and the meta-tiled empty path, and so is one without TRANSPARENT
+/// (#1065); TRANSPARENT=TRUE stays transparent.
 #[tokio::test]
 async fn all_nodata_opaque_view_is_solid_bgcolor() {
     let app = build_empty_router();
@@ -3950,7 +4888,35 @@ async fn all_nodata_opaque_view_is_solid_bgcolor() {
         assert_eq!(pixels.len(), 64 * 64);
         assert!(pixels.iter().all(|&p| p == BG), "{crs}: solid BGCOLOR");
 
+        let (_, x, body) = get_map_with(
+            &app,
+            "empty",
+            crs,
+            bbox,
+            "&FORMAT=image/png&BGCOLOR=0x336699",
+        )
+        .await;
+        assert_eq!(x, "EMPTY", "{crs}");
+        assert!(
+            png_pixels(&body).iter().all(|&p| p == BG),
+            "{crs}: no TRANSPARENT is TRANSPARENT=FALSE"
+        );
+
         let (_, x, body) = get_map_with(&app, "empty", crs, bbox, "&FORMAT=image/png").await;
+        assert_eq!(x, "EMPTY", "{crs}");
+        assert!(
+            png_pixels(&body).iter().all(|&p| p == [255, 255, 255, 255]),
+            "{crs}: BGCOLOR defaults to white"
+        );
+
+        let (_, x, body) = get_map_with(
+            &app,
+            "empty",
+            crs,
+            bbox,
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+        )
+        .await;
         assert_eq!(x, "EMPTY", "{crs}");
         assert!(png_pixels(&body).iter().all(|&p| p == [0, 0, 0, 0]));
     }
@@ -3972,8 +4938,20 @@ async fn error_tile_honours_transparent_false() {
     // [255, 0, 0, 100] over white.
     assert!(png_pixels(&body).iter().all(|&p| p == [255, 155, 155, 255]));
 
+    // Without TRANSPARENT, the same: FALSE is the default (#1065).
     let (_, x, body) =
         get_map_with(&app, "broken", "CRS:84", "10,55,30,70", "&FORMAT=image/png").await;
+    assert_eq!(x, "ERROR");
+    assert!(png_pixels(&body).iter().all(|&p| p == [255, 155, 155, 255]));
+
+    let (_, x, body) = get_map_with(
+        &app,
+        "broken",
+        "CRS:84",
+        "10,55,30,70",
+        "&FORMAT=image/png&TRANSPARENT=TRUE",
+    )
+    .await;
     assert_eq!(x, "ERROR");
     assert!(png_pixels(&body).iter().all(|&p| p == [255, 0, 0, 100]));
 }
@@ -3996,6 +4974,18 @@ async fn jpeg_is_composited_over_bgcolor() {
         crs,
         bbox,
         "&FORMAT=image/jpeg&TRANSPARENT=FALSE&BGCOLOR=0xFFFFFF",
+    )
+    .await;
+    assert_eq!(x, "HIT");
+    assert_eq!(body, default);
+    // TRANSPARENT=TRUE changes nothing either: still over white, still
+    // the same entry.
+    let (_, x, body) = get_map_with(
+        &app,
+        "radar",
+        crs,
+        bbox,
+        "&FORMAT=image/jpeg&TRANSPARENT=TRUE",
     )
     .await;
     assert_eq!(x, "HIT");
@@ -4288,9 +5278,12 @@ mod composites {
             cap: None,
             postgis: None,
             nowcast: None,
+            station_grid: None,
             bufr: None,
             satellite: None,
+            netcdf: None,
             preview: None,
+            derive_wind: None,
         };
         let style = StyleInfo {
             name: "default".to_string(),
@@ -4318,6 +5311,7 @@ mod composites {
                     ("viridis".to_string(), viridis),
                 ]),
             )]),
+            point_engines: HashMap::new(),
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             rendered_cache: Arc::new(RenderedCache::new(16)),
             tile_cache: tile_cache.clone(),
@@ -4409,6 +5403,35 @@ mod composites {
             composite.contains("REQUEST=GetLegendGraphic&amp;LAYER=sat/rgb&amp;STYLE=default"),
             "{composite}"
         );
+
+        // Its LegendURL names the format and size of the channel-list
+        // legend its link returns, as a palette style's does (#1065).
+        let url = legend_urls(&caps)
+            .into_iter()
+            .find(|url| {
+                url.children
+                    .iter()
+                    .any(|(_, href)| href.contains("LAYER=sat/rgb&"))
+            })
+            .unwrap_or_else(|| panic!("no LegendURL for sat/rgb: {caps}"));
+        let names: Vec<&str> = url.children.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Format", "OnlineResource"], "{composite}");
+        assert_eq!(url.children[0].1, "image/png");
+        assert_eq!(
+            (url.width, url.height),
+            (
+                ds_render::LEGEND_DEFAULT_WIDTH,
+                ds_render::LEGEND_DEFAULT_HEIGHT
+            )
+        );
+        let href = &url.children[1].1;
+        let query = href
+            .strip_prefix("/wms?")
+            .unwrap_or_else(|| panic!("{href}"));
+        let legend = fetch(&app, &format!("/?{query}")).await;
+        assert_eq!(legend.status, StatusCode::OK, "{href}: {}", legend.text());
+        assert_eq!(legend.content_type, "image/png", "{href}");
+        assert_eq!(png_dims(&legend.body), (url.width, url.height), "{href}");
     }
 
     /// A GetMap is `render_composite_tiles` over the band tiles at the
@@ -4441,7 +5464,9 @@ mod composites {
                 None,
             )
             .unwrap();
-        let expected = ds_render::render_composite_tiles(&tiles, &spec, ImageFormat::Png, None)
+        // TRANSPARENT omitted: FALSE, over the default BGCOLOR (#1065).
+        let white = Some([255, 255, 255]);
+        let expected = ds_render::render_composite_tiles(&tiles, &spec, ImageFormat::Png, white)
             .unwrap()
             .unwrap();
         assert_eq!(reply.body, expected);
@@ -4449,6 +5474,20 @@ mod composites {
         // East of 5°E: red 51 - 21 = 30 over -10..40 → 204, green 21 → 54,
         // blue 51 inverted over 100..0 → 125. West of it `b` is nodata.
         let pixels = png_pixels(&reply.body);
+        assert_eq!(pixels[63], [204, 54, 125, 255]);
+        assert_eq!(pixels[0], [255, 255, 255, 255]);
+
+        let transparent = get(
+            &app,
+            &get_map("sat/rgb", "CRS:84", "0,40,10,50", "&TRANSPARENT=TRUE"),
+        )
+        .await;
+        assert_eq!(transparent.x_cache, "MISS");
+        let expected = ds_render::render_composite_tiles(&tiles, &spec, ImageFormat::Png, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(transparent.body, expected);
+        let pixels = png_pixels(&transparent.body);
         assert_eq!(pixels[63], [204, 54, 125, 255]);
         assert_eq!(pixels[0], [0, 0, 0, 0]);
 
@@ -4516,9 +5555,11 @@ mod composites {
             .all(|(bands, time)| bands == &["a", "b"] && *time == Some(t(T1))));
         let (_, misses) = tile_cache.stats();
         assert_eq!(misses as usize, calls.len());
+        // TRANSPARENT omitted: the nodata west of 5°E is the default
+        // BGCOLOR, white (#1065).
         let pixels = png_pixels(&first.body);
         assert_eq!(pixels[63], [204, 54, 125, 255]);
-        assert_eq!(pixels[0], [0, 0, 0, 0]);
+        assert_eq!(pixels[0], [255, 255, 255, 255]);
 
         // Another format misses the rendered cache but assembles from the
         // same composed tiles, still at T1 after `a` gains T2.
@@ -4641,5 +5682,1148 @@ mod composites {
         )
         .unwrap();
         assert_eq!(image.body, expected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QUALITY vendor parameter and `[wms] webp_quality`
+// ---------------------------------------------------------------------------
+
+/// The first RIFF chunk of a WebP body: `VP8L` is the lossless bitstream,
+/// `VP8 ` / `VP8X` lossy (the latter with an alpha chunk).
+fn webp_chunk(body: &[u8]) -> &[u8] {
+    assert_eq!(&body[..4], b"RIFF", "not a WebP body");
+    assert_eq!(&body[8..12], b"WEBP", "not a WebP body");
+    &body[12..16]
+}
+
+struct QualityResponse {
+    status: StatusCode,
+    content_type: String,
+    x_cache: String,
+    etag: String,
+    body: Vec<u8>,
+}
+
+async fn get_quality(app: &axum::Router, crs: &str, bbox: &str, extra: &str) -> QualityResponse {
+    let uri = format!(
+        "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar&STYLES=\
+         &CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64&TIME=2024-01-01T00:00:00Z&TRANSPARENT=TRUE{extra}"
+    );
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default()
+    };
+    let (status, content_type, x_cache, etag) = (
+        resp.status(),
+        header("content-type"),
+        header("x-cache"),
+        header("etag"),
+    );
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    QualityResponse {
+        status,
+        content_type,
+        x_cache,
+        etag,
+        body,
+    }
+}
+
+/// Both render paths: the direct one (CRS:84) and the meta-tiled one
+/// (EPSG:3857), whose final encode of the assembled view takes the quality.
+const QUALITY_VIEWS: [(&str, &str); 2] = [
+    ("CRS:84", "10,55,30,70"),
+    ("EPSG:3857", "1113194,7361866,3339584,11068715"),
+];
+
+/// `QUALITY=1..99` on `image/webp` is a lossy encode; the key is
+/// case-insensitive like every WMS parameter.
+#[tokio::test]
+async fn quality_selects_lossy_webp_with_any_key_case() {
+    for (crs, bbox) in QUALITY_VIEWS {
+        let app = build_populated_router();
+        let upper = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=80").await;
+        assert_eq!(upper.status, StatusCode::OK, "{crs}");
+        assert_eq!(upper.content_type, "image/webp");
+        assert_eq!(upper.x_cache, "MISS");
+        assert_ne!(webp_chunk(&upper.body), b"VP8L", "{crs}: must be lossy");
+        // The other spellings name the same request: a cache hit on the
+        // same bytes.
+        for key in ["quality", "Quality"] {
+            let other = get_quality(&app, crs, bbox, &format!("&FORMAT=image/webp&{key}=80")).await;
+            assert_eq!(other.status, StatusCode::OK, "{crs} {key}");
+            assert_eq!(other.x_cache, "HIT", "{crs} {key}");
+            assert_eq!(other.body, upper.body, "{crs} {key}");
+        }
+    }
+}
+
+/// A lossy and a lossless WebP of one view never share a rendered-cache
+/// entry, on either render path; `QUALITY=100` is the lossless default.
+#[tokio::test]
+async fn lossy_and_lossless_webp_never_alias_in_the_cache() {
+    for (crs, bbox) in QUALITY_VIEWS {
+        let app = build_populated_router();
+        let lossless = get_quality(&app, crs, bbox, "&FORMAT=image/webp").await;
+        assert_eq!(lossless.x_cache, "MISS", "{crs}");
+        assert_eq!(
+            webp_chunk(&lossless.body),
+            b"VP8L",
+            "{crs}: default is lossless"
+        );
+
+        let lossy = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=80").await;
+        assert_eq!(
+            lossy.x_cache, "MISS",
+            "{crs}: a lossless entry must not serve lossy"
+        );
+        assert_ne!(webp_chunk(&lossy.body), b"VP8L");
+        assert_ne!(lossy.etag, lossless.etag);
+
+        // Explicit 100 is the lossless request: served from its entry.
+        let explicit = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=100").await;
+        assert_eq!(explicit.x_cache, "HIT", "{crs}");
+        assert_eq!(explicit.body, lossless.body);
+
+        // Another lossy quality is another entry; the first lossy one hits.
+        let q50 = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=50").await;
+        assert_eq!(q50.x_cache, "MISS", "{crs}");
+        let again = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=80").await;
+        assert_eq!(again.x_cache, "HIT", "{crs}");
+        assert_eq!(again.body, lossy.body);
+    }
+}
+
+/// `[wms] webp_quality` applies to a WebP GetMap without QUALITY; an explicit
+/// QUALITY wins, including 100 for lossless. JPEG keeps its own default.
+#[tokio::test]
+async fn collection_webp_quality_is_the_default_and_quality_overrides_it() {
+    let wms: ds_core::config::WmsConfig =
+        serde_json::from_value(serde_json::json!({ "webp_quality": 70 })).unwrap();
+    for (crs, bbox) in QUALITY_VIEWS {
+        let app = api_wms::router(build_populated_state_with_wms(
+            Arc::new(PopulatedMockMapEngine),
+            Some(wms.clone()),
+        ));
+        let plain = build_populated_router();
+
+        let default = get_quality(&app, crs, bbox, "&FORMAT=image/webp").await;
+        assert_eq!(default.status, StatusCode::OK);
+        assert_ne!(
+            webp_chunk(&default.body),
+            b"VP8L",
+            "{crs}: collection default is lossy"
+        );
+        // It is exactly QUALITY=70: same key, a cache hit.
+        let seventy = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=70").await;
+        assert_eq!(seventy.x_cache, "HIT", "{crs}");
+        assert_eq!(seventy.body, default.body);
+
+        let lossless = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=100").await;
+        assert_eq!(lossless.x_cache, "MISS", "{crs}");
+        assert_eq!(
+            webp_chunk(&lossless.body),
+            b"VP8L",
+            "{crs}: explicit 100 is lossless"
+        );
+        // …the same bytes a collection without a default serves.
+        let reference = get_quality(&plain, crs, bbox, "&FORMAT=image/webp").await;
+        assert_eq!(lossless.body, reference.body, "{crs}");
+
+        let q90 = get_quality(&app, crs, bbox, "&FORMAT=image/webp&QUALITY=90").await;
+        assert_eq!(q90.x_cache, "MISS", "{crs}");
+        assert_ne!(q90.body, default.body);
+
+        // JPEG ignores the WebP default.
+        let jpeg = get_quality(&app, crs, bbox, "&FORMAT=image/jpeg").await;
+        let jpeg_plain = get_quality(&plain, crs, bbox, "&FORMAT=image/jpeg").await;
+        assert_eq!(jpeg.content_type, "image/jpeg");
+        assert_eq!(jpeg.body, jpeg_plain.body, "{crs}");
+    }
+}
+
+/// JPEG takes QUALITY as its quality factor (default 85).
+#[tokio::test]
+async fn quality_sets_the_jpeg_quality() {
+    let app = build_populated_router();
+    let (crs, bbox) = QUALITY_VIEWS[0];
+    let default = get_quality(&app, crs, bbox, "&FORMAT=image/jpeg").await;
+    let q85 = get_quality(&app, crs, bbox, "&FORMAT=image/jpeg&QUALITY=85").await;
+    assert_eq!(q85.x_cache, "HIT", "85 is the JPEG default");
+    assert_eq!(q85.body, default.body);
+    let q20 = get_quality(&app, crs, bbox, "&FORMAT=image/jpeg&QUALITY=20").await;
+    assert_eq!(q20.status, StatusCode::OK);
+    assert_eq!(q20.x_cache, "MISS");
+    assert!(q20.body.len() < default.body.len());
+}
+
+/// A bad QUALITY, or one on PNG, is an `InvalidParameterValue` 400 naming
+/// the problem, never silently ignored.
+#[tokio::test]
+async fn bad_quality_is_invalid_parameter_value() {
+    let app = build_populated_router();
+    let (crs, bbox) = QUALITY_VIEWS[0];
+    for (extra, message) in [
+        (
+            "&FORMAT=image/webp&QUALITY=0",
+            "QUALITY &apos;0&apos; must be an integer from 1 to 100",
+        ),
+        (
+            "&FORMAT=image/webp&QUALITY=101",
+            "QUALITY &apos;101&apos; must be an integer from 1 to 100",
+        ),
+        (
+            "&FORMAT=image/jpeg&QUALITY=high",
+            "QUALITY &apos;high&apos; must be an integer from 1 to 100",
+        ),
+        (
+            "&FORMAT=image/png&QUALITY=80",
+            "QUALITY applies only to image/jpeg and image/webp, not image/png",
+        ),
+    ] {
+        let resp = get_quality(&app, crs, bbox, extra).await;
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST, "{extra}");
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(
+            body.contains("code=\"InvalidParameterValue\"") && body.contains(message),
+            "{extra}: {body}"
+        );
+    }
+}
+
+/// QUALITY is a GetMap parameter; GetLegendGraphic ignores it like the
+/// other GetMap-only parameters, so a client sending it everywhere works.
+#[tokio::test]
+async fn legend_graphic_ignores_quality() {
+    let app = build_populated_router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+                     &LAYER=radar&FORMAT=image/webp&QUALITY=80",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(webp_chunk(&body), b"VP8L", "legends stay lossless");
+}
+
+// ---------------------------------------------------------------------------
+// Long time and run axes as Annex C ranges (#1006)
+// ---------------------------------------------------------------------------
+
+fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+/// The two runs the archive is missing.
+const ARCHIVE_GAP: [&str; 2] = ["2022-01-01T00:00:00Z", "2022-01-01T06:00:00Z"];
+
+/// An archive store's run axis: six-hourly from 2021-05-01 to
+/// 2026-10-09T18Z, less [`ARCHIVE_GAP`] — 7950 runs, which WMS once listed
+/// in a 200 KB `<Dimension>`.
+fn archive_runs() -> Vec<chrono::DateTime<chrono::Utc>> {
+    let gap = ARCHIVE_GAP.map(utc);
+    let mut runs = Vec::new();
+    let mut rt = utc("2021-05-01T00:00:00Z");
+    while rt <= utc("2026-10-09T18:00:00Z") {
+        if !gap.contains(&rt) {
+            runs.push(rt);
+        }
+        rt += chrono::Duration::hours(6);
+    }
+    runs
+}
+
+/// 600 five-minute valid times: longer than one list.
+fn archive_times() -> Vec<chrono::DateTime<chrono::Utc>> {
+    let start = utc("2026-10-08T00:00:00Z");
+    (0..600)
+        .map(|i| start + chrono::Duration::minutes(5 * i))
+        .collect()
+}
+
+/// [`ForecastMockMapEngine`] over the archive's axes.
+struct ArchiveMockMapEngine {
+    calls: RunRecorder,
+}
+
+impl MapEngine for ArchiveMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        output_crs: &OutputCrs,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        ForecastMockMapEngine {
+            calls: self.calls.clone(),
+        }
+        .get_raster_tile(
+            bbox,
+            width,
+            height,
+            time,
+            output_crs,
+            parameter,
+            z,
+            reference_time,
+        )
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            times: archive_times(),
+            reference_times: archive_runs(),
+            ..ForecastMockMapEngine {
+                calls: self.calls.clone(),
+            }
+            .raster_info()
+        }
+    }
+
+    fn resolve_reference_time(
+        &self,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        reference_time.or_else(|| archive_runs().last().copied())
+    }
+}
+
+fn archive_capabilities() -> String {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    engines.insert(
+        "ecmwf-fc".to_string(),
+        Arc::new(ArchiveMockMapEngine {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }),
+    );
+    let mut collections = HashMap::new();
+    collections.insert(
+        "ecmwf-fc".to_string(),
+        CollectionConfig {
+            id: "ecmwf-fc".to_string(),
+            title: "Archive".to_string(),
+            description: "Archive fixture for #1006".into(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "zarr".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            cap: None,
+            postgis: None,
+            nowcast: None,
+            station_grid: None,
+            bufr: None,
+            satellite: None,
+            netcdf: None,
+            preview: None,
+            derive_wind: None,
+        },
+    );
+    let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &styles,
+        &HashMap::new(),
+        "",
+    );
+    String::from_utf8(xml).expect("capabilities XML is UTF-8")
+}
+
+/// A long run axis is written as WMS 1.3.0 Annex C `min/max/resolution`
+/// ranges, one per stretch without a missing run, and a long valid-time axis
+/// likewise; the defaults are unchanged. Short axes keep their lists (see
+/// `capabilities_emit_reference_time_dimension_for_forecast`).
+#[test]
+fn capabilities_describe_long_axes_as_annex_c_ranges() {
+    let xml = archive_capabilities();
+    assert!(
+        xml.contains(
+            "<Dimension name=\"reference_time\" units=\"ISO8601\" \
+             default=\"2026-10-09T18:00:00+00:00\">\
+             2021-05-01T00:00:00+00:00/2021-12-31T18:00:00+00:00/PT6H,\
+             2022-01-01T12:00:00+00:00/2026-10-09T18:00:00+00:00/PT6H</Dimension>"
+        ),
+        "{xml}"
+    );
+    assert!(
+        xml.contains(
+            "<Dimension name=\"time\" units=\"ISO8601\" \
+             default=\"2026-10-10T01:55:00+00:00\" nearestValue=\"1\">\
+             2026-10-08T00:00:00+00:00/2026-10-10T01:55:00+00:00/PT5M</Dimension>"
+        ),
+        "{xml}"
+    );
+    // The whole document, not 200 KB of run list.
+    assert!(xml.len() < 4_000, "{} bytes", xml.len());
+}
+
+/// Every run a range names validates as it did listed: one inside a range
+/// renders, pinned; a missing run between the ranges and an instant off the
+/// cadence are `InvalidDimensionValue`, never rendered.
+#[tokio::test]
+async fn getmap_resolves_a_run_inside_an_advertised_range() {
+    let calls: RunRecorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine: Arc<dyn MapEngine> = Arc::new(ArchiveMockMapEngine {
+        calls: calls.clone(),
+    });
+    let app = build_forecast_router_with_engine(engine);
+    let get = |run: &str| {
+        let app = app.clone();
+        let uri = format!("{FC_GETMAP_URI}&DIM_REFERENCE_TIME={run}");
+        async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+    let resp = get("2023-03-04T12:00:00Z").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        calls.lock().unwrap().clone(),
+        vec![Some(utc("2023-03-04T12:00:00Z"))]
+    );
+    for run in [ARCHIVE_GAP[1], "2023-03-04T13:00:00Z"] {
+        let resp = get(run).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{run}");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(xml.contains("InvalidDimensionValue"), "{run}: {xml}");
+    }
+    assert_eq!(calls.lock().unwrap().len(), 1, "no invalid run rendered");
+}
+
+// ---------------------------------------------------------------------------
+// OGC WMS 1.3.0 test suite findings (#1065)
+// ---------------------------------------------------------------------------
+
+/// One response, read whole.
+struct Fetched {
+    status: StatusCode,
+    content_type: String,
+    x_cache: String,
+    body: Vec<u8>,
+}
+
+impl Fetched {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+/// One request for `uri`, path and query, through `app`.
+async fn fetch(app: &axum::Router, uri: &str) -> Fetched {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default()
+    };
+    let (status, content_type, x_cache) =
+        (resp.status(), header("content-type"), header("x-cache"));
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    Fetched {
+        status,
+        content_type,
+        x_cache,
+        body,
+    }
+}
+
+/// The capabilities document `app` serves.
+async fn capabilities(app: &axum::Router) -> String {
+    let reply = fetch(app, "/?SERVICE=WMS&REQUEST=GetCapabilities").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    reply.text()
+}
+
+/// GetCapabilities as the suite spells it: every name in mixed case, the
+/// `REQUEST` value percent-encoded, and a parameter no server knows. WMS
+/// 1.3.0 §6.8.1 makes names case-insensitive and lets a server ignore an
+/// unknown parameter, so both are ordinary GetCapabilities requests.
+#[tokio::test]
+async fn getcapabilities_reads_parameter_names_in_any_case() {
+    let app = build_populated_router();
+    for uri in [
+        "/?SeRvIcE=WMS&ReQuEsT=GetCapabilities&VeRsIoN=1.3.0&BoGuS=ignored",
+        "/?sErViCe=WMS&rEqUeSt=%47%65%74%43%61%70%61%62%69%6C%69%74%69%65%73",
+    ] {
+        let reply = fetch(&app, uri).await;
+        assert_eq!(reply.status, StatusCode::OK, "{uri}: {}", reply.text());
+        assert_eq!(reply.content_type, "text/xml", "{uri}");
+        assert!(reply.text().contains("<WMS_Capabilities"), "{uri}");
+    }
+}
+
+/// GetMap as the suite spells it names the same request as the canonical
+/// spelling: the second is a rendered-cache hit on identical bytes. Every
+/// parameter that shapes the image is in the cache key — `TRANSPARENT` and
+/// `BGCOLOR` the background, `WIDTH` and `HEIGHT` the size — so a name read
+/// in one spelling and missed in the other would miss the cache. Values are
+/// percent-encoded as the suite sends them, and the unknown `BoGuS` is
+/// ignored.
+#[tokio::test]
+async fn getmap_reads_parameter_names_in_any_case() {
+    let app = build_populated_router();
+    let suite = fetch(
+        &app,
+        "/?SeRvIcE=WMS&VeRsIoN=1.3.0&ReQuEsT=%47%65%74%4D%61%70&LaYeRs=radar&StYlEs=\
+         &CrS=CRS%3A84&BbOx=10,55,30,70&WiDtH=64&HeIgHt=48&FoRmAt=image%2Fpng\
+         &TrAnSpArEnT=FALSE&BgCoLoR=0x336699&TiMe=2024-01-01T00:00:00Z&BoGuS=ignored",
+    )
+    .await;
+    assert_eq!(suite.status, StatusCode::OK, "{}", suite.text());
+    assert_eq!(suite.content_type, "image/png");
+    assert_eq!(suite.x_cache, "MISS");
+    assert_eq!(png_dims(&suite.body), (64, 48));
+
+    let canonical = fetch(
+        &app,
+        "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=radar&STYLES=\
+         &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=48&FORMAT=image/png\
+         &TRANSPARENT=FALSE&BGCOLOR=0x336699&TIME=2024-01-01T00:00:00Z",
+    )
+    .await;
+    assert_eq!(canonical.status, StatusCode::OK);
+    assert_eq!(
+        canonical.x_cache, "HIT",
+        "the canonical spelling must name the same request"
+    );
+    assert_eq!(canonical.body, suite.body);
+}
+
+/// GetLegendGraphic reads its names in any case too: the mixed-case
+/// request draws the named style at the requested size, byte for byte the
+/// canonical one, and not the default style's legend.
+#[tokio::test]
+async fn getlegendgraphic_reads_parameter_names_in_any_case() {
+    let app = build_empty_router();
+    let suite = fetch(
+        &app,
+        "/?SeRvIcE=WMS&ReQuEsT=GetLegendGraphic&LaYeR=empty&StYlE=radar_fmi\
+         &FoRmAt=image%2Fpng&WiDtH=20&HeIgHt=120",
+    )
+    .await;
+    assert_eq!(suite.status, StatusCode::OK, "{}", suite.text());
+    assert_eq!(png_dims(&suite.body), (20, 120));
+
+    let legend = |style: &str| {
+        format!(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER=empty&STYLE={style}\
+             &FORMAT=image/png&WIDTH=20&HEIGHT=120"
+        )
+    };
+    let canonical = fetch(&app, &legend("radar_fmi")).await;
+    assert_eq!(canonical.status, StatusCode::OK);
+    assert_eq!(canonical.body, suite.body);
+    let default = fetch(&app, &legend("default")).await;
+    assert_ne!(default.body, suite.body, "StYlE must select the style");
+}
+
+/// A parameter given twice, in two cases, takes its first value. Before,
+/// serde's derive rejected any repeat with a plain-text 400 that was no
+/// ServiceException.
+#[tokio::test]
+async fn a_parameter_repeated_in_another_case_takes_its_first_value() {
+    let app = build_populated_router();
+    let get_map = "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&STYLES=&CRS=CRS:84\
+                   &BBOX=10,55,30,70&WIDTH=64&HEIGHT=64&FORMAT=image/png";
+
+    let known_first = fetch(&app, &format!("{get_map}&LAYERS=radar&layers=missing")).await;
+    assert_eq!(known_first.status, StatusCode::OK, "{}", known_first.text());
+    assert_eq!(known_first.content_type, "image/png");
+
+    let unknown_first = fetch(&app, &format!("{get_map}&layers=missing&LAYERS=radar")).await;
+    assert_eq!(unknown_first.status, StatusCode::BAD_REQUEST);
+    let xml = unknown_first.text();
+    assert!(
+        xml.contains("code=\"LayerNotDefined\"") && xml.contains("missing"),
+        "{xml}"
+    );
+}
+
+/// The root names the XML Schema instance and SLD namespaces and points
+/// `xsi:schemaLocation` at the WMS 1.3.0 capabilities schema and at SLD
+/// 1.1.0's, which declares `sld:GetLegendGraphic`, so a validator can find
+/// both.
+#[tokio::test]
+async fn capabilities_root_points_at_its_schemas() {
+    use quick_xml::events::Event;
+
+    let xml = capabilities(&build_populated_router()).await;
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let root = loop {
+        match reader.read_event().expect("capabilities XML parses") {
+            Event::Start(e) => break e,
+            Event::Eof => panic!("no root element: {xml}"),
+            _ => {}
+        }
+    };
+    assert_eq!(root.name().as_ref(), "WMS_Capabilities");
+    let attribute = |name: &str| {
+        root.try_get_attribute(name)
+            .expect("attributes parse")
+            .unwrap_or_else(|| panic!("root has no {name}: {xml}"))
+            .value
+            .into_owned()
+    };
+    assert_eq!(
+        attribute("xmlns:xsi"),
+        "http://www.w3.org/2001/XMLSchema-instance"
+    );
+    assert_eq!(attribute("xmlns:sld"), "http://www.opengis.net/sld");
+    assert_eq!(
+        attribute("xsi:schemaLocation"),
+        "http://www.opengis.net/wms \
+         http://schemas.opengis.net/wms/1.3.0/capabilities_1_3_0.xsd \
+         http://www.opengis.net/sld \
+         http://schemas.opengis.net/sld/1.1.0/sld_capabilities.xsd"
+    );
+}
+
+/// `<Capability>` is `Request`, `Exception`, then the root `Layer`, the
+/// order of the schema's sequence (#1027), and `<Exception>` offers only
+/// `XML`: the format a request error is answered in, whatever `EXCEPTIONS`
+/// asks for. `<Request>` holds the operations in the schema's order,
+/// GetFeatureInfo right after GetMap (#1064), with GetLegendGraphic as SLD's
+/// extended operation: a `<GetLegendGraphic>` in the WMS namespace is not in
+/// the schema and fails validation.
+#[tokio::test]
+async fn capabilities_advertise_xml_exceptions_right_after_request() {
+    let app = build_populated_router();
+    let xml = capabilities(&app).await;
+    let names = |parent: &str| -> Vec<String> {
+        element_children(&xml, parent)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+    assert_eq!(
+        names("Capability"),
+        ["Request", "Exception", "Layer"],
+        "{xml}"
+    );
+    assert_eq!(
+        names("Request"),
+        [
+            "GetCapabilities",
+            "GetMap",
+            "GetFeatureInfo",
+            "sld:GetLegendGraphic"
+        ],
+        "{xml}"
+    );
+    assert_eq!(
+        element_children(&xml, "Exception"),
+        [("Format".to_string(), "XML".to_string())],
+        "{xml}"
+    );
+}
+
+/// What capabilities advertises is what a request error is: a
+/// ServiceExceptionReport in `text/xml`, WMS 1.3.0's MIME type for `XML`,
+/// whatever `EXCEPTIONS` says. The requests are the OGC test suite's
+/// `getmap:exceptions-default` and `getmap:exceptions-xml`, which failed on
+/// WMS 1.1.1's `application/vnd.ogc.se_xml`, plus an `INIMAGE` that is not
+/// honoured (#1027).
+#[tokio::test]
+async fn request_errors_are_text_xml_service_exception_reports() {
+    let app = build_populated_router();
+    let get_map = "/?BbOx=0,0,1,1&VeRsIoN=1.3.0&WiDtH=100&StYlEs=&FoRmAt=image%2Fpng\
+                   &HeIgHt=100&LaYeRs=NonExistant&ReQuEsT=GetMap&CrS=CRS:84";
+    for uri in [
+        get_map.to_string(),
+        format!("{get_map}&ExCePtIoNs=XML"),
+        format!("{get_map}&EXCEPTIONS=INIMAGE"),
+    ] {
+        let error = fetch(&app, &uri).await;
+        assert_eq!(error.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(error.content_type, "text/xml", "{uri}");
+        let xml = error.text();
+        assert!(
+            xml.contains("<ServiceExceptionReport") && xml.contains("code=\"LayerNotDefined\""),
+            "{uri}: {xml}"
+        );
+    }
+}
+
+/// One `<LegendURL>`: its `width` and `height` attributes, and its children
+/// in document order, each element's name with its text or, for the empty
+/// `<OnlineResource>`, its unescaped `xlink:href`.
+struct LegendUrl {
+    width: u32,
+    height: u32,
+    children: Vec<(String, String)>,
+}
+
+/// Every `<LegendURL>` of a capabilities document.
+fn legend_urls(xml: &str) -> Vec<LegendUrl> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut urls: Vec<LegendUrl> = Vec::new();
+    // Inside a `<LegendURL>`, and inside one of its child elements.
+    let (mut in_legend, mut in_child) = (false, false);
+    loop {
+        match reader.read_event().expect("capabilities XML parses") {
+            Event::Start(e) if e.name().as_ref() == "LegendURL" => {
+                let size = |name: &str| -> u32 {
+                    let value = e
+                        .try_get_attribute(name)
+                        .expect("attributes parse")
+                        .unwrap_or_else(|| panic!("<LegendURL> has no {name}: {xml}"))
+                        .value
+                        .into_owned();
+                    value
+                        .parse()
+                        .unwrap_or_else(|_| panic!("<LegendURL> {name} {value:?}"))
+                };
+                urls.push(LegendUrl {
+                    width: size("width"),
+                    height: size("height"),
+                    children: Vec::new(),
+                });
+                in_legend = true;
+            }
+            Event::Start(e) if in_legend => {
+                let name = e.name().as_ref().to_owned();
+                urls.last_mut()
+                    .unwrap()
+                    .children
+                    .push((name, String::new()));
+                in_child = true;
+            }
+            Event::Empty(e) if in_legend => {
+                let name = e.name().as_ref().to_owned();
+                let href = e
+                    .try_get_attribute("xlink:href")
+                    .expect("attributes parse")
+                    .map(|a| {
+                        a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                            .expect("href unescapes")
+                            .into_owned()
+                    })
+                    .unwrap_or_default();
+                urls.last_mut().unwrap().children.push((name, href));
+            }
+            Event::Text(t) if in_child => {
+                let child = urls.last_mut().unwrap().children.last_mut().unwrap();
+                child.1.push_str(&t);
+            }
+            Event::End(e) if e.name().as_ref() == "LegendURL" => in_legend = false,
+            Event::End(_) if in_legend => in_child = false,
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    urls
+}
+
+/// Each LegendURL follows the schema, a `<Format>` then its
+/// `<OnlineResource>`, and its `width`, `height` and format are those of
+/// the image the link returns: following it serves a PNG of exactly the
+/// advertised size.
+#[tokio::test]
+async fn legend_urls_name_the_format_and_size_their_link_returns() {
+    let app = build_empty_router();
+    let xml = capabilities(&app).await;
+    let urls = legend_urls(&xml);
+    // One per style of the `empty` layer: `default` and `radar_fmi`.
+    assert_eq!(urls.len(), 2, "{xml}");
+    for url in urls {
+        let names: Vec<&str> = url.children.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Format", "OnlineResource"], "{xml}");
+        let format = &url.children[0].1;
+        assert_eq!(format, "image/png");
+        assert_eq!(
+            (url.width, url.height),
+            (
+                ds_render::LEGEND_DEFAULT_WIDTH,
+                ds_render::LEGEND_DEFAULT_HEIGHT
+            )
+        );
+
+        // The router serves at `/` what the server mounts at `/wms`.
+        let href = &url.children[1].1;
+        let query = href
+            .strip_prefix("/wms?")
+            .unwrap_or_else(|| panic!("{href}"));
+        let legend = fetch(&app, &format!("/?{query}")).await;
+        assert_eq!(legend.status, StatusCode::OK, "{href}: {}", legend.text());
+        assert_eq!(&legend.content_type, format, "{href}");
+        assert_eq!(
+            png_dims(&legend.body),
+            (url.width, url.height),
+            "{href} must return the advertised size"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The OGC test suite's second run (#1065)
+// ---------------------------------------------------------------------------
+
+/// The `code` of a ServiceExceptionReport's one ServiceException.
+fn exception_code(xml: &str) -> &str {
+    let code = xml
+        .split_once("<ServiceException code=\"")
+        .unwrap_or_else(|| panic!("no ServiceException: {xml}"))
+        .1;
+    &code[..code.find('"').unwrap()]
+}
+
+/// ets-wms13's `getmap:invalid-crs`: a CRS the server does not offer is
+/// WMS 1.3.0 Table E.1's `InvalidCRS`, not the `CRSNotDefined` it was.
+#[tokio::test]
+async fn getmap_with_an_unoffered_crs_is_invalid_crs() {
+    let app = build_populated_router();
+    for crs in ["UndefinedCRS", "EPSG:32635"] {
+        let uri = format!(
+            "/?StYlEs=&ReQuEsT=GetMap&HeIgHt=200&FoRmAt=image%2Fpng&BbOx=-1,-1,1,1\
+             &CrS={crs}&WiDtH=200&LaYeRs=radar&VeRsIoN=1.3.0"
+        );
+        let reply = fetch(&app, &uri).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(reply.content_type, "text/xml", "{uri}");
+        assert_eq!(exception_code(&reply.text()), "InvalidCRS", "{uri}");
+    }
+}
+
+/// A list naming a layer or style the server does not serve is answered
+/// with that error, as ets-wms13's `getmap:first-layer-invalid`,
+/// `second-layer-invalid`, `first-style-invalid` and `second-style-invalid`
+/// expect, also past `LayerLimit` (5). STYLES must pair with LAYERS.
+#[tokio::test]
+async fn layer_lists_report_undefined_layers_and_styles() {
+    let app = build_populated_router();
+    for (layers, styles, code) in [
+        ("NonExistant,radar", "", "LayerNotDefined"),
+        ("radar,NonExistant", "", "LayerNotDefined"),
+        ("radar,radar", "UndefinedStyle,default", "StyleNotDefined"),
+        ("radar,radar", "default,UndefinedStyle", "StyleNotDefined"),
+        (
+            "radar,radar,radar,radar,radar,NonExistant",
+            "",
+            "LayerNotDefined",
+        ),
+        (
+            "radar,radar,radar,radar,radar,radar",
+            "",
+            "InvalidParameterValue",
+        ),
+        ("radar,radar", "default", "InvalidParameterValue"),
+        ("radar,NonExistant", "a,b,c", "InvalidParameterValue"),
+    ] {
+        let uri = format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={layers}&STYLES={styles}\
+             &CRS=CRS:84&BBOX=-0.0025,-0.0025,0.0025,0.0025&WIDTH=100&HEIGHT=100\
+             &FORMAT=image/png"
+        );
+        let reply = fetch(&app, &uri).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(exception_code(&reply.text()), code, "{uri}");
+    }
+    // Served layers with STYLES empty, of commas or named are drawn.
+    for styles in ["", ",", "default,default"] {
+        let uri = format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=radar,radar&STYLES={styles}\
+             &CRS=CRS:84&BBOX=-0.0025,-0.0025,0.0025,0.0025&WIDTH=100&HEIGHT=100\
+             &FORMAT=image/png"
+        );
+        let reply = fetch(&app, &uri).await;
+        assert_eq!(reply.status, StatusCode::OK, "{uri}");
+        assert_eq!(reply.content_type, "image/png", "{uri}");
+    }
+    // One layer keeps taking the whole STYLES value as its style.
+    let reply = fetch(
+        &app,
+        "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=radar&STYLES=default,\
+         &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64&FORMAT=image/png",
+    )
+    .await;
+    assert_eq!(exception_code(&reply.text()), "StyleNotDefined");
+}
+
+/// A malformed ELEVATION is an invalid sample dimension value, like a
+/// malformed TIME: `InvalidDimensionValue` (Table E.1).
+#[tokio::test]
+async fn malformed_elevation_is_invalid_dimension_value() {
+    let app = build_populated_router();
+    for elevation in ["high", "1,2", "NaN"] {
+        let reply = fetch(&app, &format!("{GETMAP_URI}&STYLES=&ELEVATION={elevation}")).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{elevation}");
+        assert_eq!(
+            exception_code(&reply.text()),
+            "InvalidDimensionValue",
+            "{elevation}"
+        );
+    }
+}
+
+/// Which rows of a decoded RGBA image have any visible pixel.
+fn visible_rows(pixels: &[[u8; 4]], width: usize) -> Vec<bool> {
+    pixels
+        .chunks(width)
+        .map(|row| row.iter().any(|p| p[3] != 0))
+        .collect()
+}
+
+/// WMS 1.3.0 §7.3.3.6: a geographic BBOX reaching past a pole has no
+/// content there. The engine here draws on every pixel it is asked for, as
+/// a grid's edge cell or a projected source's forward can past a pole (a
+/// global GRIB grid drew a row south of 90°S): only the rows inside the CRS
+/// may reach it. ets-wms13's `getmap:bbox-outside-crs` box, wholly past the
+/// north pole, is the empty image without an engine read.
+#[tokio::test]
+async fn geographic_getmap_past_a_pole_is_empty_there() {
+    use std::sync::atomic::Ordering;
+    let (app, _, calls) = build_counting_router(16);
+    // Transparent, so a decoded pixel's alpha tells whether it was drawn.
+    let get_map = |crs: &str, bbox: &str| {
+        format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=data&STYLES=\
+             &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH=100&HEIGHT=100\
+             &TRANSPARENT=TRUE"
+        )
+    };
+
+    let reply = fetch(&app, &get_map("CRS:84", "-10,90,10,110")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.x_cache, "EMPTY");
+    assert!(png_pixels(&reply.body).iter().all(|p| p[3] == 0));
+    // ets-wms13's request, without TRANSPARENT: FALSE, the default (#1065),
+    // so every pixel is the default BGCOLOR, white.
+    let reply = fetch(
+        &app,
+        "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=data&STYLES=\
+         &FORMAT=image/png&CRS=CRS:84&BBOX=-10,90,10,110&WIDTH=100&HEIGHT=100",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.x_cache, "EMPTY");
+    assert!(png_pixels(&reply.body)
+        .iter()
+        .all(|p| *p == [255, 255, 255, 255]));
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "engine asked past the pole"
+    );
+
+    let north_half: Vec<bool> = [[false; 50], [true; 50]].concat();
+    let south_half: Vec<bool> = [[true; 50], [false; 50]].concat();
+    for (crs, bbox, rows) in [
+        // Rows centred at 99.9°N … 80.1°N: the southern half is inside.
+        ("CRS:84", "-10,80,10,100", &north_half),
+        // The same box in EPSG:4326's latitude, longitude order.
+        ("EPSG:4326", "80,-10,100,10", &north_half),
+        ("CRS:84", "-10,-100,10,-80", &south_half),
+    ] {
+        let reply = fetch(&app, &get_map(crs, bbox)).await;
+        assert_eq!(reply.status, StatusCode::OK, "{crs} {bbox}");
+        assert_eq!(
+            &visible_rows(&png_pixels(&reply.body), 100),
+            rows,
+            "{crs} {bbox}"
+        );
+    }
+
+    // Opaque output paints the empty content in BGCOLOR: the whole image
+    // when the box is wholly past the pole, and only the cut rows of one
+    // reaching past it, the others drawn.
+    let background = [0x33, 0x66, 0x99, 0xff];
+    let opaque = |bbox: &str| {
+        get_map("CRS:84", bbox).replace("TRANSPARENT=TRUE", "TRANSPARENT=FALSE&BGCOLOR=0x336699")
+    };
+    let reply = fetch(&app, &opaque("-10,90,10,110")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.x_cache, "EMPTY");
+    assert!(png_pixels(&reply.body).iter().all(|p| *p == background));
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        3,
+        "engine asked past the pole"
+    );
+
+    let reply = fetch(&app, &opaque("-10,80,10,100")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let pixels = png_pixels(&reply.body);
+    let (cut, inside) = pixels.split_at(50 * 100);
+    assert!(cut.iter().all(|p| *p == background), "rows past the pole");
+    assert!(
+        inside.iter().all(|p| p[3] == 0xff && *p != background),
+        "rows inside the CRS"
+    );
+}
+
+/// WMS 1.3.0 §7.3.3.6: a projected BBOX wholly outside its projection's
+/// valid area is the empty image, encoded in the requested FORMAT, without
+/// an engine read (#1089). EPSG:3035's boxes lie past the LAEA disk, where
+/// they were a 400. EPSG:3067's lie past a pole, north and south, past the
+/// eastings where TM's series stops being exact (#1113, #1130), or at
+/// eastings so far out that the inverse has no finite result, a 400
+/// before. The engine
+/// draws on every pixel it is asked for, so a read would show. On both
+/// render paths a box reaching into the area still renders, and a
+/// malformed box, or one whose edges miss the area inside it, is still a
+/// 400.
+#[tokio::test]
+async fn projected_getmap_wholly_outside_its_projection_is_empty() {
+    use ds_render::{encode_jpeg, encode_png, encode_webp};
+    use std::sync::atomic::Ordering;
+    let get_map = |crs: &str, bbox: &str, extra: &str| {
+        format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=data&STYLES=\
+             &CRS={crs}&BBOX={bbox}&WIDTH=64&HEIGHT=64{extra}"
+        )
+    };
+    let outside = [
+        ("EPSG:3035", "20000000,20000000,21000000,21000000"),
+        // 32 km past the disk's rim: the meta-tile covering it crosses the
+        // rim, so only a check before meta-tiling keeps the engine out.
+        ("EPSG:3035", "17100000,3000000,17200000,3100000"),
+        // Past TM's poles, 9 997 965 m from the equator.
+        ("EPSG:3067", "0,21000000,1000000,22000000"),
+        ("EPSG:3067", "0,-22000000,1000000,-21000000"),
+        // Past its area's east and west edges, k₀ times a quarter meridian
+        // from 500 000 m: 10 497 964.943 and -9 497 964.943, the second box
+        // just past it.
+        ("EPSG:3067", "11000000,6500000,12000000,7000000"),
+        ("EPSG:3067", "-9600000,7000000,-9500000,7100000"),
+        ("EPSG:3067", "1e20,6500000,2e20,7000000"),
+    ];
+    let transparent = solid(64, 64, [0, 0, 0, 0]);
+    let white = solid(64, 64, [255, 255, 255, 255]);
+    let bg = solid(64, 64, BG);
+    let cases = [
+        (
+            "&FORMAT=image/png&TRANSPARENT=TRUE",
+            encode_png(&transparent, 64, 64),
+        ),
+        ("&FORMAT=image/png", encode_png(&white, 64, 64)),
+        (
+            "&FORMAT=image/png&TRANSPARENT=FALSE&BGCOLOR=0x336699",
+            encode_png(&bg, 64, 64),
+        ),
+        ("&FORMAT=image/jpeg", encode_jpeg(&white, 64, 64, 85)),
+        (
+            "&FORMAT=image/webp&TRANSPARENT=TRUE",
+            encode_webp(&transparent, 64, 64, 100),
+        ),
+        ("&FORMAT=image/webp", encode_webp(&white, 64, 64, 100)),
+        (
+            "&FORMAT=image/webp&TRANSPARENT=FALSE&BGCOLOR=0x336699",
+            encode_webp(&bg, 64, 64, 100),
+        ),
+    ];
+
+    // Meta-tiled, then direct with meta-tiling off.
+    for metatile_mb in [64, 0] {
+        let (app, _, calls) = build_counting_router(metatile_mb);
+        for (crs, bbox) in outside {
+            for (extra, expected) in &cases {
+                let reply = fetch(&app, &get_map(crs, bbox, extra)).await;
+                let context = format!("{metatile_mb} MB {crs} {extra}");
+                assert_eq!(reply.status, StatusCode::OK, "{context}: {}", reply.text());
+                assert_eq!(reply.x_cache, "EMPTY", "{context}");
+                let requested = extra[8..].split('&').next().unwrap();
+                assert_eq!(reply.content_type, requested, "{context}");
+                assert_magic(requested, &reply.body, &context);
+                assert_eq!(&reply.body, expected.as_ref().unwrap(), "{context}");
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "{metatile_mb} MB: engine asked outside the projection"
+        );
+
+        // Across the LAEA disk's rim, and inside it: drawn.
+        for bbox in [
+            "16000000,2200000,18000000,4200000",
+            "4000000,3000000,4512000,3512000",
+        ] {
+            let reply = fetch(
+                &app,
+                &get_map("EPSG:3035", bbox, "&FORMAT=image/png&TRANSPARENT=TRUE"),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::OK, "{metatile_mb} MB {bbox}");
+            assert_eq!(reply.x_cache, "MISS", "{metatile_mb} MB {bbox}");
+            assert!(
+                png_pixels(&reply.body).iter().any(|p| p[3] != 0),
+                "{metatile_mb} MB {bbox}: nothing drawn"
+            );
+        }
+        assert!(calls.load(Ordering::Relaxed) > 0, "{metatile_mb} MB");
+
+        for (crs, bbox) in [
+            // min ≥ max, outside or not.
+            ("EPSG:3035", "21000000,20000000,20000000,21000000"),
+            ("EPSG:3035", "20000000,20000000,20000000,21000000"),
+            ("EPSG:3067", "2e20,6500000,1e20,7000000"),
+            // Not finite numbers.
+            ("EPSG:3035", "NaN,20000000,21000000,21000000"),
+            ("EPSG:3067", "inf,6500000,2e20,7000000"),
+            ("EPSG:3035", "20000000,20000000,21000000"),
+            // Wider than the LAEA disk: its edges miss the valid area the
+            // box encloses, and give no read window. So do a tall box's,
+            // which cross the disk only between their samples.
+            ("EPSG:3035", "-30000000,-30000000,30000000,30000000"),
+            ("EPSG:3035", "17000000,-50000000,18000000,50000000"),
+        ] {
+            let reply = fetch(&app, &get_map(crs, bbox, "&FORMAT=image/png")).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{crs} {bbox}");
+            assert_eq!(
+                exception_code(&reply.text()),
+                "InvalidParameterValue",
+                "{crs} {bbox}"
+            );
+        }
     }
 }

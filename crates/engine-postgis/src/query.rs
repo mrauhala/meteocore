@@ -2,9 +2,9 @@
 //!
 //! Every emitted SELECT ends with a hard row cap (a caller-supplied
 //! `LIMIT $N` bind for observations — see [`MAX_RESPONSE_VALUES`] for the
-//! budget model — `LIMIT 50001` for locations, `LIMIT 10001` for the
-//! stations-in-polygon prefilter, `LIMIT 1` for the nearest-station
-//! position query). Every identifier goes through [`quote_ident`]; every
+//! budget model — `[postgis] max_locations + 1` for locations,
+//! [`MAX_STATIONS_IN_POLYGON`] for the stations-in-polygon prefilter,
+//! `LIMIT 1` for the nearest-station position query). Every identifier goes through [`quote_ident`]; every
 //! value is bound as `$1..$n`. The builders never interpolate request
 //! data into SQL — only config-derived identifiers from the validated
 //! [`PostgisEngineConfig`] are inlined, and those have already passed the
@@ -17,7 +17,9 @@
 //! `per_parameter` shape, where a single EDR location query fans out into
 //! one DB query per requested parameter).
 
-use chrono::{DateTime, Utc};
+use std::sync::Arc;
+
+use chrono::{DateTime, TimeDelta, Utc};
 use thiserror::Error;
 
 use crate::config::PostgisEngineConfig;
@@ -25,13 +27,6 @@ use crate::schema::{
     EventsShape, LongShape, ObservationSchema, PerParameterShape, QualifiedTable, WideShape,
 };
 use crate::security::{quote_ident, QuoteError};
-
-/// Maximum rows returned by a locations list query. 50_001 covers the
-/// real-world deployment range (FMI ~10k stations, MET Office ~5k, NOAA
-/// COOP ~30k). Operators with larger networks should narrow via
-/// `stations.where`. The 50_001th row signals the cap is breached so the
-/// engine can warn — see #110 metadata refresh status.
-pub const MAX_LOCATIONS: usize = 50_001;
 
 /// Per-query row cap for one station×parameter query inside an **area**
 /// fan-out. Area queries run concurrently, so each in-flight query needs
@@ -51,19 +46,52 @@ pub const MAX_OBSERVATION_ROWS: usize = 10001;
 /// CoverageJSON. Breach ⇒ `QueryTooLarge` ⇒ HTTP 400.
 pub const MAX_RESPONSE_VALUES: usize = 500_000;
 
-/// Sanity ceiling on stations matched by an area polygon (the prefilter
-/// fetches one extra row to detect the breach). NOT the real gate — the
-/// response budget and the query-count bound are — this only bounds the
-/// prefilter buffer and the per-request station Vec. Live `fmi-obs`
-/// advertises ~8.3k stations, so a whole-extent polygon fits.
-pub const MAX_STATIONS_IN_POLYGON: usize = 10_001;
+/// Memory guard on the stations an area polygon matches: a ceiling of
+/// 200 000, one past it here because the prefilter fetches one extra row to
+/// detect the breach. NOT the gate on a request's size —
+/// [`MAX_RESPONSE_VALUES`] is (#1062) — but the value budget does not bound
+/// per-station memory, since one value a station still makes a coverage a
+/// station. Before any row, a request holds about 300 bytes a station: the
+/// prefilter's `Location` and, on the set-based path, the id list, its
+/// index and a series slot. That is ≈ 60 MB at this ceiling. The response
+/// then holds a coverage for each station with data, of the order of a
+/// kilobyte each before serialisation, so a request at the ceiling is a
+/// few hundred MB. Well above any station network (national networks hold
+/// thousands, global SYNOP about 20 000); the same figure as the default
+/// `[postgis] max_locations`.
+pub const MAX_STATIONS_IN_POLYGON: usize = 200_000 + 1;
 
-/// Ceiling on SQL queries one area request may fan out (stations ×
+/// Ceiling on SQL queries one area **fan-out** may run (stations ×
 /// requested parameters for the `per_parameter` shape; stations × 1 for
-/// `long`/`wide`). Bounds total DB work independently of row counts —
-/// 8k stations × 1 parameter is fine, 8k × 6 parameters is not; narrow
-/// `parameter-name` instead.
+/// `long`/`wide`). Bounds the fan-out's round trips independently of row
+/// counts. It applies to the fan-out path only: the set-based path runs one
+/// statement per observation table whatever the station count, and an area
+/// query the fan-out could not take runs set-based when it has a `datetime`
+/// window (#1062), so the value budget decides.
 pub const MAX_AREA_QUERIES: usize = 20_000;
+
+/// Measured (#1062): an area query whose `datetime` window spans at most
+/// this runs **set-based** — one statement per observation table for every
+/// station in the polygon — instead of the per-station fan-out. That covers
+/// an instant (`start == end`) and every instant of a `datetime` list, which
+/// the API layer queries one at a time. Both paths pay per station (an index
+/// probe in the set-based statement, a round trip in the fan-out), so what
+/// decides between them is how many steps each station's series holds: few
+/// steps favour one statement, long series favour the fan-out's parallel
+/// `(station, time)` index scans. The engine does not know a collection's
+/// cadence, so the window length stands in for the step count. On a
+/// TimescaleDB hypertable with 10-minute steps, the database tests'
+/// timing table measured set-based faster at every size: 18–25× at one
+/// instant and 1.75× at 73 steps, 12 h, for 400 to 5 000 stations, on a
+/// database next to the server. 12 h is the longest window measured, so
+/// past it the fan-out keeps the long series it may still win. Re-run that
+/// table before raising it.
+pub const SET_BASED_MAX_WINDOW: TimeDelta = TimeDelta::hours(12);
+
+/// Output name of the station id column set-based statements lead with.
+/// Rows are decoded by position, so the name only has to differ from the
+/// statement's other output names.
+const STATION_ALIAS: &str = "mc_station";
 
 /// Default search radius for nearest-station position queries (25 km).
 pub const DEFAULT_POSITION_RADIUS_M: f64 = 25_000.0;
@@ -95,6 +123,9 @@ pub enum SqlParam {
     Int(i64),
     Timestamp(DateTime<Utc>),
     TextArray(Vec<String>),
+    /// A text array shared between statements: the set-based area path binds
+    /// one station id list to every per-table statement (#1062).
+    SharedTextArray(Arc<Vec<String>>),
 }
 
 impl SqlParam {
@@ -108,6 +139,7 @@ impl SqlParam {
             SqlParam::Int(i) => i,
             SqlParam::Timestamp(t) => t,
             SqlParam::TextArray(v) => v,
+            SqlParam::SharedTextArray(v) => &**v,
         }
     }
 }
@@ -197,6 +229,8 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
     let id = quote_ident(&s.id_col)?;
     let label = quote_ident(&s.label_col)?;
     let geom = quote_ident(&s.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let table = fq_table(&s.table)?;
 
     let mut props = String::new();
@@ -209,8 +243,7 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
     sql.push_str(&format!(
         "{id}::text AS id, \
          {label} AS label, \
-         ST_Y({geom}) AS lat, \
-         ST_X({geom}) AS lon{props} \
+         {coordinates}{props}, {geometry_check} AS mc_geometry_valid \
          FROM {table}"
     ));
     // SAFETY: `where_clause` is inlined verbatim — it CANNOT be
@@ -232,9 +265,28 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
             sql.push_str(&format!(" WHERE {w}"));
         }
     }
-    sql.push_str(&format!(" ORDER BY {id} LIMIT {MAX_LOCATIONS}"));
+    sql.push_str(&format!(
+        " ORDER BY {id} LIMIT {}",
+        location_fetch_rows(cfg)
+    ));
 
     Ok(BuiltQuery::new(sql, vec![]))
+}
+
+/// Rows a location query fetches: `max_locations + 1`, so a list that does
+/// not fit returns one row past the cap and the caller can tell "exactly the
+/// cap" from "cut at the cap" (#1061).
+///
+/// Inlined as an integer literal, not a `$N` bind: it is a validated `usize`
+/// from config (at most `POSTGIS_MAX_LOCATIONS_CEILING`), so it cannot carry
+/// SQL, and Postgres plans a bound LIMIT in a generic plan as 10 % of the
+/// rows. These prepared statements run every refresh, so after five custom
+/// plans that estimate would make the generic plan look ten times cheaper,
+/// and the windowed `DISTINCT ON` scan could switch to a plan chosen for a
+/// tenth of its rows: the kind of plan change that blows a read-only role's
+/// `statement_timeout` (#435, #438).
+pub fn location_fetch_rows(cfg: &PostgisEngineConfig) -> usize {
+    cfg.max_locations.saturating_add(1)
 }
 
 /// Derive the location list from the observations table(s)' own geometry —
@@ -257,12 +309,13 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
 /// `since` is `Some`, an `AND <time_col> >= <since>` filter restricts each scan
 /// to recent hypertable chunks (the default — keeps `DISTINCT ON` cheap on huge
 /// tables and advertises only currently-reporting stations); `None` scans full
-/// history (`observations.locations_window = "all"`). Each query is capped at
-/// [`MAX_LOCATIONS`].
+/// history (`observations.locations_window = "all"`). Each query fetches
+/// [`location_fetch_rows`] rows at most.
 pub fn build_locations_from_observations(
     cfg: &PostgisEngineConfig,
     since: Option<DateTime<Utc>>,
 ) -> Result<Vec<BuiltQuery>, BuildError> {
+    let fetch_rows = location_fetch_rows(cfg);
     match &cfg.observations {
         ObservationSchema::Long(l) => Ok(vec![obs_locations_query(
             &l.table,
@@ -271,6 +324,7 @@ pub fn build_locations_from_observations(
             &l.time_col,
             l.time_col_tz.as_deref(),
             since,
+            fetch_rows,
         )?]),
         ObservationSchema::Wide(w) => Ok(vec![obs_locations_query(
             &w.table,
@@ -279,6 +333,7 @@ pub fn build_locations_from_observations(
             &w.time_col,
             w.time_col_tz.as_deref(),
             since,
+            fetch_rows,
         )?]),
         ObservationSchema::PerParameter(pp) => {
             let mut queries = Vec::with_capacity(pp.tables.len());
@@ -291,6 +346,7 @@ pub fn build_locations_from_observations(
                     &t.time_col,
                     t.time_col_tz.as_deref(),
                     since,
+                    fetch_rows,
                 )?);
             }
             Ok(queries)
@@ -301,7 +357,8 @@ pub fn build_locations_from_observations(
 }
 
 /// One standalone observations-derived `(id, lat, lon)` query for a single table,
-/// with an optional recent-window time filter, capped at [`MAX_LOCATIONS`].
+/// with an optional recent-window time filter, fetching at most `fetch_rows`
+/// rows ([`location_fetch_rows`]).
 fn obs_locations_query(
     table: &QualifiedTable,
     station_fk_col: &str,
@@ -309,18 +366,20 @@ fn obs_locations_query(
     time_col: &str,
     time_col_tz: Option<&str>,
     since: Option<DateTime<Utc>>,
+    fetch_rows: usize,
 ) -> Result<BuiltQuery, BuildError> {
     let table_fq = fq_table(table)?;
     let fk = quote_ident(station_fk_col)?;
     let geom = quote_ident(geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let mut params: Vec<SqlParam> = Vec::new();
     // SELECT kept in a plain literal; the format! templates below interpolate
     // only already-quoted identifiers and contain no flagged SQL verb.
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
         "DISTINCT ON ({fk}) {fk}::text AS id, \
-         ST_Y({geom}) AS lat, \
-         ST_X({geom}) AS lon \
+         {coordinates}, {geometry_check} AS mc_geometry_valid \
          FROM {table_fq} \
          WHERE {geom} IS NOT NULL"
     ));
@@ -334,7 +393,7 @@ fn obs_locations_query(
         sql.push_str(&format!(" AND {time} >= {rhs}"));
         params.push(SqlParam::Timestamp(ts));
     }
-    sql.push_str(&format!(" ORDER BY {fk} LIMIT {MAX_LOCATIONS}"));
+    sql.push_str(&format!(" ORDER BY {fk} LIMIT {fetch_rows}"));
     Ok(BuiltQuery::new(sql, params))
 }
 
@@ -358,6 +417,8 @@ pub fn build_position(
     let id = quote_ident(&s.id_col)?;
     let label = quote_ident(&s.label_col)?;
     let geom = quote_ident(&s.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let table = fq_table(&s.table)?;
 
     let mut props = String::new();
@@ -370,9 +431,8 @@ pub fn build_position(
     sql.push_str(&format!(
         "{id}::text AS id, \
          {label} AS label, \
-         ST_Y({geom}) AS lat, \
-         ST_X({geom}) AS lon{props}, \
-         ST_Distance({geom}::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) AS dist_m \
+         {coordinates}{props}, \
+         ST_Distance({geom}::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) AS dist_m, {geometry_check} AS mc_geometry_valid \
          FROM {table}"
     ));
     sql.push_str(&format!(
@@ -398,10 +458,12 @@ pub fn build_position(
 
 // ─── locations inside polygon (area prefilter) ─────────────────────────────
 
-/// Prefilter stations by bbox + exact `ST_Within`. Returned stations
-/// become the fan-out set for `build_location` — the caller iterates and
-/// runs one observation query per station so the per-query `LIMIT 10001`
-/// cap protects each station independently.
+/// Prefilter stations by bbox + exact `ST_Within` (stations-only mode).
+/// Returned stations become the area query's station set: the set-based
+/// path binds their ids to one statement per observation table
+/// ([`build_area_set`]); the fan-out runs one [`build_location`] per station.
+/// Fetches at most [`MAX_STATIONS_IN_POLYGON`] rows, one past the memory
+/// guard, so the caller can tell a breach.
 pub fn build_stations_in_polygon(
     cfg: &PostgisEngineConfig,
     polygon_wkt: &str,
@@ -416,6 +478,8 @@ pub fn build_stations_in_polygon(
     let id = quote_ident(&s.id_col)?;
     let label = quote_ident(&s.label_col)?;
     let geom = quote_ident(&s.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let table = fq_table(&s.table)?;
 
     let mut props = String::new();
@@ -428,8 +492,7 @@ pub fn build_stations_in_polygon(
     sql.push_str(&format!(
         "{id}::text AS id, \
          {label} AS label, \
-         ST_Y({geom}) AS lat, \
-         ST_X({geom}) AS lon{props} \
+         {coordinates}{props}, {geometry_check} AS mc_geometry_valid \
          FROM {table} \
          WHERE {geom} && ST_GeomFromText($1, 4326) \
          AND ST_Within({geom}, ST_GeomFromText($1, 4326))"
@@ -449,6 +512,59 @@ pub fn build_stations_in_polygon(
 }
 
 // ─── observation queries (shape-aware) ─────────────────────────────────────
+
+/// Which stations one observation statement reads. The single-station and
+/// fan-out paths read one (`<fk> = $1`); the set-based area path reads a set
+/// (`<fk> = ANY($1)`, #1062), so its rows lead with the station id
+/// ([`STATION_ALIAS`]) and come back ordered by station, then time. Apart
+/// from that leading column, both select the same columns in the same order,
+/// so one row decoder serves every path.
+#[derive(Debug, Clone, Copy)]
+enum StationSelect<'a> {
+    One(&'a str),
+    Set(&'a Arc<Vec<String>>),
+}
+
+impl StationSelect<'_> {
+    /// The `$1` bind: the station id, or the shared id list.
+    fn bind(self) -> SqlParam {
+        match self {
+            StationSelect::One(id) => SqlParam::Text(id.to_string()),
+            StationSelect::Set(ids) => SqlParam::SharedTextArray(Arc::clone(ids)),
+        }
+    }
+
+    /// The leading output column: the station id on a set-based statement,
+    /// nothing on a single-station one. `fk` is already quoted.
+    fn lead_column(self, fk: &str) -> String {
+        match self {
+            StationSelect::One(_) => String::new(),
+            StationSelect::Set(_) => format!("{fk}::text AS {STATION_ALIAS}, "),
+        }
+    }
+
+    /// The station predicate on `$1`. `fk` is already quoted.
+    fn predicate(self, fk: &str) -> String {
+        match self {
+            StationSelect::One(_) => format!("{fk} = $1"),
+            StationSelect::Set(_) => format!("{fk} = ANY($1)"),
+        }
+    }
+
+    /// The `ORDER BY` list. Quoted `fk` and `time` columns.
+    fn order_by(self, fk: &str, time: &str) -> String {
+        match self {
+            StationSelect::One(_) => time.to_string(),
+            StationSelect::Set(_) => format!("{fk}, {time}"),
+        }
+    }
+}
+
+/// Column index of a row's first observation column (its time): set-based
+/// rows lead with the station id (#1062), single-station rows do not.
+pub(crate) fn first_observation_column(set_based: bool) -> usize {
+    usize::from(set_based)
+}
 
 /// Build observation queries for a single station.
 ///
@@ -473,6 +589,175 @@ pub fn build_location(
     source_keys: &[&str],
     row_limit: usize,
 ) -> Result<Vec<BuiltQuery>, BuildError> {
+    build_observations(
+        cfg,
+        StationSelect::One(station_id),
+        time_range,
+        source_keys,
+        row_limit,
+    )
+}
+
+/// Build the set-based area statements (#1062): one per observation table
+/// (`long` and `wide` one, `per_parameter` one per requested parameter), each
+/// reading every station in `station_ids` (`<fk> = ANY($1)`, the list shared
+/// between the statements) over the window. Rows carry the same columns as
+/// [`build_location`]'s, led by the station id, and come back ordered by
+/// station, then time; `LIMIT $N` is a bind the engine rewrites to the
+/// remaining response budget before each statement.
+pub fn build_area_set(
+    cfg: &PostgisEngineConfig,
+    station_ids: &Arc<Vec<String>>,
+    time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    source_keys: &[&str],
+    row_limit: usize,
+) -> Result<Vec<BuiltQuery>, BuildError> {
+    build_observations(
+        cfg,
+        StationSelect::Set(station_ids),
+        time_range,
+        source_keys,
+        row_limit,
+    )
+}
+
+/// The station map layers' content fingerprint (#1063): per observation table
+/// (`long` and `wide` one statement, `per_parameter` one per configured
+/// parameter), the rows of the stations in `station_ids` from `since` on, as
+/// one row of aggregates. `n` is the row count; every further column, all
+/// `bigint`, is a sum of 32-bit hashes: of each row's station, time (and
+/// `long` parameter), then one per value column. Integer sums are exact and
+/// independent of row order, so the fingerprint moves when a row arrives
+/// late, is deleted or has its time, station or value corrected, and holds
+/// still otherwise. A swap of two rows' values would not move it.
+///
+/// The station predicate is the set-based area path's `<fk> = ANY($1)`, so
+/// the `(<fk>, <time>)` index the README asks for answers it as one range
+/// scan a station. `$2` is the lower time bound; there is no upper one.
+pub fn build_frame_fingerprint(
+    cfg: &PostgisEngineConfig,
+    station_ids: &Arc<Vec<String>>,
+    since: DateTime<Utc>,
+) -> Result<Vec<BuiltQuery>, BuildError> {
+    let keys: Vec<&str> = cfg
+        .parameters
+        .iter()
+        .map(|p| p.source_key.as_str())
+        .collect();
+    let ids = || SqlParam::SharedTextArray(Arc::clone(station_ids));
+    match &cfg.observations {
+        ObservationSchema::Long(l) => {
+            let param = quote_ident(&l.param_col)?;
+            let mut q = fingerprint_query(
+                &l.table,
+                &l.station_fk_col,
+                &l.time_col,
+                l.time_col_tz.as_deref(),
+                Some(&param),
+                &[l.value_col.as_str()],
+            )?;
+            q.sql.push_str(&format!(" AND {param} = ANY($3)"));
+            Ok(vec![BuiltQuery::new(
+                q.sql,
+                vec![
+                    ids(),
+                    SqlParam::Timestamp(since),
+                    SqlParam::TextArray(keys.iter().map(|k| k.to_string()).collect()),
+                ],
+            )])
+        }
+        ObservationSchema::Wide(w) => {
+            let mut columns = Vec::with_capacity(keys.len());
+            for key in &keys {
+                let column = w
+                    .columns
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, c)| c.as_str())
+                    .ok_or_else(|| BuildError::UnknownParameter((*key).to_string()))?;
+                columns.push(column);
+            }
+            let q = fingerprint_query(
+                &w.table,
+                &w.station_fk_col,
+                &w.time_col,
+                w.time_col_tz.as_deref(),
+                None,
+                &columns,
+            )?;
+            Ok(vec![BuiltQuery::new(
+                q.sql,
+                vec![ids(), SqlParam::Timestamp(since)],
+            )])
+        }
+        ObservationSchema::PerParameter(pp) => {
+            let mut queries = Vec::with_capacity(keys.len());
+            for key in &keys {
+                let t = pp
+                    .tables
+                    .iter()
+                    .find(|t| t.parameter == *key)
+                    .ok_or_else(|| BuildError::UnknownParameter((*key).to_string()))?;
+                let q = fingerprint_query(
+                    &t.table,
+                    &t.station_fk_col,
+                    &t.time_col,
+                    t.time_col_tz.as_deref(),
+                    None,
+                    &[t.value_col.as_str()],
+                )?;
+                queries.push(
+                    BuiltQuery::new(q.sql, vec![ids(), SqlParam::Timestamp(since)])
+                        .with_parameter(key.to_string()),
+                );
+            }
+            Ok(queries)
+        }
+        ObservationSchema::Events(_) => Err(BuildError::NoStations),
+    }
+}
+
+/// One table's fingerprint statement up to its `WHERE` station and time
+/// predicates ([`build_frame_fingerprint`]). `param` is the quoted `long`
+/// parameter column, hashed into each row's key.
+fn fingerprint_query(
+    table: &QualifiedTable,
+    station_fk_col: &str,
+    time_col: &str,
+    time_col_tz: Option<&str>,
+    param: Option<&str>,
+    value_cols: &[&str],
+) -> Result<BuiltQuery, BuildError> {
+    let table = fq_table(table)?;
+    let fk = quote_ident(station_fk_col)?;
+    let time = quote_ident(time_col)?;
+    let rhs = time_filter_rhs("$2", time_col_tz);
+    let mut row_key =
+        format!("hashtext({fk}::text) # hashfloat8(extract(epoch from {time})::double precision)");
+    if let Some(param) = param {
+        row_key.push_str(&format!(" # hashtext({param}::text)"));
+    }
+    let mut values = String::new();
+    for column in value_cols {
+        let column = quote_ident(column)?;
+        values.push_str(&format!(", sum(hashfloat8({column}::double precision))"));
+    }
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "count(*), sum({row_key}){values} \
+         FROM {table} \
+         WHERE {fk} = ANY($1) AND {time} >= {rhs}"
+    ));
+    Ok(BuiltQuery::new(sql, vec![]))
+}
+
+fn build_observations(
+    cfg: &PostgisEngineConfig,
+    stations: StationSelect<'_>,
+    time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    source_keys: &[&str],
+    row_limit: usize,
+) -> Result<Vec<BuiltQuery>, BuildError> {
     let effective: Vec<&str> = if source_keys.is_empty() {
         cfg.parameters
             .iter()
@@ -484,15 +769,15 @@ pub fn build_location(
 
     match &cfg.observations {
         ObservationSchema::Long(l) => {
-            let q = build_location_long(l, station_id, time_range, &effective, row_limit)?;
+            let q = build_location_long(l, stations, time_range, &effective, row_limit)?;
             Ok(vec![q])
         }
         ObservationSchema::Wide(w) => {
-            let q = build_location_wide(w, station_id, time_range, &effective, row_limit)?;
+            let q = build_location_wide(w, stations, time_range, &effective, row_limit)?;
             Ok(vec![q])
         }
         ObservationSchema::PerParameter(pp) => {
-            build_location_per_parameter(pp, station_id, time_range, &effective, row_limit)
+            build_location_per_parameter(pp, stations, time_range, &effective, row_limit)
         }
         // Events have no stations; the engine layer rejects station-keyed
         // queries before reaching the builder.
@@ -525,11 +810,13 @@ pub fn build_events_area(
     let table = fq_table(&shape.table)?;
     let time_col = quote_ident(&shape.time_col)?;
     let geom = quote_ident(&shape.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let id = quote_ident(&shape.id_col)?;
     let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
     let tz = shape.time_col_tz.as_deref();
 
-    let mut projection = format!("{time_select} AS time, ST_X({geom}) AS lon, ST_Y({geom}) AS lat");
+    let mut projection = format!("{time_select} AS time, {coordinates}");
     for key in source_keys {
         // source_key == column name == row alias (identifier-validated at
         // config load and at engine resolve).
@@ -537,6 +824,7 @@ pub fn build_events_area(
         projection.push_str(&format!(", {col}::double precision AS {col}"));
     }
 
+    projection.push_str(&format!(", {geometry_check} AS mc_geometry_valid"));
     let rhs_lo = time_filter_rhs("$1", tz);
     let rhs_hi = time_filter_rhs("$2", tz);
     let mut sql = String::from("SELECT ");
@@ -586,6 +874,8 @@ pub fn build_events_window(
     let table = fq_table(&shape.table)?;
     let time_col = quote_ident(&shape.time_col)?;
     let geom = quote_ident(&shape.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
     let id = quote_ident(&shape.id_col)?;
     let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
     let tz = shape.time_col_tz.as_deref();
@@ -617,7 +907,7 @@ pub fn build_events_window(
     }
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
-        "{time_select} AS time, ST_X({geom}) AS lon, ST_Y({geom}) AS lat{attr_cols} \
+        "{time_select} AS time, {coordinates}{attr_cols}, {geometry_check} AS mc_geometry_valid \
          FROM {table} \
          WHERE {time_col} > {rhs_lo} AND {time_col} <= {rhs_hi} \
          ORDER BY {time_col} DESC, {id} LIMIT $3"
@@ -632,7 +922,7 @@ pub fn build_events_window(
 
 fn build_location_long(
     shape: &LongShape,
-    station_id: &str,
+    stations: StationSelect<'_>,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
     row_limit: usize,
@@ -644,15 +934,17 @@ fn build_location_long(
     let value_col = quote_ident(&shape.value_col)?;
     let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
     let tz = shape.time_col_tz.as_deref();
+    let lead = stations.lead_column(&station_fk);
+    let station_pred = stations.predicate(&station_fk);
 
-    let mut params: Vec<SqlParam> = vec![SqlParam::Text(station_id.to_string())];
+    let mut params: Vec<SqlParam> = vec![stations.bind()];
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
-        "{time_select} AS time, \
+        "{lead}{time_select} AS time, \
          {param_col} AS parameter, \
          {value_col}::double precision AS value \
          FROM {table} \
-         WHERE {station_fk} = $1"
+         WHERE {station_pred}"
     ));
 
     if let Some((t0, t1)) = time_range {
@@ -670,7 +962,8 @@ fn build_location_long(
         source_keys.iter().map(|s| s.to_string()).collect(),
     ));
 
-    sql.push_str(&format!(" ORDER BY {time_col} LIMIT ${}", params.len() + 1));
+    let order = stations.order_by(&station_fk, &time_col);
+    sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", params.len() + 1));
     params.push(SqlParam::Int(row_limit as i64));
     let limit_idx = params.len() - 1;
 
@@ -679,7 +972,7 @@ fn build_location_long(
 
 fn build_location_wide(
     shape: &WideShape,
-    station_id: &str,
+    stations: StationSelect<'_>,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
     row_limit: usize,
@@ -689,9 +982,11 @@ fn build_location_wide(
     let time_col = quote_ident(&shape.time_col)?;
     let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
     let tz = shape.time_col_tz.as_deref();
+    let lead = stations.lead_column(&station_fk);
+    let station_pred = stations.predicate(&station_fk);
 
     // Build the projection list from source_keys by looking up columns.
-    let mut projection = format!("{time_select} AS time");
+    let mut projection = format!("{lead}{time_select} AS time");
     for key in source_keys {
         let column = shape
             .columns
@@ -704,12 +999,12 @@ fn build_location_wide(
         projection.push_str(&format!(", {col_quoted}::double precision AS {alias}"));
     }
 
-    let mut params: Vec<SqlParam> = vec![SqlParam::Text(station_id.to_string())];
+    let mut params: Vec<SqlParam> = vec![stations.bind()];
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
         "{projection} \
          FROM {table} \
-         WHERE {station_fk} = $1"
+         WHERE {station_pred}"
     ));
     if let Some((t0, t1)) = time_range {
         let rhs_lo = time_filter_rhs("$2", tz);
@@ -721,7 +1016,8 @@ fn build_location_wide(
         params.push(SqlParam::Timestamp(t1));
     }
 
-    sql.push_str(&format!(" ORDER BY {time_col} LIMIT ${}", params.len() + 1));
+    let order = stations.order_by(&station_fk, &time_col);
+    sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", params.len() + 1));
     params.push(SqlParam::Int(row_limit as i64));
     let limit_idx = params.len() - 1;
 
@@ -732,7 +1028,7 @@ fn build_location_wide(
 
 fn build_location_per_parameter(
     shape: &PerParameterShape,
-    station_id: &str,
+    stations: StationSelect<'_>,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
     row_limit: usize,
@@ -752,14 +1048,16 @@ fn build_location_per_parameter(
         let value_col = quote_ident(&table.value_col)?;
         let time_select = time_select_expr(&time_col, table.time_col_tz.as_deref());
         let tz = table.time_col_tz.as_deref();
+        let lead = stations.lead_column(&station_fk);
+        let station_pred = stations.predicate(&station_fk);
 
-        let mut params: Vec<SqlParam> = vec![SqlParam::Text(station_id.to_string())];
+        let mut params: Vec<SqlParam> = vec![stations.bind()];
         let mut sql = String::from("SELECT ");
         sql.push_str(&format!(
-            "{time_select} AS time, \
+            "{lead}{time_select} AS time, \
              {value_col}::double precision AS value \
              FROM {table_fq} \
-             WHERE {station_fk} = $1"
+             WHERE {station_pred}"
         ));
         if let Some((t0, t1)) = time_range {
             let rhs_lo = time_filter_rhs("$2", tz);
@@ -770,7 +1068,8 @@ fn build_location_per_parameter(
             params.push(SqlParam::Timestamp(t0));
             params.push(SqlParam::Timestamp(t1));
         }
-        sql.push_str(&format!(" ORDER BY {time_col} LIMIT ${}", params.len() + 1));
+        let order = stations.order_by(&station_fk, &time_col);
+        sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", params.len() + 1));
         params.push(SqlParam::Int(row_limit as i64));
         let limit_idx = params.len() - 1;
         queries.push(
@@ -781,6 +1080,71 @@ fn build_location_per_parameter(
     }
 
     Ok(queries)
+}
+
+// ─── temporal extent ───────────────────────────────────────────────────────
+
+/// The advertised temporal extent's read: `MIN` and `MAX` of the time column
+/// as `timestamptz`, named `lo` and `hi`, over the single observation table,
+/// the first `per_parameter` table or the events table.
+///
+/// With `not_after`, only rows at or before it count (#1139). The metadata
+/// refresh reads without a bound first, and again bounded at its own `now`
+/// when that `hi` lies after it, so the extent ends at the latest row the
+/// bound admits.
+///
+/// Both reads leave the column bare, so PostgreSQL can answer each aggregate
+/// from a btree index led by the time column instead of a scan. A naive
+/// `time_col_tz` column converts the aggregate's result, not every row:
+/// `(MAX(col) AT TIME ZONE tz)`. The two agree because the conversion never
+/// reorders the local times real instants produce. The bound compares the
+/// column against the converted bind ([`time_filter_rhs`]) in the column's
+/// own local time, so in a zone's repeated autumn hour it admits rows that
+/// read back up to an hour after `not_after`.
+///
+/// `None` for a `per_parameter` mapping without tables, which config
+/// validation rejects.
+pub fn build_temporal_extent(
+    cfg: &PostgisEngineConfig,
+    not_after: Option<DateTime<Utc>>,
+) -> Result<Option<BuiltQuery>, BuildError> {
+    let (table, time_col, tz) = match &cfg.observations {
+        ObservationSchema::Long(l) => (&l.table, l.time_col.as_str(), l.time_col_tz.as_deref()),
+        ObservationSchema::Wide(w) => (&w.table, w.time_col.as_str(), w.time_col_tz.as_deref()),
+        ObservationSchema::PerParameter(pp) => {
+            let Some(first) = pp.tables.first() else {
+                return Ok(None);
+            };
+            (
+                &first.table,
+                first.time_col.as_str(),
+                first.time_col_tz.as_deref(),
+            )
+        }
+        // MIN/MAX over the event time column: index-only on any table with
+        // a leading-time btree, the documented deployment shape.
+        ObservationSchema::Events(ev) => {
+            (&ev.table, ev.time_col.as_str(), ev.time_col_tz.as_deref())
+        }
+    };
+    let table_fq = fq_table(table)?;
+    let time = quote_ident(time_col)?;
+    // The aggregate over the bare column, converted afterwards.
+    let lo = time_select_expr(&format!("MIN({time})"), tz);
+    let hi = time_select_expr(&format!("MAX({time})"), tz);
+    let mut params = Vec::new();
+    // SELECT kept in a plain literal; the format! templates below interpolate
+    // only already-quoted identifiers and contain no flagged SQL verb.
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{lo}::timestamptz AS lo, {hi}::timestamptz AS hi FROM {table_fq}"
+    ));
+    if let Some(bound) = not_after {
+        let rhs = time_filter_rhs("$1", tz);
+        sql.push_str(&format!(" WHERE {time} <= {rhs}"));
+        params.push(SqlParam::Timestamp(bound));
+    }
+    Ok(Some(BuiltQuery::new(sql, params)))
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
@@ -884,12 +1248,14 @@ mod tests {
             pool_size: 4,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: LocationSource::Stations(stations),
             observations,
             parameters,
             locations_window: None,
             events_default_window: None,
             events_extent_bbox: None,
+            station_map: Default::default(),
         }
     }
 
@@ -901,12 +1267,14 @@ mod tests {
             pool_size: 4,
             pool_label: None,
             metadata_refresh_secs: 300,
+            max_locations: ds_core::config::POSTGIS_DEFAULT_MAX_LOCATIONS,
             location_source: LocationSource::Observations,
             observations,
             parameters: vec![param("t2m", "t", "°C", "t2m", "t2m")],
             locations_window: None,
             events_default_window: None,
             events_extent_bbox: None,
+            station_map: Default::default(),
         }
     }
 
@@ -1021,8 +1389,35 @@ mod tests {
         assert!(q.sql.contains("\"territory\""));
         assert!(q.sql.contains("ST_Y(\"the_geom\")"));
         assert!(q.sql.contains("FROM \"public\".\"stations\""));
-        assert!(q.sql.contains(&format!("LIMIT {MAX_LOCATIONS}")));
+        assert!(q.sql.contains(&format!("LIMIT {}", cfg.max_locations + 1)));
         assert!(!q.sql.contains(" WHERE ")); // no where_clause in this cfg
+    }
+
+    /// #1061: every location query fetches `max_locations + 1` rows, so the
+    /// row past the cap tells "exactly the cap" from "cut at the cap".
+    #[test]
+    fn location_queries_fetch_one_row_past_max_locations() {
+        let mut cfg = nexus_per_parameter_cfg();
+        cfg.max_locations = 3;
+        assert_eq!(location_fetch_rows(&cfg), 4);
+
+        let q = build_locations(&cfg).unwrap();
+        assert!(
+            q.sql.ends_with("ORDER BY \"wigos_id\" LIMIT 4"),
+            "{}",
+            q.sql
+        );
+        assert!(q.params.is_empty());
+
+        let qs = build_locations_from_observations(&cfg, Some(t(2026, 6, 15, 0))).unwrap();
+        assert_eq!(qs.len(), 2);
+        for q in &qs {
+            assert!(
+                q.sql.ends_with("ORDER BY \"wigos_id\" LIMIT 4"),
+                "{}",
+                q.sql
+            );
+        }
     }
 
     #[test]
@@ -1045,7 +1440,7 @@ mod tests {
             assert!(q.sql.contains("ST_Y(\"the_geom\")"));
             assert!(q.sql.contains("ST_X(\"the_geom\")"));
             assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
-            assert!(q.sql.contains(&format!("LIMIT {MAX_LOCATIONS}")));
+            assert!(q.sql.contains(&format!("LIMIT {}", cfg.max_locations + 1)));
             assert!(!q.sql.contains("UNION")); // no cross-table union in SQL
                                                // Orphans carry no station metadata columns.
             assert!(!q.sql.contains("\"territory\""));
@@ -1064,9 +1459,10 @@ mod tests {
             // Recent-window filter present; the bind (not the column) is wrapped
             // for the naive-UTC column so the index/chunk-pruning stays usable.
             assert!(q.sql.contains("AND \"time\" >= ($1 AT TIME ZONE 'UTC')"));
-            assert!(q
-                .sql
-                .contains(&format!("ORDER BY \"wigos_id\" LIMIT {MAX_LOCATIONS}")));
+            assert!(q.sql.contains(&format!(
+                "ORDER BY \"wigos_id\" LIMIT {}",
+                cfg.max_locations + 1
+            )));
             assert_eq!(q.params, vec![SqlParam::Timestamp(since)]);
         }
         // None ⇒ no time filter, no bind (full-history path).
@@ -1205,9 +1601,10 @@ mod tests {
         assert!(q.sql.starts_with("SELECT DISTINCT ON (\"wigos_id\")"));
         assert!(q.sql.contains("\"wigos_id\"::text AS id"));
         assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
-        assert!(q
-            .sql
-            .contains(&format!("ORDER BY \"wigos_id\" LIMIT {MAX_LOCATIONS}")));
+        assert!(q.sql.contains(&format!(
+            "ORDER BY \"wigos_id\" LIMIT {}",
+            cfg.max_locations + 1
+        )));
         assert!(!q.sql.contains(" UNION "));
     }
 
@@ -1442,6 +1839,250 @@ mod tests {
         assert!(matches!(err, BuildError::UnknownParameter(_)));
     }
 
+    // ---- set-based area statements (#1062) ---------------------------------
+
+    fn ids(list: &[&str]) -> Arc<Vec<String>> {
+        Arc::new(list.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn area_set_long_binds_the_id_list_and_orders_by_station_then_time() {
+        let cfg = long_cfg();
+        let stations = ids(&["1001", "1002", "1003"]);
+        let qs = build_area_set(
+            &cfg,
+            &stations,
+            Some((t(2026, 4, 1, 6), t(2026, 4, 1, 6))),
+            &["t2m"],
+            MAX_RESPONSE_VALUES,
+        )
+        .unwrap();
+        assert_eq!(qs.len(), 1, "one statement for the whole station set");
+        let q = &qs[0];
+        assert!(
+            q.sql.starts_with(
+                "SELECT \"fmisid\"::text AS mc_station, \"obstime\" AS time, \
+                 \"param_name\" AS parameter, \"value\"::double precision AS value \
+                 FROM \"public\".\"observations\" WHERE \"fmisid\" = ANY($1)"
+            ),
+            "{}",
+            q.sql
+        );
+        assert!(q.sql.contains("\"param_name\" = ANY($4)"));
+        assert!(
+            q.sql.ends_with("ORDER BY \"fmisid\", \"obstime\" LIMIT $5"),
+            "{}",
+            q.sql
+        );
+        // The id list is ONE bind, shared, never inlined.
+        assert_eq!(q.params[0], SqlParam::SharedTextArray(stations.clone()));
+        assert!(!q.sql.contains("1001"));
+        assert_eq!(q.params[1], SqlParam::Timestamp(t(2026, 4, 1, 6)));
+        assert_eq!(q.params[2], SqlParam::Timestamp(t(2026, 4, 1, 6)));
+        assert_eq!(q.params[3], SqlParam::TextArray(vec!["t2m".into()]));
+        assert_eq!(q.row_limit(), Some(MAX_RESPONSE_VALUES));
+        assert_eq!(q.limit_param_idx, Some(4));
+        assert_eq!(q.values_per_row, 1);
+    }
+
+    /// The set-based statement is the single-station one with the station id
+    /// in front, `= ANY` for `=` and the station leading the order, so one
+    /// row decoder reads both (offset by [`first_observation_column`]).
+    #[test]
+    fn area_set_selects_the_single_station_columns_behind_the_station_id() {
+        for cfg in [long_cfg(), wide_cfg(), nexus_per_parameter_cfg()] {
+            let keys: Vec<&str> = cfg
+                .parameters
+                .iter()
+                .map(|p| p.source_key.as_str())
+                .collect();
+            let window = Some((t(2026, 4, 1, 0), t(2026, 4, 1, 12)));
+            let one = build_location(&cfg, "s1", window, &keys, 7).unwrap();
+            let set = build_area_set(&cfg, &ids(&["s1", "s2"]), window, &keys, 7).unwrap();
+            assert_eq!(one.len(), set.len());
+            for (o, s) in one.iter().zip(&set) {
+                let (o_cols, _) = o.sql.split_once(" FROM ").unwrap();
+                let (s_cols, _) = s.sql.split_once(" FROM ").unwrap();
+                // Both start with the same keyword; past it the set-based
+                // list is the station id, then the single-station list.
+                let lead_end = s_cols.find(" AS mc_station, ").unwrap() + " AS mc_station, ".len();
+                let o_list = o_cols.split_once(' ').unwrap().1;
+                assert_eq!(
+                    &s_cols[lead_end..],
+                    o_list,
+                    "same observation columns, same order"
+                );
+                assert_eq!(s.parameter, o.parameter);
+                assert_eq!(s.values_per_row, o.values_per_row);
+                assert_eq!(s.limit_param_idx, o.limit_param_idx);
+                assert_eq!(s.params.len(), o.params.len());
+                // Every bind but the station one is identical.
+                assert_eq!(s.params[1..], o.params[1..]);
+                assert!(s.sql.contains(" = ANY($1)"), "{}", s.sql);
+                assert!(!o.sql.contains("ANY($1)"), "{}", o.sql);
+            }
+        }
+        assert_eq!(first_observation_column(false), 0);
+        assert_eq!(first_observation_column(true), 1);
+    }
+
+    #[test]
+    fn area_set_wide_is_one_statement_weighed_by_selected_columns() {
+        let cfg = wide_cfg();
+        let qs = build_area_set(&cfg, &ids(&["a", "b"]), None, &["t2m", "rh"], 11).unwrap();
+        assert_eq!(qs.len(), 1);
+        let q = &qs[0];
+        assert!(q
+            .sql
+            .contains("\"temp_celsius\"::double precision AS \"t2m\""));
+        assert!(q
+            .sql
+            .contains("\"humidity_pct\"::double precision AS \"rh\""));
+        // No window: no time binds, the whole history of every station.
+        assert!(!q.sql.contains(">= $"), "{}", q.sql);
+        assert!(
+            q.sql
+                .ends_with("ORDER BY \"station_id\", \"valid_time\" LIMIT $2"),
+            "{}",
+            q.sql
+        );
+        assert_eq!(q.values_per_row, 2);
+        assert_eq!(q.row_limit(), Some(11));
+    }
+
+    #[test]
+    fn area_set_per_parameter_is_one_statement_per_table_sharing_the_ids() {
+        let cfg = nexus_per_parameter_cfg();
+        let stations = ids(&["0-246-0-1", "0-246-0-2"]);
+        let qs = build_area_set(
+            &cfg,
+            &stations,
+            Some((t(2026, 6, 15, 0), t(2026, 6, 15, 0))),
+            &["air_temperature", "wind_speed"],
+            MAX_RESPONSE_VALUES,
+        )
+        .unwrap();
+        assert_eq!(qs.len(), 2, "one statement per parameter table");
+        assert_eq!(qs[0].parameter.as_deref(), Some("air_temperature"));
+        assert_eq!(qs[1].parameter.as_deref(), Some("wind_speed"));
+        assert!(qs[0].sql.contains("FROM \"public\".\"airtemperature\""));
+        assert!(qs[1].sql.contains("FROM \"public\".\"wind_speed\""));
+        for q in &qs {
+            // Both share the one id list rather than copying it.
+            match &q.params[0] {
+                SqlParam::SharedTextArray(list) => assert!(Arc::ptr_eq(list, &stations)),
+                other => panic!("expected the shared id list, got {other:?}"),
+            }
+            assert!(q.sql.contains("\"time\" >= ($2 AT TIME ZONE 'UTC')"));
+            assert!(
+                q.sql.ends_with("ORDER BY \"wigos_id\", \"time\" LIMIT $4"),
+                "{}",
+                q.sql
+            );
+        }
+    }
+
+    #[test]
+    fn area_set_quotes_identifiers_and_rejects_unknown_parameters() {
+        let mut cfg = long_cfg();
+        if let ObservationSchema::Long(l) = &mut cfg.observations {
+            l.station_fk_col = "bad\"; DROP TABLE x --".into();
+        }
+        let q = build_area_set(&cfg, &ids(&["1"]), None, &["t2m"], 10)
+            .unwrap()
+            .remove(0);
+        assert!(
+            q.sql.contains("\"bad\"\"; DROP TABLE x --\" = ANY($1)"),
+            "{}",
+            q.sql
+        );
+        assert_eq!(q.sql.matches("SELECT").count(), 1);
+
+        let err = build_area_set(&wide_cfg(), &ids(&["1"]), None, &["nope"], 10).unwrap_err();
+        assert!(matches!(err, BuildError::UnknownParameter(_)));
+        let err = build_area_set(
+            &nexus_per_parameter_cfg(),
+            &ids(&["1"]),
+            None,
+            &["nope"],
+            10,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BuildError::UnknownParameter(_)));
+    }
+
+    /// #1063: the station map fingerprint is one aggregate row per
+    /// observation table over every configured parameter, on the set-based
+    /// path's `<fk> = ANY($1)` from `$2` on: a count, the row-key hash sum
+    /// and a hash sum per value column, every identifier quoted.
+    #[test]
+    fn frame_fingerprint_aggregates_each_table_from_since() {
+        let since = t(2026, 10, 18, 5);
+        let station_ids = ids(&["a", "b"]);
+
+        let q = build_frame_fingerprint(&long_cfg(), &station_ids, since)
+            .unwrap()
+            .remove(0);
+        assert!(q.sql.starts_with("SELECT count(*), sum("), "{}", q.sql);
+        assert!(
+            q.sql.contains("hashtext(\"fmisid\"::text) # hashfloat8(extract(epoch from \"obstime\")::double precision) # hashtext(\"param_name\"::text)"),
+            "{}",
+            q.sql
+        );
+        assert!(q
+            .sql
+            .contains("sum(hashfloat8(\"value\"::double precision))"));
+        assert!(q.sql.contains(
+            "FROM \"public\".\"observations\" WHERE \"fmisid\" = ANY($1) AND \"obstime\" >= $2 AND \"param_name\" = ANY($3)"
+        ));
+        assert_eq!(
+            q.params,
+            vec![
+                SqlParam::SharedTextArray(Arc::clone(&station_ids)),
+                SqlParam::Timestamp(since),
+                SqlParam::TextArray(vec!["t2m".into()]),
+            ]
+        );
+
+        // `wide`: one value hash per configured parameter's column.
+        let q = build_frame_fingerprint(&wide_cfg(), &station_ids, since)
+            .unwrap()
+            .remove(0);
+        assert!(q.sql.contains(
+            "sum(hashfloat8(\"temp_celsius\"::double precision)), sum(hashfloat8(\"humidity_pct\"::double precision))"
+        ));
+        assert_eq!(q.params.len(), 2);
+
+        // `per_parameter`: one statement per table, a naive time column
+        // compared against the converted bind.
+        let queries =
+            build_frame_fingerprint(&nexus_per_parameter_cfg(), &station_ids, since).unwrap();
+        assert_eq!(queries.len(), 2);
+        assert!(queries[1].sql.contains("FROM \"public\".\"wind_speed\""));
+        assert!(queries[1]
+            .sql
+            .contains("\"time\" >= ($2 AT TIME ZONE 'UTC')"));
+        assert_eq!(queries[1].parameter.as_deref(), Some("wind_speed"));
+        for q in &queries {
+            assert_eq!(q.sql.matches("SELECT").count(), 1);
+        }
+
+        let events = mk_cfg_obs_only(ObservationSchema::Events(lightning_shape()));
+        assert!(matches!(
+            build_frame_fingerprint(&events, &station_ids, since),
+            Err(BuildError::NoStations)
+        ));
+    }
+
+    #[test]
+    fn stations_in_polygon_fetches_one_past_the_memory_guard() {
+        // #1062: the prefilter is a memory guard at 200 000 stations, far
+        // above station networks, not the old 10 001-station ceiling.
+        assert_eq!(MAX_STATIONS_IN_POLYGON, 200_001);
+        let q = build_stations_in_polygon(&long_cfg(), "POLYGON((0 0,1 0,1 1,0 1,0 0))").unwrap();
+        assert!(q.sql.ends_with(" LIMIT 200001"), "{}", q.sql);
+    }
+
     // ---- events ------------------------------------------------------------
 
     fn lightning_shape() -> EventsShape {
@@ -1479,8 +2120,8 @@ mod tests {
 
         // Projection: timestamptz time + coords + one cast column per key.
         assert!(q.sql.contains("(\"time\" AT TIME ZONE 'UTC') AS time"));
-        assert!(q.sql.contains("ST_X(\"the_geom\") AS lon"));
-        assert!(q.sql.contains("ST_Y(\"the_geom\") AS lat"));
+        assert!(q.sql.contains("ST_X(\"the_geom\") END AS lon"));
+        assert!(q.sql.contains("ST_Y(\"the_geom\") END AS lat"));
         assert!(q
             .sql
             .contains("\"peak_current\"::double precision AS \"peak_current\""));
@@ -1595,7 +2236,7 @@ mod tests {
         .unwrap();
         assert!(!q.sql.contains("cloud_indicator"));
         assert!(!q.sql.contains("peak_current"));
-        assert!(q.sql.contains("ST_X(\"the_geom\") AS lon"));
+        assert!(q.sql.contains("ST_X(\"the_geom\") END AS lon"));
     }
 
     #[test]
@@ -1620,5 +2261,69 @@ mod tests {
         );
         // The statement still ends at the single LIMIT bind — nothing escaped.
         assert_eq!(q.sql.matches("SELECT").count(), 1);
+    }
+
+    // ---- temporal extent ---------------------------------------------------
+
+    /// #1139: the unbounded read is the extent statement as it always was;
+    /// the bounded one adds the `now` bind against the bare column.
+    #[test]
+    fn temporal_extent_sql_unbounded_and_bounded_at_now() {
+        let now = t(2026, 10, 18, 12);
+        let cfg = long_cfg(); // timestamptz column
+        let all = build_temporal_extent(&cfg, None).unwrap().unwrap();
+        assert_eq!(
+            all.sql,
+            "SELECT MIN(\"obstime\")::timestamptz AS lo, MAX(\"obstime\")::timestamptz AS hi \
+             FROM \"public\".\"observations\""
+        );
+        assert!(all.params.is_empty());
+
+        let bounded = build_temporal_extent(&cfg, Some(now)).unwrap().unwrap();
+        assert_eq!(bounded.sql, format!("{} WHERE \"obstime\" <= $1", all.sql));
+        assert_eq!(bounded.params, vec![SqlParam::Timestamp(now)]);
+    }
+
+    /// A naive column (`time_col_tz`) aggregates the bare column and converts
+    /// the result to `timestamptz`, and bounds the bare column with the
+    /// converted bind, as every observation window does: a time index serves
+    /// both reads. `per_parameter` reads its first table.
+    #[test]
+    fn temporal_extent_sql_naive_column_aggregates_the_bare_column() {
+        let now = t(2026, 10, 18, 12);
+        let cfg = nexus_per_parameter_cfg(); // time_col_tz = "UTC"
+        let all = build_temporal_extent(&cfg, None).unwrap().unwrap();
+        assert_eq!(
+            all.sql,
+            "SELECT (MIN(\"time\") AT TIME ZONE 'UTC')::timestamptz AS lo, \
+             (MAX(\"time\") AT TIME ZONE 'UTC')::timestamptz AS hi \
+             FROM \"public\".\"airtemperature\""
+        );
+        let bounded = build_temporal_extent(&cfg, Some(now)).unwrap().unwrap();
+        assert_eq!(
+            bounded.sql,
+            format!("{} WHERE \"time\" <= ($1 AT TIME ZONE 'UTC')", all.sql)
+        );
+        assert_eq!(bounded.params, vec![SqlParam::Timestamp(now)]);
+    }
+
+    #[test]
+    fn temporal_extent_sql_events_table_and_no_table() {
+        let now = t(2026, 10, 18, 12);
+        let events = mk_cfg_obs_only(ObservationSchema::Events(lightning_shape()));
+        let bounded = build_temporal_extent(&events, Some(now)).unwrap().unwrap();
+        assert!(bounded
+            .sql
+            .starts_with("SELECT (MIN(\"time\") AT TIME ZONE 'UTC')::timestamptz AS lo"));
+        assert!(bounded.sql.contains("FROM \"public\".\"lightning\""));
+        assert!(bounded
+            .sql
+            .ends_with("WHERE \"time\" <= ($1 AT TIME ZONE 'UTC')"));
+
+        let no_tables = mk_cfg_obs_only(ObservationSchema::PerParameter(PerParameterShape {
+            tables: vec![],
+        }));
+        assert_eq!(build_temporal_extent(&no_tables, None).unwrap(), None);
+        assert_eq!(build_temporal_extent(&no_tables, Some(now)).unwrap(), None);
     }
 }

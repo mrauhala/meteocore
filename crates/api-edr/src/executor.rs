@@ -1,37 +1,31 @@
 //! Bounded execution of synchronous EDR engines away from HTTP workers.
 //!
-//! Normal queries run on a dedicated multi-thread runtime: storage engines
-//! may use `block_in_place` there. Trajectory engines explicitly expect a
-//! blocking thread, so that path uses the same runtime's blocking pool.
+//! Queries run on ds-executor's shared query runtime
+//! (`ds_executor::query_runtime`), the one WMS GetFeatureInfo also runs on
+//! (#1103), under this module's own admission and 30-second deadline: storage
+//! engines may use `block_in_place` there. Cross-section trajectory engines
+//! (`TrajectoryShape::CrossSection`) explicitly expect a blocking thread, so
+//! that path uses the same runtime's blocking pool.
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use tokio::runtime::Runtime;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 static EXECUTOR: LazyLock<Executor> = LazyLock::new(Executor::new);
 
+/// EDR's admission, apart from GetFeatureInfo's render slots: one running
+/// query per query-runtime worker, 32 more waiting.
 struct Executor {
-    runtime: Runtime,
     slots: Arc<Semaphore>,
     admitted: Arc<Semaphore>,
 }
 
 impl Executor {
     fn new() -> Self {
-        let concurrency = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(2)
-            .clamp(2, 8);
+        let concurrency = ds_executor::query_workers();
         Self {
-            runtime: tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(concurrency)
-                .thread_name("edr-query")
-                .enable_all()
-                .build()
-                .expect("EDR query runtime"),
             slots: Arc::new(Semaphore::new(concurrency)),
             admitted: Arc::new(Semaphore::new(concurrency + 32)),
         }
@@ -108,10 +102,11 @@ where
         let _deadline = ds_core::deadline::enter(Some(deadline));
         work(budget)
     };
+    let runtime = ds_executor::query_runtime();
     let task = if blocking {
-        executor.runtime.spawn_blocking(work)
+        runtime.spawn_blocking(work)
     } else {
-        executor.runtime.spawn(async move { work() })
+        runtime.spawn(async move { work() })
     };
     // Keep the permit in the task even after timeout/disconnect: synchronous
     // work may still be running. Never turn a timeout into extra concurrency.
@@ -136,7 +131,6 @@ mod tests {
             .await
             .unwrap();
         }
-        executor.runtime.shutdown_background();
     }
 
     #[tokio::test]
@@ -144,7 +138,6 @@ mod tests {
         let executor = Executor {
             slots: Arc::new(Semaphore::new(1)),
             admitted: Arc::new(Semaphore::new(1)),
-            ..Executor::new()
         };
         let (release, wait) = std::sync::mpsc::channel();
         let (stopped, finished) = tokio::sync::oneshot::channel();
@@ -160,7 +153,6 @@ mod tests {
         ));
         release.send(()).unwrap();
         assert!(finished.await.unwrap());
-        executor.runtime.shutdown_background();
     }
 
     #[tokio::test]
@@ -174,7 +166,36 @@ mod tests {
         })
         .await;
         assert!(matches!(result, Err(ExecutionError::Timeout)));
-        executor.runtime.shutdown_background();
+    }
+
+    /// Every EDR query, a cross-section's blocking one too, runs on the
+    /// query runtime WMS GetFeatureInfo shares (#1103), never on the caller's,
+    /// under EDR's own 30-second deadline, not GetFeatureInfo's or the render
+    /// deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn queries_run_on_the_shared_query_runtime_under_the_edr_deadline() {
+        let caller = tokio::runtime::Handle::current().id();
+        for blocking in [false, true] {
+            let start = Instant::now();
+            let (runtime, thread, deadline) = run(blocking, |_| {
+                (
+                    tokio::runtime::Handle::current().id(),
+                    std::thread::current().name().map(str::to_owned),
+                    ds_core::deadline::current().unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(runtime, ds_executor::query_runtime().id(), "{blocking}");
+            assert_ne!(runtime, caller, "{blocking}");
+            assert_eq!(thread.as_deref(), Some(ds_executor::QUERY_THREAD_NAME));
+            let budget = deadline - start;
+            assert_eq!(QUERY_TIMEOUT, Duration::from_secs(30));
+            assert!(
+                QUERY_TIMEOUT <= budget && budget < QUERY_TIMEOUT + Duration::from_secs(1),
+                "{budget:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

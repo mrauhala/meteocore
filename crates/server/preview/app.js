@@ -11,6 +11,13 @@
 //   * Cards display title, description, API surface, spatial bbox, and (when
 //     present) a time slider scrubbing through the temporal extent's discrete
 //     timesteps.
+//   * Only an entry with map tiles gets a layer switch. One without says so
+//     and links to its collection page instead of offering a switch that
+//     draws nothing.
+//   * A multi-parameter entry opens on the engine's default parameter, the
+//     one the manifest marks `default` (what Maps and WMS draw without
+//     `parameter-name`), not on the alphabetical first.
+//   * Below 640 px the sidebar is a bottom sheet (see app.css).
 //
 // XSS hygiene: every dynamic value reaches the DOM through `textContent` or
 // as a typed `<option>` value. Never use innerHTML with manifest data.
@@ -41,6 +48,15 @@
 
     const statusEl = document.getElementById('status');
     const listEl = document.getElementById('collections');
+    const sidebarEl = document.getElementById('sidebar');
+    const sheetToggle = document.getElementById('sheet-toggle');
+    // Matches the app.css breakpoint that turns the sidebar into a sheet.
+    const phoneLayout = window.matchMedia('(max-width: 639px)');
+
+    // Gives each time slider a unique id for its `<label for>`.
+    let sliderCount = 0;
+
+    setUpSheet();
 
     // Shared across every vector collection so a click in one collection
     // dismisses an open popup from another.
@@ -131,8 +147,73 @@
     }
 
     // ------------------------------------------------------------------
+    // Sidebar / bottom sheet
+    // ------------------------------------------------------------------
+
+    // The header button folds the phone sheet down to its header. The
+    // sheet's height is published as `--sheet-offset` so MapLibre's bottom
+    // controls sit above it (CSSOM, which the page's CSP allows).
+    function setUpSheet() {
+        sheetToggle.addEventListener('click', function () {
+            const folded = sidebarEl.classList.toggle('folded');
+            sheetToggle.setAttribute('aria-expanded', folded ? 'false' : 'true');
+            // The visible text follows the state; the accessible name
+            // (aria-label) stays fixed and aria-expanded carries the state.
+            sheetToggle.textContent = folded ? 'Show list' : 'Hide list';
+        });
+        function publishSheetOffset() {
+            const offset = phoneLayout.matches
+                ? Math.max(0, window.innerHeight - sidebarEl.getBoundingClientRect().top)
+                : 0;
+            document.documentElement.style.setProperty('--sheet-offset', offset + 'px');
+        }
+        if (typeof ResizeObserver === 'function') {
+            new ResizeObserver(publishSheetOffset).observe(sidebarEl);
+        }
+        window.addEventListener('resize', publishSheetOffset);
+        publishSheetOffset();
+    }
+
+    // Map padding that keeps a fitted extent out from under the sidebar:
+    // past its right edge on a desktop, above the sheet on a phone. The
+    // right and top margins clear the navigation control.
+    function fitPadding() {
+        const rect = sidebarEl.getBoundingClientRect();
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        const padding = phoneLayout.matches
+            ? { top: 24, right: 56, bottom: Math.max(24, height - rect.top + 24), left: 24 }
+            : { top: 40, right: 64, bottom: 40, left: Math.max(24, rect.right + 24) };
+        // fitBounds does not move at all when the padding leaves no room,
+        // so give up the sidebar's side before that happens.
+        const minimum = 64;
+        if (width - padding.left - padding.right < minimum) {
+            padding.left = 24;
+            padding.right = 24;
+        }
+        if (height - padding.top - padding.bottom < minimum) {
+            padding.top = 24;
+            padding.bottom = 24;
+        }
+        return padding;
+    }
+
+    // ------------------------------------------------------------------
     // Card construction
     // ------------------------------------------------------------------
+
+    // The parameter the card opens on: the engine's default, which the
+    // manifest marks, else the first (alphabetical) entry.
+    function defaultParameter(collection) {
+        const parameters = Array.isArray(collection.parameters) ? collection.parameters : [];
+        const marked = parameters.find(function (p) { return p.default === true; });
+        if (marked) return marked.name;
+        return parameters.length > 0 ? parameters[0].name : null;
+    }
+
+    function hasMapLayer(collection) {
+        return Boolean(collection.tiles && (collection.tiles.raster || collection.tiles.vector));
+    }
 
     function buildCollectionCard(collection) {
         const state = {
@@ -144,13 +225,10 @@
             timeValues: null,
             // Selected parameter name for multi-parameter raster collections.
             // null = use the server's default. The dropdown is only rendered
-            // when `parameters.length > 1`, but state holds the first entry's
-            // name unconditionally so URL builders can append it without an
-            // extra null-check.
-            parameter:
-                Array.isArray(collection.parameters) && collection.parameters.length > 0
-                    ? collection.parameters[0].name
-                    : null,
+            // when `parameters.length > 1`, but state holds the default
+            // entry's name unconditionally so URL builders can append it
+            // without an extra null-check.
+            parameter: defaultParameter(collection),
             // Set by the time slider: re-binds it to another parameter's axis.
             rebindTimeAxis: null
         };
@@ -163,28 +241,37 @@
         card.className = 'card';
         li.appendChild(card);
 
-        // -- Header row: enable switch + title --
+        // -- Header row: enable switch + title. Only an entry with map tiles
+        //    gets the switch: on any other it would draw nothing. --
         const header = document.createElement('div');
         header.className = 'card-header';
         card.appendChild(header);
 
-        const toggle = document.createElement('label');
-        toggle.className = 'switch';
-        toggle.title = 'Toggle layer visibility';
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.checked = false;
-        toggle.appendChild(checkbox);
-        const slider = document.createElement('span');
-        slider.className = 'switch-slider';
-        toggle.appendChild(slider);
-        header.appendChild(toggle);
+        const displayTitle = collection.title || collection.id;
+        const hasTiles = hasMapLayer(collection);
+        let checkbox = null;
+        if (hasTiles) {
+            const toggle = document.createElement('label');
+            toggle.className = 'switch';
+            checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.checked = false;
+            // Each switch needs its own name: the label holds no text.
+            // The same text is the hover tooltip for mouse users.
+            checkbox.setAttribute('aria-label', 'Show ' + displayTitle + ' on the map');
+            toggle.title = 'Show ' + displayTitle + ' on the map';
+            toggle.appendChild(checkbox);
+            const slider = document.createElement('span');
+            slider.className = 'switch-slider';
+            toggle.appendChild(slider);
+            header.appendChild(toggle);
+        }
 
         const titleBlock = document.createElement('div');
         titleBlock.className = 'card-title-block';
         const title = document.createElement('div');
         title.className = 'card-title';
-        title.textContent = collection.title || collection.id;
+        title.textContent = displayTitle;
         titleBlock.appendChild(title);
         const subtitle = document.createElement('div');
         subtitle.className = 'card-subtitle';
@@ -192,7 +279,8 @@
         titleBlock.appendChild(subtitle);
         header.appendChild(titleBlock);
 
-        // -- API badges --
+        // -- API badges: the APIs that serve the collection (the manifest
+        //    derives them from the registries, not the configured `apis`). --
         if (collection.apis && collection.apis.length > 0) {
             const badges = document.createElement('div');
             badges.className = 'badges';
@@ -263,34 +351,36 @@
         // inside the callback addresses both. Guard with a tile-presence
         // check: an EDR-only collection has a `temporal_extent` but no tile
         // layer to drive — surfacing a slider there is just noise.
-        const hasTiles =
-            collection.tiles && (collection.tiles.raster || collection.tiles.vector);
-        whenStyleReady(map, function () {
-            try {
-                if (collection.tiles && collection.tiles.raster) {
-                    layerHandles.push(attachRasterLayer(collection, controlsHost, state));
+        if (hasTiles) {
+            whenStyleReady(map, function () {
+                try {
+                    if (collection.tiles && collection.tiles.raster) {
+                        layerHandles.push(attachRasterLayer(collection, controlsHost, state));
+                    }
+                    if (collection.tiles && collection.tiles.vector) {
+                        layerHandles.push(attachVectorLayer(collection, controlsHost, state));
+                    }
+                    if (state.enabled) {
+                        layerHandles.forEach(function (h) { h.setVisible(true); });
+                    }
+                    if (longestTimeAxis(collection) > 1) {
+                        attachTimeSlider(collection, controlsHost, state, layerHandles);
+                    }
+                } catch (err) {
+                    console.error(
+                        'Failed to attach layers for collection ' + collection.id + ':',
+                        err
+                    );
                 }
-                if (collection.tiles && collection.tiles.vector) {
-                    layerHandles.push(attachVectorLayer(collection, controlsHost, state));
-                }
-                if (state.enabled) {
-                    layerHandles.forEach(function (h) { h.setVisible(true); });
-                }
-                if (hasTiles && longestTimeAxis(collection) > 1) {
-                    attachTimeSlider(collection, controlsHost, state, layerHandles);
-                }
-            } catch (err) {
-                console.error(
-                    'Failed to attach layers for collection ' + collection.id + ':',
-                    err
-                );
-            }
-        });
+            });
+        }
 
-        // -- Footer: actions --
+        // -- Footer: actions. Without map tiles there is nothing to zoom
+        //    to on this map (it has no basemap): say so, and link to the
+        //    collection's own page. --
         const footer = document.createElement('div');
         footer.className = 'card-footer';
-        if (collection.spatial_extent) {
+        if (hasTiles && collection.spatial_extent) {
             const zoomBtn = document.createElement('button');
             zoomBtn.type = 'button';
             zoomBtn.className = 'link';
@@ -300,7 +390,23 @@
             });
             footer.appendChild(zoomBtn);
         }
+        if (!hasTiles) {
+            const note = document.createElement('span');
+            note.className = 'no-layer';
+            note.textContent = 'No map layer';
+            footer.appendChild(note);
+            const page = samePageOriginPath(collection.page_url);
+            if (page) {
+                const pageLink = document.createElement('a');
+                pageLink.className = 'link';
+                pageLink.href = page;
+                pageLink.textContent = 'Collection page';
+                footer.appendChild(pageLink);
+            }
+        }
         if (footer.childNodes.length > 0) card.appendChild(footer);
+
+        if (!checkbox) return li;
 
         // -- Wire toggle to layer visibility --
         checkbox.addEventListener('change', function () {
@@ -337,7 +443,16 @@
         // fit spans the seam, not the rest of the globe.
         const east = extent[2] < extent[0] ? extent[2] + 360 : extent[2];
         const bounds = new maplibregl.LngLatBounds([extent[0], south], [east, north]);
-        map.fitBounds(bounds, { padding: 80, maxZoom: 10, duration: 600, animate });
+        map.fitBounds(bounds, { padding: fitPadding(), maxZoom: 10, duration: 600, animate });
+    }
+
+    // A manifest URL as a path on this page's origin, like the tile
+    // templates: the server's configured base can name another host
+    // (127.0.0.1 vs localhost). Anything not a path is dropped.
+    function samePageOriginPath(url) {
+        if (typeof url !== 'string') return null;
+        const path = url.replace(/^https?:\/\/[^/]+/i, '');
+        return path.charAt(0) === '/' && path.charAt(1) !== '/' ? path : null;
     }
 
     function formatExtent(e) {
@@ -457,10 +572,7 @@
             collection.parameters.forEach(function (p) {
                 const opt = document.createElement('option');
                 opt.value = p.name;
-                const titleText = p.title && p.title !== p.name
-                    ? p.name + ' — ' + p.title
-                    : p.name;
-                opt.textContent = p.unit ? titleText + ' (' + p.unit + ')' : titleText;
+                opt.textContent = parameterLabel(p);
                 if (p.name === state.parameter) opt.selected = true;
                 paramSelect.appendChild(opt);
             });
@@ -514,6 +626,31 @@
             },
             refreshForTime: refreshSource
         };
+    }
+
+    // An option's text: the name and title once each, then the unit. A
+    // title that already starts with the name ("DBZH — Reflectivity") or
+    // ends with it in parentheses ("2 Metre Temperature (2t)") is shown
+    // alone, not as "DBZH — DBZH — Reflectivity".
+    function parameterLabel(p) {
+        const title = p.title || '';
+        let text;
+        if (!title || title === p.name) {
+            text = p.name;
+        } else if (startsWithWord(title, p.name) || title.endsWith('(' + p.name + ')')) {
+            text = title;
+        } else {
+            text = p.name + ' — ' + title;
+        }
+        const unit = p.unit ? ' (' + p.unit + ')' : '';
+        return unit && !text.endsWith(unit) ? text + unit : text;
+    }
+
+    // `text` begins with `word` as a whole word: "t2m temperature" starts
+    // with "t2m", "temperature" does not start with "t".
+    function startsWithWord(text, word) {
+        if (!word || !text.startsWith(word)) return false;
+        return !/[A-Za-z0-9_]/.test(text.charAt(word.length));
     }
 
     // Convert an OGC API Tiles URL template
@@ -632,8 +769,9 @@
                     map.setLayoutProperty(id, 'visibility', v);
                 });
             },
-            // Vector tiles have no time axis: the server encodes the
-            // collection's current features and rejects `datetime`.
+            // The preview draws vector tiles without a time: the server
+            // encodes the collection's default features. (It filters them
+            // by `datetime` when a request gives one, #794.)
             refreshForTime: function () {}
         };
     }
@@ -663,7 +801,8 @@
     function appendTimeParam(template, time) {
         if (!time) return template;
         // Map tiles honour `datetime`; including it also keys MapLibre's
-        // per-source HTTP cache by time. Vector tiles take no time.
+        // per-source HTTP cache by time. The preview sends none to vector
+        // tiles, which then hold the collection's default features.
         const sep = template.indexOf('?') === -1 ? '?' : '&';
         return template + sep + 'datetime=' + encodeURIComponent(time);
     }
@@ -694,8 +833,13 @@
         const row = document.createElement('div');
         row.className = 'time-slider';
 
-        const label = document.createElement('div');
+        // A real label, and the formatted time as the value a screen reader
+        // announces instead of the step index.
+        sliderCount += 1;
+        const inputId = 'time-slider-' + sliderCount;
+        const label = document.createElement('label');
         label.className = 'control-label';
+        label.htmlFor = inputId;
         label.textContent = 'Time';
         row.appendChild(label);
 
@@ -705,11 +849,12 @@
 
         const input = document.createElement('input');
         input.type = 'range';
+        input.id = inputId;
         input.min = '0';
         input.step = '1';
         input.addEventListener('input', function () {
             state.timeIndex = parseInt(input.value, 10);
-            valueLabel.textContent = formatSliderTime(values[state.timeIndex]);
+            showTime(values[state.timeIndex]);
         });
         input.addEventListener('change', function () {
             if (pendingRefresh !== null) clearTimeout(pendingRefresh);
@@ -723,6 +868,12 @@
             }, 200);
         });
         row.appendChild(input);
+
+        function showTime(iso) {
+            const text = formatSliderTime(iso);
+            valueLabel.textContent = text;
+            input.setAttribute('aria-valuetext', text);
+        }
 
         const ticks = document.createElement('div');
         ticks.className = 'time-ticks';
@@ -759,7 +910,7 @@
             appliedIndex = state.timeIndex;
             input.max = String(values.length - 1);
             input.value = String(state.timeIndex);
-            valueLabel.textContent = formatSliderTime(values[state.timeIndex]);
+            showTime(values[state.timeIndex]);
             firstTick.textContent = formatSliderTime(values[0]);
             lastTick.textContent = formatSliderTime(values[values.length - 1]);
             row.hidden = false;

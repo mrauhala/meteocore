@@ -13,8 +13,12 @@ use ds_core::feature::{check_area_budget, check_mask_budget, parse_area_coords, 
 use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
+use ds_core::temp_files;
+use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
+use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindRole, WindSource};
 
 use crate::parse::QueryData;
 
@@ -31,6 +35,8 @@ struct RunEntry {
 #[derive(Default)]
 struct RunSet {
     runs: BTreeMap<DateTime<Utc>, RunEntry>,
+    /// The latest run's wind components (#897), built with the set.
+    wind: Option<Arc<WindFacts>>,
 }
 
 impl RunSet {
@@ -62,8 +68,10 @@ pub struct QueryDataEngine {
     max_runs: usize,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
-    /// Tracks when data was last successfully loaded/updated.
-    data_updated_at: Mutex<Option<DateTime<Utc>>>,
+    /// When the engine loaded or a poll last found a loadable run set
+    /// ([`Self::poll_age`]). Not the data's age: a poll that finds the same
+    /// files again stamps it too (#1007).
+    polled_at: Mutex<Option<DateTime<Utc>>>,
 }
 
 impl QueryDataEngine {
@@ -96,7 +104,7 @@ impl QueryDataEngine {
             poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
             max_runs,
             shutdown: Shutdown::new(),
-            data_updated_at: Mutex::new(Some(Utc::now())),
+            polled_at: Mutex::new(Some(Utc::now())),
         })
     }
 
@@ -125,15 +133,12 @@ impl QueryDataEngine {
         let new_set = build_runset(&files, self.max_runs, &prev, &self.collection_id);
         if new_set.runs.is_empty() {
             return; // nothing loadable (e.g. all files corrupt) — keep old data
-                    // and do NOT stamp freshness; data_age keeps growing.
+                    // and do NOT stamp the poll; poll_age keeps growing.
         }
 
-        // We have a usable run set — stamp freshness (reflects loadable data, not
+        // We have a usable run set — stamp the poll (reflects loadable data, not
         // merely a readable directory).
-        *self
-            .data_updated_at
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
+        *self.polled_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
 
         // Swap only when the retained file set actually changed (add/remove).
         let prev_paths: BTreeSet<&Path> = prev.runs.values().map(|e| e.path.as_path()).collect();
@@ -186,19 +191,33 @@ impl QueryDataEngine {
         &self.collection_id
     }
 
-    /// How long ago the data was last successfully loaded/updated.
+    /// Age of the newest run, for `/health` `data_age_secs` and the
+    /// `collection_data_age_seconds` gauge (#1007): now minus its origin
+    /// time, the reference time in the file header that keys the run and is
+    /// its EDR instance id. An analysis file's origin time is its analysis
+    /// time, so analysis-only data needs no other rule; a forecast's newest
+    /// valid time lies in the future and would say nothing about the feeder.
+    /// It keeps growing while the feeder is stalled, even though every poll
+    /// still finds the old files.
     pub fn data_age(&self) -> Option<chrono::Duration> {
-        let updated_at = self
-            .data_updated_at
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        updated_at.map(|t| Utc::now() - t)
+        let newest = *self.runs.load().runs.keys().next_back()?;
+        Some(Utc::now() - newest)
+    }
+
+    /// Time since the engine loaded or a poll last found a loadable run set,
+    /// for `/health` `poll_age_secs`. It grows while the directory is
+    /// unreadable, empty or holds only unloadable files (the old runs are
+    /// kept), not while the files merely stop changing: that is
+    /// [`Self::data_age`].
+    pub fn poll_age(&self) -> Option<chrono::Duration> {
+        let polled_at = self.polled_at.lock().unwrap_or_else(|e| e.into_inner());
+        polled_at.map(|t| Utc::now() - t)
     }
 }
 
 impl EdrEngine for QueryDataEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(vec![])
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
     }
 
     /// Each retained `.sqd` file is a model run / EDR instance (latest last),
@@ -210,6 +229,10 @@ impl EdrEngine for QueryDataEngine {
 
     fn has_instances(&self) -> bool {
         !self.runs.load().runs.is_empty()
+    }
+
+    fn instance_reference_times(&self) -> Vec<DateTime<Utc>> {
+        self.runs.load().runs.keys().copied().collect()
     }
 
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
@@ -277,7 +300,90 @@ impl EdrEngine for QueryDataEngine {
             "position".to_string(),
             "area".to_string(),
             "radius".to_string(),
+            "trajectory".to_string(),
         ]
+    }
+
+    /// Trajectory query (#926): values along a WKT `LINESTRING` / `Z` / `M`
+    /// / `ZM` path, densified to about one sample per grid cell crossed and
+    /// bilinearly interpolated like position. The run's grid is memory
+    /// mapped, so sampling does no I/O; each sample is projected once and
+    /// reused by every parameter and timestep. No vertical axis: a Z
+    /// coordinate is ignored.
+    fn query_trajectory(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let path = TrajectoryPath::parse(coords)?;
+        let data = self.select_data(reference_time)?;
+        // A 2-D path takes the position query's steps; an M path snaps to
+        // any step of the run.
+        let time_indices = find_time_range(&data, datetime.filter(|_| !path.has_m));
+        let times: Vec<DateTime<Utc>> = time_indices.iter().map(|(_, t)| *t).collect();
+        let param_indices = select_param_indices(&data, parameters)?;
+        // The native cell size the area query samples at: exact for lat-lon
+        // grids, a fair mean for projected ones.
+        let extent = data.grid.lonlat_extent();
+        let spacing =
+            GridSpacing::from_extent(extent, [data.grid.nx as usize, data.grid.ny as usize])
+                .ok_or_else(|| DataServerError::Engine("QueryData grid has no extent".into()))?;
+        let plan = TrajectoryPlan::new(
+            &path,
+            spacing,
+            TrajectoryAxes {
+                times: &times,
+                vertical: None,
+                z: None,
+            },
+            param_indices.len(),
+        )?;
+        plan.require_extent(Some(extent))?;
+
+        // Project each sample once (per vertex, never per output pixel).
+        let gt = data.grid.geo_transform();
+        let pixels: Vec<(f64, f64)> = plan
+            .points()
+            .iter()
+            .map(|&(lon, lat)| world_to_grid_px(gt, lon, lat))
+            .collect();
+        let values: Vec<Vec<Vec<Option<f64>>>> = param_indices
+            .iter()
+            .map(|(pi, _)| {
+                plan.fields()
+                    .iter()
+                    .map(|field| {
+                        let ti = time_indices[field.time].0;
+                        field
+                            .points
+                            .iter()
+                            .map(|&p| {
+                                let (col_f, row_f) = pixels[p];
+                                sample_grid_bilinear(&data, col_f, row_f, *pi, 0, ti)
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let descriptions: Vec<(String, ParameterDescription)> = param_indices
+            .iter()
+            .map(|(_, param)| {
+                (
+                    param.name.clone(),
+                    ParameterDescription {
+                        label: param.name.clone(),
+                        unit: String::new(),
+                        observed_property: param.name.clone(),
+                        standard_name: None,
+                    },
+                )
+            })
+            .collect();
+        plan.into_response(&descriptions, &values)
     }
 
     /// Area query: a CRS84 `Grid` over the polygon's bbox at the source's
@@ -298,7 +404,9 @@ impl EdrEngine for QueryDataEngine {
 
         let time_indices = find_time_range(&data, datetime);
         if time_indices.is_empty() {
-            return Err(DataServerError::InvalidParameter(
+            // No step in the window: no data (404), so a datetime list
+            // skips the instant.
+            return Err(DataServerError::LocationNotFound(
                 "No data available for the requested time range".into(),
             ));
         }
@@ -406,9 +514,9 @@ impl EdrEngine for QueryDataEngine {
 
         let time_indices = find_time_range(&data, datetime);
         if time_indices.is_empty() {
-            // A window outside the run's steps is a request error (400), the
-            // same classification `query_area` uses — not a 500.
-            return Err(DataServerError::InvalidParameter(
+            // A window without a run step has no data (404), as in
+            // `query_area`; a datetime list skips such an instant.
+            return Err(DataServerError::LocationNotFound(
                 "No data available for the requested time range".into(),
             ));
         }
@@ -461,6 +569,18 @@ impl EdrEngine for QueryDataEngine {
     }
 }
 
+/// The latest run's wind components for `ds_core::wind::DerivedWind`
+/// (#897): an `Arc` clone of the snapshot built with the run set.
+impl WindSource for QueryDataEngine {
+    fn wind_facts(&self) -> Arc<WindFacts> {
+        self.runs
+            .load()
+            .wind
+            .clone()
+            .unwrap_or_else(WindFacts::none)
+    }
+}
+
 impl MapEngine for QueryDataEngine {
     #[allow(clippy::too_many_arguments)] // bbox/size/time/crs/parameter/z/reference_time are all genuine selectors
     fn get_raster_tile(
@@ -492,17 +612,18 @@ impl MapEngine for QueryDataEngine {
         // Each output pixel's WGS84 lon/lat comes from the shared
         // `OutputCrs::project_node` (linear lon/lat, Mercator-Y, or a projected
         // output CRS; #160), and the source grid — itself possibly projected
-        // (LCC, stereographic, rotated lat-lon) — is sampled by
-        // `world_to_grid_px` (`Crs::forward` + affine) then bilinear.
+        // (LCC, stereographic, rotated lat-lon) — is sampled at its grid
+        // position (`Crs::forward` + affine) by `sample_grid_bilinear`.
         // A lat/lon source (`Crs::Wgs84`, forward = identity) under lat/lon
         // or Web Mercator output needs no projection at all: sample per
         // pixel. Every other pairing runs a projection per node — the
         // output's inverse, the source's forward (LCC `powf`/`atan2` for
-        // MEPS), or both — so compose them into a coarse `ProjectionGrid` and
-        // bilinearly interpolate the output→source pixel map rather than
-        // projecting per output pixel (Critical Rule 5; #268, #807).
-        // Projected sources are regional, so the grid stays accurate and
-        // needs no antimeridian care.
+        // MEPS), or both — so it takes the shared sampler's coarse
+        // output→source map (`SourceGrid::output_map_quiet`) rather than
+        // projecting per output pixel (Critical Rule 5; #268, #807, #1190):
+        // a lat/lon grid's is periodic in longitude, so the pole and the
+        // EPSG:3035 cut stay registered (#323, #1188), and a projected
+        // grid's is bounded by its footprint (#1114).
         let gt = data.grid.geo_transform();
         let per_pixel = matches!(output_crs, OutputCrs::Wgs84 | OutputCrs::WebMercator)
             && matches!(gt.crs, ds_core::geo::Crs::Wgs84);
@@ -512,7 +633,14 @@ impl MapEngine for QueryDataEngine {
             // `sample_grid_bilinear` reaches). A viewport may reach past
             // ±180° (OGC API Maps unwraps a bbox crossing the antimeridian,
             // #828), and such a pixel shows the meridian a turn away: 185°
-            // is 175°W. A longitude already in the frame is used as is.
+            // is 175°W. A longitude already in the frame is used as is. A
+            // box given `west > east` (170, 10, -170, 20) is unwrapped
+            // first, as the shared map unwraps it.
+            let [west, south, mut east, north] = bbox;
+            if west > east {
+                east += 360.0;
+            }
+            let bbox = [west, south, east, north];
             let frame = (gt.pixel_width > 0.0).then(|| {
                 let west = gt.origin_x - 0.5 * gt.pixel_width;
                 west..west + 360.0
@@ -524,6 +652,7 @@ impl MapEngine for QueryDataEngine {
                 _ => lon,
             };
             for row in 0..height {
+                ds_core::deadline::check()?;
                 let fy = (row as f64 + 0.5) / height as f64;
                 for col in 0..width {
                     let fx = (col as f64 + 0.5) / width as f64;
@@ -539,20 +668,29 @@ impl MapEngine for QueryDataEngine {
                 }
             }
         } else {
-            let grid = ds_core::resample::ProjectionGrid::build_2d(
-                width,
-                height,
-                data.grid.nx,
-                data.grid.ny,
-                |fx, fy| output_crs.project_node(bbox, fx, fy),
-                |lon, lat| world_to_grid_px(gt, lon, lat),
-            );
+            let map = data
+                .grid
+                .source()
+                .output_map_quiet(bbox, width, height, output_crs);
+            if let Some(error_px) = map.capped_error() {
+                tracing::warn!(
+                    collection = %self.collection_id,
+                    ?bbox,
+                    width,
+                    height,
+                    ?output_crs,
+                    grid = ?(data.grid.nx, data.grid.ny),
+                    error_px,
+                    "Projection grid hit its cell cap over the interpolation budget; \
+                     this render may be slightly misregistered"
+                );
+            }
             for oy in 0..height {
+                ds_core::deadline::check()?;
                 for ox in 0..width {
-                    let (col_f, row_f) = grid.sample(ox, oy);
-                    values.push(sample_grid_bilinear(
-                        &data, col_f, row_f, param_idx, 0, time_idx,
-                    ));
+                    values.push(map.position(ox, oy).and_then(|(col_f, row_f)| {
+                        sample_grid_bilinear(&data, col_f, row_f, param_idx, 0, time_idx)
+                    }));
                 }
             }
         }
@@ -649,12 +787,7 @@ impl MapEngine for QueryDataEngine {
             .iter()
             .map(|p| {
                 // Extract short name from parentheses, e.g., "2 Metre Temperature (2t)" → "2t"
-                let short = p
-                    .name
-                    .rfind('(')
-                    .and_then(|start| p.name[start + 1..].strip_suffix(')'))
-                    .unwrap_or(&p.name)
-                    .to_string();
+                let short = map_name(&p.name).to_string();
                 ds_core::map_engine::ParameterInfo {
                     name: short,
                     title: p.name.clone(),
@@ -685,6 +818,11 @@ impl MapEngine for QueryDataEngine {
 /// List `.sqd` files in a directory, sorted ascending by filename (lexicographic
 /// ≈ chronological for the usual `…YYYYMMDDHHMM.sqd` naming, so the last entry is
 /// the latest run). Returns empty on a directory read error.
+///
+/// A temporary name ([`temp_files::is_temporary`]) is never listed: a publisher
+/// writes a run as a hidden `.name.sqd` and renames it once complete, and a
+/// poll in between would parse a truncated file of up to a GB, logging a
+/// spurious ERROR (#1009). The finished file is listed on the next poll.
 fn list_sqd_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         // A read failure (e.g. a permissions regression) is indistinguishable
@@ -699,6 +837,8 @@ fn list_sqd_files(dir: &Path) -> Vec<PathBuf> {
         .filter(|p| {
             p.extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("sqd"))
+                && p.file_name()
+                    .is_some_and(|name| !temp_files::is_temporary(&name.to_string_lossy()))
         })
         .collect();
     entries.sort();
@@ -763,7 +903,58 @@ fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id
             );
         }
     }
-    RunSet { runs }
+    let wind = runs
+        .values()
+        .next_back()
+        .map(|latest| Arc::new(wind_facts(&latest.data)));
+    RunSet { runs, wind }
+}
+
+/// What a run states about its wind components (#897): each parameter's
+/// FMI number and its map and EDR names, and the frame of its u/v.
+///
+/// The format has no u/v frame flag (neither the header, a parameter
+/// descriptor nor an area class carries one), so the frame is FMI newbase's
+/// convention: u and v are relative to the data's own grid. newbase's
+/// `NFmiFastQueryInfo::DoWindComponentFix` (smartmet-library-newbase,
+/// `newbase/NFmiFastQueryInfo.cpp`) relies on it when it reprojects
+/// `kFmiWindUMS`/`kFmiWindVMS` onto another grid: it turns them by the
+/// difference of the two areas' `NFmiArea::TrueNorthAzimuth`, which would be
+/// wrong for components already along east and north. So the components are
+/// grid-relative: on a lat/lon area that is east and north, giving speed and
+/// direction; on a rotated lat/lon, stereographic or LCC area `ds_core::wind`
+/// gives speed only until it can turn them to true north.
+fn wind_facts(data: &QueryData) -> WindFacts {
+    WindFacts {
+        grid: GridAxes::of(&data.grid.area.crs),
+        parameters: data
+            .params
+            .iter()
+            .map(|p| {
+                let name = map_name(&p.name);
+                ParameterFacts {
+                    edr_name: (name != p.name).then(|| p.name.clone()),
+                    // Only a wind number asserts a role. Any other id says
+                    // nothing about wind, so the name may still pair it by
+                    // the source vocabulary (`10u`/`10v` from a converter
+                    // that kept GRIB short names but not FMI's numbers).
+                    fmi_param: WindRole::from_fmi_param(p.id).map(|_| p.id),
+                    // newbase's convention, see above.
+                    frame: VectorFrame::Grid,
+                    ..ParameterFacts::new(name)
+                }
+            })
+            .collect(),
+    }
+}
+
+/// A parameter's map name: the short name in parentheses at the end of its
+/// descriptor (`"2 Metre Temperature (2t)"` → `"2t"`), else the descriptor.
+/// EDR uses the full descriptor.
+fn map_name(name: &str) -> &str {
+    name.rfind('(')
+        .and_then(|start| name[start + 1..].strip_suffix(')'))
+        .unwrap_or(name)
 }
 
 fn load_file(path: &Path, collection_id: &str) -> Result<QueryData, DataServerError> {
@@ -791,8 +982,9 @@ fn log_loaded(collection_id: &str, path: &Path, data: &QueryData) {
 /// Bilinear interpolation at (lon, lat) for a given parameter and time.
 ///
 /// Used by EDR position queries and the `Wgs84`/`WebMercator` map path. The
-/// projected map path instead drives [`sample_grid_bilinear`] through a coarse
-/// [`ProjectionGrid`] to avoid per-pixel projection (#268).
+/// projected map path instead drives [`sample_grid_bilinear`] through the
+/// shared coarse map (`OutputMap::position`) to avoid per-pixel projection
+/// (#268, #1190).
 fn interpolate(
     data: &QueryData,
     lon: f64,
@@ -834,8 +1026,9 @@ fn select_param_indices<'a>(
 
 /// Map WGS84 (lon, lat) to fractional source-grid pixel `(col_f, row_f)` — the
 /// source `Crs::forward` plus the grid's affine, with the half-pixel centre
-/// offset. This is the (possibly projected) per-node mapping fed to
-/// [`ProjectionGrid::build_2d`] and the front half of [`interpolate`].
+/// offset: the position `ds_core::resample::SourceGrid` measures, and the
+/// front half of [`interpolate`]. A map render projected per node takes its
+/// positions from the shared map instead (`OutputMap::position`).
 fn world_to_grid_px(gt: &ds_core::geo::GeoTransform, lon: f64, lat: f64) -> (f64, f64) {
     let (x, y) = gt.crs.forward(lon, lat);
     (
@@ -852,6 +1045,14 @@ fn world_to_grid_px(gt: &ds_core::geo::GeoTransform, lon: f64, lat: f64) -> (f64
 /// rejected up front because NaN comparisons are false and `NaN as i64/usize`
 /// saturates to 0, so the bounds guards would otherwise pass and return
 /// grid-origin data.
+///
+/// A global lat/lon grid's columns repeat every turn
+/// (`SourceGrid::global_period`, #1188): the column is taken within the
+/// turn from the first, and the column one past the last is the first, so
+/// a pixel or point across the grid's seam interpolates between its last
+/// and first columns. These are the shared sampler's rules
+/// (`ds_core::resample::SourceGrid`), read from the memory map instead of a
+/// decoded field.
 fn sample_grid_bilinear(
     data: &QueryData,
     col_f: f64,
@@ -864,42 +1065,60 @@ fn sample_grid_bilinear(
         return None;
     }
 
+    let nx = data.grid.nx as i64;
+    let ny = data.grid.ny as i64;
+    let period = data.grid.source().global_period();
+    let col_f = period.map_or(col_f, |p| col_f.rem_euclid(p));
+
     let col0 = col_f.floor() as i64;
     let row0 = row_f.floor() as i64;
 
-    let nx = data.grid.nx as i64;
-    let ny = data.grid.ny as i64;
-
-    if col0 < -1 || col0 >= nx || row0 < -1 || row0 >= ny {
+    if row0 < -1 || row0 >= ny || (period.is_none() && (col0 < -1 || col0 >= nx)) {
         return None;
     }
 
+    // The stored column of grid column `c`: on a global grid, one past the
+    // last is the first.
+    let column = |c: i64| {
+        if period.is_some() && c >= nx {
+            Some(0)
+        } else {
+            (0..nx).contains(&c).then_some(c)
+        }
+    };
+    let at = |c: Option<i64>, r: i64| {
+        let c = c.filter(|_| (0..ny).contains(&r))?;
+        let qd_row = (ny - 1 - r) as usize;
+        data.value(
+            param_idx,
+            qd_row * nx as usize + c as usize,
+            level_idx,
+            time_idx,
+        )
+    };
+
     let dx = col_f - col0 as f64;
     let dy = row_f - row0 as f64;
+    let (c0, c1) = (column(col0), column(col0 + 1));
 
-    let mut vals = [None; 4];
-    for (i, (dr, dc)) in [(0, 0), (0, 1), (1, 0), (1, 1)].iter().enumerate() {
-        let c = col0 + dc;
-        let r = row0 + dr;
-        if c >= 0 && c < nx && r >= 0 && r < ny {
-            let qd_row = (ny - 1 - r) as usize;
-            let grid_idx = qd_row * nx as usize + c as usize;
-            vals[i] = data.value(param_idx, grid_idx, level_idx, time_idx);
-        }
-    }
-
-    match (vals[0], vals[1], vals[2], vals[3]) {
+    match (
+        at(c0, row0),
+        at(c1, row0),
+        at(c0, row0 + 1),
+        at(c1, row0 + 1),
+    ) {
         (Some(tl), Some(tr), Some(bl), Some(br)) => {
             let top = tl + (tr - tl) * dx;
             let bot = bl + (br - bl) * dx;
             Some(top + (bot - top) * dy)
         }
         _ => {
-            let nc = (col_f + 0.5).floor().clamp(0.0, (nx - 1) as f64) as usize;
-            let nr = (row_f + 0.5).floor().clamp(0.0, (ny - 1) as f64) as usize;
-            let qd_row = (ny as usize - 1) - nr;
-            let grid_idx = qd_row * nx as usize + nc;
-            data.value(param_idx, grid_idx, level_idx, time_idx)
+            let nearest = |f: f64, n: i64| ((f + 0.5).floor() as i64).clamp(0, n - 1);
+            let nc = match period {
+                Some(_) => column((col_f + 0.5).floor() as i64),
+                None => Some(nearest(col_f, nx)),
+            };
+            at(nc, nearest(row_f, ny))
         }
     }
 }
@@ -1177,6 +1396,139 @@ mod tests {
         assert!(has_values, "Temperature should have some values");
     }
 
+    /// A `Trajectory` node `(t, lon, lat)` and one parameter's value there.
+    type TrajectorySample = ((DateTime<Utc>, f64, f64), Option<f64>);
+
+    /// The `(node, value)` pairs of one parameter of a `Trajectory` coverage.
+    fn trajectory_samples(qr: &QueryResult, param: &str) -> Vec<TrajectorySample> {
+        let DomainDescription::Trajectory { nodes, .. } = &qr.domain else {
+            panic!("expected a Trajectory domain")
+        };
+        let range = &qr.ranges[param];
+        assert_eq!(range.axis_names, ["composite"]);
+        assert_eq!(range.shape, [nodes.len()]);
+        nodes
+            .iter()
+            .copied()
+            .zip(range.values.iter().copied())
+            .collect()
+    }
+
+    /// Every trajectory sample equals a position query at its node and
+    /// timestep: the same projection and bilinear interpolation (#926).
+    fn assert_matches_position(engine: &QueryDataEngine, qr: &QueryResult, param: &str) {
+        for ((t, lon, lat), value) in trajectory_samples(qr, param) {
+            let CoverageResponse::Single(position) = engine
+                .query_position(
+                    &format!("POINT({lon} {lat})"),
+                    Some((t, t)),
+                    Some(&[param.to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap()
+            else {
+                panic!("expected Single")
+            };
+            assert_eq!(
+                value, position.ranges[param].values[0],
+                "{param} at {lon},{lat} {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn trajectory_samples_the_run_along_the_path() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        assert!(engine
+            .supported_query_types()
+            .contains(&"trajectory".to_string()));
+        let param = "2 Metre Temperature (2t)";
+        let (first, last) = engine.get_temporal_extent().unwrap();
+
+        // A 2-D path at one step: a single coverage densified on the
+        // fixture's grid, every sample a real value inside the extent.
+        let CoverageResponse::Single(qr) = engine
+            .query_trajectory(
+                "LINESTRING(35 -2, 37 0, 39 1)",
+                Some((first, first)),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("one step → one coverage")
+        };
+        assert_eq!(qr.parameters.len(), 3);
+        let samples = trajectory_samples(&qr, param);
+        assert!(samples.len() > 3, "densified: {}", samples.len());
+        assert!(samples.iter().all(|(n, v)| n.0 == first && v.is_some()));
+        assert_matches_position(&engine, &qr, param);
+
+        // An M path over the whole run: samples snap to the run's steps.
+        let coords = format!(
+            "LINESTRING M(35 -2 {}, 39 1 {})",
+            first.timestamp(),
+            last.timestamp()
+        );
+        let CoverageResponse::Single(qr) = engine
+            .query_trajectory(&coords, None, Some(&[param.to_string()]), None, None)
+            .unwrap()
+        else {
+            panic!("an M path is one coverage")
+        };
+        let samples = trajectory_samples(&qr, param);
+        assert_eq!(samples.first().unwrap().0 .0, first);
+        assert_eq!(samples.last().unwrap().0 .0, last);
+        assert!(samples.windows(2).all(|w| w[0].0 .0 <= w[1].0 .0));
+        assert_matches_position(&engine, &qr, param);
+
+        // Outside the run's time range → 400; outside the grid → 404.
+        let late = format!(
+            "LINESTRING M(35 -2 {}, 39 1 {})",
+            first.timestamp(),
+            last.timestamp() + 86_400
+        );
+        assert!(matches!(
+            engine.query_trajectory(&late, None, None, None, None),
+            Err(DataServerError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            engine.query_trajectory("LINESTRING(10 50, 11 51)", None, None, None, None),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+    }
+
+    /// The projected (LCC) MEPS crop (9–20°E, 60–65°N): samples along a
+    /// path across Sweden at its few-km cell size, projected per sample
+    /// like position.
+    #[test]
+    fn trajectory_on_a_projected_grid_matches_position() {
+        let engine = meps_engine();
+        let (first, _) = engine.get_temporal_extent().unwrap();
+        let param = engine.get_parameters()[0].clone();
+        let CoverageResponse::Single(qr) = engine
+            .query_trajectory(
+                "LINESTRING(12 61, 17 63.5)",
+                Some((first, first)),
+                Some(std::slice::from_ref(&param)),
+                None,
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("one step → one coverage")
+        };
+        let samples = trajectory_samples(&qr, &param);
+        // ~380 km at a few-km mean cell size: densified well past the two
+        // vertices, and inside the domain.
+        assert!(samples.len() > 20, "{}", samples.len());
+        assert!(samples.iter().any(|(_, v)| v.is_some()));
+        assert_matches_position(&engine, &qr, &param);
+    }
+
     #[test]
     fn engine_area_query_masks_outside_the_polygon() {
         assert!(test_file_exists(), "ecmwf-kenya fixture missing");
@@ -1233,14 +1585,23 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, DataServerError::LocationNotFound(_)), "{err}");
-        // And a datetime window past the run's steps is a 400 on both paths.
+        // And a datetime window without a run step has no data (404) on
+        // every path, so a datetime list skips that instant instead of
+        // failing (EDR 1.2 /req/core/datetime-response A).
         let far: DateTime<Utc> = "2000-01-01T00:00:00Z".parse().unwrap();
         for r in [
             engine.query_area("36,-2,38,0", Some((far, far)), None, None, None),
             engine.query_position("POINT(36.8 -1.3)", Some((far, far)), None, None, None),
+            engine.query_trajectory(
+                "LINESTRING(36 -2, 38 0)",
+                Some((far, far)),
+                None,
+                None,
+                None,
+            ),
         ] {
             assert!(
-                matches!(r, Err(DataServerError::InvalidParameter(_))),
+                matches!(r, Err(DataServerError::LocationNotFound(_))),
                 "{r:?}"
             );
         }
@@ -1444,6 +1805,83 @@ mod tests {
         assert!(latest.to_string_lossy().ends_with(".sqd"));
     }
 
+    const FIXTURE: &str = "202604042019_202604040600_ecmwf_kenya_surface.sqd";
+
+    /// A publisher's in-progress run, `.name.sqd` holding the first bytes of
+    /// the file, next to a finished one: only the finished run is listed
+    /// (#1009). Temp-suffixed copies are skipped too.
+    #[test]
+    fn list_sqd_files_skips_in_progress_names() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let bytes = std::fs::read(test_dir().join(FIXTURE)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let finished = dir.path().join(FIXTURE);
+        std::fs::write(&finished, &bytes).unwrap();
+        let hidden = format!(".2026-10-09T00:00:00Z_{FIXTURE}");
+        std::fs::write(dir.path().join(&hidden), &bytes[..bytes.len() / 10]).unwrap();
+        std::fs::write(dir.path().join(format!("{FIXTURE}.tmp")), &bytes).unwrap();
+        std::fs::write(dir.path().join(format!("{FIXTURE}.part")), &bytes).unwrap();
+
+        assert_eq!(list_sqd_files(dir.path()), [finished]);
+    }
+
+    /// A hidden run is never parsed, even when all its bytes are there: the
+    /// engine finds nothing to load in a directory holding only `.name.sqd`.
+    #[test]
+    fn engine_never_loads_a_hidden_run() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            test_dir().join(FIXTURE),
+            dir.path().join(format!(".{FIXTURE}")),
+        )
+        .unwrap();
+        let Err(err) = QueryDataEngine::new(dir.path(), "test", None, 30, 4) else {
+            panic!("a hidden .sqd must not be loaded as a run");
+        };
+        assert!(err.to_string().contains("No loadable .sqd files"), "{err}");
+    }
+
+    /// #1007: `data_age` is now minus the newest run's origin time, not the
+    /// time since the last poll. A stalled feeder leaves its files in place,
+    /// so every poll still finds them: that resets `poll_age` but not
+    /// `data_age`.
+    #[test]
+    fn data_age_is_the_newest_runs_origin_time_not_the_last_poll() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        let origin = chrono::DateTime::parse_from_rfc3339("2026-04-04T06:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            engine.get_instances().last().unwrap().reference_time,
+            origin
+        );
+
+        // `data_age` is now minus the origin time, bracketed by clock reads.
+        let assert_data_age = || {
+            let before = Utc::now();
+            let age = engine.data_age().expect("a loaded run");
+            let after = Utc::now();
+            assert!(
+                before - origin <= age && age <= after - origin,
+                "data age {age} is not now minus {origin}"
+            );
+        };
+        assert_data_age();
+
+        // The feeder stalls: a poll finds the same file. It resets the poll
+        // age, set an hour back here, and leaves the data age growing.
+        *engine.polled_at.lock().unwrap() = Some(Utc::now() - chrono::Duration::hours(1));
+        engine.poll_once();
+        let poll_age = engine.poll_age().unwrap();
+        assert!(
+            poll_age < chrono::Duration::minutes(1),
+            "poll age {poll_age}"
+        );
+        assert_data_age();
+    }
+
     #[test]
     fn instances_expose_runs_latest_default() {
         assert!(test_file_exists(), "ecmwf-kenya fixture missing");
@@ -1451,8 +1889,11 @@ mod tests {
         let instances = engine.get_instances();
         // The fixture dir has at least one .sqd → at least one run/instance.
         assert!(!instances.is_empty());
-        // raster_info advertises the same runs as reference times.
+        // raster_info advertises the same runs as reference times, and so
+        // does the run axis read without the valid times (#1006).
         assert_eq!(engine.raster_info().reference_times.len(), instances.len());
+        let runs: Vec<_> = instances.iter().map(|r| r.reference_time).collect();
+        assert_eq!(engine.instance_reference_times(), runs);
         // An un-pinned position query (reference_time = None) serves the latest
         // run; pinning the latest run's reference time returns the same series.
         let latest_rt = instances.last().unwrap().reference_time;
@@ -1476,3 +1917,12 @@ mod tests {
             .is_err());
     }
 }
+
+#[cfg(test)]
+mod footprint_tests;
+#[cfg(test)]
+mod global_tests;
+#[cfg(test)]
+mod sampler_tests;
+#[cfg(test)]
+mod wind_tests;

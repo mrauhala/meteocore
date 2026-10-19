@@ -1,0 +1,114 @@
+# MetCoOp MEPS 2.5 km forecast on pressure levels, control member, read in
+# place from MET Norway's thredds.met.no by HTTP range (#1067).
+# CC-BY-4.0, MET Norway.
+#
+# DISABLED by default: it reads from thredds.met.no, a public server. To run:
+#   1. rename to drop `.disabled`
+#   2. cargo run -p server -- --collections=meps-netcdf-pl-thredds
+# `meps-netcdf-pl-local` serves the same family from the committed sample;
+# `meps-netcdf-thredds.toml.disabled` is the surface family (sfc).
+#
+# MEPS publishes each run's pressure-level fields as 67 per-lead `pl` files
+# (leads 00-66, one valid time each, 18 variables on 13 pressure levels from
+# 1000 to 50 hPa), beside the surface files, every 3 h. The levels are the
+# collection's vertical axis (hPa, bottom first): WMS ELEVATION, Maps/Tiles
+# `elevation` and EDR `z` select them, and a map without one draws 1000 hPa.
+# The files are found and read as the surface family's are: each poll HEADs
+# the sentinel (lead 00) of every run in `time_window` not seen yet, and the
+# other leads once it appears; a file is read in place, never downloaded
+# whole. At most 8 requests go to the host at once, over every collection on
+# it; polls take 2 of them.
+#
+# Traffic (measured 2026-10-18 over a laptop link, `tests/live_thredds.rs`;
+# to be re-measured from a server's network):
+#   - probing: one HEAD per poll for each run not yet out, 66 when it
+#     appears, then one every 30 min per run served.
+#   - metadata, per file: its 1 MiB first read and 64 KiB blocks of the
+#     variables' chunk indexes: 4 GETs, 1.23 MB serving one variable
+#     (measured), about 1.5 MB serving the five below (extrapolated from the
+#     surface family's): some 100 MB per run.
+#   - per field drawn: one ~1.4 MB GET the first time any request draws it.
+#     A field is one variable at one level and lead: 13 per variable and
+#     lead, so a layer is 871 fields over a run. Fields stay cached: 512 MB
+#     of compressed chunks (MC_NETCDF_CHUNK_CACHE_MB, about 370 fields) and
+#     256 MB decoded (MC_NETCDF_FIELD_CACHE_MB).
+#   - per prewarm variable: its bottom level (what a map without ELEVATION
+#     draws), about 100 MB per run, fetched by the poll whether or not anyone
+#     draws them. Off here.
+#   - per EDR query: the same ~1.4 MB GET for each field not yet cached. A
+#     query without `z` reads every level: a position series over a whole run
+#     at all 13 levels is 871 fields (3.5 GB decoded), past the query cap
+#     MC_NETCDF_EDR_QUERY_MB (544 MiB: 140 MEPS fields), so it is a 400 that
+#     names the fields; name the levels with `z` and the variables with
+#     `parameter-name`. One level over a run is 67 fields, ~95 MB; all 13
+#     levels at one step 13 fields; a wind_speed_pl query reads both wind
+#     components, twice that.
+
+id = "meps-netcdf-pl-thredds"
+title = "MEPS Pressure Levels (CF-NetCDF, thredds.met.no)"
+description = "MetCoOp MEPS 2.5 km forecast on pressure levels, control member, read in place by HTTP range from MET Norway's per-lead CF-NetCDF files on thredds.met.no, on their Lambert conformal conic grid."
+engine_type = "netcdf"
+# EDR position, area and radius, model runs as instances; the WMS layers
+# answer GetFeatureInfo at the level drawn. The wind speed on each level is
+# derived from its grid-relative x/y components (`wind_speed_pl`, no
+# direction on this Lambert grid).
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["forecast", "NWP", "MEPS", "NetCDF", "pressure levels"]
+
+[license]
+title = "CC-BY-4.0"
+
+[netcdf]
+data_path = "https://thredds.met.no/thredds/fileServer/meps25epsarchive/"
+# Run directories by date and run hour, then the member: `{run}` is the hour.
+prefix_pattern = "%Y/%m/%d/{run}/member_00/"
+filename_template = "meps_pl_{lead}_%Y%m%dT{run}Z.nc"
+run_hours = [0, 3, 6, 9, 12, 15, 18, 21]
+# Lead 00 is the sentinel: a run is probed by it alone until it appears.
+leads = [
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16,
+    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+    34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+    51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66,
+]
+# Runs started in the last 9 h: the newest two published are always in it,
+# for `max_runs = 2`.
+time_window = "-PT9H"
+variables = [
+    "air_temperature_pl",
+    "x_wind_pl",
+    "y_wind_pl",
+    "geopotential_pl",
+    "relative_humidity_pl",
+]
+# Each kept file holds its parsed metadata: 820 KB measured for a surface
+# file, which parses 221 variables; a pl file parses 18 (not measured).
+# 67 leads x max_runs files are kept.
+max_runs = 2
+poll_interval_secs = 300
+# A file is used once two polls see it unchanged, or once it is 10 min old;
+# a run missing leads is served without them 30 min after it appeared.
+# min_age = "PT10M"
+# run_grace = "PT30M"
+# Fetch the newest run's bottom level of these variables before anyone
+# asks: about 100 MB per variable and run.
+# prewarm_variables = ["air_temperature_pl"]
+
+[netcdf.titles]
+air_temperature_pl = "Air temperature"
+x_wind_pl = "Wind along the grid's x axis"
+y_wind_pl = "Wind along the grid's y axis"
+geopotential_pl = "Geopotential"
+relative_humidity_pl = "Relative humidity"
+
+# Values are served in the files' own units: K, m/s, m^2/s^2 and fractions
+# (units "1"). Every layer takes the built-in default its name and unit
+# select, one range for every level: temperature over -90…50 °C in kelvin,
+# the x/y wind components over ±80 m/s and the derived speed over 0-80 m/s
+# (twice the surface scale, for the jet at 300-250 hPa), geopotential over
+# 0-206 000 m^2/s^2 and relative humidity over 0-1.
+[wms]
+# The parent layer's: the °C temperature palette over -90…50 °C in kelvin.
+colormap = "temperature"
+min = 183.15
+max = 323.15

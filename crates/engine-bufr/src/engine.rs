@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
@@ -13,14 +13,18 @@ use ds_core::config::{BufrConfig, Wis2Config};
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
 use ds_core::feature::{
-    check_mask_budget, parse_area_coords, parse_point_coords, sort_features, Feature, FeaturePage,
-    FeatureQuery,
+    check_mask_budget, parse_area_coords, parse_point_coords, sort_features, DatetimeInterval,
+    Feature, FeaturePage, FeatureQuery,
 };
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::geo::great_circle_distance_m;
-use ds_core::health::LiveStatus;
+use ds_core::health::{LiveStatus, WarmupCause};
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
+};
+use ds_core::state::{
+    collection_key, StateError, StateStore, StateWriter, WriteOutcome, WritePolicy,
 };
 use ds_poll::{FirstTick, Shutdown};
 
@@ -28,18 +32,33 @@ use crate::decode::{DecodeError, Decoder};
 use crate::health::Health;
 use crate::metadata::Snapshot;
 use crate::params::ParameterTable;
+use crate::persist;
 use crate::source::LocalSource;
-use crate::store::{Ingest, ObsStore};
-use crate::wis2::Wis2Source;
+use crate::store::{Ingest, ObsStore, StationInfo};
+use crate::wis2::{WarmupClock, Wis2Source};
 
-/// Stations an `area` query may touch (the postgis convention).
-pub const MAX_STATIONS_IN_POLYGON: usize = 10_001;
-/// Values (stations × parameters × timesteps) one response may carry.
+/// Values (stations × parameters × timesteps) one response may carry. The
+/// only bound on an `area` query's size (#1062): the stations it may touch
+/// are those of the in-memory store, itself bounded by `max_stations`, so a
+/// whole-network instant fits however many stations report.
 pub const MAX_RESPONSE_VALUES: usize = 500_000;
 /// How often the metadata snapshot is rebuilt when the store changed.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
 /// How often expired rows / surplus stations are pruned.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+/// WIS2 mode with a state store (#1002): a changed store is written to the
+/// state snapshot at most this often. Checked on every
+/// [`SNAPSHOT_INTERVAL`] tick; `shutdown()` flushes the rest. The same
+/// policy as engine-cap's accumulator.
+const STATE_WRITE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// An unchanged store is rewritten at least this often — or every quarter
+/// of a shorter `warmup`, never more often than [`STATE_WRITE_INTERVAL`]
+/// — so a restore can tell from the snapshot's `written_at` how long the
+/// server was down ([`state_policy`]).
+const STATE_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+/// A failing state write (read-only or full disk) is retried every
+/// [`STATE_WRITE_INTERVAL`] but WARNs at most this often.
+const STATE_WARN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 pub(crate) enum Source {
     Local(Mutex<LocalSource>),
@@ -71,6 +90,10 @@ pub struct BufrEngine {
     position_radius_m: f64,
     shutdown: Shutdown,
     pub health: Health,
+    /// WIS2 mode with a state store: the store snapshot's key and its write
+    /// policy (#1002). `None` = no persistence (`data_path` mode re-reads
+    /// its files instead).
+    state: Option<Mutex<StateWriter>>,
 }
 
 impl BufrEngine {
@@ -78,6 +101,22 @@ impl BufrEngine {
     /// scan so local fixtures serve immediately (a failing source starts
     /// `Degraded`; the poll loop retries).
     pub fn new(config: &BufrConfig, collection_id: &str) -> Result<Self, DataServerError> {
+        Self::new_with_state(config, collection_id, None)
+    }
+
+    /// [`Self::new`] with the server's state store (`[server] state_dir`,
+    /// #1002). In WIS2 mode the store is restored from the state store's
+    /// `<collection_id>.bufr` snapshot — rows older than the current
+    /// `retention` pruned, columns mapped onto the current parameter table,
+    /// the warm-up restarted when the snapshot is older than `warmup` — and
+    /// snapshotted back while the poll loop runs. A missing, unreadable or
+    /// corrupt snapshot is a cold start (logged), never an error. A
+    /// `data_path` source re-reads its files and ignores the store.
+    pub fn new_with_state(
+        config: &BufrConfig,
+        collection_id: &str,
+        state: Option<Arc<dyn StateStore>>,
+    ) -> Result<Self, DataServerError> {
         let retention = parse_iso8601_duration(&config.retention)?;
         let table = Arc::new(ParameterTable::build(
             config.builtin_parameters,
@@ -88,6 +127,7 @@ impl BufrEngine {
             (None, Some(w)) => Source::Wis2(Box::new(Wis2Source::new(
                 w.clone(),
                 parse_iso8601_duration(&config.stale_after)?,
+                wis2_warmup(w, retention)?,
             ))),
             _ => {
                 return Err(DataServerError::Config(format!(
@@ -95,7 +135,7 @@ impl BufrEngine {
                 )))
             }
         };
-        let engine = BufrEngine {
+        let mut engine = BufrEngine {
             collection_id: collection_id.to_string(),
             table,
             decoder: Decoder::new(),
@@ -108,16 +148,180 @@ impl BufrEngine {
             position_radius_m: config.position_radius_km * 1000.0,
             shutdown: Shutdown::new(),
             health: Health::new(),
+            state: None,
         };
         // Local mode: best-effort initial scan so fixtures serve at once.
         // WIS2 mode: nothing to load until the broker delivers — the
         // pipeline starts in `poll_loop` (the constructor runs on the
-        // request runtime; see crates/ds-wis2/CLAUDE.md).
+        // request runtime; see crates/ds-wis2/CLAUDE.md) — except what a
+        // state snapshot restores, served at once.
         if matches!(engine.source, Source::Local(_)) {
             engine.scan_once();
         }
+        let mut restored_age = None;
+        if let (Some(store), Source::Wis2(w)) = (state, &engine.source) {
+            let mut writer = StateWriter::new(
+                store,
+                collection_key(collection_id, persist::KIND),
+                state_policy(w.warmup()),
+            );
+            restored_age = engine.restore_state(&mut writer, Utc::now());
+            engine.state = Some(Mutex::new(writer));
+        }
         engine.rebuild_snapshot();
+        if let (Some(age), Some(writer)) = (restored_age, &engine.state) {
+            // The state store holds what was restored: no rewrite until the
+            // store changes or the refresh interval runs out.
+            writer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .mark_restored(engine.state_revision(), age, Instant::now());
+        }
         Ok(engine)
+    }
+
+    /// Restore the store from the snapshot `writer` manages (#1002). Returns
+    /// the snapshot's age when the store now holds what it held; `None` for
+    /// a cold start (no snapshot, or an unreadable or rejected one —
+    /// logged, never an error) and after a long outage, whose restarted
+    /// warm-up is not in the state store yet (written at the first tick).
+    ///
+    /// A snapshot written longer than `warmup` before `now` means the
+    /// server was down that long: whatever the feed published meanwhile is
+    /// missing for good (observations are not republished). Its rows are
+    /// restored, but the warm-up restarts — the clock is cleared, so it
+    /// starts again when the subscription comes up, and `/health` says
+    /// "warming up after a long outage" until it ends.
+    fn restore_state(&self, writer: &mut StateWriter, now: DateTime<Utc>) -> Option<Duration> {
+        let Source::Wis2(src) = &self.source else {
+            return None;
+        };
+        let id = &self.collection_id;
+        let at = writer.describe();
+        let bytes = match writer.load() {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                tracing::info!("[{id}] bufr/wis2: no state snapshot at {at} — cold start");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[{id}] bufr/wis2: cannot read state snapshot {at}: {e} — cold start"
+                );
+                return None;
+            }
+        };
+        let decoded = match persist::decode(&bytes, id, &self.table) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    "[{id}] bufr/wis2: state snapshot {at} rejected ({e}) — cold start; the \
+                     next write replaces it"
+                );
+                return None;
+            }
+        };
+        let age = now - decoded.written_at;
+        let long_outage = age > src.warmup();
+        src.set_warmup_clock(if long_outage {
+            WarmupClock {
+                filling_since: None,
+                cause: WarmupCause::LongOutage,
+            }
+        } else {
+            decoded.clock
+        });
+        let (reports, stations, dropped) = {
+            let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+            for (info, rows) in decoded.stations {
+                store.restore_station(info, rows);
+            }
+            // The current retention and max_stations, as a prune tick would.
+            let (rows_dropped, _) = store.prune(now);
+            (store.row_count(), store.station_count(), rows_dropped)
+        };
+        let columns = if decoded.columns_dropped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; column(s) no longer configured as written, values dropped: {}",
+                decoded.columns_dropped.join(", ")
+            )
+        };
+        tracing::info!(
+            "[{id}] bufr/wis2: restored {reports} report(s) at {stations} station(s) from state \
+             snapshot {at} written {} ago ({dropped} past retention or max_stations{columns})",
+            hours_minutes(age),
+        );
+        if long_outage {
+            tracing::warn!(
+                "[{id}] bufr/wis2: the state snapshot is older than warmup ({}): reports \
+                 published during the outage are missing — the warm-up restarts and /health \
+                 reports degraded until it ends",
+                hours_minutes(src.warmup())
+            );
+            return None;
+        }
+        Some(age.to_std().unwrap_or(Duration::ZERO))
+    }
+
+    /// What the state snapshot's write policy compares: moves whenever the
+    /// store changed (every change is followed by a metadata rebuild,
+    /// which bumps `version`) or the warm-up clock started. Both counters
+    /// only grow, so their sum moves when either does.
+    fn state_revision(&self) -> u64 {
+        let clock = match &self.source {
+            Source::Wis2(w) => w.clock_changes(),
+            Source::Local(_) => 0,
+        };
+        self.version.load(Ordering::Relaxed).wrapping_add(clock)
+    }
+
+    /// Write the store's state snapshot when its write policy says so
+    /// ([`state_policy`]; `force` always writes). Never fails the caller: a
+    /// failed write keeps the previous snapshot and is logged, as a WARN at
+    /// most every [`STATE_WARN_INTERVAL`]. The encode reads the store under
+    /// its read lock — requests keep reading; the only writer is this
+    /// engine's own poll loop, which is the caller (the shutdown flush may
+    /// wait for the loop's last write).
+    pub(crate) fn write_state(&self, force: bool) {
+        let (Some(writer), Source::Wis2(src)) = (&self.state, &self.source) else {
+            return;
+        };
+        let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reports = 0;
+        let outcome = writer.write_if_due(self.state_revision(), Instant::now(), force, || {
+            let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+            reports = store.row_count();
+            persist::encode(
+                &self.collection_id,
+                &store,
+                &self.table,
+                src.warmup_clock(),
+                Utc::now(),
+            )
+            .map_err(StateError::Encode)
+        });
+        match outcome {
+            WriteOutcome::NotDue => {}
+            WriteOutcome::Written { bytes } => tracing::debug!(
+                "[{}] bufr/wis2: state snapshot written: {reports} report(s), {bytes} bytes to {}",
+                self.collection_id,
+                writer.describe()
+            ),
+            WriteOutcome::Failed { error, warn: true } => tracing::warn!(
+                "[{}] bufr/wis2: cannot write state snapshot {}: {error} — the previous one \
+                 stays; retrying every {} min, this warning repeats at most every {} min",
+                self.collection_id,
+                writer.describe(),
+                STATE_WRITE_INTERVAL.as_secs() / 60,
+                STATE_WARN_INTERVAL.as_secs() / 60
+            ),
+            WriteOutcome::Failed { error, warn: false } => tracing::debug!(
+                "[{}] bufr/wis2: state snapshot write failed again: {error}",
+                self.collection_id
+            ),
+        }
     }
 
     /// Whether this collection is fed by a WIS2 subscription.
@@ -154,9 +358,13 @@ impl BufrEngine {
     /// Runtime health: `None` until the source has been probed once (boot
     /// snapshot stands), then Ready / Degraded from the source's state.
     pub fn live_health(&self) -> Option<LiveStatus> {
+        self.live_health_at(Utc::now())
+    }
+
+    fn live_health_at(&self, now: DateTime<Utc>) -> Option<LiveStatus> {
         match &self.source {
             Source::Local(_) => self.health.local_status(),
-            Source::Wis2(w) => Some(w.live_status(&self.health)),
+            Source::Wis2(w) => Some(w.live_status(&self.health, self.gauges().1 as u64, now)),
         }
     }
 
@@ -243,9 +451,7 @@ impl BufrEngine {
             Ok(d) => d,
             Err(e) => {
                 // No BUFR magic at all — the whole object is not a message.
-                self.health
-                    .decode_failures_total
-                    .fetch_add(1, Ordering::Relaxed);
+                self.health.record_decode_failure(e.kind());
                 tracing::debug!("[{}] bufr: '{label}' not decoded: {e}", self.collection_id);
                 return Err(e);
             }
@@ -253,20 +459,8 @@ impl BufrEngine {
         // Per-message failures: the other messages of a concatenated file
         // still ingest below.
         for e in &decoded.failed {
-            match e {
-                DecodeError::Unsupported(m) => {
-                    self.health
-                        .decode_unsupported_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!("[{}] bufr: '{label}' unsupported: {m}", self.collection_id);
-                }
-                e => {
-                    self.health
-                        .decode_failures_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!("[{}] bufr: '{label}' failed: {e}", self.collection_id);
-                }
-            }
+            self.health.record_decode_failure(e.kind());
+            tracing::debug!("[{}] bufr: '{label}' failed: {e}", self.collection_id);
         }
         self.health
             .subsets_skipped_total
@@ -381,17 +575,31 @@ impl BufrEngine {
     pub(crate) const SNAPSHOT_INTERVAL: Duration = SNAPSHOT_INTERVAL;
     pub(crate) const PRUNE_INTERVAL: Duration = PRUNE_INTERVAL;
 
+    /// Signal the poll loop to stop. With a state store, also flush the
+    /// snapshot (#1002): a graceful restart loses nothing, and the
+    /// snapshot's `written_at` records when the server went down.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
+        self.write_state(true);
     }
 
     // ---- query helpers -------------------------------------------------
 
-    fn selected_params(&self, parameters: Option<&[String]>) -> Vec<usize> {
-        match parameters {
-            Some(req) => req.iter().filter_map(|p| self.table.index_of(p)).collect(),
-            None => (0..self.table.len()).collect(),
-        }
+    /// The table columns `parameter-name` selects, through the shared rule:
+    /// an unknown name or an empty list is a 400 naming the valid ones, and
+    /// matching ignores case (#666, #966).
+    fn selected_params(
+        &self,
+        parameters: Option<&[String]>,
+    ) -> Result<Vec<usize>, DataServerError> {
+        let names = self.table.names();
+        let available: Vec<&str> = names.iter().map(String::as_str).collect();
+        Ok(
+            ds_core::edr_engine::select_parameters(parameters, &available)?
+                .into_iter()
+                .filter_map(|name| self.table.index_of(name))
+                .collect(),
+        )
     }
 
     /// Build one station's `PointSeries` coverage. `budget` is decremented
@@ -465,6 +673,70 @@ impl BufrEngine {
     }
 }
 
+/// The resolved `[bufr.wis2] warmup`: as configured, else the shorter of
+/// `retention` and [`ds_core::config::DEFAULT_WIS2_WARMUP`] (`PT24H`,
+/// CAP's default). The store is complete only once it holds a full
+/// retention window, but waiting for that kept a collection with a 7-day
+/// retention `degraded` for about a week after a cold start; a retention
+/// under a day still warms up for its own window. An explicit `warmup`
+/// keeps its value, even longer than a day or than `retention`.
+fn wis2_warmup(
+    w: &Wis2Config,
+    retention: chrono::Duration,
+) -> Result<chrono::Duration, DataServerError> {
+    let warmup = w.warmup_duration()?;
+    Ok(match w.warmup {
+        Some(_) => warmup,
+        None => warmup.min(retention),
+    })
+}
+
+/// The state snapshot write policy of a WIS2 collection with warm-up
+/// `warmup` (#1002), engine-cap's: a changed store at most every
+/// [`STATE_WRITE_INTERVAL`], an unchanged one at least every quarter of the
+/// warm-up, clamped to [`STATE_WRITE_INTERVAL`] ..=
+/// [`STATE_REFRESH_INTERVAL`]. The refresh keeps `written_at` close to the
+/// server's last breath even when the feed is quiet, so the long-outage
+/// check in [`BufrEngine::restore_state`] errs by at most that much.
+fn state_policy(warmup: chrono::Duration) -> WritePolicy {
+    let quarter = warmup.to_std().unwrap_or(Duration::ZERO) / 4;
+    WritePolicy {
+        min_interval: STATE_WRITE_INTERVAL,
+        refresh_interval: quarter.clamp(STATE_WRITE_INTERVAL, STATE_REFRESH_INTERVAL),
+        warn_interval: STATE_WARN_INTERVAL,
+    }
+}
+
+/// `26h05m` (negative ⇒ `0h00m`).
+fn hours_minutes(d: chrono::Duration) -> String {
+    let minutes = d.num_minutes().max(0);
+    format!("{}h{:02}m", minutes / 60, minutes % 60)
+}
+
+/// Whether `station` has at least one report INSIDE `interval`: the one
+/// `datetime` rule of Features `/items` and EDR `/locations` (#682, #932).
+/// `[first_report, last_report]` overlapping the interval is only the cheap
+/// prefilter (hourly SYNOP leaves gaps a narrow window can fall into); the
+/// rows themselves decide, one BTreeMap range probe. A reversed interval
+/// matches nothing (the API layers reject one; `range` would panic on it).
+fn has_report_in(store: &ObsStore, station: &StationInfo, interval: &DatetimeInterval) -> bool {
+    if let (Some(start), Some(end)) = (interval.start, interval.end) {
+        if start > end {
+            return false;
+        }
+    }
+    let overlaps = interval
+        .start
+        .is_none_or(|start| station.last_report >= start)
+        && interval.end.is_none_or(|end| station.first_report <= end);
+    overlaps
+        && store.get(&station.id).is_some_and(|series| {
+            let lo = interval.start.map_or(Bound::Unbounded, Bound::Included);
+            let hi = interval.end.map_or(Bound::Unbounded, Bound::Included);
+            series.rows.range((lo, hi)).next().is_some()
+        })
+}
+
 /// Rows are `f32` (BUFR values carry at most ~7 significant digits); widen
 /// back to the decimal the producer encoded rather than the binary
 /// expansion (`290.12`, not `290.1199951171875`).
@@ -477,8 +749,30 @@ fn round_stored(v: f32) -> f64 {
 // ---------------------------------------------------------------------------
 
 impl ds_core::edr_engine::EdrEngine for BufrEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        Ok(self.snapshot.load().locations.as_ref().clone())
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::clone(&self.snapshot.load().locations))
+    }
+
+    /// `/locations?datetime=` (#932): stations with a report inside one of
+    /// the intervals, the Features `datetime` rule (`has_report_in`). Holds
+    /// the store's read lock while the API filters the list, as one
+    /// `get_features` does.
+    fn location_time_filter<'a>(
+        &'a self,
+        intervals: &'a [DatetimeInterval],
+    ) -> Option<ds_core::edr_engine::LocationFilter<'a>> {
+        let snap = self.snapshot.load_full();
+        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+        Some(Box::new(move |location| {
+            snap.index
+                .get(location.id.as_str())
+                .and_then(|&i| snap.stations.get(i))
+                .is_some_and(|station| {
+                    intervals
+                        .iter()
+                        .any(|interval| has_report_in(&store, station, interval))
+                })
+        }))
     }
 
     fn query_location(
@@ -489,7 +783,7 @@ impl ds_core::edr_engine::EdrEngine for BufrEngine {
         _z: Option<&[f64]>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        let params = self.selected_params(parameters);
+        let params = self.selected_params(parameters)?;
         let store = self.store.read().unwrap_or_else(|e| e.into_inner());
         if store.get(location_id).is_none() {
             return Err(DataServerError::LocationNotFound(location_id.to_string()));
@@ -549,13 +843,7 @@ impl ds_core::edr_engine::EdrEngine for BufrEngine {
             .filter(|s| polygon.contains(s.lon, s.lat))
             .map(|s| &*s.id)
             .collect();
-        if inside.len() > MAX_STATIONS_IN_POLYGON {
-            return Err(DataServerError::QueryTooLarge(format!(
-                "{} stations inside the polygon (max {MAX_STATIONS_IN_POLYGON}) — narrow the area",
-                inside.len()
-            )));
-        }
-        let params = self.selected_params(parameters);
+        let params = self.selected_params(parameters)?;
         let store = self.store.read().unwrap_or_else(|e| e.into_inner());
         let mut budget = MAX_RESPONSE_VALUES;
         let mut out = Vec::with_capacity(inside.len());
@@ -589,6 +877,12 @@ impl ds_core::edr_engine::EdrEngine for BufrEngine {
             .map(|s| s.to_string())
             .collect()
     }
+
+    /// One `PointSeries` per station, at the station's decoded position
+    /// (the snapshot's `get_locations` entry): EDR GeoJSON names each (#929).
+    fn serves_station_series(&self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -621,10 +915,8 @@ impl FeatureEngine for BufrEngine {
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         let snap = self.snapshot.load();
         // `datetime`: a station matches when it has at least one report
-        // INSIDE the interval — `[first_report, last_report]` overlapping the
-        // interval is only the cheap prefilter (hourly SYNOP leaves gaps a
-        // narrow window can fall into), the rows themselves decide. One read
-        // lock for the whole filter; a BTreeMap range probe per candidate.
+        // inside the interval (`has_report_in`). One read lock for the whole
+        // filter.
         let store = query
             .datetime
             .as_ref()
@@ -638,16 +930,7 @@ impl FeatureEngine for BufrEngine {
                 None => true,
             })
             .filter(|(_, s)| match (&query.datetime, &store) {
-                (Some(dt), Some(store)) => {
-                    let overlaps = dt.start.is_none_or(|start| s.last_report >= start)
-                        && dt.end.is_none_or(|end| s.first_report <= end);
-                    overlaps
-                        && store.get(&s.id).is_some_and(|series| {
-                            let lo = dt.start.map_or(Bound::Unbounded, Bound::Included);
-                            let hi = dt.end.map_or(Bound::Unbounded, Bound::Included);
-                            series.rows.range((lo, hi)).next().is_some()
-                        })
-                }
+                (Some(dt), Some(store)) => has_report_in(store, s, dt),
                 _ => true,
             })
             .filter(|(f, _)| ds_core::feature::matches_property_filters(f, &query.property_filters))
@@ -754,6 +1037,11 @@ mod tests {
         let page = e.get_features(&query).unwrap();
         assert_eq!(page.number_matched, 1);
         assert_eq!(page.features[0].id, "gap-station");
+        // The station is the EDR location of its id (#1143).
+        assert_eq!(
+            page.features[0].related,
+            [ds_core::feature::Related::edr_location("gap-station")]
+        );
         query.offset = 1;
         assert_eq!(e.get_features(&query).unwrap().number_returned, 0);
         query
@@ -782,5 +1070,559 @@ mod tests {
         // Entirely outside: no match.
         assert!(!matched(Some(h(9, 1)), None));
         assert!(!matched(None, Some(h(7, 59))));
+    }
+
+    // ---- area: the value budget is the only bound (#1062) ------------------
+
+    /// 20 000 stations on a 200 × 100 grid (in the South Pacific, clear of
+    /// the fixtures), each reporting air temperature and station pressure at
+    /// `times`, in an engine whose `data_path` is an empty directory.
+    fn network(times: &[DateTime<Utc>]) -> (BufrEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BufrConfig {
+            data_path: Some(dir.path().to_string_lossy().into_owned()),
+            wis2: None,
+            poll_interval_secs: 60,
+            retention: "P36500D".to_string(),
+            max_stations: 50_000,
+            stale_after: "PT2H".to_string(),
+            position_radius_km: 25.0,
+            builtin_parameters: true,
+            parameters: Vec::new(),
+        };
+        let e = BufrEngine::new(&cfg, "bufr-network").unwrap();
+        {
+            let mut store = e.store.write().unwrap();
+            for n in 0..20_000u32 {
+                for &time in times {
+                    let report = crate::decode::ObsReport {
+                        lon: -170.0 + f64::from(n % 200) * 0.1,
+                        lat: -60.0 + f64::from(n / 200) * 0.1,
+                        elements: vec![
+                            crate::decode::Element {
+                                xy: crate::decode::XY { x: 12, y: 101 },
+                                value: 273.15 + f64::from(n % 30),
+                                period_hours: None,
+                            },
+                            crate::decode::Element {
+                                xy: crate::decode::XY { x: 10, y: 4 },
+                                value: 100_000.0 + f64::from(n % 50),
+                                period_hours: None,
+                            },
+                        ],
+                        ..report(&format!("0-20000-0-{n:05}"), time)
+                    };
+                    assert_ne!(store.ingest(&report, &e.table, time), Ingest::OutOfWindow);
+                }
+            }
+        }
+        e.rebuild_snapshot();
+        (e, dir)
+    }
+
+    const NETWORK_AREA: &str = "POLYGON((-171 -61,-149 -61,-149 -49,-171 -49,-171 -61))";
+
+    /// Every station's value at one instant is a basic observation request:
+    /// past the old 10 001-station ceiling, the 40 000 values fit the budget
+    /// and every station is in the answer.
+    #[test]
+    fn area_instant_over_twenty_thousand_stations_returns_every_station() {
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 12, 6, 0, 0).unwrap();
+        let (e, _dir) = network(&[t0]);
+        let params = ["air_temperature".to_string(), "pressure".to_string()];
+        let CoverageResponse::Collection(coverages) = e
+            .query_area(NETWORK_AREA, Some((t0, t0)), Some(&params), None, None)
+            .unwrap()
+        else {
+            panic!("an area query answers a collection");
+        };
+        assert_eq!(coverages.len(), 20_000);
+        let mut points = std::collections::HashSet::new();
+        for c in &coverages {
+            let DomainDescription::PointSeries { x, y, t, .. } = &c.domain else {
+                panic!("a station answers a PointSeries");
+            };
+            assert_eq!(t, &vec![t0]);
+            assert_eq!(c.ranges.len(), 2);
+            points.insert((x.to_bits(), y.to_bits()));
+        }
+        assert_eq!(points.len(), 20_000, "every station, each once");
+    }
+
+    /// The same polygon over a week of two reports with every parameter is
+    /// 880 000 values: the 400 names the value budget, not a station count.
+    #[test]
+    fn area_over_the_value_budget_is_a_400_naming_it() {
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 12, 6, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 9, 12, 7, 0, 0).unwrap();
+        let (e, _dir) = network(&[t0, t1]);
+        assert!(e.table.params.len() * 2 * 20_000 > MAX_RESPONSE_VALUES);
+        let week = (t1 - chrono::Duration::days(7), t1);
+        match e.query_area(NETWORK_AREA, Some(week), None, None, None) {
+            Err(DataServerError::QueryTooLarge(msg)) => {
+                assert!(msg.contains("500000 values"), "message: {msg}");
+            }
+            other => panic!("expected the value budget's QueryTooLarge, got {other:?}"),
+        }
+    }
+
+    // ---- state snapshots and warm-up (#1002) -----------------------------
+
+    use crate::decode::{Element, XY};
+    use crate::wis2::WarmupClock;
+    use ds_core::config::Wis2Config;
+    use ds_core::edr_engine::EdrEngine;
+    use ds_core::state::{FileStateStore, StateStore};
+
+    const ID: &str = "obs-wis2";
+
+    fn wis2_config(retention: &str, warmup: Option<&str>) -> BufrConfig {
+        BufrConfig {
+            data_path: None,
+            wis2: Some(Wis2Config {
+                topics: vec![
+                    "cache/a/wis2/se-smhi/data/core/weather/surface-based-observations/synop"
+                        .into(),
+                ],
+                warmup: warmup.map(String::from),
+                ..Wis2Config::default()
+            }),
+            poll_interval_secs: 60,
+            retention: retention.into(),
+            max_stations: 100,
+            stale_after: "PT2H".into(),
+            position_radius_km: 25.0,
+            builtin_parameters: true,
+            parameters: Vec::new(),
+        }
+    }
+
+    fn file_store(dir: &std::path::Path) -> Option<Arc<dyn StateStore>> {
+        Some(Arc::new(FileStateStore::new(dir)))
+    }
+
+    fn wis2(e: &BufrEngine) -> &Wis2Source {
+        match e.source() {
+            Source::Wis2(w) => w,
+            Source::Local(_) => panic!("not a WIS2 engine"),
+        }
+    }
+
+    /// `hours` before the top of the hour (fixed per test run, so a test
+    /// crossing an hour boundary still sees one timeline).
+    fn hours_ago(hours: i64) -> DateTime<Utc> {
+        static TOP: std::sync::LazyLock<DateTime<Utc>> = std::sync::LazyLock::new(|| {
+            let now = Utc::now().timestamp();
+            DateTime::from_timestamp(now - now.rem_euclid(3600), 0).unwrap()
+        });
+        *TOP - chrono::Duration::hours(hours)
+    }
+
+    /// Ingest one report (air temperature `kelvin`) as a payload would,
+    /// and publish it, as the poll loop's snapshot tick would.
+    fn put(e: &BufrEngine, station: &str, time: DateTime<Utc>, kelvin: f64) {
+        let report = crate::decode::ObsReport {
+            elements: vec![Element {
+                xy: XY { x: 12, y: 101 },
+                value: kelvin,
+                period_hours: None,
+            }],
+            name: Some(format!("Station {station}")),
+            ..report(station, time)
+        };
+        let outcome = e
+            .store
+            .write()
+            .unwrap()
+            .ingest(&report, &e.table, Utc::now());
+        assert_ne!(outcome, Ingest::OutOfWindow);
+        e.dirty.store(true, Ordering::Release);
+        e.snapshot_if_dirty();
+    }
+
+    /// `(station, time, air temperature bits)` of every row held.
+    fn rows(e: &BufrEngine) -> Vec<(String, DateTime<Utc>, u32)> {
+        let store = e.store.read().unwrap();
+        let mut out: Vec<_> = store
+            .stations()
+            .flat_map(|s| {
+                s.rows
+                    .iter()
+                    .map(|(t, r)| (s.info.id.to_string(), *t, r[0].to_bits()))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn snapshot_file(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(format!("{ID}.bufr.state"))
+    }
+
+    fn decode_file(dir: &std::path::Path, e: &BufrEngine) -> persist::Decoded {
+        let bytes = std::fs::read(snapshot_file(dir)).unwrap();
+        persist::decode(&bytes, ID, &e.table).unwrap()
+    }
+
+    #[test]
+    fn shutdown_flushes_the_store_and_the_next_build_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wis2_config("PT24H", None);
+        let a = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
+        assert_eq!(a.gauges(), (0, 0), "nothing to restore: a cold start");
+        put(&a, "A", hours_ago(2), 281.35);
+        put(&a, "A", hours_ago(1), 282.15);
+        put(&a, "B", hours_ago(0), 270.0);
+        let filling_since = hours_ago(30);
+        wis2(&a).mark_filling(filling_since);
+        assert!(!snapshot_file(dir.path()).exists());
+        a.shutdown();
+        assert!(snapshot_file(dir.path()).is_file());
+
+        let b = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
+        assert_eq!(b.gauges(), (2, 3), "served at once, before any broker");
+        assert_eq!(rows(&b), rows(&a));
+        assert_eq!(b.latest_report(), Some(hours_ago(0)));
+        let ids: Vec<String> = b
+            .get_locations()
+            .unwrap()
+            .iter()
+            .map(|l| l.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["A", "B"]);
+        assert_eq!(
+            wis2(&b).warmup_clock(),
+            WarmupClock {
+                filling_since: Some(filling_since),
+                cause: WarmupCause::ColdStart,
+            },
+            "the warm-up clock travels with the store"
+        );
+        // The state store holds what was restored: nothing to write until
+        // the store changes (or the refresh interval runs out).
+        let writer = b.state.as_ref().unwrap().lock().unwrap();
+        assert!(!writer.is_due(b.state_revision(), Instant::now(), false));
+        drop(writer);
+        put(&b, "C", hours_ago(0), 280.0);
+        let writer = b.state.as_ref().unwrap().lock().unwrap();
+        assert!(writer.is_due(b.state_revision(), Instant::now(), false));
+    }
+
+    #[test]
+    fn restore_prunes_what_the_current_retention_and_max_stations_reject() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = BufrEngine::new_with_state(&wis2_config("P2D", None), ID, file_store(dir.path()))
+            .unwrap();
+        put(&a, "A", hours_ago(40), 280.0);
+        put(&a, "A", hours_ago(30), 281.0);
+        put(&a, "A", hours_ago(1), 282.0);
+        put(&a, "OLD", hours_ago(30), 283.0);
+        put(&a, "NEW", hours_ago(0), 284.0);
+        a.shutdown();
+
+        // Retention shortened to a day since the snapshot: rows past it go,
+        // and a station left with none goes too.
+        let b = BufrEngine::new_with_state(&wis2_config("PT24H", None), ID, file_store(dir.path()))
+            .unwrap();
+        assert_eq!(b.gauges(), (2, 2));
+        let held: Vec<_> = rows(&b).into_iter().map(|(s, t, _)| (s, t)).collect();
+        assert_eq!(
+            held,
+            vec![("A".into(), hours_ago(1)), ("NEW".into(), hours_ago(0))]
+        );
+        let store = b.store.read().unwrap();
+        assert_eq!(store.get("A").unwrap().info.first_report, hours_ago(1));
+        drop(store);
+
+        // max_stations as well: the most recently seen station stays.
+        let c = BufrEngine::new_with_state(
+            &BufrConfig {
+                max_stations: 1,
+                ..wis2_config("P2D", None)
+            },
+            ID,
+            file_store(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(c.gauges(), (1, 1));
+        assert!(c.store.read().unwrap().get("NEW").is_some());
+    }
+
+    #[test]
+    fn corrupt_snapshot_is_a_cold_start_that_the_next_write_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wis2_config("PT24H", None);
+        std::fs::write(snapshot_file(dir.path()), b"\x1f\x8bnot really gzip").unwrap();
+        let e = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
+        assert_eq!(e.gauges(), (0, 0));
+        assert_eq!(wis2(&e).warmup_clock(), WarmupClock::default());
+        put(&e, "A", hours_ago(0), 280.0);
+        // The first tick writes (nothing was restored), replacing the file.
+        e.write_state(false);
+        assert_eq!(decode_file(dir.path(), &e).stations.len(), 1);
+
+        // Another collection's snapshot under this key is rejected as well.
+        let other = BufrEngine::new_with_state(&cfg, "other", None).unwrap();
+        put(&other, "Z", hours_ago(0), 280.0);
+        let bytes = persist::encode(
+            "other",
+            &other.store.read().unwrap(),
+            &other.table,
+            WarmupClock::default(),
+            Utc::now(),
+        )
+        .unwrap();
+        std::fs::write(snapshot_file(dir.path()), bytes).unwrap();
+        let f = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
+        assert_eq!(f.gauges(), (0, 0));
+    }
+
+    #[test]
+    fn unwritable_state_dir_never_fails_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("state");
+        std::fs::write(&blocker, b"").unwrap();
+        let e = BufrEngine::new_with_state(&wis2_config("PT24H", None), ID, file_store(&blocker))
+            .unwrap();
+        put(&e, "A", hours_ago(0), 280.0);
+        e.write_state(false);
+        e.shutdown();
+        assert_eq!(e.gauges(), (1, 1));
+    }
+
+    #[test]
+    fn data_path_collections_ignore_the_state_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BufrConfig {
+            data_path: Some(fixtures_dir()),
+            wis2: None,
+            retention: "P36500D".into(),
+            ..wis2_config("PT24H", None)
+        };
+        let e = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
+        assert!(e.gauges().1 > 0, "fixtures scanned");
+        assert!(e.state.is_none());
+        e.shutdown();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    fn warming(received: u64, cause: WarmupCause) -> Option<LiveStatus> {
+        Some(LiveStatus::WarmingUp {
+            received,
+            items: "reports",
+            cause,
+        })
+    }
+
+    /// A broker session that is up and delivering, and a decoded report.
+    fn connected(e: &BufrEngine) -> Arc<ds_wis2::Status> {
+        let status = Arc::new(ds_wis2::Status::new());
+        status.set_connected();
+        status.set_subscribed();
+        status.record_accepted(0);
+        wis2(e).set_status(status.clone());
+        e.health.mark_probed();
+        status
+    }
+
+    /// The default `warmup` is the shorter of `retention` and a day; an
+    /// explicit one keeps its value, whatever the retention.
+    #[test]
+    fn warmup_defaults_to_the_shorter_of_retention_and_a_day() {
+        let warmup = |retention: &str, warmup: Option<&str>| {
+            let e = BufrEngine::new(&wis2_config(retention, warmup), ID).unwrap();
+            wis2(&e).warmup()
+        };
+        let hours = chrono::Duration::hours;
+        // A retention longer than a day: a day.
+        assert_eq!(warmup("P7D", None), hours(24));
+        assert_eq!(warmup("PT36H", None), hours(24));
+        // A day or shorter: the retention window itself.
+        assert_eq!(warmup("PT24H", None), hours(24));
+        assert_eq!(warmup("PT6H", None), hours(6));
+        // Explicit: kept, shorter or longer than the default.
+        assert_eq!(warmup("P7D", Some("PT2H")), hours(2));
+        assert_eq!(warmup("P7D", Some("P7D")), hours(7 * 24));
+        assert_eq!(warmup("PT6H", Some("PT12H")), hours(12));
+    }
+
+    /// The default drives health: with a 7-day retention a cold start is
+    /// `Ready` a day after the subscription came up, not a week later, and
+    /// a snapshot written more than a day ago restarts the warm-up.
+    #[test]
+    fn a_week_of_retention_warms_up_for_a_day_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wis2_config("P7D", None);
+        let a = BufrEngine::new(&cfg, ID).unwrap();
+        connected(&a);
+        put(&a, "A", hours_ago(30), 280.0);
+        let t0 = Utc::now();
+        wis2(&a).mark_filling(t0);
+        let later = |h| t0 + chrono::Duration::hours(h);
+        assert_eq!(
+            a.live_health_at(later(23)),
+            warming(1, WarmupCause::ColdStart)
+        );
+        assert_eq!(a.live_health_at(later(25)), Some(LiveStatus::Ready));
+
+        let warm_since = Utc::now() - chrono::Duration::hours(48);
+        let restore = |written_hours_ago: i64| {
+            let bytes = persist::encode(
+                ID,
+                &a.store.read().unwrap(),
+                &a.table,
+                WarmupClock {
+                    filling_since: Some(warm_since),
+                    cause: WarmupCause::ColdStart,
+                },
+                Utc::now() - chrono::Duration::hours(written_hours_ago),
+            )
+            .unwrap();
+            FileStateStore::new(dir.path())
+                .save(&format!("{ID}.bufr"), &bytes)
+                .unwrap();
+            let e = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
+            assert_eq!(e.gauges(), (1, 1), "rows inside retention are kept");
+            wis2(&e).warmup_clock()
+        };
+        // Down for 20 hours: the clock is kept.
+        assert_eq!(restore(20).filling_since, Some(warm_since));
+        // Down for 30 hours: longer than the warm-up, which restarts.
+        assert_eq!(
+            restore(30),
+            WarmupClock {
+                filling_since: None,
+                cause: WarmupCause::LongOutage,
+            }
+        );
+    }
+
+    #[test]
+    fn cold_start_reports_warming_up_until_the_warmup_after_subscription() {
+        // No state store: every start is cold.
+        let e = BufrEngine::new(&wis2_config("PT24H", Some("PT1H")), ID).unwrap();
+        let status = connected(&e);
+        put(&e, "A", hours_ago(0), 280.0);
+        let t0 = Utc::now();
+        // Subscribed but the clock not started yet (the next tick does).
+        assert_eq!(e.live_health_at(t0), warming(1, WarmupCause::ColdStart));
+        assert_eq!(
+            e.live_health_at(t0).unwrap().degraded_reason().as_deref(),
+            Some("warming up after cold start: 1 reports received")
+        );
+        wis2(&e).mark_filling(t0);
+        let minutes = |m| t0 + chrono::Duration::minutes(m);
+        assert_eq!(
+            e.live_health_at(minutes(59)),
+            warming(1, WarmupCause::ColdStart)
+        );
+        // A broker blip inside degrade_after_secs does not end the warm-up.
+        status.set_disconnected();
+        assert_eq!(
+            e.live_health_at(minutes(59)),
+            warming(1, WarmupCause::ColdStart)
+        );
+        assert_eq!(e.live_health_at(minutes(61)), Some(LiveStatus::Ready));
+        status.set_connected();
+        status.set_subscribed();
+        assert_eq!(e.live_health_at(minutes(61)), Some(LiveStatus::Ready));
+        // A reconnect does not restart the clock.
+        wis2(&e).mark_filling(minutes(70));
+        assert_eq!(wis2(&e).warmup_clock().filling_since, Some(t0));
+    }
+
+    /// The server was down longer than `warmup`: the restored reports are
+    /// served, but the warm-up restarts — what the feed published meanwhile
+    /// is missing for good — and that is written back at once.
+    #[test]
+    fn a_snapshot_older_than_the_warmup_keeps_its_rows_but_restarts_the_warm_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wis2_config("PT24H", Some("PT1H"));
+        let a = BufrEngine::new(&cfg, ID).unwrap();
+        put(&a, "A", hours_ago(3), 280.0);
+        put(&a, "A", hours_ago(2), 281.0);
+        let warm_since = Utc::now() - chrono::Duration::hours(30);
+        let write = |written_at: DateTime<Utc>| {
+            let bytes = persist::encode(
+                ID,
+                &a.store.read().unwrap(),
+                &a.table,
+                WarmupClock {
+                    filling_since: Some(warm_since),
+                    cause: WarmupCause::ColdStart,
+                },
+                written_at,
+            )
+            .unwrap();
+            FileStateStore::new(dir.path())
+                .save(&format!("{ID}.bufr"), &bytes)
+                .unwrap();
+        };
+
+        // Last written 50 minutes ago: inside the warm-up, the clock is
+        // kept, so it is ready at once.
+        write(Utc::now() - chrono::Duration::minutes(50));
+        let fresh = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
+        connected(&fresh);
+        assert_eq!(fresh.live_health(), Some(LiveStatus::Ready));
+        assert_eq!(wis2(&fresh).warmup_clock().filling_since, Some(warm_since));
+
+        // Last written two hours ago: rows kept, warm-up restarted.
+        write(Utc::now() - chrono::Duration::hours(2));
+        let b = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
+        assert_eq!(b.gauges(), (1, 2));
+        assert_eq!(
+            wis2(&b).warmup_clock(),
+            WarmupClock {
+                filling_since: None,
+                cause: WarmupCause::LongOutage,
+            }
+        );
+        connected(&b);
+        assert_eq!(b.live_health(), warming(2, WarmupCause::LongOutage));
+        assert_eq!(
+            b.live_health().unwrap().degraded_reason().as_deref(),
+            Some("warming up after a long outage: 2 reports received")
+        );
+        // Written at the first tick, so a restart during the restarted
+        // warm-up keeps warming with the same wording.
+        b.write_state(false);
+        assert_eq!(
+            decode_file(dir.path(), &b).clock.cause,
+            WarmupCause::LongOutage
+        );
+        let c = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
+        connected(&c);
+        assert_eq!(c.live_health(), warming(2, WarmupCause::LongOutage));
+    }
+
+    #[test]
+    fn a_started_clock_is_written_before_any_report_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = BufrEngine::new_with_state(&wis2_config("PT24H", None), ID, file_store(dir.path()))
+            .unwrap();
+        e.write_state(false);
+        assert_eq!(decode_file(dir.path(), &e).clock.filling_since, None);
+        let revision = e.state_revision();
+        let t0 = hours_ago(0);
+        wis2(&e).mark_filling(t0);
+        assert_ne!(e.state_revision(), revision);
+        e.write_state(true);
+        assert_eq!(decode_file(dir.path(), &e).clock.filling_since, Some(t0));
+    }
+
+    #[test]
+    fn state_policy_refreshes_within_a_quarter_of_the_warmup() {
+        let refresh = |h: i64| state_policy(chrono::Duration::hours(h)).refresh_interval;
+        assert_eq!(refresh(24), STATE_REFRESH_INTERVAL);
+        assert_eq!(refresh(2), Duration::from_secs(30 * 60));
+        assert_eq!(
+            state_policy(chrono::Duration::minutes(10)).refresh_interval,
+            STATE_WRITE_INTERVAL
+        );
+        assert_eq!(
+            state_policy(chrono::Duration::hours(2)).min_interval,
+            STATE_WRITE_INTERVAL
+        );
     }
 }

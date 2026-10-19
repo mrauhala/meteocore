@@ -65,35 +65,46 @@ pub enum SourceUnit {
     Raw(&'static str),
 }
 
-/// Parse a WMO unit string (from Code Table 4.2 `UnitComments_en`) into a
-/// [`SourceUnit`]. Whitespace is trimmed but no other normalisation is
-/// performed. Anything unrecognised becomes [`SourceUnit::Raw`] carrying the
-/// input verbatim — but because we only call this with `&'static str` inputs
-/// from the table below, the `Raw` variant can hold a static string safely.
+/// Parse a unit string (WMO Code Table 4.2 `UnitComments_en`) into a
+/// [`SourceUnit`]. Spellings are read through
+/// [`ds_core::units::canonical_unit`] (`kg/m^2`, `kg m**-2` and `kg.m-2` are
+/// `kg m-2`; `degC` is `°C`), as [`ds_core::units::display_conversion`]
+/// reads them; WMO's words (`Proportion`, `(0 - 1)`, `Numeric`) and GRIB's
+/// `C` are matched as written. Anything unrecognised becomes
+/// [`SourceUnit::Raw`] carrying the input verbatim (trimmed) — but because
+/// we only call this with `&'static str` inputs, the `Raw` variant can hold
+/// a static string safely.
+///
+/// The lookup tables name their variants directly, so today only the tests
+/// call this: they check that each spelling it reads gets the same rule
+/// from [`default_display`] as from `display_conversion`. The variants the
+/// code tables assign from a parameter's meaning, [`SourceUnit::KelvinDifference`]
+/// and [`SourceUnit::MetresOfWater`], have no spelling and no string-keyed
+/// twin.
 ///
 /// Returns [`SourceUnit::Raw`] for unknown inputs.
 pub fn parse_source_unit(s: &'static str) -> SourceUnit {
-    match s.trim() {
+    match ds_core::units::canonical_unit(s).as_ref() {
         "K" => SourceUnit::Kelvin,
         "C" | "°C" => SourceUnit::Celsius,
         "Pa" => SourceUnit::Pascal,
         "hPa" => SourceUnit::Hectopascal,
-        "kg m-2" | "kg/m2" | "kg/m²" => SourceUnit::KgPerM2,
-        "kg m-2 s-1" | "kg/(m2 s)" | "kg m⁻² s⁻¹" => SourceUnit::KgPerM2PerS,
-        "m s-1" | "m/s" => SourceUnit::MetresPerSecond,
+        "kg m-2" => SourceUnit::KgPerM2,
+        "kg m-2 s-1" => SourceUnit::KgPerM2PerS,
+        "m s-1" => SourceUnit::MetresPerSecond,
         "m" => SourceUnit::Metres,
         "mm" => SourceUnit::Millimetres,
-        "m2 s-2" | "m² s⁻²" => SourceUnit::M2PerS2,
+        "m2 s-2" => SourceUnit::M2PerS2,
         "gpm" => SourceUnit::Gpm,
         "Proportion" | "(0 - 1)" | "proportion" => SourceUnit::Proportion,
         "%" => SourceUnit::Percent,
-        "J kg-1" | "J/kg" => SourceUnit::JoulesPerKg,
-        "J m-2" | "J/m2" => SourceUnit::JoulesPerM2,
-        "W m-2" | "W/m2" => SourceUnit::WattsPerM2,
-        "kg kg-1" | "kg/kg" => SourceUnit::KgPerKg,
-        "s-1" | "/s" | "1/s" => SourceUnit::InversePerSec,
+        "J kg-1" => SourceUnit::JoulesPerKg,
+        "J m-2" => SourceUnit::JoulesPerM2,
+        "W m-2" => SourceUnit::WattsPerM2,
+        "kg kg-1" => SourceUnit::KgPerKg,
+        "s-1" => SourceUnit::InversePerSec,
         "Numeric" | "" => SourceUnit::Dimensionless,
-        other => SourceUnit::Raw(other),
+        _ => SourceUnit::Raw(s.trim()),
     }
 }
 
@@ -158,6 +169,8 @@ fn standard_lookup(discipline: u8, category: u8, number: u8) -> Option<ParamInfo
         (0, 1, 64) => ("Total column integrated water vapour", SourceUnit::KgPerM2),
 
         // Category 2: momentum
+        (0, 2, 0) => ("Wind direction (from which blowing)", SourceUnit::Raw("°")),
+        (0, 2, 1) => ("Wind speed", SourceUnit::MetresPerSecond),
         (0, 2, 2) => ("u-component of wind", SourceUnit::MetresPerSecond),
         (0, 2, 3) => ("v-component of wind", SourceUnit::MetresPerSecond),
         (0, 2, 8) => ("Vertical velocity (pressure)", SourceUnit::Raw("Pa s-1")),
@@ -727,6 +740,176 @@ mod tests {
         assert_eq!(parse_source_unit("Proportion"), SourceUnit::Proportion);
         assert_eq!(parse_source_unit("%"), SourceUnit::Percent);
         assert_eq!(parse_source_unit("Numeric"), SourceUnit::Dimensionless);
+    }
+
+    /// Every spelling the old literal table listed still parses to its unit,
+    /// and so do the other spellings of the same unit.
+    #[test]
+    fn parse_reads_every_spelling() {
+        for (spellings, unit) in [
+            (
+                &["kg m-2", "kg/m2", "kg/m²", "kg/m^2", "kg m**-2", "kg.m-2"][..],
+                SourceUnit::KgPerM2,
+            ),
+            (
+                &["kg m-2 s-1", "kg/(m2 s)", "kg m⁻² s⁻¹", "kg/m2/s"][..],
+                SourceUnit::KgPerM2PerS,
+            ),
+            (
+                &["m s-1", "m/s", "m s**-1"][..],
+                SourceUnit::MetresPerSecond,
+            ),
+            (&["m2 s-2", "m² s⁻²", "m^2/s^2"][..], SourceUnit::M2PerS2),
+            (&["J kg-1", "J/kg"][..], SourceUnit::JoulesPerKg),
+            (&["J m-2", "J/m2"][..], SourceUnit::JoulesPerM2),
+            (&["W m-2", "W/m2"][..], SourceUnit::WattsPerM2),
+            (&["kg kg-1", "kg/kg"][..], SourceUnit::KgPerKg),
+            (&["s-1", "/s", "1/s"][..], SourceUnit::InversePerSec),
+            (&["C", "°C", "degC"][..], SourceUnit::Celsius),
+            (&["K", "kelvin"][..], SourceUnit::Kelvin),
+            (
+                &["Proportion", "(0 - 1)", "proportion"][..],
+                SourceUnit::Proportion,
+            ),
+            (&["Numeric", "", " "][..], SourceUnit::Dimensionless),
+        ] {
+            for spelling in spellings {
+                assert_eq!(parse_source_unit(spelling), unit, "{spelling:?}");
+            }
+        }
+    }
+
+    /// `ds_core::units::display_conversion` is this table's string-keyed
+    /// twin (engine-bufr's): for every spelling `parse_source_unit` reads,
+    /// the two give the same display unit and rule, and where ds_core has no
+    /// rule GRIB's display is an identity.
+    #[test]
+    fn display_rules_agree_with_ds_core_for_every_spelling() {
+        for spelling in [
+            "K",
+            "kelvin",
+            "Pa",
+            "kg m-2",
+            "kg/m^2",
+            "kg m**-2",
+            "kg.m-2",
+            "kg/m2",
+            "kg/m²",
+            "m2 s-2",
+            "m**2 s**-2",
+            "m^2/s^2",
+            "m² s⁻²",
+            "Proportion",
+            "proportion",
+            "(0 - 1)",
+        ] {
+            let core = ds_core::units::display_conversion(spelling).unwrap();
+            let grib = default_display(parse_source_unit(spelling));
+            assert_eq!(
+                (grib.display_unit, grib.scale, grib.offset),
+                (core.unit, core.scale, core.offset),
+                "{spelling}"
+            );
+        }
+        for spelling in [
+            "m s-1", "m/s", "%", "J/kg", "W m-2", "kg kg-1", "s-1", "/s", "degC", "°C", "hPa",
+            "mm", "m", "gpm", "Numeric", "1",
+        ] {
+            assert_eq!(ds_core::units::display_conversion(spelling), None);
+            assert!(
+                !default_display(parse_source_unit(spelling)).has_conversion(),
+                "{spelling}"
+            );
+        }
+    }
+
+    /// The WMO spelling of a variant, or `None` for the two the code tables
+    /// assign from a parameter's meaning: no unit string tells a temperature
+    /// difference from a temperature, or metres of water from metres.
+    /// Exhaustive, so a new variant must say how it is spelled.
+    fn wmo_spelling(unit: SourceUnit) -> Option<&'static str> {
+        Some(match unit {
+            SourceUnit::Kelvin => "K",
+            SourceUnit::KelvinDifference | SourceUnit::MetresOfWater => return None,
+            SourceUnit::Celsius => "C",
+            SourceUnit::Pascal => "Pa",
+            SourceUnit::Hectopascal => "hPa",
+            SourceUnit::KgPerM2 => "kg m-2",
+            SourceUnit::KgPerM2PerS => "kg m-2 s-1",
+            SourceUnit::MetresPerSecond => "m s-1",
+            SourceUnit::Metres => "m",
+            SourceUnit::Millimetres => "mm",
+            SourceUnit::M2PerS2 => "m2 s-2",
+            SourceUnit::Gpm => "gpm",
+            SourceUnit::Proportion => "Proportion",
+            SourceUnit::Percent => "%",
+            SourceUnit::JoulesPerKg => "J kg-1",
+            SourceUnit::JoulesPerM2 => "J m-2",
+            SourceUnit::WattsPerM2 => "W m-2",
+            SourceUnit::KgPerKg => "kg kg-1",
+            SourceUnit::InversePerSec => "s-1",
+            SourceUnit::Dimensionless => "Numeric",
+            SourceUnit::Raw(s) => s,
+        })
+    }
+
+    /// The table the lookups use, variant by variant: `default_display` of
+    /// every spelled `SourceUnit`, including the `Raw` units the tables
+    /// carry, gives ds_core's rule for its WMO spelling, or an identity
+    /// where ds_core has none. The two unspelled variants are GRIB-only.
+    #[test]
+    fn every_spelled_variant_has_ds_core_rule() {
+        let mut checked = 0;
+        for unit in [
+            SourceUnit::Kelvin,
+            SourceUnit::KelvinDifference,
+            SourceUnit::Celsius,
+            SourceUnit::Pascal,
+            SourceUnit::Hectopascal,
+            SourceUnit::KgPerM2,
+            SourceUnit::KgPerM2PerS,
+            SourceUnit::MetresPerSecond,
+            SourceUnit::Metres,
+            SourceUnit::MetresOfWater,
+            SourceUnit::Millimetres,
+            SourceUnit::M2PerS2,
+            SourceUnit::Gpm,
+            SourceUnit::Proportion,
+            SourceUnit::Percent,
+            SourceUnit::JoulesPerKg,
+            SourceUnit::JoulesPerM2,
+            SourceUnit::WattsPerM2,
+            SourceUnit::KgPerKg,
+            SourceUnit::InversePerSec,
+            SourceUnit::Dimensionless,
+            SourceUnit::Raw("°"),
+            SourceUnit::Raw("Pa s-1"),
+            SourceUnit::Raw("DU"),
+            SourceUnit::Raw("m3 m-3"),
+        ] {
+            let grib = default_display(unit);
+            let Some(spelling) = wmo_spelling(unit) else {
+                assert!(
+                    matches!(
+                        unit,
+                        SourceUnit::KelvinDifference | SourceUnit::MetresOfWater
+                    ),
+                    "{unit:?}"
+                );
+                continue;
+            };
+            assert_eq!(parse_source_unit(spelling), unit, "{spelling:?}");
+            match ds_core::units::display_conversion(spelling) {
+                Some(core) => assert_eq!(
+                    (grib.display_unit, grib.scale, grib.offset),
+                    (core.unit, core.scale, core.offset),
+                    "{unit:?}"
+                ),
+                None => assert!(!grib.has_conversion(), "{unit:?}"),
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 23);
     }
 
     #[test]

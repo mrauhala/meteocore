@@ -4,8 +4,18 @@ use std::collections::HashMap;
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, ParameterDescription, QueryResult, VerticalCoord,
 };
-use ds_core::units::qudt_unit;
+use ds_core::units::{is_ucum, qudt_unit, UCUM_TYPE};
 use serde_json::{json, Map, Number, Value};
+
+/// The media type every CoverageJSON response carries (#920): the
+/// registered CoverageJSON type, which OGC API - EDR 1.2 uses throughout.
+/// The one home for it: the data-query `Content-Type`, the `/locations`
+/// data links and the `/api` response content keys all read this constant.
+pub const COVERAGE_JSON_MEDIA_TYPE: &str = "application/vnd.cov+json";
+
+/// EDR 1.1's CoverageJSON media type. No longer sent; still accepted as an
+/// `f` value ([`crate::params::parse_edr_format`]) so 1.1 clients keep working.
+pub const LEGACY_COVERAGE_JSON_MEDIA_TYPE: &str = "application/prs.coverage+json";
 
 /// Pre-built reference system objects (shared across all responses).
 fn spatial_ref() -> Value {
@@ -56,10 +66,6 @@ pub const MAX_PARAMETER_LABEL_CHARS: usize = 50;
 /// `observedProperty.id` form of Metocean Profile Requirement 7F.
 pub const CF_STANDARD_NAME_BASE: &str = "https://vocab.nerc.ac.uk/standard_name/";
 
-/// `unit.symbol.type` of a unit QUDT has no entry for (`dBZ`): the engine's
-/// unit string stays the symbol value, typed as UCUM.
-const UCUM_SYMBOL_TYPE: &str = "http://www.opengis.net/def/uom/UCUM/";
-
 /// The parameter `label`: the engine's label, cut to at most
 /// [`MAX_PARAMETER_LABEL_CHARS`] characters (ellipsis included). The full
 /// text stays in the description and `observedProperty.label`.
@@ -95,23 +101,31 @@ fn cf_standard_name_uri(desc: &ParameterDescription) -> Option<String> {
 
 /// The `unit` object, or `None` when the engine knows no unit. A unit QUDT
 /// has an entry for carries its QUDT identifier and `qudt:symbol`
-/// (Metocean Requirement 7E); any other keeps the engine's string as a
-/// UCUM symbol. Valid in both EDR 1.1 and CoverageJSON.
+/// (Metocean Requirement 7E, a custom `type` EDR 1.2 `/req/edr/rc-parameters`
+/// G allows). Any other keeps the engine's string: typed
+/// `https://www.opengis.net/def/uom/UCUM/` when it is UCUM (`deg/km`, `1`),
+/// else a plain-string symbol with no scheme (`dBZ`, `gpm`, BUFR code
+/// tables), since G reserves the UCUM type for UCUM. Valid in both EDR 1.1
+/// and CoverageJSON, whose `symbol` is a string or a `{value, type}` object.
 fn build_unit(unit: &str) -> Option<Value> {
     let unit = unit.trim();
     if unit.is_empty() {
         return None;
     }
-    let (value, kind) = match qudt_unit(unit) {
-        Some(q) => (q.symbol.to_string(), q.uri()),
-        None => (unit.to_string(), UCUM_SYMBOL_TYPE.to_string()),
+    let typed = |value: &str, kind: String| {
+        let mut symbol = Map::with_capacity(2);
+        symbol.insert("value".into(), Value::String(value.into()));
+        symbol.insert("type".into(), Value::String(kind));
+        Value::Object(symbol)
     };
-    let mut symbol = Map::with_capacity(2);
-    symbol.insert("value".into(), Value::String(value));
-    symbol.insert("type".into(), Value::String(kind));
+    let symbol = match qudt_unit(unit) {
+        Some(q) => typed(q.symbol, q.uri()),
+        None if is_ucum(unit) => typed(unit, UCUM_TYPE.to_string()),
+        None => Value::String(unit.into()),
+    };
     let mut m = Map::with_capacity(2);
     m.insert("label".into(), i18n(unit));
-    m.insert("symbol".into(), Value::Object(symbol));
+    m.insert("symbol".into(), symbol);
     Some(Value::Object(m))
 }
 
@@ -122,18 +136,14 @@ fn i18n(text: &str) -> Value {
 }
 
 /// `observedProperty`: identified by the CF standard name URI when the
-/// engine knows one, else by `fallback_id` (if any) and described by
-/// `description` (Metocean Requirement 7F).
-fn build_observed_property(
-    desc: &ParameterDescription,
-    fallback_id: Option<&str>,
-    description: Value,
-) -> Value {
+/// engine knows one, else by the engine's observed-property name and
+/// described by `description` (Metocean Requirement 7F). EDR 1.2
+/// `/req/edr/rc-parameters` F requires the `id` either way.
+fn build_observed_property(desc: &ParameterDescription, description: Value) -> Value {
     let mut m = Map::with_capacity(3);
     let cf_id = cf_standard_name_uri(desc);
-    if let Some(id) = cf_id.as_deref().or(fallback_id) {
-        m.insert("id".into(), Value::String(id.into()));
-    }
+    let id = cf_id.as_deref().unwrap_or(&desc.observed_property);
+    m.insert("id".into(), Value::String(id.into()));
     m.insert("label".into(), i18n(&desc.label));
     if cf_id.is_none() {
         m.insert("description".into(), description);
@@ -143,10 +153,11 @@ fn build_observed_property(
 
 /// One entry of a collection's `parameter_names` (an EDR 1.1 parameter
 /// object: plain-string `label` and `description`). The coverage
-/// `parameters` of a data query say the same things (#273).
+/// `parameters` of a data query say the same things (#273), the same
+/// `observedProperty.id` included.
 pub fn collection_parameter_json(desc: &ParameterDescription) -> Value {
     let description = parameter_description(desc);
-    let observed = build_observed_property(desc, None, Value::String(description.clone()));
+    let observed = build_observed_property(desc, Value::String(description.clone()));
     let mut param = Map::with_capacity(6);
     param.insert("type".into(), Value::String("Parameter".into()));
     param.insert(
@@ -162,8 +173,9 @@ pub fn collection_parameter_json(desc: &ParameterDescription) -> Value {
 }
 
 /// A CoverageJSON parameter. Its short name is `observedProperty.label`:
-/// CoverageJSON asks to leave out a parameter `label` identical to it.
-fn build_parameter(desc: &ParameterDescription) -> Value {
+/// CoverageJSON asks to leave out a parameter `label` identical to it. The
+/// EDR GeoJSON `parameters` member lists the same objects (#929).
+pub(crate) fn build_parameter(desc: &ParameterDescription) -> Value {
     let description = parameter_description(desc);
     let mut param = Map::with_capacity(4);
     param.insert("type".into(), Value::String("Parameter".into()));
@@ -173,7 +185,7 @@ fn build_parameter(desc: &ParameterDescription) -> Value {
     }
     param.insert(
         "observedProperty".into(),
-        build_observed_property(desc, Some(&desc.observed_property), i18n(&description)),
+        build_observed_property(desc, i18n(&description)),
     );
     Value::Object(param)
 }
@@ -253,6 +265,7 @@ fn domain_type_name(domain: &DomainDescription) -> &'static str {
         DomainDescription::Grid { .. } => "Grid",
         DomainDescription::VerticalProfile { .. } => "VerticalProfile",
         DomainDescription::Section { .. } => "Section",
+        DomainDescription::Trajectory { .. } => "Trajectory",
     }
 }
 
@@ -433,6 +446,52 @@ fn build_domain(desc: &DomainDescription) -> Value {
             }
             Value::Object(domain)
         }
+        DomainDescription::Trajectory { nodes, node_z, z } => {
+            // The CoverageJSON 1.0 `Trajectory` domain: a composite axis of
+            // `[t, x, y]` tuples, or `[t, x, y, z]` when every node has its
+            // own level; a level the whole path shares is a single-valued
+            // `z` axis beside it (the only other axis the schema allows).
+            let mut referencing = vec![spatial_ref(), temporal_ref()];
+            let (coordinates, tuples): (Value, Vec<Value>) = match node_z {
+                Some(levels) => {
+                    referencing.push(vertical_ref(levels));
+                    (
+                        json!(["t", "x", "y", "z"]),
+                        nodes
+                            .iter()
+                            .zip(&levels.values)
+                            .map(|((t, x, y), z)| json!([t.to_rfc3339(), x, y, z]))
+                            .collect(),
+                    )
+                }
+                None => (
+                    json!(["t", "x", "y"]),
+                    nodes
+                        .iter()
+                        .map(|(t, x, y)| json!([t.to_rfc3339(), x, y]))
+                        .collect(),
+                ),
+            };
+            let mut axes = Map::new();
+            axes.insert(
+                "composite".into(),
+                json!({
+                    "dataType": "tuple",
+                    "coordinates": coordinates,
+                    "values": tuples,
+                }),
+            );
+            if let Some(zc) = z {
+                axes.insert("z".into(), json!({ "values": zc.values }));
+                referencing.push(vertical_ref(zc));
+            }
+            json!({
+                "type": "Domain",
+                "domainType": "Trajectory",
+                "axes": axes,
+                "referencing": referencing
+            })
+        }
     }
 }
 
@@ -444,7 +503,55 @@ pub struct LocationsContext<'a> {
     pub base_url: &'a str,
 }
 
-/// Serialize the complete EDR 1.1 location inventory directly into response
+/// The links of a `/locations` list that is not the plain complete
+/// inventory: one page of a list requested with `limit` (EDR 1.2, #922), or
+/// a list filtered by `bbox` or `datetime` (#932).
+pub struct LocationsPage<'a> {
+    /// A page's `numberMatched`: the size of the (filtered) list it was cut
+    /// from. `None` for an unpaged list, which carries no counts.
+    pub number_matched: Option<usize>,
+    /// `self`, then `next`/`prev` when they exist: `(href, rel, title)`.
+    pub links: &'a [(String, &'static str, &'static str)],
+}
+
+/// The locations a `/locations` response lists, borrowed from the engine's
+/// [`LocationSnapshot`](ds_core::model::LocationSnapshot) (#1083): a run of
+/// the inventory (all of it, or a page), or the locations a `bbox` or
+/// `datetime` filter kept (all of them, or a page). Never a copy.
+#[derive(Clone, Copy)]
+pub(crate) enum LocationRows<'a> {
+    /// Consecutive locations of the inventory, in its order.
+    Run(&'a [Location]),
+    /// The locations a filter kept, in inventory order.
+    Kept(&'a [&'a Location]),
+}
+
+impl<'a> LocationRows<'a> {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Run(run) => run.len(),
+            Self::Kept(kept) => kept.len(),
+        }
+    }
+
+    /// The rows in `range`: one page.
+    pub(crate) fn page(self, range: std::ops::Range<usize>) -> Self {
+        match self {
+            Self::Run(run) => Self::Run(&run[range]),
+            Self::Kept(kept) => Self::Kept(&kept[range]),
+        }
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = &'a Location> {
+        let (run, kept): (&[Location], &[&Location]) = match self {
+            Self::Run(run) => (run, &[]),
+            Self::Kept(kept) => (&[], kept),
+        };
+        run.iter().chain(kept.iter().copied())
+    }
+}
+
+/// Serialize the complete EDR location inventory directly into response
 /// bytes. Only one feature's links are allocated at a time; parameter and
 /// temporal metadata are borrowed instead of cloned into a full JSON tree.
 pub fn locations_to_json(
@@ -452,15 +559,19 @@ pub fn locations_to_json(
     ctx: &LocationsContext,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = Vec::new();
-    locations_to_writer(locations, ctx, &mut bytes)?;
+    locations_to_writer(LocationRows::Run(locations), ctx, None, &mut bytes)?;
     Ok(bytes)
 }
 
 /// Serialize into an admitted writer so size/deadline/memory failures stop
 /// construction before an unbounded response buffer has been allocated.
+/// `page` is `None` for the complete inventory, whose body stays exactly the
+/// pre-paging one (no counts, one `self` link); otherwise its links replace
+/// that `self` link, and a page adds `numberMatched` and `numberReturned`.
 pub(crate) fn locations_to_writer(
-    locations: &[Location],
+    locations: LocationRows<'_>,
     ctx: &LocationsContext,
+    page: Option<&LocationsPage>,
     writer: impl std::io::Write,
 ) -> Result<(), serde_json::Error> {
     let datetime = ctx
@@ -472,6 +583,24 @@ pub(crate) fn locations_to_writer(
         "{}/edr/collections/{}/locations",
         ctx.base_url, ctx.collection_id
     );
+    let links: Vec<LocationLink> = match page {
+        None => vec![LocationLink {
+            href: &href,
+            rel: "self",
+            title: "Locations",
+            kind: "application/geo+json",
+        }],
+        Some(page) => page
+            .links
+            .iter()
+            .map(|(href, rel, title)| LocationLink {
+                href,
+                rel,
+                title,
+                kind: "application/geo+json",
+            })
+            .collect(),
+    };
     serde_json::to_writer(
         writer,
         &LocationCollection {
@@ -480,12 +609,9 @@ pub(crate) fn locations_to_writer(
                 ctx,
                 datetime: &datetime,
             },
-            links: [LocationLink {
-                href: &href,
-                rel: "self",
-                title: "Locations",
-                kind: "application/geo+json",
-            }],
+            links,
+            number_matched: page.and_then(|p| p.number_matched),
+            number_returned: page.and_then(|p| p.number_matched).map(|_| locations.len()),
             kind: "FeatureCollection",
         },
     )
@@ -494,13 +620,17 @@ pub(crate) fn locations_to_writer(
 #[derive(serde::Serialize)]
 struct LocationCollection<'a> {
     features: LocationFeatures<'a>,
-    links: [LocationLink<'a>; 1],
+    links: Vec<LocationLink<'a>>,
+    #[serde(rename = "numberMatched", skip_serializing_if = "Option::is_none")]
+    number_matched: Option<usize>,
+    #[serde(rename = "numberReturned", skip_serializing_if = "Option::is_none")]
+    number_returned: Option<usize>,
     #[serde(rename = "type")]
     kind: &'static str,
 }
 
 struct LocationFeatures<'a> {
-    locations: &'a [Location],
+    locations: LocationRows<'a>,
     ctx: &'a LocationsContext<'a>,
     datetime: &'a str,
 }
@@ -537,7 +667,7 @@ struct LocationProperties<'a> {
 #[derive(serde::Serialize)]
 struct LocationLink<'a> {
     href: &'a str,
-    rel: &'static str,
+    rel: &'a str,
     title: &'a str,
     #[serde(rename = "type")]
     kind: &'static str,
@@ -547,10 +677,14 @@ impl serde::Serialize for LocationFeatures<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut sequence = serializer.serialize_seq(Some(self.locations.len()))?;
-        for loc in self.locations {
+        for loc in self.locations.iter() {
+            // Ids are free text (CSV station names with spaces and
+            // non-ASCII letters): encoded, the link is a valid RFC 3986 URI.
             let endpoint = format!(
                 "{}/edr/collections/{}/locations/{}",
-                self.ctx.base_url, self.ctx.collection_id, loc.id
+                self.ctx.base_url,
+                self.ctx.collection_id,
+                crate::geojson::encode_path_segment(&loc.id)
             );
             let title = format!("Data for {}", loc.label);
             sequence.serialize_element(&LocationFeature {
@@ -563,7 +697,7 @@ impl serde::Serialize for LocationFeatures<'_> {
                     href: &endpoint,
                     rel: "data",
                     title: &title,
-                    kind: "application/prs.coverage+json",
+                    kind: COVERAGE_JSON_MEDIA_TYPE,
                 }],
                 properties: LocationProperties {
                     datetime: self.datetime,
@@ -605,7 +739,7 @@ mod location_tests {
                 "type": "Feature", "id": "station-1",
                 "geometry": { "type": "Point", "coordinates": [24.0, 60.0] },
                 "properties": { "label": label, "datetime": "2026-01-01T00:00:00Z/2026-01-02T00:00:00Z", "parameter-name": params, "edrqueryendpoint": endpoint },
-                "links": [{ "href": endpoint, "rel": "data", "type": "application/prs.coverage+json", "title": format!("Data for {label}") }]
+                "links": [{ "href": endpoint, "rel": "data", "type": "application/vnd.cov+json", "title": format!("Data for {label}") }]
             }],
             "links": [{ "href": "https://example.org/prefix/edr/collections/weather/locations", "rel": "self", "type": "application/geo+json", "title": "Locations" }]
         });
@@ -617,5 +751,79 @@ mod location_tests {
         let empty: Value = serde_json::from_slice(&locations_to_json(&[], &ctx).unwrap()).unwrap();
         assert_eq!(empty["features"], json!([]));
         assert_eq!(empty["links"], expected["links"]);
+
+        // A page carries its counts and navigation links instead.
+        let links = [
+            (format!("{endpoint}?limit=1"), "self", "This page"),
+            (format!("{endpoint}?limit=1&offset=1"), "next", "Next page"),
+        ];
+        let mut bytes = Vec::new();
+        let page = LocationsPage {
+            number_matched: Some(7),
+            links: &links,
+        };
+        locations_to_writer(
+            LocationRows::Run(&[Location {
+                id: "station-1".into(),
+                label: "x".into(),
+                latitude: 60.0,
+                longitude: 24.0,
+            }]),
+            &ctx,
+            Some(&page),
+            &mut bytes,
+        )
+        .unwrap();
+        let paged: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(paged["numberMatched"], 7);
+        assert_eq!(paged["numberReturned"], 1);
+        assert_eq!(paged["links"][1]["rel"], "next");
+        assert_eq!(paged["links"][1]["type"], "application/geo+json");
+
+        // An unpaged filtered list: its own `self` link, no counts.
+        let self_href = format!("{endpoint}?bbox=0,0,1,1");
+        let links = [(self_href.clone(), "self", "Locations")];
+        let filtered = LocationsPage {
+            number_matched: None,
+            links: &links,
+        };
+        let mut bytes = Vec::new();
+        locations_to_writer(LocationRows::Kept(&[]), &ctx, Some(&filtered), &mut bytes).unwrap();
+        let filtered: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(filtered.get("numberMatched").is_none());
+        assert!(filtered.get("numberReturned").is_none());
+        assert_eq!(
+            filtered["links"],
+            json!([{ "href": self_href, "rel": "self", "title": "Locations", "type": "application/geo+json" }])
+        );
+    }
+
+    /// A free-text id (a CSV station name) is percent-encoded in the data
+    /// link and `edrqueryendpoint`, so both are valid RFC 3986 URIs; the
+    /// feature id and label keep the text.
+    #[test]
+    fn location_links_percent_encode_the_id() {
+        let params = vec!["t".into()];
+        let ctx = LocationsContext {
+            collection_id: "weather",
+            parameter_names: &params,
+            temporal_extent: None,
+            base_url: "https://example.org",
+        };
+        let location = Location {
+            id: "Alajärvi Möksy".into(),
+            label: "Alajärvi Möksy".into(),
+            latitude: 63.1,
+            longitude: 24.3,
+        };
+        let doc: Value =
+            serde_json::from_slice(&locations_to_json(&[location], &ctx).unwrap()).unwrap();
+        let feature = &doc["features"][0];
+        let endpoint =
+            "https://example.org/edr/collections/weather/locations/Alaj%C3%A4rvi%20M%C3%B6ksy";
+        assert_eq!(feature["properties"]["edrqueryendpoint"], endpoint);
+        assert_eq!(feature["links"][0]["href"], endpoint);
+        assert_eq!(feature["id"], "Alajärvi Möksy");
+        assert_eq!(feature["properties"]["label"], "Alajärvi Möksy");
     }
 }

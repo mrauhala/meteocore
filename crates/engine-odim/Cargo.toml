@@ -2,6 +2,7 @@
 name = "engine-odim"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 ds-core = { path = "../core" }
@@ -13,7 +14,8 @@ chrono = { version = "0.4", features = ["serde"] }
 arc-swap = "1"
 quick_cache = "0.6"
 ds-cache = { path = "../ds-cache" }
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+ds-executor = { path = "../ds-executor" }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -24,3 +26,6 @@ chrono = { version = "0.4", features = ["serde"] }
 # 3D Tiles encoding for the gen_3dtiles example + VolumeEngine integration test.
 ds-3dtiles = { path = "../ds-3dtiles" }
 ds-render = { path = "../render" }
+# The GET-counting object store of the shared volume read tests (#1127).
+async-trait = "0.1"
+futures = "0.3"

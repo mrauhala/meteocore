@@ -45,12 +45,14 @@ pub struct ParameterDefault {
     /// and no `min`/`max`, an unmatched unit means the rule does not apply.
     pub min: Option<f64>,
     pub max: Option<f64>,
-    /// Unit-gated ranges, matched against the collection's unit hint.
+    /// Unit-gated ranges, matched against the parameter's unit in any
+    /// spelling ([`crate::units::canonical_unit`]: `unit = "m/s"` matches
+    /// `m s-1`, `kg/m^2` matches `kg m-2`).
     #[serde(default)]
     pub unit_ranges: Vec<UnitRange>,
 }
 
-/// One unit-alias → range entry inside `[[parameter_defaults]]`.
+/// One unit → range entry inside `[[parameter_defaults]]`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnitRange {
     pub unit: String,
@@ -117,6 +119,18 @@ pub struct ServerSettings {
     /// survive reloads, so a change needs a restart.
     #[serde(default)]
     pub render_concurrency: Option<usize>,
+    /// Directory for engine state snapshots (#1000): the file backend of
+    /// `ds_core::state::StateStore`. A WIS2-fed CAP collection writes its
+    /// alert accumulator under the key `<collection id>.cap`, the file
+    /// `<state_dir>/<collection id>.cap.state`, and restores it when the
+    /// collection is built, so a restart does not empty the warning set.
+    /// Resolved relative to the parent directory of the main config file,
+    /// like `collections_dir`, and created at boot.
+    /// Unset (default) = no persistence. Needs a writable mount: a failed
+    /// write is a rate-limited WARN, never a load failure. Fixed at boot: a
+    /// reload that changes it logs a warning; restart to apply.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub state_dir: Option<String>,
 }
 
 /// Upper bound for `[server] render_concurrency`. Each slot runs its render
@@ -136,6 +150,16 @@ impl ServerSettings {
             Some(url) => url.trim_end_matches('/').to_string(),
             None => format!("http://{}:{}", self.host, self.port),
         }
+    }
+
+    /// `state_dir` resolved against the directory of the config file at
+    /// `config_path` (an absolute `state_dir` stays as it is).
+    pub fn state_dir_path(&self, config_path: &std::path::Path) -> Option<std::path::PathBuf> {
+        let dir = self.state_dir.as_deref()?;
+        let parent = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        Some(parent.join(dir))
     }
 }
 
@@ -161,6 +185,7 @@ impl ServerConfig {
                 watch_debounce_ms: default_watch_debounce_ms(),
                 trust_proxy_headers: false,
                 render_concurrency: None,
+                state_dir: None,
             },
             collections: Vec::new(),
             style_bundles: Vec::new(),
@@ -250,12 +275,42 @@ pub struct CollectionConfig {
     /// Nowcast derived-collection configuration. Required when
     /// engine_type = "nowcast".
     pub nowcast: Option<NowcastConfig>,
+    /// Station-grid derived-collection configuration. Required when
+    /// engine_type = "station-grid".
+    pub station_grid: Option<StationGridConfig>,
     /// BUFR surface-observation engine (`engine_type = "bufr"`).
     pub bufr: Option<BufrConfig>,
     /// Geostationary satellite imagery (`engine_type = "satellite"`).
     pub satellite: Option<SatelliteConfig>,
+    /// CF-NetCDF gridded data (`engine_type = "netcdf"`).
+    pub netcdf: Option<NetcdfConfig>,
     /// Preview-SPA-specific tuning (e.g. bound the time slider). Optional.
     pub preview: Option<PreviewConfig>,
+    /// Wind speed and direction derived from u/v component pairs (#897,
+    /// `ds_core::wind`). Unset or `true` derives them for the engines that
+    /// report their components (`grib`, `querydata`, `zarr`, `netcdf`); `false` opts
+    /// the collection out. Any other engine type rejects the key at load.
+    #[serde(default)]
+    pub derive_wind: Option<bool>,
+}
+
+/// The engine types whose collections derive wind from u/v components.
+pub const DERIVE_WIND_ENGINES: [&str; 4] = ["grib", "querydata", "zarr", "netcdf"];
+
+impl CollectionConfig {
+    /// Whether this collection serves wind derived from u/v components:
+    /// on by default for [`DERIVE_WIND_ENGINES`], off with
+    /// `derive_wind = false`.
+    pub fn derives_wind(&self) -> bool {
+        DERIVE_WIND_ENGINES.contains(&self.engine_type.as_str()) && self.derive_wind != Some(false)
+    }
+
+    /// The collection's default WebP quality, `[wms] webp_quality`: what a
+    /// WebP map or tile request without its own quality is encoded at.
+    /// `None` = lossless.
+    pub fn webp_quality(&self) -> Option<u8> {
+        self.wms.as_ref()?.webp_quality
+    }
 }
 
 /// Configuration for the nowcast derived-collection engine (#522): wraps an
@@ -410,6 +465,101 @@ fn default_nowcast_min_echo() -> f64 {
     10.0
 }
 
+/// Configuration for the station-grid derived collection (#1082): one time
+/// slice of a station collection's observations interpolated onto a regular
+/// CRS84 analysis grid, served through WMS, Maps, Tiles and EDR. The engine
+/// (`engine-station-grid`) checks the values when it is built; a bad value
+/// fails the collection, not the whole config.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StationGridConfig {
+    /// Collection id of the station collection to grid (`csv`, `bufr` or a
+    /// `postgis` stations shape) in the same config.
+    pub source: String,
+    /// The source parameters to grid, each a layer of its own.
+    pub parameters: Vec<String>,
+    /// The analysis grid.
+    pub grid: StationGridGeometry,
+    /// `"idw"` (Shepard inverse-distance weighting, the default), `"adw"`
+    /// (angular distance weighting) or `"nearest"`.
+    #[serde(default = "default_station_grid_method")]
+    pub method: String,
+    /// IDW: the power of the inverse distance (default 2). ADW: the exponent
+    /// of the exponential distance decay (default 4). Not for `nearest`.
+    #[serde(default)]
+    pub power: Option<f64>,
+    /// ADW only: the correlation decay length in km (default
+    /// `search_radius_km`).
+    #[serde(default)]
+    pub correlation_length_km: Option<f64>,
+    /// Stations each cell is interpolated from at most (default 8).
+    #[serde(default = "default_station_grid_neighbours")]
+    pub max_neighbours: usize,
+    /// Stations farther than this from a cell are not used; a cell with
+    /// none is nodata (default 150 km).
+    #[serde(default = "default_station_grid_radius_km")]
+    pub search_radius_km: f64,
+    /// A station's value at an analysis time is its latest observation not
+    /// after that time and at most this old, ISO 8601 (default `PT1H`).
+    #[serde(default = "default_station_grid_max_age")]
+    pub max_age: String,
+    /// Analysis times every `cadence` (ISO 8601, aligned to 00:00 UTC) over
+    /// the source's temporal extent. Unset: the source's own observation
+    /// instants, for a source that lists them.
+    #[serde(default)]
+    pub cadence: Option<String>,
+    /// How often the source is checked for new and revised observations.
+    #[serde(default = "default_station_grid_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// The latest analysis times computed ahead of requests, per parameter,
+    /// and re-checked for late observations on every poll (default 3).
+    #[serde(default = "default_station_grid_precompute")]
+    pub precompute: usize,
+}
+
+/// The analysis grid of a [`StationGridConfig`].
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StationGridGeometry {
+    /// The grid's CRS: CRS84 (`"EPSG:4326"`, `"CRS:84"` or `"OGC:CRS84"`)
+    /// in phase 1.
+    #[serde(default = "default_station_grid_crs")]
+    pub crs: String,
+    /// `[west, south, east, north]` in degrees; `west > east` crosses the
+    /// antimeridian.
+    pub bbox: [f64; 4],
+    /// Cell size in degrees.
+    pub resolution: f64,
+}
+
+fn default_station_grid_method() -> String {
+    "idw".to_string()
+}
+
+fn default_station_grid_neighbours() -> usize {
+    8
+}
+
+fn default_station_grid_radius_km() -> f64 {
+    150.0
+}
+
+fn default_station_grid_max_age() -> String {
+    "PT1H".to_string()
+}
+
+fn default_station_grid_poll_interval() -> u64 {
+    60
+}
+
+fn default_station_grid_precompute() -> usize {
+    3
+}
+
+fn default_station_grid_crs() -> String {
+    "EPSG:4326".to_string()
+}
+
 /// License metadata for a collection's data.
 ///
 /// Rendered as an OGC `rel="license"` link in the JSON APIs (href =
@@ -430,6 +580,13 @@ pub struct LicenseConfig {
     /// [`resolved_url`]: Self::resolved_url
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
     pub url: Option<String>,
+    /// Media type of the document at `url` (`type` in TOML): the license
+    /// link's `type`, which every OGC API link carries (EDR 1.2
+    /// `/req/core/rc-collection-info-links` B). Absent, it is `text/html`,
+    /// what a license page and the synthesized `spdx.org` URL serve. Only
+    /// valid together with `url`.
+    #[serde(default, rename = "type", deserialize_with = "de_trimmed_opt_string")]
+    pub media_type: Option<String>,
 }
 
 impl LicenseConfig {
@@ -469,6 +626,12 @@ impl LicenseConfig {
         self.resolved_url().map(|url| (self.title.clone(), url))
     }
 
+    /// The media type of the [`card_link`](Self::card_link) target: the
+    /// configured `type`, else `text/html`.
+    pub fn link_type(&self) -> &str {
+        self.media_type.as_deref().unwrap_or("text/html")
+    }
+
     /// `(title, href?)` for **display** contexts (HTML cards) that show the
     /// license name even when no URL resolves. Unlike [`card_link`](Self::card_link)
     /// this always yields the title; the href is `None` for a free-text license
@@ -476,6 +639,20 @@ impl LicenseConfig {
     pub fn card_label(&self) -> (String, Option<String>) {
         (self.title.clone(), self.resolved_url())
     }
+}
+
+/// `type/subtype` of RFC 6838 restricted-name characters, optionally followed
+/// by `;` parameters: enough to reject a typo or a bare word.
+fn is_media_type(value: &str) -> bool {
+    let token = |t: &str| {
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+    };
+    let essence = value.split(';').next().unwrap_or_default().trim();
+    essence
+        .split_once('/')
+        .is_some_and(|(kind, subtype)| token(kind) && token(subtype))
 }
 
 /// Preview-SPA tuning knobs. Only affects what `/preview/manifest.json`
@@ -522,13 +699,23 @@ pub struct WmsConfig {
     /// Parameters not listed here use the top-level `colormap`/`min`/`max`.
     #[serde(default)]
     pub parameters: Vec<WmsParameterConfig>,
-    /// Rendered image cache size in MB. Default: 128.
+    /// Rendered image cache size in MB. Default:
+    /// [`DEFAULT_RENDERED_CACHE_MB`].
     ///
     /// NOTE: like the meta-tile cache, this is actually a *global* shared cache,
     /// not per-collection; it lives here for backward compatibility. New global
     /// cache knobs (e.g. `[server] metatile_cache_mb`) go under `[server]`.
     #[serde(default = "default_rendered_cache_mb")]
     pub rendered_cache_mb: u64,
+    /// Default WebP quality for this collection's WMS, Maps and Tiles
+    /// images, 1–100: 1–99 is lossy WebP at that quality, 100 lossless.
+    /// Applies when a WebP request names no `QUALITY` / `quality`; an
+    /// explicit one wins, including 100 for lossless. Unset = lossless.
+    /// Continuous-tone layers such as satellite IR are several times smaller
+    /// and faster to encode lossy; keep colormapped radar classes lossless.
+    /// Collection-level only: not part of style bundles, which carry styles.
+    #[serde(default)]
+    pub webp_quality: Option<u8>,
 }
 
 /// Per-parameter default colormap configuration for WMS.
@@ -586,8 +773,20 @@ pub struct ColorStop {
     pub color: String,
 }
 
+/// Default size of the shared rendered-image cache, in MB, when no
+/// collection's `[wms] rendered_cache_mb` sets it (#1010).
+///
+/// Sized on a day of WMS GetMaps from a live deployment (85 000 requests,
+/// all viewports; 4 % repeated an earlier request exactly). Replaying those
+/// repeats through the cache served 1 900 of them at 128 MB, 2 300 at
+/// 256 MB and 2 200 at 512 MB. 256 MB holds roughly the last 25 minutes of
+/// renders, and about 1 hit in 8 reuses an older image, so the step down
+/// from 512 MB costs at most that share. The meta-tile cache (`[server]
+/// metatile_cache_mb`) is the one whose hit rate grows with memory.
+pub const DEFAULT_RENDERED_CACHE_MB: u64 = 256;
+
 fn default_rendered_cache_mb() -> u64 {
-    512
+    DEFAULT_RENDERED_CACHE_MB
 }
 
 fn default_metatile_cache_mb() -> u64 {
@@ -805,7 +1004,8 @@ pub struct GeoTiffConfig {
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
     /// Glob patterns for files to exclude (e.g. temporary files).
-    /// Default: ["*.tmp", "*.part"]
+    /// Default: ["*.tmp", "*.part"] ([`crate::temp_files::PARTIAL_SUFFIXES`]).
+    /// Hidden (`.name`) files are skipped whatever this holds (#1009).
     #[serde(default = "default_exclude_patterns")]
     pub exclude_patterns: Vec<String>,
     /// Maximum number of files to keep in the catalog (most recent by timestamp).
@@ -885,7 +1085,7 @@ fn default_querydata_max_runs() -> usize {
 }
 
 fn default_exclude_patterns() -> Vec<String> {
-    vec!["*.tmp".to_string(), "*.part".to_string()]
+    crate::temp_files::partial_exclude_patterns()
 }
 
 fn default_engine_type() -> String {
@@ -978,7 +1178,11 @@ pub struct BufrConfig {
     pub data_path: Option<String>,
     /// WIS2 subscription (typically
     /// `cache/a/wis2/<centre-id>/data/core/weather/surface-based-observations/synop`).
-    /// Mutually exclusive with `data_path`.
+    /// Mutually exclusive with `data_path`. Only this mode snapshots its
+    /// store into `[server] state_dir` across restarts (#1002) — a
+    /// `data_path` source re-reads its files — and only it has warm-up
+    /// health; its `warmup` defaults to the shorter of `retention` and
+    /// [`DEFAULT_WIS2_WARMUP`] (`PT24H`).
     #[serde(default)]
     pub wis2: Option<Wis2Config>,
     /// `data_path` mode: seconds between directory scans (default 60).
@@ -1148,6 +1352,10 @@ pub struct SatelliteConfig {
     /// `"isatss"`: Himawari AHI ISatSS tiles as NOAA publishes them for
     /// Himawari-9, `AHI-L2-FLDK-ISatSS/%Y/%m/%d/%H%M/OR_<sector>-…-T<tile>_…`,
     /// one scan being 88 tile files.
+    /// `"gmgsi"`: NOAA's hourly Global Mosaic of Geostationary Satellite
+    /// Imagery, `GMGSI_<product>/%Y/%m/%d/%H/GLOBCOMP…_s<start>_…nc`, one
+    /// global spherical-Mercator file per hour. Its values are 8-bit display
+    /// counts, not physical units.
     /// `"gk2a"`: KMA GK2A AMI L1B NetCDF-4 as NOAA publishes it,
     /// `AMI/L1B/<sector>/%Y%m/%d/%H/gk2a_ami_le1b_<channel>_…_<%Y%m%d%H%M>.nc`,
     /// counts calibrated to brightness temperature on ingest.
@@ -1188,14 +1396,16 @@ pub struct SatelliteCompositeConfig {
     /// Layer name (`^[a-z0-9_]+$`), distinct from every product parameter,
     /// e.g. `"airmass"`.
     pub name: String,
-    /// Human title; defaults to the name.
+    /// Human title; defaults to the recipe's title, else to the name.
     #[serde(default)]
     pub title: Option<String>,
-    /// A built-in recipe such as `"airmass"`. Reserved: recipes are not
-    /// supported yet, so setting it is a load error.
+    /// A built-in recipe, `"airmass"` or `"night_microphysics"`, instead of
+    /// `red`, `green` and `blue`: it fills them from the products whose
+    /// `band` it reads ([`crate::satellite_recipes`]).
     #[serde(default)]
     pub recipe: Option<String>,
-    /// The red channel. Red, green and blue are all required.
+    /// The red channel. Without a `recipe`, red, green and blue are all
+    /// required; with one, none may be set.
     #[serde(default)]
     pub red: Option<SatelliteCompositeChannel>,
     #[serde(default)]
@@ -1241,11 +1451,13 @@ pub struct SatelliteProductConfig {
     pub unit: String,
     /// GOES-R product, e.g. `"ABI-L2-CMIPF"` (full-disk cloud and moisture
     /// imagery) or `"ABI-L2-ACHTF"` (full-disk cloud top temperature); for
-    /// ISatSS the sector, `"HFD"` (full disk); for GK2A the observation
+    /// ISatSS the sector, `"HFD"` (full disk); for GMGSI the mosaic, one of
+    /// [`GMGSI_PRODUCTS`] (`"LW"` is longwave IR); for GK2A the observation
     /// mode, one of [`GK2A_SECTORS`] (`"FD"` is the full disk).
     pub product: String,
     /// ABI, AHI or AMI band (1–16), for per-band products such as CMIP;
-    /// required for ISatSS and GK2A (one of [`GK2A_BANDS`]).
+    /// required for ISatSS and GK2A (one of [`GK2A_BANDS`]); not taken by
+    /// GMGSI, whose product is the band.
     #[serde(default)]
     pub band: Option<u8>,
     /// NetCDF variable holding the values, e.g. `"CMI"` or `"TEMP"`.
@@ -1255,6 +1467,12 @@ pub struct SatelliteProductConfig {
 fn default_satellite_provider() -> String {
     "goes-r".to_string()
 }
+
+/// The GMGSI mosaics NOAA publishes as `GMGSI_<product>/` (#819): longwave
+/// IR (~11 µm), shortwave IR (~3.9 µm), water vapour (~6.7 µm) and visible.
+/// `GMGSI_SSR` is left out: it stopped in 2025 and names its files
+/// differently.
+pub const GMGSI_PRODUCTS: [&str; 4] = ["LW", "SW", "WV", "VIS"];
 
 /// The GK2A AMI observation modes served (#819): the full disk. The local
 /// area (`LA`) sector is a different grid and cadence, not yet tested.
@@ -1276,10 +1494,13 @@ pub fn validate_satellite(
 ) -> Result<(), crate::error::DataServerError> {
     use crate::error::DataServerError::Config;
 
-    if !matches!(cfg.provider.as_str(), "goes-r" | "isatss" | "gk2a") {
+    if !matches!(
+        cfg.provider.as_str(),
+        "goes-r" | "isatss" | "gmgsi" | "gk2a"
+    ) {
         return Err(Config(format!(
             "Collection '{id}': [satellite].provider '{}' is not supported \
-             (supported: goes-r, isatss, gk2a)",
+             (supported: goes-r, isatss, gmgsi, gk2a)",
             cfg.provider
         )));
     }
@@ -1358,11 +1579,61 @@ pub fn validate_satellite(
             }
             _ => {}
         }
+        if cfg.provider == "gmgsi" {
+            validate_gmgsi_product(id, product)?;
+        }
         if cfg.provider == "gk2a" {
             validate_gk2a_product(id, product)?;
         }
     }
     validate_satellite_composites(id, cfg)
+}
+
+/// A GMGSI product names its mosaic (`LW`, …), which is also its band.
+fn validate_gmgsi_product(
+    id: &str,
+    product: &SatelliteProductConfig,
+) -> Result<(), crate::error::DataServerError> {
+    let name = &product.parameter;
+    if product.band.is_some() {
+        return Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GMGSI parameter '{name}' takes no 'band': its product is the band"
+        )));
+    }
+    if !GMGSI_PRODUCTS.contains(&product.product.as_str()) {
+        return Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GMGSI product '{}' is not one of {}",
+            product.product,
+            GMGSI_PRODUCTS.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// A GK2A product names its sector (`FD`) and one of the calibrated bands.
+fn validate_gk2a_product(
+    id: &str,
+    product: &SatelliteProductConfig,
+) -> Result<(), crate::error::DataServerError> {
+    let name = &product.parameter;
+    if !GK2A_SECTORS.contains(&product.product.as_str()) {
+        return Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GK2A product '{}' is not one of {}",
+            product.product,
+            GK2A_SECTORS.join(", ")
+        )));
+    }
+    match product.band {
+        Some(band) if GK2A_BANDS.contains(&band) => Ok(()),
+        Some(band) => Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GK2A parameter '{name}' band {band} is not served: brightness \
+             temperature needs the channel's central wavenumber, which the files do not carry, \
+             and only band 13 (IR105) has a sourced one"
+        ))),
+        None => Err(crate::error::DataServerError::Config(format!(
+            "Collection '{id}': GK2A parameter '{name}' needs a 'band' (13, IR105)"
+        ))),
+    }
 }
 
 /// A satellite parameter or composite name: `^[a-z0-9_]+$`.
@@ -1373,9 +1644,159 @@ fn is_satellite_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
+/// Channel names in output order, for messages.
+const COMPOSITE_CHANNELS: [&str; 3] = ["red", "green", "blue"];
+
+/// `items` as English prose joined by `conjunction`: `a`, `a and b`,
+/// `a, b and c`.
+fn prose_list<T: std::fmt::Display>(items: &[T], conjunction: &str) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [init @ .., last] => {
+            let init: Vec<String> = init.iter().map(ToString::to_string).collect();
+            format!("{} {conjunction} {last}", init.join(", "))
+        }
+    }
+}
+
+/// The layer definition of a `[[satellite.composites]]` entry: its own red,
+/// green and blue, or its recipe's with each band read from the product
+/// that has that `band`. [`validate_satellite`] and engine-satellite both
+/// build composites here, so a recipe draws exactly what its channels
+/// written out would. This checks what a recipe needs; the channel rules
+/// for either form are [`validate_satellite`]'s.
+pub fn satellite_composite_def(
+    id: &str,
+    cfg: &SatelliteConfig,
+    composite: &SatelliteCompositeConfig,
+) -> Result<crate::map_engine::CompositeDef, crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+    use crate::map_engine::{CompositeChannel, CompositeDef};
+    use crate::satellite_recipes::{recipe, recipe_names, Instrument};
+
+    let name = &composite.name;
+    let prefix = format!("Collection '{id}': satellite composite '{name}'");
+    let written = [&composite.red, &composite.green, &composite.blue];
+
+    let Some(recipe_name) = &composite.recipe else {
+        let channel = |i: usize| -> Result<CompositeChannel, crate::error::DataServerError> {
+            let label = COMPOSITE_CHANNELS[i];
+            let channel = written[i]
+                .as_ref()
+                .ok_or_else(|| Config(format!("{prefix} needs a '{label}' channel")))?;
+            Ok(CompositeChannel {
+                parameter: channel.parameter.clone(),
+                minus: channel.minus.clone(),
+                min: channel.min,
+                max: channel.max,
+                gamma: channel.gamma,
+            })
+        };
+        return Ok(CompositeDef {
+            name: name.clone(),
+            title: composite.title.clone().unwrap_or_else(|| name.clone()),
+            channels: [channel(0)?, channel(1)?, channel(2)?],
+        });
+    };
+
+    let set: Vec<&str> = COMPOSITE_CHANNELS
+        .into_iter()
+        .zip(written)
+        .filter(|(_, channel)| channel.is_some())
+        .map(|(label, _)| label)
+        .collect();
+    if !set.is_empty() {
+        return Err(Config(format!(
+            "{prefix}: recipe '{recipe_name}' sets the red, green and blue channels itself; \
+             remove the {} channel{} or the recipe",
+            prose_list(&set, "and"),
+            if set.len() > 1 { "s" } else { "" }
+        )));
+    }
+    let Some(instrument) = Instrument::of_provider(&cfg.provider) else {
+        return Err(Config(format!(
+            "{prefix}: recipe '{recipe_name}' reads ABI or AHI brightness temperatures, \
+             which provider '{}' does not serve; configure the red, green and blue \
+             channels instead",
+            cfg.provider
+        )));
+    };
+    let Some(recipe) = recipe(recipe_name, instrument) else {
+        return Err(Config(format!(
+            "{prefix}: unknown recipe '{recipe_name}' (known: {})",
+            recipe_names(instrument).join(", ")
+        )));
+    };
+
+    let instrument = instrument.name();
+    let mut missing = Vec::new();
+    let mut parameters: Vec<(u8, &str)> = Vec::new();
+    for band in recipe.bands() {
+        let products: Vec<&SatelliteProductConfig> = cfg
+            .products
+            .iter()
+            .filter(|p| p.band == Some(band))
+            .collect();
+        match products.as_slice() {
+            [] => missing.push(band),
+            [product] if !crate::units::same_unit(&product.unit, "K") => {
+                return Err(Config(format!(
+                    "{prefix}: recipe '{recipe_name}' reads brightness temperatures in K, \
+                     but {instrument} band {band} is '{}' in '{}'",
+                    product.parameter, product.unit
+                )));
+            }
+            [product] => parameters.push((band, &product.parameter)),
+            several => {
+                let names: Vec<String> = several
+                    .iter()
+                    .map(|p| format!("'{}'", p.parameter))
+                    .collect();
+                return Err(Config(format!(
+                    "{prefix}: recipe '{recipe_name}' reads {instrument} band {band}, which \
+                     products {} each have; keep one, or configure the red, green and blue \
+                     channels instead",
+                    prose_list(&names, "and")
+                )));
+            }
+        }
+    }
+    if !missing.is_empty() {
+        return Err(Config(format!(
+            "{prefix}: recipe '{recipe_name}' reads {instrument} bands {}, and no \
+             [[satellite.products]] entry has 'band' = {}",
+            prose_list(&recipe.bands(), "and"),
+            prose_list(&missing, "or"),
+        )));
+    }
+    let parameter = |band: u8| -> String {
+        let (_, name) = parameters
+            .iter()
+            .find(|(b, _)| *b == band)
+            .expect("every recipe band has a product");
+        (*name).to_string()
+    };
+    Ok(CompositeDef {
+        name: name.clone(),
+        title: composite
+            .title
+            .clone()
+            .unwrap_or_else(|| recipe.title.to_string()),
+        channels: recipe.channels.map(|channel| CompositeChannel {
+            parameter: parameter(channel.band),
+            minus: channel.minus.map(parameter),
+            min: channel.min,
+            max: channel.max,
+            gamma: channel.gamma,
+        }),
+    })
+}
+
 /// `[[satellite.composites]]`: unique names that are not product
-/// parameters, and three channels reading product parameters with the
-/// range and gamma rules `ds_render::composite` renders by.
+/// parameters, and three channels, written out or from a recipe, reading
+/// product parameters with the range and gamma rules `ds_render::composite`
+/// renders by.
 fn validate_satellite_composites(
     id: &str,
     cfg: &SatelliteConfig,
@@ -1405,21 +1826,9 @@ fn validate_satellite_composites(
         {
             return Err(Config(format!("{prefix} has an empty 'title'")));
         }
-        if let Some(recipe) = &composite.recipe {
-            return Err(Config(format!(
-                "{prefix}: built-in recipes such as '{recipe}' are not supported yet; \
-                 configure its red, green and blue channels instead"
-            )));
-        }
-        for (label, channel) in [
-            ("red", &composite.red),
-            ("green", &composite.green),
-            ("blue", &composite.blue),
-        ] {
-            let Some(channel) = channel else {
-                return Err(Config(format!("{prefix} needs a '{label}' channel")));
-            };
-            for parameter in std::iter::once(&channel.parameter).chain(&channel.minus) {
+        let def = satellite_composite_def(id, cfg, composite)?;
+        for (label, channel) in COMPOSITE_CHANNELS.into_iter().zip(&def.channels) {
+            for parameter in channel.parameters() {
                 if !is_product(parameter) {
                     return Err(Config(format!(
                         "{prefix} {label} channel reads '{parameter}', which is not a \
@@ -1450,30 +1859,308 @@ fn validate_satellite_composites(
     Ok(())
 }
 
-/// A GK2A product names its sector (`FD`) and one of the calibrated bands.
-fn validate_gk2a_product(
-    id: &str,
-    product: &SatelliteProductConfig,
-) -> Result<(), crate::error::DataServerError> {
-    let name = &product.parameter;
-    if !GK2A_SECTORS.contains(&product.product.as_str()) {
-        return Err(crate::error::DataServerError::Config(format!(
-            "Collection '{id}': GK2A product '{}' is not one of {}",
-            product.product,
-            GK2A_SECTORS.join(", ")
+/// CF-NetCDF gridded data (`engine_type = "netcdf"`, #1067): one file family
+/// of a model or analysis, such as MEPS's per-lead surface files. Every file
+/// carries the collection's variables on one grid; a file's valid times come
+/// from its `time` variable and its model run from `forecast_reference_time`
+/// (files without one form a single timeline without runs). Unknown keys are
+/// a load error: a mistyped `variables` would serve every variable.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NetcdfConfig {
+    /// Local directory holding the files, read non-recursively; or an
+    /// `http(s)://` URL under which the files are found by template probing
+    /// (`prefix_pattern`, `filename_template`, `run_hours`, `leads`,
+    /// `time_window`) and read in place by HTTP range, as MEPS on
+    /// thredds.met.no's fileServer, which cannot be listed.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub data_path: Option<String>,
+    /// The files' names, as a strftime template with `{run}` for the run
+    /// hour and `{lead}` for a two-digit lead, as MET Norway's
+    /// `meps_sfc_{lead}_%Y%m%dT{run}Z.nc` (`ds_storage::discovery`'s
+    /// vocabulary): a whole name must match. Default: every name ending in
+    /// `.nc`. Names a publisher writes before renaming a finished file
+    /// (`.name`, `*.tmp`, `*.part`) are always skipped. The name only
+    /// selects a file and orders the opening, newest first: its valid times
+    /// and run come from its own variables.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub filename_template: Option<String>,
+    /// Serve only these variables, in this order; the first is the default
+    /// layer. A file missing one is skipped. Default: every variable on the
+    /// first file's grid (MEPS sfc has 221).
+    #[serde(default)]
+    pub variables: Option<Vec<String>>,
+    /// Layer titles by variable name, in place of the file's `long_name`,
+    /// e.g. `{ precipitation_amount_acc = "Precipitation since run start" }`.
+    #[serde(default)]
+    pub titles: BTreeMap<String, String>,
+    /// Ensemble member read from files with an ensemble dimension
+    /// (`standard_name = "realization"`), by index.
+    #[serde(default)]
+    pub member: u32,
+    /// Model runs kept, newest first (each one a WMS `reference_time`
+    /// value).
+    #[serde(default = "default_netcdf_max_runs")]
+    pub max_runs: usize,
+    /// Most files kept open, over all runs: older runs, or without runs the
+    /// files of the oldest times, are dropped first.
+    #[serde(default = "default_netcdf_max_files")]
+    pub max_files: usize,
+    #[serde(default = "default_netcdf_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Remote only: the strftime prefix under `data_path` of one run's
+    /// files, with `{run}` for the run hour, as MEPS's
+    /// `%Y/%m/%d/{run}/member_00/`. Default: none, the files lie directly
+    /// under `data_path`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub prefix_pattern: Option<String>,
+    /// Remote only, required: the hours (0-23) model runs start at each
+    /// day, as MEPS's `[0, 3, 6, 9, 12, 15, 18, 21]`.
+    #[serde(default)]
+    pub run_hours: Option<Vec<u32>>,
+    /// Remote only: the leads `{lead}` stands for in `filename_template`,
+    /// written with two digits; the first is the run's sentinel, the one
+    /// file probed until the run appears. Required with `{lead}`.
+    #[serde(default)]
+    pub leads: Option<Vec<u32>>,
+    /// Remote only, required: how far back from now runs are probed, an
+    /// ISO 8601 duration such as `-PT12H` (the sign is ignored).
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub time_window: Option<String>,
+    /// Remote only: a file is used once two polls see the same size and
+    /// `Last-Modified`, or at once when its `Last-Modified` is this old.
+    /// ISO 8601. Default `PT10M`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub min_age: Option<String>,
+    /// Remote only: a run whose leads have not all settled is served
+    /// without the missing ones this long after its first file appeared,
+    /// with a WARN naming them. ISO 8601. Default `PT30M`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub run_grace: Option<String>,
+    /// Remote only: variables whose fields of the newest run each poll
+    /// fetches before any request asks, into the compressed-chunk cache.
+    /// A MEPS variable costs about 100 MB per run. Default: none.
+    #[serde(default)]
+    pub prewarm_variables: Vec<String>,
+}
+
+impl NetcdfConfig {
+    /// Whether `data_path` is an `http(s)://` URL, read by HTTP range.
+    pub fn is_remote(&self) -> bool {
+        self.data_path.as_deref().is_some_and(|path| {
+            let lower = path.get(..8).unwrap_or(path).to_ascii_lowercase();
+            lower.starts_with("http://") || lower.starts_with("https://")
+        })
+    }
+}
+
+fn default_netcdf_max_runs() -> usize {
+    4
+}
+
+fn default_netcdf_max_files() -> usize {
+    1024
+}
+
+fn default_netcdf_poll_interval_secs() -> u64 {
+    60
+}
+
+/// Hard-fail validation for a [`NetcdfConfig`]. The `filename_template` is
+/// parsed by engine-netcdf, through ds-storage's `FilenameMatcher`.
+pub fn validate_netcdf(id: &str, cfg: &NetcdfConfig) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    let Some(data_path) = cfg.data_path.as_deref().filter(|path| !path.is_empty()) else {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf] needs a 'data_path' directory or http(s) URL"
+        )));
+    };
+    if cfg.is_remote() {
+        validate_netcdf_remote(id, cfg)?;
+    } else {
+        if data_path.contains("://") {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].data_path '{data_path}' is neither a local \
+                 directory nor an http(s) URL"
+            )));
+        }
+        let remote_only = [
+            ("prefix_pattern", cfg.prefix_pattern.is_some()),
+            ("run_hours", cfg.run_hours.is_some()),
+            ("leads", cfg.leads.is_some()),
+            ("time_window", cfg.time_window.is_some()),
+            ("min_age", cfg.min_age.is_some()),
+            ("run_grace", cfg.run_grace.is_some()),
+            ("prewarm_variables", !cfg.prewarm_variables.is_empty()),
+        ];
+        if let Some((field, _)) = remote_only.iter().find(|(_, set)| *set) {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].{field} applies to an http(s) data_path only"
+            )));
+        }
+    }
+    if cfg.filename_template.as_deref() == Some("") {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf].filename_template must not be empty; omit it for '*.nc'"
         )));
     }
-    match product.band {
-        Some(band) if GK2A_BANDS.contains(&band) => Ok(()),
-        Some(band) => Err(crate::error::DataServerError::Config(format!(
-            "Collection '{id}': GK2A parameter '{name}' band {band} is not served: brightness \
-             temperature needs the channel's central wavenumber, which the files do not carry, \
-             and only band 13 (IR105) has a sourced one"
-        ))),
-        None => Err(crate::error::DataServerError::Config(format!(
-            "Collection '{id}': GK2A parameter '{name}' needs a 'band' (13, IR105)"
-        ))),
+    for (field, value) in [("max_runs", cfg.max_runs), ("max_files", cfg.max_files)] {
+        if value == 0 {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].{field} must be > 0"
+            )));
+        }
     }
+    if cfg.poll_interval_secs == 0 {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf].poll_interval_secs must be > 0"
+        )));
+    }
+    if let Some(variables) = &cfg.variables {
+        if variables.is_empty() {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].variables must not be empty; omit it to serve \
+                 every variable"
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for name in variables {
+            if name.trim().is_empty() || name.trim() != name {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].variables entry '{name}' must be a variable \
+                     name without surrounding spaces"
+                )));
+            }
+            if !seen.insert(name.as_str()) {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].variables lists '{name}' twice"
+                )));
+            }
+        }
+    }
+    for (name, title) in &cfg.titles {
+        if title.trim().is_empty() {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].titles entry '{name}' must not be empty"
+            )));
+        }
+        if let Some(variables) = &cfg.variables {
+            if !variables.contains(name) {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].titles names '{name}', which is not in \
+                     [netcdf].variables"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The remote fields of a [`NetcdfConfig`] with an `http(s)://`
+/// `data_path`. The prefix pattern and filename template are checked
+/// against the run hours and leads by engine-netcdf, through ds-storage's
+/// `TemplateProber`.
+fn validate_netcdf_remote(
+    id: &str,
+    cfg: &NetcdfConfig,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    let template = cfg.filename_template.as_deref().unwrap_or_default();
+    if template.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf] with an http(s) data_path needs a filename_template: \
+             the files are found by name, the server cannot be listed"
+        )));
+    }
+    let run_hours = cfg.run_hours.as_deref().unwrap_or_default();
+    if run_hours.is_empty() || run_hours.iter().any(|&hour| hour > 23) {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf].run_hours must list the run hours, each 0-23"
+        )));
+    }
+    if run_hours
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != run_hours.len()
+    {
+        return Err(Config(format!(
+            "Collection '{id}': [netcdf].run_hours lists an hour twice"
+        )));
+    }
+    let with_lead = template.contains("{lead}");
+    match &cfg.leads {
+        Some(leads) if !with_lead => {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].leads needs {{lead}} in the filename_template \
+                 (found {} leads)",
+                leads.len()
+            )));
+        }
+        None if with_lead => {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].filename_template names {{lead}}, so leads must \
+                 list them"
+            )));
+        }
+        Some(leads) => {
+            if leads.is_empty() || leads.iter().any(|&lead| lead > 99) {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].leads must list leads of two digits, 0-99"
+                )));
+            }
+            if leads
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != leads.len()
+            {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].leads lists a lead twice"
+                )));
+            }
+        }
+        None => {}
+    }
+    let window = cfg.time_window.as_deref().ok_or_else(|| {
+        Config(format!(
+            "Collection '{id}': [netcdf] with an http(s) data_path needs a time_window, \
+             such as \"-PT12H\""
+        ))
+    })?;
+    let durations = [
+        (
+            "time_window",
+            Some(window.strip_prefix('-').unwrap_or(window)),
+        ),
+        ("min_age", cfg.min_age.as_deref()),
+        ("run_grace", cfg.run_grace.as_deref()),
+    ];
+    for (field, value) in durations {
+        if let Some(value) = value {
+            crate::datetime::parse_iso8601_duration(value)
+                .map_err(|e| Config(format!("Collection '{id}': [netcdf].{field}: {e}")))?;
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for name in &cfg.prewarm_variables {
+        if !seen.insert(name.as_str()) {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].prewarm_variables lists '{name}' twice"
+            )));
+        }
+        if let Some(variables) = &cfg.variables {
+            if !variables.contains(name) {
+                return Err(Config(format!(
+                    "Collection '{id}': [netcdf].prewarm_variables names '{name}', which is \
+                     not in [netcdf].variables"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Default WIS2 Global Broker (Météo-France). Any Global Broker carries the
@@ -1584,7 +2271,30 @@ pub struct Wis2Config {
     /// reported `degraded` (default 120).
     #[serde(default = "default_wis2_degrade_after_secs")]
     pub degrade_after_secs: u64,
+    /// Health after a cold start (#1000, #1002): a collection whose
+    /// in-memory store starts empty (no `[server] state_dir` snapshot
+    /// restored) reports `degraded` ("warming up after cold start: N alerts
+    /// received", "… N reports received") for this long after its
+    /// subscription first comes up — standing warnings only return as their
+    /// producers republish them, and observations are never republished, so
+    /// a store's history is complete again only after a full window (for
+    /// CAP, and for BUFR when `warmup` equals `retention`). A
+    /// snapshot last written longer than this ago (the server was down that
+    /// long) is restored but restarts the warm-up ("warming up after a long
+    /// outage"). ISO 8601 duration. Default: [`DEFAULT_WIS2_WARMUP`]
+    /// (`PT24H`) for `[cap.wis2]` ([`Self::warmup_duration`]); for
+    /// `[bufr.wis2]` the shorter of that and the collection's `retention`,
+    /// so a retention longer than a day is still filling its older part
+    /// when the warm-up ends (a week-long one would otherwise report
+    /// `degraded` for a week). An explicit value is used as given.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub warmup: Option<String>,
 }
+
+/// Default `[….wis2] warmup`: a day covers the daily republication cycle
+/// of standing warnings. `[bufr.wis2]` caps it at the collection's
+/// `retention` (engine-bufr resolves that).
+pub const DEFAULT_WIS2_WARMUP: &str = "PT24H";
 
 impl Default for Wis2Config {
     fn default() -> Self {
@@ -1601,11 +2311,21 @@ impl Default for Wis2Config {
             max_download_bytes: default_wis2_max_download_bytes(),
             dedup_window: default_wis2_dedup_window(),
             degrade_after_secs: default_wis2_degrade_after_secs(),
+            warmup: None,
         }
     }
 }
 
 impl Wis2Config {
+    /// The configured `warmup`, else [`DEFAULT_WIS2_WARMUP`]: CAP's
+    /// warm-up. `[bufr.wis2]` caps the default at `retention` on top
+    /// (engine-bufr).
+    pub fn warmup_duration(&self) -> Result<chrono::Duration, crate::error::DataServerError> {
+        crate::datetime::parse_iso8601_duration(
+            self.warmup.as_deref().unwrap_or(DEFAULT_WIS2_WARMUP),
+        )
+    }
+
     /// Split `broker` into `(tls, host, port)`. Only valid after
     /// [`validate_wis2`] has accepted the config.
     pub fn broker_parts(&self) -> Option<(bool, String, u16)> {
@@ -1723,6 +2443,13 @@ pub fn validate_wis2(
         return Err(Config(format!(
             "Collection '{id}': [{section}].degrade_after_secs must be > 0"
         )));
+    }
+    if let Some(w) = &cfg.warmup {
+        crate::datetime::parse_iso8601_duration(w).map_err(|e| {
+            Config(format!(
+                "Collection '{id}': [{section}].warmup is not a valid positive ISO 8601 duration: {e}"
+            ))
+        })?;
     }
     Ok(())
 }
@@ -1972,10 +2699,12 @@ pub struct OdimConfig {
     /// whole-`.h5` read on a render-semaphore permit — the cause of dropped
     /// frames on remote sources (#461) and of off-peak p99 spikes on local
     /// ones, whose page cache is reclaimed between renders (#472). Default `1`
-    /// (the lowest sweep — the standard base-reflectivity animation view, all
-    /// of its quantities). Set higher to warm more tilts, `0` to disable.
-    /// Bounded by the pixel-cache byte budget (`MC_PVOL_PIXEL_CACHE_MB`);
-    /// pre-warmed entries that overflow it evict by LRU like any other.
+    /// (the lowest sweep — the standard base-reflectivity animation view).
+    /// Only the volume's default quantity (`DBZH`, else `TH`, else the first)
+    /// is warmed, the one an unqualified layer renders; other quantities read
+    /// on first use (#992). Set higher to warm more tilts, `0` to disable.
+    /// Bounded by the pixel-cache byte budget (`MC_PVOL_PIXEL_CACHE_MB`), half
+    /// of which holds pre-warmed entries until they are read.
     #[serde(default = "default_prewarm_sweeps")]
     pub prewarm_sweeps: usize,
 }
@@ -2238,6 +2967,14 @@ pub struct PostgisConfig {
     pub pool_label: Option<String>,
     /// Metadata cache refresh cadence. Default 300 s.
     pub metadata_refresh_secs: Option<u64>,
+    /// Most stations the cached location list holds (#1061). The stations
+    /// table read and the observations-derived set both stop there; a list
+    /// cut at it degrades the collection in `/health` and sets
+    /// `postgis_locations_truncated`. Default
+    /// [`POSTGIS_DEFAULT_MAX_LOCATIONS`], at most
+    /// [`POSTGIS_MAX_LOCATIONS_CEILING`]. Not valid for the `events` shape,
+    /// which has no location list.
+    pub max_locations: Option<usize>,
     /// Optional stations table. When absent (mode A), or present but with a
     /// resolvable `observations.geom_col` (mode B, orphan fallback), location
     /// coordinates are derived from the observations table's own geometry —
@@ -2247,7 +2984,50 @@ pub struct PostgisConfig {
     pub observations: PostgisObservationsConfig,
     #[serde(default)]
     pub parameters: Vec<PostgisParameterConfig>,
+    /// Station shapes only: the WMS/Maps/Tiles station-symbol layers
+    /// (#1063). Optional; the layers exist whenever `apis` lists a map API,
+    /// with the defaults [`PostgisMapConfig`] documents.
+    #[serde(default)]
+    pub map: Option<PostgisMapConfig>,
 }
+
+/// `[postgis.map]` (#1063): how a station collection's map layers draw each
+/// station as a marker coloured by its latest value.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgisMapConfig {
+    /// ISO 8601 duration: a frame at `TIME` shows each station's latest
+    /// non-null value in `[TIME - max_age, TIME]`. Default `PT1H`, at most
+    /// [`POSTGIS_MAP_MAX_AGE_CEILING`].
+    pub max_age: Option<String>,
+    /// Marker diameter in output pixels. Default 6, at most
+    /// [`POSTGIS_MAP_MAX_MARKER_SIZE`].
+    pub marker_size: Option<u32>,
+    /// Draw the cached stations without a value in the window as markers in
+    /// the palette's `nodata_color`, instead of leaving them out. Default
+    /// `false`.
+    pub draw_missing: Option<bool>,
+    /// ISO 8601 duration: the TIME steps the layers advertise over the last
+    /// [`POSTGIS_MAP_TIME_WINDOW`], and what a requested `TIME` floors to.
+    /// Default `PT10M`; whole seconds, from [`POSTGIS_MAP_MIN_TIME_STEP`] to
+    /// [`POSTGIS_MAP_TIME_WINDOW`].
+    pub time_step: Option<String>,
+}
+
+/// How far back from the latest observation the PostGIS map layers advertise
+/// TIME steps (#504, #1063). Older frames still render on an explicit `TIME`.
+pub const POSTGIS_MAP_TIME_WINDOW: chrono::TimeDelta = chrono::TimeDelta::hours(6);
+
+/// Shortest `[postgis.map] time_step` (#1063).
+pub const POSTGIS_MAP_MIN_TIME_STEP: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
+
+/// Longest `[postgis.map] max_age` (#1063): a typo guard. A frame reads every
+/// row of the window for every station, so a long one on a dense network
+/// meets the frame's row cap first.
+pub const POSTGIS_MAP_MAX_AGE_CEILING: chrono::TimeDelta = chrono::TimeDelta::days(7);
+
+/// Largest `[postgis.map] marker_size`, in output pixels (#1063).
+pub const POSTGIS_MAP_MAX_MARKER_SIZE: u32 = 64;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisStationsConfig {
@@ -2411,6 +3191,21 @@ pub fn validate_qualified_table(name: &str) -> Result<(&str, &str), String> {
     Ok((schema, table))
 }
 
+/// Default `[postgis] max_locations` (#1061): the most stations a postgis
+/// collection caches. Sized by memory: a cached station with a name and three
+/// properties measures ≈ 613 B across the metadata snapshot (engine-postgis
+/// `metadata::tests::footprint`), so 200 000 stations is ≈ 120 MB resident
+/// and ≈ 0.3 GB while a refresh holds the old snapshot and the query's rows.
+/// That covers national and continental networks, closed stations included,
+/// with headroom; memory follows the stations actually loaded, not the cap.
+pub const POSTGIS_DEFAULT_MAX_LOCATIONS: usize = 200_000;
+
+/// Hard ceiling on `[postgis] max_locations` (#1061), checked at config load:
+/// ≈ 0.6 GB resident and ≈ 1.5 GB at a refresh by the same measure. It keeps
+/// a typo from removing the bound; the engine-postgis README lists what else
+/// grows with the list.
+pub const POSTGIS_MAX_LOCATIONS_CEILING: usize = 1_000_000;
+
 fn looks_like_db_url(s: &str) -> bool {
     s.starts_with("postgres://") || s.starts_with("postgresql://")
 }
@@ -2457,6 +3252,70 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
             return Err(Config(format!(
                 "Collection '{id}': [postgis].pool_size {n} exceeds hard cap 32"
             )));
+        }
+    }
+
+    // -- max_locations (#1061) --------------------------------------------
+    if let Some(n) = cfg.max_locations {
+        if cfg.observations.shape == "events" {
+            return Err(Config(format!(
+                "Collection '{id}': [postgis].max_locations is not valid for observations.shape 'events' (it has no location list)"
+            )));
+        }
+        if n == 0 {
+            return Err(Config(format!(
+                "Collection '{id}': [postgis].max_locations must be > 0"
+            )));
+        }
+        if n > POSTGIS_MAX_LOCATIONS_CEILING {
+            return Err(Config(format!(
+                "Collection '{id}': [postgis].max_locations {n} exceeds the hard ceiling {POSTGIS_MAX_LOCATIONS_CEILING}"
+            )));
+        }
+    }
+
+    // -- map (#1063) --------------------------------------------------------
+    if let Some(map) = &cfg.map {
+        if cfg.observations.shape == "events" {
+            return Err(Config(format!(
+                "Collection '{id}': [postgis.map] is not valid for observations.shape 'events' (its strike layer has fixed settings)"
+            )));
+        }
+        if let Some(raw) = map.max_age.as_deref() {
+            let max_age = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
+                Config(format!(
+                    "Collection '{id}': [postgis.map].max_age '{raw}' is not a valid ISO 8601 duration: {e}"
+                ))
+            })?;
+            if max_age <= chrono::TimeDelta::zero() || max_age > POSTGIS_MAP_MAX_AGE_CEILING {
+                return Err(Config(format!(
+                    "Collection '{id}': [postgis.map].max_age '{raw}' must be positive and at most P{}D",
+                    POSTGIS_MAP_MAX_AGE_CEILING.num_days()
+                )));
+            }
+        }
+        if let Some(size) = map.marker_size {
+            if size == 0 || size > POSTGIS_MAP_MAX_MARKER_SIZE {
+                return Err(Config(format!(
+                    "Collection '{id}': [postgis.map].marker_size {size} is outside 1..={POSTGIS_MAP_MAX_MARKER_SIZE}"
+                )));
+            }
+        }
+        if let Some(raw) = map.time_step.as_deref() {
+            let step = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
+                Config(format!(
+                    "Collection '{id}': [postgis.map].time_step '{raw}' is not a valid ISO 8601 duration: {e}"
+                ))
+            })?;
+            if step.subsec_nanos() != 0
+                || step < POSTGIS_MAP_MIN_TIME_STEP
+                || step > POSTGIS_MAP_TIME_WINDOW
+            {
+                return Err(Config(format!(
+                    "Collection '{id}': [postgis.map].time_step '{raw}' must be whole seconds from PT1M to PT{}H",
+                    POSTGIS_MAP_TIME_WINDOW.num_hours()
+                )));
+            }
         }
     }
 
@@ -3188,6 +4047,12 @@ impl ServerConfig {
 
     /// Validate configuration for common errors before starting the server.
     pub fn validate(&self) -> Result<(), crate::error::DataServerError> {
+        // Trimmed at load: an all-whitespace value arrives here as "".
+        if self.server.state_dir.as_deref() == Some("") {
+            return Err(crate::error::DataServerError::Config(
+                "[server] state_dir must not be empty; omit it to disable state snapshots".into(),
+            ));
+        }
         // Zero slots would stall every uncached render until its deadline.
         if let Some(n) = self.server.render_concurrency {
             if !(1..=MAX_RENDER_CONCURRENCY).contains(&n) {
@@ -3424,6 +4289,33 @@ impl ServerConfig {
                         )));
                     }
                 }
+                // `type` describes `url`; the synthesized SPDX page is HTML.
+                if let Some(media_type) = &license.media_type {
+                    if license.url.is_none() {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': [collections.license] 'type' needs a 'url' to describe"
+                        )));
+                    }
+                    if !is_media_type(media_type) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': [collections.license] 'type' must be a media type \
+                             such as \"text/html\" or \"application/pdf\""
+                        )));
+                    }
+                }
+            }
+
+            // Only the engines that report u/v components derive wind: the
+            // key anywhere else would read as a setting that does nothing.
+            if collection.derive_wind.is_some()
+                && !DERIVE_WIND_ENGINES.contains(&collection.engine_type.as_str())
+            {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': 'derive_wind' applies only to engine types {}, \
+                     not '{}'",
+                    DERIVE_WIND_ENGINES.join(", "),
+                    collection.engine_type
+                )));
             }
 
             // GeoTIFF engine requires geotiff config section
@@ -3521,6 +4413,33 @@ impl ServerConfig {
                 if nowcast.source == collection.id {
                     return Err(crate::error::DataServerError::Config(format!(
                         "Collection '{id}': nowcast source cannot be the collection itself"
+                    )));
+                }
+            }
+
+            // Station-grid engine requires its config section (and vice versa).
+            if collection.engine_type == "station-grid" && collection.station_grid.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'station-grid' requires a \
+                     [collections.station_grid] config section"
+                )));
+            }
+            if collection.station_grid.is_some() && collection.engine_type != "station-grid" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.station_grid] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(grid) = &collection.station_grid {
+                if grid.source.trim().is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': [collections.station_grid].source must be a \
+                         collection id"
+                    )));
+                }
+                if grid.source == collection.id {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': station_grid source cannot be the collection itself"
                     )));
                 }
             }
@@ -3634,9 +4553,9 @@ impl ServerConfig {
                 // age-colored strike layer). Its FeatureEngine surface is
                 // #503 — without this check an `apis = ["features"]` events
                 // collection would load cleanly and silently serve an empty
-                // station inventory. Station shapes conversely have no
-                // raster rendering: wms/maps stay rejected for them via the
-                // engine_type allowlist gate in server admin wiring.
+                // station inventory. Station shapes serve every API: their
+                // map layers draw each station as a marker coloured by its
+                // latest value (#1063).
                 if postgis.observations.shape == "events" {
                     if let Some(api) = collection
                         .apis
@@ -3647,15 +4566,16 @@ impl ServerConfig {
                             "Collection '{id}': apis entry '{api}' is not supported for observations.shape 'events' (edr/wms/maps/tiles; \"features\" arrives with #503)"
                         )));
                     }
-                } else if let Some(api) = collection
-                    .apis
-                    .iter()
-                    .find(|a| matches!(a.as_str(), "wms" | "maps"))
+                } else if postgis.map.is_some()
+                    && !collection
+                        .apis
+                        .iter()
+                        .any(|a| matches!(a.as_str(), "wms" | "maps" | "tiles"))
                 {
-                    // Station shapes have no raster surface — only the events
-                    // shape implements a meaningful MapEngine (#504).
+                    // A map section no map API reads would be silently
+                    // ignored.
                     return Err(crate::error::DataServerError::Config(format!(
-                        "Collection '{id}': apis entry '{api}' requires observations.shape 'events' (station shapes serve edr/features/tiles)"
+                        "Collection '{id}': [postgis.map] needs a map API in apis (wms, maps or tiles)"
                     )));
                 }
             } else if collection.postgis.is_some() {
@@ -3841,6 +4761,22 @@ impl ServerConfig {
                 validate_satellite(id, satellite)?;
             }
 
+            // NetCDF engine requires its config section, and vice versa.
+            if collection.engine_type == "netcdf" && collection.netcdf.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'netcdf' requires a [collections.netcdf] config section"
+                )));
+            }
+            if collection.netcdf.is_some() && collection.engine_type != "netcdf" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.netcdf] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(netcdf) = &collection.netcdf {
+                validate_netcdf(id, netcdf)?;
+            }
+
             // style_bundle: reference must resolve. Inline [wms] fields are
             // ALLOWED next to a bundle since bundles v2 — they merge
             // slot-wise, inline winning per slot (see
@@ -3890,6 +4826,15 @@ impl ServerConfig {
                         return Err(crate::error::DataServerError::Config(format!(
                             "Collection '{id}': style_bundle '{bundle_ref}' is not defined \
                              in [[style_bundles]]"
+                        )));
+                    }
+                }
+                // 1–99 lossy, 100 lossless; 0 has no meaning.
+                if let Some(quality) = wms.webp_quality {
+                    if !(1..=100).contains(&quality) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': [wms] webp_quality must be an integer \
+                             from 1 to 100 (100 = lossless), got {quality}"
                         )));
                     }
                 }
@@ -3952,6 +4897,13 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// The documented default, built from the shared partial-upload
+    /// suffixes so the two cannot drift (#1009).
+    #[test]
+    fn default_exclude_patterns_are_the_partial_suffixes() {
+        assert_eq!(default_exclude_patterns(), ["*.tmp", "*.part"]);
+    }
+
     #[test]
     fn default_for_auto_is_loopback_and_empty() {
         let cfg = ServerConfig::default_for_auto();
@@ -4006,6 +4958,24 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             lic.resolved_url().as_deref(),
             Some("https://creativecommons.org/licenses/by/4.0/")
         );
+        // No `type`: the link says text/html.
+        assert_eq!(lic.media_type, None);
+        assert_eq!(lic.link_type(), "text/html");
+    }
+
+    /// `type` names what the license `url` serves (TOML `type`, trimmed);
+    /// without it the link type is `text/html`, which the synthesized SPDX
+    /// page always is.
+    #[test]
+    fn license_type_parses_and_defaults_to_html() {
+        let lic: LicenseConfig = toml::from_str(
+            "title = \"X\"\nurl = \"https://example.com/lic.pdf\"\ntype = \" application/pdf \"",
+        )
+        .unwrap();
+        assert_eq!(lic.media_type.as_deref(), Some("application/pdf"));
+        assert_eq!(lic.link_type(), "application/pdf");
+        let spdx: LicenseConfig = toml::from_str("title = \"CC-BY-4.0\"").unwrap();
+        assert_eq!(spdx.link_type(), "text/html");
     }
 
     #[test]
@@ -4021,6 +4991,7 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         let lic = LicenseConfig {
             title: "Apache-2.0".into(),
             url: None,
+            media_type: None,
         };
         assert_eq!(
             lic.resolved_url().as_deref(),
@@ -4057,6 +5028,7 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         let lic = LicenseConfig {
             title: "All rights reserved".into(),
             url: None,
+            media_type: None,
         };
         assert_eq!(lic.resolved_url(), None);
         assert_eq!(lic.card_link(), None);
@@ -4181,6 +5153,24 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         assert!(bufr_collection("[collections.bufr.wis2]\ntopics = []\n")
             .validate()
             .is_err());
+    }
+
+    /// `warmup` is honoured by both WIS2 engines (#1002): a BUFR collection
+    /// accepts a valid one and rejects a malformed one like CAP does.
+    #[test]
+    fn bufr_wis2_accepts_warmup() {
+        let cfg =
+            bufr_collection("[collections.bufr.wis2]\ntopics = [\"cache/a\"]\nwarmup = \"PT1H\"\n");
+        assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+        let err =
+            bufr_collection("[collections.bufr.wis2]\ntopics = [\"cache/a\"]\nwarmup = \"1h\"\n")
+                .validate()
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("[bufr.wis2].warmup is not a valid positive ISO 8601 duration"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -4360,6 +5350,21 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             &wis2("download_allowlist = [\"https://gc.example/\"]\ntopics = [\"cache/a\"]\n")
         )
         .is_ok());
+        // warmup: a positive ISO 8601 duration.
+        assert!(bad("warmup = \"24h\"\ntopics = [\"cache/a\"]\n"));
+        assert!(bad("warmup = \"PT0S\"\ntopics = [\"cache/a\"]\n"));
+        assert!(bad("warmup = \"P1M\"\ntopics = [\"cache/a\"]\n"));
+    }
+
+    #[test]
+    fn wis2_warmup_defaults_to_a_day() {
+        let cfg = wis2("topics = [\"cache/a\"]\n");
+        assert_eq!(cfg.warmup, None);
+        assert_eq!(cfg.warmup_duration().unwrap(), chrono::Duration::hours(24));
+        let cfg = wis2("topics = [\"cache/a\"]\nwarmup = \" PT6H \"\n");
+        assert!(validate_wis2("c", "cap.wis2", &cfg).is_ok());
+        assert_eq!(cfg.warmup_duration().unwrap(), chrono::Duration::hours(6));
+        assert_eq!(Wis2Config::default().warmup, None);
     }
 
     #[test]
@@ -4628,6 +5633,55 @@ url = "https://creativecommons.org/licenses/by/4.0/"
     }
 
     #[test]
+    fn validate_station_grid_config_pairing() {
+        let section = |source: &str| {
+            format!(
+                "[collections.station_grid]\nsource = \"{source}\"\nparameters = [\"t2m\"]\n\
+                 grid = {{ bbox = [19.0, 59.0, 32.0, 71.0], resolution = 0.1 }}\n"
+            )
+        };
+        assert!(collection_with("engine_type = \"station-grid\"\n")
+            .validate()
+            .is_err());
+        let mismatched = collection_with(&format!(
+            "engine_type = \"csv\"\ndata_path = \"x.csv\"\n{}",
+            section("obs")
+        ));
+        assert!(mismatched.validate().is_err());
+        for source in ["c", " "] {
+            let bad = collection_with(&format!(
+                "engine_type = \"station-grid\"\n{}",
+                section(source)
+            ));
+            assert!(bad.validate().is_err(), "{source:?}");
+        }
+        let ok = collection_with(&format!(
+            "engine_type = \"station-grid\"\n{}",
+            section("obs")
+        ));
+        assert!(ok.validate().is_ok());
+        let grid = ok.collections[0].station_grid.as_ref().unwrap();
+        assert_eq!(
+            (
+                grid.method.as_str(),
+                grid.max_neighbours,
+                grid.grid.crs.as_str()
+            ),
+            ("idw", 8, "EPSG:4326")
+        );
+        // A misspelt key is an error, not a silent default.
+        let typo = format!(
+            "engine_type = \"station-grid\"\n{}max_neighbors = 4\n",
+            section("obs")
+        );
+        let parsed: Result<ServerConfig, _> = toml::from_str(&format!(
+            "[server]\nhost=\"127.0.0.1\"\nport=8000\n\n[[collections]]\nid=\"c\"\n\
+             title=\"t\"\ndescription=\"d\"\n{typo}"
+        ));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
     fn validate_rejects_empty_keyword() {
         let cfg = collection_with("keywords = [\"ok\", \"  \"]\n");
         assert!(cfg.validate().is_err());
@@ -4643,6 +5697,60 @@ url = "https://creativecommons.org/licenses/by/4.0/"
     fn validate_rejects_non_http_license_url() {
         let cfg = collection_with("[collections.license]\ntitle = \"X\"\nurl = \"ftp://x/y\"\n");
         assert!(cfg.validate().is_err());
+    }
+
+    /// A license `type` must look like a media type and needs the `url` it
+    /// describes.
+    #[test]
+    fn validate_checks_license_type() {
+        let license = |fields: &str| {
+            collection_with(&format!("[collections.license]\ntitle = \"X\"\n{fields}"))
+                .validate()
+                .map_err(|e| e.to_string())
+        };
+        let url = "url = \"https://example.com/lic\"\n";
+        assert!(license(&format!("{url}type = \"text/plain; charset=utf-8\"\n")).is_ok());
+        assert!(license(&format!("{url}type = \"application/pdf\"\n")).is_ok());
+        for bad in ["pdf", "text/", "/html", "text/ html", ""] {
+            let err = license(&format!("{url}type = \"{bad}\"\n")).unwrap_err();
+            assert!(err.contains("'type' must be a media type"), "{bad}: {err}");
+        }
+        let err = license("type = \"text/html\"\n").unwrap_err();
+        assert!(err.contains("'type' needs a 'url'"), "{err}");
+    }
+
+    /// `derive_wind` (#897): on by default for the engines that report u/v
+    /// components, off with `false`; rejected where it would do nothing,
+    /// and a non-boolean is a parse error.
+    #[test]
+    fn derive_wind_defaults_on_and_opts_out_per_collection() {
+        let grib = grib_collection("data_path = \"/data\"\n");
+        assert_eq!(grib.collections[0].derive_wind, None);
+        assert!(grib.collections[0].derives_wind());
+        let off = collection_with(
+            "engine_type = \"grib\"\nderive_wind = false\n\
+             [collections.grib]\ndata_path = \"/data\"\n",
+        );
+        assert!(!off.collections[0].derives_wind());
+        assert!(off.validate().is_ok());
+        // NetCDF states its components by CF standard_name (#1067).
+        let netcdf = collection_with(
+            "engine_type = \"netcdf\"\n[collections.netcdf]\ndata_path = \"/data\"\n",
+        );
+        assert!(netcdf.collections[0].derives_wind());
+        assert!(netcdf.validate().is_ok());
+        let csv = collection_with("derive_wind = true\n");
+        assert!(!csv.collections[0].derives_wind(), "csv has no components");
+        let err = csv.validate().unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "'derive_wind' applies only to engine types grib, querydata, zarr, netcdf"
+            ),
+            "{err}"
+        );
+        let toml = "[server]\nhost=\"h\"\nport=1\n[[collections]]\nid=\"c\"\ntitle=\"t\"\n\
+                    description=\"d\"\nengine_type=\"grib\"\nderive_wind=\"no\"\n";
+        assert!(toml::from_str::<ServerConfig>(toml).is_err());
     }
 
     #[test]
@@ -4742,6 +5850,40 @@ description = "A test"
         assert_eq!(
             load_render_concurrency("render_concurrency = 512"),
             Ok(Some(MAX_RENDER_CONCURRENCY))
+        );
+    }
+
+    #[test]
+    fn state_dir_is_optional_and_resolves_against_the_config_dir() {
+        let load = |line: &str| {
+            let tmp = TempDir::new().unwrap();
+            let toml = format!("[server]\nhost = \"127.0.0.1\"\nport = 8000\n{line}\n");
+            let path = write_config(tmp.path(), "config.toml", &toml);
+            ServerConfig::from_file(path.to_str().unwrap())
+                .map(|(config, _)| config.server.state_dir_path(&path))
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(load(""), Ok(None));
+        assert_eq!(ServerConfig::default_for_auto().server.state_dir, None);
+        let resolved = load("state_dir = \"state\"").unwrap().unwrap();
+        assert!(
+            resolved.is_absolute() && resolved.ends_with("state"),
+            "{resolved:?}"
+        );
+        let abs = std::env::temp_dir().join("mc-state");
+        let line = format!("state_dir = {:?}", abs.to_str().unwrap());
+        assert_eq!(load(&line), Ok(Some(abs)));
+        let err = load("state_dir = \"  \"").unwrap_err();
+        assert!(err.contains("state_dir must not be empty"), "{err}");
+        // A bare relative config path resolves against the working directory.
+        let settings = ServerConfig::default_for_auto().server;
+        let settings = ServerSettings {
+            state_dir: Some("state".into()),
+            ..settings
+        };
+        assert_eq!(
+            settings.state_dir_path(std::path::Path::new("config.toml")),
+            Some(std::path::PathBuf::from("state"))
         );
     }
 
@@ -5640,6 +6782,58 @@ description = "X"
         let wms = config.collections[0].wms.as_ref().unwrap();
         assert_eq!(wms.colormap, None);
         assert_eq!(wms.style_bundle, None);
+        // No webp_quality: WebP stays lossless.
+        assert_eq!(wms.webp_quality, None);
+        assert_eq!(config.collections[0].webp_quality(), None);
+    }
+
+    /// #1010: the rendered-image cache defaults to 256 MB; a collection can
+    /// still size it.
+    #[test]
+    fn wms_rendered_cache_defaults_to_256_mb() {
+        let cfg = collection_with("[collections.wms]\n");
+        let wms = cfg.collections[0].wms.as_ref().unwrap();
+        assert_eq!(wms.rendered_cache_mb, 256);
+        assert_eq!(DEFAULT_RENDERED_CACHE_MB, 256);
+        let cfg = collection_with("[collections.wms]\nrendered_cache_mb = 512\n");
+        let wms = cfg.collections[0].wms.as_ref().unwrap();
+        assert_eq!(wms.rendered_cache_mb, 512);
+    }
+
+    #[test]
+    fn wms_webp_quality_accepts_1_to_100() {
+        for quality in [1u8, 80, 100] {
+            let cfg = collection_with(&format!("[collections.wms]\nwebp_quality = {quality}\n"));
+            cfg.validate().unwrap();
+            assert_eq!(cfg.collections[0].webp_quality(), Some(quality));
+        }
+        // No [wms] block at all: no default.
+        let bare = collection_with("");
+        bare.validate().unwrap();
+        assert_eq!(bare.collections[0].webp_quality(), None);
+    }
+
+    #[test]
+    fn wms_webp_quality_out_of_range_is_a_load_error() {
+        for quality in [0u8, 101, 255] {
+            let err = collection_with(&format!("[collections.wms]\nwebp_quality = {quality}\n"))
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("[wms] webp_quality must be an integer from 1 to 100")
+                    && err.contains(&format!("got {quality}")),
+                "{err}"
+            );
+        }
+        // Beyond u8, negative, or not an integer: the TOML itself is rejected.
+        for bad in ["256", "-1", "80.5", "\"80\""] {
+            let toml = format!(
+                "[server]\nhost=\"127.0.0.1\"\nport=8000\n\n[[collections]]\nid=\"c\"\n\
+                 title=\"t\"\ndescription=\"d\"\n[collections.wms]\nwebp_quality = {bad}\n"
+            );
+            assert!(toml::from_str::<ServerConfig>(&toml).is_err(), "{bad}");
+        }
     }
 
     // ---- postgis ------------------------------------------------------------
@@ -5709,6 +6903,69 @@ observed_property = "wind_speed"
         assert_eq!(pg.observations.shape, "per_parameter");
         assert_eq!(pg.observations.tables.len(), 2);
         assert_eq!(pg.parameters.len(), 2);
+        // Absent ⇒ the engine applies POSTGIS_DEFAULT_MAX_LOCATIONS.
+        assert_eq!(pg.max_locations, None);
+    }
+
+    /// #1061: `max_locations` is read from `[postgis]` and bounded at load:
+    /// 1 ..= the hard ceiling.
+    #[test]
+    fn postgis_max_locations_validated_at_load() {
+        let with = |value: &str| {
+            nexus_postgis_toml().replace(
+                "dsn_env = \"NEXUS_DSN\"",
+                &format!("dsn_env = \"NEXUS_DSN\"\nmax_locations = {value}"),
+            )
+        };
+        let load = |toml: &str| {
+            let tmp = TempDir::new().unwrap();
+            let path = write_config(tmp.path(), "config.toml", toml);
+            ServerConfig::from_file(path.to_str().unwrap()).map(|(config, _)| config)
+        };
+
+        for ok in [
+            1,
+            POSTGIS_DEFAULT_MAX_LOCATIONS,
+            POSTGIS_MAX_LOCATIONS_CEILING,
+        ] {
+            let config = load(&with(&ok.to_string())).unwrap();
+            let pg = config.collections[0].postgis.as_ref().unwrap();
+            assert_eq!(pg.max_locations, Some(ok));
+        }
+
+        let err = load(&with("0")).unwrap_err().to_string();
+        assert!(err.contains("max_locations must be > 0"), "got: {err}");
+
+        let over = (POSTGIS_MAX_LOCATIONS_CEILING + 1).to_string();
+        let err = load(&with(&over)).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "max_locations {over} exceeds the hard ceiling {POSTGIS_MAX_LOCATIONS_CEILING}"
+            )),
+            "got: {err}"
+        );
+
+        // A negative count is not a usize: rejected by the parser.
+        assert!(load(&with("-5")).is_err());
+    }
+
+    /// #1061: the events shape has no location list, so the knob would do
+    /// nothing there — rejected rather than silently ignored.
+    #[test]
+    fn postgis_events_rejects_max_locations() {
+        let tmp = TempDir::new().unwrap();
+        let toml = lightning_events_toml().replace(
+            "dsn_env = \"NEXUS_DSN\"",
+            "dsn_env = \"NEXUS_DSN\"\nmax_locations = 1000",
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("max_locations is not valid for observations.shape 'events'"),
+            "got: {err}"
+        );
     }
 
     fn lightning_events_toml() -> &'static str {
@@ -5913,20 +7170,108 @@ unit = "1"
         assert!(config.collections[0].apis.contains(&"wms".to_string()));
     }
 
+    /// #1063: station shapes serve the map APIs, with or without a
+    /// `[postgis.map]` section.
     #[test]
-    fn postgis_station_shape_rejects_wms_api() {
+    fn postgis_station_shape_allows_map_apis() {
         let tmp = TempDir::new().unwrap();
         let toml = nexus_postgis_toml().replace(
             "apis = [\"edr\", \"features\"]",
-            "apis = [\"edr\", \"wms\"]",
+            "apis = [\"edr\", \"wms\", \"maps\", \"tiles\"]",
         );
         let path = write_config(tmp.path(), "config.toml", &toml);
-        let err = ServerConfig::from_file(path.to_str().unwrap())
-            .unwrap_err()
-            .to_string();
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert!(config.collections[0].apis.contains(&"wms".to_string()));
+        assert_eq!(config.collections[0].postgis.as_ref().unwrap().map, None);
+
+        let toml = format!(
+            "{toml}\n[collections.postgis.map]\nmax_age = \"PT30M\"\nmarker_size = 8\ndraw_missing = true\ntime_step = \"PT5M\"\n"
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        let map = config.collections[0].postgis.as_ref().unwrap().map.clone();
+        assert_eq!(
+            map,
+            Some(PostgisMapConfig {
+                max_age: Some("PT30M".into()),
+                marker_size: Some(8),
+                draw_missing: Some(true),
+                time_step: Some("PT5M".into()),
+            })
+        );
+    }
+
+    /// #1063: `[postgis.map]` is bounded at load, needs a map API, and is
+    /// not the events shape's.
+    #[test]
+    fn postgis_map_section_validated_at_load() {
+        let load = |toml: &str| {
+            let tmp = TempDir::new().unwrap();
+            let path = write_config(tmp.path(), "config.toml", toml);
+            ServerConfig::from_file(path.to_str().unwrap()).map(|(config, _)| config)
+        };
+        let station = |map: &str| {
+            format!(
+                "{}\n[collections.postgis.map]\n{map}\n",
+                nexus_postgis_toml().replace(
+                    "apis = [\"edr\", \"features\"]",
+                    "apis = [\"edr\", \"wms\"]",
+                )
+            )
+        };
+        assert!(load(&station(
+            "max_age = \"P7D\"\nmarker_size = 64\ntime_step = \"PT6H\""
+        ))
+        .is_ok());
+        assert!(load(&station("time_step = \"PT1M\"")).is_ok());
+        for (map, expected) in [
+            (
+                "max_age = \"soon\"",
+                "max_age 'soon' is not a valid ISO 8601 duration",
+            ),
+            ("max_age = \"P8D\"", "must be positive and at most P7D"),
+            (
+                "max_age = \"PT0S\"",
+                "max_age 'PT0S' is not a valid ISO 8601 duration",
+            ),
+            ("marker_size = 0", "marker_size 0 is outside 1..=64"),
+            ("marker_size = 65", "marker_size 65 is outside 1..=64"),
+            (
+                "time_step = \"PT30S\"",
+                "time_step 'PT30S' must be whole seconds from PT1M to PT6H",
+            ),
+            (
+                "time_step = \"PT7H\"",
+                "time_step 'PT7H' must be whole seconds from PT1M to PT6H",
+            ),
+            (
+                "time_step = \"often\"",
+                "time_step 'often' is not a valid ISO 8601 duration",
+            ),
+        ] {
+            let err = load(&station(map)).unwrap_err().to_string();
+            assert!(err.contains(expected), "{map}: {err}");
+        }
+        // A misspelt key is an error, not a silently ignored setting.
+        assert!(load(&station("maxage = \"PT1H\"")).is_err());
+
+        // No map API reads it.
+        let toml = format!(
+            "{}\n[collections.postgis.map]\nmax_age = \"PT1H\"\n",
+            nexus_postgis_toml()
+        );
+        let err = load(&toml).unwrap_err().to_string();
+        assert!(err.contains("[postgis.map] needs a map API"), "{err}");
+
+        // The events shape's strike layer has fixed settings.
+        let toml = format!(
+            "{}\n[collections.postgis.map]\nmax_age = \"PT1H\"\n",
+            lightning_events_toml().replace("apis = [\"edr\"]", "apis = [\"edr\", \"wms\"]")
+        );
+        let err = load(&toml).unwrap_err().to_string();
         assert!(
-            err.contains("requires observations.shape 'events'"),
-            "got: {err}"
+            err.contains("[postgis.map] is not valid for observations.shape 'events'"),
+            "{err}"
         );
     }
 
@@ -6671,6 +8016,45 @@ unit = "C"
         assert!(validate_qualified_table("1schema.tbl").is_err());
     }
 
+    /// A GMGSI product names its mosaic and takes no band.
+    #[test]
+    fn validate_satellite_gmgsi_products() {
+        let config = |product: &str, band: Option<u8>| SatelliteConfig {
+            provider: "gmgsi".into(),
+            data_path: Some("testdata/gmgsi".into()),
+            endpoint: None,
+            bucket: None,
+            time_window: None,
+            poll_interval_secs: 60,
+            products: vec![SatelliteProductConfig {
+                parameter: "ir_longwave".into(),
+                title: "Longwave IR display counts".into(),
+                unit: "1".into(),
+                product: product.into(),
+                band,
+                variable: "data".into(),
+            }],
+            composites: Vec::new(),
+        };
+        for product in GMGSI_PRODUCTS {
+            assert!(validate_satellite("g", &config(product, None)).is_ok());
+        }
+        let err = |product: &str, band| {
+            validate_satellite("g", &config(product, band))
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err("LW", Some(13)).contains("takes no 'band'"));
+        assert!(err("SSR", None).contains("not one of LW, SW, WV, VIS"));
+        assert!(err("ABI-L2-CMIPF", None).contains("not one of"));
+        let mut other = config("LW", None);
+        other.provider = "gk".into();
+        assert!(validate_satellite("g", &other)
+            .unwrap_err()
+            .to_string()
+            .contains("gmgsi"));
+    }
+
     /// A GK2A product names the full disk and a calibrated band; any other
     /// band is refused at load, naming why.
     #[test]
@@ -6865,16 +8249,256 @@ mod satellite_composite_tests {
         assert!(error(&format!("{head}\n{green}")).contains("needs a 'red' channel"));
     }
 
-    /// `recipe` is reserved for the built-in recipes of a later release: it
-    /// parses, and names what to do instead.
+    /// A collection of `provider` with one brightness-temperature product
+    /// per `(parameter, band)`, plus the `[[composites]]` given in TOML.
+    fn bands_config(provider: &str, bands: &[(&str, u8)], composites: &str) -> SatelliteConfig {
+        let product = if provider == "isatss" {
+            "HFD"
+        } else {
+            "ABI-L2-CMIPF"
+        };
+        let products: String = bands
+            .iter()
+            .map(|(parameter, band)| {
+                format!(
+                    "[[products]]\nparameter = \"{parameter}\"\ntitle = \"{parameter}\"\n\
+                     unit = \"K\"\nproduct = \"{product}\"\nband = {band}\nvariable = \"CMI\"\n"
+                )
+            })
+            .collect();
+        toml::from_str(&format!(
+            "provider = \"{provider}\"\ndata_path = \"/data/sat\"\n{products}\n{composites}"
+        ))
+        .expect("parses")
+    }
+
+    /// The ABI bands both recipes read, named by wavelength.
+    const ABI: [(&str, u8); 6] = [
+        ("ir_3_9", 7),
+        ("wv_6_2", 8),
+        ("wv_7_3", 10),
+        ("ir_9_6", 12),
+        ("ir_10_3", 13),
+        ("ir_12_3", 15),
+    ];
+
+    /// The AHI bands both recipes read: satpy's AHI recipes add band 14.
+    const AHI: [(&str, u8); 7] = [
+        ("b07", 7),
+        ("b08", 8),
+        ("b10", 10),
+        ("b12", 12),
+        ("b13", 13),
+        ("b14", 14),
+        ("b15", 15),
+    ];
+
+    const RECIPES: &str = r#"
+        [[composites]]
+        name = "airmass"
+        recipe = "airmass"
+
+        [[composites]]
+        name = "night"
+        title = "Fog and low cloud"
+        recipe = "night_microphysics"
+    "#;
+
+    /// A channel as `(parameter, minus, min, max, gamma)`.
+    fn spec(channel: &crate::map_engine::CompositeChannel) -> (&str, Option<&str>, f64, f64, f64) {
+        (
+            channel.parameter.as_str(),
+            channel.minus.as_deref(),
+            channel.min,
+            channel.max,
+            channel.gamma,
+        )
+    }
+
+    fn defs(cfg: &SatelliteConfig) -> Vec<crate::map_engine::CompositeDef> {
+        validate_satellite("goes", cfg).expect("valid");
+        cfg.composites
+            .iter()
+            .map(|c| super::satellite_composite_def("goes", cfg, c).unwrap())
+            .collect()
+    }
+
+    /// A recipe fills the cited channels, each band read from the product
+    /// with that `band`, and titles the layer unless the config does.
     #[test]
-    fn recipes_are_not_supported_yet() {
-        let message = error("[[composites]]\nname = \"airmass\"\nrecipe = \"airmass\"");
+    fn recipes_fill_the_channels_from_the_products_bands() {
+        let abi = defs(&bands_config("goes-r", &ABI, RECIPES));
+        assert_eq!(abi[0].name, "airmass");
+        assert_eq!(abi[0].title, "Airmass RGB");
+        assert_eq!(
+            abi[0].channels.each_ref().map(spec),
+            [
+                ("wv_6_2", Some("wv_7_3"), -26.2, 0.6, 1.0),
+                ("ir_9_6", Some("ir_10_3"), -43.2, 6.7, 1.0),
+                ("wv_6_2", None, 243.9, 208.5, 1.0),
+            ]
+        );
+        assert_eq!(abi[1].name, "night");
+        assert_eq!(abi[1].title, "Fog and low cloud", "a given title wins");
+        assert_eq!(
+            abi[1].channels.each_ref().map(spec),
+            [
+                ("ir_12_3", Some("ir_10_3"), -6.7, 2.6, 1.0),
+                ("ir_10_3", Some("ir_3_9"), -3.1, 5.2, 1.0),
+                ("ir_10_3", None, 243.55, 292.65, 1.0),
+            ]
+        );
+
+        // Product order does not matter: bands are matched by number.
+        let mut shuffled = ABI;
+        shuffled.reverse();
+        assert_eq!(defs(&bands_config("goes-r", &shuffled, RECIPES)), abi);
+
+        // Himawari takes satpy's AHI recipes.
+        let ahi = defs(&bands_config("isatss", &AHI, RECIPES));
+        assert_eq!(
+            ahi[0].channels.each_ref().map(spec),
+            [
+                ("b08", Some("b10"), -26.2, 0.6, 1.0),
+                ("b12", Some("b14"), -43.2, 6.7, 1.0),
+                ("b08", None, 243.9, 208.5, 1.0),
+            ]
+        );
+        assert_eq!(
+            ahi[1].channels.each_ref().map(spec),
+            [
+                ("b15", Some("b13"), -4.0, 2.0, 1.0),
+                ("b14", Some("b07"), 0.0, 10.0, 1.0),
+                ("b13", None, 243.0, 293.0, 1.0),
+            ]
+        );
+        let untitled = "[[composites]]\nname = \"nm\"\nrecipe = \"night_microphysics\"";
+        assert_eq!(
+            defs(&bands_config("isatss", &AHI, untitled))[0].title,
+            "Night Microphysics RGB"
+        );
+    }
+
+    /// A recipe composite is the composite its channels spell out.
+    #[test]
+    fn a_recipe_equals_its_channels_written_out() {
+        let written = r#"
+            [[composites]]
+            name = "airmass"
+            title = "Airmass RGB"
+            red = { parameter = "wv_6_2", minus = "wv_7_3", min = -26.2, max = 0.6 }
+            green = { parameter = "ir_9_6", minus = "ir_10_3", min = -43.2, max = 6.7 }
+            blue = { parameter = "wv_6_2", min = 243.9, max = 208.5 }
+        "#;
+        let recipe = "[[composites]]\nname = \"airmass\"\nrecipe = \"airmass\"";
+        assert_eq!(
+            defs(&bands_config("goes-r", &ABI, recipe)),
+            defs(&bands_config("goes-r", &ABI, written))
+        );
+    }
+
+    #[test]
+    fn recipe_errors_name_the_fix() {
+        let error = |provider: &str, bands: &[(&str, u8)], composites: &str| {
+            validate_satellite("goes", &bands_config(provider, bands, composites))
+                .expect_err("invalid")
+                .to_string()
+        };
+        let head = "[[composites]]\nname = \"rgb\"";
+        let red = r#"red = { parameter = "wv_6_2", min = 0.0, max = 1.0 }"#;
+        let blue = r#"blue = { parameter = "wv_6_2", min = 0.0, max = 1.0 }"#;
+        for (composites, expected) in [
+            (
+                format!("{head}\nrecipe = \"airmass\"\n{red}"),
+                "recipe 'airmass' sets the red, green and blue channels itself; \
+                 remove the red channel or the recipe",
+            ),
+            (
+                format!("{head}\nrecipe = \"airmass\"\n{red}\n{blue}"),
+                "remove the red and blue channels or the recipe",
+            ),
+            (
+                format!("{head}\nrecipe = \"true_color\""),
+                "unknown recipe 'true_color' (known: airmass, night_microphysics)",
+            ),
+        ] {
+            let message = error("goes-r", &ABI, &composites);
+            assert!(message.contains(expected), "{composites}: {message}");
+            assert!(message.contains("Collection 'goes': satellite composite 'rgb'"));
+        }
+
+        // Missing bands are named with the recipe that reads them.
+        let airmass = format!("{head}\nrecipe = \"airmass\"");
+        let message = error("goes-r", &[("ir_10_3", 13), ("wv_6_2", 8)], &airmass);
         assert!(
-            message.contains("built-in recipes such as 'airmass' are not supported yet"),
+            message.contains(
+                "recipe 'airmass' reads ABI bands 8, 10, 12 and 13, and no \
+                 [[satellite.products]] entry has 'band' = 10 or 12"
+            ),
             "{message}"
         );
-        assert!(message.contains("configure its red, green and blue channels"));
+        let message = error("isatss", &ABI, &airmass);
+        assert!(
+            message.contains(
+                "reads AHI bands 8, 10, 12 and 14, and no [[satellite.products]] entry \
+                 has 'band' = 14"
+            ),
+            "{message}"
+        );
+
+        // A band two products have is ambiguous.
+        let mut twice = ABI.to_vec();
+        twice.push(("ir_10_3_copy", 13));
+        let message = error("goes-r", &twice, &airmass);
+        assert!(
+            message.contains(
+                "recipe 'airmass' reads ABI band 13, which products 'ir_10_3' and \
+                 'ir_10_3_copy' each have"
+            ),
+            "{message}"
+        );
+    }
+
+    /// Recipes read brightness temperatures: a band declared in another
+    /// unit (an L1b radiance), or a provider without them, is refused. A
+    /// band in kelvin spelled another way is kelvin.
+    #[test]
+    fn recipes_need_brightness_temperatures() {
+        let recipe = "[[composites]]\nname = \"rgb\"\nrecipe = \"night_microphysics\"";
+        for unit in ["kelvin", "degK", " K "] {
+            let mut spelled = bands_config("goes-r", &ABI, recipe);
+            spelled.products[0].unit = unit.into();
+            validate_satellite("goes", &spelled).unwrap_or_else(|e| panic!("{unit:?}: {e}"));
+        }
+        let mut radiance = bands_config("goes-r", &ABI, recipe);
+        radiance.products[0].unit = "mW m-2 sr-1 (cm-1)-1".into();
+        let message = validate_satellite("goes", &radiance)
+            .expect_err("a radiance band")
+            .to_string();
+        assert!(
+            message.contains(
+                "recipe 'night_microphysics' reads brightness temperatures in K, but ABI \
+                 band 7 is 'ir_3_9' in 'mW m-2 sr-1 (cm-1)-1'"
+            ),
+            "{message}"
+        );
+
+        // `validate_satellite` rejects an unknown provider before any
+        // composite; the recipe resolution refuses one on its own too, so
+        // a provider added later without brightness temperatures (GMGSI's
+        // 8-bit counts) cannot reach a recipe.
+        let mut counts = bands_config("goes-r", &ABI, recipe);
+        counts.provider = "gmgsi".into();
+        let message = super::satellite_composite_def("goes", &counts, &counts.composites[0])
+            .expect_err("no brightness temperatures")
+            .to_string();
+        assert!(
+            message.contains(
+                "recipe 'night_microphysics' reads ABI or AHI brightness temperatures, which \
+                 provider 'gmgsi' does not serve"
+            ),
+            "{message}"
+        );
     }
 
     /// A misspelt key in a composite fails the load instead of silently
@@ -6890,5 +8514,169 @@ mod satellite_composite_tests {
             let message = config(composites).expect_err("unknown key").to_string();
             assert!(message.contains("unknown field"), "{message}");
         }
+    }
+}
+
+#[cfg(test)]
+mod netcdf_tests {
+    use super::{validate_netcdf, NetcdfConfig, ServerConfig};
+
+    fn netcdf(toml: &str) -> Result<NetcdfConfig, toml::de::Error> {
+        toml::from_str(toml)
+    }
+
+    fn error(toml: &str) -> String {
+        let cfg = netcdf(toml).expect("parses");
+        validate_netcdf("meps", &cfg)
+            .expect_err("invalid")
+            .to_string()
+    }
+
+    #[test]
+    fn defaults_and_a_full_table() {
+        let cfg = netcdf(r#"data_path = " testdata/meps-netcdf ""#).unwrap();
+        assert_eq!(cfg.data_path.as_deref(), Some("testdata/meps-netcdf"));
+        assert_eq!(
+            (
+                cfg.max_runs,
+                cfg.max_files,
+                cfg.poll_interval_secs,
+                cfg.member
+            ),
+            (4, 1024, 60, 0)
+        );
+        assert!(cfg.variables.is_none() && cfg.titles.is_empty());
+        validate_netcdf("meps", &cfg).unwrap();
+        let cfg = netcdf(
+            r#"
+            data_path = "/data/meps"
+            filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"
+            variables = ["air_temperature_2m", "precipitation_amount_acc"]
+            titles = { precipitation_amount_acc = "Precipitation since run start" }
+            member = 2
+            max_runs = 2
+            max_files = 200
+            poll_interval_secs = 30
+            "#,
+        )
+        .unwrap();
+        validate_netcdf("meps", &cfg).unwrap();
+    }
+
+    #[test]
+    fn mistakes_are_load_errors() {
+        // A mistyped key would otherwise serve every variable.
+        assert!(netcdf("data_path = \"d\"\nvariable = [\"t\"]").is_err());
+        assert!(error("max_runs = 4").contains("data_path"));
+        assert!(error("data_path = \"\"").contains("data_path"));
+        assert!(error("data_path = \"d\"\nfilename_template = \"\"").contains("filename_template"));
+        assert!(error("data_path = \"d\"\nmax_runs = 0").contains("max_runs"));
+        assert!(error("data_path = \"d\"\nmax_files = 0").contains("max_files"));
+        assert!(error("data_path = \"d\"\npoll_interval_secs = 0").contains("poll_interval"));
+        assert!(error("data_path = \"d\"\nvariables = []").contains("variables"));
+        assert!(error("data_path = \"d\"\nvariables = [\"t\", \"t\"]").contains("twice"));
+        assert!(error("data_path = \"d\"\nvariables = [\" t\"]").contains("spaces"));
+        let titled = "data_path = \"d\"\nvariables = [\"t\"]\ntitles = { p = \"P\" }";
+        assert!(error(titled).contains("not in"));
+        assert!(error("data_path = \"d\"\ntitles = { t = \" \" }").contains("empty"));
+    }
+
+    /// MEPS on thredds.met.no, as the disabled example configures it.
+    const REMOTE: &str = r#"
+        data_path = "https://thredds.met.no/thredds/fileServer/meps25epsarchive/"
+        prefix_pattern = "%Y/%m/%d/{run}/member_00/"
+        filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"
+        run_hours = [0, 3, 6, 9, 12, 15, 18, 21]
+        leads = [0, 1, 2]
+        time_window = "-PT12H"
+        variables = ["air_temperature_2m", "precipitation_amount_acc"]
+        prewarm_variables = ["air_temperature_2m"]
+        "#;
+
+    #[test]
+    fn a_remote_source_takes_its_template_fields() {
+        let cfg = netcdf(REMOTE).unwrap();
+        assert!(cfg.is_remote());
+        validate_netcdf("meps", &cfg).unwrap();
+        let cfg = netcdf(&format!(
+            "{REMOTE}\nmin_age = \"PT5M\"\nrun_grace = \"PT1H\""
+        ))
+        .unwrap();
+        validate_netcdf("meps", &cfg).unwrap();
+        assert!(netcdf("data_path = \"HTTPS://thredds.met.no/x/\"")
+            .unwrap()
+            .is_remote());
+        assert!(!netcdf("data_path = \"testdata/meps-netcdf\"")
+            .unwrap()
+            .is_remote());
+    }
+
+    #[test]
+    fn remote_mistakes_are_load_errors() {
+        let without = |key: &str| {
+            REMOTE
+                .lines()
+                .filter(|line| !line.trim_start().starts_with(key))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let with = |line: &str| format!("{}\n{line}", without(line.split('=').next().unwrap()));
+        assert!(error(&without("filename_template")).contains("filename_template"));
+        assert!(error(&without("run_hours")).contains("run_hours"));
+        assert!(error(&with("run_hours = [24]")).contains("run_hours"));
+        assert!(error(&with("run_hours = [3, 3]")).contains("twice"));
+        assert!(error(&without("leads")).contains("leads"));
+        assert!(error(&with("leads = []")).contains("leads"));
+        assert!(error(&with("leads = [100]")).contains("two digits"));
+        assert!(error(&with("leads = [1, 1]")).contains("twice"));
+        let no_lead = format!(
+            "{}\nfilename_template = \"meps_sfc_%Y%m%dT{{run}}Z.nc\"",
+            without("filename_template")
+        );
+        assert!(error(&no_lead).contains("{lead}"));
+        assert!(error(&without("time_window")).contains("time_window"));
+        assert!(error(&with("time_window = \"12h\"")).contains("time_window"));
+        assert!(error(&with("min_age = \"-PT5M\"")).contains("min_age"));
+        assert!(error(&with("run_grace = \"P1M\"")).contains("run_grace"));
+        assert!(error(&with("prewarm_variables = [\"x_wind_10m\"]")).contains("not in"));
+        let twice = "prewarm_variables = [\"air_temperature_2m\", \"air_temperature_2m\"]";
+        assert!(error(&with(twice)).contains("twice"));
+        // The template fields are remote only, and other schemes are refused.
+        assert!(error("data_path = \"d\"\nrun_hours = [0]").contains("http(s) data_path only"));
+        assert!(error("data_path = \"d\"\nprewarm_variables = [\"t\"]").contains("only"));
+        assert!(error("data_path = \"s3://bucket/meps\"").contains("neither"));
+    }
+
+    #[test]
+    fn the_engine_type_and_its_table_go_together() {
+        let config = |engine: &str, table: bool| {
+            let table = if table {
+                "[collections.netcdf]\ndata_path = \"testdata/meps-netcdf\""
+            } else {
+                ""
+            };
+            format!(
+                r#"
+                [server]
+                host = "127.0.0.1"
+                port = 8000
+
+                [[collections]]
+                id = "meps"
+                title = "MEPS"
+                description = "MEPS"
+                data_path = "testdata/weather.csv"
+                engine_type = "{engine}"
+                apis = ["wms"]
+                {table}
+                "#
+            )
+        };
+        let validate = |toml: &str| toml::from_str::<ServerConfig>(toml).unwrap().validate();
+        validate(&config("netcdf", true)).unwrap();
+        let error = validate(&config("netcdf", false)).unwrap_err().to_string();
+        assert!(error.contains("requires a [collections.netcdf]"), "{error}");
+        let error = validate(&config("csv", true)).unwrap_err().to_string();
+        assert!(error.contains("[collections.netcdf] is set"), "{error}");
     }
 }

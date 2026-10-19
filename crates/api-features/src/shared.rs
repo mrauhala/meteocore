@@ -34,10 +34,13 @@ fn shared_name(name: &str) -> String {
     format!("features-{name}")
 }
 
+/// `overview`: whether to say what the items are, which only the
+/// collection's own HTML page shows (#1143); the catalog skips it.
 fn contribution(
     state: &FeaturesState,
     config: &CollectionConfig,
     root: &str,
+    overview: bool,
 ) -> Option<Contribution> {
     let engine = state.engines.get(&config.id)?;
     let (fields, links) = handlers::collection_parts(engine.as_ref(), config, root, Layout::Shared);
@@ -48,6 +51,7 @@ fn contribution(
         bbox: engine.spatial_extent(),
         time: engine.temporal_extent(),
         claims: &[],
+        items: overview.then(|| handlers::items_overview(engine.as_ref())),
     })
 }
 
@@ -69,13 +73,17 @@ impl BuildingBlock for FeaturesBlock {
         state
             .collections
             .values()
-            .filter_map(|config| contribution(&state, config, root))
+            .filter_map(|config| contribution(&state, config, root, false))
             .collect()
     }
 
     fn collection(&self, id: &str, root: &str) -> Option<Contribution> {
         let state = self.state.load();
-        contribution(&state, state.collections.get(id)?, root)
+        contribution(&state, state.collections.get(id)?, root, true)
+    }
+
+    fn serves(&self, id: &str) -> bool {
+        self.state.load().collections.contains_key(id)
     }
 
     fn openapi(&self, mount: &str) -> OpenApiFragment {

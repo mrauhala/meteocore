@@ -2,6 +2,7 @@ use std::path::Path;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use ds_core::geo::{Crs, GeoTransform};
+use ds_core::resample::SourceGrid;
 use memmap2::Mmap;
 use thiserror::Error;
 
@@ -75,6 +76,8 @@ pub struct GridInfo {
     bbox: [f64; 4],
     /// [`Self::lonlat_extent`], computed once by [`Self::new`].
     lonlat_extent: [f64; 4],
+    /// [`Self::source`], built once by [`Self::new`].
+    source: SourceGrid,
 }
 
 impl GridInfo {
@@ -135,6 +138,7 @@ impl GridInfo {
             ],
             _ => bbox,
         };
+        let source = SourceGrid::new(transform.clone());
         Self {
             nx,
             ny,
@@ -142,6 +146,7 @@ impl GridInfo {
             transform,
             bbox,
             lonlat_extent,
+            source,
         }
     }
 
@@ -172,6 +177,16 @@ impl GridInfo {
     /// points; any other grid's equals [`Self::lonlat_extent`].
     pub fn bbox(&self) -> [f64; 4] {
         self.bbox
+    }
+
+    /// The shared sampler's view of the grid
+    /// (`ds_core::resample::SourceGrid`), built once by [`Self::new`]: a
+    /// projected grid's WGS84 envelope is inverse-projected there, never
+    /// per request. Map renders take their output→source map from it
+    /// (`SourceGrid::output_map_quiet`), and the engine samples its memory
+    /// map at the positions it gives (#1190).
+    pub fn source(&self) -> &SourceGrid {
+        &self.source
     }
 }
 
