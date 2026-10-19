@@ -254,18 +254,52 @@ resource as currently filtered and paged.
   URL fragment (`#filter=<name>`, `#sort=<name>`).
 - **Map preview.** Drawn with MapLibre over Natural Earth outlines, which
   the server serves under `/preview/vendor/`.
-  - It draws with whatever the collection advertises: Maps images (Web
-    Mercator PNG, up to 1024 × 768), map tiles or vector tiles. A "Draw
-    with" switch appears when there is more than one.
+  - It draws with whatever the collection advertises: map tiles, Maps
+    images (Web Mercator PNG) or vector tiles. Map tiles are the default
+    where advertised, else Maps. A "Draw with" switch appears when there is
+    more than one.
   - Maps images and map tiles get parameter, style, time and level controls
-    when the collection advertises them. Vector tiles take none.
-  - For a Maps image, the status line names the instant drawn, taken from
-    `Content-Datetime`.
+    when the collection advertises them. The style select is hidden when
+    there is one style. Vector tiles take none.
+  - Every control applies on `change`; there is no Update button. Pan and
+    zoom request a new Maps image 300 ms after the view settles, and map
+    tiles follow the view by themselves. Every request reads one drawn
+    state, so a pan never applies an edit that was not committed.
+  - A new frame never flashes. It loads at opacity 0 as its own raster
+    source and layer, below the borders, with no paint transition and no
+    tile fade. Once MapLibre reports it loaded, one paint shows it and hides
+    the old frame, which is removed after that paint. The visible source is
+    never removed or retargeted.
+  - A failed request keeps the last frame and marks it stale in the status
+    line ("Still showing …"). A 503 is retried at most three times, each
+    after `Retry-After` or a 1, 2 and 4 s backoff, whichever is longer. A 404, or map tiles that all come back
+    empty, says there is no data at that time.
+  - The legend stays, dimmed, while the next one loads. Each legend
+    document is fetched once per page, and the colour bar is drawn at the
+    data's 85 % opacity.
+  - HiDPI: a Maps image is the map's CSS size × `devicePixelRatio`, at most
+    about 4 Mpx. At a ratio of 1.5 or more, map tiles are requested at
+    512 × 512 pixels (Tiles `width`/`height`) over the same 256-pixel tile
+    area.
+  - The status line names the time drawn: for a Maps image, the instant
+    from `Content-Datetime`; for map tiles, the time requested, and only
+    once the tiles have loaded.
+  - The URL fragment keeps the view and the choices under the API's own
+    parameter names, for example
+    `#map=6/61.5/24.25&parameter-name=t&style=warm&datetime=2024-01-01T01:00:00Z&elevation=850&mode=maps`.
+    A reload or a shared link reopens them. It is written with
+    `history.replaceState` at most about once a second, and never over
+    another fragment such as `#metadata`.
+  - On a collection page the wheel and a one-finger drag scroll the page.
+    The map zooms with Ctrl or ⌘ and the wheel, and pans with two fingers.
   - On an items page, the request builder's **Use map view** copies the
     map's current view into `bbox` as a CRS84 box, west > east across the
     antimeridian.
 - **Without JavaScript.** Navigation, metadata, JSON links, paging and basic
-  text search all work. JavaScript adds the optional search fields, the
+  text search all work. The map controls are a `GET` form to the
+  collection's Maps endpoint. Its only fields are Maps parameters
+  (`parameter-name`, `datetime`, `elevation`), and each style has its own
+  "Open map image" button. JavaScript adds the optional search fields, the
   map, clipboard buttons and view switching.
 - **Theme.** Light, dark or system, remembered in the browser.
 
@@ -283,9 +317,16 @@ resource as currently filtered and paged.
 
 ```sh
 cargo test -p api-common                          # unit tests
-node --test crates/api-common/tests/map.test.cjs  # map script, stub DOM
+node --test crates/api-common/tests/map.test.cjs  # map script, stub DOM and MapLibre
 cargo test -p server --test common_discovery      # cross-API contracts
 ```
+
+The map tests run the shipped `workbench/map.js` on
+[`tests/fixtures/map-panel.html`](tests/fixtures/map-panel.html), the map
+panel as `workbench` renders it. A unit test fails when the fixture is
+stale; `UPDATE_MAP_FIXTURE=1 cargo test -p api-common map_panel_fixture`
+regenerates it. api-maps submits the panel's no-JavaScript form to its own
+router (`workbench_form` in its integration tests).
 
 [`common_discovery`](../server/tests/common_discovery.rs) runs the real
 EDR, Maps, Tiles, Features and shared-root routers over in-memory catalogs,

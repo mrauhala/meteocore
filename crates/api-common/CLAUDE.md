@@ -50,9 +50,23 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   `FeatureQuery::datetime`.
 - `workbench/map.js` prints a property number by the rule of
   `metadata::number_text` (#1140); change both together. Its tests run the
-  shipped script on a stub DOM: `node --test crates/api-common/tests/map.test.cjs`
-  (CI). It also keeps the map's view as a CRS84 box in the map element's
-  `data-view`, which the items builder's "Use map view" reads (#1143).
+  shipped script on a stub DOM and MapLibre over `tests/fixtures/map-panel.html`,
+  the panel as `map_html` renders it: `node --test crates/api-common/tests/map.test.cjs`
+  (CI). After a deliberate markup change regenerate the fixture with
+  `UPDATE_MAP_FIXTURE=1 cargo test -p api-common map_panel_fixture`. It also
+  keeps the map's view as a CRS84 box in the map element's `data-view`,
+  which the items builder's "Use map view" reads (#1143).
+- The collection map (#1220): every request reads one drawn-state object that
+  the controls write on `change`; never read a control in a render path. Only
+  `stageFrame` adds data layers: a new raster source at opacity 0 with zero
+  `raster-opacity-transition` and `raster-fade-duration`, swapped in one paint
+  once `isSourceLoaded`, the old removed after that paint. Never remove or
+  `setTiles` the visible source. A 404 tile fires no MapLibre `error`: no tile
+  loaded and none failed means no data. The controls form is a no-JS GET to the
+  Maps endpoint whose only named fields are Maps parameters (api-maps
+  `workbench_form` submits it); script-only controls stay unnamed or outside
+  it. The fragment is the map's only when empty, `#overview` or its own keys;
+  never overwrite `#metadata`.
 - The Overview's "Filter by" / "Sort by" chips (`ItemsOverview`, carried by
   `Contribution::items`, rendered by `collection_page`) open the items
   builder through the URL fragment (`#filter=<name>`, `#sort=<name>`), never

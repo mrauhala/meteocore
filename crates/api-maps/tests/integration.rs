@@ -5226,3 +5226,173 @@ async fn map_past_a_pole_asks_the_engine_only_for_rows_inside_the_crs() {
         [([-10.0, 80.0, 10.0, 90.0], 50)]
     );
 }
+
+/// #1220: the HTML workbench's map controls are a real form. Without
+/// JavaScript it is a GET to the collection's Maps endpoint whose named
+/// fields are Maps parameters only, so submitting it, with the defaults or
+/// with any choice, draws the map instead of a 400 for an unknown parameter.
+mod workbench_form {
+    use super::*;
+    use ds_core::vertical::{VerticalDimension, VerticalKind};
+
+    struct FormEngine;
+
+    impl MapEngine for FormEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![Some(0.5); (width * height) as usize].into(),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            let at = |t: &str| {
+                chrono::DateTime::parse_from_rfc3339(t)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            };
+            let parameter = |name: &str, title: &str| ds_core::map_engine::ParameterInfo {
+                name: name.into(),
+                title: title.into(),
+                unit: "K".into(),
+            };
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+                times: vec![at("2024-01-01T00:00:00Z"), at("2024-01-01T01:00:00Z")],
+                parameter: "t".into(),
+                unit: "K".into(),
+                parameters: vec![parameter("t", "Temperature"), parameter("td", "Dew point")],
+                vertical: Some(VerticalDimension::new(
+                    VerticalKind::Pressure,
+                    vec![1000.0, 850.0],
+                )),
+                grid_size: None,
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
+    async fn get(app: &axum::Router, uri: &str) -> (StatusCode, String, Vec<u8>) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_owned())
+            .unwrap_or_default();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, content_type, body)
+    }
+
+    /// An attribute of the first tag in `markup`.
+    fn attr<'a>(markup: &'a str, name: &str) -> Option<&'a str> {
+        let tag = markup.split('>').next()?;
+        tag.split(&format!(" {name}=\"")).nth(1)?.split('"').next()
+    }
+
+    #[tokio::test]
+    async fn the_no_script_map_form_submits_a_valid_maps_request() {
+        let app = build_router_with_engine(Arc::new(FormEngine));
+        let (status, _, page) = get(&app, "/collections/radar?f=html").await;
+        assert_eq!(status, StatusCode::OK);
+        let page = String::from_utf8(page).unwrap();
+        let form = page
+            .split("<form id=\"map-form\"")
+            .nth(1)
+            .expect("no map form")
+            .split("</form>")
+            .next()
+            .unwrap();
+        assert_eq!(attr(form, "method"), Some("get"));
+        let action = attr(form, "action").unwrap();
+        // The page links to the Maps mount; this router serves below it.
+        let path = action
+            .split_once("://")
+            .map_or(action, |(_, rest)| &rest[rest.find('/').unwrap()..]);
+        let path = path.strip_prefix(api_common::mounts::MAPS).unwrap_or(path);
+        assert_eq!(path, "/collections/radar/map");
+
+        // Each named field with the values it offers, Default ("") first.
+        let mut fields: Vec<(&str, Vec<&str>)> = Vec::new();
+        for element in form.split('<').skip(1) {
+            let Some(name) = attr(element, "name") else {
+                continue;
+            };
+            if element.starts_with("select") {
+                let options = form
+                    .split(&format!("name=\"{name}\""))
+                    .nth(1)
+                    .unwrap()
+                    .split("</select>")
+                    .next()
+                    .unwrap()
+                    .split("<option")
+                    .skip(1)
+                    .map(|option| attr(option, "value").unwrap())
+                    .collect();
+                fields.push((name, options));
+            } else {
+                fields.push((name, vec![""]));
+            }
+        }
+        let names: HashSet<&str> = fields.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            HashSet::from(["parameter-name", "datetime", "elevation"])
+        );
+        for name in &names {
+            assert!(
+                api_maps::params::MAP_PARAMETERS.contains(name),
+                "{name} is no Maps parameter"
+            );
+        }
+
+        // As a browser submits it: every field, percent-encoded. First the
+        // defaults, then the last choice of every field.
+        let submit = |pick: &dyn Fn(&[&str]) -> String| {
+            let query: Vec<String> = fields
+                .iter()
+                .map(|(name, values)| {
+                    format!(
+                        "{name}={}",
+                        pick(values).replace(':', "%3A").replace('+', "%2B")
+                    )
+                })
+                .collect();
+            format!("{path}?{}", query.join("&"))
+        };
+        for uri in [
+            submit(&|_| String::new()),
+            submit(&|values| (*values.last().unwrap()).to_owned()),
+        ] {
+            let (status, content_type, body) = get(&app, &uri).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(content_type, "image/png", "{uri}");
+        }
+    }
+}

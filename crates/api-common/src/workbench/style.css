@@ -2602,7 +2602,7 @@ a {
 [hidden]{display:none!important}.field{display:block;margin-bottom:16px}.field .hint{display:block;font-size:14px;color:var(--muted);font-weight:400;margin:3px 0 8px}.field input{margin-top:5px}
 .query-form .fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}.query-form.item-query{padding:22px;margin-bottom:24px}.query-form.item-query>h2{margin-bottom:18px}.query-form>details{margin-bottom:18px}.query-form>.btn{margin-right:8px}.draft{margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}.draft code{display:block;overflow-wrap:anywhere;color:var(--teal)}
 .table-scroll{overflow:auto;max-width:100%}.properties th{font-weight:400;overflow-wrap:anywhere;background:transparent;color:var(--muted)}.properties td{overflow-wrap:anywhere}.properties pre,pre{white-space:pre-wrap;overflow-wrap:anywhere}.properties pre{padding:12px;border-radius:5px}code{overflow-wrap:anywhere}.conformance{padding:24px 40px}.conformance li{padding:8px 0;overflow-wrap:anywhere}
-.map-panel{position:relative}#feature-map,#coverage-map{height:340px}.map-selection{padding:18px;display:flex;flex-wrap:wrap;gap:8px}.map-selection p{flex-basis:100%}#map-status{padding:10px 18px;font-size:14px}.geometry-details{padding:16px 20px;border-top:1px solid var(--line)}.geometry-details pre{margin-top:12px}.maplibregl-map .maplibregl-ctrl-attrib,.maplibregl-map .maplibregl-ctrl-scale{font-family:var(--font-ui);font-size:14px;color:#172e27;background:#fff}.maplibregl-map .maplibregl-ctrl-attrib a{color:#172e27}.maplibregl-map .maplibregl-ctrl button{min-height:44px;min-width:44px}
+.map-panel{position:relative}#feature-map,#coverage-map{height:340px}.map-selection{padding:18px;display:flex;flex-wrap:wrap;gap:8px}.map-selection p{flex-basis:100%}#map-status{padding:10px 18px;font-size:14px}.geometry-details{padding:16px 20px;border-top:1px solid var(--line)}.geometry-details pre{margin-top:12px}.maplibregl-map .maplibregl-ctrl-attrib,.maplibregl-map .maplibregl-ctrl-attrib.maplibregl-compact,.maplibregl-map .maplibregl-ctrl-scale{font-family:var(--font-ui);font-size:14px;color:var(--ink);background:var(--white)}.maplibregl-map .maplibregl-ctrl-scale{border-color:var(--ink)}.maplibregl-map .maplibregl-ctrl-attrib a{color:var(--ink)}.maplibregl-map .maplibregl-ctrl button{min-height:44px;min-width:44px}
 .warning{background:var(--amber-bg);color:var(--amber)}.toast.visible,#toast.visible{opacity:1;transform:translate(-50%,0);display:block}.empty{padding:35px;text-align:center}.spaced{margin-top:24px}.feature-summary{padding:18px}.property-search{display:block;padding:18px}.property-search input{margin-top:8px}.results-head{display:flex;justify-content:space-between;gap:18px;margin-bottom:18px;flex-wrap:wrap}.results-head p{font-size:14px}
 .resource-links .endpoint{align-items:start}.resource-links .endpoint>div{min-width:0}.resource-links code{font-size:14px}.resource-links .btn{flex-shrink:0}.coverage-facts strong{overflow-wrap:anywhere}.collection-row .license{font-size:14px}.metadata-section{margin-top:24px}.collection-view:target{scroll-margin-top:95px}
 @media(max-width:800px){.query-form .fields{grid-template-columns:1fr}.resource-links .endpoint{flex-wrap:wrap}.topbar{height:auto;min-height:71px}.item-table{min-width:420px}}
@@ -2623,21 +2623,25 @@ a {
 #feature-map[aria-label="Collection map data"]:not([hidden])+#map-status{height:6em;overflow:auto;margin:0}
 .map-request code{height:4.5em;line-height:1.5;overflow:auto;overflow-wrap:anywhere}
 #map-image-link[aria-disabled="true"]{cursor:default;color:var(--muted)}
-.map-controls{padding:20px}
 /* Fields wrap at a 170px minimum; the parameter's long labels and time,
-   with its arrows, take two columns wherever two fit. Update map has its
-   own row. */
-.js .map-controls.enhanced{display:grid!important;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));align-items:end;gap:16px;container-type:inline-size}
+   with its arrows, take two columns wherever two fit. The form is a real
+   GET without JavaScript, so it is laid out without it too. */
+.map-controls{padding:20px;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));align-items:end;gap:16px;container-type:inline-size}
+.js .map-controls.enhanced{display:grid!important}
+.js .map-controls label.enhanced:not([hidden]){display:flex!important}
+.map-controls>noscript{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:12px}
+.map-controls>noscript p{flex-basis:100%;font-size:14px;color:var(--muted);margin:0}
 @container (min-width:400px){.map-controls>.map-time-field,.map-controls>label:has(#map-parameter){grid-column:span 2}}
 .map-controls label{display:flex;flex-direction:column;gap:8px;min-width:0;max-width:none;margin:0;line-height:24px}
 .map-controls select,.map-controls input{display:block;width:100%;box-sizing:border-box;height:46px;min-height:46px;margin:0;font-size:16px;line-height:24px}
-.map-controls>.btn{box-sizing:border-box;height:46px;min-height:46px;margin:0;white-space:nowrap;grid-column:1/-1;justify-self:start}
 .map-controls>p{grid-column:1/-1;font-size:14px;color:var(--muted);margin:0}
-/* Maps / map tiles / vector tiles switch: its own full-width row. The
-   grid and flex rules above would otherwise override the hidden attribute. */
-.map-controls>.map-mode{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px;border:0;margin:0;padding:0;min-width:0}
+/* Map tiles / Maps / vector tiles switch: its own row above the form, of
+   which it is no field. The grid and flex rules above would otherwise
+   override the hidden attribute. */
+.map-mode{display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px;border:0;margin:0;padding:20px 20px 0;min-width:0}
+.js .map-mode.enhanced{display:flex!important}
 .map-mode legend{float:left;padding:0;margin-right:4px;font-weight:600}
-.map-mode label{flex-direction:row;align-items:center;gap:6px;line-height:24px}
+.map-mode label{display:flex;flex-direction:row;align-items:center;gap:6px;line-height:24px}
 .map-mode input{width:auto;height:auto;min-height:0}
 .map-controls [hidden],.js .map-controls.enhanced[hidden]{display:none!important}
 /* What the script hides stays hidden: the map without WebGL, its
@@ -2667,6 +2671,14 @@ a {
 .map-legend-ticks span.start{transform:none}
 .map-legend-ticks span.end{transform:translateX(-100%)}
 #map-legend-status{margin:8px 0 0;color:var(--muted)}
+/* While the next legend loads the last one stays, dimmed: no reflow. */
+.map-legend.stale #map-legend-scale{opacity:.5}
+/* The frame on the map is not the one asked for: a failed or busy request. */
+#map-status.stale{color:var(--amber)}
+/* Dark map controls: MapLibre's are light only. */
+[data-theme=dark] .maplibregl-ctrl-group{background:var(--white)}
+[data-theme=dark] .maplibregl-ctrl-group button+button{border-top-color:var(--line)}
+[data-theme=dark] .maplibregl-ctrl button .maplibregl-ctrl-icon,[data-theme=dark] .maplibregl-ctrl-attrib-button{filter:invert(1)}
 .map-legend-channels{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px}
 .map-legend-channels li{display:flex;align-items:center;gap:8px;color:var(--ink)}
 .channel-swatch{width:14px;height:14px;border-radius:3px;flex:none}

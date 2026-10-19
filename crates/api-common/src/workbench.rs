@@ -849,8 +849,13 @@ pub fn map_head(base: &str) -> String {
 
 /// Expand only advertised temporal grids, never infer a cadence from bounds.
 /// Large axes fall back to a native UTC date/time input instead of huge HTML.
+/// Each time is RFC 3339 in UTC with `Z`, the form `datetime` takes and the
+/// map script writes to the URL fragment.
 fn map_times(temporal: &Value) -> Vec<String> {
-    fn expand(temporal: &Value) -> Option<Vec<String>> {
+    let utc = |t: chrono::DateTime<chrono::FixedOffset>| {
+        crate::subset::rfc3339(t.with_timezone(&chrono::Utc))
+    };
+    let expand = |temporal: &Value| -> Option<Vec<String>> {
         let grid = &temporal["grid"];
         let count = grid["cellsCount"].as_u64()?;
         if !(1..=10_000).contains(&count) {
@@ -865,7 +870,7 @@ fn map_times(temporal: &Value) -> Vec<String> {
                 .map(|t| {
                     chrono::DateTime::parse_from_rfc3339(t.as_str()?)
                         .ok()
-                        .map(|t| t.with_timezone(&chrono::Utc).to_rfc3339())
+                        .map(utc)
                 })
                 .collect();
         }
@@ -882,10 +887,10 @@ fn map_times(temporal: &Value) -> Vec<String> {
             .map(|i| {
                 start
                     .checked_add_signed(step.checked_mul(i as i32)?)
-                    .map(|t| t.with_timezone(&chrono::Utc).to_rfc3339())
+                    .map(utc)
             })
             .collect()
-    }
+    };
     expand(temporal).unwrap_or_default()
 }
 
@@ -909,6 +914,9 @@ fn map_time_label(time: &str) -> String {
 /// valid `parameter-name` values, #279): name, label and unit, in the
 /// document's order. Reads the Maps/Tiles form (`observedProperty.label`,
 /// `unit.symbol.value`) and EDR's (`label`, `unit.symbol` or `unit.label`).
+/// A label that ends in its own name, as QueryData's
+/// "2 Metre Temperature (2t)" does, drops it: the controls add the unit in
+/// parentheses, and "(2t) (°C)" read as two units.
 fn map_parameters(parameters: &Value) -> Vec<Value> {
     fn text(value: &Value) -> Option<String> {
         value
@@ -925,6 +933,13 @@ fn map_parameters(parameters: &Value) -> Vec<Value> {
         .map(|(name, parameter)| {
             let label = text(&parameter["label"])
                 .or_else(|| text(&parameter["observedProperty"]["label"]))
+                .map(|label| {
+                    label
+                        .strip_suffix(&format!("({name})"))
+                        .map(str::trim_end)
+                        .filter(|rest| !rest.is_empty())
+                        .map_or(label.clone(), str::to_owned)
+                })
                 .unwrap_or_else(|| name.clone());
             let unit = text(&parameter["unit"]["symbol"]["value"])
                 .or_else(|| text(&parameter["unit"]["symbol"]))
@@ -939,6 +954,13 @@ fn map_parameters(parameters: &Value) -> Vec<Value> {
 /// `mapRequest` the controls, the rendered-request link and the legend.
 /// `fallback` finishes the sentence shown when the browser cannot draw the
 /// map: where the same facts are on this page.
+///
+/// The controls are a real form (#1220): a `GET` to the default style's
+/// Maps endpoint whose only named fields are Maps parameters
+/// (`parameter-name`, `datetime`, `elevation`), so without JavaScript it
+/// opens the image the choices describe. The draw-mode switch sits outside
+/// the form and the style select has no name: neither is a Maps parameter.
+/// With JavaScript every control applies on `change`; there is no submit.
 pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -> String {
     let raster = features.get("mapRequest");
     let mut controls = String::new();
@@ -950,35 +972,60 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
             .flatten()
             .filter_map(Value::as_str)
             .collect();
-        // Vector tiles alone have nothing to choose: the form stays hidden,
-        // also before the script runs.
+        // Map tiles where advertised, else Maps (#1220): pans keep the
+        // tiles, and the server's tile cache is shared between viewers.
+        let default_mode = ["tiles", "maps", "vector"]
+            .into_iter()
+            .find(|mode| modes.contains(mode))
+            .unwrap_or("maps");
+        // Vector tiles alone have nothing to choose: the controls stay
+        // hidden, also before the script runs.
         let vector_only = modes == ["vector"];
         controls.push_str(&format!(
-            "<form id=\"map-controls\" class=\"map-controls enhanced\"{}>",
+            "<div id=\"map-controls\" class=\"map-controls-block\"{}>",
             if vector_only { " hidden" } else { "" }
         ));
         if modes.iter().any(|mode| *mode != "vector") {
             legend = "<div id=\"map-legend\" class=\"map-legend enhanced\" aria-live=\"polite\"><div class=\"map-legend-head\"><strong id=\"map-legend-title\">Legend</strong><span class=\"map-legend-links\"><a id=\"map-legend-image\" hidden>Legend image ↗</a><a id=\"map-legend-link\" hidden>Legend JSON ↗</a></span></div><div id=\"map-legend-scale\" hidden></div><p id=\"map-legend-status\">Loading legend…</p></div>";
         }
-        // Both Maps and Tiles serve this collection: let the viewer choose
-        // which one draws the preview.
+        // More than one mechanism draws this collection: let the viewer
+        // choose. The switch is the script's, so it is no form field.
         if modes.len() > 1 {
-            controls.push_str("<fieldset class=\"map-mode\"><legend>Draw with</legend>");
-            for (i, (mode, label)) in [
-                ("maps", "Maps · one image per view"),
+            controls.push_str("<fieldset class=\"map-mode enhanced\"><legend>Draw with</legend>");
+            for (mode, label) in [
                 ("tiles", "Map tiles"),
+                ("maps", "Maps · one image per view"),
                 ("vector", "Vector tiles"),
             ]
             .into_iter()
             .filter(|(mode, _)| modes.contains(mode))
-            .enumerate()
             {
                 controls.push_str(&format!(
                     "<label><input type=\"radio\" name=\"map-mode\" value=\"{mode}\"{}> {label}</label>",
-                    if i == 0 { " checked" } else { "" }
+                    if mode == default_mode { " checked" } else { "" }
                 ));
             }
             controls.push_str("</fieldset>");
+        }
+        let styles = request["styles"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        fn maps_href(style: &Value) -> Option<&str> {
+            style["href"]
+                .as_str()
+                .map(safe_href)
+                .filter(|href| *href != "#")
+        }
+        // Without a Maps endpoint there is nothing to GET: the form is the
+        // script's alone.
+        let action = styles.first().and_then(maps_href);
+        match action {
+            Some(href) => controls.push_str(&format!(
+                "<form id=\"map-form\" class=\"map-controls\" method=\"get\" action=\"{}\">",
+                escape(href)
+            )),
+            None => controls.push_str("<form id=\"map-form\" class=\"map-controls enhanced\">"),
         }
         // A multi-parameter collection: choose what to draw. "Default" sends
         // no `parameter-name`; the script names what the server drew.
@@ -988,7 +1035,7 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
             .unwrap_or_default();
         if parameters.len() > 1 {
             controls.push_str(
-                "<label>Parameter<select id=\"map-parameter\"><option value=\"\">Default</option>",
+                "<label>Parameter<select id=\"map-parameter\" name=\"parameter-name\"><option value=\"\">Default</option>",
             );
             let label = |p: &Value| p["label"].as_str().unwrap_or_default().to_owned();
             for parameter in parameters {
@@ -1017,14 +1064,18 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
             }
             controls.push_str("</select></label>");
         }
+        // The style picks the endpoint, not a query parameter: no name, and
+        // shown only with the script. One style is no choice at all.
         controls.push_str(&format!(
-            "<label>Style<select id=\"map-style\" data-mode=\"{}\">",
-            escape(modes.first().copied().unwrap_or("maps"))
+            "<label class=\"enhanced\"{}>Style<select id=\"map-style\" data-mode=\"{}\">",
+            if styles.len() < 2 { " hidden" } else { "" },
+            escape(default_mode)
         ));
-        for style in request["styles"].as_array().into_iter().flatten() {
+        for style in styles {
             controls.push_str(&format!(
-                "<option value=\"{}\" data-tiles=\"{}\" data-legend=\"{}\">{}</option>",
-                escape(style["href"].as_str().map(safe_href).unwrap_or_default()),
+                "<option value=\"{}\" data-id=\"{}\" data-tiles=\"{}\" data-legend=\"{}\">{}</option>",
+                escape(maps_href(style).unwrap_or_default()),
+                escape(style["id"].as_str().unwrap_or_default()),
                 escape(style["tiles"].as_str().map(safe_href).unwrap_or_default()),
                 escape(style["legend"].as_str().map(safe_href).unwrap_or_default()),
                 escape(style["title"].as_str().unwrap_or("Default"))
@@ -1039,7 +1090,7 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
         if times.is_some() || request["temporal"] == true {
             controls.push_str("<div class=\"map-time-field\"><label for=\"map-time\">Time · UTC</label><div class=\"map-time-picker\">");
             if let Some(times) = times {
-                controls.push_str("<button type=\"button\" class=\"btn\" id=\"map-time-prev\" aria-label=\"Previous available time\">←</button><select id=\"map-time\" aria-describedby=\"map-help\"><option value=\"\">Default</option>");
+                controls.push_str("<button type=\"button\" class=\"btn enhanced\" id=\"map-time-prev\" aria-label=\"Previous available time\">←</button><select id=\"map-time\" name=\"datetime\" aria-describedby=\"map-help\"><option value=\"\">Default</option>");
                 for time in times.iter().filter_map(Value::as_str) {
                     controls.push_str(&format!(
                         "<option value=\"{}\">{}</option>",
@@ -1047,9 +1098,10 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
                         escape(&map_time_label(time))
                     ));
                 }
-                controls.push_str("</select><button type=\"button\" class=\"btn\" id=\"map-time-next\" aria-label=\"Next available time\">→</button>");
+                controls.push_str("</select><button type=\"button\" class=\"btn enhanced\" id=\"map-time-next\" aria-label=\"Next available time\">→</button>");
             } else {
-                controls.push_str("<input id=\"map-time\" type=\"datetime-local\" step=\"1\" aria-describedby=\"map-help\">");
+                // A date and time without a zone, which `datetime` reads as UTC.
+                controls.push_str("<input id=\"map-time\" name=\"datetime\" type=\"datetime-local\" step=\"1\" aria-describedby=\"map-help\">");
             }
             controls.push_str("</div></div>");
         }
@@ -1058,7 +1110,7 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
         if !levels.is_empty() {
             let (label, unit) = vertical_axis(vertical);
             controls.push_str(&format!(
-                "<label>{}<select id=\"map-level\"><option value=\"\">Default</option>",
+                "<label>{}<select id=\"map-level\" name=\"elevation\"><option value=\"\">Default</option>",
                 escape(label)
             ));
             for level in levels {
@@ -1071,14 +1123,35 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
             }
             controls.push_str("</select></label>");
         }
-        controls.push_str("<button class=\"btn primary\">Update map</button><p id=\"map-help\">Pan or zoom to request the visible area. ");
+        controls.push_str("<p id=\"map-help\" class=\"enhanced\">Every choice applies at once. Pan or zoom to draw the visible area. ");
         if let Some(times) = times {
             controls.push_str(&format!(
-                "{} advertised times; the arrows load the adjacent one. ",
+                "{} advertised times; the arrows step through them. ",
                 times.len()
             ));
         }
-        controls.push_str("Default leaves the choice to the server; the line under the map names what it drew.</p></form>");
+        controls.push_str("Default leaves the choice to the server; the line under the map names what it drew.</p>");
+        // Without the script: one Maps image of the collection's extent per
+        // style, each its own endpoint.
+        if action.is_some() {
+            controls.push_str("<noscript><p>Without JavaScript, these choices open one Maps image of the whole collection.</p>");
+            for (i, style) in styles.iter().enumerate() {
+                let Some(href) = maps_href(style) else {
+                    continue;
+                };
+                if i == 0 {
+                    controls.push_str("<button class=\"btn primary\">Open map image</button>");
+                } else {
+                    controls.push_str(&format!(
+                        "<button class=\"btn\" formaction=\"{}\">Open map image · {}</button>",
+                        escape(href),
+                        escape(style["title"].as_str().unwrap_or("Style"))
+                    ));
+                }
+            }
+            controls.push_str("</noscript>");
+        }
+        controls.push_str("</form></div>");
     }
     let label = if raster.is_some() {
         "Collection map data"
@@ -1177,7 +1250,8 @@ pub fn collection_page(
         let default_style = doc["styles"].as_array()
             .and_then(|styles|styles.iter().find(|s|s["id"] == "default"));
         let default_legend = default_style.and_then(legend);
-        let mut styles = vec![json!({"title":"Default","href":map_href,"tiles":tiles_href,"legend":default_legend})];
+        // Each style with its id, which the map's URL fragment names.
+        let mut styles = vec![json!({"id":"default","title":"Default","href":map_href,"tiles":tiles_href,"legend":default_legend})];
         for style in doc["styles"].as_array().into_iter().flatten() {
             // The collection map and tileset endpoints already render this style.
             if style["id"] == "default" { continue; }
@@ -1185,10 +1259,11 @@ pub fn collection_page(
             let href = map_link(style_links).filter(safe);
             let tiles = map_tilesets_link(style_links).filter(safe);
             if href.is_some() || tiles.is_some() {
-                styles.push(json!({"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"tiles":tiles,"legend":legend(style)}));
+                styles.push(json!({"id":style["id"],"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"tiles":tiles,"legend":legend(style)}));
             }
         }
-        let modes: Vec<&str> = [map_href.map(|_| "maps"), tiles_href.map(|_| "tiles"), vector_href.map(|_| "vector")].into_iter().flatten().collect();
+        // In the order the switch offers them, the default first (#1220).
+        let modes: Vec<&str> = [tiles_href.map(|_| "tiles"), map_href.map(|_| "maps"), vector_href.map(|_| "vector")].into_iter().flatten().collect();
         // A time axis to choose from: an interval with at least one bound.
         let temporal = doc["extent"]["temporal"]["interval"][0].as_array().is_some_and(|bounds| bounds.iter().any(Value::is_string));
         json!({"styles":styles,"modes":modes,"vector":vector_href.map(|href| json!({"href":href,"layer":id})),"parameter_names":map_parameters(&doc["parameter_names"]),"times":map_times(&doc["extent"]["temporal"]),"temporal":temporal,"vertical":doc["extent"]["vertical"]})
@@ -2834,9 +2909,10 @@ mod tests {
         temporal["grid"] = json!({"cellsCount":3,"resolution":"PT3H"});
         let times = map_times(&temporal);
         assert_eq!(times.len(), 3);
-        assert_eq!(times[1], "2026-09-18T03:00:00+00:00");
-        temporal["grid"] = json!({"cellsCount":3,"coordinates":["2026-09-18T00:00:00Z","2026-09-18T01:00:00Z","2026-09-18T06:00:00Z"]});
-        assert_eq!(map_times(&temporal)[1], "2026-09-18T01:00:00+00:00");
+        // UTC with `Z`, the form `datetime` and the map's fragment take.
+        assert_eq!(times[1], "2026-09-18T03:00:00Z");
+        temporal["grid"] = json!({"cellsCount":3,"coordinates":["2026-09-18T00:00:00Z","2026-09-18T03:00:00+02:00","2026-09-18T06:00:00Z"]});
+        assert_eq!(map_times(&temporal)[1], "2026-09-18T01:00:00Z");
         temporal["grid"] = json!({"cellsCount":10001,"resolution":"PT1S"});
         assert!(map_times(&temporal).is_empty());
         temporal["grid"] = json!({"cellsCount":3,"resolution":"P1D"});
@@ -3135,7 +3211,8 @@ mod tests {
     }
 
     /// With both Maps and Tiles (and vector tiles) the preview offers a choice
-    /// of what draws it; each style carries its own map-tileset list.
+    /// of what draws it, map tiles first and by default (#1220); each style
+    /// carries its own map-tileset list.
     #[test]
     fn map_preview_offers_maps_map_tiles_and_vector_tiles() {
         let shared = Surface {
@@ -3153,13 +3230,27 @@ mod tests {
                 {"rel":rel::MAP,"href":"https://x/collections/cap/styles/severity/map"},
                 {"rel":rel::TILESETS_MAP,"href":"https://x/collections/cap/styles/severity/map/tiles"}]}]});
         let html = collection_html(shared, &doc, None);
-        for mode in ["maps", "tiles", "vector"] {
-            assert!(
-                html.contains(&format!("name=\"map-mode\" value=\"{mode}\"")),
-                "{mode}"
-            );
-        }
-        assert!(html.contains("value=\"maps\" checked"));
+        let switch = html
+            .split("<fieldset class=\"map-mode enhanced\">")
+            .nth(1)
+            .unwrap()
+            .split("</fieldset>")
+            .next()
+            .unwrap();
+        let order: Vec<usize> = ["tiles", "maps", "vector"]
+            .iter()
+            .map(|mode| {
+                switch
+                    .find(&format!("name=\"map-mode\" value=\"{mode}\""))
+                    .unwrap_or_else(|| panic!("{mode}"))
+            })
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{switch}");
+        assert!(switch.contains("value=\"tiles\" checked"));
+        assert_eq!(switch.matches(" checked").count(), 1);
+        // Style ids name a style in the fragment.
+        assert!(html.contains("data-id=\"default\""));
+        assert!(html.contains("data-id=\"severity\""));
         assert!(html.contains("data-tiles=\"https://x/collections/cap/map/tiles\""));
         assert!(html.contains("data-tiles=\"https://x/collections/cap/styles/severity/map/tiles\""));
         let data = html.split("id=\"map-data\" hidden>").nth(1).unwrap();
@@ -3168,7 +3259,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             data["mapRequest"]["modes"],
-            json!(["maps", "tiles", "vector"])
+            json!(["tiles", "maps", "vector"])
         );
         assert_eq!(
             data["mapRequest"]["vector"],
@@ -3180,8 +3271,9 @@ mod tests {
         maps_only["links"].as_array_mut().unwrap().truncate(2);
         let html = collection_html(shared, &maps_only, None);
         assert!(html.contains("id=\"map-controls\""));
+        assert!(html.contains("data-mode=\"maps\""));
         // (The inlined map script names the input too; check the switch itself.)
-        assert!(!html.contains("<fieldset class=\"map-mode\">"));
+        assert!(!html.contains("<fieldset class=\"map-mode"));
         let mut tiles_only = doc.clone();
         tiles_only["links"].as_array_mut().unwrap().remove(1);
         tiles_only["links"].as_array_mut().unwrap().truncate(2);
@@ -3190,7 +3282,12 @@ mod tests {
         assert!(html.contains("id=\"map-controls\""));
         assert!(html.contains("data-mode=\"tiles\""));
         // (The inlined map script names the input too; check the switch itself.)
-        assert!(!html.contains("<fieldset class=\"map-mode\">"));
+        assert!(!html.contains("<fieldset class=\"map-mode"));
+        // No Maps endpoint: nothing to GET, so the form is the script's.
+        assert!(
+            map_controls(&html).contains("<form id=\"map-form\" class=\"map-controls enhanced\">")
+        );
+        assert!(!map_controls(&html).contains("<noscript>"));
     }
 
     /// The JSON embedded in a collection page's map panel.
@@ -3209,11 +3306,11 @@ mod tests {
         serde_json::from_str(&data).unwrap()
     }
 
-    /// The map controls form (the inlined script and the stylesheet name
-    /// every control too).
+    /// The map controls: the draw-mode switch and the form (the inlined
+    /// script and the stylesheet name every control too).
     fn map_controls(html: &str) -> &str {
-        let start = html.find("<form id=\"map-controls\"").unwrap();
-        let end = start + html[start..].find("</form>").unwrap();
+        let start = html.find("<div id=\"map-controls\"").unwrap();
+        let end = start + html[start..].find("</form></div>").unwrap();
         &html[start..end]
     }
 
@@ -3255,7 +3352,7 @@ mod tests {
         );
         let controls = map_controls(&html);
         assert!(controls.contains(
-            "<label>Parameter<select id=\"map-parameter\"><option value=\"\">Default</option>"
+            "<label>Parameter<select id=\"map-parameter\" name=\"parameter-name\"><option value=\"\">Default</option>"
         ));
         assert!(controls.contains(
             "<option value=\"r\" data-label=\"Relative humidity\" data-unit=\"%\">Relative humidity (%)</option>"
@@ -3303,16 +3400,20 @@ mod tests {
         doc["extent"] = json!({"temporal":{"interval":[["2026-10-17T00:00:00Z",null]]}});
         let html = collection_html(shared, &doc, None);
         assert_eq!(map_data(&html)["mapRequest"]["temporal"], true);
-        assert!(map_controls(&html).contains("<input id=\"map-time\" type=\"datetime-local\""));
+        assert!(map_controls(&html)
+            .contains("<input id=\"map-time\" name=\"datetime\" type=\"datetime-local\""));
 
         // A grid: its times, to the minute unless they have seconds.
         doc["extent"]["temporal"] = json!({"interval":[["2026-10-17T17:00:00Z","2026-10-17T17:10:30Z"]],
             "grid":{"cellsCount":2,"coordinates":["2026-10-17T17:00:00Z","2026-10-17T17:10:30Z"]}});
         let html = collection_html(shared, &doc, None);
         let controls = map_controls(&html);
-        assert!(controls.contains("<select id=\"map-time\" aria-describedby=\"map-help\"><option value=\"\">Default</option><option value=\"2026-10-17T17:00:00+00:00\">2026-10-17 17:00</option><option value=\"2026-10-17T17:10:30+00:00\">2026-10-17 17:10:30</option></select>"));
-        assert!(controls.contains("id=\"map-time-prev\""));
-        assert!(controls.contains("id=\"map-time-next\""));
+        assert!(controls.contains("<select id=\"map-time\" name=\"datetime\" aria-describedby=\"map-help\"><option value=\"\">Default</option><option value=\"2026-10-17T17:00:00Z\">2026-10-17 17:00</option><option value=\"2026-10-17T17:10:30Z\">2026-10-17 17:10:30</option></select>"));
+        // The arrows step with the script only.
+        assert!(controls
+            .contains("<button type=\"button\" class=\"btn enhanced\" id=\"map-time-prev\""));
+        assert!(controls
+            .contains("<button type=\"button\" class=\"btn enhanced\" id=\"map-time-next\""));
     }
 
     /// #1136: the panel says where the page lists the same facts when the
@@ -3348,15 +3449,16 @@ mod tests {
         assert!(panel.contains("<div id=\"map-legend\" class=\"map-legend enhanced\""));
         assert_eq!(html.matches("id=\"map-legend\"").count(), 1);
         assert!(!html.contains("<h2>Map legend</h2>"));
-        assert!(map_controls(&html)
-            .contains("<form id=\"map-controls\" class=\"map-controls enhanced\">"));
+        assert!(map_controls(&html).starts_with(
+            "<div id=\"map-controls\" class=\"map-controls-block\"><form id=\"map-form\" class=\"map-controls\" method=\"get\" action=\"https://x/collections/radar/map\">"
+        ));
 
         let vector = json!({"id":"regions","extent":{"spatial":{"bbox":[[20,60,30,70]]}},
             "links":[{"rel":"self","href":"https://x/collections/regions"},
                 {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/regions/tiles"}]});
         let html = collection_html(shared, &vector, None);
         assert!(map_controls(&html)
-            .contains("<form id=\"map-controls\" class=\"map-controls enhanced\" hidden>"));
+            .starts_with("<div id=\"map-controls\" class=\"map-controls-block\" hidden>"));
         // Vector tiles have no legend.
         assert!(!html.contains("id=\"map-legend\""));
 
@@ -3369,6 +3471,152 @@ mod tests {
         assert!(items.contains("The map needs JavaScript and WebGL. Listed in the table."));
         assert!(!items.contains("id=\"map-controls\""));
         assert!(!items.contains("id=\"map-legend\""));
+    }
+
+    /// #1220: without JavaScript the controls are a real GET to the default
+    /// style's Maps endpoint whose named fields are Maps parameters only: the
+    /// draw-mode switch sits before the form, the style select has no name
+    /// (it picks the endpoint), and each style gets its own submit button.
+    /// There is no Update button, and a single style is no choice.
+    #[test]
+    fn map_form_is_a_maps_get_with_maps_parameter_names_only() {
+        let shared = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let doc = json!({"id":"nwp","extent":{"spatial":{"bbox":[[20,60,30,70]]},
+                "temporal":{"interval":[["2026-10-17T17:00:00Z","2026-10-17T18:00:00Z"]],
+                    "grid":{"cellsCount":2,"resolution":"PT1H"}},
+                "vertical":{"interval":[[850,1000]],"values":[1000,850],"unit":"hPa"}},
+            "links":[{"rel":"self","href":"https://x/collections/nwp"},
+                {"rel":rel::MAP,"href":"https://x/collections/nwp/map"},
+                {"rel":rel::TILESETS_MAP,"href":"https://x/collections/nwp/map/tiles"}],
+            "parameter_names":{
+                "2t":{"type":"Parameter","observedProperty":{"label":{"en":"2 Metre Temperature (2t)"}},
+                    "unit":{"symbol":{"value":"°C"}}},
+                "r":{"type":"Parameter","label":"Relative humidity","unit":{"symbol":"%"}}},
+            "styles":[{"id":"warm","title":"Warm","links":[
+                {"rel":rel::MAP,"href":"https://x/collections/nwp/styles/warm/map"}]}]});
+        let html = collection_html(shared, &doc, None);
+        assert!(!html.contains("Update map"));
+        let controls = map_controls(&html);
+        let (switch, form) = controls.split_once("<form").unwrap();
+        assert!(
+            form.starts_with(" id=\"map-form\" class=\"map-controls\" method=\"get\" action=\"https://x/collections/nwp/map\">"),
+            "{form}"
+        );
+        // Every named field of the form, and nothing else, is a Maps
+        // parameter (api-maps submits the form to its own router).
+        let names: std::collections::BTreeSet<&str> = form
+            .split(" name=\"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap())
+            .collect();
+        assert_eq!(names, ["datetime", "elevation", "parameter-name"].into());
+        assert!(switch.contains("<input type=\"radio\" name=\"map-mode\" value=\"tiles\" checked>"));
+        assert!(form.contains(
+            "<label class=\"enhanced\">Style<select id=\"map-style\" data-mode=\"tiles\"><option value=\"https://x/collections/nwp/map\" data-id=\"default\""
+        ));
+        assert!(form.contains("<select id=\"map-level\" name=\"elevation\">"));
+        // One submit per style with a Maps endpoint, without JavaScript only.
+        let noscript = form.split("<noscript>").nth(1).unwrap();
+        assert!(noscript.contains("<button class=\"btn primary\">Open map image</button>"));
+        assert!(noscript.contains(
+            "<button class=\"btn\" formaction=\"https://x/collections/nwp/styles/warm/map\">Open map image · Warm</button>"
+        ));
+        // The help is the script's; it names no button.
+        assert!(
+            form.contains("<p id=\"map-help\" class=\"enhanced\">Every choice applies at once.")
+        );
+        // A label ending in its own name drops it before the unit.
+        assert!(
+            form.contains(">2 Metre Temperature (°C)</option>"),
+            "{form}"
+        );
+        assert_eq!(
+            map_data(&html)["mapRequest"]["parameter_names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == "2t")
+                .unwrap()["label"],
+            "2 Metre Temperature"
+        );
+
+        // One style: nothing to choose, so no style select is shown.
+        let mut single = doc.clone();
+        single.as_object_mut().unwrap().remove("styles");
+        let html = collection_html(shared, &single, None);
+        assert!(map_controls(&html)
+            .contains("<label class=\"enhanced\" hidden>Style<select id=\"map-style\""));
+        assert_eq!(map_controls(&html).matches(" formaction=").count(), 0);
+    }
+
+    /// The map panel of `tests/fixtures/map-panel.html`, which the map
+    /// script's node tests (`tests/map.test.cjs`) parse and run against: map
+    /// tiles and Maps, two parameters, two styles, a time grid and levels.
+    fn map_panel_fixture() -> String {
+        let shared = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let legend = |style: &str| json!({"rel":rel::LEGEND,"href":format!("https://x/collections/nwp/styles/{style}/legend")});
+        let doc = json!({"id":"nwp","title":"NWP",
+            "extent":{"spatial":{"bbox":[[20,55,30,65]]},
+                "temporal":{"interval":[["2024-01-01T00:00:00Z","2024-01-01T02:00:00Z"]],
+                    "grid":{"cellsCount":3,"resolution":"PT1H"}},
+                "vertical":{"interval":[[850,1000]],"values":[1000,850],"unit":"hPa"}},
+            "links":[{"rel":"self","href":"https://x/collections/nwp"},
+                {"rel":rel::MAP,"href":"https://x/collections/nwp/map"},
+                {"rel":rel::TILESETS_MAP,"href":"https://x/collections/nwp/map/tiles"}],
+            // In name order, which is also document order: the options read
+            // the same with and without serde_json's `preserve_order`.
+            "parameter_names":{
+                "r":{"type":"Parameter","label":"Relative humidity","unit":{"symbol":"%"}},
+                "t":{"type":"Parameter","observedProperty":{"label":{"en":"Temperature (t)"}},
+                    "unit":{"symbol":{"value":"K"}}}},
+            "styles":[{"id":"default","title":"Default","links":[legend("default")]},
+                {"id":"warm","title":"Warm","links":[
+                    {"rel":rel::MAP,"href":"https://x/collections/nwp/styles/warm/map"},
+                    {"rel":rel::TILESETS_MAP,"href":"https://x/collections/nwp/styles/warm/map/tiles"},
+                    legend("warm")]}]});
+        let html = collection_html(shared, &doc, None);
+        let start = html.find("<div id=\"map-controls\"").unwrap();
+        let end = start + html[start..].find("<script").unwrap();
+        format!("{}\n", &html[start..end])
+    }
+
+    /// The fixture the node tests read is the markup this crate renders.
+    /// After a deliberate markup change, regenerate it with
+    /// `UPDATE_MAP_FIXTURE=1 cargo test -p api-common map_panel_fixture`.
+    /// The embedded `map-data` JSON compares as JSON: its key order follows
+    /// serde_json's features, which differ between build selections.
+    #[test]
+    fn map_panel_fixture_matches_the_rendered_markup() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/map-panel.html");
+        let rendered = map_panel_fixture();
+        if std::env::var_os("UPDATE_MAP_FIXTURE").is_some() {
+            std::fs::write(path, &rendered).unwrap();
+        }
+        let fixture = std::fs::read_to_string(path).unwrap_or_default();
+        let parts = |html: &str| {
+            let (markup, rest) = html
+                .split_once("<div id=\"map-data\" hidden>")
+                .unwrap_or((html, ""));
+            let (data, tail) = rest.split_once("</div>").unwrap_or(("", ""));
+            (
+                markup.to_owned(),
+                map_data(&format!("<div id=\"map-data\" hidden>{data}</div>")),
+                tail.to_owned(),
+            )
+        };
+        let stale = format!(
+            "{path} is stale: regenerate it with UPDATE_MAP_FIXTURE=1 cargo test -p api-common map_panel_fixture"
+        );
+        assert!(fixture.contains("id=\"map-data\""), "{stale}");
+        assert!(parts(&fixture) == parts(&rendered), "{stale}");
     }
 
     /// #1136: an extent crossing the antimeridian (west > east) is one
