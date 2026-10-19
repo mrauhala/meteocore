@@ -9,10 +9,7 @@ apis = ["edr", "wms", "maps", "tiles"]
 wms_parameter = "2t"
 poll_interval_secs = 60
 
-# Each parameter's unit comes from its FMI parameter number, so the parameter
-# layers take the built-in defaults: 2t temperature (°C), msl pressure (hPa),
-# rr1h precipitation (mm). Kept on purpose: the collection layer draws this
-# palette, since its default is the full descriptor "2 Metre Temperature
-# (2t)", which names no `2t` layer.
-[wms]
-colormap = "temperature"
+# No [wms]: each parameter's unit comes from its FMI parameter number, so the
+# parameter layers take the built-in defaults: 2t temperature (°C), msl
+# pressure (hPa), rr1h precipitation (mm). The collection layer draws its
+# default parameter, 2t, with that layer's style.

@@ -51,6 +51,7 @@ use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 use engine_geotiff::GeoTiffEngine;
 use engine_grib::GribEngine;
 use engine_netcdf::NetcdfEngine;
+use engine_querydata::QueryDataEngine;
 use engine_zarr::ZarrEngine;
 
 fn testdata(dir: &str) -> PathBuf {
@@ -158,11 +159,12 @@ fn json(reply: &Reply) -> Value {
     serde_json::from_str(&reply.body).unwrap_or_else(|e| panic!("{e}: {}", reply.body))
 }
 
-/// A GetFeatureInfo answer: the value and its unit, the reported time and
-/// run, and the sampled point.
+/// A GetFeatureInfo answer: the value and its unit, the parameter read,
+/// the reported time and run, and the sampled point.
 struct Info {
     value: Value,
     unit: Value,
+    parameter: Value,
     time: Value,
     reference_time: Value,
     lon: f64,
@@ -198,6 +200,7 @@ async fn feature_info(
     Info {
         value: properties["value"].clone(),
         unit: properties["unit"].clone(),
+        parameter: properties["parameter"].clone(),
         time: properties["time"].clone(),
         reference_time: properties
             .get("reference_time")
@@ -220,7 +223,8 @@ async fn edr_position(
         edr,
         &format!(
             "/collections/{id}/position?coords=POINT({lon}%20{lat})\
-             &parameter-name={parameter}&datetime={datetime}"
+             &parameter-name={}&datetime={datetime}",
+            parameter.replace(' ', "%20")
         ),
     )
     .await;
@@ -798,6 +802,74 @@ async fn a_zarr_pixel_reads_the_display_unit_value() {
     }
 }
 
+/// The Kenya QueryData fixture, drawing `2t` by default, wrapped in
+/// `DerivedWind` as the server registers it.
+fn kenya() -> Apis {
+    let engine = Arc::new(
+        QueryDataEngine::new(&testdata("ecmwf-kenya"), "kenya", Some("2t"), 3600, 4).unwrap(),
+    );
+    let engine = Arc::new(DerivedWind::new(
+        "kenya",
+        engine,
+        Arc::new(|_: &str, _: &ds_core::wind::PairOutcome| {}),
+    ));
+    apis("kenya", "querydata", engine, &["msl", "2t", "rr1h"])
+}
+
+/// QueryData (#1215): a descriptor with a short name in parentheses,
+/// `2 Metre Temperature (2t)`, is the map layer `kenya/2t`, and
+/// GetFeatureInfo asks EDR for `2t`. QueryData's EDR takes the short name
+/// as an alias of the descriptor it advertises, so both names read the
+/// same value; `rr1h` has no short name. The root layer draws the default
+/// parameter, `2t`, and reads its value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_querydata_short_named_layer_reads_the_edr_position_value() {
+    let Apis { wms, edr } = kenya();
+    // Pixel (1, 0) of a 2 × 2 map: 37.1°E, 1.1°S, between the 0.5° nodes.
+    let bbox = "36.8,-1.4,37.2,-1.0";
+    let mut values = HashMap::new();
+    for (layer, descriptor, unit) in [
+        ("2t", "2 Metre Temperature (2t)", "°C"),
+        ("msl", "Mean Sea Level Pressure (msl)", "hPa"),
+        ("rr1h", "rr1h", "mm"),
+    ] {
+        let info = feature_info(
+            &wms,
+            &format!("kenya/{layer}"),
+            "CRS:84",
+            bbox,
+            (2, 2),
+            (1, 0),
+            "",
+        )
+        .await;
+        assert!((info.lon - 37.1).abs() < 1e-9, "{}", info.lon);
+        assert!((info.lat + 1.1).abs() < 1e-9, "{}", info.lat);
+        // The last step of the one run.
+        assert_eq!(info.time, "2026-04-04T15:00:00Z", "{layer}");
+        assert_eq!(info.reference_time, "2026-04-04T06:00:00Z", "{layer}");
+        assert_eq!(info.parameter, layer);
+        assert_eq!(info.unit, unit, "{layer}");
+        for name in [layer, descriptor] {
+            let position = edr_position(
+                &edr,
+                "kenya",
+                name,
+                (info.lon, info.lat),
+                "2026-04-04T15:00:00Z",
+            )
+            .await;
+            assert_eq!(info.value, position, "{layer} as {name}");
+        }
+        values.insert(layer, info.value);
+    }
+    assert!(values["2t"].is_number() && values["msl"].is_number());
+
+    let root = feature_info(&wms, "kenya", "CRS:84", bbox, (2, 2), (1, 0), "").await;
+    assert_eq!(root.parameter, "2t");
+    assert_eq!(root.value, values["2t"]);
+}
+
 /// The layers GetCapabilities marks queryable are the ones answered above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capabilities_mark_the_layers_queryable() {
@@ -811,6 +883,7 @@ async fn capabilities_mark_the_layers_queryable() {
             meps().wms,
             &["meps/air_temperature_2m", "meps/wind_speed_10m"][..],
         ),
+        (kenya().wms, &["kenya/2t", "kenya/msl", "kenya/rr1h"][..]),
     ] {
         let reply = get(&wms, "/?SERVICE=WMS&REQUEST=GetCapabilities").await;
         assert_eq!(reply.status, StatusCode::OK);

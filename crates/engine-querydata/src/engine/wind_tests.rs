@@ -236,6 +236,19 @@ fn ecmwf_short_names_keep_their_full_edr_names() {
     let u = components.ranges["10 metre U wind component (10u)"].values[0].unwrap();
     let v = components.ranges["10 metre V wind component (10v)"].values[0].unwrap();
     assert_eq!(derived.ranges["10si"].values[0], Some(u.hypot(v)));
+
+    // EDR takes a component's map name as its alias (#1215), next to the
+    // speed: the wrapper asks for the descriptors besides, derives from
+    // them and drops them, leaving the component under the name asked for.
+    let mixed = series(&wind, "POINT(36.8 -1.3)", &["10u", "10si"]);
+    let mut names: Vec<&str> = mixed.ranges.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["10si", "10u"]);
+    assert_eq!(mixed.ranges["10u"].values[0], Some(u));
+    assert_eq!(mixed.ranges["10si"].values[0], Some(u.hypot(v)));
+    let alias = series(&wind, "POINT(36.8 -1.3)", &["10v"]);
+    assert_eq!(alias.ranges.len(), 1);
+    assert_eq!(alias.ranges["10v"].values[0], Some(v));
 }
 
 /// A pair named in a source vocabulary pairs by name when its FMI numbers
