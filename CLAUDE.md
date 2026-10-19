@@ -886,7 +886,7 @@ one never implies the other.
 | Engine | Traits | APIs |
 |--------|--------|------|
 | CAP | `FeatureEngine` + `MapEngine` | Features, WMS, Maps, Tiles (severity-shaded alert polygons) |
-| CSV | `EdrEngine` + `FeatureEngine` | EDR (locations, area, radius), Features |
+| CSV | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (locations, area, radius), Features; WMS/Maps/Tiles station symbol layers when opted in (`[csv.map]`, or any map API in `apis`; #1204), drawn through `ds_render::station_symbols`, `content_version` 0 (static until reload) |
 | GeoJSON | `FeatureEngine` | Features, Tiles (MVT) |
 | GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | GRIB | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM), WMS, Maps, Tiles; derived wind speed + direction from u/v (`ds_core::wind`); hour-window aggregates on their own time axes (#1005) |
@@ -898,7 +898,7 @@ one never implies the other.
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (position, locations, area), Features; station shapes also WMS/Maps/Tiles when opted in (`[postgis.map]`, or `wms`/`maps` in `apis`): one symbol layer per parameter, each station a marker coloured by its latest value within `max_age` on `time_step` frames, most extreme on top (#1063); events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles, GK2A AMI L1B and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
 | NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, or projected x/y with a CF `grid_mapping`); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields, or fields on one pressure axis (`RasterInfo.vertical`: hPa, bottom first; WMS `ELEVATION`, Maps/Tiles `elevation`, EDR `z`; a map without one draws the bottom level, EDR without `z` reads every level; the MEPS `pl` family is a collection of its own). EDR samples each point or area cell as the map draws it (one projection per point, a CRS84 area grid), runs as instances, GetFeatureInfo through position at the level drawn; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (steps × levels × variables); derived wind speed from CF `x_wind`/`y_wind`, per pressure level (no direction on MEPS's Lambert grid); values and units in display units from CF `units` through `ds_core::units::display_conversion` (°C, hPa, mm, gpm; #1209) |
-| BUFR | `EdrEngine` + `FeatureEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count). Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
+| BUFR | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count); WMS/Maps/Tiles station symbol layers when opted in (`[bufr.map]`, or any map API in `apis`; #1204), `content_version` = the metadata snapshot version. Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
 | Station grid | `MapEngine` + `EdrEngine` (derived: wraps a CSV, BUFR or PostGIS stations collection's `EdrEngine`) | WMS, Maps, Tiles (one layer per parameter), EDR (position, area, radius, cube without `z`) — one time slice of the source's observations (latest per station within `max_age`, one area query) interpolated by IDW, ADW or nearest onto a CRS84 analysis grid (#1082); great-circle neighbours via a 3-D k-d tree (seam and poles); grids cached per (parameter, time, content version) in `MC_STATION_GRID_CACHE_MB`, computed on a dedicated pool under the request deadline (503, never partial); `cadence` axis; content_version moves with revised input fingerprints; EDR samples the grid the maps draw |
 
 ## Config Format
@@ -1005,9 +1005,12 @@ id = "weather"
 title = "Finnish Weather Observations"
 description = "Hourly weather observations"
 data_path = "testdata/weather.csv"
-apis = ["edr", "features"]     # defaults to ["edr"]
+apis = ["edr", "features"]     # defaults to ["edr"]; add wms/maps/tiles for station symbol layers
 engine_type = "csv"             # defaults to "csv"
 keywords = ["weather", "observations", "Finland"]   # optional discovery metadata
+# [collections.csv.map]         # optional station symbol layers (#1204); same keys as
+# max_age = "PT1H"              # [postgis.map]/[bufr.map]: max_age, time_step = "PT10M",
+#                               # marker_size = 6, draw_missing = false
 [collections.license]
 title = "CC-BY-4.0"   # required; an SPDX id (no spaces). With no `url`, the
                       # link auto-resolves to https://spdx.org/licenses/<id>.html
@@ -1153,6 +1156,8 @@ position_radius_km = 25.0      # EDR position → nearest station within this
 #                              # state_dir the store survives restarts (a snapshot older
 #                              # than warmup keeps the rows still inside retention but
 #                              # restarts the warm-up)
+# [collections.bufr.map]       # station symbol layers (#1204) when apis lists a map API:
+# max_age = "PT1H"             # max_age, time_step = "PT10M", marker_size = 6, draw_missing
 
 # CAP warnings pushed over WMO WIS2 (third cap source mode, XOR with
 # data_path / feed_url). `[….wis2]` is the shared ds-wis2 subscription

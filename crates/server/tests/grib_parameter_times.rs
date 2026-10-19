@@ -129,6 +129,7 @@ fn collection(dir: &Path, api: &str) -> CollectionConfig {
         bufr: None,
         satellite: None,
         netcdf: None,
+        csv: None,
         preview: None,
         derive_wind: None,
     }

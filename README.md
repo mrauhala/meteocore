@@ -21,7 +21,8 @@ Each engine implements one or more of the core traits.
 
 | Crate | Traits | Source |
 |-------|--------|--------|
-| `engine-csv` | `EdrEngine` + `FeatureEngine` | CSV files with fixed `location, latitude, longitude, time, …` columns |
+| `engine-csv` | `EdrEngine` + `FeatureEngine` + `MapEngine` | CSV files with fixed `location, latitude, longitude, time, …` columns; map layers draw stations as markers coloured by value |
+| `engine-bufr` | `EdrEngine` + `FeatureEngine` + `MapEngine` | WMO BUFR SYNOP/SHIP station reports from a polled directory or a WIS2 subscription, held in a time-windowed store; map layers draw stations as markers coloured by value |
 | `engine-geojson` | `FeatureEngine` | GeoJSON FeatureCollection files (WGS84 only) |
 | `engine-geotiff` | `EdrEngine` + `MapEngine` | Cloud-Optimized GeoTIFF (local dir, S3, or STAC catalog) |
 | `engine-grib` | `EdrEngine` + `MapEngine` | GRIB2 NWP data via JSON/wgrib2 index sidecars (ECMWF IFS, NOAA GFS) |
@@ -551,6 +552,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `keywords` | no | — | Array of discovery keyword strings, e.g. `["radar", "reflectivity"]`. Surfaced in collection JSON, WMS capabilities, and matched by `/collections?q=`. |
 | `license` | no | — | `[collections.license]` table with `title` (required — SPDX id or human name), optional `url` and optional `type`, the media type `url` serves (default `text/html`; only with `url`). When `url` is omitted and `title` is an SPDX id, the URL is synthesized from `https://spdx.org/licenses/<id>.html`. The `rel="license"` link carries the `type`. |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
+| `csv` | no | — | `engine_type = "csv"` only: `[collections.csv.map]`, the [station symbol layers](#station-symbol-layers). Any other key is a load error. |
 | `derive_wind` | no | on | `grib`, `querydata`, `zarr` and `netcdf` only: serve wind speed and direction derived from u/v components (see [Derived wind](#derived-wind-speed-and-direction)). `false` opts out; the key on any other engine type is a load error. |
 
 ### Per-File Collection Configs
@@ -631,6 +633,8 @@ Helsinki,60.1699,24.9384,2024-01-01T00:00:00Z,-2.5,85.0,3.2
 ```
 
 `time` is RFC 3339 with a mandatory UTC offset (`Z`, `UTC`, `+02:00` or `+0200`; a space may replace the `T`) and is stored as UTC. A timestamp without an offset fails the load: it is never assumed to be UTC. A file whose rows carry more than one distinct offset, say `Z` and `+02:00`, still loads with every row converted correctly, but logs one WARN per load naming the file, the number of distinct offsets and the row count per offset — a mix usually means concatenated exports or local time across a DST switch. `Z`, `UTC` and `+00:00` count as one offset.
+
+List `wms`, `maps` or `tiles` in `apis` to show the stations on a map: see [Station symbol layers](#station-symbol-layers).
 
 ### GeoJSON
 
@@ -1548,6 +1552,51 @@ variables = ["air_temperature_2m"]
 
 Not yet: height-above-ground and hybrid model-level axes, EDR trajectory and cube, and per-variable file layouts.
 
+### Station symbol layers
+
+CSV, BUFR and PostGIS station collections can serve one WMS/Maps/Tiles layer
+per parameter, each station a marker coloured by its latest value
+([#1063](https://github.com/mrauhala/meteocore/issues/1063),
+[#1204](https://github.com/mrauhala/meteocore/issues/1204)). The section is
+`[collections.csv.map]`, `[collections.bufr.map]` or
+`[collections.postgis.map]`, the same keys and defaults for all three:
+
+```toml
+[[collections]]
+id = "weather"
+title = "Finnish Weather Observations"
+description = "Hourly weather observations"
+data_path = "testdata/weather.csv"
+apis = ["edr", "features", "wms", "maps", "tiles"]
+
+[collections.csv.map]    # optional; the defaults are shown
+max_age = "PT1H"         # a frame shows each station's latest value in [TIME - max_age, TIME], at most P7D
+time_step = "PT10M"      # frames every step over the newest 6 h of data; a TIME floors to its step (PT1M–PT6H)
+marker_size = 6          # disc diameter in output pixels (1–64)
+draw_missing = false     # true: stations without a value as markers in the palette's nodata_color
+```
+
+- **On.** The layers are on when `apis` lists `wms` or `maps`, or the
+  section is present. For CSV and BUFR `tiles` turns them on too; a PostGIS
+  station collection that lists only `tiles` keeps its vector tiles alone.
+  A section without a map API in `apis` is a load error.
+- **Layers.** One per parameter, `weather/temperature` in WMS and
+  `parameter-name=temperature` in Maps and Tiles, styled with `[wms]` and
+  `[[wms.parameters]]` like a raster layer; without a style a layer takes
+  the built-in default its name and unit select. Where markers overlap,
+  the value farthest from the middle of the layer's default style range is
+  on top. Layers are `queryable="0"` in WMS.
+- **Frames.** CSV and BUFR read a frame from their in-memory rows, stopping
+  at each station's latest value; a frame that would read more than
+  2 000 000 rows answers an error naming `max_age`. Frames are cached
+  (`MC_STATION_FRAME_CACHE_MB`, default 32 MiB, shared by all station
+  collections; `station_frame_cache_*` in `/metrics`).
+- **Revisions.** A CSV file is static until a reload. A BUFR store revises
+  in place as reports arrive late or are corrected, so its layers' content
+  version moves with the store, within about 10 s, and responses to an
+  explicit `TIME` revalidate instead of being `immutable`. PostGIS: see
+  [its README](crates/engine-postgis/README.md#station-map-layers).
+
 ### Station grid
 
 A derived collection (`engine_type = "station-grid"`, #1082) that turns one
@@ -1736,7 +1785,7 @@ missing_values = [-32766]           # optional, ≤ 16 sentinels stored instead 
 - Requires PostgreSQL ≥ 13, PostGIS ≥ 3.0; TimescaleDB optional but recommended.
 - A value outside a parameter's `valid_range` or equal to one of its `missing_values` is served as null, like a NULL ([#1210](https://github.com/mrauhala/meteocore/issues/1210)): EDR series keep its time, and the station map layers and a `station-grid` collection over the source use each station's latest valid value.
 - TLS is deferred to [#110](https://github.com/mrauhala/meteocore/issues/110); v1 connects with `NoTls` — deploy the DB behind a private network or loopback.
-- Add `wms` or `maps` to `apis`, or a `[collections.postgis.map]` section, for one map layer per parameter, each station a marker coloured by its latest value within `max_age` (default `PT1H`), on `time_step` frames (default `PT10M`), the most extreme value on top. With either, `tiles` serves them as raster tiles beside the vector tiles.
+- Add `wms` or `maps` to `apis`, or a `[collections.postgis.map]` section, for one map layer per parameter, each station a marker coloured by its latest value within `max_age` (default `PT1H`), on `time_step` frames (default `PT10M`), the most extreme value on top (see [Station symbol layers](#station-symbol-layers)). With either, `tiles` serves them as raster tiles beside the vector tiles.
 - Full reference lives in `crates/engine-postgis/README.md` (role SQL, index recipes, station map layers, startup hard-error vs. WARN list).
 
 ## OGC API - Features
@@ -1762,7 +1811,7 @@ A single `/wms/` endpoint dispatches on the `REQUEST` query parameter:
 
 - **GetCapabilities** — XML capabilities listing layers, CRS, extents, time dimension, and styles. Its `<Service>` advertises the GetMap limits as `<LayerLimit>5</LayerLimit>`, `<MaxWidth>8000</MaxWidth>` and `<MaxHeight>8000</MaxHeight>`, so a client can size its requests.
 - **GetMap** — render a map image as PNG, JPEG, or WebP, of up to five layers drawn over each other in list order (see [Several layers](crates/api-wms/README.md#several-layers))
-- **GetFeatureInfo** — each queried layer's value at a pixel of the map, as `text/plain`, `application/json` (GeoJSON) or `text/html`: the collection's EDR position query at the pixel's centre, at the time, run and level GetMap draws. A layer is `queryable="1"` when its engine answers position queries, whether or not the collection lists `edr`; RGB composites, the ODIM `CELLS` overlay, CAP, PostGIS events, PostGIS station symbols and nowcast layers are not queryable. It waits in the render queue under its own 10 s deadline, `MC_FEATURE_INFO_TIMEOUT_MS`. See [GetFeatureInfo](crates/api-wms/README.md#getfeatureinfo)
+- **GetFeatureInfo** — each queried layer's value at a pixel of the map, as `text/plain`, `application/json` (GeoJSON) or `text/html`: the collection's EDR position query at the pixel's centre, at the time, run and level GetMap draws. A layer is `queryable="1"` when its engine answers position queries, whether or not the collection lists `edr`; RGB composites, the ODIM `CELLS` overlay, CAP, PostGIS events, station symbol (CSV, BUFR, PostGIS) and nowcast layers are not queryable. It waits in the render queue under its own 10 s deadline, `MC_FEATURE_INFO_TIMEOUT_MS`. See [GetFeatureInfo](crates/api-wms/README.md#getfeatureinfo)
 - **GetLegendGraphic** — render a colormap legend strip
 
 WMS, OGC API - Maps, and OGC API - Tiles share the same `MapEngine`, render semaphore, rendered-image cache, and colormaps. Only the HTTP layer is WMS-specific.

@@ -348,6 +348,13 @@ max = 30.0
   latest value within `max_age`, which the EDR position query, an exact
   instant at the nearest station, does not answer.
 
+CSV and BUFR station collections serve the same layers from their in-memory
+rows (`[csv.map]`, `[bufr.map]`, the same keys and defaults; see the root
+README's [station symbol layers](../../README.md#station-symbol-layers)).
+The drawing, the overlap order and the frame cache are one shared helper
+(`ds_render::station_symbols`, settings and time axis in
+`ds_core::station_map`), so a station draws the same in all three.
+
 ## Event configuration
 
 For `lightning(id, time, geom, peak_current)`, with UTC values in a timezone-less

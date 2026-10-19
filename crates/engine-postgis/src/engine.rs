@@ -104,9 +104,6 @@ pub struct PostgisEngine {
     frame_version: AtomicU64,
 }
 
-/// Source of [`PostgisEngine`]'s `instance_id`.
-static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
-
 impl std::fmt::Debug for PostgisEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgisEngine")
@@ -149,7 +146,8 @@ impl PostgisEngine {
             indexes,
             pool_key_label,
             shutdown: Shutdown::new(),
-            instance_id: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            // Shared with every station engine's frames (#1204).
+            instance_id: ds_render::station_symbols::next_frame_source(),
             station_symbols: ArcSwapOption::empty(),
             frame_version: AtomicU64::new(1),
         }

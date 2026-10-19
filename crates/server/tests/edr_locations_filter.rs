@@ -65,6 +65,7 @@ fn collection(id: &str, engine_type: &str) -> CollectionConfig {
         bufr: None,
         satellite: None,
         netcdf: None,
+        csv: None,
         preview: None,
         derive_wind: None,
     }
@@ -87,6 +88,7 @@ fn app() -> axum::Router {
             position_radius_km: 25.0,
             builtin_parameters: true,
             parameters: Vec::new(),
+            map: None,
         },
         "synop",
     )

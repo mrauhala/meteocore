@@ -262,8 +262,8 @@ fn classify_files(
 //
 // `apis` is the full set relevant to each engine type (mirroring the
 // `engine_type -> supported_apis` allowlist in `admin.rs`): raster/grid engines
-// get edr + wms + maps + tiles, csv gets edr + features, geojson gets features +
-// tiles. WMS/Maps/Tiles load without a `[wms]` block — the render path falls
+// get edr + wms + maps + tiles, csv gets edr + features (its station-symbol map
+// layers, #1204, stay opt-in), geojson gets features + tiles. WMS/Maps/Tiles load without a `[wms]` block — the render path falls
 // back to a default colormap — so the data is browsable in `/preview` out of the
 // box. The default colormap range is generic (viridis 0..1); a per-collection
 // `[wms]` colormap/min-max gives correct colours for the data's domain (#320).
@@ -397,6 +397,7 @@ fn mk_collection(
         bufr: None,
         satellite: None,
         netcdf: None,
+        csv: None,
         preview: None,
         derive_wind: None,
     }

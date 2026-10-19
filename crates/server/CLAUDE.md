@@ -41,8 +41,9 @@ disk, no TOML needed.
   COMP/PVOL probe); `*.geojson` and `*.csv` → one collection per file.
 - **APIs:** each collection enables ALL APIs relevant to its type (mirrors
   the `engine_type → supported_apis` allowlist): raster/grid
-  (zarr/grib/querydata) get edr+wms+maps+tiles, csv gets edr+features,
-  geojson gets features+tiles. Rendering works without a `[wms]` block: each
+  (zarr/grib/querydata) get edr+wms+maps+tiles, csv gets edr+features
+  (its station symbol layers, #1204, stay opt-in although the allowlist
+  accepts wms/maps/tiles), geojson gets features+tiles. Rendering works without a `[wms]` block: each
   parameter layer takes its built-in default when its name and unit match
   one, and a multi-parameter collection's root layer draws its default
   parameter's layer (#1161). Otherwise generic viridis `0..1` until a

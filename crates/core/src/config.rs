@@ -280,6 +280,10 @@ pub struct CollectionConfig {
     pub station_grid: Option<StationGridConfig>,
     /// BUFR surface-observation engine (`engine_type = "bufr"`).
     pub bufr: Option<BufrConfig>,
+    /// CSV engine options (`engine_type = "csv"`, #1204): its station-symbol
+    /// map layers' `[csv.map]`. Optional.
+    #[serde(default)]
+    pub csv: Option<CsvConfig>,
     /// Geostationary satellite imagery (`engine_type = "satellite"`).
     pub satellite: Option<SatelliteConfig>,
     /// CF-NetCDF gridded data (`engine_type = "netcdf"`).
@@ -1214,6 +1218,11 @@ pub struct BufrConfig {
     /// table (same name ⇒ replaces the built-in entry).
     #[serde(default)]
     pub parameters: Vec<BufrParameterConfig>,
+    /// The WMS/Maps/Tiles station-symbol layers (#1204). Optional; the
+    /// layers exist whenever `apis` lists a map API, with the defaults
+    /// [`StationMapConfig`] documents.
+    #[serde(default)]
+    pub map: Option<StationMapConfig>,
 }
 
 /// One parameter of a BUFR collection: which Table B element (and, for
@@ -1281,6 +1290,9 @@ pub fn validate_bufr(id: &str, cfg: &BufrConfig) -> Result<(), crate::error::Dat
         return Err(Config(format!(
             "Collection '{id}': [bufr].max_stations must be > 0"
         )));
+    }
+    if let Some(map) = &cfg.map {
+        validate_station_map(id, "bufr.map", map)?;
     }
     if !(cfg.position_radius_km > 0.0 && cfg.position_radius_km.is_finite()) {
         return Err(Config(format!(
@@ -2987,48 +2999,130 @@ pub struct PostgisConfig {
     pub parameters: Vec<PostgisParameterConfig>,
     /// Station shapes only: the WMS/Maps/Tiles station-symbol layers
     /// (#1063). Optional; the layers exist whenever `apis` lists a map API,
-    /// with the defaults [`PostgisMapConfig`] documents.
+    /// with the defaults [`StationMapConfig`] documents.
     #[serde(default)]
-    pub map: Option<PostgisMapConfig>,
+    pub map: Option<StationMapConfig>,
 }
 
-/// `[postgis.map]` (#1063): how a station collection's map layers draw each
-/// station as a marker coloured by its latest value.
+/// `[postgis.map]`, `[bufr.map]` and `[csv.map]` (#1063, #1204): how a
+/// station collection's map layers draw each station as a marker coloured by
+/// its latest value. One shape for every station engine, checked at load by
+/// [`validate_station_map`] (its messages name the section) and resolved by
+/// [`crate::station_map::StationMapSettings::resolve`].
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct PostgisMapConfig {
+pub struct StationMapConfig {
     /// ISO 8601 duration: a frame at `TIME` shows each station's latest
     /// non-null value in `[TIME - max_age, TIME]`. Default `PT1H`, at most
-    /// [`POSTGIS_MAP_MAX_AGE_CEILING`].
+    /// [`STATION_MAP_MAX_AGE_CEILING`].
     pub max_age: Option<String>,
     /// Marker diameter in output pixels. Default 6, at most
-    /// [`POSTGIS_MAP_MAX_MARKER_SIZE`].
+    /// [`STATION_MAP_MAX_MARKER_SIZE`].
     pub marker_size: Option<u32>,
-    /// Draw the cached stations without a value in the window as markers in
-    /// the palette's `nodata_color`, instead of leaving them out. Default
+    /// Draw the stations without a value in the window as markers in the
+    /// palette's `nodata_color`, instead of leaving them out. Default
     /// `false`.
     pub draw_missing: Option<bool>,
     /// ISO 8601 duration: the TIME steps the layers advertise over the last
-    /// [`POSTGIS_MAP_TIME_WINDOW`], and what a requested `TIME` floors to.
-    /// Default `PT10M`; whole seconds, from [`POSTGIS_MAP_MIN_TIME_STEP`] to
-    /// [`POSTGIS_MAP_TIME_WINDOW`].
+    /// [`STATION_MAP_TIME_WINDOW`], and what a requested `TIME` floors to.
+    /// Default `PT10M`; whole seconds, from [`STATION_MAP_MIN_TIME_STEP`] to
+    /// [`STATION_MAP_TIME_WINDOW`].
     pub time_step: Option<String>,
 }
 
-/// How far back from the latest observation the PostGIS map layers advertise
-/// TIME steps (#504, #1063). Older frames still render on an explicit `TIME`.
-pub const POSTGIS_MAP_TIME_WINDOW: chrono::TimeDelta = chrono::TimeDelta::hours(6);
+/// How far back from the latest observation the station map layers, and the
+/// PostGIS events layer, advertise TIME steps (#504, #1063). Older frames
+/// still render on an explicit `TIME`.
+pub const STATION_MAP_TIME_WINDOW: chrono::TimeDelta = chrono::TimeDelta::hours(6);
 
-/// Shortest `[postgis.map] time_step` (#1063).
-pub const POSTGIS_MAP_MIN_TIME_STEP: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
+/// Shortest `[<engine>.map] time_step` (#1063).
+pub const STATION_MAP_MIN_TIME_STEP: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
 
-/// Longest `[postgis.map] max_age` (#1063): a typo guard. A frame reads every
-/// row of the window for every station, so a long one on a dense network
-/// meets the frame's row cap first.
-pub const POSTGIS_MAP_MAX_AGE_CEILING: chrono::TimeDelta = chrono::TimeDelta::days(7);
+/// Longest `[<engine>.map] max_age` (#1063): a typo guard. A frame reads
+/// every row of the window for every station, so a long one on a dense
+/// network meets the frame's row cap first.
+pub const STATION_MAP_MAX_AGE_CEILING: chrono::TimeDelta = chrono::TimeDelta::days(7);
 
-/// Largest `[postgis.map] marker_size`, in output pixels (#1063).
-pub const POSTGIS_MAP_MAX_MARKER_SIZE: u32 = 64;
+/// Largest `[<engine>.map] marker_size`, in output pixels (#1063).
+pub const STATION_MAP_MAX_MARKER_SIZE: u32 = 64;
+
+/// Hard-fail validation of a [`StationMapConfig`]; `section` names it in the
+/// messages: `postgis.map`, `bufr.map` or `csv.map`.
+pub fn validate_station_map(
+    id: &str,
+    section: &str,
+    map: &StationMapConfig,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+    if let Some(raw) = map.max_age.as_deref() {
+        let max_age = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
+            Config(format!(
+                "Collection '{id}': [{section}].max_age '{raw}' is not a valid ISO 8601 duration: {e}"
+            ))
+        })?;
+        if max_age <= chrono::TimeDelta::zero() || max_age > STATION_MAP_MAX_AGE_CEILING {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].max_age '{raw}' must be positive and at most P{}D",
+                STATION_MAP_MAX_AGE_CEILING.num_days()
+            )));
+        }
+    }
+    if let Some(size) = map.marker_size {
+        if size == 0 || size > STATION_MAP_MAX_MARKER_SIZE {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].marker_size {size} is outside 1..={STATION_MAP_MAX_MARKER_SIZE}"
+            )));
+        }
+    }
+    if let Some(raw) = map.time_step.as_deref() {
+        let step = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
+            Config(format!(
+                "Collection '{id}': [{section}].time_step '{raw}' is not a valid ISO 8601 duration: {e}"
+            ))
+        })?;
+        if step.subsec_nanos() != 0
+            || step < STATION_MAP_MIN_TIME_STEP
+            || step > STATION_MAP_TIME_WINDOW
+        {
+            return Err(Config(format!(
+                "Collection '{id}': [{section}].time_step '{raw}' must be whole seconds from PT1M to PT{}H",
+                STATION_MAP_TIME_WINDOW.num_hours()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A `[<engine>.map]` section no map API reads would be silently ignored:
+/// reject one without `wms`, `maps` or `tiles` in `apis`.
+fn require_map_api(
+    id: &str,
+    section: &str,
+    apis: &[String],
+) -> Result<(), crate::error::DataServerError> {
+    if apis
+        .iter()
+        .any(|a| matches!(a.as_str(), "wms" | "maps" | "tiles"))
+    {
+        return Ok(());
+    }
+    Err(crate::error::DataServerError::Config(format!(
+        "Collection '{id}': [{section}] needs a map API in apis (wms, maps or tiles)"
+    )))
+}
+
+/// `[csv]` (#1204): options of a CSV collection. It holds only the
+/// station-symbol layers' `[csv.map]` for now; any other key is a load
+/// error.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CsvConfig {
+    /// The WMS/Maps/Tiles station-symbol layers (#1204). Optional; the
+    /// layers exist whenever `apis` lists a map API, with the defaults
+    /// [`StationMapConfig`] documents.
+    #[serde(default)]
+    pub map: Option<StationMapConfig>,
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisStationsConfig {
@@ -3334,42 +3428,7 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
                 "Collection '{id}': [postgis.map] is not valid for observations.shape 'events' (its strike layer has fixed settings)"
             )));
         }
-        if let Some(raw) = map.max_age.as_deref() {
-            let max_age = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
-                Config(format!(
-                    "Collection '{id}': [postgis.map].max_age '{raw}' is not a valid ISO 8601 duration: {e}"
-                ))
-            })?;
-            if max_age <= chrono::TimeDelta::zero() || max_age > POSTGIS_MAP_MAX_AGE_CEILING {
-                return Err(Config(format!(
-                    "Collection '{id}': [postgis.map].max_age '{raw}' must be positive and at most P{}D",
-                    POSTGIS_MAP_MAX_AGE_CEILING.num_days()
-                )));
-            }
-        }
-        if let Some(size) = map.marker_size {
-            if size == 0 || size > POSTGIS_MAP_MAX_MARKER_SIZE {
-                return Err(Config(format!(
-                    "Collection '{id}': [postgis.map].marker_size {size} is outside 1..={POSTGIS_MAP_MAX_MARKER_SIZE}"
-                )));
-            }
-        }
-        if let Some(raw) = map.time_step.as_deref() {
-            let step = crate::datetime::parse_iso8601_duration(raw).map_err(|e| {
-                Config(format!(
-                    "Collection '{id}': [postgis.map].time_step '{raw}' is not a valid ISO 8601 duration: {e}"
-                ))
-            })?;
-            if step.subsec_nanos() != 0
-                || step < POSTGIS_MAP_MIN_TIME_STEP
-                || step > POSTGIS_MAP_TIME_WINDOW
-            {
-                return Err(Config(format!(
-                    "Collection '{id}': [postgis.map].time_step '{raw}' must be whole seconds from PT1M to PT{}H",
-                    POSTGIS_MAP_TIME_WINDOW.num_hours()
-                )));
-            }
-        }
+        validate_station_map(id, "postgis.map", map)?;
     }
 
     // -- parameters list --------------------------------------------------
@@ -4621,17 +4680,8 @@ impl ServerConfig {
                             "Collection '{id}': apis entry '{api}' is not supported for observations.shape 'events' (edr/wms/maps/tiles; \"features\" arrives with #503)"
                         )));
                     }
-                } else if postgis.map.is_some()
-                    && !collection
-                        .apis
-                        .iter()
-                        .any(|a| matches!(a.as_str(), "wms" | "maps" | "tiles"))
-                {
-                    // A map section no map API reads would be silently
-                    // ignored.
-                    return Err(crate::error::DataServerError::Config(format!(
-                        "Collection '{id}': [postgis.map] needs a map API in apis (wms, maps or tiles)"
-                    )));
+                } else if postgis.map.is_some() {
+                    require_map_api(id, "postgis.map", &collection.apis)?;
                 }
             } else if collection.postgis.is_some() {
                 return Err(crate::error::DataServerError::Config(format!(
@@ -4798,6 +4848,22 @@ impl ServerConfig {
             }
             if let Some(bufr) = &collection.bufr {
                 validate_bufr(id, bufr)?;
+                if bufr.map.is_some() {
+                    require_map_api(id, "bufr.map", &collection.apis)?;
+                }
+            }
+
+            // CSV options (#1204): only on a CSV collection, and a `[csv.map]`
+            // needs a map API to read it.
+            if collection.csv.is_some() && collection.engine_type != "csv" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.csv] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(map) = collection.csv.as_ref().and_then(|c| c.map.as_ref()) {
+                validate_station_map(id, "csv.map", map)?;
+                require_map_api(id, "csv.map", &collection.apis)?;
             }
 
             // Satellite engine requires its config section, and vice versa.
@@ -7330,7 +7396,7 @@ unit = "1"
         let map = config.collections[0].postgis.as_ref().unwrap().map.clone();
         assert_eq!(
             map,
-            Some(PostgisMapConfig {
+            Some(StationMapConfig {
                 max_age: Some("PT30M".into()),
                 marker_size: Some(8),
                 draw_missing: Some(true),
@@ -7410,6 +7476,110 @@ unit = "1"
         assert!(
             err.contains("[postgis.map] is not valid for observations.shape 'events'"),
             "{err}"
+        );
+    }
+
+    /// #1204: `[bufr.map]` and `[csv.map]` are `[postgis.map]`'s shape with
+    /// its checks, each message naming its own section. A section needs a
+    /// map API, `[csv]` belongs to a CSV collection, and a misspelt key is an
+    /// error. CSV collections without `[csv]` parse as before.
+    #[test]
+    fn bufr_and_csv_map_sections_validated_at_load() {
+        let full = StationMapConfig {
+            max_age: Some("PT30M".into()),
+            marker_size: Some(8),
+            draw_missing: Some(true),
+            time_step: Some("PT5M".into()),
+        };
+        let full_toml =
+            "max_age = \"PT30M\"\nmarker_size = 8\ndraw_missing = true\ntime_step = \"PT5M\"";
+        // CSV: `engine_type` omitted is csv.
+        let csv = |apis: &str, map: &str| {
+            collection_with(&format!(
+                "data_path = \"w.csv\"\napis = {apis}\n[collections.csv.map]\n{map}\n"
+            ))
+        };
+        let ok = csv("[\"edr\", \"wms\"]", full_toml);
+        assert!(ok.validate().is_ok(), "{:?}", ok.validate());
+        assert_eq!(
+            ok.collections[0].csv,
+            Some(CsvConfig {
+                map: Some(full.clone())
+            })
+        );
+        let plain = collection_with("data_path = \"w.csv\"\napis = [\"edr\", \"features\"]\n");
+        assert!(plain.validate().is_ok(), "{:?}", plain.validate());
+        assert_eq!(plain.collections[0].csv, None);
+        for (apis, map, expected) in [
+            (
+                "[\"tiles\"]",
+                "marker_size = 0",
+                "[csv.map].marker_size 0 is outside 1..=64",
+            ),
+            (
+                "[\"maps\"]",
+                "max_age = \"P8D\"",
+                "[csv.map].max_age 'P8D' must be positive and at most P7D",
+            ),
+            (
+                "[\"edr\", \"features\"]",
+                "max_age = \"PT1H\"",
+                "[csv.map] needs a map API in apis (wms, maps or tiles)",
+            ),
+        ] {
+            let err = csv(apis, map).validate().unwrap_err().to_string();
+            assert!(err.contains(expected), "{map}: {err}");
+        }
+        let err = collection_with(
+            "engine_type = \"bufr\"\napis = [\"edr\"]\n[collections.bufr]\ndata_path = \"x\"\n\
+             [collections.csv]\n",
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("[collections.csv] is set but engine_type is 'bufr'"),
+            "{err}"
+        );
+        assert!(toml::from_str::<CsvConfig>("mapp = 1").is_err());
+        assert!(toml::from_str::<CsvConfig>("[map]\nmaxage = \"PT1H\"").is_err());
+
+        // BUFR.
+        let bufr = |apis: &str, map: &str| {
+            collection_with(&format!(
+                "engine_type = \"bufr\"\napis = {apis}\n[collections.bufr]\ndata_path = \"x\"\n\
+                 [collections.bufr.map]\n{map}\n"
+            ))
+        };
+        let ok = bufr("[\"edr\", \"tiles\"]", full_toml);
+        assert!(ok.validate().is_ok(), "{:?}", ok.validate());
+        assert_eq!(ok.collections[0].bufr.as_ref().unwrap().map, Some(full));
+        for (apis, map, expected) in [
+            (
+                "[\"wms\"]",
+                "time_step = \"PT30S\"",
+                "[bufr.map].time_step 'PT30S' must be whole seconds from PT1M to PT6H",
+            ),
+            (
+                "[\"wms\"]",
+                "max_age = \"soon\"",
+                "[bufr.map].max_age 'soon' is not a valid ISO 8601 duration",
+            ),
+            (
+                "[\"edr\", \"features\"]",
+                "marker_size = 4",
+                "[bufr.map] needs a map API in apis (wms, maps or tiles)",
+            ),
+        ] {
+            let err = bufr(apis, map).validate().unwrap_err().to_string();
+            assert!(err.contains(expected), "{map}: {err}");
+        }
+        assert!(toml::from_str::<BufrConfig>("data_path = \"x\"\n[map]\nsize = 4\n").is_err());
+        assert_eq!(
+            toml::from_str::<BufrConfig>("data_path = \"x\"\n")
+                .unwrap()
+                .map,
+            None
         );
     }
 

@@ -1,8 +1,8 @@
 id = "obs-bufr-local"
 title = "Surface observations (BUFR, local demo)"
-description = "SYNOP station reports decoded from WMO BUFR files — eight real reports captured from the WIS2 Global Broker on 2026-09-12 08:00Z. One location per station, one PointSeries per station and time window; stations as Point features."
+description = "SYNOP station reports decoded from WMO BUFR files — eight real reports captured from the WIS2 Global Broker on 2026-09-12 08:00Z. One location per station, one PointSeries per station and time window; stations as Point features, and on a map as markers coloured by each parameter's latest value."
 engine_type = "bufr"
-apis = ["edr", "features"]
+apis = ["edr", "features", "wms", "maps", "tiles"]
 keywords = ["observations", "SYNOP", "BUFR", "WMO", "stations"]
 
 [license]
@@ -25,3 +25,14 @@ position_radius_km = 25.0   # EDR position → nearest station within this radiu
 # descriptors = ["013011"]    # Table B FXXYYY (first match wins)
 # unit = "kg m-2"               # the BUFR Table B unit; K/Pa/kg m-2 are served as °C/hPa/mm
 # period_hours = 2            # for period-qualified elements
+
+# Station symbol layers (#1204): one map layer per parameter, each station a
+# marker coloured by its latest report within max_age. The map APIs in `apis`
+# turn them on; the section is optional (the defaults are shown). The layers
+# take the built-in default style their name and unit select (air
+# temperature in °C, pressure in hPa, ...).
+[bufr.map]
+max_age = "PT1H"
+time_step = "PT10M"
+marker_size = 6
+draw_missing = false

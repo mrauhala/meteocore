@@ -7,8 +7,11 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ds_core::feature::{Feature, Geometry, PropertyValue, Related};
+use ds_core::map_engine::RasterInfo;
 use ds_core::model::{Location, LocationSnapshot};
+use ds_render::station_symbols::StationLayers;
 
+use crate::params::ParameterTable;
 use crate::store::{ObsStore, StationInfo};
 
 #[derive(Debug, Clone)]
@@ -22,12 +25,16 @@ pub struct Snapshot {
     pub spatial_extent: Option<[f64; 4]>,
     pub temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
     pub report_count: usize,
-    /// Bumped on every rebuild that changed anything (Features ETag).
+    /// Bumped on every rebuild that changed anything (Features ETag, and
+    /// the station map layers' `content_version`, #1204).
     pub version: u64,
+    /// The station-symbol map layers' metadata (#1204): one layer per
+    /// parameter, TIME steps over the newest 6 h of reports.
+    pub raster_info: Arc<RasterInfo>,
 }
 
 impl Snapshot {
-    pub fn empty() -> Self {
+    pub fn empty(table: &ParameterTable, layers: &StationLayers) -> Self {
         Snapshot {
             stations: Arc::new(Vec::new()),
             locations: LocationSnapshot::empty(),
@@ -37,11 +44,18 @@ impl Snapshot {
             temporal_extent: None,
             report_count: 0,
             version: 0,
+            raster_info: Arc::new(crate::map::raster_info(table, layers, None, None)),
         }
     }
 
-    /// Build from the store. Stations are ordered by id for stable paging.
-    pub fn build(store: &ObsStore, version: u64) -> Self {
+    /// Build from the store. Stations are ordered by id for stable paging
+    /// (and a stable station-map draw order).
+    pub fn build(
+        store: &ObsStore,
+        version: u64,
+        table: &ParameterTable,
+        layers: &StationLayers,
+    ) -> Self {
         let mut stations: Vec<StationInfo> = store.stations().map(|s| s.info.clone()).collect();
         stations.sort_by(|a, b| a.id.cmp(&b.id));
         let report_counts: HashMap<&str, usize> = store
@@ -115,6 +129,7 @@ impl Snapshot {
             temporal_extent: temporal,
             report_count: store.row_count(),
             version,
+            raster_info: Arc::new(crate::map::raster_info(table, layers, spatial, temporal)),
         }
     }
 }

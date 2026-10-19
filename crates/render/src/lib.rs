@@ -11,6 +11,7 @@ pub mod palette;
 pub mod palette_formats;
 pub mod plot;
 pub mod rasterize;
+pub mod station_symbols;
 pub mod style;
 
 pub use colormap::{
