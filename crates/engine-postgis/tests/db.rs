@@ -951,7 +951,7 @@ async fn check_station_map(schema: &str, cfg: PostgisConfig, late_row: &str) {
 
     // 3. Nodata markers.
     let mut cfg = cfg;
-    cfg.map = Some(ds_core::config::PostgisMapConfig {
+    cfg.map = Some(ds_core::config::StationMapConfig {
         draw_missing: Some(true),
         ..Default::default()
     });

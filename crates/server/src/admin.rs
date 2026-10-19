@@ -4135,10 +4135,10 @@ pub fn load_collections(
 
                 // Raster surfaces: the events shape's age-colored lightning
                 // layer (#504), and a station shape's symbol layers (#1063)
-                // when opted in (`postgis_map_wiring`). Station shapes keep
+                // when opted in (`station_map_wiring`). Station shapes keep
                 // the MVT feature-tile path.
                 let is_events = engine.config().events().is_some();
-                let wiring = postgis_map_wiring(collection);
+                let wiring = station_map_wiring(collection);
                 let layer_params = if wiring.station_layers {
                     use ds_core::map_engine::MapEngine as _;
                     engine.raster_info_shared().parameters.clone()
@@ -4155,7 +4155,7 @@ pub fn load_collections(
                         &layer_params,
                         &bundle_index,
                     );
-                    engine.set_station_symbols(postgis_station_symbols(
+                    engine.set_station_symbols(station_symbols(
                         &styles,
                         &collection.id,
                         &layer_params,
@@ -5045,7 +5045,7 @@ fn root_layer_default(
     if root.layer == id {
         match ctx.base_layer_default(collection, None, &info.parameter, Some(&info.unit)) {
             Ok(Some(mut default)) => {
-                if is_postgis_station_collection(collection) {
+                if is_station_symbol_collection(collection) {
                     wrap_station_symbols(&mut default);
                 }
                 info!(
@@ -5147,10 +5147,10 @@ fn collection_layer_styles(
             ),
         }
     }
-    if is_postgis_station_collection(collection) {
-        // Station symbol layers (#1063): every style of the collection, so
-        // no path draws the transparent ground in an opaque nodata colour
-        // or a nodata marker as a value.
+    if is_station_symbol_collection(collection) {
+        // Station symbol layers (#1063, #1204): every style of the
+        // collection, so no path draws the transparent ground in an opaque
+        // nodata colour or a nodata marker as a value.
         for styles in layers.values_mut() {
             styles.values_mut().for_each(wrap_station_symbols);
         }
@@ -5159,74 +5159,89 @@ fn collection_layer_styles(
     layers
 }
 
-/// A station symbol layer's colormap (#1063): the transparent ground and
-/// the nodata marker drawn as symbols, never as values.
+/// A station symbol layer's colormap (#1063, #1204): the transparent ground
+/// and the nodata marker drawn as symbols, never as values.
 fn wrap_station_symbols(style: &mut ds_render::StyleInfo) {
     style.colormap = Arc::new(ds_render::SymbolColorMap::new(
         style.colormap.clone(),
-        engine_postgis::NODATA_MARKER,
+        ds_render::station_symbols::NODATA_MARKER,
     ));
 }
 
-/// Which map surfaces a PostGIS collection is wired to.
+/// Which map surfaces a station collection is wired to.
 #[derive(Debug, PartialEq, Eq)]
-struct PostgisMapWiring {
+struct StationMapWiring {
     /// The raster map APIs it is registered with, of `wms`, `maps`, `tiles`.
     raster_apis: Vec<&'static str>,
-    /// A station shape's symbol layers (#1063): styles resolved, midpoints
-    /// handed to the engine, and the per-refresh frame fingerprint on.
+    /// Its station symbol layers (#1063, #1204): styles resolved, midpoints
+    /// handed to the engine, and for PostGIS the per-refresh frame
+    /// fingerprint on.
     station_layers: bool,
-    /// The station inventory as vector tiles (MVT).
+    /// The station inventory as vector tiles (MVT): PostGIS station shapes.
     vector_tiles: bool,
 }
 
-/// The map wiring of a PostGIS collection. The events shape's strike layer
-/// (#504) serves every raster API listed. A station shape's symbol layers
-/// (#1063) are opt-in: a `[postgis.map]` section, or `wms`/`maps` in
-/// `apis`. A station collection listing only `tiles` without the section
-/// keeps its vector tiles alone, as before the layers existed: no raster
-/// tileset, no fingerprint statement per refresh, no style resolution and
-/// so no generic-colormap warning.
-fn postgis_map_wiring(collection: &CollectionConfig) -> PostgisMapWiring {
+/// The map wiring of a station collection; nothing for any other engine.
+///
+/// - PostGIS: the events shape's strike layer (#504) serves every raster
+///   API listed. A station shape's symbol layers (#1063) are opt-in: a
+///   `[postgis.map]` section, or `wms`/`maps` in `apis`. A station
+///   collection listing only `tiles` without the section keeps its vector
+///   tiles alone, as before the layers existed: no raster tileset, no
+///   fingerprint statement per refresh, no style resolution and so no
+///   generic-colormap warning.
+fn station_map_wiring(collection: &CollectionConfig) -> StationMapWiring {
     let lists = |api: &str| collection.apis.iter().any(|a| a == api);
-    let events = collection
-        .postgis
-        .as_ref()
-        .is_some_and(|p| p.observations.shape == "events");
-    let station_layers = !events
-        && (collection.postgis.as_ref().is_some_and(|p| p.map.is_some())
-            || lists("wms")
-            || lists("maps"));
-    PostgisMapWiring {
+    let postgis = collection.engine_type == "postgis";
+    let map_section = match collection.engine_type.as_str() {
+        "postgis" => collection.postgis.as_ref().is_some_and(|p| p.map.is_some()),
+        _ => {
+            return StationMapWiring {
+                raster_apis: Vec::new(),
+                station_layers: false,
+                vector_tiles: false,
+            }
+        }
+    };
+    let events = postgis
+        && collection
+            .postgis
+            .as_ref()
+            .is_some_and(|p| p.observations.shape == "events");
+    // `tiles` alone keeps a PostGIS station collection's vector tiles.
+    let station_layers = !events && (map_section || lists("wms") || lists("maps"));
+    StationMapWiring {
         raster_apis: ["wms", "maps", "tiles"]
             .into_iter()
             .filter(|api| lists(api) && (events || station_layers))
             .collect(),
         station_layers,
-        vector_tiles: !events && lists("tiles"),
+        vector_tiles: postgis && !events && lists("tiles"),
     }
 }
 
-/// A PostGIS collection of a station shape: its map layers draw station
-/// symbols (#1063), not a raster.
-fn is_postgis_station_collection(collection: &CollectionConfig) -> bool {
-    collection.engine_type == "postgis"
-        && collection
+/// A station collection whose map layers draw station symbols (#1063), not
+/// a raster: the PostGIS station shapes.
+fn is_station_symbol_collection(collection: &CollectionConfig) -> bool {
+    match collection.engine_type.as_str() {
+        "postgis" => collection
             .postgis
             .as_ref()
-            .is_some_and(|p| p.observations.shape != "events")
+            .is_some_and(|p| p.observations.shape != "events"),
+        _ => false,
+    }
 }
 
-/// The station layers' overlap order (#1063): each parameter layer's
+/// The station layers' overlap order (#1063, #1204): each parameter layer's
 /// midpoint, the middle of its default style's value range. That range is
 /// the style's `min`/`max`, which fall back to the palette's first and last
 /// stops, so markers draw in ascending distance from it and the most
 /// extreme value lands on top.
-fn postgis_station_symbols(
+fn station_symbols(
     layers: &HashMap<String, HashMap<String, ds_render::StyleInfo>>,
     collection_id: &str,
     params: &[ds_core::map_engine::ParameterInfo],
-) -> engine_postgis::StationSymbols {
+) -> ds_render::station_symbols::StationSymbols {
     let midpoints = params
         .iter()
         .filter_map(|p| {
@@ -5236,7 +5251,7 @@ fn postgis_station_symbols(
             Some((p.name.clone(), (style.min + style.max) / 2.0))
         })
         .collect();
-    engine_postgis::StationSymbols::new(midpoints)
+    ds_render::station_symbols::StationSymbols::new(midpoints)
 }
 
 /// Resolve a collection's bound bundle; None if unset (validation rejects unresolved refs).
@@ -10300,11 +10315,11 @@ colormap = "radar_fmi"
             c.postgis = Some(toml::from_str(&toml).unwrap());
             c
         };
-        let wiring = |c: &CollectionConfig| super::postgis_map_wiring(c);
+        let wiring = |c: &CollectionConfig| super::station_map_wiring(c);
 
         assert_eq!(
             wiring(&station(&["edr", "features", "tiles"], false)),
-            super::PostgisMapWiring {
+            super::StationMapWiring {
                 raster_apis: vec![],
                 station_layers: false,
                 vector_tiles: true,
@@ -10313,7 +10328,7 @@ colormap = "radar_fmi"
         );
         assert_eq!(
             wiring(&station(&["edr", "tiles"], true)),
-            super::PostgisMapWiring {
+            super::StationMapWiring {
                 raster_apis: vec!["tiles"],
                 station_layers: true,
                 vector_tiles: true,
@@ -10321,7 +10336,7 @@ colormap = "radar_fmi"
         );
         assert_eq!(
             wiring(&station(&["wms", "tiles"], false)),
-            super::PostgisMapWiring {
+            super::StationMapWiring {
                 raster_apis: vec!["wms", "tiles"],
                 station_layers: true,
                 vector_tiles: true,
@@ -10334,7 +10349,7 @@ colormap = "radar_fmi"
         events.postgis.as_mut().unwrap().observations.shape = "events".into();
         assert_eq!(
             wiring(&events),
-            super::PostgisMapWiring {
+            super::StationMapWiring {
                 raster_apis: vec!["wms", "tiles"],
                 station_layers: false,
                 vector_tiles: false,
@@ -10429,7 +10444,7 @@ colormap = "grayscale"
                 );
             }
         }
-        let symbols = super::postgis_station_symbols(&layers, "surface-obs", &params);
+        let symbols = super::station_symbols(&layers, "surface-obs", &params);
         assert_eq!(symbols.midpoint("t2m"), -5.0);
         let rh = &layers["surface-obs/rh"]["default"];
         assert_eq!(symbols.midpoint("rh"), (rh.min + rh.max) / 2.0);

@@ -14,15 +14,17 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-    # engine-postgis, its path dependencies, the EDR API it serves, the
-    # station-grid engine the tests grid it with (#1210) and that engine's
-    # executor, and the manifests and lock file, so a `cargo update` of
-    # tokio-postgres or deadpool runs these tests before it merges.
+    # engine-postgis, its path dependencies (ds-render draws its station
+    # frames, #1204), the EDR API it serves, the station-grid engine the
+    # tests grid it with (#1210) and that engine's executor, and the
+    # manifests and lock file, so a `cargo update` of tokio-postgres or
+    # deadpool runs these tests before it merges.
     paths:
       - "crates/engine-postgis/**"
       - "crates/core/**"
       - "crates/ds-poll/**"
       - "crates/ds-cache/**"
+      - "crates/render/**"
       - "crates/api-edr/**"
       - "crates/engine-station-grid/**"
       - "crates/ds-executor/**"
