@@ -30,11 +30,9 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   (`Dataset::chunks()`, via hdf5-reader on the same in-memory storage as
   netcdf-reader, so no second copy), so a block read inflates each chunk
   once. A GOES-R chunk spans the full width, so its block is a strip;
-  GMGSI's is 793 × 1322, a quarter of the width. The reader's own chunk
-  cache is off because decoded blocks are cached in `cache::STRIPS`, which
-  keeps its phase-2 name, env var and metric family. A GK2A AMI block is one
-  1375 × 1375 chunk (`Part::open_ami`): a full-width strip of them would
-  decode 15 MB.
+  GMGSI's is 793 × 1322, a quarter of the width; GK2A's 1375 × 1375. The
+  reader's own chunk cache is off because decoded blocks are cached in
+  `cache::STRIPS`, which keeps its phase-2 name, env var and metric family.
 - **No request-time S3 in the steady state: the window stays in memory.**
   The poll loop downloads each new scan whole into `cache::FRAMES`, which
   every satellite collection shares (`MC_SATELLITE_FRAME_CACHE_MB`).
@@ -260,14 +258,13 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
 
 ## Config
 
-`[satellite]`: `provider = "goes-r" | "isatss" | "gmgsi" | "gk2a"`, `data_path` (a
-mirror, listed recursively; a file in a hidden folder below it, such as
-rsync `--delay-updates`' `.~tmp~/`, is never a scan, and the same holds
-below a bucket prefix: `Source::list`, #1029) XOR
-`endpoint`+`bucket`, `time_window` (required for a bucket: ≤ 24 h of GOES-R
-or GMGSI hourly prefixes, ≤ 6 h of ISatSS ten-minute scan directories;
-`Naming::validate_window`),
-`poll_interval_secs`, and `[[satellite.products]]` with `parameter`, `title`,
+`[satellite]`: `provider = "goes-r" | "isatss" | "gmgsi" | "gk2a"`,
+`data_path` (a mirror, listed recursively; a file in a hidden folder below
+it, such as rsync `--delay-updates`' `.~tmp~/`, is never a scan, and the
+same holds below a bucket prefix: `Source::list`, #1029) XOR
+`endpoint`+`bucket`, `time_window` (required for a bucket: ≤ 24 h of GOES-R,
+GMGSI or GK2A hourly prefixes, ≤ 6 h of ISatSS ten-minute scan directories;
+`Naming::validate_window`), `poll_interval_secs`, and `[[satellite.products]]` with `parameter`, `title`,
 `unit` (declared: styles resolve at load, before any scan), `product`,
 `band` (required for ISatSS, whose `product` is the sector, `HFD`; refused
 for GMGSI, whose `product` is the mosaic, `ds_core::config::GMGSI_PRODUCTS`),
@@ -332,14 +329,13 @@ sample at the finest selected product's nadir pixel size through a
 `ProjectionGrid` (never a per-cell geostationary forward). Update `crates/api-edr/README.md` with any change here.
 Budgets, checked before any work: at most `MAX_QUERY_FETCHES` (8) evicted
 scans to download and `MAX_QUERY_PIXELS` of blocks to decode per query
-(1024 GOES-R strips, 70 GK2A chunks), summed per product on its own grid
-(products may mix 0.5/1/2 km).
+(1024 GOES-R strips, 127 GMGSI chunks, 70 GK2A chunks), summed per product
+on its own grid (products may mix 0.5/1/2 km).
 
 ## Not yet
 
-Other providers (MTG) are phases 3 and 5; GK2A bands other than IR105
-wait for a sourced central wavenumber. A regional (non-global) Mercator
-grid is refused: only GMGSI needs one, and it is global. A new provider
+MTG is phase 5. GK2A bands other than IR105 wait for a sourced central
+wavenumber. A regional (non-global) Mercator grid is refused: only GMGSI needs one, and it is global. A new provider
 gets recipes only with its own instrument table in
 `ds_core::satellite_recipes`: GK2A AMI and MTG FCI number their bands
 differently. WMS, Maps and Tiles serve the composites from
