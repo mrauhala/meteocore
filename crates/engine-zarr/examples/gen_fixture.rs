@@ -7,21 +7,34 @@
 //! deterministic, so re-running it reproduces byte-for-byte the same store
 //! (modulo codec library versions).
 //!
-//! Layout (an ERA5-like 2 m temperature snippet):
+//! Layout (an ERA5-like snippet of surface fields):
 //! - root group `/`           — CF global attributes
 //! - `/time`  int64   [4]     — "hours since 2026-01-01", values 0/6/12/18
 //! - `/lat`   float64 [12]    — degrees_north, descending 60 → 49
 //! - `/lon`   float64 [16]    — degrees_east, 0 → 15
+//! - `/msl`        float32 [4,12,16] chunk [4,6,8] gzip — units "Pa"
+//! - `/mtpr`       float32 [4,12,16] chunk [4,6,8] gzip — units
+//!   "kg m**-2 s**-1" (ERA5's spelling), a precipitation rate
 //! - `/t2m`        float32 [4,12,16] chunk [4,6,8] gzip — units "K"
 //! - `/t2m_packed` int16   [4,12,16] chunk [4,6,8] gzip — packed via
 //!   scale_factor/add_offset, with a `_FillValue` sentinel cell
 //!
-//! Both data variables encode the same exact field, which is *linear* in lat
-//! and lon so bilinear interpolation is exact and easy to assert:
+//! Every field is *linear* in lat and lon, so bilinear interpolation is
+//! exact and easy to assert. In the units stored, and as the engine serves
+//! them (#1213: °C, hPa, mm/h):
 //!
 //! ```text
-//! t2m[t, j, i] = 273.15 + 0.1 * lat[j] + 0.01 * lon[i] + 0.5 * t
+//! t2m[t, j, i]  = 273.15 + 0.1 * lat[j] + 0.01 * lon[i] + 0.5 * t   K
+//!               =          0.1 * lat[j] + 0.01 * lon[i] + 0.5 * t   °C
+//! msl[t, j, i]  = 101325 + 100 * (lat[j] - 55) - 20 * lon[i] + 50 * t   Pa
+//!               = 1013.25 +      (lat[j] - 55) - 0.2 * lon[i] + 0.5 * t  hPa
+//! mtpr[t, j, i] = (0.5 + 0.1 * (60 - lat[j]) + 0.05 * lon[i] + 0.25 * t) / 3600
+//!                                                         kg m-2 s-1
+//!               =  0.5 + 0.1 * (60 - lat[j]) + 0.05 * lon[i] + 0.25 * t  mm/h
 //! ```
+//!
+//! `t2m_packed` encodes the same field as `t2m`. Re-running keeps the
+//! directory's `test-config.toml`.
 
 use std::sync::Arc;
 
@@ -47,9 +60,32 @@ fn field(lat: f64, lon: f64, t: usize) -> f64 {
     273.15 + 0.1 * lat + 0.01 * lon + 0.5 * t as f64
 }
 
+/// Mean sea level pressure in Pa.
+fn msl(lat: f64, lon: f64, t: usize) -> f64 {
+    101_325.0 + 100.0 * (lat - 55.0) - 20.0 * lon + 50.0 * t as f64
+}
+
+/// Mean total precipitation rate in kg m-2 s-1: the mm/h rate over 3600.
+fn mtpr(lat: f64, lon: f64, t: usize) -> f64 {
+    (0.5 + 0.1 * (60.0 - lat) + 0.05 * lon + 0.25 * t as f64) / 3600.0
+}
+
 fn main() {
     let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/zarr-era5-t2m");
-    let _ = std::fs::remove_dir_all(&out);
+    // Replace the store, keeping the example config that lives beside it.
+    if let Ok(entries) = std::fs::read_dir(&out) {
+        for entry in entries {
+            let path = entry.expect("fixture dir entry").path();
+            if path.file_name() == Some("test-config.toml".as_ref()) {
+                continue;
+            }
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).expect("remove fixture array");
+            } else {
+                std::fs::remove_file(&path).expect("remove fixture file");
+            }
+        }
+    }
     std::fs::create_dir_all(&out).expect("create fixture dir");
     let store: Arc<FilesystemStore> =
         Arc::new(FilesystemStore::new(&out).expect("open filesystem store"));
@@ -58,7 +94,7 @@ fn main() {
     let group = GroupBuilder::new()
         .attributes(attrs(serde_json::json!({
             "Conventions": "CF-1.8",
-            "title": "Synthetic ERA5-like 2 m temperature",
+            "title": "Synthetic ERA5-like surface fields",
         })))
         .build(store.clone(), "/")
         .expect("build root group");
@@ -105,33 +141,43 @@ fn main() {
         }),
     );
 
-    // --- t2m: float32, clean linear field ------------------------------------
-    let mut t2m = Vec::with_capacity(NT * NY * NX);
-    for t in 0..NT {
-        for &lat in &lat_vals {
-            for &lon in &lon_vals {
-                t2m.push(field(lat, lon, t) as f32);
-            }
-        }
-    }
-    let array = ArrayBuilder::new(
-        vec![NT as u64, NY as u64, NX as u64],
-        vec![NT as u64, 6, 8], // chunk: whole time axis, spatial split 2x2
-        data_type::float32(),
-        f32::NAN,
-    )
-    .dimension_names(Some(["time", "lat", "lon"]))
-    .bytes_to_bytes_codecs(vec![Arc::new(GzipCodec::new(5).expect("gzip level"))])
-    .attributes(attrs(serde_json::json!({
-        "units": "K",
-        "standard_name": "air_temperature",
-        "long_name": "2 metre temperature",
-    })))
-    .build(store.clone(), "/t2m")
-    .expect("build t2m");
-    array.store_metadata().expect("store t2m metadata");
-    let all = ArraySubset::new_with_shape(array.chunk_grid_shape().to_vec());
-    array.store_chunks(&all, t2m).expect("store t2m chunks");
+    // --- float32 fields, clean and linear -------------------------------------
+    write_f32_field(
+        &store,
+        "/t2m",
+        &lat_vals,
+        &lon_vals,
+        field,
+        serde_json::json!({
+            "units": "K",
+            "standard_name": "air_temperature",
+            "long_name": "2 metre temperature",
+        }),
+    );
+    write_f32_field(
+        &store,
+        "/msl",
+        &lat_vals,
+        &lon_vals,
+        msl,
+        serde_json::json!({
+            "units": "Pa",
+            "standard_name": "air_pressure_at_mean_sea_level",
+            "long_name": "Mean sea level pressure",
+        }),
+    );
+    write_f32_field(
+        &store,
+        "/mtpr",
+        &lat_vals,
+        &lon_vals,
+        mtpr,
+        serde_json::json!({
+            "units": "kg m**-2 s**-1",
+            "standard_name": "precipitation_flux",
+            "long_name": "Mean total precipitation rate",
+        }),
+    );
 
     // --- t2m_packed: int16 with scale_factor/add_offset + a fill sentinel ----
     let mut packed = Vec::with_capacity(NT * NY * NX);
@@ -177,6 +223,42 @@ fn main() {
         .expect("store t2m_packed chunks");
 
     println!("wrote fixture to {}", out.display());
+}
+
+/// A float32 `[time, lat, lon]` variable holding `value(lat, lon, t)`,
+/// chunked over the whole time axis and split 2 × 2 in space, gzipped.
+fn write_f32_field(
+    store: &Arc<FilesystemStore>,
+    path: &str,
+    lat_vals: &[f64],
+    lon_vals: &[f64],
+    value: fn(f64, f64, usize) -> f64,
+    attributes: serde_json::Value,
+) {
+    let mut values = Vec::with_capacity(NT * NY * NX);
+    for t in 0..NT {
+        for &lat in lat_vals {
+            for &lon in lon_vals {
+                values.push(value(lat, lon, t) as f32);
+            }
+        }
+    }
+    let array = ArrayBuilder::new(
+        vec![NT as u64, NY as u64, NX as u64],
+        vec![NT as u64, 6, 8], // chunk: whole time axis, spatial split 2x2
+        data_type::float32(),
+        f32::NAN,
+    )
+    .dimension_names(Some(["time", "lat", "lon"]))
+    .bytes_to_bytes_codecs(vec![Arc::new(GzipCodec::new(5).expect("gzip level"))])
+    .attributes(attrs(attributes))
+    .build(store.clone(), path)
+    .expect("build float32 field");
+    array.store_metadata().expect("store field metadata");
+    let all = ArraySubset::new_with_shape(array.chunk_grid_shape().to_vec());
+    array
+        .store_chunks(&all, values)
+        .expect("store field chunks");
 }
 
 fn write_f64_coord(

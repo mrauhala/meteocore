@@ -59,8 +59,8 @@ pub(crate) struct Layout {
     /// Each variable's display conversion (#1209), in `variables` order,
     /// from its CF `units` through `ds_core::units::display_conversion`,
     /// as engine-bufr's and engine-grib's: K to °C, Pa to hPa, kg m-2 to
-    /// mm, m2 s-2 to gpm, in any spelling. `None` for a unit without a rule
-    /// (CF's `1`, m/s), served as stored. Every value the engine serves is
+    /// mm, kg m-2 s-1 to mm/h, m2 s-2 to gpm, in any spelling. `None` for a
+    /// unit without a rule (CF's `1`, m/s), served as stored. Every value the engine serves is
     /// sampled from the stored field first and converted after, in `f64`
     /// ([`Self::to_display`]), so a map pixel and an EDR value agree.
     pub display: Vec<Option<DisplayConversion>>,

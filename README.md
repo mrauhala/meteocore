@@ -988,6 +988,7 @@ Unit conversion is driven by the WMO `(discipline, category, parameter_number)` 
 | K (temperature difference, e.g. dewpoint depression) | K | identity |
 | Pa | hPa | ×0.01 |
 | kg m⁻² | mm | ×1 (accumulated liquid-equivalent, WMO standard triples) |
+| kg m⁻² s⁻¹ | mm/h | ×3600 (precipitation rate, e.g. PRATE, ECMWF `tprate`) |
 | m (metres of water) | mm | ×1000 (ECMWF local params 193/198/254) |
 | m² s⁻² | gpm | ÷9.80665 |
 | proportion (0–1) | % | ×100 |
@@ -1206,7 +1207,7 @@ Plain-Zarr generations isolate cache entries; they are not transactional snapsho
 
 **Forecast (reference + lead) handling:** when a store has a CF `forecast_reference_time` axis (model run) **and** a `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/ICON-EU), the engine uses the **latest run** and exposes valid time (= run + lead) as the time axis. Selecting older runs (EDR instances / WMS `reference_time`) is tracked in [#337](https://github.com/mrauhala/meteocore/issues/337).
 
-> **Note:** the engine returns stored values as-is — it does **not** convert units. For datasets where `temperature_2m` is already in °C (e.g. the dynamical.org forecasts), set the colormap range in °C.
+**Units:** values are served in display units, as GRIB's, BUFR's and NetCDF's are: each array's CF `units`, in any spelling, goes through `ds_core::units::display_conversion` (K as °C, Pa as hPa, kg m⁻² as mm, kg m⁻² s⁻¹ as mm/h, m² s⁻² as gpm), on every API and on plain Zarr and Icechunk alike, and the converted unit is reported (legends, EDR, GetFeatureInfo). A unit without a rule, such as m/s or a store's `degree_Celsius`, is served as stored. Layers without a style of their own take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
 
 #### Data Source Modes
 
@@ -1239,7 +1240,7 @@ Plain-Zarr generations isolate cache entries; they are not transactional snapsho
 ```toml
 [[collections]]
 id = "zarr-era5-t2m-local"
-title = "ERA5-like 2 m Temperature (Zarr V3, local)"
+title = "ERA5-like Surface Fields (Zarr V3, local)"
 description = "Synthetic CF-conventions Zarr V3 store served from a local directory"
 engine_type = "zarr"
 apis = ["edr", "wms", "maps", "tiles"]
@@ -1250,18 +1251,13 @@ zarr_version = 3
 poll_interval_secs = 300
 # parameters = ["t2m"]                  # optional — default is every variable
 
+# One WMS/Maps/Tiles layer per variable, each on the default its name and
+# served unit select; the collection's own layer draws `msl`, the first.
 [collections.wms]
-colormap = "temperature"
-
-# One WMS/Maps/Tiles layer per variable.
-[[collections.wms.parameters]]
-name = "t2m"
-colormap = "temperature"
-min = 250.0
-max = 300.0
+colormap = "pressure"
 ```
 
-A committed fixture lives at `testdata/zarr-era5-t2m`; regenerate it with `cargo run -p engine-zarr --example gen_fixture`.
+A committed fixture lives at `testdata/zarr-era5-t2m` (`msl` in Pa, `mtpr` in kg m⁻² s⁻¹, `t2m` and its packed copy in K, served in hPa, mm/h and °C); regenerate it with `cargo run -p engine-zarr --example gen_fixture`.
 
 #### Icechunk
 
@@ -1325,14 +1321,9 @@ branch = "main"
 region = "us-west-2"
 # decoded_cache_mb = 256    # separate from the compressed payload cache
 
+# temperature_2m is stored in °C: the temperature default, −90…50 °C.
 [collections.wms]
 colormap = "temperature"
-
-[[collections.wms.parameters]]
-name = "temperature_2m"
-colormap = "temperature"
-min = -30.0       # temperature_2m is already in °C — no unit conversion
-max = 40.0
 ```
 
 Ready-to-use disabled examples ship in `collections.d/` (`ecmwf-aifs-single-icechunk.toml.disabled`, `noaa-gfs-icechunk.toml.disabled`, `dwd-icon-eu.toml.disabled`) — rename to drop `.disabled` and run with `--features icechunk`.
@@ -1506,7 +1497,7 @@ Gridded CF-NetCDF data (`engine_type = "netcdf"`, #1067), served through WMS, OG
 
 - **Times come from the files.** Each file's valid times are its `time` axis and its model run its `forecast_reference_time`. Runs are the WMS `reference_time` dimension: a map draws from the newest run whose steps span the requested time, so a newer run still arriving does not hide an older one, and a pinned run draws from that run or fails. Files without `forecast_reference_time` form one timeline without runs. File names only select the files and order the opening (`filename_template`, with `{run}` and `{lead}` as in ds-storage's discovery, default `*.nc`), and global time attributes are never read.
 - **Grids:** 1-D latitude/longitude, or 1-D projected x/y in metres with a CF `grid_mapping` (`lambert_conformal_conic`, as MEPS; `geostationary`; `polar_stereographic`, by `standard_parallel` or `scale_factor_at_projection_origin`; `lambert_azimuthal_equal_area`; `transverse_mercator`). The grid mapping states its earth figure, never assumed WGS84; polar stereographic, azimuthal equal-area and transverse Mercator grids are served on WGS84 (or GRS80) only, not on a sphere. A grid around a pole advertises an extent reaching it. Rows stored south to north are drawn north-up. A projected grid has no `storageCrs`: its native CRS has no OGC URI.
-- **Fields** have one level, or levels on one pressure axis. A single level is identified by its coordinate (2 m, 10 m), never its dimension name. A pressure axis is a dimension whose coordinate's units are a pressure (CF: `hPa`, `Pa`, `mbar`, …), unless it is a parametric coordinate (`formula_terms`, or a hybrid `standard_name`); its levels, in hPa (converted from Pa where the file stores Pa), are the collection's vertical axis (see **Pressure levels** below). Any other axis of several values (height above ground, hybrid model levels) is not served. Files with an ensemble axis are read at `member`. Packed values are unpacked, and `_FillValue`, `missing_value` and NaN are transparent. Values keep the files' units (K, Pa, m/s, kg/m², fractions).
+- **Fields** have one level, or levels on one pressure axis. A single level is identified by its coordinate (2 m, 10 m), never its dimension name. A pressure axis is a dimension whose coordinate's units are a pressure (CF: `hPa`, `Pa`, `mbar`, …), unless it is a parametric coordinate (`formula_terms`, or a hybrid `standard_name`); its levels, in hPa (converted from Pa where the file stores Pa), are the collection's vertical axis (see **Pressure levels** below). Any other axis of several values (height above ground, hybrid model levels) is not served. Files with an ensemble axis are read at `member`. Packed values are unpacked, and `_FillValue`, `missing_value` and NaN are transparent. Values are served in display units, converted from the files' (see below).
 - **The first file fixes the layout:** its variables (the `variables` allowlist, else every variable on its grid) and its grid. A later file missing one, on another grid or on other pressure levels, is skipped with a WARN. A file replaced in place is read again, and tiles drawn from it before are not served again.
 - **Files stay open** while the collection keeps them: the newest `max_runs` runs, at most `max_files` files. Requests read one 2-D field per layer and time through a field cache shared by every NetCDF collection (`MC_NETCDF_FIELD_CACHE_MB`), never the whole file.
 
@@ -1524,7 +1515,7 @@ poll_interval_secs = 60
 precipitation_amount_acc = "Precipitation accumulated since run start"
 ```
 
-`apis` defaults to `["edr"]`; the examples serve all four, `["edr", "wms", "maps", "tiles"]`. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs). Values are served in display units, as GRIB's and BUFR's are: each variable's CF `units`, in any spelling, converted after sampling on every API (K as °C, Pa as hPa, kg m⁻² as mm, m² s⁻² as gpm), and reported in the converted unit; a unit without a rule, such as CF's `1` or m/s, is served as stored. Layers the example does not style take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
+`apis` defaults to `["edr"]`; the examples serve all four, `["edr", "wms", "maps", "tiles"]`. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs). Values are served in display units, as GRIB's and BUFR's are: each variable's CF `units`, in any spelling, converted after sampling on every API (K as °C, Pa as hPa, kg m⁻² as mm, kg m⁻² s⁻¹ as mm/h, m² s⁻² as gpm), and reported in the converted unit; a unit without a rule, such as CF's `1` or m/s, is served as stored. Layers the example does not style take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
 
 **Remote files.** An `http(s)://` `data_path` is a server whose files are found by name and read in place by HTTP range, never downloaded whole: MEPS on thredds.met.no's fileServer, which cannot be listed.
 
@@ -1904,7 +1895,9 @@ the stratosphere,
 `msl`/`mslp` (Pa or hPa) → `pressure`, `DBZH`/`dbz` → `radar_dbz`,
 `VRADH` → `radial_velocity`, satellite brightness temperature / cloud top
 temperature (unit K) → `ir_bt_enhanced`, relative humidity/cloud/wind
-speed/precipitation likewise. Relative humidity and cloud cover in unit `1`
+speed/precipitation likewise; a precipitation rate in mm/h (the engines
+that convert units serve a kg m⁻² s⁻¹ rate in mm/h) → `precipitation_rate`
+over 0–30 mm/h. Relative humidity and cloud cover in unit `1`
 (CF fractions, such as MEPS `relative_humidity_2m`) take the fraction twins
 `humidity_fraction` and `cloud_cover_fraction` over 0–1, since the percent
 palettes would clip a 0–1 range to their bottom 1 %; the CF area fractions
@@ -1942,9 +1935,8 @@ parameter, a WMS `LAYERS=<collection>` or a Maps or Tiles request without
 too (#1133).
 
 For multi-parameter rasters, defaults and legend labels use each selected
-parameter's own unit: GRIB and NetCDF display units, Zarr CF units as the
-files spell them, QueryData FMI parameter-number units, or ODIM quantity
-units.
+parameter's own unit: GRIB, NetCDF and Zarr display units, QueryData FMI
+parameter-number units, or ODIM quantity units.
 Temperature, pressure and the signed, geopotential, specific-humidity,
 column-water, snowfall, run-start accumulation and CF area-fraction defaults
 above require a known unit; unknown units (including a QueryData parameter

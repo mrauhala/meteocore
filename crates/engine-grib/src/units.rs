@@ -29,7 +29,7 @@ pub enum SourceUnit {
     Hectopascal,
     /// "kg m-2" — precipitation depth; 1 kg m-2 ≈ 1 mm of water.
     KgPerM2,
-    /// "kg m-2 s-1" — precipitation rate.
+    /// "kg m-2 s-1" — precipitation rate. Auto-displayed in mm/h (× 3600).
     KgPerM2PerS,
     /// "m s-1"
     MetresPerSecond,
@@ -310,6 +310,7 @@ impl DisplayConversion {
 /// - `Kelvin` → `°C` (scale 1, offset -273.15)
 /// - `Pascal` → `hPa` (scale 0.01, offset 0)
 /// - `KgPerM2` → `mm` (scale 1, offset 0) — water-depth equivalent
+/// - `KgPerM2PerS` → `mm/h` (scale 3600, offset 0) — a precipitation rate
 /// - `M2PerS2` → `gpm` (scale 1/9.80665, offset 0)
 /// - `Proportion` → `%` (scale 100, offset 0)
 /// - Everything else → identity with a canonical source-unit string.
@@ -346,9 +347,11 @@ pub fn default_display(source: SourceUnit) -> DisplayConversion {
             scale: 1.0,
             offset: 0.0,
         },
+        // A precipitation rate (PRATE, ECMWF `tprate`): 1 kg m-2 s-1 of
+        // water is 1 mm s-1, displayed per hour.
         SourceUnit::KgPerM2PerS => DisplayConversion {
-            display_unit: "kg m-2 s-1",
-            scale: 1.0,
+            display_unit: "mm/h",
+            scale: 3600.0,
             offset: 0.0,
         },
         SourceUnit::MetresPerSecond => DisplayConversion {
@@ -799,6 +802,10 @@ mod tests {
             "m**2 s**-2",
             "m^2/s^2",
             "m² s⁻²",
+            "kg m-2 s-1",
+            "kg/(m2 s)",
+            "kg m⁻² s⁻¹",
+            "kg/m2/s",
             "Proportion",
             "proportion",
             "(0 - 1)",

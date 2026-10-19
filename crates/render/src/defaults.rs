@@ -99,12 +99,15 @@ static RULES: &[DefaultRule] = &[
         ],
         fallback_range: None,
     },
-    // Precipitation rate / intensity.
+    // Precipitation rate / intensity, in mm/h. A rate stored in
+    // kg m-2 s-1 is served in mm/h by every engine that converts units
+    // (`ds_core::units::display_conversion` and engine-grib's twin, #1213),
+    // so that unit has no range here: 0–30 kg m-2 s-1 would be 108 000 mm/h.
     DefaultRule {
         names: &["prate", "rr", "rri", "prr"],
         contains: &["precipitationrate", "rainrate", "rainintensity"],
         palette: "precipitation_rate",
-        unit_ranges: &[(&["mmh", "mmhr", "mmh1", "mmhr1", "kgm2s1"], 0.0, 30.0)],
+        unit_ranges: &[(&["mmh", "mmhr", "mmh1", "mmhr1"], 0.0, 30.0)],
         fallback_range: Some((0.0, 30.0)),
     },
     // Precipitation accumulated from the run's start (#1067): MET Norway's
@@ -909,6 +912,37 @@ mod tests {
         );
     }
 
+    /// #1213: a precipitation rate stored in kg m-2 s-1, in any spelling,
+    /// is served in mm/h (`ds_core::units::display_conversion`, engine-grib's
+    /// twin), whose range the rate rule keys on; the stored unit has none.
+    #[test]
+    fn a_served_precipitation_rate_is_ranged_in_mm_per_hour() {
+        let rule = RULES
+            .iter()
+            .find(|r| r.palette == "precipitation_rate")
+            .unwrap();
+        for spelling in ["kg m-2 s-1", "kg m**-2 s**-1", "kg/m^2/s", "kg/(m2 s)"] {
+            let served = ds_core::units::display_conversion(spelling).unwrap().unit;
+            assert_eq!(served, "mm/h", "{spelling}");
+            let key = unit_key(served);
+            assert!(
+                rule.unit_ranges
+                    .iter()
+                    .any(|(aliases, min, max)| aliases.contains(&key.as_str())
+                        && (*min, *max) == (0.0, 30.0)),
+                "{key}"
+            );
+            let stored = unit_key(spelling);
+            assert!(
+                !rule
+                    .unit_ranges
+                    .iter()
+                    .any(|(aliases, ..)| aliases.contains(&stored.as_str())),
+                "{stored}"
+            );
+        }
+    }
+
     /// #1067 PR 6: a unit matches in every spelling (`unit_key`), in the
     /// embedded table and in config unit ranges alike.
     #[test]
@@ -942,13 +976,6 @@ mod tests {
                 &["m s-1", "m/s", "m s^-1"][..],
                 "diverging",
                 (-40.0, 40.0),
-            ),
-            (
-                "prate",
-                "",
-                &["kg m-2 s-1", "kg/m2/s", "kg/(m2 s)", "kg m**-2 s**-1"][..],
-                "precipitation_rate",
-                (0.0, 30.0),
             ),
             (
                 "prate",
@@ -1473,7 +1500,7 @@ mod tests {
             (
                 "PRATE",
                 "Precipitation rate",
-                Some("kg m-2 s-1"),
+                Some("mm/h"),
                 "precipitation_rate",
                 Some((0.0, 30.0)),
             ),

@@ -2,8 +2,11 @@
 //! `testdata/zarr-era5-t2m` fixture (regenerate with
 //! `cargo run -p engine-zarr --example gen_fixture`).
 //!
-//! The fixture's field is linear in lat/lon — `273.15 + 0.1*lat + 0.01*lon +
-//! 0.5*t` — so bilinear interpolation is exact and values are predictable.
+//! The fixture's fields are linear in lat/lon, so bilinear interpolation is
+//! exact and values are predictable. The engine serves them in display
+//! units (#1213): `t2m` (stored in K) as `0.1*lat + 0.01*lon + 0.5*t` °C,
+//! `msl` (Pa) as `1013.25 + (lat - 55) - 0.2*lon + 0.5*t` hPa and `mtpr`
+//! (kg m-2 s-1) as `0.5 + 0.1*(60 - lat) + 0.05*lon + 0.25*t` mm/h.
 
 use std::path::PathBuf;
 
@@ -16,6 +19,23 @@ use engine_zarr::ZarrEngine;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/zarr-era5-t2m")
+}
+
+/// A value stored in K, as the engine serves it: in °C (#1213).
+fn celsius(kelvin: f64) -> f64 {
+    kelvin - 273.15
+}
+
+/// The fixture's fields in their served units at `(lon, lat)` and time
+/// step `t`: `t2m` (and `t2m_packed`) in °C, `msl` in hPa, `mtpr` in mm/h.
+fn served(parameter: &str, lon: f64, lat: f64, t: usize) -> f64 {
+    let t = t as f64;
+    match parameter {
+        "t2m" | "t2m_packed" => 0.1 * lat + 0.01 * lon + 0.5 * t,
+        "msl" => 1013.25 + (lat - 55.0) - 0.2 * lon + 0.5 * t,
+        "mtpr" => 0.5 + 0.1 * (60.0 - lat) + 0.05 * lon + 0.25 * t,
+        other => panic!("no fixture field {other}"),
+    }
 }
 
 /// Write a tiny **forecast** Zarr V3 store (dims `init_time, lead_time, lat,
@@ -376,7 +396,7 @@ fn area_query_across_the_antimeridian_reads_both_sides() {
             // off-grid and null; every other cell carries the field.
             if lon.abs() <= 178.0 && (10.0..=20.0).contains(&lat) {
                 let v = v.unwrap_or_else(|| panic!("({lon}, {lat}) is null"));
-                let exp = 300.0 + 0.1 * lat + 0.01 * lon;
+                let exp = celsius(300.0 + 0.1 * lat + 0.01 * lon);
                 assert!(
                     (v - exp).abs() < 1e-3,
                     "({lon}, {lat}) = {v}, expected {exp}"
@@ -426,7 +446,8 @@ fn forecast_uses_latest_run_with_lead_as_time() {
     assert_eq!(e.get_available_times().unwrap().len(), 3);
 
     // A position query at (lon=10, lat=60) must read the LATEST run (init=1):
-    // value = 1*1000 + lead_idx + 0.1*60 + 0.01*10 = 1006.1, 1007.1, 1008.1.
+    // value = 1*1000 + lead_idx + 0.1*60 + 0.01*10 = 1006.1, 1007.1, 1008.1
+    // K, served in °C.
     let qr = single(
         e.query_position("POINT(10 60)", None, None, None, None)
             .unwrap(),
@@ -434,20 +455,20 @@ fn forecast_uses_latest_run_with_lead_as_time() {
     let vals = &qr.ranges.get("temp").unwrap().values;
     assert_eq!(vals.len(), 3);
     assert!(
-        (vals[0].unwrap() - 1006.1).abs() < 0.05,
+        (vals[0].unwrap() - celsius(1006.1)).abs() < 0.05,
         "lead0 {:?}",
         vals[0]
     );
     assert!(
-        (vals[2].unwrap() - 1008.1).abs() < 0.05,
+        (vals[2].unwrap() - celsius(1008.1)).abs() < 0.05,
         "lead2 {:?}",
         vals[2]
     );
 
     // The MAP render path (`read_window`, used by WMS/Maps/Tiles) must pin to
     // the same latest run. Render over the grid extent at the first valid time
-    // (latest run, lead 0); every pixel must come from init=1 (value ≥ 1000),
-    // never init=0 (~6).
+    // (latest run, lead 0); every pixel must come from init=1 (value ≥ 1000
+    // K), never init=0 (~6 K).
     let tile = e
         .get_raster_tile(
             [9.5, 58.5, 11.5, 60.5],
@@ -463,7 +484,7 @@ fn forecast_uses_latest_run_with_lead_as_time() {
     let rendered: Vec<f64> = tile.values.iter_values().flatten().collect();
     assert!(!rendered.is_empty(), "render path produced no data");
     assert!(
-        rendered.iter().all(|&v| v >= 1000.0),
+        rendered.iter().all(|&v| v >= celsius(1000.0)),
         "raster render must read the latest run (init=1), got {rendered:?}"
     );
 }
@@ -505,7 +526,8 @@ fn forecast_runs_are_instances_and_selectable() {
     assert!(e.find_instance(run0 + chrono::Duration::hours(6)).is_none());
     assert_eq!(e.raster_info().reference_times, vec![run0, run1]);
 
-    // EDR position against run 0: value = 0*1000 + lead + 0.1*60 + 0.01*10.
+    // EDR position against run 0: value = 0*1000 + lead + 0.1*60 + 0.01*10
+    // K, served in °C.
     let qr = single(
         e.query_position("POINT(10 60)", None, None, None, Some(run0))
             .unwrap(),
@@ -515,8 +537,8 @@ fn forecast_runs_are_instances_and_selectable() {
     };
     assert_eq!(t[0], run0, "valid times belong to the selected run");
     let vals = &qr.ranges["temp"].values;
-    assert!((vals[0].unwrap() - 6.1).abs() < 0.05, "{vals:?}");
-    assert!((vals[2].unwrap() - 8.1).abs() < 0.05, "{vals:?}");
+    assert!((vals[0].unwrap() - celsius(6.1)).abs() < 0.05, "{vals:?}");
+    assert!((vals[2].unwrap() - celsius(8.1)).abs() < 0.05, "{vals:?}");
     // A datetime window inside run 0's valid times but outside run 1's.
     let qr = single(
         e.query_position(
@@ -538,7 +560,7 @@ fn forecast_runs_are_instances_and_selectable() {
         .values
         .iter()
         .flatten()
-        .all(|&v| v < 1000.0));
+        .all(|&v| v < celsius(1000.0)));
     // Unknown run → ReferenceTimeNotFound; None → latest.
     let err = e
         .query_position(
@@ -572,7 +594,7 @@ fn forecast_runs_are_instances_and_selectable() {
         .unwrap();
     let rendered: Vec<f64> = tile.values.iter_values().flatten().collect();
     assert!(
-        !rendered.is_empty() && rendered.iter().all(|&v| v < 1000.0),
+        !rendered.is_empty() && rendered.iter().all(|&v| v < celsius(1000.0)),
         "{rendered:?}"
     );
     assert_eq!(e.resolve_reference_time(None, None), Some(run1));
@@ -625,14 +647,14 @@ fn single(resp: CoverageResponse) -> ds_core::model::QueryResult {
 #[test]
 fn lists_data_variables_sorted() {
     let params = engine().get_parameters();
-    assert_eq!(params, vec!["t2m".to_string(), "t2m_packed".to_string()]);
+    assert_eq!(params, ["msl", "mtpr", "t2m", "t2m_packed"]);
 }
 
 #[test]
 fn parameter_descriptions_carry_units_and_label() {
     let descs = engine().get_parameter_descriptions();
     let t2m = descs.get("t2m").unwrap();
-    assert_eq!(t2m.unit, "K");
+    assert_eq!(t2m.unit, "°C");
     assert_eq!(t2m.label, "2 metre temperature");
     // The CF `standard_name` attribute is passed through for EDR's
     // `observedProperty.id` (#273), in collection metadata and query results.
@@ -646,6 +668,106 @@ fn parameter_descriptions_carry_units_and_label() {
         qr.parameters["t2m"].standard_name.as_deref(),
         Some("air_temperature")
     );
+}
+
+/// #1213: each array is served in the display unit of its CF `units`, on
+/// every path: K as °C, Pa as hPa and ERA5's `kg m**-2 s**-1` as mm/h. At a
+/// cell centre and between cells, the map pixel, the EDR position value
+/// (what GetFeatureInfo answers) and an area cell agree and equal the
+/// stored field converted; every report names the served unit.
+#[test]
+fn values_are_served_in_display_units() {
+    use ds_core::wind::WindSource;
+
+    let e = engine();
+    let step = 2;
+    let t = e.get_available_times().unwrap()[step];
+    let units = [
+        ("msl", "hPa"),
+        ("mtpr", "mm/h"),
+        ("t2m", "°C"),
+        ("t2m_packed", "°C"),
+    ];
+    let descriptions = e.get_parameter_descriptions();
+    let info = e.raster_info();
+    let wind = e.wind_facts();
+    for (name, unit) in units {
+        assert_eq!(descriptions[name].unit, unit, "{name}");
+        assert_eq!(info.parameter_unit(Some(name)), Some(unit), "{name}");
+        let facts = wind.parameters.iter().find(|p| p.name == name).unwrap();
+        assert_eq!(facts.unit, unit, "{name}");
+    }
+
+    // A cell centre, and a point between four cells.
+    for (lon, lat) in [(8.0, 54.0), (5.5, 54.5)] {
+        let names: Vec<String> = units.iter().map(|(n, _)| n.to_string()).collect();
+        let position = single(
+            e.query_position(
+                &format!("POINT({lon} {lat})"),
+                Some((t, t)),
+                Some(&names),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let d = 0.25;
+        let area = single(
+            e.query_area(
+                &format!(
+                    "POLYGON(({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))",
+                    w = lon - d,
+                    s = lat - d,
+                    e = lon + d,
+                    n = lat + d
+                ),
+                Some((t, t)),
+                Some(&names),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        for (name, unit) in units {
+            // The packed copy holds the field to 0.01 K.
+            let tolerance = if name == "t2m_packed" { 6e-3 } else { 1e-3 };
+            let expected = served(name, lon, lat, step);
+            assert_eq!(position.parameters[name].unit, unit, "{name}");
+            let value = position.ranges[name].values[0].unwrap();
+            assert!(
+                (value - expected).abs() < tolerance,
+                "{name} at ({lon}, {lat}): {value}, expected {expected} {unit}"
+            );
+            let tile = e
+                .get_raster_tile(
+                    [lon - d, lat - d, lon + d, lat + d],
+                    1,
+                    1,
+                    Some(t),
+                    &OutputCrs::Wgs84,
+                    Some(name),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let pixel = tile.values.value_at(0).unwrap();
+            assert!(
+                (pixel - value).abs() < 1e-9,
+                "{name} at ({lon}, {lat}): pixel {pixel}, position {value}"
+            );
+            assert_eq!(area.parameters[name].unit, unit, "{name}");
+            let cells: Vec<f64> = area.ranges[name].values.iter().flatten().copied().collect();
+            assert!(!cells.is_empty(), "{name}: no area cell");
+            // Each area cell lies within the fields' change across the
+            // half-degree square around the point.
+            for cell in cells {
+                assert!(
+                    (cell - expected).abs() < 0.5,
+                    "{name} area cell {cell}, expected about {expected} {unit}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -719,7 +841,7 @@ fn trajectory_samples_along_the_path_like_position() {
         assert_eq!((samples[8].0 .1, samples[8].0 .2), (9.0, 54.0));
         for ((t, lon, lat), value) in samples {
             assert_eq!(t, times[step]);
-            let expected = 273.15 + 0.1 * lat + 0.01 * lon + 0.5 * step as f64;
+            let expected = served("t2m", lon, lat, step);
             let v = value.unwrap();
             assert!((v - expected).abs() < 0.02, "{v} vs {expected}");
             let position = single(
@@ -732,7 +854,7 @@ fn trajectory_samples_along_the_path_like_position() {
                 )
                 .unwrap(),
             );
-            for param in ["t2m", "t2m_packed"] {
+            for param in ["msl", "mtpr", "t2m", "t2m_packed"] {
                 let own = trajectory_nodes(coverage, param)
                     .into_iter()
                     .find(|n| n.0 == (t, lon, lat))
@@ -768,8 +890,8 @@ fn trajectory_time_and_level_rules() {
     // Samples every 3 h snap to the 6-hourly steps, ties to the earlier.
     assert_eq!(hours, [0, 0, 6, 6, 12, 12, 18]);
     for ((t, lon, lat), value) in samples {
-        let step = (t - t0).num_hours() as f64 / 6.0;
-        let expected = 273.15 + 0.1 * lat + 0.01 * lon + 0.5 * step;
+        let step = (t - t0).num_hours() as usize / 6;
+        let expected = served("t2m", lon, lat, step);
         assert!((value.unwrap() - expected).abs() < 0.02);
     }
 
@@ -853,7 +975,7 @@ fn area_query_grid_matches_linear_field_and_masks_the_polygon() {
                         expect_inside,
                         "cell ({lon}, {lat}) outside the triangle has a value"
                     );
-                    let exp = 273.15 + 0.1 * lat + 0.01 * lon; // f32 store: 1e-4 tolerance
+                    let exp = served("t2m", lon, lat, 0); // f32 store: 1e-4 tolerance
                     assert!(
                         (v - exp).abs() < 1e-4,
                         "({lon}, {lat}) = {v}, expected {exp}"
@@ -885,7 +1007,7 @@ fn area_query_all_timesteps_has_t_axis() {
         let nd = &qr.ranges[key];
         assert_eq!(nd.shape, vec![4, y.len(), x.len()]);
         assert_eq!(nd.axis_names, vec!["t", "y", "x"]);
-        // The field rises 0.5 K per timestep at every cell.
+        // The field rises 0.5 °C per timestep at every cell.
         let per_t = y.len() * x.len();
         for cell in 0..per_t {
             let a = nd.values[cell].unwrap();
@@ -988,11 +1110,11 @@ fn position_query_bilinear_matches_linear_field() {
         e.query_position("POINT(5.5 54.5)", None, None, None, None)
             .unwrap(),
     );
-    assert_eq!(qr.parameters.len(), 2);
+    assert_eq!(qr.parameters.len(), 4);
 
-    // Expected field at (lon=5.5, lat=54.5): 273.15 + 0.1*54.5 + 0.01*5.5 = 278.655,
-    // rising 0.5 K per timestep.
-    let expected = [278.655, 279.155, 279.655, 280.155];
+    // Expected field at (lon=5.5, lat=54.5): 0.1*54.5 + 0.01*5.5 = 5.505 °C
+    // (278.655 K), rising 0.5 per timestep.
+    let expected = [5.505, 6.005, 6.505, 7.005];
     for (key, tol) in [("t2m", 0.02_f64), ("t2m_packed", 0.02)] {
         let nd = qr.ranges.get(key).unwrap();
         assert_eq!(nd.shape, vec![4]);
@@ -1055,7 +1177,7 @@ fn datetime_filter_selects_single_step() {
     let nd = qr.ranges.get("t2m").unwrap();
     assert_eq!(nd.shape, vec![1]);
     let v = nd.values[0].unwrap();
-    assert!((v - 279.155).abs() < 0.02, "value {v}");
+    assert!((v - 6.005).abs() < 0.02, "value {v}");
 }
 
 #[test]
@@ -1066,9 +1188,20 @@ fn raster_info_describes_the_grid() {
     assert!(info.spatial_extent.is_some());
     assert_eq!(info.grid_size, Some([16, 12])); // [nx lon, ny lat]
     let names: Vec<&str> = info.parameters.iter().map(|p| p.name.as_str()).collect();
-    assert!(names.contains(&"t2m") && names.contains(&"t2m_packed"));
-    assert_eq!(info.parameter_unit(Some("t2m")), Some("K"));
-    assert_eq!(info.parameter_unit(Some("t2m_packed")), Some("K"));
+    assert_eq!(names, ["msl", "mtpr", "t2m", "t2m_packed"]);
+    for (name, unit) in [
+        ("msl", "hPa"),
+        ("mtpr", "mm/h"),
+        ("t2m", "°C"),
+        ("t2m_packed", "°C"),
+    ] {
+        assert_eq!(info.parameter_unit(Some(name)), Some(unit), "{name}");
+    }
+    // The collection's own layer draws the first variable.
+    assert_eq!(
+        (info.parameter.as_str(), info.unit.as_str()),
+        ("msl", "hPa")
+    );
 }
 
 #[test]
@@ -1094,8 +1227,8 @@ fn raster_tile_wgs84_matches_linear_field() {
         .values
         .value_at(6 * 16 + 8)
         .expect("pixel (8,6) has data");
-    // 273.15 + 0.1*54 + 0.01*8 = 278.63 at t=0.
-    assert!((v - 278.63).abs() < 0.05, "pixel value {v}");
+    // 0.1*54 + 0.01*8 = 5.48 °C (278.63 K) at t=0.
+    assert!((v - 5.48).abs() < 0.05, "pixel value {v}");
 }
 
 #[test]

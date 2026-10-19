@@ -10,9 +10,11 @@
 #   2. cargo run -p server --features icechunk -- --collections=ecmwf-aifs-single-icechunk
 #      (the `--collections` filter avoids loading the other, remote, collections)
 #
-# Verified live: serves EDR + WMS/Maps/Tiles. NOTE temperature_2m is in degrees
-# Celsius (the engine returns stored values; it does not convert units), hence
-# the Celsius colormap range below.
+# Verified live: serves EDR + WMS/Maps/Tiles. Values are served in display
+# units from each array's CF `units` (#1213): a K, Pa or kg m-2 s-1 array as
+# °C, hPa or mm/h; temperature_2m is stored in degrees Celsius already. Each
+# layer takes the built-in default its name and unit select (temperature over
+# -90…50 °C).
 #
 # Forecast: the engine uses the LATEST run and exposes valid time (= run + lead)
 # as the time axis. Selecting older runs (EDR instances / WMS reference_time) is
@@ -42,11 +44,7 @@ parameters = ["temperature_2m"]
 branch = "main"
 region = "us-west-2"
 
+# The collection's own layer draws temperature_2m: the temperature palette
+# over its own -90…50 °C, as the layer's default.
 [wms]
 colormap = "temperature"
-
-[[wms.parameters]]
-name = "temperature_2m"
-colormap = "temperature"
-min = -30.0
-max = 40.0

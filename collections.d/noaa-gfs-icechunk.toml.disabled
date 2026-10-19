@@ -7,7 +7,10 @@
 #
 # Distinct id from the GRIB `noaa-gfs.toml` example. Forecast: the engine serves
 # the LATEST run with valid time (= run + lead) as the time axis (#337 for run
-# selection). temperature_2m is in degrees Celsius (no unit conversion).
+# selection). Values are served in display units from each array's CF `units`
+# (#1213): a K, Pa or kg m-2 s-1 array as °C, hPa or mm/h; temperature_2m is
+# stored in degrees Celsius already. Each layer takes the built-in default its
+# name and unit select (temperature over -90…50 °C).
 # Verified live via the probe_models test.
 
 id = "noaa-gfs-icechunk"
@@ -31,11 +34,7 @@ parameters = ["temperature_2m"]
 branch = "main"
 region = "us-west-2"
 
+# The collection's own layer draws temperature_2m: the temperature palette
+# over its own -90…50 °C, as the layer's default.
 [wms]
 colormap = "temperature"
-
-[[wms.parameters]]
-name = "temperature_2m"
-colormap = "temperature"
-min = -30.0
-max = 40.0
