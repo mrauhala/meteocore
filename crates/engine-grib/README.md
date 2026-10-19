@@ -37,9 +37,11 @@ level type) exposes every parameter; each retained run is an EDR instance.
 - **Units.** The source unit comes from a built-in subset of WMO Code
   Table 4.2 plus ECMWF local numbers (cloud cover, land-sea mask,
   precipitation and snow in metres of water). Display conversions: K → °C
-  (temperature differences stay K), Pa → hPa, kg m⁻² → mm, metres of
-  water → mm, m² s⁻² → gpm (÷ 9.80665), proportion → %; other units pass
-  unchanged. An unknown triple is labelled by its short name, unitless.
+  (temperature differences stay K), Pa → hPa, kg m⁻² → mm, kg m⁻² s⁻¹ →
+  mm/h (× 3600, precipitation rates such as `PRATE` and ECMWF `tprate`),
+  metres of water → mm, m² s⁻² → gpm (÷ 9.80665), proportion → %; other
+  units pass unchanged. An unknown triple is labelled by its short name,
+  unitless.
 
 ## What it serves
 

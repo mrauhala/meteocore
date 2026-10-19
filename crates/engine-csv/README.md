@@ -50,7 +50,9 @@ inventory as points.
   data.
 - Features accepts `bbox` (station point inside the box), `datetime`,
   equality filters on `name`, `latitude` and `longitude`, and
-  `limit`/`offset`. The feature id is the location value.
+  `limit`/`offset`. The feature id is the location value. When the
+  collection also lists `edr`, each feature has a `related` link to the
+  station's EDR location.
 - Parameter metadata: the label is the column name with `_` as a space.
   Units come from a built-in table keyed by exact column name:
   `temperature` °C, `humidity` %, `wind_speed` m/s, `pressure` hPa,

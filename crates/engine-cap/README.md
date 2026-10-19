@@ -67,6 +67,9 @@ and as a map layer that can be drawn for any time.
   verbatim; a repeated name becomes a list, and a name that clashes with a
   standard property becomes `parameter:<valueName>`. `<eventCode>`s are
   `eventCode:<valueName>`.
+- Label: `event · areaDesc`, from the parts the area has, served as the
+  feature's `title`. HTML listings show `severity`, `onset` and
+  `active_until` first, then MeteoAlarm's `awareness_level` or `urgency`.
 - `bbox` selects areas whose bounding box intersects it (no exact-shape
   test; areas without geometry never match). `datetime` keeps areas whose
   validity window overlaps it; without it every loaded area is returned.

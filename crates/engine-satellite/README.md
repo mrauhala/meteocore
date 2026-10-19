@@ -2,17 +2,18 @@
 
 Serves geostationary satellite imagery as map layers (WMS, OGC API Maps,
 Tiles) and EDR coverages: GOES-R ABI scans, Himawari-9 AHI scans published
-as ISatSS tiles, and NOAA's hourly GMGSI global mosaic.
+as ISatSS tiles, GK2A AMI full-disk scans, and NOAA's hourly GMGSI global
+mosaic.
 
 ## What it solves
 
 Agencies publish each scan as large NetCDF-4 files in public object
 storage (about 25 MB per band for a GOES full disk, 88 tiles for a
 Himawari one), on the satellite's view geometry or a Mercator grid only
-2-D lat/lon arrays describe. This crate keeps a short time window of
-scans in memory and serves any part of them, in any supported output
-CRS, fast enough for map animation: while the window fits in memory, no
-request reads the bucket.
+2-D lat/lon arrays describe; GK2A's hold raw instrument counts. This
+crate keeps a short time window of scans in memory and serves any part
+of them, in any supported output CRS, fast enough for map animation:
+while the window fits in memory, no request reads the bucket.
 
 ## How it works
 
@@ -22,10 +23,11 @@ request reads the bucket.
   collection's time axis is their union.
 - **Discovery.** A background poll loop lists the source every
   `poll_interval_secs`: in a bucket the prefixes `time_window` covers
-  (hourly for GOES-R and GMGSI, the ten-minute scan directories not yet
-  ingested for ISatSS), a local directory recursively, skipping hidden
+  (hourly for GOES-R, GMGSI and GK2A, the ten-minute scan directories not
+  yet ingested for ISatSS), a local directory recursively, skipping hidden
   folders. File names select scans. A scan's time is its start truncated
-  to the minute, so `19:00` finds the scan that started about 20 s later.
+  to the minute, so `19:00` finds the scan that started about 20 s later;
+  a GK2A scan's is the nominal slot its file name carries.
 - **Ingest.** Each new scan is downloaded whole, newest first, at most 4
   per product per poll. The compressed file stays in memory together with
   an overview of every 4th pixel built at ingest. A Himawari scan's 88
@@ -45,7 +47,13 @@ request reads the bucket.
 - **Projections.** GOES-R and ISatSS use the file's CF geostationary grid
   mapping. GMGSI has none: its lat/lon arrays are checked at ingest to
   form a regular global EPSG:3857 grid whose columns wrap around the
-  globe. GOES-West's and Himawari's extents cross the antimeridian.
+  globe. GK2A files are not CF: their grid comes from the CGMS navigation
+  attributes, checked against the corner scan angles the file states.
+  GOES-West's, Himawari's and GK2A's extents cross the antimeridian.
+- **GK2A calibration.** A GK2A file stores 16-bit words, each a quality
+  flag and a count. A table built per scan from the file's own
+  calibration coefficients maps counts to brightness temperature (K);
+  only pixels flagged good are served.
 
 ## What it serves
 
@@ -68,15 +76,17 @@ pixel size, at most 256 cells per axis, null outside the polygon; `radius`
 is an area over the circle. The time axis is the union of the selected
 products' scans, null where a product lacks one. A `datetime` instant
 matches only a scan at exactly that time; no scan in range is 404. A
-query may download 8 evicted scans and decode 1024 blocks at most, else
-400. No named locations, vertical levels or model runs.
+query may download 8 evicted scans and decode about 133 million pixels of
+blocks at most (1024 GOES-R 2 km strips, or 70 GK2A chunks), else 400. No
+named locations, vertical levels or model runs.
 
 ## Configuration
 
 Runnable examples in `collections.d/`, all on NOAA's public buckets:
 `goes19-fd.toml`, `goes18-fd.toml` (crosses the antimeridian),
-`himawari9-fd.toml`, `gmgsi-global.toml` and `goes19-fd-rgb.toml` (both
-recipes). Inline in `config.toml` the section is `[collections.satellite]`.
+`himawari9-fd.toml`, `gk2a-fd.toml` (crosses the antimeridian),
+`gmgsi-global.toml` and `goes19-fd-rgb.toml` (both recipes). Inline in
+`config.toml` the section is `[collections.satellite]`.
 
 ```toml
 id = "goes19-fd"
@@ -86,9 +96,9 @@ engine_type = "satellite"
 apis = ["edr", "wms", "maps", "tiles"]
 
 [satellite]
-provider = "goes-r"                          # "goes-r" | "isatss" | "gmgsi"
+provider = "goes-r"     # "goes-r" | "isatss" | "gmgsi" | "gk2a"
 endpoint = "https://s3.us-east-1.amazonaws.com"
-bucket = "noaa-goes19"                       # or data_path = "<directory>"
+bucket = "noaa-goes19"  # or data_path = "<directory>"
 time_window = "-PT1H"
 poll_interval_secs = 60
 
@@ -103,10 +113,10 @@ variable = "CMI"
 
 | Field | Default | Meaning |
 |---|---|---|
-| `provider` | `"goes-r"` | `goes-r` (ABI), `isatss` (Himawari AHI tiles) or `gmgsi` |
+| `provider` | `"goes-r"` | `goes-r` (ABI), `isatss` (Himawari AHI tiles), `gmgsi` or `gk2a` (AMI L1B) |
 | `data_path` | – | Local directory, listed recursively; or `endpoint` + `bucket` |
 | `endpoint`, `bucket` | – | A public S3 bucket; requests are unsigned |
-| `time_window` | – | e.g. `"-PT1H"`. Required for a bucket: at most 24 h (`goes-r`, `gmgsi`) or 6 h (`isatss`). Without it a directory serves every scan |
+| `time_window` | – | e.g. `"-PT1H"`. Required for a bucket: at most 24 h (`goes-r`, `gmgsi`, `gk2a`) or 6 h (`isatss`). Without it a directory serves every scan |
 | `poll_interval_secs` | `60` | Must be > 0 |
 
 A product needs `parameter` (`^[a-z0-9_]+$`, unique), `title`, `unit`
@@ -120,6 +130,8 @@ A product needs `parameter` (`^[a-z0-9_]+$`, unique), `title`, `unit`
 - `gmgsi`: `product` is `LW`, `SW`, `WV` or `VIS`, no `band`,
   `variable = "data"`. The values are 8-bit display counts (0–255) though
   the file says `units = "K"`: declare `unit = "1"`.
+- `gk2a`: `product = "FD"` (full disk), `band = 13` (IR105, the only
+  channel served) and `variable = "image_pixel_values"`, `unit = "K"`.
 
 A `[[satellite.composites]]` entry has a unique `name` (`^[a-z0-9_]+$`,
 not a product's), an optional `title`, and `red`, `green` and `blue`
@@ -155,14 +167,18 @@ and `satellite_frame_reingests_total`.
 
 ## Limits
 
-- Only these three file layouts are read. A field must be stored as
+- Only these four file layouts are read. A field must be stored as
   `short` or `ushort`, or as `float` holding whole counts, on a north-up
   grid; a Mercator grid must span the globe.
 - Every scan is downloaded whole: about 20–30 MB per GOES product scan,
-  26 MB per Himawari band scan, 7.4 MB per hourly GMGSI longwave file.
-  The first polls after start ingest the whole window.
+  26 MB per Himawari band scan, 35 MB per GK2A IR105 scan, 7.4 MB per
+  hourly GMGSI longwave file. The first polls after start ingest the
+  whole window.
 - A scan missing from memory is downloaded within the request's deadline,
   so an animation whose frames do not fit the cache can return 503.
+- GK2A serves only band 13 (IR105) of the full disk: converting another
+  channel's counts needs its central wavenumber, which the files do not
+  carry.
 - Composites have no values of their own, so EDR does not serve them.
 
 ## Testing
@@ -176,7 +192,10 @@ The fixtures are small cuts of real scans with the original packing,
 each with a README: `testdata/goes19-abi` (band 13 across the limb, cloud
 top temperature), `testdata/goes18-abi` (band 13 across the
 antimeridian), `testdata/himawari9-isatss` (three tile crops around a
-lattice cell with no tile) and `testdata/gmgsi` (a decimated longwave
-mosaic, still a global Mercator grid). `tests/refetch.rs` and
+lattice cell with no tile), `testdata/gk2a-ami` (an IR105 window across
+the antimeridian with its original count words) and `testdata/gmgsi` (a
+decimated longwave mosaic, still a global Mercator grid). `tests/gk2a.rs`
+checks pixel positions against PROJ and temperatures against an
+independent calibration. `tests/refetch.rs` and
 `tests/window_capacity.rs` use zero-size and 1 MB caches to cover
 eviction and re-download. Contributor rules: [CLAUDE.md](CLAUDE.md).

@@ -27,7 +27,12 @@ or map window. Nothing is converted or copied first.
   map metadata. A failed rebuild keeps the previous catalog.
 - **Values.** A value is `raw * scale_factor + add_offset`. Raw values equal
   to `_FillValue`, `missing_value` or the array's Zarr fill value, and NaN
-  or infinite values, are null. Units are served as stored, never converted.
+  or infinite values, are null.
+- **Units.** Values are served in the display unit of the array's CF
+  `units`, in any spelling: K → °C, Pa → hPa, kg m⁻² → mm, kg m⁻² s⁻¹ →
+  mm/h, m² s⁻² → gpm, proportion → %. Other units are served as the store
+  spells them. Every API, derived wind included, reads the converted
+  values and reports the converted unit.
 - **Reads.** A position reads the 2×2 cells around the point over the
   requested time span. An area, a trajectory segment or a map reads one
   window over its bounding box plus one cell. Sampling is bilinear; when a
@@ -99,18 +104,14 @@ apis = ["edr", "wms", "maps", "tiles"]   # default ["edr"]
 data_path = "testdata/zarr-era5-t2m"
 
 [wms]
-colormap = "temperature"
-
-[[wms.parameters]]
-name = "t2m"
-colormap = "temperature"
-min = 250.0
-max = 300.0
+colormap = "pressure"   # the collection layer draws msl, the first variable
 ```
 
 In `config.toml` the tables are `[collections.zarr]` and `[collections.wms]`.
-Set colormap ranges in the stored units; without a `[wms]` colormap, layers
-use the built-in per-parameter defaults or a generic palette.
+Set colormap ranges in the served units (°C, not K). On a store with several
+variables, each variable's layer takes the built-in default its name and
+unit select ahead of the `[wms]` palette; a layer that neither styles draws
+a generic palette.
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -177,11 +178,13 @@ cargo run -p engine-zarr --example gen_fixture  # regenerate the fixture
 ```
 
 `testdata/zarr-era5-t2m` is a committed Zarr V3 store: 4 steps on a 12 × 16
-grid, `t2m` (`float32`) and `t2m_packed` (`int16`, packed, a 2 × 2 block of
-fill cells in the first step), linear in latitude and longitude so bilinear
-results are exact. `tests/integration.rs` queries it and writes forecast and
-antimeridian stores to temporary directories. `tests/icechunk.rs` writes a
-local repository; its `#[ignore]`d probes read the live public ones. Unit
-tests in `src/` cover codec caps, memory admission, caches and refresh.
+grid with `msl` (Pa), `mtpr` (kg m⁻² s⁻¹), `t2m` (K, `float32`) and
+`t2m_packed` (K, `int16`, packed, a 2 × 2 block of fill cells in the first
+step), served in hPa, mm/h and °C. Every field is linear in latitude and
+longitude, so bilinear results are exact. `tests/integration.rs` queries it
+and writes forecast and antimeridian stores to temporary directories.
+`tests/icechunk.rs` writes a local repository; its `#[ignore]`d probes read
+the live public ones. Unit tests in `src/` cover codec caps, memory
+admission, caches, refresh and unit conversion.
 
 Contributor rules for this crate are in [CLAUDE.md](CLAUDE.md).

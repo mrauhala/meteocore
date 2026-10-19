@@ -39,11 +39,15 @@ available.
   1024). Each scan pre-decodes the default quantity of the lowest
   `prewarm_sweeps` sweeps of every volume it reads, so the first map of a
   new volume is a cache hit. A request that reads several moments of one
-  file fetches it once.
+  file fetches it once, and concurrent requests that need the same remote
+  volume share one download. A request waits for a download or decode
+  that another request started only until its own deadline.
 - **Read errors.** A missing or undecodable polar volume reads as no data
-  and is remembered as bad; a deadline or storage failure fails the
-  request, so no cache keeps an empty frame. A composite that fails to load
-  is a gap in an EDR series and an error for a map.
+  and is remembered as bad. A passed deadline or a storage failure fails
+  the request, so no cache keeps an empty frame: a storage failure is a
+  503, a deadline a 503 in the map and 3D Tiles APIs and a 504 in EDR. A
+  composite that fails to load is a gap in an EDR series and an error for
+  a map.
 - **Maps** find each output pixel's source cell through a coarse
   projection grid, never a projection per pixel.
 
@@ -88,7 +92,13 @@ available.
 - **`CELLS`** (sites with a dBZ moment): storm cells at 35 dBZ, drawn as
   footprint outlines and centroid markers at each cell's peak dBZ, with
   tracks over the six previous scans. `ELEVATION` is ignored, and WMS
-  GetFeatureInfo does not query the layer.
+  GetFeatureInfo does not query the layer. The poll loop builds cell sets
+  ahead of the tiles. It builds a new volume's set from the bytes the scan
+  already downloaded, and fills the newest seven-scan window of every site
+  when it starts and after each poll: at most 32 volumes per poll, four
+  downloads at a time. The tiles of a cold window build its volumes in
+  parallel. A tile waiting for another tile's build holds no render slot,
+  so other layers keep rendering.
 - **3D Tiles**: the point cloud holds at most 8 M points. The voxel grid
   behind the isosurface, echo-top and voxel products is cylindrical (range
   × azimuth × height up to 20 km); the caller picks its size, at most 32 M
@@ -100,9 +110,12 @@ available.
   the base id `{id}`): one Point feature per radar at its antenna, id =
   `NOD`, with `nod`, `name`, `wmo`, `longitude`, `latitude`,
   `antenna_height_m`, `quantities`, `elevation_angles`, `coverage_radius_m`,
-  `latest_volume_time`, `volume_count` and `collection`. `bbox` matches the
-  antenna; `datetime` keeps sites with a volume in the interval. The same
-  site list feeds a nowcast collection's `radar_source`.
+  `latest_volume_time`, `volume_count` and `collection`, and a `related`
+  link to the site collection when Maps, Tiles or EDR serves it. `bbox`
+  matches the antenna; `datetime` keeps sites with a volume in the
+  interval. The collection's temporal extent runs from the oldest to the
+  newest volume of any site. The same site list feeds a nowcast
+  collection's `radar_source`.
 
 ## Configuration
 
@@ -194,6 +207,8 @@ cargo test -p engine-odim
   stub files. Polar volumes run against FMI and SMHI files in
   `testdata/radar-fmi-pvol/` and `testdata/radar-smhi-pvol/`, which are not
   in git; those tests skip when the files are absent.
+- `tests/cells_viewport.rs` renders a cold 35-tile `CELLS` viewport over a
+  remote source with slow GETs, within the render deadline.
 - `examples/` holds standalone tools: 3D Tiles point cloud, isosurface and
   echo-top generators, a volume statistics probe and the voxel sampling
   check in

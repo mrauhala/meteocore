@@ -43,8 +43,10 @@ memory, and answers EDR and Features queries from that store.
   the least recently reporting stations beyond `max_stations` are evicted.
   Station lists and extents come from a snapshot rebuilt every 10 s when
   the store changed.
-- **Units**: each parameter names its Table B unit; K, Pa and `kg m-2` are
-  always served as °C, hPa and mm, other units as given.
+- **Units**: each parameter names its Table B unit, served in the shared
+  display units of `ds_core::units`: K as °C, Pa as hPa, `kg m-2` as mm,
+  `kg m-2 s-1` as mm/h, `m2 s-2` as gpm and a WMO proportion as %. Other
+  units are served as given.
 - **WIS2 deletions**: a `rel=deletion` notification removes the rows its
   `data_id` produced. The last 200 000 `data_id`s are remembered.
 - **Persistence (WIS2 only)**: with `[server] state_dir` set, the store is
@@ -70,7 +72,8 @@ memory, and answers EDR and Features queries from that store.
 - Features `/items`: `bbox` matches the station point; `datetime` keeps
   stations with at least one report in the interval; `sortby` accepts
   `last_report`, `first_report`, `report_count` and `name`; every listed
-  property is filterable.
+  property is filterable. The feature id is the station id; with `edr` in
+  `apis`, each feature has a `related` link to that EDR location.
 
 Built-in parameters (`builtin_parameters = true`):
 

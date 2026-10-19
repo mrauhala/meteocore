@@ -84,6 +84,11 @@ else none. A by-id request serves the latest generation. The
   `beam_height_m`.
 - `likely_clutter`: seen for at least 6 frames, slower than 3 m/s and
   within 3 km of its start. Such a cell is demoted, not removed.
+- Label: `Rank 2 · very severe · max 52 dBZ`, from `significance_rank`,
+  `severity` and `max_dbz`, plus `· likely clutter` when flagged, served as
+  the feature's `title`. The rank orders a heuristic significance and the
+  class is this engine's; neither is a warning. HTML listings show
+  `significance`, `severity`, `max_dbz` and `area_km2` first.
 
 **Motion field (EDR).** Parameters `motion_u` and `motion_v` (eastward and
 northward precipitation motion, m/s; echo motion, not wind) and

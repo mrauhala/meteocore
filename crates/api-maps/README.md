@@ -132,7 +132,9 @@ Errors are JSON `{"code": …, "description": …}`, or a page if HTML was asked
 A collection is served when its engine implements `MapEngine` and its `apis`
 lists `"maps"`. The engine types that allow it are `geotiff`, `grib`,
 `querydata`, `zarr`, `netcdf`, `satellite`, `odim`, `odim-volume`, `cap`,
-`nowcast` and `postgis` (events shape only).
+`nowcast`, `station-grid` and `postgis`. A PostGIS events table draws as an
+age-coloured layer; a station table draws one layer per parameter, a marker
+per station coloured by its value.
 
 ```toml
 [[collections]]

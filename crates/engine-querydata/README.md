@@ -33,13 +33,25 @@ Each file is one model run, and the newest run is the default.
   file.
 - **Sampling.** Bilinear interpolation between the four surrounding grid
   points, falling back to the nearest point when one of them is missing.
+  On a lat/lon grid that spans all 360° of longitude, the first column
+  follows the last, so EDR and maps interpolate across the seam.
 - **Map rendering.** A lat/lon grid under geographic (CRS:84, EPSG:4326) or
   Web Mercator output is sampled per pixel, since it needs no projection.
-  Every other pairing maps output pixels to the grid through a coarse
-  projection grid, bounded by a projected grid's footprint.
+  Every other pairing takes its output-to-grid pixel map from the shared
+  `ds_core::resample::SourceGrid`: a coarse projection grid, bounded by a
+  projected grid's footprint. A global lat/lon grid's map is periodic in
+  longitude, so polar and EPSG:3035 views stay registered.
 - **Names.** EDR uses each parameter's full descriptor, such as
   `2 Metre Temperature (2t)`. The map APIs use the short name in the
   trailing parentheses (`2t`), or the full descriptor when there is none.
+- **Units.** A `.sqd` file has no unit strings. Each parameter's unit
+  comes from its FMI parameter number, and values are served as stored:
+  pressure (1) in hPa, temperature and dew point (4, 10) in °C, relative
+  humidity and cloud covers (13, 79, 273–275) in %, wind direction (20)
+  in °, wind speed, u, v and gusts (21, 23, 24, 417, 467) in m s-1, and
+  precipitation amounts (50, 353, 354) in mm. Any other number reports no
+  unit. EDR metadata and the map parameter list carry the unit, so the
+  built-in default palettes, which key on name and unit, apply.
 
 ## What it serves
 
@@ -108,10 +120,8 @@ wms_parameter = "2t"                 # default: the file's first parameter
 poll_interval_secs = 60              # default 30, minimum 1
 max_runs = 4                         # default 4; 1 keeps only the latest run
 
-[collections.wms]
-colormap = "temperature"             # QueryData has no units: set the range
-min = 0.0
-max = 40.0
+[collections.wms]                    # for the collection layer, see Limits
+colormap = "temperature"
 ```
 
 - `data_path` is a local directory. A relative path resolves against the
@@ -136,8 +146,15 @@ max = 40.0
   Station (point) QueryData, text-mode data, big-endian files and other
   area types fail to load.
 - Only the first vertical level is served. There is no vertical dimension.
-- Parameters carry no units. Default palettes that depend on a unit do not
-  match, so set palette ranges in `[wms]`.
+- A parameter number without a known unit reports none, so unit-keyed
+  default palettes do not match it: set its palette in `[wms]`. Maximum
+  and minimum temperature (5, 6) and precipitation rate (49) are among
+  them, since FMI's converters store each in more than one unit.
+- A map request naming no parameter (WMS layer `<collection>`, Maps or
+  Tiles without `parameter-name`) draws the default parameter in that
+  parameter's layer style only when its descriptor has no short name in
+  parentheses, such as `Temperature`. With `2 Metre Temperature (2t)` it
+  takes the collection's `[wms]` palette, so set one.
 - The run window is chosen by file name, so names must sort in origin-time
   order, as timestamped names do. Of two files with the same origin time,
   the later name is kept.
@@ -162,12 +179,17 @@ The tests are unit tests inside the crate:
 
 - `src/parse.rs`: header parsing, grid points checked against PROJ,
   parameter lookup.
+- `src/units.rs`: the parameter-number unit table.
 - `src/engine.rs`: EDR position, area and trajectory, map tiles, runs and
   instances, skipping temporary names, data age.
 - `src/engine/footprint_tests.rs`: the projected map path, world copies and
   the antimeridian.
+- `src/engine/global_tests.rs`: a global lat/lon grid over the pole and
+  across the seam.
 - `src/engine/sampler_tests.rs`: the engine's render against the shared
   `ds_core::resample::SourceGrid` sampler.
+- `src/engine/units_tests.rs`: units in EDR metadata, coverages and map
+  parameters.
 - `src/engine/wind_tests.rs`: derived wind, on fixture copies whose
   descriptors are renamed to u/v components.
 
