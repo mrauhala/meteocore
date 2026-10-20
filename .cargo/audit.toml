@@ -67,9 +67,13 @@ ignore = [
     # type conversion, and rustls-pemfile is used solely by the
     # `TlsConfiguration::Simple` PEM path we never construct. Upstream fix
     # pending (bytebeamio/rumqtt#1067, #1010). Tracked in #689.
+    # RUSTSEC-2026-0382 (distrusted intermediates) is the same crate and
+    # path: rustls 0.23's copy is bumped to the patched 0.103.16, and 0.102
+    # has no patched release.
     "RUSTSEC-2026-0049",
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0382",
     "RUSTSEC-2025-0134",
 ]
