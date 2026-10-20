@@ -1444,7 +1444,6 @@ class DashboardCheck:
 
     def check_panels(self) -> None:
         for name, p in self.panels():
-            self.check_sparse_window(p)
             t, where = self.panel_type(p), self.where(p)
             if not p.get("title"):
                 self.err(where, "has no title")
@@ -1468,43 +1467,6 @@ class DashboardCheck:
             for pl in self.placements.get(name, []):
                 if pl.repeat and pl.repeat not in self.variables:
                     self.err(where, f"repeats over undefined variable ${pl.repeat}")
-
-
-    def check_sparse_window(self, p) -> None:
-        """A percentile, or a ratio that drops an idle denominator with `> 0`,
-        over $__rate_interval is undefined for a window with no observations,
-        and renders and cache lookups come in bursts: at Grafana's default
-        1-minute window every quiet minute is a hole in the graph. Such a
-        panel sets a min interval of at least SPARSE_MIN_INTERVAL."""
-        exprs = [_get(q, "query", "spec", "expr", default="") or ""
-                 for q in self.queries(p)]
-        sparse = [e for e in exprs if "$__rate_interval" in e
-                  and ("histogram_quantile" in e or SPARSE_RATIO_RE.search(e))]
-        if not sparse:
-            return
-        interval = _get(p, "data", "spec", "queryOptions", "interval", default="") or ""
-        if duration_seconds(interval) < SPARSE_MIN_INTERVAL:
-            self.err(self.where(p), "computes a percentile or an idle-filtered ratio over "
-                     "$__rate_interval with a min interval under "
-                     f"{SPARSE_MIN_INTERVAL // 60}m (data.spec.queryOptions.interval: "
-                     f"{interval or 'unset'}): every minute without observations is a "
-                     "hole in the graph")
-
-
-# A ratio whose denominator is filtered with `> 0` so an idle window gives
-# no point instead of 0/0.
-SPARSE_RATIO_RE = re.compile(r"\)\s*>\s*0\s*\)")
-SPARSE_MIN_INTERVAL = 300
-
-
-def duration_seconds(text: str) -> float:
-    """A Grafana interval such as "5m" or "1h30m" in seconds; 0 when unset
-    or unreadable."""
-    units = {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
-    parts = re.findall(r"(\d+(?:\.\d+)?)(ms|s|m|h|d|w)", text or "")
-    if not parts or "".join(n + u for n, u in parts) != (text or "").strip():
-        return 0
-    return sum(float(n) * units[u] for n, u in parts)
 
 
 def check_dashboards(families: dict[str, Family], dashboards: list[tuple[str, object]],

@@ -2795,7 +2795,7 @@
         "spec": {
           "id": 19,
           "title": "Latency p95 by API",
-          "description": "p95 per API. Dashed lines mark 1 s and 3 s. Quantiles are unreliable below ~0.1 req/s: they interpolate to bucket tops from single samples, so check the request rate before believing a spike on a quiet API. Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "p95 per API. Dashed lines mark 1 s and 3 s. Quantiles are unreliable below ~0.1 req/s: they interpolate to bucket tops from single samples, so check the request rate before believing a spike on a quiet API. A gap is a minute with no requests: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -2825,9 +2825,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
@@ -3988,7 +3986,7 @@
         "spec": {
           "id": 23,
           "title": "Latency p50 · p95 · p99",
-          "description": "Request latency across the picked APIs. Pick API = wms for the WMS view: GetMap, GetCapabilities and GetFeatureInfo share the /wms route, so p50 is mostly warm hits and the p99 tail cold renders. The render alone, by outcome and collection, is in Rendering & admission. Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "Request latency across the picked APIs. Pick API = wms for the WMS view: GetMap, GetCapabilities and GetFeatureInfo share the /wms route, so p50 is mostly warm hits and the p99 tail cold renders. The render alone, by outcome and collection, is in Rendering & admission. A gap is a minute with no requests: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -4062,9 +4060,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
@@ -4186,7 +4182,7 @@
         "spec": {
           "id": 24,
           "title": "Latency p95 by route — top 10",
-          "description": "The ten slowest route templates per step, among routes serving at least 0.01 req/s (quieter routes only produce noise). Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "The ten slowest route templates per step, among routes serving at least 0.01 req/s (quieter routes only produce noise). A gap is a minute with no requests: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -4216,9 +4212,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
@@ -4681,7 +4675,7 @@
         "spec": {
           "id": 30,
           "title": "EDR queries — p95 by route",
-          "description": "p95 per EDR data route. A PVOL position resamples polar volumes (tens of ms warm, seconds after a remote fetch); a lightning area is one indexed SQL window (ms). A route drifting up under steady traffic is an engine or database regression, not client load. Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "p95 per EDR data route. A PVOL position resamples polar volumes (tens of ms warm, seconds after a remote fetch); a lightning area is one indexed SQL window (ms). A route drifting up under steady traffic is an engine or database regression, not client load. A gap is a minute with no EDR queries: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -4711,9 +4705,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
@@ -6242,7 +6234,7 @@
         "spec": {
           "id": 33,
           "title": "Render latency by outcome",
-          "description": "WMS GetMap, Maps map and Tiles map-tile render latency, from the rendered-cache lookup to the response, for the picked APIs and collections; p95 solid, p99 dashed. hit = rendered-cache hit (sub-ms), assembled = WMS view built from cached meta-tiles, cold = the engine read source data: the render a user actually waits for. Shed and expired renders are not here: see Shedding & deadlines. Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "WMS GetMap, Maps map and Tiles map-tile render latency, from the rendered-cache lookup to the response, for the picked APIs and collections; p95 solid, p99 dashed. hit = rendered-cache hit (sub-ms), assembled = WMS view built from cached meta-tiles, cold = the engine read source data: the render a user actually waits for. Shed and expired renders are not here: see Shedding & deadlines. A gap is a minute with no renders: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -6294,9 +6286,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
@@ -6436,7 +6426,7 @@
         "spec": {
           "id": 34,
           "title": "Render p95 by collection — top 10",
-          "description": "Which collection owns the render tail (cold and assembled; hits are sub-ms everywhere). One slow collection with the others flat points at its source (remote store, decode, overview choice), not at render admission. Click a series to filter the dashboard to it. Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "Which collection owns the render tail (cold and assembled; hits are sub-ms everywhere). One slow collection with the others flat points at its source (remote store, decode, overview choice), not at render admission. Click a series to filter the dashboard to it. A gap is a minute with no renders: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -6466,9 +6456,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
@@ -6549,7 +6537,7 @@
         "spec": {
           "id": 35,
           "title": "Render phases — p50",
-          "description": "Where a typical served render spends its time, by API and phase. queue = waiting for raster memory and a render slot; engine = get_raster_tile (source read, decode, reproject; summed over a WMS view's uncached meta-tiles); assemble = WMS meta-tile resample; encode = colorize + image encode. Hits run no phase. Phases carry no collection label, so the collection picker does not apply. Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "Where a typical served render spends its time, by API and phase. queue = waiting for raster memory and a render slot; engine = get_raster_tile (source read, decode, reproject; summed over a WMS view's uncached meta-tiles); assemble = WMS meta-tile resample; encode = colorize + image encode. Hits run no phase. Phases carry no collection label, so the collection picker does not apply. A gap is a minute with no renders: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -6579,9 +6567,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
@@ -6718,7 +6704,7 @@
         "spec": {
           "id": 36,
           "title": "Render phases — p95",
-          "description": "Where the slow renders spend their time. A rising queue line over a flat engine line means too few render slots (`[server] render_concurrency`); a rising engine line means a slow source. Expired renders are not here: see the stage split in Shedding & deadlines. Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "Where the slow renders spend their time. A rising queue line over a flat engine line means too few render slots (`[server] render_concurrency`); a rising engine line means a slow source. Expired renders are not here: see the stage split in Shedding & deadlines. A gap is a minute with no renders: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -6748,9 +6734,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
@@ -7577,7 +7561,7 @@
         "spec": {
           "id": 54,
           "title": "${cache}",
-          "description": "One card per cache picked in Cache (repeated): hit ratio and fill on the left axis, misses per second on the right. Healthy: a steady hit ratio. Fill pinned at 100 % is fine while the hit ratio holds; 100 % with a sagging ratio and rising misses means the working set no longer fits. No line = no lookups in the window. Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "One card per cache picked in Cache (repeated): hit ratio and fill on the left axis, misses per second on the right. Healthy: a steady hit ratio. Fill pinned at 100 % is fine while the hit ratio holds; 100 % with a sagging ratio and rising misses means the working set no longer fits. No line = no lookups in the window. A gap is a minute with no lookups: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -7651,9 +7635,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
@@ -10884,7 +10866,7 @@
         "spec": {
           "id": 72,
           "title": "Radar & 3D caches — hit ratio",
-          "description": "ODIM composite (full HDF5 decodes), PVOL pixel, voxel-grid (polar resamples for 3D meshes), storm-cell set (segmentations) and 3D Tiles encoded-content caches. Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "ODIM composite (full HDF5 decodes), PVOL pixel, voxel-grid (polar resamples for 3D meshes), storm-cell set (segmentations) and 3D Tiles encoded-content caches. A gap is a minute with no lookups: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -11002,9 +10984,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
@@ -12655,7 +12635,7 @@
         "spec": {
           "id": 84,
           "title": "Per-collection cache hit ratio",
-          "description": "Hit ratio per cache and collection. A ratio sagging while the cache's fill stays at 100 % means the working set no longer fits its per-source budget. Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "Hit ratio per cache and collection. A ratio sagging while the cache's fill stays at 100 % means the working set no longer fits its per-source budget. A gap is a minute with no lookups: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -12685,9 +12665,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
@@ -13844,7 +13822,7 @@
         "spec": {
           "id": 94,
           "title": "Station-grid cache",
-          "description": "Hit ratio of the shared analysis cache and its fill against MC_STATION_GRID_CACHE_MB. Every revision of the observations re-keys a collection's grids, so a burst of misses after a late report is expected; a low ratio otherwise means the cache holds fewer grids than the maps animate over. Each point covers 5 minutes, so a quiet minute leaves no gap.",
+          "description": "Hit ratio of the shared analysis cache and its fill against MC_STATION_GRID_CACHE_MB. Every revision of the observations re-keys a collection's grids, so a burst of misses after a late report is expected; a low ratio otherwise means the cache holds fewer grids than the maps animate over. A gap is a minute with no lookups: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -13896,9 +13874,7 @@
                 }
               ],
               "transformations": [],
-              "queryOptions": {
-                "interval": "5m"
-              }
+              "queryOptions": {}
             }
           },
           "vizConfig": {
