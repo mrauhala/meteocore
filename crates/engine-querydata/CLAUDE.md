@@ -20,7 +20,9 @@ runtime).
 - **Grids:** WGS84, Rotated Lat-Lon, Stereographic, Lambert Conformal Conic
   (MEPS: tangent cone, `lat1 == lat2`). `GridInfo::new` derives the
   GeoTransform once; per-pixel code reads it, never re-projects corners.
-  It samples the WGS84 extents once too (`lonlat_extent`, `bbox`); the
+  It samples the WGS84 extents once too (`lonlat_extent`, `bbox`, from
+  `bbox_with_poles`: a held pole at every longitude, `west > east` across
+  the antimeridian, #1194); the
   per-request metadata reads them, never re-projects edges (#881).
 - **Corner gotchas (`GridInfo::new`):** the stored corners are grid-point
   *centres* (spacing = span / (n − 1)). A lat/lon area starts at its first
@@ -35,7 +37,8 @@ runtime).
   on WGS84 misplaced the full MEPS interior by ~1.2 km mean (#800). The
   stored corners have only six significant digits, so corner anchoring lands
   within ~5 m of the file's world rect — pinned in `parse_meps_lcc`. The
-  stereographic record carries no radius line and still projects on WGS84.
+  stereographic record carries no radius line and still projects on WGS84 (`figure:
+  Ellipsoid::WGS84`; #1243).
 - The render path projected per node (every source but a lat/lon grid
   under CRS:84 / Web Mercator) takes the shared sampler's map (#1190):
   `GridInfo::source` is a `ds_core::resample::SourceGrid` built once at

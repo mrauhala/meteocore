@@ -19,7 +19,7 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs};
 
 use super::*;
-use crate::test_server::{gets, Request, TestServer};
+use crate::test_server::{gets, thredds_catalog, Request, TestServer};
 use crate::NetcdfEngine;
 
 const TUNING: Tuning = Tuning {
@@ -384,6 +384,88 @@ fn a_file_replaced_after_its_open_is_a_503_and_read_again() {
     render(&engine, LEAD_1, "air_temperature_2m").unwrap();
 }
 
+/// The THREDDS catalogs of [`server`]'s files, as thredds.met.no lays them
+/// out and serves them, chunked (#1170): the archive root down to the
+/// slot's `member_00`, which lists both leads as published [`old`]. Returns
+/// the `catalog_url` line.
+fn put_catalogs(server: &TestServer) -> String {
+    server.chunk_whole_gets();
+    let root = "thredds/catalog/meps25epsarchive";
+    let segments = [
+        slot().format("%Y").to_string(),
+        slot().format("%m").to_string(),
+        slot().format("%d").to_string(),
+        slot().format("%H").to_string(),
+        "member_00".to_string(),
+    ];
+    let modified = old().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let files: Vec<(String, String, String)> = [0, 1]
+        .into_iter()
+        .map(|lead| {
+            let url_path = key(slot(), lead).replace("thredds/fileServer/", "");
+            let size = format!("{:.2}", fixture(lead).len() as f64 / 1000.0);
+            (url_path, size, modified.clone())
+        })
+        .collect();
+    for depth in 0..=segments.len() {
+        let dir = segments[..depth].join("/");
+        let path = [root, dir.as_str(), "catalog.xml"]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        let body = match segments.get(depth) {
+            Some(next) => thredds_catalog(&[&[next.as_str(), "catalog.xml"].join("/")], &[]),
+            None => thredds_catalog(&[], &files),
+        };
+        server.put(&path, body, old());
+    }
+    format!("catalog_url = \"{}/{root}/catalog.xml\"", server.url)
+}
+
+/// The catalog route (#1170) finds a file a reader found replaced at once,
+/// even while its catalog still shows the old version: the next poll HEADs
+/// it for its version, and opens the new file.
+#[test]
+fn a_file_replaced_under_a_catalog_is_headed_again() {
+    let server = server();
+    let catalog = put_catalogs(&server);
+    let engine = engine(&server, &catalog);
+    assert_eq!(engine.times(), [at(LEAD_0), at(LEAD_1)]);
+    render(&engine, LEAD_0, "air_temperature_2m").unwrap();
+    let version = engine.content_version();
+
+    server.put(
+        &key(slot(), 0),
+        fixture(1),
+        old() + chrono::Duration::minutes(30),
+    );
+    server.take();
+    let replaced = render(&engine, LEAD_0, "wind_speed_of_gust");
+    assert!(
+        matches!(replaced, Err(DataServerError::ResourceExhausted)),
+        "{replaced:?}"
+    );
+    assert!(engine.content_version() > version);
+
+    engine.poll_once();
+    let polled = server.take();
+    let heads: Vec<&str> = polled
+        .iter()
+        .filter(|r| r.method == "HEAD")
+        .map(|r| r.path.as_str())
+        .collect();
+    assert_eq!(heads, [key(slot(), 0)], "{polled:#?}");
+    assert!(
+        polled
+            .iter()
+            .any(|r| r.method == "GET" && r.path.ends_with("member_00/catalog.xml")),
+        "the rechecked file's catalog: {polled:#?}"
+    );
+    assert_eq!(engine.times(), [at(LEAD_1)], "only the new file's time");
+    render(&engine, LEAD_1, "air_temperature_2m").unwrap();
+}
+
 /// A replacement the prober finds on its own (its sentinel recheck every
 /// 30 min, here forced) moves the content version too: tiles of the old
 /// file may be cached. A poll that finds nothing new moves nothing.
@@ -403,7 +485,7 @@ fn a_replacement_the_prober_finds_moves_the_content_version() {
     let crate::Source::Remote(remote) = &engine.source else {
         unreachable!("a remote engine");
     };
-    assert!(remote.prober.lock().unwrap().recheck(&key(slot(), 1)));
+    assert!(remote.finder.lock().unwrap().recheck(&key(slot(), 1)));
     engine.poll_once();
     assert!(engine.content_version() > version);
     assert_eq!(
@@ -574,13 +656,15 @@ fn a_read_failure_is_found_through_the_readers_errors() {
     assert_eq!(origin("http://127.0.0.1:8080"), "http://127.0.0.1:8080");
 }
 
-/// The shipped thredds.met.no examples, surface (sfc) and pressure levels
-/// (pl, #1067 PR 8), are valid and name MET Norway's own paths, checked
-/// without contacting the server.
+/// The shipped thredds.met.no examples, surface (sfc) by HEAD probing and
+/// through the catalogs (#1170), and pressure levels (pl, #1067 PR 8), are
+/// valid and name MET Norway's own paths, checked without contacting the
+/// server.
 #[test]
 fn the_thredds_examples_name_met_norways_files() {
     for (id, family) in [
         ("meps-netcdf-thredds", "sfc"),
+        ("meps-netcdf-thredds-catalog", "sfc"),
         ("meps-netcdf-pl-thredds", "pl"),
     ] {
         let path = format!(
@@ -595,11 +679,16 @@ fn the_thredds_examples_name_met_norways_files() {
         assert_eq!(config.leads.as_deref().map(<[u32]>::len), Some(67));
         assert_eq!(config.max_runs, 2, "{id}");
         let remote = NetcdfEngine::remote(id, &config, Tuning::DEFAULT).unwrap();
-        let key = remote
-            .prober
-            .lock()
-            .unwrap()
-            .key(at("2026-10-16T06:00:00Z"), Some(12));
+        let finder = remote.finder.lock().unwrap();
+        match (&*finder, config.catalog_url.is_some()) {
+            (crate::Finder::Template(_), false) => {}
+            (crate::Finder::Catalog { prober, .. }, true) => assert_eq!(
+                prober.catalog_url().as_str(),
+                "https://thredds.met.no/thredds/catalog/meps25epsarchive/catalog.xml"
+            ),
+            _ => panic!("{id}: catalog_url and the finder disagree"),
+        }
+        let key = finder.key(at("2026-10-16T06:00:00Z"), Some(12));
         assert_eq!(
             format!("{}/{key}", remote.origin),
             format!(

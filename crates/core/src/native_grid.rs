@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use crate::geo::{Crs, GeoTransform, SweepAxis, CRS84_WKT, WGS84_A, WGS84_F};
+use crate::geo::{Crs, Ellipsoid, GeoTransform, SweepAxis, CRS84_WKT, WGS84_A, WGS84_F};
 
 /// The OGC URI of an EPSG CRS code.
 pub fn epsg_uri(code: u32) -> String {
@@ -239,9 +239,17 @@ const DEGREE: &str = r#"ANGLEUNIT["degree",0.0174532925199433]"#;
 const METRE: &str = r#"LENGTHUNIT["metre",1]"#;
 const UNITY: &str = r#"SCALEUNIT["unity",1]"#;
 
-/// A number as WKT gives it: at most 12 decimals, no trailing zeros.
+/// A number as WKT gives it: at most 12 decimals and 15 significant
+/// digits, which an `f64` holds, no trailing zeros. An ellipsoid's
+/// 6 377 563.396 m is not printed as 6377563.395999999717.
 fn num(v: f64) -> String {
-    let s = format!("{v:.12}");
+    let integer_digits = if v.abs() >= 1.0 {
+        v.abs().log10().floor() as usize + 1
+    } else {
+        1
+    };
+    let decimals = 15usize.saturating_sub(integer_digits).min(12);
+    let s = format!("{v:.decimals$}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
     if s == "-0" {
         "0".to_owned()
@@ -276,9 +284,10 @@ fn scale(name: &str, k: f64, epsg: u32) -> String {
     )
 }
 
-/// The geographic CRS a projection is based on: the WGS 84 ellipsoid with
-/// no datum stated (MeteoCore computes these projections on it), a sphere,
-/// or a geostationary view's own ellipsoid.
+/// The geographic CRS a projection is based on, with no datum stated
+/// (MeteoCore computes these projections on the ellipsoid alone): the WGS
+/// 84 ellipsoid, a sphere, or another ellipsoid such as a geostationary
+/// view's own.
 fn base_geogcrs(semi_major: f64, semi_minor: f64) -> String {
     let primem = format!(r#"PRIMEM["Greenwich",0,{DEGREE}]"#);
     if semi_major == WGS84_A && (semi_minor - WGS84_A * (1.0 - WGS84_F)).abs() < 1e-6 {
@@ -301,6 +310,27 @@ fn base_geogcrs(semi_major: f64, semi_minor: f64) -> String {
 
 const WGS84_B: f64 = WGS84_A * (1.0 - WGS84_F);
 
+/// The geographic CRS a projection on `figure` is based on (#1192): WGS 84
+/// and GRS 1980 by name, else [`base_geogcrs`] of its axes.
+fn figure_geogcrs(figure: &Ellipsoid) -> String {
+    if *figure == Ellipsoid::GRS80 {
+        return format!(
+            r#"BASEGEOGCRS["Unknown based on GRS 1980 ellipsoid",DATUM["Unknown based on GRS 1980 ellipsoid",ELLIPSOID["GRS 1980",6378137,298.257222101,{METRE}]],PRIMEM["Greenwich",0,{DEGREE}]]"#
+        );
+    }
+    if *figure == Ellipsoid::WGS84 {
+        return base_geogcrs(WGS84_A, WGS84_B);
+    }
+    if figure.is_sphere() {
+        return base_geogcrs(figure.semi_major(), figure.semi_major());
+    }
+    let inverse_flattening = num(1.0 / figure.flattening());
+    format!(
+        r#"BASEGEOGCRS["Unknown based on an ellipsoid",DATUM["Unknown based on an ellipsoid",ELLIPSOID["Unknown",{},{inverse_flattening},{METRE}]],PRIMEM["Greenwich",0,{DEGREE}]]"#,
+        num(figure.semi_major())
+    )
+}
+
 /// A projected CRS of easting then northing, in metres.
 fn projcrs(name: &str, base: &str, method: &str, parameters: &[String]) -> String {
     format!(
@@ -311,9 +341,10 @@ fn projcrs(name: &str, base: &str, method: &str, parameters: &[String]) -> Strin
 
 /// The ISO 19162:2019 (WKT2) text of a [`Crs`], as MeteoCore computes it:
 ///
-/// - Transverse Mercator, Lambert azimuthal equal area, stereographic and
-///   Web Mercator on the WGS 84 ellipsoid (the [`Crs`] carries no other),
-///   with no datum stated;
+/// - Transverse Mercator, Lambert azimuthal equal area and stereographic
+///   on their earth figure: WGS 84 or GRS 1980 by name, a sphere, or
+///   another ellipsoid by its axes, with no datum stated (#1192);
+/// - Web Mercator on the WGS 84 ellipsoid;
 /// - Lambert conformal conic on WGS 84 or on its sphere;
 /// - a geostationary view on its own ellipsoid, sweeping x or y;
 /// - rotated lat/lon by the GRIB convention (the southern pole, no axis
@@ -334,9 +365,10 @@ pub fn crs_wkt2(crs: &Crs) -> String {
             k0,
             false_e,
             false_n,
+            figure,
         } => projcrs(
             "Transverse Mercator",
-            &wgs84(),
+            &figure_geogcrs(&figure),
             r#"METHOD["Transverse Mercator",ID["EPSG",9807]]"#,
             &[
                 angle("Latitude of natural origin", lat0, 8801),
@@ -351,9 +383,10 @@ pub fn crs_wkt2(crs: &Crs) -> String {
             lon0,
             false_e,
             false_n,
+            figure,
         } => projcrs(
             "Lambert azimuthal equal area",
-            &wgs84(),
+            &figure_geogcrs(&figure),
             r#"METHOD["Lambert Azimuthal Equal Area",ID["EPSG",9820]]"#,
             &[
                 angle("Latitude of natural origin", lat0, 8801),
@@ -392,7 +425,9 @@ pub fn crs_wkt2(crs: &Crs) -> String {
             k0,
             false_e,
             false_n,
+            figure,
         } => {
+            let base = figure_geogcrs(&figure);
             let parameters = [
                 angle("Latitude of natural origin", lat0, 8801),
                 angle("Longitude of natural origin", lon0, 8802),
@@ -405,14 +440,14 @@ pub fn crs_wkt2(crs: &Crs) -> String {
             if (lat0.abs() - std::f64::consts::FRAC_PI_2).abs() < 1e-10 {
                 projcrs(
                     "Polar stereographic",
-                    &wgs84(),
+                    &base,
                     r#"METHOD["Polar Stereographic (variant A)",ID["EPSG",9810]]"#,
                     &parameters,
                 )
             } else {
                 projcrs(
                     "Stereographic",
-                    &wgs84(),
+                    &base,
                     r#"METHOD["Stereographic"]"#,
                     &parameters,
                 )

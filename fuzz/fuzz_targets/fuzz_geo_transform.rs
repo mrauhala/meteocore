@@ -1,6 +1,6 @@
 #![no_main]
 
-use engine_geotiff::fuzz_exports::{Crs, GeoTransform, SweepAxis};
+use engine_geotiff::fuzz_exports::{Crs, Ellipsoid, GeoTransform, SweepAxis};
 use libfuzzer_sys::fuzz_target;
 
 // Fuzz CRS forward/inverse transforms and GeoTransform methods
@@ -33,12 +33,14 @@ fuzz_target!(|data: &[u8]| {
             k0: param2.clamp(0.5, 1.5),
             false_e: 500_000.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         },
         Crs::LambertAzimuthalEqualArea {
             lat0: param1.clamp(-1.4, 1.4), // ~±80°
             lon0: param2.clamp(-std::f64::consts::PI, std::f64::consts::PI),
             false_e: 0.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         },
         Crs::LambertConformalConic {
             lat1: 0.8,
@@ -58,6 +60,24 @@ fuzz_target!(|data: &[u8]| {
             false_e: 0.0,
             false_n: 0.0,
             radius: Some(6_371_220.0),
+        },
+        // Polar azimuthal equal-area on a sphere (the original EASE-Grid),
+        // whose authalic latitude is the 0/0 limit of the ellipsoid's.
+        Crs::LambertAzimuthalEqualArea {
+            lat0: std::f64::consts::FRAC_PI_2,
+            lon0: param1.clamp(-std::f64::consts::PI, std::f64::consts::PI),
+            false_e: 0.0,
+            false_n: 0.0,
+            figure: Ellipsoid::sphere(6_371_228.0),
+        },
+        // Oblique stereographic on Hughes 1980 (#1192, #1194).
+        Crs::Stereographic {
+            lat0: param1.clamp(-1.4, 1.4),
+            lon0: param2.clamp(-std::f64::consts::PI, std::f64::consts::PI),
+            k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+            figure: Ellipsoid::from_inverse_flattening(6_378_273.0, 298.279_411_123_064),
         },
         // A spherical-Mercator source grid (GMGSI): forward unbounded at
         // the poles.

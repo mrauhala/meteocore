@@ -3,7 +3,12 @@
 //! and `Last-Modified` but no ETag, a ranged GET with 206 and
 //! `Content-Range`, 412 for a GET whose `If-Unmodified-Since` the object is
 //! newer than, 404 for anything else. One thread per connection, each
-//! closed after its response. Every request is logged.
+//! closed after its response. Every request is logged. Optionally a whole
+//! GET is answered as thredds.met.no answers a catalog: chunked, without
+//! `Content-Length` ([`TestServer::chunk_whole_gets`]). Also the THREDDS
+//! catalogs such a server publishes ([`thredds_catalog`], #1170), written
+//! with `quick_xml::Writer`, never `format!` (Critical Rule 3). Shared by
+//! the lib's tests and `tests/integration.rs` (`#[path]`).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -12,6 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::Writer;
 
 /// One request the server answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +28,8 @@ pub(crate) struct Request {
     /// The requested `bytes=start-end`, inclusive.
     pub range: Option<(u64, u64)>,
     pub status: u16,
+    /// Answered `Transfer-Encoding: chunked`, without `Content-Length`.
+    pub chunked: bool,
 }
 
 #[derive(Default)]
@@ -29,6 +38,8 @@ struct State {
     log: Vec<Request>,
     /// GETs of more than this many bytes wait this long before answering.
     slow: Option<(u64, Duration)>,
+    /// Whole (unranged) GETs are answered chunked.
+    chunked: bool,
 }
 
 pub(crate) struct TestServer {
@@ -75,6 +86,13 @@ impl TestServer {
             path.trim_start_matches('/').to_string(),
             (Arc::new(body), modified),
         );
+    }
+
+    /// Answer every whole GET, a 200, chunked and without `Content-Length`,
+    /// as thredds.met.no answers `catalog.xml` (#1170). Ranged GETs and
+    /// HEADs keep their lengths.
+    pub fn chunk_whole_gets(&self) {
+        self.state.lock().unwrap().chunked = true;
     }
 
     /// Delay GETs of more than `bytes` by `delay`.
@@ -137,11 +155,11 @@ fn serve(mut stream: std::net::TcpStream, state: &Mutex<State>) {
         .and_then(|r| r.split_once('-'))
         .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)));
     let since = header("if-unmodified-since").and_then(|d| DateTime::parse_from_rfc2822(d).ok());
-    let (object, slow) = {
+    let (object, slow, chunked) = {
         let state = state.lock().unwrap();
-        (state.objects.get(&path).cloned(), state.slow)
+        (state.objects.get(&path).cloned(), state.slow, state.chunked)
     };
-    let (status, response) = respond(&method, object, range, since);
+    let (status, response, chunked) = respond(&method, object, range, since, chunked);
     if let (Some((over, delay)), Some((start, end))) = (slow, range) {
         if method == "GET" && end + 1 - start > over && status == 206 {
             std::thread::sleep(delay);
@@ -152,6 +170,7 @@ fn serve(mut stream: std::net::TcpStream, state: &Mutex<State>) {
         path,
         range,
         status,
+        chunked,
     });
     let _ = stream.write_all(&response);
 }
@@ -161,12 +180,14 @@ fn respond(
     object: Option<(Arc<Vec<u8>>, DateTime<Utc>)>,
     range: Option<(u64, u64)>,
     since: Option<DateTime<chrono::FixedOffset>>,
-) -> (u16, Vec<u8>) {
+    chunked: bool,
+) -> (u16, Vec<u8>, bool) {
     let status = |code: u16, text: &str| {
         (
             code,
             format!("HTTP/1.1 {code} {text}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .into_bytes(),
+            false,
         )
     };
     let Some((body, modified)) = object else {
@@ -189,6 +210,20 @@ fn respond(
         }
         _ => (200, "OK", 0..total, String::new()),
     };
+    if chunked && code == 200 && method == "GET" {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml;charset=UTF-8\r\n\
+             Transfer-Encoding: chunked\r\nLast-Modified: {date}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        for chunk in body.chunks(4096) {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        return (code, response, true);
+    }
     let mut response = format!(
         "HTTP/1.1 {code} {text}\r\nContent-Length: {}\r\n{extra}Last-Modified: {date}\r\n\
          Accept-Ranges: bytes\r\nConnection: close\r\n\r\n",
@@ -198,5 +233,84 @@ fn respond(
     if method == "GET" {
         response.extend_from_slice(&body[span.start as usize..span.end as usize]);
     }
-    (code, response)
+    (code, response, false)
+}
+
+/// `<name …/>`, or with `body` as its text.
+fn element(w: &mut Writer<Vec<u8>>, name: &str, attributes: &[(&str, &str)], body: Option<&str>) {
+    let start = BytesStart::new(name).with_attributes(attributes.iter().copied());
+    match body {
+        None => w.write_event(Event::Empty(start)).unwrap(),
+        Some(body) => {
+            w.write_event(Event::Start(start)).unwrap();
+            w.write_event(Event::Text(BytesText::new(body))).unwrap();
+            w.write_event(Event::End(BytesEnd::new(name))).unwrap();
+        }
+    }
+}
+
+/// A THREDDS catalog as thredds.met.no writes one: an OpenDAP and an
+/// HTTPServer service, a `catalogRef` to each of `refs`, and `files` as
+/// (urlPath, dataSize in Kbytes, modified).
+pub(crate) fn thredds_catalog(refs: &[&str], files: &[(String, String, String)]) -> Vec<u8> {
+    let mut w = Writer::new(Vec::new());
+    let open = |w: &mut Writer<Vec<u8>>, name: &str, attributes: &[(&str, &str)]| {
+        let start = BytesStart::new(name).with_attributes(attributes.iter().copied());
+        w.write_event(Event::Start(start)).unwrap();
+    };
+    let close = |w: &mut Writer<Vec<u8>>, name: &str| {
+        w.write_event(Event::End(BytesEnd::new(name))).unwrap();
+    };
+    open(
+        &mut w,
+        "catalog",
+        &[
+            (
+                "xmlns",
+                "http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0",
+            ),
+            ("xmlns:xlink", "http://www.w3.org/1999/xlink"),
+        ],
+    );
+    open(
+        &mut w,
+        "service",
+        &[("name", "all"), ("serviceType", "Compound"), ("base", "")],
+    );
+    for (kind, base) in [
+        ("OpenDAP", "/thredds/dodsC/"),
+        ("HTTPServer", "/thredds/fileServer/"),
+    ] {
+        element(
+            &mut w,
+            "service",
+            &[("name", kind), ("serviceType", kind), ("base", base)],
+            None,
+        );
+    }
+    close(&mut w, "service");
+    open(&mut w, "dataset", &[("name", "dir/")]);
+    for (url_path, size, modified) in files {
+        let name = url_path.rsplit('/').next().unwrap();
+        open(
+            &mut w,
+            "dataset",
+            &[("name", name), ("urlPath", url_path.as_str())],
+        );
+        element(&mut w, "dataSize", &[("units", "Kbytes")], Some(size));
+        element(&mut w, "date", &[("type", "modified")], Some(modified));
+        close(&mut w, "dataset");
+    }
+    for href in refs {
+        let title = href.trim_end_matches("/catalog.xml");
+        element(
+            &mut w,
+            "catalogRef",
+            &[("xlink:href", href), ("xlink:title", title)],
+            None,
+        );
+    }
+    close(&mut w, "dataset");
+    close(&mut w, "catalog");
+    w.into_inner()
 }

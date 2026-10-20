@@ -1,0 +1,68 @@
+netcdf stereographic_km {
+dimensions:
+	time = 1 ;
+	y = 9 ;
+	x = 9 ;
+variables:
+	double time(time) ;
+		time:standard_name = "time" ;
+		time:units = "hours since 2026-01-01 00:00:00" ;
+		time:calendar = "standard" ;
+	double y(y) ;
+		y:standard_name = "projection_y_coordinate" ;
+		y:units = "km" ;
+	double x(x) ;
+		x:standard_name = "projection_x_coordinate" ;
+		x:units = "km" ;
+	int crs ;
+		crs:grid_mapping_name = "stereographic" ;
+		crs:latitude_of_projection_origin = 60. ;
+		crs:longitude_of_projection_origin = 25. ;
+		crs:scale_factor_at_projection_origin = 0.9999 ;
+		crs:false_easting = 600. ;
+		crs:false_northing = -200. ;
+		crs:earth_radius = 6371000. ;
+	double easting(time, y, x) ;
+		easting:long_name = "Projected x of the cell centre" ;
+		easting:units = "m" ;
+		easting:grid_mapping = "crs" ;
+	double northing(time, y, x) ;
+		northing:long_name = "Projected y of the cell centre" ;
+		northing:units = "m" ;
+		northing:grid_mapping = "crs" ;
+
+// global attributes:
+		:Conventions = "CF-1.8" ;
+		:title = "Synthetic stereographic-km grid, MeteoCore test fixture" ;
+data:
+
+ time = 0 ;
+
+ y = 200, 100, 0, -100, -200, -300, -400, -500, -600 ;
+
+ x = 200, 300, 400, 500, 600, 700, 800, 900, 1000 ;
+
+ crs = 0 ;
+
+ easting =
+    200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000,
+    200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000,
+    200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000,
+    200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000,
+    200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000,
+    200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000,
+    200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000,
+    200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000,
+    200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000 ;
+
+ northing =
+    200000, 200000, 200000, 200000, 200000, 200000, 200000, 200000, 200000,
+    100000, 100000, 100000, 100000, 100000, 100000, 100000, 100000, 100000,
+    0, 0, 0, 0, 0, 0, 0, 0, 0,
+    -100000, -100000, -100000, -100000, -100000, -100000, -100000, -100000, -100000,
+    -200000, -200000, -200000, -200000, -200000, -200000, -200000, -200000, -200000,
+    -300000, -300000, -300000, -300000, -300000, -300000, -300000, -300000, -300000,
+    -400000, -400000, -400000, -400000, -400000, -400000, -400000, -400000, -400000,
+    -500000, -500000, -500000, -500000, -500000, -500000, -500000, -500000, -500000,
+    -600000, -600000, -600000, -600000, -600000, -600000, -600000, -600000, -600000 ;
+}

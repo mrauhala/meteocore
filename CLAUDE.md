@@ -16,7 +16,11 @@ per-host request limits for files read in place; every remote operation
 runs in a `storage{collection, store, path}` span, and an engine names its
 collection with `DataStore::for_collection(id)` where it builds the store,
 #1233; its `throttle` module is the one home for HTTP host back-off on
-429: `Retry-After` and the adaptive host limit, #1235),
+429: `Retry-After` and the adaptive host limit, #1235; THREDDS catalog
+discovery is `discovery::thredds`, #1170, and a generated HTTP document
+without `Content-Length`, such as a THREDDS catalog, is read with
+`DataStore::get_documents`, never a second client: object_store's GET fails
+a chunked response),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
 `ds-executor` (shared Tokio render admission/deadline execution and the one
@@ -686,7 +690,8 @@ one never implies the other.
   (GMGSI): forward keeps longitude unwrapped, and a global grid wraps its
   own columns.
 - **`ds_core::geo`** — CRS transforms (WGS84, TM, LAEA, LCC, Stereographic,
-  Geostationary, WebMercator), `GeoTransform`, `geometry_to_pixels`, `destination_point`,
+  Geostationary, WebMercator; TM, LAEA and Stereographic on a `figure:
+  Ellipsoid`, WGS84/GRS80 by name, a sphere or any ellipsoid, #1192), `GeoTransform`, `geometry_to_pixels`, `destination_point`,
   `geodetic_to_ecef`, `OutputCrs::footprint_pixel_window` (low-zoom ghost
   guard, #453). `Crs::WebMercator`'s northing is unbounded at the poles.
   `Crs::Geostationary` is the one **partial** transform both ways:
@@ -705,12 +710,17 @@ one never implies the other.
   `wgs84_envelope` adds `area_edge_points` (where those edges enter and
   leave the box, and the equator or pole between) and a pole the box holds
   (`holds_pole`, projected from the central meridian). A source grid's
-  `GeoTransform::bbox` misses a pole its cells hold, such as a polar
-  stereographic Arctic grid's: `bbox_with_poles` adds it at every
-  longitude, for advertised extents and `SourceGrid`'s envelope (#1167).
-  `polar_stereographic_k0` is the one conversion of a polar standard
-  parallel (PROJ `+lat_ts`, CF `standard_parallel`) to the ellipsoidal
-  `k0` of `Crs::Stereographic` (engine-odim, `ds_core::cf`); LAEA's polar
+  extent is `GeoTransform::bbox_with_poles` → `grid_extent`, the one extent
+  calculation of every gridded engine (#1194): longitude unrolled along the
+  edges, so a grid across the antimeridian is `west > east` and a polar
+  grid across its far meridian stays narrow; a pole its cells hold reached
+  at every longitude; TM's area edges. Never use the plain `bbox()` for an
+  extent. `footprint_envelope()` is its `east`-past-180 form for footprint
+  guards; engine-geotiff, engine-querydata, engine-odim, engine-netcdf and
+  `SourceGrid` take it (#1167). `polar_stereographic_k0(lat_ts, &figure)`
+  is the one conversion of a polar standard parallel (PROJ `+lat_ts`, CF
+  `standard_parallel`) to the `k0` of `Crs::Stereographic` on its figure
+  (engine-odim, `ds_core::cf`); LAEA's polar
   aspect (EASE-Grid 2.0) takes its limit `β₀ = ±90°`, `D = 1`.
 - **`ds_core::cf`** — CF semantics shared by NetCDF and Zarr readers,
   which pass plain values or an attribute lookup (no reader library here):
@@ -722,11 +732,15 @@ one never implies the other.
     `lambert_conformal_conic` (one or two parallels, a sphere or WGS84),
     `polar_stereographic` (`standard_parallel` through
     `geo::polar_stereographic_k0`, or `scale_factor_at_projection_origin`;
-    both must agree), `lambert_azimuthal_equal_area` and
-    `transverse_mercator` (WGS84 only: their `Crs` variants have no
-    sphere), each pinned to PROJ `cs2cs`. Unsupported mappings, ellipsoids,
-    scale factors and missing earth figures are errors, never a WGS84
-    guess;
+    both must agree), `stereographic` (any origin, PROJ `stere`),
+    `lambert_azimuthal_equal_area` and `transverse_mercator`, these four
+    on the figure the mapping states, sphere or ellipsoid (#1192), each
+    pinned to PROJ `cs2cs`. `coordinate_scale` takes projected x/y in m or
+    km; `grid` scales km axes to metres and the mapping's
+    `false_easting`/`false_northing` with them, since CF states those in
+    the coordinates' units (#1194). Unsupported mappings, LCC ellipsoids
+    other than WGS84, prolate figures, scale factors and missing earth
+    figures are errors, never a WGS84 guess;
   - `CfAttr::Numbers` keeps a multi-element attribute whole, and a
     one-number parameter rejects it rather than reading its first element;
   - `grid(crs, &x, &y)` over `RegularAxis` values: units through

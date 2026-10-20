@@ -22,9 +22,10 @@ or downloaded whole.
   matching `filename_template`, else every `*.nc`, skipping temporary
   upload names. An `http(s)://` `data_path` is probed by name: each poll
   HEADs the first lead (the sentinel) of every run in `time_window` not
-  seen yet, and the other leads once it appears. Each poll opens new and
-  changed files and keeps them open: the newest `max_runs` runs, at most
-  `max_files` files. Requests never open a file.
+  seen yet, and the other leads once it appears. With a `catalog_url`, the
+  server's THREDDS catalogs answer instead of the HEADs (below). Each poll
+  opens new and changed files and keeps them open: the newest `max_runs`
+  runs, at most `max_files` files. Requests never open a file.
 - **Time comes from the file, never its name:** valid times from the
   `time` axis, the model run from `forecast_reference_time`. Files without
   a run form one timeline without runs.
@@ -43,6 +44,18 @@ or downloaded whole.
   (ds-storage's host back-off).
   A retried request's log line names its collection, host and file
   (ds-storage's `storage` span).
+- **THREDDS catalogs** (`catalog_url`, #1170). The template fields still
+  name the files to pick; the `catalog.xml` of each run directory a poll
+  checks says which exist, with a size and a modification time. A poll
+  walks to the directory from `catalog_url` through the `catalogRef`s
+  leading to the runs in `time_window` only, at most 64 catalogs, and
+  reads it directly afterwards. A file settles on the catalog's size and
+  date as it would on a HEAD's, and a run is published as by probing. A
+  catalog rounds sizes (`167.8 Mbytes`), so each file listed is HEADed
+  once for its exact size, which the range reads check. Catalogs are
+  read whole although THREDDS streams them chunked, without
+  `Content-Length`, at most 16 MiB each. Catalogs and HEADs take the
+  host's request limit and back-off like every request.
 - **Run and time selection.** A pinned run is exactly that run (404 when
   absent). Otherwise a map draws from the newest run whose steps span the
   requested time, at the nearest step; without a time, the newest run's
@@ -58,7 +71,8 @@ or downloaded whole.
 
 **Data it reads:** NetCDF-4 (HDF5) and classic CDF-1/2/5 files. A
 variable has `(y, x)` as its last two axes: 1-D latitude/longitude, or
-1-D projected x/y in metres with a CF `grid_mapping` (below); a projected
+1-D projected x/y in metres or kilometres with a CF `grid_mapping`
+(below); a projected
 grid is described in its own CRS, as WKT2, by the collection's
 `meteocore:nativeGrid` member (#1237). It needs a
 time axis; an ensemble axis is read at `member`; every other axis has
@@ -71,11 +85,16 @@ applied.
 parallels, on a sphere or WGS84), `geostationary` (x/y may also be a scan
 angle in radians or microradians), `polar_stereographic` (scaled by
 `standard_parallel` or `scale_factor_at_projection_origin`; given both,
-they must agree), `lambert_azimuthal_equal_area` and
-`transverse_mercator`. The mapping must state its earth figure. The last
-three take WGS84 only, or GRS80, which matches it to 0.1 mm. A grid that
-holds a pole, such as an Arctic polar stereographic grid, advertises an
-extent reaching the pole.
+they must agree), `stereographic` at any origin (scaled by
+`scale_factor_at_projection_origin`), `lambert_azimuthal_equal_area` and
+`transverse_mercator`. The mapping must state its earth figure; the last
+four are computed on it, a sphere or any ellipsoid, such as a polar NWP
+grid's sphere, NSIDC's Hughes 1980 or Airy 1830 (#1192). Projected x/y in
+kilometres are scaled to metres, and so are the false easting and
+northing, which CF states in the coordinates' units (#1194). A
+grid that holds a pole, such as an Arctic polar stereographic grid,
+advertises an extent reaching the pole, and one across the antimeridian
+an extent `west > east`.
 
 **Display units.** Each variable's CF `units`, in any spelling, picks the
 unit it is served in: K as °C, Pa as hPa, kg m-2 as mm, kg m-2 s-1 as mm/h,
@@ -197,12 +216,15 @@ URL-only fields on a local `data_path`, are a load error.
 | `run_grace` | `PT30M` | URL only: a run missing leads is served without them after this |
 | `prewarm_variables` | `[]` | URL only: variables whose newest-run fields each poll fetches ahead (bottom level) |
 | `derive_per_step` | `true` | Serve `<name>`, the per-step amount of each `<name>_acc` accumulation in kg m-2 or mm (above) |
+| `catalog_url` | none | URL only: the THREDDS `catalog.xml` of `data_path`'s directory (`…/thredds/catalog/<dir>/catalog.xml` for `…/thredds/fileServer/<dir>/`). The catalogs say which files the template names exist, in place of a HEAD per file; the template fields stay required |
 
 Runnable examples: `collections.d/meps-netcdf-local.toml` (MEPS surface
 sample) and `collections.d/meps-netcdf-pl-local.toml` (pressure-level
 sample). `meps-netcdf-thredds.toml.disabled` and
 `meps-netcdf-pl-thredds.toml.disabled` in the same directory read these
-families from MET Norway's public thredds.met.no and state their traffic.
+families from MET Norway's public thredds.met.no and state their traffic;
+`meps-netcdf-thredds-catalog.toml.disabled` finds the surface family's
+files through the server's THREDDS catalogs instead.
 
 Process-wide environment variables, shared by every NetCDF collection:
 
@@ -222,17 +244,18 @@ Process-wide environment variables, shared by every NetCDF collection:
 - Every file must hold all the collection's variables on its grid; a
   file missing one is skipped. More than one ensemble member per
   collection is not supported.
-- Not supported grids: other mappings (such as the oblique
-  `stereographic` and `rotated_latitude_longitude`), polar stereographic,
-  azimuthal equal-area and transverse Mercator on a sphere or another
-  ellipsoid, projected x/y in kilometres, and 2-D (curvilinear)
-  latitude/longitude grids.
+- Not supported grids: other mappings (such as
+  `rotated_latitude_longitude`), a Lambert conic on an ellipsoid other
+  than WGS84, and 2-D (curvilinear) latitude/longitude grids.
 - Grid-relative wind components on a projected grid give speed only, and
   nothing on a geostationary or azimuthal equal-area grid, whose axes are
   not orthogonal on the ground. `valid_range` is not applied; non-standard
   calendars are refused.
 - A cold remote field slower than the render deadline fails that render
   with a 503; the fetch still completes into the cache for the next one.
+- `catalog_url` reads THREDDS catalogs whose tree mirrors the file server's
+  (THREDDS `datasetScan`), datasets by their `urlPath` attribute and the
+  catalog's `HTTPServer` service; `access` elements are not read.
 - Each kept file holds its parsed metadata in memory (about 820 KB for a
   221-variable MEPS surface file) and, if local, one file descriptor.
 
@@ -244,13 +267,17 @@ cargo test -p server --test netcdf_edr   # EDR responses vs. the schemas
 ```
 
 Fixtures under `testdata/`, each with a README and the script that built
-it: `meps-netcdf/` and `meps-netcdf-pl/` (real MEPS surface and
+it, or its source: `netcdf-thredds-catalog/` (MET Norway's THREDDS catalog
+of one MEPS day directory, as served, for the `catalog_url` tests);
+`meps-netcdf/` and `meps-netcdf-pl/` (real MEPS surface and
 pressure-level files cropped to 11 × 10 points, two runs);
 `netcdf-global/` (synthetic global grid without runs, packed and filled
 values); `netcdf-pressure-pa/` (synthetic Pa pressure axis, earth-relative
 wind); `netcdf-remote/` (synthetic MEPS-like files, served by a local HTTP
 test server for the range-read tests); `netcdf-projections/` (synthetic
-polar stereographic, LAEA and transverse Mercator grids whose fields are
+polar stereographic, LAEA, transverse Mercator and oblique stereographic
+grids, the last on a sphere with x/y and its false origin in kilometres,
+whose fields are
 each cell's own projected x/y, which `tests/grid_mappings.rs` checks
 against PROJ's `cs2cs`). `tests/trajectory_cube.rs` checks every
 trajectory and cube value against a position query at the same point,

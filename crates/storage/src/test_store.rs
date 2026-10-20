@@ -239,13 +239,16 @@ type Metadata = BTreeMap<String, (u64, Option<DateTime<Utc>>)>;
 
 /// Answers HEADs, and GETs with an empty body, from scripted metadata: a
 /// key without an entry in `objects` is NotFound, a key in `failing` fails.
-/// Records every key HEADed, counts every GET, and counts the operations in
-/// flight while each sleeps `delay`.
+/// A key with a `bodies` entry (a THREDDS catalog) is GET as that body.
+/// Records every key HEADed and every key GET, counts every GET, and counts
+/// the operations in flight while each sleeps `delay`.
 #[derive(Debug, Default)]
 pub(crate) struct MetaStore {
     pub objects: Mutex<Metadata>,
+    pub bodies: Mutex<BTreeMap<String, bytes::Bytes>>,
     pub failing: Mutex<HashSet<String>>,
     pub headed: Mutex<Vec<String>>,
+    pub fetched: Mutex<Vec<String>>,
     pub delay: Duration,
     /// GETs (not HEADs) asked for.
     pub gets: Arc<AtomicUsize>,
@@ -261,8 +264,16 @@ impl MetaStore {
             .insert(key.to_string(), (size, last_modified));
     }
 
+    /// Serve `body` at `key`, in place of what was there.
+    pub fn put_body(&self, key: &str, body: impl Into<bytes::Bytes>) {
+        let body = body.into();
+        self.set(key, body.len() as u64, None);
+        self.bodies.lock().unwrap().insert(key.to_string(), body);
+    }
+
     pub fn remove(&self, key: &str) {
         self.objects.lock().unwrap().remove(key);
+        self.bodies.lock().unwrap().remove(key);
     }
 
     /// The keys HEADed since the last call, sorted.
@@ -270,6 +281,13 @@ impl MetaStore {
         let mut headed = std::mem::take(&mut *self.headed.lock().unwrap());
         headed.sort();
         headed
+    }
+
+    /// The keys GET since the last call, sorted.
+    pub fn take_fetched(&self) -> Vec<String> {
+        let mut fetched = std::mem::take(&mut *self.fetched.lock().unwrap());
+        fetched.sort();
+        fetched
     }
 }
 
@@ -308,6 +326,7 @@ impl ObjectStore for MetaStore {
             self.headed.lock().unwrap().push(key.clone());
         } else {
             self.gets.fetch_add(1, Ordering::SeqCst);
+            self.fetched.lock().unwrap().push(key.clone());
         }
         let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);
@@ -325,8 +344,17 @@ impl ObjectStore for MetaStore {
                 source: "absent".into(),
             });
         };
+        let body = match options.head {
+            true => None,
+            false => self.bodies.lock().unwrap().get(&key).cloned(),
+        };
+        let range = 0..body.as_ref().map_or(0, |body| body.len() as u64);
+        let payload = match body {
+            Some(body) => futures::stream::once(async move { Ok(body) }).boxed(),
+            None => futures::stream::empty().boxed(),
+        };
         Ok(object_store::GetResult {
-            payload: object_store::GetResultPayload::Stream(futures::stream::empty().boxed()),
+            payload: object_store::GetResultPayload::Stream(payload),
             meta: ObjectMeta {
                 location: path.clone(),
                 last_modified: last_modified.unwrap_or(DateTime::UNIX_EPOCH),
@@ -334,7 +362,7 @@ impl ObjectStore for MetaStore {
                 e_tag: None,
                 version: None,
             },
-            range: 0..0,
+            range,
             attributes: Default::default(),
             extensions: Default::default(),
         })

@@ -5,6 +5,7 @@
 
 mod admitted;
 pub mod discovery;
+mod document;
 mod error;
 mod gauge;
 #[cfg(test)]
@@ -768,6 +769,83 @@ impl DataStore {
             .await;
         results.sort_by_key(|(i, _)| *i);
         results.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// Get whole documents, one result per path **in input order**, at
+    /// most `concurrency` in flight on one storage-bridge call: generated
+    /// files such as THREDDS catalogs (#1170). Unlike [`Self::get_many`],
+    /// an HTTP response without `Content-Length` (a chunked body) is read,
+    /// by the store's own transport and under all its layers: its request
+    /// limit and share, its host's `Retry-After` and 429 back-off, its
+    /// `storage` span, no redirect, no decompression (`document.rs`). Each
+    /// document is at most `max_bytes`, which fails it as soon as its
+    /// declared length or its body read so far passes it, and is limited
+    /// to the request deadline when one is in scope, else to `budget`. A
+    /// 429, a 5xx or a failed connection is retried twice, as object_store
+    /// retries. Any other store answers a plain GET, capped as it streams.
+    /// The outer `Err` is a runtime-bridge failure or an expired deadline.
+    #[allow(clippy::type_complexity)]
+    pub fn get_documents(
+        &self,
+        paths: &[ObjectPath],
+        concurrency: usize,
+        max_bytes: u64,
+        budget: FetchBudget,
+    ) -> Result<Vec<Result<Bytes, DataServerError>>, DataServerError> {
+        use futures::StreamExt;
+
+        let deadline = ds_core::deadline::current();
+        ds_core::deadline::check()?;
+        let mut results: Vec<(usize, Result<Bytes, DataServerError>)> = self.block_on_untimed(
+            futures::stream::iter(paths.iter().enumerate().map(|(i, path)| async move {
+                (
+                    i,
+                    within(budget, deadline, self.document(path, max_bytes)).await,
+                )
+            }))
+            .buffer_unordered(concurrency.max(1))
+            .collect(),
+        )?;
+        results.sort_by_key(|(i, _)| *i);
+        let total: u64 = results
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok())
+            .map(|b| b.len() as u64)
+            .sum();
+        self.bytes_read.fetch_add(total, Ordering::Relaxed);
+        Ok(results.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// One document of [`Self::get_documents`].
+    async fn document(&self, path: &ObjectPath, max_bytes: u64) -> Result<Bytes, DataServerError> {
+        use futures::StreamExt;
+
+        let storage = |e| DataServerError::from(StorageError::from(e));
+        let mut extensions = object_store::Extensions::new();
+        extensions.insert(document::Document { max_bytes });
+        let options = object_store::GetOptions {
+            extensions,
+            ..Default::default()
+        };
+        let result = self.inner.get_opts(path, options).await.map_err(storage)?;
+        let over = |bytes: u64| {
+            DataServerError::Storage(format!(
+                "document `{path}` is {bytes} bytes or more, over the {max_bytes}-byte limit"
+            ))
+        };
+        if result.meta.size > max_bytes {
+            return Err(over(result.meta.size));
+        }
+        let mut stream = result.into_stream();
+        let mut read = bytes::BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(storage)?;
+            if (read.len() + chunk.len()) as u64 > max_bytes {
+                return Err(over((read.len() + chunk.len()) as u64));
+            }
+            read.extend_from_slice(&chunk);
+        }
+        Ok(read.freeze())
     }
 
     /// Probe many object keys concurrently with `head`, returning one
@@ -1561,10 +1639,11 @@ fn throttled_http_store<S: object_store::client::HttpService + Clone>(
     base_url: &url::Url,
     transport: S,
 ) -> Result<Arc<dyn ObjectStore>, DataServerError> {
-    let connector = NoRedirectConnector(throttle::Throttled {
+    let throttled = throttle::Throttled {
         inner: transport,
         host: throttle::for_url(base_url),
-    });
+    };
+    let connector = NoRedirectConnector(throttled.clone());
     let store = object_store::http::HttpBuilder::new()
         .with_url(base_url.as_str())
         .with_http_connector(connector)
@@ -1572,7 +1651,13 @@ fn throttled_http_store<S: object_store::client::HttpService + Clone>(
         .map_err(|e| {
             DataServerError::Storage(format!("Cannot create HTTP store for {base_url}: {e}"))
         })?;
-    Ok(Arc::new(store))
+    // Documents without `Content-Length` go through the same transport
+    // (`DataStore::get_documents`, #1170).
+    Ok(Arc::new(document::Documents {
+        http: Arc::new(store),
+        transport: throttled,
+        base_url: base_url.clone(),
+    }))
 }
 
 #[cfg(test)]

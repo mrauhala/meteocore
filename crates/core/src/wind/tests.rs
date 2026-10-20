@@ -95,6 +95,7 @@ fn frames_come_from_the_grib_flag_and_the_cf_standard_name() {
         lon0: 0.17,
         false_e: 0.0,
         false_n: 0.0,
+        figure: crate::geo::Ellipsoid::WGS84,
     };
     assert_eq!(GridAxes::of(&laea), GridAxes::Skewed);
 }

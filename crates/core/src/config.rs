@@ -1962,6 +1962,18 @@ pub struct NetcdfConfig {
     /// on; `false` opts out, as `derive_wind` does for wind.
     #[serde(default = "default_true")]
     pub derive_per_step: bool,
+    /// Remote only: the THREDDS `catalog.xml` of the directory `data_path`
+    /// names, such as
+    /// `https://thredds.met.no/thredds/catalog/meps25epsarchive/catalog.xml`
+    /// for `…/thredds/fileServer/meps25epsarchive/` (#1170). The files are
+    /// then looked up in the catalogs of their run directories, reached
+    /// through `catalogRef`s within `time_window`, instead of HEADed one by
+    /// one. The template fields still name the files to pick and are
+    /// required as without it; the settling rules are the same. Each file
+    /// listed is HEADed once for its exact size, which a catalog rounds.
+    /// Default: none, HEAD probing.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub catalog_url: Option<String>,
 }
 
 impl NetcdfConfig {
@@ -2013,6 +2025,7 @@ pub fn validate_netcdf(id: &str, cfg: &NetcdfConfig) -> Result<(), crate::error:
             ("min_age", cfg.min_age.is_some()),
             ("run_grace", cfg.run_grace.is_some()),
             ("prewarm_variables", !cfg.prewarm_variables.is_empty()),
+            ("catalog_url", cfg.catalog_url.is_some()),
         ];
         if let Some((field, _)) = remote_only.iter().find(|(_, set)| *set) {
             return Err(Config(format!(
@@ -2164,6 +2177,9 @@ fn validate_netcdf_remote(
                 .map_err(|e| Config(format!("Collection '{id}': [netcdf].{field}: {e}")))?;
         }
     }
+    if let Some(url) = cfg.catalog_url.as_deref() {
+        validate_netcdf_catalog_url(id, url)?;
+    }
     let mut seen = std::collections::HashSet::new();
     for name in &cfg.prewarm_variables {
         if !seen.insert(name.as_str()) {
@@ -2179,6 +2195,40 @@ fn validate_netcdf_remote(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+/// A `catalog_url`: an http(s) URL of a THREDDS catalog document, the
+/// `.xml` and not the `.html` page browsers are shown, without a query or
+/// fragment. engine-netcdf parses it whole through ds-storage's
+/// `CatalogProber`.
+fn validate_netcdf_catalog_url(id: &str, url: &str) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    let invalid = |why: &str| {
+        Config(format!(
+            "Collection '{id}': [netcdf].catalog_url '{url}' {why}"
+        ))
+    };
+    let lower = url.to_ascii_lowercase();
+    let Some(rest) = ["https://", "http://"]
+        .iter()
+        .find_map(|scheme| lower.strip_prefix(scheme))
+    else {
+        return Err(invalid("must be an http(s) URL"));
+    };
+    if url.contains(['?', '#']) {
+        return Err(invalid(
+            "must name the catalog.xml itself, without a query or fragment",
+        ));
+    }
+    let path = rest.split_once('/').map_or("", |(_, path)| path);
+    if !path.ends_with(".xml") {
+        return Err(invalid(
+            "must name a THREDDS catalog's .xml, such as …/thredds/catalog/<dir>/catalog.xml \
+             (the .html page is for browsers)",
+        ));
     }
     Ok(())
 }
@@ -8911,6 +8961,10 @@ mod netcdf_tests {
         prewarm_variables = ["air_temperature_2m"]
         "#;
 
+    /// The catalog of the same directory as [`REMOTE`]'s `data_path`.
+    const CATALOG: &str =
+        r#"catalog_url = " https://thredds.met.no/thredds/catalog/meps25epsarchive/catalog.xml ""#;
+
     #[test]
     fn a_remote_source_takes_its_template_fields() {
         let cfg = netcdf(REMOTE).unwrap();
@@ -8920,6 +8974,13 @@ mod netcdf_tests {
             "{REMOTE}\nmin_age = \"PT5M\"\nrun_grace = \"PT1H\""
         ))
         .unwrap();
+        validate_netcdf("meps", &cfg).unwrap();
+        // The catalog route (#1170) takes the same template fields.
+        let cfg = netcdf(&format!("{REMOTE}\n{CATALOG}")).unwrap();
+        assert_eq!(
+            cfg.catalog_url.as_deref(),
+            Some("https://thredds.met.no/thredds/catalog/meps25epsarchive/catalog.xml")
+        );
         validate_netcdf("meps", &cfg).unwrap();
         assert!(netcdf("data_path = \"HTTPS://thredds.met.no/x/\"")
             .unwrap()
@@ -8959,8 +9020,36 @@ mod netcdf_tests {
         assert!(error(&with("prewarm_variables = [\"x_wind_10m\"]")).contains("not in"));
         let twice = "prewarm_variables = [\"air_temperature_2m\", \"air_temperature_2m\"]";
         assert!(error(&with(twice)).contains("twice"));
+        // A catalog replaces the HEADs, not the template that names the files.
+        let catalog = |extra: &str| format!("{REMOTE}\n{extra}");
+        let without_template = format!("{}\n{CATALOG}", without("filename_template"));
+        assert!(error(&without_template).contains("needs a filename_template"));
+        assert!(error(&format!("{}\n{CATALOG}", without("run_hours"))).contains("run_hours"));
+        for (url, why) in [
+            (
+                "ftp://thredds.met.no/thredds/catalog/x/catalog.xml",
+                "http(s) URL",
+            ),
+            (
+                "https://thredds.met.no/thredds/catalog/x/catalog.html",
+                ".html page",
+            ),
+            ("https://thredds.met.no/thredds/catalog/x/", ".xml"),
+            ("https://thredds.met.no", ".xml"),
+            (
+                "https://thredds.met.no/thredds/catalog/x/catalog.xml?dataset=a",
+                "query",
+            ),
+        ] {
+            let message = error(&catalog(&format!("catalog_url = \"{url}\"")));
+            assert!(
+                message.contains("catalog_url") && message.contains(why),
+                "{url}: {message}"
+            );
+        }
         // The template fields are remote only, and other schemes are refused.
         assert!(error("data_path = \"d\"\nrun_hours = [0]").contains("http(s) data_path only"));
+        assert!(error(&format!("data_path = \"d\"\n{CATALOG}")).contains("data_path only"));
         assert!(error("data_path = \"d\"\nprewarm_variables = [\"t\"]").contains("only"));
         assert!(error("data_path = \"s3://bucket/meps\"").contains("neither"));
     }

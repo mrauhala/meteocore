@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use ds_core::geo::Crs;
+use ds_core::geo::{Crs, Ellipsoid};
 
 /// Errors from [`parse`].
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -34,7 +34,7 @@ pub enum ParseError {
     #[error("PROJ parameter `+{0}` is required for `+proj={1}` but missing")]
     MissingParam(&'static str, &'static str),
     #[error(
-        "PROJ parameter `+R={radius}` indicates a sphere-based projection, but Phase 1's stere_forward/stere_inverse hardcodes WGS84 ellipsoid constants. Producer `xscale`/`yscale` would be in sphere metres while our forward output is in ellipsoid metres — bbox would be off by ~{percent:.3}%. Tracked as a follow-up; for now ship `+ellps=WGS84` instead, or omit `+R=` (which we then treat as WGS84)."
+        "PROJ parameter `+R={radius}` indicates a sphere-based projection, but this projdef parser computes every grid on the WGS84 ellipsoid. Producer `xscale`/`yscale` would be in sphere metres while our forward output is in ellipsoid metres — bbox would be off by ~{percent:.3}%. Tracked as a follow-up; for now ship `+ellps=WGS84` instead, or omit `+R=` (which we then treat as WGS84)."
     )]
     SphereProjection { radius: f64, percent: f64 },
 }
@@ -49,20 +49,19 @@ pub enum ParseError {
 /// - `longlat`: (no parameters needed beyond `+proj=longlat`)
 ///
 /// Unrecognised parameters (`+ellps=`, `+datum=`, `+units=`,
-/// `+no_defs`, etc.) are silently ignored — for the three Phase 1
-/// tested producers (DMI, DWD, OPERA, all `+ellps=WGS84`) the
-/// hardcoded WGS84 constants in `stere_forward` already match.
+/// `+no_defs`, etc.) are silently ignored: every grid gets the WGS84
+/// figure (`Ellipsoid::WGS84`), which the three Phase 1 tested producers
+/// (DMI, DWD, OPERA, all `+ellps=WGS84`) state.
 ///
 /// **`+R=` is the exception**: if a producer ships a custom sphere
-/// radius (e.g. FMI's `+R=6371228`), `stere_forward` would still
-/// compute WGS84-ellipsoid metres while the file's `xscale`/`yscale`
-/// are in sphere metres — producing a bbox that's wrong by ~0.1%
-/// (~5 px at OPERA scale). Until we add sphere-radius support
-/// (carry `R` through `Crs::Stereographic` and either scale or
-/// branch in `stere_forward`), reject `+R=` with a clear error
-/// when it differs materially from `WGS84_A`. A value within
-/// `WGS84_A_TOLERANCE` is accepted (some producers ship
-/// `+R=6378137` as a no-op).
+/// radius (e.g. FMI's `+R=6371228`), the WGS84 figure would compute
+/// ellipsoid metres while the file's `xscale`/`yscale` are in sphere
+/// metres — producing a bbox that's wrong by ~0.1% (~5 px at OPERA
+/// scale). `Crs::Stereographic` can carry the sphere
+/// (`Ellipsoid::sphere`, #1192), but this parser does not pass it yet:
+/// it rejects `+R=` with a clear error when it differs materially from
+/// `WGS84_A`. A value within `WGS84_A_TOLERANCE` is accepted (some
+/// producers ship `+R=6378137` as a no-op).
 ///
 /// For polar stereographic (`+lat_0=±90`) with `+lat_ts` and without an
 /// explicit `+k_0`, the scale factor is computed on the sphere as
@@ -133,11 +132,11 @@ use ds_core::geo::WGS84_A;
 /// is reaffirming the WGS84 sphere within ~1 metre.
 const WGS84_A_TOLERANCE: f64 = 1.0;
 
-/// Reject `+R=` when it differs materially from `WGS84_A`. See the
-/// module-level doc for rationale: until `Crs::Stereographic`
-/// carries a radius, the file's `xscale`/`yscale` (in producer
-/// sphere metres) would be combined with `stere_forward` output
-/// (in WGS84 ellipsoid metres) and the bbox would drift.
+/// Reject `+R=` when it differs materially from `WGS84_A`. See
+/// [`parse`] for rationale: until this parser passes the sphere on as the
+/// CRS's figure, the file's `xscale`/`yscale` (in producer sphere
+/// metres) would be combined with forward output in WGS84 ellipsoid
+/// metres and the bbox would drift.
 fn check_radius(params: &HashMap<String, String>) -> Result<(), ParseError> {
     if let Some(r) = parse_f64(params, "R")? {
         if (r - WGS84_A).abs() > WGS84_A_TOLERANCE {
@@ -178,7 +177,7 @@ fn parse_stere(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
                 let lat0_rad = lat0.to_radians();
                 let lat_ts_rad = lat_ts.to_radians();
                 if (lat0_rad.abs() - std::f64::consts::FRAC_PI_2).abs() < 1e-10 {
-                    ds_core::geo::polar_stereographic_k0(lat_ts_rad)
+                    ds_core::geo::polar_stereographic_k0(lat_ts_rad, &Ellipsoid::WGS84)
                 } else {
                     (1.0 + lat0_rad.sin() * lat_ts_rad.sin() + lat0_rad.cos() * lat_ts_rad.cos())
                         / 2.0
@@ -195,6 +194,7 @@ fn parse_stere(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
         k0,
         false_e,
         false_n,
+        figure: Ellipsoid::WGS84,
     })
 }
 
@@ -212,6 +212,7 @@ fn parse_tmerc(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
         k0,
         false_e,
         false_n,
+        figure: Ellipsoid::WGS84,
     })
 }
 
@@ -227,6 +228,7 @@ fn parse_laea(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
         lon0: lon0.to_radians(),
         false_e,
         false_n,
+        figure: Ellipsoid::WGS84,
     })
 }
 
@@ -356,6 +358,7 @@ mod tests {
                     k0: a_k0,
                     false_e: a_e,
                     false_n: a_n,
+                    figure: a_figure,
                 },
                 Crs::Stereographic {
                     lat0: e_lat0,
@@ -363,8 +366,10 @@ mod tests {
                     k0: e_k0,
                     false_e: e_e,
                     false_n: e_n,
+                    figure: e_figure,
                 },
             ) => {
+                assert_eq!(a_figure, e_figure);
                 assert!((a_lat0 - e_lat0).abs() < EPS, "lat0: {a_lat0} vs {e_lat0}");
                 assert!((a_lon0 - e_lon0).abs() < EPS, "lon0: {a_lon0} vs {e_lon0}");
                 assert!((a_k0 - e_k0).abs() < EPS, "k0: {a_k0} vs {e_k0}");
@@ -378,6 +383,7 @@ mod tests {
                     k0: a_k0,
                     false_e: a_e,
                     false_n: a_n,
+                    figure: a_figure,
                 },
                 Crs::TransverseMercator {
                     lat0: e_lat0,
@@ -385,8 +391,10 @@ mod tests {
                     k0: e_k0,
                     false_e: e_e,
                     false_n: e_n,
+                    figure: e_figure,
                 },
             ) => {
+                assert_eq!(a_figure, e_figure);
                 assert!((a_lat0 - e_lat0).abs() < EPS);
                 assert!((a_lon0 - e_lon0).abs() < EPS);
                 assert!((a_k0 - e_k0).abs() < EPS);
@@ -399,14 +407,17 @@ mod tests {
                     lon0: a_lon0,
                     false_e: a_e,
                     false_n: a_n,
+                    figure: a_figure,
                 },
                 Crs::LambertAzimuthalEqualArea {
                     lat0: e_lat0,
                     lon0: e_lon0,
                     false_e: e_e,
                     false_n: e_n,
+                    figure: e_figure,
                 },
             ) => {
+                assert_eq!(a_figure, e_figure);
                 assert!((a_lat0 - e_lat0).abs() < EPS);
                 assert!((a_lon0 - e_lon0).abs() < EPS);
                 assert!((a_e - e_e).abs() < EPS);
@@ -476,6 +487,7 @@ mod tests {
                 k0: 0.933_069_071_736_356_6,
                 false_e: 0.0,
                 false_n: 0.0,
+                figure: Ellipsoid::WGS84,
             },
         );
     }
@@ -495,6 +507,7 @@ mod tests {
                 k0: 1.0,
                 false_e: 0.0,
                 false_n: 0.0,
+                figure: Ellipsoid::WGS84,
             },
         );
     }
@@ -512,6 +525,7 @@ mod tests {
                 k0: 0.933,
                 false_e: 0.0,
                 false_n: 0.0,
+                figure: Ellipsoid::WGS84,
             },
         );
     }
@@ -531,6 +545,7 @@ mod tests {
                 k0: 0.9996,
                 false_e: 500_000.0,
                 false_n: 0.0,
+                figure: Ellipsoid::WGS84,
             },
         );
     }
@@ -548,6 +563,7 @@ mod tests {
                 lon0: 10f64.to_radians(),
                 false_e: 4_321_000.0,
                 false_n: 3_210_000.0,
+                figure: Ellipsoid::WGS84,
             },
         );
     }
@@ -606,8 +622,8 @@ mod tests {
 
     /// `+R=6371228` (the common ODIM/PROJ "mean Earth radius") is
     /// rejected with `SphereProjection` to prevent silent bbox
-    /// drift versus the WGS84 ellipsoid metres our `stere_forward`
-    /// hardcodes. Phase 1's three tested producers ship
+    /// drift versus the WGS84 ellipsoid metres the parser's figure
+    /// gives. Phase 1's three tested producers ship
     /// `+ellps=WGS84` (no `+R=`) so this never fires in practice;
     /// the rejection is here so a future FMI / KNMI sphere-based
     /// producer fails loudly at config-load time instead of
@@ -686,6 +702,7 @@ mod tests {
                 k0: 1.0,
                 false_e: 0.0,
                 false_n: 0.0,
+                figure: Ellipsoid::WGS84,
             },
         );
     }

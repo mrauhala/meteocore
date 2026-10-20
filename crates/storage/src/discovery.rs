@@ -32,6 +32,10 @@
 //!    publish (#287, #1067).
 //! 6. [`PendingFile`] — when a file seen being written has settled, shared
 //!    by the prober and engine-geotiff's local readiness check.
+//! 7. [`CatalogProber`] ([`thredds`]) — a [`TemplateProber`] whose checks a
+//!    THREDDS server's `catalog.xml` answers, walked to through its
+//!    `catalogRef`s within the time window, instead of one HEAD per file
+//!    (#1170).
 //!
 //! This module is the shared home for all of these. `engine-odim` and
 //! `engine-geotiff` use it; `engine-grib` expands its model-run
@@ -54,13 +58,15 @@ use crate::DataStore;
 
 mod settle;
 mod template;
+pub mod thredds;
 
 pub use settle::{PendingFile, STABLE_POLLS};
 pub use template::{
-    ProbeReport, ProbedFile, Schedule, Settling, TemplateProber, TemplateSpec,
+    Answers, ProbeReport, ProbedFile, Schedule, Settling, TemplateProber, TemplateSpec,
     DEFAULT_MAX_HEADS_PER_POLL, DEFAULT_MIN_AGE, DEFAULT_RUN_GRACE, MAX_TEMPLATE_SLOTS,
     PROBE_CONCURRENCY, SETTLED_RECHECK,
 };
+pub use thredds::CatalogProber;
 
 /// A signed ISO 8601 duration describing how far back (or forward)
 /// from "now" a collection's useful data extends.
