@@ -136,6 +136,68 @@ sorted by name. Each entry has a label and, where known, a unit and the
 parameter's own time extent. RGB composites are also listed. They have no
 unit, and a `description` names their channels.
 
+### Native grid
+
+A raster collection's description in Maps, Tiles and the shared root
+states the grid its data lies on (#1237), from the engine's
+`RasterInfo::native_grid` through `ds_core::ogc_extent::build_extent`:
+
+- **Lat/lon grids** keep the Common Part 2 `extent.spatial.grid` in CRS84
+  degrees, with `storageCrs` CRS84. Their `firstCoordinate` stays `null`.
+- **A grid whose source states an EPSG code that is the collection's
+  `storageCrs`** also gets the standard `extent.spatial.storageCrsBbox`
+  and a `grid` in that CRS. Today that is a GeoTIFF whose
+  `ProjectedCSTypeGeoKey` is 3067 or 3035. Both are in the storage CRS's
+  units and axis order, since "all units within the spatial grid object are
+  specified in the `storageCrs`" (Part 2 `spatialExtent.yaml`). EPSG:3035
+  lists northing first. Cells are centred: `storageCrsBbox` is the outer
+  cell edges, `firstCoordinate` is the axis minimum plus half a cell, and
+  `relativeBounds` is the half cell on either side. So `cellsCount` is the
+  extent over the resolution, as `/req/uad-collections/grid-description`
+  gives it for area cells. This closes `/req/collection-map/desc-crs` C for
+  those collections. Before, they advertised `storageCrs` without
+  `storageCrsBbox`.
+- **Every grid that is not lat/lon**, registered or not, carries the
+  extension member `extent.spatial["meteocore:nativeGrid"]`. It is
+  MeteoCore's own member, not part of any OGC standard:
+
+  ```json
+  "meteocore:nativeGrid": {
+    "crs": "PROJCRS[\"Lambert conformal conic\",…]",
+    "cellsCount": [949, 1069],
+    "resolution": [2500, 2500],
+    "unit": "m",
+    "bbox": [-1060084, -1332469, 1312416, 1340031]
+  }
+  ```
+
+  - `crs` is the OGC URI of the EPSG code the source states. Otherwise it
+    is the CRS's WKT2 (ISO 19162:2019) from `ds_core::native_grid::crs_wkt2`.
+    Each WKT2 form is checked against PROJ and pinned in its tests.
+  - `cellsCount`, `resolution` (in `unit`: `m`, or `deg` for rotated
+    lat/lon) and `bbox` (the cells' outer edges) are in grid order: x
+    (columns, easting) then y (rows, northing), whatever axis order a
+    registered `crs` defines.
+  - The authority code is only ever the one the source states, never one
+    derived from the parameters. TM35FIN parameters on WGS 84 are not
+    EPSG:3067, which is on GRS 1980 and the ETRS89 datum.
+
+The member exists because OGC API Maps rules out advertising a CRS
+MeteoCore cannot serve as `storageCrs`, and without a `storageCrs` the
+standard `grid` is in CRS84 degrees:
+
+- `/req/collection-map/desc-crs` B: "a `storageCrs` property in the
+  collection object of a geospatial collection SHALL be the URI or the
+  safe CURIE for that CRS". A WKT2 string is neither.
+- `/req/core/map-response` B: "The map response SHALL be in the storage
+  CRS specified in the description of the geospatial resource … unless
+  overridden by a specific query parameter". A custom `storageCrs` would
+  make the default `/map` a Lambert conformal conic image.
+
+So the member never changes `storageCrs`, `crs` or any declared behaviour.
+Serving maps in a collection's native CRS, with a server URI for it, is a
+separate decision.
+
 ## Shared OGC API root
 
 `shared::router` composes OGC API standards as `BuildingBlock`s under one
@@ -156,7 +218,8 @@ conformance classes. For each collection it serves, a block also adds a
 - Links are concatenated, and the first block to describe a field keeps it.
 - A block can claim a field it omits (`Contribution::claims`) so that no
   later block fills it in. Raster blocks claim `storageCrs`, which they omit
-  when the native CRS has no OGC URI.
+  when the native CRS has no OGC URI. The native grid is then in the
+  extent's `meteocore:nativeGrid` member ([Native grid](#native-grid)).
 - `styles` merge by id. `crs` lists are combined in block order, without
   duplicates.
 - Discovery uses the bbox and time span of the block whose `extent` is kept.
@@ -256,9 +319,16 @@ resource as currently filtered and paged.
     catalog, and the licence with its link.
   - **Extent.** One box, a row each for the spatial, temporal and vertical
     extent, showing only what the document carries. Spatial: the bounds in
-    the bbox's CRS with a Copy bbox button, the storage CRS, and the grid's
-    cells and resolution from `extent.spatial.grid`, which the APIs give
-    for geographic grids only. Temporal: the interval, the step from the
+    the bbox's CRS with a Copy bbox button, and the storage CRS with its
+    EPSG name. Then the native grid, read from the `meteocore:nativeGrid`
+    member, else from the standard `grid` in the storage CRS's units:
+    - its coordinate system when the storage CRS does not name it. A WKT2
+      CRS shows its name, "no EPSG code" and the WKT2 to unfold.
+    - a Resolution fact such as `2.5 km × 2.5 km · 949 × 1069 cells`.
+      Metres show under 1 km. Degrees add an approximate size in km at the
+      extent's middle latitude.
+
+    Temporal: the interval, the step from the
     temporal grid's `resolution`, the number of steps, and EDR's model runs
     where the document links them. Vertical: the range, the levels in their
     unit, the reference system. "Technical details" beside it holds the

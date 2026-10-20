@@ -673,6 +673,15 @@ pub struct RasterInfo {
     /// grid (e.g. polar radar volumes) or when the cell counts are not cheaply
     /// available without decoding data.
     pub grid_size: Option<[u32; 2]>,
+    /// The grid the source's samples lie on, in its own CRS, as the source
+    /// states it (#1237): the CRS, cell counts, cell size and outer corner,
+    /// and an EPSG code only when the source states one. Built once per
+    /// load or poll. `None` without a regular grid (polar radar volumes,
+    /// station data) or where the engine does not report it; a collection
+    /// whose parameters lie on different grids reports its default
+    /// parameter's. The collection description advertises it through
+    /// [`crate::ogc_extent::build_extent`].
+    pub native_grid: Option<crate::native_grid::NativeGrid>,
     /// Optional short label distinguishing this layer from sibling layers that
     /// share a parent grouping (e.g. a radar site place name like "Vihti").
     /// WMS prepends it to child-layer titles so flat clients that ignore the
@@ -1268,6 +1277,7 @@ mod tests {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         };
         let plain = Engine(None);
         assert_eq!(
@@ -1540,6 +1550,7 @@ mod tests {
                     grid_size: None,
                     layer_subtitle: None,
                     reference_times: Vec::new(),
+                    native_grid: None,
                 }
             }
         }

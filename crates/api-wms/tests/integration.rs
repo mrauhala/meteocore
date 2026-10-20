@@ -61,6 +61,7 @@ impl MapEngine for EmptyMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -285,6 +286,7 @@ impl MapEngine for FailingMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -484,6 +486,7 @@ impl MapEngine for PopulatedMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -862,6 +865,7 @@ impl MapEngine for CountingMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 
@@ -1135,6 +1139,7 @@ impl MapEngine for SnappingMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 
@@ -1639,6 +1644,7 @@ impl MapEngine for SiteMockMapEngine {
             grid_size: None,
             layer_subtitle: Some("Vihti".into()),
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -1706,6 +1712,7 @@ impl MapEngine for ExtentMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -2260,6 +2267,7 @@ impl MapEngine for ForecastMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: forecast_runs().to_vec(),
+            native_grid: None,
         }
     }
 
@@ -2749,6 +2757,7 @@ impl MapEngine for RunSwapMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: self.runs.read().unwrap().clone(),
+            native_grid: None,
         }
     }
 
@@ -2952,6 +2961,7 @@ impl MapEngine for AdvancingMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -3404,6 +3414,7 @@ impl MapEngine for FallbackForecastMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: forecast_runs().to_vec(),
+            native_grid: None,
         }
     }
 
@@ -3791,6 +3802,7 @@ mod default_parameter_styles {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -4350,6 +4362,7 @@ mod per_parameter_times {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
 
@@ -4576,6 +4589,7 @@ impl MapEngine for HalfDataMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -5242,6 +5256,7 @@ mod composites {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
 

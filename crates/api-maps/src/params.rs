@@ -1059,6 +1059,7 @@ mod tests {
             grid_size: Some([2000, 1500]),
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 

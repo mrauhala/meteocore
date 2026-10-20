@@ -833,6 +833,7 @@ mod tests {
             scale: None,
             offset: None,
             overviews: vec![],
+            epsg: None,
         }
     }
 

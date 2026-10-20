@@ -24,7 +24,12 @@ available.
   skipped, and so are remote objects over 64 MiB.
 - **Composites (`OdimEngine`).** The filename template (or regex) gives
   each file's time. The newest file is decoded at startup for the grid, CRS
-  and extent, so a source with no matching file fails to load. Decoded
+  and extent, so a source with no matching file fails to load. That grid is
+  the collection's native grid (#1237), in the collection description's
+  `meteocore:nativeGrid` member. Its CRS is an EPSG URI only when the
+  projdef names GRS80 with exactly TM35FIN's (EPSG:3067) or ETRS89-LAEA
+  Europe's (EPSG:3035) parameters, else its WKT2. The engine never claims a
+  `storageCrs`. Decoded
   grids live in one byte-bounded LRU shared by all composite collections
   (`MC_ODIM_COMPOSITE_CACHE_MB`, default 2048, `0` disables).
 - **Polar volumes (`PolarVolumeEngine`).** One source holds a radar

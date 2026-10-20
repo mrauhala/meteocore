@@ -2,6 +2,7 @@ use std::path::Path;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use ds_core::geo::{Crs, GeoTransform};
+use ds_core::native_grid::NativeGrid;
 use ds_core::resample::SourceGrid;
 use memmap2::Mmap;
 use thiserror::Error;
@@ -78,6 +79,8 @@ pub struct GridInfo {
     lonlat_extent: [f64; 4],
     /// [`Self::source`], built once by [`Self::new`].
     source: SourceGrid,
+    /// [`Self::native_grid`], built once by [`Self::new`].
+    native: Option<NativeGrid>,
 }
 
 impl GridInfo {
@@ -139,6 +142,8 @@ impl GridInfo {
             _ => bbox,
         };
         let source = SourceGrid::new(transform.clone());
+        // QueryData states no EPSG code: the CRS is its area's parameters.
+        let native = NativeGrid::from_geo_transform(&transform, None);
         Self {
             nx,
             ny,
@@ -147,6 +152,7 @@ impl GridInfo {
             bbox,
             lonlat_extent,
             source,
+            native,
         }
     }
 
@@ -187,6 +193,13 @@ impl GridInfo {
     /// map at the positions it gives (#1190).
     pub fn source(&self) -> &SourceGrid {
         &self.source
+    }
+
+    /// The grid in its own CRS (#1237), built once by [`Self::new`]: the
+    /// cells of [`Self::geo_transform`], whose edges lie half a cell
+    /// outside the corner points.
+    pub fn native_grid(&self) -> Option<&NativeGrid> {
+        self.native.as_ref()
     }
 }
 

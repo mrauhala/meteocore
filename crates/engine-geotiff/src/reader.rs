@@ -623,6 +623,11 @@ pub struct TiffMetadata {
     pub tiles_down: u32,
     pub samples_per_pixel: u32,
     pub geo_transform: GeoTransform,
+    /// The EPSG code of the projected CRS the file states in its
+    /// `ProjectedCSTypeGeoKey`, `None` for a user-defined or geographic
+    /// CRS. Reported as the native grid's authority (#1237), never derived
+    /// from the projection parameters.
+    pub epsg: Option<u32>,
     pub nodata: Option<f64>,
     pub scale: Option<f64>,
     pub offset: Option<f64>,
@@ -703,7 +708,7 @@ impl TiffMetadata {
             )));
         }
 
-        let geo_transform = parse_geo_transform(decoder, width, height)?;
+        let (geo_transform, epsg) = parse_geo_transform(decoder, width, height)?;
         let nodata = parse_nodata(decoder);
         let (scale, offset) = parse_scale_offset(decoder);
 
@@ -776,6 +781,7 @@ impl TiffMetadata {
             scale,
             offset,
             overviews,
+            epsg,
         })
     }
 
@@ -2012,6 +2018,7 @@ fn overview_metadata(metadata: &TiffMetadata, overview: &OverviewLevel) -> TiffM
         scale: metadata.scale,
         offset: metadata.offset,
         overviews: Vec::new(),
+        epsg: metadata.epsg,
     }
 }
 
@@ -2913,13 +2920,15 @@ fn read_tag_u32(decoder: &mut DecoderWrapper, tag: Tag) -> Option<u32> {
     }
 }
 
+/// The file's pixel ↔ world mapping and the EPSG code it states for its
+/// projected CRS ([`parse_crs`]).
 fn parse_geo_transform(
     decoder: &mut DecoderWrapper,
     width: u32,
     height: u32,
-) -> Result<GeoTransform, DataServerError> {
+) -> Result<(GeoTransform, Option<u32>), DataServerError> {
     // Parse CRS first — needed for both paths
-    let crs = parse_crs(decoder)?;
+    let (crs, epsg) = parse_crs(decoder)?;
     tracing::debug!("Parsed CRS: {:?}", crs);
 
     // Try ModelTiepointTag (33922) + ModelPixelScaleTag (33550) first — the common case
@@ -2941,15 +2950,18 @@ fn parse_geo_transform(
         let origin_x = tp[3] - tp[0] * ps[0];
         let origin_y = tp[4] + tp[1] * ps[1];
 
-        return Ok(GeoTransform {
-            origin_x,
-            origin_y,
-            pixel_width: ps[0],
-            pixel_height: ps[1],
-            width,
-            height,
-            crs,
-        });
+        return Ok((
+            GeoTransform {
+                origin_x,
+                origin_y,
+                pixel_width: ps[0],
+                pixel_height: ps[1],
+                width,
+                height,
+                crs,
+            },
+            epsg,
+        ));
     }
 
     // Fallback: try ModelTransformationTag (34264) — a 4x4 affine matrix
@@ -2958,6 +2970,7 @@ fn parse_geo_transform(
             .ok_or_else(|| DataServerError::Engine("Cannot parse ModelTransformationTag".into()))?;
 
         return GeoTransform::from_transformation_matrix(&matrix, width, height, crs)
+            .map(|gt| (gt, epsg))
             .map_err(DataServerError::Engine);
     }
 
@@ -2968,11 +2981,21 @@ fn parse_geo_transform(
     ))
 }
 
-/// Parse the CRS from GeoTIFF GeoKey Directory.
-fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
+/// Parse the CRS from GeoTIFF GeoKey Directory, with the EPSG code the
+/// file states for a projected CRS (`ProjectedCSTypeGeoKey`, 3072; not 0
+/// or 32767, user-defined).
+fn parse_crs(decoder: &mut DecoderWrapper) -> Result<(Crs, Option<u32>), DataServerError> {
+    parse_crs_inner(decoder).map(|(crs, epsg)| {
+        let epsg = (epsg != 0 && epsg != 32767 && !matches!(crs, Crs::Wgs84)).then_some(epsg);
+        (crs, epsg.map(u32::from))
+    })
+}
+
+/// [`parse_crs`]'s CRS and the raw `ProjectedCSTypeGeoKey` (0 when absent).
+fn parse_crs_inner(decoder: &mut DecoderWrapper) -> Result<(Crs, u16), DataServerError> {
     let geokeys = match decoder.get_tag(Tag::Unknown(34735)) {
         Ok(v) => extract_shorts(&v).unwrap_or_default(),
-        Err(_) => return Ok(Crs::Wgs84), // No GeoKeys → assume WGS84
+        Err(_) => return Ok((Crs::Wgs84, 0)), // No GeoKeys → assume WGS84
     };
 
     let double_params = match decoder.get_tag(Tag::Unknown(34736)) {
@@ -2981,7 +3004,7 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
     };
 
     if geokeys.len() < 4 {
-        return Ok(Crs::Wgs84);
+        return Ok((Crs::Wgs84, 0));
     }
 
     // GeoKey directory: [version, revision, minor_revision, num_keys, key1_id, key1_tiff_tag, key1_count, key1_value, ...]
@@ -3026,7 +3049,7 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
 
     if model_type == 2 {
         // Geographic CRS — check if it's WGS84-like
-        return Ok(Crs::Wgs84);
+        return Ok((Crs::Wgs84, 0));
     }
 
     // Key 3075: ProjCoordTransGeoKey (projection method)
@@ -3041,6 +3064,17 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
         _ => 0,
     };
 
+    let crs = parse_projected(keys, proj_method, epsg)?;
+    Ok((crs, epsg))
+}
+
+/// The projected CRS of the GeoKeys: a well-known EPSG code's parameters
+/// when the file gives no projection method, else the keys' own.
+fn parse_projected(
+    keys: std::collections::HashMap<u16, GeoKeyValue>,
+    proj_method: u16,
+    epsg: u16,
+) -> Result<Crs, DataServerError> {
     // If projection method is missing/user-defined, try to identify by EPSG code
     if proj_method == 0 && epsg != 0 && epsg != 32767 {
         // Use hardcoded parameters for well-known EPSG codes
@@ -4543,6 +4577,7 @@ mod tests {
                 ov(4, 310, 457),
                 ov(5, 155, 228),
             ],
+            epsg: None,
         }
     }
 
@@ -4694,6 +4729,7 @@ mod tests {
             scale: None,
             offset: None,
             overviews: Vec::new(),
+            epsg: None,
         }
     }
 
@@ -4802,6 +4838,7 @@ mod tests {
             scale: None,
             offset: None,
             overviews: Vec::new(),
+            epsg: None,
         }
     }
 

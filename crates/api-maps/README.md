@@ -57,7 +57,11 @@ api-common; the HTML pages are its
 A collection description carries `dataType: "map"`, `crs` (the five output
 CRSs), `styles` with map and legend links, `extent`, `storageCrs` when the
 native CRS has an OGC URI, and `parameter_names` on a multi-parameter
-collection. The per-API service adds a `tilesets-map` link to
+collection. The extent describes the native grid
+([api-common](../api-common/README.md#native-grid)):
+- `storageCrsBbox` and a `grid` in the `storageCrs` when the source states
+  that code;
+- the `meteocore:nativeGrid` member for any grid that is not lat/lon. The per-API service adds a `tilesets-map` link to
 `/tiles/collections/{id}/tiles` when the Tiles service renders the collection.
 
 `/conformance` lists the OGC API - Common classes and these OGC API - Maps

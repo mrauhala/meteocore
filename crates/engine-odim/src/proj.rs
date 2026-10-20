@@ -230,9 +230,117 @@ fn parse_laea(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
     })
 }
 
+/// The EPSG code a projdef states, when it names the ellipsoid of a
+/// registered CRS and gives exactly its parameters (#1237): `+ellps=GRS80`
+/// with TM35FIN's (EPSG:3067: `tmerc`, `lat_0=0 lon_0=27 k=0.9996
+/// x_0=500000 y_0=0`) or ETRS89-LAEA Europe's (EPSG:3035: `laea`,
+/// `lat_0=52 lon_0=10 x_0=4321000 y_0=3210000`).
+///
+/// Anything else states no code: another or no ellipsoid, a sphere, a
+/// datum shift other than none (`+towgs84` of zeros), a unit other than
+/// metres, or any parameter beyond these. The code is never inferred from
+/// the parameters alone: on another ellipsoid they are another CRS.
+pub fn stated_epsg(projdef: &str) -> Option<u32> {
+    let params = tokenize(projdef);
+    const ALLOWED: [&str; 12] = [
+        "proj", "lat_0", "lon_0", "k", "k_0", "x_0", "y_0", "ellps", "towgs84", "units", "no_defs",
+        "type",
+    ];
+    if params.keys().any(|k| !ALLOWED.contains(&k.as_str())) {
+        return None;
+    }
+    let text = |key: &str| params.get(key).map(String::as_str);
+    if text("ellps") != Some("GRS80")
+        || text("units").is_some_and(|u| u != "m")
+        || text("type").is_some_and(|t| t != "crs")
+        || text("no_defs").is_some_and(|v| !v.is_empty())
+    {
+        return None;
+    }
+    if let Some(shift) = text("towgs84") {
+        let zero = shift
+            .split(',')
+            .all(|v| v.trim().parse::<f64>().is_ok_and(|v| v == 0.0));
+        if !zero {
+            return None;
+        }
+    }
+    // A missing parameter takes PROJ's default, 0 (1 for the scale).
+    let value = |key: &str, default: f64| -> Option<f64> {
+        match text(key) {
+            None => Some(default),
+            Some(v) => v.parse().ok(),
+        }
+    };
+    let k = match (text("k_0"), text("k")) {
+        (Some(_), _) => value("k_0", 1.0)?,
+        (None, _) => value("k", 1.0)?,
+    };
+    let is = |key: &str, default: f64, expected: f64| value(key, default) == Some(expected);
+    match text("proj")? {
+        "tmerc"
+            if is("lat_0", 0.0, 0.0)
+                && is("lon_0", 0.0, 27.0)
+                && k == 0.9996
+                && is("x_0", 0.0, 500_000.0)
+                && is("y_0", 0.0, 0.0) =>
+        {
+            Some(3067)
+        }
+        "laea"
+            if text("k").is_none()
+                && text("k_0").is_none()
+                && is("lat_0", 0.0, 52.0)
+                && is("lon_0", 0.0, 10.0)
+                && is("x_0", 0.0, 4_321_000.0)
+                && is("y_0", 0.0, 3_210_000.0) =>
+        {
+            Some(3035)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1237: a projdef states an EPSG code only with the registered
+    /// ellipsoid and exactly the registered parameters.
+    #[test]
+    fn stated_epsg_needs_the_ellipsoid_and_every_parameter() {
+        let tm35fin = "+proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0 +ellps=GRS80";
+        assert_eq!(stated_epsg(tm35fin), Some(3067));
+        assert_eq!(
+            stated_epsg(&format!(
+                "{tm35fin} +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+            )),
+            Some(3067)
+        );
+        assert_eq!(
+            stated_epsg("+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80"),
+            Some(3035)
+        );
+        for other in [
+            // The same parameters on WGS 84, on no stated ellipsoid, on a
+            // sphere: not EPSG:3067.
+            "+proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0 +ellps=WGS84",
+            "+proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0",
+            "+proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0 +R=6371228",
+            // One parameter off, or missing where the default differs.
+            "+proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500001 +y_0=0 +ellps=GRS80",
+            "+proj=tmerc +lat_0=0 +lon_0=27 +x_0=500000 +y_0=0 +ellps=GRS80",
+            // A datum shift, another unit, an extra parameter.
+            "+proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0 +ellps=GRS80 +towgs84=1,0,0",
+            "+proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0 +ellps=GRS80 +units=km",
+            "+proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0 +ellps=GRS80 +lat_ts=60",
+            // OPERA's LAEA and a stereographic composite.
+            "+proj=laea +lat_0=55 +lon_0=10 +x_0=1950000 +y_0=-2100000 +units=m +ellps=WGS84",
+            "+proj=stere +lat_0=90 +lon_0=0 +lat_ts=60 +ellps=GRS80",
+        ] {
+            assert_eq!(stated_epsg(other), None, "{other}");
+        }
+    }
 
     /// Asserts two `Crs` values are equal across float-comparison
     /// tolerance. The enum doesn't derive `PartialEq` because it carries

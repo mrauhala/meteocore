@@ -1506,7 +1506,7 @@ max = 255.0
 Gridded CF-NetCDF data (`engine_type = "netcdf"`, #1067), served through WMS, OGC API Maps and Tiles, and OGC API EDR. One collection is one file family, such as MET Norway's MEPS surface files, one per lead time: every file carries the collection's variables on one grid. The files lie in a local directory, or on an HTTP server that is read in place (below). Each variable is a layer: a WMS child layer `coll/<variable>`, Maps/Tiles `parameter-name=<variable>`.
 
 - **Times come from the files.** Each file's valid times are its `time` axis and its model run its `forecast_reference_time`. Runs are the WMS `reference_time` dimension: a map draws from the newest run whose steps span the requested time, so a newer run still arriving does not hide an older one, and a pinned run draws from that run or fails. Files without `forecast_reference_time` form one timeline without runs. File names only select the files and order the opening (`filename_template`, with `{run}` and `{lead}` as in ds-storage's discovery, default `*.nc`), and global time attributes are never read.
-- **Grids:** 1-D latitude/longitude, or 1-D projected x/y in metres with a CF `grid_mapping` (`lambert_conformal_conic`, as MEPS; `geostationary`; `polar_stereographic`, by `standard_parallel` or `scale_factor_at_projection_origin`; `lambert_azimuthal_equal_area`; `transverse_mercator`). The grid mapping states its earth figure, never assumed WGS84; polar stereographic, azimuthal equal-area and transverse Mercator grids are served on WGS84 (or GRS80) only, not on a sphere. A grid around a pole advertises an extent reaching it. Rows stored south to north are drawn north-up. A projected grid has no `storageCrs`: its native CRS has no OGC URI.
+- **Grids:** 1-D latitude/longitude, or 1-D projected x/y in metres with a CF `grid_mapping` (`lambert_conformal_conic`, as MEPS; `geostationary`; `polar_stereographic`, by `standard_parallel` or `scale_factor_at_projection_origin`; `lambert_azimuthal_equal_area`; `transverse_mercator`). The grid mapping states its earth figure, never assumed WGS84; polar stereographic, azimuthal equal-area and transverse Mercator grids are served on WGS84 (or GRS80) only, not on a sphere. A grid around a pole advertises an extent reaching it. Rows stored south to north are drawn north-up. A projected grid has no `storageCrs`: its native CRS has no OGC URI. The extent's `meteocore:nativeGrid` member describes it, with its WKT2 ([native grid](#collection-metadata-native-grid)).
 - **Fields** have one level, or levels on one pressure axis. A single level is identified by its coordinate (2 m, 10 m), never its dimension name. A pressure axis is a dimension whose coordinate's units are a pressure (CF: `hPa`, `Pa`, `mbar`, …), unless it is a parametric coordinate (`formula_terms`, or a hybrid `standard_name`); its levels, in hPa (converted from Pa where the file stores Pa), are the collection's vertical axis (see **Pressure levels** below). Any other axis of several values (height above ground, hybrid model levels) is not served. Files with an ensemble axis are read at `member`. Packed values are unpacked, and `_FillValue`, `missing_value` and NaN are transparent. Values are served in display units, converted from the files' (see below).
 - **The first file fixes the layout:** its variables (the `variables` allowlist, else every variable on its grid) and its grid. A later file missing one, on another grid or on other pressure levels, is skipped with a WARN. A file replaced in place is read again, and tiles drawn from it before are not served again.
 - **Files stay open** while the collection keeps them: the newest `max_runs` runs, at most `max_files` files. Requests read one 2-D field per layer and time through a field cache shared by every NetCDF collection (`MC_NETCDF_FIELD_CACHE_MB`), never the whole file.
@@ -2112,6 +2112,29 @@ REST-based map image API. Maps shares the `MapEngine` trait, render semaphore, r
 | `GET /maps/collections/{id}/styles/{styleId}/map` | Render with a named style (defined under `[wms]`) |
 | `GET /maps/collections/{id}/styles` | List available styles for a collection |
 | `GET /maps/collections/{id}` | Collection metadata (extent, styles, supported CRS) |
+
+### Collection Metadata: Native Grid
+
+A raster collection's description in Maps, Tiles and the shared root says
+which grid its data lies on (#1237):
+
+- **Lat/lon grids:** `extent.spatial.grid` in CRS84 degrees.
+- **Registered CRS stated by the source:** when the source states the EPSG
+  code of the `storageCrs` (a TM35FIN GeoTIFF's EPSG:3067), the extent adds
+  the standard `storageCrsBbox` and a cell-centred `grid` in that CRS.
+- **Any grid that is not lat/lon:** the extension member
+  `extent.spatial["meteocore:nativeGrid"]`, which is not part of an OGC
+  standard. It gives the CRS as the source's EPSG URI or else WKT2,
+  `cellsCount`, `resolution` with its `unit`, and the `bbox` of the outer
+  cell edges, x then y. A MEPS collection, for example, states its 949 ×
+  1069 cells of 2.5 km on its Lambert conformal conic.
+
+OGC API Maps requires a `storageCrs` to be a URI or safe CURIE, and renders
+the default map in it. So a CRS without an EPSG code is never advertised
+as `storageCrs`, and the member changes no `storageCrs`, `crs` or default
+map CRS. The collection page shows the resolution, for example "2.5 km ×
+2.5 km · 949 × 1069 cells", with the CRS's name. Details are in the
+[api-common README](crates/api-common/README.md#native-grid).
 
 ### Query Parameters
 

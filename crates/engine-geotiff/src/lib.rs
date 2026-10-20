@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use ds_core::native_grid::NativeGrid;
 use ds_poll::Shutdown;
 use ds_storage::discovery::{
     expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, FilenameMatcher,
@@ -544,6 +545,12 @@ impl GeoTiffEngine {
         let grid_size = catalog
             .live()
             .find_map(|(_, entry)| entry.metadata().map(|m| [m.width, m.height]));
+        // The same entry's grid in its own CRS, with the EPSG code its
+        // GeoKeys state (#1237).
+        let native_grid = catalog
+            .live()
+            .find_map(|(_, entry)| entry.metadata())
+            .and_then(|m| NativeGrid::from_geo_transform(&m.geo_transform, m.epsg));
 
         ds_core::map_engine::RasterInfo {
             native_crs: crs_name,
@@ -556,6 +563,7 @@ impl GeoTiffEngine {
             vertical: None,     // single-layer raster, no vertical dimension
             grid_size,
             layer_subtitle: None,
+            native_grid,
         }
     }
 
@@ -732,6 +740,7 @@ impl GeoTiffEngine {
                 vertical: None,
                 grid_size: None,
                 layer_subtitle: None,
+                native_grid: None,
             }),
             tile_cache,
             store_mode,

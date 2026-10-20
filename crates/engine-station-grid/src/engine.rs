@@ -49,6 +49,7 @@ use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
     QueryResult,
 };
+use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
 use tracing::{debug, info, warn};
@@ -355,6 +356,7 @@ impl StationGridEngine {
                     grid_size: None,
                     layer_subtitle: None,
                     reference_times: Vec::new(),
+                    native_grid: None,
                 }),
             }),
             inputs: Mutex::new(HashMap::new()),
@@ -730,6 +732,15 @@ impl Inner {
             grid_size: Some([self.geom.nx, self.geom.ny]),
             layer_subtitle: None,
             reference_times: Vec::new(),
+            // The analysis grid MeteoCore defines, in lon/lat (#1237). A
+            // lat/lon grid gets no `meteocore:nativeGrid` member.
+            native_grid: NativeGrid::new(
+                ds_core::geo::Crs::Wgs84,
+                None,
+                [self.geom.nx, self.geom.ny],
+                [self.geom.west, self.geom.south],
+                [self.geom.dx, self.geom.dy],
+            ),
         };
         let on_axis: std::collections::HashSet<DateTime<Utc>> = times.iter().copied().collect();
         self.snapshot.store(Arc::new(Snapshot {

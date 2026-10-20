@@ -72,6 +72,7 @@ impl Mock {
                 grid_size: Some([2, 2]),
                 layer_subtitle: None,
                 reference_times: vec![hour(0)],
+                native_grid: None,
             }),
             axes: HashMap::new(),
             tiles: Mutex::new(Vec::new()),

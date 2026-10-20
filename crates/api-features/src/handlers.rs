@@ -1302,7 +1302,7 @@ pub(crate) fn collection_parts(
         .map(|(start, end)| vec![start, end])
         .unwrap_or_default();
     if let Some(mut extent) =
-        ds_core::ogc_extent::build_extent(engine.spatial_extent(), None, "", &times, None)
+        ds_core::ogc_extent::build_extent(engine.spatial_extent(), None, "", None, &times, None)
     {
         // Extent endpoints describe bounds, not two regularly sampled observations.
         if let Some(temporal) = &mut extent.temporal {

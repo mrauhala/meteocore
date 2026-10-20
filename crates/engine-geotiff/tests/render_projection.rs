@@ -269,3 +269,99 @@ fn raster_info_is_cached_and_populated_at_construction() {
     assert_eq!(info.native_crs, info2.native_crs);
     assert_eq!(info.grid_size, info2.grid_size);
 }
+
+/// #1237: the TM35FIN fixture states EPSG:3067 in its
+/// `ProjectedCSTypeGeoKey`, the `storageCrs` the engine already
+/// advertises: the description gains the standard `storageCrsBbox` and a
+/// `grid` in metres, cell-centred, and the `meteocore:nativeGrid` member
+/// names the CRS by its URI.
+#[test]
+fn the_tm35fin_fixture_states_epsg_3067_and_its_grid() {
+    let engine = tm35fin_engine();
+    let info = engine.raster_info();
+    assert_eq!(info.native_crs, "EPSG:3067");
+    let grid = info.native_grid.as_ref().expect("a native grid");
+    assert_eq!(grid.epsg(), Some(3067));
+    assert_eq!(grid.size(), [480, 360]);
+    assert_eq!(grid.spacing(), [2584.937385416667, 5080.839738888889]);
+    let [x0, y0, x1, y1] = grid.bbox();
+    // gdalinfo's corners of the fixture.
+    assert!((x0 - -196_593.004).abs() < 1e-6 && (y1 - 8_084_432.005).abs() < 1e-6);
+    assert!((x1 - 1_044_176.941).abs() < 1e-3 && (y0 - 6_255_329.699).abs() < 1e-3);
+
+    let spatial = ds_core::ogc_extent::build_extent(
+        info.spatial_extent,
+        info.grid_size,
+        &info.native_crs,
+        info.native_grid.as_ref(),
+        &info.times,
+        None,
+    )
+    .unwrap()
+    .spatial
+    .unwrap();
+    assert_eq!(spatial.storage_crs_bbox, Some(vec![grid.bbox()]));
+    let axes = spatial.grid.expect("the grid in EPSG:3067");
+    assert_eq!(axes[0].cells_count, 480);
+    assert_eq!(axes[1].cells_count, 360);
+    assert_eq!(axes[0].first_coordinate, Some(x0 + 2584.937385416667 / 2.0));
+    assert_eq!(axes[1].first_coordinate, Some(y0 + 5080.839738888889 / 2.0));
+    let member = spatial.native_grid.expect("the extension member");
+    assert_eq!(member.crs, "http://www.opengis.net/def/crs/EPSG/0/3067");
+}
+
+/// #1237: a user-defined Lambert conformal conic on WGS 84 states no EPSG
+/// code: no `storageCrs` grid, the member's CRS is its WKT2.
+#[test]
+fn a_user_defined_lambert_grid_is_described_by_its_wkt2() {
+    let config = GeoTiffConfig {
+        filename_template: Some("norway_%Y%m%dT%H%MZ.tiff".to_string()),
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: "reflectivity".to_string(),
+        unit: "dBZ".to_string(),
+        poll_interval_secs: 3600,
+        tile_cache_mb: 16,
+        band: 1,
+        max_files: None,
+        nodata: None,
+        scale: None,
+        offset: None,
+        exclude_patterns: vec![],
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+        time_window: None,
+        scan_days: None,
+        stac_url: None,
+        stac_asset_key: "data".to_string(),
+        stac_asset_allowlist: None,
+    };
+    let engine = GeoTiffEngine::new("radar-native", Some("../../testdata/radar-native"), &config)
+        .expect("engine builds from the Norwegian fixture");
+    let info = engine.raster_info();
+    assert_eq!(info.native_crs, "LCC");
+    let grid = info.native_grid.as_ref().expect("a native grid");
+    assert_eq!(grid.epsg(), None);
+    assert_eq!(grid.spacing(), [1000.0, 1000.0]);
+    assert_eq!(
+        ds_core::native_grid::wkt_name(grid.crs_ref()),
+        Some("Lambert conformal conic")
+    );
+    assert!(grid
+        .crs_ref()
+        .contains(r#"PARAMETER["Latitude of 1st standard parallel",58.964,"#));
+    let spatial = ds_core::ogc_extent::build_extent(
+        info.spatial_extent,
+        info.grid_size,
+        &info.native_crs,
+        info.native_grid.as_ref(),
+        &info.times,
+        None,
+    )
+    .unwrap()
+    .spatial
+    .unwrap();
+    assert!(spatial.storage_crs_bbox.is_none() && spatial.grid.is_none());
+    assert_eq!(spatial.native_grid.unwrap().crs, grid.crs_ref());
+}

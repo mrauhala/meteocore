@@ -70,6 +70,7 @@ impl StationMap {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         };
         Self {
             layers,

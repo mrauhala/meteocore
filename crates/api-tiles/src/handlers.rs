@@ -296,16 +296,18 @@ pub(crate) fn collection_parts(
 
     // `storageCrs`: native CRS of a raster source when it has a stable OGC URI
     // (omitted for vector collections and for projected grids with no canonical
-    // URI). Resolved up-front because OGC API – Common – Part 2 §7.13.3 requires
-    // it to be a member of `crs[]` below.
+    // URI, whose grid is the extent's `meteocore:nativeGrid` member, #1237).
+    // Resolved up-front because it is listed in `crs[]` below (#298). The
+    // current Common Part 2 text has no rule tying the two; Features Part 2
+    // `/req/crs/fc-md-storageCrs-valid-value` has one for feature collections.
     let storage_crs = raster_info.and_then(|i| ds_core::geo::native_crs_uri(&i.native_crs));
 
     // OGC API – Common – Part 2 `crs` array (#296), for parity with Maps.
     // Tiles are delivered in their TileMatrixSet's CRS (EPSG:3857 for
     // WebMercatorQuad, CRS84 for WorldCRS84Quad), plus the native `storageCrs`
-    // when present — §7.13.3 mandates `storageCrs ∈ crs[]`, and a projected
-    // raster (EPSG:3067/3035) would otherwise violate it. CRS84 is listed first
-    // for consistency with Maps and Features.
+    // when present, so `storageCrs ∈ crs[]` holds (#298) for a projected
+    // raster (EPSG:3067/3035) too. CRS84 is listed first for consistency with
+    // Maps and Features.
     const CRS84_URI: &str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
     let mut crs_uris: Vec<&'static str> = Vec::new();
     for tms_id in SUPPORTED_TILE_MATRIX_SETS {
@@ -469,6 +471,7 @@ fn build_extent(
         spatial_extent,
         raster_info.and_then(|i| i.grid_size),
         raster_info.map(|i| i.native_crs.as_str()).unwrap_or(""),
+        raster_info.and_then(|i| i.native_grid.as_ref()),
         raster_times.unwrap_or(&feature_times),
         raster_info.and_then(|i| i.vertical.as_ref()),
     )?;

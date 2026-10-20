@@ -182,6 +182,16 @@ fn discovers_the_hourly_mosaic_as_a_global_mercator_grid() {
     );
     assert_eq!(info.unit, "1");
     assert_eq!(info.grid_size, Some([102, 60]));
+    // #1237: the Mercator grid is recognised, not stated: no EPSG code, so
+    // the native grid's CRS is its WKT2 even though `storageCrs` stays
+    // EPSG:3857.
+    let grid = info.native_grid.as_ref().expect("a native grid");
+    assert_eq!(grid.size(), [102, 60]);
+    assert_eq!(grid.epsg(), None);
+    assert_eq!(
+        ds_core::native_grid::wkt_name(grid.crs_ref()),
+        Some("Web Mercator")
+    );
     // Every longitude, between the first and last rows' outer edges.
     let [w, s, e, n] = info.spatial_extent.unwrap();
     assert_eq!((w, e), (-180.0, 180.0));
