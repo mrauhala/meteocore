@@ -848,7 +848,8 @@ fn build_source(
                 .prefix_pattern
                 .clone()
                 .ok_or(EngineError::MissingPrefixPattern)?;
-            let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?;
+            let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?
+                .for_collection(collection_id);
             let time_window = match &config.time_window {
                 Some(s) => Some(TimeWindow::parse(s)?),
                 None => None,
@@ -884,6 +885,7 @@ fn build_source(
                 // amazonaws/cloudferro → S3). The returned base path is the
                 // directory; any `prefix_pattern` is appended under it.
                 let (store, base) = ds_storage::build_store(data_path)?;
+                let store = store.for_collection(collection_id);
                 let base_prefix =
                     combine_http_prefix(base.as_ref(), config.prefix_pattern.as_deref());
                 let time_window = match &config.time_window {

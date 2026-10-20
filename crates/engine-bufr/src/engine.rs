@@ -134,7 +134,9 @@ impl BufrEngine {
             &config.parameters,
         ));
         let source = match (&config.data_path, &config.wis2) {
-            (Some(path), None) => Source::Local(Mutex::new(LocalSource::new(path)?)),
+            (Some(path), None) => {
+                Source::Local(Mutex::new(LocalSource::new(collection_id, path)?))
+            }
             (None, Some(w)) => Source::Wis2(Box::new(Wis2Source::new(
                 w.clone(),
                 parse_iso8601_duration(&config.stale_after)?,

@@ -38,6 +38,8 @@ or downloaded whole.
   the version opened: a request that finds the file replaced gets a 503,
   and a later poll opens the new version. At most 8 requests go to one
   host at once, over every collection on it; polls use at most 2 of them.
+  A retried request's log line names its collection, host and file
+  (ds-storage's `storage` span).
 - **Run and time selection.** A pinned run is exactly that run (404 when
   absent). Otherwise a map draws from the newest run whose steps span the
   requested time, at the nearest step; without a time, the newest run's

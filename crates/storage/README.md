@@ -165,3 +165,37 @@ requests holding one of its permits and those waiting for one (two counting
 stores around its `LimitStore`), for the server's
 `storage_host_requests_{in_flight,queued}` and `storage_host_request_limit`
 gauges.
+
+# The storage span
+
+object_store logs each retry of a throttled or failed request at INFO,
+target `object_store::client::retry`, with only the status, the backoff and
+the attempt number. So every operation on a remote store, S3 or HTTP, runs
+inside `info_span!("storage", collection, store, path)` (#1233):
+
+- `collection`: the collection the store reads for. An engine names it
+  once, where it builds its store, with `DataStore::for_collection(id)`;
+  the field is absent until then.
+- `store`: the source. An HTTP server is `host[:port]` (`thredds.met.no`),
+  an S3 bucket its endpoint's `host[:port]` and the bucket
+  (`s3.us-east-1.amazonaws.com/noaa-goes19`). Never userinfo, a path or a
+  query string, which on a signed URL carries the signature.
+- `path`: the object key, or the list prefix.
+
+The span covers the whole operation: the wait for a request-limit permit,
+the request, object_store's retries, and the GET body or LIST stream that
+object_store retries body reads in. With `LOG_FORMAT=json` the server writes
+the current span on every event, so a retry line carries
+`"span":{"name":"storage","collection":"meps-sfc","store":"thredds.met.no","path":"…"}`;
+the human-readable format prints it as a `storage{…}` prefix. The span is at
+INFO under target `ds_storage::traced`, so a `RUST_LOG` that keeps
+object_store's INFO lines but drops that target logs them without it.
+
+Every `build_*` function that makes a remote store labels it
+(`DataStore::remote` labels a store built elsewhere); local and in-memory
+stores have no span, since they never retry. `DataStore` keeps its store
+without the span and rebuilds the span when it is limited or names its
+collection, so an operation is in exactly one `storage` span, and stores of
+one host limit that name different collections still share that limit
+(`DataStore::same_store`). `inner()` returns the store with the span, for
+callers that hand it to another library.
