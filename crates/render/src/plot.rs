@@ -9,6 +9,9 @@
 //! One [`Panel`] is drawn per parameter (stacked vertically); within a panel
 //! every [`Series`] is overlaid in a cycling colour with a legend.
 
+use std::fmt;
+use std::sync::Arc;
+
 use chrono::DateTime;
 
 use ds_core::error::DataServerError;
@@ -72,7 +75,7 @@ pub struct OverlayLine {
 /// axis then the vertical axis: `values[node * z_len + level]`, matching
 /// the CoverageJSON `Section` ndarray shape `[n_nodes, n_z]`. A `None`
 /// cell renders with the colormap's nodata colour.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Heatmap {
     /// Centred title (the parameter label).
     pub title: String,
@@ -89,11 +92,28 @@ pub struct Heatmap {
     /// Row-major `[node][level]` cell values; length `x_values.len() *
     /// y_values.len()`.
     pub values: Vec<Option<f64>>,
+    /// Colours this panel's cells and colour bar. Each panel has its own,
+    /// so stacked parameters each draw with their own palette (#1159).
+    pub colormap: Arc<dyn ColorMap>,
     /// Colour-bar lower / upper bounds (the colormap's value range).
     pub value_min: f64,
     pub value_max: f64,
     /// Overlay polylines drawn on top of the cell fill.
     pub overlays: Vec<OverlayLine>,
+}
+
+impl fmt::Debug for Heatmap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Heatmap")
+            .field("title", &self.title)
+            .field("value_label", &self.value_label)
+            .field("x_len", &self.x_values.len())
+            .field("y_len", &self.y_values.len())
+            .field("value_min", &self.value_min)
+            .field("value_max", &self.value_max)
+            .field("overlays", &self.overlays.len())
+            .finish_non_exhaustive()
+    }
 }
 
 const BLACK: [u8; 3] = [0x20, 0x20, 0x20];
@@ -255,11 +275,9 @@ pub const HEATMAP_MAX_HEIGHT_PX: u32 = 2000;
 
 /// Render one or more [`Heatmap`]s (stacked vertically) to PNG bytes —
 /// the EDR cross-section (`Section`) plot. Each heatmap is colour-mapped
-/// with `colormap`; the value range for the colour bar comes from each
-/// heatmap's `value_min`/`value_max`.
+/// with its own `colormap`, over its own `value_min`/`value_max`.
 pub fn render_heatmap(
     heatmaps: &[Heatmap],
-    colormap: &dyn ColorMap,
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>, DataServerError> {
@@ -289,7 +307,7 @@ pub fn render_heatmap(
     let panel_h = cv.h / n;
     for (i, hm) in heatmaps.iter().enumerate() {
         let top = i as i32 * panel_h;
-        draw_heatmap_panel(&mut cv, hm, colormap, top, panel_h);
+        draw_heatmap_panel(&mut cv, hm, top, panel_h);
     }
     encode_png(&cv.buf, width, height)
 }
@@ -305,13 +323,7 @@ fn over_white(c: [u8; 4]) -> [u8; 3] {
     [blend(c[0]), blend(c[1]), blend(c[2])]
 }
 
-fn draw_heatmap_panel(
-    cv: &mut Canvas,
-    hm: &Heatmap,
-    colormap: &dyn ColorMap,
-    top: i32,
-    panel_h: i32,
-) {
+fn draw_heatmap_panel(cv: &mut Canvas, hm: &Heatmap, top: i32, panel_h: i32) {
     // Margins: extra room on the right for the colour bar.
     let m_left = 58;
     let m_right = 64;
@@ -376,7 +388,7 @@ fn draw_heatmap_panel(
             let frac_x = (sx as f64 + 0.5) / pw as f64;
             let node = ((frac_x * nx as f64) as usize).min(nx - 1);
             let v = hm.values[node * nz + level];
-            let rgb = over_white(colormap.color(v));
+            let rgb = over_white(hm.colormap.color(v));
             cv.put(x0 + sx, y0 + sy, rgb);
         }
     }
@@ -421,7 +433,7 @@ fn draw_heatmap_panel(
         cv.text(xx - lw / 2, y1 + 6, &label, BLACK, 1);
     }
 
-    draw_colorbar(cv, hm, colormap, x1, y0, y1);
+    draw_colorbar(cv, hm, x1, y0, y1);
     draw_heatmap_captions(cv, hm, x0, x1, y1, top);
 }
 
@@ -518,14 +530,7 @@ fn draw_heatmap_overlays(
 
 /// Vertical colour bar just right of the plot frame, with min/mid/max
 /// value ticks.
-fn draw_colorbar(
-    cv: &mut Canvas,
-    hm: &Heatmap,
-    colormap: &dyn ColorMap,
-    x1: i32,
-    y0: i32,
-    y1: i32,
-) {
+fn draw_colorbar(cv: &mut Canvas, hm: &Heatmap, x1: i32, y0: i32, y1: i32) {
     let bar_x = x1 + 10;
     let bar_w = 12;
     let h = y1 - y0;
@@ -536,7 +541,7 @@ fn draw_colorbar(
         // Top = max value.
         let frac = 1.0 - (sy as f64 + 0.5) / h as f64;
         let v = hm.value_min + frac * (hm.value_max - hm.value_min);
-        let rgb = over_white(colormap.color(Some(v)));
+        let rgb = over_white(hm.colormap.color(Some(v)));
         for bx in 0..bar_w {
             cv.put(bar_x + bx, y0 + sy, rgb);
         }
@@ -1070,6 +1075,14 @@ mod tests {
         assert_eq!(format_time(ts, true), "05-15 13:45");
     }
 
+    fn viridis(min: f64, max: f64) -> Arc<dyn ColorMap> {
+        Arc::new(crate::colormap::LutColorMap::from_builtin(
+            crate::colormap::BuiltinColormap::Viridis,
+            min,
+            max,
+        ))
+    }
+
     fn sample_heatmap() -> Heatmap {
         // 4 nodes × 3 levels, row-major [node][level].
         let values = vec![
@@ -1094,6 +1107,7 @@ mod tests {
             x_values: vec![0.0, 10.0, 20.0, 30.0],
             y_values: vec![0.0, 1000.0, 2000.0],
             values,
+            colormap: viridis(0.0, 40.0),
             value_min: 0.0,
             value_max: 40.0,
             overlays: vec![],
@@ -1102,45 +1116,31 @@ mod tests {
 
     #[test]
     fn heatmap_renders_valid_png_of_requested_size() {
-        let cmap = crate::colormap::LutColorMap::from_builtin(
-            crate::colormap::BuiltinColormap::Viridis,
-            0.0,
-            40.0,
-        );
-        let png = render_heatmap(&[sample_heatmap()], &cmap, 800, 400).unwrap();
+        let png = render_heatmap(&[sample_heatmap()], 800, 400).unwrap();
         assert_eq!(decode_dims(&png), (800, 400));
     }
 
     #[test]
     fn heatmap_render_is_deterministic() {
-        let cmap = crate::colormap::LutColorMap::from_builtin(
+        let mut hm = sample_heatmap();
+        hm.colormap = Arc::new(crate::colormap::LutColorMap::from_builtin(
             crate::colormap::BuiltinColormap::RadarDbz,
             -32.0,
             95.0,
-        );
-        let a = render_heatmap(&[sample_heatmap()], &cmap, 400, 300).unwrap();
-        let b = render_heatmap(&[sample_heatmap()], &cmap, 400, 300).unwrap();
+        ));
+        let a = render_heatmap(std::slice::from_ref(&hm), 400, 300).unwrap();
+        let b = render_heatmap(&[hm], 400, 300).unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn heatmap_empty_is_error() {
-        let cmap = crate::colormap::LutColorMap::from_builtin(
-            crate::colormap::BuiltinColormap::Viridis,
-            0.0,
-            1.0,
-        );
-        assert!(render_heatmap(&[], &cmap, 100, 100).is_err());
+        assert!(render_heatmap(&[], 100, 100).is_err());
     }
 
     #[test]
     fn heatmap_mismatched_values_renders_no_data() {
         // values length != nx*nz → "NO DATA" panel, but still a valid PNG.
-        let cmap = crate::colormap::LutColorMap::from_builtin(
-            crate::colormap::BuiltinColormap::Viridis,
-            0.0,
-            1.0,
-        );
         let bad = Heatmap {
             title: "T".into(),
             x_label: "x".into(),
@@ -1149,11 +1149,12 @@ mod tests {
             x_values: vec![0.0, 1.0],
             y_values: vec![0.0, 1.0],
             values: vec![Some(1.0)], // should be 4
+            colormap: viridis(0.0, 1.0),
             value_min: 0.0,
             value_max: 1.0,
             overlays: vec![],
         };
-        let png = render_heatmap(&[bad], &cmap, 300, 200).unwrap();
+        let png = render_heatmap(&[bad], 300, 200).unwrap();
         assert_eq!(decode_dims(&png), (300, 200));
     }
 
@@ -1168,17 +1169,12 @@ mod tests {
 
     #[test]
     fn heatmap_too_small_for_panel_count_errors() {
-        let cmap = crate::colormap::LutColorMap::from_builtin(
-            crate::colormap::BuiltinColormap::Viridis,
-            0.0,
-            1.0,
-        );
         // 3 panels in a 120px-tall image → 40px each, below the drawable
         // minimum: a clear error, not a silent all-white PNG.
         let three = vec![sample_heatmap(), sample_heatmap(), sample_heatmap()];
-        assert!(render_heatmap(&three, &cmap, 600, 120).is_err());
+        assert!(render_heatmap(&three, 600, 120).is_err());
         // The same three panels in a tall-enough image render fine.
-        assert!(render_heatmap(&three, &cmap, 600, 600).is_ok());
+        assert!(render_heatmap(&three, 600, 600).is_ok());
     }
 
     #[test]
@@ -1188,11 +1184,6 @@ mod tests {
         // valid PNG of the requested size. Before the fix the bottom two
         // bands (0 and 100 m) each occupied a third of the height while
         // ticks were placed by value — labels floated off their bands.
-        let cmap = crate::colormap::LutColorMap::from_builtin(
-            crate::colormap::BuiltinColormap::Viridis,
-            0.0,
-            30.0,
-        );
         let hm = Heatmap {
             title: "DBZH".into(),
             x_label: "Distance (km)".into(),
@@ -1208,11 +1199,12 @@ mod tests {
                 Some(25.0),
                 Some(30.0),
             ],
+            colormap: viridis(0.0, 30.0),
             value_min: 0.0,
             value_max: 30.0,
             overlays: vec![],
         };
-        let png = render_heatmap(&[hm], &cmap, 600, 400).unwrap();
+        let png = render_heatmap(&[hm], 600, 400).unwrap();
         assert_eq!(decode_dims(&png), (600, 400));
     }
 
@@ -1222,12 +1214,7 @@ mod tests {
     /// near the radar and pierce the ceiling far out).
     #[test]
     fn heatmap_overlay_draws_and_clips() {
-        let cmap = crate::colormap::LutColorMap::from_builtin(
-            crate::colormap::BuiltinColormap::Viridis,
-            0.0,
-            40.0,
-        );
-        let plain = render_heatmap(&[sample_heatmap()], &cmap, 400, 300).unwrap();
+        let plain = render_heatmap(&[sample_heatmap()], 400, 300).unwrap();
 
         let mut hm = sample_heatmap();
         hm.overlays.push(OverlayLine {
@@ -1237,10 +1224,10 @@ mod tests {
             points: vec![(0.0, -500.0), (10.0, 400.0), (20.0, 1500.0), (30.0, 3000.0)],
             hatch_below: Some([0xb0, 0xb0, 0xb0]),
         });
-        let with = render_heatmap(&[hm.clone()], &cmap, 400, 300).unwrap();
+        let with = render_heatmap(&[hm.clone()], 400, 300).unwrap();
         assert_eq!(decode_dims(&with), (400, 300));
         assert_ne!(plain, with, "overlay must change rendered pixels");
-        let again = render_heatmap(&[hm], &cmap, 400, 300).unwrap();
+        let again = render_heatmap(&[hm], 400, 300).unwrap();
         assert_eq!(with, again, "overlay render is deterministic");
 
         // A fully-outside overlay must not disturb the plot.
@@ -1251,7 +1238,7 @@ mod tests {
             points: vec![(0.0, 90_000.0), (30.0, 95_000.0)],
             hatch_below: None,
         });
-        let clipped = render_heatmap(&[out], &cmap, 400, 300).unwrap();
+        let clipped = render_heatmap(&[out], 400, 300).unwrap();
         assert_eq!(clipped, plain, "fully-outside line clips away entirely");
     }
 
@@ -1263,11 +1250,6 @@ mod tests {
     /// 160px minus margins leaves 38px, narrower than the label).
     #[test]
     fn heatmap_overlay_label_on_tiny_plot_does_not_panic() {
-        let cmap = crate::colormap::LutColorMap::from_builtin(
-            crate::colormap::BuiltinColormap::Viridis,
-            0.0,
-            40.0,
-        );
         let mut hm = sample_heatmap();
         hm.overlays.push(OverlayLine {
             label: "lowest beam".into(),
@@ -1277,9 +1259,53 @@ mod tests {
         });
         // 3 stacked panels at the 64px-per-panel minimum height.
         let three = vec![hm.clone(), hm.clone(), hm.clone()];
-        assert!(render_heatmap(&three, &cmap, 600, 192).is_ok());
+        assert!(render_heatmap(&three, 600, 192).is_ok());
         // Minimum-width canvas.
-        assert!(render_heatmap(&[hm], &cmap, 160, 300).is_ok());
+        assert!(render_heatmap(&[hm], 160, 300).is_ok());
+    }
+
+    /// A colormap painting every value one opaque colour.
+    struct Solid([u8; 3]);
+    impl ColorMap for Solid {
+        fn color(&self, value: Option<f64>) -> [u8; 4] {
+            let [r, g, b] = self.0;
+            value.map_or([0, 0, 0, 0], |_| [r, g, b, 255])
+        }
+    }
+
+    /// Each stacked panel draws its cells and colour bar with its own
+    /// colormap (#1159): a red panel above a blue one, and neither colour
+    /// reaches the other's half.
+    #[test]
+    fn heatmap_panels_draw_with_their_own_colormaps() {
+        const RED: [u8; 3] = [0xff, 0, 0];
+        const BLUE: [u8; 3] = [0, 0, 0xff];
+        let mut top = sample_heatmap();
+        top.colormap = Arc::new(Solid(RED));
+        let mut bottom = sample_heatmap();
+        bottom.colormap = Arc::new(Solid(BLUE));
+        let (w, h) = (400u32, 400u32);
+        let png = render_heatmap(&[top, bottom], w, h).unwrap();
+
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(&png[..]));
+        decoder.set_transformations(png::Transformations::EXPAND);
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+        let frame = reader.next_frame(&mut buf).unwrap();
+        let channels = frame.color_type.samples();
+        let pixel = |x: u32, y: u32| {
+            let i = (y * w + x) as usize * channels;
+            [buf[i], buf[i + 1], buf[i + 2]]
+        };
+        let count = |rows: std::ops::Range<u32>, rgb: [u8; 3]| {
+            rows.flat_map(|y| (0..w).map(move |x| (x, y)))
+                .filter(|&(x, y)| pixel(x, y) == rgb)
+                .count()
+        };
+        assert!(count(0..h / 2, RED) > 1000, "the top panel is red");
+        assert_eq!(count(0..h / 2, BLUE), 0, "no blue in the top panel");
+        assert!(count(h / 2..h, BLUE) > 1000, "the bottom panel is blue");
+        assert_eq!(count(h / 2..h, RED), 0, "no red in the bottom panel");
     }
 
     #[test]

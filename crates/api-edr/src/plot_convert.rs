@@ -8,6 +8,9 @@
 //! One panel is produced per parameter; each coverage in a collection becomes
 //! one overlaid series (timestep for profiles, level/station for time series).
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 
 use ds_core::error::DataServerError;
@@ -246,34 +249,27 @@ fn haversine_km(lon0: f64, lat0: f64, lon1: f64, lat1: f64) -> f64 {
     EARTH_RADIUS_M * c / 1000.0
 }
 
-/// Adapter: a shared Arc colormap behind the Box<dyn ColorMap> interface
-/// this module returns.
-struct ArcColorMap(std::sync::Arc<dyn ColorMap>);
-impl ColorMap for ArcColorMap {
-    fn color(&self, value: Option<f64>) -> [u8; 4] {
-        self.0.color(value)
-    }
-    fn nodata_color(&self) -> [u8; 4] {
-        self.0.nodata_color()
-    }
-}
-
 /// Convert a cross-section (`Section`) coverage response into stacked
-/// heatmaps plus the shared colormap, ready for [`ds_render::render_heatmap`].
+/// heatmaps, ready for [`ds_render::render_heatmap`].
 ///
 /// One heatmap is produced per quantity in the **latest** coverage (a
 /// multi-timestep request renders its most recent section — a PNG is a
 /// single snapshot, and the newest scan is the right default for radar
 /// imagery). The x axis is cumulative great-circle distance (km) along
 /// the path; the y axis is the vertical coordinate (height above antenna,
-/// m). All quantities share the collection's resolved `style` (the same
-/// `StyleInfo` the raster APIs render with); with no style, viridis is
-/// stretched to the data's own finite range. For a correctly-scaled
-/// single panel, filter with `parameter-name`.
+/// m).
+///
+/// Each quantity draws with its own `default` style, resolved from the
+/// server's style layers `styles` as a map request naming that parameter
+/// resolves it ([`ds_render::resolve_layer_style`], #1159): the
+/// `{collection}/{parameter}` layer's style, which WMS, Maps and Tiles
+/// draw the parameter with, else the collection's. A quantity with
+/// neither gets viridis stretched to its own finite data range.
 pub fn section_response_to_heatmaps(
     resp: &CoverageResponse,
-    style: Option<&ds_render::StyleInfo>,
-) -> Result<(Vec<Heatmap>, Box<dyn ColorMap>), DataServerError> {
+    styles: &HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+    collection_id: &str,
+) -> Result<Vec<Heatmap>, DataServerError> {
     let qr = match resp {
         CoverageResponse::Single(q) => q,
         // The engine returns the per-timestep sections oldest-first
@@ -318,43 +314,6 @@ pub fn section_response_to_heatmaps(
         ));
     }
 
-    // Global finite data range across the rendered quantities — only used
-    // as the colormap fallback when the collection has no colormap config.
-    let mut dmin = f64::INFINITY;
-    let mut dmax = f64::NEG_INFINITY;
-    for p in &params {
-        if let Some(nd) = qr.ranges.get(*p) {
-            for v in nd.values.iter().flatten() {
-                if v.is_finite() {
-                    dmin = dmin.min(*v);
-                    dmax = dmax.max(*v);
-                }
-            }
-        }
-    }
-
-    let (colormap, vmin, vmax): (Box<dyn ColorMap>, f64, f64) = match style {
-        Some(s) => (Box::new(ArcColorMap(s.colormap.clone())), s.min, s.max),
-        None => {
-            // Fallback: viridis stretched to the data's own finite range so a
-            // collection with no style config still produces a readable image.
-            let (mut min, mut max) = (dmin, dmax);
-            if !(min.is_finite() && max.is_finite()) || max <= min {
-                min = 0.0;
-                max = 1.0;
-            }
-            (
-                Box::new(ds_render::LutColorMap::from_builtin(
-                    ds_render::BuiltinColormap::Viridis,
-                    min,
-                    max,
-                )),
-                min,
-                max,
-            )
-        }
-    };
-
     // Lowest-beam coverage floor (#514) as an overlay polyline on every
     // panel: x = along-path km, y = floor metres (raw — ds-render clips
     // the below-axis / above-ceiling reaches). The hatch below the line
@@ -380,6 +339,30 @@ pub fn section_response_to_heatmaps(
             Some(nd) => nd,
             None => continue,
         };
+        let style =
+            ds_render::resolve_layer_style(styles, collection_id, Some(p), None, "default").ok();
+        let (colormap, value_min, value_max): (Arc<dyn ColorMap>, f64, f64) = match style {
+            Some(resolved) => (
+                resolved.style.colormap.clone(),
+                resolved.style.min,
+                resolved.style.max,
+            ),
+            None => {
+                // Fallback: viridis stretched to the quantity's own finite
+                // range, so a collection with no style config still
+                // produces a readable panel.
+                let (min, max) = finite_range(&nd.values);
+                (
+                    Arc::new(ds_render::LutColorMap::from_builtin(
+                        ds_render::BuiltinColormap::Viridis,
+                        min,
+                        max,
+                    )),
+                    min,
+                    max,
+                )
+            }
+        };
         // Section ndarray is row-major [n_nodes, n_z] — exactly the
         // order `render_heatmap` expects.
         let desc = qr.parameters.get(p);
@@ -393,13 +376,31 @@ pub fn section_response_to_heatmaps(
             x_values: x_values.clone(),
             y_values: z.values.clone(),
             values: nd.values.clone(),
-            value_min: vmin,
-            value_max: vmax,
+            colormap,
+            value_min,
+            value_max,
             overlays: overlays.clone(),
         });
     }
 
-    Ok((heatmaps, colormap))
+    Ok(heatmaps)
+}
+
+/// The finite `(min, max)` of `values`, or `(0, 1)` when they hold no
+/// finite range.
+fn finite_range(values: &[Option<f64>]) -> (f64, f64) {
+    let (min, max) = values
+        .iter()
+        .flatten()
+        .filter(|v| v.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &v| {
+            (min.min(v), max.max(v))
+        });
+    if min.is_finite() && max.is_finite() && max > min {
+        (min, max)
+    } else {
+        (0.0, 1.0)
+    }
 }
 
 #[cfg(test)]
@@ -694,11 +695,42 @@ mod tests {
         }
     }
 
+    /// A section of every quantity in `quantities`, each with the
+    /// fixture's values.
+    fn section_of(quantities: &[&str]) -> QueryResult {
+        let mut qr = section(quantities[0], "dBZ");
+        for quantity in &quantities[1..] {
+            let more = section(quantity, "dBZ");
+            qr.parameters.extend(more.parameters);
+            qr.ranges.extend(more.ranges);
+        }
+        qr
+    }
+
+    /// The heatmaps of the section `qr` on the collection `site`, styled
+    /// from `styles`.
+    fn plot(
+        qr: QueryResult,
+        styles: &HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+    ) -> Vec<Heatmap> {
+        section_response_to_heatmaps(&CoverageResponse::Single(qr), styles, "site").unwrap()
+    }
+
+    /// Style layers holding only the collection's own, with `style` as its
+    /// default.
+    fn collection_layer(
+        style: ds_render::StyleInfo,
+    ) -> HashMap<String, HashMap<String, ds_render::StyleInfo>> {
+        HashMap::from([(
+            "site".to_string(),
+            HashMap::from([("default".to_string(), style)]),
+        )])
+    }
+
     #[test]
     fn section_to_heatmap_builds_distance_axis_and_shape() {
         let qr = section("DBZH", "dBZ");
-        let (heatmaps, _cmap) =
-            section_response_to_heatmaps(&CoverageResponse::Single(qr), None).unwrap();
+        let heatmaps = plot(qr, &HashMap::new());
         assert_eq!(heatmaps.len(), 1);
         let hm = &heatmaps[0];
         // x axis: 3 cumulative distances, monotonic ascending from 0.
@@ -737,8 +769,7 @@ mod tests {
             max: Some(95.0),
         });
         let qr = section("DBZH", "dBZ");
-        let (heatmaps, _cmap) =
-            section_response_to_heatmaps(&CoverageResponse::Single(qr), Some(&style)).unwrap();
+        let heatmaps = plot(qr, &collection_layer(style));
         // Style min/max drive the colour-bar bounds.
         assert_eq!(heatmaps[0].value_min, -32.0);
         assert_eq!(heatmaps[0].value_max, 95.0);
@@ -749,10 +780,97 @@ mod tests {
         // No resolved style → viridis stretched to the data's finite range
         // (5..25 in the fixture).
         let qr = section("DBZH", "dBZ");
-        let (heatmaps, _cmap) =
-            section_response_to_heatmaps(&CoverageResponse::Single(qr), None).unwrap();
+        let heatmaps = plot(qr, &HashMap::new());
         assert_eq!(heatmaps[0].value_min, 5.0);
         assert_eq!(heatmaps[0].value_max, 25.0);
+    }
+
+    /// A `default` style on `palette` over `min..max`, resolved as the
+    /// server resolves a configured one.
+    fn palette_style(palette: &str, min: f64, max: f64) -> ds_render::StyleInfo {
+        resolved_style(&ds_render::StyleSpec {
+            colormap: Some(palette),
+            color_stops: &[],
+            min: Some(min),
+            max: Some(max),
+        })
+    }
+
+    /// #1159: each panel draws with its own parameter's style layer, the
+    /// one WMS `{collection}/{parameter}` and Maps/Tiles `parameter-name`
+    /// draw that parameter with, not the collection's default.
+    #[test]
+    fn section_panels_draw_with_their_parameter_styles() {
+        let mut styles = collection_layer(palette_style("temperature", -90.0, 50.0));
+        for (layer, palette, min, max) in [
+            ("site/DBZH", "radar_dbz", -32.0, 95.0),
+            ("site/VRADH", "viridis", -30.0, 30.0),
+        ] {
+            styles.insert(
+                layer.to_string(),
+                HashMap::from([("default".to_string(), palette_style(palette, min, max))]),
+            );
+        }
+        let heatmaps = plot(section_of(&["DBZH", "VRADH"]), &styles);
+        assert_eq!(heatmaps.len(), 2);
+        for (hm, layer) in heatmaps.iter().zip(["site/DBZH", "site/VRADH"]) {
+            let style = &styles[layer]["default"];
+            assert_eq!(
+                (hm.value_min, hm.value_max),
+                (style.min, style.max),
+                "{layer}"
+            );
+            assert!(
+                Arc::ptr_eq(&hm.colormap, &style.colormap),
+                "{layer} draws with its own colormap"
+            );
+        }
+    }
+
+    /// A quantity without a style layer of its own (a moment that appeared
+    /// after the server resolved the layers) draws with the collection's
+    /// default, beside a quantity that has one.
+    #[test]
+    fn section_parameter_without_a_layer_uses_the_collection_style() {
+        let mut styles = collection_layer(palette_style("temperature", -90.0, 50.0));
+        styles.insert(
+            "site/DBZH".to_string(),
+            HashMap::from([(
+                "default".to_string(),
+                palette_style("radar_dbz", -32.0, 95.0),
+            )]),
+        );
+        let heatmaps = plot(section_of(&["DBZH", "ZDR"]), &styles);
+        let collection = &styles["site"]["default"];
+        assert_eq!(
+            (heatmaps[0].value_min, heatmaps[0].value_max),
+            (-32.0, 95.0)
+        );
+        assert_eq!(
+            (heatmaps[1].value_min, heatmaps[1].value_max),
+            (collection.min, collection.max)
+        );
+        assert!(Arc::ptr_eq(&heatmaps[1].colormap, &collection.colormap));
+    }
+
+    /// Without any style, each quantity's viridis fallback spans its own
+    /// finite values, not the union of every panel's.
+    #[test]
+    fn section_fallback_ranges_are_per_quantity() {
+        let mut qr = section_of(&["DBZH", "ZDR"]);
+        for v in qr
+            .ranges
+            .get_mut("ZDR")
+            .unwrap()
+            .values
+            .iter_mut()
+            .flatten()
+        {
+            *v /= 10.0;
+        }
+        let heatmaps = plot(qr, &HashMap::new());
+        assert_eq!((heatmaps[0].value_min, heatmaps[0].value_max), (5.0, 25.0));
+        assert_eq!((heatmaps[1].value_min, heatmaps[1].value_max), (0.5, 2.5));
     }
 
     /// The coverage floor becomes one overlay polyline per panel (#514):
@@ -762,8 +880,7 @@ mod tests {
     #[test]
     fn section_floor_maps_to_overlay() {
         let qr = section("DBZH", "dBZ");
-        let (heatmaps, _cmap) =
-            section_response_to_heatmaps(&CoverageResponse::Single(qr), None).unwrap();
+        let heatmaps = plot(qr, &HashMap::new());
         let hm = &heatmaps[0];
         assert_eq!(hm.overlays.len(), 1);
         let ov = &hm.overlays[0];
@@ -779,23 +896,26 @@ mod tests {
         if let DomainDescription::Section { coverage_floor, .. } = &mut qr.domain {
             *coverage_floor = Some(vec![1.0]); // wrong length
         }
-        let (heatmaps, _cmap) =
-            section_response_to_heatmaps(&CoverageResponse::Single(qr), None).unwrap();
+        let heatmaps = plot(qr, &HashMap::new());
         assert!(heatmaps[0].overlays.is_empty());
 
         let mut qr = section("DBZH", "dBZ");
         if let DomainDescription::Section { coverage_floor, .. } = &mut qr.domain {
             *coverage_floor = None;
         }
-        let (heatmaps, _cmap) =
-            section_response_to_heatmaps(&CoverageResponse::Single(qr), None).unwrap();
+        let heatmaps = plot(qr, &HashMap::new());
         assert!(heatmaps[0].overlays.is_empty());
     }
 
     #[test]
     fn section_heatmap_rejects_non_section() {
         let p = profile(VerticalKind::ElevationAngle, vec![0.5], vec![Some(1.0)]);
-        assert!(section_response_to_heatmaps(&CoverageResponse::Single(p), None).is_err());
+        assert!(section_response_to_heatmaps(
+            &CoverageResponse::Single(p),
+            &HashMap::new(),
+            "site"
+        )
+        .is_err());
     }
 
     /// Descending-order `color_stops` (a natural radar-dBZ legend order)
@@ -831,8 +951,7 @@ mod tests {
         });
         assert!(style.min < style.max, "resolved style must sort the range");
         let qr = section("DBZH", "dBZ");
-        let (heatmaps, _cmap) =
-            section_response_to_heatmaps(&CoverageResponse::Single(qr), Some(&style)).unwrap();
+        let heatmaps = plot(qr, &collection_layer(style));
         assert_eq!(heatmaps[0].value_min, 0.0, "min from the lowest stop");
         assert_eq!(heatmaps[0].value_max, 60.0, "max from the highest stop");
     }
