@@ -635,7 +635,8 @@ static STORAGE_HOST_REQUESTS_QUEUED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 static STORAGE_HOST_REQUEST_LIMIT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     host_gauge(
         "storage_host_request_limit",
-        "Requests a remote host allows in flight at once",
+        "Requests a remote host allows in flight at once now: the configured limit, \
+         or less while it backs off from a 429",
     )
 });
 

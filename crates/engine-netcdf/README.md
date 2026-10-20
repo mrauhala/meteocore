@@ -38,6 +38,9 @@ or downloaded whole.
   the version opened: a request that finds the file replaced gets a 503,
   and a later poll opens the new version. At most 8 requests go to one
   host at once, over every collection on it; polls use at most 2 of them.
+  A host answering 429 gets fewer: the 8 halve per 429 and grow back by
+  one per quiet 30 s, and its `Retry-After` pauses every collection on it
+  (ds-storage's host back-off).
   A retried request's log line names its collection, host and file
   (ds-storage's `storage` span).
 - **Run and time selection.** A pinned run is exactly that run (404 when

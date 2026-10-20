@@ -15,7 +15,8 @@ per-run publication) and the shared `PendingFile` settling rule (#1067);
 per-host request limits for files read in place; every remote operation
 runs in a `storage{collection, store, path}` span, and an engine names its
 collection with `DataStore::for_collection(id)` where it builds the store,
-#1233),
+#1233; its `throttle` module is the one home for HTTP host back-off on
+429: `Retry-After` and the adaptive host limit, #1235),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
 `ds-executor` (shared Tokio render admission/deadline execution and the one
