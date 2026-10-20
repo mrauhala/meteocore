@@ -509,6 +509,12 @@ cube is an area's steps and cells, never coarsened, sampled bilinearly,
   30 s `QUERY_TIMEOUT` is a `DeadlineExceeded` (EDR 504, GetFeatureInfo
   503) while its fetches go on into `CHUNKS`, so a retry makes progress
   (`remote::tests::a_query_past_its_deadline_leaves_its_chunks_cached`).
+  A query read of a field another query's detached read is still reading
+  joins it (`field::QUERY_IN_FLIGHT`): no slot, no decode, no GET; a failed
+  read leaves the joiner to read for its own error. Retries used to fill
+  the 8-slot pool and push cold reads inline, where the deadline cut their
+  GETs off (`retries_join_the_reads_a_late_query_left_running`). Remote
+  tests that pin GETs take `remote::tests::QUERY_POOL`.
   Every read reserves the decode budget; a failed read fails the query,
   never a null: a replaced file or the budget is `ResourceExhausted` (503),
   the deadline `DeadlineExceeded` (504), any other remote failure
