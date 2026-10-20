@@ -133,6 +133,9 @@ locations (`EdrEngine::serves_station_series`: CSV, BUFR, PostGIS stations).
   `'` (OWASP CSV injection guidance). A body over 64 MiB is a 400.
 - **PNG.** A time-series or profile plot (`width` × `height`, default
   800 × 600), or for a radar cross-section one heatmap panel per parameter.
+  Each panel uses its parameter's own default map style, the one the WMS
+  layer `<collection>/<parameter>` and Maps/Tiles `parameter-name` use.
+  A parameter without a style of its own uses the collection's default.
   A location list has no PNG.
 
 ### Location lists

@@ -159,6 +159,7 @@ dependencies = [
  "http-body-util",
  "jsonschema",
  "percent-encoding",
+ "png",
  "serde",
  "serde_json",
  "tokio",

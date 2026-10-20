@@ -5119,9 +5119,10 @@ type MapRegistry<'a> = (
 /// parameter, which only the engine names, so it takes that parameter's
 /// built-in default ([`ds_render::StyleContext::base_layer_default`]) in
 /// every map API, and in EDR's styles too, so EDR and the map APIs keep
-/// one resolution (the `f=png` plot draws the collection's default): the
-/// events shape's strike-age layer is one. A root layer still generic
-/// after that is warned.
+/// one resolution (the `f=png` plot draws a parameter without a style
+/// layer of its own with the collection's default, #1159): the events
+/// shape's strike-age layer is one. A root layer still generic after that
+/// is warned.
 fn default_generic_root_layers(
     ctx: &ds_render::StyleContext,
     bundles: &HashMap<&str, &StyleBundle>,
@@ -11039,6 +11040,94 @@ colormap = "radar_dbz"
         assert_eq!(edr.len(), wms.len(), "EDR and WMS share one resolution");
         assert_eq!(edr["default"].min, wms["default"].min);
         assert_eq!(edr["default"].max, wms["default"].max);
+    }
+
+    /// The EDR state holds a PVOL site's per-quantity style layers (#1159):
+    /// the `f=png` cross-section resolves each panel's quantity to the very
+    /// style WMS draws `LAYERS=<site>/<quantity>` with, a `[[wms.parameters]]`
+    /// palette included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edr_resolves_each_pvol_quantity_style_as_wms_does() {
+        let dir = tempfile::tempdir().unwrap();
+        // One volume of site `test` with DBZH and VRAD.
+        std::fs::write(
+            dir.path().join("pvol.h5"),
+            include_bytes!("../../../testdata/pvol-cold-batch.h5"),
+        )
+        .unwrap();
+        let collection: CollectionConfig = toml::from_str(&format!(
+            r#"
+id = "pvol"
+title = "Volumes"
+description = "test"
+engine_type = "odim-volume"
+apis = ["edr", "wms"]
+data_path = {path:?}
+
+[odim]
+prewarm_sweeps = 0
+
+[wms]
+colormap = "radar_dbz"
+
+[[wms.parameters]]
+name = "VRAD"
+colormap = "viridis"
+min = -30.0
+max = 30.0
+"#,
+            path = dir.path().to_str().unwrap()
+        ))
+        .unwrap();
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[collection],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let site = "pvol-test";
+        assert_eq!(
+            health_of(&result, site).status,
+            super::CollectionStatus::Ready
+        );
+        let info = result.wms_state.engines[site].raster_info_shared();
+        for quantity in ["DBZH", "VRAD"] {
+            let edr = ds_render::resolve_layer_style(
+                &result.edr_state.styles,
+                site,
+                Some(quantity),
+                None,
+                "default",
+            )
+            .unwrap();
+            let wms = ds_render::resolve_layer_style(
+                &result.wms_state.styles,
+                site,
+                Some(quantity),
+                Some(&info),
+                "default",
+            )
+            .unwrap();
+            assert_eq!(edr.layer, format!("{site}/{quantity}"));
+            assert_eq!(edr.layer, wms.layer);
+            assert!(
+                Arc::ptr_eq(&edr.style.colormap, &wms.style.colormap),
+                "{quantity}: EDR draws WMS's colormap"
+            );
+            assert_eq!(
+                (edr.style.min, edr.style.max),
+                (wms.style.min, wms.style.max)
+            );
+        }
+        let vrad = &result.edr_state.styles["pvol-test/VRAD"]["default"];
+        assert_eq!(
+            (vrad.palette.name.as_str(), vrad.min, vrad.max),
+            ("viridis", -30.0, 30.0)
+        );
     }
 
     /// A PVOL site's 3D Tiles document (#1137): each quantity is drawn with

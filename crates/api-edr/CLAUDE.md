@@ -276,7 +276,12 @@ and never under an instance.
   draws it as a hatched-below "lowest beam" overlay line. The PNG stacks one
   panel per parameter; size it with `params::section_plot_dimensions`
   (default height grows with the panels, a misfit is a 400 naming
-  `parameter-name`), never let `render_heatmap` fail it as a 500.
+  `parameter-name`), never let `render_heatmap` fail it as a 500. Each panel draws with its own parameter's style (#1159):
+  `plot_convert::section_response_to_heatmaps` resolves
+  `ds_render::resolve_layer_style(styles, id, Some(parameter), None, "default")`
+  per panel, the `{collection}/{parameter}` layer WMS, Maps and Tiles draw
+  it with, else the collection's, and `ds_render::Heatmap` carries that
+  colormap. Never colour every panel with the collection's `default`.
 - `f=png` time-series plots are why this crate (alone among API crates)
   depends on ds-render.
 - A location with no data in the requested window returns `LocationNotFound`

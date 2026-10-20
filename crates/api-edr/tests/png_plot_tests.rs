@@ -149,7 +149,11 @@ macro_rules! impl_common {
 impl_common!(ProfileEngine, profile_result());
 impl_common!(SeriesEngine, series_result());
 
-fn router_with(engine: Arc<dyn EdrEngine>) -> axum::Router {
+/// The style layers of the EDR state, keyed `"{collection}"` and
+/// `"{collection}/{parameter}"`, as the server resolves them.
+type StyleLayers = HashMap<String, HashMap<String, ds_render::StyleInfo>>;
+
+fn router_with_styles(engine: Arc<dyn EdrEngine>, styles: StyleLayers) -> axum::Router {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     engines.insert("c".to_string(), engine);
@@ -186,14 +190,22 @@ fn router_with(engine: Arc<dyn EdrEngine>) -> axum::Router {
         engines,
         feature_engines: HashMap::new(),
         collections,
-        styles: HashMap::new(),
+        styles,
         base_url: String::new(),
         trust_proxy_headers: false,
     })))
 }
 
 async fn request(engine: Arc<dyn EdrEngine>, uri: &str) -> (StatusCode, String, Vec<u8>) {
-    let app = router_with(engine);
+    request_styled(engine, HashMap::new(), uri).await
+}
+
+async fn request_styled(
+    engine: Arc<dyn EdrEngine>,
+    styles: StyleLayers,
+    uri: &str,
+) -> (StatusCode, String, Vec<u8>) {
+    let app = router_with_styles(engine, styles);
     let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
@@ -433,4 +445,108 @@ async fn section_png_that_cannot_fit_is_400() {
         let description = json["description"].as_str().unwrap();
         assert!(description.contains("parameter-name"), "{description}");
     }
+}
+
+const RED: [u8; 3] = [0xff, 0x00, 0x00];
+const GREEN: [u8; 3] = [0x00, 0xff, 0x00];
+const BLUE: [u8; 3] = [0x00, 0x00, 0xff];
+
+/// A `default` style painting every value of 0..100 one opaque colour,
+/// resolved as the server resolves configured `color_stops`.
+fn solid_style(rgb: [u8; 3]) -> ds_render::StyleInfo {
+    let color = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+    let stops = [0.0, 100.0].map(|value| ds_core::config::ColorStop {
+        value,
+        color: color.clone(),
+    });
+    let resolved = ds_render::StyleContext::with_builtins()
+        .build_colormap(&ds_render::StyleSpec {
+            colormap: None,
+            color_stops: &stops,
+            min: None,
+            max: None,
+        })
+        .unwrap();
+    ds_render::StyleInfo {
+        name: "default".into(),
+        title: "Default".into(),
+        colormap: resolved.colormap,
+        palette: resolved.palette,
+        min: resolved.min,
+        max: resolved.max,
+        parameter: None,
+    }
+}
+
+/// Style layers with `layers` as `(layer, colour)` default styles.
+fn solid_layers(layers: &[(&str, [u8; 3])]) -> StyleLayers {
+    layers
+        .iter()
+        .map(|&(layer, rgb)| {
+            (
+                layer.to_string(),
+                HashMap::from([("default".to_string(), solid_style(rgb))]),
+            )
+        })
+        .collect()
+}
+
+/// How many pixels of each of `colours` the PNG `body` has in each of
+/// `panels` equal horizontal bands, top first.
+fn colours_per_panel(body: &[u8], panels: u32, colours: &[[u8; 3]]) -> Vec<Vec<usize>> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(body));
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+    let frame = reader.next_frame(&mut buf).unwrap();
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let channels = frame.color_type.samples();
+    let band = h / panels as usize;
+    (0..panels as usize)
+        .map(|panel| {
+            colours
+                .iter()
+                .map(|rgb| {
+                    (panel * band..(panel + 1) * band)
+                        .flat_map(|y| (0..w).map(move |x| (y * w + x) * channels))
+                        .filter(|&i| buf[i..i + 3] == rgb[..])
+                        .count()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// #1159: each panel of a cross-section draws with its own parameter's
+/// style layer, the `{collection}/{parameter}` default WMS, Maps and Tiles
+/// draw that parameter with, never the collection's default for all.
+#[tokio::test]
+async fn section_png_draws_each_parameter_with_its_own_style() {
+    let styles = solid_layers(&[("c", GREEN), ("c/Q0", RED), ("c/Q1", BLUE)]);
+    let (status, _, body) =
+        request_styled(Arc::new(SectionEngine { params: 2 }), styles, SECTION).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let counts = colours_per_panel(&body, 2, &[RED, BLUE, GREEN]);
+    let [q0, q1] = [&counts[0], &counts[1]];
+    assert!(q0[0] > 1000, "Q0 draws red: {q0:?}");
+    assert_eq!((q0[1], q0[2]), (0, 0), "Q0 has no blue or green: {q0:?}");
+    assert!(q1[1] > 1000, "Q1 draws blue: {q1:?}");
+    assert_eq!((q1[0], q1[2]), (0, 0), "Q1 has no red or green: {q1:?}");
+}
+
+/// A parameter without a style layer of its own falls back to the
+/// collection's default, while its neighbour keeps its own.
+#[tokio::test]
+async fn section_png_parameter_without_a_layer_uses_the_collection_style() {
+    let styles = solid_layers(&[("c", GREEN), ("c/Q0", RED)]);
+    let (status, _, body) =
+        request_styled(Arc::new(SectionEngine { params: 2 }), styles, SECTION).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let counts = colours_per_panel(&body, 2, &[RED, GREEN]);
+    let [q0, q1] = [&counts[0], &counts[1]];
+    assert!(q0[0] > 1000 && q0[1] == 0, "Q0 draws its own red: {q0:?}");
+    assert!(
+        q1[1] > 1000 && q1[0] == 0,
+        "Q1 draws the collection's green: {q1:?}"
+    );
 }
