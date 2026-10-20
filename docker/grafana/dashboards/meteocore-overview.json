@@ -2592,7 +2592,7 @@
         "spec": {
           "id": 111,
           "title": "Cache hit ratio",
-          "description": "Hits as a share of all lookups over the last 5 min, summed over every byte-bounded cache, so the busiest caches weigh most. Red below 30 %, amber below 60 %. It dips after a restart while caches refill; a lasting drop means the working set no longer fits. The All caches table has each cache.",
+          "description": "Hits as a share of all lookups over the last 5 min, summed over every byte-bounded cache, so the busiest caches weigh most. Red below 30 %, amber below 60 %; no data, in grey, means no cache had a lookup in the window. It dips after a restart while caches refill; a lasting drop means the working set no longer fits. The All caches table has each cache.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -2611,7 +2611,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum(rate({job=~\"$job\", __name__=~\".+_cache_hits_total\"}[5m])) / ((sum(rate({job=~\"$job\", __name__=~\".+_cache_hits_total\"}[5m])) + sum(rate({job=~\"$job\", __name__=~\".+_cache_misses_total\"}[5m]))) > 0)",
+                        "expr": "sum(rate(label_replace({job=~\"$job\", __name__=~\".+_cache_hits_total\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[5m:15s])) / ((sum(rate(label_replace({job=~\"$job\", __name__=~\".+_cache_hits_total\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[5m:15s])) + sum(rate(label_replace({job=~\"$job\", __name__=~\".+_cache_misses_total\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[5m:15s]))) > 0)",
                         "legendFormat": "hit ratio",
                         "range": true,
                         "instant": false,
@@ -2659,8 +2659,12 @@
                     "mode": "absolute",
                     "steps": [
                       {
-                        "color": "red",
+                        "color": "text",
                         "value": null
+                      },
+                      {
+                        "color": "red",
+                        "value": 0
                       },
                       {
                         "color": "orange",

@@ -906,6 +906,31 @@ STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`[^`]*`')
 TAB_PARAM_RE = re.compile(r"(?:^|[?&])((?:[^&=?#]+-)?dtab)=([^&#]*)")
 
 
+# What may take a selector of several metric names as its argument: an
+# aggregation, label_replace keeping the name in a label, or Grafana's
+# label_values() series lookup. Anything else
+# (rate, increase, arithmetic, ...) drops __name__ and Prometheus rejects the
+# result with "vector cannot contain metrics with the same labelset" as soon
+# as two of the names share their labels.
+NAME_SAFE_OPEN_RE = re.compile(
+    r"(?:\b(?:sum|count|min|max|avg|group|stddev|stdvar)\s*"
+    r"(?:(?:by|without)\s*\([^()]*\)\s*)?|\blabel_replace\s*|\blabel_values\s*)\(\s*$")
+
+
+def bare_name_selectors(expr: str) -> list[tuple[str, str]]:
+    """The __name__ matchers (op, value) of selectors that a name-dropping
+    function or operator receives directly."""
+    bare = []
+    for m in re.finditer(r"\{([^{}]*)\}", expr):
+        prefix = expr[:m.start()]
+        if re.search(r"[A-Za-z_:][\w:]*\s*$", prefix):
+            continue                      # a named selector: one metric name
+        for op, val in re.findall(r'__name__\s*(=~|!~|!=)\s*"((?:[^"\\]|\\.)*)"', m.group(1)):
+            if not NAME_SAFE_OPEN_RE.search(prefix):
+                bare.append((op, val))
+    return bare
+
+
 def promql_names(expr: str) -> tuple[list[str], list[tuple[str, str]]]:
     """The metric names and the __name__ matchers of a PromQL expression
     (or of a Grafana label_values() variable query)."""
@@ -1278,6 +1303,7 @@ class DashboardCheck:
             self.err(where, f"${name} is used outside a label matcher, where this check "
                      "cannot resolve it")
         names, matchers = promql_names(e)
+        bare = bare_name_selectors(e)
         for n in names:
             if n.startswith("__VAR_"):
                 continue
@@ -1302,6 +1328,13 @@ class DashboardCheck:
                 self.err(where, f"{shown} is not a valid regex")
                 continue
             hit = {f for f in self.families for s in self.suffixes(f) if rx.fullmatch(f + s)}
+            names = {f + s for f in self.families for s in self.suffixes(f) if rx.fullmatch(f + s)}
+            if len(names) > 1 and (op, val) in bare:
+                self.err(where, f"{shown} selects {len(names)} metrics, but a function or "
+                         "operator that drops the metric name receives them: Prometheus "
+                         "rejects that with \"vector cannot contain metrics with the same "
+                         "labelset\". Aggregate them first, or label_replace the name into "
+                         "a label")
             if not hit:
                 self.err(where, f"{shown} matches no registered family")
             elif len(hit) == len(self.families) > 1:
