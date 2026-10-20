@@ -45,6 +45,8 @@ use crate::io::{self, Mode};
 
 /// Requests in flight to one host at once, over every collection reading
 /// it (#1067: thredds.met.no's fileServer is not a documented interface).
+/// ds-storage halves it while the host answers 429 and grows it back when
+/// the host is quiet (#1235).
 pub(crate) const HOST_REQUEST_LIMIT: usize = 8;
 
 /// Of [`HOST_REQUEST_LIMIT`], the requests ingest and prewarm may hold, so

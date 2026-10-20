@@ -380,7 +380,9 @@ pub(crate) struct RangeObject {
     /// such as `403 Forbidden`.
     pub status: Option<&'static str>,
     /// Answer the next requests for the object with these status lines,
-    /// one each, such as `429 Too Many Requests`, then serve it again.
+    /// one each, such as `429 Too Many Requests`, then serve it again. A
+    /// status line may carry header lines after it:
+    /// `429 Too Many Requests\r\nRetry-After: 1`.
     pub fail_next: VecDeque<&'static str>,
     /// The head of the last request, lowercased.
     pub last_request: String,

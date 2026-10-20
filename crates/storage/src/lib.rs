@@ -9,6 +9,7 @@ mod error;
 mod gauge;
 #[cfg(test)]
 mod test_store;
+mod throttle;
 mod traced;
 
 use std::ops::Range;
@@ -1332,11 +1333,16 @@ fn build_s3_from_http_url(data_path: &str) -> Result<(DataStore, ObjectPath), Da
 
 /// The generic HTTP backend must not follow an operator-trusted URL to an
 /// unvalidated host. object_store's default connector follows redirects;
-/// its injectable connector lets us enforce the policy for every operation.
+/// its injectable connector lets us enforce the policy for every operation,
+/// and send every request through its host's throttle (#1235). `S` is the
+/// transport: the no-redirect `reqwest::Client` [`http_object_store`]
+/// builds, or a scripted one in tests.
 #[derive(Debug)]
-struct NoRedirectConnector(reqwest::Client);
+struct NoRedirectConnector<S>(throttle::Throttled<S>);
 
-impl object_store::client::HttpConnector for NoRedirectConnector {
+impl<S: object_store::client::HttpService + Clone> object_store::client::HttpConnector
+    for NoRedirectConnector<S>
+{
     fn connect(
         &self,
         _options: &object_store::ClientOptions,
@@ -1348,17 +1354,30 @@ impl object_store::client::HttpConnector for NoRedirectConnector {
 /// Build a no-redirect HTTP object store without S3 URL auto-detection.
 /// Use for feeds and allowlisted document URLs, including S3-hosted objects.
 /// The source query string is preserved on each request.
+///
+/// It has no request limit, but it honours its host's `Retry-After` with
+/// every other store on the host ([`build_http_store_limited`]).
 pub fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
+    http_store(data_path, http_object_store)
+}
+
+/// [`build_http_store`] on the store `connect` makes for the base URL:
+/// [`http_object_store`], or one on a scripted transport in tests.
+fn http_store(
+    data_path: &str,
+    connect: impl Fn(&url::Url) -> Result<Arc<dyn ObjectStore>, DataServerError>,
+) -> Result<(DataStore, ObjectPath), DataServerError> {
     let (base_url, path) = http_base(data_path)?;
-    let store = http_object_store(&base_url)?;
+    let store = connect(&base_url)?;
     Ok((DataStore::remote(store, &http_label(&base_url)), path))
 }
 
-/// A host store [`build_http_store_limited`] built: its limit, the limited
-/// store, and its request counters.
+/// A host store [`build_http_store_limited`] built: its configured limit,
+/// the limited store, its adaptive limit, and its request counters.
 #[derive(Clone)]
 struct HostStore {
     limit: usize,
+    adaptive: Arc<throttle::AdaptiveLimit>,
     store: Arc<dyn ObjectStore>,
     gauges: Arc<gauge::HostGauges>,
 }
@@ -1369,7 +1388,7 @@ static HOST_STORES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 /// [`build_http_store`] with at most `max_requests` (at least 1) requests
-/// in flight to the URL's host at once ([`DataStore::with_request_limit`]).
+/// in flight to the URL's host at once.
 ///
 /// The limit is shared by every store built through this function for the
 /// same scheme, host and port, whatever their paths, so collections reading
@@ -1378,10 +1397,29 @@ static HOST_STORES: std::sync::LazyLock<
 /// of their own. The first call for a base fixes its limit for the life of
 /// the process: a later call naming another limit shares the first and
 /// logs a WARN. [`host_requests`] reports the requests in flight and
-/// waiting under each limit.
+/// waiting under each limit. A GET holds its permit until its body has
+/// been read, and [`DataStore::with_request_limit`] stacks a share on it.
+///
+/// The limit adapts to a host that throttles (#1235): a 429 Too Many
+/// Requests halves it, never below 1 and at most once a second, and each
+/// 30 s without one adds one back, up to the configured limit. Requests in
+/// flight when it is cut finish. A 429's `Retry-After` pauses new requests
+/// to the host, from every store on it, for at most a minute
+/// (`throttle.rs`).
 pub fn build_http_store_limited(
     data_path: &str,
     max_requests: usize,
+) -> Result<(DataStore, ObjectPath), DataServerError> {
+    limited_http_store(data_path, max_requests, http_object_store)
+}
+
+/// [`build_http_store_limited`] on the store `connect` makes for a base
+/// URL the first time it is named: [`http_object_store`], or one on a
+/// scripted transport in tests.
+fn limited_http_store(
+    data_path: &str,
+    max_requests: usize,
+    connect: impl Fn(&url::Url) -> Result<Arc<dyn ObjectStore>, DataServerError>,
 ) -> Result<(DataStore, ObjectPath), DataServerError> {
     let (base_url, path) = http_base(data_path)?;
     let max_requests = max_requests.max(1);
@@ -1393,14 +1431,21 @@ pub fn build_http_store_limited(
         None => {
             let gauges = Arc::new(gauge::HostGauges::default());
             let counted: Arc<dyn ObjectStore> = Arc::new(gauge::Gauged {
-                inner: http_object_store(&base_url)?,
+                inner: connect(&base_url)?,
                 count: gauges.in_flight.clone(),
             });
-            let limited = DataStore::new(counted)
-                .with_request_limit(max_requests)
-                .inner;
+            let adaptive = Arc::new(throttle::AdaptiveLimit::new(
+                http_label(&base_url),
+                max_requests,
+            ));
+            throttle::for_url(&base_url).add_limit(adaptive.clone());
+            let limited: Arc<dyn ObjectStore> = Arc::new(throttle::Limited {
+                inner: counted,
+                limit: adaptive.clone(),
+            });
             let host = HostStore {
                 limit: max_requests,
+                adaptive,
                 store: Arc::new(gauge::Gauged {
                     inner: limited,
                     count: gauges.requested.clone(),
@@ -1422,10 +1467,20 @@ pub fn build_http_store_limited(
 }
 
 /// The requests in flight and waiting under each limit
-/// [`build_http_store_limited`] has made, one entry per host and port:
-/// the bases of one host that differ in their query strings are summed.
-/// One entry per configured host, so a bounded label set for `/metrics`.
+/// [`build_http_store_limited`] has made, and the limit as it is now: the
+/// configured one, or less while the host backs off from a 429 (#1235).
+/// One entry per host and port: the bases of one host that differ in
+/// their query strings are summed. One entry per configured host, so a
+/// bounded label set for `/metrics`.
 pub fn host_requests() -> Vec<HostRequests> {
+    requests_to(|_| true)
+}
+
+/// [`host_requests`] of the hosts whose `host[:port]` is `wanted`. Reading
+/// a limit applies the growth it has earned by the caller's clock, so
+/// paused-time tests read only their own host: another test's clock would
+/// grow it.
+fn requests_to(wanted: impl Fn(&str) -> bool) -> Vec<HostRequests> {
     let hosts = HOST_STORES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1435,6 +1490,9 @@ pub fn host_requests() -> Vec<HostRequests> {
             .ok()
             .and_then(|url| traced::host_port(&url))
             .unwrap_or_default();
+        if !wanted(&label) {
+            continue;
+        }
         let (in_flight, queued) = host.gauges.read();
         let entry = by_host
             .entry(label.clone())
@@ -1444,7 +1502,7 @@ pub fn host_requests() -> Vec<HostRequests> {
                 in_flight: 0,
                 queued: 0,
             });
-        entry.limit += host.limit;
+        entry.limit += host.adaptive.limits(tokio::time::Instant::now()).0;
         entry.in_flight += in_flight;
         entry.queued += queued;
     }
@@ -1476,7 +1534,8 @@ fn http_base(data_path: &str) -> Result<(url::Url, ObjectPath), DataServerError>
     Ok((base_url, ObjectPath::from(path)))
 }
 
-/// A no-redirect HTTP object store on `base_url`.
+/// A no-redirect HTTP object store on `base_url`, under its host's
+/// throttle.
 fn http_object_store(base_url: &url::Url) -> Result<Arc<dyn ObjectStore>, DataServerError> {
     // Own all transport options here rather than using ClientOptions (whose
     // reqwest builder is private). Disable transparent decompression to keep
@@ -1492,9 +1551,23 @@ fn http_object_store(base_url: &url::Url) -> Result<Arc<dyn ObjectStore>, DataSe
         .no_deflate()
         .build()
         .map_err(|e| DataServerError::Storage(format!("Cannot create HTTP client: {e}")))?;
+    throttled_http_store(base_url, client)
+}
+
+/// An HTTP object store on `base_url` sending every request, object_store's
+/// retries included, through `transport` under the throttle of the base's
+/// scheme, host and port ([`throttle`]).
+fn throttled_http_store<S: object_store::client::HttpService + Clone>(
+    base_url: &url::Url,
+    transport: S,
+) -> Result<Arc<dyn ObjectStore>, DataServerError> {
+    let connector = NoRedirectConnector(throttle::Throttled {
+        inner: transport,
+        host: throttle::for_url(base_url),
+    });
     let store = object_store::http::HttpBuilder::new()
         .with_url(base_url.as_str())
-        .with_http_connector(NoRedirectConnector(client))
+        .with_http_connector(connector)
         .build()
         .map_err(|e| {
             DataServerError::Storage(format!("Cannot create HTTP store for {base_url}: {e}"))
@@ -2284,9 +2357,9 @@ mod range_tests {
         let limited = HOST_STORES.lock().unwrap();
         assert_eq!(limited["http://127.0.0.1:9/"].limit, 8);
         drop(limited);
-        let idle = host_requests()
+        let idle = requests_to(|host| host == "127.0.0.1:9")
             .into_iter()
-            .find(|host| host.host == "127.0.0.1:9")
+            .next()
             .unwrap();
         assert_eq!((idle.limit, idle.in_flight, idle.queued), (8, 0, 0));
     }
