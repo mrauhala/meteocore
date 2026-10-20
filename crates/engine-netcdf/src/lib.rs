@@ -15,7 +15,10 @@
 //! range, never downloaded whole. A family on a CF pressure axis (MEPS's
 //! `pl` files) serves its levels as the collection's vertical axis, in hPa,
 //! bottom first: one field is one level ([`catalog::Layout::map_level`],
-//! [`catalog::Layout::query_levels`]).
+//! [`catalog::Layout::query_levels`]). A variable accumulated since the run
+//! start (`<name>_acc` in mm, MEPS's precipitation) also gives `<name>`, its
+//! amount per step, differenced from two sampled fields of one run
+//! ([`catalog::PerStep`], #1165).
 
 mod catalog;
 pub mod decode_budget;
@@ -43,7 +46,7 @@ use ds_core::config::NetcdfConfig;
 use ds_core::deadline;
 use ds_core::error::DataServerError;
 use ds_core::geo::GeoTransform;
-use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
+use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::resample::OutputMap;
 use ds_core::units::DisplayConversion;
 use ds_poll::{FirstTick, Shutdown};
@@ -57,7 +60,7 @@ use netcdf_reader::{DynStorage, NcFile};
 pub use field::{detached_fill_metrics, field_cache_metrics};
 pub use remote::{block_cache_metrics, chunk_cache_metrics};
 
-use catalog::{Catalog, Identity, Layout, OpenFile, Run, RunKey, Step};
+use catalog::{Catalog, Identity, Layout, OpenFile, Param, Run, RunKey, Selected, Step};
 use discover::{Listed, Names};
 use ingest::{Inspected, Wanted};
 use io::Mode;
@@ -99,6 +102,8 @@ pub struct NetcdfEngine {
     max_runs: usize,
     max_files: usize,
     poll_interval: Duration,
+    /// Serve the per-step amount of each run-start accumulation (#1165).
+    derive_per_step: bool,
     catalog: ArcSwap<Catalog>,
     /// What the poll knows about the files; only the poll takes it.
     state: Mutex<PollState>,
@@ -327,6 +332,7 @@ impl NetcdfEngine {
             max_runs: config.max_runs,
             max_files: config.max_files,
             poll_interval: Duration::from_secs(config.poll_interval_secs),
+            derive_per_step: config.derive_per_step,
             catalog: ArcSwap::from_pointee(Catalog::empty(content_version)),
             state: Mutex::new(PollState {
                 known: HashMap::new(),
@@ -632,7 +638,7 @@ impl NetcdfEngine {
             );
         }
 
-        let catalog = self.build_catalog(&state, &keep);
+        let catalog = self.build_catalog(&mut state, &keep);
         tracing::debug!(
             "[{}] poll: {} listed, {} runs, {} times",
             self.collection_id,
@@ -1111,14 +1117,24 @@ impl NetcdfEngine {
                     ""
                 }
             );
-            state.layout = Some(Arc::new(Layout::new(
+            let layout = Layout::new(
                 inspected
                     .fields
                     .iter()
                     .map(|f| f.variable.clone())
                     .collect(),
                 inspected.grid.clone(),
-            )));
+                self.derive_per_step,
+            );
+            for per_step in &layout.per_step {
+                tracing::info!(
+                    "[{}] serving '{}', the per-step amount of the run-start accumulation '{}'",
+                    self.collection_id,
+                    per_step.name,
+                    layout.variables[per_step.source].name
+                );
+            }
+            state.layout = Some(Arc::new(layout));
             return Ok(());
         };
         if !layout.grid.same(&inspected.grid) {
@@ -1201,8 +1217,13 @@ impl NetcdfEngine {
         keep
     }
 
-    /// The catalog of the retained open files.
-    fn build_catalog(&self, state: &PollState, keep: &HashSet<PathBuf>) -> Catalog {
+    /// The catalog of the retained open files. A step that has another
+    /// step before it than in the catalog served so far (a lead arrived
+    /// late, or was removed, inside a run) moves the content version when
+    /// the layout serves per-step amounts (#1165): the amount at that step
+    /// changes under the same valid time and run, which is all the
+    /// rendered caches key it on.
+    fn build_catalog(&self, state: &mut PollState, keep: &HashSet<PathBuf>) -> Catalog {
         let mut runs: BTreeMap<RunKey, Run> = BTreeMap::new();
         // Of two files with a step at one valid time in one run, the greater
         // path wins, whatever the listing order.
@@ -1232,6 +1253,18 @@ impl NetcdfEngine {
             }
         }
         let layout = state.layout.clone();
+        if layout
+            .as_ref()
+            .is_some_and(|layout| !layout.per_step.is_empty())
+            && catalog::steps_before_changed(&self.catalog.load().runs, &runs)
+        {
+            state.content_version += 1;
+            tracing::info!(
+                "[{}] a step inside a run was added or removed: per-step amounts drawn \
+                 before are stale",
+                self.collection_id
+            );
+        }
         let info = catalog::raster_info(layout.as_deref(), &runs, &self.titles);
         Catalog {
             layout,
@@ -1242,19 +1275,15 @@ impl NetcdfEngine {
         }
     }
 
-    /// The layout index of `parameter`, the first variable for `None`.
-    fn variable_index(layout: &Layout, parameter: Option<&str>) -> Result<usize, DataServerError> {
+    /// The parameter served as `parameter`, the first variable for `None`.
+    fn param(layout: &Layout, parameter: Option<&str>) -> Result<Param, DataServerError> {
         match parameter {
-            None => Ok(0),
-            Some(name) => layout
-                .variables
-                .iter()
-                .position(|v| &*v.name == name)
-                .ok_or_else(|| {
-                    DataServerError::InvalidParameter(format!(
-                        "Parameter '{name}' is unavailable in this collection"
-                    ))
-                }),
+            None => Ok(Param::Stored(0)),
+            Some(name) => layout.param(name).ok_or_else(|| {
+                DataServerError::InvalidParameter(format!(
+                    "Parameter '{name}' is unavailable in this collection"
+                ))
+            }),
         }
     }
 
@@ -1275,6 +1304,46 @@ impl NetcdfEngine {
             layout.grid.flipped,
             &self.decodes,
         )
+    }
+
+    /// The fields `param` is drawn from at the step `selected` names and
+    /// level `level`: a variable's own; a per-step amount's (#1165)
+    /// accumulation at the step and at the run's step before (`None` at
+    /// its first step). Each is read once through the field cache, so the
+    /// field one frame reads is the next frame's step before.
+    fn fields_of(
+        &self,
+        layout: &Layout,
+        selected: &Selected<'_>,
+        param: Param,
+        level: usize,
+    ) -> Result<(field::Values, Option<field::Values>), DataServerError> {
+        let index = layout.source_of(param);
+        let values = self.field(layout, selected.step, index, level)?;
+        let before = match (param, selected.previous) {
+            (Param::PerStep(_), Some(step)) => Some(self.field(layout, step, index, level)?),
+            _ => None,
+        };
+        Ok((values, before))
+    }
+}
+
+/// `param` drawn onto `map` (`size` pixels) from the fields
+/// [`NetcdfEngine::fields_of`] read: a variable's field sampled in its
+/// served unit, a per-step amount by [`sample_step_amount`].
+fn draw(
+    map: &OutputMap<'_>,
+    size: (u32, u32),
+    layout: &Layout,
+    param: Param,
+    (values, before): (field::Values, Option<field::Values>),
+) -> Result<RasterTile, DataServerError> {
+    let index = layout.source_of(param);
+    match param {
+        Param::Stored(_) => sample_display(map, layout, index, &values),
+        Param::PerStep(_) => {
+            sample_step_amount(map, size, layout, index, &values, before.as_deref())
+        }
     }
 }
 
@@ -1297,11 +1366,11 @@ impl MapEngine for NetcdfEngine {
             .layout
             .as_ref()
             .ok_or_else(|| DataServerError::Engine("No NetCDF data available yet".to_string()))?;
-        let index = Self::variable_index(layout, parameter)?;
+        let param = Self::param(layout, parameter)?;
         let level = layout.map_level(z)?;
-        let values = self.field(layout, selected.step, index, level)?;
+        let fields = self.fields_of(layout, &selected, param, level)?;
         let map = layout.source.output_map(bbox, width, height, output_crs);
-        sample_display(&map, layout, index, &values)
+        draw(&map, (width, height), layout, param, fields)
     }
 
     /// Every band from the one step `select` picks and the one level
@@ -1328,17 +1397,17 @@ impl MapEngine for NetcdfEngine {
             .layout
             .as_ref()
             .ok_or_else(|| DataServerError::Engine("No NetCDF data available yet".to_string()))?;
-        let indices = parameters
+        let params = parameters
             .iter()
-            .map(|&p| Self::variable_index(layout, Some(p)))
+            .map(|&p| Self::param(layout, Some(p)))
             .collect::<Result<Vec<_>, _>>()?;
         let level = layout.map_level(z)?;
         let map = layout.source.output_map(bbox, width, height, output_crs);
-        indices
+        params
             .into_iter()
-            .map(|index| {
-                let values = self.field(layout, selected.step, index, level)?;
-                sample_display(&map, layout, index, &values)
+            .map(|param| {
+                let fields = self.fields_of(layout, &selected, param, level)?;
+                draw(&map, (width, height), layout, param, fields)
             })
             .collect()
     }
@@ -1413,6 +1482,62 @@ fn sample_display(
         Some(display) => map.sample_f32_with(values, None, |v| display.convert(v)),
         None => map.sample_f32(values, None),
     }
+}
+
+/// A per-step amount (#1165) of the accumulation variable `index` drawn
+/// onto `map` (`width` × `height`): at each pixel, `values` (the step's
+/// field) and `before` (the run's step before, `None` at its first step)
+/// are each sampled where `map` puts the pixel, as [`OutputMap::sample_f32`]
+/// samples, converted to the served unit in `f64`, and differenced by
+/// [`catalog::step_amount`], before the pixel is narrowed: an EDR position
+/// value there is the same number. Two fields sampled, never their
+/// difference interpolated. A field of the wrong length is an `Engine`
+/// error, as in `sample_f32`; the request deadline is checked per row.
+fn sample_step_amount(
+    map: &OutputMap<'_>,
+    (width, height): (u32, u32),
+    layout: &Layout,
+    index: usize,
+    values: &[f32],
+    before: Option<&[f32]>,
+) -> Result<RasterTile, DataServerError> {
+    let grid = layout.source.transform();
+    let cells = grid.width as usize * grid.height as usize;
+    if let Some(field) = std::iter::once(values)
+        .chain(before)
+        .find(|field| field.len() != cells)
+    {
+        return Err(DataServerError::Engine(format!(
+            "field has {} values for a {}x{} grid",
+            field.len(),
+            grid.width,
+            grid.height
+        )));
+    }
+    let sample = |field: &[f32], position| {
+        layout
+            .source
+            .value_at(field, None, position)
+            .map(|raw| layout.to_display(index, raw))
+    };
+    let mut data = Vec::with_capacity(width as usize * height as usize);
+    for oy in 0..height {
+        deadline::check()?;
+        for ox in 0..width {
+            let amount = map.position(ox, oy).and_then(|position| {
+                catalog::step_amount(
+                    sample(values, position),
+                    before.map(|before| sample(before, position)),
+                )
+            });
+            data.push(amount.map_or(f32::NAN, |v| v as f32));
+        }
+    }
+    Ok(RasterTile {
+        width,
+        height,
+        values: RasterValues::F32 { data, nodata: None },
+    })
 }
 
 /// Whether the scan's time limit has passed.

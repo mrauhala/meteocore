@@ -9,7 +9,7 @@
 //! does a MEPS file's, and each 15 KB field chunk is a chunk read, as a
 //! 1.5 MB MEPS chunk is.
 
-use std::sync::{Arc, Barrier, LazyLock};
+use std::sync::{Arc, Barrier, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, DurationRound, Utc};
@@ -27,6 +27,17 @@ const TUNING: Tuning = Tuning {
     first_read: 16 * 1024,
     bypass_over: 4 * 1024,
 };
+
+/// Taken by every test whose queries read through the process-wide query
+/// pool ([`crate::field::QUERY_READS`], 8 slots): the slow-server ones hold
+/// their slots for most of a second, and a test that pins its GETs needs
+/// the pool to itself. Past the pool a read runs inline under its query's
+/// deadline, and a GET the deadline cuts off is fetched again.
+static QUERY_POOL: Mutex<()> = Mutex::new(());
+
+fn query_pool() -> MutexGuard<'static, ()> {
+    QUERY_POOL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The fixture's run and its two leads' valid times.
 const RUN: &str = "2026-10-15T06:00:00Z";
@@ -718,6 +729,7 @@ fn series_within(
 /// does, and caches no decoded field: the next render decodes.
 #[test]
 fn queries_read_on_the_query_runtime_for_edr_and_get_feature_info() {
+    let _pool = query_pool();
     let server = server();
     let engine = Arc::new(engine(&server, ""));
     server.take();
@@ -826,6 +838,7 @@ fn trajectory_and_cube_within(
 /// without another GET.
 #[test]
 fn trajectories_and_cubes_read_each_remote_chunk_once() {
+    let _pool = query_pool();
     let server = server();
     let engine = Arc::new(engine(&server, ""));
     server.take();
@@ -883,6 +896,7 @@ fn trajectories_and_cubes_read_each_remote_chunk_once() {
 /// fills' (other tests read concurrently, so only a lower bound holds).
 #[test]
 fn a_query_past_its_deadline_leaves_its_chunks_cached() {
+    let _pool = query_pool();
     let server = server();
     let engine = engine(&server, "");
     server.take();
@@ -914,6 +928,43 @@ fn a_query_past_its_deadline_leaves_its_chunks_cached() {
     };
     assert!(series.iter().all(Option::is_some));
     assert_eq!(gets(&server.take()).len(), 2, "the first query's GETs only");
+}
+
+/// Retries of a query that missed its deadline join the detached reads it
+/// left running: no read, decode or query-pool slot of their own. A cold
+/// series, three retries that miss their deadlines too, and one that waits
+/// make one GET and one decode per field, the first query's. Without the
+/// join each retry read every field again in a slot of the query pool: one
+/// query and three retries of two fields filled the pool's 8, the next cold
+/// field ran inline under its query's deadline, and the deadline cut its GET
+/// off (6 GETs where 4 were due in `trajectories_and_cubes_read_each_remote_chunk_once`).
+#[test]
+fn retries_join_the_reads_a_late_query_left_running() {
+    let _pool = query_pool();
+    let server = server();
+    let engine = engine(&server, "");
+    server.take();
+    server.slow_over(TUNING.bypass_over, Duration::from_millis(1000));
+    let started = Instant::now();
+    for ms in [100, 50, 50, 50] {
+        let late = series_within(&engine, ms, "wind_speed_of_gust");
+        assert!(
+            matches!(late, Err(DataServerError::DeadlineExceeded)),
+            "{late:?}"
+        );
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(700),
+        "the retries ran while the first query's reads did"
+    );
+    let series = series_within(&engine, 5_000, "wind_speed_of_gust").unwrap();
+    assert!(series.iter().all(Option::is_some));
+    assert_eq!(
+        engine.field_decodes(),
+        2,
+        "the first query's two reads, decoded once each"
+    );
+    assert_eq!(gets(&server.take()).len(), 2);
 }
 
 /// Read sizes for the pressure-level fixture, whose chunks (one level of

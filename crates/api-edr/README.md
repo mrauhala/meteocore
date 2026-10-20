@@ -311,6 +311,22 @@ frame and the grid allows it, direction (`ds_core::wind`). The derived
 parameters work like native ones in every query and count against the same
 value budget. `derive_wind = false` turns this off for a collection.
 
+### Per-step amounts
+
+A NetCDF variable named `<name>_acc` in kg m⁻² or mm, accumulated since the
+run start (MEPS `precipitation_amount_acc`), also gives `<name>`, the
+amount of each step (`precipitation_amount`, in mm, labelled with the step:
+`Precipitation amount (1 h accumulation)`). Its value at a step is the
+accumulation there less the accumulation at the run's step before, clamped
+at zero; a run's first step is its own accumulation. It works like a native
+parameter in every NetCDF query, trajectory and cube included, in the run
+and steps the accumulation's would use, and its `observedProperty` is the
+accumulation's standard name. A trajectory sample takes its own step's step
+before, sampled at the sample: on an `M` path, the step before each
+sample's step in the run the path reads. A query reads each lead once, the
+steps before included, and the `MC_NETCDF_EDR_QUERY_MB` cap counts them.
+`[netcdf] derive_per_step = false` turns this off.
+
 ## Per-engine query-type matrix
 
 ✓ supported · – not supported · n/a no model runs.

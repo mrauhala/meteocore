@@ -65,7 +65,7 @@ or downloaded whole.
 
 | Trait | APIs | Notes |
 |---|---|---|
-| `MapEngine` | WMS, Maps, Tiles | One layer per variable (WMS child layers `<collection>/<variable>` when there are several, Maps/Tiles `parameter-name=<variable>`); a request naming no variable draws the first. Runs are WMS `DIM_REFERENCE_TIME` values. |
+| `MapEngine` | WMS, Maps, Tiles | One layer per variable (WMS child layers `<collection>/<variable>` when there are several, Maps/Tiles `parameter-name=<variable>`), and one per per-step amount (below); a request naming no variable draws the first. Runs are WMS `DIM_REFERENCE_TIME` values. |
 | `EdrEngine` | EDR, WMS GetFeatureInfo | `position` (one or several points), `area`, `radius`, `trajectory` (`LINESTRING`, `Z`, `M`, `ZM`) and `cube`; each run is an instance. No `locations`. GetFeatureInfo reads the run, step and level the map drew. |
 | `WindSource` | all of the above, through the server's derived-wind wrapper | Facts for the wind speed derived from u/v components (below). |
 
@@ -157,6 +157,30 @@ Direction is EDR-only and needs earth-relative components, or
 grid-relative ones on a latitude/longitude grid. `derive_wind = false`
 opts out.
 
+**Per-step amounts.** A variable named `<name>_acc` in kg m-2 or mm,
+MET Norway's accumulation since the run start (MEPS
+`precipitation_amount_acc`, and `rainfall_`, `snowfall_` and
+`graupelfall_amount_acc`), also gives `<name>`, the amount of each step:
+the accumulation at the step less the accumulation at the run's step
+before, clamped at zero, so a decreasing accumulation is 0. A run's first
+step has no step before it and is its own accumulation (zero at the run
+start). It is in mm, with the accumulation's standard name, and its title
+names the step, `Precipitation amount (1 h accumulation)` for MEPS, or the
+shortest and longest when the steps differ, as in a run missing a lead. It
+has the accumulation's runs, steps and levels on every API, and takes the
+per-step precipitation style (`precipitation`, 0–50 mm). Each of the two
+fields is sampled and converted, and the samples differenced, so a map
+pixel and an EDR value agree. In an EDR trajectory each sample takes its
+own step's step before, both sampled at the sample (an `M` path's, in the
+run the path reads); a cube is an area's. Each lead's field is read once: a
+map's previous step is the next step's step before, from the field cache,
+and an EDR query reads each lead once whatever needs it, the query cap
+counting the steps before. A lead arriving late
+inside a run, or removed from it, changes the amount after it and moves
+the content version. Not derived: an `_acc` in another unit (clamping
+would corrupt a signed accumulation such as net radiation), or one whose
+`<name>` the files have. `derive_per_step = false` opts out.
+
 ## Configuration
 
 ```toml
@@ -191,6 +215,7 @@ URL-only fields on a local `data_path`, are a load error.
 | `min_age` | `PT10M` | URL only: a file is used once two polls see it unchanged, or at once when this old |
 | `run_grace` | `PT30M` | URL only: a run missing leads is served without them after this |
 | `prewarm_variables` | `[]` | URL only: variables whose newest-run fields each poll fetches ahead (bottom level) |
+| `derive_per_step` | `true` | Serve `<name>`, the per-step amount of each `<name>_acc` accumulation in kg m-2 or mm (above) |
 | `catalog_url` | none | URL only: the THREDDS `catalog.xml` of `data_path`'s directory (`…/thredds/catalog/<dir>/catalog.xml` for `…/thredds/fileServer/<dir>/`). The catalogs say which files the template names exist, in place of a HEAD per file; the template fields stay required |
 
 Runnable examples: `collections.d/meps-netcdf-local.toml` (MEPS surface
@@ -209,7 +234,7 @@ Process-wide environment variables, shared by every NetCDF collection:
 | `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote files (~1.5 MB per MEPS field) |
 | `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote files; at least 8 |
 | `MC_NETCDF_READ_MEMORY_MB` | `1024` | Buffers of field reads in progress; a read that does not fit is a 503 |
-| `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read (steps × levels × variables read × one field; a trajectory counts the (step, level) fields its path reads, a cube the levels its `z` positions take), checked before any read; over it a 400. Fits one variable, or a derived wind speed (both components), over a 67-lead MEPS run |
+| `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read (steps × levels × variables read × one field; a trajectory counts the (step, level) fields its path reads, a cube the levels its `z` positions take; a per-step amount adds its accumulation at the step before each step), checked before any read; over it a 400. Fits one variable, or a derived wind speed (both components), over a 67-lead MEPS run |
 
 ## Limits
 

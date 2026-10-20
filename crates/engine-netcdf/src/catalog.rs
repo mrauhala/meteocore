@@ -80,10 +80,44 @@ pub(crate) struct Layout {
     /// `RasterInfo::vertical` and EDR's vertical extent advertise it. `None`
     /// when the variables have one level each.
     pub vertical: Option<VerticalDimension>,
+    /// The per-step amounts derived from run-start accumulations (#1165),
+    /// served after the variables ([`per_step_amounts`]); empty with
+    /// `derive_per_step = false`.
+    pub per_step: Vec<PerStep>,
+}
+
+/// A per-step amount derived from a run-start accumulation (#1165): MEPS's
+/// `precipitation_amount_acc`, accumulated since the run started, gives
+/// `precipitation_amount`, the amount of each step. Its value at a step is
+/// the accumulation there less the accumulation at the run's step before,
+/// each sampled and converted to the served unit, clamped at zero
+/// ([`step_amount`]); a run's first step has no step before and is its own
+/// accumulation. Its run, steps and levels are its accumulation's.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PerStep {
+    /// The served name: the accumulation's without its `_acc`.
+    pub name: Arc<str>,
+    /// The accumulation, an index into [`Layout::variables`].
+    pub source: usize,
+    /// What it is, in words, before the step length the title adds
+    /// ([`per_step_title`]): the accumulation's CF `standard_name`, else
+    /// the served name (`Precipitation amount`).
+    pub label: String,
+}
+
+/// A parameter a layout serves: a stored variable, or a per-step amount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Param {
+    /// [`Layout::variables`] entry `i`, as stored.
+    Stored(usize),
+    /// [`Layout::per_step`] entry `i`.
+    PerStep(usize),
 }
 
 impl Layout {
-    pub(crate) fn new(variables: Vec<Variable>, grid: FileGrid) -> Self {
+    /// The layout of `variables` on `grid`, deriving the per-step amount
+    /// of each run-start accumulation when `derive_per_step` is set.
+    pub(crate) fn new(variables: Vec<Variable>, grid: FileGrid, derive_per_step: bool) -> Self {
         let display: Vec<Option<DisplayConversion>> = variables
             .iter()
             .map(|v| cf_display_conversion(&v.units, v.standard_name.as_deref()))
@@ -95,6 +129,11 @@ impl Layout {
             .first()
             .and_then(|v| v.pressure.clone())
             .map(|levels| VerticalDimension::new(VerticalKind::Pressure, levels));
+        let per_step = if derive_per_step {
+            per_step_amounts(&variables, &display)
+        } else {
+            Vec::new()
+        };
         Self {
             source: SourceGrid::new(grid.transform.clone()),
             variables,
@@ -102,6 +141,7 @@ impl Layout {
             grid,
             wind,
             vertical,
+            per_step,
         }
     }
 
@@ -115,6 +155,45 @@ impl Layout {
     /// is served in ([`Self::unit`]).
     pub(crate) fn to_display(&self, index: usize, raw: f64) -> f64 {
         self.display[index].map_or(raw, |display| display.convert(raw))
+    }
+
+    /// Every parameter served, in `RasterInfo.parameters`' order: the
+    /// variables, then the per-step amounts.
+    pub(crate) fn params(&self) -> impl Iterator<Item = Param> + '_ {
+        (0..self.variables.len())
+            .map(Param::Stored)
+            .chain((0..self.per_step.len()).map(Param::PerStep))
+    }
+
+    /// The parameter served as `name`.
+    pub(crate) fn param(&self, name: &str) -> Option<Param> {
+        self.params().find(|&param| self.name(param) == name)
+    }
+
+    /// The name `param` is served as.
+    pub(crate) fn name(&self, param: Param) -> &str {
+        match param {
+            Param::Stored(i) => &self.variables[i].name,
+            Param::PerStep(i) => &self.per_step[i].name,
+        }
+    }
+
+    /// The variable `param` reads: itself, or a per-step amount's
+    /// accumulation. Its unit, display conversion and standard name are
+    /// `param`'s.
+    pub(crate) fn source_of(&self, param: Param) -> usize {
+        match param {
+            Param::Stored(i) => i,
+            Param::PerStep(i) => self.per_step[i].source,
+        }
+    }
+
+    /// Where `param` is in `RasterInfo.parameters` ([`Self::params`]).
+    pub(crate) fn info_index(&self, param: Param) -> usize {
+        match param {
+            Param::Stored(i) => i,
+            Param::PerStep(i) => self.variables.len() + i,
+        }
     }
 
     /// The level a map draws, as an index into the vertical axis's levels:
@@ -229,6 +308,145 @@ fn served_unit(variable: &Variable, display: Option<DisplayConversion>) -> &str 
     display.map_or(variable.units.as_str(), |display| display.unit)
 }
 
+/// The per-step amounts of `variables` (#1165): one for each variable whose
+/// name ends in `_acc`, MET Norway's mark of an accumulation since the run
+/// start (MEPS's `precipitation_amount_acc`, and `rainfall_`, `snowfall_`
+/// and `graupelfall_amount_acc`), that is served in mm: an amount of water,
+/// stored in kg m-2 or mm. Only an amount is derived, since a step's is
+/// clamped at zero, which would corrupt a signed accumulation such as a
+/// net radiation in J m-2. Named without the `_acc`: MEPS's
+/// `precipitation_amount`, CF's standard name for the precipitation and
+/// the name MET Norway's Locationforecast gives its hourly amount. Not
+/// derived when the layout serves a variable of that name itself.
+fn per_step_amounts(variables: &[Variable], display: &[Option<DisplayConversion>]) -> Vec<PerStep> {
+    variables
+        .iter()
+        .zip(display)
+        .enumerate()
+        .filter_map(|(source, (variable, &display))| {
+            let name = variable
+                .name
+                .strip_suffix("_acc")
+                .filter(|n| !n.is_empty())?;
+            let amount = ds_core::units::same_unit(served_unit(variable, display), "mm");
+            let taken = variables.iter().any(|v| &*v.name == name);
+            if !amount || taken {
+                tracing::debug!(
+                    "not deriving per-step '{name}' from '{}': {}",
+                    variable.name,
+                    if taken {
+                        "a variable has its name"
+                    } else {
+                        "not an amount in mm"
+                    }
+                );
+                return None;
+            }
+            Some(PerStep {
+                name: name.into(),
+                source,
+                label: in_words(variable.standard_name.as_deref().unwrap_or(name)),
+            })
+        })
+        .collect()
+}
+
+/// `precipitation_amount` as `Precipitation amount`.
+fn in_words(name: &str) -> String {
+    let words = name.replace('_', " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => words,
+    }
+}
+
+/// One step's amount at a point (#1165), from `now`, the run-start
+/// accumulation sampled at the step in its served unit, and `before`, the
+/// same at the run's step before, `None` at a run's first step, whose
+/// accumulation is its own: `now` less `before`, clamped at zero, so an
+/// accumulation that decreases between steps (MEPS's does, by up to
+/// 0.0005 mm in the committed sample) is no amount, never a negative one.
+/// `None` where either sample is, nodata or off the grid. The map and EDR
+/// both call this on the samples they read, so a pixel and a position
+/// value agree.
+pub(crate) fn step_amount(now: Option<f64>, before: Option<Option<f64>>) -> Option<f64> {
+    let before = before.unwrap_or(Some(0.0))?;
+    Some((now? - before).max(0.0))
+}
+
+/// The steps a per-step amount spans in `runs` (#1165): between
+/// consecutive steps of each run, and from a run's reference time to its
+/// first step (none for the run-less timeline, and none for a first step
+/// at the reference time, whose accumulation is zero). MEPS's are all one
+/// hour.
+fn step_lengths(runs: &BTreeMap<RunKey, Run>) -> std::collections::BTreeSet<chrono::Duration> {
+    let mut lengths = std::collections::BTreeSet::new();
+    for run in runs.values() {
+        let mut before = run.reference_time;
+        for &valid in run.steps.keys() {
+            if let Some(before) = before.filter(|&before| before < valid) {
+                lengths.insert(valid - before);
+            }
+            before = Some(valid);
+        }
+    }
+    lengths
+}
+
+/// A per-step amount's title (#1165): its `label` and the step it spans,
+/// as engine-grib titles a GRIB accumulation (`Precipitation amount (1 h
+/// accumulation)`), or the shortest and longest when the steps differ, as
+/// in a model whose steps lengthen with the lead, or a run missing a lead.
+fn per_step_title(label: &str, lengths: &std::collections::BTreeSet<chrono::Duration>) -> String {
+    match (lengths.first(), lengths.last()) {
+        (Some(&first), Some(&last)) if first == last => {
+            format!("{label} ({} accumulation)", step_words(first))
+        }
+        (Some(&first), Some(&last)) => format!(
+            "{label} ({} to {} accumulation per forecast step)",
+            step_words(first),
+            step_words(last)
+        ),
+        _ => format!("{label} (accumulation per forecast step)"),
+    }
+}
+
+/// A step's length in words: `1 h`, `15 min`, `90 s`.
+fn step_words(length: chrono::Duration) -> String {
+    let seconds = length.num_seconds();
+    if seconds % 3600 == 0 {
+        format!("{} h", seconds / 3600)
+    } else if seconds % 60 == 0 {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} s")
+    }
+}
+
+/// Whether a step `old` and `new` both hold has another step before it in
+/// `new` (#1165): a lead that arrived late inside a run, or was removed,
+/// changes the per-step amount of the step after it, which the cache keys
+/// (the step's valid time and run) do not name. The content version moves
+/// then. A step appended after a run's last, or a run added or dropped,
+/// changes no amount drawn before.
+pub(crate) fn steps_before_changed(
+    old: &BTreeMap<RunKey, Run>,
+    new: &BTreeMap<RunKey, Run>,
+) -> bool {
+    let key = |step: Option<(DateTime<Utc>, &Step)>| {
+        step.map(|(valid, step)| (valid, step.file.id, step.index))
+    };
+    new.iter().any(|(run_key, run)| {
+        old.get(run_key).is_some_and(|before| {
+            run.steps.keys().any(|&valid| {
+                before.steps.contains_key(&valid)
+                    && key(before.previous(valid)) != key(run.previous(valid))
+            })
+        })
+    })
+}
+
 /// A run's key: its reference time, `None` for the timeline of files
 /// without one.
 pub(crate) type RunKey = Option<DateTime<Utc>>;
@@ -270,6 +488,15 @@ impl Run {
             .min_by_key(|(&valid, _)| (valid - time).abs())
             .map(|(&valid, step)| (valid, step))
     }
+
+    /// The run's step before the one valid at `valid`, `None` at its first:
+    /// the step a per-step amount (#1165) is differenced against.
+    pub(crate) fn previous(&self, valid: DateTime<Utc>) -> Option<(DateTime<Utc>, &Step)> {
+        self.steps
+            .range(..valid)
+            .next_back()
+            .map(|(&before, step)| (before, step))
+    }
 }
 
 /// A step [`Catalog::select`] chose.
@@ -277,6 +504,9 @@ pub(crate) struct Selected<'a> {
     pub reference_time: Option<DateTime<Utc>>,
     pub valid: DateTime<Utc>,
     pub step: &'a Step,
+    /// The run's step before it, `None` at the run's first: what a
+    /// per-step amount (#1165) is differenced against.
+    pub previous: Option<&'a Step>,
 }
 
 /// What the engine serves, swapped whole by each poll.
@@ -343,6 +573,7 @@ impl Catalog {
             reference_time: run.reference_time,
             valid,
             step,
+            previous: run.previous(valid).map(|(_, step)| step),
         })
     }
 
@@ -472,7 +703,8 @@ pub(crate) fn raster_info(
     times.dedup();
     let parameters: Vec<ParameterInfo> = layout
         .map(|layout| {
-            layout
+            let lengths = step_lengths(runs);
+            let variables = layout
                 .variables
                 .iter()
                 .enumerate()
@@ -483,8 +715,15 @@ pub(crate) fn raster_info(
                         .cloned()
                         .unwrap_or_else(|| v.title.clone()),
                     unit: layout.unit(index).to_string(),
-                })
-                .collect()
+                });
+            // A per-step amount's title says the step it spans, from the
+            // runs this catalog holds; its unit is its accumulation's.
+            let per_step = layout.per_step.iter().map(|p| ParameterInfo {
+                name: p.name.to_string(),
+                title: per_step_title(&p.label, &lengths),
+                unit: layout.unit(p.source).to_string(),
+            });
+            variables.chain(per_step).collect()
         })
         .unwrap_or_default();
     let transform = layout.map(|layout| &layout.grid.transform);

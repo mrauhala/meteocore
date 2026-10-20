@@ -16,6 +16,13 @@
 //! decoded field the render cache holds is used, any other is decoded for
 //! the query alone. Trajectories ([`trajectory`]) and cubes ([`cube`]) read
 //! only the fields they sample, and the cap counts exactly those.
+//!
+//! A per-step amount (#1165) is sampled from its run-start accumulation at
+//! each step and at the run's step before, at the same positions, and the
+//! samples differenced ([`crate::catalog::step_amount`]), as the map
+//! differences them. Every (variable, step, level) field a query needs, the
+//! steps before included, is read once ([`NetcdfEngine::sample_fields`]),
+//! and the cap counts the steps before.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
@@ -36,7 +43,7 @@ use ds_core::model::{
 use ds_core::resample::SourceGrid;
 use ds_core::vertical::VerticalDimension;
 
-use crate::catalog::{Catalog, Layout, Run, Step};
+use crate::catalog::{step_amount, Catalog, Layout, Param, Run, Step};
 use crate::field;
 use crate::NetcdfEngine;
 
@@ -77,32 +84,37 @@ fn on_grid(source: &SourceGrid, lon: f64, lat: f64) -> Option<(f64, f64)> {
     source.covers(position).then_some(position)
 }
 
-/// One query's field reads: the selected variables (layout indices) at the
-/// selected steps and levels.
+/// One query's field reads: the selected parameters at the selected steps
+/// and levels of one run.
 struct Reads<'a> {
     layout: &'a Arc<Layout>,
+    /// The run the steps are of: a per-step amount's step before is this
+    /// run's.
+    run: &'a Run,
     steps: Vec<(DateTime<Utc>, &'a Step)>,
     /// Indices into the layout's pressure levels, in the order the
     /// response lists them; `[0]` without a vertical axis.
     levels: Vec<usize>,
-    variables: Vec<usize>,
+    params: Vec<Param>,
 }
 
 impl<'a> Reads<'a> {
-    /// The variables `parameters` selects (every one without) and the
-    /// levels `z` selects ([`Layout::query_levels`]) at `steps`.
+    /// The parameters `parameters` selects (every one without, the
+    /// per-step amounts included) and the levels `z` selects
+    /// ([`Layout::query_levels`]) at `steps` of `run`.
     fn new(
         layout: &'a Arc<Layout>,
+        run: &'a Run,
         steps: Vec<(DateTime<Utc>, &'a Step)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
     ) -> Result<Self, DataServerError> {
-        let names: Vec<&str> = layout.variables.iter().map(|v| &*v.name).collect();
-        let variables: Vec<usize> = select_parameters(parameters, &names)?
+        let names: Vec<&str> = layout.params().map(|p| layout.name(p)).collect();
+        let params: Vec<Param> = select_parameters(parameters, &names)?
             .into_iter()
-            .filter_map(|name| names.iter().position(|n| *n == name))
+            .filter_map(|name| layout.param(name))
             .collect();
-        if variables.is_empty() {
+        if params.is_empty() {
             return Err(DataServerError::InvalidParameter(
                 "No parameters available".into(),
             ));
@@ -110,10 +122,30 @@ impl<'a> Reads<'a> {
         let levels = layout.query_levels(z)?;
         Ok(Self {
             layout,
+            run,
             steps,
             levels,
-            variables,
+            params,
         })
+    }
+
+    /// Whether a per-step amount is selected (#1165): each step it reads
+    /// needs the run's step before too.
+    fn reads_steps_before(&self) -> bool {
+        self.params.iter().any(|p| matches!(p, Param::PerStep(_)))
+    }
+
+    /// The distinct steps the query reads: the selected ones and, for a
+    /// per-step amount, the run's step before each (#1165), at most one
+    /// more for a window of consecutive steps.
+    fn steps_read(&self) -> usize {
+        let mut steps: HashSet<DateTime<Utc>> = self.steps.iter().map(|&(t, _)| t).collect();
+        if self.reads_steps_before() {
+            for &(valid, _) in &self.steps {
+                steps.extend(self.run.previous(valid).map(|(before, _)| before));
+            }
+        }
+        steps.len()
     }
 
     /// The response's vertical coordinate: the selected levels, `None`
@@ -127,11 +159,14 @@ impl<'a> Reads<'a> {
     }
 }
 
-/// One field a query reads and where it samples it: a step, a level (an
-/// index into the layout's pressure levels, 0 without them) and the
-/// positions ([`on_grid`]). Position, area and cube queries sample every
-/// field at the same positions; a trajectory samples each at its own.
+/// One field a query reads and where it samples it: a step (its valid time
+/// and place in the run), a level (an index into the layout's pressure
+/// levels, 0 without them) and the positions ([`on_grid`]). Position, area
+/// and cube queries sample every field at the same positions; a trajectory
+/// samples each at its own. A per-step amount also reads the run's step
+/// before `valid`, at the same level and positions.
 struct Sampling<'a> {
+    valid: DateTime<Utc>,
     step: &'a Step,
     level: usize,
     positions: Positions,
@@ -205,11 +240,11 @@ impl NetcdfEngine {
                 None => DataServerError::LocationNotFound("The forecast run has no steps".into()),
             });
         }
-        Reads::new(layout, steps, parameters, z)
+        Reads::new(layout, run, steps, parameters, z)
     }
 
     /// Read every planned field and sample it at `positions`:
-    /// `[variable][step × levels + level]` → one value per position
+    /// `[parameter][step × levels + level]` → one value per position
     /// ([`Self::sample_fields`] over every step × level, step-major).
     fn sample(
         &self,
@@ -219,120 +254,218 @@ impl NetcdfEngine {
         let fields: Vec<Sampling> = reads
             .steps
             .iter()
-            .flat_map(|&(_, step)| {
+            .flat_map(|&(valid, step)| {
                 reads.levels.iter().map(move |&level| Sampling {
+                    valid,
                     step,
                     level,
                     positions: positions.clone(),
                 })
             })
             .collect();
-        self.sample_fields(reads.layout, &reads.variables, &fields)
+        self.sample_fields(reads, &fields)
     }
 
-    /// Read each of `fields` of each of `variables` (layout indices) and
-    /// sample it at the field's positions: `[variable][field]` → one value
-    /// per position. Fields are read through `ds_executor::field_jobs`,
-    /// four at a time, each job under the query's deadline; a failed read
-    /// fails the query, never a null: a replaced file or the decode budget
-    /// is a 503, the deadline a 504, any other failure a 500. A field with
-    /// no position on the grid is not read ([`Sampling::is_read`]): its
-    /// values are null, as the read would sample them, and a point far off
-    /// a remote grid costs no fetch.
+    /// Each selected parameter at each of `fields`, sampled at the field's
+    /// positions: `[parameter][field]` → one value per position. A variable
+    /// is its field's samples; a per-step amount (#1165) the difference of
+    /// its accumulation's samples at the field's step and at the run's step
+    /// before, at the same level and positions ([`step_amount`]; a run's
+    /// first step is its own accumulation).
+    ///
+    /// Every (variable, step, level) field this needs is read once, however
+    /// many parameters and fields sample it (an accumulation and its
+    /// per-step amount, or the step before one step that is another step),
+    /// and sampled once at each distinct list of positions asked of it.
+    /// Fields are read through `ds_executor::field_jobs`, four at a time,
+    /// each job under the query's deadline; a failed read fails the query,
+    /// never a null: a replaced file or the decode budget is a 503, the
+    /// deadline a 504, any other failure a 500. A field with no position on
+    /// the grid is not read ([`Sampling::is_read`]), nor is its step
+    /// before: its values are null, as the read would sample them, and a
+    /// point far off a remote grid costs no fetch.
     fn sample_fields(
         &self,
-        layout: &Arc<Layout>,
-        variables: &[usize],
+        reads: &Reads,
         fields: &[Sampling],
     ) -> Result<Vec<Vec<Vec<Option<f64>>>>, DataServerError> {
-        let mut out: Vec<Vec<Vec<Option<f64>>>> = variables
-            .iter()
-            .map(|_| {
-                fields
-                    .iter()
-                    .map(|field| vec![None; field.positions.len()])
-                    .collect()
-            })
-            .collect();
-        // One job per (variable, field) read.
-        let jobs: Vec<(usize, usize, Step, usize, usize, Positions)> = variables
-            .iter()
-            .enumerate()
-            .flat_map(|(v, &index)| {
-                fields
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, field)| field.is_read())
-                    .map(move |(f, field)| {
-                        let step = field.step.clone();
-                        (v, f, step, index, field.level, field.positions.clone())
-                    })
-            })
-            .collect();
-        if jobs.is_empty() {
-            return Ok(out);
+        let layout = reads.layout;
+        // The fields to read, each once: its step, variable and level, and
+        // the requests of it, each a positions list and the slot of its
+        // samples in `samples`.
+        type Read = (Step, usize, usize, Vec<(usize, Positions)>);
+        let mut to_read: Vec<Read> = Vec::new();
+        let mut keys: HashMap<(usize, DateTime<Utc>, usize), usize> = HashMap::new();
+        let mut requests = 0usize;
+        let mut request = |index: usize,
+                           (valid, step): (DateTime<Utc>, &Step),
+                           level: usize,
+                           positions: &Positions| {
+            let k = *keys.entry((index, valid, level)).or_insert_with(|| {
+                to_read.push((step.clone(), index, level, Vec::new()));
+                to_read.len() - 1
+            });
+            let asked = &mut to_read[k].3;
+            if let Some(&(slot, _)) = asked.iter().find(|(_, p)| Arc::ptr_eq(p, positions)) {
+                return slot;
+            }
+            asked.push((requests, positions.clone()));
+            requests += 1;
+            requests - 1
+        };
+        // Per parameter and field: the slot of its samples, and a per-step
+        // amount's of the step before (`None` at the run's first step);
+        // `None` for a field not read.
+        type Slots = Option<(usize, Option<usize>)>;
+        let mut slots: Vec<Vec<Slots>> = Vec::new();
+        for &param in &reads.params {
+            let index = layout.source_of(param);
+            let mut per_field = Vec::with_capacity(fields.len());
+            for field in fields {
+                if !field.is_read() {
+                    per_field.push(None);
+                    continue;
+                }
+                let now = request(
+                    index,
+                    (field.valid, field.step),
+                    field.level,
+                    &field.positions,
+                );
+                let before = match param {
+                    Param::Stored(_) => None,
+                    Param::PerStep(_) => reads
+                        .run
+                        .previous(field.valid)
+                        .map(|before| request(index, before, field.level, &field.positions)),
+                };
+                per_field.push(Some((now, before)));
+            }
+            slots.push(per_field);
         }
-        let flipped = layout.grid.flipped;
-        let layout = layout.clone();
-        let decodes: Arc<AtomicU64> = self.decodes.clone();
-        ds_executor::field_jobs::run_field_jobs(
-            ds_executor::query_runtime(),
-            jobs.into_iter(),
-            move |(v, f, step, index, level, positions)| {
-                let values =
-                    field::read_uncached(&step.file, index, step.index, level, flipped, &decodes)?;
-                // Sampled from the stored field, then converted to the
-                // unit served, as the map converts each pixel (#1209).
-                let samples = positions
+
+        let mut samples: Vec<Vec<Option<f64>>> = vec![Vec::new(); requests];
+        if !to_read.is_empty() {
+            let flipped = layout.grid.flipped;
+            let shared = layout.clone();
+            let decodes: Arc<AtomicU64> = self.decodes.clone();
+            ds_executor::field_jobs::run_field_jobs(
+                ds_executor::query_runtime(),
+                to_read.into_iter(),
+                move |(step, index, level, asked)| {
+                    let values = field::read_uncached(
+                        &step.file, index, step.index, level, flipped, &decodes,
+                    )?;
+                    // Sampled from the stored field, then converted to the
+                    // unit served, as the map converts each pixel (#1209).
+                    let sampled = asked
+                        .into_iter()
+                        .map(|(slot, positions)| {
+                            let values = positions
+                                .iter()
+                                .map(|position| {
+                                    position
+                                        .and_then(|p| shared.source.value_at(&values, None, p))
+                                        .map(|raw| shared.to_display(index, raw))
+                                })
+                                .collect::<Vec<_>>();
+                            (slot, values)
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(sampled)
+                },
+                |sampled| {
+                    for (slot, values) in sampled {
+                        samples[slot] = values;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        // The per-step amounts first, from samples they may share with their
+        // accumulation; then each variable takes its own samples.
+        let mut out: Vec<Option<Vec<Vec<Option<f64>>>>> = reads
+            .params
+            .iter()
+            .zip(&slots)
+            .map(|(&param, per_field)| {
+                let Param::PerStep(_) = param else {
+                    return None;
+                };
+                let amounts = fields
                     .iter()
-                    .map(|position| {
-                        position
-                            .and_then(|p| layout.source.value_at(&values, None, p))
-                            .map(|raw| layout.to_display(index, raw))
+                    .zip(per_field)
+                    .map(|(field, slot)| match slot {
+                        None => vec![None; field.positions.len()],
+                        Some((now, before)) => {
+                            let now = &samples[*now];
+                            let before = before.map(|before| &samples[before]);
+                            (0..now.len())
+                                .map(|p| step_amount(now[p], before.map(|b| b[p])))
+                                .collect()
+                        }
+                    });
+                Some(amounts.collect())
+            })
+            .collect();
+        Ok(out
+            .iter_mut()
+            .zip(&slots)
+            .map(|(amounts, per_field)| match amounts.take() {
+                Some(amounts) => amounts,
+                None => fields
+                    .iter()
+                    .zip(per_field)
+                    .map(|(field, slot)| match slot {
+                        None => vec![None; field.positions.len()],
+                        Some((now, _)) => std::mem::take(&mut samples[*now]),
                     })
-                    .collect::<Vec<_>>();
-                Ok((v, f, samples))
-            },
-            |(v, f, samples)| {
-                out[v][f] = samples;
-                Ok(())
-            },
-        )?;
-        Ok(out)
+                    .collect(),
+            })
+            .collect())
     }
 
-    /// Label, unit and CF standard name of each variable a query returns,
+    /// Label, unit and CF standard name of each parameter a query returns,
     /// as the collection describes them: the unit served, after the
     /// display conversion ([`Layout::unit`]), as the map layers report it.
+    /// A per-step amount (#1165) has its accumulation's unit and standard
+    /// name (`precipitation_amount`: CF's name holds for any period) and
+    /// its own title, which says the step.
     fn descriptions(
         catalog: &Catalog,
         layout: &Layout,
-        variables: &[usize],
+        params: &[Param],
     ) -> HashMap<String, ParameterDescription> {
-        Self::described(catalog, layout, variables)
+        Self::described(catalog, layout, params)
             .into_iter()
             .collect()
     }
 
-    /// [`Self::descriptions`] in `variables` order, the order a
-    /// trajectory's values are laid out in.
+    /// [`Self::descriptions`] in `params` order, the order a trajectory's
+    /// values are laid out in.
     fn described(
         catalog: &Catalog,
         layout: &Layout,
-        variables: &[usize],
+        params: &[Param],
     ) -> Vec<(String, ParameterDescription)> {
-        variables
+        params
             .iter()
-            .map(|&index| {
-                let variable = &layout.variables[index];
-                let info = catalog.info.parameters.get(index);
+            .map(|&param| {
+                let index = layout.source_of(param);
+                let name = layout.name(param);
+                let label = catalog
+                    .info
+                    .parameters
+                    .get(layout.info_index(param))
+                    .map_or_else(|| name.to_string(), |p| p.title.clone());
                 (
-                    variable.name.to_string(),
+                    name.to_string(),
                     ParameterDescription {
-                        label: info.map_or_else(|| variable.title.clone(), |p| p.title.clone()),
+                        label,
                         unit: layout.unit(index).to_string(),
-                        observed_property: variable.name.to_string(),
-                        standard_name: variable.standard_name.clone(),
+                        observed_property: name.to_string(),
+                        standard_name: layout.variables[index].standard_name.clone(),
                     },
                 )
             })
@@ -365,7 +498,7 @@ impl NetcdfEngine {
             reads.steps.len() * reads.levels.len(),
             1,
             points.len(),
-            reads.variables.len(),
+            reads.params.len(),
         )?;
         let source = &reads.layout.source;
         let positions: Positions = Arc::new(
@@ -376,15 +509,15 @@ impl NetcdfEngine {
         );
         let sampled = self.sample(&reads, &positions)?;
         let times: Vec<DateTime<Utc>> = reads.steps.iter().map(|(t, _)| *t).collect();
-        let descriptions = Self::descriptions(&catalog, reads.layout, &reads.variables);
+        let descriptions = Self::descriptions(&catalog, reads.layout, &reads.params);
         let vertical = reads.vertical();
         let n_levels = reads.levels.len();
-        // One variable's values at point `p` in `slots` (of `sample`'s
+        // One parameter's values at point `p` in `slots` (of `sample`'s
         // step-major `[t][z]` order), as a range on `axis`.
-        let range = |index: usize, slots: &[Vec<Option<f64>>], p: usize, axis: &str| {
+        let range = |param: Param, slots: &[Vec<Option<f64>>], p: usize, axis: &str| {
             let values: Vec<Option<f64>> = slots.iter().map(|samples| samples[p]).collect();
             (
-                reads.layout.variables[index].name.to_string(),
+                reads.layout.name(param).to_string(),
                 NdArray {
                     shape: vec![values.len()],
                     axis_names: vec![axis.to_string()],
@@ -408,12 +541,12 @@ impl NetcdfEngine {
                             },
                             parameters: descriptions.clone(),
                             ranges: reads
-                                .variables
+                                .params
                                 .iter()
                                 .zip(&sampled)
-                                .map(|(&index, slots)| {
+                                .map(|(&param, slots)| {
                                     let step = &slots[s * n_levels..(s + 1) * n_levels];
-                                    range(index, step, p, "z")
+                                    range(param, step, p, "z")
                                 })
                                 .collect(),
                         })
@@ -428,10 +561,10 @@ impl NetcdfEngine {
                     },
                     parameters: descriptions.clone(),
                     ranges: reads
-                        .variables
+                        .params
                         .iter()
                         .zip(&sampled)
-                        .map(|(&index, slots)| range(index, slots, p, "t"))
+                        .map(|(&param, slots)| range(param, slots, p, "t"))
                         .collect(),
                 }),
             };
@@ -443,11 +576,12 @@ impl NetcdfEngine {
 
 impl Reads<'_> {
     /// The query-shape cap: `limit` ([`QUERY_BYTES`]) against the bytes
-    /// the planned fields decode, from the metadata: steps × levels × each
-    /// variable's field ([`Self::field_bytes`]).
+    /// the planned fields decode, from the metadata: the steps read
+    /// ([`Self::steps_read`], a per-step amount's steps before included) ×
+    /// levels × each variable's field ([`Self::field_bytes`]).
     fn check_bytes(&self, limit: u64) -> Result<(), DataServerError> {
         check_query_bytes(
-            self.steps.len(),
+            self.steps_read(),
             self.levels.len(),
             &self.field_bytes(),
             limit,
@@ -455,39 +589,54 @@ impl Reads<'_> {
     }
 
     /// The query-shape cap over the fields a query samples, of each
-    /// selected variable: only those it reads count ([`Sampling::is_read`]),
-    /// each (step, level) once. A trajectory reads the fields its plan
-    /// names, which an `M` or `Z` path picks per sample. `time` is how the
-    /// refusal says to read fewer steps.
+    /// variable read: only those it reads count ([`Sampling::is_read`]),
+    /// each (step, level) once, and for a per-step amount the run's step
+    /// before each at the same level too (#1165). A trajectory reads the
+    /// fields its plan names, which an `M` or `Z` path picks per sample.
+    /// `time` is how the refusal says to read fewer steps.
     fn check_fields(
         &self,
         fields: &[Sampling],
         limit: u64,
         time: &str,
     ) -> Result<(), DataServerError> {
-        let read: Vec<&Sampling> = fields.iter().filter(|f| f.is_read()).collect();
-        let steps: HashSet<(u64, u32)> = read
-            .iter()
-            .map(|f| (f.step.file.id, f.step.index))
-            .collect();
-        let levels: HashSet<usize> = read.iter().map(|f| f.level).collect();
+        let before = self.reads_steps_before();
+        let mut pairs: HashSet<(DateTime<Utc>, usize)> = HashSet::new();
+        for field in fields.iter().filter(|f| f.is_read()) {
+            pairs.insert((field.valid, field.level));
+            if before {
+                if let Some((t, _)) = self.run.previous(field.valid) {
+                    pairs.insert((t, field.level));
+                }
+            }
+        }
+        let steps: HashSet<DateTime<Utc>> = pairs.iter().map(|&(t, _)| t).collect();
+        let levels: HashSet<usize> = pairs.iter().map(|&(_, l)| l).collect();
         check_field_reads(
             steps.len(),
             levels.len(),
-            read.len(),
+            pairs.len(),
             &self.field_bytes(),
             limit,
             time,
         )
     }
 
-    /// The bytes one field of each selected variable decodes
-    /// ([`crate::ingest::FieldRead::decoded_bytes`]), from the metadata.
-    /// Every file of the collection has the layout's fields on its grid, so
-    /// the first step's file sizes them all.
+    /// The bytes one field of each variable read decodes
+    /// ([`crate::ingest::FieldRead::decoded_bytes`]), from the metadata: a
+    /// per-step amount's accumulation, once however many parameters read
+    /// it. Every file of the collection has the layout's fields on its
+    /// grid, so the first step's file sizes them all.
     fn field_bytes(&self) -> Vec<u64> {
         let file = &self.steps[0].1.file;
-        self.variables
+        let mut variables: Vec<usize> = Vec::new();
+        for &param in &self.params {
+            let index = self.layout.source_of(param);
+            if !variables.contains(&index) {
+                variables.push(index);
+            }
+        }
+        variables
             .iter()
             .map(|&index| file.reads[index].decoded_bytes())
             .collect()
@@ -547,7 +696,8 @@ fn check_field_reads(
     Err(DataServerError::QueryTooLarge(format!(
         "Query would decode {} fields ({shape} × {} source variables, {:.0} MiB); the limit is \
          {:.0} MiB — narrow {time}{narrow}. A derived parameter reads each variable it is \
-         derived from: a wind speed reads both wind components",
+         derived from: a wind speed reads both wind components, and a per-step amount its \
+         accumulation at the step before as well",
         reads.saturating_mul(field_bytes.len()),
         field_bytes.len(),
         mib(bytes),
@@ -626,7 +776,7 @@ impl EdrEngine for NetcdfEngine {
         let Some(layout) = catalog.layout.as_ref() else {
             return HashMap::new();
         };
-        let all: Vec<usize> = (0..layout.variables.len()).collect();
+        let all: Vec<Param> = layout.params().collect();
         Self::descriptions(&catalog, layout, &all)
     }
 
@@ -749,7 +899,7 @@ impl EdrEngine for NetcdfEngine {
             reads.steps.len() * reads.levels.len(),
             ny,
             nx,
-            reads.variables.len(),
+            reads.params.len(),
         )?;
         check_mask_budget(nx * ny, &polygon)?;
         let mask = polygon.cell_mask(&axes);
@@ -773,10 +923,10 @@ impl EdrEngine for NetcdfEngine {
         let times: Vec<DateTime<Utc>> = reads.steps.iter().map(|(t, _)| *t).collect();
         let vertical = reads.vertical();
         let ranges = reads
-            .variables
+            .params
             .iter()
             .zip(sampled)
-            .map(|(&index, slots)| {
+            .map(|(&param, slots)| {
                 // `sample`'s slots are step-major `[t][z]`, each `[y][x]`.
                 let values: Vec<Option<f64>> = slots.into_iter().flatten().collect();
                 let mut shape = vec![ny, nx];
@@ -790,7 +940,7 @@ impl EdrEngine for NetcdfEngine {
                     axis_names.insert(0, "t");
                 }
                 (
-                    reads.layout.variables[index].name.to_string(),
+                    reads.layout.name(param).to_string(),
                     NdArray {
                         shape,
                         axis_names: axis_names.into_iter().map(String::from).collect(),
@@ -806,7 +956,7 @@ impl EdrEngine for NetcdfEngine {
                 t: time_axis.then_some(times),
                 z: vertical,
             },
-            parameters: Self::descriptions(&catalog, reads.layout, &reads.variables),
+            parameters: Self::descriptions(&catalog, reads.layout, &reads.params),
             ranges,
         }))
     }
@@ -916,7 +1066,7 @@ mod tests {
         let engine = NetcdfEngine::new("cap", &config).unwrap();
         let catalog = engine.catalog.load_full();
         let reads = NetcdfEngine::plan(&catalog, None, None, None, None, true).unwrap();
-        assert_eq!((reads.steps.len(), reads.variables.len()), (3, 2));
+        assert_eq!((reads.steps.len(), reads.params.len()), (3, 2));
         let bytes = 3 * 2 * 110 * 4;
         reads.check_bytes(bytes).unwrap();
         assert!(matches!(
@@ -965,7 +1115,7 @@ mod tests {
         let catalog = engine.catalog.load_full();
         let every = NetcdfEngine::plan(&catalog, None, None, None, None, true).unwrap();
         assert_eq!(
-            (every.steps.len(), every.levels.len(), every.variables.len()),
+            (every.steps.len(), every.levels.len(), every.params.len()),
             (2, 4, 2),
             "the newest run's two leads at all four levels"
         );
@@ -1144,5 +1294,103 @@ mod tests {
         too_large(pl.cube(&bbox, None, None, None, all, None, bytes));
         pl.cube(&bbox, None, None, None, all, None, 4 * 2 * FIXTURE_FIELD)
             .unwrap();
+    }
+
+    /// A per-step amount (#1165) reads its accumulation at the step before
+    /// each step too, and an accumulation asked for with its amount is one
+    /// variable read: every query's cap counts those fields, from the
+    /// metadata, before any read. A position window of 08Z-09Z in the 06Z
+    /// run reads 07Z as well; every step of the run reads none more; an M
+    /// path and a cube over 08Z-09Z read 07Z too.
+    #[test]
+    fn the_cap_counts_the_step_before_a_per_step_amount() {
+        let engine = fixture(
+            "meps-netcdf",
+            "sfc",
+            r#"["air_temperature_2m", "precipitation_amount_acc"]"#,
+        );
+        let catalog = engine.catalog.load_full();
+        let run = DateTime::parse_from_rfc3339("2026-10-15T06:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let hours = |h: i64| run + chrono::Duration::hours(h);
+        let both = ["precipitation_amount", "precipitation_amount_acc"].map(String::from);
+        let window = NetcdfEngine::plan(
+            &catalog,
+            Some(run),
+            Some((hours(2), hours(3))),
+            Some(&both),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                window.steps.len(),
+                window.steps_read(),
+                window.field_bytes().len()
+            ),
+            (2, 3, 1),
+            "08Z and 09Z, and 07Z before them, of one variable"
+        );
+        window.check_bytes(3 * FIXTURE_FIELD).unwrap();
+        let message = too_large(window.check_bytes(3 * FIXTURE_FIELD - 1));
+        assert!(
+            message.contains("3 fields (3 timesteps × 1 source variables")
+                && message.contains("a per-step amount its accumulation at the step before"),
+            "{message}"
+        );
+        let every = NetcdfEngine::plan(&catalog, Some(run), None, Some(&both), None, true).unwrap();
+        assert_eq!((every.steps.len(), every.steps_read()), (4, 4));
+        // The accumulation alone reads no step before.
+        let raw = ["precipitation_amount_acc".to_string()];
+        let alone = NetcdfEngine::plan(
+            &catalog,
+            Some(run),
+            Some((hours(2), hours(3))),
+            Some(&raw),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(alone.steps_read(), 2);
+
+        let amount = ["precipitation_amount".to_string()];
+        let m_path = format!(
+            "LINESTRING M(5 58 {}, 30 66 {})",
+            epoch("2026-10-15T08:00:00Z"),
+            epoch("2026-10-15T09:00:00Z")
+        );
+        let bytes = 3 * FIXTURE_FIELD;
+        let message =
+            too_large(engine.trajectory(&m_path, None, Some(&amount), None, None, bytes - 1));
+        assert!(
+            message.contains("3 fields (3 timesteps × 1 source variables"),
+            "{message}"
+        );
+        let bbox = Bbox::new(5.0, 58.0, 25.0, 66.0).unwrap();
+        let cube = |limit| {
+            engine.cube(
+                &bbox,
+                Some((hours(2), hours(3))),
+                Some(&amount),
+                None,
+                CubeResolution::default(),
+                Some(run),
+                limit,
+            )
+        };
+        let message = too_large(cube(bytes - 1));
+        assert!(
+            message.contains("3 fields (3 timesteps × 1 source variables"),
+            "{message}"
+        );
+        assert_eq!(engine.field_decodes(), 0, "refused before any read");
+        engine
+            .trajectory(&m_path, None, Some(&amount), None, None, bytes)
+            .unwrap();
+        assert_eq!(engine.field_decodes(), 3, "07Z, 08Z and 09Z, once each");
+        cube(bytes).unwrap();
+        assert_eq!(engine.field_decodes(), 6);
     }
 }

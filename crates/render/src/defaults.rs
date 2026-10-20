@@ -1549,6 +1549,29 @@ mod tests {
                 "Precipitation amount accumulated over 3 h",
                 Some("kg m-2"),
             ),
+            // engine-netcdf's per-step amounts of the run-start
+            // accumulations above (#1165), as it names, titles and serves
+            // them: graupel by its title alone.
+            (
+                "precipitation_amount",
+                "Precipitation amount (1 h accumulation)",
+                Some("mm"),
+            ),
+            (
+                "rainfall_amount",
+                "Rainfall amount (1 h accumulation)",
+                Some("mm"),
+            ),
+            (
+                "snowfall_amount",
+                "Snowfall amount (1 h to 3 h accumulation per forecast step)",
+                Some("mm"),
+            ),
+            (
+                "graupelfall_amount",
+                "Graupelfall amount (accumulation per forecast step)",
+                Some("mm"),
+            ),
         ] {
             let m = d.match_default(name, title, unit).unwrap();
             assert_eq!(

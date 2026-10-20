@@ -903,3 +903,125 @@ fn a_query_past_its_deadline_reads_nothing() {
     ));
     assert_eq!(engine.field_decodes(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Per-step amounts (#1165)
+// ---------------------------------------------------------------------------
+
+/// The MEPS surface crop with its run-start precipitation accumulation,
+/// which gives the per-step `precipitation_amount`.
+fn meps_rain() -> NetcdfEngine {
+    let config = config(
+        &testdata("meps-netcdf"),
+        r#"filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"
+           variables = ["air_temperature_2m", "precipitation_amount_acc"]"#,
+    );
+    NetcdfEngine::new("meps-rain", &config).unwrap()
+}
+
+/// From the rainy cell (row 4, column 2: 2.08 mm by 07Z in the 06Z run)
+/// inland.
+const RAIN_PATH: ((f64, f64), (f64, f64)) = ((4.93, 59.92), (15.0, 63.0));
+
+/// #1165: along a path, each sample's per-step amount is its accumulation
+/// at its step less the run's step before, both sampled at the sample's
+/// position: exactly what a position query reads at the node, time and run.
+/// A 2-D path over the 09Z run reads each lead once (the step before each
+/// step is one of them); an M path over 07Z-09Z, which only the 06Z run
+/// has, reads 07Z-09Z and 06Z, the step before its first.
+#[test]
+fn a_per_step_amount_along_a_path_reads_like_position() {
+    let parameters = ["precipitation_amount", "precipitation_amount_acc"];
+    let ((x0, y0), (x1, y1)) = RAIN_PATH;
+
+    let engine = meps_rain();
+    let path = coverages(
+        engine
+            .query_trajectory(
+                &format!("LINESTRING({x0} {y0}, {x1} {y1})"),
+                None,
+                Some(&names(&parameters)),
+                None,
+                None,
+            )
+            .unwrap(),
+    );
+    assert_eq!(path.len(), 3, "the 09Z run's three steps");
+    assert_eq!(engine.field_decodes(), 3, "each lead once");
+    for coverage in &path {
+        assert!(assert_reads_like_position(&engine, coverage, &parameters, None) > 0);
+    }
+    // 09Z is the run's first step: its own accumulation, zero.
+    assert!(path[0].ranges["precipitation_amount"]
+        .values
+        .iter()
+        .all(|v| *v == Some(0.0)));
+
+    let engine = meps_rain();
+    let six = at("2026-10-15T06:00:00Z");
+    let m_path = single(
+        engine
+            .query_trajectory(
+                &format!(
+                    "LINESTRING M({x0} {y0} {}, {x1} {y1} {})",
+                    m("2026-10-15T07:00:00Z"),
+                    m("2026-10-15T09:00:00Z")
+                ),
+                None,
+                Some(&names(&["precipitation_amount"])),
+                None,
+                None,
+            )
+            .unwrap(),
+    );
+    let (nodes, _) = nodes(&m_path);
+    let hours: Vec<u32> = nodes.iter().map(|n| n.0.hour()).collect();
+    assert_eq!((hours[0], hours[hours.len() - 1]), (7, 9), "{hours:?}");
+    assert_eq!(
+        engine.field_decodes(),
+        4,
+        "07Z, 08Z, 09Z and 06Z before them"
+    );
+    assert!(assert_reads_like_position(&engine, &m_path, &["precipitation_amount"], Some(six)) > 0);
+    let values = &m_path.ranges["precipitation_amount"].values;
+    assert!(
+        values.iter().flatten().all(|&v| v >= 0.0) && values.iter().flatten().any(|&v| v > 1.0),
+        "07Z at the rainy cell is 2.08 mm: {values:?}"
+    );
+}
+
+/// #1165: a cube's per-step amount is an area's: each cell's accumulation
+/// at the step less the run's step before, exactly what a position query
+/// reads at the cell centre, step and run. 07Z-09Z in the 06Z run reads
+/// each lead once, 06Z before them included.
+#[test]
+fn a_per_step_amount_cube_reads_like_position() {
+    let engine = meps_rain();
+    let parameters = ["precipitation_amount", "precipitation_amount_acc"];
+    let six = at("2026-10-15T06:00:00Z");
+    let cube = single(
+        engine
+            .query_cube(
+                &bbox(4.0, 58.0, 16.0, 64.0),
+                Some((at("2026-10-15T07:00:00Z"), at("2026-10-15T09:00:00Z"))),
+                Some(&names(&parameters)),
+                None,
+                NATIVE,
+                Some(six),
+            )
+            .unwrap(),
+    );
+    assert_eq!(engine.field_decodes(), 4, "06Z-09Z, once each");
+    let DomainDescription::Grid { t, .. } = &cube.domain else {
+        panic!("{:?}", cube.domain)
+    };
+    assert_eq!(t.as_ref().map(Vec::len), Some(3));
+    assert!(assert_cube_reads_like_position(&engine, &cube, &parameters, Some(six)) > 0);
+    let values = &cube.ranges["precipitation_amount"].values;
+    assert!(values.iter().flatten().all(|&v| v >= 0.0));
+    assert!(values.iter().flatten().any(|&v| v > 0.5), "{values:?}");
+    assert_eq!(
+        cube.parameters["precipitation_amount"].label,
+        "Precipitation amount (1 h accumulation)"
+    );
+}

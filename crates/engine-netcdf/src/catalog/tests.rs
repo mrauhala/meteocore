@@ -4,6 +4,34 @@ use chrono::TimeZone;
 
 use super::*;
 
+/// A variable of `units` and `standard_name`, on one level.
+fn variable(name: &str, units: &str, standard_name: Option<&str>) -> Variable {
+    Variable {
+        name: name.into(),
+        title: name.into(),
+        units: units.into(),
+        standard_name: standard_name.map(str::to_string),
+        levels: Vec::new(),
+        pressure: None,
+    }
+}
+
+/// A 2 × 2 one-degree grid.
+fn grid() -> FileGrid {
+    FileGrid {
+        transform: ds_core::geo::GeoTransform {
+            origin_x: 0.0,
+            origin_y: 2.0,
+            pixel_width: 1.0,
+            pixel_height: -1.0,
+            width: 2,
+            height: 2,
+            crs: Crs::Wgs84,
+        },
+        flipped: false,
+    }
+}
+
 /// A file to hang steps on: selection never reads it.
 fn file() -> Arc<OpenFile> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -144,14 +172,6 @@ fn files_without_a_run_form_one_timeline() {
 /// without a standard name keeps `1` and its stored values.
 #[test]
 fn unit_1_is_percent_only_for_a_fraction_standard_name() {
-    let variable = |name: &str, units: &str, standard_name: Option<&str>| Variable {
-        name: name.into(),
-        title: name.into(),
-        units: units.into(),
-        standard_name: standard_name.map(str::to_string),
-        levels: Vec::new(),
-        pressure: None,
-    };
     let layout = Layout::new(
         vec![
             variable("relative_humidity_2m", "1", Some("relative_humidity")),
@@ -163,18 +183,8 @@ fn unit_1_is_percent_only_for_a_fraction_standard_name() {
             variable("relative_humidity", "1", None),
             variable("air_temperature_2m", "K", Some("air_temperature")),
         ],
-        FileGrid {
-            transform: ds_core::geo::GeoTransform {
-                origin_x: 0.0,
-                origin_y: 2.0,
-                pixel_width: 1.0,
-                pixel_height: -1.0,
-                width: 2,
-                height: 2,
-                crs: Crs::Wgs84,
-            },
-            flipped: false,
-        },
+        grid(),
+        true,
     );
     let served: Vec<(&str, f64)> = (0..layout.variables.len())
         .map(|i| (layout.unit(i), layout.to_display(i, 0.5)))
@@ -200,4 +210,171 @@ fn unit_1_is_percent_only_for_a_fraction_standard_name() {
         .map(|p| p.unit.as_str())
         .collect();
     assert_eq!(units, ["%", "%", "%", "%", "1", "1", "1", "°C"]);
+}
+
+/// #1165: a variable named `…_acc` served in mm (kg m-2 or mm, in any
+/// spelling) gives a per-step amount named without the `_acc`, after the
+/// variables, titled from its standard name; an `_acc` in another unit, or
+/// one whose per-step name a variable already has, gives none, nor does
+/// any with `derive_per_step = false`.
+#[test]
+fn run_start_accumulations_in_mm_give_per_step_amounts() {
+    let variables = vec![
+        variable("air_temperature_2m", "K", Some("air_temperature")),
+        variable(
+            "precipitation_amount_acc",
+            "kg/m^2",
+            Some("precipitation_amount"),
+        ),
+        variable("snowfall_amount_acc", "mm", None),
+        // Signed: a step's amount clamped at zero would be wrong.
+        variable(
+            "integral_of_surface_net_downward_longwave_flux_wrt_time_acc",
+            "J m-2",
+            None,
+        ),
+        // The file serves its own per-step amount: that one is served.
+        variable("graupelfall_amount_acc", "kg m-2", None),
+        variable("graupelfall_amount", "kg m-2", None),
+        variable("_acc", "kg m-2", None),
+    ];
+    let layout = Layout::new(variables.clone(), grid(), true);
+    let derived: Vec<(&str, &str, &str, &str)> = layout
+        .per_step
+        .iter()
+        .map(|p| {
+            (
+                &*p.name,
+                &*layout.variables[p.source].name,
+                p.label.as_str(),
+                layout.unit(p.source),
+            )
+        })
+        .collect();
+    assert_eq!(
+        derived,
+        [
+            (
+                "precipitation_amount",
+                "precipitation_amount_acc",
+                "Precipitation amount",
+                "mm"
+            ),
+            (
+                "snowfall_amount",
+                "snowfall_amount_acc",
+                "Snowfall amount",
+                "mm"
+            ),
+        ]
+    );
+    // Served after the variables, by name, reading their accumulation.
+    let n = variables.len();
+    let params: Vec<Param> = layout.params().collect();
+    assert_eq!(params.len(), n + 2);
+    let precipitation = layout.param("precipitation_amount").unwrap();
+    assert_eq!(precipitation, Param::PerStep(0));
+    assert_eq!(
+        (
+            layout.source_of(precipitation),
+            layout.info_index(precipitation),
+            layout.name(precipitation)
+        ),
+        (1, n, "precipitation_amount")
+    );
+    assert_eq!(
+        layout.param("precipitation_amount_acc"),
+        Some(Param::Stored(1))
+    );
+    assert_eq!(layout.param("rain"), None);
+    assert!(Layout::new(variables, grid(), false).per_step.is_empty());
+}
+
+/// #1165: a step's amount is the accumulation less the step before's,
+/// clamped at zero; a run's first step is its own accumulation; a missing
+/// sample at either step is no value.
+#[test]
+fn a_step_amount_is_the_clamped_difference() {
+    assert_eq!(step_amount(Some(1.5), Some(Some(0.5))), Some(1.0));
+    assert_eq!(step_amount(Some(0.25), None), Some(0.25), "the first step");
+    assert_eq!(
+        step_amount(Some(0.004), Some(Some(0.0045))),
+        Some(0.0),
+        "a decreasing accumulation is no amount"
+    );
+    assert_eq!(step_amount(Some(-0.1), None), Some(0.0));
+    assert_eq!(step_amount(None, Some(Some(0.5))), None);
+    assert_eq!(step_amount(Some(1.0), Some(None)), None);
+}
+
+/// #1165: the title says the step a per-step amount spans, from the runs
+/// held: between consecutive steps, and from a run's reference time to a
+/// first step after it. One length is GRIB's `(1 h accumulation)`; several,
+/// as when a run lacks a lead, the shortest and longest; none, a run of one
+/// step at its reference time, no length.
+#[test]
+fn the_title_says_the_step_length() {
+    let title = |runs: &[(Option<i64>, &[i64])]| {
+        per_step_title("Precipitation amount", &step_lengths(&catalog(runs).runs))
+    };
+    assert_eq!(
+        title(&[(Some(6), &[6, 7, 8, 9]), (Some(9), &[9, 10, 11])]),
+        "Precipitation amount (1 h accumulation)"
+    );
+    // A run starting at its first lead after the reference time.
+    assert_eq!(
+        title(&[(Some(0), &[1, 2])]),
+        "Precipitation amount (1 h accumulation)"
+    );
+    assert_eq!(
+        title(&[(Some(6), &[6, 7, 9])]),
+        "Precipitation amount (1 h to 2 h accumulation per forecast step)"
+    );
+    assert_eq!(
+        title(&[(None, &[0, 6, 12])]),
+        "Precipitation amount (6 h accumulation)"
+    );
+    assert_eq!(
+        title(&[(Some(6), &[6])]),
+        "Precipitation amount (accumulation per forecast step)"
+    );
+    assert_eq!(step_words(chrono::Duration::minutes(15)), "15 min");
+    assert_eq!(step_words(chrono::Duration::seconds(90)), "90 s");
+}
+
+/// #1165: the step before each step of a run, through `select` as the map
+/// uses it; none at the run's first.
+#[test]
+fn a_selected_step_names_the_step_before() {
+    let catalog = meps();
+    let before = |run: Option<i64>, time: i64| {
+        let selected = catalog.select(run.map(t), Some(t(time))).unwrap();
+        selected.previous.map(|step| step.index)
+    };
+    assert_eq!(before(Some(6), 6), None, "the run's first step");
+    assert_eq!(before(Some(6), 8), Some(7));
+    assert_eq!(before(Some(9), 9), None, "09Z's first, not 06Z's 08Z");
+    assert_eq!(before(None, 11), Some(10));
+}
+
+/// #1165: a lead filled in, or removed, inside a run changes the step
+/// before a step served before; a lead appended after the run's last, or a
+/// run added, does not.
+#[test]
+fn a_lead_inside_a_run_changes_the_step_before() {
+    let changed = |old: &[(Option<i64>, &[i64])], new: &[(Option<i64>, &[i64])]| {
+        steps_before_changed(&catalog(old).runs, &catalog(new).runs)
+    };
+    assert!(!changed(&[(Some(6), &[6, 7])], &[(Some(6), &[6, 7, 8])]));
+    assert!(!changed(
+        &[(Some(6), &[6, 7])],
+        &[(Some(6), &[6, 7]), (Some(9), &[9, 10])]
+    ));
+    assert!(changed(
+        &[(Some(6), &[6, 7, 9])],
+        &[(Some(6), &[6, 7, 8, 9])]
+    ));
+    assert!(changed(&[(Some(6), &[6, 7, 8])], &[(Some(6), &[6, 8])]));
+    assert!(changed(&[(Some(6), &[7, 8])], &[(Some(6), &[6, 7, 8])]));
+    assert!(!changed(&[], &[(Some(6), &[6, 7, 8])]));
 }

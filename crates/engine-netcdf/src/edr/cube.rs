@@ -25,9 +25,13 @@
 //!   the map draws it, and converted to the unit served. engine-grib's
 //!   lat/lon cube instead takes the nearest native node.
 //!
+//! A per-step amount (#1165) is an area's: each cell's accumulation at the
+//! step less the accumulation at the run's step before, both sampled there.
+//!
 //! Both caps come before any read: `check_cube_budget` on the response's
-//! values, then [`super::QUERY_BYTES`] on the fields decoded, steps × read
-//! levels × variables. A bbox outside the grid is a 404 and reads nothing.
+//! values, then [`super::QUERY_BYTES`] on the fields decoded, steps (a
+//! per-step amount's steps before included) × read levels × variables. A
+//! bbox outside the grid is a 404 and reads nothing.
 
 use std::sync::Arc;
 
@@ -118,8 +122,8 @@ impl NetcdfEngine {
         let ny = resolution.y.unwrap_or_else(|| cells(height, res_lat));
         let (nt, nz) = (reads.steps.len(), z_source.len());
         // Both caps before anything that grows with them is allocated.
-        check_cube_budget(nt, nz, ny, nx, reads.variables.len())?;
-        check_query_bytes(nt, used.len(), &reads.field_bytes(), limit)?;
+        check_cube_budget(nt, nz, ny, nx, reads.params.len())?;
+        check_query_bytes(reads.steps_read(), used.len(), &reads.field_bytes(), limit)?;
         if !bbox.intersects_bbox(&extent) {
             return Err(DataServerError::LocationNotFound(
                 "The bbox lies outside the collection's spatial extent".into(),
@@ -157,22 +161,23 @@ impl NetcdfEngine {
         let fields: Vec<Sampling> = reads
             .steps
             .iter()
-            .flat_map(|&(_, step)| {
+            .flat_map(|&(valid, step)| {
                 let (levels, positions) = (&reads.levels, &positions);
                 used.iter().map(move |&u| Sampling {
+                    valid,
                     step,
                     level: levels[u],
                     positions: positions.clone(),
                 })
             })
             .collect();
-        let sampled = self.sample_fields(layout, &reads.variables, &fields)?;
+        let sampled = self.sample_fields(&reads, &fields)?;
         let plane = nx * ny;
         let ranges = reads
-            .variables
+            .params
             .iter()
             .zip(sampled)
-            .map(|(&index, slots)| {
+            .map(|(&param, slots)| {
                 let mut values = Vec::with_capacity(nt * nz * plane);
                 for step in 0..nt {
                     for &level in &z_source {
@@ -189,7 +194,7 @@ impl NetcdfEngine {
                     (vec![nt, ny, nx], vec!["t", "y", "x"])
                 };
                 (
-                    layout.variables[index].name.to_string(),
+                    layout.name(param).to_string(),
                     NdArray {
                         shape,
                         axis_names: axis_names.into_iter().map(String::from).collect(),
@@ -205,7 +210,7 @@ impl NetcdfEngine {
                 t: Some(reads.steps.iter().map(|(t, _)| *t).collect()),
                 z: z_axis,
             },
-            parameters: Self::descriptions(&catalog, layout, &reads.variables),
+            parameters: Self::descriptions(&catalog, layout, &reads.params),
             ranges,
         }))
     }

@@ -1955,6 +1955,13 @@ pub struct NetcdfConfig {
     /// A MEPS variable costs about 100 MB per run. Default: none.
     #[serde(default)]
     pub prewarm_variables: Vec<String>,
+    /// Serve the per-step amount of each run-start accumulation (#1165): a
+    /// variable named `<name>_acc` served in mm (kg m-2 or mm stored), such
+    /// as MEPS's `precipitation_amount_acc`, also gives `<name>`, the
+    /// difference of consecutive steps of one run clamped at zero. Default
+    /// on; `false` opts out, as `derive_wind` does for wind.
+    #[serde(default = "default_true")]
+    pub derive_per_step: bool,
     /// Remote only: the THREDDS `catalog.xml` of the directory `data_path`
     /// names, such as
     /// `https://thredds.met.no/thredds/catalog/meps25epsarchive/catalog.xml`
@@ -8904,6 +8911,7 @@ mod netcdf_tests {
             (4, 1024, 60, 0)
         );
         assert!(cfg.variables.is_none() && cfg.titles.is_empty());
+        assert!(cfg.derive_per_step, "per-step amounts are on by default");
         validate_netcdf("meps", &cfg).unwrap();
         let cfg = netcdf(
             r#"
@@ -8915,9 +8923,11 @@ mod netcdf_tests {
             max_runs = 2
             max_files = 200
             poll_interval_secs = 30
+            derive_per_step = false
             "#,
         )
         .unwrap();
+        assert!(!cfg.derive_per_step);
         validate_netcdf("meps", &cfg).unwrap();
     }
 

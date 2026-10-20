@@ -90,7 +90,10 @@ poll_interval_secs = 300
 # prewarm_variables = ["air_temperature_2m"]
 
 [netcdf.titles]
-# Accumulated from the run's start, not per step.
+# Accumulated from the run's start, not per step. Its amount per step is
+# derived as `precipitation_amount`, titled "Precipitation amount (1 h
+# accumulation)": the accumulation less the run's previous lead's, clamped
+# at zero (`derive_per_step = false` turns it off).
 precipitation_amount_acc = "Precipitation accumulated since run start"
 x_wind_10m = "10 m wind along the grid's x axis"
 y_wind_10m = "10 m wind along the grid's y axis"
@@ -102,8 +105,9 @@ y_wind_10m = "10 m wind along the grid's y axis"
 # in m/s as stored. Each layer without an entry below takes the built-in
 # default its name and unit select: temperature over -90…50 °C, pressure
 # over 950…1050 hPa, wind speed for the gusts, 0-200 mm for the
-# accumulated precipitation, and relative humidity and cloud cover on the
-# percent palettes over 0-100 %.
+# accumulated precipitation, 0-50 mm for the hourly precipitation derived
+# from it (`precipitation_amount`), and relative humidity and cloud cover on
+# the percent palettes over 0-100 %.
 [wms]
 # The collection's own palette, for a variable no default matches: the
 # temperature palette over its own -90…50 °C, the first variable's.
