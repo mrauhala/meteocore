@@ -9507,10 +9507,12 @@ prewarm_sweeps = 0
     /// example does not configure take the built-in default their name and
     /// served unit select (the temperature in °C, MSLP in hPa, the
     /// run-start accumulation in mm, relative humidity and cloud cover in %
-    /// from the files' unit `1` and fraction standard names, the gusts),
-    /// the wind components keep their narrower entries, and the
-    /// collection's own style is the temperature palette over its own
-    /// range.
+    /// from the files' unit `1` and fraction standard names, the gusts,
+    /// and the per-step precipitation derived from the run-start
+    /// accumulation (#1165), on the per-step precipitation palette), the
+    /// wind components keep their narrower entries, and the collection's
+    /// own style is the temperature palette over its own range. WMS, Maps,
+    /// Tiles and EDR all list the per-step layer.
     #[test]
     fn meps_netcdf_example_layers_get_default_styles() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -9539,12 +9541,36 @@ prewarm_sweeps = 0
             ),
             ("relative_humidity_2m", ("humidity", 0.0, 100.0)),
             ("cloud_area_fraction", ("cloud_cover", 0.0, 100.0)),
+            ("precipitation_amount", ("precipitation", 0.0, 50.0)),
             // Configured by the example.
             ("x_wind_10m", ("diverging", -20.0, 20.0)),
             ("y_wind_10m", ("diverging", -20.0, 20.0)),
         ] {
             assert_eq!(style(name), expected, "{name}");
         }
+        let id = "meps-netcdf-local";
+        for (api, info) in [
+            ("maps", loaded.maps_state.engines[id].raster_info()),
+            ("tiles", loaded.tiles_state.map_engines[id].raster_info()),
+        ] {
+            let per_step = info
+                .parameters
+                .iter()
+                .find(|p| p.name == "precipitation_amount")
+                .unwrap_or_else(|| panic!("{api}"));
+            assert_eq!(
+                per_step.title, "Precipitation amount (1 h accumulation)",
+                "{api}"
+            );
+        }
+        let edr = &loaded.edr_state.engines[id];
+        assert!(edr
+            .get_parameters()
+            .contains(&"precipitation_amount".to_string()));
+        assert_eq!(
+            edr.get_parameter_descriptions()["precipitation_amount"].unit,
+            "mm"
+        );
         let parent = &styles["meps-netcdf-local"]["default"];
         assert_eq!(
             (parent.palette.name.as_str(), parent.min, parent.max),
@@ -9560,6 +9586,7 @@ prewarm_sweeps = 0
             ("air_temperature_2m", "°C"),
             ("air_pressure_at_sea_level", "hPa"),
             ("precipitation_amount_acc", "mm"),
+            ("precipitation_amount", "mm"),
             ("relative_humidity_2m", "%"),
             ("cloud_area_fraction", "%"),
             ("wind_speed_10m", "m/s"),

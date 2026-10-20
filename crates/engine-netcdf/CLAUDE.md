@@ -6,7 +6,7 @@ shape this crate. Today: local directories and remote files read in place
 by HTTP range (thredds.met.no), WMS/Maps/Tiles, EDR position/area/radius/
 trajectory/cube with runs as instances, GetFeatureInfo, derived wind speed, and a CF
 pressure axis as the collection's vertical axis (PR 8, the last of the
-#1067 plan).
+#1067 plan), and per-step amounts of run-start accumulations (#1165).
 
 ## Model
 
@@ -488,10 +488,13 @@ cube is an area's steps and cells, never coarsened, sampled bilinearly,
   A point or cell off the grid (`SourceGrid::covers`, the rule `value_at`
   applies) is dropped before sampling, and a query with none on the grid
   reads no field: `POINT(-100 10)` on remote MEPS costs no fetch.
-- **Field jobs:** one per (variable, `Sampling`): a step, a level and its
-  own positions (`sample_fields`; position, area and cube share one
-  position set, step-major `[t][z]`, a trajectory gives each field its
-  samples; a field with no position on the grid is not read), through
+- **Field jobs:** one per (variable, step, level) field `sample_fields`
+  needs, each read once however many parameters and `Sampling`s need it (a
+  per-step amount adds its accumulation at the run's step before each
+  `Sampling.valid`, #1165), sampled once per distinct positions list
+  (position, area and cube share one position set, step-major `[t][z]`, a
+  trajectory gives each field its samples; a field with no position on the
+  grid is not read), through
   `ds_executor::field_jobs::run_field_jobs` (engine-grib's scheduler, moved
   there): four at once as tasks on the query runtime (fallback
   `ds_executor::query_runtime()` outside any runtime), each re-entering
@@ -517,7 +520,9 @@ cube is an area's steps and cells, never coarsened, sampled bilinearly,
   before any read; over it a 400 `QueryTooLarge` naming the fields, the
   MiB and the limit. Trajectory and cube count only the fields they read
   (`Reads::check_fields`, `check_field_reads`: distinct (step, level)
-  pairs per variable; a cube steps × the levels its z positions take). The default admits one parameter over one MEPS run
+  pairs per variable; a cube steps × the levels its z positions take); a
+  per-step amount's steps before count too (`Reads::steps_read`, and
+  `check_fields`' pairs). The default admits one parameter over one MEPS run
   as the client sees it, including a derived wind speed (decided on
   #1067, twice the issue's 272 MiB). It counts the variables the engine
   reads, and `DerivedWind` asks for both components of a derived speed: a
@@ -558,6 +563,33 @@ of each request, so the speed is per level
 a Pa file with earth-relative `u`/`v` on lat/lon gives `ws` and `wdir` per
 level, `pressure_in_pa_is_served_in_hpa_with_wind_direction_per_level`).
 
+## Per-step amounts (#1165)
+
+`<name>_acc` served in mm (`Layout::per_step`, `per_step_amounts`) also
+gives `<name>`: MEPS `precipitation_amount_acc` → `precipitation_amount`,
+titled with the step, "(1 h accumulation)". It is not derived for another
+unit (the clamp would corrupt signed accumulations), when a variable
+already has `<name>`, or with `[netcdf] derive_per_step = false`.
+Parameters are `catalog::Param` (`Stored`/`PerStep`), served after the
+variables (`Layout::info_index`). Value = `step_amount(now, before)`: both
+fields sampled and converted in f64, differenced, clamped ≥ 0, never a
+difference interpolated; the run's first step (`Selected::previous` /
+`Run::previous` = None) is its own accumulation. Map: `sample_step_amount`
+(`OutputMap::position` + `SourceGrid::value_at`). EDR position, area,
+trajectory and cube: `sample_fields` reads each (variable, step) once,
+including the run's step before each sample's own step, and the cap counts
+it. Title from `step_lengths`: one length `(1 h accumulation)`, else
+`(min to max accumulation per forecast step)`. Cache keys don't name the
+step before, so `build_catalog` bumps `content_version` when
+`steps_before_changed`. Pinned by `tests/integration.rs` (`per_step_*`,
+`a_decreasing_accumulation_is_no_amount`,
+`the_first_lead_present_is_its_own_accumulation`,
+`a_lead_filled_in_moves_the_content_version`,
+`derive_per_step_false_serves_the_variables_only`), `tests/trajectory_cube.rs`
+(`a_per_step_amount_*`), `catalog::tests`,
+`edr::tests::the_cap_counts_the_step_before_a_per_step_amount`, and the
+server's `netcdf_edr` and `wms_get_feature_info`.
+
 ## Runs (`catalog.rs`)
 
 `BTreeMap<Option<DateTime<Utc>>, Run>`, `None` the run-less timeline.
@@ -567,13 +599,18 @@ default-layer rule: a pinned run is exactly that run (absent ⇒
 `ReferenceTimeNotFound`, 404) and never falls back; unpinned, the newest run
 whose steps span the time, so an incomplete newer run does not hide an
 older one; without a time, the newest run's last step. Within the run, the
-nearest step, the earlier on a tie. Every variable shares the run's time
-axis (decision 3), so the per-parameter resolvers keep their defaults.
+nearest step, the earlier on a tie. Every variable, and every per-step
+amount, shares the run's time axis (decision 3), so the per-parameter
+resolvers keep their defaults; `Selected::previous` is the run's step
+before, never another run's.
 
 `content_version` starts at the process start's Unix seconds (nonzero, new
 per restart) and moves when a catalogued file is replaced in place: found
 by a poll (local identity, or a remote file the prober lists at another
-version), or by a remote read at once (`Changes::bumps`).
+version), or by a remote read at once (`Changes::bumps`). It also moves
+when a per-step layout's step gets another step before it (a lead filled
+in or removed inside a run, `catalog::steps_before_changed`, #1165);
+appended leads and new runs move nothing.
 
 ## Server wiring
 

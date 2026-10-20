@@ -550,3 +550,105 @@ async fn netcdf_pressure_level_responses_validate() {
         "EDR collection with a vertical extent",
     );
 }
+
+/// The per-step precipitation (#1165) through the EDR API: the collection
+/// lists `precipitation_amount` next to the run-start accumulation it is
+/// derived from, in mm with its step in the label; a position series is,
+/// step by step, the accumulation's own series differenced and clamped at
+/// zero, the run's first step its own accumulation; an area and an
+/// instance query serve it. Every body validates against the CoverageJSON
+/// schema and the collection against the EDR schemas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn netcdf_per_step_precipitation_responses_validate() {
+    let app = tokio::task::spawn_blocking(|| {
+        edr_router(
+            "meps-rain",
+            "meps-netcdf",
+            "meps_sfc_{lead}_%Y%m%dT{run}Z.nc",
+            &["air_temperature_2m", "precipitation_amount_acc"],
+        )
+    })
+    .await
+    .unwrap();
+    let covjson = coverage_json_schema();
+    let base = "/collections/meps-rain";
+
+    let (status, collection) = get(&app, base).await;
+    assert_eq!(status, StatusCode::OK);
+    let parameter = &collection["parameter_names"]["precipitation_amount"];
+    assert_eq!(
+        parameter["label"], "Precipitation amount (1 h accumulation)",
+        "{parameter}"
+    );
+    assert_eq!(
+        parameter["observedProperty"]["id"],
+        "https://vocab.nerc.ac.uk/standard_name/precipitation_amount"
+    );
+    assert_eq!(
+        parameter["unit"]["symbol"]["type"],
+        "https://qudt.org/vocab/unit/MilliM"
+    );
+    assert!(collection["parameter_names"]["precipitation_amount_acc"].is_object());
+    edr_schema::assert_valid(
+        "/collections/{collectionId}",
+        edr_schema::JSON,
+        &collection,
+        "EDR collection with a per-step amount",
+    );
+
+    // Fixture cell (row 4, column 2), where it rains in the 06Z run.
+    let point = "coords=POINT(4.92739%2059.91516)";
+    let queries = [
+        ("series", format!("instances/2026-10-15T06:00:00Z/position?{point}&parameter-name=precipitation_amount_acc,precipitation_amount")),
+        ("instant", format!("position?{point}&datetime=2026-10-15T08:00:00Z&parameter-name=precipitation_amount")),
+        ("area", "area?coords=10,58,20,64&datetime=2026-10-15T09:00:00Z/2026-10-15T11:00:00Z&parameter-name=precipitation_amount".to_string()),
+    ];
+    let mut answers = HashMap::new();
+    for (what, query) in &queries {
+        let (status, json) = get(&app, &format!("{base}/{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{what}: {json}");
+        assert_valid(&covjson, &json, what);
+        answers.insert(*what, json);
+    }
+    let values = |answer: &Value, name: &str| -> Vec<f64> {
+        answer["ranges"][name]["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect()
+    };
+    let series = &answers["series"];
+    assert_eq!(times(series).len(), 4, "the 06Z run's four steps");
+    let raw = values(series, "precipitation_amount_acc");
+    let per_step = values(series, "precipitation_amount");
+    assert!(raw[1] > 1.0 && raw[3] > raw[1], "it rains here: {raw:?}");
+    for k in 0..raw.len() {
+        let before = if k == 0 { 0.0 } else { raw[k - 1] };
+        assert_eq!(per_step[k], (raw[k] - before).max(0.0), "step {k}");
+    }
+    assert_eq!(
+        series["parameters"]["precipitation_amount"]["unit"]["symbol"]["type"],
+        "https://qudt.org/vocab/unit/MilliM"
+    );
+    // 08Z is the 06Z run's only: its 08Z less its 07Z.
+    assert_eq!(
+        values(&answers["instant"], "precipitation_amount"),
+        [per_step[2]]
+    );
+    let area = &answers["area"];
+    assert_eq!(times(area).len(), 3, "the 09Z run's steps");
+    assert_eq!(
+        area["ranges"]["precipitation_amount"]["axisNames"],
+        serde_json::json!(["t", "y", "x"])
+    );
+    let cells = area["ranges"]["precipitation_amount"]["values"]
+        .as_array()
+        .unwrap();
+    assert!(cells.iter().filter_map(Value::as_f64).all(|v| v >= 0.0));
+    // The 09Z run's first step is its own accumulation, zero at its start.
+    let first = cells.len() / 3;
+    assert!(cells[..first]
+        .iter()
+        .all(|v| v.is_null() || v.as_f64() == Some(0.0)));
+}

@@ -138,7 +138,10 @@ fn meps_runs_and_variables_are_advertised() {
     assert_eq!(hours, [6, 7, 8, 9, 10, 11]);
     let names: Vec<&str> = info.parameters.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names[..2], ["air_temperature_2m", "relative_humidity_2m"]);
-    assert_eq!(names.len(), 8);
+    // The eight variables, then the per-step amount of the run-start
+    // accumulation (#1165).
+    assert_eq!(names.len(), 9);
+    assert_eq!(names[8], "precipitation_amount");
     assert_eq!(info.parameter, "air_temperature_2m");
     // Display units (#1209): the file's K and kg/m^2 as °C and mm.
     assert_eq!(info.unit, "°C");
@@ -175,7 +178,11 @@ fn new_scans_and_polls_pick_up_new_files() {
     copy("meps_sfc_00_20261015T06Z.nc");
     let engine = NetcdfEngine::new("meps", &meps_config(dir.path())).unwrap();
     let info = engine.raster_info();
-    assert_eq!(info.parameters.len(), 8);
+    assert_eq!(
+        info.parameters.len(),
+        9,
+        "eight variables and a per-step amount"
+    );
     assert_eq!(info.parameters[0].unit, "°C");
     assert_eq!(info.times.len(), 1);
     assert!(matches!(
@@ -196,7 +203,7 @@ fn new_scans_and_polls_pick_up_new_files() {
     )
     .unwrap();
     missing.poll_once();
-    assert_eq!(missing.raster_info().parameters.len(), 8);
+    assert_eq!(missing.raster_info().parameters.len(), 9);
 }
 
 /// MET Norway's own latitude/longitude of each fixture cell, against the
@@ -789,8 +796,8 @@ fn edr_position_reads_the_stored_values_of_the_selected_run() {
         .all(|range| range.values.iter().all(Option::is_none)));
     assert_eq!(
         far.ranges.len(),
-        8,
-        "every parameter without parameter-name"
+        9,
+        "every parameter without parameter-name, the per-step precipitation included"
     );
     let DomainDescription::PointSeries { t, .. } = &far.domain else {
         unreachable!()
@@ -1980,4 +1987,456 @@ fn the_global_grid_keeps_its_crs84_description() {
     let axes = spatial.grid.expect("the CRS84 grid");
     assert_eq!((axes[0].cells_count, axes[0].resolution), (72, 5.0));
     assert_eq!(axes[0].first_coordinate, None);
+}
+
+// ---- Per-step amounts of run-start accumulations (#1165) ----
+
+/// Fixture cell (row 4 from the south, column 2), where it rains, and its
+/// `precipitation_amount_acc` in kg/m^2 (mm) as the CDLs print it, accumulated
+/// since each run's start: the 06Z run's leads 00-03 (06Z-09Z) and the 09Z
+/// run's leads 00-02 (09Z-11Z).
+const RAIN_CELL: (usize, usize) = (4, 2);
+const RAIN_06Z: [f64; 4] = [0.0, 2.075_439_5, 3.657_226_6, 5.193_359_4];
+const RAIN_09Z: [f64; 3] = [0.0, 0.536_865_23, 0.564_453_1];
+/// The amount of each step at [`RAIN_CELL`], worked out by hand from the
+/// leads above: lead 00 is its own accumulation (0), then
+/// 2.0754395 - 0 = 2.0754395, 3.6572266 - 2.0754395 = 1.5817871,
+/// 5.1933594 - 3.6572266 = 1.5361328; and for 09Z, 0, 0.53686523 - 0,
+/// 0.5644531 - 0.53686523 = 0.02758787.
+const RAIN_06Z_STEPS: [f64; 4] = [0.0, 2.075_439_5, 1.581_787_1, 1.536_132_8];
+const RAIN_09Z_STEPS: [f64; 3] = [0.0, 0.536_865_23, 0.027_587_87];
+/// Fixture cell (row 9, column 4), where the 06Z run's accumulation
+/// decreases from lead 01 (07Z) to lead 02 (08Z), as the CDLs print it.
+const DRY_CELL: (usize, usize) = (9, 4);
+const DRY_06Z: [f64; 2] = [0.004_638_672, 0.004_394_531_2];
+
+/// `precipitation_amount_acc` at `cell` in the fixture file of `run` and
+/// `lead`, read from the file.
+fn accumulation(run: &str, lead: u32, (j, i): (usize, usize)) -> f64 {
+    stored(
+        &format!("meps-netcdf/meps_sfc_0{lead}_20261015T{run}Z.nc"),
+        "precipitation_amount_acc",
+    )[j][i]
+}
+
+fn close_to(got: &[Option<f64>], want: &[f64], tolerance: f64) -> bool {
+    got.len() == want.len()
+        && got
+            .iter()
+            .zip(want)
+            .all(|(g, w)| g.is_some_and(|g| (g - w).abs() < tolerance))
+}
+
+/// #1165: `precipitation_amount_acc`, accumulated since the run start,
+/// gives `precipitation_amount`, the amount of each one-hour step: the
+/// accumulation at the step less the accumulation at the run's step before,
+/// in mm, titled with the step. EDR, the map and the per-step values worked
+/// out by hand from two leads agree, in the run the accumulation's own map
+/// and EDR select: the 09Z run's first step is its own accumulation, never
+/// the 06Z run's 08Z differenced.
+#[test]
+fn per_step_precipitation_is_the_difference_of_consecutive_leads() {
+    let engine = meps();
+    // The constants are the files' values.
+    for (lead, &value) in RAIN_06Z.iter().enumerate() {
+        assert!((accumulation("06", lead as u32, RAIN_CELL) - value).abs() < 1e-7);
+    }
+    for (lead, &value) in RAIN_09Z.iter().enumerate() {
+        assert!((accumulation("09", lead as u32, RAIN_CELL) - value).abs() < 1e-7);
+    }
+
+    let info = engine.raster_info();
+    let advertised = info
+        .parameters
+        .iter()
+        .find(|p| p.name == "precipitation_amount")
+        .unwrap();
+    assert_eq!(
+        (advertised.title.as_str(), advertised.unit.as_str()),
+        ("Precipitation amount (1 h accumulation)", "mm")
+    );
+    let description = &engine.get_parameter_descriptions()["precipitation_amount"];
+    assert_eq!(description.label, advertised.title);
+    assert_eq!(description.unit, "mm");
+    assert_eq!(
+        description.standard_name.as_deref(),
+        Some("precipitation_amount")
+    );
+    assert!(engine
+        .get_parameters()
+        .contains(&"precipitation_amount".to_string()));
+
+    // EDR series: every step of a run, the first its own accumulation.
+    let series = |run| {
+        let result = position(&engine, RAIN_CELL, "precipitation_amount", None, run).unwrap();
+        (
+            series_hours(&result),
+            result.ranges["precipitation_amount"].values.clone(),
+        )
+    };
+    let (hours, values) = series(Some("2026-10-15T06:00:00Z"));
+    assert_eq!(hours, [6, 7, 8, 9]);
+    assert!(close_to(&values, &RAIN_06Z_STEPS, 1e-5), "{values:?}");
+    let (hours, values) = series(None);
+    assert_eq!(hours, [9, 10, 11], "the newest run, as for every variable");
+    assert!(close_to(&values, &RAIN_09Z_STEPS, 1e-5), "{values:?}");
+    // The same as the difference of the accumulation's own series.
+    for (run, steps) in [
+        (Some("2026-10-15T06:00:00Z"), &RAIN_06Z[..]),
+        (None, &RAIN_09Z[..]),
+    ] {
+        let raw = position(&engine, RAIN_CELL, "precipitation_amount_acc", None, run).unwrap();
+        let raw = &raw.ranges["precipitation_amount_acc"].values;
+        assert!(close_to(raw, steps, 1e-5), "{raw:?}");
+        let (_, per_step) = series(run);
+        for k in 0..raw.len() {
+            let before = if k == 0 { 0.0 } else { raw[k - 1].unwrap() };
+            let want = (raw[k].unwrap() - before).max(0.0);
+            assert!((per_step[k].unwrap() - want).abs() < 1e-9, "{run:?} {k}");
+        }
+    }
+
+    // The map at the cell centre, in the run the accumulation's map uses.
+    let (lat, lon) = met_latlon();
+    let (x, y) = (lon[RAIN_CELL.0][RAIN_CELL.1], lat[RAIN_CELL.0][RAIN_CELL.1]);
+    let drawn = |time: &str, run: Option<&str>| {
+        value_at(
+            &engine,
+            x,
+            y,
+            Some("precipitation_amount"),
+            Some(at(time)),
+            run.map(at),
+        )
+        .unwrap()
+        .unwrap()
+    };
+    // 08Z only the 06Z run has: 3.6572266 - 2.0754395.
+    assert!((drawn("2026-10-15T08:00:00Z", None) - 1.581_787_1).abs() < 1e-3);
+    // 09Z unpinned: the 09Z run, whose first step is its own accumulation.
+    assert_eq!(drawn("2026-10-15T09:00:00Z", None), 0.0);
+    let nine = Some(at("2026-10-15T09:00:00Z"));
+    assert_eq!(
+        engine.resolve_reference_time(nine, None),
+        Some(at("2026-10-15T09:00:00Z"))
+    );
+    // Pinned to 06Z: that run's 09Z less its 08Z.
+    let pinned = drawn("2026-10-15T09:00:00Z", Some("2026-10-15T06:00:00Z"));
+    assert!((pinned - 1.536_132_8).abs() < 1e-3, "{pinned}");
+    // GetFeatureInfo's query at the map's resolved step and run reads it too.
+    let run = engine.resolve_reference_time(Some(at("2026-10-15T10:00:00Z")), None);
+    let ten = at("2026-10-15T10:00:00Z");
+    let queried = single(
+        engine
+            .query_position(
+                &format!("POINT({x} {y})"),
+                Some((ten, ten)),
+                Some(&names(&["precipitation_amount"])),
+                None,
+                run,
+            )
+            .unwrap(),
+    )
+    .ranges["precipitation_amount"]
+        .values[0]
+        .unwrap();
+    assert!((queried - drawn("2026-10-15T10:00:00Z", None)).abs() < 1e-3);
+    assert!((queried - RAIN_09Z_STEPS[1]).abs() < 1e-5);
+}
+
+/// #1165: a run's first step has no step before it and is its own
+/// accumulation: with the 06Z run's lead 00 missing, lead 01's amount is
+/// its accumulation since 06Z, still one hour.
+#[test]
+fn the_first_lead_present_is_its_own_accumulation() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = testdata("meps-netcdf");
+    for lead in 1..=3 {
+        let name = format!("meps_sfc_0{lead}_20261015T06Z.nc");
+        std::fs::copy(source.join(&name), dir.path().join(&name)).unwrap();
+    }
+    let engine = NetcdfEngine::new("meps", &meps_config(dir.path())).unwrap();
+    let title = |engine: &NetcdfEngine| {
+        let info = engine.raster_info();
+        let p = info
+            .parameters
+            .iter()
+            .find(|p| p.name == "precipitation_amount");
+        p.unwrap().title.clone()
+    };
+    assert_eq!(title(&engine), "Precipitation amount (1 h accumulation)");
+    let result = position(&engine, RAIN_CELL, "precipitation_amount", None, None).unwrap();
+    assert_eq!(series_hours(&result), [7, 8, 9]);
+    let values = &result.ranges["precipitation_amount"].values;
+    assert!(
+        close_to(values, &RAIN_06Z_STEPS[1..], 1e-5),
+        "07Z is 2.0754395, its accumulation: {values:?}"
+    );
+    let (lat, lon) = met_latlon();
+    let (x, y) = (lon[RAIN_CELL.0][RAIN_CELL.1], lat[RAIN_CELL.0][RAIN_CELL.1]);
+    let seven = Some(at("2026-10-15T07:00:00Z"));
+    let drawn = value_at(&engine, x, y, Some("precipitation_amount"), seven, None)
+        .unwrap()
+        .unwrap();
+    assert!((drawn - RAIN_06Z[1]).abs() < 1e-3, "{drawn}");
+}
+
+/// #1165: an accumulation that decreases from one step to the next (the
+/// 06Z run's, at [`DRY_CELL`], from 07Z to 08Z) is no amount: the map and
+/// EDR serve 0, never a negative amount. An EDR area is the clamped
+/// difference of the accumulation's own areas at the two steps, cell by
+/// cell: two sampled fields differenced, never a difference interpolated.
+#[test]
+fn a_decreasing_accumulation_is_no_amount() {
+    let engine = meps();
+    let (seven, eight) = (
+        accumulation("06", 1, DRY_CELL),
+        accumulation("06", 2, DRY_CELL),
+    );
+    assert!((seven - DRY_06Z[0]).abs() < 1e-9 && (eight - DRY_06Z[1]).abs() < 1e-9);
+    assert!(
+        eight < seven,
+        "the accumulation decreases by {}",
+        seven - eight
+    );
+    let window = ("2026-10-15T08:00:00Z", "2026-10-15T08:00:00Z");
+    let run = Some("2026-10-15T06:00:00Z");
+    let result = position(&engine, DRY_CELL, "precipitation_amount", Some(window), run).unwrap();
+    assert_eq!(result.ranges["precipitation_amount"].values, [Some(0.0)]);
+    let raw = position(
+        &engine,
+        DRY_CELL,
+        "precipitation_amount_acc",
+        Some(window),
+        run,
+    )
+    .unwrap();
+    assert!(raw.ranges["precipitation_amount_acc"].values[0].unwrap() > 0.004);
+    let (lat, lon) = met_latlon();
+    let (x, y) = (lon[DRY_CELL.0][DRY_CELL.1], lat[DRY_CELL.0][DRY_CELL.1]);
+    let drawn = value_at(
+        &engine,
+        x,
+        y,
+        Some("precipitation_amount"),
+        Some(at(window.0)),
+        None,
+    )
+    .unwrap();
+    assert_eq!(drawn, Some(0.0));
+
+    // An area: the clamped difference of the accumulation's areas.
+    let area = |parameter: &str, time: &str| {
+        let t = at(time);
+        let result = single(
+            engine
+                .query_area(
+                    "POLYGON((5 55, 30 55, 30 70, 5 70, 5 55))",
+                    Some((t, t)),
+                    Some(&names(&[parameter])),
+                    None,
+                    run.map(at),
+                )
+                .unwrap(),
+        );
+        result.ranges[parameter].values.clone()
+    };
+    let amounts = area("precipitation_amount", "2026-10-15T08:00:00Z");
+    let now = area("precipitation_amount_acc", "2026-10-15T08:00:00Z");
+    let before = area("precipitation_amount_acc", "2026-10-15T07:00:00Z");
+    assert!(amounts.iter().flatten().count() > 3);
+    for ((amount, now), before) in amounts.iter().zip(&now).zip(&before) {
+        let want = now
+            .zip(*before)
+            .map(|(now, before)| (now - before).max(0.0));
+        assert_eq!(*amount, want);
+    }
+    assert!(amounts.iter().flatten().all(|&v| v >= 0.0));
+
+    // A map: each pixel the clamped difference of the accumulation's
+    // pixels, to the f32 the tiles hold.
+    let bbox = [5.0, 55.0, 30.0, 70.0];
+    let tile = |parameter: &str, time: &str| {
+        let tile = engine
+            .get_raster_tile(
+                bbox,
+                24,
+                18,
+                Some(at(time)),
+                &OutputCrs::WebMercator,
+                Some(parameter),
+                None,
+                run.map(at),
+            )
+            .unwrap();
+        values(&tile)
+    };
+    let amounts = tile("precipitation_amount", "2026-10-15T08:00:00Z");
+    let now = tile("precipitation_amount_acc", "2026-10-15T08:00:00Z");
+    let before = tile("precipitation_amount_acc", "2026-10-15T07:00:00Z");
+    assert!(amounts.iter().flatten().any(|&v| v > 0.1));
+    for ((amount, now), before) in amounts.iter().zip(&now).zip(&before) {
+        match (amount, now.zip(*before)) {
+            (Some(amount), Some((now, before))) => {
+                assert!(*amount >= 0.0);
+                assert!(
+                    (amount - (now - before).max(0.0)).abs() < 1e-6,
+                    "{amount} {now} {before}"
+                );
+            }
+            (None, None) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    // The bands of one request: the accumulation and its amount.
+    let bands = engine
+        .get_raster_tiles(
+            bbox,
+            24,
+            18,
+            Some(at("2026-10-15T08:00:00Z")),
+            &OutputCrs::WebMercator,
+            &["precipitation_amount_acc", "precipitation_amount"],
+            None,
+            run.map(at),
+        )
+        .unwrap();
+    assert_eq!(values(&bands[0]), now);
+    assert_eq!(values(&bands[1]), amounts);
+}
+
+/// #1165: each lead's field is read once, whatever needs it. A map of a
+/// step reads its accumulation there and at the step before; the next
+/// step's map reads only its own, the step before being in the field cache.
+/// An EDR series of the accumulation and its amount reads each lead once.
+#[test]
+fn per_step_amounts_read_each_lead_once() {
+    let engine = meps();
+    let draw = |time: &str| {
+        value_at(
+            &engine,
+            15.0,
+            63.0,
+            Some("precipitation_amount"),
+            Some(at(time)),
+            Some(at("2026-10-15T06:00:00Z")),
+        )
+        .unwrap()
+    };
+    draw("2026-10-15T07:00:00Z");
+    assert_eq!(engine.field_decodes(), 2, "07Z and the step before, 06Z");
+    draw("2026-10-15T08:00:00Z");
+    assert_eq!(engine.field_decodes(), 3, "08Z only: 07Z is cached");
+    value_at(
+        &engine,
+        15.0,
+        63.0,
+        Some("precipitation_amount_acc"),
+        Some(at("2026-10-15T08:00:00Z")),
+        None,
+    )
+    .unwrap();
+    assert_eq!(engine.field_decodes(), 3, "the accumulation's own map");
+
+    let engine = meps();
+    let both = names(&["precipitation_amount_acc", "precipitation_amount"]);
+    engine
+        .query_position(
+            "POINT(15 63)",
+            None,
+            Some(&both),
+            None,
+            Some(at("2026-10-15T06:00:00Z")),
+        )
+        .unwrap();
+    assert_eq!(engine.field_decodes(), 4, "the run's four leads, once each");
+    // A window reads the step before its first step too.
+    let decodes = engine.field_decodes();
+    let result = engine
+        .query_position(
+            "POINT(15 63)",
+            Some((at("2026-10-15T08:00:00Z"), at("2026-10-15T09:00:00Z"))),
+            Some(&names(&["precipitation_amount"])),
+            None,
+            Some(at("2026-10-15T06:00:00Z")),
+        )
+        .map(single)
+        .unwrap();
+    assert_eq!(series_hours(&result), [8, 9]);
+    assert_eq!(engine.field_decodes(), decodes + 3, "07Z, 08Z and 09Z");
+}
+
+/// #1165: a lead that arrives late inside a run changes the amount of the
+/// step after it under the same valid time and run, so the content version
+/// moves and the title, which said the run's steps spanned 1 to 2 hours,
+/// says 1 hour again. A new run moves nothing.
+#[test]
+fn a_lead_filled_in_moves_the_content_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = testdata("meps-netcdf");
+    let copy = |name: &str| std::fs::copy(source.join(name), dir.path().join(name)).unwrap();
+    for lead in [0, 1, 3] {
+        copy(&format!("meps_sfc_0{lead}_20261015T06Z.nc"));
+    }
+    let engine = NetcdfEngine::new("meps", &meps_config(dir.path())).unwrap();
+    let title = |engine: &NetcdfEngine| {
+        let info = engine.raster_info();
+        let p = info
+            .parameters
+            .iter()
+            .find(|p| p.name == "precipitation_amount");
+        p.unwrap().title.clone()
+    };
+    assert_eq!(
+        title(&engine),
+        "Precipitation amount (1 h to 2 h accumulation per forecast step)"
+    );
+    let nine = Some(("2026-10-15T09:00:00Z", "2026-10-15T09:00:00Z"));
+    let amount = |engine: &NetcdfEngine| {
+        position(engine, RAIN_CELL, "precipitation_amount", nine, None)
+            .unwrap()
+            .ranges["precipitation_amount"]
+            .values[0]
+            .unwrap()
+    };
+    // 09Z less 07Z: 5.1933594 - 2.0754395.
+    assert!((amount(&engine) - 3.117_919_9).abs() < 1e-5);
+    let version = engine.content_version();
+
+    copy("meps_sfc_02_20261015T06Z.nc");
+    engine.poll_once();
+    assert!(engine.content_version() > version);
+    assert!((amount(&engine) - RAIN_06Z_STEPS[3]).abs() < 1e-5);
+    assert_eq!(title(&engine), "Precipitation amount (1 h accumulation)");
+
+    let version = engine.content_version();
+    copy("meps_sfc_00_20261015T09Z.nc");
+    engine.poll_once();
+    assert_eq!(engine.raster_info().reference_times.len(), 2);
+    assert_eq!(engine.content_version(), version, "a new run");
+}
+
+/// #1165: `derive_per_step = false` serves the variables alone.
+#[test]
+fn derive_per_step_false_serves_the_variables_only() {
+    let mut config = meps_config(&testdata("meps-netcdf"));
+    config.derive_per_step = false;
+    let engine = NetcdfEngine::new("meps", &config).unwrap();
+    let info = engine.raster_info();
+    assert_eq!(info.parameters.len(), 8);
+    assert!(!info
+        .parameters
+        .iter()
+        .any(|p| p.name == "precipitation_amount"));
+    let drawn = value_at(
+        &engine,
+        15.0,
+        63.0,
+        Some("precipitation_amount"),
+        None,
+        None,
+    );
+    assert!(matches!(drawn, Err(DataServerError::InvalidParameter(_))));
+    let queried = position(&engine, RAIN_CELL, "precipitation_amount", None, None);
+    assert!(matches!(queried, Err(DataServerError::InvalidParameter(_))));
 }

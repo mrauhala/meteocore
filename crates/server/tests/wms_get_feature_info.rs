@@ -11,7 +11,9 @@
 //!   nodes.
 //! - NetCDF: `testdata/meps-netcdf`, a crop of MET Norway's MEPS files on
 //!   their Lambert grid, two runs, wrapped in `DerivedWind` for the speed of
-//!   its grid-relative 10 m wind (#1067); and `testdata/meps-netcdf-pl`, the
+//!   its grid-relative 10 m wind (#1067), and the per-step precipitation
+//!   it derives from the run-start accumulation (#1165); and
+//!   `testdata/meps-netcdf-pl`, the
 //!   same grid on four pressure levels, where GetMap and GetFeatureInfo
 //!   without `ELEVATION` use one level, and OGC API Maps' `elevation`
 //!   selects the same levels.
@@ -436,6 +438,7 @@ fn meps() -> Apis {
             "precipitation_amount_acc",
             "relative_humidity_2m",
             "wind_speed_10m",
+            "precipitation_amount",
         ],
     )
 }
@@ -452,11 +455,14 @@ const MEPS_CELL_11Z: (f64, f64) = (1.137_076_4, 5.762_552_3);
 /// reports (#1209): 2 m temperature from K to °C, MSLP from Pa to hPa, the
 /// accumulated precipitation's kg/m^2 as mm, and relative humidity, a
 /// fraction in unit 1 whose standard name is `relative_humidity`, as %.
-const MEPS_CELL_11Z_DISPLAY: [(&str, f64, &str); 4] = [
+/// The per-step precipitation (#1165) is the 11Z accumulation less the
+/// run's 10Z one, 0.009521484 in `meps_sfc_01_20261015T09Z`.
+const MEPS_CELL_11Z_DISPLAY: [(&str, f64, &str); 5] = [
     ("air_temperature_2m", 278.38034 - 273.15, "°C"),
     ("air_pressure_at_sea_level", 100_751.086 / 100.0, "hPa"),
     ("precipitation_amount_acc", 0.021_972_656, "mm"),
     ("relative_humidity_2m", 1.000_006 * 100.0, "%"),
+    ("precipitation_amount", 0.021_972_656 - 0.009_521_484, "mm"),
 ];
 
 /// NetCDF (#1067): MEPS on its Lambert grid, south-up rows. The pixel over
@@ -464,8 +470,9 @@ const MEPS_CELL_11Z_DISPLAY: [(&str, f64, &str); 4] = [
 /// (#1209); every pixel reads the EDR position value at its centre, from
 /// the step and run GetMap draws: the newest run without `TIME`, the run
 /// that has a time the newest lacks. The derived speed is the wrapper's in
-/// both. Served by a current-thread runtime, as GRIB's above: the field
-/// jobs run on the query runtime.
+/// both, and the per-step precipitation the engine's, differenced against
+/// the step before in the run drawn (#1165). Served by a current-thread
+/// runtime, as GRIB's above: the field jobs run on the query runtime.
 #[test]
 fn a_netcdf_pixel_reads_the_edr_position_value() {
     let Apis { wms, edr } = meps();
@@ -504,8 +511,23 @@ async fn netcdf_pixels_read_the_edr_position_value(wms: axum::Router, edr: axum:
         assert_eq!(info.value, position, "{parameter}");
     }
 
+    // The per-step layer's title says its step (#1165).
+    let capabilities = get(&wms, "/?SERVICE=WMS&REQUEST=GetCapabilities").await;
+    assert!(
+        capabilities.body.contains(
+            "<Name>meps/precipitation_amount</Name>\
+             <Title>Precipitation amount (1 h accumulation)</Title>"
+        ),
+        "{}",
+        capabilities.body
+    );
+
     // 08Z only the 06Z run has; a pixel between cell centres, in EPSG:3857.
-    for parameter in ["air_temperature_2m", "wind_speed_10m"] {
+    for parameter in [
+        "air_temperature_2m",
+        "wind_speed_10m",
+        "precipitation_amount",
+    ] {
         let info = feature_info(
             &wms,
             &format!("meps/{parameter}"),
@@ -881,7 +903,11 @@ async fn capabilities_mark_the_layers_queryable() {
         ),
         (
             meps().wms,
-            &["meps/air_temperature_2m", "meps/wind_speed_10m"][..],
+            &[
+                "meps/air_temperature_2m",
+                "meps/wind_speed_10m",
+                "meps/precipitation_amount",
+            ][..],
         ),
         (kenya().wms, &["kenya/2t", "kenya/msl", "kenya/rr1h"][..]),
     ] {

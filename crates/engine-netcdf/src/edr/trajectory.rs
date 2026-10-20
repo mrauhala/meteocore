@@ -23,8 +23,14 @@
 //!   axis being a 400. Without a vertical axis a Z coordinate and `z` are
 //!   ignored.
 //!
+//! - **Per-step amounts** (#1165): each sample's value is its
+//!   accumulation at its step less the accumulation at the run's step before
+//!   that step, both sampled at the sample's position: for an M or ZM path
+//!   the step before each sample's own step, in the run the path reads.
+//!
 //! The query-shape cap ([`super::QUERY_BYTES`]) counts the fields the plan
-//! reads, each (step, level) once per variable, before any read.
+//! reads, each (step, level) once per variable, and a per-step amount's
+//! steps before, before any read.
 
 use std::sync::Arc;
 
@@ -65,7 +71,7 @@ impl NetcdfEngine {
                 let run = catalog.covering_run(reference_time, Some(earliest))?;
                 let steps: Vec<(DateTime<Utc>, &Step)> =
                     run.steps.iter().map(|(&t, step)| (t, step)).collect();
-                Reads::new(layout, steps, parameters, query_z)?
+                Reads::new(layout, run, steps, parameters, query_z)?
             }
             None => Self::select(
                 &catalog,
@@ -107,7 +113,7 @@ impl NetcdfEngine {
                 vertical,
                 z: z_levels.as_deref(),
             },
-            reads.variables.len(),
+            reads.params.len(),
         )?;
         plan.require_extent(extent)?;
 
@@ -134,8 +140,10 @@ impl NetcdfEngine {
                 };
                 let positions: Positions =
                     Arc::new(field.points.iter().map(|&p| projected[p]).collect());
+                let (valid, step) = reads.steps[field.time];
                 Ok(Sampling {
-                    step: reads.steps[field.time].1,
+                    valid,
+                    step,
                     level,
                     positions,
                 })
@@ -147,10 +155,7 @@ impl NetcdfEngine {
             "the datetime window"
         };
         reads.check_fields(&fields, limit, time)?;
-        let values = self.sample_fields(layout, &reads.variables, &fields)?;
-        plan.into_response(
-            &Self::described(&catalog, layout, &reads.variables),
-            &values,
-        )
+        let values = self.sample_fields(&reads, &fields)?;
+        plan.into_response(&Self::described(&catalog, layout, &reads.params), &values)
     }
 }
