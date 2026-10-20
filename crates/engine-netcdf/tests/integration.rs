@@ -1219,7 +1219,7 @@ fn edr_instances_are_the_runs() {
     assert!(engine.find_instance(at("2026-10-15T03:00:00Z")).is_none());
     assert_eq!(
         engine.supported_query_types(),
-        ["position", "area", "radius"]
+        ["position", "area", "radius", "trajectory", "cube"]
     );
     assert_eq!(
         engine.get_temporal_extent(),

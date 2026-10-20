@@ -1,5 +1,5 @@
-//! OGC API - EDR position, area and radius queries (#1067 PR 7), and the
-//! model runs as EDR instances.
+//! OGC API - EDR position, area, radius, trajectory and cube queries
+//! (#1067 PR 7, #1169), and the model runs as EDR instances.
 //!
 //! A query selects one run and its steps ([`Catalog::query_run`]) and, on a
 //! pressure-level collection, its levels ([`Layout::query_levels`]: `z`, or
@@ -7,23 +7,26 @@
 //! reading anything, then reads one field per (parameter, step, level)
 //! through `ds_executor::field_jobs` (at most four at once, each under the
 //! query's deadline) and samples it at every point the query asks for:
-//! each point, or each cell centre of an area's CRS84 grid, is projected
-//! onto the source grid once ([`SourceGrid::position`]) and sampled as a
-//! map draws it ([`SourceGrid::value_at`]) and converted to the unit served
-//! as the map converts it ([`Layout::to_display`], #1209), so
-//! GetFeatureInfo answers what GetMap drew. Field reads go through
-//! [`field::read_uncached`]: a decoded field the render cache holds is used,
-//! any other is decoded for the query alone.
+//! each point, each cell centre of an area's or a cube's CRS84 grid, or
+//! each sample of a trajectory, is projected onto the source grid once
+//! ([`SourceGrid::position`]) and sampled as a map draws it
+//! ([`SourceGrid::value_at`]) and converted to the unit served as the map
+//! converts it ([`Layout::to_display`], #1209), so GetFeatureInfo answers
+//! what GetMap drew. Field reads go through [`field::read_uncached`]: a
+//! decoded field the render cache holds is used, any other is decoded for
+//! the query alone. Trajectories ([`trajectory`]) and cubes ([`cube`]) read
+//! only the fields they sample, and the cap counts exactly those.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock};
 
 use chrono::{DateTime, Utc};
+use ds_core::cube::CubeResolution;
 use ds_core::edr_engine::{select_parameters, EdrEngine};
 use ds_core::error::DataServerError;
 use ds_core::feature::{
-    check_area_budget, check_mask_budget, parse_area_coords, parse_point_coords, MAX_AREA_DIM,
+    check_area_budget, check_mask_budget, parse_area_coords, parse_point_coords, Bbox, MAX_AREA_DIM,
 };
 use ds_core::instances::RunInfo;
 use ds_core::model::{
@@ -36,6 +39,9 @@ use ds_core::vertical::VerticalDimension;
 use crate::catalog::{Catalog, Layout, Run, Step};
 use crate::field;
 use crate::NetcdfEngine;
+
+mod cube;
+mod trajectory;
 
 /// A query's `datetime` window, both ends included.
 type Window = Option<(DateTime<Utc>, DateTime<Utc>)>;
@@ -82,7 +88,34 @@ struct Reads<'a> {
     variables: Vec<usize>,
 }
 
-impl Reads<'_> {
+impl<'a> Reads<'a> {
+    /// The variables `parameters` selects (every one without) and the
+    /// levels `z` selects ([`Layout::query_levels`]) at `steps`.
+    fn new(
+        layout: &'a Arc<Layout>,
+        steps: Vec<(DateTime<Utc>, &'a Step)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+    ) -> Result<Self, DataServerError> {
+        let names: Vec<&str> = layout.variables.iter().map(|v| &*v.name).collect();
+        let variables: Vec<usize> = select_parameters(parameters, &names)?
+            .into_iter()
+            .filter_map(|name| names.iter().position(|n| *n == name))
+            .collect();
+        if variables.is_empty() {
+            return Err(DataServerError::InvalidParameter(
+                "No parameters available".into(),
+            ));
+        }
+        let levels = layout.query_levels(z)?;
+        Ok(Self {
+            layout,
+            steps,
+            levels,
+            variables,
+        })
+    }
+
     /// The response's vertical coordinate: the selected levels, `None`
     /// without a vertical axis.
     fn vertical(&self) -> Option<VerticalCoord> {
@@ -94,12 +127,36 @@ impl Reads<'_> {
     }
 }
 
+/// One field a query reads and where it samples it: a step, a level (an
+/// index into the layout's pressure levels, 0 without them) and the
+/// positions ([`on_grid`]). Position, area and cube queries sample every
+/// field at the same positions; a trajectory samples each at its own.
+struct Sampling<'a> {
+    step: &'a Step,
+    level: usize,
+    positions: Positions,
+}
+
+impl Sampling<'_> {
+    /// Whether the field is read: a field with no position on the grid
+    /// samples nothing but nulls, so it is neither read nor counted.
+    fn is_read(&self) -> bool {
+        self.positions.iter().any(Option::is_some)
+    }
+}
+
+/// The layout every query reads through, or the 404 of a collection
+/// before its first file.
+fn layout(catalog: &Catalog) -> Result<&Arc<Layout>, DataServerError> {
+    catalog
+        .layout
+        .as_ref()
+        .ok_or_else(|| DataServerError::LocationNotFound("No NetCDF data available yet".into()))
+}
+
 impl NetcdfEngine {
-    /// The run, steps, levels and variables a query reads, the query-shape
-    /// cap checked. `all_steps`: a position series reads every step of the
-    /// run without a `datetime` window; an area reads the step a map without
-    /// `TIME` draws, the run's last. Levels: `z`'s, or every level
-    /// ([`Layout::query_levels`]).
+    /// [`Self::select`] with the query-shape cap checked over every step,
+    /// level and variable selected: position and area read them all.
     fn plan<'a>(
         catalog: &'a Catalog,
         reference_time: Option<DateTime<Utc>>,
@@ -108,9 +165,26 @@ impl NetcdfEngine {
         z: Option<&[f64]>,
         all_steps: bool,
     ) -> Result<Reads<'a>, DataServerError> {
-        let layout = catalog.layout.as_ref().ok_or_else(|| {
-            DataServerError::LocationNotFound("No NetCDF data available yet".into())
-        })?;
+        let reads = Self::select(catalog, reference_time, window, parameters, z, all_steps)?;
+        reads.check_bytes(*QUERY_BYTES)?;
+        Ok(reads)
+    }
+
+    /// The run, steps, levels and variables a query selects. `all_steps`: a
+    /// position series (and a 2-D or Z trajectory) reads every step of the
+    /// run without a `datetime` window; an area (and a cube) reads the step
+    /// a map without `TIME` draws, the run's last. Levels: `z`'s, or every
+    /// level ([`Layout::query_levels`]). The caller checks the cap over
+    /// what it reads of them.
+    fn select<'a>(
+        catalog: &'a Catalog,
+        reference_time: Option<DateTime<Utc>>,
+        window: Window,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        all_steps: bool,
+    ) -> Result<Reads<'a>, DataServerError> {
+        let layout = layout(catalog)?;
         let run: &Run = catalog.query_run(reference_time, window)?;
         let steps: Vec<(DateTime<Utc>, &Step)> = match window {
             Some((start, end)) => run.steps_within(start, end).collect(),
@@ -131,72 +205,80 @@ impl NetcdfEngine {
                 None => DataServerError::LocationNotFound("The forecast run has no steps".into()),
             });
         }
-        let names: Vec<&str> = layout.variables.iter().map(|v| &*v.name).collect();
-        let variables: Vec<usize> = select_parameters(parameters, &names)?
-            .into_iter()
-            .filter_map(|name| names.iter().position(|n| *n == name))
-            .collect();
-        if variables.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "No parameters available".into(),
-            ));
-        }
-        let levels = layout.query_levels(z)?;
-        let reads = Reads {
-            layout,
-            steps,
-            levels,
-            variables,
-        };
-        reads.check_bytes(*QUERY_BYTES)?;
-        Ok(reads)
+        Reads::new(layout, steps, parameters, z)
     }
 
     /// Read every planned field and sample it at `positions`:
-    /// `[variable][step × levels + level]` → one value per position. Fields
-    /// are read through `ds_executor::field_jobs`, four at a time, each job
-    /// under the query's deadline; a failed read fails the query, never a
-    /// null: a replaced file or the decode budget is a 503, the deadline a
-    /// 504, any other failure a 500. With no position on the grid nothing is
-    /// read: every value is null, as the reads would sample it, and a point
-    /// far off a remote grid costs no fetch.
+    /// `[variable][step × levels + level]` → one value per position
+    /// ([`Self::sample_fields`] over every step × level, step-major).
     fn sample(
         &self,
         reads: &Reads,
         positions: &Positions,
     ) -> Result<Vec<Vec<Vec<Option<f64>>>>, DataServerError> {
-        let (n_vars, n_levels) = (reads.variables.len(), reads.levels.len());
-        let n_fields = reads.steps.len() * n_levels;
-        if positions.iter().all(Option::is_none) {
-            return Ok(vec![vec![vec![None; positions.len()]; n_fields]; n_vars]);
-        }
-        let mut out: Vec<Vec<Vec<Option<f64>>>> = vec![vec![Vec::new(); n_fields]; n_vars];
-        let flipped = reads.layout.grid.flipped;
-        // One job per (variable, step, level): `f` is the step's and level's
-        // slot, step-major, so a variable's slots are `[t][z]`.
-        let jobs: Vec<(usize, usize, Step, usize, usize)> = reads
-            .variables
+        let fields: Vec<Sampling> = reads
+            .steps
+            .iter()
+            .flat_map(|&(_, step)| {
+                reads.levels.iter().map(move |&level| Sampling {
+                    step,
+                    level,
+                    positions: positions.clone(),
+                })
+            })
+            .collect();
+        self.sample_fields(reads.layout, &reads.variables, &fields)
+    }
+
+    /// Read each of `fields` of each of `variables` (layout indices) and
+    /// sample it at the field's positions: `[variable][field]` → one value
+    /// per position. Fields are read through `ds_executor::field_jobs`,
+    /// four at a time, each job under the query's deadline; a failed read
+    /// fails the query, never a null: a replaced file or the decode budget
+    /// is a 503, the deadline a 504, any other failure a 500. A field with
+    /// no position on the grid is not read ([`Sampling::is_read`]): its
+    /// values are null, as the read would sample them, and a point far off
+    /// a remote grid costs no fetch.
+    fn sample_fields(
+        &self,
+        layout: &Arc<Layout>,
+        variables: &[usize],
+        fields: &[Sampling],
+    ) -> Result<Vec<Vec<Vec<Option<f64>>>>, DataServerError> {
+        let mut out: Vec<Vec<Vec<Option<f64>>>> = variables
+            .iter()
+            .map(|_| {
+                fields
+                    .iter()
+                    .map(|field| vec![None; field.positions.len()])
+                    .collect()
+            })
+            .collect();
+        // One job per (variable, field) read.
+        let jobs: Vec<(usize, usize, Step, usize, usize, Positions)> = variables
             .iter()
             .enumerate()
             .flat_map(|(v, &index)| {
-                reads
-                    .steps
+                fields
                     .iter()
                     .enumerate()
-                    .flat_map(move |(s, (_, step))| {
-                        reads.levels.iter().enumerate().map(move |(l, &level)| {
-                            (v, s * n_levels + l, (*step).clone(), index, level)
-                        })
+                    .filter(|(_, field)| field.is_read())
+                    .map(move |(f, field)| {
+                        let step = field.step.clone();
+                        (v, f, step, index, field.level, field.positions.clone())
                     })
             })
             .collect();
-        let layout = reads.layout.clone();
-        let positions = positions.clone();
+        if jobs.is_empty() {
+            return Ok(out);
+        }
+        let flipped = layout.grid.flipped;
+        let layout = layout.clone();
         let decodes: Arc<AtomicU64> = self.decodes.clone();
         ds_executor::field_jobs::run_field_jobs(
             ds_executor::query_runtime(),
             jobs.into_iter(),
-            move |(v, f, step, index, level)| {
+            move |(v, f, step, index, level, positions)| {
                 let values =
                     field::read_uncached(&step.file, index, step.index, level, flipped, &decodes)?;
                 // Sampled from the stored field, then converted to the
@@ -227,6 +309,18 @@ impl NetcdfEngine {
         layout: &Layout,
         variables: &[usize],
     ) -> HashMap<String, ParameterDescription> {
+        Self::described(catalog, layout, variables)
+            .into_iter()
+            .collect()
+    }
+
+    /// [`Self::descriptions`] in `variables` order, the order a
+    /// trajectory's values are laid out in.
+    fn described(
+        catalog: &Catalog,
+        layout: &Layout,
+        variables: &[usize],
+    ) -> Vec<(String, ParameterDescription)> {
         variables
             .iter()
             .map(|&index| {
@@ -350,16 +444,53 @@ impl NetcdfEngine {
 impl Reads<'_> {
     /// The query-shape cap: `limit` ([`QUERY_BYTES`]) against the bytes
     /// the planned fields decode, from the metadata: steps × levels × each
-    /// variable's field. Every file of the collection has the layout's
-    /// fields on its grid, so the first step's file sizes them all.
+    /// variable's field ([`Self::field_bytes`]).
     fn check_bytes(&self, limit: u64) -> Result<(), DataServerError> {
+        check_query_bytes(
+            self.steps.len(),
+            self.levels.len(),
+            &self.field_bytes(),
+            limit,
+        )
+    }
+
+    /// The query-shape cap over the fields a query samples, of each
+    /// selected variable: only those it reads count ([`Sampling::is_read`]),
+    /// each (step, level) once. A trajectory reads the fields its plan
+    /// names, which an `M` or `Z` path picks per sample. `time` is how the
+    /// refusal says to read fewer steps.
+    fn check_fields(
+        &self,
+        fields: &[Sampling],
+        limit: u64,
+        time: &str,
+    ) -> Result<(), DataServerError> {
+        let read: Vec<&Sampling> = fields.iter().filter(|f| f.is_read()).collect();
+        let steps: HashSet<(u64, u32)> = read
+            .iter()
+            .map(|f| (f.step.file.id, f.step.index))
+            .collect();
+        let levels: HashSet<usize> = read.iter().map(|f| f.level).collect();
+        check_field_reads(
+            steps.len(),
+            levels.len(),
+            read.len(),
+            &self.field_bytes(),
+            limit,
+            time,
+        )
+    }
+
+    /// The bytes one field of each selected variable decodes
+    /// ([`crate::ingest::FieldRead::decoded_bytes`]), from the metadata.
+    /// Every file of the collection has the layout's fields on its grid, so
+    /// the first step's file sizes them all.
+    fn field_bytes(&self) -> Vec<u64> {
         let file = &self.steps[0].1.file;
-        let per_step: Vec<u64> = self
-            .variables
+        self.variables
             .iter()
             .map(|&index| file.reads[index].decoded_bytes())
-            .collect();
-        check_query_bytes(self.steps.len(), self.levels.len(), &per_step, limit)
+            .collect()
     }
 }
 
@@ -373,7 +504,29 @@ fn check_query_bytes(
     field_bytes: &[u64],
     limit: u64,
 ) -> Result<(), DataServerError> {
-    let reads = steps.saturating_mul(levels);
+    check_field_reads(
+        steps,
+        levels,
+        steps.saturating_mul(levels),
+        field_bytes,
+        limit,
+        "the datetime window",
+    )
+}
+
+/// Whether `reads` (step, level) fields, over `steps` timesteps and
+/// `levels` levels, of fields decoding `field_bytes` each fit `limit`
+/// ([`check_query_bytes`]). `reads` is `steps × levels` unless a
+/// trajectory picks its fields per sample, which the refusal then names as
+/// pairs; `time` names what to narrow for fewer steps.
+fn check_field_reads(
+    steps: usize,
+    levels: usize,
+    reads: usize,
+    field_bytes: &[u64],
+    limit: u64,
+    time: &str,
+) -> Result<(), DataServerError> {
     let bytes = field_bytes.iter().sum::<u64>().saturating_mul(reads as u64);
     if bytes <= limit {
         return Ok(());
@@ -381,19 +534,20 @@ fn check_query_bytes(
     let mib = |b: u64| b as f64 / ds_cache::MIB as f64;
     // The levels, and the advice to name fewer, only when the query reads
     // several: a single-level collection ignores `z` (clause A).
-    let (levels, narrow) = if levels > 1 {
-        (
-            format!(" × {levels} levels"),
-            ", name fewer parameters or fewer pressure levels (z)",
-        )
+    let shape = match (reads == steps.saturating_mul(levels), levels > 1) {
+        (true, true) => format!("{steps} timesteps × {levels} levels"),
+        (true, false) => format!("{steps} timesteps"),
+        (false, _) => format!("{reads} timestep and level pairs"),
+    };
+    let narrow = if levels > 1 {
+        ", name fewer parameters or fewer pressure levels (z)"
     } else {
-        (String::new(), " or name fewer parameters")
+        " or name fewer parameters"
     };
     Err(DataServerError::QueryTooLarge(format!(
-        "Query would decode {} fields ({steps} timesteps{levels} × {} source variables, {:.0} \
-         MiB); the limit is {:.0} MiB — narrow the datetime window{narrow}. A derived \
-         parameter reads each variable it is derived from: a wind speed reads both wind \
-         components",
+        "Query would decode {} fields ({shape} × {} source variables, {:.0} MiB); the limit is \
+         {:.0} MiB — narrow {time}{narrow}. A derived parameter reads each variable it is \
+         derived from: a wind speed reads both wind components",
         reads.saturating_mul(field_bytes.len()),
         field_bytes.len(),
         mib(bytes),
@@ -498,8 +652,13 @@ impl EdrEngine for NetcdfEngine {
         self.catalog.load().info.vertical.clone()
     }
 
+    /// Trajectory along a path, and cube over a bbox (#1169): on a
+    /// single-level collection a cube is a `t`, `y`, `x` grid, as a station
+    /// grid's is.
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["position".into(), "area".into(), "radius".into()]
+        ["position", "area", "radius", "trajectory", "cube"]
+            .map(String::from)
+            .to_vec()
     }
 
     /// A time series at the point: every step of the run in the `datetime`
@@ -651,6 +810,54 @@ impl EdrEngine for NetcdfEngine {
             ranges,
         }))
     }
+
+    /// Values along a WKT `LINESTRING`, `Z`, `M` or `ZM` path (#1169):
+    /// `ds_core::trajectory` plans the samples (about one per source cell
+    /// crossed), their steps and levels; each sample is projected once and
+    /// sampled as a position query samples a point, and each field the plan
+    /// names is read once for all its samples. See [`trajectory`].
+    fn query_trajectory(
+        &self,
+        coords: &str,
+        datetime: Window,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        self.trajectory(
+            coords,
+            datetime,
+            parameters,
+            z,
+            reference_time,
+            *QUERY_BYTES,
+        )
+    }
+
+    /// A CRS84 `Grid` over `bbox` with a `t` axis and, on pressure levels,
+    /// a `z` axis (#1169): the steps an area reads, `z`'s levels (every
+    /// level without), and cells at the source's mean cell size or
+    /// `resolution`'s counts, each sampled as a position query samples a
+    /// point. See [`cube`].
+    fn query_cube(
+        &self,
+        bbox: &Bbox,
+        datetime: Window,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        resolution: CubeResolution,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        self.cube(
+            bbox,
+            datetime,
+            parameters,
+            z,
+            resolution,
+            reference_time,
+            *QUERY_BYTES,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -789,5 +996,153 @@ mod tests {
             none.err()
         );
         assert_eq!(engine.field_decodes(), 0, "nothing read");
+    }
+
+    /// One fixture field: 11 × 10 `f32`.
+    const FIXTURE_FIELD: u64 = 110 * 4;
+
+    /// The engine over `testdata/<dir>` with its family's file names and
+    /// `variables`.
+    fn fixture(dir: &str, family: &str, variables: &str) -> NetcdfEngine {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata")
+            .join(dir);
+        let config: ds_core::config::NetcdfConfig = toml::from_str(&format!(
+            "data_path = {:?}\nfilename_template = \"meps_{family}_{{lead}}_%Y%m%dT{{run}}Z.nc\"\n\
+             variables = {variables}",
+            dir.display().to_string()
+        ))
+        .unwrap();
+        NetcdfEngine::new(family, &config).unwrap()
+    }
+
+    fn epoch(s: &str) -> i64 {
+        DateTime::parse_from_rfc3339(s).unwrap().timestamp()
+    }
+
+    /// The refusal's message, or a panic naming what came instead.
+    fn too_large<T: std::fmt::Debug>(result: Result<T, DataServerError>) -> String {
+        match result {
+            Err(DataServerError::QueryTooLarge(message)) => message,
+            other => panic!("expected QueryTooLarge, got {other:?}"),
+        }
+    }
+
+    /// A trajectory's cap counts the fields its plan reads, each (step,
+    /// level) once per variable, before any read (#1169): a 2-D path every
+    /// step of the newest run, an M path only the steps its samples snap
+    /// to, a ZM path its (step, level) pairs. Over the limit it is the 400
+    /// a position query gets, and nothing is decoded.
+    #[test]
+    fn a_trajectory_is_capped_by_the_fields_its_plan_reads() {
+        let engine = fixture(
+            "meps-netcdf",
+            "sfc",
+            r#"["air_temperature_2m", "cloud_area_fraction"]"#,
+        );
+        let path = "LINESTRING(5 58, 30 66)";
+        let bytes = 3 * 2 * FIXTURE_FIELD;
+        let message = too_large(engine.trajectory(path, None, None, None, None, bytes - 1));
+        assert!(
+            message.contains("6 fields (3 timesteps × 2 source variables")
+                && message.contains("narrow the datetime window or name fewer parameters"),
+            "{message}"
+        );
+        assert_eq!(engine.field_decodes(), 0, "refused before any read");
+        engine
+            .trajectory(path, None, None, None, None, bytes)
+            .unwrap();
+        assert_eq!(engine.field_decodes(), 6);
+
+        // 09:00 to 10:00 snaps to two of the run's three steps.
+        let m_path = format!(
+            "LINESTRING M(5 58 {}, 30 66 {})",
+            epoch("2026-10-15T09:00:00Z"),
+            epoch("2026-10-15T10:00:00Z")
+        );
+        let bytes = 2 * 2 * FIXTURE_FIELD;
+        let message = too_large(engine.trajectory(&m_path, None, None, None, None, bytes - 1));
+        assert!(
+            message.contains("4 fields (2 timesteps × 2 source variables")
+                && message.contains("narrow the path's time span"),
+            "{message}"
+        );
+        engine
+            .trajectory(&m_path, None, None, None, None, bytes)
+            .unwrap();
+
+        let pl = fixture("meps-netcdf-pl", "pl", r#"["air_temperature_pl"]"#);
+        let zm = format!(
+            "LINESTRING ZM(5 58 1000 {}, 30 66 500 {})",
+            epoch("2026-10-15T09:00:00Z"),
+            epoch("2026-10-15T10:00:00Z")
+        );
+        let CoverageResponse::Single(result) = pl
+            .trajectory(&zm, None, None, None, None, u64::MAX)
+            .unwrap()
+        else {
+            panic!("a ZM path is one coverage")
+        };
+        let DomainDescription::Trajectory { nodes, node_z, .. } = &result.domain else {
+            panic!("{:?}", result.domain)
+        };
+        let levels = &node_z.as_ref().unwrap().values;
+        let pairs: HashSet<(DateTime<Utc>, u64)> = nodes
+            .iter()
+            .zip(levels)
+            .map(|(node, level)| (node.0, level.to_bits()))
+            .collect();
+        let steps: HashSet<DateTime<Utc>> = nodes.iter().map(|node| node.0).collect();
+        let distinct: HashSet<u64> = levels.iter().map(|l| l.to_bits()).collect();
+        assert!(
+            pairs.len() < steps.len() * distinct.len(),
+            "fewer pairs than steps × levels: {pairs:?}"
+        );
+        assert_eq!(pl.field_decodes(), pairs.len() as u64, "each pair once");
+        let bytes = pairs.len() as u64 * FIXTURE_FIELD;
+        pl.trajectory(&zm, None, None, None, None, bytes).unwrap();
+        let message = too_large(pl.trajectory(&zm, None, None, None, None, bytes - 1));
+        assert!(
+            message.contains(&format!(
+                "{} fields ({} timestep and level pairs × 1 source variables",
+                pairs.len(),
+                pairs.len()
+            )),
+            "{message}"
+        );
+    }
+
+    /// A cube's cap counts steps × the levels it reads × variables: with
+    /// `resolution-z`, only the levels some position takes. Over the limit
+    /// it is a 400 before any read.
+    #[test]
+    fn a_cube_is_capped_by_the_levels_it_reads() {
+        let pl = fixture(
+            "meps-netcdf-pl",
+            "pl",
+            r#"["air_temperature_pl", "geopotential_pl"]"#,
+        );
+        let bbox = Bbox::new(10.0, 58.0, 25.0, 66.0).unwrap();
+        // 300, 650 and 1000 hPa take 300, 500 and 1000: three of four levels.
+        let resolution = CubeResolution {
+            z: Some(3),
+            ..CubeResolution::default()
+        };
+        let bytes = 3 * 2 * FIXTURE_FIELD;
+        let message = too_large(pl.cube(&bbox, None, None, None, resolution, None, bytes - 1));
+        assert!(
+            message.contains("6 fields (1 timesteps × 3 levels × 2 source variables")
+                && message.contains("fewer pressure levels (z)"),
+            "{message}"
+        );
+        assert_eq!(pl.field_decodes(), 0, "refused before any read");
+        pl.cube(&bbox, None, None, None, resolution, None, bytes)
+            .unwrap();
+        assert_eq!(pl.field_decodes(), 6);
+        // Every level read at native resolution: four.
+        let all = CubeResolution::default();
+        too_large(pl.cube(&bbox, None, None, None, all, None, bytes));
+        pl.cube(&bbox, None, None, None, all, None, 4 * 2 * FIXTURE_FIELD)
+            .unwrap();
     }
 }

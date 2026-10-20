@@ -15,7 +15,10 @@ use crate::feature::MAX_AREA_VALUES;
 /// `Some(n)` asks for `n` evenly spaced positions from the axis minimum to
 /// its maximum, both included ([`axis_positions`]), each taking the value of
 /// the nearest native coordinate ([`nearest_indices`]). The API layer never
-/// passes `Some(0)`.
+/// passes `Some(0)`. A source grid that is not CRS84-aligned has no native
+/// coordinate on a CRS84 axis: engine-netcdf samples each `x`/`y` position
+/// as its position query samples a point (bilinear in the source grid),
+/// and its levels still take the nearest.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CubeResolution {
     pub x: Option<usize>,

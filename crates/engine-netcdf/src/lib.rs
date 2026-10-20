@@ -1,6 +1,6 @@
 //! CF-NetCDF gridded forecasts and analyses (#1067), served through WMS,
-//! OGC API Maps and Tiles, and OGC API EDR position, area and radius
-//! queries ([`edr`]).
+//! OGC API Maps and Tiles, and OGC API EDR position, area, radius,
+//! trajectory and cube queries ([`edr`]).
 //!
 //! One collection is one file family, such as MEPS's per-lead surface files:
 //! every file carries the collection's variables on one grid, its valid

@@ -53,7 +53,7 @@ or downloaded whole.
 | Trait | APIs | Notes |
 |---|---|---|
 | `MapEngine` | WMS, Maps, Tiles | One layer per variable (WMS child layers `<collection>/<variable>` when there are several, Maps/Tiles `parameter-name=<variable>`); a request naming no variable draws the first. Runs are WMS `DIM_REFERENCE_TIME` values. |
-| `EdrEngine` | EDR, WMS GetFeatureInfo | `position` (one or several points), `area`, `radius`; each run is an instance. No `locations`, `trajectory` or `cube`. GetFeatureInfo reads the run, step and level the map drew. |
+| `EdrEngine` | EDR, WMS GetFeatureInfo | `position` (one or several points), `area`, `radius`, `trajectory` (`LINESTRING`, `Z`, `M`, `ZM`) and `cube`; each run is an instance. No `locations`. GetFeatureInfo reads the run, step and level the map drew. |
 | `WindSource` | all of the above, through the server's derived-wind wrapper | Facts for the wind speed derived from u/v components (below). |
 
 **Data it reads:** NetCDF-4 (HDF5) and classic CDF-1/2/5 files. A
@@ -109,8 +109,24 @@ apart from its surface family (MEPS `sfc`).
 - An area is a CRS84 grid over the polygon's bounding box at the source's
   mean cell size, at most 256 cells per axis; cells outside the polygon
   are null. `radius` is answered as an area.
+- A trajectory is densified along great circles to about one sample per
+  source cell (`ds_core::trajectory`), and each sample is read as a
+  position query reads a point. A 2-D or Z path takes a position query's
+  steps, one coverage per step; an M or ZM path reads the run that covers
+  its earliest time, each sample at that run's nearest step. On pressure
+  levels a Z path's samples take the nearest level, and a 2-D or M path
+  gives one coverage per `z` level.
+- A cube is a CRS84 grid over the bbox with a `t` axis (an area's steps)
+  and, on pressure levels, a `z` axis (`z`'s levels, or every level). Its
+  native cells are an area's without the 256 cap, bounded by the
+  1 million value budget; `resolution-x`/`-y` place that many positions
+  from edge to edge, and `resolution-z` positions take the nearest level.
+  Every cell is sampled as a position query samples a point. A bbox off
+  the grid is a 404.
 - Each field is read once per query for all points, four at a time, and
-  is not added to the field cache.
+  is not added to the field cache. A trajectory or cube reads only the
+  fields it samples, and a field it samples nowhere on the grid is not
+  read.
 
 **Derived wind.** Components are identified by CF `standard_name`
 (`x_wind`/`y_wind` and `grid_eastward_wind`/`grid_northward_wind` are
@@ -171,7 +187,7 @@ Process-wide environment variables, shared by every NetCDF collection:
 | `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote files (~1.5 MB per MEPS field) |
 | `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote files; at least 8 |
 | `MC_NETCDF_READ_MEMORY_MB` | `1024` | Buffers of field reads in progress; a read that does not fit is a 503 |
-| `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read (steps × levels × variables read × one field), checked before any read; over it a 400. Fits one variable, or a derived wind speed (both components), over a 67-lead MEPS run |
+| `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read (steps × levels × variables read × one field; a trajectory counts the (step, level) fields its path reads, a cube the levels its `z` positions take), checked before any read; over it a 400. Fits one variable, or a derived wind speed (both components), over a 67-lead MEPS run |
 
 ## Limits
 
@@ -211,7 +227,9 @@ wind); `netcdf-remote/` (synthetic MEPS-like files, served by a local HTTP
 test server for the range-read tests); `netcdf-projections/` (synthetic
 polar stereographic, LAEA and transverse Mercator grids whose fields are
 each cell's own projected x/y, which `tests/grid_mappings.rs` checks
-against PROJ's `cs2cs`). `tests/live_thredds.rs` reads a few
+against PROJ's `cs2cs`). `tests/trajectory_cube.rs` checks every
+trajectory and cube value against a position query at the same point,
+time, level and run. `tests/live_thredds.rs` reads a few
 MEPS files from thredds.met.no and is ignored by default
 (`cargo test -p engine-netcdf --test live_thredds -- --ignored`).
 Contributor notes are in [CLAUDE.md](CLAUDE.md).

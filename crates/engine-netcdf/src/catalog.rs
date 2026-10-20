@@ -328,22 +328,7 @@ impl Catalog {
                 "No NetCDF data available yet".to_string(),
             ));
         }
-        let run = match (reference_time, time) {
-            (Some(rt), _) => self.runs.get(&Some(rt)).ok_or_else(|| {
-                DataServerError::ReferenceTimeNotFound(format!(
-                    "no forecast run for reference time {rt}"
-                ))
-            })?,
-            (None, Some(t)) => self
-                .runs
-                .values()
-                .rev()
-                .find(|run| run.covers(t))
-                .ok_or_else(|| {
-                    DataServerError::InvalidParameter(format!("No forecast run covers time {t}"))
-                })?,
-            (None, None) => self.runs.values().next_back().expect("runs is not empty"),
-        };
+        let run = self.covering_run(reference_time, time)?;
         let (valid, step) = match time {
             Some(t) => run.nearest(t).ok_or_else(|| {
                 DataServerError::InvalidParameter(format!("No forecast step for time {t}"))
@@ -359,6 +344,41 @@ impl Catalog {
             valid,
             step,
         })
+    }
+
+    /// The run [`Self::select`] draws `time` from: a pinned run is exactly
+    /// that run (absent ⇒ [`DataServerError::ReferenceTimeNotFound`], 404);
+    /// unpinned, the newest run whose steps span `time` (none ⇒
+    /// [`DataServerError::InvalidParameter`], 400), or the newest run
+    /// without a time. An EDR trajectory `M` path selects its run by its
+    /// earliest vertex time here, as a map selects one by `TIME`
+    /// (engine-grib's `covering_run`), and its samples then snap to that
+    /// run's steps.
+    pub(crate) fn covering_run(
+        &self,
+        reference_time: Option<DateTime<Utc>>,
+        time: Option<DateTime<Utc>>,
+    ) -> Result<&Run, DataServerError> {
+        match (reference_time, time) {
+            (Some(rt), _) => self.runs.get(&Some(rt)).ok_or_else(|| {
+                DataServerError::ReferenceTimeNotFound(format!(
+                    "no forecast run for reference time {rt}"
+                ))
+            }),
+            (None, Some(t)) => self
+                .runs
+                .values()
+                .rev()
+                .find(|run| run.covers(t))
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!("No forecast run covers time {t}"))
+                }),
+            (None, None) => self
+                .runs
+                .values()
+                .next_back()
+                .ok_or_else(|| DataServerError::Engine("No NetCDF data available yet".into())),
+        }
     }
 
     /// The run an EDR query reads, as engine-grib selects it

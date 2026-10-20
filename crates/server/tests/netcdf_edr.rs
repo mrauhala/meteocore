@@ -1,5 +1,5 @@
-//! engine-netcdf through the EDR API (#1067), end to end on the committed
-//! MEPS samples (`testdata/meps-netcdf`: two runs on MET Norway's Lambert
+//! engine-netcdf through the EDR API (#1067, trajectory and cube #1169),
+//! end to end on the committed MEPS samples (`testdata/meps-netcdf`: two runs on MET Norway's Lambert
 //! grid; `testdata/meps-netcdf-pl`: the same on four pressure levels),
 //! wrapped in `DerivedWind` as the server registers it: every CoverageJSON
 //! body validates against `schemas/coveragejson.json` (Critical Rule 12),
@@ -131,6 +131,14 @@ async fn netcdf_edr_responses_validate() {
         ("radius", "radius?coords=POINT(15%2063)&within=400&within-units=km&parameter-name=wind_speed_10m"),
         ("instance position", "instances/2026-10-15T06:00:00Z/position?coords=POINT(24.94%2060.17)&parameter-name=air_temperature_2m"),
         ("instance area", "instances/2026-10-15T06:00:00Z/area?coords=10,58,20,64&datetime=2026-10-15T09:00:00Z"),
+        ("trajectory", "trajectory?coords=LINESTRING(5%2058,30%2066,20%2070)&parameter-name=air_temperature_2m,wind_speed_10m"),
+        ("trajectory instant", "trajectory?coords=LINESTRING(5%2058,30%2066)&datetime=2026-10-15T10:00:00Z"),
+        ("trajectory M", "trajectory?coords=LINESTRINGM(5%2058%201792054800,30%2066%201792062000)&parameter-name=wind_speed_10m"),
+        ("trajectory datetime list", "trajectory?coords=LINESTRING(5%2058,30%2066)&datetime=2026-10-15T07:00:00Z,2026-10-15T07:30:00Z,2026-10-15T10:00:00Z&parameter-name=air_temperature_2m"),
+        ("cube", "cube?bbox=5,56,30,68&parameter-name=air_temperature_2m,wind_speed_10m"),
+        ("cube interval", "cube?bbox=10,58,25,66&datetime=2026-10-15T07:00:00Z/2026-10-15T09:00:00Z&resolution-x=4&resolution-y=3&parameter-name=air_pressure_at_sea_level"),
+        ("cube datetime list", "cube?bbox=10,58,25,66&datetime=2026-10-15T07:00:00Z,2026-10-15T07:30:00Z,2026-10-15T10:00:00Z&parameter-name=air_temperature_2m"),
+        ("instance cube", "instances/2026-10-15T06:00:00Z/cube?bbox=10,58,25,66&parameter-name=air_temperature_2m"),
     ];
     let mut answers = HashMap::new();
     for (what, query) in queries {
@@ -217,13 +225,118 @@ async fn netcdf_edr_responses_validate() {
         let (status, json) = get(&app, &format!("{base}/{query}")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{query}: {json}");
     }
-    // Not served: trajectory and cube.
+    // Trajectories (#1169): one coverage per step of the newest run, or of
+    // the instant; an M path one coverage over the steps it snaps to; a
+    // datetime list skips the instant without a step.
+    let steps = |answer: &Value| -> Vec<String> {
+        let coverages = match answer["type"].as_str() {
+            Some("CoverageCollection") => answer["coverages"].as_array().unwrap().clone(),
+            _ => vec![answer.clone()],
+        };
+        coverages
+            .iter()
+            .map(|c| {
+                c["domain"]["axes"]["composite"]["values"][0][0]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    let trajectory = &answers["trajectory"];
+    assert_eq!(
+        trajectory["coverages"][0]["domain"]["domainType"],
+        "Trajectory"
+    );
+    assert_eq!(
+        steps(trajectory),
+        [
+            "2026-10-15T09:00:00+00:00",
+            "2026-10-15T10:00:00+00:00",
+            "2026-10-15T11:00:00+00:00"
+        ]
+    );
+    let nodes = trajectory["coverages"][0]["domain"]["axes"]["composite"]["values"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!(nodes > 3, "densified along the path: {nodes}");
+    for parameter in ["air_temperature_2m", "wind_speed_10m"] {
+        let range = &trajectory["coverages"][0]["ranges"][parameter];
+        assert_eq!(range["axisNames"], serde_json::json!(["composite"]));
+        assert!(range["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(Value::is_number));
+    }
+    assert_eq!(
+        steps(&answers["trajectory instant"]),
+        ["2026-10-15T10:00:00+00:00"]
+    );
+    let m_path = &answers["trajectory M"];
+    assert_eq!(m_path["type"], "Coverage");
+    let composite = m_path["domain"]["axes"]["composite"]["values"]
+        .as_array()
+        .unwrap();
+    assert_eq!(composite[0][0], "2026-10-15T09:00:00+00:00");
+    assert_eq!(
+        composite[composite.len() - 1][0],
+        "2026-10-15T11:00:00+00:00"
+    );
+    assert_eq!(
+        steps(&answers["trajectory datetime list"]),
+        ["2026-10-15T07:00:00+00:00", "2026-10-15T10:00:00+00:00"]
+    );
+    // Cubes (#1169): a [t, y, x] grid without levels, the steps of an area.
+    let cube = &answers["cube"];
+    assert_eq!(cube["domain"]["domainType"], "Grid");
+    assert_eq!(times(cube), ["2026-10-15T11:00:00+00:00"]);
+    assert!(cube["domain"]["axes"].get("z").is_none());
+    assert_eq!(
+        cube["ranges"]["wind_speed_10m"]["axisNames"],
+        serde_json::json!(["t", "y", "x"])
+    );
+    let resampled = &answers["cube interval"];
+    assert_eq!(times(resampled).len(), 3, "07Z to 09Z from the 06Z run");
+    assert_eq!(
+        resampled["domain"]["axes"]["x"]["values"],
+        serde_json::json!([10.0, 15.0, 20.0, 25.0])
+    );
+    assert_eq!(
+        resampled["domain"]["axes"]["y"]["values"],
+        serde_json::json!([66.0, 62.0, 58.0])
+    );
+    assert_eq!(
+        resampled["ranges"]["air_pressure_at_sea_level"]["shape"],
+        serde_json::json!([3, 3, 4])
+    );
+    assert_eq!(
+        times(&answers["cube datetime list"]),
+        ["2026-10-15T07:00:00+00:00", "2026-10-15T10:00:00+00:00"]
+    );
+    assert_eq!(
+        times(&answers["instance cube"]),
+        ["2026-10-15T09:00:00+00:00"],
+        "the 06Z run's last step"
+    );
+
+    // A trajectory or cube off the grid: 404. An M path with datetime, a
+    // time outside the run, resolution-z without levels: 400.
     for query in [
-        "trajectory?coords=LINESTRING(10%2060,20%2062)",
-        "cube?bbox=10,58,20,64",
+        "trajectory?coords=LINESTRING(-100%2010,-90%2020)",
+        "cube?bbox=100,0,110,10",
     ] {
-        let (status, _) = get(&app, &format!("{base}/{query}")).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{query}");
+        let (status, json) = get(&app, &format!("{base}/{query}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{query}: {json}");
+    }
+    for query in [
+        "trajectory?coords=LINESTRINGM(5%2058%201792054800,30%2066%201792062000)&datetime=2026-10-15T09:00:00Z",
+        "trajectory?coords=LINESTRINGM(5%2058%201792047600,30%2066%201792062000)",
+        "cube?bbox=10,58,25,66&resolution-z=3",
+    ] {
+        let (status, json) = get(&app, &format!("{base}/{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {json}");
     }
 
     let (status, collection) = get(&app, &base).await;
@@ -234,7 +347,17 @@ async fn netcdf_edr_responses_validate() {
         .keys()
         .map(String::as_str)
         .collect();
-    assert_eq!(queries, ["position", "area", "radius", "instances"]);
+    assert_eq!(
+        queries,
+        [
+            "position",
+            "area",
+            "radius",
+            "trajectory",
+            "cube",
+            "instances"
+        ]
+    );
     assert!(collection["parameter_names"]["wind_speed_10m"].is_object());
     edr_schema::assert_valid(
         "/collections/{collectionId}",
@@ -297,6 +420,12 @@ async fn netcdf_pressure_level_responses_validate() {
         ("area one level", "area?coords=POLYGON((5%2055,30%2055,5%2068,5%2055))&z=500&parameter-name=geopotential_pl".to_string()),
         ("radius", "radius?coords=POINT(15%2063)&within=300&within-units=km&z=850&parameter-name=wind_speed_pl".to_string()),
         ("instance", format!("instances/2026-10-15T06:00:00Z/position?{point}&z=850,500&parameter-name=air_temperature_pl")),
+        ("trajectory levels", "trajectory?coords=LINESTRING(5%2058,30%2066)&z=850,500&datetime=2026-10-15T09:00:00Z&parameter-name=air_temperature_pl,wind_speed_pl".to_string()),
+        ("trajectory Z", "trajectory?coords=LINESTRINGZ(5%2058%201000,30%2066%20300)&datetime=2026-10-15T09:00:00Z&parameter-name=air_temperature_pl".to_string()),
+        ("trajectory ZM", "trajectory?coords=LINESTRINGZM(5%2058%201000%201792054800,30%2066%20500%201792058400)&parameter-name=geopotential_pl".to_string()),
+        ("cube levels", "cube?bbox=10,58,25,66&z=850,500&datetime=2026-10-15T09:00:00Z/2026-10-15T10:00:00Z&parameter-name=air_temperature_pl,wind_speed_pl".to_string()),
+        ("cube bbox heights", "cube?bbox=10,58,400,25,66,900&parameter-name=geopotential_pl".to_string()),
+        ("cube resolution-z", "cube?bbox=10,58,25,66&resolution-z=3&resolution-x=2&resolution-y=2&parameter-name=air_temperature_pl".to_string()),
     ];
     let mut answers = HashMap::new();
     for (what, query) in &queries {
@@ -350,11 +479,55 @@ async fn netcdf_pressure_level_responses_validate() {
         serde_json::json!(["z", "y", "x"])
     );
 
-    // A level the collection lacks: 400; a malformed z: 400.
+    // Trajectories: one coverage per level of `z`, each with a one-value
+    // z axis; a Z or ZM path's levels in its node tuples.
+    let per_level = answers["trajectory levels"]["coverages"]
+        .as_array()
+        .unwrap();
+    let levels: Vec<Value> = per_level.iter().map(z).collect();
+    assert_eq!(
+        levels,
+        [serde_json::json!([850.0]), serde_json::json!([500.0])]
+    );
+    for path in ["trajectory Z", "trajectory ZM"] {
+        let axes = &answers[path]["domain"]["axes"]["composite"];
+        assert_eq!(
+            axes["coordinates"],
+            serde_json::json!(["t", "x", "y", "z"]),
+            "{path}"
+        );
+        let tuples = axes["values"].as_array().unwrap();
+        assert_eq!(tuples[0][3], 1000.0, "{path}");
+    }
+    // Cubes: a [t, z, y, x] grid over `z`'s levels, a six-number bbox's
+    // heights, or resolution-z's positions.
+    let cube = &answers["cube levels"];
+    assert_eq!(z(cube), serde_json::json!([850.0, 500.0]));
+    assert_eq!(times(cube).len(), 2);
+    assert_eq!(
+        cube["ranges"]["wind_speed_pl"]["axisNames"],
+        serde_json::json!(["t", "z", "y", "x"])
+    );
+    assert_eq!(
+        z(&answers["cube bbox heights"]),
+        serde_json::json!([850.0, 500.0])
+    );
+    let resampled = &answers["cube resolution-z"];
+    assert_eq!(z(resampled), serde_json::json!([300.0, 650.0, 1000.0]));
+    assert_eq!(
+        resampled["ranges"]["air_temperature_pl"]["shape"],
+        serde_json::json!([1, 3, 2, 2])
+    );
+
+    // A level the collection lacks: 400; a malformed z: 400; a Z path
+    // level outside the axis, or with z: 400.
     for query in [
         format!("position?{point}&z=925"),
         format!("position?{point}&z=1100/1200"),
         format!("position?{point}&z=abc"),
+        "trajectory?coords=LINESTRINGZ(5%2058%201000,30%2066%20200)".to_string(),
+        "trajectory?coords=LINESTRINGZ(5%2058%201000,30%2066%20300)&z=850".to_string(),
+        "cube?bbox=10,58,25,66&z=925".to_string(),
     ] {
         let (status, json) = get(&app, &format!("{base}/{query}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {json}");

@@ -177,7 +177,7 @@ errors from all data-query handlers map through `map_query_error`.
 collection, and the handler, `data_queries` and `api_definition()` all read
 it:
 
-- `AlongPath` (default; GRIB, QueryData, Zarr): the handler parses the
+- `AlongPath` (default; GRIB, QueryData, Zarr, NetCDF): the handler parses the
   whole WKT with `ds_core::trajectory::TrajectoryPath` before dispatch and
   enforces EDR 1.2's exclusions (Z/ZM + `z`, M/ZM + `datetime` → 400);
   CoverageJSON (and HTML) only — `params::query_formats` takes the shape, so the
