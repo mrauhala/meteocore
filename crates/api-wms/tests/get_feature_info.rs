@@ -151,6 +151,7 @@ impl MapEngine for Nwp {
             grid_size: None,
             layer_subtitle: None,
             reference_times: RUNS.iter().map(|t| at(t)).collect(),
+            native_grid: None,
         }
     }
 

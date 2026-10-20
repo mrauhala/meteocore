@@ -30,7 +30,9 @@ Each file is one model run, and the newest run is the default.
 - **Grids.** Lat/lon, rotated lat/lon, stereographic and Lambert conformal
   conic (LCC) areas. An LCC grid is placed on the sphere whose radius the
   file states. The grid transform and WGS84 extents are computed once per
-  file.
+  file, and so is the native grid (#1237): the cells around the corner
+  points, in the area's own CRS, which the collection's
+  `meteocore:nativeGrid` member describes as WKT2 when it is not lat/lon.
 - **Sampling.** Bilinear interpolation between the four surrounding grid
   points, falling back to the nearest point when one of them is missing.
   On a lat/lon grid that spans all 360° of longitude, the first column

@@ -58,6 +58,12 @@ tiles a request touches, so a remote COG is not downloaded whole.
   runs. An EDR `z` is ignored.
 - The native CRS is reported as `EPSG:3067`, `EPSG:3035` or `CRS:84` when
   the grid matches one of those; other projections get no EPSG code.
+- The native grid (#1237) is the first loaded file's: its cells in its own
+  CRS, with the EPSG code its `ProjectedCSTypeGeoKey` states. When that code
+  is the advertised `storageCrs`, the collection description adds
+  `storageCrsBbox` and a grid in that CRS. Any projected grid also gets the
+  `meteocore:nativeGrid` member, whose CRS is the stated code's URI or else
+  the WKT2. See the [api-common README](../api-common/README.md#native-grid).
 - Per-query details are in the EDR status page's
   [matrix](../api-edr/README.md#per-engine-query-type-matrix).
 

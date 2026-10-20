@@ -37,6 +37,7 @@ impl Default for Discovery {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: vec![],
+                native_grid: None,
             }),
         }
     }
@@ -247,6 +248,7 @@ impl GribEngine {
             // Each retained forecast run is a selectable reference time (WMS
             // `reference_time` dimension); ascending, latest last.
             reference_times: catalog.runs.keys().copied().collect(),
+            native_grid: None,
         }
     }
 }
@@ -299,6 +301,7 @@ mod tests {
                 Some(grid.bbox),
                 Some(grid.cells),
                 "CRS:84",
+                None,
                 &[],
                 None,
             )

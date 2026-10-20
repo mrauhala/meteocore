@@ -47,6 +47,7 @@ impl MockMapEngine {
             grid_size: Some([2000, 1500]),
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -1258,6 +1259,7 @@ impl MapEngine for MultiParamMockEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -2299,6 +2301,7 @@ mod temporal_grid_jitter {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -2640,6 +2643,7 @@ impl MapEngine for RunSwapMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: self.runs.read().unwrap().clone(),
+            native_grid: None,
         }
     }
 
@@ -3529,6 +3533,7 @@ mod per_parameter_times {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
 
@@ -3802,6 +3807,7 @@ mod composites {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
 
@@ -4252,6 +4258,7 @@ mod map_tile_parameters {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
 

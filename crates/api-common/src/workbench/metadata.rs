@@ -487,71 +487,203 @@ fn extent_row(label: &str, facts: &str) -> String {
     )
 }
 
-/// The cells and resolution `extent.spatial.grid` gives, one entry per axis
-/// of the bbox's CRS (Common Part 2), as facts: `16 × 21 cells` and
-/// `0.5°`, one value when every axis has the same, else one per axis.
-/// Degrees for a CRS84 or EPSG:4326 box. Empty without a grid.
-pub(super) fn spatial_grid_facts(spatial: &Value) -> String {
-    let Some(axes) = spatial["grid"].as_array().filter(|axes| !axes.is_empty()) else {
-        return String::new();
+/// The `extent.spatial` member of MeteoCore's native-grid extension
+/// (#1237): `crs` (a URI or WKT2), `cellsCount`, `resolution`, `unit` and
+/// `bbox`, all x then y.
+pub(super) const NATIVE_GRID: &str = "meteocore:nativeGrid";
+
+/// A CRS URI as a chip, with its registered name under it where MeteoCore
+/// knows it: `EPSG:3067`, `EUREF-FIN / TM35FIN(E,N)`.
+fn crs_named(crs: &str) -> String {
+    match ds_core::native_grid::registered_crs(crs) {
+        Some(registered) => format!(
+            "{}<span class=\"secondary\">{}</span>",
+            crs_chip(crs),
+            escape(registered.name)
+        ),
+        None => crs_chip(crs),
+    }
+}
+
+/// A number pair `[x, y]` of an extension member.
+fn pair(value: &Value) -> Option<[f64; 2]> {
+    match value.as_array()?.as_slice() {
+        [x, y] => Some([x.as_f64()?, y.as_f64()?]),
+        _ => None,
+    }
+}
+
+/// A cell size in words: metres to 1 decimal under 1 km, else km to 2
+/// (`2.5 km`, `2.58 km`), degrees (`0.25°`), or the number and its unit.
+fn cell_size(value: f64, unit: &str) -> String {
+    let number = ds_core::html::display_value;
+    match unit {
+        "m" if value < 1000.0 => format!("{} m", display_number(value, 1)),
+        "m" => format!("{} km", display_number(value / 1000.0, 2)),
+        "deg" => format!("{}°", number(value)),
+        "" => number(value),
+        unit => format!("{} {unit}", number(value)),
+    }
+}
+
+/// An approximate distance in km: whole km from 10 up, else 1 decimal.
+fn approx_km(km: f64) -> String {
+    if km >= 10.0 {
+        format!("{km:.0}")
+    } else {
+        format!("{km:.1}")
+    }
+}
+
+/// The Resolution fact: the cell size along x and y, then the cell
+/// counts (`2.5 km × 2.5 km · 949 × 1069 cells`), the exact sizes in the
+/// `title`. A grid in degrees adds its size in km at `latitude`, the
+/// extent's middle (111.32 km a degree of latitude, of longitude times its
+/// cosine): an approximation, said so.
+fn resolution_fact(
+    resolution: [f64; 2],
+    unit: &str,
+    cells: [u64; 2],
+    latitude: Option<f64>,
+) -> String {
+    let [x, y] = resolution;
+    // Each part keeps its line: a narrow column breaks only between them.
+    let mut parts = vec![format!("{} × {}", cell_size(x, unit), cell_size(y, unit))];
+    let unit_label = match unit {
+        "deg" => "°",
+        "m" => " m",
+        _ => "",
     };
-    let crs = spatial["crs"]
-        .as_str()
-        .map_or_else(|| "CRS84".to_owned(), crs_name);
-    let (order, unit) = match (crs.as_str(), axes.len()) {
-        ("CRS84", 2) => (" · lon × lat", "°"),
-        ("EPSG:4326", 2) => (" · lat × lon", "°"),
-        _ => ("", ""),
-    };
+    let mut exact = format!("{x}{unit_label} × {y}{unit_label}");
+    if let (true, Some(latitude)) = (unit == "deg", latitude) {
+        const KM_PER_DEGREE: f64 = 111.32;
+        let across = x * KM_PER_DEGREE * latitude.to_radians().cos();
+        let along = y * KM_PER_DEGREE;
+        parts.push(format!(
+            "(≈ {} km × {} km)",
+            approx_km(across),
+            approx_km(along)
+        ));
+        exact.push_str(&format!(
+            "; km approximate at latitude {}",
+            display_coordinate(latitude)
+        ));
+    }
+    let size = parts
+        .iter()
+        .map(|part| format!("<span>{}</span>", escape(part)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    fact(
+        "Resolution",
+        &format!(
+            "<span class=\"grid-resolution\" title=\"{}\">{size} · <span>{} × {} cells</span></span>",
+            escape(&exact),
+            cells[0],
+            cells[1]
+        ),
+        false,
+    )
+}
+
+/// The facts of a `meteocore:nativeGrid` member: its coordinate system
+/// when the `storageCrs` does not already name it (a URI with its name, or
+/// a WKT2 CRS by its name, "no EPSG code", and the WKT2 to unfold), and
+/// its resolution. `None` when the member lacks its counts or sizes.
+fn native_grid_facts(native: &Value, storage_crs: Option<&str>) -> Option<String> {
+    let [nx, ny] = pair(&native["cellsCount"])?;
+    let resolution =
+        pair(&native["resolution"]).filter(|r| r.iter().all(|v| v.is_finite() && *v > 0.0))?;
+    let unit = native["unit"].as_str().unwrap_or("");
     let mut out = String::new();
-    let cells: Option<Vec<String>> = axes
-        .iter()
-        .map(|axis| axis["cellsCount"].as_u64().map(|n| n.to_string()))
-        .collect();
-    if let Some(cells) = cells {
-        out.push_str(&fact(
-            &format!("Grid{order}"),
-            &escape(&format!("{} cells", cells.join(" × "))),
-            false,
-        ));
+    // The WKT2 unfolds below the facts, so the name and the resolution
+    // stay side by side.
+    let mut definition = String::new();
+    match native["crs"].as_str() {
+        Some(crs) if Some(crs) == storage_crs => {}
+        Some(crs) if crs.starts_with("http") || crs.starts_with('[') => {
+            out.push_str(&fact("Native coordinate system", &crs_named(crs), false));
+        }
+        Some(wkt) => {
+            let name = ds_core::native_grid::wkt_name(wkt).unwrap_or("Custom coordinate system");
+            out.push_str(&fact(
+                "Native coordinate system",
+                &format!(
+                    "{}<span class=\"secondary\">no EPSG code</span>",
+                    escape(name)
+                ),
+                false,
+            ));
+            definition = format!(
+                "<details class=\"fact wide\"><summary>Native coordinate system as WKT2</summary><pre class=\"wkt mono\">{}</pre></details>",
+                escape(wkt)
+            );
+        }
+        None => {}
     }
-    let resolution: Option<Vec<f64>> = axes
-        .iter()
-        .map(|axis| {
-            axis["resolution"]
-                .as_f64()
-                .filter(|r| r.is_finite() && *r > 0.0)
-        })
-        .collect();
-    if let Some(resolution) = resolution {
-        let shown: Vec<String> = resolution
-            .iter()
-            .map(|r| format!("{}{unit}", ds_core::html::display_value(*r)))
-            .collect();
-        let text = if shown.iter().all(|s| *s == shown[0]) {
-            shown[0].clone()
-        } else {
-            shown.join(" × ")
-        };
-        let exact: Vec<String> = resolution.iter().map(f64::to_string).collect();
-        out.push_str(&fact(
-            &format!("Resolution{order}"),
-            &format!(
-                "<span title=\"{}\">{}</span>",
-                escape(&exact.join(" × ")),
-                escape(&text)
-            ),
-            false,
-        ));
+    let latitude = native["bbox"]
+        .as_array()
+        .and_then(|b| Some((b.get(1)?.as_f64()? + b.get(3)?.as_f64()?) / 2.0));
+    out.push_str(&resolution_fact(
+        resolution,
+        unit,
+        [nx as u64, ny as u64],
+        latitude,
+    ));
+    out.push_str(&definition);
+    Some(out)
+}
+
+/// The facts of the standard `extent.spatial.grid`, whose units and axis
+/// order are the `storageCrs`'s (CRS84 without one, Common Part 2): degrees
+/// for CRS84 and EPSG:4326 (latitude first), metres for the registered
+/// projected CRSs MeteoCore advertises, axes put x first. `None` without a
+/// two-axis grid of cell counts and positive resolutions.
+fn standard_grid_facts(spatial: &Value, storage_crs: Option<&str>) -> Option<String> {
+    let axes = spatial["grid"].as_array().filter(|axes| axes.len() == 2)?;
+    let axis = |axis: &Value| -> Option<(u64, f64)> {
+        let resolution = axis["resolution"]
+            .as_f64()
+            .filter(|r| r.is_finite() && *r > 0.0)?;
+        Some((axis["cellsCount"].as_u64()?, resolution))
+    };
+    let (mut first, mut second) = (axis(&axes[0])?, axis(&axes[1])?);
+    let registered = storage_crs.map(ds_core::native_grid::registered_crs);
+    let (unit, northing_first) = match registered {
+        None => ("deg", false),
+        Some(Some(r)) => (r.unit, r.northing_first),
+        Some(None) => ("", false),
+    };
+    if northing_first {
+        std::mem::swap(&mut first, &mut second);
     }
-    out
+    let latitude = bbox_xy(&spatial["bbox"][0]).map(|[_, s, _, n]| (s + n) / 2.0);
+    Some(resolution_fact(
+        [first.1, second.1],
+        unit,
+        [first.0, second.0],
+        latitude,
+    ))
+}
+
+/// The grid facts of an `extent.spatial` (#1237): from the
+/// `meteocore:nativeGrid` member when there is one, else from the standard
+/// `grid` in the `storageCrs`. Empty without either.
+pub(super) fn spatial_grid_facts(spatial: &Value, storage_crs: Option<&str>) -> String {
+    spatial
+        .get(NATIVE_GRID)
+        .filter(|native| native.is_object())
+        .and_then(|native| native_grid_facts(native, storage_crs))
+        .or_else(|| standard_grid_facts(spatial, storage_crs))
+        .unwrap_or_default()
 }
 
 /// The Overview's Extent box rows (#1228), one per dimension the document
 /// describes, with the facts it carries and nothing inferred:
 /// - Spatial: the bounds in the bbox's CRS to 2 decimals (the exact values
-///   in the `title`, a Copy bbox button), the storage CRS, and the cells
-///   and resolution of `extent.spatial.grid`.
+///   in the `title`, a Copy bbox button), the storage CRS with its name,
+///   and the native grid ([`spatial_grid_facts`]): its coordinate system
+///   and its resolution with the cell counts.
 /// - Temporal: the interval, the step from the grid's `resolution`, the
 ///   number of steps, and the model runs where the document links them
 ///   (EDR `instances`).
@@ -574,14 +706,15 @@ pub(super) fn extent_rows(doc: &Value) -> Option<String> {
             exact = escape(&bbox_exact(v))
         ));
     }
-    if let Some(storage) = doc["storageCrs"].as_str() {
+    let storage = doc["storageCrs"].as_str();
+    if let Some(storage) = storage {
         facts.push_str(&fact(
             "Storage coordinate system",
-            &crs_chip(storage),
+            &crs_named(storage),
             false,
         ));
     }
-    facts.push_str(&spatial_grid_facts(spatial));
+    facts.push_str(&spatial_grid_facts(spatial, storage));
     if !facts.is_empty() {
         rows.push_str(&extent_row("Spatial", &facts));
     }

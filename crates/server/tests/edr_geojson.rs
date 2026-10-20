@@ -521,6 +521,7 @@ impl ds_core::map_engine::MapEngine for DiscSource {
             grid_size: Some([200, 200]),
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }

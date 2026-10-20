@@ -38,6 +38,7 @@ use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
     QueryResult,
 };
+use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
 use ds_storage::discovery::TimeWindow;
@@ -134,8 +135,8 @@ struct Catalog {
     composite_times: Vec<Arc<[DateTime<Utc>]>>,
     /// Per product: the CRS84 extent of its grid, from its first scan.
     extents: Vec<Option<[f64; 4]>>,
-    /// Per product: its grid size, from its first scan.
-    grids: Vec<Option<[u32; 2]>>,
+    /// Per product: its grid, from its first scan.
+    grids: Vec<Option<NativeGrid>>,
     info: Arc<RasterInfo>,
     /// When the last poll finished listing every product.
     polled_at: Option<DateTime<Utc>>,
@@ -423,7 +424,11 @@ impl SatelliteEngine {
                         if extents[index].is_none() {
                             extents[index] = frame.extent();
                         }
-                        grids[index].get_or_insert([frame.gt.width, frame.gt.height]);
+                        if grids[index].is_none() {
+                            // The scan's own grid: no EPSG code is stated,
+                            // even GMGSI's Mercator is recognised (#1237).
+                            grids[index] = NativeGrid::from_geo_transform(&frame.gt, None);
+                        }
                         frames[index].insert(
                             scan.time,
                             Held {
@@ -844,17 +849,19 @@ impl Catalog {
         frames: Vec<BTreeMap<DateTime<Utc>, Held>>,
         parameters: &[ParameterInfo],
         extents: Vec<Option<[f64; 4]>>,
-        grids: Vec<Option<[u32; 2]>>,
+        grids: Vec<Option<NativeGrid>>,
         native_crs: &str,
         composite_bands: &[Vec<usize>],
     ) -> Catalog {
         // A grid size is advertised only when every product with a scan
         // shares it: a 0.5 km band next to 2 km products has no one grid.
-        let mut sizes = grids.iter().flatten();
+        let mut sizes = grids.iter().flatten().map(NativeGrid::size);
         let grid_size = sizes
             .next()
-            .copied()
-            .filter(|first| sizes.all(|size| size == first));
+            .filter(|first| sizes.all(|size| size == *first));
+        // The native grid is the default parameter's (the first product's):
+        // the layer a map shows by default. A finer band may sit on its own.
+        let native_grid = grids.first().cloned().flatten();
         let spatial_extent = union_extent(extents.iter().flatten());
         let times: Vec<Arc<[DateTime<Utc>]>> = frames
             .iter()
@@ -883,6 +890,7 @@ impl Catalog {
             grid_size,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid,
         };
         Catalog {
             frames,
@@ -1362,6 +1370,7 @@ mod tests {
     use ds_core::config::{SatelliteConfig, SatelliteProductConfig};
     use ds_core::edr_engine::EdrEngine;
     use ds_core::map_engine::{MapEngine, OutputCrs, ParameterInfo};
+    use ds_core::native_grid::NativeGrid;
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -1406,7 +1415,8 @@ mod tests {
         ));
     }
 
-    /// A grid size is advertised only when the products share it.
+    /// A grid size is advertised only when the products share it; the
+    /// native grid is the first product's, the default parameter's (#1237).
     #[test]
     fn grid_size_only_when_products_agree() {
         let parameter = |name: &str| ParameterInfo {
@@ -1415,8 +1425,22 @@ mod tests {
             unit: "K".into(),
         };
         let parameters = [parameter("ir"), parameter("vis")];
-        let build = |grids: Vec<Option<[u32; 2]>>| {
-            Catalog::build(
+        let build = |sizes: Vec<Option<[u32; 2]>>| {
+            let grids = sizes
+                .into_iter()
+                .map(|size| {
+                    size.and_then(|size| {
+                        NativeGrid::new(
+                            ds_core::geo::Crs::WebMercator,
+                            None,
+                            size,
+                            [0.0, 0.0],
+                            [2000.0, 2000.0],
+                        )
+                    })
+                })
+                .collect();
+            let info = Catalog::build(
                 vec![BTreeMap::new(); 2],
                 &parameters,
                 vec![None; 2],
@@ -1424,16 +1448,19 @@ mod tests {
                 "geos",
                 &[],
             )
-            .info
-            .grid_size
+            .info;
+            (
+                info.grid_size,
+                info.native_grid.as_ref().map(NativeGrid::size),
+            )
         };
-        assert_eq!(build(vec![Some([5424, 5424]), None]), Some([5424, 5424]));
-        assert_eq!(
-            build(vec![Some([5424, 5424]), Some([5424, 5424])]),
-            Some([5424, 5424])
-        );
-        assert_eq!(build(vec![Some([5424, 5424]), Some([21696, 21696])]), None);
-        assert_eq!(build(vec![None, None]), None);
+        let full = Some([5424, 5424]);
+        assert_eq!(build(vec![full, None]), (full, full));
+        assert_eq!(build(vec![full, full]), (full, full));
+        // Bands on different grids: no one grid size, the default's grid.
+        assert_eq!(build(vec![full, Some([21696, 21696])]), (None, full));
+        assert_eq!(build(vec![None, full]), (full, None));
+        assert_eq!(build(vec![None, None]), (None, None));
     }
 
     #[test]

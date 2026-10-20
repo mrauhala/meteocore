@@ -1853,9 +1853,14 @@ impl RequestFacts {
         };
         let latest = utc(&temporal["interval"][0][1])
             .or_else(|| utc(temporal["values"].as_array()?.last()?));
+        // The standard grid is in the `storageCrs`'s units (#1237): degrees
+        // only without one or with CRS84.
+        let grid_in_degrees = doc["storageCrs"]
+            .as_str()
+            .is_none_or(|crs| metadata::crs_name(crs) == "CRS84");
         let resolution = spatial["grid"]
             .as_array()
-            .filter(|axes| geographic && axes.len() == 2)
+            .filter(|axes| geographic && grid_in_degrees && axes.len() == 2)
             .and_then(|axes| {
                 Some([
                     axes[0]["resolution"].as_f64()?,
@@ -5626,9 +5631,14 @@ mod tests {
     #[test]
     fn extent_box_rows_hold_the_advertised_facts() {
         let mut doc = rich_collection();
+        // The EPSG:3067 radar fixture's grid, in its storage CRS (#1237).
+        doc["extent"]["spatial"]["storageCrsBbox"] =
+            json!([[-196593.004, 6255329.699, 1044176.941, 8084432.005]]);
         doc["extent"]["spatial"]["grid"] = json!([
-            {"cellsCount": 3249, "resolution": 0.011565390529645244, "firstCoordinate": null},
-            {"cellsCount": 1750, "resolution": 0.011565390529645243, "firstCoordinate": null}]);
+            {"cellsCount": 480, "resolution": 2584.937385416667, "firstCoordinate": -195300.5353072917,
+             "relativeBounds": [-1292.4686927083334, 1292.4686927083334]},
+            {"cellsCount": 360, "resolution": 5080.839738888889, "firstCoordinate": 6257870.118869444,
+             "relativeBounds": [-2540.4198694444444, 2540.4198694444444]}]);
         doc["extent"]["vertical"] = json!({"interval": [[300.0, 1000.0]], "vrs": ds_core::vertical::VerticalKind::Pressure.vrs(),
             "values": [1000.0, 850.0, 500.0, 300.0], "unit": "hPa", "grid": {"cellsCount": 4, "coordinates": [1000.0, 850.0, 500.0, 300.0]}});
         doc["data_queries"]["instances"] =
@@ -5647,14 +5657,10 @@ mod tests {
         assert!(spatial.contains("<small>Bounds · CRS84 · west, south → east, north</small>"));
         assert!(spatial.contains("title=\"0.4190042054438888,54.570768841987515,37.99495803626129,74.81020226886669\">0.42, 54.57 → 37.99, 74.81</strong>"), "{spatial}");
         assert!(spatial.contains("data-copy=\"0.4190042054438888,54.570768841987515,37.99495803626129,74.81020226886669\">Copy bbox</button>"));
-        assert!(spatial.contains("<small>Storage coordinate system</small><strong><span class=\"chip crs\" title=\"http://www.opengis.net/def/crs/EPSG/0/3067\">EPSG:3067</span></strong>"), "{spatial}");
-        assert!(
-            spatial.contains("<small>Grid · lon × lat</small><strong>3249 × 1750 cells</strong>"),
-            "{spatial}"
-        );
-        // One resolution where the axes agree to the digits shown, the
-        // exact values in the title.
-        assert!(spatial.contains("<small>Resolution · lon × lat</small><strong><span title=\"0.011565390529645244 × 0.011565390529645243\">0.0116°</span></strong>"), "{spatial}");
+        assert!(spatial.contains("<small>Storage coordinate system</small><strong><span class=\"chip crs\" title=\"http://www.opengis.net/def/crs/EPSG/0/3067\">EPSG:3067</span><span class=\"secondary\">EUREF-FIN / TM35FIN(E,N)</span></strong>"), "{spatial}");
+        // The grid in the storage CRS's metres: x then y, then the cells,
+        // the exact sizes in the title.
+        assert!(spatial.contains("<small>Resolution</small><strong><span class=\"grid-resolution\" title=\"2584.937385416667 m × 5080.839738888889 m\"><span>2.58 km × 5.08 km</span> · <span>480 × 360 cells</span></span></strong>"), "{spatial}");
         let temporal = row("Temporal");
         assert!(
             temporal.contains("<span>2026-03-24</span><span>23:15–23:35 UTC</span>"),
@@ -5688,19 +5694,118 @@ mod tests {
         assert!(vertical.contains("<summary>Vertical reference system</summary>"));
         // The catalog row shows the same bounds text.
         assert!(collection_facts(&doc).contains(">0.42, 54.57 → 37.99, 74.81</span>"));
-        // A grid of unequal resolution names each axis's; a projected box
-        // names no axes and no degrees.
-        let unequal = json!({"crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84", "grid": [
-            {"cellsCount": 16, "resolution": 0.5}, {"cellsCount": 21, "resolution": 0.25}]});
-        assert!(metadata::spatial_grid_facts(&unequal).contains(">0.5° × 0.25°</span>"));
-        let projected = json!({"crs": "http://www.opengis.net/def/crs/EPSG/0/3067", "grid": [
-            {"cellsCount": 760, "resolution": 1000.0}, {"cellsCount": 1226, "resolution": 1000.0}]});
-        let facts = metadata::spatial_grid_facts(&projected);
+        // A CRS84 grid is in degrees, with its size in km at the extent's
+        // middle latitude, approximately and said so.
+        let degrees = json!({"crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+            "bbox": [[-180.0, -90.0, 180.0, 90.0]], "grid": [
+            {"cellsCount": 1440, "resolution": 0.25}, {"cellsCount": 720, "resolution": 0.25}]});
+        let facts = metadata::spatial_grid_facts(&degrees, Some(CRS84));
+        assert!(facts.contains("<span class=\"grid-resolution\" title=\"0.25° × 0.25°; km approximate at latitude 0\"><span>0.25° × 0.25°</span> <span>(≈ 28 km × 28 km)</span> · <span>1440 × 720 cells</span></span>"), "{facts}");
+        let nordic = json!({"bbox": [[0.0, 55.0, 30.0, 65.0]], "grid": [
+            {"cellsCount": 300, "resolution": 0.1}, {"cellsCount": 200, "resolution": 0.05}]});
+        assert!(metadata::spatial_grid_facts(&nordic, None)
+            .contains("><span>0.1° × 0.05°</span> <span>(≈ 5.6 km × 5.6 km)</span> · <span>300 × 200 cells</span>"));
+        // EPSG:3035 lists northing first: the page puts x first.
+        let laea = json!({"grid": [
+            {"cellsCount": 400, "resolution": 500.0}, {"cellsCount": 300, "resolution": 1000.0}]});
+        let facts =
+            metadata::spatial_grid_facts(&laea, Some("http://www.opengis.net/def/crs/EPSG/0/3035"));
         assert!(
-            facts.contains("<small>Grid</small><strong>760 × 1226 cells</strong>"),
+            facts.contains("><span>1 km × 500 m</span> · <span>300 × 400 cells</span>"),
             "{facts}"
         );
-        assert!(facts.contains(">1000</span>"), "{facts}");
+        // A storage CRS the page does not know gives bare numbers.
+        let other = metadata::spatial_grid_facts(
+            &laea,
+            Some("http://www.opengis.net/def/crs/EPSG/0/32635"),
+        );
+        assert!(
+            other.contains("><span>500 × 1000</span> · <span>400 × 300 cells</span>"),
+            "{other}"
+        );
+    }
+
+    const CRS84: &str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
+
+    /// #1237: the `meteocore:nativeGrid` member gives the Resolution row of
+    /// any grid, and its coordinate system where the storage CRS does not
+    /// name it: a custom CRS by its WKT2 name, "no EPSG code", the WKT2 to
+    /// unfold; a registered one as a chip with its name.
+    #[test]
+    fn extent_box_shows_the_native_grid_member() {
+        let wkt = ds_core::native_grid::crs_wkt2(&ds_core::geo::Crs::LambertConformalConic {
+            lat1: 63.3_f64.to_radians(),
+            lat2: 63.3_f64.to_radians(),
+            lat0: 63.3_f64.to_radians(),
+            lon0: 15.0_f64.to_radians(),
+            false_e: 0.0,
+            false_n: 0.0,
+            radius: Some(6_371_000.0),
+        });
+        let mut doc = rich_collection();
+        doc.as_object_mut().unwrap().remove("storageCrs");
+        doc["extent"]["spatial"]["meteocore:nativeGrid"] = json!({"crs": wkt,
+            "cellsCount": [949, 1069], "resolution": [2500.0, 2500.0], "unit": "m",
+            "bbox": [-1060084.0, -1332469.0, 1312416.0, 1340031.0]});
+        let rows = metadata::extent_rows(&doc).unwrap();
+        assert!(!rows.contains("Storage coordinate system"), "{rows}");
+        assert!(rows.contains("<small>Native coordinate system</small><strong>Lambert conformal conic<span class=\"secondary\">no EPSG code</span></strong>"), "{rows}");
+        assert!(rows.contains("<details class=\"fact wide\"><summary>Native coordinate system as WKT2</summary><pre class=\"wkt mono\">PROJCRS[&quot;Lambert conformal conic&quot;,"), "{rows}");
+        assert!(rows.contains("<small>Resolution</small><strong><span class=\"grid-resolution\" title=\"2500 m × 2500 m\"><span>2.5 km × 2.5 km</span> · <span>949 × 1069 cells</span></span></strong>"), "{rows}");
+        // The member wins over a standard grid; metres under 1 km stay
+        // metres.
+        doc["extent"]["spatial"]["grid"] =
+            json!([{"cellsCount": 1, "resolution": 1.0}, {"cellsCount": 1, "resolution": 1.0}]);
+        doc["extent"]["spatial"]["meteocore:nativeGrid"]["resolution"] = json!([250.0, 500.0]);
+        let rows = metadata::extent_rows(&doc).unwrap();
+        assert!(
+            rows.contains("><span>250 m × 500 m</span> · <span>949 × 1069 cells</span>"),
+            "{rows}"
+        );
+        // A registered native CRS that is the storage CRS is named once.
+        let tm35 = "http://www.opengis.net/def/crs/EPSG/0/3067";
+        doc["storageCrs"] = json!(tm35);
+        doc["extent"]["spatial"]["meteocore:nativeGrid"]["crs"] = json!(tm35);
+        let rows = metadata::extent_rows(&doc).unwrap();
+        assert!(!rows.contains("Native coordinate system"), "{rows}");
+        assert_eq!(
+            rows.matches("EUREF-FIN / TM35FIN(E,N)").count(),
+            1,
+            "{rows}"
+        );
+        // One the storage CRS does not name is shown with its name.
+        doc.as_object_mut().unwrap().remove("storageCrs");
+        let rows = metadata::extent_rows(&doc).unwrap();
+        assert!(rows.contains("<small>Native coordinate system</small><strong><span class=\"chip crs\" title=\"http://www.opengis.net/def/crs/EPSG/0/3067\">EPSG:3067</span><span class=\"secondary\">EUREF-FIN / TM35FIN(E,N)</span></strong>"), "{rows}");
+        // Rotated lat/lon degrees, approximately km at its middle latitude.
+        doc["extent"]["spatial"]["meteocore:nativeGrid"] = json!({"crs": "GEOGCRS[\"Rotated pole\"]",
+            "cellsCount": [100, 80], "resolution": [0.1, 0.1], "unit": "deg",
+            "bbox": [-5.0, -4.0, 5.0, 4.0]});
+        let rows = metadata::extent_rows(&doc).unwrap();
+        assert!(
+            rows.contains(
+                "<strong>Rotated pole<span class=\"secondary\">no EPSG code</span></strong>"
+            ),
+            "{rows}"
+        );
+        assert!(
+            rows.contains("><span>0.1° × 0.1°</span> <span>(≈ 11 km × 11 km)</span> · <span>100 × 80 cells</span>"),
+            "{rows}"
+        );
+    }
+
+    /// #1237: the request guide sizes its area example from a grid in
+    /// degrees only: a storage CRS's metres are not degrees.
+    #[test]
+    fn request_facts_read_degrees_only_from_a_crs84_grid() {
+        let mut doc = rich_collection();
+        doc["extent"]["spatial"]["grid"] = json!([
+            {"cellsCount": 480, "resolution": 2584.9}, {"cellsCount": 360, "resolution": 5080.8}]);
+        assert_eq!(RequestFacts::of(&doc).resolution, None);
+        doc.as_object_mut().unwrap().remove("storageCrs");
+        doc["extent"]["spatial"]["grid"] = json!([
+            {"cellsCount": 480, "resolution": 0.1}, {"cellsCount": 360, "resolution": 0.05}]);
+        assert_eq!(RequestFacts::of(&doc).resolution, Some([0.1, 0.05]));
     }
 
     /// #1228: a dimension the document does not describe has no row, and

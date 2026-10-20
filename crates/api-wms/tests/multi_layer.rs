@@ -184,6 +184,7 @@ impl MapEngine for Region {
             grid_size: None,
             layer_subtitle: None,
             reference_times: self.runs.clone(),
+            native_grid: None,
         }
     }
 

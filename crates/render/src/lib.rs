@@ -1366,6 +1366,7 @@ mod tests {
             grid_size: None,
             layer_subtitle: None,
             reference_times: vec![],
+            native_grid: None,
         };
         let mut style = style_over("viridis", "default", "Default", 0.0, 1.0);
         for (requested, styled, expected, expected_unit) in [

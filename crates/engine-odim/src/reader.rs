@@ -372,6 +372,9 @@ pub(crate) fn read_raw_pixels_2d(
 pub struct OdimComposite {
     /// Native projection parsed from `/where/projdef`.
     pub crs: Crs,
+    /// The EPSG code the projdef states ([`proj::stated_epsg`]): the
+    /// registered ellipsoid with exactly the registered parameters.
+    pub crs_epsg: Option<u32>,
     /// Grid width (number of columns).
     pub xsize: u32,
     /// Grid height (number of rows).
@@ -788,6 +791,7 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
         nodata,
         undetect,
         pixels,
+        crs_epsg: proj::stated_epsg(&projdef),
     })
 }
 

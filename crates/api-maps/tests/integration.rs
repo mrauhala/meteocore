@@ -46,6 +46,7 @@ impl MockMapEngine {
             grid_size: Some([2000, 1500]),
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -1672,6 +1673,7 @@ impl MapEngine for MultiParamMockEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -1918,6 +1920,7 @@ mod vertical_extent {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -1987,6 +1990,7 @@ mod vertical_extent {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -2013,6 +2017,9 @@ mod vertical_extent {
 
 mod extent_edge_cases {
     use super::*;
+    use ds_core::geo::Crs;
+    use ds_core::native_grid::NativeGrid;
+    use serde_json::json;
 
     /// Engine whose native CRS is a projection with no canonical OGC URI
     /// (engines label these "TM"/"LAEA"/"projected"/…).
@@ -2049,6 +2056,71 @@ mod extent_edge_cases {
                 grid_size: Some([2000, 1500]),
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                // An OPERA-like LAEA grid: no EPSG code.
+                native_grid: NativeGrid::new(
+                    Crs::LambertAzimuthalEqualArea {
+                        lat0: 55.0_f64.to_radians(),
+                        lon0: 10.0_f64.to_radians(),
+                        false_e: 1_950_000.0,
+                        false_n: -2_100_000.0,
+                    },
+                    None,
+                    [2000, 1500],
+                    [0.0, -3_000_000.0],
+                    [2000.0, 2000.0],
+                ),
+            }
+        }
+    }
+
+    /// Engine whose source states EPSG:3067, the `storageCrs` its label
+    /// advertises (the TM35FIN radar fixture's grid).
+    struct RegisteredMockEngine;
+
+    impl MapEngine for RegisteredMockEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![None; (width * height) as usize].into(),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "EPSG:3067".into(),
+                spatial_extent: Some([6.68, 55.93, 43.12, 72.2]),
+                times: vec![],
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([480, 360]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+                native_grid: NativeGrid::new(
+                    Crs::TransverseMercator {
+                        lat0: 0.0,
+                        lon0: 27.0_f64.to_radians(),
+                        k0: 0.9996,
+                        false_e: 500_000.0,
+                        false_n: 0.0,
+                    },
+                    Some(3067),
+                    [480, 360],
+                    [-196_000.0, 6_255_000.0],
+                    [2500.0, 5000.0],
+                ),
             }
         }
     }
@@ -2099,12 +2171,17 @@ mod extent_edge_cases {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
 
+    /// #1237: a native CRS with no OGC URI gets no `storageCrs` (Maps
+    /// requires a URI or safe CURIE there, and the default map in it), so
+    /// no standard `grid` either: the grid is the `meteocore:nativeGrid`
+    /// member, its CRS as WKT2. `crs` lists only what Maps renders.
     #[tokio::test]
-    async fn storage_crs_and_spatial_grid_omitted_for_projected_native_crs() {
+    async fn projected_native_crs_is_only_the_native_grid_member() {
         let json =
             fetch_collection_json(Arc::new(ProjectedMockEngine), "proj", vec!["maps".into()]).await;
         // Mislabelling a projected grid as CRS84 is worse than omitting it.
@@ -2113,13 +2190,61 @@ mod extent_edge_cases {
             "storageCrs must be absent for a native CRS with no OGC URI, got {:?}",
             json.get("storageCrs")
         );
+        let spatial = &json["extent"]["spatial"];
         // The bbox is still advertised...
-        assert!(json["extent"]["spatial"]["bbox"].is_array());
+        assert!(spatial["bbox"].is_array());
         // ...but not a CRS84-degree grid: a projected grid isn't degree-regular.
         assert!(
-            json["extent"]["spatial"].get("grid").is_none(),
-            "projected grids must not advertise a CRS84-degree spatial.grid"
+            spatial.get("grid").is_none() && spatial.get("storageCrsBbox").is_none(),
+            "projected grids must not advertise a CRS84-degree spatial.grid: {spatial}"
         );
+        let member = &spatial["meteocore:nativeGrid"];
+        assert!(member["crs"]
+            .as_str()
+            .unwrap()
+            .starts_with("PROJCRS[\"Lambert azimuthal equal area\","));
+        assert_eq!(member["cellsCount"], json!([2000, 1500]));
+        assert_eq!(member["resolution"], json!([2000.0, 2000.0]));
+        assert_eq!(member["unit"], "m");
+        assert_eq!(member["bbox"], json!([0.0, -3_000_000.0, 4_000_000.0, 0.0]));
+        assert!(
+            !json["crs"].to_string().contains("PROJCRS"),
+            "{}",
+            json["crs"]
+        );
+    }
+
+    /// #1237: a source-stated EPSG:3067 that is the advertised `storageCrs`
+    /// gives the standard `storageCrsBbox` (`/req/collection-map/desc-crs`
+    /// C) and a cell-centred `grid` in metres, plus the member by URI.
+    #[tokio::test]
+    async fn registered_native_crs_gets_the_standard_storage_extent() {
+        let json =
+            fetch_collection_json(Arc::new(RegisteredMockEngine), "tm35", vec!["maps".into()])
+                .await;
+        let tm35 = "http://www.opengis.net/def/crs/EPSG/0/3067";
+        assert_eq!(json["storageCrs"], tm35);
+        let spatial = &json["extent"]["spatial"];
+        assert_eq!(
+            spatial["crs"],
+            "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+        );
+        assert_eq!(
+            spatial["storageCrsBbox"],
+            json!([[-196_000.0, 6_255_000.0, 1_004_000.0, 8_055_000.0]])
+        );
+        assert_eq!(
+            spatial["grid"],
+            json!([
+                {"cellsCount": 480, "resolution": 2500.0, "firstCoordinate": -194_750.0,
+                 "relativeBounds": [-1250.0, 1250.0]},
+                {"cellsCount": 360, "resolution": 5000.0, "firstCoordinate": 6_257_500.0,
+                 "relativeBounds": [-2500.0, 2500.0]}
+            ])
+        );
+        assert_eq!(spatial["meteocore:nativeGrid"]["crs"], tm35);
+        // The output CRSs are what they were.
+        assert!(json["crs"].as_array().unwrap().contains(&json!(tm35)));
     }
 
     #[tokio::test]
@@ -2175,6 +2300,7 @@ mod extent_edge_cases {
                 grid_size: Some([2000, 1000]),
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -2489,6 +2615,7 @@ impl MapEngine for RunSwapMockMapEngine {
             grid_size: None,
             layer_subtitle: None,
             reference_times: self.runs.read().unwrap().clone(),
+            native_grid: None,
         }
     }
 
@@ -3339,6 +3466,7 @@ mod per_parameter_times {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
 
@@ -3747,6 +3875,7 @@ mod composites {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
 
@@ -5281,6 +5410,7 @@ mod workbench_form {
                 grid_size: None,
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }

@@ -50,6 +50,12 @@ while the window fits in memory, no request reads the bucket.
   globe. GK2A files are not CF: their grid comes from the CGMS navigation
   attributes, checked against the corner scan angles the file states.
   GOES-West's, Himawari's and GK2A's extents cross the antimeridian.
+- **Native grid.** The default parameter's (first product's) grid, from
+  its first scan, is the collection's native grid (#1237). The collection
+  description's `meteocore:nativeGrid` member gives it in the view's
+  metres (scan angle × satellite height) with its WKT2. Other bands may be
+  finer. GMGSI's Mercator is recognised, not stated, so its member's CRS is
+  WKT2 too, while `storageCrs` stays EPSG:3857.
 - **GK2A calibration.** A GK2A file stores 16-bit words, each a quality
   flag and a count. A table built per scan from the file's own
   calibration coefficients maps counts to brightness temperature (K);

@@ -2835,6 +2835,8 @@ a.api-chip:hover{text-decoration-color:currentColor}
 .extent-facts>.fact{min-width:0}
 .extent-facts .fact strong{overflow-wrap:anywhere}
 .extent-facts>details>summary{font-size:14px;color:var(--teal)}
+.grid-resolution>span{white-space:nowrap}
+.extent-facts pre.wkt{margin:8px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-all;font-size:13px;line-height:1.5}
 .level-list{color:var(--ink);overflow-wrap:anywhere}
 .extent-panel>.empty-state{padding:24px 20px;border:0;border-radius:0}
 .request-guide>.section-note{max-width:80ch}

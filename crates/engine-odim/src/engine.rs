@@ -38,6 +38,7 @@ use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
+use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
 
@@ -329,6 +330,9 @@ pub struct OdimEngine {
     pub(crate) seed_spatial_extent: [f64; 4],
     pub(crate) seed_xsize: u32,
     pub(crate) seed_ysize: u32,
+    /// The seed composite's grid in its own CRS (#1237): its outer pixel
+    /// edges, and the EPSG code its projdef states.
+    seed_native_grid: Option<NativeGrid>,
     /// Local directory or S3/HTTP object store the poll loop re-scans.
     source: Source,
     matcher: FilenameMatcher,
@@ -541,6 +545,12 @@ impl OdimEngine {
         let seed_spatial_extent = composite.wgs84_bbox;
         let seed_xsize = composite.xsize;
         let seed_ysize = composite.ysize;
+        let seed_native_grid = NativeGrid::from_edges(
+            composite.crs.clone(),
+            composite.crs_epsg,
+            [seed_xsize, seed_ysize],
+            composite.bbox,
+        );
 
         // Seed the process-global composite cache so the first render of the
         // most recent file is a hit (we just decoded it for the metadata
@@ -560,6 +570,7 @@ impl OdimEngine {
             seed_spatial_extent,
             seed_xsize,
             seed_ysize,
+            seed_native_grid,
             source,
             matcher,
             max_files,
@@ -1181,6 +1192,7 @@ impl MapEngine for OdimEngine {
             grid_size: Some([self.seed_xsize, self.seed_ysize]),
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: self.seed_native_grid.clone(),
         }
     }
 

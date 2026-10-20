@@ -93,6 +93,7 @@ impl MapEngine for MockSource {
             grid_size: Some([W, H]),
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 }
@@ -700,6 +701,7 @@ fn f32_source_keeps_nodata_and_values() {
                 grid_size: Some([W, H]),
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -1051,6 +1053,7 @@ fn dry_scene_leaves_both_skill_gauges_unset() {
                 grid_size: Some([W, H]),
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -1353,6 +1356,7 @@ fn geometry_change_resets_cell_tracks() {
                 grid_size: Some([W, H]),
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -1460,6 +1464,7 @@ fn growth_decay_dims_decaying_echo() {
                 grid_size: Some([W, H]),
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -1574,6 +1579,7 @@ fn cells_are_ranked_by_significance_with_reasons() {
                 grid_size: Some([W, H]),
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -1824,6 +1830,7 @@ fn impact_context_lifts_a_populated_cell_above_a_stronger_one() {
                 grid_size: Some([W, H]),
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -2131,6 +2138,7 @@ fn a_stationary_echo_is_flagged_and_demoted() {
                 grid_size: Some([W, H]),
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }
@@ -2400,6 +2408,7 @@ fn ranks_are_monotonic_in_the_order_cells_are_served() {
                 grid_size: Some([W, H]),
                 layer_subtitle: None,
                 reference_times: Vec::new(),
+                native_grid: None,
             }
         }
     }

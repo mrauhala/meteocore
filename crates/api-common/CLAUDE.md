@@ -27,7 +27,7 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   OpenAPI fragments and per-collection `Contribution`s; the composer owns `/`,
   `/api`, `/conformance`, `/collections`, `/collections/{id}`. Merge rules: links
   concatenate in block order, the first block to describe a field wins unless an
-  earlier block `claims` it (raster blocks claim `storageCrs`), `styles` merge by
+  earlier block `claims` it (raster blocks claim `storageCrs`; a native CRS without one is described only by the extent's `meteocore:nativeGrid` member, #1237), `styles` merge by
   id, `crs` lists union in block order (Features Part 2: a feature collection's
   list must be exactly what `/items` accepts, #685). Block order (Maps, Tiles, Features in `server/src/main.rs`) is therefore
   field precedence; discovery bounds follow the kept extent. Blocks must keep
@@ -84,6 +84,9 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   only. EDR examples follow EDR's query types (`locations` → stations,
   `position` → grid, else areas with no `datetime`): never offer a query EDR
   would 404. Escape every value; Copy is `data-copy` (app.js).
+- The Extent box and the request guide read the standard `grid` in the
+  `storageCrs`'s units: degrees only for CRS84 or no `storageCrs`. A grid
+  with no registered CRS is read from `meteocore:nativeGrid` (#1237).
 - The Overview's "Filter by" / "Sort by" chips (`ItemsOverview`, carried by
   `Contribution::items`, rendered by `collection_page`) open the items
   builder through the URL fragment (`#filter=<name>`, `#sort=<name>`), never

@@ -69,7 +69,9 @@ plus:
   for an RGB composite the legend lists the channels.
 
 Collection metadata adds `dataType`, `crs`, `storageCrs`, `styles`,
-`parameter_names` and `tilesets-map`/`tilesets-vector` links; tilesets give
+`parameter_names` and `tilesets-map`/`tilesets-vector` links. Its extent
+describes the native grid as Maps does
+([api-common](../api-common/README.md#native-grid)). Tilesets give
 `tileMatrixSetLimits` for zooms 0–18 from the extent. Catalog search and HTML
 pages come from [api-common](../api-common/README.md).
 

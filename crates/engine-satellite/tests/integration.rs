@@ -151,6 +151,27 @@ fn discovers_products_with_their_own_time_axes() {
     assert!(extent.iter().all(|v| v.is_finite()), "{extent:?}");
     // Both fixture crops are 320 x 240, so the collection has one grid.
     assert_eq!(info.grid_size, Some([320, 240]));
+    // #1237: the default band's scan grid in the geostationary view's
+    // metres (scan angle × height), with no EPSG code: its WKT2.
+    let grid = info.native_grid.as_ref().expect("a native grid");
+    assert_eq!(grid.size(), [320, 240]);
+    assert!(matches!(
+        grid.crs(),
+        ds_core::geo::Crs::Geostationary { .. }
+    ));
+    assert_eq!(grid.epsg(), None);
+    assert_eq!(grid.unit(), "m");
+    let [dx, dy] = grid.spacing();
+    // ABI's 2 km infrared pixels at nadir: 56 µrad × 35 786 km.
+    assert!(
+        (dx - 2004.0).abs() < 1.0 && (dy - 2004.0).abs() < 1.0,
+        "{dx} {dy}"
+    );
+    assert_eq!(
+        ds_core::native_grid::wkt_name(grid.crs_ref()),
+        Some("Geostationary satellite view")
+    );
+    assert!(grid.crs_ref().contains("Geostationary Satellite (Sweep X)"));
     assert_eq!(engine.status().0, 2);
 }
 

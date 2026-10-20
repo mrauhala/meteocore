@@ -719,6 +719,7 @@ impl MapEngine for QueryDataEngine {
                     grid_size: None,
                     layer_subtitle: None,
                     reference_times,
+                    native_grid: None,
                 };
             }
         };
@@ -774,6 +775,7 @@ impl MapEngine for QueryDataEngine {
             grid_size: Some([gt.width, gt.height]),
             layer_subtitle: None,
             reference_times,
+            native_grid: data.grid.native_grid().cloned(),
         }
     }
 }
@@ -1300,6 +1302,50 @@ mod tests {
         ] {
             assert!((got - want).abs() < 1e-3, "{edge} {got}, PROJ {want}");
         }
+    }
+
+    /// #1237: the MEPS run reports its grid in its own Lambert conformal
+    /// conic CRS: QueryData's sphere, no EPSG code (QueryData states
+    /// none), the corner points' cells; the description's
+    /// `meteocore:nativeGrid` member carries its WKT2.
+    #[test]
+    fn meps_reports_its_native_lambert_grid() {
+        let info = meps_engine().raster_info();
+        let grid = info.native_grid.as_ref().expect("a native grid");
+        assert_eq!(Some(grid.size()), info.grid_size);
+        let ds_core::geo::Crs::LambertConformalConic {
+            lat1, lon0, radius, ..
+        } = *grid.crs()
+        else {
+            panic!("{:?}", grid.crs());
+        };
+        assert!((lat1.to_degrees() - 63.3).abs() < 1e-9 && (lon0.to_degrees() - 15.0).abs() < 1e-9);
+        assert_eq!(radius, Some(6_371_220.0));
+        assert_eq!(grid.epsg(), None);
+        // The fixture's 103 × 112 cells of 5 km, from the corner points
+        // forward-projected on the sphere: within a metre of nominal.
+        assert_eq!(grid.size(), [103, 112]);
+        let [dx, dy] = grid.spacing();
+        assert!(
+            (dx - 5000.0).abs() < 1.0 && (dy - 5000.0).abs() < 1.0,
+            "{dx} {dy}"
+        );
+        assert!(grid.crs_ref().contains(r#"ELLIPSOID["Sphere",6371220,0,"#));
+        let spatial = ds_core::ogc_extent::build_extent(
+            info.spatial_extent,
+            info.grid_size,
+            &info.native_crs,
+            info.native_grid.as_ref(),
+            &info.times,
+            None,
+        )
+        .unwrap()
+        .spatial
+        .unwrap();
+        assert!(spatial.storage_crs_bbox.is_none() && spatial.grid.is_none());
+        let member = spatial.native_grid.unwrap();
+        assert_eq!(member.crs, grid.crs_ref());
+        assert_eq!(member.resolution, [dx, dy]);
     }
 
     /// The exact per-pixel render of `bbox` — the path lat/lon and Web

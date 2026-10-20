@@ -4935,6 +4935,7 @@ impl MapEngine for PolarVolumeSiteView {
             // layer's title and flat clients can tell the sites apart.
             layer_subtitle: meta.map(|m| m.plc.clone().unwrap_or_else(|| self.nod.clone())),
             reference_times: Vec::new(),
+            native_grid: None,
         }
     }
 

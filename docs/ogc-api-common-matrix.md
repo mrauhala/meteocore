@@ -171,16 +171,17 @@ collection.
 | Temporal extent metadata | Yes — engine-dependent | Yes — raster times | Yes — raster or feature extent [5] | Yes — time-aware engines [5] |
 | Multiple spatial boxes / temporal intervals for sparse data | No — one overall extent | No — one overall extent | No — one overall extent | No — one overall extent |
 | Supported output CRS metadata (`crs`) | Yes — CRS84 | Yes — supported map CRSs | Yes — tile matrix set CRSs and native CRS where known | Yes — CRS84, EPSG:4326, 3857, 3067, 3035 (Features Part 2 `crs`/`bbox-crs`) |
-| Native CRS metadata (`storageCrs`) | No | Partial — known CRS URI only | Partial — known raster CRS URI only | Yes — CRS84 |
-| Native spatial bounds (`storageCrsBbox`) | No | No [6] | No [6] | N/A — storage and extent both CRS84 |
+| Native CRS metadata (`storageCrs`) | No | Partial — known CRS URI only [6] | Partial — known raster CRS URI only [6] | Yes — CRS84 |
+| Native spatial bounds (`storageCrsBbox`) | No | Partial — when the source states the `storageCrs` code [6] | Partial — same [6] | N/A — storage and extent both CRS84 |
 | Scale/cell-size suitability metadata (`minScaleDenominator`, `maxScaleDenominator`, `minCellSize`, `maxCellSize`) | No | No | No | No |
 | Vertical extent information | Partial — EDR-specific representation [7] | Yes — interval/vrs/unit/levels grid [7] | Yes — raster interval/vrs/unit/levels grid [7] | No |
 | Uniform Additional Dimensions class (§8) | No — EDR extent model [7] | Partial — no full class support [7] | Partial — no full class support [7] | No |
-| Regular spatial grid description (§8.2) | No Common grid descriptor | Partial — geographic grids only | Partial — geographic raster grids only | N/A — feature data |
+| Regular spatial grid description (§8.2) | No Common grid descriptor | Partial — geographic grids, and grids in a source-stated `storageCrs` [6] | Partial — same, raster only [6] | N/A — feature data |
+| Native grid of any CRS (`meteocore:nativeGrid`, extension) | No — EDR's extent has no place for it [6] | Yes — every grid that is not lat/lon [6] | Yes — same, raster only [6] | N/A — feature data |
 | Regular/irregular temporal grid description (§8.2) | No — EDR `temporal.values` instead | Yes — available raster time series | Partial — raster only | No — intervals only [5] |
 | Additional axes such as ensemble/reference-time using the uniform extent model | No | No | No | No |
 | Collection JSON and HTML encodings (§9) | Yes | Yes | Yes | Yes |
-| Complete current Part 2 abstract-test-suite result | Unverified | Unverified; native-bounds gap remains | Unverified; native-bounds gap remains | Unverified |
+| Complete current Part 2 abstract-test-suite result | Unverified | Unverified; native-bounds gap remains where the source states no code [6] | Unverified; same [6] | Unverified |
 | **Part 3 — Schemas** | | | | |
 | Logical schemas using the Part 3 JSON Schema vocabulary (§7) | No | No | No | No |
 | Schema annotations: roles, ordering, units, semantic definitions, special nulls (§7.2) | No | No | No | No |
@@ -243,10 +244,30 @@ collection.
    back to feature temporal bounds. Unknown extents remain eligible under the
    draft. Feature interval endpoints are no longer advertised as a two-sample grid;
    actual raster time series retain their regular/irregular grid descriptions.
-6. The current Part 2 text requires native spatial bounds when storage and extent
-   CRSs differ, while also retaining a related SHOULD recommendation. Projected
-   Maps/Tiles metadata can advertise `storageCrs` without `storageCrsBbox`.
-   This deserves both an implementation fix and a standards wording review.
+6. Native grids (#1237). A `storageCrs` other than CRS84 needs
+   `storageCrsBbox`: Maps `/req/collection-map/desc-crs` C makes it a SHALL,
+   and Part 2 `/rec/collections/description-extent-storage-crs-bbox` a SHOULD.
+   - **Registered CRSs.** When the source states the EPSG code of the
+     advertised `storageCrs`, Maps/Tiles add `storageCrsBbox` and a cell-centred
+     `grid` in that CRS's units and axis order. Today that is a GeoTIFF whose
+     `ProjectedCSTypeGeoKey` is 3067 or 3035. `storageCrsBbox` holds the outer
+     edges, `firstCoordinate` is the minimum plus half a cell, and
+     `relativeBounds` is the half cell either side. A `storageCrs` the source
+     does not state as a code keeps the gap: GMGSI's recognised EPSG:3857, or
+     TM35FIN or ETRS89-LAEA parameters without a GeoKey.
+   - **Custom CRSs.** These have no `storageCrs`, because Maps requires one
+     that is a "URI or the safe CURIE" (`/req/collection-map/desc-crs` B), and
+     the default map "SHALL be in the storage CRS" (`/req/core/map-response`
+     B). Without a `storageCrs`, Part 2 puts the standard `grid` in CRS84
+     units, which a projected grid is not. So every grid that is not lat/lon,
+     registered or not, gets the MeteoCore extension member
+     `extent.spatial["meteocore:nativeGrid"]`. Its `crs` is the source's EPSG
+     URI, else WKT2. Its `cellsCount`, `resolution` with `unit`, and `bbox` of
+     outer edges are in grid order, x then y. It changes no `storageCrs`,
+     `crs` or declared behaviour. See the api-common README.
+   - **EDR.** Its collection extent has `spatial.values` (`"R720/0/0.5"`) only
+     in the extent's `crs`, which EDR Core fixes to CRS84, so EDR is
+     unchanged.
 7. EDR intentionally retains its own string-valued vertical and timestep metadata
    for EDR 1.1. Maps/Tiles emit numeric vertical intervals, units and coordinates,
    with the dimension's `vrs` (a registered URI, or inline WKT2 as EDR uses) and a
@@ -255,10 +276,14 @@ collection.
    suite checks it strictly, since the bundle's extension branch accepts any
    object). Advertised bboxes are normalized to the CRS84 domain on every API,
    and an extent describing no area is omitted. Geographic spatial and raster temporal
-   grid descriptors exist. Regular temporal grids identify their first timestamp;
-   spatial grids use the schema's nullable `firstCoordinate` because sample
-   registration and axis direction are unknown. Projected spatial grids and
-   general additional axes do not. No API advertises the uniform-dimensions class.
+   grid descriptors exist, and spatial ones in a source-stated `storageCrs` [6].
+   Regular temporal grids identify their first timestamp. Geographic spatial
+   grids use the schema's nullable `firstCoordinate` because sample
+   registration and axis direction are unknown from bounds and counts. A
+   storage-CRS grid gives its first cell centre and `relativeBounds`. Custom
+   projected spatial grids, which use the extension member [6], and general
+   additional axes have no standard grid. No API advertises the
+   uniform-dimensions class.
 8. Features item property filters and `sortby` work on supporting engines. Neither
    provides Part 3 `/queryables` or `/sortables` resources. OpenAPI schemas and
    EDR `parameter_names` likewise do not establish Part 3 support.

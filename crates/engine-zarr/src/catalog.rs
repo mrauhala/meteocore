@@ -1086,6 +1086,7 @@ fn build_raster_info(
         vertical: None,
         grid_size: Some(grid_size),
         layer_subtitle: None,
+        native_grid: None,
     }
 }
 
