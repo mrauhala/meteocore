@@ -54,6 +54,13 @@
 //! newest slot first, the sentinels and missing leads of unpublished slots;
 //! then the due rechecks. What the cap leaves waits for the next poll
 //! ([`ProbeReport::deferred`]).
+//!
+//! # Other answers than HEADs
+//!
+//! [`TemplateProber::poll_with`] takes each planned key's version from a
+//! caller's function instead of a HEAD, with everything above unchanged: a
+//! THREDDS catalog answers for a whole directory in one GET
+//! ([`super::CatalogProber`], #1170).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -200,14 +207,21 @@ pub struct ProbedFile {
     pub version: ObjectVersion,
 }
 
-/// What one [`TemplateProber::poll`] did.
+/// What one [`TemplateProber::poll`] (or [`super::CatalogProber::poll`])
+/// did.
 #[derive(Debug, Default)]
 pub struct ProbeReport {
+    /// Files checked: HEADed, or looked up in a THREDDS catalog.
+    pub checked: usize,
     /// HEAD requests made.
     pub heads: usize,
-    /// HEADs that failed other than with a 404, each logged at WARN.
+    /// HEADs that failed other than with a 404, logged at WARN.
     pub failed: usize,
-    /// HEADs the per-poll cap left for the next poll.
+    /// THREDDS catalogs fetched ([`super::CatalogProber`]).
+    pub catalogs: usize,
+    /// Catalogs that could not be fetched or read, logged at WARN.
+    pub catalogs_failed: usize,
+    /// Checks the per-poll cap left for the next poll.
     pub deferred: usize,
     /// Slots published, whole or partial.
     pub published: Vec<DateTime<Utc>>,
@@ -224,7 +238,18 @@ impl ProbeReport {
     pub fn changed(&self) -> bool {
         !self.added.is_empty() || !self.withdrawn.is_empty()
     }
+
+    /// Whether the poll made requests and every one of them failed: the
+    /// server is unreachable, not merely missing files.
+    pub fn unreachable(&self) -> bool {
+        let made = self.heads + self.catalogs;
+        made > 0 && self.failed + self.catalogs_failed == made
+    }
 }
+
+/// One answer per key to [`TemplateProber::poll_with`]: the version the key
+/// names, `Ok(None)` when nothing is there, `Err` when it could not be told.
+pub type Answers = Vec<Result<Option<ObjectVersion>, DataServerError>>;
 
 /// Probes a template source on every poll and keeps what it found: the
 /// state of each candidate file of each slot in the window. See the
@@ -371,6 +396,15 @@ impl TemplateProber {
         true
     }
 
+    /// The key of each tracked slot's first file, one per slot in the window
+    /// as of the last poll: a slot's files share its directory.
+    pub(super) fn slot_sentinels(&self) -> Vec<String> {
+        self.slots
+            .keys()
+            .map(|&time| self.key(time, self.leads[0]))
+            .collect()
+    }
+
     /// Probe once at `now`: forget the slots that left the window, HEAD
     /// what the plan and the per-poll cap allow, settle, and publish.
     ///
@@ -381,6 +415,32 @@ impl TemplateProber {
         &mut self,
         store: &DataStore,
         now: DateTime<Utc>,
+    ) -> Result<ProbeReport, DataServerError> {
+        let mut heads = 0;
+        let mut report = self.poll_with(now, |keys| {
+            heads = keys.len();
+            Ok(store
+                .head_many(keys, PROBE_CONCURRENCY)?
+                .into_iter()
+                .map(|answer| answer.map(|found| found.as_ref().map(ObjectVersion::from)))
+                .collect())
+        })?;
+        report.heads = heads;
+        Ok(report)
+    }
+
+    /// [`Self::poll`] with each planned key's version told by `answer`, one
+    /// answer per key in order ([`Answers`]), in place of a HEAD: a THREDDS
+    /// catalog answers for a whole directory in one GET
+    /// ([`super::CatalogProber`]). The settling, the publication and the
+    /// per-poll cap are [`Self::poll`]'s. [`ProbeReport::checked`] counts
+    /// the keys asked and [`ProbeReport::failed`] the `Err` answers, which
+    /// leave their files as they were, as a failed HEAD does; one WARN per
+    /// distinct error. `answer` is not called when nothing is due.
+    pub fn poll_with(
+        &mut self,
+        now: DateTime<Utc>,
+        answer: impl FnOnce(&[ObjectPath]) -> Result<Answers, DataServerError>,
     ) -> Result<ProbeReport, DataServerError> {
         let mut report = ProbeReport::default();
         let window: BTreeSet<DateTime<Utc>> = self.slot_times(now).into_iter().collect();
@@ -409,10 +469,36 @@ impl TemplateProber {
                 .iter()
                 .map(|probe| ObjectPath::from(probe.key.as_str()))
                 .collect();
-            let answers = store.head_many(&paths, PROBE_CONCURRENCY)?;
-            report.heads = paths.len();
+            let answers = answer(&paths)?;
+            if answers.len() != paths.len() {
+                return Err(DataServerError::Engine(format!(
+                    "[{}] {} answers for {} keys",
+                    self.spec.label,
+                    answers.len(),
+                    paths.len()
+                )));
+            }
+            report.checked = paths.len();
+            let mut failures = BTreeMap::<String, (usize, String)>::new();
             for (probe, answer) in plan.iter().zip(answers) {
+                if let Err(e) = &answer {
+                    let (count, _) = failures
+                        .entry(e.to_string())
+                        .or_insert_with(|| (0, probe.key.clone()));
+                    *count += 1;
+                    report.failed += 1;
+                }
                 self.apply(now, probe, answer, &mut report);
+            }
+            // One line per cause: a catalog that failed fails every key in
+            // it, while each failed HEAD names its own key.
+            let label = &self.spec.label;
+            for (e, (count, key)) in failures {
+                if count == 1 {
+                    tracing::warn!("[{label}] checking `{key}` failed: {e}");
+                } else {
+                    tracing::warn!("[{label}] checking {count} files failed (`{key}` …): {e}");
+                }
             }
         }
         // A due slot counts as rechecked once none of its HEADs were cut.
@@ -543,7 +629,7 @@ impl TemplateProber {
         &mut self,
         now: DateTime<Utc>,
         probe: &Probe,
-        answer: Result<Option<object_store::ObjectMeta>, DataServerError>,
+        answer: Result<Option<ObjectVersion>, DataServerError>,
         report: &mut ProbeReport,
     ) {
         let sentinel = probe.lead == self.leads[0];
@@ -551,17 +637,13 @@ impl TemplateProber {
         let Some(slot) = self.slots.get_mut(&probe.time) else {
             return;
         };
-        let found = match answer {
-            Ok(found) => found,
-            Err(e) => {
-                tracing::warn!("[{label}] HEAD `{}` failed: {e}", probe.key);
-                report.failed += 1;
-                // Answered for the grace period's sake; otherwise as it was.
-                slot.files.entry(probe.lead).or_insert(FileState::Absent);
-                return;
-            }
+        let Ok(found) = answer else {
+            // Logged and counted by `poll_with`. Answered for the grace
+            // period's sake; otherwise as it was.
+            slot.files.entry(probe.lead).or_insert(FileState::Absent);
+            return;
         };
-        let version = found.as_ref().map(ObjectVersion::from).filter(|version| {
+        let version = found.filter(|version| {
             let oversized = self.spec.max_size.is_some_and(|max| version.size > max);
             if oversized {
                 tracing::warn!(

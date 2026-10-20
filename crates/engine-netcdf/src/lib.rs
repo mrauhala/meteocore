@@ -6,7 +6,8 @@
 //! every file carries the collection's variables on one grid, its valid
 //! times in `time` and its model run in `forecast_reference_time`. The poll
 //! loop finds the files, in a local directory or by probing an HTTP server
-//! for the names a template gives ([`remote`]), opens each new file once
+//! for the names a template gives, or by looking them up in its THREDDS
+//! catalogs ([`remote`], [`Finder`]), opens each new file once
 //! and keeps its handle while the catalog keeps the file
 //! ([`catalog::OpenFile`]); a render reads one 2-D field through the
 //! engine-wide field cache ([`field`]) and resamples it with
@@ -47,8 +48,10 @@ use ds_core::resample::OutputMap;
 use ds_core::units::DisplayConversion;
 use ds_poll::{FirstTick, Shutdown};
 use ds_storage::discovery::{
-    FilenameMatcher, Schedule, Settling, TemplateProber, TemplateSpec, TimeWindow,
+    CatalogProber, FilenameMatcher, ProbeReport, ProbedFile, Schedule, Settling, TemplateProber,
+    TemplateSpec, TimeWindow,
 };
+use ds_storage::DataStore;
 use netcdf_reader::{DynStorage, NcFile};
 
 pub use field::{detached_fill_metrics, field_cache_metrics};
@@ -119,21 +122,81 @@ struct Remote {
     host: Arc<Host>,
     /// `https://thredds.met.no`: the files' URLs are this and their keys.
     origin: String,
-    prober: Mutex<TemplateProber>,
+    finder: Mutex<Finder>,
     tuning: Tuning,
     /// One run's leads: a poll opens at least this many files.
     leads: usize,
     prewarm: Vec<String>,
-    /// HEADs this source's probes have made.
+    /// HEADs this source's discovery has made.
     heads: AtomicU64,
+    /// THREDDS catalogs this source's discovery has read.
+    catalogs: AtomicU64,
+}
+
+/// How a remote source's files are found: both name them by template and
+/// settle them alike; they differ in what tells whether a file is there.
+enum Finder {
+    /// A HEAD per file (#1107).
+    Template(Box<TemplateProber>),
+    /// The THREDDS catalog of its directory (`catalog_url`, #1170), read
+    /// through `catalogs`, the catalog host's background share.
+    Catalog {
+        prober: Box<CatalogProber>,
+        catalogs: DataStore,
+    },
+}
+
+impl Finder {
+    fn spec(&self) -> &TemplateSpec {
+        match self {
+            Finder::Template(prober) => prober.spec(),
+            Finder::Catalog { prober, .. } => prober.spec(),
+        }
+    }
+
+    /// The key of `lead`'s file in the run slot at `time`.
+    #[cfg(test)]
+    fn key(&self, time: DateTime<Utc>, lead: Option<u32>) -> String {
+        match self {
+            Finder::Template(prober) => prober.key(time, lead),
+            Finder::Catalog { prober, .. } => prober.key(time, lead),
+        }
+    }
+
+    /// The published files, each with the version a HEAD found.
+    fn files(&self) -> Vec<ProbedFile> {
+        match self {
+            Finder::Template(prober) => prober.files(),
+            Finder::Catalog { prober, .. } => prober.files(),
+        }
+    }
+
+    fn recheck(&mut self, key: &str) -> bool {
+        match self {
+            Finder::Template(prober) => prober.recheck(key),
+            Finder::Catalog { prober, .. } => prober.recheck(key),
+        }
+    }
+
+    /// One discovery poll; HEADs go through `files`, the file host's
+    /// background share.
+    fn poll(&mut self, files: &DataStore, now: DateTime<Utc>) -> Result<ProbeReport, String> {
+        match self {
+            Finder::Template(prober) => prober.poll(files, now),
+            Finder::Catalog { prober, catalogs } => prober.poll(catalogs, files, now),
+        }
+        .map_err(|e| e.to_string())
+    }
 }
 
 /// What a remote source has asked of its host
 /// ([`NetcdfEngine::remote_traffic`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteTraffic {
-    /// HEADs this collection's probes made.
+    /// HEADs this collection's discovery made.
     pub heads: u64,
+    /// THREDDS catalogs this collection's discovery read (`catalog_url`).
+    pub catalogs: u64,
     /// Range GETs made to the host, by every collection on it.
     pub gets: u64,
     /// Bytes those GETs read.
@@ -285,7 +348,8 @@ impl NetcdfEngine {
     }
 
     /// The remote source of `config`: the host's stores and a template
-    /// prober over MEPS-like run and lead names.
+    /// prober over MEPS-like run and lead names, its checks answered by
+    /// HEADs, or by THREDDS catalogs with a `catalog_url`.
     fn remote(
         collection_id: &str,
         config: &NetcdfConfig,
@@ -322,14 +386,27 @@ impl NetcdfEngine {
                 collection_id,
             )
         };
+        let finder = match config.catalog_url.as_deref() {
+            None => Finder::Template(Box::new(TemplateProber::new(spec)?)),
+            Some(catalog_url) => {
+                // The catalog host's limit and share: thredds.met.no's
+                // catalogs and fileServer are one host, one limit.
+                let (catalog_host, _) = remote::host(collection_id, catalog_url)?;
+                Finder::Catalog {
+                    prober: Box::new(CatalogProber::new(spec, catalog_url, data_path)?),
+                    catalogs: catalog_host.background.clone(),
+                }
+            }
+        };
         Ok(Remote {
             host,
             origin: remote::origin(data_path).to_string(),
-            prober: Mutex::new(TemplateProber::new(spec)?),
+            finder: Mutex::new(finder),
             tuning,
             leads: leads.len().max(1),
             prewarm: config.prewarm_variables.clone(),
             heads: AtomicU64::new(0),
+            catalogs: AtomicU64::new(0),
         })
     }
 
@@ -421,6 +498,7 @@ impl NetcdfEngine {
             Source::Local { .. } => None,
             Source::Remote(remote) => Some(RemoteTraffic {
                 heads: remote.heads.load(Ordering::Relaxed),
+                catalogs: remote.catalogs.load(Ordering::Relaxed),
                 gets: remote.host.gets.load(Ordering::Relaxed),
                 bytes: remote.host.requests.bytes_read(),
             }),
@@ -575,7 +653,8 @@ impl NetcdfEngine {
     /// settled yet: its old pixels may be cached, so the content version
     /// moves (a run aging out of the window moves nothing; a new version
     /// listed at once is `record`ed when opened). Up to `rounds` probes,
-    /// stopping once a run is published or `limits.until` passes.
+    /// stopping once a run is published or `limits.until` passes. With a
+    /// `catalog_url` the catalogs answer the probes ([`Finder::Catalog`]).
     fn probe(
         &self,
         remote: &Remote,
@@ -583,7 +662,7 @@ impl NetcdfEngine {
         rounds: usize,
         limits: &Limits,
     ) -> Result<Vec<Listed>, String> {
-        let mut prober = remote.prober.lock().unwrap_or_else(|e| e.into_inner());
+        let mut prober = remote.finder.lock().unwrap_or_else(|e| e.into_inner());
         for (key, version) in self.changes.take_stale() {
             prober.recheck(&key);
             let path = PathBuf::from(&key);
@@ -604,12 +683,15 @@ impl NetcdfEngine {
                 break;
             }
             let now = Utc::now();
-            let report = prober
+            let mut report = prober
                 .poll(&remote.host.background, now)
                 .map_err(|e| format!("cannot probe {}: {e}", remote.origin))?;
             remote
                 .heads
                 .fetch_add(report.heads as u64, Ordering::Relaxed);
+            remote
+                .catalogs
+                .fetch_add(report.catalogs as u64, Ordering::Relaxed);
             // The window's start, as the prober takes it: its span back
             // from now, whatever its sign.
             let start = prober.spec().time_window.as_ref().map(|window| {
@@ -617,20 +699,20 @@ impl NetcdfEngine {
                 now - (to - from)
             });
             withdrawn.extend(
-                report
-                    .withdrawn
+                std::mem::take(&mut report.withdrawn)
                     .into_iter()
                     .filter(|file| start.is_none_or(|start| file.time >= start)),
             );
-            // Every HEAD failing is the server unreachable: the catalog
+            // Every request failing is the server unreachable: the catalog
             // stays as it was, and `/health` degrades if it lasts.
-            if report.heads > 0 && report.failed == report.heads {
+            if report.unreachable() {
                 return Err(format!(
-                    "every one of {} HEADs to {} failed",
-                    report.heads, remote.origin
+                    "every one of {} requests to {} failed",
+                    report.heads + report.catalogs,
+                    remote.origin
                 ));
             }
-            if !prober.files().is_empty() || report.heads == 0 {
+            if !prober.files().is_empty() || report.checked == 0 {
                 break;
             }
         }

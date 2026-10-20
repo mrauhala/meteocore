@@ -20,6 +20,10 @@
 //! "handle × 67 × max_runs". `meps_pressure_levels_from_thredds` opens
 //! two pl files and reads four fields, about 9 MB.
 //! `a_ranged_get_names_the_whole_file` is one HEAD and a 1 KiB GET.
+//! `the_catalog_route_finds_what_probing_finds` (#1170) reads the THREDDS
+//! catalogs on the way to the runs in the window, opens the newest run's
+//! leads 00-02 found there (about 3.7 MB), and probes the same files by HEAD
+//! (their metadata then comes from the block cache): about 4 MB.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -279,6 +283,45 @@ fn meps_pressure_levels_from_thredds() {
     }
     assert_eq!(after.gets - opened.gets, 4, "one chunk per field");
     println!("total {:?}", traffic(&engine));
+}
+
+/// The catalog of `CONFIG`'s `data_path` directory.
+const CATALOG: &str =
+    r#"catalog_url = "https://thredds.met.no/thredds/catalog/meps25epsarchive/catalog.xml""#;
+
+/// The catalog route (#1170), live: it finds the files HEAD probing finds.
+/// thredds.met.no streams its catalogs chunked, without `Content-Length`,
+/// which `DataStore::get_documents` reads. It prints the catalogs read, the
+/// HEADs, the time.
+#[test]
+#[ignore = "reads about 4 MB from thredds.met.no; run by hand"]
+fn the_catalog_route_finds_what_probing_finds() {
+    let config: NetcdfConfig = toml::from_str(&[CONFIG, CATALOG].join("\n")).unwrap();
+    let started = Instant::now();
+    let catalog = NetcdfEngine::new("meps-live-catalog", &config).unwrap();
+    let found = traffic(&catalog);
+    println!(
+        "catalog route, first scan: {:.1} s, {found:?}, run {:?}, valid times {:?}",
+        started.elapsed().as_secs_f64(),
+        catalog.raster_info().reference_times,
+        catalog.times()
+    );
+    assert!(found.catalogs > 0);
+    // One HEAD per file of each run in the window, for its version.
+    assert!(found.heads >= 3, "{found:?}");
+    assert_eq!(catalog.times().len(), 3, "leads 00-02 of the newest run");
+
+    let probing = NetcdfEngine::new(
+        "meps-live-probing",
+        &toml::from_str::<NetcdfConfig>(CONFIG).unwrap(),
+    )
+    .unwrap();
+    println!("probing, first scan: {:?}", traffic(&probing));
+    assert_eq!(
+        catalog.raster_info().reference_times,
+        probing.raster_info().reference_times
+    );
+    assert_eq!(catalog.times(), probing.times());
 }
 
 /// One file of the archive, the run the committed MEPS sample was cut from.

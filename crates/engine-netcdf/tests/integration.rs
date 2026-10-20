@@ -1981,3 +1981,231 @@ fn the_global_grid_keeps_its_crs84_description() {
     assert_eq!((axes[0].cells_count, axes[0].resolution), (72, 5.0));
     assert_eq!(axes[0].first_coordinate, None);
 }
+
+// THREDDS catalog discovery (#1170): the remote route with a `catalog_url`,
+// against a local server answering like thredds.met.no, which serves MET
+// Norway's captured day catalog (testdata/netcdf-thredds-catalog) as the
+// catalog of the run's day.
+
+#[allow(dead_code)]
+#[path = "../src/test_server.rs"]
+mod test_server;
+
+use chrono::{DurationRound, Timelike};
+use test_server::{thredds_catalog, TestServer};
+
+/// A run published on a THREDDS server an hour ago: leads 00 and 01 of the
+/// synthetic MEPS-like files of testdata/netcdf-remote (run 2026-10-15 06Z
+/// inside: time comes from the file, never its name) under the run slot an
+/// hour before now, on the fileServer, and the catalogs from the archive
+/// root down to the run's `member_00`, the captured MET Norway day catalog
+/// at the run's day. Every catalog is answered as thredds.met.no answers
+/// one: chunked, without `Content-Length`. Returns the server and the slot.
+fn thredds_server() -> (TestServer, DateTime<Utc>) {
+    let now = Utc::now();
+    let slot = (now - chrono::Duration::hours(1))
+        .duration_trunc(chrono::Duration::hours(1))
+        .unwrap();
+    let modified = now - chrono::Duration::hours(1);
+    let server = TestServer::new();
+    server.chunk_whole_gets();
+    let catalogs = "thredds/catalog/meps25epsarchive";
+    let at_path = |path: &str| [catalogs, path, "catalog.xml"].join("/");
+    let (year, month, day, hour) = (
+        slot.format("%Y").to_string(),
+        slot.format("%m").to_string(),
+        slot.format("%d").to_string(),
+        slot.format("%H").to_string(),
+    );
+    let day_dir = [year.as_str(), month.as_str(), day.as_str()].join("/");
+    let run_dir = [day_dir.as_str(), hour.as_str()].join("/");
+    let member = [run_dir.as_str(), "member_00"].join("/");
+    let refs = |next: &str| [next, "catalog.xml"].join("/");
+    server.put(
+        &[catalogs, "catalog.xml"].join("/"),
+        thredds_catalog(&[&refs(&year)], &[]),
+        modified,
+    );
+    server.put(
+        &at_path(&year),
+        thredds_catalog(&[&refs(&month)], &[]),
+        modified,
+    );
+    server.put(
+        &at_path(&[year.as_str(), month.as_str()].join("/")),
+        thredds_catalog(&[&refs(&day)], &[]),
+        modified,
+    );
+    let captured = std::fs::read(testdata(
+        "netcdf-thredds-catalog/meps25epsarchive_2026_10_19_catalog.xml",
+    ))
+    .unwrap();
+    server.put(&at_path(&day_dir), captured, modified);
+    server.put(
+        &at_path(&run_dir),
+        thredds_catalog(&["member_00/catalog.xml", "member_01/catalog.xml"], &[]),
+        modified,
+    );
+    let stamp = slot.format("%Y%m%dT%H").to_string();
+    let mut files = Vec::new();
+    for lead in [0u32, 1] {
+        let bytes = std::fs::read(testdata(&format!(
+            "netcdf-remote/meps_sfc_{lead:02}_20261015T06Z.nc"
+        )))
+        .unwrap();
+        let name = format!("meps_sfc_{lead:02}_{stamp}Z.nc");
+        let url_path = ["meps25epsarchive", member.as_str(), name.as_str()].join("/");
+        // THREDDS states sizes rounded, such as `62.11` Kbytes.
+        let size = format!("{:.2}", bytes.len() as f64 / 1000.0);
+        files.push((
+            url_path.clone(),
+            size,
+            modified.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ));
+        server.put(
+            &["thredds/fileServer", url_path.as_str()].join("/"),
+            bytes,
+            modified,
+        );
+    }
+    server.put(&at_path(&member), thredds_catalog(&[], &files), modified);
+    // A member nothing may read.
+    server.put(
+        &at_path(&[run_dir.as_str(), "member_01"].join("/")),
+        thredds_catalog(&[], &files),
+        modified,
+    );
+    (server, slot)
+}
+
+/// The remote config over `server`, with `extra` lines.
+fn thredds_config(server: &TestServer, slot: DateTime<Utc>, extra: &str) -> NetcdfConfig {
+    toml::from_str(&format!(
+        r#"data_path = "{}/thredds/fileServer/meps25epsarchive/"
+           prefix_pattern = "%Y/%m/%d/{{run}}/member_00/"
+           filename_template = "meps_sfc_{{lead}}_%Y%m%dT{{run}}Z.nc"
+           run_hours = [{}]
+           leads = [0, 1]
+           time_window = "-PT3H"
+           {extra}"#,
+        server.url,
+        slot.hour()
+    ))
+    .unwrap()
+}
+
+/// #1170: with a `catalog_url` the engine finds the run in the catalogs,
+/// each streamed chunked without `Content-Length` as thredds.met.no streams
+/// them, walking from the archive root through MET Norway's own day catalog
+/// to the run's `member_00` and no other of the day's 24 hours or members,
+/// HEADs each file once for its exact size (the catalog rounds it to
+/// Kbytes), and serves what HEAD probing serves from the same server. A
+/// later poll reads nothing until the run is due a recheck.
+#[test]
+fn a_thredds_catalog_finds_what_probing_finds() {
+    let (server, slot) = thredds_server();
+    let catalog_url = format!(
+        "catalog_url = \"{}/thredds/catalog/meps25epsarchive/catalog.xml\"",
+        server.url
+    );
+    let catalog =
+        NetcdfEngine::new("meps-catalog", &thredds_config(&server, slot, &catalog_url)).unwrap();
+    let requests = server.take();
+    let paths = |method: &str| -> Vec<String> {
+        let mut paths: Vec<String> = requests
+            .iter()
+            .filter(|r| r.method == method && r.path.ends_with("catalog.xml"))
+            .map(|r| r.path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    };
+    let day = slot.format("%Y/%m/%d").to_string();
+    let run = [day.as_str(), &slot.format("%H").to_string()].join("/");
+    let mut walked: Vec<String> = [
+        String::new(),
+        slot.format("%Y").to_string(),
+        slot.format("%Y/%m").to_string(),
+        day.clone(),
+        run.clone(),
+        [run.as_str(), "member_00"].join("/"),
+    ]
+    .iter()
+    .map(|dir| {
+        ["thredds/catalog/meps25epsarchive", dir, "catalog.xml"]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("/")
+    })
+    .collect();
+    walked.sort();
+    assert_eq!(paths("GET"), walked);
+    let catalogs = || requests.iter().filter(|r| r.path.ends_with("catalog.xml"));
+    assert!(
+        catalogs().all(|r| r.chunked && r.status == 200),
+        "{requests:#?}"
+    );
+    assert!(requests
+        .iter()
+        .filter(|r| r.path.ends_with(".nc"))
+        .all(|r| !r.chunked));
+    let heads: Vec<&str> = requests
+        .iter()
+        .filter(|r| r.method == "HEAD")
+        .map(|r| r.path.as_str())
+        .collect();
+    assert_eq!(heads.len(), 2, "one per file, for its version: {heads:?}");
+    assert!(heads
+        .iter()
+        .all(|path| path.starts_with("thredds/fileServer/")));
+    assert!(requests.iter().all(|r| r.status < 400), "{requests:?}");
+    let traffic = catalog.remote_traffic().unwrap();
+    assert_eq!(traffic.heads, 2);
+    assert_eq!(
+        traffic.catalogs, 7,
+        "the walk, then member_00 again for lead 01"
+    );
+
+    let probing = NetcdfEngine::new("meps-probing", &thredds_config(&server, slot, "")).unwrap();
+    let (a, b) = (catalog.raster_info(), probing.raster_info());
+    assert_eq!(a.reference_times, [at("2026-10-15T06:00:00Z")]);
+    assert_eq!(
+        a.times,
+        [at("2026-10-15T06:00:00Z"), at("2026-10-15T07:00:00Z")]
+    );
+    assert_eq!(
+        (&a.reference_times, &a.times, a.grid_size),
+        (&b.reference_times, &b.times, b.grid_size)
+    );
+    let extent = a.spatial_extent.unwrap();
+    for time in &a.times {
+        let draw = |engine: &NetcdfEngine| {
+            values(
+                &engine
+                    .get_raster_tile(
+                        extent,
+                        16,
+                        16,
+                        Some(*time),
+                        &OutputCrs::Wgs84,
+                        Some("air_temperature_2m"),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+            )
+        };
+        let drawn = draw(&catalog);
+        assert!(drawn.iter().any(Option::is_some));
+        assert_eq!(drawn, draw(&probing));
+    }
+
+    server.take();
+    catalog.poll_once();
+    assert!(
+        server.take().is_empty(),
+        "nothing to check until the run's recheck"
+    );
+}

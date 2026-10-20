@@ -16,7 +16,11 @@ per-host request limits for files read in place; every remote operation
 runs in a `storage{collection, store, path}` span, and an engine names its
 collection with `DataStore::for_collection(id)` where it builds the store,
 #1233; its `throttle` module is the one home for HTTP host back-off on
-429: `Retry-After` and the adaptive host limit, #1235),
+429: `Retry-After` and the adaptive host limit, #1235; THREDDS catalog
+discovery is `discovery::thredds`, #1170, and a generated HTTP document
+without `Content-Length`, such as a THREDDS catalog, is read with
+`DataStore::get_documents`, never a second client: object_store's GET fails
+a chunked response),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
 `ds-executor` (shared Tokio render admission/deadline execution and the one

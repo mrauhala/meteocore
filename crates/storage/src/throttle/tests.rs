@@ -36,6 +36,9 @@ struct Answer {
 struct Script {
     /// The answers to the next requests, in order; a 200 after them.
     answers: Mutex<VecDeque<Answer>>,
+    /// The body of every 200 to a GET, sent without `Content-Length` as a
+    /// chunked one is, in place of [`BODY`] (#1170).
+    chunked: Mutex<Option<Bytes>>,
     /// How long a 200 takes.
     delay: Duration,
     /// When each request was sent, and the status it was answered.
@@ -68,6 +71,12 @@ impl Scripted {
             retry_after: retry_after.map(str::to_string),
             after,
         });
+    }
+
+    /// Answer every GET with `body` and no `Content-Length`; HEADs keep
+    /// [`BODY`]'s.
+    fn chunked(&self, body: &'static [u8]) {
+        *self.0.chunked.lock().unwrap() = Some(Bytes::from_static(body));
     }
 
     /// Answer the next request without a script with a 429 at once.
@@ -120,14 +129,16 @@ impl HttpService for Scripted {
         let _active = Active::new(script);
         tokio::time::sleep(answer.after).await;
         let ok = answer.status == 200;
+        let chunked = script.chunked.lock().unwrap().clone();
         let body = match ok && request.method() == reqwest::Method::GET {
-            true => Bytes::from_static(BODY),
+            true => chunked.clone().unwrap_or(Bytes::from_static(BODY)),
             false => Bytes::new(),
         };
         let mut response = HttpResponse::new(HttpResponseBody::from(body));
         *response.status_mut() = StatusCode::from_u16(answer.status).unwrap();
         let headers = response.headers_mut();
-        if ok {
+        let get = request.method() == reqwest::Method::GET;
+        if ok && (chunked.is_none() || !get) {
             headers.insert(CONTENT_LENGTH, HeaderValue::from(BODY.len()));
         }
         if let Some(value) = answer.retry_after {
@@ -520,4 +531,89 @@ async fn a_retry_after_over_http_holds_the_retry() {
         requests(server.url.trim_start_matches("http://")),
         (2, 0, 0)
     );
+}
+
+/// A document (#1170) answered without `Content-Length`, as THREDDS streams
+/// its catalogs, is read whole through the host's own transport, where
+/// object_store's GET fails it, and capped while it streams. (Its 429s:
+/// `a_429_on_a_catalog_poll_backs_off_the_host`.)
+#[tokio::test(start_paused = true)]
+async fn a_chunked_document_is_read_through_the_hosts_transport() {
+    const HOST: &str = "document.backoff.test";
+    const CATALOG: &[u8] = b"<catalog/>";
+    let host = Scripted::new(Duration::ZERO);
+    host.chunked(CATALOG);
+    let (store, path) = limited(&format!("http://{HOST}/thredds/catalog.xml"), 8, &host);
+
+    let error = store.inner().get(&path).await.unwrap_err().to_string();
+    assert!(error.contains("Content-Length"), "{error}");
+    assert_eq!(store.document(&path, 1024).await.unwrap(), CATALOG);
+    assert_eq!(host.sent().len(), 2, "one request each");
+    assert_eq!(requests(HOST), (8, 0, 0), "and the permit given back");
+
+    let error = store.document(&path, 5).await.unwrap_err().to_string();
+    assert!(error.contains("over the 5-byte limit"), "{error}");
+}
+
+/// The catalog route's own fetch (#1170): a [`crate::discovery::CatalogProber`]
+/// poll whose catalog the host first answers 429 with `Retry-After: 1`
+/// backs off the host, cutting its limit and holding the retry for the
+/// second, then reads the chunked catalog and lists its file. The retry is
+/// logged in the `storage` span naming the collection (#1233). Real time:
+/// the poll bridges to a runtime of its own, as off the poll runtime. The
+/// only test that retries a document, so no other registers the retry's
+/// log line while this one listens.
+#[test]
+fn a_429_on_a_catalog_poll_backs_off_the_host() {
+    use crate::discovery::{CatalogProber, Schedule, TemplateSpec, TimeWindow};
+
+    const HOST: &str = "catalog.backoff.test";
+    // A catalog listing one file of the 06Z run, 10 bytes ([`BODY`]): a
+    // literal, never `format!` (Critical Rule 3).
+    const CATALOG: &[u8] = br#"<catalog><service name="files" serviceType="HTTPServer" base="/files/"/><dataset name="run_20261019T06Z.nc" urlPath="run_20261019T06Z.nc"><dataSize units="bytes">10</dataSize><date type="modified">2026-10-19T07:00:00Z</date></dataset></catalog>"#;
+    let log = JsonLog::default();
+    let _logging = tracing::subscriber::set_default(log.subscriber());
+    let host = Scripted::new(Duration::ZERO);
+    host.chunked(CATALOG);
+    let (catalogs, _) = limited(&format!("http://{HOST}/catalog.xml"), 8, &host);
+    let catalogs = catalogs.for_collection("meps-sfc");
+    let (files, base) = limited(&format!("http://{HOST}/files/"), 8, &host);
+    let spec = TemplateSpec {
+        time_window: Some(TimeWindow::parse("-PT6H").unwrap()),
+        ..TemplateSpec::new(
+            base.as_ref(),
+            "run_%Y%m%dT{run}Z.nc",
+            Schedule::Runs { run_hours: vec![6] },
+            "catalog-backoff",
+        )
+    };
+    let mut prober = CatalogProber::new(
+        spec,
+        &format!("http://{HOST}/catalog.xml"),
+        &format!("http://{HOST}/files/"),
+    )
+    .unwrap();
+
+    host.throttle(Some("1"));
+    let now = "2026-10-19T08:00:00Z".parse().unwrap();
+    let report = prober.poll(&catalogs, &files, now).unwrap();
+    assert_eq!((report.catalogs, report.catalogs_failed), (1, 0));
+    let sent = host.sent();
+    let [(throttled, 429), (retried, 200), (_, 200)] = sent.as_slice() else {
+        panic!("a 429, the catalog's retry and the file's HEAD: {sent:?}");
+    };
+    assert!(*retried - *throttled >= Duration::from_secs(1), "{sent:?}");
+    assert_eq!(requests(HOST).0, 4, "the 429 cut the host's limit");
+    let retries: Vec<serde_json::Value> = log
+        .lines()
+        .into_iter()
+        .filter(|line| line["target"] == "ds_storage::document")
+        .collect();
+    assert_eq!(retries.len(), 1, "{retries:#?}");
+    assert_eq!(retries[0]["span"]["collection"], "meps-sfc");
+    assert_eq!(retries[0]["span"]["path"], "catalog.xml");
+    let listed = prober.files();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].key, "files/run_20261019T06Z.nc");
+    assert_eq!(listed[0].version.size, BODY.len() as u64);
 }

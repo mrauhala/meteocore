@@ -1,0 +1,97 @@
+# MetCoOp MEPS 2.5 km surface forecast, control member, read in place from
+# MET Norway's thredds.met.no by HTTP range, its files found in the server's
+# THREDDS catalogs (#1170) instead of by HEAD probing. CC-BY-4.0, MET Norway.
+#
+# DISABLED by default: it reads from thredds.met.no, a public server. To run:
+#   1. rename to drop `.disabled`
+#   2. cargo run -p server -- --collections=meps-netcdf-thredds-catalog
+# `meps-netcdf-thredds.toml.disabled` reads the same family by HEAD probing,
+# and states the traffic of opening and drawing the files, which is the
+# same here; `meps-netcdf-local` serves it from the committed sample.
+#
+# How the files are found: the template fields below still name the files
+# to pick (sfc, member 00, leads 00-66 of the runs every 3 h), and the
+# catalogs say which of them exist, with a size and a modification time.
+# Each poll reads the catalog of each run directory it checks, walking to it
+# once from `catalog_url` through the catalogRefs on the way to the runs in
+# `time_window` (the archive root, the year, month and day, the run hour,
+# member_00) and directly afterwards; nothing outside the window is read. A
+# file is used once two polls see it unchanged in its catalog, or once its
+# catalog date is `min_age` old, and a run when all its leads are, or
+# `run_grace` after its first appeared, as with probing. A catalog rounds
+# sizes (`167.8 Mbytes`), so each file listed is HEADed once for its exact
+# size, which every range read is checked against.
+#
+# Traffic of finding the files: while a run is awaited, one catalog per poll,
+# its day's (21 KB, measured) or its run directory's; when it appears, one
+# catalog per poll until its files settle, then 67 HEADs, one per file; then
+# one catalog per run every 30 min, to catch a replaced file. Probing makes
+# a HEAD per unsettled file per poll instead.
+#
+# The catalogs advertise OpenDAP for these datasets; the HTTPServer service
+# they also name is the fileServer read here, not a documented interface.
+
+id = "meps-netcdf-thredds-catalog"
+title = "MEPS Surface (CF-NetCDF, thredds.met.no catalogs)"
+description = "MetCoOp MEPS 2.5 km surface forecast, control member, read in place by HTTP range from MET Norway's per-lead CF-NetCDF files on thredds.met.no, found through its THREDDS catalogs."
+engine_type = "netcdf"
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["forecast", "NWP", "MEPS", "NetCDF", "THREDDS"]
+
+[license]
+title = "CC-BY-4.0"
+
+[netcdf]
+data_path = "https://thredds.met.no/thredds/fileServer/meps25epsarchive/"
+# The catalog of the same directory as data_path: thredds/catalog/<dir>/ for
+# thredds/fileServer/<dir>/.
+catalog_url = "https://thredds.met.no/thredds/catalog/meps25epsarchive/catalog.xml"
+# Run directories by date and run hour, then the member: `{run}` is the hour.
+prefix_pattern = "%Y/%m/%d/{run}/member_00/"
+filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"
+run_hours = [0, 3, 6, 9, 12, 15, 18, 21]
+leads = [
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16,
+    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+    34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+    51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66,
+]
+# Runs started in the last 9 h: the newest two published (about 1.9 h after
+# their run time) are always in it, for `max_runs = 2`.
+time_window = "-PT9H"
+variables = [
+    "air_temperature_2m",
+    "x_wind_10m",
+    "y_wind_10m",
+    "precipitation_amount_acc",
+]
+# Each kept file holds its parsed metadata, about 820 KB (measured): 67 leads
+# x 2 runs is some 110 MB of heap.
+max_runs = 2
+poll_interval_secs = 300
+# min_age = "PT10M"
+# run_grace = "PT30M"
+
+[netcdf.titles]
+# Accumulated from the run's start, not per step.
+precipitation_amount_acc = "Precipitation accumulated since run start"
+x_wind_10m = "10 m wind along the grid's x axis"
+y_wind_10m = "10 m wind along the grid's y axis"
+
+# Values are served in display units: temperature in °C, the accumulated
+# precipitation in mm, wind in m/s as stored. Layers without an entry below
+# take the built-in default their name and unit select.
+[wms]
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "x_wind_10m"
+colormap = "diverging"
+min = -20.0
+max = 20.0
+
+[[wms.parameters]]
+name = "y_wind_10m"
+colormap = "diverging"
+min = -20.0
+max = 20.0
