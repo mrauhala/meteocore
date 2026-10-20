@@ -2479,7 +2479,7 @@ Services:
 | `prometheus` | `dhi.io/prometheus:3.11` | 9090 | Scrapes `/metrics` every 15s |
 | `loki` | `dhi.io/loki:3.6` | 3100 | Stores structured log events |
 | `alloy` | `dhi.io/alloy:1.15` | 12345 | Tails meteocore stdout, parses JSON, pushes to Loki |
-| `grafana` | `dhi.io/grafana:12.3` | 3000 | Auto-provisioned dashboard + both datasources |
+| `grafana` | `dhi.io/grafana:13.1` | 3000 | Auto-provisioned dashboard + both datasources; the dashboard needs Grafana 13 or newer |
 
 First-time setup (DHI Community images require authentication):
 
@@ -2498,7 +2498,22 @@ Tear down including volumes: `docker compose down -v`.
 
 Alloy promotes a bounded set of labels to Loki: `level`, `api`, `query_type`, `status_class` (`2xx` / `4xx` / `5xx`). High-cardinality fields like `collection`, `path`, `request_id`, the raw query string, `user_agent` and `referer` stay in the log body and are queryable via `| json` in LogQL — this keeps Loki's index bounded as the number of collections grows.
 
-The bundled Grafana dashboard at `docker/grafana/dashboards/meteocore-overview.json` has a **Logs** row with four Loki-backed panels: request rate by `(api, query_type)`, error rate by `status_class`, live request stream, and a dedicated 4xx/5xx stream. All panels work with the Prometheus and Loki datasources that are auto-provisioned from `docker/grafana/provisioning/`.
+The bundled Grafana dashboard at `docker/grafana/dashboards/meteocore-overview.json` is laid out in tabs. **Overview** opens first and stays short: six stats (collections ready, degraded and failed; requests per second; 5xx ratio; p95 latency; render queue; cache hit ratio), each linking to the panel that explains it, over four time series: requests by API, p95 latency by API, errors and shedding, and render pressure. Each other tab answers one kind of question:
+
+| Tab | Sections |
+|-----|----------|
+| Requests & latency | traffic and errors with the routes table, latency, egress, EDR queries |
+| Rendering & caches | render admission and shedding, render latency, the cache table with one card per cache |
+| Memory & admission | process memory, admission budgets |
+| Storage & sources | freshness and collections by state, remote reads |
+| Engines | one sub-tab per engine: radar, nowcast, gridded sources, satellite, station grids, PostGIS, WIS2 ingest |
+| Logs | request rate by `(api, query_type)`, error rate by `status_class` and requests by collection from Loki; streams of warnings & errors, 4xx/5xx responses and live requests |
+
+Sections inside a tab are rows that stay open, so nothing needs expanding while scrolling; panels load as they scroll into view. Variables pick the Prometheus job, collections, APIs and caches, and the two datasource pickers sit in the dashboard controls menu. Every `<name>_cache_*` family the server exposes gets a row in the cache table and a repeated hit-ratio/fill/miss card without a dashboard change. Restarts, failed scrapes and collection reloads are annotations, toggled from the controls menu. Links between panels carry the target tab (`dtab=`), so they open on the right tab.
+
+The file is a `dashboard.grafana.app/v2` resource, the dynamic-dashboard schema that Grafana 13 provisions with default feature toggles; Grafana 12 cannot load it, which is why the stack pins `dhi.io/grafana:13.1`. The file provider in `docker/grafana/provisioning/dashboards/` reads it as it is, the dashboard keeps the uid `meteocore-overview`, so bookmarks still open it, and all panels work with the Prometheus and Loki datasources that are auto-provisioned from `docker/grafana/provisioning/`.
+
+CI keeps the dashboard and the server in step with `python3 scripts/check_grafana_dashboard.py`, which needs only the standard library. It reads every metric family the server registers from the Rust sources and fails when a family is not queried by any panel, or when a panel queries a metric that is not a family. It also fails on structural mistakes: a file that is not a v2 resource with tabs at the top, a panel placed twice or not at all, a reference to a panel that does not exist, overlapping or off-grid panels, collapsed rows, hard-coded datasources or hosts, undefined variables, panels without a title, description or unit, links to panels or tabs that do not exist, a rate or arithmetic over a selector of several metric names, which Prometheus rejects once two of them share their labels. It validates the spec against Grafana's own schema, `scripts/grafana/dashboard_v2_spec.cue`, vendored unchanged from the Grafana 13.1.8 release: required fields, enum values and layout kinds, and fields the schema does not have. Grafana's provisioning does not validate the file and drops unknown fields silently, so without this check such a mistake would only show up as a broken panel in the browser. Each problem is one line naming the dashboard and panel, or the Rust source line of the family, and what is wrong. A family added to the server therefore needs its panel in the same PR. Cache families are the exception: a new `<name>_cache_*` set is picked up by the cache table and cards without one. The script's tests are in `scripts/tests/`, run with `python3 -m unittest discover -s scripts/tests`.
 
 Privileged GitHub workflows pin actions to commit SHAs, updated by Dependabot.
 Claude comment triggers require an owner, member or collaborator; automatic

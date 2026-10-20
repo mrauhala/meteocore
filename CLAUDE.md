@@ -1314,10 +1314,29 @@ no `url` are rejected.
   patterns, never raw URLs (cardinality explosion).
 - **Grafana dashboards live in this repo:**
   `docker/grafana/dashboards/meteocore-overview.json`, provisioned via
-  `docker/grafana/provisioning/`. **When adding a new `/metrics` family,
-  update the dashboard too** (same PR or a follow-up issue). Cache families
-  follow the established panel pattern: hit ratio, bytes vs capacity, miss
-  rate.
+  `docker/grafana/provisioning/`: a `dashboard.grafana.app/v2` resource
+  that needs Grafana 13 or newer. Panels are `spec.elements`, named
+  `panel-<id>`; `spec.layout` places each exactly once. Tabs: Overview
+  (six stats and four time series; keep it that small), Requests &
+  latency, Rendering & caches, Memory & admission, Storage & sources,
+  Engines (a sub-tab per engine), Logs. Rows inside a tab stay open
+  (`collapse: false`). Every PromQL query carries `job=~"$job"`;
+  per-collection metrics also `collection=~"$collection"`. Queries name
+  `${DS_PROMETHEUS}` or `${DS_LOKI}` as their datasource; a link into
+  another tab carries `dtab=<slug>`.
+  **When adding a new `/metrics` family, update the dashboard in the same
+  PR**, in the tab and row its question belongs to. `python3
+  scripts/check_grafana_dashboard.py` enforces this in CI: it fails on a
+  registered family no panel queries, on a PromQL name that is not a
+  family, on broken layout, variables, datasources, hosts or links, and
+  on anything Grafana's v2 schema (vendored unchanged in
+  `scripts/grafana/`) rejects or would silently drop. A cache
+  named `<name>_cache_{hits_total,misses_total,bytes,capacity_bytes}`
+  needs no panel: the `cache` variable feeds it to the cache table and
+  the repeated card of hit ratio, fill and miss rate. Add a per-collection
+  cache to the Engines › Gridded sources regex, and a memory budget
+  `<name>_{reserved_bytes,capacity_bytes,rejected_total}` to the
+  admission-budget panels in Memory & admission.
 - **State:** API state wrapped in `ArcSwap` for lock-free reads. Render
   semaphore (`[server] render_concurrency`, default 2× CPU cores, min 8;
   fixed at boot, so restart to change) shared across Maps/Tiles/WMS. Engine

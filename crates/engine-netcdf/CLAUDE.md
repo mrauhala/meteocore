@@ -381,8 +381,10 @@ Read in place by HTTP range, never downloaded whole (decision 4).
   chunk cache and the per-host request gauges);
   and, for every host behind `build_http_store_limited`,
   `storage_host_{requests_in_flight,requests_queued,request_limit}{host}`.
-  Grafana: the cache-family panels, the two "NetCDF field-read" panels,
-  "Remote requests per host" and "NetCDF detached field fills".
+  Grafana: the Caches row of Rendering & caches, the `netcdf_read` budget
+  in Memory & admission ("Admission budgets — use", "Admission budgets",
+  "Admission rejections"), "Remote requests per host" in Storage &
+  sources and "NetCDF detached field fills" in Engines › Gridded sources.
 - **A failed read is an `Err` (`Storage`)**, never a tile of nodata, and is
   not cached.
 - `block_in_place` panics on a current-thread runtime: tests that render
