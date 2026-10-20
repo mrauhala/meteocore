@@ -93,6 +93,48 @@ const WEB_MERCATOR: &str = concat!(
     r#",CONVERSION["Web Mercator",METHOD["Popular Visualisation Pseudo Mercator",ID["EPSG",1024]],PARAMETER["Latitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8801]],PARAMETER["Longitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],PARAMETER["False easting",0,LENGTHUNIT["metre",1],ID["EPSG",8806]],PARAMETER["False northing",0,LENGTHUNIT["metre",1],ID["EPSG",8807]]],"#,
     east_north!(),
 );
+// The earth figures of #1192, each read back by PROJ 9.8.1 (`projinfo
+// '<wkt>' -o PROJ`) to its `Crs`, and `cs2cs EPSG:4326 '<wkt>'` of 25°E
+// 60°N (BNG: 0.1276°W 51.5072°N) and 10°E 50°N within 0.1 mm of
+// `Crs::forward`, pinned below in `figure_wkt2_projects_where_proj_reads_it`:
+//
+// - TM35_GRS80: +proj=utm +zone=35 +ellps=GRS80
+// - BNG_AIRY: +proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy
+// - POLAR_STERE_SPHERE: +proj=stere +lat_0=90 +lon_0=-105 +k=0.933012701892 +R=6371229
+// - POLAR_STERE_HUGHES: +proj=stere +lat_0=90 +lon_0=-45 +k=0.969858189439 +a=6378273 +rf=298.279411123064
+// - EASE_LAEA_SPHERE: +proj=laea +lat_0=90 +lon_0=0 +R=6371228
+// - OBLIQUE_STERE_SPHERE: +proj=stere +lat_0=60 +lon_0=25 +k=0.9999 +x_0=600000 +y_0=-200000 +R=6371000
+
+const TM35_GRS80: &str = concat!(
+    r#"PROJCRS["Transverse Mercator",BASEGEOGCRS["Unknown based on GRS 1980 ellipsoid",DATUM["Unknown based on GRS 1980 ellipsoid",ELLIPSOID["GRS 1980",6378137,298.257222101,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]]],CONVERSION["Transverse Mercator",METHOD["Transverse Mercator",ID["EPSG",9807]],PARAMETER["Latitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8801]],PARAMETER["Longitude of natural origin",27,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],PARAMETER["Scale factor at natural origin",0.9996,SCALEUNIT["unity",1],ID["EPSG",8805]],PARAMETER["False easting",500000,LENGTHUNIT["metre",1],ID["EPSG",8806]],PARAMETER["False northing",0,LENGTHUNIT["metre",1],ID["EPSG",8807]]],"#,
+    east_north!(),
+);
+
+const BNG_AIRY: &str = concat!(
+    r#"PROJCRS["Transverse Mercator",BASEGEOGCRS["Unknown based on an ellipsoid",DATUM["Unknown based on an ellipsoid",ELLIPSOID["Unknown",6377563.396,299.3249646,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]]],CONVERSION["Transverse Mercator",METHOD["Transverse Mercator",ID["EPSG",9807]],PARAMETER["Latitude of natural origin",49,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8801]],PARAMETER["Longitude of natural origin",-2,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],PARAMETER["Scale factor at natural origin",0.9996012717,SCALEUNIT["unity",1],ID["EPSG",8805]],PARAMETER["False easting",400000,LENGTHUNIT["metre",1],ID["EPSG",8806]],PARAMETER["False northing",-100000,LENGTHUNIT["metre",1],ID["EPSG",8807]]],"#,
+    east_north!(),
+);
+
+const POLAR_STERE_SPHERE: &str = concat!(
+    r#"PROJCRS["Polar stereographic",BASEGEOGCRS["Unknown based on a sphere",DATUM["Unknown based on a sphere of radius 6371229 m",ELLIPSOID["Sphere",6371229,0,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]]],CONVERSION["Polar stereographic",METHOD["Polar Stereographic (variant A)",ID["EPSG",9810]],PARAMETER["Latitude of natural origin",90,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8801]],PARAMETER["Longitude of natural origin",-105,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],PARAMETER["Scale factor at natural origin",0.933012701892,SCALEUNIT["unity",1],ID["EPSG",8805]],PARAMETER["False easting",0,LENGTHUNIT["metre",1],ID["EPSG",8806]],PARAMETER["False northing",0,LENGTHUNIT["metre",1],ID["EPSG",8807]]],"#,
+    east_north!(),
+);
+
+const POLAR_STERE_HUGHES: &str = concat!(
+    r#"PROJCRS["Polar stereographic",BASEGEOGCRS["Unknown based on an ellipsoid",DATUM["Unknown based on an ellipsoid",ELLIPSOID["Unknown",6378273,298.279411123064,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]]],CONVERSION["Polar stereographic",METHOD["Polar Stereographic (variant A)",ID["EPSG",9810]],PARAMETER["Latitude of natural origin",90,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8801]],PARAMETER["Longitude of natural origin",-45,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],PARAMETER["Scale factor at natural origin",0.969858189439,SCALEUNIT["unity",1],ID["EPSG",8805]],PARAMETER["False easting",0,LENGTHUNIT["metre",1],ID["EPSG",8806]],PARAMETER["False northing",0,LENGTHUNIT["metre",1],ID["EPSG",8807]]],"#,
+    east_north!(),
+);
+
+const EASE_LAEA_SPHERE: &str = concat!(
+    r#"PROJCRS["Lambert azimuthal equal area",BASEGEOGCRS["Unknown based on a sphere",DATUM["Unknown based on a sphere of radius 6371228 m",ELLIPSOID["Sphere",6371228,0,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]]],CONVERSION["Lambert azimuthal equal area",METHOD["Lambert Azimuthal Equal Area",ID["EPSG",9820]],PARAMETER["Latitude of natural origin",90,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8801]],PARAMETER["Longitude of natural origin",0,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],PARAMETER["False easting",0,LENGTHUNIT["metre",1],ID["EPSG",8806]],PARAMETER["False northing",0,LENGTHUNIT["metre",1],ID["EPSG",8807]]],"#,
+    east_north!(),
+);
+
+const OBLIQUE_STERE_SPHERE: &str = concat!(
+    r#"PROJCRS["Stereographic",BASEGEOGCRS["Unknown based on a sphere",DATUM["Unknown based on a sphere of radius 6371000 m",ELLIPSOID["Sphere",6371000,0,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]]],CONVERSION["Stereographic",METHOD["Stereographic"],PARAMETER["Latitude of natural origin",60,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8801]],PARAMETER["Longitude of natural origin",25,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8802]],PARAMETER["Scale factor at natural origin",0.9999,SCALEUNIT["unity",1],ID["EPSG",8805]],PARAMETER["False easting",600000,LENGTHUNIT["metre",1],ID["EPSG",8806]],PARAMETER["False northing",-200000,LENGTHUNIT["metre",1],ID["EPSG",8807]]],"#,
+    east_north!(),
+);
+
 fn d(degrees: f64) -> f64 {
     degrees.to_radians()
 }
@@ -104,6 +146,7 @@ fn tm35fin() -> Crs {
         k0: 0.9996,
         false_e: 500_000.0,
         false_n: 0.0,
+        figure: Ellipsoid::WGS84,
     }
 }
 
@@ -129,6 +172,7 @@ fn every_crs_has_its_pinned_wkt2() {
                 lon0: d(10.0),
                 false_e: 1_950_000.0,
                 false_n: -2_100_000.0,
+                figure: Ellipsoid::WGS84,
             },
             OPERA_LAEA,
         ),
@@ -152,6 +196,7 @@ fn every_crs_has_its_pinned_wkt2() {
                 k0: 0.933_012_701_892_219_3,
                 false_e: 0.0,
                 false_n: 0.0,
+                figure: Ellipsoid::WGS84,
             },
             POLAR_STERE,
         ),
@@ -162,6 +207,7 @@ fn every_crs_has_its_pinned_wkt2() {
                 k0: 1.0,
                 false_e: 0.0,
                 false_n: 0.0,
+                figure: Ellipsoid::WGS84,
             },
             DMI_STERE,
         ),
@@ -197,6 +243,111 @@ fn every_crs_has_its_pinned_wkt2() {
     ];
     for (crs, wkt) in cases {
         assert_eq!(crs_wkt2(&crs), wkt, "{crs:?}");
+    }
+}
+
+/// The figured CRSs of #1192 with their WKT2 and where PROJ projects 10°E
+/// 50°N through it.
+fn figured() -> Vec<(Crs, &'static str, (f64, f64))> {
+    let hughes = Ellipsoid::from_inverse_flattening(6_378_273.0, 298.279_411_123_064);
+    let sphere = Ellipsoid::sphere(6_371_229.0);
+    vec![
+        (
+            Crs::TransverseMercator {
+                lat0: 0.0,
+                lon0: d(27.0),
+                k0: 0.9996,
+                false_e: 500_000.0,
+                false_n: 0.0,
+                figure: Ellipsoid::GRS80,
+            },
+            TM35_GRS80,
+            (-715_001.983_5, 5_678_591.055_2),
+        ),
+        (
+            Crs::TransverseMercator {
+                lat0: d(49.0),
+                lon0: d(-2.0),
+                k0: 0.999_601_271_7,
+                false_e: 400_000.0,
+                false_n: -100_000.0,
+                figure: Ellipsoid::from_inverse_flattening(6_377_563.396, 299.324_964_6),
+            },
+            BNG_AIRY,
+            (1_258_793.770_2, 80_522.676_9),
+        ),
+        (
+            Crs::Stereographic {
+                lat0: d(90.0),
+                lon0: d(-105.0),
+                k0: crate::geo::polar_stereographic_k0(d(60.0), &sphere),
+                false_e: 0.0,
+                false_n: 0.0,
+                figure: sphere,
+            },
+            POLAR_STERE_SPHERE,
+            (3_921_772.047_0, 1_828_752.339_0),
+        ),
+        (
+            Crs::Stereographic {
+                lat0: d(90.0),
+                lon0: d(-45.0),
+                k0: crate::geo::polar_stereographic_k0(d(70.0), &hughes),
+                false_e: 0.0,
+                false_n: 0.0,
+                figure: hughes,
+            },
+            POLAR_STERE_HUGHES,
+            (3_695_272.273_2, -2_587_457.501_4),
+        ),
+        (
+            Crs::LambertAzimuthalEqualArea {
+                lat0: d(90.0),
+                lon0: 0.0,
+                false_e: 0.0,
+                false_n: 0.0,
+                figure: Ellipsoid::sphere(6_371_228.0),
+            },
+            EASE_LAEA_SPHERE,
+            (756_789.429_3, -4_291_966.131_7),
+        ),
+        (
+            Crs::Stereographic {
+                lat0: d(60.0),
+                lon0: d(25.0),
+                k0: 0.9999,
+                false_e: 600_000.0,
+                false_n: -200_000.0,
+                figure: Ellipsoid::sphere(6_371_000.0),
+            },
+            OBLIQUE_STERE_SPHERE,
+            (-473_846.769_3, -1_198_419.407_4),
+        ),
+    ]
+}
+
+/// A figure flows into the WKT2: WGS 84 and GRS 1980 by name, a sphere,
+/// or another ellipsoid by its axis and inverse flattening (#1192).
+#[test]
+fn figure_wkt2_names_the_ellipsoid() {
+    for (crs, wkt, _) in figured() {
+        assert_eq!(crs_wkt2(&crs), wkt, "{crs:?}");
+    }
+    assert!(TM35_GRS80.contains(r#"DATUM["Unknown based on GRS 1980 ellipsoid""#));
+    assert!(POLAR_STERE_SPHERE.contains(r#"ELLIPSOID["Sphere",6371229,0,"#));
+    assert!(BNG_AIRY.contains(r#"ELLIPSOID["Unknown",6377563.396,299.3249646,"#));
+}
+
+/// Each figured CRS projects 10°E 50°N where PROJ puts it reading its
+/// WKT2 (`cs2cs EPSG:4326 '<wkt>'`), so the text describes the math.
+#[test]
+fn figure_wkt2_projects_where_proj_reads_it() {
+    for (crs, _, (x_proj, y_proj)) in figured() {
+        let (x, y) = crs.forward(10.0, 50.0);
+        assert!(
+            (x - x_proj).abs() < 1e-3 && (y - y_proj).abs() < 1e-3,
+            "{crs:?}: ({x}, {y}), PROJ ({x_proj}, {y_proj})"
+        );
     }
 }
 
@@ -316,4 +467,7 @@ fn wkt_numbers_drop_float_noise() {
     assert_eq!(num(0.9996), "0.9996");
     assert_eq!(num(-2_100_000.0), "-2100000");
     assert_eq!(deg(d(10.5666)), "10.5666");
+    // Twelve decimals of a seven-digit number are past an f64's digits.
+    assert_eq!(num(6_377_563.396), "6377563.396");
+    assert_eq!(num(1.0 / (1.0 / 299.324_964_6)), "299.3249646");
 }

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-use ds_core::geo::{Crs, GeoTransform};
+use ds_core::geo::{Crs, Ellipsoid, GeoTransform};
 use ds_core::native_grid::NativeGrid;
 use ds_core::resample::SourceGrid;
 use memmap2::Mmap;
@@ -131,7 +131,7 @@ impl GridInfo {
             height: ny,
             crs: area.crs.clone(),
         };
-        let bbox = transform.bbox();
+        let bbox = transform.bbox_with_poles();
         let lonlat_extent = match area.crs {
             Crs::Wgs84 => [
                 bl.0.min(tr.0),
@@ -172,15 +172,20 @@ impl GridInfo {
     /// `top_right` are the corners as stored, and a north-to-south (or
     /// cropped) grid stores the north one first. Any other grid's is its
     /// projected rectangle's edges, which reach past the corners' lon/lat
-    /// box (an LCC rectangle's northern edge is wider than its corners).
+    /// box (an LCC rectangle's northern edge is wider than its corners):
+    /// [`Self::bbox`], `west > east` across the antimeridian and reaching a
+    /// pole the grid holds at every longitude.
     pub fn lonlat_extent(&self) -> [f64; 4] {
         self.lonlat_extent
     }
 
-    /// The WGS84 envelope `[west, south, east, north]` of the grid's cell
-    /// edges: [`GeoTransform::bbox`] of [`Self::geo_transform`], sampled once
-    /// by [`Self::new`]. A lat/lon grid's reaches half a cell past its corner
-    /// points; any other grid's equals [`Self::lonlat_extent`].
+    /// The WGS84 extent `[west, south, east, north]` of the grid's cell
+    /// edges: [`GeoTransform::bbox_with_poles`] of [`Self::geo_transform`],
+    /// sampled once by [`Self::new`] (#1194). In the CRS84 domain: `west >
+    /// east` across the antimeridian, and a pole the grid holds reached at
+    /// every longitude, which the edges alone stop short of. A lat/lon
+    /// grid's reaches half a cell past its corner points; any other grid's
+    /// equals [`Self::lonlat_extent`].
     pub fn bbox(&self) -> [f64; 4] {
         self.bbox
     }
@@ -852,12 +857,15 @@ fn read_stereographic_area(r: &mut TextReader) -> Result<GridArea, QueryDataErro
     Ok(GridArea {
         bottom_left: bl,
         top_right: tr,
+        // The record carries no radius line: projected on WGS84, as before
+        // the figure was a parameter (#1192).
         crs: Crs::Stereographic {
             lat0: central_lat.to_radians(),
             lon0: central_lon.to_radians(),
             k0: 1.0,
             false_e: 0.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         },
     })
 }
@@ -1291,6 +1299,57 @@ mod tests {
         );
     }
 
+    /// A stereographic area, newbase's polar aspect, on WGS84 as the
+    /// record gives no radius.
+    fn polar_area(lon0: f64, bottom_left: (f64, f64), top_right: (f64, f64)) -> GridArea {
+        GridArea {
+            bottom_left,
+            top_right,
+            crs: Crs::Stereographic {
+                lat0: 90.0_f64.to_radians(),
+                lon0: lon0.to_radians(),
+                k0: 1.0,
+                false_e: 0.0,
+                false_n: 0.0,
+                figure: Ellipsoid::WGS84,
+            },
+        }
+    }
+
+    /// The extents are pole- and seam-aware (#1194): an area around the
+    /// North Pole reaches it at every longitude, which its edges circle
+    /// and stay short of, and one across the antimeridian is `west >
+    /// east`, never a longitude past 180°, which the CRS84 domain cut.
+    #[test]
+    fn extents_reach_the_pole_and_cross_the_antimeridian() {
+        // Corners at 70°N on the 45°W and 135°E meridians: the pole is the
+        // middle of the grid.
+        let grid = GridInfo::new(41, 41, polar_area(0.0, (-45.0, 70.0), (135.0, 70.0)));
+        let [w, s, e, n] = grid.lonlat_extent();
+        assert_eq!((w, e, n), (-180.0, 180.0, 90.0), "{:?}", grid.bbox());
+        assert!((69.0..70.0).contains(&s), "{s}");
+        assert_eq!(grid.bbox(), grid.lonlat_extent());
+        let [.., edges_n] = grid.geo_transform().bbox();
+        assert!(edges_n < 76.0, "the edges stop at {edges_n}");
+        // Centred on the antimeridian, 170°E to 170°W.
+        let grid = GridInfo::new(21, 21, polar_area(180.0, (170.0, 55.0), (-170.0, 65.0)));
+        let [w, s, e, n] = grid.lonlat_extent();
+        assert!(
+            (160.0..170.0).contains(&w) && (-170.0..-160.0).contains(&e),
+            "{w}..{e}"
+        );
+        assert!(
+            (50.0..55.0).contains(&s) && (65.0..70.0).contains(&n),
+            "{s}..{n}"
+        );
+        let [.., edges_e, _] = grid.geo_transform().bbox();
+        assert!(edges_e > 190.0, "the edges run on to {edges_e}");
+        // Its cell size, as the area query samples it, is the 20° it spans
+        // over its 21 columns, not the 340° the other way round.
+        let (lon_span, _) = ds_core::geo::crs84_bbox_spans(grid.lonlat_extent());
+        assert!((20.0..40.0).contains(&lon_span), "{lon_span}");
+    }
+
     /// Both WGS84 extents are snapshots taken by `GridInfo::new` (#881): the
     /// per-request metadata reads them without re-projecting the edges.
     #[test]
@@ -1315,13 +1374,13 @@ mod tests {
                 },
             },
         );
-        let bbox = grid.transform.bbox();
+        let bbox = grid.transform.bbox_with_poles();
         assert_eq!(grid.bbox(), bbox);
         assert_eq!(grid.lonlat_extent(), bbox);
         // Shift the transform behind the snapshots' back: an accessor that
         // re-projected per call would follow it.
         grid.transform.origin_x += 100_000.0;
-        assert_ne!(grid.transform.bbox(), bbox);
+        assert_ne!(grid.transform.bbox_with_poles(), bbox);
         assert_eq!(grid.bbox(), bbox);
         assert_eq!(grid.lonlat_extent(), bbox);
 

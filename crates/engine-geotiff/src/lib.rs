@@ -30,7 +30,7 @@ pub mod stac;
 #[doc(hidden)]
 pub mod fuzz_exports {
     pub use crate::reader::{DataSource, TiffMetadata};
-    pub use ds_core::geo::{Crs, GeoTransform, SweepAxis};
+    pub use ds_core::geo::{Crs, Ellipsoid, GeoTransform, SweepAxis};
 }
 
 use std::collections::{BTreeMap, HashMap};
@@ -1988,7 +1988,9 @@ fn filter_by_datetime(
 ///
 /// Projected variants only claim a specific EPSG code when their parameters
 /// match a grid with a stable code (TM35FIN → EPSG:3067, ETRS89-LAEA Europe →
-/// EPSG:3035); any other zone gets a generic label so the API layer omits
+/// EPSG:3035) on its earth figure, GRS 1980, or WGS 84 within the 0.1 mm
+/// between them (#1192); any other zone, or the same parameters on a sphere
+/// or another ellipsoid, gets a generic label so the API layer omits
 /// `storageCrs` rather than asserting a wrong code. WGS84 maps to `"CRS:84"`
 /// (lon-first), not `"EPSG:4326"` (lat-first), to match the engine's internal
 /// axis order. Rotated lat/lon has no standard EPSG code.
@@ -2004,8 +2006,10 @@ fn crs_label(crs: &ds_core::geo::Crs) -> String {
             k0,
             false_e,
             false_n,
+            figure,
         } => {
-            let is_tm35fin = lat0.abs() < ANG
+            let is_tm35fin = figure.is_wgs84_like()
+                && lat0.abs() < ANG
                 && (lon0 - 27.0_f64.to_radians()).abs() < ANG
                 && (k0 - 0.9996).abs() < 1e-9
                 && (false_e - 500_000.0).abs() < OFF
@@ -2021,8 +2025,10 @@ fn crs_label(crs: &ds_core::geo::Crs) -> String {
             lon0,
             false_e,
             false_n,
+            figure,
         } => {
-            let is_etrs89_laea = (lat0 - 52.0_f64.to_radians()).abs() < ANG
+            let is_etrs89_laea = figure.is_wgs84_like()
+                && (lat0 - 52.0_f64.to_radians()).abs() < ANG
                 && (lon0 - 10.0_f64.to_radians()).abs() < ANG
                 && (false_e - 4_321_000.0).abs() < OFF
                 && (false_n - 3_210_000.0).abs() < OFF;
@@ -2042,6 +2048,27 @@ fn crs_label(crs: &ds_core::geo::Crs) -> String {
         ds_core::geo::Crs::Geostationary { .. } => "geos".to_string(),
         ds_core::geo::Crs::WebMercator => "EPSG:3857".to_string(),
     }
+}
+
+/// A footprint `envelope` spanning every longitude (a grid holding a
+/// pole) on a geographic output: over `bbox`'s own longitudes, which OGC
+/// API Maps unwraps past ±180° across the antimeridian (#828), so the guard
+/// bounds latitude only, as the shared sampler's does
+/// (`ds_core::resample::SourceGrid`). Walked as −180…180, it clipped the
+/// view past the seam. Any other envelope as it is: a regional grid is not
+/// moved by whole turns into a view of another one.
+fn every_longitude_near(
+    envelope: [f64; 4],
+    bbox: [f64; 4],
+    output_crs: &ds_core::map_engine::OutputCrs,
+) -> [f64; 4] {
+    let [w, s, e, n] = envelope;
+    if e - w < 360.0 || matches!(output_crs, ds_core::map_engine::OutputCrs::Projected { .. }) {
+        return envelope;
+    }
+    let [west, _, east, _] = bbox;
+    let east = if east < west { east + 360.0 } else { east };
+    [west, s, east, n]
 }
 
 /// A map request's output CRS for a log line: its code, and for a projected
@@ -2165,13 +2192,20 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         // tile would otherwise steer `select_overview`, decode that level
         // and refine a grid to its cell cap, all for pixels the guard then
         // empties. Every level shares the full-resolution extent, so its
-        // envelope serves whichever level is read.
-        let Some(footprint) = output_crs.footprint_window_in_image(
-            bbox,
-            metadata.geo_transform.bbox(),
-            width,
-            height,
-        ) else {
+        // envelope serves whichever level is read. The envelope reaches a
+        // pole the grid holds and runs on past 180° across the
+        // antimeridian (`GeoTransform::footprint_envelope`, #1194); with
+        // none, every pixel may draw.
+        let footprint = match metadata.geo_transform.footprint_envelope() {
+            Some(envelope) => output_crs.footprint_window_in_image(
+                bbox,
+                every_longitude_near(envelope, bbox, output_crs),
+                width,
+                height,
+            ),
+            None => (width > 0 && height > 0).then(|| (0, width - 1, 0, height - 1)),
+        };
+        let Some(footprint) = footprint else {
             return Ok(ds_core::map_engine::RasterTile {
                 width,
                 height,
@@ -3023,8 +3057,36 @@ mod tests {
             k0: 0.9996,
             false_e: 500_000.0,
             false_n: 0.0,
+            figure: ds_core::geo::Ellipsoid::WGS84,
         };
         assert_eq!(crs_label(&tm35fin), "EPSG:3067");
+        // On GRS 1980, EPSG:3067's own figure, too; on a sphere or Airy
+        // 1830 the same parameters are another CRS (#1192).
+        let on = |figure| match tm35fin {
+            ds_core::geo::Crs::TransverseMercator {
+                lat0,
+                lon0,
+                k0,
+                false_e,
+                false_n,
+                ..
+            } => ds_core::geo::Crs::TransverseMercator {
+                lat0,
+                lon0,
+                k0,
+                false_e,
+                false_n,
+                figure,
+            },
+            _ => unreachable!(),
+        };
+        assert_eq!(crs_label(&on(ds_core::geo::Ellipsoid::GRS80)), "EPSG:3067");
+        for other in [
+            ds_core::geo::Ellipsoid::sphere(6_371_000.0),
+            ds_core::geo::Ellipsoid::from_inverse_flattening(6_377_563.396, 299.324_964_6),
+        ] {
+            assert_eq!(crs_label(&on(other)), "TM", "{other:?}");
+        }
         // A different TM zone (e.g. UTM 33N central meridian 15°E) is not 3067.
         let utm33n = ds_core::geo::Crs::TransverseMercator {
             lat0: 0.0,
@@ -3032,6 +3094,7 @@ mod tests {
             k0: 0.9996,
             false_e: 500_000.0,
             false_n: 0.0,
+            figure: ds_core::geo::Ellipsoid::WGS84,
         };
         assert_eq!(crs_label(&utm33n), "TM");
     }
@@ -3043,13 +3106,28 @@ mod tests {
             lon0: 10.0_f64.to_radians(),
             false_e: 4_321_000.0,
             false_n: 3_210_000.0,
+            figure: ds_core::geo::Ellipsoid::WGS84,
         };
         assert_eq!(crs_label(&etrs89), "EPSG:3035");
+        for (figure, label) in [
+            (ds_core::geo::Ellipsoid::GRS80, "EPSG:3035"),
+            (ds_core::geo::Ellipsoid::sphere(6_371_007.0), "LAEA"),
+        ] {
+            let crs = ds_core::geo::Crs::LambertAzimuthalEqualArea {
+                lat0: 52.0_f64.to_radians(),
+                lon0: 10.0_f64.to_radians(),
+                false_e: 4_321_000.0,
+                false_n: 3_210_000.0,
+                figure,
+            };
+            assert_eq!(crs_label(&crs), label, "{figure:?}");
+        }
         let other = ds_core::geo::Crs::LambertAzimuthalEqualArea {
             lat0: 0.0,
             lon0: 0.0,
             false_e: 0.0,
             false_n: 0.0,
+            figure: ds_core::geo::Ellipsoid::WGS84,
         };
         assert_eq!(crs_label(&other), "LAEA");
     }
@@ -3087,6 +3165,7 @@ mod tests {
             k0: 1.0,
             false_e: 0.0,
             false_n: 0.0,
+            figure: ds_core::geo::Ellipsoid::WGS84,
         };
         assert_eq!(crs_label(&lcc), "LCC");
         assert_eq!(crs_label(&stere), "stere");

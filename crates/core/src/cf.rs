@@ -14,7 +14,7 @@
 //! lookup closure, so this module stays independent of any NetCDF or Zarr
 //! library.
 
-use crate::geo::{polar_stereographic_k0, Crs, GeoTransform, SweepAxis, WGS84_A, WGS84_F};
+use crate::geo::{polar_stereographic_k0, Crs, Ellipsoid, GeoTransform, SweepAxis};
 
 mod axis;
 mod time;
@@ -37,21 +37,31 @@ pub enum CfAttr {
 ///
 /// `attr(name)` returns attribute `name` of the grid-mapping variable.
 /// Supported `grid_mapping_name`s: `latitude_longitude`, `geostationary`,
-/// `lambert_conformal_conic`, `polar_stereographic`,
+/// `lambert_conformal_conic`, `polar_stereographic`, `stereographic`,
 /// `lambert_azimuthal_equal_area` and `transverse_mercator`. Any other
 /// mapping, a missing required parameter, or one this server cannot honour
 /// is an error rather than a guess: a wrong earth figure alone moves a
 /// geostationary pixel by kilometres. Not honoured: a non-zero geostationary
 /// false easting or equatorial origin, a conic
 /// `scale_factor_at_projection_origin` other than 1, a cone on an ellipsoid
-/// other than WGS84, and a polar stereographic, azimuthal equal-area or
-/// transverse Mercator projection on any figure but WGS84, a sphere
-/// included.
+/// other than WGS84, and a prolate earth figure.
+///
+/// Every mapping but latitude/longitude needs its earth figure stated
+/// (`earth_radius`, or `semi_major_axis` with `semi_minor_axis` or
+/// `inverse_flattening`): polar stereographic, stereographic, azimuthal
+/// equal-area and transverse Mercator are computed on it, sphere or
+/// ellipsoid (#1192).
+///
+/// `false_easting` and `false_northing` are taken as stated: CF gives them
+/// in the units of the projection coordinates, which [`grid`] scales to
+/// metres with the axes.
 ///
 /// A polar stereographic mapping gives its scale by `standard_parallel`
-/// (EPSG method 9829), converted to the scale factor at the pole by
-/// [`polar_stereographic_k0`], or by `scale_factor_at_projection_origin`
-/// (method 9810). Both together must agree to 1e-7.
+/// (EPSG method 9829), converted to the scale factor at the pole on its
+/// figure by [`polar_stereographic_k0`], or by
+/// `scale_factor_at_projection_origin` (method 9810). Both together must
+/// agree to 1e-7. The CF `stereographic` mapping is PROJ's `stere` at any
+/// origin (#1194), its scale `scale_factor_at_projection_origin`.
 pub fn crs_from_grid_mapping(attr: impl Fn(&str) -> Option<CfAttr>) -> Result<Crs, String> {
     let text = |name: &str| match attr(name) {
         Some(CfAttr::Text(value)) => Ok(Some(value)),
@@ -155,7 +165,7 @@ pub fn crs_from_grid_mapping(attr: impl Fn(&str) -> Option<CfAttr>) -> Result<Cr
             }
             let radius = match earth_figure(&number)? {
                 (a, b) if a == b => Some(a),
-                (a, b) if is_wgs84(a, b) => None,
+                (a, b) if Ellipsoid::from_axes(a, b).is_wgs84_like() => None,
                 (a, b) => {
                     return Err(format!(
                         "lambert_conformal_conic on the ellipsoid a={a}, b={b} is not \
@@ -182,6 +192,7 @@ pub fn crs_from_grid_mapping(attr: impl Fn(&str) -> Option<CfAttr>) -> Result<Cr
                 ));
             }
             let lon0 = required("straight_vertical_longitude_from_pole")?;
+            let figure = ellipsoid(&number)?;
             let scale = number("scale_factor_at_projection_origin")?;
             let k0 = match number("standard_parallel")? {
                 Some(parallel) => {
@@ -193,7 +204,7 @@ pub fn crs_from_grid_mapping(attr: impl Fn(&str) -> Option<CfAttr>) -> Result<Cr
                              the pole at {lat0}"
                         ));
                     }
-                    let k0 = polar_stereographic_k0(toward_pole.to_radians());
+                    let k0 = polar_stereographic_k0(toward_pole.to_radians(), &figure);
                     if let Some(given) = scale {
                         if (given - k0).abs() > 1e-7 {
                             return Err(format!(
@@ -214,13 +225,37 @@ pub fn crs_from_grid_mapping(attr: impl Fn(&str) -> Option<CfAttr>) -> Result<Cr
                     "scale_factor_at_projection_origin must be positive, got {k0}"
                 ));
             }
-            require_wgs84(mapping, earth_figure(&number)?)?;
             Ok(Crs::Stereographic {
                 lat0: lat0.to_radians(),
                 lon0: lon0.to_radians(),
                 k0,
                 false_e: number("false_easting")?.unwrap_or(0.0),
                 false_n: number("false_northing")?.unwrap_or(0.0),
+                figure,
+            })
+        }
+        "stereographic" => {
+            let lat0 = required("latitude_of_projection_origin")?;
+            if lat0.abs() > 90.0 {
+                return Err(format!(
+                    "latitude_of_projection_origin {lat0} is not a latitude"
+                ));
+            }
+            let lon0 = required("longitude_of_projection_origin")?;
+            // No scale factor is not a guess of 1.
+            let k0 = required("scale_factor_at_projection_origin")?;
+            if k0 <= 0.0 {
+                return Err(format!(
+                    "scale_factor_at_projection_origin must be positive, got {k0}"
+                ));
+            }
+            Ok(Crs::Stereographic {
+                lat0: lat0.to_radians(),
+                lon0: lon0.to_radians(),
+                k0,
+                false_e: number("false_easting")?.unwrap_or(0.0),
+                false_n: number("false_northing")?.unwrap_or(0.0),
+                figure: ellipsoid(&number)?,
             })
         }
         "lambert_azimuthal_equal_area" => {
@@ -231,12 +266,12 @@ pub fn crs_from_grid_mapping(attr: impl Fn(&str) -> Option<CfAttr>) -> Result<Cr
                 ));
             }
             let lon0 = required("longitude_of_projection_origin")?;
-            require_wgs84(mapping, earth_figure(&number)?)?;
             Ok(Crs::LambertAzimuthalEqualArea {
                 lat0: lat0.to_radians(),
                 lon0: lon0.to_radians(),
                 false_e: number("false_easting")?.unwrap_or(0.0),
                 false_n: number("false_northing")?.unwrap_or(0.0),
+                figure: ellipsoid(&number)?,
             })
         }
         "transverse_mercator" => {
@@ -253,34 +288,35 @@ pub fn crs_from_grid_mapping(attr: impl Fn(&str) -> Option<CfAttr>) -> Result<Cr
                     "latitude_of_projection_origin {lat0} is not a latitude"
                 ));
             }
-            require_wgs84(mapping, earth_figure(&number)?)?;
             Ok(Crs::TransverseMercator {
                 lat0: lat0.to_radians(),
                 lon0: lon0.to_radians(),
                 k0,
                 false_e: number("false_easting")?.unwrap_or(0.0),
                 false_n: number("false_northing")?.unwrap_or(0.0),
+                figure: ellipsoid(&number)?,
             })
         }
         other => Err(format!("grid mapping '{other}' is not supported")),
     }
 }
 
-/// The earth figure of a mapping whose [`Crs`] is defined on WGS84 alone
-/// (polar stereographic, azimuthal equal-area, transverse Mercator): WGS84
-/// or an ellipsoid within [`is_wgs84`]'s millimetre of it (GRS80), never a
-/// sphere or another ellipsoid.
-fn require_wgs84(mapping: &str, (a, b): (f64, f64)) -> Result<(), String> {
-    if is_wgs84(a, b) {
-        Ok(())
-    } else if a == b {
-        Err(format!(
-            "{mapping} on a sphere of radius {a} m is not supported, only WGS84"
-        ))
-    } else {
-        Err(format!(
-            "{mapping} on the ellipsoid a={a}, b={b} is not supported, only WGS84"
-        ))
+/// The [`Ellipsoid`] of the CF earth-figure attributes ([`earth_figure`]):
+/// a sphere when the axes are equal, never a prolate figure, whose
+/// semi-minor axis is the longer, or one with no positive semi-minor axis.
+/// An `inverse_flattening` gives the flattening exactly, which the
+/// semi-minor axis computed from it would lose digits of.
+fn ellipsoid(number: &impl Fn(&str) -> Result<Option<f64>, String>) -> Result<Ellipsoid, String> {
+    let (a, b) = earth_figure(number)?;
+    if !(b > 0.0 && b <= a) {
+        return Err(format!(
+            "the earth figure a={a}, b={b} is not an oblate ellipsoid or a sphere"
+        ));
+    }
+    let by_flattening = number("earth_radius")?.is_none() && number("semi_minor_axis")?.is_none();
+    match number("inverse_flattening")? {
+        Some(rf) if by_flattening && rf != 0.0 => Ok(Ellipsoid::from_inverse_flattening(a, rf)),
+        _ => Ok(Ellipsoid::from_axes(a, b)),
     }
 }
 
@@ -314,12 +350,6 @@ fn earth_figure(
     }
 }
 
-/// Whether an ellipsoid is WGS84 to within a millimetre in both axes.
-/// GRS80, 0.1 mm off in the semi-minor axis, passes.
-fn is_wgs84(semi_major: f64, semi_minor: f64) -> bool {
-    (semi_major - WGS84_A).abs() < 1e-3 && (semi_minor - WGS84_A * (1.0 - WGS84_F)).abs() < 1e-3
-}
-
 /// The sweep axis from CF's `sweep_angle_axis` or its complement
 /// `fixed_angle_axis`; one is required and they must agree.
 fn sweep_axis(sweep: Option<String>, fixed: Option<String>) -> Result<SweepAxis, String> {
@@ -348,23 +378,27 @@ fn sweep_axis(sweep: Option<String>, fixed: Option<String>) -> Result<SweepAxis,
 }
 
 /// `crs`'s own coordinate units per unit of an x/y coordinate variable, or
-/// `None` for a unit it cannot be in. A projected coordinate is metres. A
-/// geostationary coordinate is the scan angle — radians (`rad`, GOES-R) or
-/// microradians (Himawari ISatSS) — and the projection works in the angle
-/// times the satellite height. A latitude/longitude coordinate is degrees.
+/// `None` for a unit it cannot be in. A projected coordinate is metres, or
+/// kilometres scaled to metres (#1194). A geostationary coordinate is the
+/// scan angle — radians (`rad`, GOES-R) or microradians (Himawari ISatSS)
+/// — and the projection works in the angle times the satellite height, or
+/// that length itself. A latitude/longitude coordinate is degrees.
 pub fn coordinate_scale(units: &str, crs: &Crs) -> Option<f64> {
     let units = units.trim();
-    let metres = matches!(units, "m" | "meter" | "meters" | "metre" | "metres");
+    let length = match units {
+        "m" | "meter" | "meters" | "metre" | "metres" => Some(1.0),
+        "km" | "kilometer" | "kilometers" | "kilometre" | "kilometres" => Some(1000.0),
+        _ => None,
+    };
     match crs {
         Crs::Geostationary { height, .. } => match units {
             "rad" | "radian" | "radians" => Some(*height),
             "microradian" | "microradians" | "urad" | "µrad" => Some(height * 1e-6),
-            _ if metres => Some(1.0),
-            _ => None,
+            _ => length,
         },
         Crs::Wgs84 => is_degrees(units).then_some(1.0),
         Crs::RotatedLatLon { .. } => None,
-        _ => metres.then_some(1.0),
+        _ => length,
     }
 }
 
@@ -453,12 +487,19 @@ pub struct CfGrid {
 /// or [`Crs::Wgs84`] for latitude/longitude axes. Each axis's units go
 /// through [`coordinate_scale`]. `x` must ascend; a descending `y` is
 /// north-up as stored, and an ascending one is flipped.
+///
+/// CF states `false_easting` and `false_northing` in the units of the
+/// projection coordinates, as GDAL and NetCDF-Java read them: on axes in
+/// kilometres the false origin is in kilometres too, and is scaled to
+/// metres with them (#1194). The returned transform's CRS carries it in
+/// metres.
 pub fn grid(crs: Crs, x: &RegularAxis, y: &RegularAxis) -> Result<CfGrid, String> {
     let scale = |axis: &RegularAxis, name: &str| {
         coordinate_scale(&axis.units, &crs)
             .ok_or_else(|| format!("{name} coordinate has unusable units '{}'", axis.units))
     };
     let (sx, sy) = (scale(x, "x")?, scale(y, "y")?);
+    let crs = false_origin_in_metres(crs, sx, sy);
     let flipped = y.step > 0.0;
     let (y0, dy) = if flipped {
         (
@@ -478,6 +519,32 @@ pub fn grid(crs: Crs, x: &RegularAxis, y: &RegularAxis) -> Result<CfGrid, String
         crs,
     )?;
     Ok(CfGrid { transform, flipped })
+}
+
+/// `crs` with its false easting and northing, stated in the units of the
+/// `x` and `y` coordinates, scaled by their metres per unit `sx` and `sy`.
+/// A geostationary view has no false origin (it is refused when non-zero),
+/// and its axes' scale is the satellite height.
+fn false_origin_in_metres(mut crs: Crs, sx: f64, sy: f64) -> Crs {
+    match &mut crs {
+        Crs::TransverseMercator {
+            false_e, false_n, ..
+        }
+        | Crs::LambertAzimuthalEqualArea {
+            false_e, false_n, ..
+        }
+        | Crs::LambertConformalConic {
+            false_e, false_n, ..
+        }
+        | Crs::Stereographic {
+            false_e, false_n, ..
+        } => {
+            *false_e *= sx;
+            *false_n *= sy;
+        }
+        Crs::Wgs84 | Crs::RotatedLatLon { .. } | Crs::Geostationary { .. } | Crs::WebMercator => {}
+    }
+    crs
 }
 
 /// The unit of a CF pressure coordinate. CF 1.11 §4.3 identifies a
@@ -559,6 +626,8 @@ fn round_significant(value: f64, digits: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::f64::consts::FRAC_PI_2;
+
     use super::*;
 
     /// A pressure axis is known by its units, in any CF spelling, and its
@@ -899,7 +968,8 @@ mod tests {
             Ok(crs.clone())
         );
         assert_eq!(coordinate_scale("m", &crs), Some(1.0));
-        assert_eq!(coordinate_scale("km", &crs), None);
+        assert_eq!(coordinate_scale("km", &crs), Some(1000.0));
+        assert_eq!(coordinate_scale("cm", &crs), None);
     }
 
     /// A secant cone on WGS84 with a false origin, pinned to `cs2cs
@@ -1043,9 +1113,10 @@ mod tests {
             Crs::Stereographic {
                 lat0: 90.0_f64.to_radians(),
                 lon0: (-45.0_f64).to_radians(),
-                k0: polar_stereographic_k0(70.0_f64.to_radians()),
+                k0: polar_stereographic_k0(70.0_f64.to_radians(), &Ellipsoid::WGS84),
                 false_e: 0.0,
                 false_n: 0.0,
+                figure: Ellipsoid::WGS84,
             }
         );
         assert_matches_proj(
@@ -1173,7 +1244,7 @@ mod tests {
     #[test]
     fn a_polar_scale_factor_must_agree_with_the_standard_parallel() {
         let crs = crs_from_grid_mapping(attrs(&sea_ice_polar_stereographic_north())).unwrap();
-        let k0 = polar_stereographic_k0(70.0_f64.to_radians());
+        let k0 = polar_stereographic_k0(70.0_f64.to_radians(), &Ellipsoid::WGS84);
         // Written as a float: within its rounding.
         let as_float = f64::from(k0 as f32);
         assert_ne!(as_float, k0);
@@ -1220,19 +1291,263 @@ mod tests {
         )
         .is_err());
         assert!(self::with(scale_only, "scale_factor_at_projection_origin", n(0.97)).is_ok());
-        // A sphere is not honoured, nor NSIDC's Hughes 1980 ellipsoid.
-        let error = with("earth_radius", n(6371229.0)).unwrap_err();
-        assert!(error.contains("sphere"), "{error}");
-        let mut hughes = sea_ice_polar_stereographic_north();
-        hughes.retain(|(key, _)| !["semi_major_axis", "inverse_flattening"].contains(key));
-        hughes.extend([
-            ("semi_major_axis", n(6378273.0)),
-            ("inverse_flattening", n(298.279411123064)),
-        ]);
-        let error = crs_from_grid_mapping(attrs(&hughes)).unwrap_err();
-        assert!(error.contains("only WGS84"), "{error}");
+        // No earth figure is not a WGS84 guess, and a prolate one, or one
+        // with no semi-minor axis, is not an earth figure.
+        assert!(without(&["semi_major_axis", "inverse_flattening"]).is_err());
+        assert!(with("semi_minor_axis", n(6400000.0)).is_err());
+        assert!(with("inverse_flattening", n(0.5)).is_err());
+        assert!(with("inverse_flattening", n(-298.0)).is_err());
+    }
+
+    /// A polar stereographic grid on a sphere, as NWP models write them,
+    /// and NSIDC's on the Hughes 1980 ellipsoid (EPSG:3411 and 3412), each
+    /// on its own figure (#1192): `cs2cs +proj=longlat +R=6371229 +to
+    /// +proj=stere +lat_0=90 +lat_ts=60 +lon_0=-105 +x_0=0 +y_0=0
+    /// +R=6371229 +units=m`, `cs2cs +proj=longlat +a=6378273
+    /// +rf=298.279411123064 +to +proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45
+    /// +k=1 +x_0=0 +y_0=0 +a=6378273 +rf=298.279411123064 +units=m` and the
+    /// same with `+lat_0=-90 +lat_ts=-70 +lon_0=0` (PROJ 9.8.1, forward `-f
+    /// %.4f`, inverse `-I -f %.9f`). On WGS84 the Hughes points lie up to
+    /// 110 m away (100°E 45°N), and the sphere's scale factor from WGS84's
+    /// formula moves 60°N by 190 m.
+    #[test]
+    fn polar_stereographic_on_a_sphere_and_on_hughes_1980_matches_proj() {
+        let sphere = crs_from_grid_mapping(attrs(&[
+            ("grid_mapping_name", t("polar_stereographic")),
+            ("straight_vertical_longitude_from_pole", n(-105.0)),
+            ("latitude_of_projection_origin", n(90.0)),
+            ("standard_parallel", n(60.0)),
+            ("earth_radius", n(6371229.0)),
+        ]))
+        .unwrap();
+        let Crs::Stereographic { k0, figure, .. } = sphere else {
+            panic!("{sphere:?}");
+        };
+        assert_eq!(figure, Ellipsoid::sphere(6371229.0));
+        // On a sphere the scale at 60° is (1 + sin 60°) / 2, which moves
+        // 60°N by 190 m from WGS84's k0.
+        assert!(
+            (k0 - (1.0 + 60.0_f64.to_radians().sin()) / 2.0).abs() < 1e-15,
+            "{k0}"
+        );
+        let wgs84_k0 = polar_stereographic_k0(60.0_f64.to_radians(), &Ellipsoid::WGS84);
+        assert!(3185614.5 * (wgs84_k0 / k0 - 1.0) > 190.0, "{wgs84_k0}");
+        assert_matches_proj(
+            &sphere,
+            &[
+                (-105.0, 90.0, 0.0, 0.0),
+                (-105.0, 60.0, 0.0, -3185614.5000),
+                (0.0, 50.0, 4179751.0285, 1119960.9126),
+                (100.0, 70.0, -885947.1134, 1899919.7159),
+                (-150.0, 30.0, -4853612.9626, -4853612.9626),
+                (75.0, 85.0, 0.0, 519079.4999),
+            ],
+        );
+        assert_inverse_matches_proj(
+            &sphere,
+            &[
+                (-4000000.0, 3000000.0, 128.130102354, 44.380530530),
+                (2500000.0, -6000000.0, -82.380135052, 32.666533322),
+            ],
+        );
+
+        let hughes = || {
+            let mut pairs = sea_ice_polar_stereographic_north();
+            pairs.retain(|(key, _)| !["semi_major_axis", "inverse_flattening"].contains(key));
+            pairs.extend([
+                ("semi_major_axis", n(6378273.0)),
+                ("inverse_flattening", n(298.279411123064)),
+            ]);
+            pairs
+        };
+        let north = crs_from_grid_mapping(attrs(&hughes())).unwrap();
+        assert_matches_proj(
+            &north,
+            &[
+                (-45.0, 90.0, 0.0, 0.0),
+                (0.0, 60.0, 2349878.8355, -2349878.8355),
+                (-45.0, 70.0, 0.0, -2187973.8190),
+                (135.0, 75.0, 0.0, 1633913.9541),
+                (100.0, 45.0, 2943470.6401, 4203711.7276),
+                (-150.0, 85.0, -523510.6651, 140274.2600),
+            ],
+        );
+        assert_inverse_matches_proj(
+            &north,
+            &[
+                (-3850000.0, 5850000.0, 168.349700562, 30.980564051),
+                (3750000.0, -5350000.0, -9.972057687, 34.345371341),
+            ],
+        );
+        // The Hughes figure given by its semi-minor axis is the same.
+        let by_axes = with(hughes(), "semi_minor_axis", n(6356889.449)).unwrap();
+        assert_matches_proj(&by_axes, &[(100.0, 45.0, 2943470.6401, 4203711.7276)]);
+        let south = replaced(hughes(), "latitude_of_projection_origin", n(-90.0));
+        let south = replaced(south, "straight_vertical_longitude_from_pole", n(0.0));
+        let south = with(south, "standard_parallel", n(-70.0)).unwrap();
+        assert_matches_proj(
+            &south,
+            &[
+                (0.0, -90.0, 0.0, 0.0),
+                (0.0, -70.0, 0.0, 2187973.8190),
+                (90.0, -60.0, 3323230.5192, 0.0),
+                (-120.0, -75.0, -1415010.9918, -816956.9770),
+            ],
+        );
+        assert_inverse_matches_proj(
+            &south,
+            &[(-3950000.0, 4350000.0, -42.240892341, -39.230888400)],
+        );
+        // On WGS84 the same Hughes grid misplaces the points.
+        let on_wgs84 = crs_from_grid_mapping(attrs(&sea_ice_polar_stereographic_north())).unwrap();
+        let (x, y) = on_wgs84.forward(100.0, 45.0);
+        assert!(
+            (x - 2943470.6401).hypot(y - 4203711.7276) > 100.0,
+            "({x}, {y})"
+        );
+    }
+
+    /// The CF `stereographic` mapping at an arbitrary origin, PROJ's
+    /// `stere` (#1194), on WGS84 with DMI's origin and on a sphere with a
+    /// scale factor and a false origin: `cs2cs +proj=longlat +datum=WGS84
+    /// +to +proj=stere +lat_0=56 +lon_0=10.5666 +k=1 +x_0=0 +y_0=0
+    /// +datum=WGS84 +units=m` and `cs2cs +proj=longlat +R=6371000 +to
+    /// +proj=stere +lat_0=60 +lon_0=25 +k=0.9999 +x_0=600000 +y_0=-200000
+    /// +R=6371000 +units=m` (PROJ 9.8.1, forward `-f %.4f`, inverse `-I -f
+    /// %.9f`).
+    #[test]
+    fn oblique_stereographic_matches_proj() {
+        let dmi = crs_from_grid_mapping(attrs(&oblique_stereographic())).unwrap();
+        assert_eq!(
+            dmi,
+            Crs::Stereographic {
+                lat0: 56.0_f64.to_radians(),
+                lon0: 10.5666_f64.to_radians(),
+                k0: 1.0,
+                false_e: 0.0,
+                false_n: 0.0,
+                figure: Ellipsoid::WGS84,
+            }
+        );
+        assert_matches_proj(
+            &dmi,
+            &[
+                (10.5666, 56.0, 0.0, 0.0),
+                (12.57, 55.68, 126013.8926, -33808.9124),
+                (8.0, 54.9, -164632.6290, -119433.9215),
+                (15.1, 57.2, 273918.0996, 142666.0946),
+                (-10.0, 64.0, -998050.4488, 1049877.1608),
+            ],
+        );
+        assert_inverse_matches_proj(
+            &dmi,
+            &[
+                (300000.0, -200000.0, 15.155836989, 54.115192298),
+                (-1500000.0, 900000.0, -17.932623645, 61.159555675),
+            ],
+        );
+        let sphere = crs_from_grid_mapping(attrs(&[
+            ("grid_mapping_name", t("stereographic")),
+            ("latitude_of_projection_origin", n(60.0)),
+            ("longitude_of_projection_origin", n(25.0)),
+            ("scale_factor_at_projection_origin", n(0.9999)),
+            ("false_easting", n(600000.0)),
+            ("false_northing", n(-200000.0)),
+            ("earth_radius", n(6371000.0)),
+        ]))
+        .unwrap();
+        assert_matches_proj(
+            &sphere,
+            &[
+                (25.0, 60.0, 600000.0, -200000.0),
+                (24.94, 60.17, 596681.6351, -181097.2329),
+                (30.0, 70.0, 791410.5305, 922272.1677),
+                (10.0, 50.0, -473846.7693, -1198419.4074),
+            ],
+        );
+        assert_inverse_matches_proj(
+            &sphere,
+            &[
+                (1500000.0, 1000000.0, 48.180810052, 69.267630602),
+                (-500000.0, -800000.0, 8.332193982, 53.397524197),
+            ],
+        );
+        // A polar origin is the polar aspect, here by its scale factor.
+        let polar = with(
+            oblique_stereographic(),
+            "latitude_of_projection_origin",
+            n(90.0),
+        );
+        assert!(matches!(polar, Ok(Crs::Stereographic { lat0, .. }) if lat0 == FRAC_PI_2));
+    }
+
+    /// DMI's composite origin as a CF `stereographic` grid mapping.
+    fn oblique_stereographic() -> Vec<(&'static str, CfAttr)> {
+        vec![
+            ("grid_mapping_name", t("stereographic")),
+            ("latitude_of_projection_origin", n(56.0)),
+            ("longitude_of_projection_origin", n(10.5666)),
+            ("scale_factor_at_projection_origin", n(1.0)),
+            ("semi_major_axis", n(6378137.0)),
+            ("inverse_flattening", n(298.257223563)),
+        ]
+    }
+
+    #[test]
+    fn unusable_stereographic_mappings_are_errors() {
+        let with = |name, value| with(oblique_stereographic(), name, value);
+        let without = |names: &[&str]| without(oblique_stereographic(), names);
+        // No scale factor is not a guess of 1.
+        assert!(without(&["scale_factor_at_projection_origin"]).is_err());
+        assert!(with("scale_factor_at_projection_origin", n(0.0)).is_err());
+        assert!(without(&["latitude_of_projection_origin"]).is_err());
+        assert!(without(&["longitude_of_projection_origin"]).is_err());
+        assert!(with("latitude_of_projection_origin", n(91.0)).is_err());
+        // The polar mapping's spelling of the meridian is not this one's.
+        let mut polar = oblique_stereographic();
+        polar.retain(|(key, _)| *key != "longitude_of_projection_origin");
+        assert!(self::with(polar, "straight_vertical_longitude_from_pole", n(10.0)).is_err());
         // No earth figure is not a WGS84 guess.
         assert!(without(&["semi_major_axis", "inverse_flattening"]).is_err());
+    }
+
+    /// The original EASE-Grid North (EPSG:3408), polar LAEA on the
+    /// 6 371 228 m sphere (#1192): `cs2cs +proj=longlat +R=6371228 +to
+    /// +proj=laea +lat_0=90 +lon_0=0 +x_0=0 +y_0=0 +R=6371228 +units=m`
+    /// (PROJ 9.8.1, forward `-f %.4f`, inverse `-I -f %.9f`), out to the
+    /// equator and past it.
+    #[test]
+    fn lambert_azimuthal_equal_area_on_a_sphere_matches_proj() {
+        let crs = crs_from_grid_mapping(attrs(&[
+            ("grid_mapping_name", t("lambert_azimuthal_equal_area")),
+            ("latitude_of_projection_origin", n(90.0)),
+            ("longitude_of_projection_origin", n(0.0)),
+            ("false_easting", n(0.0)),
+            ("false_northing", n(0.0)),
+            ("earth_radius", n(6371228.0)),
+        ]))
+        .unwrap();
+        assert!(matches!(
+            crs,
+            Crs::LambertAzimuthalEqualArea { figure, .. } if figure == Ellipsoid::sphere(6371228.0)
+        ));
+        assert_matches_proj(
+            &crs,
+            &[
+                (0.0, 90.0, 0.0, 0.0),
+                (45.0, 60.0, 2332031.3013, -2332031.3013),
+                (-120.0, 30.0, -5517645.3013, 3185614.0000),
+                (180.0, 0.0, 0.0, 9010277.0466),
+                (90.0, -30.0, 11035290.6026, 0.0),
+            ],
+        );
+        assert_inverse_matches_proj(
+            &crs,
+            &[
+                (-9000000.0, 9000000.0, -135.0, -84.526388065),
+                (3000000.0, -1000000.0, 71.565051177, 61.261666610),
+            ],
+        );
     }
 
     /// EPSG:3035 (LAEA Europe, on GRS80) as CF attributes.
@@ -1262,6 +1577,7 @@ mod tests {
                 lon0: 10.0_f64.to_radians(),
                 false_e: 4321000.0,
                 false_n: 3210000.0,
+                figure: Ellipsoid::GRS80,
             }
         );
         assert_matches_proj(
@@ -1337,9 +1653,13 @@ mod tests {
         assert!(without(&["longitude_of_projection_origin"]).is_err());
         assert!(with("latitude_of_projection_origin", n(95.0)).is_err());
         assert!(with("longitude_of_projection_origin", ns(&[10.0, 11.0])).is_err());
-        let error = without(&["inverse_flattening"]).unwrap_err();
-        assert!(error.contains("sphere"), "{error}");
+        // The semi-major axis alone is a sphere.
+        assert!(matches!(
+            without(&["inverse_flattening"]),
+            Ok(Crs::LambertAzimuthalEqualArea { figure, .. }) if figure == Ellipsoid::sphere(6378137.0)
+        ));
         assert!(without(&["semi_major_axis", "inverse_flattening"]).is_err());
+        assert!(with("semi_minor_axis", n(6400000.0)).is_err());
     }
 
     /// UTM zone 33N (EPSG:32633) as CF attributes.
@@ -1376,6 +1696,7 @@ mod tests {
                 k0: 0.9996,
                 false_e: 500000.0,
                 false_n: 0.0,
+                figure: Ellipsoid::WGS84,
             }
         );
         assert_matches_proj_within(
@@ -1418,9 +1739,29 @@ mod tests {
             ("inverse_flattening", n(298.257222101)),
         ]))
         .unwrap();
+        // EPSG:3067's parameters on its own GRS 1980; its output CRS is
+        // computed on WGS 84.
+        let Some(Crs::TransverseMercator {
+            lat0,
+            lon0,
+            k0,
+            false_e,
+            false_n,
+            figure: Ellipsoid::WGS84,
+        }) = crate::geo::projected_output_crs("EPSG:3067")
+        else {
+            panic!("EPSG:3067 is Transverse Mercator on WGS 84");
+        };
         assert_eq!(
-            Some(tm35fin.clone()),
-            crate::geo::projected_output_crs("EPSG:3067")
+            tm35fin,
+            Crs::TransverseMercator {
+                lat0,
+                lon0,
+                k0,
+                false_e,
+                false_n,
+                figure: Ellipsoid::GRS80,
+            }
         );
         assert_matches_proj_within(
             &tm35fin,
@@ -1457,6 +1798,97 @@ mod tests {
         );
     }
 
+    /// The British National Grid (EPSG:27700's parameters) on Airy 1830,
+    /// and a Transverse Mercator on a sphere, each on its own figure
+    /// (#1192): `cs2cs +proj=longlat +a=6377563.396 +rf=299.3249646 +to
+    /// +proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000
+    /// +y_0=-100000 +a=6377563.396 +rf=299.3249646 +units=m` and `cs2cs
+    /// +proj=longlat +R=6371229 +to +proj=tmerc +lat_0=0 +lon_0=9 +k=1
+    /// +x_0=200000 +y_0=0 +R=6371229 +units=m` (PROJ 9.8.1, forward `-f
+    /// %.4f`, inverse `-I -f %.9f`). On WGS84 the Airy points lie 28 m
+    /// (London) to 111 m (Lerwick) away.
+    #[test]
+    fn transverse_mercator_on_airy_1830_and_on_a_sphere_matches_proj() {
+        let airy = crs_from_grid_mapping(attrs(&[
+            ("grid_mapping_name", t("transverse_mercator")),
+            ("scale_factor_at_central_meridian", n(0.9996012717)),
+            ("longitude_of_central_meridian", n(-2.0)),
+            ("latitude_of_projection_origin", n(49.0)),
+            ("false_easting", n(400000.0)),
+            ("false_northing", n(-100000.0)),
+            ("semi_major_axis", n(6377563.396)),
+            ("inverse_flattening", n(299.3249646)),
+        ]))
+        .unwrap();
+        let Crs::TransverseMercator { figure, .. } = airy else {
+            panic!("{airy:?}");
+        };
+        assert_eq!(
+            figure,
+            Ellipsoid::from_inverse_flattening(6377563.396, 299.3249646)
+        );
+        assert_matches_proj_within(
+            &airy,
+            &[
+                (-2.0, 49.0, 400000.0, -100000.0),
+                (-0.1276, 51.5072, 529930.2723, 180412.1108),
+                (-3.19, 55.95, 325695.6991, 673630.8943),
+                (-1.15, 60.15, 447190.7589, 1140854.6027),
+                (-5.71, 50.07, 134559.3851, 25541.9743),
+                (1.75, 52.48, 654605.6239, 293550.7678),
+            ],
+            TM_SERIES_METRES,
+        );
+        assert_inverse_matches_proj(
+            &airy,
+            &[
+                (700000.0, 1200000.0, 3.478031205, 60.571537096),
+                (100000.0, 50000.0, -6.211003780, 50.272975458),
+            ],
+        );
+        let on_wgs84 = Crs::TransverseMercator {
+            lat0: 49.0_f64.to_radians(),
+            lon0: (-2.0_f64).to_radians(),
+            k0: 0.9996012717,
+            false_e: 400000.0,
+            false_n: -100000.0,
+            figure: Ellipsoid::WGS84,
+        };
+        let (x, y) = on_wgs84.forward(-0.1276, 51.5072);
+        assert!(
+            (x - 529930.2723).hypot(y - 180412.1108) > 25.0,
+            "({x}, {y})"
+        );
+
+        let sphere = crs_from_grid_mapping(attrs(&[
+            ("grid_mapping_name", t("transverse_mercator")),
+            ("scale_factor_at_central_meridian", n(1.0)),
+            ("longitude_of_central_meridian", n(9.0)),
+            ("latitude_of_projection_origin", n(0.0)),
+            ("false_easting", n(200000.0)),
+            ("earth_radius", n(6371229.0)),
+        ]))
+        .unwrap();
+        assert_matches_proj_within(
+            &sphere,
+            &[
+                (9.0, 0.0, 200000.0, 0.0),
+                (12.0, 50.0, 414414.8141, 5564248.0557),
+                (3.0, 62.0, -112907.5591, 6908818.3602),
+                (9.0, 80.0, 200000.0, 8895913.8759),
+                (40.0, 30.0, 3256538.9363, 3776590.9799),
+            ],
+            TM_SERIES_METRES,
+        );
+        assert_inverse_matches_proj(
+            &sphere,
+            &[
+                (300000.0, 7000000.0, 10.976782137, 62.936433111),
+                (4000000.0, 2000000.0, 42.620708205, 15.127684160),
+            ],
+        );
+    }
+
     #[test]
     fn unusable_transverse_mercator_mappings_are_errors() {
         let with = |name, value| with(utm_33n(), name, value);
@@ -1471,12 +1903,9 @@ mod tests {
         let mut azimuthal = utm_33n();
         azimuthal.retain(|(key, _)| *key != "longitude_of_central_meridian");
         assert!(self::with(azimuthal, "longitude_of_projection_origin", n(15.0)).is_err());
-        // Airy 1830 (the British National Grid's) is another ellipsoid.
-        let airy = replaced(utm_33n(), "semi_major_axis", n(6377563.396));
-        let error = self::with(airy, "inverse_flattening", n(299.3249646)).unwrap_err();
-        assert!(error.contains("only WGS84"), "{error}");
-        assert!(with("earth_radius", n(6371000.0)).is_err());
+        // No earth figure is not a WGS84 guess.
         assert!(without(&["semi_major_axis", "inverse_flattening"]).is_err());
+        assert!(with("earth_radius", n(-6371000.0)).is_err());
     }
 
     #[test]
@@ -1578,14 +2007,131 @@ mod tests {
     fn unusable_axes_are_errors() {
         let x = axis(-1000.0, 2500.0, 4, "m");
         let y = axis(3000.0, -2500.0, 3, "m");
-        // Each axis's own units count: kilometres are not metres.
-        let error = grid(meps_crs(), &x, &axis(3000.0, -2500.0, 3, "km")).unwrap_err();
+        // Each axis's own units count: centimetres are not a projected unit.
+        let error = grid(meps_crs(), &x, &axis(3000.0, -2500.0, 3, "cm")).unwrap_err();
         assert!(error.contains("y coordinate"), "{error}");
         assert!(grid(meps_crs(), &axis(-1000.0, 2500.0, 4, ""), &y).is_err());
         assert!(grid(Crs::Wgs84, &x, &y).is_err(), "metres are not degrees");
         // x must run west to east.
         assert!(grid(meps_crs(), &axis(6500.0, -2500.0, 4, "m"), &y).is_err());
         assert!(grid(meps_crs(), &x, &axis(0.0, 2500.0, 0, "m")).is_err());
+    }
+
+    /// Projected x/y in kilometres are metres times 1000 (#1194): the grid
+    /// is the one its coordinates in metres give, and a PROJ point lands in
+    /// the same cell.
+    #[test]
+    fn kilometre_coordinates_are_scaled_to_metres() {
+        for units in ["km", "kilometre", "kilometers"] {
+            let km = grid(
+                meps_crs(),
+                &axis(-1060.084, 2.5, 949, units),
+                &axis(-1332.5179, 2.5, 1069, units),
+            )
+            .unwrap();
+            let m = grid(
+                meps_crs(),
+                &axis(-1060084.0, 2500.0, 949, "m"),
+                &axis(-1332517.9, 2500.0, 1069, "metres"),
+            )
+            .unwrap();
+            let (gk, gm) = (&km.transform, &m.transform);
+            assert!(km.flipped && m.flipped);
+            for (a, b) in [
+                (gk.origin_x, gm.origin_x),
+                (gk.origin_y, gm.origin_y),
+                (gk.pixel_width, gm.pixel_width),
+                (gk.pixel_height, gm.pixel_height),
+            ] {
+                assert!((a - b).abs() < 1e-6, "{units}: {a} vs {b}");
+            }
+            assert_eq!(gk.world_to_pixel(0.279, 50.32), Some((0, 1068)), "{units}");
+        }
+        let polar = crs_from_grid_mapping(attrs(&sea_ice_polar_stereographic_north())).unwrap();
+        assert_eq!(coordinate_scale("km", &polar), Some(1000.0));
+        // A latitude/longitude or rotated grid is in degrees, never km.
+        assert_eq!(coordinate_scale("km", &Crs::Wgs84), None);
+    }
+
+    /// On axes in kilometres a CF false origin is in kilometres too, as GDAL
+    /// and NetCDF-Java read it, and is scaled to metres with them (#1194):
+    /// UTM zone 33N written in km, `false_easting = 500`, is the zone in
+    /// metres. Pinned to `cs2cs +proj=longlat +datum=WGS84 +to +proj=tmerc
+    /// +lat_0=0 +lon_0=15 +k=0.9996 +x_0=500000 +y_0=0 +datum=WGS84
+    /// +units=m` (PROJ 9.8.1, forward `-f %.4f`, inverse `-I -f %.9f`), and
+    /// the oblique stereographic with a false origin of 600 km, -200 km on a
+    /// sphere to the `cs2cs` of `oblique_stereographic_matches_proj`.
+    #[test]
+    fn a_false_origin_in_kilometres_is_scaled_with_the_axes() {
+        let utm_km =
+            crs_from_grid_mapping(attrs(&replaced(utm_33n(), "false_easting", n(500.0)))).unwrap();
+        let km = grid(
+            utm_km,
+            &axis(250.0, 50.0, 11, "km"),
+            &axis(7000.0, -50.0, 13, "km"),
+        )
+        .unwrap();
+        let metres = grid(
+            crs_from_grid_mapping(attrs(&utm_33n())).unwrap(),
+            &axis(250000.0, 50000.0, 11, "m"),
+            &axis(7000000.0, -50000.0, 13, "m"),
+        )
+        .unwrap();
+        assert_eq!(km.transform.crs, metres.transform.crs);
+        assert!(matches!(
+            km.transform.crs,
+            Crs::TransverseMercator { false_e, .. } if false_e == 500000.0
+        ));
+        assert_matches_proj_within(
+            &km.transform.crs,
+            &[
+                (15.0, 60.0, 500000.0, 6651411.1904),
+                (18.0, 60.0, 667294.8211, 6655205.4836),
+                (12.0, 58.5, 325187.2397, 6488282.4683),
+            ],
+            TM_SERIES_METRES,
+        );
+        assert_inverse_matches_proj(
+            &km.transform.crs,
+            &[(700000.0, 6450000.0, 18.398284982, 58.145953698)],
+        );
+        // PROJ's (12, 58.5), at 325.187 km, lies in the cell centred on
+        // 350 km, 6500 km: column 2, row 10.
+        assert_eq!(km.transform.world_to_pixel(12.0, 58.5), Some((2, 10)));
+        assert_eq!(metres.transform.world_to_pixel(12.0, 58.5), Some((2, 10)));
+
+        let mut sphere = vec![
+            ("grid_mapping_name", t("stereographic")),
+            ("latitude_of_projection_origin", n(60.0)),
+            ("longitude_of_projection_origin", n(25.0)),
+            ("scale_factor_at_projection_origin", n(0.9999)),
+            ("false_easting", n(600.0)),
+            ("false_northing", n(-200.0)),
+            ("earth_radius", n(6371000.0)),
+        ];
+        let km = grid(
+            crs_from_grid_mapping(attrs(&sphere)).unwrap(),
+            &axis(200.0, 100.0, 9, "km"),
+            &axis(200.0, -100.0, 9, "km"),
+        )
+        .unwrap();
+        assert_matches_proj(
+            &km.transform.crs,
+            &[
+                (25.0, 60.0, 600000.0, -200000.0),
+                (24.94, 60.17, 596681.6351, -181097.2329),
+            ],
+        );
+        // Each axis's own unit scales its own offset.
+        sphere.retain(|(key, _)| *key != "false_northing");
+        sphere.push(("false_northing", n(-200000.0)));
+        let mixed = grid(
+            crs_from_grid_mapping(attrs(&sphere)).unwrap(),
+            &axis(200.0, 100.0, 9, "km"),
+            &axis(200000.0, -100000.0, 9, "m"),
+        )
+        .unwrap();
+        assert_eq!(mixed.transform.crs, km.transform.crs);
     }
 
     #[test]

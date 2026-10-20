@@ -365,6 +365,7 @@ mod tests {
             k0: 0.9996,
             false_e: 500_000.0,
             false_n: 0.0,
+            figure: crate::geo::Ellipsoid::WGS84,
         }
     }
 
@@ -439,6 +440,7 @@ mod tests {
             lon0: 10.0_f64.to_radians(),
             false_e: 4_321_000.0,
             false_n: 3_210_000.0,
+            figure: crate::geo::Ellipsoid::WGS84,
         };
         let grid = NativeGrid::new(
             laea,

@@ -1872,6 +1872,7 @@ async fn native_grids_are_described_without_changing_storage_crs() {
             k0: 0.9996,
             false_e: 500_000.0,
             false_n: 0.0,
+            figure: ds_core::geo::Ellipsoid::WGS84,
         },
         Some(3067),
         [480, 360],

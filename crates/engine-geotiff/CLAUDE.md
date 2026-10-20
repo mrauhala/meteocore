@@ -12,8 +12,12 @@ apply here.
 - **CRS:** WGS84, TM, LAEA, LCC, Stereographic (math in
   `ds-core/src/geo.rs`). Earth model: an LCC whose geodetic GeoKeys
   describe a sphere (semi-minor = semi-major, inverse flattening 0, or an
-  EPSG sphere ellipsoid) is projected on that sphere (`radius`, #810);
-  everything else on WGS84. TM and LAEA have no sphere form yet. LCC 2SP
+  EPSG sphere ellipsoid) is projected on that sphere (LCC `radius`, #810;
+  TM/LAEA `figure`, #1192); everything else on WGS84, EPSG:3067/3035 by
+  code too. `crs_label` claims those codes only on a WGS84-like figure
+  (`Ellipsoid::is_wgs84_like`). Extent and footprint guard:
+  `bbox_with_poles` / `footprint_envelope`, never `bbox()`; a full-turn
+  footprint bounds latitude only (`every_longitude_near`). LCC 2SP
   takes its origin from the false-origin GeoKeys (3084-3087), the
   natural-origin ones (3080-3083) only as a fallback.
 - **Reprojection:** `bbox_to_pixels()` samples 20 points per edge to capture

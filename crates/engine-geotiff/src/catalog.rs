@@ -206,29 +206,19 @@ impl Catalog {
     }
 }
 
-/// Compute the union bounding box across all file entries.
-/// Returns None if there are no entries.
+/// Compute the union bounding box across all file entries: each loaded
+/// file's grid extent, seam- and pole-aware (`GeoTransform::bbox_with_poles`,
+/// #1194), or a STAC stub's bbox, united across the antimeridian
+/// (`ds_core::geo::crs84_union`). A grid crossing it is `west > east`, and
+/// one holding a pole reaches it at every longitude. Returns None if there
+/// are no entries, or none has an extent.
 fn compute_spatial_union<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Option<[f64; 4]> {
-    let mut result: Option<[f64; 4]> = None;
-    for entry in entries {
-        let bbox = match &entry.state {
-            FileState::Loaded { metadata, .. } => metadata.geo_transform.bbox(),
-            FileState::Stub { stub } => match stub.bbox {
-                Some(b) => b,
-                None => continue,
-            },
-        };
-        result = Some(match result {
-            None => bbox,
-            Some([w, s, e, n]) => [
-                w.min(bbox[0]),
-                s.min(bbox[1]),
-                e.max(bbox[2]),
-                n.max(bbox[3]),
-            ],
-        });
-    }
-    result
+    ds_core::geo::crs84_union(entries.filter_map(|entry| match &entry.state {
+        FileState::Loaded { metadata, .. } => {
+            ds_core::geo::crs84_extent(metadata.geo_transform.bbox_with_poles())
+        }
+        FileState::Stub { stub } => stub.bbox,
+    }))
 }
 
 /// Scan a directory for GeoTIFF files matching a filename pattern.

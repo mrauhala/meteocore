@@ -22,8 +22,18 @@ use super::*;
 /// and 120 × 90: the production composite's extent at a tenth of its
 /// resolution.
 fn engine() -> GeoTiffEngine {
-    let config = ds_core::config::GeoTiffConfig {
-        filename_template: Some("radar_tm35_%Y%m%dT%H%MZ.tif".to_string()),
+    GeoTiffEngine::new(
+        "radar-tm35fin",
+        Some("../../testdata/radar-tm35fin"),
+        &config("radar_tm35_%Y%m%dT%H%MZ.tif"),
+    )
+    .expect("engine over the committed TM35FIN fixture")
+}
+
+/// A local engine's config for files named by `template`.
+fn config(template: &str) -> ds_core::config::GeoTiffConfig {
+    ds_core::config::GeoTiffConfig {
+        filename_template: Some(template.to_string()),
         filename_pattern: None,
         timestamp_format: None,
         parameter: "reflectivity".to_string(),
@@ -44,13 +54,7 @@ fn engine() -> GeoTiffEngine {
         stac_url: None,
         stac_asset_key: "data".to_string(),
         stac_asset_allowlist: None,
-    };
-    GeoTiffEngine::new(
-        "radar-tm35fin",
-        Some("../../testdata/radar-tm35fin"),
-        &config,
-    )
-    .expect("engine over the committed TM35FIN fixture")
+    }
 }
 
 /// The WGS84 box of a WMS Web Mercator meta-tile: `level` of the
@@ -139,7 +143,7 @@ fn whole_tile_render(
                 (c1 - c0) as usize,
                 (c0, r0, c1, r1),
                 window.nodata,
-                crs.footprint_pixel_window(bbox, gt.bbox(), size, size),
+                crs.footprint_pixel_window(bbox, gt.footprint_envelope().unwrap(), size, size),
                 &mut data,
             );
             RasterValues::U8 {
@@ -297,7 +301,12 @@ fn a_partly_covered_tile_is_refined_for_its_footprint() {
         // Within the footprint: outside it the forward folds, and the
         // guard leaves those pixels empty whatever they project to.
         let (x_lo, x_hi, y_lo, y_hi) = merc
-            .footprint_window_in_image(bbox, metadata.geo_transform.bbox(), 256, 256)
+            .footprint_window_in_image(
+                bbox,
+                metadata.geo_transform.footprint_envelope().unwrap(),
+                256,
+                256,
+            )
             .expect("the footprint meets the tile");
         let mut drawn = 0;
         for (i, value) in values(&tile).into_iter().enumerate() {
@@ -358,5 +367,42 @@ fn tiles_at_the_antimeridian_draw_as_before() {
         assert!(values(&tile) == values(&before), "{name} moved pixels");
         assert!(tile.is_empty(), "{name} draws data");
         assert_eq!(projections, 0, "{name} projects");
+    }
+}
+
+/// The committed 8 × 8 polar azimuthal equal-area grid around the North
+/// Pole, ±1000 km on the 6 371 228 m sphere, every pixel 7 (see the
+/// reader's `sphere_laea_geotiff_uses_its_sphere_and_reaches_its_pole`).
+fn polar_engine() -> GeoTiffEngine {
+    GeoTiffEngine::new(
+        "laea-polar",
+        Some("tests/fixtures/laea-polar"),
+        &config("laea_polar_%Y%m%dT%H%MZ.tif"),
+    )
+    .expect("engine over the committed polar fixture")
+}
+
+/// A grid holding the pole reaches it, at every longitude: its extent, and
+/// the footprint its renders are guarded by (#1194). The edges circle the
+/// pole and stop short of it, at 81°N, so before, the guard emptied every
+/// map of the cap north of them and the extent ended there.
+#[test]
+fn a_grid_holding_the_pole_is_drawn_up_to_it() {
+    let engine = polar_engine();
+    let [w, s, e, n] = engine.get_spatial_extent().expect("an extent");
+    assert_eq!((w, e, n), (-180.0, 180.0, 90.0));
+    assert!((s - 77.255_872_426).abs() < 1e-8, "{s}");
+    assert_eq!(engine.raster_info().spatial_extent, Some([w, s, e, n]));
+    // The cap north of 85°, and the same cap across the seam box's
+    // meridians, 170°E to 170°W: every pixel lies on the grid.
+    for bbox in [[-180.0, 85.0, 180.0, 90.0], [170.0, 85.0, 190.0, 90.0]] {
+        let (tile, _) = render(&engine, bbox, 32, &OutputCrs::Wgs84);
+        let drawn = values(&tile);
+        assert!(
+            drawn.iter().all(|v| *v == Some(7.0)),
+            "{bbox:?}: {} of {} pixels drawn",
+            drawn.iter().filter(|v| v.is_some()).count(),
+            drawn.len()
+        );
     }
 }

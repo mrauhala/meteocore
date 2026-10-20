@@ -12,7 +12,7 @@ use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
 
 use crate::decode_budget::{Permit, BUDGET};
-use ds_core::geo::{Crs, GeoTransform};
+use ds_core::geo::{Crs, Ellipsoid, GeoTransform};
 
 /// Bridge async to sync for standalone functions.
 /// Uses `block_in_place` when inside a tokio runtime, or creates a temporary runtime otherwise.
@@ -3078,6 +3078,9 @@ fn parse_projected(
     // If projection method is missing/user-defined, try to identify by EPSG code
     if proj_method == 0 && epsg != 0 && epsg != 32767 {
         // Use hardcoded parameters for well-known EPSG codes
+        // EPSG's own parameters, computed on WGS84 as the output CRSs of
+        // the same codes are (`ds_core::geo::projected_output_crs`): their
+        // GRS 1980 moves a point by 0.1 mm at most.
         return match epsg {
             3067 => Ok(Crs::TransverseMercator {
                 lat0: 0.0,
@@ -3085,12 +3088,14 @@ fn parse_projected(
                 k0: 0.9996,
                 false_e: 500_000.0,
                 false_n: 0.0,
+                figure: Ellipsoid::WGS84,
             }),
             3035 => Ok(Crs::LambertAzimuthalEqualArea {
                 lat0: 52.0_f64.to_radians(),
                 lon0: 10.0_f64.to_radians(),
                 false_e: 4_321_000.0,
                 false_n: 3_210_000.0,
+                figure: Ellipsoid::WGS84,
             }),
             _ => Err(DataServerError::Engine(format!(
                 "EPSG:{} is not supported and GeoKeys lack projection parameters. \
@@ -3121,6 +3126,7 @@ fn parse_projected(
                 k0,
                 false_e,
                 false_n,
+                figure: figure(&keys),
             })
         }
         // CT_LambertConfConic_2SP = 8
@@ -3181,6 +3187,7 @@ fn parse_projected(
                 lon0,
                 false_e,
                 false_n,
+                figure: figure(&keys),
             })
         }
         _ => Err(DataServerError::Engine(format!(
@@ -3191,6 +3198,13 @@ fn parse_projected(
             proj_method
         ))),
     }
+}
+
+/// The earth figure a Transverse Mercator or azimuthal equal-area grid is
+/// computed on (#1192): the sphere the geodetic GeoKeys describe
+/// ([`sphere_radius`]), as a conic's is (#810), else WGS84 as before.
+fn figure(keys: &std::collections::HashMap<u16, GeoKeyValue>) -> Ellipsoid {
+    sphere_radius(keys).map_or(Ellipsoid::WGS84, Ellipsoid::sphere)
 }
 
 /// The radius of the earth model the geodetic GeoKeys describe, when it is
@@ -4687,6 +4701,7 @@ mod tests {
                 k0: 0.9996,
                 false_e: 500_000.0,
                 false_n: 0.0,
+                figure: Ellipsoid::WGS84,
             },
         };
         m
@@ -5200,5 +5215,37 @@ mod tests {
         let (lon, lat) = gt.pixel_to_world(0, 0);
         assert!((lon - 13.463229343).abs() < 1e-6, "lon {lon}");
         assert!((lat - 63.966371701).abs() < 1e-6, "lat {lat}");
+    }
+
+    /// A polar azimuthal equal-area GeoTIFF on the original EASE-Grid's
+    /// 6 371 228 m sphere (GDAL writes semi-minor = semi-major) is projected
+    /// on that sphere, as a conic's is (#810, #1192), and its extent
+    /// reaches the North Pole it holds at every longitude (#1194). Made with
+    /// `gdal_create -outsize 8 8 -ot Byte -burn 7 -a_nodata 255 -a_srs
+    /// '+proj=laea +lat_0=90 +lon_0=0 +R=6371228' -a_ullr -1000000 1000000
+    /// 1000000 -1000000`. Pixel (0, 0)'s centre (-875 000, 875 000) and a
+    /// corner pinned against `cs2cs -I +proj=longlat +R=6371228 +to
+    /// +proj=laea +lat_0=90 +lon_0=0 +R=6371228` (PROJ 9.8.1); WGS84 would
+    /// put the pixel at 78.902 459°N, 5 km away.
+    #[test]
+    fn sphere_laea_geotiff_uses_its_sphere_and_reaches_its_pole() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/laea-polar/laea_polar_20261020T0000Z.tif");
+        let meta = TiffMetadata::from_source(&DataSource::from_path(&path)).unwrap();
+        let gt = &meta.geo_transform;
+        match gt.crs {
+            Crs::LambertAzimuthalEqualArea { lat0, figure, .. } => {
+                assert_eq!(figure, Ellipsoid::sphere(6_371_228.0));
+                assert_eq!(lat0, 90.0_f64.to_radians());
+            }
+            ref other => panic!("expected LAEA, got {other:?}"),
+        }
+        let (lon, lat) = gt.pixel_to_world(0, 0);
+        assert!((lon - -135.0).abs() < 1e-9, "lon {lon}");
+        assert!((lat - 78.854295635).abs() < 1e-8, "lat {lat}");
+        let [w, s, e, n] = gt.bbox_with_poles();
+        assert_eq!((w, e, n), (-180.0, 180.0, 90.0));
+        assert!((s - 77.255872426).abs() < 1e-8, "south {s}");
+        assert!(gt.bbox()[3] < 81.0, "the edges stop short of the pole");
     }
 }

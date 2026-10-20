@@ -392,8 +392,8 @@ pub struct OdimComposite {
     /// quadrilateral that bows in lon/lat, so its true lon/lat
     /// extent is wider than the LL→UR diagonal. OPERA's LAEA grid,
     /// for instance, reaches ~29° further west at its `UL` corner
-    /// than at `LL`. Edge sampling captures that (the same approach
-    /// `ds_core::geo::GeoTransform::bbox` uses for GeoTIFF).
+    /// than at `LL`. Edge sampling captures that: the shared grid extent
+    /// every gridded engine takes, `ds_core::geo::grid_extent`.
     ///
     /// A grid crossing the antimeridian has `west > east` (#180).
     pub wgs84_bbox: [f64; 4],
@@ -430,114 +430,30 @@ impl OdimComposite {
     }
 }
 
-/// Compute the WGS84 envelope `[west, south, east, north]` of a
-/// native-CRS `bbox` `[west, south, east, north]` by sampling
-/// `EDGE_SAMPLES` points along every edge and inverse-projecting
-/// each. Points that fail to reproject are skipped.
+/// The WGS84 envelope `[west, south, east, north]` of a native-CRS `bbox`
+/// `[west, south, east, north]`: the shared grid extent,
+/// [`ds_core::geo::grid_extent`], which every gridded engine takes
+/// (#1194). It samples every edge and inverse-projects each point,
+/// capturing the bow of a projected grid in lon/lat. Longitude is
+/// antimeridian-aware (#180): a grid crossing ±180° reports its narrow
+/// extent as `west > east` (the `Bbox` convention), not a near-global
+/// `min`/`max` of mixed-sign longitudes, and never a longitude past ±180°.
+/// A grid containing a pole spans every longitude and reaches that pole's
+/// latitude.
 ///
-/// Sampling the edges (not just the four corners) is what captures
-/// the bow of a projected grid in lon/lat — the same technique
-/// `ds_core::geo::GeoTransform::bbox` uses for GeoTIFF, so the two
-/// raster engines report consistent extents for the same data.
-///
-/// Longitude is antimeridian-aware (#180): a grid crossing ±180°
-/// reports its narrow extent as `west > east` (the `Bbox`
-/// convention), not a near-global `min`/`max` of mixed-sign
-/// longitudes, and never a longitude past ±180°. A grid containing
-/// a pole spans every longitude and reaches that pole's latitude.
-/// For every other grid the result is the plain `min`/`max`, as
-/// before.
+/// If every reprojection failed (a pathological CRS), a conservative
+/// global extent. Returning the native `bbox` here would be a
+/// unit-confusion bug: for a projected CRS it is in metres, and the caller
+/// expects WGS84 degrees. `[-180, -90, 180, 90]` is over-broad but at
+/// least dimensionally valid. (Unreachable for any real grid —
+/// `Crs::Wgs84::inverse` is the identity and projected inverses succeed
+/// near the grid.)
 fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
-    /// Samples per edge. 20 matches `GeoTransform::bbox`; enough to
-    /// pin the bow of a continental LAEA grid to well under a pixel.
-    const EDGE_SAMPLES: usize = 20;
-
-    let [w, s, e, n] = bbox;
-    let x_at = |i: usize| w + (i as f64 / EDGE_SAMPLES as f64) * (e - w);
-    let y_at = |i: usize| s + (i as f64 / EDGE_SAMPLES as f64) * (n - s);
-    // The perimeter as one closed ring (bottom W→E, right S→N, top
-    // E→W, left N→S), so consecutive samples are neighbours on a
-    // continuous curve.
-    let ring = (0..=EDGE_SAMPLES)
-        .map(|i| (x_at(i), s))
-        .chain((0..=EDGE_SAMPLES).map(|i| (e, y_at(i))))
-        .chain((0..=EDGE_SAMPLES).rev().map(|i| (x_at(i), n)))
-        .chain((0..=EDGE_SAMPLES).rev().map(|i| (w, y_at(i))));
-
-    let mut min_lat = f64::MAX;
-    let mut max_lat = f64::MIN;
-    // Longitude unrolled along the ring: each sample moves by whole
-    // turns to within 180° of its predecessor, so the curve stays
-    // continuous across ±180° and the extent is the interval
-    // `[min, max]` of the unrolled values. Each extreme keeps the
-    // sample's own longitude, so a grid that never crosses the seam
-    // (every shift zero) yields exactly the plain `min`/`max`.
-    let mut prev: Option<f64> = None;
-    let mut west = (f64::MAX, 0.0);
-    let mut east = (f64::MIN, 0.0);
-    for (x, y) in ring {
-        let Some((lon, lat)) = crs.inverse(x, y) else {
-            continue;
-        };
-        min_lat = min_lat.min(lat);
-        max_lat = max_lat.max(lat);
-        let unrolled = match prev {
-            Some(p) => lon + 360.0 * ((p - lon) / 360.0).round(),
-            None => lon,
-        };
-        prev = Some(unrolled);
-        if unrolled < west.0 {
-            west = (unrolled, lon);
-        }
-        if unrolled > east.0 {
-            east = (unrolled, lon);
-        }
-    }
-
-    // If every reprojection failed (a pathological CRS), fall back
-    // to a conservative global extent. Returning the native `bbox`
-    // here would be a unit-confusion bug: for a projected CRS it is
-    // in metres, and the caller expects WGS84 degrees. `[-180, -90,
-    // 180, 90]` is over-broad but at least dimensionally valid.
-    // (Unreachable for any real grid — `Crs::Wgs84::inverse` is the
-    // identity and projected inverses succeed near the grid.)
-    if west.0 > east.0 {
+    let [w, s, e, n] = ds_core::geo::grid_extent(crs, bbox);
+    if s > n {
         return [-180.0, -90.0, 180.0, 90.0];
     }
-
-    // A pole inside a projected grid is its latitude extreme and
-    // spans every longitude, but no edge sample reaches it. (A
-    // lon/lat grid's pole is a whole edge, already sampled.)
-    let contains_pole = |lat: f64| {
-        if matches!(crs, Crs::Wgs84) {
-            return false;
-        }
-        let (x, y) = crs.forward(0.0, lat);
-        (w..=e).contains(&x) && (s..=n).contains(&y)
-    };
-    let (north_pole, south_pole) = (contains_pole(90.0), contains_pole(-90.0));
-    if north_pole {
-        max_lat = 90.0;
-    }
-    if south_pole {
-        min_lat = -90.0;
-    }
-    if north_pole || south_pole || east.0 - west.0 >= 360.0 {
-        return [-180.0, min_lat, 180.0, max_lat];
-    }
-    // Back into the CRS84 domain, leaving in-range longitudes
-    // untouched: west in [-180, 180), east in (-180, 180].
-    let west = if (-180.0..180.0).contains(&west.1) {
-        west.1
-    } else {
-        (west.1 + 180.0).rem_euclid(360.0) - 180.0
-    };
-    let east = if east.1 > -180.0 && east.1 <= 180.0 {
-        east.1
-    } else {
-        180.0 - (180.0 - east.1).rem_euclid(360.0)
-    };
-    [west, min_lat, east, max_lat]
+    [w, s, e, n]
 }
 
 /// Parse an ODIM_H5 composite from a byte slice. The whole file must
@@ -850,6 +766,7 @@ mod tests {
             lon0: 10.0_f64.to_radians(),
             false_e: 1_950_000.0,
             false_n: -2_100_000.0,
+            figure: ds_core::geo::Ellipsoid::WGS84,
         };
         let native_bbox = [0.0, -4_400_000.0, 3_800_000.0, 0.0];
         let [w, s, e, n] = wgs84_envelope(&crs, native_bbox);

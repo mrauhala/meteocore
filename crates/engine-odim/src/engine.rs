@@ -1248,6 +1248,7 @@ mod tests {
             k0: 1.0,
             false_e: 0.0,
             false_n: 0.0,
+            figure: ds_core::geo::Ellipsoid::WGS84,
         };
         // Generic labels must match engine-geotiff's vocabulary (no EPSG claim
         // for spherical composites) so native_crs_uri maps both consistently.

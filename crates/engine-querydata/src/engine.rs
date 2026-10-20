@@ -405,8 +405,10 @@ impl EdrEngine for QueryDataEngine {
 
         // Native resolution in degrees from the grid's corner coordinates —
         // exact for lat-lon grids, a fair mean cell size for projected ones.
-        let res_lon = (extent[2] - extent[0]) / data.grid.nx.max(1) as f64;
-        let res_lat = (extent[3] - extent[1]) / data.grid.ny.max(1) as f64;
+        // An extent across the antimeridian is `west > east` (#1194).
+        let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(extent);
+        let res_lon = lon_span / data.grid.nx.max(1) as f64;
+        let res_lat = lat_span / data.grid.ny.max(1) as f64;
         let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
         let (nx, ny) = axes.dims();
         check_area_budget(time_indices.len(), ny, nx, selected.len())?;

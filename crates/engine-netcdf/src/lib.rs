@@ -1011,6 +1011,11 @@ impl NetcdfEngine {
                     ds_core::geo::Crs::Wgs84 => "latitude/longitude",
                     ds_core::geo::Crs::LambertConformalConic { .. } => "Lambert conformal conic",
                     ds_core::geo::Crs::Geostationary { .. } => "geostationary",
+                    ds_core::geo::Crs::Stereographic { lat0, .. }
+                        if lat0.abs() < std::f64::consts::FRAC_PI_2 - 1e-10 =>
+                    {
+                        "stereographic"
+                    }
                     ds_core::geo::Crs::Stereographic { .. } => "polar stereographic",
                     ds_core::geo::Crs::LambertAzimuthalEqualArea { .. } => {
                         "Lambert azimuthal equal-area"
