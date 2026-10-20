@@ -676,6 +676,117 @@ fn queries_read_on_the_query_runtime_for_edr_and_get_feature_info() {
     assert!(gets(&server.take()).is_empty(), "the chunk is cached");
 }
 
+/// The middle of the fixture's extent: `[w, s, e, n]` shrunk by 30% on
+/// each side.
+fn inner_bbox(engine: &NetcdfEngine) -> [f64; 4] {
+    let [w, s, e, n] = engine.raster_info().spatial_extent.unwrap();
+    let (dx, dy) = (e - w, n - s);
+    [w + dx * 0.3, s + dy * 0.3, e - dx * 0.3, n - dy * 0.3]
+}
+
+/// Every value of `response`, coverage by coverage, for `parameter`.
+fn values_of(response: ds_core::model::CoverageResponse, parameter: &str) -> Samples {
+    let results = match response {
+        ds_core::model::CoverageResponse::Single(result) => vec![result],
+        ds_core::model::CoverageResponse::Collection(results) => results,
+    };
+    results
+        .into_iter()
+        .flat_map(|result| result.ranges[parameter].values.clone())
+        .collect()
+}
+
+/// One query's values, coverage by coverage.
+type Samples = Vec<Option<f64>>;
+
+/// A trajectory and a cube under a deadline `ms` from now, over the
+/// middle of the extent and both leads.
+fn trajectory_and_cube_within(
+    engine: &NetcdfEngine,
+    ms: u64,
+) -> Result<(Samples, Samples), DataServerError> {
+    use ds_core::edr_engine::EdrEngine;
+    let _deadline = deadline::enter(Some(Instant::now() + Duration::from_millis(ms)));
+    let [w, s, e, n] = inner_bbox(engine);
+    let trajectory = engine.query_trajectory(
+        &format!("LINESTRING({w} {s}, {e} {n})"),
+        None,
+        Some(&["air_temperature_2m".to_string()]),
+        None,
+        None,
+    )?;
+    let cube = engine.query_cube(
+        &ds_core::feature::Bbox::new(w, s, e, n).unwrap(),
+        Some((at(LEAD_0), at(LEAD_1))),
+        Some(&["wind_speed_of_gust".to_string()]),
+        None,
+        ds_core::cube::CubeResolution::default(),
+        None,
+    )?;
+    Ok((
+        values_of(trajectory, "air_temperature_2m"),
+        values_of(cube, "wind_speed_of_gust"),
+    ))
+}
+
+/// Trajectories and cubes (#1169) read remote fields as position does: on
+/// the shared query runtime (Critical Rule 7), one chunk GET per field for
+/// every sample, the values the local files give, and no decoded field
+/// kept. A cold query slower than its deadline is the 504 a series gets,
+/// and its reads go on into the chunk cache, so a retry makes progress
+/// without another GET.
+#[test]
+fn trajectories_and_cubes_read_each_remote_chunk_once() {
+    let server = server();
+    let engine = Arc::new(engine(&server, ""));
+    server.take();
+    let worker = engine.clone();
+    let (trajectory, cube) = ds_executor::query_runtime()
+        .block_on(
+            ds_executor::query_runtime()
+                .spawn(async move { trajectory_and_cube_within(&worker, 30_000) }),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(trajectory.len() > 4 && trajectory.iter().all(Option::is_some));
+    assert!(cube.len() > 4 && cube.iter().all(Option::is_some));
+    assert_eq!(
+        gets(&server.take()).len(),
+        4,
+        "two leads of each variable, one chunk each"
+    );
+    assert_eq!(
+        (trajectory, cube),
+        trajectory_and_cube_within(&local(), 30_000).unwrap()
+    );
+    let decodes = engine.field_decodes();
+    render(&engine, LEAD_0, "air_temperature_2m").unwrap();
+    assert_eq!(engine.field_decodes(), decodes + 1, "nothing kept decoded");
+    assert!(gets(&server.take()).is_empty(), "the chunk is cached");
+
+    let server = self::server();
+    let engine = self::engine(&server, "");
+    server.take();
+    server.slow_over(TUNING.bypass_over, Duration::from_millis(800));
+    let started = Instant::now();
+    let late = trajectory_and_cube_within(&engine, 100);
+    assert!(
+        matches!(late, Err(DataServerError::DeadlineExceeded)),
+        "{late:?}"
+    );
+    let done = loop {
+        match trajectory_and_cube_within(&engine, 300) {
+            Ok(done) => break done,
+            Err(DataServerError::DeadlineExceeded) => {
+                assert!(started.elapsed() < Duration::from_secs(10), "never cached");
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert!(done.0.iter().chain(&done.1).all(Option::is_some));
+    assert_eq!(gets(&server.take()).len(), 4, "each chunk fetched once");
+}
+
 /// A cold series slower than its query's deadline fails with the deadline,
 /// and the reads it started go on into the chunk cache: a retry makes
 /// progress, and the series costs one GET per field however often it is

@@ -148,7 +148,7 @@ contributes nothing, and a list where no id has data is a 204.
 
 ### Trajectory
 
-- **Along a path** (GRIB, QueryData, Zarr). `ds_core::trajectory`
+- **Along a path** (GRIB, QueryData, Zarr, NetCDF). `ds_core::trajectory`
   densifies the path along great circles to about one sample per source
   cell (at most 2000 samples), and each engine samples it like its position
   query. `M` is Unix epoch seconds, interpolated along the path; each sample
@@ -168,16 +168,21 @@ contributes nothing, and a list where no id has data is a 204.
 
 ### Cube
 
-GRIB pressure and model-level views offer `cube`, and so do station grids,
-whose cube is a `t`, `y`, `x` grid without levels. Parameters: `bbox` (four
-numbers, or six whose vertical pair is a `z` interval that an explicit `z`
-overrides), `z`, `datetime`, `parameter-name`, `resolution-x`/`-y`/`-z`,
+GRIB pressure and model-level views offer `cube`, and so do NetCDF
+collections and station grids; a collection without levels (a station grid,
+a NetCDF surface family) answers a `t`, `y`, `x` grid. Parameters: `bbox`
+(four numbers, or six whose vertical pair is a `z` interval that an explicit
+`z` overrides), `z`, `datetime`, `parameter-name`, `resolution-x`/`-y`/`-z`,
 `crs`, `f` and `limit`; any other or repeated parameter is a 400. Without
 `z` every level is returned. `resolution-*` is a count of evenly spaced
 positions from edge to edge, each taking the nearest native value (0 or
-absent is native; at most 1 000 000). `resolution-z` on a collection
-without levels is a 400. A `datetime` list joins one cube per instant along
-`t`. The response is capped at 1 million values.
+absent is native; at most 1 000 000). A NetCDF grid is rarely aligned with
+CRS84, so its native cells are those of its area query, at the source's
+mean cell size but never coarsened, and every cell or position is sampled
+bilinearly, as its position query samples a point; its `resolution-z` too
+takes the nearest level. `resolution-z` on a collection without levels is
+a 400. A `datetime` list joins one cube per instant along `t`. The response
+is capped at 1 million values.
 
 ### Items
 
@@ -314,7 +319,7 @@ value budget. `derive_wind = false` turns this off for a collection.
 | GRIB | – | ✓ | ✓ | ✓ | ✓ level views | ✓ path | ✓ | – |
 | QueryData | – | ✓ | ✓ | ✓ | – | ✓ path | ✓ | – |
 | Zarr | – | ✓ | ✓ | ✓ | – | ✓ path | ✓ | – |
-| NetCDF | – | ✓ | ✓ | ✓ | – | – | ✓ | – |
+| NetCDF | – | ✓ | ✓ | ✓ | ✓ | ✓ path | ✓ | – |
 | ODIM composite | – | ✓ | ✓ | ✓ | – | – | n/a | – |
 | ODIM PVOL site | ✓ | ✓ | ✓ | ✓ | – | ✓ section | n/a | – |
 | PostGIS stations | ✓ | ✓ | ✓ | ✓ | – | – | n/a | ✓ |
@@ -334,7 +339,7 @@ need no engine code of their own; items serve the engine's own
 | GeoTIFF | grid at native resolution; on a STAC source, a window of more than 400 items whose metadata is not loaded yet is a 400 |
 | GRIB | native grid nodes over the bbox; `datetime` matches steps exactly; without `datetime`, the last step of the latest run that has every named parameter. Cube on the `<id>-pressure` and `<id>-model` views that `[grib] level_types` creates |
 | QueryData, Zarr, ODIM composite, Satellite | grid over the bbox, at most 256 cells per axis, cells outside the polygon null. Zarr reads at most 8 variables per area query. Satellite: each product has its own time axis, an instant matches only a scan at exactly that time, RGB composites are not EDR parameters, and a query fetches at most 8 evicted scans and decodes at most 133 million pixels of image blocks (1024 GOES-R 2 km strips or 70 GK2A chunks) |
-| NetCDF | CRS84 grid at the source's mean cell size, at most 256 cells per axis, over lat/lon or CF Lambert conformal conic, geostationary, polar stereographic, Lambert azimuthal equal-area and transverse Mercator grids (a polar grid's extent reaches its pole); pressure levels through `z`; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (default 544 MiB) |
+| NetCDF | CRS84 grid at the source's mean cell size, at most 256 cells per axis, over lat/lon or CF Lambert conformal conic, geostationary, polar stereographic, Lambert azimuthal equal-area and transverse Mercator grids (a polar grid's extent reaches its pole); pressure levels through `z`. Trajectory and cube sample each point like position; an M path reads the run that covers its earliest time; a cube has a `t` axis and, on pressure levels, a `z` axis, and its native cells are the area's without the 256 cap. A query decodes at most `MC_NETCDF_EDR_QUERY_MB` (default 544 MiB), counting only the fields it reads: a trajectory's planned (step, level) fields, a cube's steps × the levels its positions take |
 | ODIM PVOL site | polar sampling of each volume; `/locations` lists the site; trajectory is a vertical cross-section |
 | PostGIS stations | stations inside the polygon, one series each; `/locations` holds at most `max_locations` stations (default 200 000); a value outside its parameter's `valid_range` or equal to one of its `missing_values` is a null, its time kept; see [engine-postgis](../engine-postgis/README.md) |
 | PostGIS events | events inside the polygon as `Point` coverages, with the same `valid_range` and `missing_values` nulls |
@@ -398,8 +403,8 @@ Environment variables: `MC_EDR_LOCATIONS_MAX_BYTES` (bytes, default
 - No `locations`, `trajectory` or `items` under `/instances/{instanceId}/`.
 - GeoJSON and CSV only on station collections; no GeoJSON for area; no
   NetCDF output.
-- Along-path trajectory only on GRIB, QueryData and Zarr; cube only on GRIB
-  level views and station grids.
+- Along-path trajectory only on GRIB, QueryData, Zarr and NetCDF; cube only
+  on GRIB level views, NetCDF and station grids.
 - `parameter_names` entries carry no `dataType`, and every CoverageJSON
   range is encoded as `float`.
 - `position`, `area`, `radius`, `trajectory` and `/locations/{locId}` ignore

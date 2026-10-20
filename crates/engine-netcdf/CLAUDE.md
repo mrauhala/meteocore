@@ -3,8 +3,8 @@
 CF-NetCDF gridded forecasts and analyses (#1067), first for MET Norway's
 MEPS. Read the root `CLAUDE.md` first — Critical Rules 5, 6, 7, 9 and 10
 shape this crate. Today: local directories and remote files read in place
-by HTTP range (thredds.met.no), WMS/Maps/Tiles, EDR position/area/radius
-with runs as instances, GetFeatureInfo, derived wind speed, and a CF
+by HTTP range (thredds.met.no), WMS/Maps/Tiles, EDR position/area/radius/
+trajectory/cube with runs as instances, GetFeatureInfo, derived wind speed, and a CF
 pressure axis as the collection's vertical axis (PR 8, the last of the
 #1067 plan).
 
@@ -460,8 +460,11 @@ and every other unit-keyed match read them through
 ## EDR (`edr.rs`) — #1067 PR 7
 
 `EdrEngine`: position (one point, or `query_positions`' several), area and
-radius (the trait default: a 64-vertex polygon through area); no
-locations, trajectory or cube.
+radius (the trait default: a 64-vertex polygon through area); trajectory
+and cube (#1169, `edr/trajectory.rs`, `edr/cube.rs`; see their module
+docs: an M path reads `Catalog::covering_run` of its earliest time; a
+cube is an area's steps and cells, never coarsened, sampled bilinearly,
+`resolution-z` taking the nearest level); no locations.
 
 - **Run and steps** (`Catalog::query_run`, engine-grib's `resolve_run`
   rule): a pinned run is exactly that run (absent ⇒ 404
@@ -485,8 +488,10 @@ locations, trajectory or cube.
   A point or cell off the grid (`SourceGrid::covers`, the rule `value_at`
   applies) is dropped before sampling, and a query with none on the grid
   reads no field: `POINT(-100 10)` on remote MEPS costs no fetch.
-- **Field jobs:** one per (variable, step, level), each variable's slots
-  step-major (`[t][z]`), through
+- **Field jobs:** one per (variable, `Sampling`): a step, a level and its
+  own positions (`sample_fields`; position, area and cube share one
+  position set, step-major `[t][z]`, a trajectory gives each field its
+  samples; a field with no position on the grid is not read), through
   `ds_executor::field_jobs::run_field_jobs` (engine-grib's scheduler, moved
   there): four at once as tasks on the query runtime (fallback
   `ds_executor::query_runtime()` outside any runtime), each re-entering
@@ -510,7 +515,9 @@ locations, trajectory or cube.
   `FieldRead::decoded_bytes`
   (the `f32` field, or its chunk when larger), from the first step's file,
   before any read; over it a 400 `QueryTooLarge` naming the fields, the
-  MiB and the limit. The default admits one parameter over one MEPS run
+  MiB and the limit. Trajectory and cube count only the fields they read
+  (`Reads::check_fields`, `check_field_reads`: distinct (step, level)
+  pairs per variable; a cube steps × the levels its z positions take). The default admits one parameter over one MEPS run
   as the client sees it, including a derived wind speed (decided on
   #1067, twice the issue's 272 MiB). It counts the variables the engine
   reads, and `DerivedWind` asks for both components of a derived speed: a
