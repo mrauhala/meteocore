@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{ParameterInfo, RasterInfo};
+use ds_core::native_grid::NativeGrid;
 use ds_core::resample::SourceGrid;
 use ds_core::units::{cf_display_conversion, DisplayConversion};
 use ds_core::vertical::{VerticalDimension, VerticalKind};
@@ -493,6 +494,9 @@ pub(crate) fn raster_info(
         grid_size: transform.map(|t| [t.width, t.height]),
         layer_subtitle: None,
         reference_times: runs.keys().flatten().copied().collect(),
+        // The CF grid as read, in its own CRS (#1237). CF states no EPSG
+        // code MeteoCore reads, so the CRS is described by its parameters.
+        native_grid: transform.and_then(|t| NativeGrid::from_geo_transform(t, None)),
     }
 }
 

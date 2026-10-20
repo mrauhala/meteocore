@@ -1999,3 +1999,42 @@ fn comp_template_discovery_carries_forward_known_without_reprobe() {
         "known slots must be carried forward without re-probing"
     );
 }
+
+/// #1237: the DMI composite reports its stereographic grid as its projdef
+/// and corners state it: the outer pixel edges, square cells, no EPSG
+/// code (the projdef names none), so the description's
+/// `meteocore:nativeGrid` member carries the WKT2 and no `storageCrs` grid.
+#[test]
+fn raster_info_reports_the_dmi_native_grid() {
+    let (engine, _guard) = dmi_engine();
+    let info = engine.raster_info();
+    let grid = info.native_grid.as_ref().expect("a native grid");
+    assert_eq!(Some(grid.size()), info.grid_size);
+    assert!(matches!(
+        grid.crs(),
+        ds_core::geo::Crs::Stereographic { .. }
+    ));
+    assert_eq!(grid.epsg(), None);
+    let [dx, dy] = grid.spacing();
+    assert!(
+        (dx - 500.0).abs() < 1.0 && (dy - 500.0).abs() < 1.0,
+        "{dx} {dy}"
+    );
+    assert_eq!(
+        ds_core::native_grid::wkt_name(grid.crs_ref()),
+        Some("Stereographic")
+    );
+    let spatial = ds_core::ogc_extent::build_extent(
+        info.spatial_extent,
+        info.grid_size,
+        &info.native_crs,
+        info.native_grid.as_ref(),
+        &info.times,
+        None,
+    )
+    .unwrap()
+    .spatial
+    .unwrap();
+    assert!(spatial.storage_crs_bbox.is_none() && spatial.grid.is_none());
+    assert_eq!(spatial.native_grid.unwrap().crs, grid.crs_ref());
+}

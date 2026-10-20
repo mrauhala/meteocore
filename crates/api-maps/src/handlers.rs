@@ -341,6 +341,7 @@ fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Va
         info.spatial_extent,
         info.grid_size,
         &info.native_crs,
+        info.native_grid.as_ref(),
         &info.times,
         info.vertical.as_ref(),
     )?;

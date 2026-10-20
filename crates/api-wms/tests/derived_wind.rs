@@ -54,6 +54,7 @@ fn info(parameters: &[&str]) -> RasterInfo {
         grid_size: None,
         layer_subtitle: None,
         reference_times: Vec::new(),
+        native_grid: None,
     }
 }
 

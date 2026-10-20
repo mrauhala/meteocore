@@ -17,6 +17,7 @@ use ds_core::{
     feature_engine::FeatureEngine,
     map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile},
     model::{CoverageResponse, LocationSnapshot},
+    native_grid::NativeGrid,
     vertical::{VerticalDimension, VerticalKind},
 };
 use http_body_util::BodyExt;
@@ -43,6 +44,8 @@ struct Fixture {
     /// `RasterInfo.native_crs`: `"CRS:84"`, or `"projected"` as engine-netcdf
     /// and engine-querydata label a CF projected grid.
     native_crs: &'static str,
+    /// `RasterInfo.native_grid` (#1237).
+    native_grid: Option<NativeGrid>,
 }
 
 impl EdrEngine for Fixture {
@@ -141,6 +144,7 @@ impl MapEngine for Fixture {
             grid_size: self.bbox.map(|_| [80, 80]),
             layer_subtitle: None,
             reference_times: vec![],
+            native_grid: self.native_grid.clone(),
         }
     }
     fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
@@ -228,6 +232,7 @@ fn catalog() -> Catalog {
             vertical,
             parameters,
             native_crs: "CRS:84",
+            native_grid: None,
         });
         edr.insert(id.into(), fixture.clone());
         maps.insert(id.into(), fixture.clone());
@@ -257,6 +262,7 @@ fn numbered_catalog(n: usize) -> Catalog {
             vertical: None,
             parameters: vec![],
             native_crs: "CRS:84",
+            native_grid: None,
         });
         edr.insert(id.clone(), fixture.clone());
         maps.insert(id.clone(), fixture.clone());
@@ -1756,6 +1762,7 @@ async fn shared_root_extent_precedence_matches_discovery() {
             vertical: None,
             parameters: vec![],
             native_crs: "CRS:84",
+            native_grid: None,
         }),
     );
     // `f-wind` is served by Features alone: no map, no tiles.
@@ -1832,32 +1839,71 @@ async fn shared_root_extent_precedence_matches_discovery() {
 }
 
 /// A map collection on a projected grid (engine-netcdf's MEPS, #1067:
-/// `native_crs = "projected"`, 949 × 1069 cells) advertises neither a
-/// `storageCrs` nor a `grid` of degrees, which only a CRS84 grid has, and
-/// its description still validates, on every map surface.
+/// `native_crs = "projected"`, 949 × 1069 cells of 2.5 km on a Lambert
+/// conformal conic) advertises neither a `storageCrs` nor a standard
+/// `grid`, which would be in degrees without one; its grid is the
+/// `meteocore:nativeGrid` member, CRS as WKT2 (#1237). A grid whose source
+/// states EPSG:3067, the `storageCrs` it already advertises, also gets the
+/// standard `storageCrsBbox` and a `grid` in metres. Neither changes
+/// `storageCrs` or `crs`, and both descriptions validate, on every map
+/// surface.
 #[tokio::test]
-async fn a_projected_grid_advertises_no_storage_crs_or_degree_grid() {
+async fn native_grids_are_described_without_changing_storage_crs() {
     let (mut configs, _, mut maps, features) = catalog();
-    let mut config = configs["c-match"].clone();
-    config.id = "g-projected".into();
-    configs.insert(config.id.clone(), config);
-    maps.insert(
-        "g-projected".into(),
-        Arc::new(Fixture {
-            bbox: Some([-18.1, 49.8, 54.2, 75.2]),
-            time: Some((
-                instant("2024-01-01T00:00:00Z"),
-                instant("2024-01-01T01:00:00Z"),
-            )),
-            times: vec![
-                instant("2024-01-01T00:00:00Z"),
-                instant("2024-01-01T01:00:00Z"),
-            ],
-            vertical: None,
-            parameters: vec![],
-            native_crs: "projected",
-        }),
+    let meps = NativeGrid::new(
+        ds_core::geo::Crs::LambertConformalConic {
+            lat1: 63.3_f64.to_radians(),
+            lat2: 63.3_f64.to_radians(),
+            lat0: 63.3_f64.to_radians(),
+            lon0: 15.0_f64.to_radians(),
+            false_e: 0.0,
+            false_n: 0.0,
+            radius: Some(6_371_000.0),
+        },
+        None,
+        [949, 1069],
+        [-1_060_084.0, -1_332_469.0],
+        [2500.0, 2500.0],
     );
+    let tm35fin = NativeGrid::new(
+        ds_core::geo::Crs::TransverseMercator {
+            lat0: 0.0,
+            lon0: 27.0_f64.to_radians(),
+            k0: 0.9996,
+            false_e: 500_000.0,
+            false_n: 0.0,
+        },
+        Some(3067),
+        [480, 360],
+        [-196_000.0, 6_255_000.0],
+        [2500.0, 5000.0],
+    );
+    for (id, native_crs, native_grid) in [
+        ("g-projected", "projected", meps),
+        ("g-tm35fin", "EPSG:3067", tm35fin),
+    ] {
+        let mut config = configs["c-match"].clone();
+        config.id = id.into();
+        configs.insert(config.id.clone(), config);
+        maps.insert(
+            id.into(),
+            Arc::new(Fixture {
+                bbox: Some([-18.1, 49.8, 54.2, 75.2]),
+                time: Some((
+                    instant("2024-01-01T00:00:00Z"),
+                    instant("2024-01-01T01:00:00Z"),
+                )),
+                times: vec![
+                    instant("2024-01-01T00:00:00Z"),
+                    instant("2024-01-01T01:00:00Z"),
+                ],
+                vertical: None,
+                parameters: vec![],
+                native_crs,
+                native_grid,
+            }),
+        );
+    }
     let surfaces = [
         (
             api_maps::router(maps_state(configs.clone(), maps.clone())),
@@ -1877,24 +1923,63 @@ async fn a_projected_grid_advertises_no_storage_crs_or_degree_grid() {
             "/base",
         ),
     ];
+    let tm35 = "http://www.opengis.net/def/crs/EPSG/0/3067";
     for (router, prefix) in surfaces {
         let app = Router::new().nest(prefix, router);
         let url = format!("{prefix}/collections/g-projected");
         let projected = get_json(&app, &url).await;
         schema::assert_valid("/collections/{collectionId}", &projected, &url);
         assert!(projected.get("storageCrs").is_none(), "{url}: {projected}");
+        let spatial = &projected["extent"]["spatial"];
+        assert!(spatial.get("grid").is_none(), "{url}: {projected}");
         assert!(
-            projected["extent"]["spatial"].get("grid").is_none(),
+            spatial.get("storageCrsBbox").is_none(),
             "{url}: {projected}"
         );
-        assert!(projected["extent"]["spatial"]["bbox"].is_array(), "{url}");
-        // The same fields on a CRS84 grid, so the absence above means something.
+        assert!(spatial["bbox"].is_array(), "{url}");
+        let member = &spatial["meteocore:nativeGrid"];
+        assert!(
+            member["crs"]
+                .as_str()
+                .is_some_and(|crs| crs.starts_with("PROJCRS[\"Lambert conformal conic\",")),
+            "{url}: {member}"
+        );
+        assert_eq!(member["cellsCount"], json!([949, 1069]), "{url}");
+        assert_eq!(member["resolution"], json!([2500.0, 2500.0]), "{url}");
+        assert_eq!(member["unit"], "m", "{url}");
+        assert!(
+            !projected["crs"].to_string().contains("PROJCRS"),
+            "{url}: no WKT among the output CRSs"
+        );
+
+        let url = format!("{prefix}/collections/g-tm35fin");
+        let registered = get_json(&app, &url).await;
+        schema::assert_valid("/collections/{collectionId}", &registered, &url);
+        assert_eq!(registered["storageCrs"], tm35, "{url}");
+        let spatial = &registered["extent"]["spatial"];
+        assert_eq!(
+            spatial["storageCrsBbox"],
+            json!([[-196_000.0, 6_255_000.0, 1_004_000.0, 8_055_000.0]]),
+            "{url}"
+        );
+        assert_eq!(spatial["grid"][0]["firstCoordinate"], -194_750.0, "{url}");
+        assert_eq!(
+            spatial["grid"][1]["relativeBounds"],
+            json!([-2500.0, 2500.0]),
+            "{url}"
+        );
+        assert_eq!(spatial["meteocore:nativeGrid"]["crs"], tm35, "{url}");
+
+        // A CRS84 grid keeps its degree grid and gets no member.
         let crs84 = get_json(&app, &format!("{prefix}/collections/c-match")).await;
         assert!(crs84["storageCrs"].is_string(), "{prefix}: {crs84}");
         assert!(
             crs84["extent"]["spatial"]["grid"].is_array(),
             "{prefix}: {crs84}"
         );
+        assert!(crs84["extent"]["spatial"]
+            .get("meteocore:nativeGrid")
+            .is_none());
     }
 }
 

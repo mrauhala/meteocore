@@ -1889,3 +1889,95 @@ fn pressure_in_pa_is_served_in_hpa_with_wind_direction_per_level() {
         );
     }
 }
+
+/// #1237: MEPS reports its grid in its own Lambert conformal conic CRS, as
+/// CF states it: the sphere of `earth_radius`, no EPSG code, so the WKT2.
+/// The collection description carries it as the `meteocore:nativeGrid`
+/// member only: no `storageCrs` grid, nothing in degrees.
+#[test]
+fn meps_reports_its_native_lambert_grid() {
+    use ds_core::geo::Crs;
+    use ds_core::native_grid::{crs_wkt2, wkt_name};
+    let engine = meps();
+    let info = engine.raster_info();
+    let grid = info.native_grid.as_ref().expect("MEPS has a native grid");
+    // The fixture keeps every 100th cell of the 2.5 km grid: 250 km.
+    assert_eq!(grid.size(), [10, 11]);
+    let [dx, dy] = grid.spacing();
+    assert!(
+        (dx - 250_000.0).abs() < 0.1 && (dy - 250_000.0).abs() < 0.1,
+        "{dx} {dy}"
+    );
+    // Cell centres at the CF coordinates, edges half a cell outside them.
+    let [x0, y0, x1, y1] = grid.bbox();
+    assert!((x0 - (-1_060_084.0 - 125_000.0)).abs() < 1.0, "{x0}");
+    assert!((x1 - (1_189_916.0 + 125_000.0)).abs() < 1.0, "{x1}");
+    assert!((y0 - (-1_332_517.9 - 125_000.0)).abs() < 1.0, "{y0}");
+    assert!((y1 - (1_167_482.1 + 125_000.0)).abs() < 1.0, "{y1}");
+    let Crs::LambertConformalConic {
+        lat1,
+        lat0,
+        lon0,
+        radius,
+        ..
+    } = *grid.crs()
+    else {
+        panic!("{:?}", grid.crs());
+    };
+    assert!((lat1.to_degrees() - 63.3).abs() < 1e-9 && (lat0.to_degrees() - 63.3).abs() < 1e-9);
+    assert!((lon0.to_degrees() - 15.0).abs() < 1e-9);
+    assert_eq!(radius, Some(6_371_000.0));
+    assert_eq!(grid.epsg(), None);
+    assert_eq!(grid.unit(), "m");
+    assert_eq!(grid.crs_ref(), crs_wkt2(grid.crs()));
+    assert_eq!(wkt_name(grid.crs_ref()), Some("Lambert conformal conic"));
+    assert!(grid.crs_ref().contains(r#"ELLIPSOID["Sphere",6371000,0,"#));
+    assert!(grid
+        .crs_ref()
+        .contains(r#"PARAMETER["Latitude of 1st standard parallel",63.3,"#));
+
+    let spatial = ds_core::ogc_extent::build_extent(
+        info.spatial_extent,
+        info.grid_size,
+        &info.native_crs,
+        info.native_grid.as_ref(),
+        &info.times,
+        None,
+    )
+    .unwrap()
+    .spatial
+    .unwrap();
+    assert!(spatial.grid.is_none() && spatial.storage_crs_bbox.is_none());
+    let member = spatial.native_grid.expect("the extension member");
+    assert_eq!(member.crs, grid.crs_ref());
+    assert_eq!(member.cells_count, [10, 11]);
+    assert_eq!(member.unit, "m");
+    assert_eq!(member.bbox, grid.bbox());
+}
+
+/// #1237: the global grid is lat/lon: its native grid adds nothing to the
+/// description, which keeps the CRS84 grid it had.
+#[test]
+fn the_global_grid_keeps_its_crs84_description() {
+    let engine = global();
+    let info = engine.raster_info();
+    let grid = info.native_grid.as_ref().expect("a native grid");
+    assert!(grid.is_lon_lat());
+    assert_eq!(grid.size(), [72, 36]);
+    assert_eq!(grid.spacing(), [5.0, 5.0]);
+    let spatial = ds_core::ogc_extent::build_extent(
+        info.spatial_extent,
+        info.grid_size,
+        &info.native_crs,
+        info.native_grid.as_ref(),
+        &info.times,
+        None,
+    )
+    .unwrap()
+    .spatial
+    .unwrap();
+    assert!(spatial.native_grid.is_none() && spatial.storage_crs_bbox.is_none());
+    let axes = spatial.grid.expect("the CRS84 grid");
+    assert_eq!((axes[0].cells_count, axes[0].resolution), (72, 5.0));
+    assert_eq!(axes[0].first_coordinate, None);
+}

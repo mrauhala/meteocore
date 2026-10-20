@@ -493,7 +493,7 @@ pub fn parameter_names(
     };
     let extent = |name: &str| {
         parameter_times(name)
-            .and_then(|times| ds_core::ogc_extent::build_extent(None, None, "", &times, None))
+            .and_then(|times| ds_core::ogc_extent::build_extent(None, None, "", None, &times, None))
             .map(|extent| serde_json::to_value(extent).expect("Extent serializes to JSON"))
     };
     let mut entries: Vec<(String, Value)> = Vec::new();
@@ -722,6 +722,7 @@ mod tests {
             grid_size: None,
             layer_subtitle: None,
             reference_times: vec![],
+            native_grid: None,
         }
     }
 

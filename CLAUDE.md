@@ -489,6 +489,12 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    never assumed. Add the engine type to `config::DERIVE_WIND_ENGINES` and
    register it through `wind_wrapped` in `server/src/admin.rs`; the shared
    `DerivedWind` wrapper does the rest (#897).
+   **If the engine reads a regular grid**, set `RasterInfo.native_grid`
+   (`NativeGrid::from_geo_transform`/`from_edges`) once per load or poll.
+   Give an EPSG code only when the source states it (a GeoKey, or an exact
+   projdef with its ellipsoid), never one derived from the `Crs`. A grid on
+   several bands reports the default parameter's. Wrappers forward the
+   source's grid, or report their own if they resample (#1237).
 8. Ship a runnable (enabled) example collection config AND do an end-to-end
    server + curl smoke test against real data. Unit tests alone miss
    integration and unit-conversion bugs.
@@ -898,6 +904,13 @@ one never implies the other.
   u and v, intersected axes; #507/#521/#1026).
   Per collection `derive_wind = false` opts out. Engines report facts
   (`WindSource`); they never compute derived fields themselves.
+- **`ds_core::native_grid`** — `NativeGrid` (#1237) and `crs_wkt2`, the one
+  WKT2 form per `Crs` variant, PROJ-checked and pinned in tests.
+  `ogc_extent::build_extent` emits `storageCrsBbox` and a cell-centred
+  `grid` only when the stated code is the advertised `storageCrs`, and
+  `meteocore:nativeGrid` for every grid that is not lat/lon. Never add a
+  `storageCrs` MeteoCore cannot render: Maps `/req/core/map-response` B
+  makes it the default output.
 
 ## Engine Capabilities
 

@@ -8232,6 +8232,7 @@ mod tests {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         };
         let bundles = HashMap::new();
         // The resolved root layer and its drawn parameter, when warned.
@@ -8345,6 +8346,7 @@ mod tests {
             grid_size: None,
             layer_subtitle: None,
             reference_times: Vec::new(),
+            native_grid: None,
         };
         let ctx = ds_render::StyleContext::with_builtins();
         let bundles = HashMap::new();

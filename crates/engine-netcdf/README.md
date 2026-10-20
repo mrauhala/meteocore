@@ -58,7 +58,9 @@ or downloaded whole.
 
 **Data it reads:** NetCDF-4 (HDF5) and classic CDF-1/2/5 files. A
 variable has `(y, x)` as its last two axes: 1-D latitude/longitude, or
-1-D projected x/y in metres with a CF `grid_mapping` (below). It needs a
+1-D projected x/y in metres with a CF `grid_mapping` (below); a projected
+grid is described in its own CRS, as WKT2, by the collection's
+`meteocore:nativeGrid` member (#1237). It needs a
 time axis; an ensemble axis is read at `member`; every other axis has
 size 1, except one pressure axis. Rows stored south to north are drawn
 north-up. CF `scale_factor`/`add_offset`, `_FillValue`, `missing_value`,

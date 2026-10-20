@@ -47,6 +47,7 @@ use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
     QueryResult,
 };
+use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
 use ds_core::significance::WeightedScorer;
 
@@ -261,6 +262,7 @@ fn compatible_source(a: &RasterInfo, b: &RasterInfo) -> bool {
     a.native_crs == b.native_crs
         && a.spatial_extent == b.spatial_extent
         && a.grid_size == b.grid_size
+        && a.native_grid == b.native_grid
         && a.parameter == b.parameter
         && a.unit == b.unit
         && a.parameters == b.parameters
@@ -1423,6 +1425,7 @@ fn empty_info(source_info: &RasterInfo) -> RasterInfo {
         grid_size: None,
         layer_subtitle: None,
         reference_times: Vec::new(),
+        native_grid: None,
     }
 }
 
@@ -1444,6 +1447,23 @@ fn build_info(
         layer_subtitle: None,
         // Ascending by BTreeMap order — the #521 cache-pinning contract.
         reference_times: generations.keys().copied().collect(),
+        // The working grid the frames are on (#1237): lon/lat over the
+        // source's extent, not the source's own grid, which the nowcast
+        // does not serve. A lat/lon grid gets no `meteocore:nativeGrid`
+        // member; the CRS84 `grid` describes it.
+        native_grid: latest.and_then(|g| {
+            let geom = &g.geom;
+            NativeGrid::new(
+                ds_core::geo::Crs::Wgs84,
+                None,
+                [geom.width, geom.height],
+                [geom.west, geom.south],
+                [
+                    (geom.east - geom.west) / f64::from(geom.width),
+                    (geom.north - geom.south) / f64::from(geom.height),
+                ],
+            )
+        }),
     }
 }
 
