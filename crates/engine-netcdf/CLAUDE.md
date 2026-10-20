@@ -252,6 +252,11 @@ Read in place by HTTP range, never downloaded whole (decision 4).
   (`HOST_REQUEST_LIMIT` = 8, one limit per host for the process, over
   every collection) and a `BACKGROUND_SHARE` (2) stacked on it, also one
   per host (`with_request_limit`). The prober's HEADs take the share too.
+  `remote::host(collection_id, …)` returns that host's stores named with
+  `DataStore::for_collection` (one `Host` per collection over the shared
+  limit, share and `gets` counter), so a retry line names the collection
+  (#1233); find a host by `DataStore::same_store`, never `Arc::ptr_eq` on
+  `inner()`.
   A permit wait counts against the deadline. `ds_storage::host_requests`
   reports in flight and queued per host.
 - **Blocks** (`BLOCKS`, `MC_NETCDF_BLOCK_CACHE_MB`, default 64 MiB, floor

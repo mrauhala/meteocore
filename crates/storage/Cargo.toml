@@ -30,3 +30,7 @@ tempfile = "3"
 # Paused virtual time for the fetch-budget tests (#1011): a 120 s budget is
 # tested without waiting for it.
 tokio = { version = "1", features = ["macros", "test-util"] }
+# The `storage` span tests (#1233) read the log lines the server's
+# `LOG_FORMAT=json` subscriber writes.
+tracing-subscriber = { version = "0.3", features = ["json"] }
+serde_json = "1"

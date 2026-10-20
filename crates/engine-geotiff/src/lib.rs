@@ -642,7 +642,8 @@ impl GeoTiffEngine {
             let display = format!("stac:{}", stac_url);
             (StoreMode::RemoteStac { client }, display)
         } else if let (Some(endpoint), Some(bucket)) = (&config.endpoint, &config.bucket) {
-            let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?;
+            let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?
+                .for_collection(collection_id);
             let prefix_pattern = config.prefix_pattern.clone().unwrap_or_default();
             let display = format!("s3://{}/{}", bucket, prefix_pattern);
 
@@ -669,6 +670,7 @@ impl GeoTiffEngine {
 
             if is_remote {
                 let (store, prefix) = ds_storage::build_store(data_path)?;
+                let store = store.for_collection(collection_id);
                 (StoreMode::Remote { store, prefix }, data_path.to_string())
             } else {
                 let directory = PathBuf::from(data_path);

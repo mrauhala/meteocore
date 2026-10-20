@@ -292,7 +292,7 @@ impl NetcdfEngine {
         tuning: Tuning,
     ) -> Result<Remote, DataServerError> {
         let data_path = config.data_path.as_deref().unwrap_or_default();
-        let (host, base) = remote::host(data_path)?;
+        let (host, base) = remote::host(collection_id, data_path)?;
         let duration = |value: Option<&str>, default| match value {
             Some(value) => ds_core::datetime::parse_iso8601_duration(value),
             None => Ok(default),

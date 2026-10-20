@@ -177,6 +177,20 @@ fn paths(requests: &[&Request]) -> Vec<String> {
     requests.iter().map(|r| r.path.clone()).collect()
 }
 
+/// Collections on one host each get stores naming them on the `storage`
+/// span (#1233), over the host's one limit, one background share and one
+/// GET counter.
+#[test]
+fn collections_on_one_host_share_its_limit_share_and_counter() {
+    let (sfc, base) = host("meps-sfc", "http://127.0.0.4:9/meps/sfc/").unwrap();
+    let (pl, _) = host("meps-pl", "http://127.0.0.4:9/meps/pl/").unwrap();
+    assert_eq!(base.as_ref(), "meps/sfc");
+    assert!(sfc.requests.same_store(&pl.requests));
+    assert!(sfc.background.same_store(&pl.background));
+    assert!(!sfc.requests.same_store(&sfc.background));
+    assert!(Arc::ptr_eq(&sfc.gets, &pl.gets));
+}
+
 /// Every map drawn over HTTP ranges equals the same map read from the
 /// local files: every GET is ranged and answered 206, never the whole file.
 #[test]

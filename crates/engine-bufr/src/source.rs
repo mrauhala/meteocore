@@ -47,10 +47,12 @@ pub struct Fetched {
 }
 
 impl LocalSource {
-    pub fn new(data_path: &str) -> Result<Self, DataServerError> {
+    /// The source of collection `collection_id` at `data_path`, a
+    /// directory or an object-store prefix.
+    pub fn new(collection_id: &str, data_path: &str) -> Result<Self, DataServerError> {
         let (store, base) = build_store(data_path)?;
         Ok(LocalSource {
-            store,
+            store: store.for_collection(collection_id),
             base,
             label: data_path.to_string(),
             seen: HashMap::new(),
@@ -175,7 +177,7 @@ mod tests {
             std::fs::write(dir.path().join(format!("m{i:03}.bufr")), &smhi).unwrap();
         }
         std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
-        let mut src = LocalSource::new(dir.path().to_str().unwrap()).unwrap();
+        let mut src = LocalSource::new("test", dir.path().to_str().unwrap()).unwrap();
 
         let mut got: Vec<String> = Vec::new();
         let fetched = src
@@ -212,7 +214,7 @@ mod tests {
         let smhi = fixture("synop_se-smhi_20260912T0800Z.bufr");
         std::fs::write(dir.path().join("m000.bufr"), &smhi).unwrap();
         std::fs::write(dir.path().join(".m001.bufr"), &smhi[..smhi.len() / 2]).unwrap();
-        let mut src = LocalSource::new(dir.path().to_str().unwrap()).unwrap();
+        let mut src = LocalSource::new("test", dir.path().to_str().unwrap()).unwrap();
 
         let mut got: Vec<String> = Vec::new();
         assert_eq!(src.scan(|f| got.push(f.path)).unwrap(), 1);
@@ -236,7 +238,7 @@ mod tests {
         std::fs::write(dir.path().join("2026/m001.bufr"), &smhi).unwrap();
         std::fs::write(dir.path().join(".~tmp~/m002.bufr"), half).unwrap();
         std::fs::write(dir.path().join("2026/.~tmp~/m003.bufr"), half).unwrap();
-        let mut src = LocalSource::new(dir.path().to_str().unwrap()).unwrap();
+        let mut src = LocalSource::new("test", dir.path().to_str().unwrap()).unwrap();
 
         let mut got: Vec<String> = Vec::new();
         assert_eq!(src.scan(|f| got.push(f.path)).unwrap(), 2);

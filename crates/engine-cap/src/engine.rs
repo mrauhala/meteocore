@@ -166,6 +166,7 @@ impl CapEngine {
             }
             None => (
                 Source::build(
+                    collection_id,
                     config.data_path.as_deref(),
                     config.feed_url.as_deref(),
                     &config.feed_allowlist,

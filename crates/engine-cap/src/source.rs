@@ -45,6 +45,9 @@ pub enum Source {
     },
     /// Atom/RSS feed index → linked CAP documents.
     Feed {
+        /// The collection the feed is for, which names it on the stores of
+        /// the documents' origins, built per fetch.
+        collection: String,
         cache: Mutex<DocumentCache>,
         index_store: DataStore,
         index_path: ObjectPath,
@@ -63,8 +66,10 @@ pub enum Source {
 }
 
 impl Source {
-    /// Build the source's object store(s). No network calls — only client setup.
+    /// Build the source's object store(s) for collection `collection_id`.
+    /// No network calls — only client setup.
     pub fn build(
+        collection_id: &str,
         data_path: Option<&str>,
         feed_url: Option<&str>,
         feed_allowlist: &[String],
@@ -73,7 +78,7 @@ impl Source {
             (Some(path), None) => {
                 let (store, base) = build_store(path)?;
                 Ok(Source::Local {
-                    store,
+                    store: store.for_collection(collection_id),
                     base,
                     cache: Mutex::default(),
                 })
@@ -81,8 +86,9 @@ impl Source {
             (None, Some(url)) => {
                 let (index_store, index_path) = build_http_store(url)?;
                 Ok(Source::Feed {
+                    collection: collection_id.to_string(),
                     cache: Mutex::default(),
-                    index_store,
+                    index_store: index_store.for_collection(collection_id),
                     index_path,
                     feed_url: url.to_string(),
                     allowlist: feed_allowlist.to_vec(),
@@ -112,12 +118,20 @@ impl Source {
         match self {
             Source::Local { store, base, cache } => load_local(store, base, cache),
             Source::Feed {
+                collection,
                 cache,
                 index_store,
                 index_path,
                 feed_url,
                 allowlist,
-            } => load_feed(index_store, index_path, feed_url, allowlist, cache),
+            } => load_feed(
+                collection,
+                index_store,
+                index_path,
+                feed_url,
+                allowlist,
+                cache,
+            ),
             Source::Wis2 { source, .. } => Ok(SourceLoad {
                 alerts: source.snapshot(now),
                 failed_documents: 0,
@@ -168,8 +182,10 @@ fn load_local(
         .update(documents))
 }
 
-/// Fetch the feed index, extract CAP document links, and fetch + parse them.
+/// Fetch the feed index, extract CAP document links, and fetch + parse them,
+/// for collection `collection`.
 fn load_feed(
+    collection: &str,
     index_store: &DataStore,
     index_path: &ObjectPath,
     feed_url: &str,
@@ -279,7 +295,10 @@ fn load_feed(
     let mut documents = Vec::new();
     for (origin, paths) in by_origin {
         match build_http_store(&origin) {
-            Ok((store, _)) => documents.extend(fetch_and_parse(&store, &paths, &origin)),
+            Ok((store, _)) => {
+                let store = store.for_collection(collection);
+                documents.extend(fetch_and_parse(&store, &paths, &origin))
+            }
             Err(e) => {
                 tracing::warn!("cap feed: cannot build store for origin '{origin}': {e}");
                 documents.extend(paths.iter().map(|p| (format!("{origin}/{p}"), None)));
@@ -292,6 +311,7 @@ fn load_feed(
     for u in with_query {
         let fetched = build_http_store(u.as_str()).and_then(|(store, path)| {
             store
+                .for_collection(collection)
                 .get_many(std::slice::from_ref(&path), 1, Some(MAX_DOC_BYTES))?
                 .into_iter()
                 .next()

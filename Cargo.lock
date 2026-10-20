@@ -1323,10 +1323,12 @@ dependencies = [
  "object_store",
  "regex",
  "reqwest 0.13.4",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
