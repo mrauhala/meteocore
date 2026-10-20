@@ -1506,7 +1506,9 @@ async fn shared_root_composes_maps_tiles_and_features_over_one_catalog() {
     // The HTML workspace belongs to the shared root, with one root crumb.
     let (_, _, html) = get(&app, &format!("{prefix}/collections/c-match?f=html"), None).await;
     assert!(html.contains("id=\"map-controls\""));
-    assert!(html.contains(&format!("href=\"{BASE}/api/docs\">Map request parameters")));
+    assert!(html.contains(&format!(
+        "<a class=\"btn\" href=\"{BASE}/api/docs\">API reference ↗</a>"
+    )));
     let crumbs = html.split("id=\"breadcrumbs\"").nth(1).unwrap();
     let crumbs = crumbs.split("</nav>").next().unwrap();
     assert_eq!(

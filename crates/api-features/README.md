@@ -210,10 +210,12 @@ A feature page lists every property with its JSON type, and shows its
 `related` links as buttons. Feature titles come from a `name`-like property
 (an engine's label arrives as `title`), else the id.
 
-A collection's overview page adds the engine's `items_description` and two
-chip rows: the properties its items page filters and sorts by. A chip opens
-the items page with the builder set to that property, through the URL
-fragment (`#filter=<name>`, `#sort=<name>`), never a query parameter.
+A collection's overview page adds the engine's `items_description` under
+its title. Its request guide's Features entry gives the first 10 items as a
+ready request, the request builder, and two chip rows: the properties its
+items page filters and sorts by. A chip opens the items page with the
+builder set to that property, through the URL fragment (`#filter=<name>`,
+`#sort=<name>`), never a query parameter.
 
 ## Shared OGC API root
 

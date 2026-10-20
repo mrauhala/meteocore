@@ -9,6 +9,8 @@ mod error;
 mod gauge;
 #[cfg(test)]
 mod test_store;
+mod throttle;
+mod traced;
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -177,18 +179,106 @@ pub enum RangeAnswer {
 /// async `ObjectStore` operations into synchronous calls. This is safe
 /// when called from a thread with access to a tokio runtime handle
 /// (e.g., from `spawn_blocking` or during startup).
+///
+/// Every operation on a remote store runs inside a `storage` span naming
+/// the source, the object key and, once [`Self::for_collection`] has named
+/// it, the collection (#1233), so object_store's retry lines say where they
+/// come from.
 #[derive(Clone)]
 pub struct DataStore {
+    /// The store every operation goes through: for a remote store, its
+    /// `base` inside the `storage` span ([`traced`]).
     inner: Arc<dyn ObjectStore>,
+    /// `None` for a local or in-memory store, whose `inner` has no span.
+    remote: Option<Arc<Remote>>,
     bytes_read: Arc<AtomicU64>,
 }
 
+/// A remote store's store without the `storage` span, and what the span
+/// names.
+struct Remote {
+    /// [`DataStore::with_request_limit`] and [`DataStore::for_collection`]
+    /// build on it, so a span never nests in another.
+    base: Arc<dyn ObjectStore>,
+    labels: traced::Labels,
+}
+
 impl DataStore {
+    /// A store whose operations run in no span of their own: a local or
+    /// in-memory one, which never retries.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self::layered(store, None, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// A store reading a remote `source`, an HTTP server or an S3 bucket:
+    /// each operation runs inside a `storage` span with `store = source`.
+    /// `source` is what a log line shows, `host[:port]` of a server or
+    /// `host[:port]/bucket` of a bucket, so it must carry no credentials
+    /// or query string. Every `build_*` function of this crate that makes
+    /// a remote store labels it.
+    pub fn remote(store: Arc<dyn ObjectStore>, source: &str) -> Self {
+        let labels = traced::Labels {
+            store: source.into(),
+            collection: None,
+        };
+        Self::layered(store, Some(labels), Arc::new(AtomicU64::new(0)))
+    }
+
+    /// `base`, inside the span `labels` name when there are any.
+    fn layered(
+        base: Arc<dyn ObjectStore>,
+        labels: Option<traced::Labels>,
+        bytes_read: Arc<AtomicU64>,
+    ) -> Self {
+        let Some(labels) = labels else {
+            return Self {
+                inner: base,
+                remote: None,
+                bytes_read,
+            };
+        };
         Self {
-            inner: store,
-            bytes_read: Arc::new(AtomicU64::new(0)),
+            inner: traced::layer(base.clone(), labels.clone()),
+            remote: Some(Arc::new(Remote { base, labels })),
+            bytes_read,
         }
+    }
+
+    /// The store without the `storage` span.
+    fn base(&self) -> &Arc<dyn ObjectStore> {
+        self.remote
+            .as_ref()
+            .map_or(&self.inner, |remote| &remote.base)
+    }
+
+    /// This store, reading for collection `id`: the `storage` span of each
+    /// of its operations names `collection = id`. The engine calls it once,
+    /// where it builds its store.
+    ///
+    /// The span is rebuilt on the store under it, never nested in the one
+    /// it had, so an operation has exactly one `storage` span. Everything
+    /// else is kept: the store, its request limits, and its byte counter.
+    /// Two collections calling it on stores [`build_http_store_limited`]
+    /// built for one host still share that host's limit. A local or
+    /// in-memory store has no span and is returned as it is.
+    #[must_use]
+    pub fn for_collection(self, id: &str) -> DataStore {
+        let Some(remote) = &self.remote else {
+            return self;
+        };
+        let labels = traced::Labels {
+            store: remote.labels.store.clone(),
+            collection: Some(id.into()),
+        };
+        Self::layered(remote.base.clone(), Some(labels), self.bytes_read.clone())
+    }
+
+    /// Whether `self` and `other` read through one store, whatever
+    /// collection each names: the stores [`build_http_store_limited`]
+    /// built for one host do, and so does a store and the result of
+    /// [`Self::for_collection`] on it.
+    pub fn same_store(&self, other: &DataStore) -> bool {
+        Arc::ptr_eq(self.base(), other.base())
     }
 
     /// Get the entire contents of an object, under [`FetchBudget::Request`].
@@ -874,7 +964,8 @@ impl DataStore {
     }
 
     /// Get the underlying async ObjectStore for use in async contexts
-    /// (e.g., the catalog poll loop).
+    /// (e.g., the catalog poll loop). A remote store's operations still run
+    /// inside its `storage` span.
     pub fn inner(&self) -> &Arc<dyn ObjectStore> {
         &self.inner
     }
@@ -887,15 +978,15 @@ impl DataStore {
     /// a host's limit of 8 is `host_store.with_request_limit(2)`. A GET
     /// holds its permit until its body has been read. The wait for a permit
     /// counts against the operation's budget and the request deadline, like
-    /// the request itself. The byte counter is shared with this store.
+    /// the request itself. The byte counter and the `storage` span's labels
+    /// are this store's.
     pub fn with_request_limit(&self, max_requests: usize) -> DataStore {
-        DataStore {
-            inner: Arc::new(object_store::limit::LimitStore::new(
-                self.inner.clone(),
-                max_requests.max(1),
-            )),
-            bytes_read: self.bytes_read.clone(),
-        }
+        let base = Arc::new(object_store::limit::LimitStore::new(
+            self.base().clone(),
+            max_requests.max(1),
+        ));
+        let labels = self.remote.as_ref().map(|remote| remote.labels.clone());
+        Self::layered(base, labels, self.bytes_read.clone())
     }
 }
 
@@ -1104,7 +1195,8 @@ pub fn build_s3_store_from_parts(
         })?;
 
     tracing::info!("S3 store: endpoint={endpoint}, bucket={bucket}");
-    Ok(DataStore::new(Arc::new(store)))
+    let source = traced::s3_label(Some(endpoint), None, bucket);
+    Ok(DataStore::remote(Arc::new(store), &source))
 }
 
 /// Detect S3-style HTTP URLs like https://s3-eu-west-1.amazonaws.com/bucket/...
@@ -1135,6 +1227,7 @@ fn build_local_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataSer
 }
 
 fn build_s3_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
+    use object_store::aws::AmazonS3ConfigKey;
     // Parse s3://bucket/prefix/path/ (scheme matched case-insensitively).
     let without_scheme = strip_scheme(data_path, "s3://")
         .ok_or_else(|| DataServerError::Storage("Expected s3:// prefix".into()))?;
@@ -1144,15 +1237,23 @@ fn build_s3_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServer
         None => (without_scheme, ""),
     };
 
-    let store = object_store::aws::AmazonS3Builder::from_env()
-        .with_bucket_name(bucket)
-        .build()
-        .map_err(|e| {
-            DataServerError::Storage(format!("Cannot create S3 store for bucket '{bucket}': {e}"))
-        })?;
+    let builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+    // The endpoint and region object_store will use (`AWS_ENDPOINT_URL_S3`
+    // over `AWS_ENDPOINT`), for the span's label only.
+    let config = |key| builder.get_config_value(&key);
+    let source = traced::s3_label(
+        config(AmazonS3ConfigKey::S3Endpoint)
+            .or_else(|| config(AmazonS3ConfigKey::Endpoint))
+            .as_deref(),
+        config(AmazonS3ConfigKey::Region).as_deref(),
+        bucket,
+    );
+    let store = builder.build().map_err(|e| {
+        DataServerError::Storage(format!("Cannot create S3 store for bucket '{bucket}': {e}"))
+    })?;
 
     let prefix_path = ObjectPath::from(prefix.trim_end_matches('/'));
-    Ok((DataStore::new(Arc::new(store)), prefix_path))
+    Ok((DataStore::remote(Arc::new(store), &source), prefix_path))
 }
 
 /// Parse an S3 HTTP URL into bucket + prefix and build an S3 store.
@@ -1226,16 +1327,22 @@ fn build_s3_from_http_url(data_path: &str) -> Result<(DataStore, ObjectPath), Da
         .map_err(|e| DataServerError::Storage(format!("Cannot create S3 store: {e}")))?;
 
     let prefix_path = ObjectPath::from(prefix.trim_end_matches('/'));
-    Ok((DataStore::new(Arc::new(store)), prefix_path))
+    let source = traced::s3_label(Some(&endpoint), None, &bucket);
+    Ok((DataStore::remote(Arc::new(store), &source), prefix_path))
 }
 
 /// The generic HTTP backend must not follow an operator-trusted URL to an
 /// unvalidated host. object_store's default connector follows redirects;
-/// its injectable connector lets us enforce the policy for every operation.
+/// its injectable connector lets us enforce the policy for every operation,
+/// and send every request through its host's throttle (#1235). `S` is the
+/// transport: the no-redirect `reqwest::Client` [`http_object_store`]
+/// builds, or a scripted one in tests.
 #[derive(Debug)]
-struct NoRedirectConnector(reqwest::Client);
+struct NoRedirectConnector<S>(throttle::Throttled<S>);
 
-impl object_store::client::HttpConnector for NoRedirectConnector {
+impl<S: object_store::client::HttpService + Clone> object_store::client::HttpConnector
+    for NoRedirectConnector<S>
+{
     fn connect(
         &self,
         _options: &object_store::ClientOptions,
@@ -1247,16 +1354,30 @@ impl object_store::client::HttpConnector for NoRedirectConnector {
 /// Build a no-redirect HTTP object store without S3 URL auto-detection.
 /// Use for feeds and allowlisted document URLs, including S3-hosted objects.
 /// The source query string is preserved on each request.
+///
+/// It has no request limit, but it honours its host's `Retry-After` with
+/// every other store on the host ([`build_http_store_limited`]).
 pub fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
-    let (base_url, path) = http_base(data_path)?;
-    Ok((DataStore::new(http_object_store(&base_url)?), path))
+    http_store(data_path, http_object_store)
 }
 
-/// A host store [`build_http_store_limited`] built: its limit, the limited
-/// store, and its request counters.
+/// [`build_http_store`] on the store `connect` makes for the base URL:
+/// [`http_object_store`], or one on a scripted transport in tests.
+fn http_store(
+    data_path: &str,
+    connect: impl Fn(&url::Url) -> Result<Arc<dyn ObjectStore>, DataServerError>,
+) -> Result<(DataStore, ObjectPath), DataServerError> {
+    let (base_url, path) = http_base(data_path)?;
+    let store = connect(&base_url)?;
+    Ok((DataStore::remote(store, &http_label(&base_url)), path))
+}
+
+/// A host store [`build_http_store_limited`] built: its configured limit,
+/// the limited store, its adaptive limit, and its request counters.
 #[derive(Clone)]
 struct HostStore {
     limit: usize,
+    adaptive: Arc<throttle::AdaptiveLimit>,
     store: Arc<dyn ObjectStore>,
     gauges: Arc<gauge::HostGauges>,
 }
@@ -1267,7 +1388,7 @@ static HOST_STORES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 /// [`build_http_store`] with at most `max_requests` (at least 1) requests
-/// in flight to the URL's host at once ([`DataStore::with_request_limit`]).
+/// in flight to the URL's host at once.
 ///
 /// The limit is shared by every store built through this function for the
 /// same scheme, host and port, whatever their paths, so collections reading
@@ -1276,10 +1397,29 @@ static HOST_STORES: std::sync::LazyLock<
 /// of their own. The first call for a base fixes its limit for the life of
 /// the process: a later call naming another limit shares the first and
 /// logs a WARN. [`host_requests`] reports the requests in flight and
-/// waiting under each limit.
+/// waiting under each limit. A GET holds its permit until its body has
+/// been read, and [`DataStore::with_request_limit`] stacks a share on it.
+///
+/// The limit adapts to a host that throttles (#1235): a 429 Too Many
+/// Requests halves it, never below 1 and at most once a second, and each
+/// 30 s without one adds one back, up to the configured limit. Requests in
+/// flight when it is cut finish. A 429's `Retry-After` pauses new requests
+/// to the host, from every store on it, for at most a minute
+/// (`throttle.rs`).
 pub fn build_http_store_limited(
     data_path: &str,
     max_requests: usize,
+) -> Result<(DataStore, ObjectPath), DataServerError> {
+    limited_http_store(data_path, max_requests, http_object_store)
+}
+
+/// [`build_http_store_limited`] on the store `connect` makes for a base
+/// URL the first time it is named: [`http_object_store`], or one on a
+/// scripted transport in tests.
+fn limited_http_store(
+    data_path: &str,
+    max_requests: usize,
+    connect: impl Fn(&url::Url) -> Result<Arc<dyn ObjectStore>, DataServerError>,
 ) -> Result<(DataStore, ObjectPath), DataServerError> {
     let (base_url, path) = http_base(data_path)?;
     let max_requests = max_requests.max(1);
@@ -1291,14 +1431,21 @@ pub fn build_http_store_limited(
         None => {
             let gauges = Arc::new(gauge::HostGauges::default());
             let counted: Arc<dyn ObjectStore> = Arc::new(gauge::Gauged {
-                inner: http_object_store(&base_url)?,
+                inner: connect(&base_url)?,
                 count: gauges.in_flight.clone(),
             });
-            let limited = DataStore::new(counted)
-                .with_request_limit(max_requests)
-                .inner;
+            let adaptive = Arc::new(throttle::AdaptiveLimit::new(
+                http_label(&base_url),
+                max_requests,
+            ));
+            throttle::for_url(&base_url).add_limit(adaptive.clone());
+            let limited: Arc<dyn ObjectStore> = Arc::new(throttle::Limited {
+                inner: counted,
+                limit: adaptive.clone(),
+            });
             let host = HostStore {
                 limit: max_requests,
+                adaptive,
                 store: Arc::new(gauge::Gauged {
                     inner: limited,
                     count: gauges.requested.clone(),
@@ -1316,14 +1463,24 @@ pub fn build_http_store_limited(
             host.limit
         );
     }
-    Ok((DataStore::new(host.store), path))
+    Ok((DataStore::remote(host.store, &http_label(&base_url)), path))
 }
 
 /// The requests in flight and waiting under each limit
-/// [`build_http_store_limited`] has made, one entry per host and port:
-/// the bases of one host that differ in their query strings are summed.
-/// One entry per configured host, so a bounded label set for `/metrics`.
+/// [`build_http_store_limited`] has made, and the limit as it is now: the
+/// configured one, or less while the host backs off from a 429 (#1235).
+/// One entry per host and port: the bases of one host that differ in
+/// their query strings are summed. One entry per configured host, so a
+/// bounded label set for `/metrics`.
 pub fn host_requests() -> Vec<HostRequests> {
+    requests_to(|_| true)
+}
+
+/// [`host_requests`] of the hosts whose `host[:port]` is `wanted`. Reading
+/// a limit applies the growth it has earned by the caller's clock, so
+/// paused-time tests read only their own host: another test's clock would
+/// grow it.
+fn requests_to(wanted: impl Fn(&str) -> bool) -> Vec<HostRequests> {
     let hosts = HOST_STORES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1331,14 +1488,11 @@ pub fn host_requests() -> Vec<HostRequests> {
     for (base, host) in hosts.iter() {
         let label = url::Url::parse(base)
             .ok()
-            .and_then(|url| {
-                let name = url.host_str()?.to_string();
-                Some(match url.port() {
-                    Some(port) => format!("{name}:{port}"),
-                    None => name,
-                })
-            })
+            .and_then(|url| traced::host_port(&url))
             .unwrap_or_default();
+        if !wanted(&label) {
+            continue;
+        }
         let (in_flight, queued) = host.gauges.read();
         let entry = by_host
             .entry(label.clone())
@@ -1348,11 +1502,17 @@ pub fn host_requests() -> Vec<HostRequests> {
                 in_flight: 0,
                 queued: 0,
             });
-        entry.limit += host.limit;
+        entry.limit += host.adaptive.limits(tokio::time::Instant::now()).0;
         entry.in_flight += in_flight;
         entry.queued += queued;
     }
     by_host.into_values().collect()
+}
+
+/// The `storage` span's `store` label of an HTTP store on `base_url`: its
+/// `host[:port]`, without the userinfo or query string the URL may carry.
+fn http_label(base_url: &url::Url) -> String {
+    traced::host_port(base_url).unwrap_or_default()
 }
 
 /// The base URL an HTTP store is built on (the URL without its path or
@@ -1374,7 +1534,8 @@ fn http_base(data_path: &str) -> Result<(url::Url, ObjectPath), DataServerError>
     Ok((base_url, ObjectPath::from(path)))
 }
 
-/// A no-redirect HTTP object store on `base_url`.
+/// A no-redirect HTTP object store on `base_url`, under its host's
+/// throttle.
 fn http_object_store(base_url: &url::Url) -> Result<Arc<dyn ObjectStore>, DataServerError> {
     // Own all transport options here rather than using ClientOptions (whose
     // reqwest builder is private). Disable transparent decompression to keep
@@ -1390,9 +1551,23 @@ fn http_object_store(base_url: &url::Url) -> Result<Arc<dyn ObjectStore>, DataSe
         .no_deflate()
         .build()
         .map_err(|e| DataServerError::Storage(format!("Cannot create HTTP client: {e}")))?;
+    throttled_http_store(base_url, client)
+}
+
+/// An HTTP object store on `base_url` sending every request, object_store's
+/// retries included, through `transport` under the throttle of the base's
+/// scheme, host and port ([`throttle`]).
+fn throttled_http_store<S: object_store::client::HttpService + Clone>(
+    base_url: &url::Url,
+    transport: S,
+) -> Result<Arc<dyn ObjectStore>, DataServerError> {
+    let connector = NoRedirectConnector(throttle::Throttled {
+        inner: transport,
+        host: throttle::for_url(base_url),
+    });
     let store = object_store::http::HttpBuilder::new()
         .with_url(base_url.as_str())
-        .with_http_connector(NoRedirectConnector(client))
+        .with_http_connector(connector)
         .build()
         .map_err(|e| {
             DataServerError::Storage(format!("Cannot create HTTP store for {base_url}: {e}"))
@@ -1931,7 +2106,7 @@ mod budget_tests {
 #[cfg(test)]
 mod range_tests {
     use super::*;
-    use crate::test_store::{MetaStore, RangeServer};
+    use crate::test_store::{JsonLog, MetaStore, RangeServer};
     use chrono::{DateTime, Utc};
     use object_store::PutPayload;
 
@@ -2165,23 +2340,215 @@ mod range_tests {
         assert_eq!(meta.peak.load(Ordering::SeqCst), 4, "the host limit holds");
     }
 
-    /// Stores built for one host share its limit, whatever their paths; the
-    /// first limit named for a host is kept.
+    /// Stores built for one host share its limit, whatever their paths and
+    /// whichever collection each names; the first limit named for a host is
+    /// kept.
     #[test]
     fn stores_for_one_host_share_its_limit() {
         let (a, path) = build_http_store_limited("http://127.0.0.1:9/meps/a.nc", 8).unwrap();
         let (b, _) = build_http_store_limited("http://127.0.0.1:9/other/", 3).unwrap();
         let (c, _) = build_http_store_limited("http://127.0.0.2:9/meps/a.nc", 8).unwrap();
         assert_eq!(path.as_ref(), "meps/a.nc");
-        assert!(Arc::ptr_eq(a.inner(), b.inner()));
-        assert!(!Arc::ptr_eq(a.inner(), c.inner()));
+        assert!(a.same_store(&b));
+        assert!(!a.same_store(&c));
+        let (a, b) = (a.for_collection("meps-sfc"), b.for_collection("meps-pl"));
+        assert!(a.same_store(&b), "a collection keeps the host's store");
+        assert!(!Arc::ptr_eq(a.inner(), b.inner()), "each names its own");
         let limited = HOST_STORES.lock().unwrap();
         assert_eq!(limited["http://127.0.0.1:9/"].limit, 8);
         drop(limited);
-        let idle = host_requests()
+        let idle = requests_to(|host| host == "127.0.0.1:9")
             .into_iter()
-            .find(|host| host.host == "127.0.0.1:9")
+            .next()
             .unwrap();
         assert_eq!((idle.limit, idle.in_flight, idle.queued), (8, 0, 0));
+    }
+
+    /// Collections naming themselves on one store keep sharing its limits,
+    /// the host's and a background share stacked on it (#1233).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collections_on_one_store_share_its_limits() {
+        let meta = Arc::new(MetaStore {
+            delay: std::time::Duration::from_millis(20),
+            ..MetaStore::default()
+        });
+        let paths: Vec<ObjectPath> = (0..12).map(|i| ObjectPath::from(format!("k{i}"))).collect();
+        for path in &paths {
+            meta.set(path.as_ref(), 1, None);
+        }
+        let host = DataStore::remote(meta.clone(), "meta.test").with_request_limit(3);
+        let background = host.with_request_limit(1);
+        let peak = |stores: [DataStore; 2]| {
+            meta.peak.store(0, Ordering::SeqCst);
+            let paths = paths.clone();
+            async move {
+                let tasks = stores.map(|store| {
+                    let paths = paths.clone();
+                    tokio::task::spawn_blocking(move || store.head_many(&paths, 16).unwrap())
+                });
+                for task in tasks {
+                    task.await.unwrap();
+                }
+            }
+        };
+        peak([
+            host.clone().for_collection("a"),
+            host.clone().for_collection("b"),
+        ])
+        .await;
+        assert_eq!(meta.peak.load(Ordering::SeqCst), 3, "the host limit holds");
+        peak([
+            background.clone().for_collection("a"),
+            background.clone().for_collection("b"),
+        ])
+        .await;
+        assert_eq!(meta.peak.load(Ordering::SeqCst), 1, "the share holds");
+    }
+
+    /// The lines `read` logs, as the server's `LOG_FORMAT=json` writes them.
+    fn logged(read: impl FnOnce()) -> Vec<serde_json::Value> {
+        let log = JsonLog::default();
+        tracing::subscriber::with_default(log.subscriber(), read);
+        log.lines()
+    }
+
+    /// object_store's retry lines among `lines`.
+    fn retries(lines: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        lines
+            .iter()
+            .filter(|line| line["target"] == "object_store::client::retry")
+            .collect()
+    }
+
+    /// The `storage` spans `line` is in, outermost first.
+    fn storage_spans(line: &serde_json::Value) -> Vec<&serde_json::Value> {
+        line["spans"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|span| span["name"] == "storage")
+            .collect()
+    }
+
+    /// object_store's line for a retried 429 runs inside the `storage` span
+    /// (#1233), which names the collection, the server's host and port and
+    /// the object key, never the URL's userinfo or query string.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retry_line_names_the_collection_source_and_key() {
+        let server = RangeServer::new(b"0123456789", at("2026-10-17T08:00:00Z"));
+        server
+            .object
+            .lock()
+            .unwrap()
+            .fail_next
+            .push_back("429 Too Many Requests");
+        let address = server.url.trim_start_matches("http://").to_string();
+        let url = format!("http://reader:secret@{address}/object?token=abc");
+        let (store, path) = build_http_store(&url).unwrap();
+        let store = store.for_collection("meps");
+
+        let lines = logged(|| assert_eq!(store.get_range(&path, 2..5).unwrap(), &b"234"[..]));
+        let request = server.object.lock().unwrap().last_request.clone();
+        assert!(request.starts_with("get /object?token=abc "), "{request}");
+        let retries = retries(&lines);
+        assert_eq!(retries.len(), 1, "{lines:#?}");
+        let retry = retries[0];
+        assert!(
+            retry["message"].as_str().unwrap().contains("429"),
+            "{retry:#}"
+        );
+        assert_eq!(
+            retry["span"],
+            serde_json::json!({
+                "name": "storage",
+                "collection": "meps",
+                "store": address,
+                "path": "object",
+            }),
+            "{retry:#}"
+        );
+        assert_eq!(storage_spans(retry).len(), 1, "{retry:#}");
+    }
+
+    /// Two collections on one limited host, one on a background share of
+    /// it: each retry line is in one `storage` span naming its own
+    /// collection, never in a nested one without it (#1233).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_lines_of_collections_on_one_host_name_each_once() {
+        let server = RangeServer::new(b"0123456789", at("2026-10-17T08:00:00Z"));
+        let url = format!("{}/object", server.url);
+        let (sfc, path) = build_http_store_limited(&url, 4).unwrap();
+        let (pl, _) = build_http_store_limited(&url, 4).unwrap();
+        let sfc = sfc.for_collection("meps-sfc");
+        let pl = pl.with_request_limit(2).for_collection("meps-pl");
+        for (store, collection) in [(&sfc, "meps-sfc"), (&pl, "meps-pl")] {
+            server
+                .object
+                .lock()
+                .unwrap()
+                .fail_next
+                .push_back("503 Service Unavailable");
+            let lines = logged(|| assert_eq!(store.head(&path).unwrap().size, 10));
+            let retries = retries(&lines);
+            assert_eq!(retries.len(), 1, "{lines:#?}");
+            let spans = storage_spans(retries[0]);
+            assert_eq!(spans.len(), 1, "{:#}", retries[0]);
+            assert_eq!(spans[0]["collection"], collection);
+            assert_eq!(retries[0]["span"]["collection"], collection);
+        }
+    }
+
+    /// A remote store's `store` label is the server's or the bucket
+    /// endpoint's host and port, and the bucket: never credentials, a path
+    /// or a query string. A local store has none.
+    #[test]
+    fn store_labels_name_the_host_and_bucket_only() {
+        let label = |store: &DataStore| {
+            let remote = store.remote.as_ref();
+            remote.map(|remote| remote.labels.store.to_string())
+        };
+        let (virtual_hosted, _) =
+            build_store("https://noaa-goes19.s3.us-east-1.amazonaws.com/ABI-L2-CMIPF/").unwrap();
+        assert_eq!(
+            label(&virtual_hosted).as_deref(),
+            Some("s3.us-east-1.amazonaws.com/noaa-goes19")
+        );
+        let (path_style, _) = build_store("https://s3.waw3-1.cloudferro.com/radar/odim/").unwrap();
+        assert_eq!(
+            label(&path_style).as_deref(),
+            Some("s3.waw3-1.cloudferro.com/radar")
+        );
+        let parts = build_s3_store_from_parts("http://minio.example:9000", "goes").unwrap();
+        assert_eq!(label(&parts).as_deref(), Some("minio.example:9000/goes"));
+        let (http, _) =
+            build_http_store("https://user:pw@thredds.met.no/thredds/x.nc?token=t").unwrap();
+        assert_eq!(label(&http).as_deref(), Some("thredds.met.no"));
+        let (limited, _) =
+            build_http_store_limited("http://user:pw@127.0.0.3:8080/x.nc?sig=s", 2).unwrap();
+        assert_eq!(label(&limited).as_deref(), Some("127.0.0.3:8080"));
+
+        for (endpoint, region, expected) in [
+            (None, None, "s3.us-east-1.amazonaws.com/b"),
+            (None, Some("eu-north-1"), "s3.eu-north-1.amazonaws.com/b"),
+            (Some("minio.example:9000"), None, "minio.example:9000/b"),
+            (
+                Some("https://key:secret@minio.example:9000/x?X-Amz-Signature=s"),
+                None,
+                "minio.example:9000/b",
+            ),
+            (
+                Some("key:secret@minio.example/x?sig=s"),
+                None,
+                "minio.example/b",
+            ),
+        ] {
+            assert_eq!(traced::s3_label(endpoint, region, "b"), expected);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (local, _) = build_store(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(label(&local), None);
+        let local = local.for_collection("radar");
+        assert!(local.remote.is_none(), "no span layer");
     }
 }

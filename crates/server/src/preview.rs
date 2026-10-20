@@ -1183,6 +1183,7 @@ mod tests {
             maps: Arc::new(ArcSwap::from_pointee(maps)),
             tiles: Arc::new(ArcSwap::from_pointee(tiles)),
             tiles_3d: Arc::new(ArcSwap::from_pointee(tiles_3d)),
+            served_by: Default::default(),
             accepted_load: RwLock::new(None),
             recovery_shutdown: ds_poll::Shutdown::new(),
             config_path: String::new(),

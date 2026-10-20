@@ -203,14 +203,18 @@ impl SatelliteEngine {
         let source = match (&config.data_path, &config.endpoint, &config.bucket) {
             (Some(path), _, _) => {
                 let (store, base) = ds_storage::build_store(path)?;
-                Source::Directory { store, base }
+                Source::Directory {
+                    store: store.for_collection(collection_id),
+                    base,
+                }
             }
             (None, Some(endpoint), Some(bucket)) => {
                 for product in &products {
                     product.naming.validate_window(window.as_ref())?;
                 }
                 Source::Bucket {
-                    store: ds_storage::build_s3_store_from_parts(endpoint, bucket)?,
+                    store: ds_storage::build_s3_store_from_parts(endpoint, bucket)?
+                        .for_collection(collection_id),
                 }
             }
             _ => unreachable!("validate_satellite requires a source"),

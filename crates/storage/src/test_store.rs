@@ -1,9 +1,10 @@
 //! Object stores for tests: one that instruments LISTs, for the concurrent
 //! listing and catalog scan tests; one whose GET bodies stall, for the fetch
 //! budget tests; and one that answers HEADs from scripted metadata, for the
-//! template prober and request limit tests.
+//! template prober and request limit tests. Also a one-object HTTP server
+//! and a JSON log sink, for the range read and `storage` span tests.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -378,15 +379,21 @@ pub(crate) struct RangeObject {
     /// Answer every request for the object with this status line instead,
     /// such as `403 Forbidden`.
     pub status: Option<&'static str>,
+    /// Answer the next requests for the object with these status lines,
+    /// one each, such as `429 Too Many Requests`, then serve it again. A
+    /// status line may carry header lines after it:
+    /// `429 Too Many Requests\r\nRetry-After: 1`.
+    pub fail_next: VecDeque<&'static str>,
     /// The head of the last request, lowercased.
     pub last_request: String,
 }
 
 /// A one-object HTTP/1.1 server on 127.0.0.1, for the range read tests:
-/// HEAD and ranged GET (206) of `/object`, a 412 when the object was
-/// modified after a request's `If-Unmodified-Since`, a 416 for a range
-/// starting past its end, and a 404 for any other path. One connection at
-/// a time, each closed after its response.
+/// HEAD and ranged GET (206) of `/object`, whatever the query string, a
+/// 412 when the object was modified after a request's
+/// `If-Unmodified-Since`, a 416 for a range starting past its end, and a
+/// 404 for any other path. One connection at a time, each closed after its
+/// response.
 pub(crate) struct RangeServer {
     pub url: String,
     pub object: Arc<Mutex<RangeObject>>,
@@ -405,6 +412,7 @@ impl RangeServer {
             last_modified,
             ignore_preconditions: false,
             status: None,
+            fail_next: VecDeque::new(),
             last_request: String::new(),
         }));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -464,7 +472,8 @@ fn respond(object: &mut RangeObject, request: &str) -> Vec<u8> {
     const HTTP_DATE: &str = "%a, %d %b %Y %H:%M:%S GMT";
     object.last_request = request.to_string();
     let mut fields = request.split_whitespace();
-    let (method, path) = (fields.next().unwrap(), fields.next().unwrap());
+    let (method, target) = (fields.next().unwrap(), fields.next().unwrap());
+    let path = target.split_once('?').map_or(target, |(path, _)| path);
     let header = |name: &str| {
         request
             .lines()
@@ -476,7 +485,7 @@ fn respond(object: &mut RangeObject, request: &str) -> Vec<u8> {
     if path != "/object" {
         return status("404 Not Found").into_bytes();
     }
-    if let Some(code) = object.status {
+    if let Some(code) = object.fail_next.pop_front().or(object.status) {
         return status(code).into_bytes();
     }
     let unmodified_since =
@@ -521,4 +530,52 @@ fn respond(object: &mut RangeObject, request: &str) -> Vec<u8> {
     .into_bytes();
     response.extend_from_slice(body);
     response
+}
+
+/// A JSON log sink: the lines a JSON `fmt` subscriber writes, as the
+/// server's `LOG_FORMAT=json` does, with the list of spans an event is in
+/// as well as the current one.
+#[derive(Clone, Default)]
+pub(crate) struct JsonLog(Arc<Mutex<Vec<u8>>>);
+
+impl JsonLog {
+    /// A subscriber writing to this sink, at INFO and above.
+    pub fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_writer(self.clone())
+            .finish()
+    }
+
+    /// The lines written so far.
+    pub fn lines(&self) -> Vec<serde_json::Value> {
+        let bytes = self.0.lock().unwrap().clone();
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+impl std::io::Write for JsonLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JsonLog {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
 }

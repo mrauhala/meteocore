@@ -680,13 +680,6 @@ main {
   height:7px;
   border-radius:50%;
 }
-.coverage-facts {
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:18px;
-  padding:20px;
-  border-top:1px solid var(--line);
-}
 .fact small {
   display:block;
   margin-bottom:5px;
@@ -1309,10 +1302,6 @@ dialog::backdrop {
   }
   .aside-stack {
     display:flex;
-  }
-  .coverage-facts {
-    gap:15px;
-    padding:17px;
   }
   .item-layout>.panel {
     display:block;
@@ -2452,7 +2441,6 @@ code{overflow-wrap:anywhere}
 .resource-links .endpoint>div{min-width:0}
 .resource-links code{font-size:14px}
 .resource-links .btn{flex-shrink:0}
-.coverage-facts strong{overflow-wrap:anywhere}
 .collection-row .license{font-size:14px}
 .metadata-section{margin-top:24px}
 .collection-view:target{scroll-margin-top:95px}
@@ -2755,7 +2743,7 @@ code.term{display:inline;margin-right:4px}
 .structured-list{margin:0;padding-left:20px}
 .structured-list>li{margin-bottom:8px}
 .all-fields{margin-top:14px}
-:is(.parameter-table,.styles-table,.query-table,.conformance-table) .chip-row,.coverage-facts .chip-row{display:flex;flex-wrap:wrap;gap:6px}
+:is(.parameter-table,.styles-table,.query-table,.conformance-table) .chip-row,.extent-facts .chip-row{display:flex;flex-wrap:wrap;gap:6px}
 :is(.parameter-table,.styles-table,.query-table,.conformance-table) :is(td,th) details{margin-top:6px}
 :is(.parameter-table,.styles-table,.query-table,.conformance-table) .chip{white-space:nowrap}
 :is(.parameter-table,.styles-table,.query-table,.conformance-table) tbody th{background:transparent;font-weight:400}
@@ -2827,3 +2815,46 @@ h1{overflow-wrap:anywhere}
 .item-fields .chip-row{display:flex;flex-wrap:wrap;gap:6px}
 .related-links{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .related-links .btn{white-space:normal}
+
+/* Collection page (#1228): the heading's API chips, which link to each
+   API's view of the collection, its keywords and licence; the Extent box,
+   a row per dimension; the request guide, a card per API serving the
+   collection, each request with Copy and Open. */
+a.api-chip{text-decoration:underline;text-decoration-color:transparent;text-underline-offset:3px}
+a.api-chip:hover{text-decoration-color:currentColor}
+.detail-heading .heading-keywords{margin-top:14px}
+.detail-heading .row-line .chip-row{margin:0}
+.detail-heading .license{margin-top:8px}
+.detail-heading .license a{color:var(--teal);text-decoration:underline;text-underline-offset:3px}
+.extent-rows{margin:0}
+.map-panel+.extent-rows{border-top:1px solid var(--line)}
+.extent-row{display:grid;grid-template-columns:7rem minmax(0,1fr);gap:8px 20px;padding:18px 20px}
+.extent-row+.extent-row{border-top:1px solid var(--line)}
+.extent-row>dt{font-weight:600;color:var(--ink)}
+.extent-facts{margin:0;min-width:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,9rem),1fr));gap:14px 22px}
+.extent-facts>.fact{min-width:0}
+.extent-facts .fact strong{overflow-wrap:anywhere}
+.extent-facts>details>summary{font-size:14px;color:var(--teal)}
+.level-list{color:var(--ink);overflow-wrap:anywhere}
+.extent-panel>.empty-state{padding:24px 20px;border:0;border-radius:0}
+.request-guide>.section-note{max-width:80ch}
+.guide-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,26rem),1fr));gap:16px;margin-top:16px;align-items:start}
+.guide-entry{display:flex;flex-direction:column;gap:12px;min-width:0;padding:18px 20px;border:1px solid var(--line);border-radius:10px;background:var(--white)}
+.guide-entry h3{margin:0;font-size:var(--text-subheading)}
+.guide-entry>p{line-height:1.6}
+.guide-endpoints{margin:0;display:flex;flex-direction:column;gap:6px}
+.guide-endpoints>div{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;min-width:0}
+.guide-endpoints dt{min-width:5.5rem;font-size:14px;color:var(--muted)}
+.guide-endpoints dd{margin:0;min-width:0}
+.guide-endpoints a{text-decoration:underline;text-underline-offset:3px}
+.guide-example{display:flex;flex-direction:column;gap:8px;padding-top:12px;border-top:1px solid var(--line)}
+.guide-example>p{font-size:14px}
+.guide-example .request-identity{gap:10px;padding:8px 10px;border-radius:6px;background:var(--code-bg)}
+.guide-example .request-identity code{font-size:14px;color:var(--ink)}
+.guide-actions{display:flex;flex-wrap:wrap;gap:8px}
+.guide-entry .row-line,.guide-more{margin:0}
+.guide-reference{margin-top:18px}
+@media(max-width:600px){
+  .extent-row{grid-template-columns:minmax(0,1fr);padding:14px 16px}
+  .guide-entry{padding:16px}
+}

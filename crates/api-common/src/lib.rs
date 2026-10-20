@@ -61,6 +61,9 @@ pub mod mounts {
     /// WMS 1.3.0, outside the shared root: the collection page's WMS draw
     /// mode requests its GetMap here (#1220).
     pub const WMS: &str = "/wms";
+    /// OGC 3D Tiles, outside the shared root: a radar volume's collection
+    /// page links its tileset here (#1228).
+    pub const TILES_3D: &str = "/3dtiles";
 }
 
 /// Registered OGC link relation types. Standards print some as `https://`

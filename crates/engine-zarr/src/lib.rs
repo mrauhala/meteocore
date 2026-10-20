@@ -597,7 +597,11 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, Data
                  (endpoint={endpoint}, bucket={bucket}): {e}"
             ))
         })?;
-        return Ok(DsStore::new(ds, path, config.cache_mb));
+        return Ok(DsStore::new(
+            ds.for_collection(collection_id),
+            path,
+            config.cache_mb,
+        ));
     }
 
     let data_path = config.data_path.as_deref().ok_or_else(|| {
@@ -621,7 +625,7 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, Data
         ))
     })?;
     Ok(DsStore::new(
-        ds,
+        ds.for_collection(collection_id),
         prefix.as_ref().to_string(),
         config.cache_mb,
     ))

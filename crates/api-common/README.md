@@ -243,15 +243,54 @@ resource as currently filtered and paged.
   area, vertical range, and parameters or styles. Feature collections also
   show an item count. A dash marks a value that is not advertised. Results
   can be shown as a list or as cards.
-- **Collection page.** Overview and metadata tabs. The heading shows one
-  chip per OGC API that the collection's links advertise. The metadata tab
+- **Collection page.** Overview and metadata tabs. The metadata tab
   shows every member of the collection JSON as tables and links, including
   every link with its relation and media type. A missing member reads "Not
-  advertised", and nothing is inferred. When the Features API serves the
-  collection's items, the Overview adds a line on what one item is (when the
-  engine gives one) and "Filter by" and "Sort by" chips. Each chip opens the
-  items page with its request builder set to that property, named in the
-  URL fragment (`#filter=<name>`, `#sort=<name>`).
+  advertised", and nothing is inferred.
+  - **Heading.** A chip for every API serving the collection, each a link to
+    that API's view of it: Maps (the map image), Tiles (the tileset list)
+    and Features (the items page) as the collection's links advertise them,
+    EDR (its collection page), WMS (GetCapabilities) and 3D Tiles (the
+    tileset). Then the title, the description, a line on what one item is
+    when the engine gives one, the keywords as chips that search the
+    catalog, and the licence with its link.
+  - **Extent.** One box, a row each for the spatial, temporal and vertical
+    extent, showing only what the document carries. Spatial: the bounds in
+    the bbox's CRS with a Copy bbox button, the storage CRS, and the grid's
+    cells and resolution from `extent.spatial.grid`, which the APIs give
+    for geographic grids only. Temporal: the interval, the step from the
+    temporal grid's `resolution`, the number of steps, and EDR's model runs
+    where the document links them. Vertical: the range, the levels in their
+    unit, the reference system. "Technical details" beside it holds the
+    data type, the coordinate systems and the number of items.
+  - **Request data from this collection.** An entry per API serving the
+    collection: what it is for, its endpoints, and ready requests over the
+    collection's own extent at its latest time, with Copy and Open, then a
+    link to the API reference. A request names no `parameter-name`, so it
+    gets the default parameter.
+    - Maps: an image of the extent, 1024 pixels wide.
+    - Tiles: the tileset list, and the WebMercatorQuad tile over the
+      extent's centre at the zoom where the extent spans about a tile.
+    - Features: the first 10 items as GeoJSON, the request builder, and
+      "Filter by" and "Sort by" chips. Each chip opens the items page with
+      its builder set to that property, named in the URL fragment
+      (`#filter=<name>`, `#sort=<name>`).
+    - EDR, by the queries EDR offers the collection, so an example never
+      asks for a query it would answer 404: for stations (`locations`) the
+      locations and the whole extent; for a grid (`position`) the values at
+      the centre and an area a fiftieth of the extent across; else, as for
+      lightning events or a motion field, the whole extent with no time.
+      Every query is a chip that opens its form.
+    - WMS: GetCapabilities, and a GetMap of the extent in EPSG:3857 as the
+      map's WMS mode draws it.
+    - 3D Tiles: the tileset, and the 3D viewer.
+  - On the shared root, the server tells the page what EDR, WMS and 3D
+    Tiles serve of each collection (`shared::CollectionServices`): a
+    snapshot of their registries per load, with EDR's query types. The
+    collection document names none of them, and `apis` can over-claim: a
+    radar volume's network inventory keeps the configured id for Features
+    alone. Without the snapshot the page reads them from `apis` and gives
+    no EDR example. Per-API pages show the APIs their document advertises.
 - **Static assets.** The stylesheets (`style.css`, and `map.css` on pages
   with a map) and scripts (`app.js`, `map.js`) are not inlined. The server
   mounts `workbench::assets::router()` at its root and serves them at
@@ -265,8 +304,9 @@ resource as currently filtered and paged.
 - **Map preview.** Drawn with MapLibre over Natural Earth outlines, which
   the server serves under `/preview/vendor/`.
   - **Layout.** A collection with a map opens its Overview on it: the
-    content width, `clamp(420px, 70vh, 820px)` tall, with the coverage
-    facts, parameters and details below. Its panels float over it:
+    content width, `clamp(420px, 70vh, 820px)` tall, with the Extent box,
+    parameters, technical details and the request guide below. Its panels
+    float over it:
     - top left, the layer card: parameter, style (hidden with one style),
       level and draw mode (Tiles, Image or WMS). It folds into a pill that
       names the layer, such as "Temperature · 850 hPa";
@@ -311,8 +351,8 @@ resource as currently filtered and paged.
     figures. Icons are inline SVG from `icon()`, no icon font.
   - It draws with whatever the collection advertises: map tiles, Maps
     images (Web Mercator PNG) or vector tiles. On the shared root, a
-    collection the WMS serves (its `apis` lists `wms`) can also be drawn with
-    WMS 1.3.0 GetMap, the meta-tiled path desktop WMS clients see. Map tiles
+    collection the WMS serves can also be drawn with WMS 1.3.0 GetMap, the
+    meta-tiled path desktop WMS clients see. Map tiles
     are the default where advertised, else Maps. A "Draw with" switch
     appears when there is more than one.
   - Maps images, map tiles and WMS get parameter, style, time and level

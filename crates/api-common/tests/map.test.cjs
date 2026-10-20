@@ -1477,6 +1477,45 @@ test('the status chip shows a load or a failure and the live region says the sam
   assert.equal(q.byId('map-chip').hidden, true);
 });
 
+test('the loading chip counts every frame loaded once, and a short hold shows none', async () => {
+  const q = await page();
+  await q.run();
+  const chip = q.byId('map-chip');
+  // Frames that arrive within the hold delay never show the chip.
+  await q.click('map-play');
+  const loading = () => !chip.hidden && chip.textContent.startsWith('Loading');
+  for (let i = 0; i < 8; i++) { await q.run(150); assert.equal(loading(), false, `step ${i}: ${chip.textContent}`); }
+  await q.click('map-play');
+  // A frame held back: the count includes the frames shown and dropped
+  // from the pool, not only the ones still buffered.
+  const p = await page();
+  await p.run();
+  p.held.add('2024-01-01T01:00:00Z');
+  await p.click('map-play');
+  await p.run(300);
+  assert.doesNotMatch(p.byId('map-chip').hidden ? '' : p.byId('map-chip').textContent, /^Loading/);
+  await p.run(1000);
+  assert.equal(p.byId('map-chip').textContent, 'Loading 2/3');
+  p.held.clear();
+  await p.run();
+  assert.equal(p.byId('map-chip').hidden, true);
+});
+
+test('on a first slow loop the chip counts the frames loaded so far, not only the buffered ones', async () => {
+  const p = await page({ mapData: r => { r.axis = { start: '2024-01-01T00:00:00Z', step: 300, count: 24 }; } });
+  await p.run();
+  const at = i => new Date(Date.parse('2024-01-01T00:00:00Z') + i * 300000).toISOString().replace('.000Z', 'Z');
+  // Every frame but the latest, shown on load, is slow to arrive.
+  for (let i = 0; i < 23; i++) p.held.add(at(i));
+  await p.click('map-play');
+  await p.run(1000);
+  assert.equal(p.byId('map-chip').textContent, 'Loading 1/24');
+  // Each frame arrives in turn; those shown and dropped from the pool keep
+  // counting.
+  for (let i = 0; i < 5; i++) { p.held.delete(at(i)); await p.run(1000); }
+  assert.equal(p.byId('map-chip').textContent, 'Loading 6/24');
+});
+
 test('the attribution names Natural Earth and the collection licence, escaped; the legend folds without losing its scale', async () => {
   const p = await page();
   const [attribution, position] = p.map.controls.find(([control]) => control.options?.customAttribution);

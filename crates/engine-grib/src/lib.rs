@@ -331,7 +331,10 @@ impl GribEngine {
             // Local stores are rooted at data_path; remote stores return its
             // object prefix separately. Append the optional literal sub-prefix.
             let prefix = fixed_source_prefix(&source_prefix, config.prefix_pattern.as_deref());
-            (store, ScanMode::FixedPrefix { prefix })
+            (
+                store.for_collection(collection_id),
+                ScanMode::FixedPrefix { prefix },
+            )
         } else {
             let endpoint = config.endpoint.as_deref().ok_or_else(|| {
                 DataServerError::Config(format!(
@@ -358,7 +361,10 @@ impl GribEngine {
                     "Collection '{collection_id}': failed to build store: {e}"
                 ))
             })?;
-            (store, ScanMode::Remote { prefix_pattern })
+            (
+                store.for_collection(collection_id),
+                ScanMode::Remote { prefix_pattern },
+            )
         };
 
         let grid_cache = GridCache::new(config.grid_cache_mb);

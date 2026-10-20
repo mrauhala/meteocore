@@ -160,8 +160,73 @@ against the operation's budget and the request deadline.
 `build_http_store_limited(url, n)` gives every store built for the same
 scheme, host and port one shared limit, so collections reading one server
 stay under it together; the first limit named for a host is kept for the
-life of the process. `host_requests()` reports, per host and port, the
-requests holding one of its permits and those waiting for one (two counting
-stores around its `LimitStore`), for the server's
-`storage_host_requests_{in_flight,queued}` and `storage_host_request_limit`
+life of the process. That limit adapts to a host that throttles (next
+section). `host_requests()` reports, per host and port, the limit as it is
+now, the requests holding one of its permits and those waiting for one
+(two counting stores around the limited store), for the server's
+`storage_host_request_limit` and `storage_host_requests_{in_flight,queued}`
 gauges.
+
+# Host back-off
+
+A concurrency limit is not a rate limit, and object_store retries a 429 Too
+Many Requests one request at a time, after a 0.1 s backoff, while the other
+requests to the host go on. So every HTTP store, limited or not, sends its
+requests through one throttle per scheme, host and port (`throttle.rs`,
+#1235). It sees the response to every attempt, object_store's retries
+included, and on a 429:
+
+- **`Retry-After`**, in seconds or as an HTTP-date, pauses new requests to
+  the host, from every store and collection on it, until then, at most 60 s
+  (`MAX_RETRY_AFTER`). The wait comes before the request is sent and is
+  part of the operation, so its fetch budget and the request deadline bound
+  it: one longer than the deadline fails the operation at the deadline.
+  A 429 without `Retry-After` pauses nothing.
+- **The adaptive limit** of a `build_http_store_limited` host halves, never
+  below 1 and at most once per second (`CUT_WINDOW`), so the 429s of one
+  burst cut it once. Each 30 s without a 429 (`QUIET_INTERVAL`) adds one
+  back, up to the configured limit. A cut takes the free permits at once
+  and the held ones as they are released: requests in flight finish, new
+  ones see the lower limit. A share stacked with `with_request_limit` stays
+  within it.
+
+`storage_host_request_limit{host}` shows the limit as it is now, so a cut
+shows on the dashboard's host panel. A cut, or a `Retry-After` pause, logs
+one WARN per host per minute naming the host, the limit, the configured
+limit and the wait; the limit's return to the configured one logs an INFO.
+S3 is out of scope: it throttles with 503 SlowDown, which object_store
+retries.
+
+# The storage span
+
+object_store logs each retry of a throttled or failed request at INFO,
+target `object_store::client::retry`, with only the status, the backoff and
+the attempt number. So every operation on a remote store, S3 or HTTP, runs
+inside `info_span!("storage", collection, store, path)` (#1233):
+
+- `collection`: the collection the store reads for. An engine names it
+  once, where it builds its store, with `DataStore::for_collection(id)`;
+  the field is absent until then.
+- `store`: the source. An HTTP server is `host[:port]` (`thredds.met.no`),
+  an S3 bucket its endpoint's `host[:port]` and the bucket
+  (`s3.us-east-1.amazonaws.com/noaa-goes19`). Never userinfo, a path or a
+  query string, which on a signed URL carries the signature.
+- `path`: the object key, or the list prefix.
+
+The span covers the whole operation: the wait for a request-limit permit
+and for a host's `Retry-After`, the request, object_store's retries, and the GET body or LIST stream that
+object_store retries body reads in. With `LOG_FORMAT=json` the server writes
+the current span on every event, so a retry line carries
+`"span":{"name":"storage","collection":"meps-sfc","store":"thredds.met.no","path":"…"}`;
+the human-readable format prints it as a `storage{…}` prefix. The span is at
+INFO under target `ds_storage::traced`, so a `RUST_LOG` that keeps
+object_store's INFO lines but drops that target logs them without it.
+
+Every `build_*` function that makes a remote store labels it
+(`DataStore::remote` labels a store built elsewhere); local and in-memory
+stores have no span, since they never retry. `DataStore` keeps its store
+without the span and rebuilds the span when it is limited or names its
+collection, so an operation is in exactly one `storage` span, and stores of
+one host limit that name different collections still share that limit
+(`DataStore::same_store`). `inner()` returns the store with the span, for
+callers that hand it to another library.

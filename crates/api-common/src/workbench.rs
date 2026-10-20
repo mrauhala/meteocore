@@ -90,36 +90,6 @@ fn vector_tilesets_link(links: &[Value]) -> Option<&str> {
         .and_then(|l| l["href"].as_str())
 }
 
-/// The OGC APIs a collection description advertises access through, as
-/// `(label, chip class, description)`. Derived from its links, not from the
-/// API serving the page, so a shared-root collection lists every mechanism.
-fn api_chips(doc: &Value) -> Vec<(&'static str, &'static str, &'static str)> {
-    let links = doc["links"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let has = |rel: &str| links.iter().any(|l| l["rel"] == rel);
-    let mut chips = Vec::new();
-    if map_link(links).is_some() {
-        chips.push(("Maps", "purple", "OGC API - Maps: rendered map images"));
-    }
-    if links.iter().any(|l| {
-        l["rel"]
-            .as_str()
-            .is_some_and(|r| r.starts_with(TILESETS_REL_PREFIX))
-    }) {
-        chips.push(("Tiles", "amber", "OGC API - Tiles: map or vector tiles"));
-    }
-    if has("items") {
-        chips.push(("Features", "teal", "OGC API - Features: feature items"));
-    }
-    if doc["data_queries"].is_object() {
-        chips.push((
-            "EDR",
-            "teal",
-            "OGC API - EDR: position, area and other data queries",
-        ));
-    }
-    chips
-}
-
 pub fn path_segment(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes())
         .collect::<String>()
@@ -1451,12 +1421,34 @@ pub struct ItemsOverview {
     pub sortables: Vec<String>,
 }
 
+/// The services outside the shared root that serve a collection (#1228),
+/// with their URLs: the collection document names none of them. The shared
+/// root's page has them (`shared::CollectionServices`); a per-API page has
+/// none, and EDR's own page reads its queries from `data_queries`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Services<'a> {
+    pub edr: Option<EdrService<'a>>,
+    /// The WMS endpoint, serving the collection as the layer named by its
+    /// id.
+    pub wms: Option<String>,
+    /// The collection in the 3D Tiles API.
+    pub tiles_3d: Option<String>,
+}
+
+/// The collection in the EDR API and the query types EDR offers for it;
+/// empty when they are not known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdrService<'a> {
+    pub href: String,
+    pub queries: &'a [String],
+}
+
 pub fn collection_html(
     surface: Surface<'_>,
     doc: &Value,
     license: Option<&LicenseConfig>,
 ) -> String {
-    collection_page(surface, doc, license, None, None)
+    collection_page(surface, doc, license, None, &Services::default())
 }
 
 /// A chip row of item properties on the Overview, each opening the items
@@ -1482,15 +1474,17 @@ fn item_field_chips(items: &str, label: &str, kind: &str, names: &[String]) -> S
 }
 
 /// [`collection_html`] with what the Features API says of the collection's
-/// items, when it serves them, and the WMS endpoint when WMS serves the
-/// collection as a layer named by its id: the map then offers WMS GetMap
-/// as a draw mode (#1220).
+/// items, when it serves them, and the services outside the shared root
+/// that serve the collection (#1228): the heading names every API serving
+/// it, and the Overview's request guide gives each one's endpoint and
+/// ready requests. A collection WMS serves, as the layer named by its id,
+/// can also be drawn with WMS GetMap (#1220).
 pub fn collection_page(
     surface: Surface<'_>,
     doc: &Value,
     license: Option<&LicenseConfig>,
     overview: Option<&ItemsOverview>,
-    wms: Option<&str>,
+    services: &Services<'_>,
 ) -> String {
     let Surface { base, root, api } = surface;
     let title = doc["title"]
@@ -1506,11 +1500,6 @@ pub fn collection_page(
         .unwrap_or_default();
     let url = with_format(href, "json");
     let catalog = format!("{root}/collections");
-    // Data access follows the advertised links, not the API the page is
-    // served by, so a collection offering several mechanisms shows each.
-    let items = links
-        .and_then(|ls| ls.iter().find(|l| l["rel"] == "items"))
-        .and_then(|l| l["href"].as_str());
     // The preview draws with Maps (one image per view), map tiles and/or
     // vector tiles (Web Mercator tilesets), whichever the collection
     // advertises. Each style carries its own map link and map-tileset list
@@ -1540,7 +1529,7 @@ pub fn collection_page(
             }
         }
         // WMS draws a raster collection, as the layer named by its id.
-        let wms = wms.filter(|_| map_href.is_some() || tiles_href.is_some()).map(safe_href).filter(|href| *href != "#");
+        let wms = services.wms.as_deref().filter(|_| map_href.is_some() || tiles_href.is_some()).map(safe_href).filter(|href| *href != "#");
         // In the order the switch offers them, the default first (#1220).
         let modes: Vec<&str> = [tiles_href.map(|_| "tiles"), map_href.map(|_| "maps"), wms.map(|_| "wms"), vector_href.map(|_| "vector")].into_iter().flatten().collect();
         // A time axis to choose from: an interval with at least one bound.
@@ -1549,28 +1538,39 @@ pub fn collection_page(
         let license = license.map(|license| json!({"title":license.title,"href":license.resolved_url()}));
         json!({"styles":styles,"modes":modes,"vector":vector_href.map(|href| json!({"href":href,"layer":id})),"wms":wms.map(|href| json!({"href":href,"layer":id})),"parameter_names":map_parameters(&doc["parameter_names"]),"axis":map_axis(&doc["extent"]["temporal"]),"temporal":temporal,"vertical":doc["extent"]["vertical"],"license":license})
     });
-    // One chip per OGC API the collection is available through. Its kind
-    // (`dataType`/`itemType`) is under "Collection details" as Data type; a
-    // `feature` chip beside a `Features` one only read as a duplicate.
-    let chips = api_chips(doc);
-    let api_chips = if chips.is_empty() {
+    // Every API serving the collection (#1228): its chip by the title and
+    // its entry in the request guide. Its kind (`dataType`/`itemType`) is
+    // under "Technical details" as Data type; a `feature` chip beside a
+    // `Features` one only read as a duplicate.
+    let accesses = accesses(doc, href, services, overview, map_request.is_some());
+    let api_chips = if accesses.is_empty() {
         format!("<span class=\"chip teal\">{}</span>", escape(api))
     } else {
-        chips
-            .iter()
-            .map(|(label, class, description)| {
-                format!(
-                    "<span class=\"chip api-chip {class}\" title=\"{description}\">{label}</span>"
-                )
-            })
-            .collect()
+        accesses.iter().map(Access::chip).collect()
     };
     // What one item is, where the description alone could mislead (#1143).
     let items_note = overview
         .and_then(|o| o.description.as_deref())
         .map(|note| format!("<p class=\"items-note\">{}</p>", escape(note)))
         .unwrap_or_default();
-    let mut body=format!("<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← Back to collections</a><div class=\"detail-heading\"><div class=\"chip-row\" aria-label=\"Available through\">{api_chips}</div><h1>{}</h1><div class=\"mono\">{}</div><p>{}</p>{items_note}</div><nav class=\"detail-tabs\" aria-label=\"Collection views\"><a data-collection-tab=\"overview\" class=\"active\" href=\"#overview\">Overview</a>",escape(&catalog),escape(&with_format(&catalog,"html")),escape(title),escape(id),escape(doc["description"].as_str().unwrap_or_default()));
+    // The description, then the keywords (each a catalog search) and the
+    // licence, in the heading (#1228).
+    let keywords: String = doc["keywords"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|k| anchor(&query_edit(&catalog, "q", Some(k)), k, "chip"))
+        .collect();
+    let keywords = if keywords.is_empty() {
+        keywords
+    } else {
+        format!("<div class=\"row-line heading-keywords\"><span class=\"row-label\">Keywords</span><span class=\"chip-row\">{keywords}</span></div>")
+    };
+    let mut body=format!("<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← Back to collections</a><div class=\"detail-heading\"><div class=\"chip-row\" aria-label=\"Available through\">{api_chips}</div><h1>{}</h1><div class=\"mono\">{}</div><p>{}</p>{items_note}{keywords}{}</div><nav class=\"detail-tabs\" aria-label=\"Collection views\"><a data-collection-tab=\"overview\" class=\"active\" href=\"#overview\">Overview</a>",escape(&catalog),escape(&with_format(&catalog,"html")),escape(title),escape(id),escape(doc["description"].as_str().unwrap_or_default()),license_html(license));
+    let items = links
+        .and_then(|ls| ls.iter().find(|l| l["rel"] == "items"))
+        .and_then(|l| l["href"].as_str());
     if let Some(items) = items {
         body.push_str(&anchor(&with_format(items, "html"), "Request data", ""));
     }
@@ -1615,7 +1615,9 @@ pub fn collection_page(
         ));
         body.push_str("</div>");
     }
-    body.push_str("<div class=\"detail-layout\"><div><section class=\"panel\"><div class=\"panel-head\"><h2>Data coverage</h2><span class=\"chip\">CRS84</span></div>");
+    // One Extent box: a row each for the spatial, temporal and vertical
+    // extent (#1228).
+    body.push_str("<div class=\"detail-layout\"><div><section class=\"panel extent-panel\" id=\"extent\"><div class=\"panel-head\"><h2>Extent</h2></div>");
     if map_request.is_none() {
         // A locator of the advertised extent.
         if let Some(extent) = &extent {
@@ -1626,12 +1628,12 @@ pub fn collection_page(
                 false,
                 MAP_EXTENT_FALLBACK,
             ));
-        } else {
-            body.push_str("<div class=\"empty-state\"><p>Spatial extent not advertised.</p></div>");
         }
     }
-    // Time, cadence, steps and bounds with the catalog's formatting (#1140).
-    body.push_str(&metadata::coverage_facts(doc));
+    match metadata::extent_rows(doc) {
+        Some(rows) => body.push_str(&rows),
+        None => body.push_str("<div class=\"empty-state\"><p>No extent advertised.</p></div>"),
+    }
     body.push_str("</section>");
     // The parameters a request names in `parameter-name`, with their units.
     if let Some(parameters) = doc["parameter_names"].as_object().filter(|p| !p.is_empty()) {
@@ -1641,113 +1643,16 @@ pub fn collection_page(
             metadata::parameter_table(parameters, false)
         ));
     }
-    body.push_str("<section class=\"section-space\"><h2>Request data from this collection</h2>");
-    if let Some(items) = items {
-        body.push_str(&format!("<div class=\"callout spaced\">Filter features within this collection by its supported properties, area and time. Inspect the results or copy the GeoJSON request. These filters select data, not collections.</div><div class=\"action-row spaced\">{}{}</div>",anchor(&with_format(items,"html"),"Build a data request →","btn primary"),anchor(&url,"View metadata JSON","btn")));
-        if let Some(overview) = overview {
-            body.push_str(&item_field_chips(
-                items,
-                "Filter by",
-                "filter",
-                &overview.filterables,
-            ));
-            body.push_str(&item_field_chips(
-                items,
-                "Sort by",
-                "sort",
-                &overview.sortables,
-            ));
-        }
-    }
-    if let Some(queries) = doc["data_queries"].as_object() {
-        body.push_str("<div class=\"endpoint-list spaced\">");
-        for (name, query) in queries {
-            if let Some(href) = query["link"]["href"].as_str() {
-                let target = if name == "instances" {
-                    with_format(href, "html")
-                } else {
-                    format!("{root}/api/docs")
-                };
-                body.push_str(&format!("<div class=\"endpoint\"><div><a class=\"resource-title\" href=\"{}\"><strong>{} query</strong><code>{}</code></a><p>{}</p></div>{}</div>",escape(safe_href(&data_query_target(name, href))),escape(name),escape(href),value_html(&query["link"]["variables"]["output_formats"]),anchor(&target,if name=="instances"{"Browse runs →"}else{"API docs ↗"},"btn small")));
-            }
-        }
-        body.push_str("</div>");
-    }
-    if let Some(map_href) = map_href.filter(|_| map_request.is_some()) {
-        body.push_str("<p class=\"spaced\">With JavaScript, “This frame as an API request” under the map holds the exact request of the frame drawn: its style, time, vertical level, bounds and output size. The JSON switch opens this collection’s metadata.</p>");
-        // Document the map request at the API serving the map link, which
-        // need not be the API rendering this page.
-        let map_api = map_href.split("/collections/").next().unwrap_or(root);
-        body.push_str(&anchor(
-            &format!("{map_api}/api/docs"),
-            "Map request parameters ↗",
-            "btn",
-        ));
-    }
-    // Tilesets are listed whenever advertised, next to any map preview.
-    let tilesets: Vec<Value> = links
-        .into_iter()
-        .flatten()
-        .filter(|l| {
-            l["rel"]
-                .as_str()
-                .is_some_and(|r| r == "tiles" || r.starts_with(TILESETS_REL_PREFIX))
-        })
-        .cloned()
-        .collect();
-    if !tilesets.is_empty() {
-        body.push_str(&document_links(&json!({ "links": tilesets })));
-    }
-    body.push_str("</section></div><aside class=\"aside-stack\"><section class=\"panel\"><div class=\"panel-head\"><h2>Collection details</h2></div><div class=\"panel-body\"><dl class=\"definition\">");
-    // Plain labels; the JSON terms and CRS URIs are secondary text (#1140).
-    body.push_str(&format!(
-        "<dt>Data type</dt><dd>{}</dd><dt>Storage coordinate system</dt><dd>{}</dd>",
-        metadata::kind_html(doc),
-        doc["storageCrs"]
-            .as_str()
-            .map_or_else(|| metadata::NOT_ADVERTISED.to_owned(), metadata::crs_chip)
-    ));
-    if let Some(list) = doc["crs"].as_array().filter(|l| !l.is_empty()) {
-        let chips: String = list
-            .iter()
-            .filter_map(Value::as_str)
-            .map(metadata::crs_chip)
-            .collect();
-        body.push_str(&format!(
-            "<dt>Coordinate systems</dt><dd><span class=\"chip-row\">{chips}</span></dd>"
-        ));
-    }
-    if let Some(n) = doc.get("numberItems") {
-        body.push_str(&format!("<dt>Items</dt><dd>{}</dd>", value_html(n)));
-    }
-    body.push_str("<dt>Keywords</dt><dd><div class=\"tag-list\">");
-    for k in doc["keywords"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
-        body.push_str(&anchor(&query_edit(&catalog, "q", Some(k)), k, ""));
-    }
-    if !doc["keywords"]
-        .as_array()
-        .is_some_and(|ks| ks.iter().any(Value::is_string))
-    {
-        body.push_str(metadata::NOT_ADVERTISED);
-    }
-    body.push_str("</div></dd></dl>");
-    body.push_str(&license_html(license));
-    body.push_str("</div></section>");
-    // Each href once on the Overview (#1140): the data query end points are
-    // listed under "Request data" from `data_queries` (each opening its
-    // HTML view, a query's form, #1138), the tilesets beside the
-    // map, and a configured license in the details. The metadata tab's
-    // link table lists every link at its own href.
-    let query_hrefs: Vec<&str> = doc["data_queries"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter_map(|(_, query)| query["link"]["href"].as_str())
+    body.push_str("</div><aside class=\"aside-stack\">");
+    body.push_str(&technical_details(doc));
+    // Each href once on the Overview (#1140): the request guide lists the
+    // endpoints of every API serving the collection, and the heading its
+    // license. The metadata tab's link table lists every link at its own
+    // href.
+    let shown: Vec<String> = accesses
+        .iter()
+        .flat_map(|access| access.endpoints.iter())
+        .map(|(_, href)| metadata::resource_key(href))
         .collect();
     let license_href = license.and_then(|license| license.resolved_url());
     let resource_links: Vec<&Value> = links
@@ -1756,8 +1661,7 @@ pub fn collection_page(
         .filter(|l| {
             let href = l["href"].as_str().unwrap_or_default();
             !matches!(l["rel"].as_str(), Some("self" | "alternate"))
-                && !(l["rel"] == "data" && query_hrefs.contains(&href))
-                && !tilesets.iter().any(|t| t["href"] == href)
+                && !shown.contains(&metadata::resource_key(href))
                 && !(l["rel"] == "license" && license_href.as_deref() == Some(href))
         })
         .collect();
@@ -1767,7 +1671,9 @@ pub fn collection_page(
         body.push_str(&metadata::resource_cards(&resource_links));
         body.push_str("</div></section>");
     }
-    body.push_str("</aside></div></section><section id=\"metadata\" class=\"collection-view metadata-section\" data-collection-view><section class=\"panel\"><div class=\"panel-head\"><h2>Coverage &amp; metadata</h2>");
+    body.push_str("</aside></div>");
+    body.push_str(&request_guide(&accesses, root));
+    body.push_str("</section><section id=\"metadata\" class=\"collection-view metadata-section\" data-collection-view><section class=\"panel\"><div class=\"panel-head\"><h2>Coverage &amp; metadata</h2>");
     body.push_str(&anchor(&url, "View full JSON { }", "quiet"));
     body.push_str("</div>");
     // Every member but the links, as tables and anchors, never as JSON text.
@@ -1792,6 +1698,671 @@ pub fn collection_page(
         labels.push((href, title));
         labels
     })
+}
+
+/// The Overview's "Technical details" (#1228): what the collection holds,
+/// the coordinate systems its data comes in and, for features, how many
+/// items it has. The extent's own facts are in the Extent box.
+fn technical_details(doc: &Value) -> String {
+    // Plain labels; the JSON terms and CRS URIs are secondary text (#1140).
+    let mut html = format!(
+        "<section class=\"panel\"><div class=\"panel-head\"><h2>Technical details</h2></div><div class=\"panel-body\"><dl class=\"definition\"><dt>Data type</dt><dd>{}</dd>",
+        metadata::kind_html(doc)
+    );
+    if let Some(list) = doc["crs"].as_array().filter(|l| !l.is_empty()) {
+        let chips: String = list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(metadata::crs_chip)
+            .collect();
+        html.push_str(&format!(
+            "<dt>Coordinate systems</dt><dd><span class=\"chip-row\">{chips}</span></dd>"
+        ));
+    }
+    if let Some(n) = doc.get("numberItems") {
+        html.push_str(&format!("<dt>Items</dt><dd>{}</dd>", value_html(n)));
+    }
+    html.push_str("</dl></div></section>");
+    html
+}
+
+/// One API serving a collection (#1228): its chip by the title and its
+/// entry in the Overview's request guide.
+struct Access {
+    /// Its guide entry is `#request-{key}`.
+    key: &'static str,
+    label: &'static str,
+    standard: &'static str,
+    /// The chip's colour.
+    class: &'static str,
+    /// What the API is for, as text.
+    purpose: String,
+    /// Where the chip goes, the API's own view of the collection, and what
+    /// that opens.
+    view: String,
+    view_title: &'static str,
+    /// The collection's endpoints in the API, labelled.
+    endpoints: Vec<(&'static str, String)>,
+    /// Ready requests: what each asks for, and its URL.
+    examples: Vec<(&'static str, String)>,
+    /// Trusted markup after the examples.
+    more: String,
+    /// The reference of the API serving it.
+    reference: Option<String>,
+}
+
+impl Access {
+    fn chip(&self) -> String {
+        format!(
+            "<a class=\"chip api-chip {}\" href=\"{}\" title=\"{}: {}\">{}</a>",
+            self.class,
+            escape(safe_href(&self.view)),
+            escape(self.standard),
+            escape(self.view_title),
+            escape(self.label)
+        )
+    }
+
+    /// The guide entry: purpose, endpoints, then each example as its
+    /// request with Copy and Open, as under the map (#1220). `docs` is the
+    /// page's own API reference, linked once after every entry.
+    fn entry(&self, docs: &str) -> String {
+        let key = self.key;
+        let mut html = format!(
+            "<section class=\"guide-entry\" id=\"request-{key}\" aria-labelledby=\"request-{key}-title\"><h3 id=\"request-{key}-title\">{}<small class=\"term\">{}</small></h3><p>{}</p><dl class=\"guide-endpoints\">",
+            escape(self.label),
+            escape(self.standard),
+            escape(&self.purpose)
+        );
+        for (label, href) in &self.endpoints {
+            html.push_str(&format!(
+                "<div><dt>{}</dt><dd><a href=\"{}\"><code>{}</code></a></dd></div>",
+                escape(label),
+                escape(safe_href(href)),
+                escape(href)
+            ));
+        }
+        html.push_str("</dl>");
+        for (label, url) in &self.examples {
+            if safe_href(url) == "#" {
+                continue;
+            }
+            let url = escape(url);
+            html.push_str(&format!(
+                "<div class=\"guide-example\"><p>{}</p><div class=\"request-identity\"><span class=\"method\">GET</span><code>{url}</code></div><div class=\"guide-actions\"><button type=\"button\" class=\"btn small enhanced\" data-copy=\"{url}\">Copy</button><a class=\"btn small\" href=\"{url}\">Open ↗</a></div></div>",
+                escape(label)
+            ));
+        }
+        html.push_str(&self.more);
+        if let Some(reference) = self.reference.as_deref().filter(|r| *r != docs) {
+            html.push_str(&format!(
+                "<p class=\"guide-more\">{}</p>",
+                anchor(reference, &format!("{} API reference ↗", self.label), "")
+            ));
+        }
+        html.push_str("</section>");
+        html
+    }
+}
+
+/// The Overview's "Request data from this collection" (#1228): an entry
+/// per API serving the collection, then the page's API reference.
+fn request_guide(accesses: &[Access], root: &str) -> String {
+    let docs = format!("{root}/api/docs");
+    let mut html = String::from("<section class=\"section-space request-guide\" id=\"request-data\"><h2>Request data from this collection</h2>");
+    if accesses.is_empty() {
+        html.push_str("<p class=\"section-note\">No API advertises a way to request this collection’s data.</p>");
+    } else {
+        html.push_str("<p class=\"section-note\">Each API that serves this collection, with its endpoint and ready requests over the collection’s own extent at its latest time. A request without <code>parameter-name</code> gets the default parameter.</p><div class=\"guide-list\">");
+        for access in accesses {
+            html.push_str(&access.entry(&docs));
+        }
+        html.push_str("</div>");
+    }
+    html.push_str(&format!(
+        "<p class=\"guide-reference\">{}</p></section>",
+        anchor(&docs, "API reference ↗", "btn")
+    ));
+    html
+}
+
+/// What a collection's example requests are built from (#1228): its CRS84
+/// bbox, east unwrapped past 180 across the antimeridian; the latest time
+/// of its temporal extent, in UTC; and the spatial grid's resolution in
+/// degrees, where the document gives it.
+struct RequestFacts {
+    bbox: Option<[f64; 4]>,
+    latest: Option<String>,
+    resolution: Option<[f64; 2]>,
+}
+
+impl RequestFacts {
+    fn of(doc: &Value) -> Self {
+        let spatial = &doc["extent"]["spatial"];
+        let geographic = spatial["crs"]
+            .as_str()
+            .is_none_or(|crs| metadata::crs_name(crs) == "CRS84");
+        let bbox = metadata::bbox_xy(&spatial["bbox"][0])
+            .filter(|[w, s, e, n]| geographic && s < n && w != e)
+            .map(|[w, s, e, n]| [w, s, if w > e { e + 360. } else { e }, n]);
+        let temporal = &doc["extent"]["temporal"];
+        let utc = |t: &Value| {
+            chrono::DateTime::parse_from_rfc3339(t.as_str()?)
+                .ok()
+                .map(|t| crate::subset::rfc3339(t.with_timezone(&chrono::Utc)))
+        };
+        let latest = utc(&temporal["interval"][0][1])
+            .or_else(|| utc(temporal["values"].as_array()?.last()?));
+        let resolution = spatial["grid"]
+            .as_array()
+            .filter(|axes| geographic && axes.len() == 2)
+            .and_then(|axes| {
+                Some([
+                    axes[0]["resolution"].as_f64()?,
+                    axes[1]["resolution"].as_f64()?,
+                ])
+            })
+            .filter(|r| r.iter().all(|r| r.is_finite() && *r > 0.));
+        Self {
+            bbox,
+            latest,
+            resolution,
+        }
+    }
+
+    /// The bbox's centre, its longitude in [-180, 180).
+    fn centre(&self) -> Option<[f64; 2]> {
+        let [w, s, e, n] = self.bbox?;
+        let lon = (w + e) / 2.;
+        Some([if lon >= 180. { lon - 360. } else { lon }, (s + n) / 2.])
+    }
+
+    /// The bbox when it does not cross the antimeridian: a `bbox` or an
+    /// area polygon then needs no wrapping.
+    fn plain_bbox(&self) -> Option<[f64; 4]> {
+        self.bbox.filter(|b| b[2] <= 180.)
+    }
+
+    /// A box around the centre, a fiftieth of the extent across and at
+    /// least two grid cells: an area query's sample that stays small on any
+    /// grid (`MAX_AREA_VALUES`).
+    fn sample_box(&self) -> Option<[f64; 4]> {
+        let [w, s, e, n] = self.bbox?;
+        let [lon, lat] = self.centre()?;
+        let [rx, ry] = self.resolution.unwrap_or([0., 0.]);
+        let half_x = ((e - w) / 100.).max(rx);
+        let half_y = ((n - s) / 100.).max(ry);
+        Some([lon - half_x, lat - half_y, lon + half_x, lat + half_y])
+    }
+
+    /// `datetime` at the latest time, when there is one.
+    fn time(&self, key: &'static str) -> Option<(&'static str, String)> {
+        self.latest.clone().map(|t| (key, t))
+    }
+}
+
+/// A coordinate in an example request: at most 4 decimals, about 10 m.
+fn coordinate(value: f64) -> String {
+    ds_core::html::display_number(value, 4)
+}
+
+/// `href` with the query `pairs`, each value percent-encoded as a query
+/// value but `:`, `,`, `/`, `(` and `)` kept, which RFC 3986 allows in a
+/// query: the example requests of the request guide (#1228) stay
+/// readable. The keys are the APIs' own parameter names.
+fn example_url<'a>(href: &str, pairs: impl IntoIterator<Item = (&'a str, String)>) -> String {
+    let mut url = href.to_owned();
+    for (i, (key, value)) in pairs.into_iter().enumerate() {
+        url.push(if i == 0 && !href.contains('?') {
+            '?'
+        } else {
+            '&'
+        });
+        url.push_str(key);
+        url.push('=');
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || b"-._~:,/()".contains(&byte) {
+                url.push(char::from(byte));
+            } else {
+                url.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    url
+}
+
+/// The API reference of the API serving `href`, one of its collection's
+/// resources: `{api root}/api/docs`.
+fn reference_of(href: &str) -> Option<String> {
+    href.split_once("/collections/")
+        .map(|(api, _)| format!("{api}/api/docs"))
+}
+
+/// The WebMercatorQuad tile at zoom `z` holding `[lon, lat]`, as
+/// `(row, col)`. Latitude is clamped to the tile grid's limit, which is
+/// only for choosing a tile index (root CLAUDE.md rule 4).
+fn web_mercator_tile(z: u32, [lon, lat]: [f64; 2]) -> (u64, u64) {
+    use ds_core::web_mercator::{lat_to_y, lon_to_x, LAT_LIMIT_DEG};
+    let tiles = f64::from(1u32 << z);
+    let half = lon_to_x(180.);
+    let index = |fraction: f64| (fraction * tiles).floor().clamp(0., tiles - 1.) as u64;
+    let col = index((lon_to_x(lon) + half) / (2. * half));
+    let row = index((half - lat_to_y(lat.clamp(-LAT_LIMIT_DEG, LAT_LIMIT_DEG))) / (2. * half));
+    (row, col)
+}
+
+/// Every API serving a collection, in the order the chips show them (#1228):
+/// the shared root's Maps, Tiles and Features as the document's links
+/// advertise them, then EDR (from `data_queries` on its own page, else
+/// `services`), WMS and 3D Tiles from `services`. `href` is the page's
+/// `self`.
+fn accesses(
+    doc: &Value,
+    href: &str,
+    services: &Services<'_>,
+    overview: Option<&ItemsOverview>,
+    map_drawn: bool,
+) -> Vec<Access> {
+    let links = doc["links"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let safe = |href: &&str| safe_href(href) != "#";
+    let id = doc["id"].as_str().unwrap_or_default();
+    let facts = RequestFacts::of(doc);
+    let mut accesses = Vec::new();
+    if let Some(map) = map_link(links).filter(safe) {
+        let bbox = facts.plain_bbox().map(|[w, s, e, n]| {
+            // Outward to 2 decimals.
+            let out = |v: f64, up: bool, limit: f64| {
+                let v = if up {
+                    (v * 100.).ceil()
+                } else {
+                    (v * 100.).floor()
+                } / 100.;
+                ds_core::html::display_number(v.clamp(-limit, limit), 2)
+            };
+            (
+                "bbox",
+                [
+                    out(w, false, 180.),
+                    out(s, false, 90.),
+                    out(e, true, 180.),
+                    out(n, true, 90.),
+                ]
+                .join(","),
+            )
+        });
+        let url = example_url(
+            map,
+            bbox.into_iter()
+                .chain([("width", "1024".to_owned())])
+                .chain(facts.time("datetime"))
+                .chain([("f", "image/png".to_owned())]),
+        );
+        accesses.push(Access {
+            key: "maps",
+            label: "Maps",
+            standard: "OGC API - Maps",
+            class: "purple",
+            purpose: "Renders the collection as one map image for a bounding box, size, time, level and style: a picture to show, not values to compute with.".into(),
+            view: map.to_owned(),
+            view_title: "a map image of the collection",
+            endpoints: vec![("Map", map.to_owned())],
+            examples: vec![(
+                if facts.latest.is_some() {
+                    "The extent at the latest time, 1024 pixels wide"
+                } else {
+                    "The extent, 1024 pixels wide"
+                },
+                url,
+            )],
+            more: if map_drawn {
+                "<p class=\"guide-more\">“This frame as an API request” under the map holds the request of the frame drawn: its style, time, level, bounds and size.</p>".into()
+            } else {
+                String::new()
+            },
+            reference: reference_of(map),
+        });
+    }
+    let map_tiles = map_tilesets_link(links).filter(safe);
+    let vector_tiles = vector_tilesets_link(links).filter(safe);
+    // Any other tileset list: Common's `tiles`, another `tilesets-*`.
+    let other_tiles = links
+        .iter()
+        .find(|l| {
+            l["rel"]
+                .as_str()
+                .is_some_and(|r| r == "tiles" || r.starts_with(TILESETS_REL_PREFIX))
+        })
+        .and_then(|l| l["href"].as_str())
+        .filter(safe);
+    if let Some(list) = map_tiles.or(vector_tiles).or(other_tiles) {
+        let mut endpoints = Vec::new();
+        if let Some(tiles) = map_tiles {
+            endpoints.push(("Map tilesets", tiles.to_owned()));
+        }
+        if let Some(tiles) = vector_tiles.filter(|v| Some(*v) != map_tiles) {
+            endpoints.push(("Vector tilesets", tiles.to_owned()));
+        }
+        if endpoints.is_empty() {
+            endpoints.push(("Tilesets", list.to_owned()));
+        }
+        let mut examples = vec![(
+            "Its tilesets, each with its tile matrix set and zoom levels",
+            example_url(list, [("f", "json".to_owned())]),
+        )];
+        // One tile over the centre, at the zoom where the extent spans about
+        // a tile.
+        if let (Some([w, _, e, _]), Some(centre)) = (facts.bbox, facts.centre()) {
+            let z = (360. / (e - w)).log2().floor().clamp(0., 18.) as u32;
+            let (row, col) = web_mercator_tile(z, centre);
+            examples.push((
+                if facts.latest.is_some() {
+                    "The WebMercatorQuad tile over the centre of the extent, at the latest time"
+                } else {
+                    "The WebMercatorQuad tile over the centre of the extent"
+                },
+                example_url(
+                    &format!("{list}/WebMercatorQuad/{z}/{row}/{col}"),
+                    facts.time("datetime"),
+                ),
+            ));
+        }
+        accesses.push(Access {
+            key: "tiles",
+            label: "Tiles",
+            standard: "OGC API - Tiles",
+            class: "amber",
+            purpose: if map_tiles.is_some() {
+                "Serves the collection as map tiles in tile matrix sets such as WebMercatorQuad: the pieces web maps load and cache."
+            } else {
+                "Serves the collection’s features as Mapbox vector tiles in tile matrix sets such as WebMercatorQuad, for web maps to style."
+            }
+            .into(),
+            view: list.to_owned(),
+            view_title: "the collection’s tilesets",
+            endpoints,
+            examples,
+            more: String::new(),
+            reference: reference_of(list),
+        });
+    }
+    let items = links
+        .iter()
+        .find(|l| l["rel"] == "items")
+        .and_then(|l| l["href"].as_str())
+        .filter(safe);
+    if let Some(items) = items {
+        let endpoint = items.split('?').next().unwrap_or(items);
+        let page = with_format(items, "html");
+        let mut more = format!(
+            "<div class=\"action-row guide-more\">{}</div>",
+            anchor(&page, "Build a data request →", "btn primary")
+        );
+        if let Some(overview) = overview {
+            more.push_str(&item_field_chips(
+                items,
+                "Filter by",
+                "filter",
+                &overview.filterables,
+            ));
+            more.push_str(&item_field_chips(
+                items,
+                "Sort by",
+                "sort",
+                &overview.sortables,
+            ));
+        }
+        accesses.push(Access {
+            key: "features",
+            label: "Features",
+            standard: "OGC API - Features",
+            class: "teal",
+            purpose: "Returns the collection’s features as GeoJSON, filtered by area, time and their properties, and paged. These filters select data, not collections.".into(),
+            view: page,
+            view_title: "the collection’s items",
+            endpoints: vec![("Items", endpoint.to_owned())],
+            examples: vec![(
+                "The first 10 features, as GeoJSON",
+                example_url(endpoint, [("limit", "10".to_owned()), ("f", "json".to_owned())]),
+            )],
+            more,
+            reference: reference_of(endpoint),
+        });
+    }
+    // EDR's own page lists its queries, each below the collection (or
+    // instance) it queries; elsewhere the server says which EDR offers.
+    let edr = match doc["data_queries"].as_object() {
+        Some(queries) => {
+            let queries: Vec<(&str, String)> = queries
+                .iter()
+                .filter_map(|(name, query)| {
+                    Some((name.as_str(), query["link"]["href"].as_str()?.to_owned()))
+                })
+                .collect();
+            // The collection the queries hang off, else the page's own.
+            let collection = queries
+                .iter()
+                .filter(|(_, href)| safe_href(href) != "#")
+                .find_map(|(_, href)| href.rsplit_once('/'))
+                .map_or_else(
+                    || href.split('?').next().unwrap_or(href).to_owned(),
+                    |(collection, _)| collection.to_owned(),
+                );
+            Some((collection, queries))
+        }
+        None => services.edr.as_ref().map(|edr| {
+            (
+                edr.href.clone(),
+                edr.queries
+                    .iter()
+                    .map(|name| (name.as_str(), format!("{}/{name}", edr.href)))
+                    .collect(),
+            )
+        }),
+    };
+    if let Some((collection, queries)) = edr {
+        let query = |name: &str| {
+            queries
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, href)| href.as_str())
+                .filter(safe)
+        };
+        let coverage = || ("f", "CoverageJSON".to_owned());
+        let polygon = |[w, s, e, n]: [f64; 4]| {
+            let [w, s, e, n] = [w, s, e, n].map(coordinate);
+            (
+                "coords",
+                format!("POLYGON(({w} {s},{e} {s},{e} {n},{w} {n},{w} {s}))"),
+            )
+        };
+        let mut examples = Vec::new();
+        // What the queries offered say the data is (#1228):
+        // - located (stations, a radar site): its locations, and the whole
+        //   extent at the latest time, one value per location;
+        // - gridded (a position query): the values at the centre, and a
+        //   small area around it, at the latest time; the whole grid could
+        //   exceed an area query's budget;
+        // - neither (lightning events, a motion field): the whole extent
+        //   with no `datetime`, which such a query answers with its latest
+        //   (a motion field is anchored at its generation's time, not at a
+        //   time step of the collection's own axis).
+        let located = query("locations");
+        let gridded = query("position")
+            .zip(facts.centre())
+            .filter(|_| located.is_none());
+        if let Some(locations) = located {
+            examples.push((
+                "Its locations, as GeoJSON",
+                example_url(locations, [("f", "GeoJSON".to_owned())]),
+            ));
+        } else if let Some((position, [lon, lat])) = gridded {
+            examples.push((
+                "Values at the centre of the extent, at the latest time",
+                example_url(
+                    position,
+                    [(
+                        "coords",
+                        format!("POINT({} {})", coordinate(lon), coordinate(lat)),
+                    )]
+                    .into_iter()
+                    .chain(facts.time("datetime"))
+                    .chain([coverage()]),
+                ),
+            ));
+        }
+        let area = match (located, gridded) {
+            (Some(_), _) => facts.plain_bbox().map(|b| {
+                (
+                    "The whole extent, at the latest time",
+                    b,
+                    facts.time("datetime"),
+                )
+            }),
+            (None, Some(_)) => facts.sample_box().map(|b| {
+                (
+                    "A small area around the centre, at the latest time",
+                    b,
+                    facts.time("datetime"),
+                )
+            }),
+            (None, None) => facts
+                .plain_bbox()
+                .map(|b| ("The whole extent, its latest data", b, None)),
+        };
+        if let (Some(href), Some((label, b, time))) = (query("area"), area) {
+            examples.push((
+                label,
+                example_url(
+                    href,
+                    [polygon(b)].into_iter().chain(time).chain([coverage()]),
+                ),
+            ));
+        }
+        let chips: String = queries
+            .iter()
+            .map(|(name, href)| anchor(&data_query_target(name, href), name, "chip"))
+            .collect();
+        let more = if chips.is_empty() {
+            String::new()
+        } else {
+            format!("<div class=\"row-line query-chips\"><span class=\"row-label\">Queries</span><span class=\"chip-row\">{chips}</span></div>")
+        };
+        accesses.push(Access {
+            key: "edr",
+            label: "EDR",
+            standard: "OGC API - EDR",
+            class: "teal",
+            purpose: "Returns the data values themselves, not pictures, for the queries below: each as CoverageJSON or the other formats it lists. A query opened without coordinates is its form.".into(),
+            view: with_format(&collection, "html"),
+            view_title: "the collection’s data queries",
+            endpoints: vec![("Collection", collection.clone())],
+            examples,
+            more,
+            reference: reference_of(&collection),
+        });
+    }
+    if let Some(wms) = services.wms.as_deref().filter(safe) {
+        let capabilities = example_url(
+            wms,
+            [
+                ("SERVICE", "WMS".to_owned()),
+                ("REQUEST", "GetCapabilities".to_owned()),
+                ("VERSION", "1.3.0".to_owned()),
+            ],
+        );
+        let mut examples = vec![(
+            "The capabilities: every layer with its styles, times and levels",
+            capabilities.clone(),
+        )];
+        // GetMap as the map draws it (#1220): EPSG:3857, so BBOX is
+        // minx,miny,maxx,maxy in metres, the longer side 1024 px. A pole
+        // has no Web Mercator northing: the box stops at the tile grid's
+        // limit.
+        if let Some([w, s, e, n]) = facts.bbox {
+            use ds_core::web_mercator::{lat_to_y, lon_to_x, LAT_LIMIT_DEG};
+            let y = |lat: f64| lat_to_y(lat.clamp(-LAT_LIMIT_DEG, LAT_LIMIT_DEG));
+            let (minx, miny, maxx, maxy) = (lon_to_x(w), y(s), lon_to_x(e), y(n));
+            let aspect = (maxx - minx) / (maxy - miny);
+            if aspect.is_finite() && aspect > 0. {
+                let (width, height) = if aspect >= 1. {
+                    (1024., (1024. / aspect).round().max(1.))
+                } else {
+                    ((1024. * aspect).round().max(1.), 1024.)
+                };
+                let metres = |v: f64| ds_core::html::display_number(v, 2);
+                examples.push((
+                    if facts.latest.is_some() {
+                        "A GetMap of the extent in EPSG:3857, at the latest time"
+                    } else {
+                        "A GetMap of the extent in EPSG:3857"
+                    },
+                    example_url(
+                        wms,
+                        [
+                            ("SERVICE", "WMS".to_owned()),
+                            ("VERSION", "1.3.0".to_owned()),
+                            ("REQUEST", "GetMap".to_owned()),
+                            ("LAYERS", id.to_owned()),
+                            ("STYLES", String::new()),
+                            ("CRS", "EPSG:3857".to_owned()),
+                            ("BBOX", [minx, miny, maxx, maxy].map(metres).join(",")),
+                            ("WIDTH", width.to_string()),
+                            ("HEIGHT", height.to_string()),
+                            ("FORMAT", "image/png".to_owned()),
+                            ("TRANSPARENT", "TRUE".to_owned()),
+                            ("EXCEPTIONS", "XML".to_owned()),
+                        ]
+                        .into_iter()
+                        .chain(facts.time("TIME")),
+                    ),
+                ));
+            }
+        }
+        accesses.push(Access {
+            key: "wms",
+            label: "WMS",
+            standard: "OGC WMS 1.3.0",
+            class: "purple",
+            purpose: format!("For desktop GIS and web map clients: the collection is the layer {id}, and a parameter of it the layer {id}/<parameter>."),
+            view: capabilities,
+            view_title: "the service’s capabilities",
+            endpoints: vec![("Service", wms.to_owned())],
+            examples,
+            more: String::new(),
+            reference: None,
+        });
+    }
+    if let Some(collection) = services.tiles_3d.as_deref().filter(safe) {
+        let tileset = format!("{collection}/tileset.json");
+        let more = collection
+            .split_once("/collections/")
+            .map(|(api, _)| {
+                format!(
+                    "<div class=\"action-row guide-more\">{}</div>",
+                    anchor(
+                        &format!("{api}/viewer?collection={}", path_segment(id)),
+                        "Open the 3D viewer ↗",
+                        "btn"
+                    )
+                )
+            })
+            .unwrap_or_default();
+        accesses.push(Access {
+            key: "3dtiles",
+            label: "3D Tiles",
+            standard: "OGC 3D Tiles",
+            class: "amber",
+            purpose: "Serves the radar volume as OGC 3D Tiles, for 3D globes such as CesiumJS."
+                .into(),
+            view: tileset.clone(),
+            view_title: "the collection’s tileset",
+            endpoints: vec![("Collection", collection.to_owned())],
+            examples: vec![("The latest volume as a point cloud tileset", tileset)],
+            more,
+            reference: None,
+        });
+    }
+    accesses
 }
 
 /// Where a `data_queries` link points in HTML (every link an `<a>`, OGC
@@ -1840,7 +2411,7 @@ fn license_html(license: Option<&LicenseConfig>) -> String {
         .map(|license| {
             let text = license
                 .resolved_url()
-                .map(|url| anchor(&url, &license.title, ""))
+                .map(|url| plain_anchor(&url, &license.title))
                 .unwrap_or_else(|| escape(&license.title));
             format!("<p class=\"license\">License: {text}</p>")
         })
@@ -1982,28 +2553,35 @@ fn vertical_summary(vertical: &Value) -> Option<String> {
     Some(escape(&format!("{label}: {bounds} {unit}{count}")))
 }
 
-fn vertical_coverage(vertical: &Value) -> String {
-    let Some(summary) = vertical_summary(vertical) else {
-        return String::new();
-    };
-    let mut html = format!(
-        "<div class=\"fact wide\"><small>Vertical dimension</small><strong>{summary}</strong>"
-    );
+/// The Extent box's vertical facts (#1228): the axis's range with its unit
+/// and number of levels, the levels themselves in that unit (the values a
+/// request's `z` or `elevation` takes), and the reference system folded.
+/// `None` without a vertical extent.
+fn vertical_facts(vertical: &Value) -> Option<String> {
+    let summary = vertical_summary(vertical)?;
+    let mut html =
+        format!("<div class=\"fact wide\"><small>Range</small><strong>{summary}</strong></div>");
     let levels = vertical_values(vertical);
     if !levels.is_empty() {
+        let (_, unit) = vertical_axis(vertical);
+        let label = if unit.is_empty() {
+            "Levels".to_owned()
+        } else {
+            format!("Levels · {unit}")
+        };
         html.push_str(&format!(
-            "<details><summary>Available levels · z</summary><p class=\"mono\">{}</p></details>",
+            "<div class=\"fact wide\"><small>{}</small><p class=\"mono level-list\">{}</p></div>",
+            escape(&label),
             escape(&levels.join(", "))
         ));
     }
     if let Some(vrs) = vertical.get("vrs") {
         html.push_str(&format!(
-            "<details><summary>Vertical reference system</summary>{}</details>",
+            "<details class=\"fact wide\"><summary>Vertical reference system</summary>{}</details>",
             value_html(vrs)
         ));
     }
-    html.push_str("</div>");
-    html
+    Some(html)
 }
 
 /// An empty catalog fact slot: a dash, read out as "Not advertised".
@@ -2794,6 +3372,14 @@ mod tests {
         api: "maps",
     };
 
+    /// The services of a collection WMS serves, at `href`.
+    fn wms_at(href: &str) -> Services<'static> {
+        Services {
+            wms: Some(href.to_owned()),
+            ..Services::default()
+        }
+    }
+
     /// Render a collection page for an API at its per-API mount below `base`.
     fn collection(base: &str, api: &str, doc: &Value, license: Option<&LicenseConfig>) -> String {
         let root = format!("{base}/{api}");
@@ -3294,8 +3880,11 @@ mod tests {
             for api in ["edr", "maps", "tiles"] {
                 let html = collection("https://example.test", api, &doc, None);
                 let overview = html.split("id=\"metadata\"").next().unwrap();
-                assert!(overview.contains("Vertical dimension"));
-                assert!(overview.contains("Available levels · z"));
+                // The Extent box's vertical row (#1228): its range and
+                // its levels in their unit.
+                let row = overview.split("<dt>Vertical</dt>").nth(1).unwrap();
+                assert!(row.contains("<small>Range</small>"), "{row}");
+                assert!(row.contains("<small>Levels"), "{row}");
                 if api == "maps" {
                     assert!(overview.contains("id=\"map-level\""));
                 }
@@ -3313,8 +3902,8 @@ mod tests {
         // The script contains the selector name, so assert the actual element.
         assert!(!collection("", "maps", &doc, None).contains("id=\"map-level\""));
         let malicious = json!({"interval":[[0,1]],"values":[0,"<script>","NaN",1],"unit":"<img onerror=alert(1)>"});
-        assert!(!vertical_coverage(&malicious).contains("<img"));
-        assert!(vertical_coverage(&malicious).contains("&lt;img"));
+        assert!(!vertical_facts(&malicious).unwrap().contains("<img"));
+        assert!(vertical_facts(&malicious).unwrap().contains("&lt;img"));
         assert_eq!(vertical_values(&malicious), ["0", "1"]);
     }
 
@@ -3348,9 +3937,10 @@ mod tests {
         ] {
             assert!(html.contains(value), "missing {value}");
         }
-        assert!(html.contains(
-            "Storage coordinate system</dt><dd><span class=\"muted\">Not advertised</span></dd>"
-        ));
+        // The Overview shows only what the document carries (#1228).
+        let overview = html.split("id=\"metadata\"").next().unwrap();
+        assert!(!overview.contains("Storage coordinate system"));
+        assert!(!overview.contains("Not advertised"));
     }
 
     #[test]
@@ -3451,8 +4041,11 @@ mod tests {
         // Other superseded per-API services are not offered (#789).
         assert!(html.contains("value=\"https://example.test/edr/?f=html\""));
         assert!(!html.contains("value=\"https://example.test/maps/?f=html\""));
-        // Map request parameters are documented by the API serving the map.
-        assert!(html.contains("href=\"https://example.test/maps/api/docs\">Map request parameters"));
+        // Map requests are documented by the API serving the map, the page's
+        // own requests by its own API (#1228).
+        assert!(html.contains("href=\"https://example.test/maps/api/docs\">Maps API reference ↗"));
+        assert!(html
+            .contains("href=\"https://example.test/relocated/features/api/docs\">API reference ↗"));
         // The conformance page is named for what it lists (#1140).
         let conformance = html
             .split("href=\"https://example.test/relocated/features/conformance?f=html\">")
@@ -3485,53 +4078,292 @@ mod tests {
         }
     }
 
+    /// The request guide's entries (#1228), each `(id, markup)` in order.
+    fn guide_entries(html: &str) -> Vec<(String, String)> {
+        let guide = html.split("id=\"request-data\"").nth(1).unwrap();
+        guide
+            .split("<section class=\"guide-entry\" id=\"")
+            .skip(1)
+            .map(|entry| {
+                let (id, rest) = entry.split_once('"').unwrap();
+                (
+                    id.to_owned(),
+                    rest.split("</section>").next().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// The example requests of a guide entry, unescaped, each checked to
+    /// be its Copy button's text and its Open link.
+    fn guide_examples(entry: &str) -> Vec<String> {
+        entry
+            .split("<div class=\"guide-example\">")
+            .skip(1)
+            .map(|example| {
+                let code = example
+                    .split("<code>")
+                    .nth(1)
+                    .unwrap()
+                    .split("</code>")
+                    .next()
+                    .unwrap();
+                assert!(
+                    example.contains(&format!("data-copy=\"{code}\">Copy</button>")),
+                    "{example}"
+                );
+                assert!(
+                    example.contains(&format!(
+                        "<a class=\"btn small\" href=\"{code}\">Open ↗</a>"
+                    )),
+                    "{example}"
+                );
+                code.replace("&amp;", "&")
+            })
+            .collect()
+    }
+
+    /// #1228: "Request data from this collection" has an entry per API
+    /// serving the collection, in the chips' order: what it is for, its
+    /// endpoints, and ready requests over the collection's own extent at
+    /// its latest time, each with Copy and Open, then the page's API
+    /// reference. Tilesets are the Tiles entry's endpoints.
     #[test]
-    fn request_section_lists_tilesets_next_to_the_map_preview() {
-        let doc = json!({"id":"a","links":[
+    fn request_guide_has_an_entry_per_api_with_ready_requests() {
+        let doc = json!({"id":"a","extent":{"spatial":{"bbox":[[20,60,30,70]]},
+                "temporal":{"interval":[["2026-10-17T00:00:00Z","2026-10-17T01:00:00+00:00"]],"grid":{"cellsCount":2,"resolution":"PT1H"}}},
+            "links":[
             {"rel":"self","href":"https://x/collections/a"},
             {"rel":rel::MAP,"href":"https://x/collections/a/map"},
             {"rel":rel::TILESETS_MAP,"href":"https://x/collections/a/map/tiles","type":"application/json","title":"Map tilesets"},
-            {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/a/tiles","type":"application/json","title":"Vector tilesets"}]});
-        let surface = Surface {
-            base: "https://x",
-            root: "https://x",
-            api: crate::shared::WORKSPACE,
+            {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/a/tiles","type":"application/json","title":"Vector tilesets"},
+            {"rel":"items","href":"https://x/collections/a/items","type":"application/geo+json"}]});
+        let queries = [
+            "position".to_owned(),
+            "area".to_owned(),
+            "radius".to_owned(),
+        ];
+        let services = Services {
+            edr: Some(EdrService {
+                href: "https://x/edr/collections/a".into(),
+                queries: &queries,
+            }),
+            wms: Some("https://x/wms".into()),
+            tiles_3d: Some("https://x/3dtiles/collections/a".into()),
         };
-        let html = collection_html(surface, &doc, None);
-        let request = html
-            .split("<h2>Request data from this collection</h2>")
-            .nth(1)
-            .unwrap()
-            .split("</section>")
-            .next()
-            .unwrap();
-        assert!(request.contains("Map request parameters"));
-        assert!(request.contains("https://x/collections/a/map/tiles"));
-        assert!(request.contains("https://x/collections/a/tiles"));
+        let html = collection_page(SHARED_X, &doc, None, None, &services);
+        let entries = guide_entries(&html);
+        let ids: Vec<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "request-maps",
+                "request-tiles",
+                "request-features",
+                "request-edr",
+                "request-wms",
+                "request-3dtiles"
+            ]
+        );
+        let entry = |id: &str| &entries.iter().find(|(i, _)| i == id).unwrap().1;
+        let time = "datetime=2026-10-17T01:00:00Z";
+        assert_eq!(
+            guide_examples(entry("request-maps")),
+            [format!(
+                "https://x/collections/a/map?bbox=20,60,30,70&width=1024&{time}&f=image/png"
+            )]
+        );
+        assert!(entry("request-maps").contains("<dt>Map</dt><dd><a href=\"https://x/collections/a/map\"><code>https://x/collections/a/map</code></a></dd>"));
+        // The tile over the centre (25, 65) at zoom 5, where the extent is
+        // about a tile across.
+        let tiles = entry("request-tiles");
+        assert!(
+            tiles.contains("<dt>Map tilesets</dt>")
+                && tiles.contains(
+                    "<dt>Vector tilesets</dt><dd><a href=\"https://x/collections/a/tiles\">"
+                )
+        );
+        assert_eq!(
+            guide_examples(tiles),
+            [
+                "https://x/collections/a/map/tiles?f=json".to_owned(),
+                format!("https://x/collections/a/map/tiles/WebMercatorQuad/5/8/18?{time}"),
+            ]
+        );
+        let features = entry("request-features");
+        assert_eq!(
+            guide_examples(features),
+            ["https://x/collections/a/items?limit=10&f=json"]
+        );
+        assert!(features.contains("<a class=\"btn primary\" href=\"https://x/collections/a/items?f=html\">Build a data request →</a>"));
+        // A gridded collection: the values at the centre and a small area
+        // around it, a fiftieth of the extent across.
+        let edr = entry("request-edr");
+        assert_eq!(
+            guide_examples(edr),
+            [
+                format!("https://x/edr/collections/a/position?coords=POINT(25%2065)&{time}&f=CoverageJSON"),
+                format!("https://x/edr/collections/a/area?coords=POLYGON((24.9%2064.9,25.1%2064.9,25.1%2065.1,24.9%2065.1,24.9%2064.9))&{time}&f=CoverageJSON"),
+            ]
+        );
+        for query in ["position", "area", "radius"] {
+            assert!(edr.contains(&format!(
+                "<a class=\"chip\" href=\"https://x/edr/collections/a/{query}?f=html\">{query}</a>"
+            )));
+        }
+        assert!(
+            edr.contains("<a class=\"\" href=\"https://x/edr/api/docs\">EDR API reference ↗</a>"),
+            "{edr}"
+        );
+        // WMS: the capabilities, and a GetMap of the extent in EPSG:3857 as
+        // the map draws it, its BBOX from ds_core's Web Mercator.
+        let wms = guide_examples(entry("request-wms"));
+        assert_eq!(
+            wms[0],
+            "https://x/wms?SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.3.0"
+        );
+        use ds_core::web_mercator::{lat_to_y, lon_to_x};
+        let bbox = [lon_to_x(20.), lat_to_y(60.), lon_to_x(30.), lat_to_y(70.)]
+            .map(|v| ds_core::html::display_number(v, 2))
+            .join(",");
+        // Taller than wide: 1024 px high.
+        let width =
+            (1024. * (lon_to_x(30.) - lon_to_x(20.)) / (lat_to_y(70.) - lat_to_y(60.))).round();
+        assert_eq!(
+            wms[1],
+            format!("https://x/wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=a&STYLES=&CRS=EPSG:3857&BBOX={bbox}&WIDTH={width}&HEIGHT=1024&FORMAT=image/png&TRANSPARENT=TRUE&EXCEPTIONS=XML&TIME=2026-10-17T01:00:00Z")
+        );
+        let tiles_3d = entry("request-3dtiles");
+        assert_eq!(
+            guide_examples(tiles_3d),
+            ["https://x/3dtiles/collections/a/tileset.json"]
+        );
+        assert!(tiles_3d.contains("<a class=\"btn\" href=\"https://x/3dtiles/viewer?collection=a\">Open the 3D viewer ↗</a>"));
+        // The page's own API reference ends the guide; an entry served at
+        // the same root names none of its own.
+        let guide = html.split("id=\"request-data\"").nth(1).unwrap();
+        assert!(guide.contains("<p class=\"guide-reference\"><a class=\"btn\" href=\"https://x/api/docs\">API reference ↗</a></p>"));
+        assert!(!entry("request-maps").contains("API reference"));
     }
 
-    /// The heading lists every OGC API the collection advertises, from its
-    /// links rather than from the API serving the page.
+    /// #1228: the EDR examples follow the queries EDR offers the
+    /// collection, never one it would answer 404: a gridded collection
+    /// gets its values at the centre and a small area; one of stations
+    /// (CSV: locations, area, radius) its locations and the whole extent at
+    /// the latest time; one answering areas alone (a nowcast's motion
+    /// field, PostGIS lightning events: area, radius) the whole extent
+    /// with no time, which those answer with their latest. With the
+    /// queries unknown (the `apis` fallback) there is no example.
     #[test]
-    fn heading_chips_name_every_advertised_api() {
-        let shared = Surface {
-            base: "https://x",
-            root: "https://x",
-            api: crate::shared::WORKSPACE,
+    fn edr_examples_follow_the_queries_edr_offers() {
+        let doc = json!({"id":"c","extent":{"spatial":{"bbox":[[20,60,30,70]]},
+            "temporal":{"interval":[["2026-10-17T00:00:00Z","2026-10-17T01:00:00Z"]]}},
+            "links":[{"rel":"self","href":"https://x/collections/c"}]});
+        let examples = |queries: &[&str]| {
+            let queries: Vec<String> = queries.iter().map(|q| (*q).to_owned()).collect();
+            let services = Services {
+                edr: Some(EdrService {
+                    href: "https://x/edr/collections/c".into(),
+                    queries: &queries,
+                }),
+                ..Services::default()
+            };
+            let html = collection_page(SHARED_X, &doc, None, None, &services);
+            let entries = guide_entries(&html);
+            assert_eq!(entries.len(), 1);
+            guide_examples(&entries[0].1)
         };
-        let chips = |doc: &Value| {
-            let html = collection_html(shared, doc, None);
-            let row = html
-                .split("aria-label=\"Available through\">")
-                .nth(1)
-                .unwrap()
-                .split("</div>")
-                .next()
-                .unwrap()
-                .to_owned();
-            ["Maps", "Tiles", "Features", "EDR", crate::shared::WORKSPACE]
+        let whole = "coords=POLYGON((20%2060,30%2060,30%2070,20%2070,20%2060))";
+        let time = "datetime=2026-10-17T01:00:00Z";
+        for area_only in [&["area", "radius"][..], &["radius", "area"]] {
+            assert_eq!(
+                examples(area_only),
+                [format!(
+                    "https://x/edr/collections/c/area?{whole}&f=CoverageJSON"
+                )],
+                "nowcast or lightning events: no position"
+            );
+        }
+        assert_eq!(
+            examples(&["locations", "area", "radius"]),
+            [
+                "https://x/edr/collections/c/locations?f=GeoJSON".to_owned(),
+                format!("https://x/edr/collections/c/area?{whole}&{time}&f=CoverageJSON"),
+            ],
+            "CSV stations"
+        );
+        // Stations that also answer at a point (BUFR, PostGIS) are listed
+        // too: a point between them has no station near.
+        assert_eq!(
+            examples(&["locations", "position", "area", "radius"])[0],
+            "https://x/edr/collections/c/locations?f=GeoJSON"
+        );
+        let gridded = examples(&["position", "area", "radius", "trajectory"]);
+        assert!(
+            gridded[0].starts_with("https://x/edr/collections/c/position?coords=POINT(25%2065)&")
+        );
+        assert!(gridded[1].contains("POLYGON((24.9%2064.9,"), "{gridded:?}");
+        assert!(examples(&[]).is_empty(), "queries unknown");
+        assert!(examples(&["cube"]).is_empty());
+    }
+
+    /// #1228: every interpolated value of the guide is escaped, as markup
+    /// and as a query value: an id with `&`, `<` and a space.
+    #[test]
+    fn request_guide_escapes_every_value() {
+        let doc = json!({"id":"r&d <x>","extent":{"spatial":{"bbox":[[20,60,30,70]]}},
+            "links":[{"rel":"self","href":"https://x/collections/r%26d%20%3Cx%3E"}]});
+        let html = collection_page(SHARED_X, &doc, None, None, &wms_at("https://x/wms?map=a&b"));
+        let wms = &guide_entries(&html)[0].1;
+        assert!(!html.contains("<x>"), "{html}");
+        assert!(wms.contains("the collection is the layer r&amp;d &lt;x&gt;, and a parameter of it the layer r&amp;d &lt;x&gt;/&lt;parameter&gt;."), "{wms}");
+        let examples = guide_examples(wms);
+        assert!(
+            examples[1].contains("&LAYERS=r%26d%20%3Cx%3E&"),
+            "{examples:?}"
+        );
+        assert!(
+            examples[0].starts_with("https://x/wms?map=a&b&SERVICE=WMS&"),
+            "{examples:?}"
+        );
+    }
+
+    /// The chips of a page's heading, as `(label, href)`.
+    fn heading_chips(html: &str) -> Vec<(String, String)> {
+        let row = html
+            .split("aria-label=\"Available through\">")
+            .nth(1)
+            .unwrap()
+            .split("</div>")
+            .next()
+            .unwrap();
+        row.split("<a class=\"chip api-chip ")
+            .skip(1)
+            .map(|chip| {
+                let href = chip
+                    .split("href=\"")
+                    .nth(1)
+                    .unwrap()
+                    .split('"')
+                    .next()
+                    .unwrap();
+                let label = chip.split('>').nth(1).unwrap().split('<').next().unwrap();
+                (label.to_owned(), href.replace("&amp;", "&"))
+            })
+            .collect()
+    }
+
+    /// #1228: the heading has a chip for every API serving the collection,
+    /// each a link to that API's view of it: Maps, Tiles and Features from
+    /// the document's links, EDR, WMS and 3D Tiles from the services the
+    /// server names (none unless it names them), or EDR from
+    /// `data_queries` on its own page. Not from the API serving the page.
+    #[test]
+    fn heading_chips_name_every_api_serving_the_collection() {
+        let labels = |chips: Vec<(String, String)>| {
+            chips
                 .into_iter()
-                .filter(|label| row.contains(&format!(">{label}</span>")))
+                .map(|(label, _)| label)
                 .collect::<Vec<_>>()
         };
         let all = json!({"id":"a","links":[
@@ -3539,12 +4371,68 @@ mod tests {
             {"rel":rel::MAP,"href":"https://x/collections/a/map"},
             {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/a/tiles"},
             {"rel":"items","href":"https://x/collections/a/items","type":"application/geo+json"}]});
-        assert_eq!(chips(&all), ["Maps", "Tiles", "Features"]);
+        let html = collection_html(SHARED_X, &all, None);
+        assert_eq!(
+            heading_chips(&html),
+            [
+                ("Maps".to_owned(), "https://x/collections/a/map".to_owned()),
+                (
+                    "Tiles".to_owned(),
+                    "https://x/collections/a/tiles".to_owned()
+                ),
+                (
+                    "Features".to_owned(),
+                    "https://x/collections/a/items?f=html".to_owned()
+                ),
+            ]
+        );
+        // Each chip says what it opens.
+        assert!(html.contains("<a class=\"chip api-chip purple\" href=\"https://x/collections/a/map\" title=\"OGC API - Maps: a map image of the collection\">Maps</a>"));
+        // EDR, WMS and 3D Tiles as the server names them, each at its view.
+        let queries = ["position".to_owned(), "area".to_owned()];
+        let services = Services {
+            edr: Some(EdrService {
+                href: "https://x/edr/collections/a".into(),
+                queries: &queries,
+            }),
+            wms: Some("https://x/wms".into()),
+            tiles_3d: Some("https://x/3dtiles/collections/a".into()),
+        };
+        let chips = heading_chips(&collection_page(SHARED_X, &all, None, None, &services));
+        assert_eq!(
+            chips[3..],
+            [
+                (
+                    "EDR".to_owned(),
+                    "https://x/edr/collections/a?f=html".to_owned()
+                ),
+                (
+                    "WMS".to_owned(),
+                    "https://x/wms?SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.3.0".to_owned()
+                ),
+                (
+                    "3D Tiles".to_owned(),
+                    "https://x/3dtiles/collections/a/tileset.json".to_owned()
+                ),
+            ]
+        );
+        // Not listed, no chip: WMS alone adds only its own.
+        let chips = labels(heading_chips(&collection_page(
+            SHARED_X,
+            &all,
+            None,
+            None,
+            &wms_at("https://x/wms"),
+        )));
+        assert_eq!(chips, ["Maps", "Tiles", "Features", "WMS"]);
         let features = json!({"id":"b","itemType":"feature","links":[
             {"rel":"items","href":"https://x/collections/b/items","type":"application/geo+json"}]});
-        assert_eq!(chips(&features), ["Features"]);
+        assert_eq!(
+            labels(heading_chips(&collection_html(SHARED_X, &features, None))),
+            ["Features"]
+        );
         // The kind is a detail row, not a second "feature" chip.
-        let html = collection_html(shared, &features, None);
+        let html = collection_html(SHARED_X, &features, None);
         let row = html
             .split("aria-label=\"Available through\">")
             .nth(1)
@@ -3553,13 +4441,23 @@ mod tests {
         assert!(html.contains(
             "<dt>Data type</dt><dd>Features<small class=\"term\">itemType <code>feature</code></small></dd>"
         ));
-        let edr = json!({"id":"c","links":[],"data_queries":{"position":{}}});
-        assert_eq!(chips(&edr), ["EDR"]);
-        // Nothing advertised: the serving API still labels the page.
+        // EDR's own page: its chip from `data_queries`, at the collection
+        // the queries hang off; without hrefs, at the page's own.
+        let edr = json!({"id":"c","links":[{"rel":"self","href":"https://x/edr/collections/c"}],"data_queries":{"position":{}}});
         assert_eq!(
-            chips(&json!({"id":"d","links":[]})),
-            [crate::shared::WORKSPACE]
+            heading_chips(&collection_html(SHARED_X, &edr, None)),
+            [(
+                "EDR".to_owned(),
+                "https://x/edr/collections/c?f=html".to_owned()
+            )]
         );
+        // Nothing serving it: the serving API still labels the page.
+        let html = collection_html(SHARED_X, &json!({"id":"d","links":[]}), None);
+        assert!(heading_chips(&html).is_empty());
+        assert!(html.contains(&format!(
+            "aria-label=\"Available through\"><span class=\"chip teal\">{}</span>",
+            crate::shared::WORKSPACE
+        )));
     }
 
     /// With both Maps and Tiles (and vector tiles) the preview offers a choice
@@ -3965,7 +4863,7 @@ mod tests {
                     "extent":{"temporal":{"interval":[["2026-10-17T00:05:00Z","2026-10-17T00:15:00Z"]],
                         "grid":{"cellsCount":2,"resolution":"PT10M","firstCoordinate":"2026-10-17T00:05:00Z"}}}},
                 "vis":{"type":"Parameter","label":"Visible"}}});
-        let html = collection_page(shared, &doc, None, None, Some("https://x/wms"));
+        let html = collection_page(shared, &doc, None, None, &wms_at("https://x/wms"));
         let request = &map_data(&html)["mapRequest"];
         assert_eq!(request["modes"], json!(["tiles", "maps", "wms"]));
         assert_eq!(
@@ -4004,7 +4902,7 @@ mod tests {
         );
         let vector = json!({"id":"regions","links":[{"rel":"self","href":"https://x/collections/regions"},
             {"rel":rel::TILESETS_VECTOR,"href":"https://x/collections/regions/tiles"}]});
-        let html = collection_page(shared, &vector, None, None, Some("https://x/wms"));
+        let html = collection_page(shared, &vector, None, None, &wms_at("https://x/wms"));
         assert_eq!(map_data(&html)["mapRequest"]["modes"], json!(["vector"]));
     }
 
@@ -4058,12 +4956,12 @@ mod tests {
     }
 
     /// #1220: a collection's map opens its Overview at the content width,
-    /// before the coverage facts. Its panels are the script's: the layer
+    /// before the Extent box (#1228). Its panels are the script's: the layer
     /// card's pill, the status chip, the full-window and basemap tools with
     /// the data's opacity at 85 %, icons drawn inline. The attribution names
     /// the collection's licence, and the frame's request sits under the map
     /// with Copy and Open. A collection without a map keeps the extent
-    /// locator in the coverage panel.
+    /// locator in the Extent box.
     #[test]
     fn the_overview_opens_on_the_map_and_names_the_licence() {
         let shared = Surface {
@@ -4081,10 +4979,10 @@ mod tests {
             url: None,
             media_type: None,
         };
-        let html = collection_page(shared, &doc, Some(&license), None, None);
+        let html = collection_page(shared, &doc, Some(&license), None, &Services::default());
         let overview = html.split("<section id=\"overview\"").nth(1).unwrap();
         let map = overview.find("<div class=\"map-section\">").unwrap();
-        assert!(map < overview.find("<h2>Data coverage</h2>").unwrap());
+        assert!(map < overview.find("<h2>Extent</h2>").unwrap());
         assert!(map < overview.find("<div class=\"detail-layout\">").unwrap());
         assert_eq!(
             map_data(&html)["mapRequest"]["license"],
@@ -4134,9 +5032,9 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .retain(|l| l["rel"] != rel::MAP);
-        let html = collection_page(shared, &no_map, None, None, None);
+        let html = collection_page(shared, &no_map, None, None, &Services::default());
         assert!(!html.contains("map-section"));
-        let coverage = html.split("<h2>Data coverage</h2>").nth(1).unwrap();
+        let coverage = html.split("<h2>Extent</h2>").nth(1).unwrap();
         assert!(coverage
             .split("</section>")
             .next()
@@ -4248,7 +5146,7 @@ mod tests {
             url: None,
             media_type: None,
         };
-        let html = collection_page(shared, &doc, Some(&license), None, Some("https://x/wms"));
+        let html = collection_page(shared, &doc, Some(&license), None, &wms_at("https://x/wms"));
         let start = html.find("<div class=\"map-panel map-raster\">").unwrap();
         let end = start + html[start..].find("<script").unwrap();
         format!("{}\n", &html[start..end])
@@ -4595,25 +5493,35 @@ mod tests {
             filterables: vec!["name".into(), "a b/c".into()],
             sortables: vec!["volume_count".into()],
         };
-        let html = collection_page(SHARED_X, &doc, None, Some(&overview), None);
+        let html = collection_page(SHARED_X, &doc, None, Some(&overview), &Services::default());
         assert!(html.contains("<p>Polar volumes</p><p class=\"items-note\">Radar site inventory: one point per radar.</p>"));
         assert!(html.contains("<span class=\"row-label\">Filter by</span><span class=\"chip-row\"><a class=\"chip\" href=\"https://x/collections/b/items?f=html#filter=name\">name</a><a class=\"chip\" href=\"https://x/collections/b/items?f=html#filter=a%20b%2Fc\">a b/c</a></span>"), "{html}");
         assert!(html.contains("<a class=\"chip\" href=\"https://x/collections/b/items?f=html#sort=volume_count\">volume_count</a>"));
         // Nothing to say, no rows; no items link, no chips.
-        let html = collection_page(SHARED_X, &doc, None, Some(&ItemsOverview::default()), None);
+        let html = collection_page(
+            SHARED_X,
+            &doc,
+            None,
+            Some(&ItemsOverview::default()),
+            &Services::default(),
+        );
         // The stylesheet is inline: look for the elements.
         assert!(
             !html.contains("class=\"row-line item-fields\"")
                 && !html.contains("class=\"items-note\"")
         );
         let no_items = json!({"id": "b", "links": []});
-        assert!(
-            !collection_page(SHARED_X, &no_items, None, Some(&overview), None)
-                .contains("class=\"row-line item-fields\"")
-        );
+        assert!(!collection_page(
+            SHARED_X,
+            &no_items,
+            None,
+            Some(&overview),
+            &Services::default()
+        )
+        .contains("class=\"row-line item-fields\""));
         assert_eq!(
             collection_html(SHARED_X, &doc, None),
-            collection_page(SHARED_X, &doc, None, None, None)
+            collection_page(SHARED_X, &doc, None, None, &Services::default())
         );
     }
 
@@ -4708,35 +5616,132 @@ mod tests {
         assert!(!collection_html(SHARED_X, &none, None).contains("id=\"parameters\""));
     }
 
-    /// #1140: the coverage facts use the catalog's formatting: the time
-    /// span, cadence and steps, the bounds to 2 decimals with a Copy bbox
-    /// button holding the exact values, and one wording when missing.
+    /// #1228: the Extent box has a row each for the spatial, temporal and
+    /// vertical extent, with the facts the document carries, formatted as
+    /// the catalog formats them (#1140): the bounds in their CRS to 2
+    /// decimals with the exact values in the `title` and a Copy bbox button,
+    /// the storage CRS, the grid's cells and resolution; the interval, the
+    /// step from the temporal grid's `resolution`, the number of steps and
+    /// the model runs; the vertical range and levels in their unit.
     #[test]
-    fn coverage_facts_use_the_catalog_formatting() {
-        let doc = rich_collection();
-        let facts = metadata::coverage_facts(&doc);
+    fn extent_box_rows_hold_the_advertised_facts() {
+        let mut doc = rich_collection();
+        doc["extent"]["spatial"]["grid"] = json!([
+            {"cellsCount": 3249, "resolution": 0.011565390529645244, "firstCoordinate": null},
+            {"cellsCount": 1750, "resolution": 0.011565390529645243, "firstCoordinate": null}]);
+        doc["extent"]["vertical"] = json!({"interval": [[300.0, 1000.0]], "vrs": ds_core::vertical::VerticalKind::Pressure.vrs(),
+            "values": [1000.0, 850.0, 500.0, 300.0], "unit": "hPa", "grid": {"cellsCount": 4, "coordinates": [1000.0, 850.0, 500.0, 300.0]}});
+        doc["data_queries"]["instances"] =
+            json!({"link": {"href": "https://x/edr/collections/r/instances", "rel": "data"}});
+        let rows = metadata::extent_rows(&doc).unwrap();
+        let row = |label: &str| {
+            rows.split(&format!("<dt>{label}</dt>"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("no {label} row: {rows}"))
+                .split("</dd>")
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        let spatial = row("Spatial");
+        assert!(spatial.contains("<small>Bounds · CRS84 · west, south → east, north</small>"));
+        assert!(spatial.contains("title=\"0.4190042054438888,54.570768841987515,37.99495803626129,74.81020226886669\">0.42, 54.57 → 37.99, 74.81</strong>"), "{spatial}");
+        assert!(spatial.contains("data-copy=\"0.4190042054438888,54.570768841987515,37.99495803626129,74.81020226886669\">Copy bbox</button>"));
+        assert!(spatial.contains("<small>Storage coordinate system</small><strong><span class=\"chip crs\" title=\"http://www.opengis.net/def/crs/EPSG/0/3067\">EPSG:3067</span></strong>"), "{spatial}");
         assert!(
-            facts.contains("<span>2026-03-24</span><span>23:15–23:35 UTC</span>"),
-            "{facts}"
+            spatial.contains("<small>Grid · lon × lat</small><strong>3249 × 1750 cells</strong>"),
+            "{spatial}"
         );
-        assert!(facts.contains("<small>Cadence</small><strong>Every 5 min</strong>"));
-        assert!(facts.contains("<small>Steps</small><strong>5 steps</strong>"));
-        assert!(facts.contains("title=\"0.4190042054438888,54.570768841987515,37.99495803626129,74.81020226886669\">0.42, 54.57 → 37.99, 74.81</strong>"), "{facts}");
-        assert!(facts.contains("data-copy=\"0.4190042054438888,54.570768841987515,37.99495803626129,74.81020226886669\">Copy bbox</button>"));
+        // One resolution where the axes agree to the digits shown, the
+        // exact values in the title.
+        assert!(spatial.contains("<small>Resolution · lon × lat</small><strong><span title=\"0.011565390529645244 × 0.011565390529645243\">0.0116°</span></strong>"), "{spatial}");
+        let temporal = row("Temporal");
+        assert!(
+            temporal.contains("<span>2026-03-24</span><span>23:15–23:35 UTC</span>"),
+            "{temporal}"
+        );
+        assert!(
+            temporal.contains(
+                "<small>Step</small><strong><span title=\"PT5M\">Every 5 min</span></strong>"
+            ),
+            "{temporal}"
+        );
+        assert!(temporal.contains("<small>Steps</small><strong>5 steps</strong>"));
+        assert!(
+            temporal.contains(
+                "<a href=\"https://x/edr/collections/r/instances?f=html\">Browse model runs →</a>"
+            ),
+            "{temporal}"
+        );
+        let vertical = row("Vertical");
+        assert!(
+            vertical
+                .contains("<small>Range</small><strong>Pressure: 300–1000 hPa · 4 levels</strong>"),
+            "{vertical}"
+        );
+        assert!(
+            vertical.contains(
+                "<small>Levels · hPa</small><p class=\"mono level-list\">1000, 850, 500, 300</p>"
+            ),
+            "{vertical}"
+        );
+        assert!(vertical.contains("<summary>Vertical reference system</summary>"));
         // The catalog row shows the same bounds text.
         assert!(collection_facts(&doc).contains(">0.42, 54.57 → 37.99, 74.81</span>"));
-        let empty = metadata::coverage_facts(&json!({"id": "e"}));
-        assert_eq!(empty.matches("Not advertised").count(), 2, "{empty}");
-        assert!(!empty.contains("Cadence") && !empty.contains("Steps"));
+        // A grid of unequal resolution names each axis's; a projected box
+        // names no axes and no degrees.
+        let unequal = json!({"crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84", "grid": [
+            {"cellsCount": 16, "resolution": 0.5}, {"cellsCount": 21, "resolution": 0.25}]});
+        assert!(metadata::spatial_grid_facts(&unequal).contains(">0.5° × 0.25°</span>"));
+        let projected = json!({"crs": "http://www.opengis.net/def/crs/EPSG/0/3067", "grid": [
+            {"cellsCount": 760, "resolution": 1000.0}, {"cellsCount": 1226, "resolution": 1000.0}]});
+        let facts = metadata::spatial_grid_facts(&projected);
+        assert!(
+            facts.contains("<small>Grid</small><strong>760 × 1226 cells</strong>"),
+            "{facts}"
+        );
+        assert!(facts.contains(">1000</span>"), "{facts}");
+    }
+
+    /// #1228: a dimension the document does not describe has no row, and
+    /// a fact it does not carry is not shown: no "Not advertised" filler,
+    /// no storage CRS, grid, step or levels it lacks. Without any extent
+    /// the box says so.
+    #[test]
+    fn extent_box_omits_what_the_document_does_not_carry() {
+        let spatial_only = json!({"id": "s", "extent": {"spatial": {"bbox": [[20, 60, 30, 70]]}}});
+        let rows = metadata::extent_rows(&spatial_only).unwrap();
+        assert!(rows.contains("<dt>Spatial</dt>"));
+        for absent in [
+            "<dt>Temporal</dt>",
+            "<dt>Vertical</dt>",
+            "Storage coordinate system",
+            "Grid",
+            "Resolution",
+            "Not advertised",
+        ] {
+            assert!(!rows.contains(absent), "{absent}: {rows}");
+        }
+        let temporal_only = json!({"id": "t", "extent": {"temporal": {"interval": [["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"]]}}});
+        let rows = metadata::extent_rows(&temporal_only).unwrap();
+        assert!(rows.contains("<dt>Temporal</dt>") && !rows.contains("<dt>Spatial</dt>"));
+        assert!(
+            !rows.contains("<small>Step</small>") && !rows.contains("Model runs"),
+            "{rows}"
+        );
+        assert!(metadata::extent_rows(&json!({"id": "e"})).is_none());
         let html = collection_html(SHARED_X, &json!({"id": "e", "links": []}), None);
+        let overview = html.split("id=\"metadata\"").next().unwrap();
+        assert!(overview.contains("<h2>Extent</h2></div><div class=\"empty-state\"><p>No extent advertised.</p></div>"), "{overview}");
         assert!(!html.contains("Not available"), "{html}");
     }
 
-    /// #1140: the Overview's resource cards are labelled in plain words, one
-    /// per resource; the items JSON and HTML share a card; the map card
-    /// says it covers the whole extent; nothing listed elsewhere on the
-    /// Overview repeats, and an empty list gets no panel. The details give
-    /// the kind from `dataType` and keywords as a term.
+    /// #1140, #1228: the Overview's resource cards list only what the
+    /// request guide does not: there each endpoint of an API serving the
+    /// collection is listed once, and the license is in the heading. The
+    /// technical details give the kind from `dataType`, the CRS list as
+    /// chips and the number of items; the keywords, the storage CRS and the
+    /// license are elsewhere.
     #[test]
     fn overview_resource_cards_use_plain_labels_once_per_resource() {
         let license = LicenseConfig {
@@ -4745,49 +5750,47 @@ mod tests {
             media_type: None,
         };
         let html = collection_html(SHARED_X, &rich_collection(), Some(&license));
-        let overview = html.split("id=\"metadata\"").next().unwrap();
+        let overview = html
+            .split("<section id=\"overview\"")
+            .nth(1)
+            .unwrap()
+            .split("id=\"metadata\"")
+            .next()
+            .unwrap();
         let aside = overview
             .split("<aside class=\"aside-stack\">")
             .nth(1)
+            .unwrap()
+            .split("</aside>")
+            .next()
             .unwrap();
         let cards = aside.split("<h2>Resource links</h2>").nth(1).unwrap();
-        assert_eq!(cards.matches("class=\"endpoint\"").count(), 3, "{cards}");
-        for label in ["Map image", "Styles", "Features"] {
-            assert!(
-                cards.contains(&format!("<strong>{label}</strong>")),
-                "{label}"
+        assert_eq!(cards.matches("class=\"endpoint\"").count(), 1, "{cards}");
+        assert!(cards.contains("<strong>Styles</strong>"), "{cards}");
+        for href in [
+            "https://x/collections/r/map",
+            "https://x/collections/r/map/tiles",
+            "https://x/collections/r/items",
+        ] {
+            assert_eq!(
+                overview.matches(&format!("href=\"{href}\"")).count(),
+                1,
+                "{href}"
             );
         }
-        // The items card opens the HTML view and keeps the GeoJSON link.
-        assert!(cards.contains(
-            "<a class=\"resource-title\" href=\"https://x/collections/r/items?f=html\"><strong>Features</strong><code>https://x/collections/r/items</code></a>"
-        ), "{cards}");
-        assert!(cards
-            .contains("<a class=\"chip\" href=\"https://x/collections/r/items\">As GeoJSON</a>"));
-        assert!(cards.contains("<code class=\"term\" title=\"items\">items</code>"));
-        assert!(cards.contains(&format!(
-            "<code class=\"term\" title=\"{}\">map</code>",
-            rel::MAP
-        )));
-        assert!(cards.contains("Covers the whole extent unless the request sets a bbox"));
-        // A title that only repeats the label is not shown again.
-        assert!(!cards.contains("Map · "));
-        assert!(!overview.contains("requires bbox"));
-        // Tilesets are listed beside the map, the license in the details.
-        assert!(!cards.contains("map/tiles\""));
-        assert!(!cards.contains("licenses/cc-by"));
-        assert_eq!(
-            overview
-                .matches("href=\"https://x/collections/r/map/tiles\"")
-                .count(),
-            1
-        );
+        assert!(!overview.contains("href=\"https://x/licenses/cc-by\""));
+        let heading = html.split("<div class=\"detail-heading\">").nth(1).unwrap();
+        let heading = heading.split("</div><nav").next().unwrap();
+        assert!(heading.contains("<p class=\"license\">License: <a href=\"https://x/licenses/cc-by\">CC-BY-4.0</a></p>"), "{heading}");
+        assert!(aside.contains("<h2>Technical details</h2>"));
         assert!(aside.contains(
             "<dt>Data type</dt><dd>Map layer<small class=\"term\">dataType <code>map</code> · itemType <code>feature</code></small></dd>"
         ), "{aside}");
-        assert!(aside.contains("<dt>Keywords</dt><dd><div class=\"tag-list\">"));
-        assert!(!aside.contains("<label>Keywords</label>"));
-        assert!(aside.contains("<dt>Storage coordinate system</dt><dd><span class=\"chip crs\" title=\"http://www.opengis.net/def/crs/EPSG/0/3067\">EPSG:3067</span></dd>"));
+        assert!(aside.contains("<dt>Coordinate systems</dt><dd><span class=\"chip-row\"><span class=\"chip crs\" title=\"http://www.opengis.net/def/crs/OGC/1.3/CRS84\">CRS84</span><span class=\"chip crs\" title=\"http://www.opengis.net/def/crs/EPSG/0/3067\">EPSG:3067</span></span></dd>"), "{aside}");
+        assert!(aside.contains("<dt>Items</dt><dd>3</dd>"), "{aside}");
+        for elsewhere in ["Keywords", "Storage coordinate system", "License"] {
+            assert!(!aside.contains(elsewhere), "{elsewhere}: {aside}");
+        }
         // Nothing left to list: no empty panel.
         let bare =
             json!({"id": "b", "links": [{"href": "https://x/collections/b", "rel": "self"}]});

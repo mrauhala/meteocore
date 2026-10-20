@@ -45,6 +45,8 @@ use crate::io::{self, Mode};
 
 /// Requests in flight to one host at once, over every collection reading
 /// it (#1067: thredds.met.no's fileServer is not a documented interface).
+/// ds-storage halves it while the host answers 429 and grows it back when
+/// the host is quiet (#1235).
 pub(crate) const HOST_REQUEST_LIMIT: usize = 8;
 
 /// Of [`HOST_REQUEST_LIMIT`], the requests ingest and prewarm may hold, so
@@ -74,36 +76,55 @@ impl Tuning {
     };
 }
 
-/// A host's stores: requests read through its whole limit, ingest and
-/// prewarm through a share of it. One per host for the process, shared by
-/// every collection on it.
+/// A host's stores, as one collection reads them: requests read through
+/// the host's whole limit, ingest and prewarm through a share of it. The
+/// limits, the share and the counters are one per host for the process,
+/// shared by every collection on it; the stores name the collection on its
+/// `storage` spans (#1233).
 pub(crate) struct Host {
     pub requests: DataStore,
     pub background: DataStore,
-    /// Range GETs made to the host.
-    pub gets: AtomicU64,
+    /// Range GETs made to the host, by every collection on it.
+    pub gets: Arc<AtomicU64>,
 }
 
-/// The host stores for `data_path` and the key prefix under them.
-pub(crate) fn host(data_path: &str) -> Result<(Arc<Host>, ObjectPath), DataServerError> {
-    static HOSTS: LazyLock<Mutex<Vec<Arc<Host>>>> = LazyLock::new(Default::default);
+impl Host {
+    /// The host's stores, naming collection `id`.
+    fn for_collection(&self, id: &str) -> Host {
+        Host {
+            requests: self.requests.clone().for_collection(id),
+            background: self.background.clone().for_collection(id),
+            gets: self.gets.clone(),
+        }
+    }
+}
+
+/// The host stores for `data_path`, read for collection `collection_id`,
+/// and the key prefix under them.
+pub(crate) fn host(
+    collection_id: &str,
+    data_path: &str,
+) -> Result<(Arc<Host>, ObjectPath), DataServerError> {
+    static HOSTS: LazyLock<Mutex<Vec<Host>>> = LazyLock::new(Default::default);
     let (requests, base) = ds_storage::build_http_store_limited(data_path, HOST_REQUEST_LIMIT)?;
     let mut hosts = HOSTS.lock().unwrap_or_else(|e| e.into_inner());
     // `build_http_store_limited` returns one store per host: the share
     // stacks on that one.
-    if let Some(host) = hosts
+    let index = match hosts
         .iter()
-        .find(|host| Arc::ptr_eq(host.requests.inner(), requests.inner()))
+        .position(|host| host.requests.same_store(&requests))
     {
-        return Ok((host.clone(), base));
-    }
-    let host = Arc::new(Host {
-        background: requests.with_request_limit(BACKGROUND_SHARE),
-        requests,
-        gets: AtomicU64::new(0),
-    });
-    hosts.push(host.clone());
-    Ok((host, base))
+        Some(index) => index,
+        None => {
+            hosts.push(Host {
+                background: requests.with_request_limit(BACKGROUND_SHARE),
+                requests,
+                gets: Arc::default(),
+            });
+            hosts.len() - 1
+        }
+    };
+    Ok((Arc::new(hosts[index].for_collection(collection_id)), base))
 }
 
 /// The scheme and authority of a URL, `https://thredds.met.no`.

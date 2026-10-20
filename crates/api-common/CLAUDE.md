@@ -75,9 +75,15 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   goes before prefetch; tiles stage one prefetch frame at a time, images fetch
   at most two. The status line announces steps, pauses and errors, never a
   played frame; the slider moves only on a viewer's move or a pause. No
-  autoplay. WMS mode comes from the collection's `apis`
-  (`shared::wms_endpoint`): the collection document names no WMS, so this is
-  the one map control gated on config rather than an advertised link.
+  autoplay. WMS mode comes from `shared::CollectionServices` (#1228), as do the
+  page's EDR, WMS and 3D Tiles chips and guide entries: the server's per-load
+  snapshot of its registries (`admin::served_by`), read in O(1); `apis`
+  (`wms_endpoint`) only without it. No collection document names them, and
+  `apis` over-claims (a PVOL network inventory is Features only).
+- The request guide (#1228) builds examples from the document and services
+  only. EDR examples follow EDR's query types (`locations` → stations,
+  `position` → grid, else areas with no `datetime`): never offer a query EDR
+  would 404. Escape every value; Copy is `data-copy` (app.js).
 - The Overview's "Filter by" / "Sort by" chips (`ItemsOverview`, carried by
   `Contribution::items`, rendered by `collection_page`) open the items
   builder through the URL fragment (`#filter=<name>`, `#sort=<name>`), never

@@ -2431,6 +2431,8 @@ Two log formats are supported, selected via the `LOG_FORMAT` environment variabl
 
 Log level is controlled via the standard `RUST_LOG` env var (default `info`), e.g. `RUST_LOG=server=debug,engine_geotiff=warn`.
 
+object_store's retry lines (target `object_store::client::retry`) run inside a `storage` span naming the `collection`, the `store` (an HTTP host or an S3 endpoint host and bucket, never credentials or a query string) and the object `path`; see [ds-storage](crates/storage/README.md#the-storage-span).
+
 #### Correlation IDs
 
 Every request is assigned a correlation ID:

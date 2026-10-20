@@ -411,6 +411,7 @@ pub(crate) mod tests {
             maps: Arc::new(ArcSwap::from_pointee(result.maps_state)),
             tiles: Arc::new(ArcSwap::from_pointee(result.tiles_state)),
             tiles_3d: Arc::new(ArcSwap::from_pointee(result.tiles_3d_state)),
+            served_by: Arc::new(ArcSwap::from_pointee(result.served_by)),
             accepted_load: RwLock::new(Some(Arc::new(crate::admin::AcceptedLoad::new(
                 &config,
                 style_ctx,

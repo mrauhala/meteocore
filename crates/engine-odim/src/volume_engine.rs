@@ -454,7 +454,8 @@ fn build_source(
                 .prefix_pattern
                 .clone()
                 .ok_or(EngineError::MissingPrefixPattern)?;
-            let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?;
+            let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?
+                .for_collection(collection_id);
             let time_window = match &config.time_window {
                 Some(s) => Some(TimeWindow::parse(s)?),
                 None => None,

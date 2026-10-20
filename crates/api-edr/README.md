@@ -358,6 +358,12 @@ Each engine crate documents its own query details.
   400. JSON clients still get the 400.
 - The `/locations` page shows 100 locations at a time with a map; `items`
   pages show a feature table.
+- A collection page's request guide, here and on the shared root's page,
+  gives ready EDR requests built from the queries the collection offers:
+  its locations and the whole extent for stations, the values at the
+  extent's centre and a small area for a grid, the whole extent for one
+  answering areas alone (a nowcast, lightning events). The shared root reads
+  the queries from the EDR registry, once per load.
 
 ## Configuration
 

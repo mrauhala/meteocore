@@ -1,11 +1,11 @@
 //! Requests through a per-host limit, counted for `/metrics` (#1067): how
 //! many hold one of the host's permits and how many wait for one.
 //!
-//! [`crate::build_http_store_limited`] wraps the host's `LimitStore` in a
-//! [`Gauged`] store and the HTTP store under it in another: the outer one
-//! counts every request that has asked for a permit, the inner one those
-//! that hold one. Each counts a GET until its body has been read or
-//! dropped, as `LimitStore` holds its permit.
+//! [`crate::build_http_store_limited`] wraps the host's limited store
+//! (`throttle::Limited`) in a [`Gauged`] store and the HTTP store under it
+//! in another: the outer one counts every request that has asked for a
+//! permit, the inner one those that hold one. Each counts a GET until its
+//! body has been read or dropped, as the limit holds its permit.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -133,9 +133,12 @@ impl ObjectStore for Gauged {
 pub struct HostRequests {
     /// The host and port, as `thredds.met.no` or `127.0.0.1:8080`.
     pub host: String,
-    /// Requests the host allows in flight at once.
+    /// Requests the host allows in flight at once now: the configured
+    /// limit, or less while it backs off from a 429 (#1235). Requests in
+    /// flight when it was cut finish, so `in_flight` can exceed it.
     pub limit: usize,
-    /// Requests holding one of its permits.
+    /// Requests holding one of its permits, those waiting for the host's
+    /// `Retry-After` included: the wait comes after the permit.
     pub in_flight: usize,
     /// Requests waiting for one.
     pub queued: usize,
