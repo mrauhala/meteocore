@@ -19,10 +19,14 @@
 //! that a fill runs inline, under the request's deadline. An EDR or
 //! GetFeatureInfo read ([`read_uncached`]) detaches from a pool of its own,
 //! [`MAX_QUERY_DETACHED_READS`], so query load never takes the slots render
-//! fills need to leave a warm cache behind a missed 3 s deadline.
+//! fills need to leave a warm cache behind a missed 3 s deadline. A query
+//! read of a field another query's detached read is still reading joins
+//! that read ([`QUERY_IN_FLIGHT`]) rather than taking a slot of its own, so
+//! retries of a query that missed its deadline never fill the pool.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use ds_cache::{ByteBoundedCache, CacheEntry};
@@ -138,6 +142,81 @@ static RENDER_FILLS: DetachedPool = DetachedPool::new(MAX_DETACHED_FILLS);
 /// The EDR and GetFeatureInfo reads' pool ([`MAX_QUERY_DETACHED_READS`]).
 pub(crate) static QUERY_READS: DetachedPool = DetachedPool::new(MAX_QUERY_DETACHED_READS);
 
+/// Detached query reads in flight, by field: a query read of a field in
+/// here waits for that read instead of starting its own.
+///
+/// Without it, every retry of a query that missed its deadline started a
+/// detached read of each field the first attempt was still reading. Each
+/// waited on the first read's chunk (one GET, `crate::remote`'s
+/// single-flight) while holding a [`QUERY_READS`] slot. One cold query and
+/// three retries held 8 slots, the whole pool, for 2 fields. The next
+/// cold field then ran inline under its query's deadline, which cut its GET
+/// off: nothing cached, and the next retry fetched it again.
+static QUERY_IN_FLIGHT: LazyLock<Mutex<HashMap<FieldKey, Arc<InFlight>>>> =
+    LazyLock::new(Mutex::default);
+
+/// One detached query read, for the queries that joined it.
+#[derive(Default)]
+struct InFlight {
+    /// `Some(Some(values))` once read, `Some(None)` once failed.
+    outcome: Mutex<Option<Option<Values>>>,
+    done: Condvar,
+}
+
+impl InFlight {
+    /// The read's values, `Ok(None)` if it failed, or `Err(())` if it is
+    /// still running at `end` (30 s without one).
+    fn wait(&self, end: Option<Instant>) -> Result<Option<Values>, ()> {
+        let wait = end.map_or(Duration::from_secs(30), |end| {
+            end.saturating_duration_since(Instant::now())
+        });
+        let outcome = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        let (outcome, _) = self
+            .done
+            .wait_timeout_while(outcome, wait, |outcome| outcome.is_none())
+            .unwrap_or_else(|e| e.into_inner());
+        outcome.clone().ok_or(())
+    }
+}
+
+/// Settles a detached query read when dropped, a panic included: records
+/// its outcome (a failure if none was recorded), wakes the queries that
+/// joined it, and takes it out of [`QUERY_IN_FLIGHT`], so a later read of
+/// the field starts afresh (its chunk then cached).
+struct Settle {
+    key: FieldKey,
+    flight: Arc<InFlight>,
+    values: Option<Values>,
+}
+
+impl Drop for Settle {
+    fn drop(&mut self) {
+        let mut in_flight = QUERY_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if in_flight
+            .get(&self.key)
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
+            in_flight.remove(&self.key);
+        }
+        drop(in_flight);
+        *self
+            .flight
+            .outcome
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(self.values.take());
+        self.flight.done.notify_all();
+    }
+}
+
+/// How a query reads a remote field: joining another query's detached read
+/// of it, starting one (with its pool slot), or inline when the pool is
+/// full.
+enum QueryRead {
+    Join(Arc<InFlight>),
+    Start(Arc<InFlight>, Detached),
+    Inline,
+}
+
 /// The render fills' detached reads: `(running now, started in total,
 /// filled inline because MAX_DETACHED_FILLS were running)`. Query reads
 /// ([`QUERY_READS`]) are not counted here.
@@ -227,10 +306,13 @@ pub(crate) fn read(
 /// runtime under [`Mode::Detached`] (no deadline, the background fetch
 /// budget), and the query waits for it only until its own deadline. A
 /// query that misses its deadline fails, while the reads it started go on
-/// into the chunk cache, so a retry makes progress. The slot comes from
-/// [`QUERY_READS`], never the render fills' pool; past
-/// [`MAX_QUERY_DETACHED_READS`] the read runs here, under the deadline.
-/// Each read reserves its transient peak from the decode budget.
+/// into the chunk cache, so a retry makes progress. A query reading a field
+/// another query's detached read is still reading joins it
+/// ([`QUERY_IN_FLIGHT`]): no slot, no decode of its own; if that read
+/// fails, the joiner reads the field itself, under its deadline, for its
+/// own error. The slot comes from [`QUERY_READS`], never the render fills'
+/// pool; past [`MAX_QUERY_DETACHED_READS`] the read runs here, under the
+/// deadline. Each read reserves its transient peak from the decode budget.
 pub(crate) fn read_uncached(
     file: &Arc<OpenFile>,
     index: usize,
@@ -245,30 +327,67 @@ pub(crate) fn read_uncached(
         return Ok(values);
     }
     let end = deadline::current();
+    let timed_out = || {
+        if end.is_some() {
+            DataServerError::DeadlineExceeded
+        } else {
+            DataServerError::Storage("timed out waiting for a NetCDF field read".into())
+        }
+    };
     let result = io::blocking(|| {
-        let slot = file.remote.as_ref().and_then(|_| QUERY_READS.claim());
-        let Some(slot) = slot else {
+        if file.remote.is_none() {
             return fill(file, index, time, level, flipped, decodes);
+        }
+        let read = {
+            let mut in_flight = QUERY_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            match in_flight.get(&key) {
+                Some(flight) => QueryRead::Join(flight.clone()),
+                None => match QUERY_READS.claim() {
+                    Some(slot) => {
+                        let flight = Arc::new(InFlight::default());
+                        in_flight.insert(key.clone(), flight.clone());
+                        QueryRead::Start(flight, slot)
+                    }
+                    None => QueryRead::Inline,
+                },
+            }
+        };
+        let (flight, slot) = match read {
+            QueryRead::Inline => return fill(file, index, time, level, flipped, decodes),
+            QueryRead::Join(flight) => {
+                return match flight.wait(end) {
+                    Ok(Some(values)) => Ok(values),
+                    // The read joined failed: read here, for this query's
+                    // own error, or values if the failure has passed.
+                    Ok(None) => fill(file, index, time, level, flipped, decodes),
+                    Err(()) => Err(timed_out()),
+                };
+            }
+            QueryRead::Start(flight, slot) => (flight, slot),
         };
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let (file, decodes) = (file.clone(), decodes.clone());
+        let key = key.clone();
         io::handle().spawn_blocking(move || {
             let _slot = slot;
             let _mode = io::enter(Mode::Detached);
+            let mut settle = Settle {
+                key,
+                flight,
+                values: None,
+            };
+            let result = fill(&file, index, time, level, flipped, &decodes);
+            settle.values = result.as_ref().ok().cloned();
+            drop(settle);
             // The query may have given up: the chunk is cached anyway.
-            let _ = sender.send(fill(&file, index, time, level, flipped, &decodes));
+            let _ = sender.send(result);
         });
         let wait = end.map_or(Duration::from_secs(30), |end| {
             end.saturating_duration_since(Instant::now())
         });
         match receiver.recv_timeout(wait) {
             Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if end.is_some() => {
-                Err(DataServerError::DeadlineExceeded)
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(DataServerError::Storage(
-                "timed out waiting for a NetCDF field read".into(),
-            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(timed_out()),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(DataServerError::Engine(
                 "a detached NetCDF field read stopped".into(),
             )),
