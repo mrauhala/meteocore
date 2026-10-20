@@ -18,6 +18,110 @@ pub const CRS84_WKT: &str = r#"GEOGCRS["WGS 84 (CRS84)",DATUM["World Geodetic Sy
 pub(crate) const WGS84_F: f64 = 1.0 / 298.257223563; // flattening
 const WGS84_E2: f64 = 2.0 * WGS84_F - WGS84_F * WGS84_F; // eccentricity squared
 
+/// The figure of the Earth a projection is computed on: an ellipsoid of
+/// revolution by its semi-major axis and flattening, or a sphere, whose
+/// flattening is 0 (#1192). [`Crs::TransverseMercator`],
+/// [`Crs::LambertAzimuthalEqualArea`] and [`Crs::Stereographic`] carry one.
+///
+/// Built from what a source states ([`Self::sphere`], [`Self::from_axes`],
+/// [`Self::from_inverse_flattening`]). A figure within 10 µm of WGS 84's or
+/// GRS 1980's axes is that ellipsoid exactly, whatever precision the source
+/// wrote it to, so it compares equal and its WKT2 names it. The two differ
+/// by 0.1 mm in the semi-minor axis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ellipsoid {
+    /// Semi-major axis, or the sphere's radius, in metres.
+    a: f64,
+    /// Flattening `(a − b) / a`; 0 for a sphere.
+    f: f64,
+}
+
+/// How close a stated figure's axes must lie to a named ellipsoid's to be
+/// it, metres: well under the 0.1 mm between WGS 84 and GRS 1980, and over
+/// the micrometre a CF attribute written to six decimals rounds by.
+const NAMED_FIGURE_TOLERANCE: f64 = 1e-5;
+
+impl Ellipsoid {
+    /// WGS 84: a = 6 378 137 m, 1/f = 298.257 223 563.
+    pub const WGS84: Ellipsoid = Ellipsoid {
+        a: WGS84_A,
+        f: WGS84_F,
+    };
+
+    /// GRS 1980 (ETRS89's ellipsoid, EPSG:3067's and EPSG:3035's): a =
+    /// 6 378 137 m, 1/f = 298.257 222 101.
+    pub const GRS80: Ellipsoid = Ellipsoid {
+        a: WGS84_A,
+        f: 1.0 / 298.257_222_101,
+    };
+
+    /// A sphere of `radius` metres.
+    pub const fn sphere(radius: f64) -> Ellipsoid {
+        Ellipsoid { a: radius, f: 0.0 }
+    }
+
+    /// The ellipsoid of semi-major axis `a` and semi-minor axis `b`,
+    /// metres, `0 < b <= a`; a sphere when they are equal.
+    pub fn from_axes(a: f64, b: f64) -> Ellipsoid {
+        if a == b {
+            return Ellipsoid::sphere(a);
+        }
+        Ellipsoid::named(a, b).unwrap_or(Ellipsoid { a, f: (a - b) / a })
+    }
+
+    /// The ellipsoid of semi-major axis `a`, metres, and inverse flattening
+    /// `rf`, which is greater than 1. As [`Self::from_axes`], the flattening
+    /// exactly `1 / rf`.
+    pub fn from_inverse_flattening(a: f64, rf: f64) -> Ellipsoid {
+        Ellipsoid::named(a, a * (1.0 - 1.0 / rf)).unwrap_or(Ellipsoid { a, f: 1.0 / rf })
+    }
+
+    /// WGS 84 or GRS 1980 when the axes `a` and `b` are theirs to
+    /// [`NAMED_FIGURE_TOLERANCE`].
+    fn named(a: f64, b: f64) -> Option<Ellipsoid> {
+        [Ellipsoid::WGS84, Ellipsoid::GRS80]
+            .into_iter()
+            .find(|named| {
+                (a - named.a).abs() < NAMED_FIGURE_TOLERANCE
+                    && (b - named.semi_minor()).abs() < NAMED_FIGURE_TOLERANCE
+            })
+    }
+
+    /// The semi-major axis, or the sphere's radius, in metres.
+    pub fn semi_major(&self) -> f64 {
+        self.a
+    }
+
+    /// The semi-minor axis in metres.
+    pub fn semi_minor(&self) -> f64 {
+        self.a * (1.0 - self.f)
+    }
+
+    /// The flattening `(a − b) / a`; 0 for a sphere.
+    pub fn flattening(&self) -> f64 {
+        self.f
+    }
+
+    /// Whether the figure is a sphere.
+    pub fn is_sphere(&self) -> bool {
+        self.f == 0.0
+    }
+
+    /// The first eccentricity squared, `e² = 2f − f²`.
+    fn e2(&self) -> f64 {
+        2.0 * self.f - self.f * self.f
+    }
+
+    /// Whether the figure is WGS 84 to within a millimetre in both axes:
+    /// WGS 84 or GRS 1980, which a registered CRS's parameters may be
+    /// computed on interchangeably at map scale. A sphere or any other
+    /// ellipsoid is not.
+    pub fn is_wgs84_like(&self) -> bool {
+        (self.a - WGS84_A).abs() < 1e-3
+            && (self.semi_minor() - Ellipsoid::WGS84.semi_minor()).abs() < 1e-3
+    }
+}
+
 /// Convert WGS84 geodetic coordinates to Earth-Centered, Earth-Fixed (ECEF)
 /// metres (EPSG:4978). `lon_deg`/`lat_deg` are degrees, `h` is metres above
 /// the WGS84 ellipsoid. Used to place 3D content (e.g. OGC 3D Tiles volumes)
@@ -186,35 +290,45 @@ pub fn intermediate_point(
 pub enum Crs {
     /// WGS84 geographic (EPSG:4326 / CRS84). Coordinates are (lon, lat) in degrees.
     Wgs84,
-    /// Transverse Mercator (e.g., EPSG:3067 TM35FIN, UTM) on the WGS84
-    /// ellipsoid, by Krüger's series to sixth order (#1130).
+    /// Transverse Mercator (e.g., EPSG:3067 TM35FIN, UTM) on its `figure`,
+    /// by Krüger's series to sixth order in its third flattening (#1130),
+    /// which on a sphere is the exact spherical projection.
     ///
     /// Its valid area, where the inverse answers, is a square in projected
     /// metres around the point where the central meridian crosses the
-    /// equator, of half-side k₀ times the quarter meridian (k₀ ·
+    /// equator, of half-side k₀ times the quarter meridian (on WGS84, k₀ ·
     /// 10 001 965.729 m): up to the poles' northings, and as far east and
     /// west. The inverse is `None` past them (#1113). On the Earth that is
     /// the hemisphere within 90° of the central meridian, except near the
-    /// equator, where it ends 66.29° from the meridian; from 23.41° of
-    /// latitude to the poles it reaches the meridians 90° out. Inside it,
-    /// the series matches the exact projection to under a millimetre
-    /// (`TM_MAX_ETA`). Past a pole lies the far side of the Earth, and
-    /// past the eastings the series runs away from the projection.
-    /// The forward transform answers everywhere: exact inside the area,
-    /// and past it unbounded near the equator 90° from the meridian.
+    /// equator, where it ends 66.29° from the meridian on WGS84; from
+    /// 23.41° of latitude to the poles it reaches the meridians 90° out.
+    /// Inside it, the series matches the exact projection to under a
+    /// millimetre (`TM_MAX_ETA`). Past a pole lies the far side of the
+    /// Earth, and past the eastings the series runs away from the
+    /// projection. The forward transform answers everywhere: exact inside
+    /// the area, and past it unbounded near the equator 90° from the
+    /// meridian.
     TransverseMercator {
         lat0: f64,    // latitude of natural origin (radians)
         lon0: f64,    // central meridian (radians)
         k0: f64,      // scale factor at natural origin
         false_e: f64, // false easting (meters)
         false_n: f64, // false northing (meters)
+        /// The earth figure, e.g. GRS 1980 for EPSG:3067 or Airy 1830 for
+        /// the British National Grid.
+        figure: Ellipsoid,
     },
-    /// Lambert Azimuthal Equal Area (e.g., EPSG:3035).
+    /// Lambert Azimuthal Equal Area (e.g., EPSG:3035) on its `figure`, by
+    /// Snyder's ellipsoidal formulas, which on a sphere are the spherical
+    /// ones.
     LambertAzimuthalEqualArea {
         lat0: f64,    // latitude of natural origin (radians)
         lon0: f64,    // longitude of natural origin (radians)
         false_e: f64, // false easting (meters)
         false_n: f64, // false northing (meters)
+        /// The earth figure, e.g. GRS 1980 for EPSG:3035 or the 6 371 228 m
+        /// sphere of the original EASE-Grid.
+        figure: Ellipsoid,
     },
     /// Lambert Conformal Conic with 2 standard parallels; equal
     /// parallels are the tangent (1SP, scale 1) cone.
@@ -231,16 +345,23 @@ pub enum Crs {
         /// and in the producers that define grids this way.
         radius: Option<f64>,
     },
-    /// Polar Stereographic (e.g., FMI ODIM radar composites).
+    /// Stereographic, polar (e.g., FMI ODIM radar composites, NSIDC sea ice
+    /// grids) or oblique (DMI's composite, CF `stereographic`), on its
+    /// `figure`.
     ///
-    /// Oblique stereographic on WGS84 ellipsoid using the conformal sphere
-    /// approach (Gauss conformal latitude). Parameters match PROJ +proj=stere.
+    /// On an ellipsoid the oblique aspect projects the conformal latitude
+    /// (Snyder eqs. 21-26 to 21-30) and the polar aspect is Snyder eq.
+    /// 21-33; on a sphere both are the spherical projection. Parameters
+    /// match PROJ `+proj=stere`.
     Stereographic {
         lat0: f64,    // latitude of natural origin (radians)
         lon0: f64,    // central meridian (radians)
         k0: f64,      // scale factor at natural origin
         false_e: f64, // false easting (meters)
         false_n: f64, // false northing (meters)
+        /// The earth figure, e.g. WGS 84, NSIDC's Hughes 1980 or an NWP
+        /// model's sphere.
+        figure: Ellipsoid,
     },
     /// Rotated latitude-longitude grid (e.g., HIRLAM NWP models).
     ///
@@ -363,6 +484,36 @@ pub fn crs84_extent(bbox: [f64; 4]) -> Option<[f64; 4]> {
     Some([w, s, e, n])
 }
 
+/// The CRS84 box covering every extent `[west, south, east, north]` in
+/// `extents`, `None` for none. Longitudes are measured from the first box's
+/// centre, so boxes crossing the antimeridian union to a `west > east` box
+/// (as the seam box 170, 10, -170, 20), not a −180…180 one; boxes spanning
+/// a turn between them are −180…180.
+pub fn crs84_union(extents: impl IntoIterator<Item = [f64; 4]>) -> Option<[f64; 4]> {
+    let mut extents = extents.into_iter();
+    let first = extents.next()?;
+    let width = |[w, _, e, _]: [f64; 4]| if e >= w { e - w } else { e + 360.0 - w };
+    let reference = first[0] + width(first) / 2.0;
+    let relative = |lon: f64| wrap_lon(lon - reference);
+    let [mut w, mut s, mut e, mut n] = [
+        relative(first[0]),
+        first[1],
+        relative(first[0]) + width(first),
+        first[3],
+    ];
+    for extent in extents {
+        let west = relative(extent[0]);
+        w = w.min(west);
+        e = e.max(west + width(extent));
+        s = s.min(extent[1]);
+        n = n.max(extent[3]);
+    }
+    if e - w >= 360.0 {
+        return Some([-180.0, s, 180.0, n]);
+    }
+    Some([wrap_lon(reference + w), s, wrap_lon(reference + e), n])
+}
+
 /// Positive longitude and latitude spans (degrees) of a CRS84 bbox
 /// `[west, south, east, north]`. Handles an anti-meridian crossing where
 /// `east < west` (e.g. a STAC bbox like `[170.0, …, -170.0, …]`, a 20°-wide
@@ -389,6 +540,10 @@ pub fn crs84_bbox_spans(bbox: [f64; 4]) -> (f64, f64) {
 ///
 /// This is the single source of truth so api-wms and api-maps build identical
 /// output projections (#160).
+///
+/// Both are computed on the WGS 84 ellipsoid. Their own, GRS 1980, moves a
+/// point by 0.1 mm at most, and every pinned output projection keeps its
+/// numbers (#1192).
 pub fn projected_output_crs(epsg: &str) -> Option<Crs> {
     match epsg {
         "EPSG:3067" => Some(Crs::TransverseMercator {
@@ -397,12 +552,14 @@ pub fn projected_output_crs(epsg: &str) -> Option<Crs> {
             k0: 0.9996,
             false_e: 500_000.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         }),
         "EPSG:3035" => Some(Crs::LambertAzimuthalEqualArea {
             lat0: 52.0_f64.to_radians(),
             lon0: 10.0_f64.to_radians(),
             false_e: 4_321_000.0,
             false_n: 3_210_000.0,
+            figure: Ellipsoid::WGS84,
         }),
         _ => None,
     }
@@ -565,14 +722,16 @@ pub fn area_edge_points(crs: &Crs, bbox: [f64; 4]) -> Vec<(f64, f64)> {
         k0,
         false_e,
         false_n,
+        figure,
     } = *crs
     else {
         return Vec::new();
     };
-    let ka = k0 * TM_A;
+    let series = TmSeries::of(&figure);
+    let ka = k0 * series.a_rect;
     let [min_e, min_n, max_e, max_n] = bbox;
     let (eta_lo, eta_hi) = ((min_e - false_e) / ka, (max_e - false_e) / ka);
-    let xi0 = tm_xi0(lat0);
+    let xi0 = series.xi0(lat0);
     let (xi_lo, xi_hi) = ((min_n - false_n) / ka + xi0, (max_n - false_n) / ka + xi0);
     let mut points = Vec::new();
     // The edge at `fixed` (an η for the east and west edges, a ξ for the
@@ -587,7 +746,7 @@ pub fn area_edge_points(crs: &Crs, bbox: [f64; 4]) -> Vec<(f64, f64)> {
             let mid = (lo < 0.0 && 0.0 < hi).then_some(0.0);
             for t in [Some(lo), Some(hi), mid].into_iter().flatten() {
                 let (xi, eta) = if east_west { (t, fixed) } else { (fixed, t) };
-                let (lat, lam) = tm_lat_lam(xi, eta);
+                let (lat, lam) = series.lat_lam(xi, eta);
                 points.push((lon0.to_degrees() + lam.to_degrees(), lat.to_degrees()));
             }
         };
@@ -634,8 +793,12 @@ pub fn outside_projection_domain(crs: &Crs, bbox: [f64; 4]) -> bool {
             k0,
             false_e,
             false_n,
+            figure,
             ..
-        } => (false_e, tm_equator_northing(lat0, k0, false_n)),
+        } => (
+            false_e,
+            tm_equator_northing(&TmSeries::of(&figure), lat0, k0, false_n),
+        ),
         _ => return false,
     };
     let [min_e, min_n, max_e, max_n] = bbox;
@@ -654,8 +817,8 @@ fn maps_to_earth(crs: &Crs, e: f64, n: f64) -> bool {
 /// The northing of a Transverse Mercator projection's equator: the centre
 /// line of its valid area, which reaches `k0` times a quarter meridian
 /// either side of it.
-fn tm_equator_northing(lat0: f64, k0: f64, false_n: f64) -> f64 {
-    false_n - k0 * TM_A * tm_xi0(lat0)
+fn tm_equator_northing(series: &TmSeries, lat0: f64, k0: f64, false_n: f64) -> f64 {
+    false_n - k0 * series.a_rect * series.xi0(lat0)
 }
 
 /// Projected envelope `[min_e, min_n, max_e, max_n]` (in `crs`'s metres) of a
@@ -686,6 +849,7 @@ pub fn projected_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
         k0,
         false_e,
         false_n,
+        figure,
     } = *crs
     else {
         return envelope;
@@ -693,20 +857,220 @@ pub fn projected_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
     let [west, south, east, north] = bbox;
     let [mut min_e, mut min_n, mut max_e, mut max_n] = envelope;
     if south <= 0.0 && 0.0 <= north {
-        let n_eq = tm_equator_northing(lat0, k0, false_n);
+        let series = TmSeries::of(&figure);
+        let n_eq = tm_equator_northing(&series, lat0, k0, false_n);
         for side in [-1.0, 1.0] {
             // The singular point's longitude, the first turn of it at or
             // east of the box's west edge.
             let lon = lon0.to_degrees() + side * 90.0;
             let lon = lon + 360.0 * ((west - lon) / 360.0).ceil();
             if lon <= east {
-                let e = false_e + side * k0 * TM_A * TM_MAX_ETA;
+                let e = false_e + side * k0 * series.a_rect * TM_MAX_ETA;
                 (min_e, max_e) = (min_e.min(e), max_e.max(e));
                 (min_n, max_n) = (min_n.min(n_eq), max_n.max(n_eq));
             }
         }
     }
     [min_e, min_n, max_e, max_n]
+}
+
+/// Edge samples per side of a grid's extent ([`grid_extent`]), as
+/// [`GeoTransform::bbox`] takes: enough to pin the bow of a continental
+/// LAEA grid to well under a pixel.
+const GRID_EXTENT_SAMPLES: usize = 20;
+
+/// The WGS84 extent `[west, south, east, north]` of a source grid whose
+/// cells' outer edges span the projected `bbox` `[min_x, min_y, max_x,
+/// max_y]` in `crs`, in the CRS84 domain (#1194, #180): the one extent
+/// calculation of every gridded engine, through
+/// [`GeoTransform::bbox_with_poles`].
+///
+/// - **Edges.** Points sampled along the four edges are inverse-projected,
+///   skipping those that do not, so the bow of a projected grid between
+///   its corners counts. Their longitude is unrolled along the perimeter,
+///   walked as one ring: each sample moves by whole turns to within 180°
+///   of the one before. So the edges stay continuous across ±180°, and
+///   across the meridian opposite a polar or azimuthal projection's
+///   centre, where its inverse's longitudes wrap. A grid crossing the
+///   antimeridian is `west > east` (as the seam box 170, 10, -170, 20),
+///   never a near-global box the wrong way round, and no longitude lies
+///   past ±180°: Transverse Mercator's inverse runs on past them from a
+///   central meridian near the antimeridian. Each extreme keeps its
+///   sample's own longitude, so a grid that never crosses the seam keeps
+///   the plain minimum and maximum.
+/// - **Poles.** A pole inside a projected grid ([`holds_pole`]) is its
+///   latitude extreme, where every meridian meets, and no edge sample
+///   reaches it: the extent runs to that pole at every longitude. So on
+///   Transverse Mercator too, whose inverse ends at the pole's northing
+///   but whose forward maps the far side of the Earth past it, into the
+///   grid's cells. A grid that spans a turn of longitude is −180…180 too.
+/// - **Transverse Mercator's area.** Where the valid area's own edges run
+///   inside the grid, past which its inverse answers nothing, the extent
+///   takes them too ([`area_edge_points`]).
+/// - **Geostationary** views take their visible disk's limb
+///   ([`GeoTransform::bbox`]).
+///
+/// Returns the `[MAX, MAX, MIN, MIN]` sentinel when no point
+/// inverse-projects; [`crs84_extent`] turns that into `None`.
+pub fn grid_extent(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
+    if let Some(geos) = Geos::from_crs(crs) {
+        return geostationary_extent(&geos, crs, bbox);
+    }
+    let (extent, poles) = unrolled_grid_extent(crs, bbox);
+    extent.finish(poles)
+}
+
+/// [`grid_extent`]'s edges, unrolled from the first that inverse-projects,
+/// with whether the bbox holds the North and South Pole.
+fn unrolled_grid_extent(crs: &Crs, bbox: [f64; 4]) -> (UnrolledExtent, [bool; 2]) {
+    let [w, s, e, n] = bbox;
+    let x_at = |i: usize| w + (i as f64 / GRID_EXTENT_SAMPLES as f64) * (e - w);
+    let y_at = |i: usize| s + (i as f64 / GRID_EXTENT_SAMPLES as f64) * (n - s);
+    // The perimeter as one closed ring (bottom W→E, right S→N, top E→W,
+    // left N→S), so consecutive samples are neighbours on a continuous
+    // curve.
+    let ring = (0..=GRID_EXTENT_SAMPLES)
+        .map(|i| (x_at(i), s))
+        .chain((0..=GRID_EXTENT_SAMPLES).map(|i| (e, y_at(i))))
+        .chain((0..=GRID_EXTENT_SAMPLES).rev().map(|i| (x_at(i), n)))
+        .chain((0..=GRID_EXTENT_SAMPLES).rev().map(|i| (w, y_at(i))));
+    let mut extent = UnrolledExtent::default();
+    for (x, y) in ring {
+        if let Some((lon, lat)) = crs.inverse(x, y) {
+            extent.add(lon, lat);
+        }
+    }
+    for (lon, lat) in area_edge_points(crs, bbox) {
+        extent.add(lon, lat);
+    }
+    let poles = [90.0, -90.0].map(|pole| holds_pole(crs, bbox, pole));
+    (extent, poles)
+}
+
+/// Longitudes and latitudes accumulated along a path, the longitude
+/// unrolled: each moves by whole turns to within 180° of the one before
+/// ([`grid_extent`]).
+struct UnrolledExtent {
+    prev: Option<f64>,
+    /// The least and greatest unrolled longitude, each with its sample's
+    /// own longitude.
+    west: (f64, f64),
+    east: (f64, f64),
+    south: f64,
+    north: f64,
+}
+
+impl Default for UnrolledExtent {
+    fn default() -> Self {
+        UnrolledExtent {
+            prev: None,
+            west: (f64::MAX, 0.0),
+            east: (f64::MIN, 0.0),
+            south: f64::MAX,
+            north: f64::MIN,
+        }
+    }
+}
+
+impl UnrolledExtent {
+    fn add(&mut self, lon: f64, lat: f64) {
+        self.south = self.south.min(lat);
+        self.north = self.north.max(lat);
+        let unrolled = match self.prev {
+            Some(p) => lon + 360.0 * ((p - lon) / 360.0).round(),
+            None => lon,
+        };
+        self.prev = Some(unrolled);
+        if unrolled < self.west.0 {
+            self.west = (unrolled, lon);
+        }
+        if unrolled > self.east.0 {
+            self.east = (unrolled, lon);
+        }
+    }
+
+    /// `[west, south, east, north]` with the longitudes as unrolled,
+    /// `west <= east`, reaching the North and South Pole where `poles`
+    /// says the area holds them, at every longitude (−180…180) then, or
+    /// when the longitudes span a turn. `None` when nothing was added.
+    fn unrolled(&self, [north_pole, south_pole]: [bool; 2]) -> Option<[f64; 4]> {
+        if self.west.0 > self.east.0 {
+            return None;
+        }
+        let south = if south_pole { -90.0 } else { self.south };
+        let north = if north_pole { 90.0 } else { self.north };
+        if north_pole || south_pole || self.east.0 - self.west.0 >= 360.0 {
+            return Some([-180.0, south, 180.0, north]);
+        }
+        Some([self.west.0, south, self.east.0, north])
+    }
+
+    /// [`Self::unrolled`] in the CRS84 domain, `west > east` across the
+    /// antimeridian; the `[MAX, MAX, MIN, MIN]` sentinel when nothing was
+    /// added.
+    fn finish(&self, poles: [bool; 2]) -> [f64; 4] {
+        let Some([w, south, e, north]) = self.unrolled(poles) else {
+            return [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        };
+        if e - w >= 360.0 {
+            return [w, south, e, north];
+        }
+        // Back into the CRS84 domain, leaving in-range longitudes
+        // untouched: west in [-180, 180), east in (-180, 180].
+        let west = if (-180.0..180.0).contains(&self.west.1) {
+            self.west.1
+        } else {
+            (self.west.1 + 180.0).rem_euclid(360.0) - 180.0
+        };
+        let east = if self.east.1 > -180.0 && self.east.1 <= 180.0 {
+            self.east.1
+        } else {
+            180.0 - (180.0 - self.east.1).rem_euclid(360.0)
+        };
+        [west, south, east, north]
+    }
+}
+
+/// The WGS84 extent of a geostationary raster whose cells' outer edges
+/// span `[x_min, y_min, x_max, y_max]`.
+///
+/// Longitude and latitude have no extremum inside the visible part of
+/// the raster (the projection is a local diffeomorphism there), so the
+/// extremes lie on its boundary: the raster edges where they are on the
+/// disk, and the stretch of limb inside the raster. Along the limb,
+/// latitude and longitude each have one maximum and one minimum — the
+/// disk's four extreme points — so the extremes on a stretch of limb are
+/// at its ends (where it meets a raster edge) or at one of those points.
+fn geostationary_extent(
+    geos: &Geos,
+    crs: &Crs,
+    [x_min, y_min, x_max, y_max]: [f64; 4],
+) -> [f64; 4] {
+    let mut extent = SeamExtent::new(geos.lon0.to_degrees());
+    let inverse = |x: f64, y: f64| crs.inverse(x, y);
+    let corners = [
+        (x_min, y_max),
+        (x_max, y_max),
+        (x_max, y_min),
+        (x_min, y_min),
+    ];
+    for k in 0..4 {
+        let (a, b) = (corners[k], corners[(k + 1) % 4]);
+        visit_edge_with_boundaries(
+            64,
+            |t| (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)),
+            inverse,
+            |(lon, lat)| extent.add(lon, lat),
+        );
+    }
+    for (lat, lon) in geos.limb_extremes() {
+        if let Some((x, y)) = geos.forward(lat, lon) {
+            if (x_min..=x_max).contains(&x) && (y_min..=y_max).contains(&y) {
+                extent.add(lon.to_degrees(), lat.to_degrees());
+            }
+        }
+    }
+    extent.finish()
 }
 
 impl Crs {
@@ -726,6 +1090,7 @@ impl Crs {
                 k0,
                 false_e,
                 false_n,
+                figure,
             } => tm_forward(
                 lat_deg.to_radians(),
                 lon_deg.to_radians(),
@@ -734,20 +1099,16 @@ impl Crs {
                 *k0,
                 *false_e,
                 *false_n,
+                figure,
             ),
             Crs::LambertAzimuthalEqualArea {
                 lat0,
                 lon0,
                 false_e,
                 false_n,
-            } => laea_forward(
-                lat_deg.to_radians(),
-                lon_deg.to_radians(),
-                *lat0,
-                *lon0,
-                *false_e,
-                *false_n,
-            ),
+                figure,
+            } => Laea::new(*lat0, *lon0, *false_e, *false_n, figure)
+                .forward(lat_deg.to_radians(), lon_deg.to_radians()),
             Crs::LambertConformalConic {
                 lat1,
                 lat2,
@@ -764,15 +1125,9 @@ impl Crs {
                 k0,
                 false_e,
                 false_n,
-            } => stere_forward(
-                lat_deg.to_radians(),
-                lon_deg.to_radians(),
-                *lat0,
-                *lon0,
-                *k0,
-                *false_e,
-                *false_n,
-            ),
+                figure,
+            } => Stere::new(*lat0, *lon0, *k0, *false_e, *false_n, figure)
+                .forward(lat_deg.to_radians(), lon_deg.to_radians()),
             Crs::RotatedLatLon {
                 south_pole_lat,
                 south_pole_lon,
@@ -811,8 +1166,9 @@ impl Crs {
                 k0,
                 false_e,
                 false_n,
+                figure,
             } => {
-                let (lat, lon) = tm_inverse(x, y, *lat0, *lon0, *k0, *false_e, *false_n)?;
+                let (lat, lon) = tm_inverse(x, y, *lat0, *lon0, *k0, *false_e, *false_n, figure)?;
                 (lon.to_degrees(), lat.to_degrees())
             }
             Crs::LambertAzimuthalEqualArea {
@@ -820,8 +1176,9 @@ impl Crs {
                 lon0,
                 false_e,
                 false_n,
+                figure,
             } => {
-                let (lat, lon) = laea_inverse(x, y, *lat0, *lon0, *false_e, *false_n);
+                let (lat, lon) = Laea::new(*lat0, *lon0, *false_e, *false_n, figure).inverse(x, y);
                 (lon.to_degrees(), lat.to_degrees())
             }
             Crs::LambertConformalConic {
@@ -843,8 +1200,10 @@ impl Crs {
                 k0,
                 false_e,
                 false_n,
+                figure,
             } => {
-                let (lat, lon) = stere_inverse(x, y, *lat0, *lon0, *k0, *false_e, *false_n);
+                let (lat, lon) =
+                    Stere::new(*lat0, *lon0, *k0, *false_e, *false_n, figure).inverse(x, y);
                 (lon.to_degrees(), lat.to_degrees())
             }
             Crs::RotatedLatLon {
@@ -1081,6 +1440,12 @@ impl GeoTransform {
     /// For projected CRS, samples points along all edges (not just corners)
     /// to handle projection distortion. Skips points that fail to reproject.
     ///
+    /// The plain minimum and maximum of the edge samples: it stops short
+    /// of a pole the grid holds, spans nearly every longitude when the
+    /// inverse's longitudes wrap inside the grid, and keeps a Transverse
+    /// Mercator longitude past ±180°. A collection's extent is
+    /// [`Self::bbox_with_poles`].
+    ///
     /// A geostationary raster's edges may lie wholly in space (a full disk),
     /// so its box also covers where the edges meet the limb and the disk's
     /// extreme points, and is `west > east` when it crosses the antimeridian.
@@ -1088,7 +1453,7 @@ impl GeoTransform {
     /// reprojects; [`crs84_extent`] turns that into `None`.
     pub fn bbox(&self) -> [f64; 4] {
         if let Some(geos) = Geos::from_crs(&self.crs) {
-            return self.geostationary_bbox(&geos);
+            return geostationary_extent(&geos, &self.crs, self.edges());
         }
         let x_min = self.origin_x;
         let x_max = self.origin_x + self.width as f64 * self.pixel_width;
@@ -1129,71 +1494,54 @@ impl GeoTransform {
         [min_lon, min_lat, max_lon, max_lat]
     }
 
-    /// [`bbox`](Self::bbox) reaching every pole the grid holds, at every
-    /// longitude. A polar stereographic or azimuthal grid's edges circle
-    /// its pole and stay short of it, so the edge samples alone miss the
-    /// pole and the latitudes around it. The sentinel stays the sentinel.
+    /// The grid's cells' outer edges `[min_x, min_y, max_x, max_y]`, in its
+    /// CRS.
+    pub fn edges(&self) -> [f64; 4] {
+        [
+            self.origin_x,
+            self.origin_y - self.height as f64 * self.pixel_height,
+            self.origin_x + self.width as f64 * self.pixel_width,
+            self.origin_y,
+        ]
+    }
+
+    /// The grid's WGS84 extent in the CRS84 domain, [`grid_extent`] of its
+    /// cells' outer edges: `west > east` across the antimeridian, and
+    /// reaching every pole the grid holds, at every longitude (#1167,
+    /// #1194). A collection's spatial extent and a map's footprint guard
+    /// both take it.
     pub fn bbox_with_poles(&self) -> [f64; 4] {
-        let [mut w, mut s, mut e, mut n] = self.bbox();
-        if s > n {
-            return [w, s, e, n];
-        }
-        for pole in [90.0, -90.0] {
-            if self.cells_hold_pole(pole) {
-                (w, e) = (-180.0, 180.0);
-                s = s.min(pole);
-                n = n.max(pole);
-            }
-        }
-        [w, s, e, n]
+        grid_extent(&self.crs, self.edges())
     }
 
-    /// Whether the grid's forward transform puts the pole at latitude
-    /// `pole` (±90°) inside its cells.
-    pub fn cells_hold_pole(&self, pole: f64) -> bool {
-        let (col, row) = self.world_to_pixel_f64(0.0, pole);
-        (0.0..f64::from(self.width)).contains(&col) && (0.0..f64::from(self.height)).contains(&row)
+    /// [`Self::bbox_with_poles`] as the footprint
+    /// [`OutputCrs::footprint_window_in_image`] walks, whose edges run west
+    /// to east: `west <= east`, with `east` past 180° when the grid crosses
+    /// the antimeridian. `None` when no edge point inverse-projects.
+    pub fn footprint_envelope(&self) -> Option<[f64; 4]> {
+        let [w, s, mut e, n] = self.bbox_with_poles();
+        if !(w.is_finite() && s.is_finite() && e.is_finite() && n.is_finite()) || s > n {
+            return None;
+        }
+        if w > e {
+            e += 360.0;
+        }
+        Some([w, s, e, n])
     }
 
-    /// [`bbox`](Self::bbox) of a geostationary raster.
-    ///
-    /// Longitude and latitude have no extremum inside the visible part of
-    /// the raster (the projection is a local diffeomorphism there), so the
-    /// extremes lie on its boundary: the raster edges where they are on the
-    /// disk, and the stretch of limb inside the raster. Along the limb,
-    /// latitude and longitude each have one maximum and one minimum — the
-    /// disk's four extreme points — so the extremes on a stretch of limb are
-    /// at its ends (where it meets a raster edge) or at one of those points.
-    fn geostationary_bbox(&self, geos: &Geos) -> [f64; 4] {
-        let x_min = self.origin_x;
-        let x_max = self.origin_x + self.width as f64 * self.pixel_width;
-        let y_max = self.origin_y;
-        let y_min = self.origin_y - self.height as f64 * self.pixel_height;
-        let mut extent = SeamExtent::new(geos.lon0.to_degrees());
-        let inverse = |x: f64, y: f64| self.crs.inverse(x, y);
-        let corners = [
-            (x_min, y_max),
-            (x_max, y_max),
-            (x_max, y_min),
-            (x_min, y_min),
-        ];
-        for k in 0..4 {
-            let (a, b) = (corners[k], corners[(k + 1) % 4]);
-            visit_edge_with_boundaries(
-                64,
-                |t| (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)),
-                inverse,
-                |(lon, lat)| extent.add(lon, lat),
-            );
+    /// The middle longitude of the grid's extent in the frame its CRS's
+    /// inverse gives the grid's first edge point, unrolled along its edges
+    /// from there; 0 when the grid spans every longitude, `None` when no
+    /// edge point inverse-projects. The shared sampler projects a pixel's
+    /// longitude within half a turn of it: a Lambert grid's is near its
+    /// central meridian even across the antimeridian, where its forward
+    /// needs it (θ = n·Δλ is not periodic, #1114).
+    pub(crate) fn inverse_frame_centre(&self) -> Option<f64> {
+        if Geos::from_crs(&self.crs).is_some() {
+            return self.footprint_envelope().map(|[w, _, e, _]| (w + e) / 2.0);
         }
-        for (lat, lon) in geos.limb_extremes() {
-            if let Some((x, y)) = geos.forward(lat, lon) {
-                if (x_min..=x_max).contains(&x) && (y_min..=y_max).contains(&y) {
-                    extent.add(lon.to_degrees(), lat.to_degrees());
-                }
-            }
-        }
-        extent.finish()
+        let (extent, poles) = unrolled_grid_extent(&self.crs, self.edges());
+        extent.unrolled(poles).map(|[w, _, e, _]| (w + e) / 2.0)
     }
 
     /// [`bbox_to_pixels`](Self::bbox_to_pixels) of a geostationary raster:
@@ -1353,120 +1701,182 @@ impl GeoTransform {
 // `+approx` selects Snyder's older one).
 // ============================================================================
 
-/// WGS84's third flattening n = f / (2 − f), the series' small parameter.
-const TM_N: f64 = WGS84_F / (2.0 - WGS84_F);
+/// A Transverse Mercator's series on its earth figure: what Krüger's
+/// series to sixth order in the third flattening n = f / (2 − f) derives
+/// from the figure, once per transform (#1192). On a sphere n is 0, every
+/// coefficient vanishes and the series is the exact spherical projection.
+struct TmSeries {
+    /// The eccentricity e.
+    e: f64,
+    /// 1 − e².
+    e2m: f64,
+    /// The rectifying radius A, to n⁶: a quarter meridian is A·π/2, on
+    /// WGS84 10 001 965.729 m.
+    a_rect: f64,
+    /// Krüger's αⱼ, j = 1…6, to n⁶ (Karney 2011).
+    alpha: [f64; 6],
+    /// Krüger's βⱼ, j = 1…6, to n⁶ (Karney 2011).
+    beta: [f64; 6],
+}
 
-/// The rectifying radius A, to n⁶: a quarter meridian is A·π/2,
-/// 10 001 965.729 m.
-const TM_A: f64 = WGS84_A / (1.0 + TM_N)
-    * (1.0 + TM_N * TM_N * (1.0 / 4.0 + TM_N * TM_N * (1.0 / 64.0 + TM_N * TM_N / 256.0)));
+impl TmSeries {
+    fn of(figure: &Ellipsoid) -> TmSeries {
+        let f = figure.f;
+        let n = f / (2.0 - f);
+        let e2 = figure.e2();
+        TmSeries {
+            e: e2.sqrt(),
+            e2m: 1.0 - e2,
+            a_rect: figure.a / (1.0 + n)
+                * (1.0 + n * n * (1.0 / 4.0 + n * n * (1.0 / 64.0 + n * n / 256.0))),
+            alpha: [
+                n * (1.0 / 2.0
+                    + n * (-2.0 / 3.0
+                        + n * (5.0 / 16.0
+                            + n * (41.0 / 180.0 + n * (-127.0 / 288.0 + n * 7891.0 / 37800.0))))),
+                n * n
+                    * (13.0 / 48.0
+                        + n * (-3.0 / 5.0
+                            + n * (557.0 / 1440.0
+                                + n * (281.0 / 630.0 - n * 1983433.0 / 1935360.0)))),
+                n * n
+                    * n
+                    * (61.0 / 240.0
+                        + n * (-103.0 / 140.0 + n * (15061.0 / 26880.0 + n * 167603.0 / 181440.0))),
+                n * n
+                    * n
+                    * n
+                    * (49561.0 / 161280.0 + n * (-179.0 / 168.0 + n * 6601661.0 / 7257600.0)),
+                n * n * n * n * n * (34729.0 / 80640.0 - n * 3418889.0 / 1995840.0),
+                n * n * n * n * n * n * 212378941.0 / 319334400.0,
+            ],
+            beta: [
+                n * (1.0 / 2.0
+                    + n * (-2.0 / 3.0
+                        + n * (37.0 / 96.0
+                            + n * (-1.0 / 360.0 + n * (-81.0 / 512.0 + n * 96199.0 / 604800.0))))),
+                n * n
+                    * (1.0 / 48.0
+                        + n * (1.0 / 15.0
+                            + n * (-437.0 / 1440.0
+                                + n * (46.0 / 105.0 - n * 1118711.0 / 3870720.0)))),
+                n * n
+                    * n
+                    * (17.0 / 480.0
+                        + n * (-37.0 / 840.0 + n * (-209.0 / 4480.0 + n * 5569.0 / 90720.0))),
+                n * n
+                    * n
+                    * n
+                    * (4397.0 / 161280.0 + n * (-11.0 / 504.0 - n * 830251.0 / 7257600.0)),
+                n * n * n * n * n * (4583.0 / 161280.0 - n * 108847.0 / 3991680.0),
+                n * n * n * n * n * n * 20648693.0 / 638668800.0,
+            ],
+        }
+    }
 
-/// Krüger's αⱼ, j = 1…6, to n⁶ (Karney 2011).
-const TM_ALPHA: [f64; 6] = [
-    TM_N * (1.0 / 2.0
-        + TM_N
-            * (-2.0 / 3.0
-                + TM_N
-                    * (5.0 / 16.0
-                        + TM_N
-                            * (41.0 / 180.0 + TM_N * (-127.0 / 288.0 + TM_N * 7891.0 / 37800.0))))),
-    TM_N * TM_N
-        * (13.0 / 48.0
-            + TM_N
-                * (-3.0 / 5.0
-                    + TM_N
-                        * (557.0 / 1440.0
-                            + TM_N * (281.0 / 630.0 - TM_N * 1983433.0 / 1935360.0)))),
-    TM_N * TM_N
-        * TM_N
-        * (61.0 / 240.0
-            + TM_N * (-103.0 / 140.0 + TM_N * (15061.0 / 26880.0 + TM_N * 167603.0 / 181440.0))),
-    TM_N * TM_N
-        * TM_N
-        * TM_N
-        * (49561.0 / 161280.0 + TM_N * (-179.0 / 168.0 + TM_N * 6601661.0 / 7257600.0)),
-    TM_N * TM_N * TM_N * TM_N * TM_N * (34729.0 / 80640.0 - TM_N * 3418889.0 / 1995840.0),
-    TM_N * TM_N * TM_N * TM_N * TM_N * TM_N * 212378941.0 / 319334400.0,
-];
+    /// τ′ = tan χ, the conformal latitude's tangent, of τ = tan φ.
+    fn taup(&self, tau: f64) -> f64 {
+        let tau1 = tau.hypot(1.0);
+        let sigma = self.sigma(tau / tau1);
+        sigma.hypot(1.0) * tau - sigma * tau1
+    }
 
-/// Krüger's βⱼ, j = 1…6, to n⁶ (Karney 2011).
-const TM_BETA: [f64; 6] = [
-    TM_N * (1.0 / 2.0
-        + TM_N
-            * (-2.0 / 3.0
-                + TM_N
-                    * (37.0 / 96.0
-                        + TM_N
-                            * (-1.0 / 360.0
-                                + TM_N * (-81.0 / 512.0 + TM_N * 96199.0 / 604800.0))))),
-    TM_N * TM_N
-        * (1.0 / 48.0
-            + TM_N
-                * (1.0 / 15.0
-                    + TM_N
-                        * (-437.0 / 1440.0
-                            + TM_N * (46.0 / 105.0 - TM_N * 1118711.0 / 3870720.0)))),
-    TM_N * TM_N
-        * TM_N
-        * (17.0 / 480.0
-            + TM_N * (-37.0 / 840.0 + TM_N * (-209.0 / 4480.0 + TM_N * 5569.0 / 90720.0))),
-    TM_N * TM_N
-        * TM_N
-        * TM_N
-        * (4397.0 / 161280.0 + TM_N * (-11.0 / 504.0 - TM_N * 830251.0 / 7257600.0)),
-    TM_N * TM_N * TM_N * TM_N * TM_N * (4583.0 / 161280.0 - TM_N * 108847.0 / 3991680.0),
-    TM_N * TM_N * TM_N * TM_N * TM_N * TM_N * 20648693.0 / 638668800.0,
-];
+    /// σ = sinh(e · atanh(e · sin φ)), of `sin φ`: τ′ = τ √(1 + σ²) − σ √(1 + τ²).
+    fn sigma(&self, sin_lat: f64) -> f64 {
+        (self.e * (self.e * sin_lat).atanh()).sinh()
+    }
+
+    /// τ = tan φ of τ′ = tan χ, by Newton's method from τ′ / (1 − e²). It
+    /// converges quadratically, so a step under √ε/10 leaves an error under ε:
+    /// one or two steps.
+    fn tau(&self, taup: f64) -> f64 {
+        let e2m = self.e2m;
+        let tol = f64::EPSILON.sqrt() / 10.0 * taup.abs().max(1.0);
+        let mut tau = taup / e2m;
+        for _ in 0..5 {
+            let taupa = self.taup(tau);
+            // dτ′/dτ = (1 − e²) √(1 + τ′²) √(1 + τ²) / (1 + (1 − e²) τ²).
+            let step = (taup - taupa) * (1.0 + e2m * tau * tau)
+                / (e2m * tau.hypot(1.0) * taupa.hypot(1.0));
+            tau += step;
+            if step.abs() < tol || !step.is_finite() {
+                break;
+            }
+        }
+        tau
+    }
+
+    /// The normalized coordinates `(ξ, η)`, northing and easting from the
+    /// equator on the central meridian over k₀A, of latitude `lat` and
+    /// longitude `lam` from the central meridian, in radians. Exact to the
+    /// series' error inside the valid area ([`TM_MAX_ETA`]); past it the
+    /// series diverges, without bound near the equator 90° from the meridian.
+    fn xi_eta(&self, lat: f64, lam: f64) -> (f64, f64) {
+        let (sin_lat, cos_lat) = lat.sin_cos();
+        let sigma = self.sigma(sin_lat);
+        // τ′ over cos φ, as `taup` of tan φ.
+        let taup = (sin_lat * sigma.hypot(1.0) - sigma) / cos_lat;
+        let (sin_lam, cos_lam) = lam.sin_cos();
+        // ξ′ = atan2(τ′, cos λ) and sinh η′ = sin λ / r, r² = τ′² + cos² λ, so
+        // the series' double angles follow from τ′ and λ alone.
+        let r2 = taup * taup + cos_lam * cos_lam;
+        let xip = taup.atan2(cos_lam);
+        let etap = (sin_lam / r2.sqrt()).asinh();
+        let double = [
+            2.0 * taup * cos_lam / r2,
+            (cos_lam * cos_lam - taup * taup) / r2,
+            2.0 * sin_lam * taup.hypot(1.0) / r2,
+            (1.0 + taup * taup + sin_lam * sin_lam) / r2,
+        ];
+        let (dxi, deta) = tm_sine_series(&self.alpha, double);
+        (xip + dxi, etap + deta)
+    }
+
+    /// Latitude and longitude from the central meridian, radians, of the
+    /// normalized coordinates `(ξ, η)`. Unchecked: [`tm_inverse`] keeps it to
+    /// the valid area.
+    fn lat_lam(&self, xi: f64, eta: f64) -> (f64, f64) {
+        let (sin, cos) = (2.0 * xi).sin_cos();
+        let sinh = (2.0 * eta).sinh();
+        let (dxi, deta) = tm_sine_series(&self.beta, [sin, cos, sinh, sinh.hypot(1.0)]);
+        let (sin_xip, cos_xip) = (xi - dxi).sin_cos();
+        let sinh_etap = (eta - deta).sinh();
+        let r = sinh_etap.hypot(cos_xip);
+        let lam = sinh_etap.atan2(cos_xip);
+        let lat = if r > 0.0 {
+            self.tau(sin_xip / r).atan()
+        } else {
+            FRAC_PI_2.copysign(xi)
+        };
+        (lat, lam)
+    }
+
+    /// ξ of the latitude of natural origin `lat0`, on the central meridian.
+    fn xi0(&self, lat0: f64) -> f64 {
+        if lat0 == 0.0 {
+            0.0
+        } else {
+            self.xi_eta(lat0, 0.0).0
+        }
+    }
+}
 
 /// The normalized easting η = (E − E₀) / (k₀A) where a Transverse Mercator
 /// projection's valid area ends, east and west of its central meridian
 /// (#1130). The poles' northings, ξ = ±π/2, end it north and south, so the
 /// area is a square of half-side k₀ times the quarter meridian.
 ///
-/// The series' error grows with η, each omitted term as e^(2jη). Against
-/// the exact projection, found by integrating the meridian arc along a
-/// complex isometric latitude, it is under 0.6 mm forward and 7 µm inverse
-/// anywhere on this edge, and 1 mm forward at η = 1.65, 1 m at 2.13 and
-/// 140 m at 2.50: 68°, 76° and 80° from the meridian on the equator. PROJ's
-/// `tmerc` answers to about 80.5° there.
+/// The series' error grows with η, each omitted term as e^(2jη). On WGS84,
+/// against the exact projection, found by integrating the meridian arc
+/// along a complex isometric latitude, it is under 0.6 mm forward and 7 µm
+/// inverse anywhere on this edge, and 1 mm forward at η = 1.65, 1 m at 2.13
+/// and 140 m at 2.50: 68°, 76° and 80° from the meridian on the equator.
+/// PROJ's `tmerc` answers to about 80.5° there.
 const TM_MAX_ETA: f64 = FRAC_PI_2;
 
 /// How far past a pole's northing, in ξ, a point still counts as the pole:
 /// a few rounding errors, the pole projected and inverted again.
 const TM_POLE_SLACK: f64 = 4.0 * f64::EPSILON;
-
-/// τ′ = tan χ, the conformal latitude's tangent, of τ = tan φ.
-fn tm_taup(tau: f64) -> f64 {
-    let tau1 = tau.hypot(1.0);
-    let sigma = tm_sigma(tau / tau1);
-    sigma.hypot(1.0) * tau - sigma * tau1
-}
-
-/// σ = sinh(e · atanh(e · sin φ)), of `sin φ`: τ′ = τ √(1 + σ²) − σ √(1 + τ²).
-fn tm_sigma(sin_lat: f64) -> f64 {
-    let e = WGS84_E2.sqrt();
-    (e * (e * sin_lat).atanh()).sinh()
-}
-
-/// τ = tan φ of τ′ = tan χ, by Newton's method from τ′ / (1 − e²). It
-/// converges quadratically, so a step under √ε/10 leaves an error under ε:
-/// one or two steps.
-fn tm_tau(taup: f64) -> f64 {
-    let e2m = 1.0 - WGS84_E2;
-    let tol = f64::EPSILON.sqrt() / 10.0 * taup.abs().max(1.0);
-    let mut tau = taup / e2m;
-    for _ in 0..5 {
-        let taupa = tm_taup(tau);
-        // dτ′/dτ = (1 − e²) √(1 + τ′²) √(1 + τ²) / (1 + (1 − e²) τ²).
-        let step =
-            (taup - taupa) * (1.0 + e2m * tau * tau) / (e2m * tau.hypot(1.0) * taupa.hypot(1.0));
-        tau += step;
-        if step.abs() < tol || !step.is_finite() {
-            break;
-        }
-    }
-    tau
-}
 
 /// `Σ cⱼ sin 2jζ`, j = 1…6, of the complex `ζ = ξ + iη`, as its real and
 /// imaginary parts, by Clenshaw's recurrence, from `[sin 2ξ, cos 2ξ,
@@ -1488,60 +1898,7 @@ fn tm_sine_series(c: &[f64; 6], [sin, cos, sinh, cosh]: [f64; 4]) -> (f64, f64) 
     (sr * b1.0 - si * b1.1, sr * b1.1 + si * b1.0)
 }
 
-/// The normalized coordinates `(ξ, η)`, northing and easting from the
-/// equator on the central meridian over k₀A, of latitude `lat` and
-/// longitude `lam` from the central meridian, in radians. Exact to the
-/// series' error inside the valid area ([`TM_MAX_ETA`]); past it the
-/// series diverges, without bound near the equator 90° from the meridian.
-fn tm_xi_eta(lat: f64, lam: f64) -> (f64, f64) {
-    let (sin_lat, cos_lat) = lat.sin_cos();
-    let sigma = tm_sigma(sin_lat);
-    // τ′ over cos φ, as `tm_taup` of tan φ.
-    let taup = (sin_lat * sigma.hypot(1.0) - sigma) / cos_lat;
-    let (sin_lam, cos_lam) = lam.sin_cos();
-    // ξ′ = atan2(τ′, cos λ) and sinh η′ = sin λ / r, r² = τ′² + cos² λ, so
-    // the series' double angles follow from τ′ and λ alone.
-    let r2 = taup * taup + cos_lam * cos_lam;
-    let xip = taup.atan2(cos_lam);
-    let etap = (sin_lam / r2.sqrt()).asinh();
-    let double = [
-        2.0 * taup * cos_lam / r2,
-        (cos_lam * cos_lam - taup * taup) / r2,
-        2.0 * sin_lam * taup.hypot(1.0) / r2,
-        (1.0 + taup * taup + sin_lam * sin_lam) / r2,
-    ];
-    let (dxi, deta) = tm_sine_series(&TM_ALPHA, double);
-    (xip + dxi, etap + deta)
-}
-
-/// Latitude and longitude from the central meridian, radians, of the
-/// normalized coordinates `(ξ, η)`. Unchecked: [`tm_inverse`] keeps it to
-/// the valid area.
-fn tm_lat_lam(xi: f64, eta: f64) -> (f64, f64) {
-    let (sin, cos) = (2.0 * xi).sin_cos();
-    let sinh = (2.0 * eta).sinh();
-    let (dxi, deta) = tm_sine_series(&TM_BETA, [sin, cos, sinh, sinh.hypot(1.0)]);
-    let (sin_xip, cos_xip) = (xi - dxi).sin_cos();
-    let sinh_etap = (eta - deta).sinh();
-    let r = sinh_etap.hypot(cos_xip);
-    let lam = sinh_etap.atan2(cos_xip);
-    let lat = if r > 0.0 {
-        tm_tau(sin_xip / r).atan()
-    } else {
-        FRAC_PI_2.copysign(xi)
-    };
-    (lat, lam)
-}
-
-/// ξ of the latitude of natural origin `lat0`, on the central meridian.
-fn tm_xi0(lat0: f64) -> f64 {
-    if lat0 == 0.0 {
-        0.0
-    } else {
-        tm_xi_eta(lat0, 0.0).0
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 fn tm_forward(
     lat: f64,
     lon: f64,
@@ -1550,10 +1907,12 @@ fn tm_forward(
     k0: f64,
     false_e: f64,
     false_n: f64,
+    figure: &Ellipsoid,
 ) -> (f64, f64) {
-    let (xi, eta) = tm_xi_eta(lat, lon - lon0);
-    let ka = k0 * TM_A;
-    (false_e + ka * eta, false_n + ka * (xi - tm_xi0(lat0)))
+    let series = TmSeries::of(figure);
+    let (xi, eta) = series.xi_eta(lat, lon - lon0);
+    let ka = k0 * series.a_rect;
+    (false_e + ka * eta, false_n + ka * (xi - series.xi0(lat0)))
 }
 
 /// `(lat, lon)` in radians of the projected point `(x, y)`, `None` outside
@@ -1561,6 +1920,7 @@ fn tm_forward(
 /// Earth lies, or so far east or west that the series is no longer exact
 /// (#1113, #1130). The longitude is the central meridian's plus the
 /// offset, unwrapped.
+#[allow(clippy::too_many_arguments)]
 fn tm_inverse(
     x: f64,
     y: f64,
@@ -1569,15 +1929,17 @@ fn tm_inverse(
     k0: f64,
     false_e: f64,
     false_n: f64,
+    figure: &Ellipsoid,
 ) -> Option<(f64, f64)> {
-    let ka = k0 * TM_A;
-    let xi = (y - false_n) / ka + tm_xi0(lat0);
+    let series = TmSeries::of(figure);
+    let ka = k0 * series.a_rect;
+    let xi = (y - false_n) / ka + series.xi0(lat0);
     let eta = (x - false_e) / ka;
     // `!(a <= b)` also rejects NaN.
     if !(xi.abs() <= FRAC_PI_2 + TM_POLE_SLACK && eta.abs() <= TM_MAX_ETA) {
         return None;
     }
-    let (lat, lam) = tm_lat_lam(xi.clamp(-FRAC_PI_2, FRAC_PI_2), eta);
+    let (lat, lam) = series.lat_lam(xi.clamp(-FRAC_PI_2, FRAC_PI_2), eta);
     Some((lat, lon0 + lam))
 }
 
@@ -1586,91 +1948,119 @@ fn tm_inverse(
 // Reference: Snyder, "Map Projections: A Working Manual", USGS PP 1395, p.187
 // ============================================================================
 
-fn laea_forward(
-    lat: f64,
-    lon: f64,
+/// A Lambert Azimuthal Equal Area's constants on its earth figure, derived
+/// once per call and shared by forward and inverse. On a sphere (e = 0)
+/// Snyder's ellipsoidal formulas are the spherical ones: q = 2 sin φ, the
+/// authalic latitude is the latitude, `Rq` the radius and `D` 1.
+struct Laea {
+    /// Eccentricity; 0 on a sphere.
+    e: f64,
+    /// Snyder's `qp`, q at the pole.
+    qp: f64,
+    /// The authalic radius `Rq`.
+    rq: f64,
+    /// The origin's authalic latitude `β₀` and Snyder's `D` (eq. 24-20).
+    beta0: f64,
+    dd: f64,
     lat0: f64,
     lon0: f64,
     false_e: f64,
     false_n: f64,
-) -> (f64, f64) {
-    let e2 = WGS84_E2;
-    let e = e2.sqrt();
-
-    let q_val = q_authalic(lat, e);
-    let qp = q_authalic(PI / 2.0, e);
-
-    let beta = (q_val / qp).clamp(-1.0, 1.0).asin();
-
-    let rq = WGS84_A * (qp / 2.0).sqrt();
-    let (beta0, dd) = laea_origin(lat0, e, qp, rq);
-
-    let dl = lon - lon0;
-
-    // Snyder eq. 24-2, 24-3 (oblique)
-    let b = rq
-        * (2.0 / (1.0 + beta0.sin() * beta.sin() + beta0.cos() * beta.cos() * dl.cos()))
-            .max(0.0)
-            .sqrt();
-
-    let x = false_e + b * dd * beta.cos() * dl.sin();
-    let y = false_n + (b / dd) * (beta0.cos() * beta.sin() - beta0.sin() * beta.cos() * dl.cos());
-
-    (x, y)
 }
 
-/// Closed-form inverse, Snyder eqs. 24-26 to 24-30 (oblique ellipsoid) with
-/// the authalic-latitude inverse (3-18). Every point of the projection's disk
-/// resolves to its own `(lat, lon)`, including points beyond the pole; the
-/// longitude comes back within ±180° of `lon0`, so it is continuous except
-/// across the antimeridian of `lon0`. Outside the disk (`ρ > 2·Rq`) it is
-/// NaN.
-///
-/// This replaced a Newton iteration on [`laea_forward`], which folds at the
-/// pole: past it the iteration settled on latitudes above 90° or never
-/// converged, blanking and scrambling every polar EPSG:3035 view (#323).
-fn laea_inverse(x: f64, y: f64, lat0: f64, lon0: f64, false_e: f64, false_n: f64) -> (f64, f64) {
-    let e2 = WGS84_E2;
-    let e = e2.sqrt();
-    let qp = q_authalic(PI / 2.0, e);
-    let rq = WGS84_A * (qp / 2.0).sqrt();
-    let (beta0, dd) = laea_origin(lat0, e, qp, rq);
-
-    let (x, y) = (x - false_e, y - false_n);
-    let rho = ((x / dd).powi(2) + (dd * y).powi(2)).sqrt();
-    if rho < 1e-9 {
-        return (lat0, lon0);
+impl Laea {
+    fn new(lat0: f64, lon0: f64, false_e: f64, false_n: f64, figure: &Ellipsoid) -> Self {
+        let (a, e2) = (figure.a, figure.e2());
+        let e = e2.sqrt();
+        let qp = q_authalic(PI / 2.0, e);
+        let rq = a * (qp / 2.0).sqrt();
+        let (beta0, dd) = laea_origin(lat0, a, e2, qp, rq);
+        Laea {
+            e,
+            qp,
+            rq,
+            beta0,
+            dd,
+            lat0,
+            lon0,
+            false_e,
+            false_n,
+        }
     }
-    let ce = 2.0 * (rho / (2.0 * rq)).asin();
-    let (sin_ce, cos_ce) = ce.sin_cos();
-    let q = qp * (cos_ce * beta0.sin() + dd * y * sin_ce * beta0.cos() / rho);
-    let lon = lon0
-        + (x * sin_ce).atan2(dd * rho * beta0.cos() * cos_ce - dd * dd * y * beta0.sin() * sin_ce);
-    (authalic_inverse(q, e), lon)
+
+    /// `(lat, lon)` in radians to `(x, y)` metres.
+    fn forward(&self, lat: f64, lon: f64) -> (f64, f64) {
+        let (beta0, dd, rq) = (self.beta0, self.dd, self.rq);
+        let beta = (q_authalic(lat, self.e) / self.qp).clamp(-1.0, 1.0).asin();
+        let dl = lon - self.lon0;
+
+        // Snyder eq. 24-2, 24-3 (oblique)
+        let b = rq
+            * (2.0 / (1.0 + beta0.sin() * beta.sin() + beta0.cos() * beta.cos() * dl.cos()))
+                .max(0.0)
+                .sqrt();
+
+        let x = self.false_e + b * dd * beta.cos() * dl.sin();
+        let y = self.false_n
+            + (b / dd) * (beta0.cos() * beta.sin() - beta0.sin() * beta.cos() * dl.cos());
+
+        (x, y)
+    }
+
+    /// Closed-form inverse, Snyder eqs. 24-26 to 24-30 (oblique ellipsoid)
+    /// with the authalic-latitude inverse (3-18). Every point of the
+    /// projection's disk resolves to its own `(lat, lon)`, including points
+    /// beyond the pole; the longitude comes back within ±180° of `lon0`, so
+    /// it is continuous except across the antimeridian of `lon0`. Outside
+    /// the disk (`ρ > 2·Rq`) it is NaN.
+    ///
+    /// This replaced a Newton iteration on the forward, which folds at the
+    /// pole: past it the iteration settled on latitudes above 90° or never
+    /// converged, blanking and scrambling every polar EPSG:3035 view (#323).
+    fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+        let (beta0, dd, rq) = (self.beta0, self.dd, self.rq);
+        let (x, y) = (x - self.false_e, y - self.false_n);
+        let rho = ((x / dd).powi(2) + (dd * y).powi(2)).sqrt();
+        if rho < 1e-9 {
+            return (self.lat0, self.lon0);
+        }
+        let ce = 2.0 * (rho / (2.0 * rq)).asin();
+        let (sin_ce, cos_ce) = ce.sin_cos();
+        let q = self.qp * (cos_ce * beta0.sin() + dd * y * sin_ce * beta0.cos() / rho);
+        let lon = self.lon0
+            + (x * sin_ce)
+                .atan2(dd * rho * beta0.cos() * cos_ce - dd * dd * y * beta0.sin() * sin_ce);
+        (authalic_inverse(q, self.e), lon)
+    }
 }
 
 /// The origin's authalic latitude `β₀` and Snyder's `D` (eq. 24-20), how
 /// much the oblique aspect stretches x, and shrinks y, at the origin, for
-/// the origin latitude `lat0`, eccentricity `e`, `qp` and the authalic
-/// radius `rq`. A polar origin (EASE-Grid 2.0, EPSG:6931/6932) is the
-/// limit, `β₀ = ±90°` and `D = 1`: there `D`'s factors `cos φ₀` and
-/// `cos β₀` both vanish, and the ratio of their rounded values is 0.45 %
-/// off it, which put a point 2300 km from the pole 10 km out of place.
-fn laea_origin(lat0: f64, e: f64, qp: f64, rq: f64) -> (f64, f64) {
+/// the origin latitude `lat0`, semi-major axis `a`, eccentricity squared
+/// `e2`, `qp` and the authalic radius `rq`. A polar origin (EASE-Grid 2.0,
+/// EPSG:6931/6932) is the limit, `β₀ = ±90°` and `D = 1`: there `D`'s
+/// factors `cos φ₀` and `cos β₀` both vanish, and the ratio of their rounded
+/// values is 0.45 % off it, which put a point 2300 km from the pole 10 km
+/// out of place.
+fn laea_origin(lat0: f64, a: f64, e2: f64, qp: f64, rq: f64) -> (f64, f64) {
     if FRAC_PI_2 - lat0.abs() < 1e-10 {
         return (FRAC_PI_2.copysign(lat0), 1.0);
     }
-    let beta0 = (q_authalic(lat0, e) / qp).clamp(-1.0, 1.0).asin();
-    let m0 = lat0.cos() / (1.0 - WGS84_E2 * lat0.sin().powi(2)).sqrt();
-    (beta0, WGS84_A * m0 / (rq * beta0.cos()))
+    let beta0 = (q_authalic(lat0, e2.sqrt()) / qp).clamp(-1.0, 1.0).asin();
+    let m0 = lat0.cos() / (1.0 - e2 * lat0.sin().powi(2)).sqrt();
+    (beta0, a * m0 / (rq * beta0.cos()))
 }
 
 /// Snyder's `q` (eq. 3-12), odd in `lat` to the bit: computed as written
 /// for a southern latitude, the logarithm's quotient rounds differently,
 /// `q(−90°)/q(90°)` misses −1, and `asin` turns that ulp into 20 cm at the
-/// south pole.
+/// south pole. On a sphere (`e = 0`), where eq. 3-12 is 0/0, its limit
+/// `2 sin φ`.
 fn q_authalic(lat: f64, e: f64) -> f64 {
     let sin_lat = lat.abs().sin();
+    if e == 0.0 {
+        return (2.0 * sin_lat).copysign(lat);
+    }
     let e_sin = e * sin_lat;
     let q = (1.0 - e * e)
         * (sin_lat / (1.0 - e_sin * e_sin)
@@ -1819,13 +2209,13 @@ fn lcc_t(lat: f64, e: f64) -> f64 {
 }
 
 // ============================================================================
-// Oblique Stereographic — used by FMI/DMI ODIM radar composites
-// Reference: EPSG guidance note 7-2, method 9809 (Oblique Stereographic)
-// Uses conformal sphere approach (Gauss conformal latitude)
+// Stereographic — used by FMI/DMI ODIM radar composites, NSIDC sea ice grids
+// and polar NWP grids
+// Reference: Snyder, "Map Projections — A Working Manual", USGS PP 1395, §21
 // ============================================================================
 
 /// The scale factor at the pole, `k₀` of a polar [`Crs::Stereographic`],
-/// of a projection on WGS84 whose scale is true at latitude `lat_ts`
+/// of a projection on `figure` whose scale is true at latitude `lat_ts`
 /// (radians): the standard parallel of EPSG method 9829, PROJ's `+lat_ts`
 /// and CF's `standard_parallel`. `lat_ts` lies on the pole's side of the
 /// equator, measured toward that pole: a south-polar projection's −71° is
@@ -1842,15 +2232,15 @@ fn lcc_t(lat: f64, e: f64) -> f64 {
 /// D   = √((1+e)^(1+e) · (1−e)^(1−e))
 /// ```
 ///
-/// (Snyder, "Map Projections — A Working Manual", USGS PP 1395, 1987). The
-/// spherical shortcut `(1 + sin lat_ts)/2` is 0.012 % off at 60°, some
-/// 200 m at 3000 km from the pole. Scale true at the pole itself is
-/// `k₀ = 1`, the limit as `t_c → 0`.
-pub fn polar_stereographic_k0(lat_ts: f64) -> f64 {
+/// (Snyder, "Map Projections — A Working Manual", USGS PP 1395, 1987). On
+/// a sphere (e = 0) that is `(1 + sin lat_ts)/2`; on WGS84 the spherical
+/// shortcut is 0.012 % off at 60°, some 200 m at 3000 km from the pole.
+/// Scale true at the pole itself is `k₀ = 1`, the limit as `t_c → 0`.
+pub fn polar_stereographic_k0(lat_ts: f64, figure: &Ellipsoid) -> f64 {
     if FRAC_PI_2 - lat_ts < 1e-10 {
         return 1.0;
     }
-    let e2 = WGS84_E2;
+    let e2 = figure.e2();
     let e = e2.sqrt();
     let sin_lat_ts = lat_ts.sin();
     let cos_lat_ts = lat_ts.cos();
@@ -1861,7 +2251,10 @@ pub fn polar_stereographic_k0(lat_ts: f64) -> f64 {
     m_c * d / (2.0 * t_c)
 }
 
-/// Oblique stereographic projection on the conformal sphere, EPSG 9809.
+/// How close to ±90°, radians, an origin latitude is the polar aspect.
+const STERE_POLAR_THRESHOLD: f64 = 1e-10;
+
+/// A stereographic projection's parameters on its earth figure.
 ///
 /// The previous implementation had an `n = sqrt(1 + e²·cos⁴(lat0)/(1-e²))`
 /// factor borrowed from Lambert Conformal Conic (where it's the cone
@@ -1872,102 +2265,202 @@ pub fn polar_stereographic_k0(lat_ts: f64) -> f64 {
 /// composites — output pixels missed the source grid by hundreds of
 /// kilometres.
 ///
-/// EPSG 9809 ("Oblique Stereographic") uses no LCC cone constant:
-///   χ(φ)   — conformal latitude (Snyder eq. 3-1)
-///   R_c    — conformal sphere radius at origin: √(M(φ₀) · N(φ₀))
-///   k(P)   — scale factor at the point P
-///   x = false_e + 2·R_c·k₀·cos(χ)·sin(λ-λ₀)/B
-///   y = false_n + 2·R_c·k₀·(cos(χ₀)·sin(χ) - sin(χ₀)·cos(χ)·cos(λ-λ₀))/B
-/// where B = 1 + sin(χ₀)·sin(χ) + cos(χ₀)·cos(χ)·cos(λ-λ₀).
-///
-/// Polar stereographic (lat₀ = ±90°) falls out of the same formula
-/// without special-casing, so a single implementation handles ODIM's
-/// polar (FMI/OPERA) and oblique (DMI) variants.
-fn stere_forward(
-    lat: f64,
-    lon: f64,
+/// Polar stereographic (lat₀ = ±90°) has its own branch (Snyder eq.
+/// 21-33), so a single implementation handles ODIM's polar (FMI/OPERA) and
+/// oblique (DMI) variants.
+struct Stere {
     lat0: f64,
     lon0: f64,
     k0: f64,
     false_e: f64,
     false_n: f64,
-) -> (f64, f64) {
-    // Snyder, "Map Projections — A Working Manual" (USGS PP 1395,
-    // 1987), §21 "Stereographic", ellipsoidal aspect. Matches
-    // PROJ's `+proj=stere`. The earlier `(rn0·rm0).sqrt()` form
-    // was the double-stereographic / EPSG 9809 radius (PROJ's
-    // `+proj=sterea`), a different projection that diverges from
-    // `+proj=stere` by ~300 m at 100 km from origin and would
-    // misalign DMI/OPERA tiles even though forward+inverse
-    // roundtripped self-consistently.
-    //
-    // Two ellipsoidal cases:
-    //   - Oblique (|lat0| < π/2): Snyder eq. 21-26..30. Uses
-    //     `m_c / cos(χ_c)` for the radius factor.
-    //   - Polar (|lat0| = π/2): Snyder eq. 21-33. The oblique
-    //     formula's `m_c` and `cos(χ_c)` both numerically vanish
-    //     at the pole (their ratio happens to stay finite by IEEE
-    //     754 rounding alone), so use the dedicated polar form
-    //     `ρ = 2·a·k₀·t / D` with `D = √((1+e)^(1+e)·(1-e)^(1-e))`.
-    let e2 = WGS84_E2;
-    let e = e2.sqrt();
-    let a = WGS84_A;
+    /// Semi-major axis, or the sphere's radius (metres).
+    a: f64,
+    /// Eccentricity; 0 on a sphere, where Snyder's ellipsoidal formulas
+    /// reduce to the spherical ones.
+    e: f64,
+    e2: f64,
+}
 
-    // Polar branch — check before computing oblique-only terms
-    // that would be ill-conditioned at the pole.
-    const POLAR_THRESHOLD: f64 = 1e-10;
-    if (lat0.abs() - std::f64::consts::FRAC_PI_2).abs() < POLAR_THRESHOLD {
-        let north_polar = lat0 > 0.0;
-        let sin_lat = lat.sin();
-        let t = ((std::f64::consts::FRAC_PI_4 - if north_polar { lat / 2.0 } else { -lat / 2.0 })
-            .tan())
-            * ((1.0 + e * sin_lat * if north_polar { 1.0 } else { -1.0 })
-                / (1.0 - e * sin_lat * if north_polar { 1.0 } else { -1.0 }))
-            .powf(e / 2.0);
-        let d = ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
-        let rho = 2.0 * a * k0 * t / d;
-        let dl = lon - lon0;
-        let x = false_e + rho * dl.sin();
-        let y = false_n
-            + if north_polar {
-                -rho * dl.cos()
-            } else {
-                rho * dl.cos()
-            };
-        return (x, y);
+impl Stere {
+    fn new(lat0: f64, lon0: f64, k0: f64, false_e: f64, false_n: f64, figure: &Ellipsoid) -> Self {
+        let e2 = figure.e2();
+        Stere {
+            lat0,
+            lon0,
+            k0,
+            false_e,
+            false_n,
+            a: figure.a,
+            e: e2.sqrt(),
+            e2,
+        }
     }
 
-    // Oblique branch
-    let sin_lat0 = lat0.sin();
-    let cos_lat0 = lat0.cos();
-    let m_c = cos_lat0 / (1.0 - e2 * sin_lat0 * sin_lat0).sqrt();
+    fn polar(&self) -> bool {
+        (self.lat0.abs() - FRAC_PI_2).abs() < STERE_POLAR_THRESHOLD
+    }
 
-    let chi0 = conformal_latitude(lat0, e);
-    let chi = conformal_latitude(lat, e);
+    /// `(lat, lon)` in radians to `(x, y)` metres.
+    fn forward(&self, lat: f64, lon: f64) -> (f64, f64) {
+        // Snyder, "Map Projections — A Working Manual" (USGS PP 1395,
+        // 1987), §21 "Stereographic", ellipsoidal aspect. Matches
+        // PROJ's `+proj=stere`. The earlier `(rn0·rm0).sqrt()` form
+        // was the double-stereographic / EPSG 9809 radius (PROJ's
+        // `+proj=sterea`), a different projection that diverges from
+        // `+proj=stere` by ~300 m at 100 km from origin and would
+        // misalign DMI/OPERA tiles even though forward+inverse
+        // roundtripped self-consistently.
+        //
+        // Two ellipsoidal cases:
+        //   - Oblique (|lat0| < π/2): Snyder eq. 21-26..30. Uses
+        //     `m_c / cos(χ_c)` for the radius factor.
+        //   - Polar (|lat0| = π/2): Snyder eq. 21-33. The oblique
+        //     formula's `m_c` and `cos(χ_c)` both numerically vanish
+        //     at the pole (their ratio happens to stay finite by IEEE
+        //     754 rounding alone), so use the dedicated polar form
+        //     `ρ = 2·a·k₀·t / D` with `D = √((1+e)^(1+e)·(1-e)^(1-e))`.
+        let (e, a, k0) = (self.e, self.a, self.k0);
 
-    let dl = lon - lon0;
-    let (sin_chi0, cos_chi0) = chi0.sin_cos();
-    let (sin_chi, cos_chi) = chi.sin_cos();
-    let cos_dl = dl.cos();
+        // Polar branch — check before computing oblique-only terms
+        // that would be ill-conditioned at the pole.
+        if self.polar() {
+            let north_polar = self.lat0 > 0.0;
+            let sin_lat = lat.sin();
+            let t = ((std::f64::consts::FRAC_PI_4
+                - if north_polar { lat / 2.0 } else { -lat / 2.0 })
+            .tan())
+                * ((1.0 + e * sin_lat * if north_polar { 1.0 } else { -1.0 })
+                    / (1.0 - e * sin_lat * if north_polar { 1.0 } else { -1.0 }))
+                .powf(e / 2.0);
+            let d = ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
+            let rho = 2.0 * a * k0 * t / d;
+            let dl = lon - self.lon0;
+            let x = self.false_e + rho * dl.sin();
+            let y = self.false_n
+                + if north_polar {
+                    -rho * dl.cos()
+                } else {
+                    rho * dl.cos()
+                };
+            return (x, y);
+        }
 
-    let b = 1.0 + sin_chi0 * sin_chi + cos_chi0 * cos_chi * cos_dl;
-    // A = 2·a·k₀·m_c / (cos(χ₀) · b)
-    let factor = 2.0 * a * k0 * m_c / (cos_chi0 * b);
+        // Oblique branch
+        let sin_lat0 = self.lat0.sin();
+        let cos_lat0 = self.lat0.cos();
+        let m_c = cos_lat0 / (1.0 - self.e2 * sin_lat0 * sin_lat0).sqrt();
 
-    let x = false_e + factor * cos_chi * dl.sin();
-    let y = false_n + factor * (cos_chi0 * sin_chi - sin_chi0 * cos_chi * cos_dl);
+        let chi0 = conformal_latitude(self.lat0, e);
+        let chi = conformal_latitude(lat, e);
 
-    (x, y)
+        let dl = lon - self.lon0;
+        let (sin_chi0, cos_chi0) = chi0.sin_cos();
+        let (sin_chi, cos_chi) = chi.sin_cos();
+        let cos_dl = dl.cos();
+
+        let b = 1.0 + sin_chi0 * sin_chi + cos_chi0 * cos_chi * cos_dl;
+        // A = 2·a·k₀·m_c / (cos(χ₀) · b)
+        let factor = 2.0 * a * k0 * m_c / (cos_chi0 * b);
+
+        let x = self.false_e + factor * cos_chi * dl.sin();
+        let y = self.false_n + factor * (cos_chi0 * sin_chi - sin_chi0 * cos_chi * cos_dl);
+
+        (x, y)
+    }
+
+    /// `(x, y)` metres to `(lat, lon)` in radians.
+    fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+        // Polar branch — must mirror the forward's polar branch.
+        // The oblique Newton iteration breaks at the pole because the
+        // Jacobian is singular there (longitude is degenerate when
+        // ρ = 0; finite-difference derivatives at lat = ±π/2 step
+        // outside the valid latitude range). Use Snyder eq. 21-35..37
+        // (ellipsoidal polar inverse) instead.
+        if self.polar() {
+            let (e, a, k0) = (self.e, self.a, self.k0);
+            let north_polar = self.lat0 > 0.0;
+
+            let dx = x - self.false_e;
+            let dy = y - self.false_n;
+            let rho = (dx * dx + dy * dy).sqrt();
+
+            // ρ = 0 means we're at the pole exactly; lon is degenerate,
+            // return the central meridian.
+            if rho < 1e-9 {
+                return (self.lat0, self.lon0);
+            }
+
+            let d = ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
+            let t = rho * d / (2.0 * a * k0);
+
+            // Iterate Snyder eq. 21-37:
+            //   φ_{i+1} = π/2 - 2·atan(t · ((1 - e·sin φ_i)/(1 + e·sin φ_i))^(e/2))
+            // Initial guess uses the spherical inverse φ₀ = π/2 - 2·atan(t),
+            // exact on a sphere.
+            let mut phi = std::f64::consts::FRAC_PI_2 - 2.0 * t.atan();
+            for _ in 0..15 {
+                let sin_phi = phi.sin();
+                let new_phi = std::f64::consts::FRAC_PI_2
+                    - 2.0 * (t * ((1.0 - e * sin_phi) / (1.0 + e * sin_phi)).powf(e / 2.0)).atan();
+                if (new_phi - phi).abs() < 1e-12 {
+                    phi = new_phi;
+                    break;
+                }
+                phi = new_phi;
+            }
+
+            let lat_out = if north_polar { phi } else { -phi };
+            let lon_out = if north_polar {
+                self.lon0 + dx.atan2(-dy)
+            } else {
+                self.lon0 + dx.atan2(dy)
+            };
+            return (lat_out, lon_out);
+        }
+
+        // Oblique branch — Newton iteration on the forward function.
+        // Robust at any distance from center, locked to the forward by
+        // construction so any future change to forward automatically
+        // applies here. It stops a micrometre from the point: at a
+        // centimetre, its longitude was 1e-7° off PROJ's 1500 km out.
+        let mut lat = self.lat0;
+        let mut lon = self.lon0;
+
+        for _ in 0..20 {
+            let (fx, fy) = self.forward(lat, lon);
+            let ex = x - fx;
+            let ey = y - fy;
+            if ex.abs() < 1e-6 && ey.abs() < 1e-6 {
+                break;
+            }
+            let h = 1e-8;
+            let (fx_dlat, fy_dlat) = self.forward(lat + h, lon);
+            let (fx_dlon, fy_dlon) = self.forward(lat, lon + h);
+            let de_dlat = (fx_dlat - fx) / h;
+            let de_dlon = (fx_dlon - fx) / h;
+            let dn_dlat = (fy_dlat - fy) / h;
+            let dn_dlon = (fy_dlon - fy) / h;
+            let det = de_dlat * dn_dlon - de_dlon * dn_dlat;
+            if det.abs() < 1e-30 {
+                break;
+            }
+            lat += (dn_dlon * ex - de_dlon * ey) / det;
+            lon += (-dn_dlat * ex + de_dlat * ey) / det;
+        }
+
+        (lat, lon)
+    }
 }
 
 /// Conformal latitude χ(φ) = 2·atan(tan(π/4 + φ/2) · ((1-e·sinφ)/(1+e·sinφ))^(e/2)) - π/2.
-/// At the equator and poles χ = φ. For WGS84 the maximum deviation
-/// from geodetic latitude is ~12′ near 45°.
+/// At the equator and poles χ = φ, and on a sphere everywhere. For WGS84
+/// the maximum deviation from geodetic latitude is ~12′ near 45°.
 ///
 /// **Not called at φ = ±π/2.** `tan(π/4 + π/4) = tan(π/2)` is
 /// algebraically ∞; IEEE 754 happens to evaluate it to ~1.63e16 so
 /// `2·atan(...) - π/2 ≈ π/2` would still be numerically correct,
-/// but the polar branches in `stere_forward` and `stere_inverse`
+/// but the polar branches of [`Stere::forward`] and [`Stere::inverse`]
 /// short-circuit before reaching this helper. That keeps the
 /// hot path off the FP overflow corner case.
 fn conformal_latitude(lat: f64, e: f64) -> f64 {
@@ -1975,97 +2468,6 @@ fn conformal_latitude(lat: f64, e: f64) -> f64 {
     let ratio = (1.0 - e * sin_lat) / (1.0 + e * sin_lat);
     let inner = (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan() * ratio.powf(e / 2.0);
     2.0 * inner.atan() - std::f64::consts::FRAC_PI_2
-}
-
-fn stere_inverse(
-    x: f64,
-    y: f64,
-    lat0: f64,
-    lon0: f64,
-    k0: f64,
-    false_e: f64,
-    false_n: f64,
-) -> (f64, f64) {
-    // Polar branch — must mirror `stere_forward`'s polar branch.
-    // The oblique Newton iteration breaks at the pole because the
-    // Jacobian is singular there (longitude is degenerate when
-    // ρ = 0; finite-difference derivatives at lat = ±π/2 step
-    // outside the valid latitude range). Use Snyder eq. 21-35..37
-    // (ellipsoidal polar inverse) instead.
-    const POLAR_THRESHOLD: f64 = 1e-10;
-    if (lat0.abs() - std::f64::consts::FRAC_PI_2).abs() < POLAR_THRESHOLD {
-        let e2 = WGS84_E2;
-        let e = e2.sqrt();
-        let a = WGS84_A;
-        let north_polar = lat0 > 0.0;
-
-        let dx = x - false_e;
-        let dy = y - false_n;
-        let rho = (dx * dx + dy * dy).sqrt();
-
-        // ρ = 0 means we're at the pole exactly; lon is degenerate,
-        // return the central meridian.
-        if rho < 1e-9 {
-            return (lat0, lon0);
-        }
-
-        let d = ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
-        let t = rho * d / (2.0 * a * k0);
-
-        // Iterate Snyder eq. 21-37:
-        //   φ_{i+1} = π/2 - 2·atan(t · ((1 - e·sin φ_i)/(1 + e·sin φ_i))^(e/2))
-        // Initial guess uses the spherical inverse φ₀ = π/2 - 2·atan(t).
-        let mut phi = std::f64::consts::FRAC_PI_2 - 2.0 * t.atan();
-        for _ in 0..15 {
-            let sin_phi = phi.sin();
-            let new_phi = std::f64::consts::FRAC_PI_2
-                - 2.0 * (t * ((1.0 - e * sin_phi) / (1.0 + e * sin_phi)).powf(e / 2.0)).atan();
-            if (new_phi - phi).abs() < 1e-12 {
-                phi = new_phi;
-                break;
-            }
-            phi = new_phi;
-        }
-
-        let lat_out = if north_polar { phi } else { -phi };
-        let lon_out = if north_polar {
-            lon0 + dx.atan2(-dy)
-        } else {
-            lon0 + dx.atan2(dy)
-        };
-        return (lat_out, lon_out);
-    }
-
-    // Oblique branch — Newton iteration on the forward function.
-    // Robust at any distance from center, locked to `stere_forward`
-    // by construction so any future change to forward automatically
-    // applies here.
-    let mut lat = lat0;
-    let mut lon = lon0;
-
-    for _ in 0..20 {
-        let (fx, fy) = stere_forward(lat, lon, lat0, lon0, k0, false_e, false_n);
-        let ex = x - fx;
-        let ey = y - fy;
-        if ex.abs() < 0.01 && ey.abs() < 0.01 {
-            break;
-        }
-        let h = 1e-8;
-        let (fx_dlat, fy_dlat) = stere_forward(lat + h, lon, lat0, lon0, k0, false_e, false_n);
-        let (fx_dlon, fy_dlon) = stere_forward(lat, lon + h, lat0, lon0, k0, false_e, false_n);
-        let de_dlat = (fx_dlat - fx) / h;
-        let de_dlon = (fx_dlon - fx) / h;
-        let dn_dlat = (fy_dlat - fy) / h;
-        let dn_dlon = (fy_dlon - fy) / h;
-        let det = de_dlat * dn_dlon - de_dlon * dn_dlat;
-        if det.abs() < 1e-30 {
-            break;
-        }
-        lat += (dn_dlon * ex - de_dlon * ey) / det;
-        lon += (-dn_dlat * ex + de_dlat * ey) / det;
-    }
-
-    (lat, lon)
 }
 
 // ============================================================================
@@ -2734,7 +3136,10 @@ mod tests {
         // The area's north and south edge, a pole's northing: against the
         // WGS84 quarter meridian of 10 001 965.729 m, EPSG:3067's poles lie
         // 0.9996 · 10 001 965.729 = 9 997 964.943 m from the equator.
-        assert_eq!(tm_equator_northing(0.0, 0.9996, 0.0), 0.0);
+        assert_eq!(
+            tm_equator_northing(&TmSeries::of(&Ellipsoid::WGS84), 0.0, 0.9996, 0.0),
+            0.0
+        );
         for (north, outside) in [(9_997_000.0, false), (9_999_000.0, true)] {
             for bbox in [[0.0, north, 1.0e6, 2.1e7], [0.0, -2.1e7, 1.0e6, -north]] {
                 assert_eq!(outside_projection_domain(&tm, bbox), outside, "{bbox:?}");
@@ -2869,6 +3274,7 @@ mod tests {
             k0: 0.9996,
             false_e: 500_000.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         };
         let (e, n) = crs.forward(24.9384, 60.1699);
         // Known approximate values for TM35FIN
@@ -3034,6 +3440,7 @@ mod tests {
             k0: 0.9996,
             false_e: 500_000.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         };
         // (longitude, latitude, PROJ easting, northing)
         for (lon, lat, e, n) in [
@@ -3106,7 +3513,7 @@ mod tests {
     #[test]
     fn tm_projected_envelope_reaches_the_area_around_its_singular_points() {
         let tm = projected_output_crs("EPSG:3067").unwrap();
-        let half = 0.9996 * TM_A * FRAC_PI_2;
+        let half = 0.9996 * TmSeries::of(&Ellipsoid::WGS84).a_rect * FRAC_PI_2;
         let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
         let edges = edge_envelope([-180.0, -90.0, 180.0, 90.0], |lon, lat| {
             Some(tm.forward(lon, lat))
@@ -3206,9 +3613,10 @@ mod tests {
             );
             (500_000.0 + k0 * g.0, k0 * (arc - g.1))
         };
-        let edge = 500_000.0 + k0 * TM_A * (TM_MAX_ETA - 1e-6);
+        let a_rect = TmSeries::of(&Ellipsoid::WGS84).a_rect;
+        let edge = 500_000.0 + k0 * a_rect * (TM_MAX_ETA - 1e-6);
         for xi in [0.0, 0.1, 0.2, 0.3, 0.4] {
-            let (lon, lat) = tm.inverse(edge, k0 * TM_A * xi).unwrap();
+            let (lon, lat) = tm.inverse(edge, k0 * a_rect * xi).unwrap();
             let (x, y) = exact(lon, lat);
             let (fx, fy) = tm.forward(lon, lat);
             assert!(
@@ -3462,6 +3870,250 @@ mod tests {
         assert!(area_edge_points(&tm, [1.1e7, 6.5e6, 1.2e7, 7.0e6]).is_empty());
     }
 
+    /// Asserts an extent matches a PROJ reference to 1e-8°.
+    fn assert_extent(got: [f64; 4], want: [f64; 4]) {
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-8, "got {got:?}, want {want:?}");
+        }
+    }
+
+    /// The seam box 170,10,-170,20 as a lat/lon grid, and a UTM zone 60
+    /// grid over it, whose inverse runs on past 180°: each is the narrow
+    /// box `west > east`, never one past ±180° that the CRS84 domain cuts
+    /// at 180° (#1194). The UTM grid's bounds are PROJ 9.8.1's, `cs2cs -I
+    /// -f %.9f +proj=longlat +datum=WGS84 +to +proj=utm +zone=60
+    /// +datum=WGS84`: west and east its top corners (-300 000, 2 300 000)
+    /// and (1 300 000, 2 300 000), south its bottom corners, north the top
+    /// edge on the central meridian, (500 000, 2 300 000).
+    #[test]
+    fn grid_extent_crosses_the_antimeridian_west_to_east() {
+        let seam =
+            GeoTransform::from_cell_centres(170.25, 0.5, 19.75, -0.5, 40, 20, Crs::Wgs84).unwrap();
+        assert_eq!(seam.bbox_with_poles(), [170.0, 10.0, -170.0, 20.0]);
+        assert_eq!(
+            crs84_extent(seam.bbox_with_poles()),
+            Some([170.0, 10.0, -170.0, 20.0])
+        );
+        assert_eq!(seam.footprint_envelope(), Some([170.0, 10.0, 190.0, 20.0]));
+        let utm60 = Crs::TransverseMercator {
+            lat0: 0.0,
+            lon0: 177.0_f64.to_radians(),
+            k0: 0.9996,
+            false_e: 500_000.0,
+            false_n: 0.0,
+            figure: Ellipsoid::WGS84,
+        };
+        let gt = GeoTransform::from_cell_centres(
+            -290_000.0,
+            20_000.0,
+            2_290_000.0,
+            -20_000.0,
+            80,
+            60,
+            utm60,
+        )
+        .unwrap();
+        assert_eq!(
+            gt.edges(),
+            [-300_000.0, 1_100_000.0, 1_300_000.0, 2_300_000.0]
+        );
+        let (west, east) = (169.338_563_731, -175.338_563_731);
+        assert_extent(
+            gt.bbox_with_poles(),
+            [west, 9.871_937_349, east, 20.799_879_377],
+        );
+        let [w, _, e, _] = gt.footprint_envelope().unwrap();
+        assert!(
+            (w - west).abs() < 1e-8 && (e - (east + 360.0)).abs() < 1e-8,
+            "{w}..{e}"
+        );
+        // The edges' plain envelope runs past 180°, and the CRS84 domain
+        // cut it there.
+        assert!(gt.bbox()[2] > 184.0);
+        assert_eq!(crs84_extent(gt.bbox()).unwrap()[2], 180.0);
+    }
+
+    /// A polar stereographic grid off the pole that crosses the meridian
+    /// opposite its centre, EPSG:3413's 135°E, where its inverse's
+    /// longitudes wrap from -225° to 135°: its extent is the 53° it spans,
+    /// not the 359° between the wrapped longitudes, -224° to 135°, which
+    /// the CRS84 domain then cut to -180°..135° (#1194). Bounds from PROJ
+    /// 9.8.1, `cs2cs -I -f %.9f +proj=longlat +datum=WGS84 +to +proj=stere
+    /// +lat_0=90 +lat_ts=70 +lon_0=-45 +x_0=0 +y_0=0 +datum=WGS84`: west
+    /// and east the bottom corners (500 000, 1 000 000) and (-500 000,
+    /// 1 000 000), north the bottom edge's middle, south a top corner.
+    #[test]
+    fn grid_extent_spans_a_polar_grid_across_its_far_meridian() {
+        let crs = Crs::Stereographic {
+            lat0: FRAC_PI_2,
+            lon0: (-45.0_f64).to_radians(),
+            k0: polar_stereographic_k0(70.0_f64.to_radians(), &Ellipsoid::WGS84),
+            false_e: 0.0,
+            false_n: 0.0,
+            figure: Ellipsoid::WGS84,
+        };
+        let gt = GeoTransform::from_cell_centres(
+            -487_500.0,
+            25_000.0,
+            1_987_500.0,
+            -25_000.0,
+            40,
+            40,
+            crs,
+        )
+        .unwrap();
+        assert_eq!(
+            gt.edges(),
+            [-500_000.0, 1_000_000.0, 500_000.0, 2_000_000.0]
+        );
+        let extent = [
+            108.434_948_823,
+            71.134_643_958,
+            161.565_051_177,
+            80.787_812_971,
+        ];
+        assert_extent(gt.bbox_with_poles(), extent);
+        assert_extent(crs84_extent(gt.bbox_with_poles()).unwrap(), extent);
+        // The edges' plain envelope spans the wrapped longitudes.
+        let [w, _, e, _] = gt.bbox();
+        assert!(e - w > 350.0, "{w}..{e}");
+        // Its middle in the inverse's own frame, from the first edge
+        // point: the bottom-left corner, -198.4°.
+        let centre = gt.inverse_frame_centre().unwrap();
+        assert!((centre - (-225.0)).abs() < 1e-8, "{centre}");
+        // The same grid across the antimeridian, centred on 180°: `west >
+        // east`.
+        let bering = Crs::Stereographic {
+            lat0: FRAC_PI_2,
+            lon0: 0.0,
+            k0: polar_stereographic_k0(70.0_f64.to_radians(), &Ellipsoid::WGS84),
+            false_e: 0.0,
+            false_n: 0.0,
+            figure: Ellipsoid::WGS84,
+        };
+        let gt = GeoTransform { crs: bering, ..gt };
+        let [w, _, e, _] = gt.bbox_with_poles();
+        assert!(
+            (w - 153.434_948_823).abs() < 1e-8 && (e - -153.434_948_823).abs() < 1e-8,
+            "{w}..{e}"
+        );
+    }
+
+    /// A grid holding a pole reaches it at every longitude, on a sphere as
+    /// on WGS84, and on Transverse Mercator, whose forward maps the far
+    /// side of the Earth past the pole's northing (#1167, #1194). A TM grid
+    /// short of the pole reaches its area's edge along the meridian 90°
+    /// out. References are PROJ 9.8.1's, `cs2cs -I -f %.9f`: a south
+    /// polar grid's corner (500 000, 500 000) at 83.675 419 067°S on WGS84
+    /// and 83.647 579 670°S on the 6 371 229 m sphere (`+proj=stere
+    /// +lat_0=-90 +lon_0=0 +k=1`), and EPSG:3067's bottom corners (0,
+    /// 9 000 000) and (1 000 000, 9 000 000) at 80.011 663 589°N
+    /// (`+proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0
+    /// +datum=WGS84`).
+    #[test]
+    fn grid_extent_reaches_a_pole_the_grid_holds() {
+        for (figure, north) in [
+            (Ellipsoid::WGS84, -83.675_419_067),
+            (Ellipsoid::sphere(6_371_229.0), -83.647_579_670),
+        ] {
+            let crs = Crs::Stereographic {
+                lat0: -FRAC_PI_2,
+                lon0: 0.0,
+                k0: 1.0,
+                false_e: 0.0,
+                false_n: 0.0,
+                figure,
+            };
+            let gt = GeoTransform::from_cell_centres(
+                -475_000.0, 50_000.0, 475_000.0, -50_000.0, 20, 20, crs,
+            )
+            .unwrap();
+            let [w, s, e, n] = gt.bbox_with_poles();
+            assert_eq!((w, s, e), (-180.0, -90.0, 180.0), "{figure:?}");
+            assert!((n - north).abs() < 1e-8, "{figure:?}: {n}");
+        }
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        let gt = GeoTransform::from_cell_centres(
+            25_000.0,
+            50_000.0,
+            10_475_000.0,
+            -50_000.0,
+            20,
+            30,
+            tm,
+        )
+        .unwrap();
+        assert_eq!(gt.edges(), [0.0, 9_000_000.0, 1_000_000.0, 10_500_000.0]);
+        let [w, s, e, n] = gt.bbox_with_poles();
+        assert_eq!((w, e, n), (-180.0, 180.0, 90.0));
+        assert!((s - 80.011_663_589).abs() < 1e-8, "{s}");
+        // East of the pole, across the area's north edge: its corner
+        // (2 000 000, 9 997 964.943) on the meridian 90° out, 117°E, is
+        // 76.684 126 655°N, and the grid's edges stop short of both.
+        let gt = GeoTransform::from_cell_centres(
+            2_025_000.0,
+            50_000.0,
+            10_475_000.0,
+            -50_000.0,
+            40,
+            20,
+            projected_output_crs("EPSG:3067").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            gt.edges(),
+            [2_000_000.0, 9_500_000.0, 4_000_000.0, 10_500_000.0]
+        );
+        let [_, _, e, n] = gt.bbox_with_poles();
+        assert!(
+            (e - 117.0).abs() < 1e-9 && (n - 76.684_126_655).abs() < 1e-8,
+            "{e}, {n}"
+        );
+        let [_, _, edge_e, edge_n] = gt.bbox();
+        assert!(edge_e < 116.9 && edge_n < 76.68, "{edge_e}, {edge_n}");
+    }
+
+    /// An earth figure stated to any precision is WGS 84 or GRS 1980 when
+    /// its axes are theirs to 10 µm, which lie 0.1 mm apart; any other is
+    /// its own, its flattening exact from an inverse flattening.
+    #[test]
+    fn earth_figures_name_wgs84_and_grs80() {
+        let wgs84_b = 6_356_752.314_245;
+        assert_eq!(Ellipsoid::from_axes(WGS84_A, wgs84_b), Ellipsoid::WGS84);
+        assert_eq!(
+            Ellipsoid::from_inverse_flattening(WGS84_A, 298.257_223_563),
+            Ellipsoid::WGS84
+        );
+        assert_eq!(
+            Ellipsoid::from_inverse_flattening(WGS84_A, 298.257_222_101),
+            Ellipsoid::GRS80
+        );
+        assert_eq!(
+            Ellipsoid::from_axes(WGS84_A, 6_356_752.314_140),
+            Ellipsoid::GRS80
+        );
+        assert!(
+            (Ellipsoid::WGS84.semi_minor() - Ellipsoid::GRS80.semi_minor() - 1.048e-4).abs() < 1e-6
+        );
+        // Both are WGS 84 to a millimetre; a sphere and Airy 1830 are not.
+        assert!(Ellipsoid::WGS84.is_wgs84_like() && Ellipsoid::GRS80.is_wgs84_like());
+        let airy = Ellipsoid::from_inverse_flattening(6_377_563.396, 299.324_964_6);
+        assert!(!airy.is_wgs84_like() && !Ellipsoid::sphere(WGS84_A).is_wgs84_like());
+        assert_eq!(airy.flattening(), 1.0 / 299.324_964_6);
+        assert_eq!(
+            Ellipsoid::from_axes(6_371_000.0, 6_371_000.0),
+            Ellipsoid::sphere(6_371_000.0)
+        );
+        assert!(Ellipsoid::sphere(6_371_000.0).is_sphere() && !airy.is_sphere());
+        // WGS84's series is the one the constants were (#1130).
+        let series = TmSeries::of(&Ellipsoid::WGS84);
+        assert!((series.a_rect * FRAC_PI_2 - 10_001_965.729).abs() < 1e-3);
+        // On a sphere every coefficient vanishes.
+        let sphere = TmSeries::of(&Ellipsoid::sphere(6_371_000.0));
+        assert_eq!(sphere.a_rect, 6_371_000.0);
+        assert!(sphere.alpha.iter().chain(&sphere.beta).all(|&c| c == 0.0));
+    }
+
     // LAEA EPSG:3035-like: center (10, 55), false origin (1950000, -2100000)
     // OPERA radar uses this
     #[test]
@@ -3471,6 +4123,7 @@ mod tests {
             lon0: 10.0_f64.to_radians(),
             false_e: 1_950_000.0,
             false_n: -2_100_000.0,
+            figure: Ellipsoid::WGS84,
         };
         // Center of projection should map to (false_e, false_n)
         let (e, n) = crs.forward(10.0, 55.0);
@@ -3615,6 +4268,7 @@ mod tests {
             k0: 0.9996,
             false_e: 500_000.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         };
         // UL: (-208000, 7926000) should be ~(7.79, 70.42)
         let (lon, lat) = crs.inverse(-208_000.0, 7_926_000.0).unwrap();
@@ -3640,6 +4294,7 @@ mod tests {
             lon0: 10.0_f64.to_radians(),
             false_e: 1_950_000.0,
             false_n: -2_100_000.0,
+            figure: Ellipsoid::WGS84,
         };
         // UL: (-1000, 1000) should be ~(-39.57, 67.02)
         let (lon, lat) = crs.inverse(-1000.0, 1000.0).unwrap();
@@ -3716,6 +4371,7 @@ mod tests {
                 lon0: 10.0_f64.to_radians(),
                 false_e: 1_950_000.0,
                 false_n: -2_100_000.0,
+                figure: Ellipsoid::WGS84,
             },
         };
 
@@ -3785,6 +4441,7 @@ mod tests {
             k0: 1.0,
             false_e: 0.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         };
         // Center of projection should map to (0, 0)
         let (e, n) = crs.forward(25.0, 60.0);
@@ -3800,6 +4457,7 @@ mod tests {
             k0: 1.0,
             false_e: 0.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         };
         // Helsinki roundtrip
         let (e, n) = crs.forward(24.9384, 60.1699);
@@ -3817,6 +4475,7 @@ mod tests {
             k0: 1.0,
             false_e: 0.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         };
         // Copenhagen roundtrip
         let (e, n) = crs.forward(12.5683, 55.6761);
@@ -3844,6 +4503,7 @@ mod tests {
             k0: 1.0,
             false_e: 0.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         };
         for (lon, lat) in [
             (3.0, 60.0),
@@ -3864,7 +4524,7 @@ mod tests {
         }
     }
 
-    /// Validate `stere_inverse` against **independent** reference
+    /// Validate `Stere::inverse` against **independent** reference
     /// projected coordinates, not just roundtrip self-consistency.
     /// Reference values were computed with `cs2cs +proj=longlat
     /// +ellps=WGS84 +to +proj=stere +lat_0=56 +lon_0=10.5666 +k_0=1
@@ -3878,7 +4538,7 @@ mod tests {
     /// shifting tiles by ~50%. This test eliminates that residual
     /// doubt by asserting `inverse(known_xy) ≈ expected_lonlat`,
     /// where the (x, y) values come from PROJ rather than from
-    /// `stere_forward`.
+    /// `Stere::forward`.
     #[test]
     fn stereographic_inverse_absolute_dmi() {
         let crs = Crs::Stereographic {
@@ -3887,6 +4547,7 @@ mod tests {
             k0: 1.0,
             false_e: 0.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         };
         for (x_proj, y_proj, lon_exp, lat_exp) in [
             (91726.258980, -110388.867174, 12.0, 55.0),
@@ -3933,6 +4594,7 @@ mod tests {
             k0,
             false_e: 0.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         };
         for (x_proj, y_proj, lon_exp, lat_exp) in [
             (0.0, -3197104.586924, 25.0, 60.0),
@@ -3957,12 +4619,15 @@ mod tests {
     #[test]
     fn polar_stereographic_k0_from_the_standard_parallel() {
         assert_eq!(
-            polar_stereographic_k0(60.0_f64.to_radians()),
+            polar_stereographic_k0(60.0_f64.to_radians(), &Ellipsoid::WGS84),
             0.933_069_071_736_356_6
         );
-        assert!((polar_stereographic_k0(60.0_f64.to_radians()) - 0.933_012_7).abs() > 5e-5);
-        assert_eq!(polar_stereographic_k0(FRAC_PI_2), 1.0);
-        let near_pole = polar_stereographic_k0(89.999_f64.to_radians());
+        assert!(
+            (polar_stereographic_k0(60.0_f64.to_radians(), &Ellipsoid::WGS84) - 0.933_012_7).abs()
+                > 5e-5
+        );
+        assert_eq!(polar_stereographic_k0(FRAC_PI_2, &Ellipsoid::WGS84), 1.0);
+        let near_pole = polar_stereographic_k0(89.999_f64.to_radians(), &Ellipsoid::WGS84);
         assert!((near_pole - 1.0).abs() < 1e-9, "{near_pole}");
     }
 
@@ -3975,6 +4640,7 @@ mod tests {
             k0: 1.0,
             false_e: 0.0,
             false_n: 0.0,
+            figure: Ellipsoid::WGS84,
         };
         // Tromsø, ~1200km from center
         let (e, n) = crs.forward(19.0, 69.65);

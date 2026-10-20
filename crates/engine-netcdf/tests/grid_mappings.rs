@@ -1,6 +1,7 @@
 //! engine-netcdf over grids on the CF `polar_stereographic`,
 //! `lambert_azimuthal_equal_area` and `transverse_mercator` mappings
-//! (#1167): testdata/netcdf-projections, whose two fields are each cell's
+//! (#1167), and the oblique `stereographic` one on a sphere in kilometres
+//! (#1194): testdata/netcdf-projections, whose two fields are each cell's
 //! own projected coordinates. A read at a longitude/latitude returns the
 //! projected point the server puts it at, pinned to PROJ's `cs2cs` (PROJ
 //! 9.8.1), forward `-f %.3f` and inverse `-I -f %.9f`, with the commands
@@ -181,5 +182,40 @@ fn transverse_mercator_reads_where_proj_puts_it() {
             (11.0, 62.0, 290586.062, 6880638.214),
             (18.398284982, 58.145953698, 700000.0, 6450000.0),
         ],
+    );
+}
+
+/// The oblique CF `stereographic` mapping on a 6371 km sphere, its x/y in
+/// kilometres and so its false origin, 600 km and -200 km, both scaled to
+/// the projection's metres (#1192, #1194): `cs2cs +proj=longlat +R=6371000
+/// +to +proj=stere +lat_0=60 +lon_0=25 +k=0.9999 +x_0=600000 +y_0=-200000
+/// +R=6371000 +units=m`; the last two points are the cell centres (900 000,
+/// -400 000) and (300 000, 100 000) through `-I`. The grid's description
+/// gives the sphere and the metres.
+#[test]
+fn oblique_stereographic_on_a_sphere_in_kilometres_reads_where_proj_puts_it() {
+    let engine = engine("stereographic-km");
+    assert_lands_where_proj_says(
+        &engine,
+        &[
+            (25.0, 60.0, 600000.0, -200000.0),
+            (24.94, 60.17, 596681.635, -181097.233),
+            (22.27, 60.45, 450336.695, -146871.594),
+            (29.76, 62.6, 843495.681, 98006.825),
+            (27.0, 58.0, 717858.364, -420626.541),
+            (30.108463183, 58.098110179, 900000.0, -400000.0),
+            (19.137700843, 62.576599006, 300000.0, 100000.0),
+        ],
+    );
+    let grid = engine.raster_info().native_grid.expect("a native grid");
+    assert_eq!(grid.unit(), "m");
+    assert_eq!(grid.bbox(), [150_000.0, -650_000.0, 1_050_000.0, 250_000.0]);
+    assert!(
+        grid.crs_ref().contains(r#"ELLIPSOID["Sphere",6371000,0,"#)
+            && grid
+                .crs_ref()
+                .contains(r#"PARAMETER["False easting",600000,"#),
+        "{}",
+        grid.crs_ref()
     );
 }

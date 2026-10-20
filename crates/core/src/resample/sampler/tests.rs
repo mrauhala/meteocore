@@ -89,6 +89,7 @@ fn polar() -> GeoTransform {
         k0: 1.0,
         false_e: 0.0,
         false_n: 0.0,
+        figure: crate::geo::Ellipsoid::WGS84,
     };
     GeoTransform::from_cell_centres(
         -2_975_000.0,
@@ -708,7 +709,8 @@ fn polar_meta_tiles_refine_only_the_footprint() {
     for (label, gt) in [("sample", meps_sample()), ("full", meps())] {
         let grid = SourceGrid::new(gt.clone());
         let Layout::Projected {
-            envelope: Some([w, _, e, _]),
+            centre: Some(centre),
+            ..
         } = grid.layout
         else {
             panic!("{label}: no envelope");
@@ -777,8 +779,7 @@ fn polar_meta_tiles_refine_only_the_footprint() {
                     continue;
                 }
                 let (lon, lat) = crs.project_node(bbox, fx, fy);
-                let exact =
-                    centred(gt.world_to_pixel_f64(within_half_turn(lon, (w + e) / 2.0), lat));
+                let exact = centred(gt.world_to_pixel_f64(within_half_turn(lon, centre), lat));
                 let want = grid.sample(&values, None, exact.0, exact.1);
                 if !read {
                     // Outside the footprint: nothing drawn, nothing to draw.

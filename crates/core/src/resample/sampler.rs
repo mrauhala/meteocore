@@ -31,9 +31,8 @@
 //!   envelope stays empty (#449, #453), and the coordinate map is refined
 //!   for that window alone ([`ProjectionGrid::build_2d_within`], #1110).
 //!   A footprint wholly off the image builds no map at all (#1129). The
-//!   envelope is the grid's inverse-projected cell edges
-//!   ([`GeoTransform::bbox`]), computed once by [`SourceGrid::new`], never
-//!   per request.
+//!   envelope is the grid's extent ([`GeoTransform::footprint_envelope`]),
+//!   computed once by [`SourceGrid::new`], never per request.
 //!
 //! The output is [`RasterValues::F32`]: interpolation runs in `f64` and only
 //! the stored value is narrowed, with NaN for nodata. An engine serving
@@ -70,10 +69,16 @@ enum Layout {
     /// when the columns fill the turn (within half a column).
     Periodic { period: f64, global: bool },
     /// Any other CRS. `envelope` is the grid's WGS84 `[w, s, e, n]`, with
-    /// `e > 180°` when it crosses the antimeridian; `None` when no edge
-    /// point inverse-projects, which leaves longitudes as they come and
-    /// turns the footprint guard off.
-    Projected { envelope: Option<[f64; 4]> },
+    /// `e > 180°` when it crosses the antimeridian
+    /// ([`GeoTransform::footprint_envelope`]), and `centre` the longitude
+    /// its pixels are projected within half a turn of
+    /// ([`GeoTransform::inverse_frame_centre`]); `None` when no edge point
+    /// inverse-projects, which leaves longitudes as they come and turns the
+    /// footprint guard off.
+    Projected {
+        envelope: Option<[f64; 4]>,
+        centre: Option<f64>,
+    },
 }
 
 impl SourceGrid {
@@ -96,7 +101,8 @@ impl SourceGrid {
                 }
             }
             _ => Layout::Projected {
-                envelope: wgs84_envelope(&transform),
+                envelope: transform.footprint_envelope(),
+                centre: transform.inverse_frame_centre(),
             },
         };
         SourceGrid { transform, layout }
@@ -197,8 +203,7 @@ impl SourceGrid {
                 )),
                 None,
             ),
-            Layout::Projected { envelope } => {
-                let centre = envelope.map(|[w, _, e, _]| (w + e) / 2.0);
+            Layout::Projected { envelope, centre } => {
                 let to_src = |lon, lat| {
                     let lon = centre.map_or(lon, |c| within_half_turn(lon, c));
                     centred(gt.world_to_pixel_f64(lon, lat))
@@ -249,8 +254,9 @@ impl SourceGrid {
     pub fn position(&self, lon: f64, lat: f64) -> (f64, f64) {
         let lon = match self.layout {
             Layout::Projected {
-                envelope: Some([w, _, e, _]),
-            } => within_half_turn(lon, (w + e) / 2.0),
+                centre: Some(centre),
+                ..
+            } => within_half_turn(lon, centre),
             _ => lon,
         };
         centred(self.transform.world_to_pixel_f64(lon, lat))
@@ -495,25 +501,6 @@ fn within_half_turn(lon: f64, centre: f64) -> f64 {
     } else {
         start + (lon - start).rem_euclid(360.0)
     }
-}
-
-/// The grid's WGS84 envelope, `[w, s, e, n]` with `w <= e` (`e` past 180°
-/// when it crosses the antimeridian), or `None` when no edge point
-/// inverse-projects.
-///
-/// The edges miss a pole the grid holds (a polar stereographic grid's
-/// edges stay south of it), so a grid whose forward transform puts a pole
-/// inside its cells reaches that pole, at every longitude
-/// ([`GeoTransform::bbox_with_poles`]).
-fn wgs84_envelope(transform: &GeoTransform) -> Option<[f64; 4]> {
-    let [w, s, mut e, n] = transform.bbox_with_poles();
-    if !(w.is_finite() && s.is_finite() && e.is_finite() && n.is_finite()) || s > n {
-        return None;
-    }
-    if w > e {
-        e += 360.0;
-    }
-    Some([w, s, e, n])
 }
 
 /// The envelope [`OutputCrs::footprint_pixel_window`] needs for `bbox`: on

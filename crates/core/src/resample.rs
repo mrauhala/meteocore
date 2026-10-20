@@ -835,6 +835,7 @@ mod tests {
                 k0: 0.9996,
                 false_e: 500_000.0,
                 false_n: 0.0,
+                figure: crate::geo::Ellipsoid::WGS84,
             },
         }
     }
@@ -860,6 +861,7 @@ mod tests {
                 k0: 0.9996,
                 false_e: 500_000.0,
                 false_n: 0.0,
+                figure: crate::geo::Ellipsoid::WGS84,
             },
         }
     }
@@ -895,6 +897,7 @@ mod tests {
                 k0: 1.0,
                 false_e: 0.0,
                 false_n: 0.0,
+                figure: crate::geo::Ellipsoid::WGS84,
             },
         }
     }

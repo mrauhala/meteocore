@@ -58,7 +58,8 @@ or downloaded whole.
 
 **Data it reads:** NetCDF-4 (HDF5) and classic CDF-1/2/5 files. A
 variable has `(y, x)` as its last two axes: 1-D latitude/longitude, or
-1-D projected x/y in metres with a CF `grid_mapping` (below); a projected
+1-D projected x/y in metres or kilometres with a CF `grid_mapping`
+(below); a projected
 grid is described in its own CRS, as WKT2, by the collection's
 `meteocore:nativeGrid` member (#1237). It needs a
 time axis; an ensemble axis is read at `member`; every other axis has
@@ -71,11 +72,16 @@ applied.
 parallels, on a sphere or WGS84), `geostationary` (x/y may also be a scan
 angle in radians or microradians), `polar_stereographic` (scaled by
 `standard_parallel` or `scale_factor_at_projection_origin`; given both,
-they must agree), `lambert_azimuthal_equal_area` and
-`transverse_mercator`. The mapping must state its earth figure. The last
-three take WGS84 only, or GRS80, which matches it to 0.1 mm. A grid that
-holds a pole, such as an Arctic polar stereographic grid, advertises an
-extent reaching the pole.
+they must agree), `stereographic` at any origin (scaled by
+`scale_factor_at_projection_origin`), `lambert_azimuthal_equal_area` and
+`transverse_mercator`. The mapping must state its earth figure; the last
+four are computed on it, a sphere or any ellipsoid, such as a polar NWP
+grid's sphere, NSIDC's Hughes 1980 or Airy 1830 (#1192). Projected x/y in
+kilometres are scaled to metres, and so are the false easting and
+northing, which CF states in the coordinates' units (#1194). A
+grid that holds a pole, such as an Arctic polar stereographic grid,
+advertises an extent reaching the pole, and one across the antimeridian
+an extent `west > east`.
 
 **Display units.** Each variable's CF `units`, in any spelling, picks the
 unit it is served in: K as °C, Pa as hPa, kg m-2 as mm, kg m-2 s-1 as mm/h,
@@ -197,11 +203,9 @@ Process-wide environment variables, shared by every NetCDF collection:
 - Every file must hold all the collection's variables on its grid; a
   file missing one is skipped. More than one ensemble member per
   collection is not supported.
-- Not supported grids: other mappings (such as the oblique
-  `stereographic` and `rotated_latitude_longitude`), polar stereographic,
-  azimuthal equal-area and transverse Mercator on a sphere or another
-  ellipsoid, projected x/y in kilometres, and 2-D (curvilinear)
-  latitude/longitude grids.
+- Not supported grids: other mappings (such as
+  `rotated_latitude_longitude`), a Lambert conic on an ellipsoid other
+  than WGS84, and 2-D (curvilinear) latitude/longitude grids.
 - Grid-relative wind components on a projected grid give speed only, and
   nothing on a geostationary or azimuthal equal-area grid, whose axes are
   not orthogonal on the ground. `valid_range` is not applied; non-standard
@@ -225,7 +229,9 @@ pressure-level files cropped to 11 × 10 points, two runs);
 values); `netcdf-pressure-pa/` (synthetic Pa pressure axis, earth-relative
 wind); `netcdf-remote/` (synthetic MEPS-like files, served by a local HTTP
 test server for the range-read tests); `netcdf-projections/` (synthetic
-polar stereographic, LAEA and transverse Mercator grids whose fields are
+polar stereographic, LAEA, transverse Mercator and oblique stereographic
+grids, the last on a sphere with x/y and its false origin in kilometres,
+whose fields are
 each cell's own projected x/y, which `tests/grid_mappings.rs` checks
 against PROJ's `cs2cs`). `tests/trajectory_cube.rs` checks every
 trajectory and cube value against a position query at the same point,

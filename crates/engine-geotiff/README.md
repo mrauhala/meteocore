@@ -57,7 +57,11 @@ tiles a request touches, so a remote COG is not downloaded whole.
   `cube`, `trajectory` or `corridor` query, no vertical axis and no model
   runs. An EDR `z` is ignored.
 - The native CRS is reported as `EPSG:3067`, `EPSG:3035` or `CRS:84` when
-  the grid matches one of those; other projections get no EPSG code.
+  the grid matches one of those, its parameters on WGS84 or GRS80 (#1192);
+  other projections, and those parameters on a sphere, get no EPSG code.
+- The spatial extent reaches a pole the grid holds, at every longitude,
+  and is `west > east` across the antimeridian; the map footprint guard
+  takes the same extent (#1194).
 - The native grid (#1237) is the first loaded file's: its cells in its own
   CRS, with the EPSG code its `ProjectedCSTypeGeoKey` states. When that code
   is the advertised `storageCrs`, the collection description adds
@@ -78,9 +82,10 @@ skipped with a warning in the log.
 - **Georeferencing:** ModelTiepoint + ModelPixelScale, or an axis-aligned
   ModelTransformation. Rotated or skewed rasters are rejected.
 - **CRS:** geographic (read as WGS84 lon/lat, as is a file without
-  GeoKeys), Transverse Mercator, Lambert Conformal Conic 2SP (on a sphere
-  when the GeoKeys describe one) and Lambert Azimuthal Equal Area.
-  EPSG:3067 and EPSG:3035 are also recognised by code alone.
+  GeoKeys), Transverse Mercator, Lambert Conformal Conic 2SP and Lambert
+  Azimuthal Equal Area, each on a sphere when the GeoKeys describe one,
+  else on WGS84. EPSG:3067 and EPSG:3035 are also recognised by code
+  alone.
 - **Samples:** UInt8, UInt16, Int16, Float32, Float64; other types fail
   when read. A multi-band file serves one band (`band`). Value = raw ×
   scale + offset; nodata is null.
@@ -185,8 +190,9 @@ cargo test -p engine-geotiff
 ```
 
 Fixtures: `testdata/radar/` (WGS84 radar COGs), `testdata/radar-tm35fin/`
-(an EPSG:3067 COG) and `tests/fixtures/lcc_sphere.tif` (a spherical LCC
-grid). Remote and STAC paths run against in-memory object stores and
+(an EPSG:3067 COG), `tests/fixtures/lcc_sphere.tif` (a spherical LCC
+grid) and `tests/fixtures/laea-polar/` (a polar LAEA grid around the North
+Pole on the EASE-Grid sphere). Remote and STAC paths run against in-memory object stores and
 in-process HTTP servers. The ignored tests (`-- --ignored`) call the public
 MET Norway STAC API or measure a COG named by an environment variable.
 Benchmarks run with `cargo bench -p engine-geotiff`; the

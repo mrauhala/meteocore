@@ -28,7 +28,7 @@ pressure axis as the collection's vertical axis (PR 8, the last of the
   `min_time`/`max_time` attributes are wrong in MEPS and never read.
   Non-standard calendars are refused, not approximated.
 - **Variables:** `(y, x)` last, on 1-D latitude/longitude or 1-D projected
-  x/y with a `grid_mapping` (`ds_core::cf::{classify_axis,
+  x/y in m or km with a `grid_mapping` (`ds_core::cf::{classify_axis,
   crs_from_grid_mapping, RegularAxis, grid}`); one time axis; an ensemble
   axis read at `member`; every other axis of size 1, whose coordinate value
   and units are the level identity (MEPS puts 10 m wind on `height6`,
@@ -406,7 +406,8 @@ Rule 10): `native_crs` `CRS:84` only for latitude/longitude axes, else
 `projected` (`geos` for geostationary), so the Common `storageCrs` and
 degree grid are omitted for MEPS; `spatial_extent` from
 `GeoTransform::bbox_with_poles`, so a polar grid's reaches the pole it
-holds and an EDR area there is not a 404 (#1167); `grid_size` `[nx, ny]`;
+holds, one across the antimeridian is `west > east`, and an EDR area
+there is not a 404 (#1167, #1194); `grid_size` `[nx, ny]`;
 `reference_times`
 ascending; `times` the union over runs; titles from `titles`, else
 `long_name`; units the served ones (`Layout::unit`, below). Style defaults
@@ -617,7 +618,9 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
 - `testdata/netcdf-projections/`: one synthetic file per CF mapping of
   #1167, each its own collection directory (`polar-stereographic/` with
   EPSG:3413's parameters around the North Pole, `laea/` with EPSG:3035's
-  on GRS80 and rows south-up, `transverse-mercator/` UTM 33N), one step,
+  on GRS80 and rows south-up, `transverse-mercator/` UTM 33N,
+  `stereographic-km/` the oblique CF `stereographic` on a 6371 km sphere
+  with x/y and its 600 km, −200 km false origin in km, #1194), one step,
   no run; the fields `easting`/`northing` are each cell centre's own
   projected x/y, so a read returns where the server puts a point
   (`make_cdl.py`). `tests/grid_mappings.rs` reads them through EDR

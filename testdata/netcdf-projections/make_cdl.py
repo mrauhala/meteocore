@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Write the synthetic CF grid-mapping fixtures' CDL, one per mapping (#1167).
+"""Write the synthetic CF grid-mapping fixtures' CDL, one per mapping (#1167, #1194).
 
 Usage: make_cdl.py <output dir>; then in each subdirectory
 `ncgen -k nc4 -o <name>.nc <name>.cdl`.
 
-Each file is a small regular grid on 1-D projected x/y in metres with a CF
-grid-mapping variable `crs`, one step and no forecast_reference_time. Its
-two fields hold each cell's own projected coordinates:
+Each file is a small regular grid on 1-D projected x/y in metres (or
+kilometres) with a CF grid-mapping variable `crs`, one step and no
+forecast_reference_time. Its two fields hold each cell's own projected
+coordinates, in metres:
 
   easting  = x of the cell centre (m)
   northing = y of the cell centre (m)
@@ -24,6 +25,10 @@ them at a longitude/latitude and compares them with PROJ's cs2cs.
 - transverse-mercator/: UTM zone 33N (central meridian 15°E, k0 0.9996,
   false easting 500 km, WGS84), 11 x 13 cells of 50 km over southern
   Scandinavia, rows stored north to south.
+- stereographic-km/: the oblique CF `stereographic` mapping (origin 60°N
+  25°E, k0 0.9999) on a 6371 km sphere, x/y in km and so its false origin,
+  600 km and -200 km (CF states it in the coordinates' units): 9 x 9 cells
+  of 100 km around Helsinki, rows stored north to south.
 """
 
 import sys
@@ -58,6 +63,20 @@ FIXTURES = {
         ]
         + GRS80,
     },
+    "stereographic-km": {
+        "units": "km",
+        "x": [200 + 100 * i for i in range(9)],
+        "y": [200 - 100 * j for j in range(9)],
+        "mapping": [
+            ("grid_mapping_name", '"stereographic"'),
+            ("latitude_of_projection_origin", "60."),
+            ("longitude_of_projection_origin", "25."),
+            ("scale_factor_at_projection_origin", "0.9999"),
+            ("false_easting", "600."),
+            ("false_northing", "-200."),
+            ("earth_radius", "6371000."),
+        ],
+    },
     "transverse-mercator": {
         "x": [250_000 + 50_000 * i for i in range(11)],
         "y": [7_000_000 - 50_000 * j for j in range(13)],
@@ -82,8 +101,10 @@ def rows(values, per_line):
 def cdl(name, fixture):
     xs, ys = fixture["x"], fixture["y"]
     nx, ny = len(xs), len(ys)
-    easting = [str(x) for _ in ys for x in xs]
-    northing = [str(y) for y in ys for _ in xs]
+    units = fixture.get("units", "m")
+    metres = {"m": 1, "km": 1000}[units]
+    easting = [str(x * metres) for _ in ys for x in xs]
+    northing = [str(y * metres) for y in ys for _ in xs]
     out = [
         f"netcdf {name.replace('-', '_')} {{",
         "dimensions:",
@@ -97,10 +118,10 @@ def cdl(name, fixture):
         '\t\ttime:calendar = "standard" ;',
         "\tdouble y(y) ;",
         '\t\ty:standard_name = "projection_y_coordinate" ;',
-        '\t\ty:units = "m" ;',
+        f'\t\ty:units = "{units}" ;',
         "\tdouble x(x) ;",
         '\t\tx:standard_name = "projection_x_coordinate" ;',
-        '\t\tx:units = "m" ;',
+        f'\t\tx:units = "{units}" ;',
         "\tint crs ;",
     ]
     out += [f"\t\tcrs:{key} = {value} ;" for key, value in fixture["mapping"]]

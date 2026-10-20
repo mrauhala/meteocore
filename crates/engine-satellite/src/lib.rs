@@ -922,36 +922,11 @@ fn shared_times(times: &[Arc<[DateTime<Utc>]>], bands: &[usize]) -> Arc<[DateTim
         .collect()
 }
 
-/// The CRS84 box covering every product's extent. Longitudes are measured
-/// from the first box's centre so disks crossing the antimeridian (GOES-West)
-/// union to a `west > east` box, not a −180…180 one.
-fn union_extent<'a>(mut extents: impl Iterator<Item = &'a [f64; 4]>) -> Option<[f64; 4]> {
-    let first = *extents.next()?;
-    let width = |[w, _, e, _]: [f64; 4]| if e >= w { e - w } else { e + 360.0 - w };
-    let reference = first[0] + width(first) / 2.0;
-    let relative = |lon: f64| ds_core::geo::wrap_lon(lon - reference);
-    let [mut w, mut s, mut e, mut n] = [
-        relative(first[0]),
-        first[1],
-        relative(first[0]) + width(first),
-        first[3],
-    ];
-    for extent in extents {
-        let west = relative(extent[0]);
-        w = w.min(west);
-        e = e.max(west + width(*extent));
-        s = s.min(extent[1]);
-        n = n.max(extent[3]);
-    }
-    if e - w >= 360.0 {
-        return Some([-180.0, s, 180.0, n]);
-    }
-    Some([
-        ds_core::geo::wrap_lon(reference + w),
-        s,
-        ds_core::geo::wrap_lon(reference + e),
-        n,
-    ])
+/// The CRS84 box covering every product's extent, seam-aware
+/// ([`ds_core::geo::crs84_union`]): disks crossing the antimeridian
+/// (GOES-West) union to a `west > east` box, not a −180…180 one.
+fn union_extent<'a>(extents: impl Iterator<Item = &'a [f64; 4]>) -> Option<[f64; 4]> {
+    ds_core::geo::crs84_union(extents.copied())
 }
 
 /// Reads full-resolution pixels of one scan through the block cache,
