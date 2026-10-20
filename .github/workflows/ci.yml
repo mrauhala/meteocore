@@ -71,6 +71,18 @@ jobs:
     - name: Geo/XML safety check (web-mercator + WMS XML invariants)
       run: bash scripts/check_geo_safety.sh
 
+    # Every /metrics family the server registers must be on a dashboard
+    # panel, and the dashboard must be a well-formed Grafana 13 v2 resource
+    # that matches Grafana's schema (vendored in scripts/grafana/).
+    # Standard-library Python on the runner's python3, a second or two. The
+    # script's own tests run first: a wrong verdict there would pass or fail
+    # every run silently.
+    - name: Grafana dashboard check tests
+      run: python3 -m unittest discover -s scripts/tests -v
+
+    - name: Grafana dashboard check (every /metrics family on a panel)
+      run: python3 scripts/check_grafana_dashboard.py
+
     - name: Clippy
       run: cargo clippy --all-targets -- -D warnings
 

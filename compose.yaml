@@ -109,7 +109,9 @@ services:
       - loki
 
   grafana:
-    image: dhi.io/grafana:12.3
+    # 13 or newer: the bundled dashboard is a dashboard.grafana.app/v2
+    # resource (tabs), which Grafana 12 cannot provision.
+    image: dhi.io/grafana:13.1
     container_name: meteocore-grafana
     environment:
       # Anonymous admin keeps local dev frictionless. Do NOT use this in

@@ -111,7 +111,7 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
 latest analysis — the first thing to check), `station_grid_analyses_total`,
 `station_grid_failures_total`, `station_grid_last_analysis_ms`, the
 `station_grid_cache_*` family and `station_grid_compute_*` admission; panels
-in the dashboard's "Station grids" row. Keep them in step.
+on the dashboard's Engines › Station grids tab. Keep them in step.
 
 ## Not in phase 1 (follow-up issue)
 
