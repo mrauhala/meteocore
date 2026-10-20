@@ -2,7 +2,7 @@
 
 Generic HTTP/HTTPS sources do not follow redirects, including same-origin
 redirects. Configure the final object/feed URL directly. A 3xx response is a
-storage error, not a missing object. GET, HEAD, range reads and batched reads
+storage error, not a missing object. GET, HEAD, range reads, batched reads and documents
 share this policy. Explicit `http://` sources are allowed; HTTPS sources remain
 HTTPS-only. Certificate validation and the process's proxy environment apply.
 
@@ -126,6 +126,56 @@ the published files, so an engine can open new files and drop what it holds
 for withdrawn ones. Call `poll` where `head` may be called: from the
 background poll runtime. engine-geotiff's local scan settles new files with
 the same `PendingFile` rule, by size alone.
+
+# THREDDS catalog discovery
+
+A THREDDS Data Server lists each directory in a `catalog.xml`: every file
+(`dataset`) with its `urlPath`, a `dataSize` in units (`71.56 Gbytes`) and
+a `date type="modified"`, every subdirectory as a `catalogRef`, and the
+services the files are served by. `discovery::thredds::parse` reads one with
+quick-xml events: entity references in text arrive as `GeneralRef` events
+of their own since quick-xml 0.38 and are kept, attribute values are
+unescaped, and a document whose root is not `catalog` (an HTML error page)
+is an error.
+
+`CatalogProber` is a `TemplateProber` whose checks the catalogs answer
+(`TemplateProber::poll_with`) instead of a HEAD each: the template still
+names the files, and the catalog of each key's directory says whether the
+file is there and in which version. Settling, publication and rechecks are
+the template prober's, over the catalog's size and date. A poll reads the
+catalogs on the way to the directories it checks: from the root
+`catalog_url` it follows only `catalogRef`s leading toward a directory of a
+slot in the window, never one to another origin or outside the root's
+directory, at most `MAX_CATALOGS_PER_POLL` (64) catalogs, four at a time
+and one storage-bridge call per level of the walk. A directory's catalog URL, once found, is kept
+while a slot in the window lies under it and read directly. A catalog that
+cannot be read fails its keys, which keep their state, and is walked to
+again from its parent. The catalog tree must mirror the file tree under the
+template's base, as THREDDS `datasetScan` serves it.
+
+A catalog's size has four significant digits, so it cannot be the identity
+a conditional range read checks. Each listed file is HEADed once for its
+exact `ObjectVersion`, and again when its catalog entry changes or
+`recheck(key)` is called; `files()` carries the HEADs' versions, and a
+poll's `added` and `withdrawn` are what joined and left it. The catalogs and
+the HEADs take the stores they are given: an engine passes its host's
+background share.
+
+THREDDS streams its catalogs chunked, without `Content-Length`
+(thredds.met.no answers `Transfer-Encoding: chunked`), and object_store's
+GET fails a response without one. Catalogs are therefore read with
+`DataStore::get_documents`: a GET marked as a document in its
+`GetOptions::extensions` passes through every layer of the store as any GET
+(the `storage` span naming the collection, the store's request share, the
+host's adaptive limit and request gauges, each held until the body is
+read) and is sent, at the bottom of every HTTP store this crate builds, by
+the store's own transport (`document.rs`): the host's throttled `reqwest`
+client, so its `Retry-After` holds the request and a 429 cuts the host's
+limit, with no redirect followed and nothing decompressed. The body is read
+whole with a size cap checked against a declared length first and then
+while it streams, never after; a 429, a 5xx or a failed connection is
+retried twice, within the request deadline or the fetch budget. Any other
+store answers a plain GET, capped the same way.
 
 # Range reads of files read in place
 

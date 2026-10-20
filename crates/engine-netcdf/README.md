@@ -22,9 +22,10 @@ or downloaded whole.
   matching `filename_template`, else every `*.nc`, skipping temporary
   upload names. An `http(s)://` `data_path` is probed by name: each poll
   HEADs the first lead (the sentinel) of every run in `time_window` not
-  seen yet, and the other leads once it appears. Each poll opens new and
-  changed files and keeps them open: the newest `max_runs` runs, at most
-  `max_files` files. Requests never open a file.
+  seen yet, and the other leads once it appears. With a `catalog_url`, the
+  server's THREDDS catalogs answer instead of the HEADs (below). Each poll
+  opens new and changed files and keeps them open: the newest `max_runs`
+  runs, at most `max_files` files. Requests never open a file.
 - **Time comes from the file, never its name:** valid times from the
   `time` axis, the model run from `forecast_reference_time`. Files without
   a run form one timeline without runs.
@@ -43,6 +44,18 @@ or downloaded whole.
   (ds-storage's host back-off).
   A retried request's log line names its collection, host and file
   (ds-storage's `storage` span).
+- **THREDDS catalogs** (`catalog_url`, #1170). The template fields still
+  name the files to pick; the `catalog.xml` of each run directory a poll
+  checks says which exist, with a size and a modification time. A poll
+  walks to the directory from `catalog_url` through the `catalogRef`s
+  leading to the runs in `time_window` only, at most 64 catalogs, and
+  reads it directly afterwards. A file settles on the catalog's size and
+  date as it would on a HEAD's, and a run is published as by probing. A
+  catalog rounds sizes (`167.8 Mbytes`), so each file listed is HEADed
+  once for its exact size, which the range reads check. Catalogs are
+  read whole although THREDDS streams them chunked, without
+  `Content-Length`, at most 16 MiB each. Catalogs and HEADs take the
+  host's request limit and back-off like every request.
 - **Run and time selection.** A pinned run is exactly that run (404 when
   absent). Otherwise a map draws from the newest run whose steps span the
   requested time, at the nearest step; without a time, the newest run's
@@ -178,12 +191,15 @@ URL-only fields on a local `data_path`, are a load error.
 | `min_age` | `PT10M` | URL only: a file is used once two polls see it unchanged, or at once when this old |
 | `run_grace` | `PT30M` | URL only: a run missing leads is served without them after this |
 | `prewarm_variables` | `[]` | URL only: variables whose newest-run fields each poll fetches ahead (bottom level) |
+| `catalog_url` | none | URL only: the THREDDS `catalog.xml` of `data_path`'s directory (`…/thredds/catalog/<dir>/catalog.xml` for `…/thredds/fileServer/<dir>/`). The catalogs say which files the template names exist, in place of a HEAD per file; the template fields stay required |
 
 Runnable examples: `collections.d/meps-netcdf-local.toml` (MEPS surface
 sample) and `collections.d/meps-netcdf-pl-local.toml` (pressure-level
 sample). `meps-netcdf-thredds.toml.disabled` and
 `meps-netcdf-pl-thredds.toml.disabled` in the same directory read these
-families from MET Norway's public thredds.met.no and state their traffic.
+families from MET Norway's public thredds.met.no and state their traffic;
+`meps-netcdf-thredds-catalog.toml.disabled` finds the surface family's
+files through the server's THREDDS catalogs instead.
 
 Process-wide environment variables, shared by every NetCDF collection:
 
@@ -212,6 +228,9 @@ Process-wide environment variables, shared by every NetCDF collection:
   calendars are refused.
 - A cold remote field slower than the render deadline fails that render
   with a 503; the fetch still completes into the cache for the next one.
+- `catalog_url` reads THREDDS catalogs whose tree mirrors the file server's
+  (THREDDS `datasetScan`), datasets by their `urlPath` attribute and the
+  catalog's `HTTPServer` service; `access` elements are not read.
 - Each kept file holds its parsed metadata in memory (about 820 KB for a
   221-variable MEPS surface file) and, if local, one file descriptor.
 
@@ -223,7 +242,9 @@ cargo test -p server --test netcdf_edr   # EDR responses vs. the schemas
 ```
 
 Fixtures under `testdata/`, each with a README and the script that built
-it: `meps-netcdf/` and `meps-netcdf-pl/` (real MEPS surface and
+it, or its source: `netcdf-thredds-catalog/` (MET Norway's THREDDS catalog
+of one MEPS day directory, as served, for the `catalog_url` tests);
+`meps-netcdf/` and `meps-netcdf-pl/` (real MEPS surface and
 pressure-level files cropped to 11 × 10 points, two runs);
 `netcdf-global/` (synthetic global grid without runs, packed and filled
 values); `netcdf-pressure-pa/` (synthetic Pa pressure axis, earth-relative

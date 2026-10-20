@@ -24,6 +24,13 @@ thiserror = "2"
 regex = "1"
 # The per-host request gauges (`gauge.rs`) implement `ObjectStore`.
 async-trait = "0.1"
+# THREDDS catalog discovery (`discovery::thredds`, #1170): catalog.xml read
+# as events, and catalog URLs' paths compared decoded.
+quick-xml = "0.42"
+percent-encoding = "2"
+# The request of a document GET (`document.rs`), sent through the host's
+# own transport.
+http = "1"
 
 [dev-dependencies]
 tempfile = "3"

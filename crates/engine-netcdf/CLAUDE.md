@@ -125,8 +125,26 @@ newest `max_runs` run slots, newest run first, lead order, are the listing
 (an older run's files would be opened only for the retention to close
 them: ~80 MB a MEPS run); a key is the `Known` map's path. A run is
 published whole (or after its grace), so the engine never sees a run
-half-uploaded. Every HEAD of a probe failing is an `Err` (the catalog stays,
-`/health` degrades after five polls).
+half-uploaded. Every request of a probe failing (`ProbeReport::unreachable`,
+HEADs and THREDDS catalogs) is an `Err` (the catalog stays, `/health`
+degrades after five polls).
+
+**Remote with `catalog_url`** (#1170): `Finder::Catalog`, ds-storage's
+`CatalogProber` (`discovery::thredds`): the same `TemplateSpec`, its checks
+answered by THREDDS catalogs through `TemplateProber::poll_with` instead of
+HEADs, so it lists exactly the files probing lists, settled and published by
+the same rules over the catalog's rounded size and `date type="modified"`.
+The walk from `catalog_url` follows only `catalogRef`s toward directories of
+slots in the window (never another origin or outside the root), ≤ 64
+catalogs per poll, and keeps each found directory's URL while a slot lies
+under it. Catalog sizes have four significant digits, so each listed file is
+HEADed once for its exact `ObjectVersion` (what range reads check), again
+when its catalog entry changes or `recheck` is called. Catalogs go through
+`remote::host(collection_id, catalog_url)`'s background share. THREDDS
+streams catalogs chunked without `Content-Length`; they are read with
+`DataStore::get_documents` (ds-storage `document.rs`: the store's own
+throttled transport under all its layers, the 16 MiB cap enforced while
+streaming).
 
 The poll (`poll_once`, on `poll_runtime()`, Critical Rule 6) remembers every
 listed file by path and identity (`catalog::Identity`, an `ObjectVersion`:
@@ -615,6 +633,14 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
   run, leads 00 and 01, LCC, south-up, 64 × 96, two variables chunked one
   field per chunk with shuffle + deflate 3 and noisy values, so a chunk is
   ~15 KB), written by `make_fixture.py` (needs `ncgen`).
+- `testdata/netcdf-thredds-catalog/`: MET Norway's `catalog.xml` of one MEPS
+  day directory (2026-10-19), as served (21 KB). ds-storage
+  `discovery::thredds::tests` pin the catalog route against the template
+  route on its `meps_det_2_5km` files; `tests/integration.rs`
+  `a_thredds_catalog_finds_what_probing_finds` serves it, chunked, as the
+  run's day from `src/test_server.rs` (its `thredds_catalog` writes the
+  other catalogs with `quick_xml::Writer`);
+  `remote::tests::a_file_replaced_under_a_catalog_is_headed_again`.
 - `testdata/netcdf-projections/`: one synthetic file per CF mapping of
   #1167, each its own collection directory (`polar-stereographic/` with
   EPSG:3413's parameters around the North Pole, `laea/` with EPSG:3035's
