@@ -165,6 +165,12 @@ def link(url):
     return set_defaults("links", [{"title": "x", "url": url}])
 
 
+def unset_interval(name):
+    def mutate(d):
+        d["spec"]["elements"][name]["spec"]["data"]["spec"]["queryOptions"].pop("interval", None)
+    return mutate
+
+
 def annotation_expr_drift(d):
     d["spec"]["annotations"][0]["spec"]["legacyOptions"]["expr"] = "up == 0"
 
@@ -195,6 +201,8 @@ MUTATIONS = [
      "metric 'http_requests_totl' is not a registered /metrics family"),
     ("unknown __name__ regex", set_expr('sum({job=~"$job", __name__=~".+_cahce_bytes"})'),
      '__name__=~".+_cahce_bytes" matches no registered family'),
+    ("percentile at the default window", unset_interval("panel-33"),
+     "every minute without observations is a hole in the graph"),
     ("rate over several metric names",
      set_expr('sum(rate({job=~"$job", __name__=~".+_cache_hits_total"}[5m]))'),
      "but a function or operator that drops the metric name receives them"),
