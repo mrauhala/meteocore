@@ -12,7 +12,10 @@ with bounded concurrent prefix LISTs (#816/#817), listing-free template
 probing (`TemplateProber`: `{run}`/`{lead}` keys, sentinel HEADs, settling,
 per-run publication) and the shared `PendingFile` settling rule (#1067);
 `DataStore` adds budgeted and `If-Unmodified-Since` range reads and
-per-host request limits for files read in place),
+per-host request limits for files read in place; every remote operation
+runs in a `storage{collection, store, path}` span, and an engine names its
+collection with `DataStore::for_collection(id)` where it builds the store,
+#1233),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
 `ds-executor` (shared Tokio render admission/deadline execution and the one
