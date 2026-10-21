@@ -22,7 +22,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use ds_cache::{ByteBoundedCache, CacheMetrics, MIB};
+use ds_cache::{ByteBoundedCache, CacheFillGuard, CacheMetrics, MIB};
 use ds_executor::budget::{ByteBudget, BytePermit};
 
 /// A grid's cache key.
@@ -34,8 +34,9 @@ pub(crate) struct GridKey {
     pub parameter: usize,
     /// Analysis time, Unix seconds.
     pub time: i64,
-    /// How many times the input of this (parameter, time) was revised
-    /// before the grid was asked for.
+    /// How many times the input of this (parameter, time) had been revised
+    /// when the grid's input was recorded ([`store`] re-keys a grid whose
+    /// computation found a revision).
     pub revision: u64,
 }
 
@@ -94,6 +95,28 @@ pub(crate) fn cache_capacity() -> u64 {
 /// Drop one engine instance's grids (it was shut down).
 pub(crate) fn evict_epoch(epoch: u64) {
     CACHE.retain(|key, _| key.epoch != epoch);
+}
+
+/// Publish a computed grid to whoever waits on `guard`, claimed under
+/// `claimed`, and keep it under `current`: the key of the input it was
+/// computed from, as recorded once it was computed. A computation that
+/// found its input revised moved the revision after `claimed` was taken, so
+/// the grid goes under the new revision, where the next request looks
+/// (#1206). `None` (a newer input was recorded meanwhile) leaves it where
+/// it was claimed.
+pub(crate) fn store(
+    guard: CacheFillGuard<'static, GridKey, Arc<AnalysisGrid>>,
+    claimed: GridKey,
+    current: Option<GridKey>,
+    grid: Arc<AnalysisGrid>,
+) {
+    let _ = guard.insert(Arc::clone(&grid));
+    if let Some(current) = current.filter(|key| *key != claimed) {
+        // Nobody asks for the claimed revision any more: move the entry
+        // rather than count its bytes twice.
+        CACHE.remove(&claimed);
+        CACHE.insert(current, grid);
+    }
 }
 
 /// Reserve a request's computation, or fail with `ResourceExhausted`.
