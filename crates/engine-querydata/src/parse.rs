@@ -845,7 +845,14 @@ fn read_stereographic_area(r: &mut TextReader) -> Result<GridArea, QueryDataErro
         })?;
 
     // True latitude
-    let _true_lat_line = r.read_line()?;
+    let true_lat_line = r.read_line()?;
+    let true_lat: f64 = true_lat_line
+        .trim()
+        .parse()
+        .map_err(|_| QueryDataError::Parse {
+            offset: r.pos,
+            message: format!("Invalid true latitude: '{true_lat_line}'"),
+        })?;
 
     // "radialRange 0 0"
     let _radial = r.read_line()?;
@@ -857,17 +864,33 @@ fn read_stereographic_area(r: &mut TextReader) -> Result<GridArea, QueryDataErro
     Ok(GridArea {
         bottom_left: bl,
         top_right: tr,
-        // The record carries no radius line: projected on WGS84, as before
-        // the figure was a parameter (#1192).
-        crs: Crs::Stereographic {
-            lat0: central_lat.to_radians(),
-            lon0: central_lon.to_radians(),
-            k0: 1.0,
-            false_e: 0.0,
-            false_n: 0.0,
-            figure: Ellipsoid::WGS84,
-        },
+        crs: newbase_stereographic(central_lon, central_lat, true_lat),
     })
+}
+
+/// newbase's earth radius, `kRearth` (`NFmiGlobals.h`, `const double
+/// kRearth = 6371220.;`): the sphere its stereographic areas are computed
+/// on (#1243).
+const NEWBASE_EARTH_RADIUS: f64 = 6_371_220.0;
+
+/// The stereographic projection newbase master computes an
+/// `NFmiStereographicArea` with (#1243): on the [`NEWBASE_EARTH_RADIUS`]
+/// sphere, its PROJ string `+proj=stere +lat_0={} +lat_ts={} +lon_0={}
+/// +R={}` with `kRearth`, and scaled by `itsTrueLatScaleFactor`, `(D +
+/// kRearth·sin φts) / (D + kRearth)` with `D = kRearth`: `(1 + sin φts) /
+/// 2`, the scale true at the true latitude. The record states no figure,
+/// but the world rect newbase stores in it is this projection's corners
+/// to a millimetre, and kilometres off them on WGS84, on which newbase's
+/// unmerged `WGS84` branch reads the record.
+fn newbase_stereographic(central_lon: f64, central_lat: f64, true_lat: f64) -> Crs {
+    Crs::Stereographic {
+        lat0: central_lat.to_radians(),
+        lon0: central_lon.to_radians(),
+        k0: (1.0 + true_lat.to_radians().sin()) / 2.0,
+        false_e: 0.0,
+        false_n: 0.0,
+        figure: Ellipsoid::sphere(NEWBASE_EARTH_RADIUS),
+    }
 }
 
 /// Read NFmiLambertConformalConicArea (classId=84, extends NFmiArea directly).
@@ -906,14 +929,19 @@ fn read_lcc_area(r: &mut TextReader) -> Result<GridArea, QueryDataError> {
     let true_lat1 = true_lats.0;
     let true_lat2 = true_lats.1;
 
-    // Earth radius, e.g. 6371220: the grid is defined on this sphere. An
-    // unreadable value falls back to WGS84 rather than failing the file.
-    let radius = r
-        .read_line()?
+    // Earth radius, e.g. 6371220: newbase master computes the cone on this
+    // sphere (`+proj=lcc … +R={}` with `itsRadius`), so a record without a
+    // usable one is an error, never a WGS84 guess (#1243).
+    let radius_line = r.read_line()?;
+    let radius = radius_line
         .trim()
         .parse::<f64>()
         .ok()
-        .filter(|r| r.is_finite() && *r > 0.0);
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .ok_or_else(|| QueryDataError::Parse {
+            offset: r.pos,
+            message: format!("Invalid earth radius: '{radius_line}'"),
+        })?;
 
     // World rect (4 doubles as 2 points, precision 15)
     let _wr_p1 = r.read_line()?;
@@ -934,7 +962,7 @@ fn read_lcc_area(r: &mut TextReader) -> Result<GridArea, QueryDataError> {
             lon0: central_lon.to_radians(),
             false_e: 0.0,
             false_n: 0.0,
-            radius,
+            radius: Some(radius),
         },
     })
 }
@@ -1299,20 +1327,133 @@ mod tests {
         );
     }
 
-    /// A stereographic area, newbase's polar aspect, on WGS84 as the
-    /// record gives no radius.
+    /// A stereographic area, newbase's polar aspect true at 60°N, on its
+    /// sphere.
     fn polar_area(lon0: f64, bottom_left: (f64, f64), top_right: (f64, f64)) -> GridArea {
         GridArea {
             bottom_left,
             top_right,
-            crs: Crs::Stereographic {
-                lat0: 90.0_f64.to_radians(),
-                lon0: lon0.to_radians(),
-                k0: 1.0,
+            crs: newbase_stereographic(lon0, 90.0, 60.0),
+        }
+    }
+
+    /// Two stereographic records as newbase master writes them, from
+    /// qdtools' test data (`input/qdtogrib/smartmet.fqd` and
+    /// `output/qdfilter_sum_griddata_a`): XY rect, corners, central
+    /// longitude and latitude, true latitude, radial range, and the world
+    /// rect, its projected corner and size in metres to 15 digits.
+    const NEWBASE_STEREOGRAPHIC_RECORDS: [&str; 2] = [
+        "13 kNFmiStereographicArea\n0 0\n1 1\n5.4211 52.6997\n45.3471 70.8257\n20\n90\n60\n0 0 0\n\
+         -1010031.25495442 -3883432.02090379\n1869703.85148815 2068643.30449177\n",
+        "13 kNFmiStereographicArea\n0 0\n1 1\n19 58\n40 71\n25\n90\n60\n0 0 0\n\
+         -356345.400197232 -3390400.00861632\n871269.145981957 1468678.42758681\n",
+    ];
+
+    /// The world rect a record stores: its south-west corner and size, m.
+    fn stored_world_rect(record: &str) -> [f64; 4] {
+        let lines: Vec<&str> = record.lines().collect();
+        let point = |line: &str| -> Vec<f64> {
+            line.split_whitespace()
+                .map(|v| v.parse().unwrap())
+                .collect()
+        };
+        let (place, size) = (point(lines[9]), point(lines[10]));
+        [place[0], place[1], size[0], size[1]]
+    }
+
+    /// The world rect `crs` gives the area's corners, as newbase computes
+    /// it: the south-west corner and the size, m.
+    fn world_rect(crs: &Crs, area: &GridArea) -> [f64; 4] {
+        let (x0, y0) = crs.forward(area.bottom_left.0, area.bottom_left.1);
+        let (x1, y1) = crs.forward(area.top_right.0, area.top_right.1);
+        [x0, y0, x1 - x0, y1 - y0]
+    }
+
+    /// A stereographic area projects on newbase master's 6 371 220 m
+    /// sphere, scaled true at its true latitude (#1243). The world rects
+    /// newbase wrote into qdtools' test files are this projection's
+    /// corners to a millimetre; on WGS84 they miss by kilometres. Pinned
+    /// against `cs2cs +proj=longlat +R=6371220 +to +proj=stere +lat_0=90
+    /// +lat_ts=60 +lon_0=20 +R=6371220`, forward `-f %.4f`, inverse `-I -f
+    /// %.9f` (PROJ 9.8.1).
+    #[test]
+    fn stereographic_areas_are_on_newbase_sphere() {
+        let areas: Vec<GridArea> = NEWBASE_STEREOGRAPHIC_RECORDS
+            .iter()
+            .map(|record| read_grid_area(&mut TextReader::new(record.as_bytes(), 0)).unwrap())
+            .collect();
+        let crs = &areas[0].crs;
+        match *crs {
+            Crs::Stereographic { k0, figure, .. } => {
+                assert_eq!(figure, Ellipsoid::sphere(6_371_220.0));
+                assert_eq!(k0, (1.0 + 60.0_f64.to_radians().sin()) / 2.0);
+            }
+            ref other => panic!("expected Stereographic, got {other:?}"),
+        }
+        for ((lon, lat), (x, y)) in [
+            ((20.0, 60.0), (0.0, -3_185_610.0)),
+            ((30.0, 65.0), (457_683.884_8, -2_595_654.294_8)),
+        ] {
+            let (fx, fy) = crs.forward(lon, lat);
+            assert!((fx - x).abs() < 1e-3 && (fy - y).abs() < 1e-3, "{fx},{fy}");
+        }
+        for ((x, y), (lon, lat)) in [
+            ((0.0, -3_000_000.0), (20.0, 61.675_594_113)),
+            ((500_000.0, -2_500_000.0), (31.309_932_474, 65.793_002_496)),
+        ] {
+            let (ilon, ilat) = crs.inverse(x, y).unwrap();
+            assert!(
+                (ilon - lon).abs() < 1e-9 && (ilat - lat).abs() < 1e-9,
+                "{ilon},{ilat}"
+            );
+        }
+        for (record, area) in NEWBASE_STEREOGRAPHIC_RECORDS.iter().zip(&areas) {
+            let stored = stored_world_rect(record);
+            let on = |crs: &Crs| {
+                let rect = world_rect(crs, area);
+                (0..4)
+                    .map(|i| (rect[i] - stored[i]).abs())
+                    .fold(0.0, f64::max)
+            };
+            assert!(on(&area.crs) < 1e-3, "{record}: {} m", on(&area.crs));
+            let Crs::Stereographic { lat0, lon0, .. } = area.crs else {
+                unreachable!()
+            };
+            let on_wgs84 = Crs::Stereographic {
+                lat0,
+                lon0,
+                k0: ds_core::geo::polar_stereographic_k0(60.0_f64.to_radians(), &Ellipsoid::WGS84),
                 false_e: 0.0,
                 false_n: 0.0,
                 figure: Ellipsoid::WGS84,
-            },
+            };
+            assert!(on(&on_wgs84) > 1000.0, "{record}: {} m", on(&on_wgs84));
+        }
+    }
+
+    /// An LCC record's radius is the sphere newbase master computes the
+    /// cone on; one without a usable radius is an error, never WGS84
+    /// (#1243). MEPS's record, as `parse_meps_lcc` reads it from the file.
+    #[test]
+    fn lcc_area_needs_its_radius() {
+        let record = |radius: &str| {
+            format!(
+                "84 kNFmiLambertConformalConicArea\n0 0\n1 1\n9.04369 64.9579\n19.134 60.0194\n\n\
+                 15 63.3\n63.3 63.3\n{radius}\n-280072.240243339 -357576.50374628\n\
+                 509991.857955311 554975.392815288\n\n"
+            )
+        };
+        let read =
+            |radius: &str| read_grid_area(&mut TextReader::new(record(radius).as_bytes(), 0));
+        match read("6.37122e+06").unwrap().crs {
+            Crs::LambertConformalConic { radius, .. } => assert_eq!(radius, Some(6_371_220.0)),
+            other => panic!("expected LCC, got {other:?}"),
+        }
+        for bad in ["", "abc", "0", "-6371220"] {
+            assert!(
+                matches!(read(bad), Err(QueryDataError::Parse { .. })),
+                "radius '{bad}'"
+            );
         }
     }
 

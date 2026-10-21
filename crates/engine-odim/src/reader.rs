@@ -591,9 +591,9 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     //
     //   - Our `Crs::Stereographic` and the producer's projection
     //     may not numerically agree at the edges of the grid even
-    //     when both implement the same EPSG formulation (different
-    //     ellipsoid choices — DMI uses WGS84, SMHI uses Bessel —
-    //     plus implementation details). The envelope of all four
+    //     when both implement the same EPSG formulation on the same
+    //     figure (corner attributes rounded to a few decimals, plus
+    //     implementation details). The envelope of all four
     //     forward-projected corners thus picks up those errors and
     //     ends up off-axis or off-size; under that bbox most output
     //     samples miss the actual data.

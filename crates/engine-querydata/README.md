@@ -28,8 +28,9 @@ Each file is one model run, and the newest run is the default.
   changes. An empty or unreadable directory, or one holding only unloadable
   files, keeps the current runs.
 - **Grids.** Lat/lon, rotated lat/lon, stereographic and Lambert conformal
-  conic (LCC) areas. An LCC grid is placed on the sphere whose radius the
-  file states. The grid transform and WGS84 extents are computed once per
+  conic (LCC) areas, on the figures newbase computes them on: an LCC grid
+  on the sphere whose radius the file states, a stereographic one on
+  newbase's 6 371 220 m sphere, true at its true latitude. The grid transform and WGS84 extents are computed once per
   file (an extent reaches a pole the grid holds and is `west > east`
   across the antimeridian, #1194), and so is the native grid (#1237): the cells around the corner
   points, in the area's own CRS, which the collection's

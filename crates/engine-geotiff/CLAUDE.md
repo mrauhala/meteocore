@@ -10,12 +10,18 @@ apply here.
 - **Must be tiled COG.** Strip-based TIFFs are rejected. One parameter
   (band) per collection.
 - **CRS:** WGS84, TM, LAEA, LCC, Stereographic (math in
-  `ds-core/src/geo.rs`). Earth model: an LCC whose geodetic GeoKeys
-  describe a sphere (semi-minor = semi-major, inverse flattening 0, or an
-  EPSG sphere ellipsoid) is projected on that sphere (LCC `radius`, #810;
-  TM/LAEA `figure`, #1192); everything else on WGS84, EPSG:3067/3035 by
-  code too. `crs_label` claims those codes only on a WGS84-like figure
-  (`Ellipsoid::is_wgs84_like`). Extent and footprint guard:
+  `ds-core/src/geo.rs`). Earth model: `reader::stated_figure` (#1243),
+  libgeotiff's order: semi-major axis (2057) with semi-minor (2058) or
+  inverse flattening (2059, 0 = sphere), which GDAL writes for every
+  figure, else the `GeogEllipsoidGeoKey` (2056) EPSG code via
+  `EPSG_ELLIPSOIDS` (every metre-based EPSG ellipsoid in proj.db). TM/LAEA
+  take it as `figure`; LCC only a sphere (`radius`, #810) or WGS84/GRS80,
+  any other ellipsoid is a load error, as in `ds_core::cf`. No stated
+  figure ⇒ WGS84, EPSG:3067/3035 by code too. An unknown 2056 code or
+  invalid axes is a load error, never a WGS84 guess. `crs_label` claims
+  those codes only on a WGS84-like figure (`Ellipsoid::is_wgs84_like`).
+  Fixtures: `tm_airy.tif` (GDAL axis keys), `laea_bessel_code.tif` (code
+  only, crafted with `listgeo` + `geotifcp -g`). Extent and footprint guard:
   `bbox_with_poles` / `footprint_envelope`, never `bbox()`; a full-turn
   footprint bounds latitude only (`every_longitude_near`). LCC 2SP
   takes its origin from the false-origin GeoKeys (3084-3087), the

@@ -12,7 +12,7 @@ use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
 
 use crate::decode_budget::{Permit, BUDGET};
-use ds_core::geo::{Crs, Ellipsoid, GeoTransform};
+use ds_core::geo::{Crs, Ellipsoid, GeoTransform, WGS84_A};
 
 /// Bridge async to sync for standalone functions.
 /// Uses `block_in_place` when inside a tokio runtime, or creates a temporary runtime otherwise.
@@ -3126,7 +3126,7 @@ fn parse_projected(
                 k0,
                 false_e,
                 false_n,
-                figure: figure(&keys),
+                figure: stated_figure(&keys)?.unwrap_or(Ellipsoid::WGS84),
             })
         }
         // CT_LambertConfConic_2SP = 8
@@ -3160,7 +3160,7 @@ fn parse_projected(
                 lon0,
                 false_e,
                 false_n,
-                radius: sphere_radius(&keys),
+                radius: lcc_radius(stated_figure(&keys)?)?,
             })
         }
         // CT_LambertAzimEqualArea = 10
@@ -3187,7 +3187,7 @@ fn parse_projected(
                 lon0,
                 false_e,
                 false_n,
-                figure: figure(&keys),
+                figure: stated_figure(&keys)?.unwrap_or(Ellipsoid::WGS84),
             })
         }
         _ => Err(DataServerError::Engine(format!(
@@ -3200,37 +3200,157 @@ fn parse_projected(
     }
 }
 
-/// The earth figure a Transverse Mercator or azimuthal equal-area grid is
-/// computed on (#1192): the sphere the geodetic GeoKeys describe
-/// ([`sphere_radius`]), as a conic's is (#810), else WGS84 as before.
-fn figure(keys: &std::collections::HashMap<u16, GeoKeyValue>) -> Ellipsoid {
-    sphere_radius(keys).map_or(Ellipsoid::WGS84, Ellipsoid::sphere)
-}
-
-/// The radius of the earth model the geodetic GeoKeys describe, when it is
-/// a sphere (#810): semi-minor equal to semi-major (2058 = 2057), an
-/// inverse flattening of 0 (2059), or an EPSG sphere ellipsoid code
-/// (2056). `None` is an ellipsoid, projected on WGS84 as before.
-fn sphere_radius(keys: &std::collections::HashMap<u16, GeoKeyValue>) -> Option<f64> {
-    if let Some(a) = get_double_key(keys, 2057).filter(|a| a.is_finite() && *a > 0.0) {
-        if let Some(b) = get_double_key(keys, 2058) {
-            return ((b - a).abs() <= 1e-6 * a).then_some(a);
-        }
-        if let Some(inv_f) = get_double_key(keys, 2059) {
-            return (inv_f == 0.0).then_some(a);
-        }
+/// The earth figure the geodetic GeoKeys state (#810, #1192, #1243), as
+/// libgeotiff reads them: `GeogSemiMajorAxisGeoKey` (2057) with
+/// `GeogSemiMinorAxisGeoKey` (2058) or `GeogInvFlatteningGeoKey` (2059,
+/// 0 a sphere), which GDAL writes for every figure, else the EPSG
+/// ellipsoid `GeogEllipsoidGeoKey` (2056) names ([`EPSG_ELLIPSOIDS`]).
+/// A semi-minor axis within a millionth of the semi-major one is a
+/// sphere.
+///
+/// `None` when they state no figure: the grid is projected on WGS84, as
+/// before. An ellipsoid code this table does not hold, and axes that are
+/// not a sphere or an oblate ellipsoid, are errors, never a WGS84 guess.
+fn stated_figure(
+    keys: &std::collections::HashMap<u16, GeoKeyValue>,
+) -> Result<Option<Ellipsoid>, DataServerError> {
+    let unsupported = |what: String| {
+        DataServerError::Engine(format!(
+            "{what} is not a supported earth figure. Convert with: gdalwarp -t_srs \
+             EPSG:4326 -of COG input.tif output.tif"
+        ))
+    };
+    let a = get_double_key(keys, 2057);
+    let (b, rf) = (get_double_key(keys, 2058), get_double_key(keys, 2059));
+    if let (Some(a), true) = (a, b.is_some() || rf.is_some()) {
+        let figure = match (b, rf) {
+            (Some(b), _) if (b - a).abs() <= 1e-6 * a => Some(Ellipsoid::sphere(a)),
+            (Some(b), _) => (b > 0.0 && b < a).then(|| Ellipsoid::from_axes(a, b)),
+            (None, Some(0.0)) => Some(Ellipsoid::sphere(a)),
+            (None, rf) => rf
+                .filter(|rf| rf.is_finite() && *rf > 1.0)
+                .map(|rf| Ellipsoid::from_inverse_flattening(a, rf)),
+        };
+        return figure
+            .filter(|_| a.is_finite() && a > 0.0)
+            .map(Some)
+            .ok_or_else(|| {
+                unsupported(format!(
+                    "The GeoKeys' ellipsoid (semi-major axis {a}, semi-minor axis {b:?}, \
+                     inverse flattening {rf:?})"
+                ))
+            });
     }
+    // A semi-major axis alone gives no shape: the ellipsoid code, if any.
     match keys.get(&2056) {
-        // EPSG ellipsoids 7035 "Sphere", 7047 and 7048 "GRS 1980 Authalic
-        // Sphere" (radii from `projinfo -k ellipsoid`).
-        Some(GeoKeyValue::Short(7035)) => Some(6_371_000.0),
-        Some(GeoKeyValue::Short(7047)) => Some(6_370_997.0),
-        Some(GeoKeyValue::Short(7048)) => Some(6_371_007.0),
-        _ => None,
+        // Absent, or user-defined (32767) with no complete axes: no figure.
+        None | Some(GeoKeyValue::Short(0 | 32767)) => Ok(None),
+        Some(GeoKeyValue::Short(code)) => EPSG_ELLIPSOIDS
+            .iter()
+            .find(|(c, ..)| c == code)
+            .map(|&(_, a, shape)| Some(shape.figure(a)))
+            .ok_or_else(|| unsupported(format!("EPSG ellipsoid {code} (GeogEllipsoidGeoKey)"))),
+        Some(other) => Err(unsupported(format!("GeogEllipsoidGeoKey {other:?}"))),
     }
 }
 
-#[derive(Debug)]
+/// The `radius` of [`Crs::LambertConformalConic`] on a stated figure: a
+/// sphere's radius, `None` (WGS84) on WGS 84, GRS 1980 or no stated
+/// figure. The conic computes on no other ellipsoid, so another one is an
+/// error, as in `ds_core::cf`.
+fn lcc_radius(figure: Option<Ellipsoid>) -> Result<Option<f64>, DataServerError> {
+    match figure {
+        None => Ok(None),
+        Some(f) if f.is_sphere() => Ok(Some(f.semi_major())),
+        Some(f) if f.is_wgs84_like() => Ok(None),
+        Some(f) => Err(DataServerError::Engine(format!(
+            "Lambert Conformal Conic on the ellipsoid a={}, 1/f={} is not supported, \
+             only a sphere or WGS84. Convert with: gdalwarp -t_srs EPSG:4326 -of COG \
+             input.tif output.tif",
+            f.semi_major(),
+            1.0 / f.flattening()
+        ))),
+    }
+}
+
+/// How the EPSG dataset states an ellipsoid's shape after its semi-major
+/// axis: the inverse flattening, or the semi-minor axis in metres.
+#[derive(Clone, Copy)]
+enum Shape {
+    Rf(f64),
+    B(f64),
+}
+
+impl Shape {
+    fn figure(self, a: f64) -> Ellipsoid {
+        match self {
+            Shape::Rf(rf) => Ellipsoid::from_inverse_flattening(a, rf),
+            Shape::B(b) => Ellipsoid::from_axes(a, b),
+        }
+    }
+}
+
+/// The EPSG ellipsoids `GeogEllipsoidGeoKey` names, every one the EPSG
+/// dataset states in metres, from PROJ 9.8.1's `proj.db` (`select code,
+/// semi_major_axis, inv_flattening, semi_minor_axis from ellipsoid where
+/// auth_name = 'EPSG' and uom_code = '9001'`). `WGS84_A` is its 6378137.0.
+#[rustfmt::skip]
+const EPSG_ELLIPSOIDS: [(u16, f64, Shape); 49] = {
+    use Shape::{Rf, B};
+    [
+        (1024, WGS84_A, Rf(298.257222101)),    // CGCS2000
+        (1025, 6378136.5, Rf(298.2564151)),    // GSK-2011
+        (1026, 6376045.0, Rf(310.0)),          // Zach 1812
+        (7001, 6377563.396, Rf(299.3249646)),  // Airy 1830
+        (7002, 6377340.189, Rf(299.3249646)),  // Airy Modified 1849
+        (7003, 6378160.0, Rf(298.25)),         // Australian National Spheroid
+        (7004, 6377397.155, Rf(299.1528128)),  // Bessel 1841
+        (7005, 6377492.018, Rf(299.1528128)),  // Bessel Modified
+        (7006, 6377483.865, Rf(299.1528128)),  // Bessel Namibia (deprecated)
+        (7008, 6378206.4, B(6356583.8)),       // Clarke 1866
+        (7010, 6378300.789, B(6356566.435)),   // Clarke 1880 (Benoit)
+        (7011, 6378249.2, B(6356515.0)),       // Clarke 1880 (IGN)
+        (7012, 6378249.145, Rf(293.465)),      // Clarke 1880 (RGS)
+        (7013, 6378249.145, Rf(293.4663077)),  // Clarke 1880 (Arc)
+        (7014, 6378249.2, Rf(293.46598)),      // Clarke 1880 (SGA 1922)
+        (7015, 6377276.345, Rf(300.8017)),     // Everest 1830 (1937 Adjustment)
+        (7016, 6377298.556, Rf(300.8017)),     // Everest 1830 (1967 Definition)
+        (7018, 6377304.063, Rf(300.8017)),     // Everest 1830 Modified
+        (7019, WGS84_A, Rf(298.257222101)),    // GRS 1980
+        (7020, 6378200.0, Rf(298.3)),          // Helmert 1906
+        (7021, 6378160.0, Rf(298.247)),        // Indonesian National Spheroid
+        (7022, 6378388.0, Rf(297.0)),          // International 1924
+        (7024, 6378245.0, Rf(298.3)),          // Krassowsky 1940
+        (7025, 6378145.0, Rf(298.25)),         // NWL 9D
+        (7027, 6376523.0, Rf(308.64)),         // Plessis 1817
+        (7028, 6378298.3, Rf(294.73)),         // Struve 1860
+        (7029, 6378300.0, Rf(296.0)),          // War Office
+        (7030, WGS84_A, Rf(298.257223563)),    // WGS 84
+        (7031, WGS84_A, Rf(298.257223563)),    // GEM 10C
+        (7032, 6378136.2, Rf(298.257223563)),  // OSU86F
+        (7033, 6378136.3, Rf(298.257223563)),  // OSU91A
+        (7035, 6371000.0, B(6371000.0)),       // Sphere (deprecated)
+        (7036, 6378160.0, Rf(298.247167427)),  // GRS 1967
+        (7041, 6378135.0, Rf(298.257)),        // Average Terrestrial System 1977
+        (7043, 6378135.0, Rf(298.26)),         // WGS 72
+        (7044, 6377301.243, Rf(300.8017255)),  // Everest 1830 (1962 Definition)
+        (7045, 6377299.151, Rf(300.8017255)),  // Everest 1830 (1975 Definition)
+        (7047, 6370997.0, B(6370997.0)),       // GRS 1980 Authalic Sphere (deprecated)
+        (7048, 6371007.0, B(6371007.0)),       // GRS 1980 Authalic Sphere
+        (7049, 6378140.0, Rf(298.257)),        // IAG 1975
+        (7050, 6378160.0, Rf(298.25)),         // GRS 1967 Modified
+        (7051, 6377019.27, Rf(300.0)),         // Danish 1876
+        (7052, 6370997.0, B(6370997.0)),       // Clarke 1866 Authalic Sphere
+        (7053, 6378270.0, Rf(297.0)),          // Hough 1960
+        (7054, 6378136.0, Rf(298.257839303)),  // PZ-90
+        (7056, 6377295.664, Rf(300.8017)),     // Everest 1830 (RSO 1969)
+        (7057, 6371228.0, B(6371228.0)),       // International 1924 Authalic Sphere
+        (7058, 6378273.0, B(6356889.449)),     // Hughes 1980
+        (7059, WGS84_A, B(WGS84_A)),           // Popular Visualisation Sphere (deprecated)
+    ]
+};
+
+#[derive(Debug, Clone)]
 enum GeoKeyValue {
     Short(u16),
     Double(f64),
@@ -5247,5 +5367,224 @@ mod tests {
         assert_eq!((w, e, n), (-180.0, 180.0, 90.0));
         assert!((s - 77.255872426).abs() < 1e-8, "south {s}");
         assert!(gt.bbox()[3] < 81.0, "the edges stop short of the pole");
+    }
+
+    /// A user-defined Transverse Mercator on Airy 1830, as GDAL writes it
+    /// (`GeogSemiMajorAxisGeoKey` and `GeogInvFlatteningGeoKey`, the
+    /// ellipsoid code user-defined), is projected on Airy, not WGS84
+    /// (#1243). Made with `gdal_create -outsize 4 4 -ot Byte -burn 7
+    /// -a_nodata 255 -co TILED=YES -co BLOCKXSIZE=16 -co BLOCKYSIZE=16
+    /// -a_srs '+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000
+    /// +y_0=-100000 +ellps=airy' -a_ullr 300000 500000 500000 300000`.
+    /// Pixel centres and points pinned against `cs2cs +proj=longlat
+    /// +ellps=airy +to <the same PROJ string>` (`-f %.4f`, inverse `-I -f
+    /// %.9f`, PROJ 9.8.1); WGS84 would put the pixels 51 m and 38 m away.
+    /// The British National Grid's parameters without its datum: no EPSG
+    /// code, and `crs_label` claims none.
+    #[test]
+    fn airy_tm_geotiff_uses_its_ellipsoid() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tm_airy.tif");
+        let meta = TiffMetadata::from_source(&DataSource::from_path(&path)).unwrap();
+        let gt = &meta.geo_transform;
+        match gt.crs {
+            Crs::TransverseMercator { figure, .. } => assert_eq!(
+                figure,
+                Ellipsoid::from_inverse_flattening(6_377_563.396, 299.324_964_6)
+            ),
+            ref other => panic!("expected TM, got {other:?}"),
+        }
+        assert_eq!(crate::crs_label(&gt.crs), "TM");
+        assert_figure_matches_proj(
+            &gt.crs,
+            &[
+                ((-1.0, 52.0), (468_643.108_1, 234_025.789_9)),
+                ((-3.0, 53.5), (333_674.865_9, 400_859.976_5)),
+            ],
+        );
+        for ((col, row), (lon, lat)) in [
+            ((0, 0), (-3.148_859_187, 54.165_144_360)),
+            ((3, 3), (-0.887_012_103, 52.816_985_713)),
+        ] {
+            let (x, y) = gt.pixel_to_world(col, row);
+            assert!((x - lon).abs() < 1e-9 && (y - lat).abs() < 1e-9, "{x},{y}");
+        }
+    }
+
+    /// A Lambert azimuthal equal-area whose GeoKeys name Bessel 1841 by its
+    /// EPSG code alone (`GeogEllipsoidGeoKey` 7004, no axes) is projected
+    /// on Bessel (#1243). Made from `gdal_create … -a_srs '+proj=laea
+    /// +lat_0=60 +lon_0=20 +ellps=bessel' -a_ullr -100000 100000 100000
+    /// -100000` (4 × 4, 16 × 16 tiles) by `listgeo`, dropping the axis keys
+    /// and setting the code, and `geotifcp -g keys.txt -t -w 16 -l 16`;
+    /// `gdalinfo` reads it as `+ellps=bessel`. Pinned against `cs2cs
+    /// +proj=longlat +ellps=bessel +to +proj=laea +lat_0=60 +lon_0=20
+    /// +ellps=bessel` (`-f %.4f`, inverse `-I -f %.9f`, PROJ 9.8.1); WGS84
+    /// would put the pixels 13 m away.
+    #[test]
+    fn ellipsoid_code_geotiff_uses_its_ellipsoid() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/laea_bessel_code.tif");
+        let meta = TiffMetadata::from_source(&DataSource::from_path(&path)).unwrap();
+        let gt = &meta.geo_transform;
+        match gt.crs {
+            Crs::LambertAzimuthalEqualArea { figure, .. } => assert_eq!(
+                figure,
+                Ellipsoid::from_inverse_flattening(6_377_397.155, 299.152_812_8)
+            ),
+            ref other => panic!("expected LAEA, got {other:?}"),
+        }
+        assert_figure_matches_proj(
+            &gt.crs,
+            &[
+                ((21.0, 60.5), (54_947.784, 56_116.349_6)),
+                ((19.0, 59.0), (-57_467.074_8, -110_957.598_8)),
+            ],
+        );
+        for ((col, row), (lon, lat)) in [
+            ((0, 0), (18.628_001_097, 60.666_247_671)),
+            ((3, 3), (21.317_399_692, 59.320_028_937)),
+        ] {
+            let (x, y) = gt.pixel_to_world(col, row);
+            assert!((x - lon).abs() < 1e-9 && (y - lat).abs() < 1e-9, "{x},{y}");
+        }
+    }
+
+    /// A lon/lat and the x/y PROJ projects it to.
+    type ProjPin = ((f64, f64), (f64, f64));
+
+    /// `crs.forward` of each lon/lat lies within 1 mm of PROJ's x/y.
+    #[track_caller]
+    fn assert_figure_matches_proj(crs: &Crs, forward: &[ProjPin]) {
+        for &((lon, lat), (x, y)) in forward {
+            let (fx, fy) = crs.forward(lon, lat);
+            assert!(
+                (fx - x).abs() < 1e-3 && (fy - y).abs() < 1e-3,
+                "forward {lon},{lat} = {fx},{fy}, PROJ {x},{y}"
+            );
+        }
+    }
+
+    /// GeoKeys of a user-defined Transverse Mercator, `+lon_0=16 +k=0.9996
+    /// +x_0=500000`, with `geodetic` as its earth-figure keys.
+    fn tm_keys(geodetic: &[(u16, GeoKeyValue)]) -> std::collections::HashMap<u16, GeoKeyValue> {
+        let mut keys = std::collections::HashMap::from([
+            (3080, GeoKeyValue::Double(16.0)),
+            (3092, GeoKeyValue::Double(0.9996)),
+            (3082, GeoKeyValue::Double(500_000.0)),
+        ]);
+        keys.extend(geodetic.iter().cloned());
+        keys
+    }
+
+    /// Each ellipsoid code the GeoTIFF names maps to PROJ's figure (#1243):
+    /// a Transverse Mercator 4° from its meridian on it projects 20°E 62°N
+    /// where `cs2cs -f %.4f +proj=longlat +ellps=<name> +to +proj=tmerc
+    /// +lon_0=16 +k=0.9996 +x_0=500000 +ellps=<name>` does (PROJ 9.8.1),
+    /// the name PROJ gives the same EPSG ellipsoid.
+    #[test]
+    fn ellipsoid_codes_match_proj() {
+        use GeoKeyValue::{Double, Short};
+        for (code, name, x, y) in [
+            (7030, "WGS84", 709_413.938_3, 6_880_638.213_8),
+            (7019, "GRS80", 709_413.938_3, 6_880_638.213_7),
+            (7004, "bessel", 709_388.005_1, 6_879_914.500_3),
+            (7022, "intl", 709_424.501_2, 6_880_803.744_3),
+            (7024, "krass", 709_417.405_6, 6_880_758.287_8),
+            (7001, "airy", 709_393.148_8, 6_880_108.095_0),
+            (7008, "clrk66", 709_422.312_9, 6_880_436.756_4),
+        ] {
+            let crs = parse_projected(tm_keys(&[(2056, Short(code))]), 1, 32767).unwrap();
+            let (fx, fy) = crs.forward(20.0, 62.0);
+            assert!(
+                (fx - x).abs() < 1e-3 && (fy - y).abs() < 1e-3,
+                "EPSG ellipsoid {code} ({name}): {fx},{fy}"
+            );
+        }
+        let figure = |geodetic: &[(u16, GeoKeyValue)]| stated_figure(&tm_keys(geodetic)).unwrap();
+        assert_eq!(figure(&[(2056, Short(7030))]), Some(Ellipsoid::WGS84));
+        assert_eq!(figure(&[(2056, Short(7019))]), Some(Ellipsoid::GRS80));
+        assert_eq!(
+            figure(&[(2056, Short(7057))]),
+            Some(Ellipsoid::sphere(6_371_228.0))
+        );
+        // The axes, as GDAL writes them, and as libgeotiff reads them: over
+        // the code beside them.
+        let grs80 = [
+            (2056, Short(7004)),
+            (2057, Double(WGS84_A)),
+            (2059, Double(298.257_222_101)),
+        ];
+        assert_eq!(figure(&grs80), Some(Ellipsoid::GRS80));
+        assert_eq!(
+            figure(&[(2057, Double(6_371_220.0)), (2058, Double(6_371_220.0))]),
+            Some(Ellipsoid::sphere(6_371_220.0))
+        );
+        assert_eq!(
+            figure(&[(2057, Double(6_371_220.0)), (2059, Double(0.0))]),
+            Some(Ellipsoid::sphere(6_371_220.0))
+        );
+        assert_eq!(
+            figure(&[(2057, Double(6_378_206.4)), (2058, Double(6_356_583.8))]),
+            Some(Ellipsoid::from_axes(6_378_206.4, 6_356_583.8))
+        );
+        // No figure stated: none, projected on WGS84 as before. A semi-major
+        // axis alone gives no shape.
+        assert_eq!(figure(&[]), None);
+        assert_eq!(figure(&[(2056, Short(32767))]), None);
+        assert_eq!(figure(&[(2057, Double(6_378_388.0))]), None);
+        // TM35FIN's parameters on GRS 1980 by its axes claim EPSG:3067; the
+        // same on Bessel do not.
+        let tm35fin = |geodetic: &[(u16, GeoKeyValue)]| {
+            let mut keys = tm_keys(geodetic);
+            keys.insert(3080, Double(27.0));
+            crate::crs_label(&parse_projected(keys, 1, 32767).unwrap())
+        };
+        assert_eq!(tm35fin(&grs80[1..]), "EPSG:3067");
+        assert_eq!(tm35fin(&[(2056, Short(7004))]), "TM");
+    }
+
+    /// A figure the reader cannot compute on is an error, never a WGS84
+    /// guess (#1243): an ellipsoid code it does not know (Clarke 1858 is in
+    /// feet), axes that are not a sphere or an oblate ellipsoid, and a
+    /// Lambert Conformal Conic on an ellipsoid other than WGS 84 or GRS
+    /// 1980, which `Crs::LambertConformalConic` cannot carry. The conic
+    /// keeps its sphere and WGS84.
+    #[test]
+    fn a_figure_it_cannot_compute_on_is_an_error() {
+        use GeoKeyValue::{Double, Short};
+        for geodetic in [
+            vec![(2056, Short(7007))],
+            vec![(2056, Short(1))],
+            vec![(2057, Double(WGS84_A)), (2058, Double(6_400_000.0))],
+            vec![(2057, Double(6_378_388.0)), (2059, Double(0.5))],
+            vec![(2057, Double(-6_378_388.0)), (2059, Double(297.0))],
+        ] {
+            let err = parse_projected(tm_keys(&geodetic), 1, 32767).unwrap_err();
+            assert!(
+                err.to_string().contains("not a supported earth figure"),
+                "{geodetic:?}: {err}"
+            );
+        }
+        let lcc = |geodetic: &[(u16, GeoKeyValue)]| {
+            let mut keys = tm_keys(geodetic);
+            keys.insert(3078, Double(63.3));
+            keys.insert(3079, Double(63.3));
+            parse_projected(keys, 8, 32767)
+        };
+        assert!(lcc(&[(2056, Short(7004))])
+            .unwrap_err()
+            .to_string()
+            .contains("Lambert Conformal Conic on the ellipsoid"));
+        for (geodetic, expected) in [
+            (vec![(2056, Short(7019))], None),
+            (vec![], None),
+            (vec![(2056, Short(7048))], Some(6_371_007.0)),
+        ] {
+            match lcc(&geodetic).unwrap() {
+                Crs::LambertConformalConic { radius, .. } => assert_eq!(radius, expected),
+                other => panic!("expected LCC, got {other:?}"),
+            }
+        }
     }
 }

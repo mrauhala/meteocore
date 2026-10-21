@@ -52,6 +52,17 @@ around `ds-storage` calls (Critical Rules 6–7).
   dBZ); unknown codes fall back to the bare string. WMS layer `<Title>`s are
   prefixed with the site place name via `RasterInfo.layer_subtitle` (ODIM
   `/what` PLC).
+- **COMP projdef earth figure (#1243).** `proj::figure` follows PROJ
+  9.8.1's CRS rules, each pinned to `cs2cs`: `+R=` sphere overrules all;
+  `+ellps=` (all 46 `proj -le` names, `NAMED_ELLIPSOIDS`, case-sensitive)
+  or `+datum=` (10 PROJ datums; `ire65` = EPSG Airy Modified 1849, not
+  `mod_airy`); `+a=` + first of rf/f/es/e/b, `+a` alone = sphere; nothing
+  = WGS84. Unknown names, shape without `+a`, prolate figures, `+R_*`,
+  and a name beside axes (PROJ resolves that per parameter) are errors —
+  never a WGS84 guess. Datum shifts are not applied. `stated_epsg` still
+  requires literal `+ellps=GRS80` + exact parameters; GRS80 by axes or
+  datum is the figure but no EPSG claim. SMHI's composite is Bessel: its
+  corners match the file's to ~20 m on Bessel vs ~200 m on WGS84.
 
 ## Rendering
 
