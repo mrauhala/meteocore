@@ -188,7 +188,8 @@ fn an_allowlisted_variable_missing_fails_the_file() {
     let names = vec!["air_temperature_2m".to_string(), "snowfall".to_string()];
     let error = inspect(&nc, &storage, &Wanted::Listed(&names), 0)
         .err()
-        .unwrap();
+        .unwrap()
+        .to_string();
     assert!(error.contains("'snowfall'"), "{error}");
 }
 
@@ -864,4 +865,54 @@ fn stated_axes_win_over_auxiliaries_and_names_decide_nothing() {
             "{named}"
         );
     }
+}
+
+/// A curvilinear grid over `MAX_NODES` is refused from its dimensions
+/// alone, before the decode budget or the file is touched: not one byte of
+/// its 2-D latitude/longitude is read (at the cap, ~134 MB per `f64`
+/// array).
+#[test]
+fn an_oversized_curvilinear_grid_is_refused_unread() {
+    let storage = counting(CURVILINEAR);
+    let nc = open_storage(storage.clone()).unwrap();
+    storage.take();
+    let (ny, nx) = (4097, 4096);
+    assert!(nx * ny > ds_core::resample::curvilinear::MAX_NODES as u64);
+    let variables = [
+        variable(
+            "lat",
+            &[("y", ny), ("x", nx)],
+            &[("standard_name", "latitude")],
+        ),
+        variable(
+            "lon",
+            &[("y", ny), ("x", nx)],
+            &[("standard_name", "longitude")],
+        ),
+    ];
+    let field = variable(
+        "column",
+        &[("time", 1), ("y", ny), ("x", nx)],
+        &[("coordinates", "lon lat")],
+    );
+    let placement = Placement::Auxiliary {
+        lat: "lat".into(),
+        lon: "lon".into(),
+    };
+    let Err(Unservable::File(reason)) = file_grid(&nc, &variables, &field, "y", "x", &placement)
+    else {
+        panic!("an oversized grid is a file it cannot serve");
+    };
+    assert!(reason.contains("more than 16777216"), "{reason}");
+    assert_eq!(storage.take(), (0, 0), "read before refusing");
+    // What a grid's read reserves: 40 B per node of `float` arrays (the
+    // helper's type), 52 B of `double` ones.
+    let fixture = [
+        variable("lat", &[("y", 28), ("x", 19)], &[]),
+        variable("lon", &[("y", 28), ("x", 19)], &[]),
+    ];
+    assert_eq!(
+        curvilinear_peak_bytes(19 * 28, &fixture[0], &fixture[1]),
+        19 * 28 * (16 + 12 + 3 * 4)
+    );
 }

@@ -126,7 +126,16 @@ curvilinear grids placed by 2-D latitude/longitude (#1174).
   later file on other nodes is skipped. Remote cost: a curvilinear remote
   family reads both arrays per file opened. Rows are as stored, never
   flipped; `transform()` is `None`, `size()` `(nx, ny)`. At most
-  `ds_core::resample::curvilinear::MAX_NODES` (4096²).
+  `ds_core::resample::curvilinear::MAX_NODES` (4096²), checked from the
+  dimensions before any read (`CurvilinearNodes::check_size`): an
+  oversized file is skipped unread. The read reserves its transient peak
+  from `decode_budget::BUDGET` (`ingest::curvilinear_peak_bytes`: 16 B for
+  both `f64` arrays + 12 B of vectors + 3 × the stored size, 52 B/node for
+  `double`); a full budget is `ingest::Unservable::Busy`, which
+  `open_inspect` turns into `Opened::Retry`: the file is opened again next
+  poll, never remembered as skipped. Packing is applied in place
+  (`mapv_inplace`, then the array's own buffer), so no second full-size
+  `f64` buffer exists.
 - **The lookup:** `Layout::new` builds `CurvilinearGrid` (k-d tree over
   the nodes, 5 B/node, and the extent) once per layout, inside
   `SourceGrid::from_curvilinear`. Everything downstream is the shared

@@ -107,13 +107,7 @@ impl CurvilinearNodes {
     /// lengths other than `nx * ny`, or no cell whose four corners all have
     /// a position.
     pub fn new(nx: usize, ny: usize, lon: &[f64], lat: &[f64]) -> Result<Self, String> {
-        if nx < 2 || ny < 2 {
-            return Err(format!("a {nx} x {ny} grid has no cell"));
-        }
-        let n = nx
-            .checked_mul(ny)
-            .filter(|&n| n <= MAX_NODES)
-            .ok_or_else(|| format!("{nx} x {ny} nodes are more than {MAX_NODES}"))?;
+        let n = Self::check_size(nx, ny)?;
         if lon.len() != n || lat.len() != n {
             return Err(format!(
                 "{} longitudes and {} latitudes for {nx} x {ny} nodes",
@@ -138,6 +132,19 @@ impl CurvilinearNodes {
             return Err("no cell has a valid latitude and longitude at all four corners".into());
         }
         Ok(nodes)
+    }
+
+    /// The node count of an `nx` × `ny` grid, or why it makes no grid:
+    /// fewer than 2 × 2 nodes, or more than [`MAX_NODES`]. A reader checks
+    /// it from the dimensions before reading an array, so an oversized grid
+    /// is refused unread.
+    pub fn check_size(nx: usize, ny: usize) -> Result<usize, String> {
+        if nx < 2 || ny < 2 {
+            return Err(format!("a {nx} x {ny} grid has no cell"));
+        }
+        nx.checked_mul(ny)
+            .filter(|&n| n <= MAX_NODES)
+            .ok_or_else(|| format!("{nx} x {ny} nodes are more than {MAX_NODES}"))
     }
 
     /// `(columns, rows)`: `(nx, ny)`.

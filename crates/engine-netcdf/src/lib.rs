@@ -266,7 +266,9 @@ enum Opened {
     Ready(Box<Ready>),
     /// Not servable: remembered and not opened again until it changes.
     Skip(String),
-    /// A remote read failed: forgotten, and tried again next poll.
+    /// A remote read failed, or the decode budget had no room for a
+    /// curvilinear grid's 2-D coordinates (#1174): forgotten, and tried
+    /// again next poll.
     Retry(String),
 }
 
@@ -896,7 +898,9 @@ impl NetcdfEngine {
         };
         let inspected = match ingest::inspect(&nc, &storage, wanted, self.member) {
             Ok(inspected) => inspected,
-            Err(e) => {
+            // The decode budget is full now (#1174): the next poll tries again.
+            Err(ingest::Unservable::Busy(e)) => return Opened::Retry(e),
+            Err(ingest::Unservable::File(e)) => {
                 return match &remote {
                     Some(remote) => verdict(remote, e),
                     None => Opened::Skip(e),
