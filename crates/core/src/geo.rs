@@ -920,6 +920,27 @@ pub fn grid_extent(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
     extent.finish(poles)
 }
 
+/// The WGS84 extent `[west, south, east, north]` of the area a closed ring
+/// of `(lon, lat)` points encloses, walked in order: a curvilinear grid's
+/// outer cell edges (#1174, `resample::CurvilinearGrid::extent`), which
+/// have no CRS for [`grid_extent`] to project. The same unrolling: each
+/// longitude moves by whole turns to within 180° of the one before, so a
+/// ring across the antimeridian is `west > east` (as the seam box 170, 10,
+/// -170, 20), and `poles` says whether the area holds the North and South
+/// Pole, which no ring point reaches: the extent then runs to that pole at
+/// every longitude (−180…180). Non-finite points are skipped; the
+/// `[MAX, MAX, MIN, MIN]` sentinel when none is left, which
+/// [`crs84_extent`] turns into `None`.
+pub fn ring_extent(ring: impl IntoIterator<Item = (f64, f64)>, poles: [bool; 2]) -> [f64; 4] {
+    let mut extent = UnrolledExtent::default();
+    for (lon, lat) in ring {
+        if lon.is_finite() && lat.is_finite() {
+            extent.add(lon, lat);
+        }
+    }
+    extent.finish(poles)
+}
+
 /// [`grid_extent`]'s edges, unrolled from the first that inverse-projects,
 /// with whether the bbox holds the North and South Pole.
 fn unrolled_grid_extent(crs: &Crs, bbox: [f64; 4]) -> (UnrolledExtent, [bool; 2]) {

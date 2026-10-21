@@ -33,6 +33,13 @@
 //!   A footprint wholly off the image builds no map at all (#1129). The
 //!   envelope is the grid's extent ([`GeoTransform::footprint_envelope`]),
 //!   computed once by [`SourceGrid::new`], never per request.
+//! - **Curvilinear grids** (a latitude and longitude per cell, no CRS,
+//!   #1174) are placed by [`CurvilinearGrid::locate`], the inverse lookup
+//!   over the grid's nodes, at the coarse grid's nodes only, and a point
+//!   query's position is the same lookup: the rules above then sample the
+//!   field (bilinear, nearest at a nodata neighbour, the half cell past the
+//!   outer cell edges). The footprint guard walks the grid's extent
+//!   ([`CurvilinearGrid::footprint_envelope`]), as for a projected grid.
 //!
 //! The output is [`RasterValues::F32`]: interpolation runs in `f64` and only
 //! the stored value is narrowed, with NaN for nodata. An engine serving
@@ -48,18 +55,24 @@
 //! engine-satellite keep their own samplers, and their own maps, by design:
 //! moving either onto this one changes their pixels (#1172).
 
-use super::ProjectionGrid;
+use std::sync::Arc;
+
+use super::{CurvilinearGrid, ProjectionGrid};
 use crate::error::DataServerError;
 use crate::geo::{Crs, GeoTransform};
 use crate::map_engine::{OutputCrs, RasterTile, RasterValues};
 
-/// A regular source grid: its [`GeoTransform`] with what sampling derives
-/// from it, built once per grid and kept by the engine (it is cheap to
-/// clone and immutable). Rows run north to south, as the transform's do: a
-/// source stored south-up is flipped when decoded.
+/// A source grid: a regular one's [`GeoTransform`], or a curvilinear
+/// one's [`CurvilinearGrid`], with what sampling derives from it, built
+/// once per grid and kept by the engine (it is cheap to clone and
+/// immutable). A regular grid's rows run north to south, as the
+/// transform's do: a source stored south-up is flipped when decoded. A
+/// curvilinear grid's rows are as stored.
 #[derive(Debug, Clone)]
 pub struct SourceGrid {
-    transform: GeoTransform,
+    /// Columns and rows.
+    width: u32,
+    height: u32,
     layout: Layout,
 }
 
@@ -67,7 +80,11 @@ pub struct SourceGrid {
 enum Layout {
     /// Columns linear in longitude, `period` columns per turn. `global`
     /// when the columns fill the turn (within half a column).
-    Periodic { period: f64, global: bool },
+    Periodic {
+        transform: GeoTransform,
+        period: f64,
+        global: bool,
+    },
     /// Any other CRS. `envelope` is the grid's WGS84 `[w, s, e, n]`, with
     /// `e > 180°` when it crosses the antimeridian
     /// ([`GeoTransform::footprint_envelope`]), and `centre` the longitude
@@ -76,8 +93,16 @@ enum Layout {
     /// inverse-projects, which leaves longitudes as they come and turns the
     /// footprint guard off.
     Projected {
+        transform: GeoTransform,
         envelope: Option<[f64; 4]>,
         centre: Option<f64>,
+    },
+    /// A latitude and longitude per cell and no CRS (#1174): every point
+    /// placed by the grid's inverse lookup. `envelope` as a projected
+    /// grid's ([`CurvilinearGrid::footprint_envelope`]).
+    Curvilinear {
+        grid: Arc<CurvilinearGrid>,
+        envelope: Option<[f64; 4]>,
     },
 }
 
@@ -92,25 +117,65 @@ impl SourceGrid {
             }
             _ => None,
         };
+        let (width, height) = (transform.width, transform.height);
         let layout = match turn {
             Some(turn) if transform.pixel_width.is_finite() && transform.pixel_width > 0.0 => {
                 let period = turn / transform.pixel_width;
                 Layout::Periodic {
-                    period,
                     global: f64::from(transform.width) >= period - 0.5,
+                    transform,
+                    period,
                 }
             }
             _ => Layout::Projected {
                 envelope: transform.footprint_envelope(),
                 centre: transform.inverse_frame_centre(),
+                transform,
             },
         };
-        SourceGrid { transform, layout }
+        SourceGrid {
+            width,
+            height,
+            layout,
+        }
     }
 
-    /// The grid's transform.
-    pub fn transform(&self) -> &GeoTransform {
-        &self.transform
+    /// The sampler's view of a curvilinear grid (#1174), which
+    /// [`CurvilinearGrid::new`] has indexed once.
+    pub fn from_curvilinear(grid: Arc<CurvilinearGrid>) -> Self {
+        let (nx, ny) = grid.size();
+        SourceGrid {
+            width: nx as u32,
+            height: ny as u32,
+            layout: Layout::Curvilinear {
+                envelope: grid.footprint_envelope(),
+                grid,
+            },
+        }
+    }
+
+    /// A regular grid's transform; `None` for a curvilinear grid, which
+    /// has none.
+    pub fn transform(&self) -> Option<&GeoTransform> {
+        match &self.layout {
+            Layout::Periodic { transform, .. } | Layout::Projected { transform, .. } => {
+                Some(transform)
+            }
+            Layout::Curvilinear { .. } => None,
+        }
+    }
+
+    /// A curvilinear grid's lookup; `None` for a regular grid.
+    pub fn curvilinear(&self) -> Option<&CurvilinearGrid> {
+        match &self.layout {
+            Layout::Curvilinear { grid, .. } => Some(grid),
+            _ => None,
+        }
+    }
+
+    /// `(columns, rows)`: the length of a field is their product.
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     /// Columns per turn of a grid whose columns fill the turn of longitude
@@ -123,6 +188,7 @@ impl SourceGrid {
             Layout::Periodic {
                 period,
                 global: true,
+                ..
             } => Some(period),
             _ => None,
         }
@@ -187,53 +253,42 @@ impl SourceGrid {
             east += 360.0;
         }
         let bbox = [west, south, east, north];
-        let gt = &self.transform;
         let node = |fx: f64, fy: f64| output_crs.project_node(bbox, fx, fy);
-        let (grid, window) = match self.layout {
-            Layout::Periodic { period, .. } => (
+        let (grid, window) = match &self.layout {
+            Layout::Periodic {
+                transform, period, ..
+            } => (
                 Some(ProjectionGrid::refined(
                     width,
                     height,
-                    gt.width,
-                    gt.height,
-                    Some(period),
+                    self.width,
+                    self.height,
+                    Some(*period),
                     None,
                     node,
-                    |lon, lat| centred(gt.world_to_pixel_f64(lon, lat)),
+                    |lon, lat| centred(transform.world_to_pixel_f64(lon, lat)),
                 )),
                 None,
             ),
-            Layout::Projected { envelope, centre } => {
-                let to_src = |lon, lat| {
+            Layout::Projected {
+                transform,
+                envelope,
+                centre,
+            } => self.footprint_map(
+                *envelope,
+                (bbox, width, height, output_crs),
+                node,
+                |lon, lat| {
                     let lon = centre.map_or(lon, |c| within_half_turn(lon, c));
-                    centred(gt.world_to_pixel_f64(lon, lat))
-                };
-                // Only the footprint is sampled, so only its error counts
-                // (#1110). A footprint off the image, or an empty image,
-                // leaves nothing to sample and builds no grid (#1129).
-                let window = envelope.map(|env| {
-                    output_crs.footprint_window_in_image(
-                        bbox,
-                        envelope_near(env, bbox, output_crs),
-                        width,
-                        height,
-                    )
-                });
-                let grid = match window {
-                    Some(None) => None,
-                    read => Some(ProjectionGrid::refined(
-                        width,
-                        height,
-                        gt.width,
-                        gt.height,
-                        None,
-                        read.flatten(),
-                        node,
-                        to_src,
-                    )),
-                };
-                (grid, window.flatten())
-            }
+                    centred(transform.world_to_pixel_f64(lon, lat))
+                },
+            ),
+            Layout::Curvilinear { grid, envelope } => self.footprint_map(
+                *envelope,
+                (bbox, width, height, output_crs),
+                node,
+                |lon, lat| grid.locate(lon, lat),
+            ),
         };
         OutputMap {
             source: self,
@@ -244,6 +299,42 @@ impl SourceGrid {
         }
     }
 
+    /// The coarse map of a grid drawn only within its footprint (a
+    /// projected or curvilinear grid): only the footprint is sampled, so
+    /// only its error counts (#1110). A footprint off the image, or an
+    /// empty image, leaves nothing to sample and builds no grid (#1129).
+    /// `envelope` `None` turns the guard off.
+    fn footprint_map(
+        &self,
+        envelope: Option<[f64; 4]>,
+        (bbox, width, height, output_crs): ([f64; 4], u32, u32, &OutputCrs),
+        node: impl Fn(f64, f64) -> (f64, f64),
+        to_src: impl Fn(f64, f64) -> (f64, f64),
+    ) -> MapGrid {
+        let window = envelope.map(|env| {
+            output_crs.footprint_window_in_image(
+                bbox,
+                envelope_near(env, bbox, output_crs),
+                width,
+                height,
+            )
+        });
+        let grid = match window {
+            Some(None) => None,
+            read => Some(ProjectionGrid::refined(
+                width,
+                height,
+                self.width,
+                self.height,
+                None,
+                read.flatten(),
+                node,
+                to_src,
+            )),
+        };
+        (grid, window.flatten())
+    }
+
     /// The fractional source position of WGS84 `(lon, lat)`, measured from
     /// the first cell's centre: the one forward projection a point query
     /// makes (an EDR position, or an area's cell centre), reused for every
@@ -251,15 +342,19 @@ impl SourceGrid {
     /// grid takes the longitude within half a turn of its own centre, and a
     /// longitude-linear grid's columns repeat every turn ([`Self::value_at`]
     /// wraps them), so a point given at 190°E or -170°E is the same point.
+    /// A curvilinear grid's is its inverse lookup
+    /// ([`CurvilinearGrid::locate`]), the one a map makes at its nodes.
     pub fn position(&self, lon: f64, lat: f64) -> (f64, f64) {
-        let lon = match self.layout {
+        match &self.layout {
+            Layout::Periodic { transform, .. } => centred(transform.world_to_pixel_f64(lon, lat)),
             Layout::Projected {
-                centre: Some(centre),
-                ..
-            } => within_half_turn(lon, centre),
-            _ => lon,
-        };
-        centred(self.transform.world_to_pixel_f64(lon, lat))
+                transform, centre, ..
+            } => {
+                let lon = centre.map_or(lon, |c| within_half_turn(lon, c));
+                centred(transform.world_to_pixel_f64(lon, lat))
+            }
+            Layout::Curvilinear { grid, .. } => grid.locate(lon, lat),
+        }
     }
 
     /// The value of `values`, the grid's row-major field (row 0 north) with
@@ -274,7 +369,7 @@ impl SourceGrid {
         nodata: Option<f32>,
         (col, row): (f64, f64),
     ) -> Option<f64> {
-        let cells = self.transform.width as usize * self.transform.height as usize;
+        let cells = self.width as usize * self.height as usize;
         if values.len() != cells {
             return None;
         }
@@ -295,8 +390,8 @@ impl SourceGrid {
     /// past its edges, [`Self::locate`]) or where the mapping is undefined.
     fn sample(&self, values: &[f32], nodata: Option<f32>, col: f64, row: f64) -> Option<f64> {
         let (col, global) = self.locate(col, row)?;
-        let nx = i64::from(self.transform.width);
-        let ny = i64::from(self.transform.height);
+        let nx = i64::from(self.width);
+        let ny = i64::from(self.height);
         let col0 = col.floor() as i64;
         let row0 = row.floor() as i64;
         let column = |c: i64| {
@@ -349,14 +444,15 @@ impl SourceGrid {
         if !col.is_finite() || !row.is_finite() {
             return None;
         }
-        let nx = i64::from(self.transform.width);
-        let ny = i64::from(self.transform.height);
+        let nx = i64::from(self.width);
+        let ny = i64::from(self.height);
         let (col, global) = match self.layout {
             // A global grid's columns run [0, period); one past its last
             // column reads its first.
             Layout::Periodic {
                 period,
                 global: true,
+                ..
             } => (col.rem_euclid(period), true),
             // A regional one is drawn in the turn centred on it.
             Layout::Periodic { period, .. } => {
@@ -368,7 +464,7 @@ impl SourceGrid {
                 };
                 (col, false)
             }
-            Layout::Projected { .. } => (col, false),
+            Layout::Projected { .. } | Layout::Curvilinear { .. } => (col, false),
         };
         let col0 = col.floor() as i64;
         let row0 = row.floor() as i64;
@@ -378,6 +474,11 @@ impl SourceGrid {
         Some((col, global))
     }
 }
+
+/// A map's coarse grid, `None` when nothing is drawn, and the inclusive
+/// output window `(px_lo, px_hi, py_lo, py_hi)` its footprint occupies,
+/// `None` for every pixel.
+type MapGrid = (Option<ProjectionGrid>, Option<(u32, u32, u32, u32)>);
 
 /// One map request's output→source pixel map onto a [`SourceGrid`]
 /// ([`SourceGrid::output_map`]).
@@ -419,14 +520,12 @@ impl OutputMap<'_> {
         nodata: Option<f32>,
         convert: impl Fn(f64) -> f64,
     ) -> Result<RasterTile, DataServerError> {
-        let gt = &self.source.transform;
-        let cells = gt.width as usize * gt.height as usize;
+        let (width, height) = self.source.size();
+        let cells = width as usize * height as usize;
         if values.len() != cells {
             return Err(DataServerError::Engine(format!(
-                "field has {} values for a {}x{} grid",
+                "field has {} values for a {width}x{height} grid",
                 values.len(),
-                gt.width,
-                gt.height
             )));
         }
         let mut data = Vec::with_capacity(self.width as usize * self.height as usize);

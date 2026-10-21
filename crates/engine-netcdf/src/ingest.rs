@@ -15,6 +15,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use ds_core::cf::{self, AxisRole, CfAttr, PressureUnit, RegularAxis};
 use ds_core::geo::{Crs, GeoTransform};
+use ds_core::resample::CurvilinearNodes;
 use netcdf_reader::{
     DynStorage, FileStorage, NcAttrValue, NcFile, NcFormat, NcOpenOptions, NcSliceInfo,
     NcSliceInfoElem, NcType, NcVariable,
@@ -248,24 +249,72 @@ impl Variable {
 
 /// A file's grid: the CF grid of its fields' `(y, x)` axes.
 #[derive(Debug, Clone)]
-pub(crate) struct FileGrid {
-    pub transform: GeoTransform,
-    /// The stored rows run south to north and are reversed when decoded.
-    pub flipped: bool,
+pub(crate) enum FileGrid {
+    /// 1-D latitude/longitude or projected x/y axes: a regular grid, its
+    /// transform north-up. `flipped`: the stored rows run south to north
+    /// and are reversed when decoded.
+    Regular {
+        transform: GeoTransform,
+        flipped: bool,
+    },
+    /// 2-D latitude and longitude auxiliaries and no CRS (#1174): each
+    /// node's position, read once at ingest. Rows are drawn as stored.
+    Curvilinear(Arc<CurvilinearNodes>),
 }
 
 impl FileGrid {
-    /// Whether `other` is the same grid, to a thousandth of a cell.
+    /// A regular grid's transform; `None` on a curvilinear grid.
+    pub(crate) fn transform(&self) -> Option<&GeoTransform> {
+        match self {
+            FileGrid::Regular { transform, .. } => Some(transform),
+            FileGrid::Curvilinear(_) => None,
+        }
+    }
+
+    /// Whether the stored rows are reversed when decoded: a regular grid
+    /// stored south to north. Never a curvilinear one.
+    pub(crate) fn flipped(&self) -> bool {
+        matches!(self, FileGrid::Regular { flipped: true, .. })
+    }
+
+    /// `(columns, rows)`.
+    pub(crate) fn size(&self) -> (u32, u32) {
+        match self {
+            FileGrid::Regular { transform, .. } => (transform.width, transform.height),
+            FileGrid::Curvilinear(nodes) => {
+                let (nx, ny) = nodes.size();
+                (nx as u32, ny as u32)
+            }
+        }
+    }
+
+    /// Whether `other` is the same grid: a regular one to a thousandth of
+    /// a cell, a curvilinear one node by node to a thousandth of each
+    /// node's spacing ([`CurvilinearNodes::same`]).
     pub(crate) fn same(&self, other: &FileGrid) -> bool {
-        let (a, b) = (&self.transform, &other.transform);
-        let close = |x: f64, y: f64, cell: f64| (x - y).abs() <= cell.abs() * 1e-3;
-        self.flipped == other.flipped
-            && a.crs == b.crs
-            && (a.width, a.height) == (b.width, b.height)
-            && close(a.origin_x, b.origin_x, a.pixel_width)
-            && close(a.origin_y, b.origin_y, a.pixel_height)
-            && close(a.pixel_width, b.pixel_width, a.pixel_width)
-            && close(a.pixel_height, b.pixel_height, a.pixel_height)
+        match (self, other) {
+            (
+                FileGrid::Regular {
+                    transform: a,
+                    flipped,
+                },
+                FileGrid::Regular {
+                    transform: b,
+                    flipped: other_flipped,
+                },
+            ) => {
+                let close = |x: f64, y: f64, cell: f64| (x - y).abs() <= cell.abs() * 1e-3;
+                flipped == other_flipped
+                    && a.crs == b.crs
+                    && (a.width, a.height) == (b.width, b.height)
+                    && close(a.origin_x, b.origin_x, a.pixel_width)
+                    && close(a.origin_y, b.origin_y, a.pixel_height)
+                    && close(a.pixel_width, b.pixel_width, a.pixel_width)
+                    && close(a.pixel_height, b.pixel_height, a.pixel_height)
+            }
+            (FileGrid::Curvilinear(a), FileGrid::Curvilinear(b)) => Arc::ptr_eq(a, b) || a.same(b),
+            _ => false,
+        }
     }
 }
 
@@ -311,7 +360,6 @@ pub(crate) fn inspect(
     let h5 = matches!(nc.format(), NcFormat::Nc4 | NcFormat::Nc4Classic)
         .then(|| hdf5_reader::Hdf5File::from_storage(storage.clone()).ok())
         .flatten();
-    let role = |dim: &str| role(variables, dim);
     let coordinate = |dim: &str| coordinate(variables, dim);
 
     let candidates: Vec<&NcVariable> = match wanted {
@@ -327,32 +375,26 @@ pub(crate) fn inspect(
         Wanted::All => variables
             .iter()
             .filter(|v| v.dimensions.len() >= 2 && !v.is_coordinate_variable())
-            .filter(|v| {
-                let n = v.dimensions.len();
-                spatial_pair(
-                    role(&v.dimensions[n - 2].name),
-                    role(&v.dimensions[n - 1].name),
-                )
-                .is_some()
-            })
+            .filter(|v| placement(variables, v).is_some())
             .collect(),
     };
 
-    let mut grid: Option<(String, String, Option<String>, FileGrid)> = None;
+    let mut grid: Option<(GridKey, FileGrid)> = None;
     let mut time_dim: Option<String> = None;
     let mut fields = Vec::new();
     let mut skipped = Vec::new();
     for var in candidates {
         let outcome = field(nc, h5.as_ref(), variables, var, member).and_then(|(field, key)| {
-            let (y, x, mapping) = &key;
             match &grid {
-                Some((gy, gx, gm, _)) if (gy, gx, gm) != (y, x, mapping) => {
+                Some((found, _)) if *found != key => {
+                    let (y, x, _) = &key;
                     return Err(format!("is on another grid ({y}, {x})"));
                 }
                 Some(_) => {}
                 None => {
-                    let found = file_grid(nc, variables, var, y, x, mapping.as_deref())?;
-                    grid = Some((y.clone(), x.clone(), mapping.clone(), found));
+                    let (y, x, placement) = &key;
+                    let found = file_grid(nc, variables, var, y, x, placement)?;
+                    grid = Some((key, found));
                 }
             }
             let time = field.time_dim.clone();
@@ -374,10 +416,10 @@ pub(crate) fn inspect(
         }
     }
     let fields = one_vertical_axis(fields, wanted, &mut skipped)?;
-    let (Some((.., grid)), Some(time_dim)) = (grid, time_dim) else {
+    let (Some((_, grid)), Some(time_dim)) = (grid, time_dim) else {
         return Err(
-            "has no variable on a 1-D latitude/longitude or projected x/y grid with a \
-                    time axis"
+            "has no variable on a 1-D latitude/longitude or projected x/y grid, or on 2-D \
+             latitude/longitude, with a time axis"
                 .to_string(),
         );
     };
@@ -483,7 +525,94 @@ struct Candidate {
     time_dim: String,
 }
 
-type GridKey = (String, String, Option<String>);
+/// A field's grid: its y and x dimensions and how they are placed.
+type GridKey = (String, String, Placement);
+
+/// How a variable's `(y, x)` dimensions are placed on the Earth.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Placement {
+    /// 1-D coordinate variables: latitude/longitude, or projected x/y
+    /// placed by the variable's `grid_mapping`, named here.
+    Axes(Option<String>),
+    /// 2-D latitude and longitude auxiliaries (#1174), named by the
+    /// variable's CF `coordinates`: a curvilinear grid.
+    Auxiliary { lat: String, lon: String },
+}
+
+/// How `var`'s last two dimensions, `(y, x)`, are placed, `None` when
+/// nothing places them.
+///
+/// Its axes when their roles form a grid ([`spatial_pair`]: latitude and
+/// longitude, or projected y and x), as before 2-D coordinates were read.
+/// Otherwise its 2-D latitude and longitude auxiliaries
+/// ([`auxiliaries`]): a curvilinear grid. Where it has both, the axes win
+/// only as their coordinate variables' own attributes state them, never
+/// by a dimension's name (a bare index axis `x` reads as a longitude by
+/// name): latitude/longitude, or projected x/y with a `grid_mapping`. So
+/// MEPS, whose fields carry 2-D `latitude`/`longitude` beside their
+/// Lambert axes, stays a projected grid and its 2-D arrays stay unread.
+fn placement(variables: &[NcVariable], var: &NcVariable) -> Option<Placement> {
+    let n = var.dimensions.len();
+    if n < 2 {
+        return None;
+    }
+    let (y, x) = (&var.dimensions[n - 2].name, &var.dimensions[n - 1].name);
+    let mapping = text_attr(var, "grid_mapping").map(|m| m.trim().to_string());
+    let Some((lat, lon)) = auxiliaries(variables, var, y, x) else {
+        return spatial_pair(role(variables, y), role(variables, x))
+            .map(|()| Placement::Axes(mapping));
+    };
+    let stated = |dim: &str| coordinate(variables, dim).map(stated_role);
+    match (stated(y), stated(x)) {
+        (Some(AxisRole::Lat), Some(AxisRole::Lon)) => Some(Placement::Axes(mapping)),
+        (Some(AxisRole::ProjectionY), Some(AxisRole::ProjectionX)) if mapping.is_some() => {
+            Some(Placement::Axes(mapping))
+        }
+        _ => Some(Placement::Auxiliary { lat, lon }),
+    }
+}
+
+/// The 2-D latitude and longitude auxiliaries of `var` on its `(y, x)`:
+/// the variables its CF `coordinates` attribute names whose dimensions are
+/// exactly `(y, x)`, a latitude and a longitude by their `standard_name`
+/// or `units` ([`stated_role`]), never by their names. `None` unless there
+/// is exactly one of each.
+fn auxiliaries(
+    variables: &[NcVariable],
+    var: &NcVariable,
+    y: &str,
+    x: &str,
+) -> Option<(String, String)> {
+    let names = text_attr(var, "coordinates")?;
+    let (mut lat, mut lon) = (Vec::new(), Vec::new());
+    for name in names.split_whitespace() {
+        let Some(aux) = variables.iter().find(|v| v.name == name) else {
+            continue;
+        };
+        if !matches!(&aux.dimensions[..], [a, b] if a.name == y && b.name == x) {
+            continue;
+        }
+        match stated_role(aux) {
+            AxisRole::Lat => lat.push(name),
+            AxisRole::Lon => lon.push(name),
+            _ => {}
+        }
+    }
+    match (&lat[..], &lon[..]) {
+        ([lat], [lon]) => Some((lat.to_string(), lon.to_string())),
+        _ => None,
+    }
+}
+
+/// The role `var`'s own `standard_name` and `units` state, without the
+/// name fallback [`cf::classify_axis`] applies to a dimension.
+fn stated_role(var: &NcVariable) -> AxisRole {
+    cf::classify_axis(
+        "",
+        text_attr(var, "standard_name").as_deref(),
+        text_attr(var, "units").as_deref(),
+    )
+}
 
 /// Classify `var`'s dimensions and read how its field is stored.
 fn field(
@@ -500,7 +629,9 @@ fn field(
         .iter()
         .map(|d| (d.name.clone(), d.size, role(variables, &d.name)))
         .collect();
-    let shape = classify(&roles, member, |dim| {
+    let placement = placement(variables, var);
+    let curvilinear = matches!(placement, Some(Placement::Auxiliary { .. }));
+    let shape = classify(&roles, member, curvilinear, |dim| {
         pressure_unit(variables, dim).is_some()
     })?;
     let (pressure, level_index) = match shape.vertical {
@@ -540,7 +671,7 @@ fn field(
     let key = (
         roles[roles.len() - 2].0.clone(),
         roles[roles.len() - 1].0.clone(),
-        text_attr(var, "grid_mapping").map(|m| m.trim().to_string()),
+        placement.unwrap_or(Placement::Axes(None)),
     );
     let field = Field {
         variable: Variable {
@@ -591,7 +722,9 @@ pub(crate) struct Shape {
     pub nx: u64,
 }
 
-/// Classify a variable's `(name, size, role)` dimensions: `(y, x)` last,
+/// Classify a variable's `(name, size, role)` dimensions: `(y, x)` last
+/// (latitude/longitude or projected axes, or any two placed by 2-D
+/// latitude/longitude auxiliaries when `curvilinear`, #1174),
 /// one time axis, any ensemble axis read at `member`, at most one axis of
 /// several pressure levels (a dimension `pressure` says is one: its
 /// coordinate's units are a pressure and it is no parametric coordinate,
@@ -602,6 +735,7 @@ pub(crate) struct Shape {
 pub(crate) fn classify(
     dims: &[(String, u64, AxisRole)],
     member: u32,
+    curvilinear: bool,
     pressure: impl Fn(&str) -> bool,
 ) -> Result<Shape, String> {
     let n = dims.len();
@@ -609,10 +743,10 @@ pub(crate) fn classify(
         return Err("has fewer than two dimensions".to_string());
     }
     let (y, x) = (&dims[n - 2], &dims[n - 1]);
-    if spatial_pair(y.2, x.2).is_none() {
+    if !curvilinear && spatial_pair(y.2, x.2).is_none() {
         return Err(format!(
-            "is not on a 1-D latitude/longitude or projected x/y grid (its last dimensions are \
-             '{}', '{}')",
+            "is not on a 1-D latitude/longitude or projected x/y grid, nor on 2-D latitude/\
+             longitude (its last dimensions are '{}', '{}')",
             y.0, x.0
         ));
     }
@@ -735,15 +869,40 @@ fn spatial_pair(y: AxisRole, x: AxisRole) -> Option<()> {
 }
 
 /// The grid of `var`'s `(y, x)` axes: CRS84 for latitude/longitude axes,
-/// else the CRS of its `grid_mapping`.
+/// else the CRS of its `grid_mapping`; or the curvilinear grid of its 2-D
+/// latitude/longitude auxiliaries, both read whole, once per file
+/// (#1174): they are the grid's identity, which every later file's must
+/// match ([`FileGrid::same`]).
 fn file_grid(
     nc: &NcFile,
     variables: &[NcVariable],
     var: &NcVariable,
     y: &str,
     x: &str,
-    mapping: Option<&str>,
+    placement: &Placement,
 ) -> Result<FileGrid, String> {
+    let mapping = match placement {
+        Placement::Axes(mapping) => mapping.as_deref(),
+        Placement::Auxiliary { lat, lon } => {
+            let read = |name: &str| {
+                let aux = variables
+                    .iter()
+                    .find(|v| v.name == name)
+                    .ok_or_else(|| format!("coordinate '{name}' does not exist"))?;
+                read_whole(nc, aux)
+            };
+            let (lat_values, lon_values) = (read(lat)?, read(lon)?);
+            let size = |dim: &str| {
+                var.dimensions
+                    .iter()
+                    .find(|d| d.name == dim)
+                    .map_or(0, |d| d.size as usize)
+            };
+            let nodes = CurvilinearNodes::new(size(x), size(y), &lon_values, &lat_values)
+                .map_err(|e| format!("2-D latitude '{lat}' and longitude '{lon}': {e}"))?;
+            return Ok(FileGrid::Curvilinear(Arc::new(nodes)));
+        }
+    };
     let crs = match role(variables, x) {
         AxisRole::Lon => Crs::Wgs84,
         _ => {
@@ -765,10 +924,52 @@ fn file_grid(
     };
     let grid =
         cf::grid(crs, &axis(x)?, &axis(y)?).map_err(|e| format!("variable '{}': {e}", var.name))?;
-    Ok(FileGrid {
+    Ok(FileGrid::Regular {
         transform: grid.transform,
         flipped: grid.flipped,
     })
+}
+
+/// A whole 2-D auxiliary coordinate (#1174), CF packing applied, with
+/// `_FillValue`, `missing_value` (compared in the stored type) and NaN as
+/// NaN: a node without a position. A slice read, so nothing stays cached
+/// in the reader.
+fn read_whole(nc: &NcFile, var: &NcVariable) -> Result<Vec<f64>, String> {
+    let stored = Stored::of(var.dtype())
+        .ok_or_else(|| format!("coordinate '{}' is not numeric", var.name))?;
+    let selections = var
+        .dimensions
+        .iter()
+        .map(|d| NcSliceInfoElem::Slice {
+            start: 0,
+            end: d.size,
+            step: 1,
+        })
+        .collect();
+    let raw = nc
+        .read_variable_slice_as_f64(&var.name, &NcSliceInfo { selections })
+        .map_err(|e| format!("coordinate '{}': {e}", var.name))?;
+    let number = |name: &str| var.attribute(name).and_then(|a| a.value.as_f64());
+    let fill: Vec<f64> = ["_FillValue", "missing_value"]
+        .iter()
+        .filter_map(|name| var.attribute(name)?.value.as_f64_vec())
+        .flatten()
+        .map(|v| stored.normalize(v))
+        .collect();
+    let (scale, offset) = (
+        number("scale_factor").unwrap_or(1.0),
+        number("add_offset").unwrap_or(0.0),
+    );
+    Ok(raw
+        .into_iter()
+        .map(|v| {
+            if v.is_nan() || fill.contains(&v) {
+                f64::NAN
+            } else {
+                v * scale + offset
+            }
+        })
+        .collect())
 }
 
 /// A whole 1-D (or scalar) coordinate variable, CF packing applied: a slice

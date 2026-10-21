@@ -72,8 +72,8 @@ or downloaded whole.
 **Data it reads:** NetCDF-4 (HDF5) and classic CDF-1/2/5 files. A
 variable has `(y, x)` as its last two axes: 1-D latitude/longitude, or
 1-D projected x/y in metres or kilometres with a CF `grid_mapping`
-(below); a projected
-grid is described in its own CRS, as WKT2, by the collection's
+(below), or 2-D latitude/longitude (a curvilinear grid, below); a
+projected grid is described in its own CRS, as WKT2, by the collection's
 `meteocore:nativeGrid` member (#1237). It needs a
 time axis; an ensemble axis is read at `member`; every other axis has
 size 1, except one pressure axis. Rows stored south to north are drawn
@@ -95,6 +95,31 @@ northing, which CF states in the coordinates' units (#1194). A
 grid that holds a pole, such as an Arctic polar stereographic grid,
 advertises an extent reaching the pole, and one across the antimeridian
 an extent `west > east`.
+
+**Curvilinear grids** (#1174). A variable whose CF `coordinates`
+attribute names 2-D `latitude(y, x)` and `longitude(y, x)` variables,
+known by their `standard_name` or their `degrees_north`/`degrees_east`
+units, never their names, and whose `(y, x)` have no 1-D
+latitude/longitude, nor projected x/y with a `grid_mapping`, is on a
+curvilinear grid, as ocean, sea-ice and regional products are. Where a
+file has both, the axes win and the 2-D arrays are not read: MEPS
+carries them beside its Lambert axes. Each file's two arrays are read
+whole when it is opened: they are its grid, and a later file whose
+nodes differ (by a thousandth of a node's spacing) is skipped. The
+collection builds a k-d tree over the nodes once (17 bytes per node).
+Every point is then placed by an inverse lookup, made only at a map's
+coarse projection grid nodes and once per EDR point: the nearest node,
+then the fractional position inside a cell around it, so maps
+interpolate smoothly between lookups. Both work on the sphere, so the
+antimeridian and the poles need nothing special. Values are sampled as
+on any grid (bilinear, the nearest cell at a nodata neighbour, the half
+cell past the outer cell edges); farther off the grid is empty, never the
+edge cell drawn on. The extent comes from the outer cell edges, reaching
+a pole the grid holds. Rows are drawn as stored. The grid has no CRS:
+`native_crs` is `curvilinear`, with no `storageCrs` and no native grid
+description. Grid-relative wind components give nothing on it (the axes'
+directions on the ground are unknown); earth-relative ones give speed and
+direction.
 
 **Display units.** Each variable's CF `units`, in any spelling, picks the
 unit it is served in: K as °C, Pa as hPa, kg m-2 as mm, kg m-2 s-1 as mm/h,
@@ -219,8 +244,10 @@ URL-only fields on a local `data_path`, are a load error.
 | `catalog_url` | none | URL only: the THREDDS `catalog.xml` of `data_path`'s directory (`…/thredds/catalog/<dir>/catalog.xml` for `…/thredds/fileServer/<dir>/`). The catalogs say which files the template names exist, in place of a HEAD per file; the template fields stay required |
 
 Runnable examples: `collections.d/meps-netcdf-local.toml` (MEPS surface
-sample) and `collections.d/meps-netcdf-pl-local.toml` (pressure-level
-sample). `meps-netcdf-thredds.toml.disabled` and
+sample), `collections.d/meps-netcdf-pl-local.toml` (pressure-level
+sample) and `collections.d/netcdf-curvilinear-local.toml` (a synthetic
+curvilinear grid around the North Pole whose fields are each node's own
+column and row). `meps-netcdf-thredds.toml.disabled` and
 `meps-netcdf-pl-thredds.toml.disabled` in the same directory read these
 families from MET Norway's public thredds.met.no and state their traffic;
 `meps-netcdf-thredds-catalog.toml.disabled` finds the surface family's
@@ -245,11 +272,14 @@ Process-wide environment variables, shared by every NetCDF collection:
   file missing one is skipped. More than one ensemble member per
   collection is not supported.
 - Not supported grids: other mappings (such as
-  `rotated_latitude_longitude`), a Lambert conic on an ellipsoid other
-  than WGS84, and 2-D (curvilinear) latitude/longitude grids.
+  `rotated_latitude_longitude`), and a Lambert conic on an ellipsoid other
+  than WGS84. A curvilinear grid has at most 16.8 million nodes (4096²),
+  and its 2-D latitude/longitude are read whole each time a file is
+  opened.
 - Grid-relative wind components on a projected grid give speed only, and
   nothing on a geostationary or azimuthal equal-area grid, whose axes are
-  not orthogonal on the ground. `valid_range` is not applied; non-standard
+  not orthogonal on the ground, nor on a curvilinear grid, whose axes'
+  directions are unknown. `valid_range` is not applied; non-standard
   calendars are refused.
 - A cold remote field slower than the render deadline fails that render
   with a 503; the fetch still completes into the cache for the next one.
