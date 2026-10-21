@@ -126,6 +126,12 @@ no opt-out, as for GRIB; a client wanting kelvin converts back.
   read lock for one station lookup or one area scan. Every capability
   accessor (`get_locations`, extents, Features listing) reads the
   `ArcSwap<Snapshot>` rebuilt every 10 s when dirty (Critical Rule 10).
+- The snapshot's `instants` (every distinct report time, off-hour reports
+  included; O(reports) into a `BTreeSet` at the rebuild) answer
+  `EdrEngine::observation_instants`, the analysis times of a station grid
+  without a `cadence` (#1206). Keep `get_available_times` at `None`: the
+  API layers would publish thousands of irregular instants as the
+  collection's temporal `values`.
 - `position` = nearest station within `position_radius_km` (25) by
   `ds_core::geo::great_circle_distance_m` — never a local haversine;
   `area` = `parse_area_coords` + `check_mask_budget` + exact

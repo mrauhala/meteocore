@@ -33,7 +33,11 @@ late or corrected reports change the field when it is next computed.
   goes round the Earth. Values are `f32` in the source's units. Analysis
   times fall every `cadence` across the source's temporal extent, on
   multiples of `cadence` counted from 1970-01-01T00:00Z (on the hour for
-  `PT1H`); the latest 10 000 are kept.
+  `PT1H`). Without `cadence` they are the source's own observation
+  instants: every distinct time a CSV file or a BUFR store holds,
+  off-hour reports included, read from the source's snapshot and not
+  listed in its own metadata; a PostGIS source lists none and needs a
+  `cadence`. The latest 10 000 are kept.
 - **Computing and caching.** A grid is computed once per collection,
   parameter, analysis time and revision of its input, on one thread of a
   pool of its own, and kept in a process-wide cache; concurrent requests
@@ -44,10 +48,14 @@ late or corrected reports change the field when it is next computed.
 - **Poll and revisions.** Every `poll_interval_secs`, on the background poll
   runtime, the engine rebuilds the time axis, re-reads the latest
   `precompute` times of every parameter and computes those not cached, one
-  at a time, leaving half the admission budget to requests. A changed slice
-  fingerprint is a revision: that time's grid is computed again and the
-  content version moves, which re-keys the rendered map caches. The version
-  is never 0, so maps for an explicit `TIME` revalidate after 60 s.
+  at a time, leaving half the admission budget to requests. It then
+  re-reads at most 8 older times whose grid is still cached, newest first
+  and round-robin across cycles. A changed slice fingerprint is a revision:
+  that time's grid is computed again and the content version moves, which
+  re-keys the rendered map caches. A request whose own computation finds a
+  revision keeps the grid under the new revision, so the next request hits
+  the cache. The version is never 0, so maps for an explicit `TIME`
+  revalidate after 60 s.
 
 ## What it serves
 
@@ -117,7 +125,7 @@ over the `weather` CSV collection.
 | `max_neighbours` | `8` | Stations per cell, 1 to 64 |
 | `search_radius_km` | `150` | Above 0, at most 10 000 |
 | `max_age` | `"PT1H"` | Oldest observation used, ISO 8601 |
-| `cadence` | – | Analysis time step, ISO 8601. Required: no station engine lists its instants |
+| `cadence` | – | Analysis time step, ISO 8601. Unset: the source's observation instants; required over PostGIS, which lists none |
 | `poll_interval_secs` | `60` | Poll period, above 0; under 5 runs as 5 |
 | `precompute` | `3` | Latest times per parameter computed ahead and re-checked, 0 to 24 |
 
@@ -138,9 +146,13 @@ CPUs, between 1 and 4).
   cell sampling shows cells as blocks.
 - A CSV source answers an area of at most 500 stations, so a grid whose
   search box holds more fails to compute.
-- Late reports are found within one poll only for the latest `precompute`
-  times; an older time is re-checked when its grid is next computed. A
-  revision re-keys the map tiles of every time.
+- Late reports are found within one poll for the latest `precompute`
+  times. Older times whose grid is cached are re-read 8 a cycle, so with K
+  of them a late report is found within ⌈K / 8⌉ polls. An older time whose
+  grid has left the cache is not re-read: its next request reads the
+  source, but map tiles already rendered from it stay cached until the
+  content version next moves. A revision re-keys the map tiles of every
+  time.
 - A reload rebuilds a grid whose config or source changed, and every grid
   over a CSV source (CSV engines are always rebuilt).
 
@@ -157,5 +169,8 @@ engine (maps in three CRSs, every EDR query type, bad configs) and in-memory
 sources (`170,10,-170,20` across the antimeridian, a polar EPSG:3035 view,
 late reports, a miss past the deadline). The Python script is an independent
 IDW/ADW implementation; the test pins its output to 1e-4 °C.
+`src/engine/revision_tests.rs` covers revisions found by a request, the
+round-robin re-checks of older cached times, and analysis times from the
+source's own instants.
 
 Contributor rules for this crate are in [CLAUDE.md](CLAUDE.md).

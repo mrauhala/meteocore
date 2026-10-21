@@ -509,7 +509,8 @@ pub struct StationGridConfig {
     pub max_age: String,
     /// Analysis times every `cadence` (ISO 8601, aligned to 00:00 UTC) over
     /// the source's temporal extent. Unset: the source's own observation
-    /// instants, for a source that lists them.
+    /// instants (`EdrEngine::observation_instants`), which CSV and BUFR list
+    /// and PostGIS does not, so a PostGIS source needs a cadence.
     #[serde(default)]
     pub cadence: Option<String>,
     /// How often the source is checked for new and revised observations.

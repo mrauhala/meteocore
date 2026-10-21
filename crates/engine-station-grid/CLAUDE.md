@@ -25,6 +25,13 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
   the set-based "every station at one time" read (#1062). CSV caps an area
   query at 500 stations — a demo source; BUFR and PostGIS have no station
   ceiling, only their value budgets.
+- Analysis times: every `cadence`, or without one the source's
+  `EdrEngine::observation_instants` (#1206): CSV and BUFR list every
+  distinct instant from their in-memory snapshots, off-hour reports
+  included; PostGIS lists none, so it needs a `cadence` (load error). The
+  hook is an O(1) `Arc` read by the station grid alone. Never switch it to
+  `get_available_times`: the API layers publish that as the source's
+  temporal `values`, which would change the CSV/BUFR collection JSON.
 - `geometry`, `interpolate` and `kdtree` are dependency-free pure functions —
   keep them that way. `compute` owns the cache, budget and pool; `engine`
   owns the axis, the version, the poll loop and both traits.
@@ -60,12 +67,26 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
   has one value): a revision re-keys every time's map tiles. It starts at
   1, never 0, so explicit-`TIME` responses revalidate. The grid cache keys
   on the time's own revision instead, so only the revised time's grid is
-  computed again and the other tiles re-render from cached grids. A time
-  older than `precompute` is re-checked only when its grid is computed again
-  — per-instant source versions are a follow-up.
+  computed again and the other tiles re-render from cached grids.
+- **Older times** (#1206, `engine/recheck.rs`): after the pre-compute, each
+  poll re-reads at most `RECHECK_PER_CYCLE` (8) times older than the
+  `precompute` window whose grid the cache holds, newest first and
+  round-robin across cycles (Critical Rule 9: a cap per cycle, never one
+  read per cached grid). A revision moves the time's revision and the
+  version through `observe` and computes the new grid ahead (background
+  admission); an unchanged one touches nothing. Selection uses
+  `contains_key`, never a get, so a re-check never keeps a grid warm. With
+  K such grids a revision is found within ⌈K / 8⌉ polls. No request reads
+  the source to look for a revision. An older time whose grid left the
+  cache is not re-checked: its next request reads the source, but map tiles
+  rendered from it stay in the no-TTL caches until the version next moves.
 - Grid cache key: (engine epoch, parameter, time, revision). The
   epoch is unique per engine construction and stands for the source and the
-  method config; `shutdown` evicts its grids.
+  method config; `shutdown` evicts its grids. A grid lives under the
+  revision of the input it was computed from (`compute::store`): a
+  computation that finds a revision itself fills its claimed key's waiters,
+  then moves the entry to the new revision, so the next request hits
+  (#1206). Never key a stored grid on the revision read before the compute.
 
 ## Execution (compute.rs) — never on a request worker
 
@@ -116,6 +137,6 @@ on the dashboard's Engines › Station grids tab. Keep them in step.
 ## Not in phase 1 (follow-up issue)
 
 Lapse-rate correction with a DEM, a land/sea mask, leave-one-out residuals,
-station exclusions and quality flags, projected analysis grids, per-instant
-revision tracking, kriging/natural neighbour, parallel interpolation of one
-large grid across the pool.
+station exclusions and quality flags, projected analysis grids, a per-time
+content version (a `MapEngine` trait change), kriging/natural neighbour,
+parallel interpolation of one large grid across the pool.

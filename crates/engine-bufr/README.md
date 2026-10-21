@@ -42,7 +42,11 @@ memory, and answers EDR and Features queries from that store.
   hour in the future, are rejected. Every 60 s, expired rows are pruned and
   the least recently reporting stations beyond `max_stations` are evicted.
   Station lists and extents come from a snapshot rebuilt every 10 s when
-  the store changed.
+  the store changed. The snapshot also lists every distinct report time,
+  off-hour reports included: a
+  [station grid](../engine-station-grid/README.md) over the collection
+  without a `cadence` takes them as its analysis times. The collection's
+  own metadata does not list them.
 - **Units**: each parameter names its Table B unit, served in the shared
   display units of `ds_core::units`: K as °C, Pa as hPa, `kg m-2` as mm,
   `kg m-2 s-1` as mm/h, `m2 s-2` as gpm and a WMO proportion as %. Other

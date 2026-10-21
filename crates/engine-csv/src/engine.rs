@@ -27,6 +27,9 @@ pub struct CsvEngine {
     /// First and last observation time, computed once: the Features
     /// temporal extent is read per request (Critical Rule 10).
     time_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// Every distinct observation time, ascending, built once: a station
+    /// grid's analysis times without a `cadence` (#1206).
+    instants: Arc<[DateTime<Utc>]>,
     /// The station-symbol map layers (#1204), built once: the file is
     /// static until a reload rebuilds the engine.
     pub(crate) map: StationMap,
@@ -52,6 +55,9 @@ impl CsvEngine {
             .map(|row| row.time)
             .min()
             .zip(store.rows.iter().map(|row| row.time).max());
+        let mut instants: Vec<DateTime<Utc>> = store.rows.iter().map(|row| row.time).collect();
+        instants.sort_unstable();
+        instants.dedup();
         let locations = Arc::new(LocationSnapshot::new(inventory(&store)));
         let map = StationMap::new(&store, time_extent, StationMapSettings::default());
         Self {
@@ -59,6 +65,7 @@ impl CsvEngine {
             stations,
             locations,
             time_extent,
+            instants: instants.into(),
             map,
         }
     }
@@ -324,6 +331,12 @@ impl EdrEngine for CsvEngine {
     /// coordinates `get_locations` lists: EDR GeoJSON can name each (#929).
     fn serves_station_series(&self) -> bool {
         true
+    }
+
+    /// Every distinct row time of the file, for a station grid without a
+    /// `cadence` (#1206). Not advertised: `get_available_times` stays `None`.
+    fn observation_instants(&self) -> Option<Arc<[DateTime<Utc>]>> {
+        Some(Arc::clone(&self.instants))
     }
 
     fn query_area(
@@ -857,6 +870,21 @@ mod tests {
             ))
             .unwrap(),
         )
+    }
+
+    /// A station grid over the file reads its distinct row times, in order
+    /// (#1206); the collection's public metadata does not list them.
+    #[test]
+    fn observation_instants_are_the_distinct_row_times() {
+        let engine = station_history();
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            engine.observation_instants().as_deref(),
+            Some(&[at("2026-01-01T00:00:00Z"), at("2026-01-01T01:00:00Z")][..])
+        );
+        assert_eq!(engine.get_available_times(), None);
+        let weather = CsvEngine::new(test_store());
+        assert_eq!(weather.observation_instants().unwrap().len(), 31 * 24);
     }
 
     /// The x of every coverage, in answer order.

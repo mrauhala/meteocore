@@ -349,9 +349,11 @@ fn rejects_bad_configurations() {
             .expect("must fail")
             .to_string()
     };
+    // CSV lists its observation instants, so `cadence` may be left out
+    // (#1206); a source that lists none needs one (unit tests).
     let mut c = config("idw");
     c.cadence = None;
-    assert!(fail(c).contains("cadence"));
+    assert!(StationGridEngine::new("ok", "weather", fixture(), &c).is_ok());
     let mut c = config("idw");
     c.correlation_length_km = Some(100.0);
     assert!(fail(c).contains("adw"));

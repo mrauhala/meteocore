@@ -780,6 +780,10 @@ impl EdrEngine for DerivedWind {
         self.edr.get_available_times()
     }
 
+    fn observation_instants(&self) -> Option<Arc<[DateTime<Utc>]>> {
+        self.edr.observation_instants()
+    }
+
     fn get_parameter_available_times(&self, parameter: &str) -> Option<Vec<DateTime<Utc>>> {
         let plan = self.plan();
         let Some(d) = plan.get(parameter) else {
