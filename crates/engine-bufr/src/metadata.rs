@@ -2,7 +2,7 @@
 //! O(1) from a snapshot). Rebuilt by the poll loop from the store when
 //! something changed; served through `ArcSwap`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -24,6 +24,10 @@ pub struct Snapshot {
     pub index: Arc<HashMap<String, usize>>,
     pub spatial_extent: Option<[f64; 4]>,
     pub temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// Every distinct report time in the store, ascending: a station grid's
+    /// analysis times without a `cadence` (#1206). Off-hour reports are
+    /// instants too.
+    pub instants: Arc<[DateTime<Utc>]>,
     pub report_count: usize,
     /// Bumped on every rebuild that changed anything (Features ETag, and
     /// the station map layers' `content_version`, #1204).
@@ -42,6 +46,7 @@ impl Snapshot {
             index: Arc::new(HashMap::new()),
             spatial_extent: None,
             temporal_extent: None,
+            instants: Arc::from([]),
             report_count: 0,
             version: 0,
             raster_info: Arc::new(crate::map::raster_info(table, layers, None, None)),
@@ -61,6 +66,12 @@ impl Snapshot {
         let report_counts: HashMap<&str, usize> = store
             .stations()
             .map(|s| (&*s.info.id, s.rows.len()))
+            .collect();
+        // O(reports) into a set of the few distinct times: a global store
+        // (~270 k reports) takes milliseconds, at most once per 10 s rebuild.
+        let instants: BTreeSet<DateTime<Utc>> = store
+            .stations()
+            .flat_map(|s| s.rows.keys().copied())
             .collect();
 
         let mut spatial: Option<[f64; 4]> = None;
@@ -127,6 +138,7 @@ impl Snapshot {
             index: Arc::new(index),
             spatial_extent: spatial,
             temporal_extent: temporal,
+            instants: instants.into_iter().collect(),
             report_count: store.row_count(),
             version,
             raster_info: Arc::new(crate::map::raster_info(table, layers, spatial, temporal)),

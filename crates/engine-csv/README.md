@@ -21,6 +21,10 @@ inventory as points.
   stations first appear in the file, along with the EDR location list and
   the observation time span. `/locations`, Features `/items` and the
   Features temporal extent are served from these without scanning the rows.
+- It also lists the file's distinct observation times once. A
+  [station grid](../engine-station-grid/README.md) over the collection
+  without a `cadence` takes them as its analysis times; the collection's
+  own metadata does not list them.
 - A station sits at the latitude and longitude of its first row.
 - Every EDR result is a `PointSeries` per station, without a vertical axis.
   Because each one sits at a listed location, the EDR layer answers

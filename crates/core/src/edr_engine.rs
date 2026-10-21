@@ -177,6 +177,19 @@ pub trait EdrEngine: Send + Sync {
         None
     }
 
+    /// The distinct instants a station collection holds observations at,
+    /// ascending: a station grid over it without a `cadence` takes them as
+    /// its analysis times (#1206). `None` when the engine cannot list them
+    /// (a database source). **O(1)**: an `Arc` of a snapshot.
+    ///
+    /// Read by the station grid alone, never published: unlike
+    /// [`Self::get_available_times`], which the API layers advertise as the
+    /// collection's temporal `values`, a station store can hold thousands of
+    /// irregular report instants.
+    fn observation_instants(&self) -> Option<Arc<[DateTime<Utc>]>> {
+        None
+    }
+
     fn get_spatial_extent(&self) -> Option<[f64; 4]>;
 
     /// Returns the collection's vertical axis, when it has one.

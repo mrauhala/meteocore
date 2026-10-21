@@ -25,7 +25,8 @@ search_radius_km = 150
 # old.
 max_age = "PT1H"
 # Analysis times every hour across the source's temporal extent. Without
-# it the source must list its own instants; CSV, BUFR and PostGIS do not.
+# it they are the source's own observation instants: CSV and BUFR list
+# them (the same hours here); a PostGIS source lists none and needs it.
 cadence = "PT1H"
 # The latest analyses computed ahead and re-checked for late reports.
 precompute = 3

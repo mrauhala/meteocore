@@ -890,6 +890,13 @@ impl ds_core::edr_engine::EdrEngine for BufrEngine {
         self.snapshot.load().temporal_extent
     }
 
+    /// Every distinct report time held, from the snapshot (so at most 10 s
+    /// behind the store), for a station grid without a `cadence` (#1206).
+    /// Not advertised: `get_available_times` stays `None`.
+    fn observation_instants(&self) -> Option<Arc<[DateTime<Utc>]>> {
+        Some(Arc::clone(&self.snapshot.load().instants))
+    }
+
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
         self.snapshot.load().spatial_extent
     }
@@ -1094,6 +1101,59 @@ mod tests {
         // Entirely outside: no match.
         assert!(!matched(Some(h(9, 1)), None));
         assert!(!matched(None, Some(h(7, 59))));
+    }
+
+    /// The distinct report times a station grid without a `cadence` takes
+    /// as its analysis times (#1206): every instant the store holds, an
+    /// off-hour report included, from the snapshot, so a report shows
+    /// after the rebuild and a withdrawn one is gone after the next. The
+    /// public metadata does not list them.
+    #[test]
+    fn observation_instants_follow_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BufrConfig {
+            data_path: Some(dir.path().to_string_lossy().into_owned()),
+            wis2: None,
+            poll_interval_secs: 60,
+            retention: "P36500D".to_string(),
+            max_stations: 50_000,
+            stale_after: "PT2H".to_string(),
+            position_radius_km: 25.0,
+            builtin_parameters: true,
+            parameters: Vec::new(),
+            map: None,
+        };
+        let e = BufrEngine::new(&cfg, "bufr-instants").unwrap();
+        assert_eq!(e.observation_instants().as_deref(), Some(&[][..]));
+        let h = |hh: u32, mm: u32| Utc.with_ymd_and_hms(2026, 9, 12, hh, mm, 0).unwrap();
+        {
+            let mut store = e.store.write().unwrap();
+            for (id, t) in [
+                ("a", h(9, 0)),
+                ("b", h(9, 0)),
+                ("a", h(8, 0)),
+                ("ship:XYZ", h(9, 20)),
+            ] {
+                store.ingest(&report(id, t), &e.table, h(9, 30));
+            }
+        }
+        assert_eq!(
+            e.observation_instants().as_deref(),
+            Some(&[][..]),
+            "the snapshot, not the store"
+        );
+        e.rebuild_snapshot();
+        assert_eq!(
+            e.observation_instants().as_deref(),
+            Some(&[h(8, 0), h(9, 0), h(9, 20)][..])
+        );
+        assert_eq!(e.remove_reports(&[("ship:XYZ".to_string(), h(9, 20))]), 1);
+        e.rebuild_snapshot();
+        assert_eq!(
+            e.observation_instants().as_deref(),
+            Some(&[h(8, 0), h(9, 0)][..])
+        );
+        assert_eq!(e.get_available_times(), None);
     }
 
     // ---- area: the value budget is the only bound (#1062) ------------------

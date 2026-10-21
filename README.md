@@ -1636,7 +1636,7 @@ method = "adw"              # "idw" (default) | "adw" | "nearest"
 max_neighbours = 8          # default 8, at most 64
 search_radius_km = 150      # default 150; a cell with no station in reach is nodata
 max_age = "PT1H"            # a station's latest value not after the time, at most this old
-cadence = "PT1H"            # analysis times; required today (see below)
+cadence = "PT1H"            # analysis times; optional over csv and bufr (see below)
 precompute = 3              # latest times computed ahead and re-checked, per parameter
 poll_interval_secs = 60
 ```
@@ -1654,9 +1654,13 @@ poll_interval_secs = 60
   the output CRS like any raster.
 - **Time.** The analysis times are every `cadence` (aligned to 00:00 UTC)
   across the source's temporal extent, the latest 10 000. Without `cadence`
-  the source's own instants are used, which none of the station engines list
-  yet, so the collection then fails at load asking for one. A map snaps to
-  the latest analysis time not after its `TIME`/`datetime`.
+  they are the source's own observation instants: every distinct time a CSV
+  file or a BUFR store holds, off-hour reports included, a BUFR store's at
+  most 10 s behind it. The source's own metadata does not list them. A
+  PostGIS source lists none, so there the collection fails at load asking
+  for a `cadence`. Over a live BUFR feed with ship or off-hour reports, a
+  `cadence` keeps the axis regular. A map snaps to the latest analysis time
+  not after its `TIME`/`datetime`.
 - **Revisions.** Observations arrive late and are corrected. Every analysis
   fingerprints its input; a different input for a time already analysed
   moves that time's revision, which re-keys its grid, and the collection's
@@ -1664,8 +1668,12 @@ poll_interval_secs = 60
   revalidate (`max-age=60, must-revalidate`)
   rather than being `immutable`. The poll re-reads the latest `precompute`
   times of every parameter each cycle, so late reports for them show within
-  one poll interval; an older time is checked when its grid is next
-  computed.
+  one poll interval. It also re-reads up to 8 older times a cycle whose grid
+  is still cached, newest first and round-robin, so with K such grids a
+  late report shows within ⌈K / 8⌉ poll intervals: 6 for a day of hourly
+  grids of two parameters at the default `precompute`. An older time whose
+  grid is not cached is read from the source when it is next asked for; no
+  request reads the source to look for a revision.
 - **Input values.** A station's latest finite value not after the analysis
   time and at most `max_age` old; a null is no value. A PostGIS source turns
   the values its parameters' `valid_range` and `missing_values` reject into

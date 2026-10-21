@@ -4,11 +4,12 @@
 //! # Time
 //!
 //! The analysis times are every `cadence` (aligned to 00:00 UTC) across the
-//! source's temporal extent, or, without one, the source's own instants
-//! (`EdrEngine::get_available_times`; none of today's station engines list
-//! them, so the engine then fails at load and asks for a cadence). A map
-//! request snaps to the latest analysis time not after it ([`select_time`]),
-//! and `resolve_time` uses the same function (#507).
+//! source's temporal extent, or, without one, the source's own observation
+//! instants (`EdrEngine::observation_instants`: CSV and BUFR list them from
+//! their in-memory stores, #1206; a source that lists none, PostGIS, fails
+//! the engine at load asking for a cadence). A map request snaps to the
+//! latest analysis time not after it ([`select_time`]), and `resolve_time`
+//! uses the same function (#507).
 //!
 //! # Revisions
 //!
@@ -17,13 +18,18 @@
 //! slice; when the fingerprint of a (parameter, time) differs from the one
 //! recorded before, that time's revision moves, which re-keys its grid in
 //! the grid cache, and so does the engine's content version, which re-keys
-//! the no-TTL map caches (`MapEngine::content_version`). The poll loop
+//! the no-TTL map caches (`MapEngine::content_version`). A grid is kept
+//! under the revision of the input it was computed from, even when its own
+//! computation found the revision (`compute::store`). The poll loop
 //! re-reads the latest `precompute` times of every parameter on each cycle,
-//! so late observations for them are found within one poll interval; an
-//! older time is checked again whenever its grid is recomputed. The content
-//! version is one value for the collection (the trait has no other): a
-//! revision re-keys every time's map tiles, but only the revised time's
-//! grid is computed again; the other tiles re-render from cached grids.
+//! so late observations for them are found within one poll interval, and a
+//! bounded round of the older times whose grid is cached (`recheck`), so a
+//! cached older grid is found revised within a few cycles; an older time
+//! without a cached grid is read afresh when it is next asked for. No
+//! request reads the source to find a revision. The content version is one
+//! value for the collection (the trait has no other): a revision re-keys
+//! every time's map tiles, but only the revised time's grid is computed
+//! again; the other tiles re-render from cached grids.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,6 +65,12 @@ use crate::geometry::{wrap_lon, GridGeom};
 use crate::interpolate::{interpolate_grid, Method, Settings, Stations};
 use crate::residuals::{self, Summary};
 use crate::source::{self, Slice};
+
+mod recheck;
+#[cfg(test)]
+mod revision_tests;
+
+pub use recheck::RECHECK_PER_CYCLE;
 
 /// Analysis times kept on the axis, the latest ones.
 pub const MAX_TIMES: usize = 10_000;
@@ -139,6 +151,8 @@ struct Inner {
     snapshot: ArcSwap<Snapshot>,
     /// The input last seen per (parameter, time).
     inputs: Mutex<HashMap<(usize, DateTime<Utc>), Input>>,
+    /// Where the next round of older re-checks starts (`recheck`).
+    recheck_from: Mutex<Option<recheck::Position>>,
     /// Per parameter, the latest analysis time computed and its station
     /// count.
     latest: Mutex<Vec<Option<Latest>>>,
@@ -314,10 +328,10 @@ impl StationGridEngine {
             .as_deref()
             .map(|c| duration("cadence", c))
             .transpose()?;
-        if cadence.is_none() && source.get_available_times().is_none() {
+        if cadence.is_none() && source.observation_instants().is_none() {
             return Err(bad(format!(
-                "source '{source_id}' does not list its observation instants; set `cadence` \
-                 (e.g. \"PT1H\") for the analysis times"
+                "source '{source_id}' does not list its observation instants (a CSV or BUFR \
+                 source does); set `cadence` (e.g. \"PT1H\") for the analysis times"
             )));
         }
         if config.poll_interval_secs == 0 {
@@ -362,6 +376,7 @@ impl StationGridEngine {
                 }),
             }),
             inputs: Mutex::new(HashMap::new()),
+            recheck_from: Mutex::new(None),
             latest: Mutex::new(vec![None; params.len()]),
             params,
             analyses: AtomicU64::new(0),
@@ -448,9 +463,9 @@ impl StationGridEngine {
     }
 
     /// The background loop: refresh the axis, compute the latest times
-    /// ahead and re-check them for late observations. Spawn it on the
-    /// background poll runtime (a multi-thread runtime: the cycle runs in
-    /// `block_in_place`).
+    /// ahead, and re-check them and a bounded round of the older cached
+    /// ones for late observations. Spawn it on the background poll runtime
+    /// (a multi-thread runtime: the cycle runs in `block_in_place`).
     pub async fn poll_loop(&self) {
         let mut ticker = self
             .shutdown
@@ -466,7 +481,9 @@ impl StationGridEngine {
 
     /// One poll cycle, synchronously: the axis from the source's current
     /// extent, then the latest `precompute` times of every parameter read
-    /// again and computed when new or revised.
+    /// again and computed when new or revised, then at most
+    /// [`RECHECK_PER_CYCLE`] older times whose grid is cached read again
+    /// and computed when revised.
     pub fn poll_once(&self) {
         let inner = &self.inner;
         inner.publish(inner.build_times());
@@ -479,6 +496,7 @@ impl StationGridEngine {
                 inner.precompute_one(p, time);
             }
         }
+        inner.recheck_older(&times);
     }
 
     /// Stop the poll loop and drop this instance's grids.
@@ -688,6 +706,26 @@ impl Inner {
         }
     }
 
+    /// The key a grid computed from an input with `fingerprint` belongs
+    /// under: the time's recorded revision, while that is still this input.
+    fn key_of_input(
+        &self,
+        parameter: usize,
+        time: DateTime<Utc>,
+        fingerprint: u64,
+    ) -> Option<GridKey> {
+        let inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
+        let input = inputs
+            .get(&(parameter, time))
+            .filter(|input| input.fingerprint == fingerprint)?;
+        Some(GridKey {
+            epoch: self.epoch,
+            parameter,
+            time: time.timestamp(),
+            revision: input.revision,
+        })
+    }
+
     /// The analysis times from the source's current metadata.
     fn build_times(&self) -> Vec<DateTime<Utc>> {
         let mut times = match self.cadence {
@@ -715,7 +753,10 @@ impl Inner {
                     .filter_map(|t| DateTime::from_timestamp(t, 0))
                     .collect()
             }
-            None => self.source.get_available_times().unwrap_or_default(),
+            None => {
+                let instants = self.source.observation_instants().unwrap_or_default();
+                instants[instants.len().saturating_sub(MAX_TIMES)..].to_vec()
+            }
         };
         times.sort_unstable();
         times.dedup();
@@ -845,12 +886,15 @@ impl Inner {
         })
     }
 
-    /// Queue a computation on the pool; its result also fills `guard`.
+    /// Queue a computation on the pool; its result also fills `guard`,
+    /// claimed under `key`, and is kept under the revision of the input it
+    /// was computed from.
     fn submit(
         self: &Arc<Self>,
         parameter: usize,
         time: DateTime<Utc>,
         slice: Option<Slice>,
+        key: GridKey,
         guard: ds_cache::CacheFillGuard<'static, GridKey, Arc<AnalysisGrid>>,
         permit: ds_executor::budget::BytePermit,
     ) -> mpsc::Receiver<Result<Arc<AnalysisGrid>, DataServerError>> {
@@ -861,7 +905,8 @@ impl Inner {
             let result = inner.compute(parameter, time, slice).map(Arc::new);
             match &result {
                 Ok(grid) => {
-                    let _ = guard.insert(grid.clone());
+                    let current = inner.key_of_input(parameter, time, grid.fingerprint);
+                    compute::store(guard, key, current, grid.clone());
                 }
                 Err(e) => {
                     inner.failures.fetch_add(1, Ordering::Relaxed);
@@ -893,7 +938,7 @@ impl Inner {
                 CACHE.record_miss();
                 let permit = compute::reserve(self.job_bytes)?;
                 Ok(Pending::Job(
-                    self.submit(parameter, time, None, guard, permit),
+                    self.submit(parameter, time, None, key, guard, permit),
                 ))
             }
             CacheEntry::Timeout => Ok(Pending::Elsewhere(key)),
@@ -923,7 +968,7 @@ impl Inner {
                     CacheEntry::Vacant(guard) => {
                         CACHE.record_miss();
                         let permit = compute::reserve(self.job_bytes)?;
-                        wait(self.submit(parameter, time, None, guard, permit))
+                        wait(self.submit(parameter, time, None, key, guard, permit))
                     }
                 }
             }
@@ -956,28 +1001,41 @@ impl Inner {
     }
 
     /// Re-read one of the latest times and compute it when it is new, was
-    /// revised, or fell out of the cache. Background admission only: it
-    /// never takes the half of the budget requests keep.
+    /// revised, or fell out of the cache.
     fn precompute_one(self: &Arc<Self>, parameter: usize, time: DateTime<Utc>) {
+        let Some(slice) = self.read_ahead(parameter, time) else {
+            return;
+        };
+        self.observe(parameter, time, slice.fingerprint);
+        self.compute_ahead(parameter, time, slice);
+    }
+
+    /// Read a slice for the poll; a failure is counted and logged.
+    fn read_ahead(&self, parameter: usize, time: DateTime<Utc>) -> Option<Slice> {
         let name = &self.params[parameter].name;
-        let slice = match source::fetch(
+        match source::fetch(
             self.source.as_ref(),
             name,
             self.query_bbox,
             time,
             self.max_age,
         ) {
-            Ok(slice) => slice,
+            Ok(slice) => Some(slice),
             Err(e) => {
                 self.failures.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "[{}] reading {name} at {time} from '{}' failed: {e}",
                     self.collection_id, self.source_id
                 );
-                return;
+                None
             }
-        };
-        self.observe(parameter, time, slice.fingerprint);
+        }
+    }
+
+    /// Compute the grid of an observed `slice` unless the cache holds it,
+    /// and wait for it. Background admission only: it never takes the half
+    /// of the budget requests keep.
+    fn compute_ahead(self: &Arc<Self>, parameter: usize, time: DateTime<Utc>, slice: Slice) {
         let key = self.key(parameter, time);
         let CacheEntry::Vacant(guard) =
             CACHE.get_value_or_guard_untracked(&key, std::time::Duration::ZERO)
@@ -986,13 +1044,13 @@ impl Inner {
         };
         let Some(permit) = compute::reserve_background(self.job_bytes) else {
             debug!(
-                "[{}] pre-compute of {name} at {time} deferred: requests hold the budget",
-                self.collection_id
+                "[{}] pre-compute of {} at {time} deferred: requests hold the budget",
+                self.collection_id, self.params[parameter].name
             );
             return;
         };
         let _ = self
-            .submit(parameter, time, Some(slice), guard, permit)
+            .submit(parameter, time, Some(slice), key, guard, permit)
             .recv();
     }
 }
