@@ -184,7 +184,11 @@ discovery), `radar-fi-volume-s3-h5` (polar volumes on public S3). The
 
 - Composites: `/what/object` must be `COMP`, and only `/dataset1/data1` is
   read. Supported projections are PROJ `stere`, `tmerc`, `laea` and
-  `longlat`; a `+R=` sphere radius other than WGS84's is rejected.
+  `longlat`, each projected one on the earth figure the projdef states
+  (#1243): a `+R=` sphere, a PROJ ellipsoid or datum name, or `+a=` with
+  a shape, by PROJ's rules; WGS84 when it states none. An unknown name, an
+  invalid figure, and a name stated beside axes are errors. Datum shifts
+  are not applied.
 - Polar sources are a local directory (not recursive) or S3; HTTP is not
   supported. A volume without a `NOD`, or with a non-alphanumeric one, is
   skipped.

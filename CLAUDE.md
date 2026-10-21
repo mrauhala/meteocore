@@ -691,7 +691,11 @@ one never implies the other.
   own columns.
 - **`ds_core::geo`** — CRS transforms (WGS84, TM, LAEA, LCC, Stereographic,
   Geostationary, WebMercator; TM, LAEA and Stereographic on a `figure:
-  Ellipsoid`, WGS84/GRS80 by name, a sphere or any ellipsoid, #1192), `GeoTransform`, `geometry_to_pixels`, `destination_point`,
+  Ellipsoid`, WGS84/GRS80 by name, a sphere or any ellipsoid, #1192;
+  `ds_core::cf`, engine-odim projdefs and engine-geotiff GeoKeys pass the
+  figure their source states, an unknown or unrepresentable one an error;
+  engine-querydata the one newbase master computes on, #1243),
+  `GeoTransform`, `geometry_to_pixels`, `destination_point`,
   `geodetic_to_ecef`, `OutputCrs::footprint_pixel_window` (low-zoom ghost
   guard, #453). `Crs::WebMercator`'s northing is unbounded at the poles.
   `Crs::Geostationary` is the one **partial** transform both ways:

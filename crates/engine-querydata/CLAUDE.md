@@ -36,9 +36,19 @@ runtime).
   { radius: Some(r) }`: the grid is defined on that sphere, and projecting it
   on WGS84 misplaced the full MEPS interior by ~1.2 km mean (#800). The
   stored corners have only six significant digits, so corner anchoring lands
-  within ~5 m of the file's world rect — pinned in `parse_meps_lcc`. The
-  stereographic record carries no radius line and still projects on WGS84 (`figure:
-  Ellipsoid::WGS84`; #1243).
+  within ~5 m of the file's world rect — pinned in `parse_meps_lcc`. A
+  record without a usable radius is a parse error, never WGS84 (#1243).
+- **Earth figures follow newbase master (#1243), never its unmerged
+  `WGS84` branch** (which reads legacy records with `+datum=WGS84`). A
+  stereographic record states no figure: `newbase_stereographic` puts it
+  on `kRearth`, the 6 371 220 m sphere (`NEWBASE_EARTH_RADIUS`), with
+  `k0 = (1 + sin trueLat) / 2` (master's `itsTrueLatScaleFactor`), so its
+  projected metres equal the world rect newbase stores to < 1 mm — pinned
+  in `stereographic_areas_are_on_newbase_sphere` with two qdtools records
+  (WGS84 misses by km). Lat/lon and rotated areas: master's `kRearth`
+  only scales world metres, unused here. When adding an area type, take
+  the figure master's `NFmi*Area` computes on and check it against a
+  record's stored world rect.
 - The render path projected per node (every source but a lat/lon grid
   under CRS:84 / Web Mercator) takes the shared sampler's map (#1190):
   `GridInfo::source` is a `ds_core::resample::SourceGrid` built once at
