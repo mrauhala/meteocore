@@ -105,13 +105,6 @@ fn per_kelvin(unit: &str) -> Option<f64> {
     }
 }
 
-/// The terrain and the mask as sampled.
-struct Rasters {
-    dem: Option<Dem>,
-    /// Per analysis cell: inside the mask.
-    inside: Option<Vec<bool>>,
-}
-
 /// One parameter's corrections.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ParamCorrection {
@@ -129,7 +122,10 @@ pub(crate) struct Corrections {
     geom: GridGeom,
     elevation: Option<(RasterSource, DemGrid)>,
     land_mask: Option<RasterSource>,
-    rasters: OnceLock<Rasters>,
+    /// The terrain and the mask, each kept once sampled.
+    dem: OnceLock<Dem>,
+    /// Per analysis cell: inside the mask.
+    inside: OnceLock<Vec<bool>>,
     exclusions: Exclusions,
     stations: Option<Arc<dyn FeatureEngine>>,
     inventory: ArcSwap<Inventory>,
@@ -283,17 +279,14 @@ impl Corrections {
             geom: *geom,
             elevation,
             land_mask,
-            rasters: OnceLock::new(),
+            dem: OnceLock::new(),
+            inside: OnceLock::new(),
             exclusions,
             stations: aux.stations,
             inventory: ArcSwap::from_pointee(Inventory::default()),
             waiting: Mutex::new(None),
             logged: Mutex::new((Logged::default(), Logged::default())),
         })
-    }
-
-    fn needs_rasters(&self) -> bool {
-        self.elevation.is_some() || self.land_mask.is_some()
     }
 
     /// Whether any parameter reads station heights.
@@ -324,8 +317,7 @@ impl Corrections {
     /// inventory read, where they are needed: until then the engine has no
     /// analysis time.
     pub fn ready(&self) -> bool {
-        (!self.needs_rasters() || self.rasters.get().is_some())
-            && (!self.needs_inventory() || self.inventory.load().version.is_some())
+        self.rasters_ready() && (!self.needs_inventory() || self.inventory.load().version.is_some())
     }
 
     /// Why the engine has no analysis time yet, when the corrections are
@@ -358,17 +350,9 @@ impl Corrections {
     /// then re-read the station inventory when the source's moved.
     /// Synchronous source I/O: the background poll runtime only.
     pub fn refresh(&self) {
-        if self.needs_rasters() && self.rasters.get().is_none() {
-            match self.sample() {
-                Ok(rasters) => {
-                    let _ = self.rasters.set(rasters);
-                    info!(
-                        "[{}] sampled {} onto the analysis grid",
-                        self.collection_id,
-                        self.sources()
-                    );
-                }
-                Err(e) => return self.wait(e),
+        if !self.rasters_ready() {
+            if let Err(e) = self.sample() {
+                return self.wait(e);
             }
         }
         if let Err(e) = self.refresh_inventory() {
@@ -394,45 +378,62 @@ impl Corrections {
         *waiting = Some(reason);
     }
 
-    fn sources(&self) -> String {
-        self.elevation
-            .iter()
-            .map(|(s, _)| format!("the terrain of '{}'", s.id))
-            .chain(
-                self.land_mask
-                    .iter()
-                    .map(|s| format!("the mask of '{}'", s.id)),
-            )
-            .collect::<Vec<_>>()
-            .join(" and ")
+    /// Whether every raster the corrections read is sampled.
+    fn rasters_ready(&self) -> bool {
+        (self.elevation.is_none() || self.dem.get().is_some())
+            && (self.land_mask.is_none() || self.inside.get().is_some())
     }
 
-    fn sample(&self) -> Result<Rasters, String> {
-        let dem = match &self.elevation {
-            Some((source, grid)) => Some(Dem {
-                grid: *grid,
-                metres: source.sample_metres(&grid.geom)?,
-            }),
-            None => None,
-        };
-        let inside = match &self.land_mask {
-            Some(source) => {
-                let inside = source.sample_inside(&self.geom)?;
-                if !inside.contains(&true) {
-                    warn!(
-                        "[{}] every cell of the grid is outside land_mask_source '{}'",
-                        self.collection_id, source.id
-                    );
+    /// Sample each raster not sampled yet, keeping each once it is: a
+    /// terrain read is never repeated while the mask is still missing.
+    fn sample(&self) -> Result<(), String> {
+        let mut missing = Vec::new();
+        if let Some((source, grid)) = &self.elevation {
+            if self.dem.get().is_none() {
+                match source.sample_metres(&grid.geom) {
+                    Ok(metres) => {
+                        let _ = self.dem.set(Dem {
+                            grid: *grid,
+                            metres,
+                        });
+                        info!(
+                            "[{}] sampled the terrain of '{}' onto the analysis grid",
+                            self.collection_id, source.id
+                        );
+                    }
+                    Err(e) => missing.push(e),
                 }
-                Some(inside)
             }
-            None => None,
-        };
-        Ok(Rasters { dem, inside })
+        }
+        if let Some(source) = &self.land_mask {
+            if self.inside.get().is_none() {
+                match source.sample_inside(&self.geom) {
+                    Ok(inside) => {
+                        if !inside.contains(&true) {
+                            warn!(
+                                "[{}] every cell of the grid is outside land_mask_source '{}'",
+                                self.collection_id, source.id
+                            );
+                        }
+                        let _ = self.inside.set(inside);
+                        info!(
+                            "[{}] sampled the mask of '{}' onto the analysis grid",
+                            self.collection_id, source.id
+                        );
+                    }
+                    Err(e) => missing.push(e),
+                }
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(missing.join("; "))
+        }
     }
 
     fn dem(&self) -> Option<&Dem> {
-        self.rasters.get().and_then(|r| r.dem.as_ref())
+        self.dem.get()
     }
 
     /// Re-read the station inventory when the source's data version moved.
@@ -573,9 +574,8 @@ impl Corrections {
         if correction.lapse_per_m.is_none() && !correction.masked {
             return Ok(());
         }
-        let rasters = self.rasters.get().ok_or_else(not_ready)?;
         if let Some(rate) = correction.lapse_per_m {
-            let dem = rasters.dem.as_ref().ok_or_else(not_ready)?;
+            let dem = self.dem.get().ok_or_else(not_ready)?;
             let nx = self.geom.nx as usize;
             for (i, value) in values.iter_mut().enumerate() {
                 let z = dem.at_cell((i % nx) as u32, (i / nx) as u32);
@@ -587,7 +587,7 @@ impl Corrections {
             }
         }
         if correction.masked {
-            let inside = rasters.inside.as_ref().ok_or_else(not_ready)?;
+            let inside = self.inside.get().ok_or_else(not_ready)?;
             for (value, &inside) in values.iter_mut().zip(inside) {
                 if !inside {
                     *value = f32::NAN;

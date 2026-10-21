@@ -120,7 +120,7 @@ fn health<'a>(result: &'a super::LoadResult, id: &str) -> &'a super::CollectionH
         .health
         .iter()
         .find(|h| h.id == id)
-        .unwrap_or_else(|| panic!("no health entry for {id}"))
+        .unwrap_or_else(|| panic!("a health entry"))
 }
 
 fn grid_engine(
@@ -131,7 +131,7 @@ fn grid_engine(
         .station_grid_engines
         .iter()
         .find(|e| e.collection_id() == id)
-        .unwrap_or_else(|| panic!("no station grid {id}"))
+        .unwrap_or_else(|| panic!("a station grid engine"))
         .clone()
 }
 
@@ -163,14 +163,17 @@ fn station_grid_corrects_with_terrain_and_mask_collections() {
     ));
     let result = load(&configs);
     let h = health(&result, "grid");
-    assert_eq!(h.status, super::CollectionStatus::Degraded, "{:?}", h.error);
+    assert_eq!(
+        h.status,
+        super::CollectionStatus::Degraded,
+        "unexpected value"
+    );
     assert!(
         h.error
             .as_deref()
             .unwrap_or("")
             .contains("waiting for elevation_source 'terrain' and land_mask_source 'land'"),
-        "{:?}",
-        h.error
+        "unexpected value"
     );
     // The layers are styled at load, before the first analysis time.
     assert!(result.wms_state.styles.contains_key("grid/temperature"));
@@ -181,7 +184,7 @@ fn station_grid_corrects_with_terrain_and_mask_collections() {
     let engine = grid_engine(&result, "grid");
     assert!(!engine.has_data());
     engine.poll_once();
-    assert!(engine.has_data(), "{:?}", engine.waiting_for());
+    assert!(engine.has_data(), "unexpected value");
     grid_engine(&result, "plain").poll_once();
 
     // At sea (the Bothnian Sea off Pori): nothing; the plain grid has a value.
@@ -194,7 +197,7 @@ fn station_grid_corrects_with_terrain_and_mask_collections() {
     let plain = temperature_at(&result, "plain", lon, lat).unwrap();
     assert!(
         corrected != plain && (corrected - plain).abs() < 3.0,
-        "{corrected} vs {plain}"
+        "the correction moves the land value by under 3 °C"
     );
 
     // The map draws what EDR answers, one pixel per cell.
@@ -252,11 +255,14 @@ fn station_grid_terrain_and_mask_must_be_raster_collections() {
         ));
         let result = load(&configs);
         let h = health(&result, "grid");
-        assert_eq!(h.status, super::CollectionStatus::Failed, "{extra}");
+        assert_eq!(
+            h.status,
+            super::CollectionStatus::Failed,
+            "unexpected value"
+        );
         assert!(
             h.error.as_deref().unwrap_or("").contains(needle),
-            "{extra}: {:?}",
-            h.error
+            "unexpected value"
         );
         assert!(!result.wms_state.engines.contains_key("grid"));
         assert_eq!(
@@ -285,11 +291,7 @@ fn station_grid_reuse_follows_its_terrain_and_mask() {
     };
     let old_configs = collections(&body(30));
     let built = load(&old_configs);
-    assert!(
-        built.engines_by_id.contains_key("grid"),
-        "{:?}",
-        health(&built, "grid").error
-    );
+    assert!(built.engines_by_id.contains_key("grid"), "unexpected value");
     let old: HashMap<String, CollectionConfig> = old_configs
         .iter()
         .map(|c| (c.id.clone(), c.clone()))
@@ -300,14 +302,14 @@ fn station_grid_reuse_follows_its_terrain_and_mask() {
         ["synop", "terrain", "land", "grid"]
             .iter()
             .all(|id| reused.contains(*id)),
-        "{reused:?}"
+        "unexpected value"
     );
     // A changed terrain is rebuilt, so is the grid that reads it.
     let changed = collections(&body(60));
     let reused = super::reusable_collections(&old, &changed, &live);
     assert!(
         !reused.contains("terrain") && !reused.contains("grid"),
-        "{reused:?}"
+        "unexpected value"
     );
     assert!(reused.contains("land") && reused.contains("synop"));
 }

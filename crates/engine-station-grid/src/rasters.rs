@@ -7,8 +7,11 @@
 //! - A request for a CRS84 box `[w, s, e, n]` at `width × height` draws
 //!   pixel `(i, j)` at `(w + (i + ½)(e − w)/width, n − (j + ½)(n − s)/height)`
 //!   (`OutputCrs::project_node` at the pixel centre, as every engine samples
-//!   through `ProjectionGrid`). Asked for the grid's own box at `nx × ny`,
-//!   each pixel is a cell centre. A box across the antimeridian is passed
+//!   through `ProjectionGrid`). Asked for whole cells of the grid at one
+//!   pixel each, each pixel is a cell centre. The grid is asked for in
+//!   blocks of at most [`SAMPLE_BLOCK_CELLS`] cells, so the engine's tile is
+//!   a bounded transient; the values go straight into the `f32` heights or
+//!   `bool` mask the engine keeps. A box across the antimeridian is passed
 //!   unwrapped, `east > 180`, as the map APIs pass it.
 //! - The terrain covers more than the grid: the grid widened by whole cells
 //!   to every station within the search radius ([`dem_grid`]), so a station
@@ -26,6 +29,10 @@ use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo};
 use ds_core::units::canonical_unit;
 
 use crate::geometry::GridGeom;
+
+/// Cells of one `get_raster_tile` call when sampling: bounds the engine's
+/// transient tile (16 bytes a pixel in the boxed form) at 16 MiB.
+pub(crate) const SAMPLE_BLOCK_CELLS: usize = 1 << 20;
 
 /// What a raster collection is read as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,68 +93,106 @@ impl RasterSource {
         check(&self.engine.raster_info(), self)
     }
 
-    /// The raster at `geom`'s cell centres, row-major from the north;
-    /// `None` for nodata. Synchronous source I/O: the poll loop only.
-    fn sample(&self, geom: &GridGeom) -> Result<(Vec<Option<f64>>, f64), String> {
+    /// Read the raster at `geom`'s cell centres, block by block of at most
+    /// `block_cells` cells, and hand each finite value to `put` as (cell
+    /// index, value, the reading's factor). Synchronous source I/O: the
+    /// poll loop only.
+    ///
+    /// The engine's tile of one block is the only transient: at most
+    /// `block_cells` pixels, 16 bytes each in the boxed `F64` form, so
+    /// [`SAMPLE_BLOCK_CELLS`] bounds it at 16 MiB whatever the grid. The
+    /// results land straight in the resident arrays the load check counts.
+    fn sample_into(
+        &self,
+        geom: &GridGeom,
+        block_cells: usize,
+        mut put: impl FnMut(usize, f64, f64),
+    ) -> Result<(), String> {
         let id = &self.id;
         let key = self.kind.key();
         let reading = self
             .check()?
             .ok_or_else(|| format!("{key} '{id}' has no data yet"))?;
-        let bbox = [
-            geom.west,
-            geom.south,
-            geom.west + geom.lon_span(),
-            geom.north,
-        ];
-        let tile = self
-            .engine
-            .get_raster_tile(
-                bbox,
-                geom.nx,
-                geom.ny,
-                None,
-                &OutputCrs::Wgs84,
-                reading.request.as_deref(),
-                None,
-                None,
-            )
-            .map_err(|e| format!("{key} '{id}' could not be read: {e}"))?;
-        let cells = geom.cells();
-        if (tile.width, tile.height) != (geom.nx, geom.ny) || tile.values.len() != cells {
-            return Err(format!(
-                "{key} '{id}' answered {} × {} values for a {} × {} grid",
-                tile.width, tile.height, geom.nx, geom.ny
-            ));
+        let (nx, ny) = (geom.nx as usize, geom.ny as usize);
+        let block_width = nx.min(block_cells.max(1));
+        let block_rows = (block_cells / block_width).max(1);
+        let mut any = false;
+        for row0 in (0..ny).step_by(block_rows) {
+            let rows = block_rows.min(ny - row0);
+            for col0 in (0..nx).step_by(block_width) {
+                let cols = block_width.min(nx - col0);
+                let mut west = geom.west + col0 as f64 * geom.dx;
+                // A box across 180° goes unwrapped, west within ±180°.
+                if west > 180.0 {
+                    west -= 360.0;
+                }
+                let north = geom.north - row0 as f64 * geom.dy;
+                let bbox = [
+                    west,
+                    north - rows as f64 * geom.dy,
+                    west + cols as f64 * geom.dx,
+                    north,
+                ];
+                let tile = self
+                    .engine
+                    .get_raster_tile(
+                        bbox,
+                        cols as u32,
+                        rows as u32,
+                        None,
+                        &OutputCrs::Wgs84,
+                        reading.request.as_deref(),
+                        None,
+                        None,
+                    )
+                    .map_err(|e| format!("{key} '{id}' could not be read: {e}"))?;
+                if (tile.width as usize, tile.height as usize) != (cols, rows)
+                    || tile.values.len() != cols * rows
+                {
+                    return Err(format!(
+                        "{key} '{id}' answered {} × {} values for a {cols} × {rows} block",
+                        tile.width, tile.height
+                    ));
+                }
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let Some(v) = tile.values.value_at(r * cols + c) else {
+                            continue;
+                        };
+                        if v.is_finite() {
+                            any = true;
+                            put((row0 + r) * nx + col0 + c, v, reading.factor);
+                        }
+                    }
+                }
+            }
         }
-        let values: Vec<Option<f64>> = (0..cells)
-            .map(|i| tile.values.value_at(i).filter(|v| v.is_finite()))
-            .collect();
-        if values.iter().all(Option::is_none) {
+        if !any {
             return Err(format!("{key} '{id}' has no value over the analysis grid"));
         }
-        Ok((values, reading.factor))
+        Ok(())
     }
 
-    /// Terrain heights in metres over `geom` (NaN for nodata).
+    /// Terrain heights in metres over `geom` (NaN for nodata), `f32` from
+    /// the engine's tiles with no intermediate copy.
     pub fn sample_metres(&self, geom: &GridGeom) -> Result<Vec<f32>, String> {
         debug_assert_eq!(self.kind, Kind::Elevation);
-        let (values, metres_per_unit) = self.sample(geom)?;
-        Ok(values
-            .into_iter()
-            .map(|v| v.map_or(f32::NAN, |v| (v * metres_per_unit) as f32))
-            .collect())
+        let mut metres = vec![f32::NAN; geom.cells()];
+        self.sample_into(geom, SAMPLE_BLOCK_CELLS, |i, v, metres_per_unit| {
+            metres[i] = (v * metres_per_unit) as f32;
+        })?;
+        Ok(metres)
     }
 
     /// Per cell of `geom`, whether it is inside the mask: a value at or
     /// above the threshold. Nodata is outside.
     pub fn sample_inside(&self, geom: &GridGeom) -> Result<Vec<bool>, String> {
         debug_assert_eq!(self.kind, Kind::LandMask);
-        let (values, threshold) = self.sample(geom)?;
-        Ok(values
-            .into_iter()
-            .map(|v| v.is_some_and(|v| v >= threshold))
-            .collect())
+        let mut inside = vec![false; geom.cells()];
+        self.sample_into(geom, SAMPLE_BLOCK_CELLS, |i, v, threshold| {
+            inside[i] = v >= threshold;
+        })?;
+        Ok(inside)
     }
 }
 
@@ -398,8 +443,7 @@ mod tests {
         let d = dem_grid(&g, 100_000.0);
         assert!(
             d.geom.west > 160.0 && d.geom.west < 170.0,
-            "{}",
-            d.geom.west
+            "unexpected value"
         );
         assert!(d.geom.west + d.geom.lon_span() > 190.0);
         // The analysis cell either side of 180° maps to its terrain cell.
@@ -411,7 +455,7 @@ mod tests {
 
         let near_seam = GridGeom::new([-179.0, 0.0, -170.0, 5.0], 0.5).unwrap();
         let d = dem_grid(&near_seam, 300_000.0);
-        assert!(d.geom.west > 170.0, "wrapped west of 180°: {}", d.geom.west);
+        assert!(d.geom.west > 170.0, "wrapped west of 180°");
     }
 
     /// Bilinear between cell centres; the cell under the point next to
@@ -443,7 +487,106 @@ mod tests {
         assert_eq!(holey.height_at(1.1, 1.9), None);
         // The south row has no nodata: bilinear along it.
         let south = holey.height_at(1.1, 0.4).unwrap();
-        assert!((south - 360.0).abs() < 1e-9, "{south}");
+        assert!((south - 360.0).abs() < 1e-9, "unexpected value");
+    }
+
+    /// A raster as a formula of the pixel centre, counting its reads.
+    struct Formula(std::sync::atomic::AtomicUsize);
+
+    fn field(lon: f64, lat: f64) -> Option<f64> {
+        // Continuous across 180°; nodata in one corner.
+        let lon = lon.rem_euclid(360.0);
+        (lat < 19.0 || lon < 189.0).then_some(lon * 10.0 + lat)
+    }
+
+    impl MapEngine for Formula {
+        fn get_raster_tile(
+            &self,
+            bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _: Option<chrono::DateTime<chrono::Utc>>,
+            crs: &OutputCrs,
+            _: Option<&str>,
+            _: Option<f64>,
+            _: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<ds_core::map_engine::RasterTile, ds_core::error::DataServerError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                (-180.0..=180.0).contains(&bbox[0]),
+                "a block's west within ±180°"
+            );
+            let mut values = Vec::new();
+            for j in 0..height {
+                for i in 0..width {
+                    let (lon, lat) = crs.project_node(
+                        bbox,
+                        (i as f64 + 0.5) / width as f64,
+                        (j as f64 + 0.5) / height as f64,
+                    );
+                    values.push(field(lon, lat));
+                }
+            }
+            Ok(ds_core::map_engine::RasterTile {
+                width,
+                height,
+                values: ds_core::map_engine::RasterValues::F64(values),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "EPSG:4326".into(),
+                spatial_extent: None,
+                times: Vec::new(),
+                parameter: "h".into(),
+                unit: "m".into(),
+                parameters: Vec::new(),
+                vertical: None,
+                grid_size: None,
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+                native_grid: None,
+            }
+        }
+    }
+
+    /// Small blocks read the same values as one call, each cell at its
+    /// centre, across the antimeridian, with every block's west within
+    /// ±180°.
+    #[test]
+    fn blocks_read_every_cell_at_its_centre() {
+        let geom = GridGeom::new([170.0, 10.0, -170.0, 20.0], 0.5).unwrap();
+        let engine = Arc::new(Formula(Default::default()));
+        let source = RasterSource::new("dem", Kind::Elevation, engine.clone(), None);
+        let read = |block: usize| {
+            let mut out = vec![f32::NAN; geom.cells()];
+            source
+                .sample_into(&geom, block, |i, v, f| out[i] = (v * f) as f32)
+                .unwrap();
+            out
+        };
+        let whole = read(SAMPLE_BLOCK_CELLS);
+        assert_eq!(engine.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let blocks = read(7);
+        assert_eq!(
+            engine.0.load(std::sync::atomic::Ordering::SeqCst),
+            1 + 6 * 20,
+            "7-cell blocks of 40-cell rows"
+        );
+        for row in 0..geom.ny {
+            for col in 0..geom.nx {
+                let i = (row * geom.nx + col) as usize;
+                let want = field(geom.lon(col), geom.lat(row)).map_or(f32::NAN, |v| v as f32);
+                for got in [whole[i], blocks[i]] {
+                    assert!(
+                        got == want || (got.is_nan() && want.is_nan()),
+                        "a cell's value at its centre"
+                    );
+                }
+            }
+        }
+        assert!(whole.iter().any(|v| v.is_nan()) && whole.iter().any(|v| v.is_finite()));
     }
 
     #[test]

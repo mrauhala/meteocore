@@ -500,12 +500,11 @@ fn valley_analysis_follows_the_terrain() {
     assert!(!engine.has_data());
     assert!(engine.waiting_for().is_some());
     engine.poll_once();
-    assert!(engine.has_data(), "{:?}", engine.waiting_for());
+    assert!(engine.has_data(), "unexpected value");
     assert_eq!(engine.station_counts(), vec![("t2m".to_string(), Some(2))]);
     assert!(
         engine.provenance().contains("lapse rate (t2m -6.5 K/km)"),
-        "{}",
-        engine.provenance()
+        "unexpected value"
     );
 
     let plain = build(
@@ -518,11 +517,14 @@ fn valley_analysis_follows_the_terrain() {
     .unwrap();
     for (lon, lat, want, want_plain) in VALLEY {
         let got = at(&engine, "t2m", lon, lat).unwrap();
-        assert!((got - want).abs() < 1e-4, "{lon},{lat}: {got} vs {want}");
+        assert!(
+            (got - want).abs() < 1e-4,
+            "the corrected analysis is the reference's"
+        );
         let got_plain = at(&plain, "t2m", lon, lat).unwrap();
         assert!(
             (got_plain - want_plain).abs() < 1e-4,
-            "{lon},{lat}: {got_plain} vs {want_plain}"
+            "the uncorrected analysis is the reference's"
         );
     }
     // The east ridge is colder, the valley floor warmer, than without.
@@ -549,11 +551,11 @@ fn valley_analysis_follows_the_terrain() {
     assert_eq!((width, height), (48, 22));
     assert!(
         (w - 22.1).abs() < 1e-9 && (e - 26.9).abs() < 1e-9,
-        "{w} {e}"
+        "unexpected value"
     );
     assert!(
         (s - 59.1).abs() < 1e-9 && (n - 61.3).abs() < 1e-9,
-        "{s} {n}"
+        "unexpected value"
     );
     assert_eq!(parameter, None, "a single-parameter collection");
 }
@@ -583,7 +585,7 @@ fn stated_heights_terrain_fallback_and_nodata() {
         .iter()
         .filter(|w| w.contains("states a height of 2000 m"))
         .collect();
-    assert_eq!(disagreements.len(), 1, "{warnings:?}");
+    assert_eq!(disagreements.len(), 1, "unexpected value");
     assert!(disagreements[0].contains("1095 m from the terrain's 905 m"));
     assert_eq!(
         warnings
@@ -591,7 +593,7 @@ fn stated_heights_terrain_fallback_and_nodata() {
             .filter(|w| w.contains("(24.95, 60.05) has no stated height"))
             .count(),
         1,
-        "{warnings:?}"
+        "unexpected value"
     );
 
     // The ridge station on its stated 2000 m: its own cell is its value
@@ -599,7 +601,7 @@ fn stated_heights_terrain_fallback_and_nodata() {
     let ridge = at(&engine, "t2m", 24.05, 60.25).unwrap();
     assert!(
         (ridge - (-4.0 + 0.0065 * (2000.0 - 905.0))).abs() < 1e-4,
-        "{ridge}"
+        "unexpected value"
     );
     // The valley station on the terrain under it.
     assert!((at(&engine, "t2m", 24.45, 60.15).unwrap() - 1.5).abs() < 1e-5);
@@ -617,7 +619,7 @@ fn stated_heights_terrain_fallback_and_nodata() {
     let again = warnings_of("heights", || engine.poll_once());
     assert!(
         !again.iter().any(|w| w.contains("states a height")),
-        "{again:?}"
+        "unexpected value"
     );
 }
 
@@ -654,12 +656,12 @@ fn land_mask_is_nodata_in_maps_and_edr() {
         (24.95, 60.15),
     ];
     for (lon, lat) in inside {
-        assert!(at(&engine, "t2m", lon, lat).is_some(), "{lon},{lat}");
+        assert!(at(&engine, "t2m", lon, lat).is_some(), "unexpected value");
     }
     for (lon, lat) in outside {
-        assert_eq!(at(&engine, "t2m", lon, lat), None, "{lon},{lat}");
+        assert_eq!(at(&engine, "t2m", lon, lat), None, "unexpected value");
         // `rh` opts out: today's estimate from every station.
-        assert!(at(&engine, "rh", lon, lat).is_some(), "{lon},{lat}");
+        assert!(at(&engine, "rh", lon, lat).is_some(), "unexpected value");
     }
     // The map: one pixel per cell, NaN exactly where EDR answers null.
     let pixels = tile(&engine, "t2m", VALLEY_BBOX, 10, 4);
@@ -669,7 +671,7 @@ fn land_mask_is_nodata_in_maps_and_edr() {
             assert_eq!(
                 pixels[row * 10 + col].is_nan(),
                 at(&engine, "t2m", lon, lat).is_none(),
-                "{lon},{lat}"
+                "unexpected value"
             );
         }
     }
@@ -712,7 +714,10 @@ fn per_parameter_lapse_rates() {
     let err = build("rates-none", &source, &cfg, Some(terrain_engine()), None)
         .err()
         .expect("must fail");
-    assert!(err.contains("no parameter is corrected"), "{err}");
+    assert!(
+        err.contains("no parameter is corrected"),
+        "unexpected value"
+    );
 
     cfg.parameters = vec![
         options("t2m", Some(0.0), None),
@@ -724,7 +729,10 @@ fn per_parameter_lapse_rates() {
     assert_eq!(at(&engine, "t2m", lon, lat), at(&plain, "t2m", lon, lat));
     let td = at(&engine, "td", lon, lat).unwrap();
     let td_plain = at(&plain, "td", lon, lat).unwrap();
-    assert!(td < td_plain - 0.5, "{td} vs {td_plain}");
+    assert!(
+        td < td_plain - 0.5,
+        "the corrected dew point is colder on the ridge"
+    );
 
     cfg.parameters = vec!["t2m".into(), "td".into()];
     let engine = build("rates-default", &source, &cfg, Some(terrain_engine()), None).unwrap();
@@ -754,7 +762,7 @@ fn exclusions_change_the_analysis_and_the_version() {
     engine.poll_once();
     assert_eq!(engine.station_counts(), vec![("t2m".to_string(), Some(2))]);
     let excluded = at(&engine, "t2m", 24.75, 60.05).unwrap();
-    assert!(excluded < 2.0, "the station's 8 °C is left out: {excluded}");
+    assert!(excluded < 2.0, "the station's 8 °C is left out");
     let version = engine.content_version();
     assert!(engine.provenance().contains("exclude_where"));
 
@@ -775,7 +783,7 @@ fn exclusions_change_the_analysis_and_the_version() {
     .err()
     .unwrap()
     .to_string();
-    assert!(err.contains("no station inventory"), "{err}");
+    assert!(err.contains("no station inventory"), "unexpected value");
 }
 
 /// A terrain still polling (remote, no data yet): no analysis time, an
@@ -798,8 +806,7 @@ fn nothing_is_served_before_the_terrain_is_sampled() {
             .waiting_for()
             .unwrap()
             .contains("'dem' has no data yet"),
-        "{:?}",
-        engine.waiting_for()
+        "unexpected value"
     );
     assert_eq!(engine.resolve_time(Some(t0()), None), None);
     assert!(tile(&engine, "t2m", VALLEY_BBOX, 10, 4)
@@ -818,6 +825,50 @@ fn nothing_is_served_before_the_terrain_is_sampled() {
     assert_eq!(engine.resolve_time(None, None), Some(t0()));
     let (lon, lat, want, _) = VALLEY[3];
     assert!((at(&engine, "t2m", lon, lat).unwrap() - want).abs() < 1e-4);
+}
+
+/// A raster once sampled is kept: while the mask is still missing, each
+/// retry reads the mask alone, never the terrain again.
+#[test]
+fn a_sampled_terrain_is_not_read_again_while_the_mask_is_missing() {
+    let source = Source::new(valley_stations());
+    let terrain = terrain_engine();
+    let mask = Raster::new(&[("land", "1")], |_, _| Some(1.0));
+    mask.ready.store(false, Ordering::SeqCst);
+    let mut cfg = config(vec!["t2m".into()]);
+    cfg.elevation_source = Some("dem".into());
+    cfg.land_mask_source = Some("land".into());
+    let engine = build(
+        "retries",
+        &source,
+        &cfg,
+        Some(terrain.clone()),
+        Some(mask.clone()),
+    )
+    .unwrap();
+    for _ in 0..3 {
+        engine.poll_once();
+    }
+    assert!(!engine.has_data());
+    assert!(engine
+        .waiting_for()
+        .unwrap_or_default()
+        .contains("land_mask_source 'land' has no data yet"));
+    assert_eq!(
+        terrain.requests.lock().unwrap().len(),
+        1,
+        "terrain read once"
+    );
+
+    mask.ready.store(true, Ordering::SeqCst);
+    engine.poll_once();
+    assert!(engine.has_data());
+    assert_eq!(
+        terrain.requests.lock().unwrap().len(),
+        1,
+        "terrain read once"
+    );
+    assert_eq!(mask.requests.lock().unwrap().len(), 1, "mask read once");
 }
 
 /// The canonical seam box `170,10,-170,20`: the terrain and the mask are
@@ -867,13 +918,16 @@ fn terrain_and_mask_across_the_antimeridian() {
     )
     .unwrap();
     engine.poll_once();
-    assert!(engine.has_data(), "{:?}", engine.waiting_for());
+    assert!(engine.has_data(), "unexpected value");
 
     let (mask_bbox, w, h, _) = mask.requests.lock().unwrap()[0].clone();
     assert_eq!(mask_bbox, [170.0, 10.0, 190.0, 20.0], "unwrapped past 180°");
     assert_eq!((w, h), (40, 20));
     let (dem_bbox, ..) = terrain.requests.lock().unwrap()[0].clone();
-    assert!(dem_bbox[0] < 170.0 && dem_bbox[2] > 190.0, "{dem_bbox:?}");
+    assert!(
+        dem_bbox[0] < 170.0 && dem_bbox[2] > 190.0,
+        "unexpected value"
+    );
 
     let pixels = tile(&engine, "t2m", [170.0, 10.0, -170.0, 20.0], 40, 20);
     // Row of 15.25 N; columns of 179.75 and -179.75.
@@ -882,11 +936,11 @@ fn terrain_and_mask_across_the_antimeridian() {
     let want_east = sea_level - lapse * height(180.25);
     assert!(
         (f64::from(west) - want_west).abs() < 1e-4,
-        "{west} vs {want_west}"
+        "west of 180° follows the terrain"
     );
     assert!(
         (f64::from(east) - want_east).abs() < 1e-4,
-        "{east} vs {want_east}"
+        "east of 180° follows the terrain"
     );
     assert_eq!(
         at(&engine, "t2m", -179.75, 15.25).map(|v| v as f32),
@@ -941,7 +995,7 @@ fn residuals_with_corrections() {
     )])]);
     let engine = build("residuals", &source, &cfg, Some(terrain), Some(mask)).unwrap();
     engine.poll_once();
-    assert!(engine.has_data(), "{:?}", engine.waiting_for());
+    assert!(engine.has_data(), "unexpected value");
 
     let page = engine
         .get_features(&FeatureQuery {
@@ -952,7 +1006,7 @@ fn residuals_with_corrections() {
         .unwrap();
     let float = |f: &Feature, name: &str| match f.properties.get(name) {
         Some(PropertyValue::Float(v)) => *v,
-        other => panic!("{name}: {other:?}"),
+        _ => panic!("a float property"),
     };
     let found: Vec<(f64, f64, f64, f64, f64)> = page
         .features
@@ -970,26 +1024,20 @@ fn residuals_with_corrections() {
             )
         })
         .collect();
-    assert_eq!(
-        found.len(),
-        4,
-        "neither the excluded nor the height-less: {found:?}"
-    );
+    assert_eq!(found.len(), 4, "neither the excluded nor the height-less");
     for (lon, lat, value, estimate, residual) in VALLEY_RESIDUALS {
         let got = found
             .iter()
             .find(|f| (f.0 - lon).abs() < 1e-9 && (f.1 - lat).abs() < 1e-9)
-            .unwrap_or_else(|| panic!("no residual at {lon},{lat}: {found:?}"));
+            .unwrap_or_else(|| panic!("a residual at every reference station"));
         assert_eq!(got.2, value, "the observed value");
         assert!(
             (got.3 - estimate).abs() < 1e-9,
-            "{lon},{lat}: {} vs {estimate}",
-            got.3
+            "the estimate is the reference's"
         );
         assert!(
             (got.4 - residual).abs() < 1e-9,
-            "{lon},{lat}: {} vs {residual}",
-            got.4
+            "the residual is the reference's"
         );
     }
     // The east-ridge station's cell is masked; its residual is kept.
@@ -1045,7 +1093,7 @@ fn rechecks_of_older_times_see_exclusions() {
     engine.poll_once();
     assert!(engine.content_version() > version);
     let revised = at_older().unwrap();
-    assert!(revised < 2.0, "the excluded 8 °C is gone: {revised}");
+    assert!(revised < 2.0, "the excluded 8 °C is gone");
 }
 
 /// Every new key's errors.
@@ -1071,14 +1119,17 @@ fn rejects_bad_corrections() {
     // A corrected parameter must be a temperature.
     let c = with_dem(vec![options("rh", Some(-6.5), None)]);
     let err = fail(&c, Some(terrain_engine()), None);
-    assert!(err.contains("unit '%' is not a temperature"), "{err}");
+    assert!(
+        err.contains("unit '%' is not a temperature"),
+        "unexpected value"
+    );
     // The rate's range.
     for rate in [-500.0, f64::NAN] {
         let c = with_dem(vec![options("t2m", Some(rate), None)]);
         let err = fail(&c, Some(terrain_engine()), None);
         assert!(
             err.contains("lapse_rate of 't2m' must be a number of K/km"),
-            "{err}"
+            "unexpected value"
         );
     }
     // No corrected parameter: dew point has no default.
@@ -1086,27 +1137,30 @@ fn rejects_bad_corrections() {
     assert!(err.contains("elevation_source 'dem' is set but no parameter is corrected"));
     // Named but not wired (built without its engine).
     let err = fail(&with_dem(vec!["t2m".into()]), None, None);
-    assert!(err.contains("elevation_source 'dem' is not wired"), "{err}");
+    assert!(
+        err.contains("elevation_source 'dem' is not wired"),
+        "unexpected value"
+    );
     // Heights in a unit that is not a length.
     let bad_unit = Raster::new(&[("height", "dBZ")], |_, _| Some(1.0));
     let err = fail(&with_dem(vec!["t2m".into()]), Some(bad_unit), None);
     assert!(
         err.contains("in 'dBZ'; they must be in m, km, ft or gpm"),
-        "{err}"
+        "unexpected value"
     );
     // Several parameters: name one, and only one it has.
     let several = || Raster::new(&[("orog", "m"), ("lsm", "1")], |_, _| Some(1.0));
     let err = fail(&with_dem(vec!["t2m".into()]), Some(several()), None);
     assert!(
         err.contains("has 2 parameters (orog, lsm); name the one to read with elevation_parameter"),
-        "{err}"
+        "unexpected value"
     );
     let mut c = with_dem(vec!["t2m".into()]);
     c.elevation_parameter = Some("height".into());
     let err = fail(&c, Some(several()), None);
     assert!(
         err.contains("elevation_parameter 'height' is not a parameter"),
-        "{err}"
+        "unexpected value"
     );
     c.elevation_parameter = Some("orog".into());
     let several_dem = several();
@@ -1129,7 +1183,7 @@ fn rejects_bad_corrections() {
     let err = fail(&c, None, Some(metres));
     assert!(
         err.contains("land_mask_source 'land' states its mask ('land') in 'm'"),
-        "{err}"
+        "unexpected value"
     );
     // Every parameter opting out of the mask.
     c.parameters = vec![options("t2m", None, Some(false))];
@@ -1137,7 +1191,7 @@ fn rejects_bad_corrections() {
     let err = fail(&c, None, Some(fraction));
     assert!(
         err.contains("every parameter sets land_mask = false"),
-        "{err}"
+        "unexpected value"
     );
     // Exclusion rules naming nothing.
     let mut c = config(vec!["t2m".into()]);

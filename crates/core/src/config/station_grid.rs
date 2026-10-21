@@ -259,11 +259,14 @@ mod tests {
         assert_eq!(h.parameters[0].lapse_rate(), None);
         // The table's own error names the unknown key.
         let typo = parse("parameters = [{ name = \"t2m\", lapse = -6.5 }]").unwrap_err();
-        assert!(typo.contains("unknown field `lapse`"), "{typo}");
+        assert!(typo.contains("unknown field `lapse`"), "unexpected value");
         let missing = parse("parameters = [{ lapse_rate = -6.5 }]").unwrap_err();
-        assert!(missing.contains("missing field `name`"), "{missing}");
+        assert!(missing.contains("missing field `name`"), "unexpected value");
         let wrong = parse("parameters = [42]").unwrap_err();
-        assert!(wrong.contains("a parameter name or a table"), "{wrong}");
+        assert!(
+            wrong.contains("a parameter name or a table"),
+            "unexpected value"
+        );
     }
 
     #[test]
@@ -293,7 +296,10 @@ mod tests {
         assert_eq!(many.exclude_where.0[2]["level"][0].filter_text(), "1.5");
         assert!(parse("").unwrap().exclude_where.is_empty());
         let bad = parse("exclude_where = 3").unwrap_err();
-        assert!(bad.contains("a table of station properties"), "{bad}");
+        assert!(
+            bad.contains("a table of station properties"),
+            "unexpected value"
+        );
         let nested = parse("exclude_where = { a = { b = 1 } }").unwrap_err();
         assert!(!nested.is_empty());
     }

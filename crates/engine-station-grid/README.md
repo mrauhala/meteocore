@@ -203,8 +203,9 @@ cadence = "PT1H"
   QueryData, satellite, ODIM composite), whatever APIs it lists. A missing,
   derived or non-raster collection fails the grid at load. The poll samples
   each once per engine through the collection's map rendering, CRS84 at
-  one value per analysis cell centre; the terrain over the grid widened by
-  whole cells to the search radius, for stations outside the grid. Until
+  one value per analysis cell centre, in blocks of at most 1 Mi cells; the
+  terrain over the grid widened by whole cells to the search radius, for
+  stations outside the grid. Each is kept once sampled. Until
   both are sampled (a remote collection still polling) the collection has no
   analysis time: maps are empty and EDR answers 404, never an uncorrected or
   unmasked value, and `/health` says what it waits for. The poll retries
