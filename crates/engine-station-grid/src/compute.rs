@@ -48,10 +48,14 @@ pub struct AnalysisGrid {
     pub stations: usize,
     /// The input slice's fingerprint.
     pub fingerprint: u64,
+    /// Each station's leave-one-out residual, in slice order (#1206):
+    /// computed with the grid, cached with it.
+    pub residuals: Vec<crate::residuals::Residual>,
 }
 
 fn weigh(_: &GridKey, grid: &Arc<AnalysisGrid>) -> u64 {
-    grid_bytes(grid.values.len()) + 128
+    let residuals = grid.residuals.len() * std::mem::size_of::<crate::residuals::Residual>();
+    grid_bytes(grid.values.len()) + residuals as u64 + 128
 }
 
 /// Bytes of a grid of `cells` cells.

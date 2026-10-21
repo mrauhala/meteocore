@@ -185,6 +185,12 @@ renders with. A collection's `crs` list is exactly what `/items` accepts.
   detail. A request that asked for HTML gets the error as an HTML page with
   the same status. A rejected `/items` HTML request returns the items page
   with the request form filled in and the faulty field marked.
+- An engine's own error on `/items` or `/items/{featureId}`: a request it
+  turns down (`QueryTooLarge`, such as a station grid's analysis cap) is a
+  400 with its message; one it cannot answer yet or now
+  (`ResourceExhausted`, `DeadlineExceeded`: a station grid whose residuals
+  are still being computed) is a 503 with `Retry-After: 1`; a missing
+  feature is a 404; anything else is a 500.
 
 ## HTML
 
@@ -250,6 +256,7 @@ api-tiles vector-tile cache key.
 | BUFR | one station (Point) | point inside the box | stations with a report in the interval | `last_report`, `first_report`, `report_count`, `name` | `name`, `wigos_station_identifier`, `elevation`, `first_report`, `last_report`, `report_count` | yes / oldest to newest report | changes per snapshot |
 | ODIM PVOL network | one radar site (Point), the site inventory | point inside the box | sites with a retained volume in the interval | 400 | site properties (below) | yes / earliest to latest retained volume | changes with the inventory |
 | Nowcast | one tracked storm cell (Point) of one generation | cell point inside the box | the newest retained generation inside the interval; none inside: no features. Without `datetime`: the latest | cell facts (below) | every cell property except `significance_contributions`, including the groups of wired sources | yes / retained history | changes every generation |
+| Station grid | one station's leave-one-out residual (Point) for one parameter and analysis time | station point inside the box | every analysis time inside the interval, at most 96 analyses (times × parameters; else 400); an instant that is no analysis time: no features. Without `datetime`: the latest analysis time | `residual`, `estimate`, `value`, `neighbours`, `time`, `parameter` | `parameter`, `time`, `value`, `estimate`, `residual`, `neighbours` | the grid widened by the search radius / first to last analysis time | its content version |
 
 - Every `bbox` test above handles a box that crosses the antimeridian.
 - ODIM PVOL site filters: `nod`, `name`, `wmo`, `longitude`, `latitude`,
@@ -267,8 +274,20 @@ api-tiles vector-tile cache key.
 - An ODIM volume source with `features` in `apis` serves the site inventory
   under its own id. The per-site radar collections are not feature
   collections.
-- GeoTIFF, GRIB, QueryData, Zarr, NetCDF, Satellite, ODIM composite and
-  station-grid collections have no `FeatureEngine`.
+- Station grid (#1206): `estimate` is the analysis at the station from the
+  other stations, by the grid's method, neighbours and radius; `residual`
+  is `estimate − value`, null with no other station in reach; `neighbours`
+  counts the stations behind the estimate. They are computed with each
+  grid on the station-grid pool and cached with it. `/items` never waits
+  for a computation: an analysis not computed yet is a 503 with
+  `Retry-After: 1` while it is computed, and the retry is served from the
+  cache. The latest `precompute` analysis times are kept ready. A
+  `parameter` or `time` filter narrows the analyses read and counted
+  against the cap; `datetime` picks the analysis times. Ids are
+  `<parameter>@<time>@<lon>,<lat>`. The collection's EDR `items` query is
+  not wired: its EDR data is the grid.
+- GeoTIFF, GRIB, QueryData, Zarr, NetCDF, Satellite and ODIM composite
+  collections have no `FeatureEngine`.
 
 ### Labels, columns and related links
 
@@ -281,6 +300,7 @@ api-tiles vector-tile cache key.
 | BUFR | – | default | the station's EDR location |
 | ODIM PVOL network | – | default | the site's own collection |
 | Nowcast | `Rank 2 · very severe · max 52 dBZ` from `significance_rank`, `severity` and `max_dbz`, plus `· likely clutter` when flagged | `significance`, `severity`, `max_dbz`, `area_km2` | – |
+| Station grid | `temperature at 60.25, 24.95`: the parameter and the station's latitude and longitude | `residual`, `value`, `estimate`, `neighbours` | – |
 
 - Without a label, a page titles a feature by its `name`-like property, else
   its id. "Default" columns are the sortables, then the other properties
@@ -290,7 +310,9 @@ api-tiles vector-tile cache key.
   the site, else to EDR, else it is left out.
 - The ODIM PVOL network's overview says what an item is: "Radar site
   inventory: one point per radar. Each site's volumes are in its own
-  collection." No other engine sets `items_description`.
+  collection." So does a station grid's: one point per station, parameter
+  and analysis time, and what `estimate` and `residual` are. No other
+  engine sets `items_description`.
 - The nowcast label's rank orders a heuristic significance, and the
   severity class is the engine's own. Neither is a warning.
 
@@ -298,7 +320,8 @@ api-tiles vector-tile cache key.
 
 The crate has no config section of its own. List `features` in a
 collection's `apis`. The engine types that accept it are `csv`, `geojson`,
-`cap`, `bufr`, `postgis` (station shapes), `odim-volume` and `nowcast`.
+`cap`, `bufr`, `postgis` (station shapes), `odim-volume`, `nowcast` and
+`station-grid`.
 
 ```toml
 [server]
@@ -316,7 +339,8 @@ apis = ["edr", "features"]
 Runnable examples in `collections.d/`: `weather.toml` (CSV), `regions.toml`
 and `municipalities.toml` (GeoJSON), `cap-alerts.toml` and
 `cap-meteoalarm-wis2.toml` (CAP), `obs-bufr-local.toml` and
-`obs-synop-wis2.toml` (BUFR), and `radar-fi-nowcast.toml` (Nowcast).
+`obs-synop-wis2.toml` (BUFR), `radar-fi-nowcast.toml` (Nowcast) and
+`weather-analysis.toml` (Station grid).
 
 ## Limits
 
@@ -345,7 +369,11 @@ files.
   `/api` against `schemas/openapi-3.0.json`.
 - `crs_tests.rs`: Part 2, with expected coordinates taken from PROJ `cs2cs`.
 - `caching_tests.rs`: ETag, `If-None-Match` and Cache-Control.
+- `engine_errors_tests.rs`: an engine's errors on `/items` and
+  `/items/{featureId}` and their statuses.
 
 Shared code paths have tests elsewhere: run `cargo test -p api-edr --test
-items_tests` for EDR `items`, and `cargo test -p server --test
-common_discovery` for the shared root and collection discovery.
+items_tests` for EDR `items`, `cargo test -p server --test
+common_discovery` for the shared root and collection discovery, and
+`cargo test -p server --test station_grid_features` for a station grid's
+residuals over HTTP.

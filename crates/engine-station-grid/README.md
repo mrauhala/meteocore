@@ -1,8 +1,9 @@
 # engine-station-grid
 
 Grids station observations on the fly and serves the fields through WMS
-1.3.0, OGC API - Maps, OGC API - Tiles and OGC API - EDR
-(`engine_type = "station-grid"`).
+1.3.0, OGC API - Maps, OGC API - Tiles and OGC API - EDR, and how well each
+station fits the field, its leave-one-out residual, through OGC API -
+Features (`engine_type = "station-grid"`).
 
 ## What it solves
 
@@ -34,6 +35,11 @@ late or corrected reports change the field when it is next computed.
   times fall every `cadence` across the source's temporal extent, on
   multiples of `cadence` counted from 1970-01-01T00:00Z (on the hour for
   `PT1H`); the latest 10 000 are kept.
+- **Leave-one-out residuals.** With each grid, every station of the slice
+  is estimated at its own position from the other stations, through the
+  same per-target estimate a grid cell gets (same method, neighbours and
+  radius); its residual is that estimate minus its value. One neighbour
+  search per station, cached with the grid.
 - **Computing and caching.** A grid is computed once per collection,
   parameter, analysis time and revision of its input, on one thread of a
   pool of its own, and kept in a process-wide cache; concurrent requests
@@ -55,6 +61,7 @@ late or corrected reports change the field when it is next computed.
 |---|---|---|
 | `MapEngine` | WMS, Maps, Tiles | One layer per parameter; without a parameter name, the first |
 | `EdrEngine` | EDR | `position`, `area`, `radius`, `cube` |
+| `FeatureEngine` | Features | Leave-one-out residuals, with `features` in `apis` |
 
 **Maps.** A requested instant (WMS `TIME`, Maps/Tiles `datetime`) draws the
 latest analysis time not after it, or the earliest when it precedes them
@@ -79,17 +86,43 @@ map shows, not an estimate at the exact point.
   An area, radius or cube response holds at most 1 M values (else 400).
 - No `locations` or `trajectory` query, instances, items or vertical axis.
 
+**Features.** `/collections/<id>/items` is one Point per station,
+parameter and analysis time, with `parameter`, `time` (the analysis time),
+`value` (the station's value in the slice), `estimate` (the analysis there
+from the other stations), `residual` (`estimate − value`) and `neighbours`
+(the stations behind the estimate). `estimate` and `residual` are null for
+a station with no other in reach. The largest `|residual|` marks a station
+its neighbours do not support: a faulty sensor, a wrong position, or a
+local effect the network cannot resolve.
+
+- Without `datetime` the latest analysis time; an instant selects it if it
+  is an analysis time, else nothing; an interval selects every analysis
+  time inside it, ends included. At most 96 analyses (times × parameters)
+  per request, else 400. A `parameter` or `time` filter narrows the
+  analyses read.
+- `sortby` takes `residual`, `estimate`, `value`, `neighbours`, `time` and
+  `parameter`; every property is a filter. Ids are
+  `<parameter>@<time>@<lon>,<lat>`, with `~<n>` for further stations at
+  one position.
+- A request never waits for a computation: an analysis not computed yet is
+  a 503 with `Retry-After: 1` while the pool computes it, and the retry is
+  served from the cache. The poll keeps the latest `precompute` analysis
+  times ready, so a request without `datetime` is served at once.
+- No EDR `items`: the collection's EDR data is the grid.
+
 Every API's collection description ends with a note on the source, method
 and grid. `/health` shows the collection degraded until its first analysis
 time. Of the `station_grid_*` metrics, `station_grid_stations` counts the
-stations behind each parameter's latest analysis.
+stations behind each parameter's latest analysis, `station_grid_loo_rmse`
+is the RMSE of its leave-one-out residuals in the parameter's units, and
+`station_grid_loo_residuals` counts the stations that have one.
 
 ## Configuration
 
 ```toml
 id = "weather-analysis"
 engine_type = "station-grid"
-apis = ["wms", "maps", "tiles", "edr"]   # only these four
+apis = ["wms", "maps", "tiles", "edr", "features"]   # only these five
 
 [station_grid]
 source = "weather"
@@ -138,6 +171,9 @@ CPUs, between 1 and 4).
   cell sampling shows cells as blocks.
 - A CSV source answers an area of at most 500 stations, so a grid whose
   search box holds more fails to compute.
+- A residual is computed in the field's own space, with no correction for
+  station height, so a station on a hill reads as an outlier in a
+  temperature field until a lapse-rate correction exists.
 - Late reports are found within one poll only for the latest `precompute`
   times; an older time is re-checked when its grid is next computed. A
   revision re-keys the map tiles of every time.
@@ -149,6 +185,7 @@ CPUs, between 1 and 4).
 ```sh
 cargo test -p engine-station-grid
 python3 crates/engine-station-grid/tests/reference/idw_adw_reference.py
+python3 crates/engine-station-grid/tests/reference/loo_reference.py
 ```
 
 Unit tests in `src/` cover the grid geometry, the neighbour search and the
@@ -157,5 +194,11 @@ engine (maps in three CRSs, every EDR query type, bad configs) and in-memory
 sources (`170,10,-170,20` across the antimeridian, a polar EPSG:3035 view,
 late reports, a miss past the deadline). The Python script is an independent
 IDW/ADW implementation; the test pins its output to 1e-4 °C.
+`tests/residuals.rs` pins the leave-one-out residuals to
+`loo_reference.py`, which applies that implementation to each slice
+without the station, to 1e-9: the fixture's RMSE and worst-fitting station,
+and an outlier in a synthetic lattice. It also covers the Features rules:
+`datetime`, the 96-analysis cap, paging, sorting, filters, ids, and a
+request that does not wait.
 
 Contributor rules for this crate are in [CLAUDE.md](CLAUDE.md).

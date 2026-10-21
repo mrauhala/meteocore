@@ -3,8 +3,10 @@ title = "Finnish Weather Analysis (gridded stations)"
 description = "Hourly temperature and wind speed fields gridded on the fly from the Finnish station observations."
 # Derived collection (#1082): interpolates one time slice of a station
 # collection onto a regular CRS84 grid, served as map layers and through EDR.
+# `features` serves each station's leave-one-out residual (#1206): the
+# analysis at the station from the other stations, minus its value.
 engine_type = "station-grid"
-apis = ["wms", "maps", "tiles", "edr"]
+apis = ["wms", "maps", "tiles", "edr", "features"]
 keywords = ["observations", "analysis", "stations", "Finland"]
 
 [station_grid]

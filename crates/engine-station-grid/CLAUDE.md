@@ -25,9 +25,10 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
   the set-based "every station at one time" read (#1062). CSV caps an area
   query at 500 stations — a demo source; BUFR and PostGIS have no station
   ceiling, only their value budgets.
-- `geometry`, `interpolate` and `kdtree` are dependency-free pure functions —
-  keep them that way. `compute` owns the cache, budget and pool; `engine`
-  owns the axis, the version, the poll loop and both traits.
+- `geometry`, `interpolate`, `kdtree` and `residuals` are dependency-free
+  pure functions — keep them that way. `compute` owns the cache, budget and
+  pool; `engine` owns the axis, the version, the poll loop, `MapEngine` and
+  `EdrEngine`; `features` owns the `FeatureEngine` over the residuals.
 
 ## Methods (interpolate.rs)
 
@@ -105,17 +106,60 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
   bbox's west edge (across the seam), or `resolution-x/-y` positions; both
   `[t, y, x]` with the `t` axis always present. No `z`.
 
+## Leave-one-out residuals and Features (#1206)
+
+- `residuals::leave_one_out` estimates each station of the slice at its
+  own position through `interpolate::estimate_without`, which is the ONE
+  per-target `estimate` a grid cell uses, with `exclude = Some(i)`: it asks
+  the k-d tree for `k + 1` neighbours and drops station `i`. Never fork the
+  method math for residuals; a change to `estimate` (a correction, a new
+  method) reaches the residuals by construction.
+- The estimate is formed from `Stations::value` (what the grid
+  interpolates) and put back at the station's own offset:
+  `estimate = observed + (ê − interpolated)`. Today the offset is exactly
+  0. If the interpolated values are reduced per station (a lapse-rate
+  correction, `Γ·z_station`), pass the reduced `Stations` and the observed
+  `slice.stations`: the estimate is re-applied at the station's height and
+  the residual is the reduced-space one. Pinned by
+  `a_per_station_reduction_is_reapplied_at_the_station`.
+- Residuals are computed in `Inner::compute`, with the grid on the pool,
+  and stored in `AnalysisGrid::residuals` under the grid's key (`weigh`
+  counts them). The per-parameter `Summary` (count, RMSE) of the latest
+  analysis lives in `Inner::latest` beside the station count and feeds
+  `station_grid_loo_rmse` / `station_grid_loo_residuals`.
+- `features.rs`: one Point per (station, parameter, analysis time).
+  `datetime` is OGC datetime over the analysis times (an instant that is
+  none selects nothing), the latest without one; at most
+  `MAX_QUERY_GRIDS` analyses (times × parameters, after a `parameter` /
+  `time` pre-filter that only narrows what is read), else `QueryTooLarge`.
+  Without `sortby`, only the page's features are built.
+- **Features `/items` runs on a request worker with no deadline, so it must
+  never block**: `residual_grids` enters a deadline of "now" when none is
+  set. A miss queues its computation (single-flight, bytes reserved) and is
+  `ResourceExhausted` at once (503 + `Retry-After: 1` in api-features); the
+  retry is served from the cache. With a deadline (tests, a future EDR
+  `items`) it waits until it, as maps do. `feature_count` reads
+  `Inner::latest` and never computes.
+- Ids are `<parameter>@<time>@<lon>,<lat>` (`~<n>` for the n-th further
+  station at one position, the slice being sorted by position); positions
+  are `f64` shortest decimals that parse back to the same bits.
+  `tests/reference/loo_reference.py` applies `idw_adw_reference.py` to each
+  slice without the station; `tests/residuals.rs` pins it to 1e-9.
+
 ## Metrics
 
 `station_grid_stations{collection,parameter}` (the stations behind the
-latest analysis — the first thing to check), `station_grid_analyses_total`,
-`station_grid_failures_total`, `station_grid_last_analysis_ms`, the
-`station_grid_cache_*` family and `station_grid_compute_*` admission; panels
-on the dashboard's Engines › Station grids tab. Keep them in step.
+latest analysis — the first thing to check), `station_grid_loo_rmse` and
+`station_grid_loo_residuals{collection,parameter}` (the RMSE of its
+leave-one-out residuals in the parameter's units, and the stations with
+one), `station_grid_analyses_total`, `station_grid_failures_total`,
+`station_grid_last_analysis_ms`, the `station_grid_cache_*` family and
+`station_grid_compute_*` admission; panels on the dashboard's Engines ›
+Station grids tab. Keep them in step.
 
 ## Not in phase 1 (follow-up issue)
 
-Lapse-rate correction with a DEM, a land/sea mask, leave-one-out residuals,
-station exclusions and quality flags, projected analysis grids, per-instant
-revision tracking, kriging/natural neighbour, parallel interpolation of one
-large grid across the pool.
+Lapse-rate correction with a DEM, a land/sea mask, station exclusions and
+quality flags, projected analysis grids, per-instant revision tracking,
+kriging/natural neighbour, parallel interpolation of one large grid across
+the pool (#1206).
