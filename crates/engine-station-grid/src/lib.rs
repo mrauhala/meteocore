@@ -11,12 +11,17 @@
 //!   grids are computed on.
 //! - [`engine`] is the collection: time axis, content version, poll loop,
 //!   `MapEngine` and `EdrEngine`.
+//! - [`residuals`] is the leave-one-out residual of each station (#1206),
+//!   computed with each grid; `features` serves them as the collection's
+//!   `FeatureEngine`.
 
 mod compute;
 pub mod engine;
+mod features;
 pub mod geometry;
 pub mod interpolate;
 mod kdtree;
+pub mod residuals;
 mod source;
 
 pub use compute::{budget_metrics, cache_metrics, pool_workers, AnalysisGrid};

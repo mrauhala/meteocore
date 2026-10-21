@@ -1653,6 +1653,19 @@
                                     "name": "panel-95"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 16,
+                                  "width": 24,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-114"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -13490,7 +13503,7 @@
         "spec": {
           "id": 92,
           "title": "Stations behind the latest analysis",
-          "description": "Stations the latest analysis of each station-grid parameter was computed from: the first thing to check when an analysis looks wrong. A drop means the source lost stations and the field is interpolated from fewer, farther ones; 0 draws an empty map.",
+          "description": "Stations the latest analysis of each station-grid parameter was computed from: the first thing to check when an analysis looks wrong. A drop means the source lost stations and the field is interpolated from fewer, farther ones; 0 draws an empty map. Dashed: the stations with a leave-one-out residual, those with another station within the search radius; the gap to the solid line is the isolated stations.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -13511,6 +13524,28 @@
                       "spec": {
                         "expr": "max by (collection, parameter) (station_grid_stations{job=~\"$job\", collection=~\"$collection\"})",
                         "legendFormat": "{{collection}} · {{parameter}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (collection, parameter) (station_grid_loo_residuals{job=~\"$job\", collection=~\"$collection\"})",
+                        "legendFormat": "{{collection}} · {{parameter}} with a residual",
                         "range": true,
                         "instant": false,
                         "editorMode": "code"
@@ -13591,7 +13626,26 @@
                   "min": 0,
                   "decimals": 0
                 },
-                "overrides": []
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byRegexp",
+                      "options": "/with a residual$/"
+                    },
+                    "properties": [
+                      {
+                        "id": "custom.lineStyle",
+                        "value": {
+                          "fill": "dash",
+                          "dash": [
+                            10,
+                            10
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                ]
               }
             }
           }
@@ -14134,6 +14188,118 @@
                     ]
                   }
                 ]
+              }
+            }
+          }
+        }
+      },
+      "panel-114": {
+        "kind": "Panel",
+        "spec": {
+          "id": 114,
+          "title": "Leave-one-out RMSE",
+          "description": "Root mean square of the leave-one-out residuals of the latest analysis of each station-grid parameter, in the parameter's own units: at every station, the analysis from the other stations minus the station's value. It measures how well the method fits the network. A step up means a station reports values its neighbours do not support (a faulty sensor, a wrong position) or the network thinned. Find the station with the collection's Features items sorted by residual (sortby=-residual, then sortby=residual).",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (collection, parameter) (station_grid_loo_rmse{job=~\"$job\", collection=~\"$collection\"})",
+                        "legendFormat": "{{collection}} · {{parameter}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "none",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [
+                    {
+                      "title": "Filter dashboard to ${__field.labels.collection}",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${job:queryparam}&${api:queryparam}&${cache:queryparam}&var-collection=${__field.labels.collection}&dtab=engines&engines-dtab=station-grids"
+                    }
+                  ],
+                  "min": 0,
+                  "decimals": 2
+                },
+                "overrides": []
               }
             }
           }

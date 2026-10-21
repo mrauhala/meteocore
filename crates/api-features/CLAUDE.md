@@ -40,6 +40,13 @@ without reading code.
   `caching.rs` middleware honours a handler-set ETag. It is a near-twin of
   `api-edr/src/caching.rs` — keep the two in sync (ds-core is
   framework-free, so the axum glue cannot be shared; #306).
+- **An engine's error maps to its status** (`handlers::engine_failure`, both
+  `/items` and `/items/{featureId}`): `QueryTooLarge` and the invalid-input
+  errors are a 400 with the engine's message, `FeatureNotFound` a 404,
+  `ResourceExhausted` / `DeadlineExceeded` a 503 with `Retry-After: 1`, and
+  everything else a generic 500. `get_features` runs on the request worker
+  with no deadline, so an engine must answer from memory or fail fast,
+  never block (the station grid's residuals answer 503 while computing).
 - **Part 2 CRS lives in `src/crs.rs`** (#685). `crs::SUPPORTED` is both the
   advertised collection `crs` list and the set `/items` accepts in `crs` and
   `bbox-crs` — change them together. Projection math comes from

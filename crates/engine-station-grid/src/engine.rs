@@ -63,6 +63,7 @@ use tracing::{debug, info, warn};
 use crate::compute::{self, AnalysisGrid, GridKey, CACHE};
 use crate::geometry::{wrap_lon, GridGeom};
 use crate::interpolate::{interpolate_grid, Method, Settings, Stations};
+use crate::residuals::{self, Summary};
 use crate::source::{self, Slice};
 
 mod recheck;
@@ -97,8 +98,9 @@ pub fn select_time(times: &[DateTime<Utc>], time: Option<DateTime<Utc>>) -> Opti
     select_common_time(&[times], time)
 }
 
-/// The latest analysis computed of a parameter: its time and station count.
-type Latest = (DateTime<Utc>, usize);
+/// The latest analysis computed of a parameter: its time, station count and
+/// leave-one-out residual summary.
+type Latest = (DateTime<Utc>, usize, Summary);
 
 /// What one (parameter, time) was last computed from.
 #[derive(Debug, Clone, Copy)]
@@ -424,8 +426,31 @@ impl StationGridEngine {
             .params
             .iter()
             .zip(latest.iter())
-            .map(|(p, l)| (p.name.clone(), l.map(|(_, n)| n)))
+            .map(|(p, l)| (p.name.clone(), l.map(|(_, n, _)| n)))
             .collect()
+    }
+
+    /// Per parameter, the leave-one-out residuals of the latest analysis
+    /// computed (`None` before one is), for the `station_grid_loo_*` gauges.
+    pub fn residual_summaries(&self) -> Vec<(String, Option<Summary>)> {
+        let latest = self.inner.latest.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner
+            .params
+            .iter()
+            .zip(latest.iter())
+            .map(|(p, l)| (p.name.clone(), l.map(|(_, _, summary)| summary)))
+            .collect()
+    }
+
+    /// The analysis times, oldest first.
+    pub(crate) fn analysis_times(&self) -> Arc<[DateTime<Utc>]> {
+        self.inner.snapshot.load().times.clone()
+    }
+
+    /// The box the source is read over: the grid widened by the search
+    /// radius, where every station of an analysis lies.
+    pub(crate) fn search_bbox(&self) -> [f64; 4] {
+        self.inner.query_bbox
     }
 
     /// `(analyses computed, analyses failed, last analysis in ms)`.
@@ -503,7 +528,7 @@ impl StationGridEngine {
             })
     }
 
-    fn parameter_names(&self) -> Vec<String> {
+    pub(crate) fn parameter_names(&self) -> Vec<String> {
         self.inner.params.iter().map(|p| p.name.clone()).collect()
     }
 
@@ -546,7 +571,7 @@ impl StationGridEngine {
 
     /// The grids of every (parameter, time), all queued before any is
     /// waited for.
-    fn grids_for(
+    pub(crate) fn grids_for(
         &self,
         params: &[usize],
         times: &[DateTime<Utc>],
@@ -835,14 +860,16 @@ impl Inner {
         };
         let stations = Stations::new(&slice.stations);
         let values = interpolate_grid(&stations, &self.settings, &self.geom);
+        let residuals = residuals::leave_one_out(&stations, &slice.stations, &self.settings);
+        let summary = residuals::summarize(&residuals);
         self.observe(parameter, time, slice.fingerprint);
         let elapsed = started.elapsed().as_millis() as u64;
         self.analyses.fetch_add(1, Ordering::Relaxed);
         self.last_analysis_ms.store(elapsed, Ordering::Relaxed);
         {
             let mut latest = self.latest.lock().unwrap_or_else(|e| e.into_inner());
-            if latest[parameter].is_none_or(|(t, _)| t <= time) {
-                latest[parameter] = Some((time, stations.len()));
+            if latest[parameter].is_none_or(|(t, _, _)| t <= time) {
+                latest[parameter] = Some((time, stations.len(), summary));
             }
         }
         debug!(
@@ -855,6 +882,7 @@ impl Inner {
             values,
             stations: stations.len(),
             fingerprint: slice.fingerprint,
+            residuals,
         })
     }
 
