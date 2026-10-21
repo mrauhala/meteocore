@@ -139,6 +139,52 @@ fn error_response(description: &str) -> Value {
 /// request log reads (#119); a `(StatusCode, Json)` tuple converts via `?`.
 type HandlerError = JsonError;
 
+/// The response to an engine's error on `/items` or `/items/{featureId}`.
+/// A request the engine turns down (`QueryTooLarge`: a station grid's
+/// analysis cap) is a 400 with its message, a missing feature a 404, an
+/// engine that is not ready or busy (`ResourceExhausted`, as a station grid
+/// whose residuals are still being computed answers, or `DeadlineExceeded`)
+/// a 503 with `Retry-After`, and anything else a 500 that names nothing
+/// internal.
+fn engine_failure(e: &ds_core::error::DataServerError, route: &str) -> Response {
+    use ds_core::error::DataServerError as E;
+    let (status, code, description) = match e {
+        E::InvalidParameter(_)
+        | E::InvalidBbox(_)
+        | E::InvalidDatetime(_)
+        | E::QueryTooLarge(_) => (StatusCode::BAD_REQUEST, "BadRequest", e.to_string()),
+        E::FeatureNotFound(_) => (
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            "Feature not found".to_string(),
+        ),
+        E::ResourceExhausted | E::DeadlineExceeded => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServerBusy",
+            "Not ready or busy, try again later".to_string(),
+        ),
+        _ => {
+            tracing::error!("Features {route} error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ServerError",
+                "Internal server error".to_string(),
+            )
+        }
+    };
+    let mut response = JsonError(
+        status,
+        Json(json!({ "code": code, "description": description })),
+    )
+    .into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    response
+}
+
 /// A 400 from a plain message (used for `?f=` content negotiation errors).
 fn bad_request_msg(msg: &str) -> HandlerError {
     JsonError(
@@ -431,7 +477,8 @@ pub(crate) fn items_openapi_paths(
                         },
                         "400": error_response("Bad request. An HTML request gets the items page again, the field at fault marked."),
                         "404": error_response("Collection not found"),
-                        "500": error_response("Server error")
+                        "500": error_response("Server error"),
+                        "503": error_response("Not ready or busy: retry after the Retry-After seconds")
                     }
                 }
             }),
@@ -465,7 +512,8 @@ pub(crate) fn items_openapi_paths(
                         },
                         "400": error_response("Bad request"),
                         "404": error_response("Feature not found"),
-                        "500": error_response("Server error")
+                        "500": error_response("Server error"),
+                        "503": error_response("Not ready or busy: retry after the Retry-After seconds")
                     }
                 }
             }),
@@ -937,12 +985,10 @@ pub async fn items(
         Err(rejected) => return Err(rejected.error),
     };
 
-    let page = engine.get_features(&query).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-        )
-    })?;
+    let page = match engine.get_features(&query) {
+        Ok(page) => page,
+        Err(e) => return Ok(engine_failure(&e, "items")),
+    };
 
     // Hash the ETag over the document with an empty `timeStamp` placeholder:
     // the field is the response *generation* time, so a hash over the final
@@ -1213,16 +1259,10 @@ pub async fn item(
         }
     };
     let crs = response_crs(params.crs.as_deref(), wanted)?;
-    let feature = engine.get_feature(&feature_id).map_err(|e| match &e {
-        ds_core::error::DataServerError::FeatureNotFound(_) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "code": "NotFound", "description": "Feature not found" })),
-        ),
-        _ => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-        ),
-    })?;
+    let feature = match engine.get_feature(&feature_id) {
+        Ok(feature) => feature,
+        Err(e) => return Ok(engine_failure(&e, "item")),
+    };
 
     let base = &request_base_url(&state, &headers);
     let root = &mount.root(base);

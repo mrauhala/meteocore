@@ -32,7 +32,7 @@ Each engine implements one or more of the core traits.
 | `engine-satellite` | `EdrEngine` + `MapEngine` | Geostationary satellite imagery: GOES-R ABI NetCDF-4 scans, Himawari-9 AHI ISatSS tiles and NOAA's hourly GMGSI global mosaic (NOAA open data on AWS, or a local mirror), one parameter per band/product, each with its own time axis |
 | `engine-netcdf` | `MapEngine` + `EdrEngine` | CF-NetCDF gridded forecasts and analyses (MET Norway MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server that cannot be listed (thredds.met.no): one layer per variable, pressure levels as the vertical axis, model runs from `forecast_reference_time` as EDR instances, EDR position/area/radius/trajectory/cube, wind speed derived from u/v |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` + `MapEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible); map layers draw stations as markers coloured by value, and lightning events by age |
-| `engine-station-grid` | `MapEngine` + `EdrEngine` | Derived: one time slice of a station collection (CSV, BUFR, PostGIS stations) interpolated on the fly (IDW, ADW, nearest) onto a CRS84 analysis grid, served as map layers and through EDR (see [Station grid](#station-grid)) |
+| `engine-station-grid` | `MapEngine` + `EdrEngine` + `FeatureEngine` | Derived: one time slice of a station collection (CSV, BUFR, PostGIS stations) interpolated on the fly (IDW, ADW, nearest) onto a CRS84 analysis grid, served as map layers and through EDR, with each station's leave-one-out residual as Features (see [Station grid](#station-grid)) |
 
 ### OGC API Plugins
 
@@ -207,7 +207,7 @@ not re-scan the auto roots.
 | `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote NetCDF files, in MB, shared by every NetCDF collection: what the reader parses when it opens a file (its first 1 MiB) and the blocks of the chunk indexes. At least 8: without it every metadata read would be a request. |
 | `MC_NETCDF_EDR_QUERY_MB` | `544` | Most decoded bytes one NetCDF EDR query may read, in MiB, counted from the files' metadata before any read: timesteps × pressure levels × variables read × one field (4.06 MB for MEPS); a trajectory counts the (step, level) fields its path reads, a cube the levels its `z` positions take. The default admits one parameter over a whole MEPS run (67 leads) as the client sees it, including a derived wind speed, which reads both of its components (134 fields, 519 MiB); three variables over a run do not fit, nor one over a run at all 13 MEPS pressure levels (871 fields). Over it the query is a 400 naming the fields and the limit. |
 | `MC_NETCDF_READ_MEMORY_MB` | `1024` | Process-wide admission budget for NetCDF field reads in progress, in MiB: a cold field read reserves three times its decoded chunk plus three times its compressed chunk (~24 MB for MEPS); cache hits and readers waiting for another's read reserve nothing. A read that does not fit fails at once with 503. Restart to change. |
-| `MC_STATION_GRID_CACHE_MB` | `256` | Station-grid analyses held in memory (`f32`, 4 bytes per cell), in MB, shared by every station-grid collection. One grid per collection, parameter, analysis time and content version; a collection whose one grid does not fit fails at load. |
+| `MC_STATION_GRID_CACHE_MB` | `256` | Station-grid analyses held in memory (`f32`, 4 bytes per cell, plus 48 bytes per station for its leave-one-out residual), in MB, shared by every station-grid collection. One grid per collection, parameter, analysis time and content version; a collection whose one grid does not fit fails at load. |
 | `MC_STATION_GRID_MEMORY_MB` | `512` | Admission budget for station-grid analyses being computed, in MiB: each reserves its grid plus 4 MiB before it is queued. A request that does not fit is a 503 at once; the background pre-compute takes only what leaves half the budget to requests. A collection whose one analysis needs more than half fails at load. Restart to change. |
 | `MC_STATION_GRID_WORKERS` | half the CPUs, 1–4 | Station-grid analyses computed at once, on their own pool, never on the request runtime. Restart to change. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool, across all renders. A projected WMS view (EPSG:3857/3067/3035) renders one meta-tile at a time with only a few fetches in flight, so raising this does not shorten its first view; a whole-viewport render (WMS EPSG:4326, a Maps image) fetches all its missing tiles at once and does wait on the pool. Raise it (e.g. 32–64) when cold renders queue on a high-latency object store. Value must be ≥ 1. |
@@ -1615,8 +1615,9 @@ A derived collection (`engine_type = "station-grid"`, #1082) that turns one
 time slice of a station collection into a field: every station's value of a
 parameter at an analysis time is interpolated onto a regular CRS84 grid, on
 the fly, and served as one WMS/Maps/Tiles layer per parameter and through
-EDR. The source is a CSV, BUFR or PostGIS stations collection in the same
-config, whatever APIs it lists.
+EDR. With `features` in its `apis`, each station's leave-one-out residual is
+a Features collection (#1206). The source is a CSV, BUFR or PostGIS stations
+collection in the same config, whatever APIs it lists.
 
 ```toml
 # collections.d/weather-analysis.toml
@@ -1624,7 +1625,7 @@ id = "weather-analysis"
 title = "Finnish Weather Analysis (gridded stations)"
 description = "Hourly temperature and wind speed fields."
 engine_type = "station-grid"
-apis = ["wms", "maps", "tiles", "edr"]
+apis = ["wms", "maps", "tiles", "edr", "features"]   # features: leave-one-out residuals
 
 [station_grid]
 source = "weather"                          # a csv, bufr or postgis stations collection
@@ -1691,14 +1692,31 @@ poll_interval_secs = 60
   its bytes reserved against `MC_STATION_GRID_MEMORY_MB`. A miss that is not
   ready by the request's deadline is a 503 with `Retry-After`, never a
   partial grid; its computation goes on and serves the retry.
+- **Leave-one-out residuals (Features).** With each grid, the engine
+  estimates every station of the slice from the other stations, by the
+  same method, neighbours and radius, and keeps the residual (estimate
+  minus value) with the cached grid. `/collections/<id>/items` serves one
+  Point per station, parameter and analysis time, with `parameter`,
+  `time`, `value`, `estimate`, `residual` (null with no other station in
+  reach) and `neighbours`. A large residual is a station its neighbours do
+  not support: a faulty sensor, a wrong position, or a local effect the
+  network is too sparse for. `sortby=-residual` and `sortby=residual` list
+  them first. `datetime` selects analysis times (the latest without one),
+  at most 96 analyses (times × parameters) per request, else 400.
+  `/items` never waits for a computation: an analysis not computed yet is a
+  503 with `Retry-After: 1`, and the retry is served from the cache; the
+  latest `precompute` times are kept ready.
 - **Metadata.** Every API's collection description ends with the
   provenance: the source, parameters, method and grid. `/metrics` reports
   `station_grid_stations{collection,parameter}`, the stations behind the
-  latest analysis, plus `station_grid_analyses_total`,
-  `station_grid_failures_total`, `station_grid_last_analysis_ms`, the
-  `station_grid_cache_*` family and `station_grid_compute_*` admission.
-- **Not yet:** lapse-rate correction with a DEM, a land/sea mask,
-  leave-one-out residuals, station exclusions and projected analysis grids.
+  latest analysis, `station_grid_loo_rmse{collection,parameter}`, the RMSE
+  of its leave-one-out residuals in the parameter's units, and
+  `station_grid_loo_residuals{collection,parameter}`, the stations with
+  one, plus `station_grid_analyses_total`, `station_grid_failures_total`,
+  `station_grid_last_analysis_ms`, the `station_grid_cache_*` family and
+  `station_grid_compute_*` admission.
+- **Not yet:** lapse-rate correction with a DEM, a land/sea mask, station
+  exclusions and projected analysis grids.
 
 ## OGC 3D Tiles
 

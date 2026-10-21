@@ -95,15 +95,31 @@ impl Stations {
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
+
+    /// The value station `i` contributes to every estimate.
+    pub fn value(&self, i: usize) -> f64 {
+        self.values[i]
+    }
 }
 
-/// Reusable buffers for [`estimate_at`].
+/// Reusable buffers for [`estimate_at`] and [`estimate_without`].
 #[derive(Default)]
 pub struct Scratch {
     found: Vec<(f64, u32)>,
     neighbours: Vec<(f64, usize)>,
     weights: Vec<f64>,
     directions: Vec<[f64; 3]>,
+    used: usize,
+}
+
+impl Scratch {
+    /// The stations the last estimate was computed from: the stations
+    /// within the radius it weighted (at most `max_neighbours`), the
+    /// coincident ones when a station sat on the target, 1 for `nearest`,
+    /// 0 without an estimate.
+    pub fn used(&self) -> usize {
+        self.used
+    }
 }
 
 /// The unit vector of `(lon, lat)` degrees.
@@ -139,24 +155,57 @@ pub fn estimate_at(
         settings,
         unit(lon, lat),
         m_to_chord2(settings.radius_m),
+        None,
         scratch,
     )
 }
 
+/// The leave-one-out estimate at station `station`'s own position: the
+/// estimate every grid cell gets, from the other stations alone (the same
+/// method, neighbours and radius). `None` with no other station within the
+/// radius.
+pub fn estimate_without(
+    stations: &Stations,
+    settings: &Settings,
+    station: usize,
+    scratch: &mut Scratch,
+) -> Option<f64> {
+    estimate(
+        stations,
+        settings,
+        stations.points[station],
+        m_to_chord2(settings.radius_m),
+        Some(station),
+        scratch,
+    )
+}
+
+/// The estimate at `target` from the stations within `max_chord2`, without
+/// station `exclude`: the one per-target function behind both a grid cell
+/// and a leave-one-out residual.
 fn estimate(
     stations: &Stations,
     settings: &Settings,
     target: [f64; 3],
     max_chord2: f64,
+    exclude: Option<usize>,
     scratch: &mut Scratch,
 ) -> Option<f64> {
     let k = match settings.method {
         Method::Nearest => 1,
         _ => settings.max_neighbours,
     };
+    scratch.used = 0;
+    // One more than `k`, less the excluded station: the `k` nearest of the
+    // others, ties still to the lower index.
+    let wanted = k + usize::from(exclude.is_some());
     stations
         .tree
-        .nearest(target, k, max_chord2, &mut scratch.found);
+        .nearest(target, wanted, max_chord2, &mut scratch.found);
+    if let Some(excluded) = exclude {
+        scratch.found.retain(|&(_, i)| i as usize != excluded);
+        scratch.found.truncate(k);
+    }
     if scratch.found.is_empty() {
         return None;
     }
@@ -174,8 +223,10 @@ fn estimate(
         .map(|&(_, i)| stations.values[i])
         .collect();
     if !coincident.is_empty() {
+        scratch.used = coincident.len();
         return Some(coincident.iter().sum::<f64>() / coincident.len() as f64);
     }
+    scratch.used = neighbours.len();
     let d_min = neighbours[0].0;
     let weights = &mut scratch.weights;
     weights.clear();
@@ -262,7 +313,7 @@ pub fn interpolate_grid(stations: &Stations, settings: &Settings, geom: &GridGeo
         let out = &mut values[row as usize * geom.nx as usize..][..geom.nx as usize];
         for (cell, &(cos_lon, sin_lon)) in out.iter_mut().zip(&cols) {
             let target = [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat];
-            if let Some(v) = estimate(stations, settings, target, max_chord2, &mut scratch) {
+            if let Some(v) = estimate(stations, settings, target, max_chord2, None, &mut scratch) {
                 *cell = v as f32;
             }
         }

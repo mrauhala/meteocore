@@ -1353,6 +1353,58 @@ static STATION_GRID_LAST_ANALYSIS_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
+// Leave-one-out residuals (#1206): how well the analysis fits its stations.
+static STATION_GRID_LOO_RMSE: LazyLock<GaugeVec> = LazyLock::new(|| {
+    let gauge = GaugeVec::new(
+        Opts::new(
+            "station_grid_loo_rmse",
+            "RMSE of the leave-one-out residuals of the latest analysis of a station-grid \
+             parameter, in the parameter's units",
+        ),
+        &["collection", "parameter"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static STATION_GRID_LOO_RESIDUALS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "station_grid_loo_residuals",
+            "Stations of the latest analysis of a station-grid parameter with a leave-one-out \
+             residual (another station within the search radius)",
+        ),
+        &["collection", "parameter"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// Set the leave-one-out gauges from each engine's latest analyses,
+/// dropping the series of collections and parameters that have none.
+fn update_station_grid_residual_gauges(engines: &[Arc<engine_station_grid::StationGridEngine>]) {
+    STATION_GRID_LOO_RMSE.reset();
+    STATION_GRID_LOO_RESIDUALS.reset();
+    for engine in engines {
+        let collection = engine.collection_id();
+        for (parameter, summary) in engine.residual_summaries() {
+            let Some(summary) = summary else {
+                continue;
+            };
+            STATION_GRID_LOO_RESIDUALS
+                .with_label_values(&[collection, &parameter])
+                .set(summary.count as i64);
+            if let Some(rmse) = summary.rmse {
+                STATION_GRID_LOO_RMSE
+                    .with_label_values(&[collection, &parameter])
+                    .set(rmse);
+            }
+        }
+    }
+}
+
 static STATION_GRID_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
     CacheMetricSet::new(
         "station_grid_cache",
@@ -1852,8 +1904,10 @@ impl EngineHandle {
     /// implement both over one collection. `None` for engines without
     /// features or without EDR, and where the features are another resource:
     /// a PVOL network's site inventory (its EDR collections are per-site
-    /// views) and the PostGIS events shape, whose events are not features
-    /// yet (#503).
+    /// views), the PostGIS events shape, whose events are not features
+    /// yet (#503), and a station grid's leave-one-out residuals, which
+    /// describe its analysis rather than the gridded data EDR serves
+    /// (#1206).
     fn edr_items_engine(&self) -> Option<Arc<dyn ds_core::feature_engine::FeatureEngine>> {
         match self {
             Self::Csv(e) => Some(e.clone()),
@@ -2319,7 +2373,7 @@ pub fn load_collections(
             "bufr" => &["edr", "features", "wms", "maps", "tiles"],
             "postgis" => &["edr", "features", "tiles", "wms", "maps"],
             "nowcast" => &["wms", "maps", "tiles", "features", "edr"],
-            "station-grid" => &["wms", "maps", "tiles", "edr"],
+            "station-grid" => &["wms", "maps", "tiles", "edr", "features"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -4735,6 +4789,15 @@ pub fn load_collections(
             tiles_collections.insert(collection.id.clone(), described.clone());
             tiles_styles.extend(styles());
             info!("Collection '{}': wired to Tiles API", collection.id);
+        }
+        // Features: the leave-one-out residual of each station (#1206).
+        if collection.apis.contains(&"features".to_string()) {
+            feature_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+            );
+            feature_collections.insert(collection.id.clone(), described.clone());
+            info!("Collection '{}': wired to Features API", collection.id);
         }
 
         // Without an analysis time yet (a WIS2 source that has heard
@@ -7367,6 +7430,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
                 .with_label_values(&[collection])
                 .set(last_ms as i64);
         }
+        update_station_grid_residual_gauges(&engines);
         if !engines.is_empty() {
             STATION_GRID_CACHE_METRICS.update(engine_station_grid::cache_metrics(), None);
             let (used, limit, rejected) = engine_station_grid::budget_metrics();
@@ -8796,7 +8860,9 @@ prewarm_sweeps = 0
         csv.apis = vec!["features".to_string()];
         let mut grid = nowcast_test_collection("t2m", "station-grid", None);
         grid.description = "Analysed temperature.".to_string();
-        grid.apis = ["edr", "wms", "maps", "tiles"].map(String::from).to_vec();
+        grid.apis = ["edr", "wms", "maps", "tiles", "features"]
+            .map(String::from)
+            .to_vec();
         grid.station_grid = Some(ds_core::config::StationGridConfig {
             source: source.to_string(),
             parameters: vec!["temperature".to_string()],
@@ -8819,9 +8885,10 @@ prewarm_sweeps = 0
     }
 
     /// A station grid over a CSV collection that lists no EDR: wired into
-    /// every map API and EDR, with one styled layer per parameter, its
-    /// provenance in every description, and GetFeatureInfo through its
-    /// position query.
+    /// every map API, EDR and Features (its leave-one-out residuals,
+    /// #1206), with one styled layer per parameter, its provenance in every
+    /// description, and GetFeatureInfo through its position query. The
+    /// residuals are not EDR items.
     #[test]
     fn station_grid_wires_maps_and_edr_over_a_station_source() {
         let result = load_with_reuse(
@@ -8852,6 +8919,85 @@ prewarm_sweeps = 0
         assert_eq!(
             &result.maps_state.collections["t2m"].description,
             description
+        );
+        assert!(result.features_state.engines.contains_key("t2m"));
+        assert_eq!(
+            &result.features_state.collections["t2m"].description,
+            description
+        );
+        assert!(!result.edr_state.feature_engines.contains_key("t2m"));
+
+        // Without `features` in its `apis`, no Features collection.
+        let mut collections = station_grid_collections("weather");
+        collections[1].apis.retain(|api| api != "features");
+        let result = load_with_reuse(&collections, super::EngineReuse::default());
+        assert_eq!(
+            health_of(&result, "t2m").status,
+            super::CollectionStatus::Ready
+        );
+        assert!(!result.features_state.engines.contains_key("t2m"));
+    }
+
+    /// `station_grid_loo_rmse` and `station_grid_loo_residuals` report the
+    /// latest analysis computed: here the ADW analysis of `weather.csv` at
+    /// 2026-01-15T12:00Z, whose RMSE the engine's independent reference
+    /// (`crates/engine-station-grid/tests/reference/loo_reference.py`)
+    /// gives. No analysis yet: no series.
+    #[test]
+    fn station_grid_loo_gauges_report_the_latest_analysis() {
+        use super::Encoder as _;
+        use chrono::TimeZone as _;
+        use ds_core::feature_engine::FeatureEngine as _;
+        let scrape = || {
+            let mut text = Vec::new();
+            super::TextEncoder::new()
+                .encode(&super::REGISTRY.gather(), &mut text)
+                .unwrap();
+            String::from_utf8(text).unwrap()
+        };
+        let result = load_with_reuse(
+            &station_grid_collections("weather"),
+            super::EngineReuse::default(),
+        );
+        let engines = &result.station_grid_engines;
+        let labels = ["t2m", "temperature"];
+        super::update_station_grid_residual_gauges(engines);
+        assert!(
+            !scrape().contains("station_grid_loo_rmse{collection=\"t2m\""),
+            "no series before an analysis"
+        );
+
+        let t = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        let _deadline = ds_core::deadline::enter(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ));
+        let page = engines[0]
+            .get_features(&ds_core::feature::FeatureQuery {
+                datetime: Some(ds_core::feature::DatetimeInterval {
+                    start: Some(t),
+                    end: Some(t),
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.number_matched, 192);
+        super::update_station_grid_residual_gauges(engines);
+        let rmse = super::STATION_GRID_LOO_RMSE
+            .with_label_values(&labels)
+            .get();
+        assert!((rmse - 0.7580437671169754).abs() < 1e-9, "{rmse}");
+        assert_eq!(
+            super::STATION_GRID_LOO_RESIDUALS
+                .with_label_values(&labels)
+                .get(),
+            192
+        );
+        let text = scrape();
+        assert!(
+            text.contains(
+                "station_grid_loo_residuals{collection=\"t2m\",parameter=\"temperature\"} 192"
+            ),
+            "{text}"
         );
     }
 
