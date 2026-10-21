@@ -151,6 +151,11 @@ fn config(precompute: usize) -> StationGridConfig {
     StationGridConfig {
         source: "obs".into(),
         parameters: vec!["t2m".into()],
+        elevation_source: None,
+        elevation_parameter: None,
+        land_mask_source: None,
+        land_mask_parameter: None,
+        exclude_where: Default::default(),
         grid: StationGridGeometry {
             crs: "CRS:84".into(),
             bbox: [22.0, 58.0, 28.0, 62.0],

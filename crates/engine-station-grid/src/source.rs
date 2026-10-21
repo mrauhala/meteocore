@@ -15,10 +15,34 @@ use crate::interpolate::Station;
 /// The stations of one slice, in a canonical order, and a fingerprint of
 /// what they hold.
 pub struct Slice {
+    /// Each station's position and observed value.
     pub stations: Vec<Station>,
     /// Changes whenever a station, its position or its value does: late
     /// and corrected observations move it (`content_version`).
     pub fingerprint: u64,
+    /// Per station, what the lapse-rate correction takes off its value
+    /// before interpolation, `Γ·z_station` (#1206); empty without one.
+    pub reduction: Vec<f64>,
+}
+
+impl Slice {
+    /// The stations as the grid interpolates them: each value less its
+    /// reduction.
+    pub fn interpolated(&self) -> std::borrow::Cow<'_, [Station]> {
+        if self.reduction.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.stations);
+        }
+        std::borrow::Cow::Owned(
+            self.stations
+                .iter()
+                .zip(&self.reduction)
+                .map(|(s, r)| Station {
+                    value: s.value - r,
+                    ..*s
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Read the slice of `parameter` (the source's own spelling) at `time` from
@@ -61,6 +85,7 @@ pub fn fetch(
     Ok(Slice {
         fingerprint: fingerprint(&stations),
         stations,
+        reduction: Vec::new(),
     })
 }
 

@@ -1636,6 +1636,7 @@ dependencies = [
  "engine-csv",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

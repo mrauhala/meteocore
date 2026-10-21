@@ -1,0 +1,37 @@
+# Finland's land as a land/sea mask, the `land_mask_source` of the
+# station-grid example `weather-analysis-terrain` (#1206).
+#
+# DISABLED by default, with its two companions. To run the example:
+#   1. rename finland-land, terrain-test and weather-analysis-terrain to drop
+#      `.disabled`
+#   2. cargo run -p server -- --collections=weather,finland-land,terrain-test,weather-analysis-terrain
+#
+# 1 on land, 0 elsewhere, at each 0.05° cell centre over [19, 59, 32, 71],
+# rasterized from Statistics Finland's regions in testdata/regions.geojson:
+#   gdal_rasterize -burn 1 -init 0 -te 19 59 32 71 -tr 0.05 0.05 -ot Byte \
+#     testdata/regions.geojson land.tif
+#   gdal_translate -a_srs EPSG:4326 -a_nodata none -co TILED=YES \
+#     -co BLOCKXSIZE=256 -co BLOCKYSIZE=256 -co COMPRESS=DEFLATE \
+#     land.tif testdata/station-grid-terrain/land_20000101T0000Z.tif
+# A station grid reads the mask's unit: `1` (or `proportion`, or none) is a
+# fraction, inside from 0.5; `%` is inside from 50. Nodata is outside.
+id = "finland-land"
+title = "Finland Land Mask"
+description = "Finland's land area (1) and everything else (0) on a 0.05° grid, rasterized from Statistics Finland's regional boundaries."
+engine_type = "geotiff"
+# A station grid reads the mask whatever APIs it lists; these show it.
+apis = ["wms", "maps", "tiles"]
+keywords = ["mask", "land", "Finland"]
+data_path = "testdata/station-grid-terrain"
+
+[geotiff]
+# The GeoTIFF engine dates its files by name; a static mask takes any date.
+filename_template = "land_%Y%m%dT%H%MZ.tif"
+parameter = "land"
+unit = "1"
+poll_interval_secs = 3600
+
+[wms]
+colormap = "viridis"
+min = 0.0
+max = 1.0

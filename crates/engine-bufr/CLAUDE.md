@@ -92,7 +92,11 @@ dew_point_temperature, relative_humidity, pressure (010004), pressure_msl
 (010051), pressure_tendency_3h, wind_direction/speed/gust,
 precipitation_{1,3,6,12,24}h (013011 by period; 24 h also 013023),
 air_temperature_{max,min}_{12,24}h (012111/012112 by period), visibility,
-cloud_cover_total, present_weather (code table), snow_depth.
+cloud_cover_total, present_weather (code table), snow_depth. Every
+built-in's `observed_property` but `present_weather` is a CF standard name
+and is published as `standard_name` (EDR's NERC URI; a station grid's
+default lapse rate reads it, #1206); a config entry's free-text
+`observed_property` states none.
 `[[bufr.parameters]]` replaces by name or appends; `builtin_parameters =
 false` serves only the config entries. Column order = table order; the
 store row is a dense `Box<[f32]>` (`NaN` = missing); output widens through

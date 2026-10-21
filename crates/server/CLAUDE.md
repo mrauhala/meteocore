@@ -77,6 +77,8 @@ disk, no TOML needed.
     rotation is by `Arc` identity (`diff_by_identity`): reused engines are
     neither `shutdown()` nor re-spawned (either would break — #442).
   - **Exceptions:** `csv`/`geojson` always rebuild to reread changed files.
+    A station grid keeps its engine only when its source, `elevation_source`
+    and `land_mask_source` collections keep theirs (#1082, #1206).
     A nowcast whose own collection config and raster source are unchanged can
     retain its live engine, forecasts, cell history and track IDs (#604).
     Auxiliary lightning/impact/radar sources are ALL revalidated against the

@@ -40,7 +40,12 @@ fn fixture() -> Arc<dyn EdrEngine> {
 fn config(method: &str, parameters: &[&str], resolution: f64) -> StationGridConfig {
     StationGridConfig {
         source: "weather".into(),
-        parameters: parameters.iter().map(|p| p.to_string()).collect(),
+        parameters: parameters.iter().map(|&p| p.into()).collect(),
+        elevation_source: None,
+        elevation_parameter: None,
+        land_mask_source: None,
+        land_mask_parameter: None,
+        exclude_where: Default::default(),
         grid: StationGridGeometry {
             crs: "EPSG:4326".into(),
             bbox: [19.0, 59.0, 32.0, 71.0],

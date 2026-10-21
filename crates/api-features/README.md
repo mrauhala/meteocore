@@ -277,7 +277,11 @@ api-tiles vector-tile cache key.
 - Station grid (#1206): `estimate` is the analysis at the station from the
   other stations, by the grid's method, neighbours and radius; `residual`
   is `estimate − value`, null with no other station in reach; `neighbours`
-  counts the stations behind the estimate. They are computed with each
+  counts the stations behind the estimate. A lapse-rate corrected
+  parameter's estimate comes from the other stations' sea-level values and
+  is put back at the station's own height; a station `exclude_where`
+  excludes, or one without a height, has no residual, and the land/sea
+  mask removes none. They are computed with each
   grid on the station-grid pool and cached with it. `/items` never waits
   for a computation: an analysis not computed yet is a 503 with
   `Retry-After: 1` while it is computed, and the retry is served from the

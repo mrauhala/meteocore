@@ -2,6 +2,12 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+mod station_grid;
+pub use station_grid::{
+    StationExclusionRule, StationExclusions, StationGridParameter, StationGridParameterOptions,
+    StationPropertyValue,
+};
+
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     pub server: ServerSettings,
@@ -480,8 +486,29 @@ pub struct StationGridConfig {
     /// Collection id of the station collection to grid (`csv`, `bufr` or a
     /// `postgis` stations shape) in the same config.
     pub source: String,
-    /// The source parameters to grid, each a layer of its own.
-    pub parameters: Vec<String>,
+    /// The source parameters to grid, each a layer of its own: a name, or a
+    /// table with that parameter's corrections (#1206).
+    pub parameters: Vec<StationGridParameter>,
+    /// Collection id of a raster map collection holding terrain height (a
+    /// DEM), sampled once onto the analysis grid for lapse-rate correction
+    /// (#1206).
+    #[serde(default)]
+    pub elevation_source: Option<String>,
+    /// The `elevation_source` parameter holding the height, when it has
+    /// several.
+    #[serde(default)]
+    pub elevation_parameter: Option<String>,
+    /// Collection id of a raster map collection holding a land/sea mask:
+    /// cells outside it are nodata (#1206).
+    #[serde(default)]
+    pub land_mask_source: Option<String>,
+    /// The `land_mask_source` parameter holding the mask, when it has
+    /// several.
+    #[serde(default)]
+    pub land_mask_parameter: Option<String>,
+    /// Stations of the source's inventory left out of every analysis.
+    #[serde(default)]
+    pub exclude_where: StationExclusions,
     /// The analysis grid.
     pub grid: StationGridGeometry,
     /// `"idw"` (Shepard inverse-distance weighting, the default), `"adw"`
@@ -4614,6 +4641,26 @@ impl ServerConfig {
                         "Collection '{id}': station_grid source cannot be the collection itself"
                     )));
                 }
+                for (key, value) in [
+                    ("elevation_source", &grid.elevation_source),
+                    ("land_mask_source", &grid.land_mask_source),
+                ] {
+                    match value.as_deref().map(str::trim) {
+                        Some("") => {
+                            return Err(crate::error::DataServerError::Config(format!(
+                                "Collection '{id}': [collections.station_grid].{key} must be a \
+                                 collection id"
+                            )))
+                        }
+                        Some(other) if other == collection.id => {
+                            return Err(crate::error::DataServerError::Config(format!(
+                                "Collection '{id}': station_grid {key} cannot be the collection \
+                                 itself"
+                            )))
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             // Zarr engine requires zarr config section.
@@ -5858,6 +5905,50 @@ url = "https://creativecommons.org/licenses/by/4.0/"
              title=\"t\"\ndescription=\"d\"\n{typo}"
         ));
         assert!(parsed.is_err());
+    }
+
+    /// #1206: the terrain and mask collections are named by id, never this
+    /// collection or an empty string; the table forms parse.
+    #[test]
+    fn validate_station_grid_auxiliary_sources() {
+        let grid = |extra: &str| {
+            collection_with(&format!(
+                "engine_type = \"station-grid\"\n[collections.station_grid]\n\
+                 source = \"obs\"\nparameters = [\"t2m\", {{ name = \"td\", lapse_rate = -2.0 }}]\n\
+                 grid = {{ bbox = [19.0, 59.0, 32.0, 71.0], resolution = 0.1 }}\n{extra}"
+            ))
+        };
+        let ok = grid(
+            "elevation_source = \"dem\"\nland_mask_source = \"land\"\n\
+             exclude_where = { exclude_from_gridding = true }\n",
+        );
+        assert!(ok.validate().is_ok());
+        let parsed = ok.collections[0].station_grid.as_ref().unwrap();
+        assert_eq!(parsed.elevation_source.as_deref(), Some("dem"));
+        assert_eq!(parsed.land_mask_source.as_deref(), Some("land"));
+        assert_eq!(parsed.parameters[1].lapse_rate(), Some(-2.0));
+        assert_eq!(parsed.exclude_where.0.len(), 1);
+        for (extra, needle) in [
+            (
+                "elevation_source = \"c\"\n",
+                "elevation_source cannot be the collection",
+            ),
+            (
+                "land_mask_source = \"c\"\n",
+                "land_mask_source cannot be the collection",
+            ),
+            (
+                "elevation_source = \" \"\n",
+                "elevation_source must be a collection id",
+            ),
+            (
+                "land_mask_source = \"\"\n",
+                "land_mask_source must be a collection id",
+            ),
+        ] {
+            let err = grid(extra).validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{extra}: {err}");
+        }
     }
 
     #[test]
