@@ -694,7 +694,7 @@ mod tests {
         let nc = open_storage(dynamic.clone()).unwrap();
         let names = vec!["wind_speed_of_gust".to_string()];
         let inspected = inspect(&nc, &dynamic, &Wanted::Listed(&names), 0).unwrap();
-        let flipped = inspected.grid.flipped;
+        let flipped = inspected.grid.flipped();
         let file = Arc::new(OpenFile {
             id: crate::next_file_id(),
             path: path.clone(),

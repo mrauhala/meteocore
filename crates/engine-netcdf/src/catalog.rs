@@ -10,7 +10,7 @@ use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{ParameterInfo, RasterInfo};
 use ds_core::native_grid::NativeGrid;
-use ds_core::resample::SourceGrid;
+use ds_core::resample::{CurvilinearGrid, SourceGrid};
 use ds_core::units::{cf_display_conversion, DisplayConversion};
 use ds_core::vertical::{VerticalDimension, VerticalKind};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
@@ -69,7 +69,8 @@ pub(crate) struct Layout {
     /// `f64` ([`Self::to_display`]), so a map pixel and an EDR value agree.
     pub display: Vec<Option<DisplayConversion>>,
     pub grid: FileGrid,
-    /// The sampler over the grid, built once.
+    /// The sampler over the grid, built once: a curvilinear grid's lookup
+    /// index (#1174) is built here, once per layout.
     pub source: SourceGrid,
     /// What the files state about wind components, for
     /// `ds_core::wind::DerivedWind`: built once with the layout, so the
@@ -122,7 +123,12 @@ impl Layout {
             .iter()
             .map(|v| cf_display_conversion(&v.units, v.standard_name.as_deref()))
             .collect();
-        let wind = Arc::new(wind_facts(&variables, &display, &grid.transform.crs));
+        // A curvilinear grid's axes follow no projection: whether they are
+        // orthogonal on the ground is unknown (#1174).
+        let axes = grid
+            .transform()
+            .map_or(GridAxes::Skewed, |transform| GridAxes::of(&transform.crs));
+        let wind = Arc::new(wind_facts(&variables, &display, axes));
         // Every variable of a layout is on the same levels, or none is
         // (`ingest::one_vertical_axis`).
         let vertical = variables
@@ -134,8 +140,14 @@ impl Layout {
         } else {
             Vec::new()
         };
+        let source = match &grid {
+            FileGrid::Regular { transform, .. } => SourceGrid::new(transform.clone()),
+            FileGrid::Curvilinear(nodes) => {
+                SourceGrid::from_curvilinear(Arc::new(CurvilinearGrid::new(nodes.clone())))
+            }
+        };
         Self {
-            source: SourceGrid::new(grid.transform.clone()),
+            source,
             variables,
             display,
             grid,
@@ -265,16 +277,19 @@ impl Layout {
 /// `x_wind_pl`/`y_wind_pl` pair level by level (#1067 PR 8). MEPS's
 /// Lambert grid is `GridAxes::Rotated`, so its grid-relative 10 m wind
 /// gives a speed and no direction until the components are turned by the
-/// convergence angle (a follow-up on #897). Nothing is taken from a name.
+/// convergence angle (a follow-up on #897); a curvilinear grid's are
+/// `GridAxes::Skewed` (#1174), so grid-relative components give nothing
+/// there, while earth-relative ones give both. Nothing is taken from a
+/// name.
 /// The unit is the one served ([`Layout::unit`]): `DerivedWind` combines
 /// the values the engine serves.
 pub(crate) fn wind_facts(
     variables: &[Variable],
     display: &[Option<DisplayConversion>],
-    crs: &Crs,
+    grid: GridAxes,
 ) -> WindFacts {
     WindFacts {
-        grid: GridAxes::of(crs),
+        grid,
         parameters: variables
             .iter()
             .zip(display)
@@ -726,19 +741,32 @@ pub(crate) fn raster_info(
             variables.chain(per_step).collect()
         })
         .unwrap_or_default();
-    let transform = layout.map(|layout| &layout.grid.transform);
+    let grid = layout.map(|layout| &layout.grid);
+    let transform = grid.and_then(FileGrid::transform);
     RasterInfo {
-        native_crs: match transform.map(|t| &t.crs) {
+        native_crs: match grid {
             // Lon-first degrees, OGC `storageCrs` CRS84. A projected grid
             // has no stable OGC URI, so its label leaves `storageCrs` and
-            // the Common grid out, as engine-querydata's does.
-            None | Some(Crs::Wgs84) => "CRS:84",
-            Some(Crs::Geostationary { .. }) => "geos",
-            Some(_) => "projected",
+            // the Common grid out, as engine-querydata's does; a
+            // curvilinear one (#1174) has no CRS at all.
+            None => "CRS:84",
+            Some(FileGrid::Curvilinear(_)) => "curvilinear",
+            Some(FileGrid::Regular { transform, .. }) => match transform.crs {
+                Crs::Wgs84 => "CRS:84",
+                Crs::Geostationary { .. } => "geos",
+                _ => "projected",
+            },
         }
         .to_string(),
-        // A polar grid's edges circle its pole: the extent reaches the pole.
-        spatial_extent: transform.and_then(|t| ds_core::geo::crs84_extent(t.bbox_with_poles())),
+        // A polar grid's edges circle its pole: the extent reaches the
+        // pole. A curvilinear grid's comes from its outer nodes, computed
+        // once with its index.
+        spatial_extent: layout.and_then(|layout| match &layout.grid {
+            FileGrid::Regular { transform, .. } => {
+                ds_core::geo::crs84_extent(transform.bbox_with_poles())
+            }
+            FileGrid::Curvilinear(_) => layout.source.curvilinear()?.extent(),
+        }),
         times,
         parameter: parameters
             .first()
@@ -750,11 +778,15 @@ pub(crate) fn raster_info(
             .unwrap_or_default(),
         parameters,
         vertical: layout.and_then(|layout| layout.vertical.clone()),
-        grid_size: transform.map(|t| [t.width, t.height]),
+        grid_size: grid.map(|g| {
+            let (width, height) = g.size();
+            [width, height]
+        }),
         layer_subtitle: None,
         reference_times: runs.keys().flatten().copied().collect(),
         // The CF grid as read, in its own CRS (#1237). CF states no EPSG
         // code MeteoCore reads, so the CRS is described by its parameters.
+        // A curvilinear grid has no CRS to describe it in.
         native_grid: transform.and_then(|t| NativeGrid::from_geo_transform(t, None)),
     }
 }

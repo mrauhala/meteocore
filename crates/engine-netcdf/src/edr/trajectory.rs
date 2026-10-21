@@ -93,14 +93,14 @@ impl NetcdfEngine {
             _ => None,
         };
         let extent = catalog.info.spatial_extent;
-        let transform = layout.source.transform();
+        let (columns, rows) = layout.source.size();
         // The source's mean cell size in degrees, as an area samples at.
         let spacing = extent
             .and_then(|extent| {
                 let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(extent);
                 GridSpacing::new(
-                    lon_span / f64::from(transform.width.max(1)),
-                    lat_span / f64::from(transform.height.max(1)),
+                    lon_span / f64::from(columns.max(1)),
+                    lat_span / f64::from(rows.max(1)),
                 )
             })
             .ok_or_else(|| DataServerError::Engine("NetCDF grid has no extent".into()))?;

@@ -103,12 +103,13 @@ fn meps_fields_are_lambert_south_up_with_levels_by_value() {
         inspected.skipped
     );
     let grid = &inspected.grid;
-    assert!(grid.flipped, "MEPS's y ascends");
+    assert!(grid.flipped(), "MEPS's y ascends");
+    let transform = grid.transform().expect("MEPS is on its Lambert axes");
     assert!(matches!(
-        grid.transform.crs,
+        transform.crs,
         Crs::LambertConformalConic { radius: Some(r), .. } if r == 6_371_000.0
     ));
-    assert_eq!((grid.transform.width, grid.transform.height), (10, 11));
+    assert_eq!((transform.width, transform.height), (10, 11));
     let run = DateTime::parse_from_rfc3339("2026-10-15T06:00:00Z").unwrap();
     assert_eq!(inspected.run, Some(run.into()));
     assert_eq!(inspected.times, [DateTime::<Utc>::from(run)]);
@@ -151,10 +152,10 @@ fn a_global_grid_north_up_without_runs_with_packing() {
         inspected.times[2] - inspected.times[0],
         chrono::Duration::hours(12)
     );
-    assert!(!inspected.grid.flipped);
-    assert_eq!(inspected.grid.transform.crs, Crs::Wgs84);
+    assert!(!inspected.grid.flipped());
+    assert_eq!(inspected.grid.transform().unwrap().crs, Crs::Wgs84);
     assert_eq!(
-        inspected.grid.transform.bbox(),
+        inspected.grid.transform().unwrap().bbox(),
         [-180.0, -90.0, 180.0, 90.0]
     );
     let read = |name: &str| {
@@ -187,7 +188,8 @@ fn an_allowlisted_variable_missing_fails_the_file() {
     let names = vec!["air_temperature_2m".to_string(), "snowfall".to_string()];
     let error = inspect(&nc, &storage, &Wanted::Listed(&names), 0)
         .err()
-        .unwrap();
+        .unwrap()
+        .to_string();
     assert!(error.contains("'snowfall'"), "{error}");
 }
 
@@ -213,6 +215,7 @@ fn single_level_fields_on_a_time_axis_are_served() {
             ("x", 949, ProjectionX),
         ]),
         0,
+        false,
         no_pressure,
     )
     .unwrap();
@@ -235,6 +238,7 @@ fn single_level_fields_on_a_time_axis_are_served() {
             ("lon", 20, Lon),
         ]),
         2,
+        false,
         no_pressure,
     )
     .unwrap();
@@ -255,7 +259,7 @@ fn single_level_fields_on_a_time_axis_are_served() {
 fn fields_that_cannot_be_served_say_why() {
     use AxisRole::*;
     let reason = |spec: &[(&str, u64, AxisRole)], member| {
-        classify(&dims(spec), member, no_pressure).unwrap_err()
+        classify(&dims(spec), member, false, no_pressure).unwrap_err()
     };
     // An axis of several levels that is not a pressure axis, never pinned
     // to one level silently.
@@ -440,7 +444,7 @@ fn pressure_levels_in_pa_are_served_in_hpa() {
         );
         assert_eq!(field.read.levels, [2, 1, 0]);
     }
-    assert_eq!(inspected.grid.transform.crs, Crs::Wgs84);
+    assert_eq!(inspected.grid.transform().unwrap().crs, Crs::Wgs84);
     assert_eq!(inspected.run, None);
 }
 
@@ -460,6 +464,7 @@ fn a_pressure_axis_is_the_one_vertical_axis() {
             ("x", 949, ProjectionX),
         ]),
         0,
+        false,
         pressure,
     )
     .unwrap();
@@ -478,6 +483,7 @@ fn a_pressure_axis_is_the_one_vertical_axis() {
             ("x", 4, ProjectionX),
         ]),
         0,
+        false,
         pressure,
     )
     .unwrap();
@@ -506,7 +512,7 @@ fn a_pressure_axis_is_the_one_vertical_axis() {
             "3 values on its 'height_above_ground' axis",
         ),
     ] {
-        let reason = classify(&dims(&spec), 0, pressure).unwrap_err();
+        let reason = classify(&dims(&spec), 0, false, pressure).unwrap_err();
         assert!(reason.contains(error), "{reason}");
     }
 }
@@ -739,4 +745,174 @@ fn same_quantity_compares_pressure_levels() {
     assert!(!served.same_quantity(&on(Some(&[1000.0, 850.0, 500.0]))));
     assert!(!served.same_quantity(&on(Some(&[925.0, 850.0]))));
     assert!(!served.same_quantity(&on(None)));
+}
+
+const CURVILINEAR: &str = "netcdf-curvilinear/svalbard_curvilinear.nc";
+
+/// #1174: fields whose CF `coordinates` name 2-D latitude/longitude, with
+/// no 1-D coordinates on their `(y, x)`, are on a curvilinear grid: both
+/// arrays read once per file, rows as stored, compared node by node with
+/// another file's. The auxiliaries themselves have no time axis, and are
+/// skipped as MEPS's are.
+#[test]
+fn two_dimensional_latitude_longitude_make_a_curvilinear_grid() {
+    let (nc, storage) = open_fixture(CURVILINEAR);
+    let inspected = inspect(&nc, &storage, &Wanted::All, 0).unwrap();
+    let names: Vec<&str> = inspected.fields.iter().map(|f| &*f.variable.name).collect();
+    assert_eq!(names, ["column", "row"]);
+    let mut skipped: Vec<&str> = inspected.skipped.iter().map(|(n, _)| n.as_str()).collect();
+    skipped.sort_unstable();
+    assert_eq!(skipped, ["lat", "lon"], "{:?}", inspected.skipped);
+    let FileGrid::Curvilinear(nodes) = &inspected.grid else {
+        panic!("not curvilinear: {:?}", inspected.grid);
+    };
+    assert_eq!(nodes.size(), (19, 28));
+    assert_eq!(inspected.grid.size(), (19, 28));
+    assert!(!inspected.grid.flipped() && inspected.grid.transform().is_none());
+    assert_eq!(
+        inspected.fields[0].read.dims,
+        [Dim::Time, Dim::Whole(28), Dim::Whole(19)]
+    );
+    let names = vec!["row".to_string()];
+    let again = inspect(&nc, &storage, &Wanted::Listed(&names), 0).unwrap();
+    assert!(inspected.grid.same(&again.grid));
+    let (meps, meps_storage) = open_fixture(MEPS_00);
+    let meps = inspect(&meps, &meps_storage, &Wanted::All, 0).unwrap();
+    assert!(!inspected.grid.same(&meps.grid) && !meps.grid.same(&inspected.grid));
+}
+
+/// How a field's `(y, x)` are placed: 2-D auxiliaries by their
+/// `standard_name` or `units`, never their names; with both, 1-D axes win
+/// only as their own attributes state them (latitude/longitude, or
+/// projected x/y with a `grid_mapping`, as MEPS), never as a bare index
+/// axis's name reads.
+#[test]
+fn stated_axes_win_over_auxiliaries_and_names_decide_nothing() {
+    let (ny, nx) = (3, 4);
+    let grid_var = |name: &str, (y, x): (&str, &str), attrs: &[(&str, &str)]| {
+        variable(name, &[(y, ny), (x, nx)], attrs)
+    };
+    let place = |(y, x): (&str, &str), axes: Vec<NcVariable>, attrs: &[(&str, &str)]| {
+        let mut variables = vec![
+            grid_var("nav_lat", (y, x), &[("units", "degrees_north")]),
+            grid_var("nav_lon", (y, x), &[("standard_name", "longitude")]),
+            grid_var("latitude", (y, x), &[]),
+            grid_var("longitude", (y, x), &[]),
+            grid_var("lat2", (y, x), &[("standard_name", "latitude")]),
+            grid_var("lat_t", (x, y), &[("standard_name", "latitude")]),
+        ];
+        variables.extend(axes);
+        let field = variable("t", &[("time", 1), (y, ny), (x, nx)], attrs);
+        placement(&variables, &field)
+    };
+    let aux = || {
+        Some(Placement::Auxiliary {
+            lat: "nav_lat".into(),
+            lon: "nav_lon".into(),
+        })
+    };
+    let coords = ("coordinates", "nav_lon nav_lat");
+    let yx = ("y", "x");
+    assert_eq!(place(("nj", "ni"), vec![], &[coords]), aux());
+    // Index axes named y and x read as latitude/longitude by their names:
+    // the auxiliaries win; without them, the names do, as before.
+    let index = || {
+        vec![
+            variable("y", &[("y", ny)], &[]),
+            variable("x", &[("x", nx)], &[]),
+        ]
+    };
+    assert_eq!(place(yx, index(), &[coords]), aux());
+    assert_eq!(place(yx, index(), &[]), Some(Placement::Axes(None)));
+    // Projected axes stated, with a grid mapping (MEPS): the axes.
+    let projected = || {
+        vec![
+            variable(
+                "y",
+                &[("y", ny)],
+                &[("standard_name", "projection_y_coordinate"), ("units", "m")],
+            ),
+            variable(
+                "x",
+                &[("x", nx)],
+                &[("standard_name", "projection_x_coordinate"), ("units", "m")],
+            ),
+        ]
+    };
+    assert_eq!(
+        place(yx, projected(), &[coords, ("grid_mapping", "crs")]),
+        Some(Placement::Axes(Some("crs".into())))
+    );
+    assert_eq!(place(yx, projected(), &[coords]), aux());
+    // Latitude/longitude axes stated: the axes.
+    let degrees = vec![
+        variable("y", &[("y", ny)], &[("units", "degrees_north")]),
+        variable("x", &[("x", nx)], &[("units", "degrees_east")]),
+    ];
+    assert_eq!(place(yx, degrees, &[coords]), Some(Placement::Axes(None)));
+    // Auxiliaries known only by name, two latitudes, or one on (x, y):
+    // nothing places dimensions without a role.
+    let nowhere = ("nj", "ni");
+    for named in [
+        "longitude latitude",
+        "nav_lon nav_lat lat2",
+        "nav_lon lat_t",
+        "nav_lon",
+    ] {
+        assert_eq!(
+            place(nowhere, vec![], &[("coordinates", named)]),
+            None,
+            "{named}"
+        );
+    }
+}
+
+/// A curvilinear grid over `MAX_NODES` is refused from its dimensions
+/// alone, before the decode budget or the file is touched: not one byte of
+/// its 2-D latitude/longitude is read (at the cap, ~134 MB per `f64`
+/// array).
+#[test]
+fn an_oversized_curvilinear_grid_is_refused_unread() {
+    let storage = counting(CURVILINEAR);
+    let nc = open_storage(storage.clone()).unwrap();
+    storage.take();
+    let (ny, nx) = (4097, 4096);
+    assert!(nx * ny > ds_core::resample::curvilinear::MAX_NODES as u64);
+    let variables = [
+        variable(
+            "lat",
+            &[("y", ny), ("x", nx)],
+            &[("standard_name", "latitude")],
+        ),
+        variable(
+            "lon",
+            &[("y", ny), ("x", nx)],
+            &[("standard_name", "longitude")],
+        ),
+    ];
+    let field = variable(
+        "column",
+        &[("time", 1), ("y", ny), ("x", nx)],
+        &[("coordinates", "lon lat")],
+    );
+    let placement = Placement::Auxiliary {
+        lat: "lat".into(),
+        lon: "lon".into(),
+    };
+    let Err(Unservable::File(reason)) = file_grid(&nc, &variables, &field, "y", "x", &placement)
+    else {
+        panic!("an oversized grid is a file it cannot serve");
+    };
+    assert!(reason.contains("more than 16777216"), "{reason}");
+    assert_eq!(storage.take(), (0, 0), "read before refusing");
+    // What a grid's read reserves: 40 B per node of `float` arrays (the
+    // helper's type), 52 B of `double` ones.
+    let fixture = [
+        variable("lat", &[("y", 28), ("x", 19)], &[]),
+        variable("lon", &[("y", 28), ("x", 19)], &[]),
+    ];
+    assert_eq!(
+        curvilinear_peak_bytes(19 * 28, &fixture[0], &fixture[1]),
+        19 * 28 * (16 + 12 + 3 * 4)
+    );
 }

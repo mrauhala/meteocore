@@ -266,7 +266,9 @@ enum Opened {
     Ready(Box<Ready>),
     /// Not servable: remembered and not opened again until it changes.
     Skip(String),
-    /// A remote read failed: forgotten, and tried again next poll.
+    /// A remote read failed, or the decode budget had no room for a
+    /// curvilinear grid's 2-D coordinates (#1174): forgotten, and tried
+    /// again next poll.
     Retry(String),
 }
 
@@ -486,10 +488,12 @@ impl NetcdfEngine {
         self.catalog.load().info.times.clone()
     }
 
-    /// The grid fields are rendered from, north-up, once a file is ingested.
+    /// The regular grid fields are rendered from, north-up, once a file is
+    /// ingested; `None` before, and on a curvilinear grid (#1174), which
+    /// has no transform.
     pub fn grid(&self) -> Option<GeoTransform> {
         let catalog = self.catalog.load();
-        Some(catalog.layout.as_ref()?.grid.transform.clone())
+        catalog.layout.as_ref()?.grid.transform().cloned()
     }
 
     /// Fields this engine has decoded, every cache fill counted once.
@@ -894,7 +898,9 @@ impl NetcdfEngine {
         };
         let inspected = match ingest::inspect(&nc, &storage, wanted, self.member) {
             Ok(inspected) => inspected,
-            Err(e) => {
+            // The decode budget is full now (#1174): the next poll tries again.
+            Err(ingest::Unservable::Busy(e)) => return Opened::Retry(e),
+            Err(ingest::Unservable::File(e)) => {
                 return match &remote {
                     Some(remote) => verdict(remote, e),
                     None => Opened::Skip(e),
@@ -1023,7 +1029,7 @@ impl NetcdfEngine {
         let next = AtomicUsize::new(0);
         let done = Mutex::new(Vec::new());
         let stop = std::sync::atomic::AtomicBool::new(false);
-        let flipped = layout.grid.flipped;
+        let flipped = layout.grid.flipped();
         let work = || {
             let _mode = io::enter(Mode::Background);
             while !stop.load(Ordering::Relaxed) && Instant::now() < until {
@@ -1088,30 +1094,33 @@ impl NetcdfEngine {
                     );
                 }
             }
-            let t = &inspected.grid.transform;
+            let (width, height) = inspected.grid.size();
             tracing::info!(
                 "[{}] serving {} variables on a {} x {} {} grid{}",
                 self.collection_id,
                 inspected.fields.len(),
-                t.width,
-                t.height,
-                match t.crs {
-                    ds_core::geo::Crs::Wgs84 => "latitude/longitude",
-                    ds_core::geo::Crs::LambertConformalConic { .. } => "Lambert conformal conic",
-                    ds_core::geo::Crs::Geostationary { .. } => "geostationary",
-                    ds_core::geo::Crs::Stereographic { lat0, .. }
+                width,
+                height,
+                match inspected.grid.transform().map(|t| &t.crs) {
+                    None => "curvilinear (2-D latitude/longitude)",
+                    Some(ds_core::geo::Crs::Wgs84) => "latitude/longitude",
+                    Some(ds_core::geo::Crs::LambertConformalConic { .. }) => {
+                        "Lambert conformal conic"
+                    }
+                    Some(ds_core::geo::Crs::Geostationary { .. }) => "geostationary",
+                    Some(ds_core::geo::Crs::Stereographic { lat0, .. })
                         if lat0.abs() < std::f64::consts::FRAC_PI_2 - 1e-10 =>
                     {
                         "stereographic"
                     }
-                    ds_core::geo::Crs::Stereographic { .. } => "polar stereographic",
-                    ds_core::geo::Crs::LambertAzimuthalEqualArea { .. } => {
+                    Some(ds_core::geo::Crs::Stereographic { .. }) => "polar stereographic",
+                    Some(ds_core::geo::Crs::LambertAzimuthalEqualArea { .. }) => {
                         "Lambert azimuthal equal-area"
                     }
-                    ds_core::geo::Crs::TransverseMercator { .. } => "transverse Mercator",
-                    _ => "projected",
+                    Some(ds_core::geo::Crs::TransverseMercator { .. }) => "transverse Mercator",
+                    Some(_) => "projected",
                 },
-                if inspected.grid.flipped {
+                if inspected.grid.flipped() {
                     " (rows stored south to north)"
                 } else {
                     ""
@@ -1301,7 +1310,7 @@ impl NetcdfEngine {
             index,
             step.index,
             level,
-            layout.grid.flipped,
+            layout.grid.flipped(),
             &self.decodes,
         )
     }
@@ -1501,17 +1510,15 @@ fn sample_step_amount(
     values: &[f32],
     before: Option<&[f32]>,
 ) -> Result<RasterTile, DataServerError> {
-    let grid = layout.source.transform();
-    let cells = grid.width as usize * grid.height as usize;
+    let (columns, rows) = layout.source.size();
+    let cells = columns as usize * rows as usize;
     if let Some(field) = std::iter::once(values)
         .chain(before)
         .find(|field| field.len() != cells)
     {
         return Err(DataServerError::Engine(format!(
-            "field has {} values for a {}x{} grid",
+            "field has {} values for a {columns}x{rows} grid",
             field.len(),
-            grid.width,
-            grid.height
         )));
     }
     let sample = |field: &[f32], position| {

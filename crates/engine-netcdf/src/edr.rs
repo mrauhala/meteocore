@@ -346,7 +346,7 @@ impl NetcdfEngine {
 
         let mut samples: Vec<Vec<Option<f64>>> = vec![Vec::new(); requests];
         if !to_read.is_empty() {
-            let flipped = layout.grid.flipped;
+            let flipped = layout.grid.flipped();
             let shared = layout.clone();
             let decodes: Arc<AtomicU64> = self.decodes.clone();
             ds_executor::field_jobs::run_field_jobs(
@@ -887,11 +887,11 @@ impl EdrEngine for NetcdfEngine {
                 "The polygon lies outside the collection's spatial extent".into(),
             ));
         }
-        let transform = reads.layout.source.transform();
+        let (columns, rows) = reads.layout.source.size();
         let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(extent);
         let axes = polygon.sample_grid(
-            lon_span / f64::from(transform.width.max(1)),
-            lat_span / f64::from(transform.height.max(1)),
+            lon_span / f64::from(columns.max(1)),
+            lat_span / f64::from(rows.max(1)),
             MAX_AREA_DIM,
         );
         let (nx, ny) = axes.dims();

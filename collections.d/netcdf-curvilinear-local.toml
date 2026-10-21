@@ -1,0 +1,38 @@
+id = "netcdf-curvilinear-local"
+title = "Curvilinear grid test pattern (CF-NetCDF, local sample)"
+description = "A synthetic CF-NetCDF grid placed only by 2-D latitude/longitude auxiliaries, no grid mapping: 19 x 28 nodes 100 km apart around the North Pole, over Svalbard and across the antimeridian. Its two fields are each node's own column and row index, so a map or an EDR read shows where the server placed a point."
+engine_type = "netcdf"
+# Every point is placed by an inverse lookup over the grid's nodes (a k-d
+# tree and the cell around the nearest node), made at a map's coarse
+# projection grid nodes and once per EDR point. EDR position, area,
+# radius, trajectory and cube; the WMS layers answer GetFeatureInfo.
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["NetCDF", "curvilinear", "test pattern", "Svalbard"]
+
+[license]
+title = "CC0-1.0"
+
+[netcdf]
+# One file, one step (2026-10-21T00Z), no model run. Regenerate it with
+# testdata/netcdf-curvilinear/make_cdl.py and `ncgen -k nc4`.
+data_path = "testdata/netcdf-curvilinear"
+poll_interval_secs = 300
+
+[netcdf.titles]
+column = "Grid column (0-18)"
+row = "Grid row (0-27)"
+
+[wms]
+colormap = "viridis"
+
+[[wms.parameters]]
+name = "column"
+colormap = "viridis"
+min = 0.0
+max = 18.0
+
+[[wms.parameters]]
+name = "row"
+colormap = "viridis"
+min = 0.0
+max = 27.0
