@@ -15,6 +15,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use ds_core::cf::{self, AxisRole, CfAttr, PressureUnit, RegularAxis};
 use ds_core::geo::{Crs, GeoTransform};
+use ds_core::resample::CurvilinearNodes;
+
+use crate::decode_budget::BUDGET;
 use netcdf_reader::{
     DynStorage, FileStorage, NcAttrValue, NcFile, NcFormat, NcOpenOptions, NcSliceInfo,
     NcSliceInfoElem, NcType, NcVariable,
@@ -248,24 +251,72 @@ impl Variable {
 
 /// A file's grid: the CF grid of its fields' `(y, x)` axes.
 #[derive(Debug, Clone)]
-pub(crate) struct FileGrid {
-    pub transform: GeoTransform,
-    /// The stored rows run south to north and are reversed when decoded.
-    pub flipped: bool,
+pub(crate) enum FileGrid {
+    /// 1-D latitude/longitude or projected x/y axes: a regular grid, its
+    /// transform north-up. `flipped`: the stored rows run south to north
+    /// and are reversed when decoded.
+    Regular {
+        transform: GeoTransform,
+        flipped: bool,
+    },
+    /// 2-D latitude and longitude auxiliaries and no CRS (#1174): each
+    /// node's position, read once at ingest. Rows are drawn as stored.
+    Curvilinear(Arc<CurvilinearNodes>),
 }
 
 impl FileGrid {
-    /// Whether `other` is the same grid, to a thousandth of a cell.
+    /// A regular grid's transform; `None` on a curvilinear grid.
+    pub(crate) fn transform(&self) -> Option<&GeoTransform> {
+        match self {
+            FileGrid::Regular { transform, .. } => Some(transform),
+            FileGrid::Curvilinear(_) => None,
+        }
+    }
+
+    /// Whether the stored rows are reversed when decoded: a regular grid
+    /// stored south to north. Never a curvilinear one.
+    pub(crate) fn flipped(&self) -> bool {
+        matches!(self, FileGrid::Regular { flipped: true, .. })
+    }
+
+    /// `(columns, rows)`.
+    pub(crate) fn size(&self) -> (u32, u32) {
+        match self {
+            FileGrid::Regular { transform, .. } => (transform.width, transform.height),
+            FileGrid::Curvilinear(nodes) => {
+                let (nx, ny) = nodes.size();
+                (nx as u32, ny as u32)
+            }
+        }
+    }
+
+    /// Whether `other` is the same grid: a regular one to a thousandth of
+    /// a cell, a curvilinear one node by node to a thousandth of each
+    /// node's spacing ([`CurvilinearNodes::same`]).
     pub(crate) fn same(&self, other: &FileGrid) -> bool {
-        let (a, b) = (&self.transform, &other.transform);
-        let close = |x: f64, y: f64, cell: f64| (x - y).abs() <= cell.abs() * 1e-3;
-        self.flipped == other.flipped
-            && a.crs == b.crs
-            && (a.width, a.height) == (b.width, b.height)
-            && close(a.origin_x, b.origin_x, a.pixel_width)
-            && close(a.origin_y, b.origin_y, a.pixel_height)
-            && close(a.pixel_width, b.pixel_width, a.pixel_width)
-            && close(a.pixel_height, b.pixel_height, a.pixel_height)
+        match (self, other) {
+            (
+                FileGrid::Regular {
+                    transform: a,
+                    flipped,
+                },
+                FileGrid::Regular {
+                    transform: b,
+                    flipped: other_flipped,
+                },
+            ) => {
+                let close = |x: f64, y: f64, cell: f64| (x - y).abs() <= cell.abs() * 1e-3;
+                flipped == other_flipped
+                    && a.crs == b.crs
+                    && (a.width, a.height) == (b.width, b.height)
+                    && close(a.origin_x, b.origin_x, a.pixel_width)
+                    && close(a.origin_y, b.origin_y, a.pixel_height)
+                    && close(a.pixel_width, b.pixel_width, a.pixel_width)
+                    && close(a.pixel_height, b.pixel_height, a.pixel_height)
+            }
+            (FileGrid::Curvilinear(a), FileGrid::Curvilinear(b)) => Arc::ptr_eq(a, b) || a.same(b),
+            _ => false,
+        }
     }
 }
 
@@ -288,6 +339,26 @@ pub(crate) struct Inspected {
     pub skipped: Vec<(String, String)>,
 }
 
+/// Why [`inspect`] serves nothing from a file.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Unservable {
+    /// The file cannot be served as it is: remembered, and not opened
+    /// again until it changes.
+    #[error("{0}")]
+    File(String),
+    /// Not now: the decode budget (`MC_NETCDF_READ_MEMORY_MB`) had no room
+    /// to read a curvilinear grid's 2-D latitude/longitude (#1174). The
+    /// poll forgets the file and opens it again next poll.
+    #[error("{0}")]
+    Busy(String),
+}
+
+impl From<String> for Unservable {
+    fn from(reason: String) -> Self {
+        Unservable::File(reason)
+    }
+}
+
 /// Which variables [`inspect`] looks at.
 pub(crate) enum Wanted<'a> {
     /// These, in this order; the file fails without any one of them.
@@ -297,7 +368,8 @@ pub(crate) enum Wanted<'a> {
 }
 
 /// Read `nc`'s grid, times, run and fields. An `Err` is why the file
-/// cannot be served at all.
+/// cannot be served at all ([`Unservable::File`]), or cannot be read now
+/// ([`Unservable::Busy`]).
 ///
 /// `storage` is the file's storage, read once more through hdf5-reader for
 /// the chunk shapes, which the NetCDF metadata does not carry.
@@ -306,12 +378,11 @@ pub(crate) fn inspect(
     storage: &DynStorage,
     wanted: &Wanted,
     member: u32,
-) -> Result<Inspected, String> {
+) -> Result<Inspected, Unservable> {
     let variables = nc.variables().map_err(|e| format!("metadata: {e}"))?;
     let h5 = matches!(nc.format(), NcFormat::Nc4 | NcFormat::Nc4Classic)
         .then(|| hdf5_reader::Hdf5File::from_storage(storage.clone()).ok())
         .flatten();
-    let role = |dim: &str| role(variables, dim);
     let coordinate = |dim: &str| coordinate(variables, dim);
 
     let candidates: Vec<&NcVariable> = match wanted {
@@ -327,34 +398,38 @@ pub(crate) fn inspect(
         Wanted::All => variables
             .iter()
             .filter(|v| v.dimensions.len() >= 2 && !v.is_coordinate_variable())
-            .filter(|v| {
-                let n = v.dimensions.len();
-                spatial_pair(
-                    role(&v.dimensions[n - 2].name),
-                    role(&v.dimensions[n - 1].name),
-                )
-                .is_some()
-            })
+            .filter(|v| placement(variables, v).is_some())
             .collect(),
     };
 
-    let mut grid: Option<(String, String, Option<String>, FileGrid)> = None;
+    let mut grid: Option<(GridKey, FileGrid)> = None;
     let mut time_dim: Option<String> = None;
     let mut fields = Vec::new();
     let mut skipped = Vec::new();
     for var in candidates {
-        let outcome = field(nc, h5.as_ref(), variables, var, member).and_then(|(field, key)| {
-            let (y, x, mapping) = &key;
-            match &grid {
-                Some((gy, gx, gm, _)) if (gy, gx, gm) != (y, x, mapping) => {
-                    return Err(format!("is on another grid ({y}, {x})"));
+        let outcome = match field(nc, h5.as_ref(), variables, var, member) {
+            Err(reason) => Err(reason),
+            Ok((field, key)) => match &grid {
+                Some((found, _)) if *found != key => {
+                    let (y, x, _) = &key;
+                    Err(format!("is on another grid ({y}, {x})"))
                 }
-                Some(_) => {}
+                Some(_) => Ok(field),
                 None => {
-                    let found = file_grid(nc, variables, var, y, x, mapping.as_deref())?;
-                    grid = Some((y.clone(), x.clone(), mapping.clone(), found));
+                    let (y, x, placement) = &key;
+                    match file_grid(nc, variables, var, y, x, placement) {
+                        Ok(found) => {
+                            grid = Some((key, found));
+                            Ok(field)
+                        }
+                        Err(Unservable::File(reason)) => Err(reason),
+                        // Not this variable's fault: the whole file waits.
+                        Err(busy) => return Err(busy),
+                    }
                 }
-            }
+            },
+        };
+        let outcome = outcome.and_then(|field| {
             let time = field.time_dim.clone();
             match &time_dim {
                 Some(t) if *t != time => Err(format!("is on another time axis ('{time}')")),
@@ -368,17 +443,18 @@ pub(crate) fn inspect(
         match outcome {
             Ok(field) => fields.push(field),
             Err(reason) => match wanted {
-                Wanted::Listed(_) => return Err(format!("variable '{}' {reason}", var.name)),
+                Wanted::Listed(_) => return Err(format!("variable '{}' {reason}", var.name).into()),
                 Wanted::All => skipped.push((var.name.clone(), reason)),
             },
         }
     }
     let fields = one_vertical_axis(fields, wanted, &mut skipped)?;
-    let (Some((.., grid)), Some(time_dim)) = (grid, time_dim) else {
+    let (Some((_, grid)), Some(time_dim)) = (grid, time_dim) else {
         return Err(
-            "has no variable on a 1-D latitude/longitude or projected x/y grid with a \
-                    time axis"
-                .to_string(),
+            "has no variable on a 1-D latitude/longitude or projected x/y grid, or on 2-D \
+             latitude/longitude, with a time axis"
+                .to_string()
+                .into(),
         );
     };
     let time_var = coordinate(&time_dim)
@@ -483,7 +559,94 @@ struct Candidate {
     time_dim: String,
 }
 
-type GridKey = (String, String, Option<String>);
+/// A field's grid: its y and x dimensions and how they are placed.
+type GridKey = (String, String, Placement);
+
+/// How a variable's `(y, x)` dimensions are placed on the Earth.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Placement {
+    /// 1-D coordinate variables: latitude/longitude, or projected x/y
+    /// placed by the variable's `grid_mapping`, named here.
+    Axes(Option<String>),
+    /// 2-D latitude and longitude auxiliaries (#1174), named by the
+    /// variable's CF `coordinates`: a curvilinear grid.
+    Auxiliary { lat: String, lon: String },
+}
+
+/// How `var`'s last two dimensions, `(y, x)`, are placed, `None` when
+/// nothing places them.
+///
+/// Its axes when their roles form a grid ([`spatial_pair`]: latitude and
+/// longitude, or projected y and x), as before 2-D coordinates were read.
+/// Otherwise its 2-D latitude and longitude auxiliaries
+/// ([`auxiliaries`]): a curvilinear grid. Where it has both, the axes win
+/// only as their coordinate variables' own attributes state them, never
+/// by a dimension's name (a bare index axis `x` reads as a longitude by
+/// name): latitude/longitude, or projected x/y with a `grid_mapping`. So
+/// MEPS, whose fields carry 2-D `latitude`/`longitude` beside their
+/// Lambert axes, stays a projected grid and its 2-D arrays stay unread.
+fn placement(variables: &[NcVariable], var: &NcVariable) -> Option<Placement> {
+    let n = var.dimensions.len();
+    if n < 2 {
+        return None;
+    }
+    let (y, x) = (&var.dimensions[n - 2].name, &var.dimensions[n - 1].name);
+    let mapping = text_attr(var, "grid_mapping").map(|m| m.trim().to_string());
+    let Some((lat, lon)) = auxiliaries(variables, var, y, x) else {
+        return spatial_pair(role(variables, y), role(variables, x))
+            .map(|()| Placement::Axes(mapping));
+    };
+    let stated = |dim: &str| coordinate(variables, dim).map(stated_role);
+    match (stated(y), stated(x)) {
+        (Some(AxisRole::Lat), Some(AxisRole::Lon)) => Some(Placement::Axes(mapping)),
+        (Some(AxisRole::ProjectionY), Some(AxisRole::ProjectionX)) if mapping.is_some() => {
+            Some(Placement::Axes(mapping))
+        }
+        _ => Some(Placement::Auxiliary { lat, lon }),
+    }
+}
+
+/// The 2-D latitude and longitude auxiliaries of `var` on its `(y, x)`:
+/// the variables its CF `coordinates` attribute names whose dimensions are
+/// exactly `(y, x)`, a latitude and a longitude by their `standard_name`
+/// or `units` ([`stated_role`]), never by their names. `None` unless there
+/// is exactly one of each.
+fn auxiliaries(
+    variables: &[NcVariable],
+    var: &NcVariable,
+    y: &str,
+    x: &str,
+) -> Option<(String, String)> {
+    let names = text_attr(var, "coordinates")?;
+    let (mut lat, mut lon) = (Vec::new(), Vec::new());
+    for name in names.split_whitespace() {
+        let Some(aux) = variables.iter().find(|v| v.name == name) else {
+            continue;
+        };
+        if !matches!(&aux.dimensions[..], [a, b] if a.name == y && b.name == x) {
+            continue;
+        }
+        match stated_role(aux) {
+            AxisRole::Lat => lat.push(name),
+            AxisRole::Lon => lon.push(name),
+            _ => {}
+        }
+    }
+    match (&lat[..], &lon[..]) {
+        ([lat], [lon]) => Some((lat.to_string(), lon.to_string())),
+        _ => None,
+    }
+}
+
+/// The role `var`'s own `standard_name` and `units` state, without the
+/// name fallback [`cf::classify_axis`] applies to a dimension.
+fn stated_role(var: &NcVariable) -> AxisRole {
+    cf::classify_axis(
+        "",
+        text_attr(var, "standard_name").as_deref(),
+        text_attr(var, "units").as_deref(),
+    )
+}
 
 /// Classify `var`'s dimensions and read how its field is stored.
 fn field(
@@ -500,7 +663,9 @@ fn field(
         .iter()
         .map(|d| (d.name.clone(), d.size, role(variables, &d.name)))
         .collect();
-    let shape = classify(&roles, member, |dim| {
+    let placement = placement(variables, var);
+    let curvilinear = matches!(placement, Some(Placement::Auxiliary { .. }));
+    let shape = classify(&roles, member, curvilinear, |dim| {
         pressure_unit(variables, dim).is_some()
     })?;
     let (pressure, level_index) = match shape.vertical {
@@ -540,7 +705,7 @@ fn field(
     let key = (
         roles[roles.len() - 2].0.clone(),
         roles[roles.len() - 1].0.clone(),
-        text_attr(var, "grid_mapping").map(|m| m.trim().to_string()),
+        placement.unwrap_or(Placement::Axes(None)),
     );
     let field = Field {
         variable: Variable {
@@ -591,7 +756,9 @@ pub(crate) struct Shape {
     pub nx: u64,
 }
 
-/// Classify a variable's `(name, size, role)` dimensions: `(y, x)` last,
+/// Classify a variable's `(name, size, role)` dimensions: `(y, x)` last
+/// (latitude/longitude or projected axes, or any two placed by 2-D
+/// latitude/longitude auxiliaries when `curvilinear`, #1174),
 /// one time axis, any ensemble axis read at `member`, at most one axis of
 /// several pressure levels (a dimension `pressure` says is one: its
 /// coordinate's units are a pressure and it is no parametric coordinate,
@@ -602,6 +769,7 @@ pub(crate) struct Shape {
 pub(crate) fn classify(
     dims: &[(String, u64, AxisRole)],
     member: u32,
+    curvilinear: bool,
     pressure: impl Fn(&str) -> bool,
 ) -> Result<Shape, String> {
     let n = dims.len();
@@ -609,10 +777,10 @@ pub(crate) fn classify(
         return Err("has fewer than two dimensions".to_string());
     }
     let (y, x) = (&dims[n - 2], &dims[n - 1]);
-    if spatial_pair(y.2, x.2).is_none() {
+    if !curvilinear && spatial_pair(y.2, x.2).is_none() {
         return Err(format!(
-            "is not on a 1-D latitude/longitude or projected x/y grid (its last dimensions are \
-             '{}', '{}')",
+            "is not on a 1-D latitude/longitude or projected x/y grid, nor on 2-D latitude/\
+             longitude (its last dimensions are '{}', '{}')",
             y.0, x.0
         ));
     }
@@ -735,15 +903,57 @@ fn spatial_pair(y: AxisRole, x: AxisRole) -> Option<()> {
 }
 
 /// The grid of `var`'s `(y, x)` axes: CRS84 for latitude/longitude axes,
-/// else the CRS of its `grid_mapping`.
+/// else the CRS of its `grid_mapping`; or the curvilinear grid of its 2-D
+/// latitude/longitude auxiliaries, both read whole, once per file
+/// (#1174): they are the grid's identity, which every later file's must
+/// match ([`FileGrid::same`]).
+///
+/// A curvilinear grid's size is checked from the dimensions before
+/// anything is read ([`CurvilinearNodes::check_size`]), so a grid over
+/// `MAX_NODES` is refused unread, and the read reserves its transient
+/// peak from the decode budget, as a field read does
+/// ([`curvilinear_peak_bytes`]): when it does not fit, the file is
+/// [`Unservable::Busy`] and opened again next poll.
 fn file_grid(
     nc: &NcFile,
     variables: &[NcVariable],
     var: &NcVariable,
     y: &str,
     x: &str,
-    mapping: Option<&str>,
-) -> Result<FileGrid, String> {
+    placement: &Placement,
+) -> Result<FileGrid, Unservable> {
+    let mapping = match placement {
+        Placement::Axes(mapping) => mapping.as_deref(),
+        Placement::Auxiliary { lat, lon } => {
+            let named = |e: String| format!("2-D latitude '{lat}' and longitude '{lon}': {e}");
+            let size = |dim: &str| {
+                var.dimensions
+                    .iter()
+                    .find(|d| d.name == dim)
+                    .map_or(0, |d| d.size as usize)
+            };
+            let (nx, ny) = (size(x), size(y));
+            let nodes = CurvilinearNodes::check_size(nx, ny).map_err(named)?;
+            let aux = |name: &str| {
+                variables
+                    .iter()
+                    .find(|v| v.name == name)
+                    .ok_or_else(|| format!("coordinate '{name}' does not exist"))
+            };
+            let (lat_var, lon_var) = (aux(lat)?, aux(lon)?);
+            let peak = curvilinear_peak_bytes(nodes, lat_var, lon_var);
+            let _permit = BUDGET.reserve(peak).map_err(|_| {
+                Unservable::Busy(named(format!(
+                    "the NetCDF read budget has no room for the {} MiB their read takes now",
+                    peak.div_ceil(1 << 20)
+                )))
+            })?;
+            let lat_values = read_whole(nc, lat_var)?;
+            let lon_values = read_whole(nc, lon_var)?;
+            let grid = CurvilinearNodes::new(nx, ny, &lon_values, &lat_values).map_err(named)?;
+            return Ok(FileGrid::Curvilinear(Arc::new(grid)));
+        }
+    };
     let crs = match role(variables, x) {
         AxisRole::Lon => Crs::Wgs84,
         _ => {
@@ -765,9 +975,72 @@ fn file_grid(
     };
     let grid =
         cf::grid(crs, &axis(x)?, &axis(y)?).map_err(|e| format!("variable '{}': {e}", var.name))?;
-    Ok(FileGrid {
+    Ok(FileGrid::Regular {
         transform: grid.transform,
         flipped: grid.flipped,
+    })
+}
+
+/// The transient peak of reading a curvilinear grid of `nodes` nodes from
+/// `lat` and `lon`, which [`file_grid`] reserves: both arrays as `f64`
+/// (16 B per node, the first held while the second is read), the unit
+/// vectors built from them (12 B), and one array's decode in its stored
+/// type, three times over as a field read counts it (the inflated chunk,
+/// its unshuffled copy, and the compressed chunk it bounds). 52 B per node
+/// for `double` arrays: 2.6 MB per 50 000 nodes, 870 MB at `MAX_NODES`.
+pub(crate) fn curvilinear_peak_bytes(nodes: usize, lat: &NcVariable, lon: &NcVariable) -> u64 {
+    let stored = |v: &NcVariable| Stored::of(v.dtype()).map_or(8, Stored::size);
+    let per_node = 16 + 12 + 3 * stored(lat).max(stored(lon));
+    (nodes as u64).saturating_mul(per_node)
+}
+
+/// A whole 2-D auxiliary coordinate (#1174), CF packing applied in place,
+/// with `_FillValue`, `missing_value` (compared in the stored type) and
+/// NaN as NaN: a node without a position. A slice read, so nothing stays
+/// cached in the reader.
+fn read_whole(nc: &NcFile, var: &NcVariable) -> Result<Vec<f64>, String> {
+    let stored = Stored::of(var.dtype())
+        .ok_or_else(|| format!("coordinate '{}' is not numeric", var.name))?;
+    let selections = var
+        .dimensions
+        .iter()
+        .map(|d| NcSliceInfoElem::Slice {
+            start: 0,
+            end: d.size,
+            step: 1,
+        })
+        .collect();
+    let mut array = nc
+        .read_variable_slice_as_f64(&var.name, &NcSliceInfo { selections })
+        .map_err(|e| format!("coordinate '{}': {e}", var.name))?;
+    let number = |name: &str| var.attribute(name).and_then(|a| a.value.as_f64());
+    let fill: Vec<f64> = ["_FillValue", "missing_value"]
+        .iter()
+        .filter_map(|name| var.attribute(name)?.value.as_f64_vec())
+        .flatten()
+        .map(|v| stored.normalize(v))
+        .collect();
+    let (scale, offset) = (
+        number("scale_factor").unwrap_or(1.0),
+        number("add_offset").unwrap_or(0.0),
+    );
+    array.mapv_inplace(|v| {
+        if v.is_nan() || fill.contains(&v) {
+            f64::NAN
+        } else {
+            v * scale + offset
+        }
+    });
+    // Row-major as read, without a second copy: a freshly read array is
+    // in standard layout.
+    let len = array.len();
+    Ok(if array.is_standard_layout() {
+        let (mut values, first) = array.into_raw_vec_and_offset();
+        values.drain(..first.unwrap_or(0));
+        values.truncate(len);
+        values
+    } else {
+        array.iter().copied().collect()
     })
 }
 

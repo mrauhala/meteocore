@@ -30,10 +30,13 @@
 //! reusable rather than re-derived per engine (#203, #236).
 //!
 //! [`SourceGrid`] builds on it: the shared `f32` sampler a gridded engine
-//! renders a decoded field with (see [`sampler`]).
+//! renders a decoded field with (see [`sampler`]), over a regular grid or a
+//! curvilinear one placed by an inverse lookup ([`curvilinear`], #1174).
 
+pub mod curvilinear;
 pub mod sampler;
 
+pub use curvilinear::{CurvilinearGrid, CurvilinearNodes};
 pub use sampler::{OutputMap, SourceGrid};
 
 /// Initial node spacing, in output pixels. The adaptive refinement in

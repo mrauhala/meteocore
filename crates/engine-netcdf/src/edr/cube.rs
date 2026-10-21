@@ -108,10 +108,10 @@ impl NetcdfEngine {
         let extent = catalog.info.spatial_extent.ok_or_else(|| {
             DataServerError::LocationNotFound("No NetCDF data available yet".into())
         })?;
-        let transform = layout.source.transform();
+        let (columns, rows) = layout.source.size();
         let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(extent);
-        let res_lon = lon_span / f64::from(transform.width.max(1));
-        let res_lat = lat_span / f64::from(transform.height.max(1));
+        let res_lon = lon_span / f64::from(columns.max(1));
+        let res_lat = lat_span / f64::from(rows.max(1));
         let width = if bbox.crosses_antimeridian() {
             bbox.east + 360.0 - bbox.west
         } else {

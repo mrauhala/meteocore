@@ -18,7 +18,7 @@ fn variable(name: &str, units: &str, standard_name: Option<&str>) -> Variable {
 
 /// A 2 × 2 one-degree grid.
 fn grid() -> FileGrid {
-    FileGrid {
+    FileGrid::Regular {
         transform: ds_core::geo::GeoTransform {
             origin_x: 0.0,
             origin_y: 2.0,

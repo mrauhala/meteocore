@@ -6,7 +6,8 @@ shape this crate. Today: local directories and remote files read in place
 by HTTP range (thredds.met.no), WMS/Maps/Tiles, EDR position/area/radius/
 trajectory/cube with runs as instances, GetFeatureInfo, derived wind speed, and a CF
 pressure axis as the collection's vertical axis (PR 8, the last of the
-#1067 plan), and per-step amounts of run-start accumulations (#1165).
+#1067 plan), per-step amounts of run-start accumulations (#1165), and
+curvilinear grids placed by 2-D latitude/longitude (#1174).
 
 ## Model
 
@@ -29,7 +30,8 @@ pressure axis as the collection's vertical axis (PR 8, the last of the
   Non-standard calendars are refused, not approximated.
 - **Variables:** `(y, x)` last, on 1-D latitude/longitude or 1-D projected
   x/y in m or km with a `grid_mapping` (`ds_core::cf::{classify_axis,
-  crs_from_grid_mapping, RegularAxis, grid}`); one time axis; an ensemble
+  crs_from_grid_mapping, RegularAxis, grid}`), or placed by 2-D
+  latitude/longitude auxiliaries (see "Curvilinear grids"); one time axis; an ensemble
   axis read at `member`; every other axis of size 1, whose coordinate value
   and units are the level identity (MEPS puts 10 m wind on `height6`,
   `height7` or `height2` by family: never compare dimension names). At most
@@ -42,8 +44,12 @@ pressure axis as the collection's vertical axis (PR 8, the last of the
   `scale_factor`/`add_offset`, `_FillValue`, `missing_value` (compared in
   the stored type), netCDF's default float fill without a `_FillValue`,
   and NaN apply. `valid_range` is not applied.
-- **2-D latitude/longitude auxiliaries are never read** (MEPS carries them as
-  Float64 next to every field): the grid is the projected axes.
+- **2-D latitude/longitude auxiliaries are read only for a curvilinear
+  grid** (#1174, `ingest::placement`): when a field's `(y, x)` have no 1-D
+  latitude/longitude, nor projected x/y with a `grid_mapping`. MEPS carries
+  them as Float64 next to every field, beside its Lambert axes and
+  `grid_mapping`: there the axes win and the arrays stay unread
+  (`ingest::tests::stated_axes_win_over_auxiliaries_and_names_decide_nothing`).
 
 ## Pressure levels (#1067 PR 8)
 
@@ -97,6 +103,64 @@ pressure axis as the collection's vertical axis (PR 8, the last of the
   index 0 only (13 MEPS levels would be 1.3 GB per variable and run).
 - **Not served:** height above ground (`VerticalKind::Height` is above
   MSL) and hybrid levels (`ModelLevel` expects ordinal levels).
+
+## Curvilinear grids (#1174)
+
+- **Identity:** `ingest::placement`. A field's CF `coordinates` names
+  2-D variables on exactly its `(y, x)`, one a latitude and one a
+  longitude by `standard_name` or `degrees_north`/`degrees_east` units
+  (`ingest::stated_role`: `classify_axis` without the name fallback),
+  never by name; exactly one of each (`ingest::auxiliaries`). Where the
+  field also has 1-D axes, they win only as their own coordinate
+  variables' attributes state them: latitude/longitude, or projected x/y
+  with a `grid_mapping` (MEPS). A bare index axis named `x`/`y`, which
+  `classify_axis` reads as longitude/latitude by name, loses to the
+  auxiliaries; without auxiliaries the old rule stands unchanged.
+  `classify` then skips its `(y, x)` role check (`curvilinear`).
+- **The grid:** `FileGrid::Curvilinear(Arc<CurvilinearNodes>)`. Each
+  file's two arrays are read whole (`ingest::read_whole`: slice read,
+  packing, `_FillValue`/`missing_value`/NaN as a node without a position)
+  once per file, into `f32` unit vectors (12 B/node); the arrays are not
+  kept. They are the grid identity: `FileGrid::same` compares node by
+  node, to a thousandth of each node's spacing (at least 1e-6 rad), so a
+  later file on other nodes is skipped. Remote cost: a curvilinear remote
+  family reads both arrays per file opened. Rows are as stored, never
+  flipped; `transform()` is `None`, `size()` `(nx, ny)`. At most
+  `ds_core::resample::curvilinear::MAX_NODES` (4096²), checked from the
+  dimensions before any read (`CurvilinearNodes::check_size`): an
+  oversized file is skipped unread. The read reserves its transient peak
+  from `decode_budget::BUDGET` (`ingest::curvilinear_peak_bytes`: 16 B for
+  both `f64` arrays + 12 B of vectors + 3 × the stored size, 52 B/node for
+  `double`); a full budget is `ingest::Unservable::Busy`, which
+  `open_inspect` turns into `Opened::Retry`: the file is opened again next
+  poll, never remembered as skipped. Packing is applied in place
+  (`mapv_inplace`, then the array's own buffer), so no second full-size
+  `f64` buffer exists.
+- **The lookup:** `Layout::new` builds `CurvilinearGrid` (k-d tree over
+  the nodes, 5 B/node, and the extent) once per layout, inside
+  `SourceGrid::from_curvilinear`. Everything downstream is the shared
+  sampler: `SourceGrid::output_map` evaluates `CurvilinearGrid::locate`
+  at the coarse `ProjectionGrid` nodes only (Critical Rule 5), with the
+  footprint guard over the extent; `SourceGrid::position` is the same
+  lookup for EDR, so a map pixel and an EDR value at one point stay the
+  same number. `locate`: nearest node from the tree (chord on unit
+  vectors: no antimeridian or pole case), then the cell around it
+  inverted on the gnomonic plane at the point (Newton), walking at most
+  `MAX_WALK` cells; NaN when the nearest node is beyond `REACH` (3) of its
+  own neighbour spacing or the edge cell's extrapolation lands more than
+  `EDGE_MARGIN` (2) nodes past the outer nodes. The sampler's usual rules
+  then apply (bilinear, nearest at a nodata neighbour, drawn up to one
+  node past the outer nodes, the half cell past the outer cell edges).
+- **Metadata:** `native_crs` `"curvilinear"` (no `storageCrs`), no
+  `native_grid`, `grid_size` `[nx, ny]`, `spatial_extent`
+  `CurvilinearGrid::extent` (outer nodes moved half a spacing out, walked
+  as a ring through `ds_core::geo::ring_extent`; a pole the grid holds,
+  found by locating it, makes −180…180 up to it). `engine.grid()` is
+  `None`. Wind: `GridAxes::Skewed`, so grid-relative components give
+  nothing, earth-relative ones speed and direction.
+- **EDR:** unchanged code; area, cube and trajectory spacing use
+  `SourceGrid::size()` over the extent's degrees, so a grid around a pole
+  samples longitude at 360° / nx, as the projected polar grids do.
 
 ## Discovery
 
@@ -414,15 +478,19 @@ Read in place by HTTP range, never downloaded whole (decision 4).
 `SourceGrid::output_map` → `OutputMap::sample_f32_with` (the variable's
 display conversion, #1209) → `RasterValues::F32`. The
 `SourceGrid` is built once per layout (its WGS84 envelope is
-inverse-projected once). `get_raster_tiles` builds the output map once and
+inverse-projected once; a curvilinear grid's index and extent are built
+once, #1174). Code that needs the grid's size uses `SourceGrid::size()`,
+never `transform()`, which a curvilinear grid has not. `get_raster_tiles` builds the output map once and
 samples every band from it, all at one level. `z` selects the level through
 `Layout::map_level` (ignored without a vertical axis, where the API layers
 refuse it first).
 
 `RasterInfo` is built once per poll (`raster_info_shared` is O(1), Critical
 Rule 10): `native_crs` `CRS:84` only for latitude/longitude axes, else
-`projected` (`geos` for geostationary), so the Common `storageCrs` and
+`projected` (`geos` for geostationary, `curvilinear` for 2-D
+latitude/longitude, #1174), so the Common `storageCrs` and
 degree grid are omitted for MEPS; `spatial_extent` from
+`CurvilinearGrid::extent` on a curvilinear grid, else from
 `GeoTransform::bbox_with_poles`, so a polar grid's reaches the pole it
 holds, one across the antimeridian is `west > east`, and an EDR area
 there is not a 404 (#1167, #1194); `grid_size` `[nx, ny]`;
@@ -696,6 +764,20 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
   position and a one-pixel map at points pinned to PROJ `cs2cs` (forward,
   and cell centres through `-I`), within the 1 m their `f32` rounding
   allows, and the polar grid's extent and an EDR area at the pole.
+- `testdata/netcdf-curvilinear/`: synthetic, 2-D `lat`/`lon` only (no 1-D
+  coordinates on `y`/`x`, no grid mapping), 19 × 28 nodes of a spherical
+  polar stereographic plane 100 km apart around the North Pole, over
+  Svalbard and across the antimeridian, one step, no run; its fields
+  `column` and `row` are each node's own indices (`make_cdl.py`, cs2cs to
+  the ninth decimal). `tests/curvilinear.rs` pins EDR positions and map
+  pixels (CRS84 across the antimeridian, EPSG:3857) to
+  `tests/curvilinear_reference.py`, a stdlib brute force over the CDL's
+  arrays (closed-form cell inversion, nearest node past the edge), plus a
+  one-pixel map equal to EDR, a meta-tile against a direct render, a
+  world map drawing only the cap, and area/radius/cube/trajectory reading
+  what position reads. ds-core `resample::curvilinear::tests` pins the
+  lookup against the exact projection, the footprint, the extent and
+  `same`; `ingest::tests` the recognition rules.
 - `remote::tests` (in the lib test binary): a local HTTP/1.1 server
   (`test_server.rs`: HEAD without ETag, 206 with `Content-Range`, 412 on
   `If-Unmodified-Since`, a request log, slow chunk GETs on demand) and the

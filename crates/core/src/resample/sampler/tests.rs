@@ -361,12 +361,9 @@ fn covers_is_where_value_at_finds_a_cell() {
     let global = SourceGrid::new(lat_lon(0.5, 1.0, 89.5, -1.0, 360, 180));
     let meps = SourceGrid::new(meps_shaped());
     for grid in [&regional, &global, &meps] {
-        let cells = grid.transform.width as usize * grid.transform.height as usize;
-        let values = vec![1.0f32; cells];
-        let (nx, ny) = (
-            f64::from(grid.transform.width),
-            f64::from(grid.transform.height),
-        );
+        let (width, height) = grid.size();
+        let values = vec![1.0f32; width as usize * height as usize];
+        let (nx, ny) = (f64::from(width), f64::from(height));
         let mut on = 0;
         for col in [
             -400.0,
