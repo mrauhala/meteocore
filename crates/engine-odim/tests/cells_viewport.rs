@@ -121,7 +121,7 @@ fn tile_bbox(i: usize) -> [f64; 4] {
 /// the deadline and every tile is a 503.
 ///
 /// A tile may be shed at admission only when the viewport outnumbers the
-/// slots and their queue together (fewer than nine slots).
+/// queue (fewer than twelve slots at the default queue of three per slot).
 #[test]
 fn cold_cells_viewport_finishes_within_the_render_deadline() {
     const TILES: usize = 35;
@@ -144,7 +144,7 @@ fn cold_cells_viewport_finishes_within_the_render_deadline() {
     let elapsed = started.elapsed();
 
     let slots = ds_executor::render_concurrency();
-    let admissible = slots + ds_executor::metrics().capacity;
+    let queue = ds_executor::metrics().capacity;
     let (mut served, mut shed, mut late) = (0, 0, 0);
     for (i, result) in results.into_iter().enumerate() {
         match result {
@@ -163,9 +163,15 @@ fn cold_cells_viewport_finishes_within_the_render_deadline() {
         "{late} of {TILES} tiles outlasted the render deadline, {elapsed:?} for the \
          viewport with {slots} slots"
     );
+    // A tile is shed only when it finds every queue place held, each by a
+    // tile that is not shed, so at least `queue` tiles are not shed. The
+    // slots add no guarantee: a running tile can hold a queue place and its
+    // slot at once, as `wait_without_slot` takes the place before it drops
+    // the slot and the slot again before it drops the place (#1208). Up to
+    // one tile per slot more than `TILES - slots - queue` may then be shed.
     assert!(
-        shed <= TILES.saturating_sub(admissible),
-        "{shed} tiles shed with {slots} slots and room for {admissible}"
+        shed <= TILES.saturating_sub(queue),
+        "{shed} tiles shed with {slots} slots and {queue} queue places"
     );
     assert_eq!(served + shed, TILES);
     assert!(
