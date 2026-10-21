@@ -1239,6 +1239,11 @@ async fn check_value_filters(schema: &str, cfg: fn(&str) -> PostgisConfig) {
     let grid_config = ds_core::config::StationGridConfig {
         source: schema.into(),
         parameters: vec!["t2m".into()],
+        elevation_source: None,
+        elevation_parameter: None,
+        land_mask_source: None,
+        land_mask_parameter: None,
+        exclude_where: Default::default(),
         grid: ds_core::config::StationGridGeometry {
             crs: "EPSG:4326".into(),
             bbox: [0.0, 0.0, 6.0, 6.0],

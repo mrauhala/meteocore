@@ -1899,6 +1899,23 @@ impl EngineHandle {
         }
     }
 
+    /// The raster a station grid may read its terrain or land/sea mask from
+    /// (#1206): a non-derived gridded collection's `MapEngine`, whichever
+    /// APIs it lists. `None` for station, vector, polar-volume and derived
+    /// engines.
+    fn raster_source(&self) -> Option<Arc<dyn ds_core::map_engine::MapEngine>> {
+        match self {
+            Self::Geotiff(e) => Some(e.clone()),
+            Self::QueryData(e) => Some(e.clone()),
+            Self::Grib(e) => Some(e.clone()),
+            Self::Zarr(e) => Some(e.clone()),
+            Self::Satellite(e) => Some(e.clone()),
+            Self::Netcdf(e) => Some(e.clone()),
+            Self::Odim(e) => Some(e.clone()),
+            _ => None,
+        }
+    }
+
     /// The `FeatureEngine` that serves this collection's EDR `items` query
     /// (#928): the engine behind its `EdrEngine`, for the engines that
     /// implement both over one collection. `None` for engines without
@@ -1928,6 +1945,48 @@ impl EngineHandle {
             | Self::StationGrid(_) => None,
         }
     }
+}
+
+/// The collections a station grid's corrections read (#1206), among the
+/// engines built so far: its terrain and land/sea mask, non-derived raster
+/// collections named by id, and its source's station inventory. A missing,
+/// derived or non-raster collection fails the grid.
+fn station_grid_auxiliary(
+    grid: &ds_core::config::StationGridConfig,
+    engines: &HashMap<String, EngineHandle>,
+    collections: &[CollectionConfig],
+) -> Result<engine_station_grid::Auxiliary, String> {
+    let raster = |key: &str,
+                  id: Option<&String>|
+     -> Result<Option<Arc<dyn ds_core::map_engine::MapEngine>>, String> {
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        if let Some(engine) = engines.get(id).and_then(EngineHandle::raster_source) {
+            return Ok(Some(engine));
+        }
+        Err(match collections.iter().find(|c| &c.id == id) {
+            None => format!("{key} '{id}' not found (it must be defined in the same config)"),
+            Some(c) if matches!(c.engine_type.as_str(), "nowcast" | "station-grid") => format!(
+                "{key} '{id}' is a derived {} collection; it must be a non-derived raster \
+                 collection",
+                c.engine_type
+            ),
+            Some(c) if engines.contains_key(id) => format!(
+                "{key} '{id}' is a {} collection, not a raster map collection (geotiff, grib, \
+                 zarr, netcdf, querydata, satellite or odim)",
+                c.engine_type
+            ),
+            Some(_) => format!("{key} '{id}' failed to load"),
+        })
+    };
+    Ok(engine_station_grid::Auxiliary {
+        elevation: raster("elevation_source", grid.elevation_source.as_ref())?,
+        land_mask: raster("land_mask_source", grid.land_mask_source.as_ref())?,
+        stations: engines
+            .get(&grid.source)
+            .and_then(EngineHandle::edr_items_engine),
+    })
 }
 
 /// Live engines an incremental reload may reuse, keyed by collection id.
@@ -2030,13 +2089,18 @@ pub(crate) fn reusable_collections(
             out.insert(c.id.clone());
         }
     }
-    // A station grid keeps its engine only with its station source's: a
-    // rebuilt source (a CSV always is) is a new `Arc` the grid must read.
+    // A station grid keeps its engine only with its station source's, and
+    // its terrain's and mask's (#1206): a rebuilt one (a CSV always is) is a
+    // new `Arc` the grid must read.
     for c in new.iter().filter(|c| c.engine_type == "station-grid") {
         if unchanged(c)
-            && c.station_grid
-                .as_ref()
-                .is_some_and(|g| base.contains(&g.source))
+            && c.station_grid.as_ref().is_some_and(|g| {
+                base.contains(&g.source)
+                    && [&g.elevation_source, &g.land_mask_source]
+                        .into_iter()
+                        .flatten()
+                        .all(|id| base.contains(id))
+            })
         {
             out.insert(c.id.clone());
         }
@@ -4712,13 +4776,22 @@ pub fn load_collections(
             ));
             continue;
         };
+        // The terrain, the mask and the station inventory (#1206).
+        let aux = match station_grid_auxiliary(grid_config, &engines_by_id, collections) {
+            Ok(aux) => aux,
+            Err(e) => {
+                fail(e);
+                continue;
+            }
+        };
         let engine = match engine_reuse.take_station_grid(&collection.id) {
             Some(live) => live,
-            None => match engine_station_grid::StationGridEngine::new(
+            None => match engine_station_grid::StationGridEngine::new_with(
                 &collection.id,
                 &grid_config.source,
                 source,
                 grid_config,
+                aux,
             ) {
                 Ok(engine) => Arc::new(engine),
                 Err(e) => {
@@ -4812,10 +4885,12 @@ pub fn load_collections(
                 CollectionStatus::Degraded
             },
             error: (!has_data).then(|| {
-                format!(
-                    "waiting for the first observations of '{}'",
-                    grid_config.source
-                )
+                engine.waiting_for().unwrap_or_else(|| {
+                    format!(
+                        "waiting for the first observations of '{}'",
+                        grid_config.source
+                    )
+                })
             }),
         });
         info!(
@@ -6550,6 +6625,11 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
             .iter()
             .map(|e| (e.collection_id(), e.has_data()))
             .collect();
+        // What a grid still waits for (#1206: its terrain or mask).
+        let waiting: HashMap<&str, String> = engines
+            .iter()
+            .filter_map(|e| Some((e.collection_id(), e.waiting_for()?)))
+            .collect();
         for h in health
             .iter_mut()
             .filter(|h| h.engine_type == "station-grid")
@@ -6557,6 +6637,8 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
             if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
                 h.status = CollectionStatus::Ready;
                 h.error = None;
+            } else if let Some(reason) = waiting.get(h.id.as_str()) {
+                h.error = Some(reason.clone());
             }
         }
     }
@@ -8865,7 +8947,12 @@ prewarm_sweeps = 0
             .to_vec();
         grid.station_grid = Some(ds_core::config::StationGridConfig {
             source: source.to_string(),
-            parameters: vec!["temperature".to_string()],
+            parameters: vec!["temperature".into()],
+            elevation_source: None,
+            elevation_parameter: None,
+            land_mask_source: None,
+            land_mask_parameter: None,
+            exclude_where: Default::default(),
             grid: ds_core::config::StationGridGeometry {
                 crs: "EPSG:4326".to_string(),
                 bbox: [19.0, 59.0, 32.0, 71.0],
@@ -12134,3 +12221,8 @@ colormap = "no_such_map"
         assert!(series.contains_key("age-querydata"), "{series:?}");
     }
 }
+
+/// Station-grid terrain and mask wiring (#1206), in a file of its own.
+#[cfg(test)]
+#[path = "station_grid_corrections_tests.rs"]
+mod station_grid_corrections_tests;

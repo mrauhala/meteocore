@@ -1,0 +1,64 @@
+# The weather-analysis station grid with a lapse-rate correction over a
+# terrain and a land/sea mask (#1206).
+#
+# DISABLED by default: its terrain, terrain-test, is synthetic. See
+# finland-land.toml.disabled for running it, and swap in a real DEM.
+id = "weather-analysis-terrain"
+title = "Finnish Weather Analysis over Terrain (gridded stations)"
+description = "Hourly temperature, humidity and wind speed gridded on the fly from the Finnish station observations, temperature corrected for height."
+engine_type = "station-grid"
+apis = ["wms", "maps", "tiles", "edr"]
+keywords = ["observations", "analysis", "stations", "terrain", "Finland"]
+
+[station_grid]
+source = "weather"
+# A name, or a table with that parameter's corrections. CSV states no CF
+# standard name, so temperature sets its lapse rate (K/km): the -6.5
+# default applies only where the source's metadata identifies air
+# temperature (BUFR's air_temperature, a PostGIS observed_property).
+# `land_mask = false` keeps a parameter's estimate over the sea.
+parameters = [
+    { name = "temperature", lapse_rate = -6.5 },
+    "humidity",
+    { name = "wind_speed", land_mask = false },
+]
+# Raster collections in the same config, sampled once onto the grid. A
+# station's height is the one its source states (BUFR, or a PostGIS
+# `elevation` station property), else the terrain at its position.
+elevation_source = "terrain-test"
+land_mask_source = "finland-land"
+# Stations left out, by their properties in the source's station inventory
+# (CSV stations carry only `name`); a list of tables is several rules.
+# exclude_where = { name = "Parainen Utö" }
+# The test terrain covers south-western Finland only.
+grid = { crs = "EPSG:4326", bbox = [19.0, 59.0, 25.0, 63.0], resolution = 0.05 }
+method = "adw"
+max_neighbours = 8
+search_radius_km = 150
+max_age = "PT1H"
+cadence = "PT1H"
+precompute = 3
+poll_interval_secs = 60
+
+[wms]
+colormap = "temperature"
+min = -35.0
+max = 5.0
+
+[[wms.parameters]]
+name = "temperature"
+colormap = "temperature"
+min = -35.0
+max = 5.0
+
+[[wms.parameters]]
+name = "humidity"
+colormap = "viridis"
+min = 40.0
+max = 100.0
+
+[[wms.parameters]]
+name = "wind_speed"
+colormap = "viridis"
+min = 0.0
+max = 15.0

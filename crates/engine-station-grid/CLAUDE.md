@@ -13,8 +13,9 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
   admin.rs`, whatever APIs the source lists). The server wires it in a
   third pass, after the nowcast pass; it never grids a derived collection.
   It is reused across a reload only when its config is unchanged AND its
-  source is reused (a CSV source never is), because it holds the source's
-  `Arc`.
+  source, `elevation_source` and `land_mask_source` collections are reused
+  (a CSV source never is), because it holds their `Arc`s
+  (`admin::reusable_collections`).
 - A slice is ONE EDR area query over the grid's search box
   (`GridGeom::query_bbox`: the grid widened by the search radius, across the
   seam or to every longitude at a pole) with the window `[t - max_age, t]`;
@@ -35,7 +36,9 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
 - `geometry`, `interpolate`, `kdtree` and `residuals` are dependency-free
   pure functions — keep them that way. `compute` owns the cache, budget and
   pool; `engine` owns the axis, the version, the poll loop, `MapEngine` and
-  `EdrEngine`; `features` owns the `FeatureEngine` over the residuals.
+  `EdrEngine`; `features` owns the `FeatureEngine` over the residuals;
+  `correction` (with `rasters` and `inventory`) owns the terrain, the mask
+  and the exclusions.
 
 ## Methods (interpolate.rs)
 
@@ -82,12 +85,67 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
   cache is not re-checked: its next request reads the source, but map tiles
   rendered from it stay in the no-TTL caches until the version next moves.
 - Grid cache key: (engine epoch, parameter, time, revision). The
-  epoch is unique per engine construction and stands for the source and the
-  method config; `shutdown` evicts its grids. A grid lives under the
+  epoch is unique per engine construction and stands for the source, the
+  method config and the terrain and mask, sampled once per engine;
+  `shutdown` evicts its grids. A grid lives under the
   revision of the input it was computed from (`compute::store`): a
   computation that finds a revision itself fills its claimed key's waiters,
   then moves the entry to the new revision, so the next request hits
   (#1206). Never key a stored grid on the revision read before the compute.
+
+## Corrections (#1206, correction.rs, rasters.rs, inventory.rs)
+
+- **Terrain and mask are other collections, named by id**
+  (`elevation_source`, `land_mask_source`): a non-derived raster
+  `MapEngine` (`EngineHandle::raster_source`), whatever APIs it lists. No
+  file path, no engine-to-engine crate dependency. The server resolves them
+  in the station-grid pass (`admin::station_grid_auxiliary`) with the
+  source's station inventory (`EngineHandle::edr_items_engine`) and builds
+  the engine with `new_with`; `new` fails a config that names either.
+- **Sampled ONCE per engine, by the poll**, never at load or on a request:
+  `get_raster_tile` with `OutputCrs::Wgs84` over the grid's box at
+  `nx × ny`, so each pixel centre is a cell centre (`project_node` at
+  `(i + ½)/width`); a box across 180° goes unwrapped, `east > 180`, as the
+  map APIs pass it. The terrain covers the grid widened by whole cells to
+  the search radius (`rasters::dem_grid`), for stations outside the grid.
+  Units only from the collection's metadata: heights `m`/`km`/`ft`/`gpm`, a
+  mask `1`/`proportion`/none (inside from 0.5) or `%` (from 50); anything
+  else, or several parameters without `*_parameter`, is an error, never a
+  guess. Their bytes count with one grid against the cache at load.
+- **No analysis time until the terrain and mask are sampled and the
+  inventory read** (`Corrections::ready`, checked in `build_times` before
+  either axis, `cadence` or `observation_instants`): an empty tile and
+  `resolve_time` None, EDR 404, health degraded with `waiting_for()`; the
+  poll retries every 5 s. Never compute or serve an uncorrected or unmasked
+  grid; `prepare`/`finish` refuse (`ResourceExhausted`) if they ever run
+  before.
+- **Every read goes through `Inner::read`** (`source::fetch` then
+  `Corrections::prepare`): a request's compute, `read_ahead` for the
+  pre-compute and the older-time re-checks alike, so exclusions and heights
+  move any time's fingerprint. Never call `source::fetch` directly.
+- **Lapse rate**: `prepare` keeps each station's observed value and its
+  reduction `Γ·z_station` (`Slice::reduction`); the grid interpolates
+  `Slice::interpolated()` and `finish` adds `Γ·z_cell` per cell (one pass on
+  the pool, never per output pixel); terrain nodata ⇒ nodata. Γ defaults to
+  −6.5 K/km ONLY where the source's metadata identifies air temperature
+  (`identifies_air_temperature`: CF `standard_name`, or an
+  `observed_property` that is not just the parameter's name). Never decide
+  from a parameter name; dew point gets no default. A station's height is
+  the `elevation` its inventory states, else the terrain at its position;
+  neither ⇒ left out of corrected parameters. Per-station logs are bounded
+  (`MAX_LOGGED_STATIONS`): a ship is at a new position every report.
+- **Mask** is applied in `finish`, before the grid is cached, so maps and
+  EDR read the same masked grid. Stations are never filtered by it, and it
+  removes no residual.
+- **Inventory** (heights, `exclude_where`) is the source's existing
+  `FeatureEngine`, read by the poll when its `data_version` moves, matched
+  to slice stations by position (`inventory::key`, 1e-6°): the EDR area
+  answer carries no station id. `prepare` folds the stations left out and
+  the heights used into the slice fingerprint, so an exclusion or height
+  change is a revision (content_version moves) like a late report.
+- `tests/reference/lapse_rate_reference.py` (stdlib) pins the valley
+  analysis and the corrected residuals in `tests/corrections.rs` (1e-4 /
+  1e-9).
 
 ## Execution (compute.rs) — never on a request worker
 
@@ -137,12 +195,14 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
   method) reaches the residuals by construction.
 - The estimate is formed from `Stations::value` (what the grid
   interpolates) and put back at the station's own offset:
-  `estimate = observed + (ê − interpolated)`. Today the offset is exactly
-  0. If the interpolated values are reduced per station (a lapse-rate
-  correction, `Γ·z_station`), pass the reduced `Stations` and the observed
-  `slice.stations`: the estimate is re-applied at the station's height and
-  the residual is the reduced-space one. Pinned by
-  `a_per_station_reduction_is_reapplied_at_the_station`.
+  `estimate = observed + (ê − interpolated)`. Without a correction the
+  offset is exactly 0. A lapse-rate corrected parameter's `Stations` are
+  built over `Slice::interpolated()` (values less `Γ·z_station`) and
+  `slice.stations` keeps the observed values, so the estimate is re-applied
+  at the station's height and the residual is the reduced-space one.
+  Excluded and height-less stations are not in the slice, so they have no
+  residual. Pinned by `a_per_station_reduction_is_reapplied_at_the_station`
+  and `tests/corrections.rs::residuals_with_corrections`.
 - Residuals are computed in `Inner::compute`, with the grid on the pool,
   and stored in `AnalysisGrid::residuals` under the grid's key (`weigh`
   counts them). The per-parameter `Summary` (count, RMSE) of the latest
@@ -180,7 +240,7 @@ Station grids tab. Keep them in step.
 
 ## Not in phase 1 (follow-up issue)
 
-Lapse-rate correction with a DEM, a land/sea mask, station exclusions and
-quality flags, projected analysis grids, a per-time content version (a
+Quality flags, projected analysis grids, a per-time content version (a
 `MapEngine` trait change), kriging/natural neighbour, parallel
-interpolation of one large grid across the pool (#1206).
+interpolation of one large grid across the pool, provenance as structured
+collection metadata (#1206).

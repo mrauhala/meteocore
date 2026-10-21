@@ -61,6 +61,7 @@ use ds_poll::{FirstTick, Shutdown};
 use tracing::{debug, info, warn};
 
 use crate::compute::{self, AnalysisGrid, GridKey, CACHE};
+use crate::correction::{Auxiliary, Corrections};
 use crate::geometry::{wrap_lon, GridGeom};
 use crate::interpolate::{interpolate_grid, Method, Settings, Stations};
 use crate::residuals::{self, Summary};
@@ -85,6 +86,8 @@ pub const MAX_RADIUS_KM: f64 = 10_000.0;
 /// How long a caller without a request deadline (the poll, a test) waits
 /// for a grid.
 const NO_DEADLINE_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+/// How often the poll retries terrain and mask not sampled yet.
+const CORRECTIONS_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Distinct engine instances: a grid cache key names the instance, whose
 /// source and configuration are fixed for its life.
@@ -140,6 +143,8 @@ struct Inner {
     geom: GridGeom,
     /// The box the source is asked for: the grid widened by the radius.
     query_bbox: [f64; 4],
+    /// Terrain, mask and exclusions (#1206).
+    corrections: Corrections,
     max_age: Duration,
     cadence: Option<Duration>,
     poll_interval: std::time::Duration,
@@ -174,11 +179,32 @@ pub struct StationGridEngine {
 impl StationGridEngine {
     /// Build the engine over the station collection `source`. Checks every
     /// setting; reads only the source's metadata snapshots, never its data.
+    /// A config naming an `elevation_source` or `land_mask_source` needs
+    /// [`Self::new_with`].
     pub fn new(
         collection_id: &str,
         source_id: &str,
         source: Arc<dyn EdrEngine>,
         config: &StationGridConfig,
+    ) -> Result<Self, DataServerError> {
+        Self::new_with(
+            collection_id,
+            source_id,
+            source,
+            config,
+            Auxiliary::default(),
+        )
+    }
+
+    /// [`Self::new`] with the collections the corrections read (#1206): the
+    /// terrain, the mask and the source's station inventory. Their data is
+    /// read by the poll loop, never here.
+    pub fn new_with(
+        collection_id: &str,
+        source_id: &str,
+        source: Arc<dyn EdrEngine>,
+        config: &StationGridConfig,
+        aux: Auxiliary,
     ) -> Result<Self, DataServerError> {
         let bad = |message: String| DataServerError::Config(format!("station_grid: {message}"));
         if !source.serves_station_series() {
@@ -198,7 +224,12 @@ impl StationGridEngine {
         }
         let available = source.get_parameters();
         let available: Vec<&str> = available.iter().map(String::as_str).collect();
-        let names = select_parameters(Some(&config.parameters), &available)
+        let wanted: Vec<String> = config
+            .parameters
+            .iter()
+            .map(|p| p.name().to_string())
+            .collect();
+        let names = select_parameters(Some(&wanted), &available)
             .map_err(|e| bad(format!("source '{source_id}': {e}")))?;
         if names.len() != config.parameters.len() {
             return Err(bad("parameters must not repeat".into()));
@@ -292,14 +323,30 @@ impl StationGridEngine {
             )));
         }
         let geom = GridGeom::new(config.grid.bbox, config.grid.resolution).map_err(bad)?;
+        let described: Vec<(String, ParameterDescription)> = params
+            .iter()
+            .map(|p| (p.name.clone(), p.description.clone()))
+            .collect();
+        let corrections = Corrections::new(
+            collection_id,
+            config,
+            aux,
+            &described,
+            &geom,
+            settings.radius_m,
+        )
+        .map_err(bad)?;
         let grid_bytes = compute::grid_bytes(geom.cells());
-        if grid_bytes > compute::cache_capacity() {
+        // The terrain and mask grids live as long as the engine: they count
+        // with one grid against the cache.
+        let resident = grid_bytes + corrections.resident_bytes();
+        if resident > compute::cache_capacity() {
             return Err(bad(format!(
-                "one grid of {} cells is {} MiB, more than the {} MiB grid cache \
-                 (MC_STATION_GRID_CACHE_MB) holds, so every map tile would recompute it; \
-                 raise the cache or coarsen the grid",
+                "one grid of {} cells is {} MiB with its terrain and mask, more than the {} MiB \
+                 grid cache (MC_STATION_GRID_CACHE_MB) holds, so every map tile would recompute \
+                 it; raise the cache or coarsen the grid",
                 geom.cells(),
-                grid_bytes.div_ceil(ds_cache::MIB),
+                resident.div_ceil(ds_cache::MIB),
                 compute::cache_capacity() / ds_cache::MIB
             )));
         }
@@ -344,12 +391,19 @@ impl StationGridEngine {
             )));
         }
 
-        let provenance = provenance(source_id, &params, &settings, &geom, &config.max_age);
+        let provenance = [
+            provenance(source_id, &params, &settings, &geom, &config.max_age),
+            corrections.describe(),
+        ]
+        .join(" ")
+        .trim_end()
+        .to_string();
         let inner = Arc::new(Inner {
             collection_id: collection_id.to_string(),
             source_id: source_id.to_string(),
             source,
             query_bbox: geom.query_bbox(settings.radius_m),
+            corrections,
             settings,
             geom,
             max_age,
@@ -418,6 +472,12 @@ impl StationGridEngine {
         !self.inner.snapshot.load().times.is_empty()
     }
 
+    /// Why there is no analysis time yet, when it is the terrain, the mask
+    /// or the station inventory the engine waits for.
+    pub fn waiting_for(&self) -> Option<String> {
+        self.inner.corrections.waiting_for()
+    }
+
     /// Per parameter, the stations of the latest analysis computed (`None`
     /// before one is), for the `station_grid_stations` gauge.
     pub fn station_counts(&self) -> Vec<(String, Option<usize>)> {
@@ -472,6 +532,14 @@ impl StationGridEngine {
             .ticker(self.inner.poll_interval, FirstTick::Immediate);
         while ticker.tick().await {
             tokio::task::block_in_place(|| self.poll_once());
+            // Until the terrain and mask are sampled there is no analysis:
+            // retry them sooner than the poll interval.
+            while !self.inner.corrections.ready() {
+                if !self.shutdown.sleep(CORRECTIONS_RETRY).await {
+                    break;
+                }
+                tokio::task::block_in_place(|| self.poll_once());
+            }
         }
         info!(
             "[{}] station-grid poll loop shutting down",
@@ -486,6 +554,7 @@ impl StationGridEngine {
     /// and computed when revised.
     pub fn poll_once(&self) {
         let inner = &self.inner;
+        inner.corrections.refresh();
         inner.publish(inner.build_times());
         let times = inner.snapshot.load().times.clone();
         for p in 0..inner.params.len() {
@@ -726,8 +795,12 @@ impl Inner {
         })
     }
 
-    /// The analysis times from the source's current metadata.
+    /// The analysis times from the source's current metadata; none until
+    /// the corrections are ready, so nothing uncorrected is ever computed.
     fn build_times(&self) -> Vec<DateTime<Utc>> {
+        if !self.corrections.ready() {
+            return Vec::new();
+        }
         let mut times = match self.cadence {
             Some(step) => {
                 let Some((start, end)) = self.source.get_temporal_extent() else {
@@ -769,9 +842,14 @@ impl Inner {
     /// Swap in a new axis, and forget the inputs of times no longer
     /// on it.
     fn publish(&self, times: Vec<DateTime<Utc>>) {
-        if *self.snapshot.load().times == *times {
+        // The first call publishes the parameters even without a time, so
+        // the layers' styles resolve at load (#1206: no time until the
+        // terrain and mask are sampled).
+        let current = self.snapshot.load();
+        if *current.times == *times && !current.info.parameters.is_empty() {
             return;
         }
+        drop(current);
         let first = self.params.first();
         let info = RasterInfo {
             native_crs: "EPSG:4326".into(),
@@ -840,6 +918,19 @@ impl Inner {
         );
     }
 
+    /// One slice from the source, as `parameter` grids it: exclusions left
+    /// out, a corrected parameter's values reduced to sea level.
+    fn read(&self, parameter: usize, time: DateTime<Utc>) -> Result<Slice, DataServerError> {
+        let slice = source::fetch(
+            self.source.as_ref(),
+            &self.params[parameter].name,
+            self.query_bbox,
+            time,
+            self.max_age,
+        )?;
+        self.corrections.prepare(parameter, slice)
+    }
+
     /// Read (unless given) and grid one slice.
     fn compute(
         &self,
@@ -850,16 +941,13 @@ impl Inner {
         let started = Instant::now();
         let slice = match slice {
             Some(slice) => slice,
-            None => source::fetch(
-                self.source.as_ref(),
-                &self.params[parameter].name,
-                self.query_bbox,
-                time,
-                self.max_age,
-            )?,
+            None => self.read(parameter, time)?,
         };
-        let stations = Stations::new(&slice.stations);
-        let values = interpolate_grid(&stations, &self.settings, &self.geom);
+        // The grid interpolates the values reduced to sea level (#1206);
+        // the residuals put each estimate back at its station's height.
+        let stations = Stations::new(&slice.interpolated());
+        let mut values = interpolate_grid(&stations, &self.settings, &self.geom);
+        self.corrections.finish(parameter, &mut values)?;
         let residuals = residuals::leave_one_out(&stations, &slice.stations, &self.settings);
         let summary = residuals::summarize(&residuals);
         self.observe(parameter, time, slice.fingerprint);
@@ -1013,13 +1101,9 @@ impl Inner {
     /// Read a slice for the poll; a failure is counted and logged.
     fn read_ahead(&self, parameter: usize, time: DateTime<Utc>) -> Option<Slice> {
         let name = &self.params[parameter].name;
-        match source::fetch(
-            self.source.as_ref(),
-            name,
-            self.query_bbox,
-            time,
-            self.max_age,
-        ) {
+        // Through the corrections, as a request's read: exclusions and
+        // heights move a pre-computed or re-checked time's fingerprint.
+        match self.read(parameter, time) {
             Ok(slice) => Some(slice),
             Err(e) => {
                 self.failures.fetch_add(1, Ordering::Relaxed);

@@ -294,8 +294,9 @@ set of builders and follow Requirement 7 of the Metocean EDR profile:
 - `unit.symbol` is the QUDT unit when `ds_core::units` knows one, else
   UCUM-typed for a UCUM unit, else a plain string (`dBZ`, `gpm`).
 - `observedProperty.id` is the NERC CF standard-name URI when the engine
-  knows the name (Zarr and NetCDF from `standard_name`, and derived wind),
-  otherwise the engine's observed-property name.
+  knows the name (Zarr and NetCDF from `standard_name`, BUFR's built-in
+  parameters, and derived wind), otherwise the engine's observed-property
+  name.
 - A parameter with its own time axis (satellite products, GRIB windows that
   some steps lack) carries its own `extent.temporal`.
 
@@ -364,7 +365,7 @@ need no engine code of their own; items serve the engine's own
 | PostGIS events | events inside the polygon as `Point` coverages, with the same `valid_range` and `missing_values` nulls |
 | BUFR | stations inside the polygon over the in-memory retention window; position is the nearest station within `position_radius_km` (default 25 km) |
 | Nowcast | the motion field (`motion_u`, `motion_v` in m/s, `motion_quality`) over the polygon's bbox; generations are instances; items are tracked cells |
-| Station grid | the analysis grid the map draws (each station's latest valid value within `[station_grid] max_age`, interpolated onto a CRS84 grid), read at the cell under each point; without `datetime` the latest analysis; an instant must be an analysis time; at most 96 analyses (times × parameters) per query; an analysis still computing at the deadline is a 503, and its computation goes on for a retry |
+| Station grid | the analysis grid the map draws (each station's latest valid value within `[station_grid] max_age`, interpolated onto a CRS84 grid), read at the cell under each point; without `datetime` the latest analysis; an instant must be an analysis time; at most 96 analyses (times × parameters) per query; an analysis still computing at the deadline is a 503, and its computation goes on for a retry. With a terrain, lapse-rate corrected values; with a land/sea mask, null outside it; no analysis time (404) until both are sampled |
 
 Each engine crate documents its own query details.
 

@@ -21,3 +21,5 @@ tracing = "0.1"
 # (`testdata/weather.csv`) through the public CSV engine, the same
 # `Arc<dyn EdrEngine>` the server hands the engine.
 engine-csv = { path = "../engine-csv" }
+# `tests/corrections.rs` reads the WARN lines a poll logs (#1206).
+tracing-subscriber = "0.3"

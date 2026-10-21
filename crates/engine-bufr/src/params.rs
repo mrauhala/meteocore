@@ -33,6 +33,10 @@ pub struct ParamDef {
     pub display: Option<DisplayConversion>,
     pub label: String,
     pub observed_property: String,
+    /// The CF standard name of the observed property, for a built-in whose
+    /// observed property is one (#1206); `None` for a config entry, whose
+    /// `observed_property` is free text.
+    pub standard_name: Option<String>,
     pub period_hours: Option<f64>,
 }
 
@@ -43,6 +47,7 @@ impl ParamDef {
         source_unit: String,
         label: String,
         observed_property: String,
+        standard_name: Option<String>,
         period_hours: Option<f64>,
     ) -> Self {
         let display = display_conversion(&source_unit);
@@ -57,10 +62,15 @@ impl ParamDef {
             display,
             label,
             observed_property,
+            standard_name,
             period_hours,
         }
     }
 }
+
+/// Built-in observed properties that are not CF standard names; every other
+/// built-in's is one, and is published as its `standard_name` (#1206).
+const NOT_CF_STANDARD_NAMES: &[&str] = &["present_weather"];
 
 struct Builtin {
     name: &'static str,
@@ -276,6 +286,8 @@ impl ParameterTable {
                         b.unit.to_string(),
                         b.label.to_string(),
                         b.observed_property.to_string(),
+                        (!NOT_CF_STANDARD_NAMES.contains(&b.observed_property))
+                            .then(|| b.observed_property.to_string()),
                         b.period_hours,
                     )
                 })
@@ -295,6 +307,7 @@ impl ParameterTable {
                 o.observed_property
                     .clone()
                     .unwrap_or_else(|| o.name.clone()),
+                None,
                 o.period_hours,
             );
             match params.iter().position(|p| p.name == def.name) {
@@ -336,7 +349,7 @@ impl ParameterTable {
                         label: p.label.clone(),
                         unit: p.unit.clone(),
                         observed_property: p.observed_property.clone(),
-                        standard_name: None,
+                        standard_name: p.standard_name.clone(),
                     },
                 )
             })
@@ -372,6 +385,36 @@ mod tests {
         assert_eq!(names.len(), t.len());
         assert!(t.params.iter().all(|p| !p.descriptors.is_empty()));
         assert_eq!(t.index_of("air_temperature"), Some(0));
+    }
+
+    /// Built-ins state the CF standard name their observed property is
+    /// (#1206), so a consumer can tell air temperature from its metadata; a
+    /// config entry's free-text observed property states none.
+    #[test]
+    fn builtins_state_cf_standard_names() {
+        let t = ParameterTable::build(true, &[]);
+        let d = t.descriptions();
+        assert_eq!(
+            d["air_temperature"].standard_name.as_deref(),
+            Some("air_temperature")
+        );
+        assert_eq!(
+            d["dew_point_temperature"].standard_name.as_deref(),
+            Some("dew_point_temperature")
+        );
+        assert_eq!(d["present_weather"].standard_name, None);
+        let o = ParameterTable::build(
+            true,
+            &[BufrParameterConfig {
+                name: "air_temperature".into(),
+                descriptors: vec!["012101".into()],
+                unit: "K".into(),
+                label: None,
+                period_hours: None,
+                observed_property: Some("air_temperature".into()),
+            }],
+        );
+        assert_eq!(o.descriptions()["air_temperature"].standard_name, None);
     }
 
     #[test]

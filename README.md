@@ -207,7 +207,7 @@ not re-scan the auto roots.
 | `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote NetCDF files, in MB, shared by every NetCDF collection: what the reader parses when it opens a file (its first 1 MiB) and the blocks of the chunk indexes. At least 8: without it every metadata read would be a request. |
 | `MC_NETCDF_EDR_QUERY_MB` | `544` | Most decoded bytes one NetCDF EDR query may read, in MiB, counted from the files' metadata before any read: timesteps × pressure levels × variables read × one field (4.06 MB for MEPS); a trajectory counts the (step, level) fields its path reads, a cube the levels its `z` positions take. The default admits one parameter over a whole MEPS run (67 leads) as the client sees it, including a derived wind speed, which reads both of its components (134 fields, 519 MiB); three variables over a run do not fit, nor one over a run at all 13 MEPS pressure levels (871 fields). Over it the query is a 400 naming the fields and the limit. |
 | `MC_NETCDF_READ_MEMORY_MB` | `1024` | Process-wide admission budget for NetCDF field reads in progress, in MiB: a cold field read reserves three times its decoded chunk plus three times its compressed chunk (~24 MB for MEPS); cache hits and readers waiting for another's read reserve nothing. A read that does not fit fails at once with 503. Restart to change. |
-| `MC_STATION_GRID_CACHE_MB` | `256` | Station-grid analyses held in memory (`f32`, 4 bytes per cell, plus 48 bytes per station for its leave-one-out residual), in MB, shared by every station-grid collection. One grid per collection, parameter, analysis time and content version; a collection whose one grid does not fit fails at load. |
+| `MC_STATION_GRID_CACHE_MB` | `256` | Station-grid analyses held in memory (`f32`, 4 bytes per cell, plus 48 bytes per station for its leave-one-out residual), in MB, shared by every station-grid collection. One grid per collection, parameter, analysis time and content version; a collection whose one grid, with its terrain and land/sea mask, does not fit fails at load. |
 | `MC_STATION_GRID_MEMORY_MB` | `512` | Admission budget for station-grid analyses being computed, in MiB: each reserves its grid plus 4 MiB before it is queued. A request that does not fit is a 503 at once; the background pre-compute takes only what leaves half the budget to requests. A collection whose one analysis needs more than half fails at load. Restart to change. |
 | `MC_STATION_GRID_WORKERS` | half the CPUs, 1–4 | Station-grid analyses computed at once, on their own pool, never on the request runtime. Restart to change. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool, across all renders. A projected WMS view (EPSG:3857/3067/3035) renders one meta-tile at a time with only a few fetches in flight, so raising this does not shorten its first view; a whole-viewport render (WMS EPSG:4326, a Maps image) fetches all its missing tiles at once and does wait on the pool. Raise it (e.g. 32–64) when cold renders queue on a high-latency object store. Value must be ≥ 1. |
@@ -1640,6 +1640,11 @@ max_age = "PT1H"            # a station's latest value not after the time, at mo
 cadence = "PT1H"            # analysis times; optional over csv and bufr (see below)
 precompute = 3              # latest times computed ahead and re-checked, per parameter
 poll_interval_secs = 60
+# Corrections (#1206): raster collections of the same config, named by id.
+# parameters = [{ name = "temperature", lapse_rate = -6.5 }, { name = "wind_speed", land_mask = false }]
+# elevation_source = "terrain"      # heights in m, km, ft or gpm
+# land_mask_source = "land"         # a fraction (1) or a percentage (%)
+# exclude_where = { exclude_from_gridding = true }   # station properties
 ```
 
 - **Methods.** IDW is Shepard's inverse-distance weighting; ADW weights
@@ -1715,8 +1720,26 @@ poll_interval_secs = 60
   one, plus `station_grid_analyses_total`, `station_grid_failures_total`,
   `station_grid_last_analysis_ms`, the `station_grid_cache_*` family and
   `station_grid_compute_*` admission.
-- **Not yet:** lapse-rate correction with a DEM, a land/sea mask, station
-  exclusions and projected analysis grids.
+- **Corrections.** `elevation_source` and `land_mask_source` name raster
+  collections of the same config (GeoTIFF/COG, Zarr, NetCDF, GRIB, …),
+  sampled once per engine onto the analysis cell centres by the poll; until
+  they are, the collection has no analysis time (empty maps, EDR 404), never
+  an uncorrected or unmasked one. A corrected parameter's station values are
+  reduced to sea level with a lapse rate Γ (K/km), interpolated, and each
+  cell gets Γ times its terrain height back. Γ is the parameter's
+  `lapse_rate`, or −6.5 only where the source's own metadata says it is air
+  temperature (BUFR's built-in `air_temperature`, a PostGIS
+  `observed_property = "air_temperature"`), never from a name; a station's
+  height is the one its source states (`elevation`), else the terrain at
+  it. Cells outside the mask are nodata in maps and EDR alike, unless a
+  parameter sets `land_mask = false`. `exclude_where` leaves out stations
+  by their properties in the source's station inventory. A corrected
+  parameter's residual is estimated from the other stations' sea-level
+  values and put back at the station's own height; excluded stations and
+  stations without a height have none, and the mask removes none. See
+  [engine-station-grid](crates/engine-station-grid/README.md#corrections)
+  and the disabled example `collections.d/weather-analysis-terrain.toml.disabled`.
+- **Not yet:** quality-flag filters and projected analysis grids.
 
 ## OGC 3D Tiles
 

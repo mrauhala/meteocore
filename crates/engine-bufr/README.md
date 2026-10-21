@@ -95,6 +95,13 @@ Built-in parameters (`builtin_parameters = true`):
 | `cloud_cover_total` | `020010` | % |
 | `present_weather` | `020003` | code table 0 20 003 |
 
+Each built-in but `present_weather` states its observed property as a CF
+standard name (`air_temperature`, `wind_speed`, …): EDR publishes it as the
+NERC vocabulary URI, and a [station grid](../engine-station-grid/README.md#corrections)
+reads it to apply its default lapse rate to air temperature. A
+`[[bufr.parameters]]` entry's `observed_property` is free text and states
+no standard name.
+
 ## Configuration
 
 ```toml

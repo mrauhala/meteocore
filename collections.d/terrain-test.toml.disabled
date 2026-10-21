@@ -1,0 +1,34 @@
+# A SYNTHETIC test terrain, the `elevation_source` of the station-grid
+# example `weather-analysis-terrain` (#1206). Not real heights: replace it
+# with a real DEM before relying on the corrections.
+#
+# DISABLED by default; see finland-land.toml.disabled for running the
+# example.
+#
+# A plane rising to the north-east, z = 20 + 30 (lon − 19) + 40 (lat − 59) m
+# at each 0.05° cell centre over [19, 59, 25, 63], as Int16 metres. A real
+# DEM in its place, resampled to about the analysis resolution, e.g.
+#   gdalwarp -t_srs EPSG:4326 -te 19 59 32 71 -tr 0.05 0.05 -r average \
+#     -ot Int16 -co TILED=YES -co COMPRESS=DEFLATE dem.tif \
+#     <dir>/dem_20000101T0000Z.tif
+# Any non-derived raster collection serves: a COG, a Zarr or NetCDF
+# orography, a GRIB surface height. Its unit must say how heights are given:
+# m, km, ft or gpm. A collection of several parameters needs the station
+# grid's `elevation_parameter`.
+id = "terrain-test"
+title = "Synthetic Test Terrain"
+description = "A synthetic plane of heights over south-western Finland, for testing station-grid lapse-rate corrections. Not real terrain."
+engine_type = "geotiff"
+apis = ["wms", "maps", "tiles"]
+data_path = "testdata/station-grid-terrain"
+
+[geotiff]
+filename_template = "dem_%Y%m%dT%H%MZ.tif"
+parameter = "height"
+unit = "m"
+poll_interval_secs = 3600
+
+[wms]
+colormap = "viridis"
+min = 0.0
+max = 400.0

@@ -11,11 +11,12 @@
 //!
 //! The estimate is formed from the values the grid interpolates
 //! ([`Stations::value`]), and the station's own observed value is added back
-//! at its own position: `estimate = observed + (ê − interpolated)`. Today
-//! both are the observed value, so the offset is exactly 0. Should the
-//! interpolated values be reduced to a reference height (a lapse-rate
-//! correction), the offset re-applies the station's own reduction, and the
-//! residual `ê − interpolated` is the same in either space.
+//! at its own position: `estimate = observed + (ê − interpolated)`. Without
+//! a correction both are the observed value, so the offset is exactly 0. A
+//! lapse-rate corrected parameter interpolates values reduced to sea level
+//! (`Slice::interpolated`, #1206): the offset re-applies the station's own
+//! reduction `Γ·z_station`, and the residual `ê − interpolated` is the same
+//! in either space.
 //!
 //! Cost: one neighbour search and one weighting per station, on the pool,
 //! with the grid; never on a request.

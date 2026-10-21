@@ -34,6 +34,11 @@ fn engine() -> Arc<StationGridEngine> {
     let config = StationGridConfig {
         source: "weather".into(),
         parameters: vec!["temperature".into()],
+        elevation_source: None,
+        elevation_parameter: None,
+        land_mask_source: None,
+        land_mask_parameter: None,
+        exclude_where: Default::default(),
         grid: StationGridGeometry {
             crs: "EPSG:4326".into(),
             bbox: [19.0, 59.0, 32.0, 71.0],
