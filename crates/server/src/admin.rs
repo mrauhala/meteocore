@@ -6262,10 +6262,19 @@ fn apply_load(
     // nowcast generation loop have the same requirement — Critical Rule 7).
     // A REUSED engine appears in both lists and gets NEITHER: shutting it
     // down would kill its live loop, respawning would double-poll (#442).
+    //
+    // With `$take_over`, a new engine first takes over the state of the
+    // removed engine of its collection (#1036: a rebuilt WIS2 CAP or BUFR
+    // collection, whose new engine restored only the last periodic
+    // snapshot while the old one kept receiving). Every removed engine is
+    // shut down before that, which ends its ingest, and the new engine's
+    // poll loop has not started: everything the old engine received moves
+    // over, and the swap below serves it at once. A rejected reload never
+    // gets here, so its live engines keep running untouched.
     let mut shut_down = 0usize;
     let mut spawned = 0usize;
     macro_rules! rotate_poll_loops {
-        ($field:ident) => {{
+        ($field:ident $(, $take_over:ident)?) => {{
             let old = state
                 .$field
                 .read()
@@ -6278,6 +6287,14 @@ fn apply_load(
                 engine.shutdown();
             }
             for engine in &added {
+                $(
+                    if let Some(replaced) = removed
+                        .iter()
+                        .find(|r| r.collection_id() == engine.collection_id())
+                    {
+                        engine.$take_over(replaced);
+                    }
+                )?
                 let poller = engine.clone();
                 crate::poll_runtime().spawn(async move {
                     poller.poll_loop().await;
@@ -6293,8 +6310,8 @@ fn apply_load(
     rotate_poll_loops!(netcdf_engines);
     rotate_poll_loops!(odim_engines);
     rotate_poll_loops!(odim_volume_engines);
-    rotate_poll_loops!(cap_engines);
-    rotate_poll_loops!(bufr_engines);
+    rotate_poll_loops!(cap_engines, take_over);
+    rotate_poll_loops!(bufr_engines, take_over);
     rotate_poll_loops!(postgis_engines);
     rotate_poll_loops!(nowcast_engines);
     rotate_poll_loops!(station_grid_engines);
@@ -11849,6 +11866,141 @@ colormap = "no_such_map"
         let restored = load();
         assert_eq!(restored.bufr_engines[0].gauges(), (1, ingested));
         restored.bufr_engines[0].shutdown();
+    }
+
+    /// #1036: a reload that rebuilds a WIS2 CAP or BUFR collection hands
+    /// everything the replaced engine received to the new one, which
+    /// serves it from the swap on; a rejected reload shuts nothing down.
+    /// No state store: the take-over is in memory. No broker either: the
+    /// reload spawns the new engines' poll loops, which find nothing at
+    /// `127.0.0.1:1`.
+    #[test]
+    fn a_reload_that_rebuilds_a_wis2_collection_keeps_what_it_received() {
+        let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        // A changed title rebuilds a collection. The file-fed CAP
+        // collection is the one that is ready, so the reload is accepted.
+        let write = |title: &str, with_ready: bool| {
+            let ready = if with_ready {
+                format!(
+                    "[[collections]]\nid = \"cap-file\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                     engine_type = \"cap\"\napis = [\"features\"]\n\
+                     [collections.cap]\ndata_path = \"{testdata}/cap\"\n"
+                )
+            } else {
+                String::new()
+            };
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[server]\nhost = \"127.0.0.1\"\nport = 8000\n{ready}\
+                     [[collections]]\nid = \"cap-wis2\"\ntitle = \"{title}\"\ndescription = \"d\"\n\
+                     engine_type = \"cap\"\napis = [\"features\"]\n\
+                     [collections.cap]\n[collections.cap.wis2]\nbroker = \"mqtt://127.0.0.1:1\"\n\
+                     topics = [\"cache/a/wis2/test/data/core/weather/advisories-warnings\"]\n\
+                     [[collections]]\nid = \"obs-wis2\"\ntitle = \"{title}\"\ndescription = \"d\"\n\
+                     engine_type = \"bufr\"\napis = [\"edr\", \"features\"]\n\
+                     [collections.bufr]\nretention = \"P36500D\"\n[collections.bufr.wis2]\n\
+                     broker = \"mqtt://127.0.0.1:1\"\n\
+                     topics = [\"cache/a/wis2/test/data/core/weather/surface-based-observations/synop\"]\n"
+                ),
+            )
+            .unwrap();
+        };
+        let alert = |identifier: &str| ds_wis2::Resolved {
+            notification: ds_wis2::Notification {
+                topic: "cache/a/wis2/test/data/core/weather/advisories-warnings".into(),
+                centre_id: None,
+                id: format!("id-{identifier}"),
+                data_id: format!("d-{identifier}"),
+                pubtime: chrono::Utc::now(),
+                datetime: None,
+                start_datetime: None,
+                end_datetime: None,
+                geometry: None,
+                integrity: None,
+                content: None,
+                links: Vec::new(),
+                metadata_id: None,
+                wigos_station_identifier: None,
+                global_cache: None,
+                extra: Default::default(),
+            },
+            payload: Some(ds_wis2::Payload {
+                bytes: std::fs::read_to_string(format!("{testdata}/cap/helsinki-flood.xml"))
+                    .unwrap()
+                    .replace("urn:test:helsinki-flood-1", identifier)
+                    .replace(
+                        "<severity>Severe</severity>",
+                        "<severity>Severe</severity><expires>2099-01-01T00:00:00+00:00</expires>",
+                    )
+                    .into_bytes()
+                    .into(),
+                source: ds_wis2::PayloadSource::Inline,
+                media_type: None,
+                verified: None,
+            }),
+        };
+        let receive = |cap: &engine_cap::CapEngine, identifier: &str| {
+            cap.wis2_source().unwrap().apply_with_hint(
+                alert(identifier),
+                None,
+                "test",
+                chrono::Utc::now(),
+            );
+        };
+        let live = |state: &super::AdminState| {
+            let cap = state
+                .cap_engines
+                .read()
+                .unwrap()
+                .iter()
+                .find(|e| e.collection_id() == "cap-wis2")
+                .unwrap()
+                .clone();
+            (cap, state.bufr_engines.read().unwrap()[0].clone())
+        };
+
+        write("v1", true);
+        let state = crate::watcher::tests::build_state(&config_path);
+        let (old_cap, old_bufr) = live(&state);
+        // What their poll loops would have applied since the boot.
+        receive(&old_cap, "a");
+        old_cap.refresh().unwrap();
+        let fixture = std::fs::read(format!(
+            "{testdata}/bufr-synop/synop_se-smhi_20260912T0800Z.bufr"
+        ))
+        .unwrap();
+        let reports = old_bufr.ingest_bytes(&fixture, "fixture", chrono::Utc::now());
+        assert!(reports > 0);
+
+        write("v2", true);
+        super::do_reload(&state).unwrap();
+        let (cap, bufr) = live(&state);
+        assert!(!Arc::ptr_eq(&cap, &old_cap) && !Arc::ptr_eq(&bufr, &old_bufr));
+        assert_eq!(cap.wis2_source().unwrap().len(), 1);
+        assert!(cap.record_count() > 0);
+        assert_eq!(cap.record_count(), old_cap.record_count());
+        assert_eq!(bufr.gauges(), (1, reports));
+        // The replaced engine is shut down: nothing more lands in it.
+        receive(&old_cap, "late");
+        assert_eq!(old_cap.wis2_source().unwrap().len(), 1);
+
+        // Rejected (no collection would be ready): the live engines stay
+        // and keep receiving.
+        write("v3", false);
+        assert!(matches!(
+            super::do_reload(&state),
+            Err(super::ReloadError::NoReadyCollections { .. })
+        ));
+        let (still_cap, still_bufr) = live(&state);
+        assert!(Arc::ptr_eq(&still_cap, &cap) && Arc::ptr_eq(&still_bufr, &bufr));
+        receive(&cap, "b");
+        assert_eq!(cap.wis2_source().unwrap().len(), 2);
+
+        cap.shutdown();
+        bufr.shutdown();
     }
 
     #[test]

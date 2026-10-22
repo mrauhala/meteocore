@@ -183,7 +183,10 @@ memory. Things that differ from the pull sources:
   every five minutes (`SNAPSHOT_WRITE_INTERVAL`); an unchanged accumulator
   is rewritten every quarter of `warmup`, 5 min–1 h
   (`snapshot_policy`), so `written_at` tracks when the server was last
-  alive; and `shutdown()` always flushes it.
+  alive; and `shutdown()` always flushes it. `shutdown()` seals the
+  accumulator first (`Wis2CapSource::seal`, set under the accumulator
+  lock, which `apply_with_hint` and `delete` hold while they check it), so
+  the flush holds everything applied and nothing lands after it (#1036).
   Restored by `new_with_state` BEFORE the first catalog build, and the
   restored catalog is published at once (still `connecting` until the
   session is up). Restore applies the CURRENT config: past validity + grace
@@ -223,6 +226,15 @@ memory. Things that differ from the pull sources:
   and the cause travels in the snapshot, so a restart during it keeps the
   wording. The refresh above bounds the error of "down that long" by the
   refresh interval; the shutdown flush makes it exact for a graceful stop.
+- **Reload (#1036).** A reload that rebuilds the collection builds the new
+  engine while the old one still receives; its build restores only the
+  last periodic snapshot. After the reload is accepted the server calls
+  `old.shutdown()` (seal, then flush) and `new.take_over(&old)` before the
+  new poll loop starts: `export` then `restore` under the new config, the
+  same path as a snapshot restore (expired and filtered alerts and
+  disallowed hints drop), the warm-up clock and cause kept, then a catalog
+  build, so the registry swap serves the whole set. In memory, with or
+  without a state store; the new engine's next write replaces the flush.
 - If the broker pipeline ends on its own, `wis2_loop` marks the session
   disconnected and respawns it after 30 s — an unchanged-config reload
   reuses the engine, so nothing else would restart it.

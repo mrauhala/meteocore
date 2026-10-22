@@ -139,6 +139,13 @@ impl ObsStore {
         }
     }
 
+    /// Drop every station, before a take-over (#1036) puts back the
+    /// replaced engine's.
+    pub(crate) fn clear(&mut self) {
+        self.stations.clear();
+        self.rows = 0;
+    }
+
     /// Put back one station restored from a snapshot (#1002). Its
     /// `first_report`/`last_report` follow `rows` (an empty `rows` is
     /// ignored); a station of the same id is replaced. Call [`Self::prune`]
