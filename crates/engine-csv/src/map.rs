@@ -38,6 +38,7 @@ impl StationMap {
     pub(crate) fn new(
         store: &CsvDataStore,
         time_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        spatial_extent: Option<[f64; 4]>,
         settings: StationMapSettings,
     ) -> Self {
         let layers = StationLayers::new(settings);
@@ -55,7 +56,7 @@ impl StationMap {
             .collect();
         let raster_info = RasterInfo {
             native_crs: "CRS:84".to_string(),
-            spatial_extent: crate::engine::spatial_extent(store),
+            spatial_extent,
             times: layers.advertised_times(time_extent),
             parameter: parameters
                 .first()
