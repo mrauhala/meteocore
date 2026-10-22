@@ -771,6 +771,83 @@ impl DataStore {
         results.into_iter().map(|(_, r)| r).collect()
     }
 
+    /// Read one byte range of each of many objects, at most `concurrency`
+    /// in flight, returning one slot per read **in input order** (#1042).
+    /// Each read is limited to the request deadline when one is in scope,
+    /// else to `budget`; a failed read is its slot's `Err` and does not
+    /// sink the batch.
+    ///
+    /// The batch ends at `until`. A read that has not finished by then is
+    /// `None`: no read starts after it, and one still in flight is dropped.
+    /// A poll that reads the headers of a backlog keeps what arrived within
+    /// its time and leaves the rest to the next poll, so order `reads` by
+    /// priority. The outer `Err` is a runtime-bridge failure or an expired
+    /// request deadline.
+    ///
+    /// Drives the whole batch on ONE bridge call, with the thread-context
+    /// rules of [`Self::get_many`]: call it from the poll runtime, never
+    /// from a rayon worker. Every range is held until the batch returns, so
+    /// call it with a bounded batch.
+    #[allow(clippy::type_complexity)]
+    pub fn get_range_many(
+        &self,
+        reads: &[(ObjectPath, Range<usize>)],
+        concurrency: usize,
+        budget: FetchBudget,
+        until: std::time::Instant,
+    ) -> Result<Vec<Option<Result<Bytes, DataServerError>>>, DataServerError> {
+        let deadline = ds_core::deadline::current();
+        ds_core::deadline::check()?;
+        let results =
+            self.block_on_untimed(self.read_ranges(reads, concurrency, budget, deadline, until))?;
+        let total: u64 = results
+            .iter()
+            .filter_map(|r| r.as_ref()?.as_ref().ok())
+            .map(|b| b.len() as u64)
+            .sum();
+        self.bytes_read.fetch_add(total, Ordering::Relaxed);
+        Ok(results)
+    }
+
+    /// The batch [`Self::get_range_many`] drives: one slot per read, in
+    /// input order, `None` for a read `until` cut off or never started.
+    async fn read_ranges(
+        &self,
+        reads: &[(ObjectPath, Range<usize>)],
+        concurrency: usize,
+        budget: FetchBudget,
+        deadline: Option<std::time::Instant>,
+        until: std::time::Instant,
+    ) -> Vec<Option<Result<Bytes, DataServerError>>> {
+        use futures::StreamExt;
+
+        // The runtime's clock, so a test with paused time moves it too.
+        let until = tokio::time::Instant::from_std(until);
+        let mut results: Vec<(usize, Option<Result<Bytes, DataServerError>>)> =
+            futures::stream::iter(
+                reads
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (path, range))| async move {
+                        if tokio::time::Instant::now() >= until {
+                            return (i, None);
+                        }
+                        let read = within(budget, deadline, async {
+                            self.inner
+                                .get_range(path, to_u64(range.clone()))
+                                .await
+                                .map_err(|e| DataServerError::from(StorageError::from(e)))
+                        });
+                        (i, tokio::time::timeout_at(until, read).await.ok())
+                    }),
+            )
+            .buffer_unordered(concurrency.max(1))
+            .collect()
+            .await;
+        results.sort_by_key(|(i, _)| *i);
+        results.into_iter().map(|(_, r)| r).collect()
+    }
+
     /// Get whole documents, one result per path **in input order**, at
     /// most `concurrency` in flight on one storage-bridge call: generated
     /// files such as THREDDS catalogs (#1170). Unlike [`Self::get_many`],
@@ -2181,6 +2258,116 @@ mod budget_tests {
             )
             .unwrap();
         assert_eq!(many[0].as_ref().unwrap(), &b"abc"[..]);
+        assert_eq!(store.bytes_read(), 6);
+    }
+
+    /// `count` objects `k0`, `k1`, …, object `i` holding ten bytes of `i`,
+    /// every GET taking `delay`.
+    async fn slow_reads(count: usize, delay: Duration) -> Arc<crate::test_store::SlowReads> {
+        let store = crate::test_store::SlowReads {
+            delay,
+            ..Default::default()
+        };
+        for i in 0..count {
+            store
+                .inner
+                .put(
+                    &ObjectPath::from(format!("k{i}")),
+                    PutPayload::from(vec![i as u8; 10]),
+                )
+                .await
+                .unwrap();
+        }
+        Arc::new(store)
+    }
+
+    /// Bytes 2..5 of each of `count` objects.
+    fn header_reads(count: usize) -> Vec<(ObjectPath, Range<usize>)> {
+        (0..count)
+            .map(|i| (ObjectPath::from(format!("k{i}")), 2..5))
+            .collect()
+    }
+
+    /// A range batch keeps `concurrency` reads in flight and never more, so
+    /// ten one-second reads three at a time take four seconds, not ten
+    /// (#1042). Each slot holds its own read's range, in input order.
+    #[tokio::test(start_paused = true)]
+    async fn a_range_batch_overlaps_its_reads_up_to_the_bound() {
+        let slow = slow_reads(10, Duration::from_secs(1)).await;
+        let store = DataStore::new(slow.clone());
+        let started = tokio::time::Instant::now();
+        let until = (started + Duration::from_secs(3600)).into_std();
+
+        let read = store
+            .read_ranges(&header_reads(10), 3, FetchBudget::Background, None, until)
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            (Duration::from_secs(4)..Duration::from_secs(5)).contains(&elapsed),
+            "{elapsed:?}"
+        );
+        assert_eq!(slow.peak.load(Ordering::SeqCst), 3);
+        for (i, slot) in read.iter().enumerate() {
+            let bytes = slot.as_ref().expect("finished").as_ref().unwrap();
+            assert_eq!(bytes, &[i as u8; 3][..]);
+        }
+    }
+
+    /// A range batch ends at `until`: the reads that finished keep their
+    /// bytes, a read still in flight is dropped and one not yet started
+    /// never starts, both `None`.
+    #[tokio::test(start_paused = true)]
+    async fn a_range_batch_ends_at_until() {
+        let slow = slow_reads(6, Duration::from_secs(1)).await;
+        let store = DataStore::new(slow.clone());
+        let started = tokio::time::Instant::now();
+        let until = (started + Duration::from_millis(1500)).into_std();
+
+        let read = store
+            .read_ranges(&header_reads(6), 2, FetchBudget::Background, None, until)
+            .await;
+        assert_eq!(started.elapsed(), Duration::from_millis(1500));
+        let finished: Vec<bool> = read
+            .iter()
+            .map(|slot| matches!(slot, Some(Ok(_))))
+            .collect();
+        assert_eq!(finished, [true, true, false, false, false, false]);
+        assert!(read[2..].iter().all(Option::is_none));
+        // k2 and k3 were in flight at `until`; k4 and k5 never started.
+        assert_eq!(*slow.started.lock().unwrap(), ["k0", "k1", "k2", "k3"]);
+        assert_eq!(slow.active.load(Ordering::SeqCst), 0);
+    }
+
+    /// The public entry point reads on the ambient runtime, counts the bytes
+    /// of the reads that finished and keeps a failed read in its slot; once
+    /// `until` has passed it starts nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_range_batch_counts_bytes_and_keeps_failures_in_their_slot() {
+        let slow = slow_reads(2, Duration::ZERO).await;
+        let store = DataStore::new(slow.clone());
+        let mut reads = header_reads(2);
+        reads.push((ObjectPath::from("missing"), 0..4));
+        let later = std::time::Instant::now() + Duration::from_secs(60);
+
+        let read = store
+            .get_range_many(&reads, 4, FetchBudget::Background, later)
+            .unwrap();
+        assert_eq!(read[0].as_ref().unwrap().as_ref().unwrap(), &[0u8; 3][..]);
+        assert_eq!(read[1].as_ref().unwrap().as_ref().unwrap(), &[1u8; 3][..]);
+        assert!(matches!(read[2], Some(Err(_))), "{:?}", read[2]);
+        assert_eq!(store.bytes_read(), 6);
+
+        slow.started.lock().unwrap().clear();
+        let read = store
+            .get_range_many(
+                &reads,
+                4,
+                FetchBudget::Background,
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        assert!(read.iter().all(Option::is_none));
+        assert!(slow.started.lock().unwrap().is_empty());
         assert_eq!(store.bytes_read(), 6);
     }
 }

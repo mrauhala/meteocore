@@ -785,7 +785,9 @@ impl TiffMetadata {
         })
     }
 
-    /// Parse metadata from a partial header read (COG range read).
+    /// Parse metadata from a partial header read (COG range read) of one
+    /// object: what the remote scan does for each new file, in batches
+    /// (`catalog::read_new_files`, #1042).
     ///
     /// Reads the first `HEADER_READ_SIZE` bytes from the remote file and
     /// parses the IFD. Also extracts tile offsets, byte counts, compression,
@@ -800,23 +802,38 @@ impl TiffMetadata {
     ///   handles: the IFD lies past the first `HEADER_READ_SIZE` bytes, the
     ///   compression is unsupported, or the object is empty. The caller
     ///   falls back to a full download.
+    #[cfg(test)]
     pub fn from_header_read(
         store: &ds_storage::DataStore,
         path: &ds_storage::object_store::path::Path,
         file_size: u64,
     ) -> Result<Option<(Self, RemoteTileInfo)>, DataServerError> {
-        let read_size = HEADER_READ_SIZE.min(file_size as usize);
-        if read_size == 0 {
+        let Some(range) = Self::header_range(file_size) else {
             return Ok(None);
-        }
+        };
         // Only the poll scan reads headers before cataloguing, so a stalled
         // attempt may retry under the background budget (#1011).
         let header_bytes =
-            store.get_range_with_budget(path, 0..read_size, ds_storage::FetchBudget::Background)?;
-        Ok(Self::parse_header(
-            header_bytes,
-            format!("<remote:{}>", path),
-        ))
+            store.get_range_with_budget(path, range, ds_storage::FetchBudget::Background)?;
+        Ok(Self::from_header_bytes(header_bytes, path))
+    }
+
+    /// The range a header read asks for: the first `HEADER_READ_SIZE`
+    /// bytes, or the whole of a smaller object. `None` for an empty object,
+    /// which holds no COG header.
+    pub(crate) fn header_range(file_size: u64) -> Option<std::ops::Range<usize>> {
+        let read_size = HEADER_READ_SIZE.min(file_size as usize);
+        (read_size > 0).then_some(0..read_size)
+    }
+
+    /// Parse the bytes a read of [`Self::header_range`] returned for the
+    /// object at `path`: `None` when they are not a COG header this reader
+    /// handles, which the scan downloads whole (#1003).
+    pub(crate) fn from_header_bytes(
+        header_bytes: Bytes,
+        path: &ds_storage::object_store::path::Path,
+    ) -> Option<(Self, RemoteTileInfo)> {
+        Self::parse_header(header_bytes, format!("<remote:{}>", path))
     }
 
     /// Parse the metadata and tile layout from the first bytes of a COG, or

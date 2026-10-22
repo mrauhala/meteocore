@@ -43,6 +43,14 @@ the runtime (#999), and several threads can wait for it behind an `Arc`
 deadline, so one request's deadline never cuts off a read another waits on;
 the read is aborted when its last holder drops it.
 
+`get_range_many` takes the budget too: one byte range of each of many
+objects on one storage-bridge call, at most `concurrency` in flight, one
+slot per read in input order (#1042). The batch also ends at an `until`
+instant: a read that has not finished by then is `None`, whether it was
+in flight or never started, so a poll keeps what arrived and leaves the
+rest to the next one. GeoTIFF's remote scan reads new files' COG headers
+through it, newest first.
+
 # Catalog discovery
 
 `discovery` holds what every engine that polls one file per timestep needs:

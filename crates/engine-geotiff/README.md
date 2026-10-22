@@ -23,7 +23,10 @@ tiles a request touches, so a remote COG is not downloaded whole.
 - **Metadata.** Each new file's header is read once: tiling, overviews,
   georeferencing, nodata (`GDAL_NODATA`) and scale/offset (GDAL metadata).
   A remote file is read by a 512 KiB range request; when those bytes are
-  not a COG this reader handles, the file is downloaded whole.
+  not a COG this reader handles, the file is downloaded whole. A poll
+  reads its new files four at a time, newest first, for at most two
+  minutes, and leaves the files it did not reach to the next poll, so a
+  backlog never holds back the latest frame.
 - **Reading.** A request reads only the tiles that cover its window; a map
   reads the overview level that fits its output resolution. Remote tiles
   are fetched in parallel by byte range; local files are memory-mapped.

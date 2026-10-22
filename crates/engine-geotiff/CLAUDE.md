@@ -63,12 +63,25 @@ apply here.
   metadata reuse compares the directory entry's own size, mtime and inode.
   A dynamic source passes no `max_files` to the scan: `do_scan` trims after
   the metadata pass, so a file that fails to parse does not cost a slot.
-- **Remote header read (#1003):** `TiffMetadata::from_header_read` returns
-  `Err` when the range read fails and `Ok(None)` when the bytes are not a
-  COG header. Only `Ok(None)` takes the full-download fallback. On `Err`
-  the scan leaves the file out of the catalog, so the next poll reads its
-  header again. A timeout is not a non-COG, and a full download from the
-  same stalled storage only stalls longer.
+- **Remote header read (#1003):** a header read that fails (its
+  `get_range_many` slot is `Err`) is not a header that does not parse
+  (`TiffMetadata::from_header_bytes` is `None`). Only the second, and a
+  source that ignores `Range` (`range_not_honoured`), take the
+  full-download fallback. On a failed read the scan leaves the file out of
+  the catalog, so the next poll reads its header again. A timeout is not a
+  non-COG, and a full download from the same stalled storage only stalls
+  longer. `from_header_read` is the one-object form, for tests.
+- **Remote metadata pass (#1042):** `catalog::load_remote` reads new files'
+  headers newest first through `DataStore::get_range_many`,
+  `SCAN_READ_CONCURRENCY` (4) in flight, in batches of `SCAN_READ_BATCH`
+  (32, so a backlog holds at most 16 MiB of headers at once), then
+  downloads the fallbacks through `get_many_with_budget`, newest first,
+  four at a time. Never loop one blocking read per file (root Critical
+  Rule 9). The per-scan read budget (`scan_remote_within`, 120 s) is the
+  batch's `until`: a header read not finished by then is dropped, nothing
+  starts after it, and the files left over, the oldest, wait for the next
+  poll. A group of downloads that started runs to its end. Engine
+  construction's initial scan is the same pass.
 
 ## STAC metadata loading (#90, #889, #1075)
 
