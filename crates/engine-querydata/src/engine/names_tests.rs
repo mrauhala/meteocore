@@ -173,3 +173,74 @@ fn a_descriptor_wins_over_another_parameters_short_name() {
     assert_eq!(one.ranges["msl"].values, all.ranges["msl"].values);
     assert_eq!(one.parameters["msl"].unit, "mm");
 }
+
+/// A descriptor in FMI's ISO-8859-1, `Lämpötila` for the 2 m temperature
+/// (#1251), names its parameter like an ASCII one: EDR advertises, selects
+/// and keys it, the map lists, defaults to and renders it, and
+/// `wms_parameter` names it. The parameter is still its number, with its
+/// unit and its values.
+#[test]
+fn a_latin1_descriptor_names_its_parameter() {
+    const LAMPOTILA: &str = "Lämpötila";
+    let fixture = super::wind_tests::Fixture::new(
+        super::wind_tests::KENYA,
+        &[(
+            b"\n4\n24 2 Metre Temperature (2t)\n",
+            b"\n4\n9 L\xe4mp\xf6tila\n",
+        )],
+    );
+    let point = |engine: &QueryDataEngine, name: &str| {
+        single(
+            engine
+                .query_position(
+                    "POINT(36.8 -1.3)",
+                    None,
+                    Some(&[name.to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+        )
+    };
+    let tile = |engine: &QueryDataEngine, name: &str| -> Vec<Option<f64>> {
+        engine
+            .get_raster_tile(
+                [36.0, -2.0, 38.0, 0.0],
+                8,
+                8,
+                None,
+                &OutputCrs::Wgs84,
+                Some(name),
+                None,
+                None,
+            )
+            .unwrap()
+            .values
+            .iter_values()
+            .collect()
+    };
+    let original = kenya(Some("2t"));
+    let want = point(&original, T2M).ranges[T2M].values.clone();
+    let want_tile = tile(&original, "2t");
+    assert!(want_tile.iter().all(Option::is_some), "inside the grid");
+    for wms_parameter in [LAMPOTILA, "lämpötila", "4"] {
+        let engine = QueryDataEngine::new(&fixture.0, "qd", Some(wms_parameter), 30, 4).unwrap();
+        assert_eq!(engine.get_parameters(), [MSL, LAMPOTILA, "rr1h"]);
+        let info = engine.raster_info();
+        assert_eq!(info.parameter, LAMPOTILA, "{wms_parameter}");
+        assert_eq!(info.parameter_unit(None), Some("°C"), "{wms_parameter}");
+        let names: Vec<&str> = info.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["msl", LAMPOTILA, "rr1h"]);
+        assert_eq!(tile(&engine, LAMPOTILA), want_tile);
+
+        for name in [LAMPOTILA, "lämpötila"] {
+            let result = point(&engine, name);
+            assert_eq!(keys(&result), [LAMPOTILA], "{name}");
+            assert_eq!(result.ranges[LAMPOTILA].values, want, "{name}");
+            assert_eq!(result.parameters[LAMPOTILA].label, LAMPOTILA);
+            assert_eq!(result.parameters[LAMPOTILA].unit, "°C");
+        }
+        // An ASCII name beside it is unchanged.
+        assert_eq!(keys(&point(&engine, "MSL")), ["msl"]);
+    }
+}
