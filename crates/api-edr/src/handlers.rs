@@ -33,8 +33,8 @@ use crate::params::{
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{
-    collection_parameter_json, coverage_response_to_json, locations_to_writer, LocationRows,
-    LocationsContext, LocationsPage, COVERAGE_JSON_MEDIA_TYPE,
+    collection_parameter_json, locations_to_writer, CoverageJson, LocationRows, LocationsContext,
+    LocationsPage, COVERAGE_JSON_MEDIA_TYPE,
 };
 
 /// Converting through [`JsonError`] is what attaches the `ErrorReason` the
@@ -70,16 +70,49 @@ fn query_timeout() -> HandlerError {
 /// Serialise a data-query result as a CoverageJSON response, typed
 /// [`COVERAGE_JSON_MEDIA_TYPE`] (EDR 1.2, #920). Every data query's
 /// CoverageJSON goes through here, so the media type cannot drift per
-/// query type. `label` names the query in the (server-side only) log line.
+/// query type. The document is written straight into a body admitted by
+/// the EDR response budget (#1041), which `expired` (the query's deadline)
+/// stops. `label` names the query in the (server-side only) log line.
 fn coverage_json_response(
     result: &CoverageResponse,
     label: &str,
+    expired: &dyn Fn() -> bool,
 ) -> Result<Response, HandlerError> {
-    let body = serde_json::to_string(&coverage_response_to_json(result)).map_err(|e| {
-        tracing::error!("{label} CoverageJSON serialise error: {e}");
-        server_error()
-    })?;
-    Ok(([(header::CONTENT_TYPE, COVERAGE_JSON_MEDIA_TYPE)], body).into_response())
+    let mut writer = crate::response_budget::Writer::new(expired);
+    if let Err(e) = serde_json::to_writer(&mut writer, &CoverageJson(result)) {
+        return Err(response_budget_error(writer.failure, || {
+            tracing::error!("{label} CoverageJSON serialise error: {e}");
+        }));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, COVERAGE_JSON_MEDIA_TYPE)],
+        writer.into_bytes(),
+    )
+        .into_response())
+}
+
+/// The error of a response body the EDR response budget stopped (#1041):
+/// a body that does not fit is a 503 `ServerBusy` to retry, a query past
+/// its deadline the 504. Any other failure (`None`, or a size cap only
+/// `/locations` has and maps itself) is a 500, after `log`.
+fn response_budget_error(
+    failure: Option<crate::response_budget::Failure>,
+    log: impl FnOnce(),
+) -> HandlerError {
+    use crate::response_budget::Failure;
+    match failure {
+        Some(Failure::Memory) => JsonError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({"code": "ServerBusy", "description": "EDR response memory capacity exhausted; retry later"}),
+            ),
+        ),
+        Some(Failure::Cancelled) => query_timeout(),
+        Some(Failure::Limit) | None => {
+            log();
+            server_error()
+        }
+    }
 }
 
 /// What a data query's GeoJSON representation needs besides the result: the
@@ -363,16 +396,17 @@ fn render_station_geojson(
     result: &CoverageResponse,
     number_matched: Option<usize>,
     req: &GeoJsonRequest,
+    expired: &dyn Fn() -> bool,
 ) -> Result<Response, HandlerError> {
     let names = req.station_names()?;
-    let mut body = Vec::new();
+    let mut writer = crate::response_budget::Writer::new(expired);
     crate::geojson::write_station_series(
         result,
         |i, q| names.identify(i, q),
         &req.collection_url(),
         &req.links(),
         number_matched,
-        &mut body,
+        &mut writer,
     )
     .map_err(|e| match e {
         GeoJsonError::ReservedParameterName(name) => bad_request_msg(&format!(
@@ -387,14 +421,13 @@ fn render_station_geojson(
             );
             server_error()
         }
-        GeoJsonError::Json(e) => {
+        GeoJsonError::Json(e) => response_budget_error(writer.failure, || {
             tracing::error!("EDR GeoJSON serialise error: {e}");
-            server_error()
-        }
+        }),
     })?;
     Ok((
         [(header::CONTENT_TYPE, EdrFormat::GeoJson.media_type())],
-        body,
+        writer.into_bytes(),
     )
         .into_response())
 }
@@ -406,10 +439,11 @@ fn render_station_csv(
     req: &GeoJsonRequest,
 ) -> Result<Response, HandlerError> {
     let names = req.station_names()?;
-    let body = crate::csv::write_station_series(
+    let (body, reservation) = crate::csv::write_station_series(
         result,
         |i, q| names.identify(i, q),
         crate::csv::MAX_BYTES,
+        |size| crate::response_budget::reserve(size).ok(),
     )
     .map_err(|e| match e {
         crate::csv::CsvError::TooLarge => bad_request(&DataServerError::QueryTooLarge(format!(
@@ -426,7 +460,13 @@ fn render_station_csv(
             );
             server_error()
         }
+        crate::csv::CsvError::Busy => {
+            response_budget_error(Some(crate::response_budget::Failure::Memory), || ())
+        }
     })?;
+    let body = reservation
+        .into_bytes(body.into_bytes())
+        .map_err(|failure| response_budget_error(Some(failure), || ()))?;
     Ok(([(header::CONTENT_TYPE, crate::csv::CONTENT_TYPE)], body).into_response())
 }
 
@@ -441,7 +481,8 @@ fn render_station_csv(
 /// and on a station collection's area); `HTML` is a page of the CoverageJSON
 /// (#971), plus the GeoJSON's location identity where GeoJSON is offered.
 /// A response that can't be plotted (a gridded/area result) maps
-/// to 400.
+/// to 400. Every body but the plot is admitted by the EDR response budget
+/// (#1041); `expired` (the query's deadline) stops one being written.
 fn render_coverage_response(
     result: CoverageResponse,
     number_matched: Option<usize>,
@@ -449,10 +490,11 @@ fn render_coverage_response(
     width: Option<u32>,
     height: Option<u32>,
     geojson: &GeoJsonRequest,
+    expired: &dyn Fn() -> bool,
 ) -> Result<Response, HandlerError> {
     match format {
-        EdrFormat::CoverageJson => coverage_json_response(&result, "EDR"),
-        EdrFormat::GeoJson => render_station_geojson(&result, number_matched, geojson),
+        EdrFormat::CoverageJson => coverage_json_response(&result, "EDR", expired),
+        EdrFormat::GeoJson => render_station_geojson(&result, number_matched, geojson, expired),
         EdrFormat::Csv => render_station_csv(&result, geojson),
         EdrFormat::Png => {
             let panels = coverage_response_to_panels(&result).map_err(|e| bad_request(&e))?;
@@ -465,11 +507,9 @@ fn render_coverage_response(
         }
         EdrFormat::Html => {
             let locations = geojson.html_locations(&result, number_matched)?;
-            Ok(crate::html::response(crate::html::coverage_page(
-                &result,
-                &geojson.html_page(&result),
-                locations.as_ref(),
-            )))
+            crate::html::coverage_page(&result, &geojson.html_page(&result), locations.as_ref())
+                .map(crate::html::response)
+                .map_err(|failure| response_budget_error(Some(failure), || ()))
         }
     }
 }
@@ -951,8 +991,9 @@ const SHARED_RESPONSES: [(u16, &str, &str); 6] = [
     (
         503,
         "ServiceUnavailable",
-        "The query executor is at capacity (ServerBusy), or a response would exceed its \
-         configured budget (ResponseLimit); retry later, or narrow the request.",
+        "The query executor or the response memory budget is at capacity (ServerBusy, with \
+         Retry-After), or a response would exceed its configured budget (ResponseLimit); retry \
+         later, or narrow the request.",
     ),
     (
         504,
@@ -967,8 +1008,9 @@ const METADATA_ERRORS: &[u16] = &[400, 404];
 
 /// Error statuses of a data query: an invalid request (400); an unknown
 /// collection, a query type it does not support or no data (404); and the
-/// query executor's capacity (503) and deadline (504), from
-/// [`execute_query`] and [`map_query_error`].
+/// query executor's and the response budget's capacity (503) and the
+/// deadline (504), from [`execute_query`], [`map_query_error`] and
+/// [`response_budget_error`].
 const QUERY_ERRORS: &[u16] = &[400, 404, 503, 504];
 
 /// Statuses every route of this router can answer, whatever its handler:
@@ -1248,7 +1290,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             );
             list_responses["503"] = error_response(
                 503,
-                "The query executor is at capacity (ServerBusy), or the list is over the response budget (ResponseLimit): page a list over it with limit, or request a smaller limit",
+                "The query executor or the response memory budget is at capacity (ServerBusy, with Retry-After), or the list is over its response limit (ResponseLimit): page a list over it with limit, or request a smaller limit",
             );
             collection_paths[&locations_path] = json!({
                 "get": {
@@ -2594,7 +2636,7 @@ pub async fn locations(
         // Keep construction, serialization and hashing under the same worker
         // permit as retrieval, even if the request times out or disconnects.
         let cancelled = || budget.expired();
-        let mut writer = crate::location_budget::Writer::new(&cancelled);
+        let mut writer = crate::response_budget::Writer::locations(&cancelled);
         let written = if format.format == EdrFormat::Html {
             let page = locations_html_page(
                 &href,
@@ -2627,19 +2669,12 @@ pub async fn locations(
             });
             locations_to_writer(page_locs, &ctx, page.as_ref(), &mut writer).map_err(Into::into)
         };
-        written.map_err(|_| {
-            match writer.failure {
-                Some(crate::location_budget::Failure::Cancelled) => query_timeout(),
-                Some(crate::location_budget::Failure::Limit) => JsonError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"code": "ResponseLimit", "description": too_large})),
-                ),
-                Some(crate::location_budget::Failure::Memory) => JsonError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"code": "ServerBusy", "description": "Location response memory capacity exhausted; retry later"})),
-                ),
-                None => server_error(),
-            }
+        written.map_err(|_| match writer.failure {
+            Some(crate::response_budget::Failure::Limit) => JsonError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"code": "ResponseLimit", "description": too_large})),
+            ),
+            failure => response_budget_error(failure, || ()),
         })?;
         let body = writer.into_bytes();
         let etag = ds_core::http_cache::etag_of(&body);
@@ -2848,6 +2883,7 @@ pub async fn location_query(
                 params.width,
                 params.height,
                 &geojson,
+                &|| budget.expired(),
             )
         })
         .await?;
@@ -2884,6 +2920,7 @@ pub async fn location_query(
             params.width,
             params.height,
             &geojson,
+            &|| budget.expired(),
         )
     })
     .await?;
@@ -3241,6 +3278,7 @@ async fn run_position_query(
             params.width,
             params.height,
             &geojson,
+            &|| budget.expired(),
         )
     })
     .await?;
@@ -3343,6 +3381,7 @@ async fn run_area_query(
             None,
             None,
             &page,
+            &|| budget.expired(),
         )
     })
     .await?;
@@ -3455,6 +3494,7 @@ async fn run_radius_query(
             None,
             None,
             &geojson,
+            &|| budget.expired(),
         )
     })
     .await?;
@@ -3594,6 +3634,7 @@ async fn run_cube_query(
             None,
             None,
             &page,
+            &|| budget.expired(),
         )
     })
     .await?;
@@ -3681,7 +3722,8 @@ pub async fn trajectory_query(
     // runtime handle and needs a blocking thread; along-path sampling runs
     // on the query runtime's workers like position and area.
     let blocking = shape == TrajectoryShape::CrossSection;
-    // The HTML page (#971) renders on the query worker, as every query's does.
+    // The CoverageJSON and the HTML page (#971) are written on the query
+    // worker under the response budget, as every query's are.
     let page = (format == EdrFormat::Html).then(|| {
         DataRequest {
             instance_id: None,
@@ -3692,7 +3734,13 @@ pub async fn trajectory_query(
     });
     let engine = engine.clone();
     let coords = params.coords.clone();
-    let (result, html) = execute_query(blocking, move |budget| {
+    // What the executor hands back: a written body, or the result the plot
+    // is drawn from.
+    enum Rendered {
+        Body(Response),
+        Plot(CoverageResponse),
+    }
+    let rendered = execute_query(blocking, move |budget| {
         // A `datetime` list runs one query per instant and merges them
         // (one coverage per instant for an along-path 2-D or Z path; an M
         // path never gets here with a `datetime`).
@@ -3711,20 +3759,37 @@ pub async fn trajectory_query(
         )
         .map_err(|e| map_query_error(&e, "Trajectory"))?;
         let result = limit_coverages(result, limit);
-        let html =
-            page.map(|page| crate::html::coverage_page(&result, &page.html_page(&result), None));
-        Ok((result, html))
+        Ok(match (format, page) {
+            (EdrFormat::CoverageJson, _) => {
+                Rendered::Body(coverage_json_response(&result, "Trajectory", &|| {
+                    budget.expired()
+                })?)
+            }
+            (EdrFormat::Html, Some(page)) => Rendered::Body(
+                crate::html::coverage_page(&result, &page.html_page(&result), None)
+                    .map(crate::html::response)
+                    .map_err(|failure| response_budget_error(Some(failure), || ()))?,
+            ),
+            _ => Rendered::Plot(result),
+        })
     })
     .await?;
+    let result = match rendered {
+        Rendered::Body(body) => {
+            return Ok(with_format_vary(
+                with_data_cache_control(body, window),
+                negotiated,
+            ))
+        }
+        Rendered::Plot(result) => result,
+    };
 
     let response = match format {
-        EdrFormat::CoverageJson => {
-            with_data_cache_control(coverage_json_response(&result, "Trajectory")?, window)
-        }
-        // `query_formats` never offers GeoJSON or CSV for a trajectory.
-        EdrFormat::GeoJson | EdrFormat::Csv => {
+        // Written on the executor above; `query_formats` never offers
+        // GeoJSON or CSV for a trajectory.
+        EdrFormat::CoverageJson | EdrFormat::Html | EdrFormat::GeoJson | EdrFormat::Csv => {
             tracing::error!(
-                "EDR trajectory: {} negotiated for a trajectory",
+                "EDR trajectory: {} negotiated but not rendered",
                 format.name()
             );
             return Err(server_error());
@@ -3756,13 +3821,6 @@ pub async fn trajectory_query(
                 ([(header::CONTENT_TYPE, "image/png")], png).into_response(),
                 window,
             )
-        }
-        EdrFormat::Html => {
-            let Some(html) = html else {
-                tracing::error!("EDR trajectory: HTML negotiated but not rendered");
-                return Err(server_error());
-            };
-            with_data_cache_control(crate::html::response(html), window)
         }
     };
     Ok(with_format_vary(response, negotiated))

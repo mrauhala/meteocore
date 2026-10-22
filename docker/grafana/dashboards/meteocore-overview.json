@@ -8552,7 +8552,7 @@
         "spec": {
           "id": 59,
           "title": "Admission budgets — use",
-          "description": "Transient memory reserved against each admission budget: render (MC_RENDER_MEMORY_MB), GeoTIFF decode (MC_GEOTIFF_DECODE_MEMORY_MB), Zarr read (MC_ZARR_READ_MEMORY_MB), NetCDF field read (MC_NETCDF_READ_MEMORY_MB), station-grid compute (MC_STATION_GRID_MEMORY_MB). These are admission estimates, not measured RSS; a request that does not fit is answered 503.",
+          "description": "Transient memory reserved against each admission budget: render (MC_RENDER_MEMORY_MB), GeoTIFF decode (MC_GEOTIFF_DECODE_MEMORY_MB), Zarr read (MC_ZARR_READ_MEMORY_MB), NetCDF field read (MC_NETCDF_READ_MEMORY_MB), station-grid compute (MC_STATION_GRID_MEMORY_MB), EDR response bodies (MC_EDR_RESPONSE_MEMORY_MB). These are admission estimates, not measured RSS; a request that does not fit is answered 503.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -8571,7 +8571,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute)_reserved_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_reserved_bytes\")) / (sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute)_capacity_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)",
+                        "expr": "sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute|edr_response)_reserved_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_reserved_bytes\")) / (sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute|edr_response)_capacity_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)",
                         "legendFormat": "{{budget}}",
                         "range": true,
                         "instant": false,
@@ -8805,6 +8805,28 @@
                       }
                     }
                   }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "F",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum(rate(edr_response_rejected_total{job=~\"$job\"}[$__rate_interval])) * 60",
+                        "legendFormat": "edr_response",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
                 }
               ],
               "transformations": [],
@@ -8904,7 +8926,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute)_reserved_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_reserved_bytes\")) or label_replace(sum(render_budget_total_bytes{job=~\"$job\"}) - sum(render_budget_available_bytes{job=~\"$job\"}), \"budget\", \"render\", \"\", \"\")",
+                        "expr": "sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute|edr_response)_reserved_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_reserved_bytes\")) or label_replace(sum(render_budget_total_bytes{job=~\"$job\"}) - sum(render_budget_available_bytes{job=~\"$job\"}), \"budget\", \"render\", \"\", \"\")",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -8927,7 +8949,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute)_capacity_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) or label_replace(sum(render_budget_total_bytes{job=~\"$job\"}), \"budget\", \"render\", \"\", \"\")",
+                        "expr": "sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute|edr_response)_capacity_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) or label_replace(sum(render_budget_total_bytes{job=~\"$job\"}), \"budget\", \"render\", \"\", \"\")",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -8950,7 +8972,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "(sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute)_reserved_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_reserved_bytes\")) or label_replace(sum(render_budget_total_bytes{job=~\"$job\"}) - sum(render_budget_available_bytes{job=~\"$job\"}), \"budget\", \"render\", \"\", \"\")) / ((sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute)_capacity_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) or label_replace(sum(render_budget_total_bytes{job=~\"$job\"}), \"budget\", \"render\", \"\", \"\")) > 0)",
+                        "expr": "(sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute|edr_response)_reserved_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_reserved_bytes\")) or label_replace(sum(render_budget_total_bytes{job=~\"$job\"}) - sum(render_budget_available_bytes{job=~\"$job\"}), \"budget\", \"render\", \"\", \"\")) / ((sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute|edr_response)_capacity_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) or label_replace(sum(render_budget_total_bytes{job=~\"$job\"}), \"budget\", \"render\", \"\", \"\")) > 0)",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -8973,7 +8995,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "label_replace(sum(increase(geotiff_decode_rejected_total{job=~\"$job\"}[$__range])), \"budget\", \"geotiff_decode\", \"\", \"\") or label_replace(sum(increase(zarr_read_rejected_total{job=~\"$job\"}[$__range])), \"budget\", \"zarr_read\", \"\", \"\") or label_replace(sum(increase(netcdf_read_rejected_total{job=~\"$job\"}[$__range])), \"budget\", \"netcdf_read\", \"\", \"\") or label_replace(sum(increase(station_grid_compute_rejected_total{job=~\"$job\"}[$__range])), \"budget\", \"station_grid_compute\", \"\", \"\") or label_replace(sum(increase(render_budget_rejected_total{job=~\"$job\"}[$__range])), \"budget\", \"render\", \"\", \"\")",
+                        "expr": "label_replace(sum(increase(geotiff_decode_rejected_total{job=~\"$job\"}[$__range])), \"budget\", \"geotiff_decode\", \"\", \"\") or label_replace(sum(increase(zarr_read_rejected_total{job=~\"$job\"}[$__range])), \"budget\", \"zarr_read\", \"\", \"\") or label_replace(sum(increase(netcdf_read_rejected_total{job=~\"$job\"}[$__range])), \"budget\", \"netcdf_read\", \"\", \"\") or label_replace(sum(increase(station_grid_compute_rejected_total{job=~\"$job\"}[$__range])), \"budget\", \"station_grid_compute\", \"\", \"\") or label_replace(sum(increase(edr_response_rejected_total{job=~\"$job\"}[$__range])), \"budget\", \"edr_response\", \"\", \"\") or label_replace(sum(increase(render_budget_rejected_total{job=~\"$job\"}[$__range])), \"budget\", \"render\", \"\", \"\")",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,

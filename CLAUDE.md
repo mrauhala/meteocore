@@ -660,12 +660,14 @@ one never implies the other.
 | engine-netcdf `decode_budget::BUDGET` (a `ByteBudget`) | bytes of one field read in progress: 3 × decoded + 3 × compressed, the decoded chunk bounding the compressed one (~24 MB per MEPS field); cache waiters and hits reserve nothing; a remote fill detached from its request and a poll's prewarm reserve it too | `MC_NETCDF_READ_MEMORY_MB`, 1024 MiB | 503 |
 | engine-netcdf `edr::QUERY_BYTES` | decoded bytes of the fields one EDR query reads: steps × levels × variables read × one field (`FieldRead::decoded_bytes`, 4.06 MB for MEPS), from the file metadata; a trajectory counts each (step, level) its plan reads once, a cube the levels its z positions take | `MC_NETCDF_EDR_QUERY_MB`, 544 MiB: one parameter over one MEPS run (67 leads) as the client sees it, including a derived wind speed, which reads both components (134 fields); not three variables over a run, nor one over a run at all 13 MEPS pressure levels (871 fields: name the levels with `z`) | 400 "Query too large: Query would decode N fields …", before any read |
 | `ds_core::feature::MAX_AREA_DIM` / `MAX_AREA_VALUES` | EDR area output cells per axis / values per response | 256 / 1 M | coarsened / 400 "Query too large: …" |
+| api-edr `response_budget` (a `ByteBudget`) | bytes of every EDR response body in memory, each buffer charged before it is allocated and until the body is delivered or dropped: CoverageJSON (serialised straight into it), EDR GeoJSON, CSV (its counted size), an HTML data page (its estimate, before it renders) and `/locations`; not PNG plots, `items`, metadata, the engine result or the HTML page's `Value` document | `MC_EDR_RESPONSE_MEMORY_MB`, 512 MiB; `/locations` also `MC_EDR_LOCATIONS_MAX_BYTES`, 16 MiB per body | 503 `ServerBusy` + `Retry-After: 1` at once; a `/locations` body over its cap 503 `ResponseLimit` |
 | `engine_geotiff::STAC_REQUEST_MAX_COLD_ITEMS` | STAC items whose header one EDR query reads (items in its window with no metadata yet; without `datetime`, in the whole catalog) | 400 (a closed day of 5-minute frames is 289) | 400 "Query too large: …", counted from the STAC response before it is installed or anything loads (#889) |
 | EDR `f=png` plot, WMS `GetLegendGraphic` | output px | 160–2000 × 120–2000 / ≤ 512 × 1024 | never: clamped silently |
 
-- The engines' source byte budgets are each their own instance of
-  `ds_executor::budget::ByteBudget`, with their own env var and static; a new
-  engine's is one more instance, never a copy (#1067). Unlike
+- The engines' source byte budgets, and EDR's response budget (#1041), are
+  each their own instance of `ds_executor::budget::ByteBudget`, with their
+  own env var and static; a new engine's is one more instance, never a copy
+  (#1067). Unlike
   `RENDER_MEMORY`, a waiting `RenderBudget`, they fail at once. A refused
   batch probe (`try_reserve`) or background reservation
   (`try_reserve_background`, at most half the budget) is not a counted

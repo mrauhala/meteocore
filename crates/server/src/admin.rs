@@ -1678,6 +1678,26 @@ static RENDER_MEMORY_REJECTED: LazyLock<[DeltaCounter; 2]> = LazyLock::new(|| {
         )
     })
 });
+// EDR response bodies in memory (#1041): one process-wide byte budget,
+// `MC_EDR_RESPONSE_MEMORY_MB`.
+static EDR_RESPONSE_USED: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "edr_response_reserved_bytes",
+        "Reserved EDR response body memory",
+    )
+});
+static EDR_RESPONSE_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "edr_response_capacity_bytes",
+        "EDR response body memory capacity",
+    )
+});
+static EDR_RESPONSE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "edr_response_rejected_total",
+        "EDR responses rejected by memory admission",
+    )
+});
 
 static STORAGE_BYTES_READ: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -7056,6 +7076,10 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     let [oversize, deadline] = &*RENDER_MEMORY_REJECTED;
     oversize.feed(memory.rejected_oversize());
     deadline.feed(memory.rejected_deadline());
+    let (used, limit, rejected) = api_edr::response_budget_metrics();
+    EDR_RESPONSE_USED.set(used.min(i64::MAX as u64) as i64);
+    EDR_RESPONSE_LIMIT.set(limit.min(i64::MAX as u64) as i64);
+    EDR_RESPONSE_REJECTED.feed(rejected);
 
     // Rendered image cache: global (single cache shared across collections).
     RENDERED_CACHE_METRICS.update(
