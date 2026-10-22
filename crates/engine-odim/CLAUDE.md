@@ -87,7 +87,8 @@ around `ds-storage` calls (Critical Rules 6–7).
   nothing on a split-cut scan whose lowest sweep lacks the quantity.
 - **Pixel pre-warm** (`[odim] prewarm_sweeps`, default `1`; #461/#472).
   Pixel arrays are read lazily per moment (#289), so a moment's first render
-  does a cold whole-`.h5` read **while holding a render-semaphore permit** —
+  does a cold read (its byte ranges, #1047, else the whole `.h5`) **while
+  holding a render-semaphore permit** —
   a client animating N timesteps fires N concurrent cold reads and some
   requests get cut off by the front proxy (intermittent "missing timestep"
   frames; retry works because the backend finishes and caches). Fix: the
@@ -122,14 +123,23 @@ around `ds-storage` calls (Critical Rules 6–7).
   and quantities), the cross-section (`section_plan`: gates computed once
   per cell, the sweeps they hit prefetched), the point cloud and voxel grid
   (`volume_moments`) — first resolves exactly the moments it will read with
-  `Pixels::prefetch`/`load_moments` (one GET + one HDF5 open through
-  `PixelCache::load_many`, #993 classification intact) and samples through
+  `Pixels::prefetch`/`load_moments` (one read, of the moments' byte ranges
+  when they have a plan (#1047) else one whole-file GET, and one HDF5 open
+  through `PixelCache::load_many`, #993 classification intact) and samples
+  through
   `Pixels::batched`. Never loop `Pixels::moment` cold over quantities ×
   sweeps: each first miss of a quantity downloads the whole file again
   (V × Q GETs per request). A batch read must name every moment the walk
   samples — anything left out reads as nodata — so share the target helper
   (`level_target`, `slant_cell_moment`) between prefetch and sampler.
   Pinned by the `*_fetches_*_volume_file_once` tests (`file_fetches`).
+  The batch's arrays outlive LRU eviction until the walk moves on to the
+  next volume, so an EDR walk over every quantity (no `parameter-name`:
+  `resolve_quantities` returns them all) holds one decoded volume per
+  request, every quantity × sweep it samples, while it samples: on the
+  order of 60–100 MB for an FMI volume, times the EDR queries running at
+  once. No budget counts it yet: the EDR response budget (#1041) counts
+  response bodies only.
 - **EDR walks over several volumes download ahead (#999).** The profiles
   and `level_series` of `site_coverages` and the sections of
   `site_trajectory` go through `walk_volumes`: `prepare` names each
@@ -190,10 +200,40 @@ around `ds-storage` calls (Critical Rules 6–7).
   Pinned by `one_volume_walks_waiting_on_a_cold_file_leave_the_runtime_running`
   (more walks than workers), `walks_waiting_on_a_cold_file_stop_at_their_deadline`
   and `file_load_waiter_gives_up_at_its_deadline`.
+- **Cold reads by byte range (#1047).** `parse_and_cache` runs
+  `layout::probe` on the bytes the scan holds: per moment, a fresh
+  `Hdf5File` over a recording storage resolves the dataset and walks
+  `iter_chunks` with filters that fail at once (`probe_filters`), so each
+  chunk's raw read is recorded and nothing is decompressed. The reads,
+  merged within `PLAN_GAP` (64 KiB), are `PolarMoment::spans` (u32, next to
+  `PolarVolume::file_len`). A cold miss with no held and no read-ahead
+  bytes builds a `ReadPlan` over the moments it needs and fetches only
+  those ranges (`fetch_spans`: local reads after a length check; remote
+  `DataStore::get_ranges_opt[_on]`, a GET per range, at most ten at once,
+  without object_store's 1 MiB merge), then decodes through `SpanStorage`.
+  No plan means the whole file: a moment not stored in chunks (contiguous
+  or compact, like `testdata/pvol-cold-batch.h5`), more than
+  `MAX_PLAN_RANGES` (10) ranges, or more than `MAX_PLAN_FRACTION` (half)
+  of the file. A decode that reads outside the fetched ranges
+  (`SpanStorage::missed`, logged at WARN) or a file whose length changed
+  also reads the whole file; neither is ever bad data. #993 holds: a
+  missing object is `Bad`, a deadline or other failure `Abort`, with no
+  whole-file retry. A ranged single-moment miss decodes no sibling. Walks
+  over several remote volumes still read whole files ahead (#999, #1127):
+  reading ranges ahead needs an async ranged start, a follow-up. A cold
+  base-sweep DBZH miss reads 0.46 % of the 41.4 MB FMI volume in 7 ranges,
+  1.37 % of a 25.5 MB SMHI volume in 4 and 3.9 % of a 1.2 MB DMI volume in
+  4. Pinned by `layout::tests`, `cold_miss_reads_only_the_moments_byte_ranges`,
+  `ranged_miss_is_classified_as_the_whole_file_read`,
+  `misses_without_a_usable_plan_read_the_whole_file`,
+  `a_batch_reads_byte_ranges_or_the_whole_file` and, when the uncommitted
+  radar fixtures are present, `fixture_volumes_decode_identically_from_their_byte_ranges`,
+  which decodes every moment from exactly its recorded reads.
 - **Cold single-moment misses (#293, #994):** only a map render reads one
-  moment at a time. A `Pixels::moment` miss fetches the source-qualified
-  file once, decodes **only the requested moment** on the caller's thread
-  and returns it. Speculation (`sibling_requests`) is the requested quantity
+  moment at a time. A `Pixels::moment` miss reads the moment's byte ranges
+  (previous bullet) or else fetches the source-qualified file once, decodes
+  **only the requested moment** on the caller's thread and returns it.
+  After a whole-file fetch only, speculation (`sibling_requests`) is the requested quantity
   at the `MAX_SIBLING_SWEEPS` (2) nearest other sweeps — what a viewer
   stepping `ELEVATION` reads next — within one sweep's worth of bytes (the
   requested sweep's moment count × its array at four bytes/sample, at most

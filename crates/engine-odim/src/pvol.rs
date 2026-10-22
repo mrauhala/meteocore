@@ -74,6 +74,11 @@ pub struct PolarMoment {
     /// (`/datasetN/dataM/data`), for the lazy pixel read. The array is
     /// shape `(nrays, nbins)`, indexed `[ray, bin]`.
     pub dataset_path: String,
+    /// The byte spans of the volume file the decode of this moment reads,
+    /// recorded when a scan had the file's bytes (`crate::layout::probe`,
+    /// #1047), so a cold miss fetches only these. `None` when not recorded
+    /// or not followable: a miss then reads the whole file.
+    pub(crate) spans: Option<Box<[crate::layout::Span]>>,
 }
 
 /// One elevation sweep of a polar volume: all moments measured at a
@@ -109,6 +114,8 @@ pub struct PolarVolume {
     pub object: String,
     /// Elevation sweeps, sorted by `elangle` ascending.
     pub sweeps: Vec<Sweep>,
+    /// Length of the file the volume was read from, in bytes.
+    pub(crate) file_len: u64,
 }
 
 /// Parse an ODIM `/what/source` string into `(NOD, PLC, WMO)`.
@@ -245,6 +252,7 @@ pub fn read_polar_volume(bytes: &[u8]) -> Result<PolarVolume, ReadError> {
         time,
         object,
         sweeps,
+        file_len: bytes.len() as u64,
     })
 }
 
@@ -371,6 +379,7 @@ fn read_moment(
         nodata,
         undetect,
         dataset_path,
+        spans: None,
     })
 }
 
@@ -415,19 +424,53 @@ pub fn read_moments_pixels<'a>(
     Ok(out)
 }
 
+/// [`read_moments_pixels`] over a random-access `storage`: the byte ranges a
+/// cold miss fetched (#1047).
+pub(crate) fn read_moments_pixels_in<'a>(
+    storage: hdf5_reader::storage::DynStorage,
+    requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
+) -> Result<Vec<(String, RawPixels)>, ReadError> {
+    let mut out = Vec::new();
+    visit_moments_pixels_in(storage, requests, |path, result| match result {
+        Ok(px) => out.push((path.to_string(), px)),
+        Err(e) => tracing::debug!("read_moments_pixels: skipping moment `{path}`: {e}"),
+    })?;
+    Ok(out)
+}
+
 /// Stream decoded moments from one HDF5 open, retaining at most one decode
 /// outside the caller's bounded cache. A corrupt optional sibling does not
 /// prevent the requested moment from being returned.
 pub fn visit_moments_pixels<'a>(
     bytes: &[u8],
     requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
-    mut visit: impl FnMut(&str, Result<RawPixels, ReadError>),
+    visit: impl FnMut(&str, Result<RawPixels, ReadError>),
 ) -> Result<(), ReadError> {
     let file = Hdf5File::from_bytes(bytes).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
-    for (path, nrays, nbins) in requests {
-        visit(path, read_moment_array(&file, path, nrays, nbins));
-    }
+    visit_file_moments(&file, requests, visit);
     Ok(())
+}
+
+/// [`visit_moments_pixels`] over a random-access `storage` rather than the
+/// whole file in memory: the byte ranges a cold miss fetched (#1047).
+pub(crate) fn visit_moments_pixels_in<'a>(
+    storage: hdf5_reader::storage::DynStorage,
+    requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
+    visit: impl FnMut(&str, Result<RawPixels, ReadError>),
+) -> Result<(), ReadError> {
+    let file = Hdf5File::from_storage(storage).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
+    visit_file_moments(&file, requests, visit);
+    Ok(())
+}
+
+fn visit_file_moments<'a>(
+    file: &Hdf5File,
+    requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
+    mut visit: impl FnMut(&str, Result<RawPixels, ReadError>),
+) {
+    for (path, nrays, nbins) in requests {
+        visit(path, read_moment_array(file, path, nrays, nbins));
+    }
 }
 
 /// Combine ODIM's split `/what/date` (`YYYYMMDD`) and `/what/time`

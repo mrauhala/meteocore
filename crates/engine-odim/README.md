@@ -43,10 +43,16 @@ available.
   into a shared byte-bounded cache (`MC_PVOL_PIXEL_CACHE_MB`, default
   1024). Each scan pre-decodes the default quantity of the lowest
   `prewarm_sweeps` sweeps of every volume it reads, so the first map of a
-  new volume is a cache hit. A request that reads several moments of one
-  file fetches it once, and concurrent requests that need the same remote
-  volume share one download. A request waits for a download or decode
-  that another request started only until its own deadline.
+  new volume is a cache hit. The scan also records the byte ranges of the
+  file each moment's decode reads, so a cold read fetches only those: for
+  a base-sweep reflectivity map of a 20–40 MB volume, a few hundred
+  kilobytes in four to seven GETs run at once. The whole file is read when
+  a moment is not stored in chunks, or when the read would take more than
+  ten ranges or more than half the file, as an all-quantity EDR profile
+  does. A request that reads several moments of one file reads it once,
+  and concurrent requests that need the same remote volume share one
+  download. A request waits for a download or decode that another request
+  started only until its own deadline.
 - **Read errors.** A missing or undecodable polar volume reads as no data
   and is remembered as bad. A passed deadline or a storage failure fails
   the request, so no cache keeps an empty frame: a storage failure is a
@@ -210,7 +216,10 @@ cargo test -p engine-odim
 
 - Unit tests use synthetic volumes, `testdata/pvol-cold-batch.h5` (a small
   two-sweep volume from `testdata/make_pvol_cold_batch.py`) and
-  `testdata/odim-dmi-fixture.h5` (a DMI composite).
+  `testdata/odim-dmi-fixture.h5` (a DMI composite, whose chunked dataset
+  the byte-range tests read). The byte-range tests also decode every
+  moment of the uncommitted FMI, SMHI and DMI volumes from its ranges when
+  those files are present.
 - `tests/integration.rs` runs composites against the DMI fixture, read
   locally and through an object-store adapter; template discovery probes
   stub files. Polar volumes run against FMI and SMHI files in

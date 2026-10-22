@@ -367,6 +367,56 @@ impl DataStore {
         Ok(result)
     }
 
+    /// Several byte `ranges` of one object, one buffer per range in input
+    /// order, under [`FetchBudget::Request`]. Each range is a GET of its
+    /// own, up to ten at once (object_store's `coalesce_ranges`), and only
+    /// ranges that overlap or touch are merged: the caller decides which
+    /// near ranges are worth one GET. object_store's own `get_ranges` would
+    /// merge any within 1 MiB. A missing object is `Ok(None)`, as in
+    /// [`Self::get_opt`]; every other failure, the deadline included, is an
+    /// `Err`. A range past the object's end may come back short, so a
+    /// caller that needs the exact length checks it.
+    pub fn get_ranges_opt(
+        &self,
+        path: &ObjectPath,
+        ranges: &[Range<usize>],
+    ) -> Result<Option<Vec<Bytes>>, DataServerError> {
+        self.get_ranges_opt_with(None, path, ranges)
+    }
+
+    /// [`Self::get_ranges_opt`] driven on an explicitly-provided runtime
+    /// `Handle`, as [`Self::get_opt_on`] is to [`Self::get_opt`].
+    pub fn get_ranges_opt_on(
+        &self,
+        path: &ObjectPath,
+        ranges: &[Range<usize>],
+        handle: &tokio::runtime::Handle,
+    ) -> Result<Option<Vec<Bytes>>, DataServerError> {
+        self.get_ranges_opt_with(Some(handle), path, ranges)
+    }
+
+    fn get_ranges_opt_with(
+        &self,
+        handle: Option<&tokio::runtime::Handle>,
+        path: &ObjectPath,
+        ranges: &[Range<usize>],
+    ) -> Result<Option<Vec<Bytes>>, DataServerError> {
+        let ranges: Vec<Range<u64>> = ranges.iter().cloned().map(to_u64).collect();
+        let result = self.block_on_with(handle, FetchBudget::Request, async {
+            let fetch = |range| self.inner.get_range(path, range);
+            match object_store::coalesce_ranges(&ranges, fetch, 0).await {
+                Ok(parts) => Ok(Some(parts)),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })?;
+        if let Some(parts) = &result {
+            let total: usize = parts.iter().map(Bytes::len).sum();
+            self.bytes_read.fetch_add(total as u64, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
     /// Like [`Self::get_range`], but a refusal that no retry can change is a
     /// [`RangeAnswer::Refused`] rather than an error (#1074): a missing
     /// object (404), a key these credentials may not read (401/403), and a
@@ -1936,6 +1986,47 @@ mod deadline_tests {
             ));
             assert!(matches!(
                 store.get_opt_on(&present, &handle),
+                Err(DataServerError::DeadlineExceeded)
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    /// #1047: `get_ranges_opt[_on]` returns each range's bytes in input
+    /// order and counts them, keeps a missing object (`Ok(None)`) apart from
+    /// a failed read, and answers an expired deadline without reading.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_ranges_opt_reads_ranges_and_separates_missing_from_deadline() {
+        use object_store::ObjectStoreExt;
+        let inner = object_store::memory::InMemory::new();
+        let present = ObjectPath::from("present.h5");
+        let data: Vec<u8> = (0..=255).collect();
+        inner
+            .put(&present, object_store::PutPayload::from(data))
+            .await
+            .unwrap();
+        let store = DataStore::new(Arc::new(inner));
+        let handle = tokio::runtime::Handle::current();
+        let ranges = [200..203, 4..6];
+        let parts = store.get_ranges_opt(&present, &ranges).unwrap().unwrap();
+        assert_eq!(parts, [&[200u8, 201, 202][..], &[4, 5][..]]);
+        assert_eq!(store.bytes_read(), 5);
+        tokio::task::spawn_blocking(move || {
+            let missing = ObjectPath::from("missing.h5");
+            assert!(store
+                .get_ranges_opt_on(&missing, &ranges, &handle)
+                .unwrap()
+                .is_none());
+            let parts = store.get_ranges_opt_on(&present, &ranges, &handle).unwrap();
+            assert_eq!(parts.unwrap()[1].as_ref(), &[4, 5]);
+            let _scope = ds_core::deadline::enter(Some(std::time::Instant::now()));
+            assert!(matches!(
+                store.get_ranges_opt_on(&missing, &ranges, &handle),
+                Err(DataServerError::DeadlineExceeded)
+            ));
+            assert!(matches!(
+                store.get_ranges_opt(&present, &ranges),
                 Err(DataServerError::DeadlineExceeded)
             ));
         })

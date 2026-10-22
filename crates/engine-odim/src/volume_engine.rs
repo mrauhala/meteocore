@@ -84,10 +84,11 @@ use ds_storage::discovery::{
 
 use crate::catalog::MAX_REMOTE_FILE_SIZE;
 use crate::engine::EngineError;
-use crate::pixel_cache::{MomentPixels, PixelCache};
+use crate::layout::{ReadPlan, SpanStorage};
+use crate::pixel_cache::{MomentPixels, MomentRequest, PixelCache};
 use crate::pvol::{read_polar_volume, PolarMoment, PolarVolume, Sweep};
 use crate::quantities;
-use crate::reader::{PixelClass, RawPixels};
+use crate::reader::{PixelClass, RawPixels, ReadError};
 
 /// Default lazy-pixel cache size (MB) when `MC_PVOL_PIXEL_CACHE_MB` is
 /// unset. One shared budget bounds resident decoded pixels across every
@@ -565,7 +566,9 @@ impl PixelReadError {
 /// reads of its own, and the shared remote reads a request starts rather
 /// than joins ([`RemoteRead::start`]); and of those a walk started ahead
 /// (`Pixels::start_read`). Tests pin with them how many times a volume file
-/// is downloaded (#994, #1127) and that a walk read it ahead (#999).
+/// is downloaded (#994, #1127) and that a walk read it ahead (#999). Reads
+/// of byte ranges ([`fetch_spans`], #1047) are counted apart, with their
+/// bytes.
 #[cfg(test)]
 mod file_fetches {
     use std::collections::HashMap;
@@ -575,6 +578,8 @@ mod file_fetches {
 
     static FETCHES: Counts = Mutex::new(None);
     static AHEAD: Counts = Mutex::new(None);
+    static RANGED: Counts = Mutex::new(None);
+    static RANGED_BYTES: Counts = Mutex::new(None);
 
     fn bump(counts: &Counts, file_id: &str) {
         let mut counts = counts.lock().unwrap_or_else(|e| e.into_inner());
@@ -605,6 +610,24 @@ mod file_fetches {
 
     pub(super) fn count(file_id: &str) -> usize {
         get(&FETCHES, file_id)
+    }
+
+    /// A read of a file's byte ranges (#1047), not counted as a fetch.
+    pub(super) fn record_ranged(file_id: &str, bytes: u64) {
+        bump(&RANGED, file_id);
+        let mut counts = RANGED_BYTES.lock().unwrap_or_else(|e| e.into_inner());
+        *counts
+            .get_or_insert_with(HashMap::new)
+            .entry(file_id.to_owned())
+            .or_default() += bytes as usize;
+    }
+
+    pub(super) fn ranged(file_id: &str) -> usize {
+        get(&RANGED, file_id)
+    }
+
+    pub(super) fn ranged_bytes(file_id: &str) -> usize {
+        get(&RANGED_BYTES, file_id)
     }
 
     pub(super) fn ahead(file_id: &str) -> usize {
@@ -640,13 +663,9 @@ fn fetch_file_bytes<'a>(
         Source::Local { .. } => {
             #[cfg(test)]
             file_fetches::record(file_id);
-            let bytes = std::fs::read(file_id).map(Bytes::from).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    PixelReadError::Bad(format!("read `{file_id}`: {e}"))
-                } else {
-                    PixelReadError::from_storage(file_id, DataServerError::Io(e))
-                }
-            })?;
+            let bytes = std::fs::read(file_id)
+                .map(Bytes::from)
+                .map_err(|e| local_read_error(file_id, e))?;
             Ok((bytes, None))
         }
         Source::Remote { store, .. } => {
@@ -666,6 +685,92 @@ fn fetch_file_bytes<'a>(
             Ok((classify_remote_read(file_id, bytes)?, None))
         }
     }
+}
+
+/// A failed read of a local volume file as the pixel reader sees it (#993):
+/// a missing file is unusable data, any other failure the request's.
+fn local_read_error(file_id: &str, e: std::io::Error) -> PixelReadError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        PixelReadError::Bad(format!("read `{file_id}`: {e}"))
+    } else {
+        PixelReadError::from_storage(file_id, DataServerError::Io(e))
+    }
+}
+
+/// Read the byte ranges `plan` names of one volume file: the cold-miss read
+/// of moments whose spans a scan recorded (#1047). A local file is read
+/// range by range; a remote object with a GET per range, all at once
+/// (`DataStore::get_ranges_opt`), never one GET per chunk. `Ok(None)` when
+/// the file no longer matches the scan that recorded the spans (another
+/// length, a range that comes back short): the caller then reads the whole
+/// file.
+///
+/// Classified as the whole-file read is (#993): a missing file or object
+/// is [`PixelReadError::Bad`], a deadline or any other storage failure
+/// [`PixelReadError::Abort`]. `handle` picks the async→sync bridge as for
+/// [`fetch_file_bytes`]'s unshared read.
+fn fetch_spans(
+    source: &Source,
+    file_id: &str,
+    plan: &ReadPlan,
+    handle: Option<&tokio::runtime::Handle>,
+) -> Result<Option<Arc<SpanStorage>>, PixelReadError> {
+    #[cfg(test)]
+    file_fetches::record_ranged(file_id, plan.bytes());
+    let fetched = match source {
+        Source::Local { .. } => read_local_ranges(file_id, plan)?,
+        Source::Remote { store, .. } => {
+            let object = ds_storage::object_store::path::Path::from(file_id);
+            let ranges: Vec<_> = plan
+                .ranges()
+                .iter()
+                .map(|r| r.start as usize..r.end as usize)
+                .collect();
+            let read = match handle {
+                Some(h) => store.get_ranges_opt_on(&object, &ranges, h),
+                None => store.get_ranges_opt(&object, &ranges),
+            };
+            match read {
+                Ok(Some(parts)) => Some(parts),
+                Ok(None) => {
+                    return Err(PixelReadError::Bad(format!(
+                        "get `{file_id}`: object not found"
+                    )))
+                }
+                Err(e) => return Err(PixelReadError::from_storage(file_id, e)),
+            }
+        }
+    };
+    let storage = fetched.and_then(|parts| SpanStorage::new(plan, parts));
+    if storage.is_none() {
+        tracing::debug!("PVOL `{file_id}` changed since its scan; reading the whole file");
+    }
+    Ok(storage.map(Arc::new))
+}
+
+/// [`fetch_spans`] of a local file: `None` when its length is not the one
+/// the spans were recorded from.
+fn read_local_ranges(file_id: &str, plan: &ReadPlan) -> Result<Option<Vec<Bytes>>, PixelReadError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(file_id).map_err(|e| local_read_error(file_id, e))?;
+    let len = file
+        .metadata()
+        .map_err(|e| local_read_error(file_id, e))?
+        .len();
+    if len != plan.file_len() {
+        return Ok(None);
+    }
+    plan.ranges()
+        .iter()
+        .map(|range| {
+            let mut buf = vec![0; (range.end - range.start) as usize];
+            file.seek(SeekFrom::Start(range.start))?;
+            file.read_exact(&mut buf)?;
+            Ok(Bytes::from(buf))
+        })
+        .collect::<std::io::Result<_>>()
+        .map(Some)
+        .map_err(|e| local_read_error(file_id, e))
 }
 
 /// The runtime a remote volume read runs on as a task, so that other
@@ -1015,6 +1120,7 @@ impl<'a> Pixels<'a> {
     ) -> Result<MomentPixels, DataServerError> {
         self.load_moments(
             file_id,
+            volume,
             volume.sweeps.iter().flat_map(|sweep| {
                 sweep
                     .moments
@@ -1025,9 +1131,11 @@ impl<'a> Pixels<'a> {
         )
     }
 
-    /// Resolve exactly `targets` — moments of the one volume file `file_id`
-    /// — as one batch: cached arrays are reused, and every missing one is
-    /// decoded from a single GET and HDF5 open of the file (#994), or from
+    /// Resolve exactly `targets` — moments of `volume`, read from the file
+    /// `file_id` — as one batch: cached arrays are reused, and every missing
+    /// one is decoded from a single read and HDF5 open of the file (#994):
+    /// the byte ranges their decode reads when the scan recorded them and
+    /// they are a small part of the file (#1047), else the whole file, or
     /// the bytes a background sibling decode still holds. The returned Arcs
     /// outlive LRU eviction for the rest of the request.
     ///
@@ -1038,9 +1146,10 @@ impl<'a> Pixels<'a> {
     fn load_moments<'v>(
         &self,
         file_id: &str,
+        volume: &PolarVolume,
         targets: impl IntoIterator<Item = (&'v Sweep, &'v PolarMoment)>,
     ) -> Result<MomentPixels, DataServerError> {
-        self.load_moments_from(file_id, targets, None)
+        self.load_moments_from(file_id, volume, targets, None)
     }
 
     /// [`Self::load_moments`], decoding any missing moment from `fetched`
@@ -1053,18 +1162,30 @@ impl<'a> Pixels<'a> {
     fn load_moments_from<'v>(
         &self,
         file_id: &str,
+        volume: &PolarVolume,
         targets: impl IntoIterator<Item = (&'v Sweep, &'v PolarMoment)>,
         fetched: Option<Result<Bytes, PixelReadError>>,
     ) -> Result<MomentPixels, DataServerError> {
         let cache_id = pixel_cache_id(self.source, file_id);
-        let requests: Vec<_> = targets
+        let (moments, requests): (Vec<_>, Vec<_>) = targets
             .into_iter()
-            .map(|(sweep, m)| (m.dataset_path.as_str(), sweep.nrays, sweep.nbins))
-            .collect();
+            .map(|(sweep, m)| (m, (m.dataset_path.as_str(), sweep.nrays, sweep.nbins)))
+            .unzip();
         if requests.is_empty() {
             return Ok(MomentPixels::new());
         }
         let (pixels, failures) = PIXEL_CACHE.load_many(&cache_id, &requests, |missing, held| {
+            if held.is_none() && fetched.is_none() {
+                match self.moments_from_spans(file_id, volume, &moments, missing) {
+                    Ok(Some(pixels)) => return Ok(pixels),
+                    Ok(None) => {}
+                    Err(PixelReadError::Abort(e)) => return Err(e),
+                    Err(PixelReadError::Bad(e)) => {
+                        tracing::warn!("PVOL batch pixel read failed for `{file_id}`: {e}");
+                        return Ok(Vec::new());
+                    }
+                }
+            }
             // Held until the moments are decoded (#1127).
             let mut download = None;
             let bytes = match (held, fetched) {
@@ -1110,13 +1231,49 @@ impl<'a> Pixels<'a> {
     fn prefetch<'v>(
         &self,
         file_id: &str,
+        volume: &PolarVolume,
         targets: impl IntoIterator<Item = (&'v Sweep, &'v PolarMoment)>,
         fetched: Option<Result<Bytes, PixelReadError>>,
     ) -> Result<Option<MomentPixels>, DataServerError> {
         if self.moments.is_some() {
             return Ok(None);
         }
-        self.load_moments_from(file_id, targets, fetched).map(Some)
+        self.load_moments_from(file_id, volume, targets, fetched)
+            .map(Some)
+    }
+
+    /// A batch's `missing` moments (of `moments`, all of `volume`) read by
+    /// byte range (#1047): the spans their decode reads, fetched at once
+    /// ([`fetch_spans`]), decoded in one HDF5 open. `Ok(None)` when the
+    /// whole file must be read instead: no plan for these moments
+    /// ([`ReadPlan::new`]), the file changed since the scan, or the decode
+    /// read outside the fetched ranges. A moment that does not decode is
+    /// left out, as from the whole file.
+    fn moments_from_spans(
+        &self,
+        file_id: &str,
+        volume: &PolarVolume,
+        moments: &[&PolarMoment],
+        missing: &[MomentRequest<'_>],
+    ) -> Result<Option<Vec<(String, RawPixels)>>, PixelReadError> {
+        let wanted: Option<Vec<&PolarMoment>> = missing
+            .iter()
+            .map(|(path, _, _)| moments.iter().copied().find(|m| m.dataset_path == *path))
+            .collect();
+        let Some(plan) = wanted.and_then(|wanted| ReadPlan::new(volume, wanted)) else {
+            return Ok(None);
+        };
+        let Some(storage) = fetch_spans(self.source, file_id, &plan, self.handle)? else {
+            return Ok(None);
+        };
+        let decoded = crate::pvol::read_moments_pixels_in(storage.clone(), missing.iter().copied());
+        if storage.missed() {
+            tracing::warn!("PVOL batch of `{file_id}` read outside its spans; reading the file");
+            return Ok(None);
+        }
+        decoded
+            .map(Some)
+            .map_err(|e| PixelReadError::Bad(e.to_string()))
     }
 
     /// The runtime a walk over `volumes` volumes starts its downloads on
@@ -1183,12 +1340,15 @@ impl<'a> Pixels<'a> {
         }
     }
 
-    /// Fetch a decoded moment. A cold miss downloads the file once, decodes
-    /// only the requested moment on the caller's thread and returns it; a
-    /// bounded set of siblings (`sibling_requests`) is decoded afterwards on
-    /// the background runtime (#994). Concurrent misses on one file share a
-    /// file lock, and a miss while a sibling decode still holds the file's
-    /// bytes decodes from them instead of downloading again.
+    /// Fetch a decoded moment. A cold miss reads the byte ranges the
+    /// moment's decode needs when the scan recorded them
+    /// ([`Self::moment_from_spans`], #1047), else downloads the file once;
+    /// either way it decodes only the requested moment on the caller's
+    /// thread and returns it. After a whole-file download a bounded set of
+    /// siblings (`sibling_requests`) is decoded on the background runtime
+    /// (#994). Concurrent misses on one file share a file lock, and a miss
+    /// while a sibling decode still holds the file's bytes decodes from them
+    /// instead of reading again.
     ///
     /// `Ok(None)` when the data itself is unusable (missing file, HDF5 open or
     /// decode failure): the caller samples nodata, so one corrupt file degrades
@@ -1255,34 +1415,43 @@ impl<'a> Pixels<'a> {
                 return Ok(None);
             }
             PIXEL_CACHE.record_miss();
-            // Held until the moment is decoded and cached (#1127).
-            let mut download = None;
-            let bytes = match held {
-                Some(bytes) => Ok(bytes),
-                None => fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
-                    download = read;
-                    bytes
-                }),
+            let path = moment.dataset_path.as_str();
+            // The moment's byte ranges first (#1047), unless a sibling decode
+            // holds the whole file.
+            let ranged = match &held {
+                Some(_) => Ok(None),
+                None => self.moment_from_spans(file_id, volume, moment, nrays, nbins),
             };
-            let decoded = bytes.and_then(|bytes| {
-                let path = moment.dataset_path.as_str();
-                let mut result = None;
-                crate::pvol::visit_moments_pixels(&bytes, [(path, nrays, nbins)], |_, r| {
-                    result = Some(r);
-                })
-                .map_err(|e| PixelReadError::Bad(format!("open volume: {e}")))?;
-                let raw = match result {
-                    Some(Ok(raw)) => raw,
-                    Some(Err(e)) => {
-                        return Err(PixelReadError::Bad(format!("decode `{path}`: {e}")));
+            let decoded = ranged.and_then(|raw| {
+                if let Some(raw) = raw {
+                    let pixels = Arc::new(raw);
+                    PIXEL_CACHE.insert(&cache_id, path, pixels.clone());
+                    return Ok(pixels);
+                }
+                // Held until the moment is decoded and cached (#1127).
+                let mut download = None;
+                let bytes = match held {
+                    Some(bytes) => Ok(bytes),
+                    None => {
+                        fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
+                            download = read;
+                            bytes
+                        })
                     }
-                    None => return Err(PixelReadError::Bad(format!("decode `{path}` failed"))),
                 };
-                let pixels = Arc::new(raw);
-                PIXEL_CACHE.insert(&cache_id, path, pixels.clone());
-                let siblings = sibling_requests(volume, moment, nrays, nbins, &cache_id);
-                spawn_sibling_decode(background, &cache_id, &bytes, siblings);
-                Ok(pixels)
+                bytes.and_then(|bytes| {
+                    let mut result = None;
+                    let opened = crate::pvol::visit_moments_pixels(
+                        &bytes,
+                        [(path, nrays, nbins)],
+                        |_, r| result = Some(r),
+                    );
+                    let pixels = Arc::new(single_moment(path, opened, result)?);
+                    PIXEL_CACHE.insert(&cache_id, path, pixels.clone());
+                    let siblings = sibling_requests(volume, moment, nrays, nbins, &cache_id);
+                    spawn_sibling_decode(background, &cache_id, &bytes, siblings);
+                    Ok(pixels)
+                })
             });
             match decoded {
                 Ok(pixels) => Ok(Some(pixels)),
@@ -1299,6 +1468,59 @@ impl<'a> Pixels<'a> {
                 }
             }
         })?
+    }
+
+    /// A cold single-moment miss read by byte range (#1047): the spans the
+    /// moment's decode reads, fetched at once ([`fetch_spans`]) and decoded
+    /// on this thread. `Ok(None)` when the whole file must be read instead:
+    /// no plan for the moment ([`ReadPlan::new`]), the file changed since
+    /// the scan, or the decode read outside the fetched ranges.
+    ///
+    /// No sibling is decoded ahead (#994): after a whole-file download the
+    /// siblings cost no I/O, after a ranged read each would be another, and
+    /// the next `ELEVATION` step is a ranged miss of its own.
+    fn moment_from_spans(
+        &self,
+        file_id: &str,
+        volume: &PolarVolume,
+        moment: &PolarMoment,
+        nrays: usize,
+        nbins: usize,
+    ) -> Result<Option<RawPixels>, PixelReadError> {
+        let Some(plan) = ReadPlan::new(volume, [moment]) else {
+            return Ok(None);
+        };
+        let Some(storage) = fetch_spans(self.source, file_id, &plan, self.handle)? else {
+            return Ok(None);
+        };
+        let path = moment.dataset_path.as_str();
+        let mut result = None;
+        let opened = crate::pvol::visit_moments_pixels_in(
+            storage.clone(),
+            [(path, nrays, nbins)],
+            |_, r| result = Some(r),
+        );
+        if storage.missed() {
+            tracing::warn!("PVOL `{path}` of `{file_id}` read outside its spans; reading the file");
+            return Ok(None);
+        }
+        single_moment(path, opened, result).map(Some)
+    }
+}
+
+/// The one moment a single-moment decode produced, as a cold miss classifies
+/// it (#993): a volume that does not open, or a moment that does not
+/// decode, is unusable data.
+fn single_moment(
+    path: &str,
+    opened: Result<(), ReadError>,
+    result: Option<Result<RawPixels, ReadError>>,
+) -> Result<RawPixels, PixelReadError> {
+    opened.map_err(|e| PixelReadError::Bad(format!("open volume: {e}")))?;
+    match result {
+        Some(Ok(raw)) => Ok(raw),
+        Some(Err(e)) => Err(PixelReadError::Bad(format!("decode `{path}`: {e}"))),
+        None => Err(PixelReadError::Bad(format!("decode `{path}` failed"))),
     }
 }
 
@@ -1875,14 +2097,15 @@ fn build_catalog(
         }
         match spec {
             // Local reads are cheap; do them inline.
-            FetchSpec::Local(path) => match std::fs::read(&path) {
+            FetchSpec::Local(path) => match std::fs::read(&path).map(Bytes::from) {
                 Ok(bytes) => {
                     if let Some(v) = parse_and_cache(collection_id, &id, &bytes, cache) {
                         // Prime the pixel cache from the bytes still in hand
                         // (#472): off-peak the page cache for these files is
                         // routinely reclaimed, so without this the first
-                        // render of each new timestep pays a cold whole-file
-                        // read + parse on a render permit (~2–3 s p99 spikes).
+                        // render of each new timestep pays a cold disk read
+                        // + parse on a render permit (~2–3 s p99 spikes when
+                        // that read was the whole file, before #1047).
                         // Only reached for parse-cache misses: steady-state
                         // polls warm just the new files. A PROCESS START warms
                         // the whole retained window once (every file is a
@@ -1954,8 +2177,8 @@ fn build_catalog(
                         // Prime the pixel cache from the bytes still in hand
                         // (background runtime), so the first interactive render
                         // of this newly-fetched volume is a cache hit instead
-                        // of a cold whole-`.h5` S3 re-download on a render
-                        // permit (#461; the local arm does the same — #472).
+                        // of a cold S3 read on a render permit (#461; the
+                        // local arm does the same — #472).
                         prewarm_pixels(source, id, &v, &bytes, prewarm_sweeps);
                         if newest_of_site(cells_after, &v) {
                             crate::cells::warm_from_bytes(source, id, &v, &bytes);
@@ -1989,14 +2212,25 @@ fn newest_of_site(previous: Option<&Catalog>, volume: &PolarVolume) -> bool {
 /// Parse `bytes` into a `PolarVolume`, insert into the shared parse cache
 /// keyed by `id`, and return the shared handle. A parse failure is logged
 /// and yields `None` (the file is skipped, not fatal to the scan).
+///
+/// Each moment also records the byte spans its decode reads
+/// ([`crate::layout::probe`], #1047), from the bytes in hand, so that a cold
+/// pixel miss fetches those ranges rather than the whole file.
 fn parse_and_cache(
     collection_id: &str,
     id: &str,
-    bytes: &[u8],
+    bytes: &Bytes,
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
 ) -> Option<Arc<PolarVolume>> {
     match read_polar_volume(bytes) {
-        Ok(v) => {
+        Ok(mut v) => {
+            let probed = crate::layout::probe(bytes, &mut v);
+            let moments: usize = v.sweeps.iter().map(|s| s.moments.len()).sum();
+            if probed < moments {
+                tracing::debug!(
+                    "[{collection_id}] PVOL `{id}`: {probed} of {moments} moments range-readable"
+                );
+            }
             let v = Arc::new(v);
             cache
                 .lock()
@@ -2018,8 +2252,10 @@ fn parse_and_cache(
 ///
 /// This is the poll-time half of the lazy-pixel design (#289): the catalog
 /// holds metadata only and a moment's array is normally read on its first
-/// render — a cold whole-`.h5` read + full HDF5 parse performed **while
-/// holding a render semaphore permit**. Both source kinds need the warm-up:
+/// render — a cold read + HDF5 open performed **while holding a render
+/// semaphore permit**, of the moment's byte ranges when the scan recorded
+/// them (#1047), else of the whole `.h5`. Both source kinds need the
+/// warm-up:
 ///
 /// - **Remote (#461):** under a burst (a client animating the latest N
 ///   timesteps) the cold S3 downloads contend and some requests are cut off
@@ -3302,7 +3538,7 @@ fn walk_volumes<'v, S, T>(
         // request that needs the file meanwhile does not download it again
         // (#1127).
         let fetched = read.as_mut().map(|read| read.wait(pix.handle));
-        let batch = pix.prefetch(&entry.id, targets, fetched)?;
+        let batch = pix.prefetch(&entry.id, &entry.volume, targets, fetched)?;
         drop(read);
         out.push(sample(entry, state, pix.batched(&batch))?);
     }
@@ -6792,10 +7028,12 @@ mod tests {
                     PolarMoment {
                         quantity: "CCORH".to_string(),
                         dataset_path: format!("/dataset{n}/data1/data"),
+                        spans: None,
                         ..dbzh.clone()
                     },
                     PolarMoment {
                         dataset_path: format!("/dataset{n}/data2/data"),
+                        spans: None,
                         ..dbzh
                     },
                 ];
@@ -7215,6 +7453,7 @@ mod tests {
             nodata: 65_535.0,
             undetect: 65_534.0,
             dataset_path: SYNTHETIC_DS.to_string(),
+            spans: None,
         };
         let pix = test_pixels();
         assert!(pix
@@ -7343,6 +7582,372 @@ mod tests {
             .is_none());
         let cache_id = pixel_cache_id(&source, &missing);
         assert!(pixel_cache().is_known_bad(&cache_id, &moment.dataset_path));
+    }
+
+    /// The committed DMI composite padded to 4 MiB as a one-moment volume,
+    /// with the spans a scan records ([`crate::layout::probe`], #1047): the
+    /// moment's ranges are then a small part of the file, as in a real
+    /// volume. Returns the bytes, the volume, and the whole-file decode.
+    fn ranged_volume() -> (Bytes, PolarVolume, RawPixels) {
+        use crate::layout::tests::{one_moment_volume, padded, COMP, COMP_DATA};
+        let bytes = padded(COMP, 4 << 20);
+        let mut volume = one_moment_volume(&bytes, COMP_DATA);
+        assert_eq!(crate::layout::probe(&bytes, &mut volume), 1);
+        let sweep = &volume.sweeps[0];
+        let whole =
+            crate::pvol::read_moment_pixels(&bytes, COMP_DATA, sweep.nrays, sweep.nbins).unwrap();
+        (bytes, volume, whole)
+    }
+
+    /// `bytes` under a fresh key of a GET-counting in-memory remote source.
+    fn counted_remote(bytes: &Bytes) -> (Arc<Source>, String, Arc<CountingStore>) {
+        use ds_storage::object_store::{ObjectStoreExt, PutPayload};
+        let key = unique_file_id();
+        let inner = ds_storage::object_store::memory::InMemory::new();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(inner.put(
+                &ds_storage::object_store::path::Path::from(key.as_str()),
+                PutPayload::from(bytes.clone()),
+            ))
+            .unwrap();
+        let counted = Arc::new(CountingStore {
+            inner: Arc::new(inner),
+            gets: Mutex::default(),
+            fail_first: Mutex::default(),
+        });
+        let source = Source::Remote {
+            store: ds_storage::DataStore::new(counted.clone()),
+            endpoint: "https://s3.example.com".to_string(),
+            bucket: "range-read-test".to_string(),
+            prefix_pattern: "%Y/".to_string(),
+            time_window: None,
+        };
+        (Arc::new(source), key, counted)
+    }
+
+    fn bytes_read(source: &Source) -> u64 {
+        match source {
+            Source::Remote { store, .. } => store.bytes_read(),
+            Source::Local { .. } => unreachable!("a remote source"),
+        }
+    }
+
+    /// #1047: a cold miss on a moment with recorded spans reads only their
+    /// byte ranges, one GET per range and no whole-file GET, and decodes the
+    /// whole-file pixels bit for bit; from a request worker (no handle) and
+    /// from a blocking-pool worker (explicit handle) alike.
+    #[test]
+    fn cold_miss_reads_only_the_moments_byte_ranges() {
+        use crate::layout::tests::same_pixels;
+        let (bytes, volume, whole) = ranged_volume();
+        let volume = Arc::new(volume);
+        let moment = &volume.sweeps[0].moments[0];
+        let plan = ReadPlan::new(&volume, [moment]).expect("a plan");
+        assert!(plan.bytes() * 50 < bytes.len() as u64, "{plan:?}");
+
+        let (source, key, store) = counted_remote(&bytes);
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let (nrays, nbins) = (volume.sweeps[0].nrays, volume.sweeps[0].nbins);
+        let raw = pix
+            .moment_with(&key, &volume, moment, nrays, nbins, None)
+            .unwrap()
+            .expect("decoded from its ranges");
+        assert!(same_pixels(&raw, &whole));
+        assert_eq!(store.gets(&key), plan.ranges().len());
+        assert_eq!(bytes_read(&source), plan.bytes());
+        assert_eq!(file_fetches::count(&key), 0, "no whole-file read");
+        assert_eq!(file_fetches::ranged(&key), 1);
+        pix.moment_with(&key, &volume, moment, nrays, nbins, None)
+            .unwrap()
+            .expect("a cache hit");
+        assert_eq!(store.gets(&key), plan.ranges().len(), "a hit reads nothing");
+
+        let (source, key, store) = counted_remote(&bytes);
+        let runtime = query_runtime();
+        let handle = runtime.handle().clone();
+        let (blocking_source, blocking_key, blocking_volume) =
+            (source.clone(), key.clone(), volume.clone());
+        let raw = runtime
+            .block_on(runtime.spawn_blocking(move || {
+                let pix = Pixels {
+                    moments: None,
+                    source: &blocking_source,
+                    handle: Some(&handle),
+                };
+                let moment = &blocking_volume.sweeps[0].moments[0];
+                pix.moment_with(&blocking_key, &blocking_volume, moment, nrays, nbins, None)
+            }))
+            .unwrap()
+            .unwrap()
+            .expect("decoded from its ranges");
+        assert!(same_pixels(&raw, &whole));
+        assert_eq!(store.gets(&key), plan.ranges().len());
+        assert_eq!(file_fetches::count(&key), 0);
+    }
+
+    /// #1047 keeps #993: a ranged miss on a missing object is unusable data
+    /// (nodata, known bad, no whole-file retry), and one cut off by the
+    /// deadline is the request's error, marks nothing bad, and a retry reads.
+    #[test]
+    fn ranged_miss_is_classified_as_the_whole_file_read() {
+        let (bytes, volume, _) = ranged_volume();
+        let (source, key, _) = counted_remote(&bytes);
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let sweep = &volume.sweeps[0];
+        let moment = &sweep.moments[0];
+
+        let missing = unique_file_id();
+        assert!(pix
+            .moment(&missing, &volume, moment, sweep.nrays, sweep.nbins)
+            .unwrap()
+            .is_none());
+        let missing_id = pixel_cache_id(&source, &missing);
+        assert!(pixel_cache().is_known_bad(&missing_id, &moment.dataset_path));
+        assert_eq!(file_fetches::ranged(&missing), 1);
+        assert_eq!(file_fetches::count(&missing), 0);
+
+        {
+            let _deadline = expired_deadline();
+            let result = pix.moment(&key, &volume, moment, sweep.nrays, sweep.nbins);
+            assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
+        }
+        let cache_id = pixel_cache_id(&source, &key);
+        assert!(!pixel_cache().is_known_bad(&cache_id, &moment.dataset_path));
+        assert!(pix
+            .moment(&key, &volume, moment, sweep.nrays, sweep.nbins)
+            .unwrap()
+            .is_some());
+        assert_eq!(file_fetches::count(&key), 0);
+    }
+
+    /// #1047: a miss with no usable plan reads the whole file, and so does
+    /// one whose ranged decode reads outside the fetched ranges, or whose
+    /// local file no longer has the probed length; the pixels are the same
+    /// and nothing is marked bad.
+    #[test]
+    fn misses_without_a_usable_plan_read_the_whole_file() {
+        use crate::layout::tests::{same_pixels, truncate_last_span};
+        let dir = tempfile::tempdir().unwrap();
+        let pix = test_pixels();
+        let cold_miss = |path: &std::path::Path, volume: &PolarVolume| {
+            let file_id = path.to_str().unwrap().to_owned();
+            let sweep = &volume.sweeps[0];
+            let raw = pix
+                .moment_with(
+                    &file_id,
+                    volume,
+                    &sweep.moments[0],
+                    sweep.nrays,
+                    sweep.nbins,
+                    None,
+                )
+                .unwrap()
+                .expect("decoded");
+            let ranged = file_fetches::ranged(&file_id);
+            let whole = file_fetches::count(&file_id);
+            assert!(!pixel_cache().is_known_bad(&file_id, &sweep.moments[0].dataset_path));
+            (raw, ranged, whole)
+        };
+
+        // Contiguous storage: no spans, no ranged read.
+        let cold_batch = include_bytes!("../../../testdata/pvol-cold-batch.h5");
+        let mut contiguous = crate::pvol::read_polar_volume(cold_batch).unwrap();
+        crate::layout::probe(&Bytes::from_static(cold_batch), &mut contiguous);
+        let path = dir.path().join("contiguous.h5");
+        std::fs::write(&path, cold_batch).unwrap();
+        let (_, ranged, whole) = cold_miss(&path, &contiguous);
+        assert_eq!((ranged, whole), (0, 1));
+
+        // The decode reads past its spans: a miss, then the whole file.
+        let (bytes, mut volume, expected) = ranged_volume();
+        truncate_last_span(&mut volume.sweeps[0].moments[0]);
+        let path = dir.path().join("missed.h5");
+        std::fs::write(&path, &bytes).unwrap();
+        let (raw, ranged, whole) = cold_miss(&path, &volume);
+        assert!(same_pixels(&raw, &expected));
+        assert_eq!((ranged, whole), (1, 1));
+
+        // The file grew since the scan: its length is checked, not trusted.
+        let (bytes, volume, expected) = ranged_volume();
+        let path = dir.path().join("grown.h5");
+        std::fs::write(&path, [&bytes[..], b"more"].concat()).unwrap();
+        let (raw, ranged, whole) = cold_miss(&path, &volume);
+        assert!(same_pixels(&raw, &expected));
+        assert_eq!((ranged, whole), (1, 1));
+    }
+
+    /// #1047: a batch (an EDR walk's prefetch, the 3D read) reads its missing
+    /// moments' byte ranges when they have a plan, and the whole file when
+    /// one has no spans; a moment that does not decode is left out either
+    /// way.
+    #[test]
+    fn a_batch_reads_byte_ranges_or_the_whole_file() {
+        use crate::layout::tests::same_pixels;
+        let (bytes, volume, whole) = ranged_volume();
+        let (source, key, store) = counted_remote(&bytes);
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let quantity = volume.sweeps[0].moments[0].quantity.clone();
+        let plan = ReadPlan::new(&volume, &volume.sweeps[0].moments).unwrap();
+        let moments = pix.volume_moments(&volume, &key, &quantity).unwrap();
+        let path = &volume.sweeps[0].moments[0].dataset_path;
+        assert!(same_pixels(&moments[path], &whole));
+        assert_eq!(store.gets(&key), plan.ranges().len());
+        assert_eq!(
+            (file_fetches::ranged(&key), file_fetches::count(&key)),
+            (1, 0)
+        );
+
+        // A second sweep with no spans (and no dataset) takes the batch to
+        // the whole file.
+        let mut mixed = volume.clone();
+        let mut absent = mixed.sweeps[0].clone();
+        absent.elangle = 1.5;
+        absent.moments[0].dataset_path = "/dataset9/data1/data".into();
+        absent.moments[0].spans = None;
+        mixed.sweeps.push(absent);
+        let (source, key, _) = counted_remote(&bytes);
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let moments = pix.volume_moments(&mixed, &key, &quantity).unwrap();
+        assert_eq!(moments.len(), 1, "the absent dataset is left out");
+        assert!(same_pixels(&moments[path], &whole));
+        assert_eq!(
+            (file_fetches::ranged(&key), file_fetches::count(&key)),
+            (0, 1)
+        );
+    }
+
+    /// #1047 on the local radar fixtures (not committed; each skips when
+    /// absent): the scan records spans for every moment of the FMI, SMHI and
+    /// DMI volumes; each moment decodes from exactly its recorded reads, and
+    /// from its plan when it has one, bit for bit as from the whole file; and
+    /// a cold miss on the base sweep's default quantity reads a small part
+    /// of the file. Run with `--nocapture` for the bytes read per fixture.
+    #[test]
+    fn fixture_volumes_decode_identically_from_their_byte_ranges() {
+        use crate::layout::tests::{decode_planned, decode_planned_batch, exact_plan, same_pixels};
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
+        let mut found = 0;
+        for dir in [
+            "radar-fmi-pvol",
+            "radar-smhi-pvol",
+            "radar-dmi-pvol",
+            "radar-fmi-vihti-h5",
+        ] {
+            let Some(path) = std::fs::read_dir(root.join(dir)).ok().and_then(|entries| {
+                let mut paths: Vec<_> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
+                paths.sort();
+                paths
+                    .into_iter()
+                    .find(|p| p.extension().is_some_and(|e| e == "h5"))
+            }) else {
+                eprintln!("skipping {dir}: fixture absent");
+                continue;
+            };
+            found += 1;
+            let file_id = path.to_str().unwrap().to_owned();
+            let bytes = Bytes::from(std::fs::read(&path).unwrap());
+            let cache = Mutex::new(HashMap::new());
+            let volume = parse_and_cache("fixture", &file_id, &bytes, &cache).unwrap();
+            let mut planned = 0;
+            for sweep in &volume.sweeps {
+                for moment in &sweep.moments {
+                    let path = moment.dataset_path.as_str();
+                    assert!(moment.spans.is_some(), "{file_id}: {path} has no spans");
+                    let whole =
+                        crate::pvol::read_moment_pixels(&bytes, path, sweep.nrays, sweep.nbins)
+                            .unwrap();
+                    let exact = exact_plan(&bytes, path).unwrap();
+                    let (raw, missed) =
+                        decode_planned(&bytes, &exact, path, sweep.nrays, sweep.nbins);
+                    assert!(!missed, "{file_id}: {path} read outside its recorded reads");
+                    assert!(same_pixels(&raw.unwrap(), &whole), "{file_id}: {path}");
+                    if let Some(plan) = ReadPlan::new(&volume, [moment]) {
+                        planned += 1;
+                        let (raw, missed) =
+                            decode_planned(&bytes, &plan, path, sweep.nrays, sweep.nbins);
+                        assert!(!missed && same_pixels(&raw.unwrap(), &whole), "{path}");
+                    }
+                }
+            }
+
+            // The base sweep's moments in one open, as an EDR profile's
+            // batch reads them, when they fit a plan.
+            let base = &volume.sweeps[0];
+            if let Some(plan) = ReadPlan::new(&volume, &base.moments) {
+                let requests: Vec<_> = base
+                    .moments
+                    .iter()
+                    .map(|m| (m.dataset_path.as_str(), base.nrays, base.nbins))
+                    .collect();
+                let (decoded, missed) = decode_planned_batch(&bytes, &plan, &requests);
+                assert!(!missed, "{dir}: the base sweep batch read outside its plan");
+                assert_eq!(decoded.len(), requests.len());
+                for (path, raw) in decoded {
+                    let whole =
+                        crate::pvol::read_moment_pixels(&bytes, &path, base.nrays, base.nbins)
+                            .unwrap();
+                    assert!(same_pixels(&raw, &whole), "{dir}: batch {path}");
+                }
+            }
+
+            let quantities: Vec<String> = {
+                let mut q: Vec<_> = volume.sweeps[0]
+                    .moments
+                    .iter()
+                    .map(|m| m.quantity.clone())
+                    .collect();
+                q.sort();
+                q
+            };
+            let quantity = default_quantity_of(&quantities).unwrap();
+            let base = &volume.sweeps[0];
+            let moment = base
+                .moments
+                .iter()
+                .find(|m| m.quantity == quantity)
+                .unwrap();
+            let raw = test_pixels()
+                .moment_with(&file_id, &volume, moment, base.nrays, base.nbins, None)
+                .unwrap()
+                .expect("the base sweep decodes");
+            assert_eq!(raw.shape(), (base.nrays, base.nbins));
+            let read = file_fetches::ranged_bytes(&file_id) as u64;
+            let ranges = ReadPlan::new(&volume, [moment]).map_or(0, |p| p.ranges().len());
+            eprintln!(
+                "{dir}: cold {quantity} base-sweep miss read {read} of {} bytes ({:.2} %) \
+                 in {ranges} ranges; {planned} of {} moments have a plan alone",
+                bytes.len(),
+                100.0 * read as f64 / bytes.len() as f64,
+                volume.sweeps.iter().map(|s| s.moments.len()).sum::<usize>(),
+            );
+            assert_eq!(
+                file_fetches::count(&file_id),
+                0,
+                "{dir}: no whole-file read"
+            );
+            assert!(read * 20 < bytes.len() as u64, "{dir}: {read} bytes");
+        }
+        if found == 0 {
+            eprintln!("skipping fixture_volumes_decode_identically_from_their_byte_ranges");
+        }
     }
 
     /// #993: any storage failure other than a missing object is retryable:
@@ -8161,6 +8766,7 @@ mod tests {
             nodata: 65_535.0,
             undetect: 65_534.0,
             dataset_path: SYNTHETIC_DS.to_string(),
+            spans: None,
         };
         let sweep = Sweep {
             elangle: 0.5,
@@ -8183,6 +8789,7 @@ mod tests {
             time: Utc::now(),
             object: "PVOL".to_string(),
             sweeps: vec![sweep],
+            file_len: 0,
         }
     }
 
@@ -8459,6 +9066,7 @@ mod tests {
             nodata: 65_535.0,
             undetect: 65_534.0,
             dataset_path: SYNTHETIC_DS.to_string(),
+            spans: None,
         };
         (moment, RawPixels::U16(data))
     }
@@ -8671,6 +9279,7 @@ mod tests {
             nodata: 65_535.0,
             undetect: 65_534.0,
             dataset_path: SYNTHETIC_DS.to_string(),
+            spans: None,
         };
         let sweep = Sweep {
             elangle: 0.5,
@@ -8693,6 +9302,7 @@ mod tests {
             time: Utc::now(),
             object: "PVOL".to_string(),
             sweeps: vec![sweep],
+            file_len: 0,
         };
         // A box NE of the site spanning many azimuths within range.
         let bbox = [
@@ -8756,6 +9366,7 @@ mod tests {
             nodata: 65_535.0,
             undetect: 65_534.0,
             dataset_path: SYNTHETIC_DS.to_string(),
+            spans: None,
         };
         let sweep = Sweep {
             elangle: 0.5,
@@ -8778,6 +9389,7 @@ mod tests {
             time: Utc::now(),
             object: "PVOL".to_string(),
             sweeps: vec![sweep],
+            file_len: 0,
         };
         let bbox = [
             site_lon + 0.02,

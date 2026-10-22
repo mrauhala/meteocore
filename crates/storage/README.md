@@ -200,6 +200,15 @@ HTTP store, carry the status only in the text of a private error, which
 Every other failure stays an `Err`. engine-geotiff's tile reads use it to
 tell a gone object from a failed read.
 
+`get_ranges_opt` (and `_on`) reads several byte ranges of one object under
+the request budget: one GET per range, up to ten at once, through
+object_store's `coalesce_ranges`. Only ranges that overlap or touch are
+merged, so the caller decides which near ranges are worth one GET;
+object_store's own `get_ranges` would merge any within 1 MiB. A missing
+object is `Ok(None)`, as in `get_opt`, and a range past the end may come
+back short, so the caller checks lengths. The PVOL engine reads the byte
+spans of a moment's decode with it (#1047).
+
 # Request limits
 
 `DataStore::with_request_limit(n)` wraps a store in object_store's

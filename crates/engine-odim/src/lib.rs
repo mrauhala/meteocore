@@ -23,6 +23,7 @@ pub mod catalog;
 pub mod cells;
 pub mod edr;
 pub mod engine;
+mod layout;
 pub mod pixel_cache;
 pub mod proj;
 pub mod pvol;
