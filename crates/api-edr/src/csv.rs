@@ -113,18 +113,24 @@ pub enum CsvError {
     NotStationSeries(&'static str),
     /// The body would be over the byte cap it was written with.
     TooLarge,
+    /// Admission refused the body's counted size: the EDR response budget
+    /// is in use (#1041).
+    Busy,
 }
 
 /// Encode a station-series result as CSV in the long layout (see the module
 /// docs), at most `max_bytes` long ([`MAX_BYTES`] for a response).
 /// `identify` names the location each coverage (by index) belongs to, as
 /// for the GeoJSON encoding. Every coverage is checked before a row is
-/// written, and the body's size is counted before it is allocated.
-pub fn write_station_series<'n>(
+/// written, and the body's size is counted before it is allocated, then
+/// admitted: `admit`'s `None` is [`CsvError::Busy`]. The response keeps
+/// what `admit` returns (its budget reservation, #1041) with the body.
+pub(crate) fn write_station_series<'n, A>(
     result: &CoverageResponse,
     identify: impl Fn(usize, &QueryResult) -> Option<FeatureIdentity<'n>>,
     max_bytes: usize,
-) -> Result<String, CsvError> {
+    admit: impl FnOnce(usize) -> Option<A>,
+) -> Result<(String, A), CsvError> {
     let coverages: &[QueryResult] = match result {
         CoverageResponse::Single(q) => std::slice::from_ref(q),
         CoverageResponse::Collection(v) => v,
@@ -139,11 +145,12 @@ pub fn write_station_series<'n>(
         max: max_bytes,
     };
     write_rows(coverages, &identify, &mut size).map_err(|fmt::Error| CsvError::TooLarge)?;
+    let admitted = admit(size.bytes).ok_or(CsvError::Busy)?;
     let mut out = String::with_capacity(size.bytes);
     // Writing into a `String` cannot fail.
     let _ = write_rows(coverages, &identify, &mut out);
     debug_assert_eq!(out.len(), size.bytes);
-    Ok(out)
+    Ok((out, admitted))
 }
 
 /// A `fmt::Write` sink that only counts bytes, failing once they pass `max`.
@@ -280,6 +287,15 @@ mod tests {
 
     use super::*;
 
+    /// The body alone, admitted whatever its size.
+    fn unadmitted<'n>(
+        result: &CoverageResponse,
+        identify: impl Fn(usize, &QueryResult) -> Option<FeatureIdentity<'n>>,
+        max_bytes: usize,
+    ) -> Result<String, CsvError> {
+        write_station_series(result, identify, max_bytes, |_| Some(())).map(|(body, ())| body)
+    }
+
     fn series(
         x: f64,
         y: f64,
@@ -362,8 +378,7 @@ mod tests {
                 ("air_temperature", "°C", vec![Some(-17.9), Some(f64::NAN)]),
             ],
         ));
-        let csv = write_station_series(&result, |_, _| named("Alajärvi Möksy", "Möksy"), MAX_BYTES)
-            .unwrap();
+        let csv = unadmitted(&result, |_, _| named("Alajärvi Möksy", "Möksy"), MAX_BYTES).unwrap();
         assert_eq!(
             csv,
             "location_id,label,longitude,latitude,datetime,parameter,value,unit\r\n\
@@ -385,7 +400,7 @@ mod tests {
             &[0, 1, 2, 3, 4, 5],
             &[("v", "", values.iter().map(|v| Some(*v)).collect())],
         ));
-        let csv = write_station_series(&result, |_, _| None, MAX_BYTES).unwrap();
+        let csv = unadmitted(&result, |_, _| None, MAX_BYTES).unwrap();
         let written: Vec<&str> = csv
             .lines()
             .skip(1)
@@ -421,22 +436,37 @@ mod tests {
             })
             .collect();
         let result = CoverageResponse::Collection(coverages);
-        let body = write_station_series(&result, |_, _| named("id", "Station"), MAX_BYTES).unwrap();
+        let body = unadmitted(&result, |_, _| named("id", "Station"), MAX_BYTES).unwrap();
         assert_eq!(body.lines().count(), 1 + 50 * 3);
         assert_eq!(
-            write_station_series(&result, |_, _| named("id", "Station"), body.len()).unwrap(),
+            unadmitted(&result, |_, _| named("id", "Station"), body.len()).unwrap(),
             body
         );
         assert_eq!(
-            write_station_series(&result, |_, _| named("id", "Station"), body.len() - 1),
+            unadmitted(&result, |_, _| named("id", "Station"), body.len() - 1),
             Err(CsvError::TooLarge)
         );
         assert_eq!(
-            write_station_series(&result, |_, _| named("id", "Station"), 10),
+            unadmitted(&result, |_, _| named("id", "Station"), 10),
             Err(CsvError::TooLarge)
         );
         // The README and the `f` description in `/api` state it as 64 MiB.
         assert_eq!(MAX_BYTES, 64 << 20);
+        // Admission (#1041) is asked for the exact size before the body is
+        // allocated, and its refusal is `Busy`.
+        let mut asked = None;
+        let admitted = write_station_series(
+            &result,
+            |_, _| named("id", "Station"),
+            MAX_BYTES,
+            |size| asked.replace(size).map_or(Some(()), |_| None),
+        );
+        assert_eq!(admitted, Ok((body.clone(), ())));
+        assert_eq!(asked, Some(body.len()));
+        assert_eq!(
+            write_station_series(&result, |_, _| None, MAX_BYTES, |_| None::<()>),
+            Err(CsvError::Busy)
+        );
     }
 
     #[test]
@@ -520,16 +550,16 @@ mod tests {
             grid,
         ]);
         assert_eq!(
-            write_station_series(&result, |_, _| None, MAX_BYTES),
+            unadmitted(&result, |_, _| None, MAX_BYTES),
             Err(CsvError::NotStationSeries("Grid"))
         );
         // Checked before the size: a cap the body cannot meet still names
         // the broken coverage.
         assert_eq!(
-            write_station_series(&result, |_, _| None, 0),
+            unadmitted(&result, |_, _| None, 0),
             Err(CsvError::NotStationSeries("Grid"))
         );
-        let empty = write_station_series(
+        let empty = unadmitted(
             &CoverageResponse::Collection(Vec::new()),
             |_, _| None,
             MAX_BYTES,

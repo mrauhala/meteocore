@@ -5,7 +5,9 @@ use ds_core::model::{
     CoverageResponse, DomainDescription, Location, ParameterDescription, QueryResult, VerticalCoord,
 };
 use ds_core::units::{is_ucum, qudt_unit, UCUM_TYPE};
-use serde_json::{json, Map, Number, Value};
+use serde::ser::{SerializeMap, Serializer};
+use serde::Serialize;
+use serde_json::{json, Map, Value};
 
 /// The media type every CoverageJSON response carries (#920): the
 /// registered CoverageJSON type, which OGC API - EDR 1.2 uses throughout.
@@ -190,36 +192,6 @@ pub(crate) fn build_parameter(desc: &ParameterDescription) -> Value {
     Value::Object(param)
 }
 
-fn build_ndarray(ndarray: &ds_core::model::NdArray) -> Value {
-    let values: Vec<Value> = ndarray
-        .values
-        .iter()
-        .map(|v| match v {
-            // `Number::from_f64` returns `None` for NaN / ±inf (JSON has
-            // no representation), so a non-finite measurement must encode
-            // as `null` — not `0`, which would be indistinguishable from a
-            // genuine zero reading. Flagged by claude-review on PR #275.
-            Some(f) => Number::from_f64(*f)
-                .map(Value::Number)
-                .unwrap_or(Value::Null),
-            None => Value::Null,
-        })
-        .collect();
-
-    let mut obj = Map::with_capacity(5);
-    obj.insert("type".into(), Value::String("NdArray".into()));
-    obj.insert("dataType".into(), Value::String("float".into()));
-    // A 0-d scalar range (a `Point` coverage's single value) omits
-    // `axisNames`/`shape` per the CoverageJSON spec; any dimensioned
-    // array keeps both.
-    if !(ndarray.axis_names.is_empty() && ndarray.shape.is_empty()) {
-        obj.insert("axisNames".into(), json!(ndarray.axis_names));
-        obj.insert("shape".into(), json!(ndarray.shape));
-    }
-    obj.insert("values".into(), Value::Array(values));
-    Value::Object(obj)
-}
-
 /// Iterate a per-query `HashMap` in sorted key order. This workspace's
 /// serde_json is built with `preserve_order` (pulled in by zarrs), so
 /// insertion order IS the wire order — and a fresh `HashMap`'s iteration
@@ -240,21 +212,151 @@ fn build_parameters(result: &QueryResult) -> Map<String, Value> {
     parameters
 }
 
-fn build_ranges(result: &QueryResult) -> Map<String, Value> {
-    let mut ranges = Map::with_capacity(result.ranges.len());
-    for (name, ndarray) in sorted(&result.ranges) {
-        ranges.insert(name.clone(), build_ndarray(ndarray));
+/// A coverage of a CoverageJSON document; `parameters` is false inside a
+/// CoverageCollection, which hoists them.
+struct Coverage<'a> {
+    result: &'a QueryResult,
+    parameters: bool,
+}
+
+impl Serialize for Coverage<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut coverage = serializer.serialize_map(None)?;
+        coverage.serialize_entry("type", "Coverage")?;
+        coverage.serialize_entry("domain", &build_domain(&self.result.domain))?;
+        if self.parameters {
+            coverage.serialize_entry("parameters", &build_parameters(self.result))?;
+        }
+        coverage.serialize_entry("ranges", &Ranges(self.result))?;
+        coverage.end()
     }
-    ranges
+}
+
+/// A coverage's `ranges`, by parameter name.
+struct Ranges<'a>(&'a QueryResult);
+
+impl Serialize for Ranges<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            sorted(&self.0.ranges)
+                .into_iter()
+                .map(|(name, ndarray)| (name, NdArrayJson(ndarray))),
+        )
+    }
+}
+
+struct NdArrayJson<'a>(&'a ds_core::model::NdArray);
+
+impl Serialize for NdArrayJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let ndarray = self.0;
+        let mut obj = serializer.serialize_map(None)?;
+        obj.serialize_entry("type", "NdArray")?;
+        obj.serialize_entry("dataType", "float")?;
+        // A 0-d scalar range (a `Point` coverage's single value) omits
+        // `axisNames`/`shape` per the CoverageJSON spec; any dimensioned
+        // array keeps both.
+        if !(ndarray.axis_names.is_empty() && ndarray.shape.is_empty()) {
+            obj.serialize_entry("axisNames", &ndarray.axis_names)?;
+            obj.serialize_entry("shape", &ndarray.shape)?;
+        }
+        obj.serialize_entry("values", &Values(&ndarray.values))?;
+        obj.end()
+    }
+}
+
+/// A range's values, written one by one from the engine's result.
+struct Values<'a>(&'a [Option<f64>]);
+
+impl Serialize for Values<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // JSON has no NaN / ±inf: a non-finite measurement must encode as
+        // `null`, not `0`, which would be indistinguishable from a genuine
+        // zero reading. Flagged by claude-review on PR #275.
+        serializer.collect_seq(self.0.iter().map(|v| v.filter(|f| f.is_finite())))
+    }
+}
+
+/// A data query's CoverageJSON document, serialised straight into the
+/// response body (#1041): the range values are written from the engine's
+/// result, never copied into a `Value` tree first. Every object keeps the
+/// member order the document has always had, so with serde_json's
+/// `preserve_order`, which the server build enables, the body is the one
+/// the `Value` tree serialised to. The domain and the parameters, small
+/// beside the ranges, are still built as `Value`s.
+pub struct CoverageJson<'a>(pub &'a CoverageResponse);
+
+impl Serialize for CoverageJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let coverages = match self.0 {
+            CoverageResponse::Single(result) => {
+                return Coverage {
+                    result,
+                    parameters: true,
+                }
+                .serialize(serializer)
+            }
+            CoverageResponse::Collection(coverages) => coverages,
+        };
+        let mut collection = serializer.serialize_map(None)?;
+        collection.serialize_entry("type", "CoverageCollection")?;
+        if coverages.is_empty() {
+            collection.serialize_entry("coverages", &[] as &[Value])?;
+            return collection.end();
+        }
+
+        // Hoist parameters to collection level — the union across
+        // every coverage, so a (hypothetical) mixed-parameter
+        // collection still advertises them all rather than only the
+        // first coverage's. Each coverage's domain keeps its own
+        // `referencing`, so a collection may mix domain shapes safely.
+        let mut parameters = Map::new();
+        for qr in coverages {
+            parameters.append(&mut build_parameters(qr));
+        }
+
+        // A collection-level `domainType` is only emitted when every
+        // coverage agrees (it is an optional hint). A heterogeneous
+        // collection omits it rather than emitting a type that
+        // mismatches some coverages — each coverage's domain still
+        // carries its own `domainType`.
+        let first_type = domain_type_name(&coverages[0].domain);
+        let homogeneous = coverages
+            .iter()
+            .all(|c| domain_type_name(&c.domain) == first_type);
+        if homogeneous {
+            collection.serialize_entry("domainType", first_type)?;
+        }
+        collection.serialize_entry("parameters", &parameters)?;
+        collection.serialize_entry("coverages", &Coverages(coverages))?;
+        collection.end()
+    }
+}
+
+/// A CoverageCollection's coverages, without their hoisted parameters.
+struct Coverages<'a>(&'a [QueryResult]);
+
+impl Serialize for Coverages<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|result| Coverage {
+            result,
+            parameters: false,
+        }))
+    }
+}
+
+/// A CoverageJSON document as a `Value`: what the HTML page lays out and
+/// tests inspect. The same serialisation as the response body
+/// ([`CoverageJson`]), so the two cannot drift.
+fn to_value(document: impl Serialize) -> Value {
+    serde_json::to_value(document).expect("a CoverageJSON document has only string keys")
 }
 
 pub fn query_result_to_coverage_json(result: &QueryResult) -> Value {
-    let mut coverage = Map::with_capacity(4);
-    coverage.insert("type".into(), Value::String("Coverage".into()));
-    coverage.insert("domain".into(), build_domain(&result.domain));
-    coverage.insert("parameters".into(), Value::Object(build_parameters(result)));
-    coverage.insert("ranges".into(), Value::Object(build_ranges(result)));
-    Value::Object(coverage)
+    to_value(Coverage {
+        result,
+        parameters: true,
+    })
 }
 
 /// CoverageJSON `domainType` string for a domain description.
@@ -270,59 +372,9 @@ fn domain_type_name(domain: &DomainDescription) -> &'static str {
 }
 
 /// Serialise an EDR query result — a single `Coverage` or, for multiple
-/// coverages, a `CoverageCollection`.
+/// coverages, a `CoverageCollection` — as a `Value` (see [`to_value`]).
 pub fn coverage_response_to_json(result: &CoverageResponse) -> Value {
-    match result {
-        CoverageResponse::Single(qr) => query_result_to_coverage_json(qr),
-        CoverageResponse::Collection(coverages) => {
-            if coverages.is_empty() {
-                return json!({
-                    "type": "CoverageCollection",
-                    "coverages": []
-                });
-            }
-
-            // Hoist parameters to collection level — the union across
-            // every coverage, so a (hypothetical) mixed-parameter
-            // collection still advertises them all rather than only the
-            // first coverage's. Each coverage's domain keeps its own
-            // `referencing`, so a collection may mix domain shapes safely.
-            let mut parameters = Map::new();
-            for qr in coverages {
-                parameters.append(&mut build_parameters(qr));
-            }
-
-            // A collection-level `domainType` is only emitted when every
-            // coverage agrees (it is an optional hint). A heterogeneous
-            // collection omits it rather than emitting a type that
-            // mismatches some coverages — each coverage's domain still
-            // carries its own `domainType`.
-            let first_type = domain_type_name(&coverages[0].domain);
-            let homogeneous = coverages
-                .iter()
-                .all(|c| domain_type_name(&c.domain) == first_type);
-
-            let coverage_items: Vec<Value> = coverages
-                .iter()
-                .map(|qr| {
-                    let mut cov = Map::with_capacity(3);
-                    cov.insert("type".into(), Value::String("Coverage".into()));
-                    cov.insert("domain".into(), build_domain(&qr.domain));
-                    cov.insert("ranges".into(), Value::Object(build_ranges(qr)));
-                    Value::Object(cov)
-                })
-                .collect();
-
-            let mut collection = Map::with_capacity(4);
-            collection.insert("type".into(), Value::String("CoverageCollection".into()));
-            if homogeneous {
-                collection.insert("domainType".into(), Value::String(first_type.into()));
-            }
-            collection.insert("parameters".into(), Value::Object(parameters));
-            collection.insert("coverages".into(), Value::Array(coverage_items));
-            Value::Object(collection)
-        }
-    }
+    to_value(CoverageJson(result))
 }
 
 fn build_domain(desc: &DomainDescription) -> Value {
@@ -709,6 +761,58 @@ impl serde::Serialize for LocationFeatures<'_> {
             })?;
         }
         sequence.end()
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use ds_core::model::NdArray;
+
+    /// The body is written member by member in the document's order, the
+    /// order the `Value` tree it replaced serialised to, whatever
+    /// serde_json's `preserve_order` (#1041); the `Value` form is the same
+    /// document.
+    #[test]
+    fn the_body_streams_in_the_document_order() {
+        let result = CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::VerticalProfile {
+                x: 24.0,
+                y: 60.0,
+                t: None,
+                z: VerticalCoord {
+                    kind: ds_core::vertical::VerticalKind::Height,
+                    values: vec![1.0, 2.0, 3.0],
+                },
+            },
+            parameters: HashMap::new(),
+            ranges: HashMap::from([(
+                "a".to_owned(),
+                NdArray {
+                    shape: vec![3],
+                    axis_names: vec!["z".into()],
+                    values: vec![Some(1.5), Some(f64::NAN), None],
+                },
+            )]),
+        });
+        let body = serde_json::to_string(&CoverageJson(&result)).unwrap();
+        assert!(
+            body.starts_with(r#"{"type":"Coverage","domain":{"#),
+            "{body}"
+        );
+        assert!(
+            body.ends_with(
+                r#""parameters":{},"ranges":{"a":{"type":"NdArray","dataType":"float","axisNames":["z"],"shape":[3],"values":[1.5,null,null]}}}"#
+            ),
+            "{body}"
+        );
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed, coverage_response_to_json(&result));
+        let empty = CoverageResponse::Collection(Vec::new());
+        assert_eq!(
+            serde_json::to_string(&CoverageJson(&empty)).unwrap(),
+            r#"{"type":"CoverageCollection","coverages":[]}"#
+        );
     }
 }
 

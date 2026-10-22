@@ -15,11 +15,10 @@
 //    admitted process-wide. EDR 1.2 `limit` pages it under the same caps (#922).
 //
 // 2. FULL IN-MEMORY RESPONSE CONSTRUCTION.
-//    CoverageJSON responses build a serde_json::Value tree before serialization.
-//    Locations use direct serialization. For large time
-//    series (e.g., 1 year of hourly data = 8760 timesteps x N parameters),
-//    this creates significant allocation pressure. Streaming serialization
-//    (e.g., via axum::body::Body::from_stream) would reduce peak memory.
+//    Every response body is built in memory, then sent. CoverageJSON range
+//    values and locations are serialised directly, without a JSON tree,
+//    and every body is admitted process-wide by the EDR response memory
+//    budget until it is delivered or dropped (#1041).
 //
 // 3. NO 413 (Payload Too Large) SUPPORT.
 //    The OGC EDR 1.1 spec defines HTTP 413 as a valid response for query
@@ -285,11 +284,13 @@ async fn locations_metadata_runs_off_http_worker_and_etag_matches_response() {
 }
 
 // Run with isolated environment settings: the production budget is process-wide.
+// `/locations` shares the EDR response budget (#1041);
+// `MC_EDR_LOCATIONS_MEMORY_MB`, its own budget before, is ignored.
 #[test]
 fn locations_budget_errors_are_complete_json_and_memory_recovers() {
     const CHILD: &str = "MC_TEST_LOCATIONS_BUDGET";
     let Ok(mode) = std::env::var(CHILD) else {
-        for mode in ["size", "memory"] {
+        for mode in ["size", "memory", "retired"] {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child
                 .args([
@@ -298,11 +299,17 @@ fn locations_budget_errors_are_complete_json_and_memory_recovers() {
                     "--nocapture",
                 ])
                 .env(CHILD, mode)
-                .env("MC_EDR_LOCATIONS_MEMORY_MB", "1")
                 .env(
                     "MC_EDR_LOCATIONS_MAX_BYTES",
                     if mode == "size" { "128" } else { "1048576" },
                 );
+            if mode == "retired" {
+                child
+                    .env("MC_EDR_LOCATIONS_MEMORY_MB", "1")
+                    .env_remove("MC_EDR_RESPONSE_MEMORY_MB");
+            } else {
+                child.env("MC_EDR_RESPONSE_MEMORY_MB", "1");
+            }
             assert!(child.status().unwrap().success(), "{mode} child failed");
         }
         return;
@@ -333,10 +340,16 @@ fn locations_budget_errors_are_complete_json_and_memory_recovers() {
             for _ in 0..=16 {
                 let response = app.clone().oneshot(request()).await.unwrap();
                 if response.status() == StatusCode::OK {
-                    assert_eq!(mode, "memory");
+                    assert_ne!(mode, "size");
                     held.push(response);
                 } else {
+                    assert_ne!(mode, "retired", "the retired variable limits nothing");
                     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                    // Busy is worth retrying; over the per-response cap is not.
+                    assert_eq!(
+                        response.headers().get("retry-after").is_some(),
+                        mode == "memory"
+                    );
                     let bytes = axum::body::to_bytes(response.into_body(), 4096)
                         .await
                         .unwrap();
@@ -360,7 +373,13 @@ fn locations_budget_errors_are_complete_json_and_memory_recovers() {
                     return;
                 }
             }
-            panic!("budget never rejected a response");
+            assert_eq!(mode, "retired", "budget never rejected a response");
+            assert_eq!(held.len(), 17);
+            let (used, capacity, _) = api_edr::response_budget_metrics();
+            assert_eq!(capacity, 512 << 20, "MC_EDR_RESPONSE_MEMORY_MB's default");
+            assert!(used >= 17 * 64 * 1024, "{used}");
+            drop(held);
+            assert_eq!(api_edr::response_budget_metrics().0, 0);
         });
 }
 
@@ -435,6 +454,238 @@ fn locations_pages_share_the_inventory_byte_budget() {
             assert_eq!(page["numberReturned"], 2);
             assert_eq!(page["features"][1]["id"], "loc_99");
         });
+}
+
+/// Serves `/locations/big`, one million values as long decimals (about
+/// 18 MB of CoverageJSON), and `/locations/small`, ten.
+struct MillionValuesEngine;
+
+impl EdrEngine for MillionValuesEngine {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(Arc::new(LocationSnapshot::new(
+            ["big", "small"]
+                .map(|id| Location {
+                    id: id.into(),
+                    label: id.into(),
+                    latitude: 60.0,
+                    longitude: 24.0,
+                })
+                .into(),
+        )))
+    }
+
+    fn query_location(
+        &self,
+        location_id: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let (steps, parameters) = match location_id {
+            "big" => (10_000, 100),
+            "small" => (10, 1),
+            _ => return Err(DataServerError::LocationNotFound(location_id.into())),
+        };
+        let base: DateTime<Utc> = "2024-01-01T00:00:00Z".parse().unwrap();
+        let mut result = QueryResult {
+            domain: DomainDescription::PointSeries {
+                x: 24.0,
+                y: 60.0,
+                t: (0..steps)
+                    .map(|h| base + chrono::Duration::hours(h))
+                    .collect(),
+                z: None,
+            },
+            parameters: HashMap::new(),
+            ranges: HashMap::new(),
+        };
+        for p in 0..parameters {
+            let name = format!("param_{p}");
+            result.parameters.insert(
+                name.clone(),
+                ParameterDescription {
+                    label: name.clone(),
+                    unit: "K".into(),
+                    observed_property: name.clone(),
+                    standard_name: None,
+                },
+            );
+            result.ranges.insert(
+                name,
+                NdArray {
+                    shape: vec![steps as usize],
+                    axis_names: vec!["t".into()],
+                    values: (0..steps)
+                        .map(|i| Some((p * steps + i) as f64 / 7.0))
+                        .collect(),
+                },
+            );
+        }
+        Ok(CoverageResponse::Single(result))
+    }
+
+    fn get_parameters(&self) -> Vec<String> {
+        vec!["param_0".into()]
+    }
+
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        None
+    }
+
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        Some([24.0, 60.0, 24.0, 60.0])
+    }
+}
+
+/// Runs `test` in a child process with `env`: the response budget is
+/// process-wide and read once.
+fn in_child(test: &str, env: &[(&str, &str)], body: impl FnOnce()) {
+    const CHILD: &str = "MC_TEST_RESPONSE_BUDGET_CHILD";
+    if std::env::var(CHILD).is_ok() {
+        return body();
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(CHILD, "1")
+        .envs(env.iter().copied())
+        .status()
+        .unwrap();
+    assert!(status.success(), "{test} child failed");
+}
+
+/// With an EDR response budget smaller than one million-value response,
+/// its CoverageJSON and its HTML page are both a 503 to retry, the HTML
+/// before it renders; a small response is still served, and every
+/// reservation is released once its body drops (#1041).
+#[test]
+fn large_bodies_over_the_response_budget_are_503() {
+    in_child(
+        "large_bodies_over_the_response_budget_are_503",
+        &[("MC_EDR_RESPONSE_MEMORY_MB", "4")],
+        || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let app = api_edr::router(make_edr_state(Arc::new(MillionValuesEngine)));
+                    let get = |uri: &'static str| {
+                        let app = app.clone();
+                        async move {
+                            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                                .await
+                                .unwrap()
+                        }
+                    };
+                    for uri in [
+                        "/collections/weather/locations/big",
+                        "/collections/weather/locations/big?f=html",
+                    ] {
+                        let response = get(uri).await;
+                        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+                        assert_eq!(response.headers()["retry-after"], "1", "{uri}");
+                        if !uri.ends_with("html") {
+                            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                                .await
+                                .unwrap();
+                            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                            assert_eq!(error["code"], "ServerBusy");
+                        }
+                        assert_eq!(api_edr::response_budget_metrics().0, 0, "{uri}");
+                    }
+                    let (_, capacity, rejected) = api_edr::response_budget_metrics();
+                    assert_eq!(capacity, 4 << 20);
+                    assert_eq!(rejected, 2);
+                    for uri in [
+                        "/collections/weather/locations/small",
+                        "/collections/weather/locations/small?f=html",
+                    ] {
+                        let response = get(uri).await;
+                        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+                        assert!(api_edr::response_budget_metrics().0 > 0, "{uri}");
+                        drop(response);
+                        assert_eq!(api_edr::response_budget_metrics().0, 0, "{uri}");
+                    }
+                });
+        },
+    );
+}
+
+/// A body being sent stays charged to the response budget, and a client
+/// that disconnects mid-body releases it (#1041).
+#[test]
+fn a_disconnected_client_releases_its_response_bytes() {
+    in_child(
+        "a_disconnected_client_releases_its_response_bytes",
+        &[],
+        || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let app = api_edr::router(make_edr_state(Arc::new(MillionValuesEngine)));
+            let listener = runtime
+                .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            runtime.spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            use std::io::{Read, Write};
+            let mut client = std::net::TcpStream::connect(address).unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+                .unwrap();
+            client
+                .write_all(
+                    b"GET /collections/weather/locations/big HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .unwrap();
+            // Read the head and the first bytes of the body, then stop.
+            let mut received = Vec::new();
+            let mut buffer = [0u8; 16 * 1024];
+            let head = loop {
+                let n = client.read(&mut buffer).unwrap();
+                assert!(n > 0, "connection closed before the head");
+                received.extend_from_slice(&buffer[..n]);
+                if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break String::from_utf8_lossy(&received[..end]).into_owned();
+                }
+            };
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            let length: u64 = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(str::to_owned)
+                })
+                .expect("a buffered body has a length")
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(
+                length > 16 << 20,
+                "{length}: larger than the socket buffers"
+            );
+            let (used, _, _) = api_edr::response_budget_metrics();
+            assert!(
+                used >= length,
+                "the body in flight is charged: {used} < {length}"
+            );
+
+            drop(client);
+            let released = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while api_edr::response_budget_metrics().0 != 0 {
+                assert!(
+                    std::time::Instant::now() < released,
+                    "still charged after the client left: {:?}",
+                    api_edr::response_budget_metrics()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        },
+    );
 }
 
 // ===========================================================================

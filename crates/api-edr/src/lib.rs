@@ -7,18 +7,25 @@ pub(crate) mod geojson;
 pub mod handlers;
 mod html;
 pub mod items;
-mod location_budget;
 pub mod params;
 pub(crate) mod plot_convert;
 mod query_form;
 pub mod response;
+mod response_budget;
 
 use axum::routing::get;
 use axum::Router;
 
 use handlers::AppState;
 
+/// The EDR response memory budget's (reserved bytes, capacity bytes,
+/// rejected responses), for `/metrics` (#1041).
+pub use response_budget::metrics as response_budget_metrics;
+
 pub fn router(state: AppState) -> Router {
+    // Reads the budget's environment at startup, where a retired variable
+    // is reported.
+    response_budget::init();
     let router = Router::new()
         .route("/", get(handlers::landing_page))
         .route("/api", get(handlers::api_definition))

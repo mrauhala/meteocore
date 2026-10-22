@@ -28,7 +28,8 @@ GeoJSON, CSV, a PNG plot or an HTML page.
   worker (2 to 8, from the CPU count), 32 more waiting, and a 30-second
   deadline that includes the wait. A full queue answers 503 at once; a
   missed deadline answers 504. Radar cross-sections run on the same
-  runtime's blocking pool.
+  runtime's blocking pool. Response bodies are encoded there too, under
+  the response memory budget (see [Responses and limits](#responses-and-limits)).
 - `params::query_formats` is the one list of formats each query offers. The
   handlers negotiate over it and `data_queries` advertises it, so the two
   agree.
@@ -265,12 +266,18 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   values per response. On most gridded engines, masking a polygon that is
   not a rectangle is also capped at 20 million cell × vertex tests. Over a
   cap is a 400 that says how to narrow the query.
-- **`/locations` memory.** Encoded location lists are capped by
-  `MC_EDR_LOCATIONS_MAX_BYTES` (default 16 MiB per response) and
-  `MC_EDR_LOCATIONS_MEMORY_MB` (default 128 MiB across the process). A list
-  over the per-response cap is a 503 suggesting `limit`; when the
-  process-wide budget is in use, a 503 to retry later. The body is never
-  truncated.
+- **Response memory.** Every CoverageJSON, GeoJSON, CSV and HTML body and
+  every `/locations` list is admitted by one process-wide budget,
+  `MC_EDR_RESPONSE_MEMORY_MB` (default 512 MiB). A body is charged for
+  each buffer before it is allocated: CoverageJSON is serialised straight
+  into it, CSV is counted first, and an HTML page reserves its estimated
+  size before it renders. It stays charged until the client has read it
+  or gone away. A body that does not fit is a 503 `ServerBusy` with
+  `Retry-After: 1`. PNG plots are not counted. `/locations` lists are also
+  capped at `MC_EDR_LOCATIONS_MAX_BYTES` (default 16 MiB) each: a list over
+  it is a 503 `ResponseLimit` suggesting `limit`. A body is never
+  truncated. `MC_EDR_LOCATIONS_MEMORY_MB` is retired: it is ignored, with a
+  warning at startup.
 
 ## Parameter metadata
 
@@ -411,8 +418,8 @@ apis = ["edr", "features"]
 `collections.d/weather-analysis.toml` grids that collection's temperature
 and wind speed as a station grid.
 
-Environment variables: `MC_EDR_LOCATIONS_MAX_BYTES` (bytes, default
-16 MiB) and `MC_EDR_LOCATIONS_MEMORY_MB` (default 128); see
+Environment variables: `MC_EDR_RESPONSE_MEMORY_MB` (default 512) and
+`MC_EDR_LOCATIONS_MAX_BYTES` (bytes, default 16 MiB); see
 [Responses and limits](#responses-and-limits).
 
 ## Limits

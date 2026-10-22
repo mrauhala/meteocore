@@ -381,6 +381,34 @@ accepting each point. Batch implementations must also check their full allocatio
 budget before fetching. The executor installs `ds_core::deadline` for storage
 and engine loops; propagate it explicitly to field workers and map expiry to 504.
 
+Response bodies (#1041) go through `response_budget`: one process-wide
+`ds_executor::budget::ByteBudget`, `MC_EDR_RESPONSE_MEMORY_MB` (512 MiB),
+for every body a data query or `/locations` encodes. Render every body on
+the executor, inside `execute_query`, never after its `.await`.
+CoverageJSON (`response::CoverageJson`) and EDR GeoJSON are serialised
+through `response_budget::Writer`, which reserves each buffer before
+allocating it and stops at the query deadline; CoverageJSON range values
+are written straight from the result, never through a `Value` tree. CSV
+reserves its counted size before it allocates (`csv::write_station_series`'
+`admit`), and an HTML data page its `body_estimate` before it renders
+(`DataPage::render_admitted`). `/locations` adds its own per-body cap
+(`Writer::locations`, `MC_EDR_LOCATIONS_MAX_BYTES`, 16 MiB);
+`MC_EDR_LOCATIONS_MEMORY_MB` is retired, ignored with a startup WARN. The
+reservation lives in the body's `Bytes` owner, so it is released only when
+the last clone drops: the body delivered, or the client gone. Nothing
+waits: a body that does not fit is 503 `ServerBusy` with `Retry-After: 1`
+(`api_common::JsonError` adds it to every `ServerBusy`), an expired query
+504. `coverage_response_to_json` is `CoverageJson` through `to_value`, so the
+HTML page and the JSON cannot drift: change member order in `CoverageJson`
+only, where it is the order the `Value` builder it replaced wrote, byte for
+byte under the server build's serde_json `preserve_order`. Not counted:
+PNG plots, `items`, metadata, the engine result and the HTML page's `Value`
+document. `/metrics` exports `edr_response_{reserved,capacity}_bytes` and
+`edr_response_rejected_total`. Pinned by `response_budget::tests`,
+`coverage_tests::the_body_streams_in_the_document_order` and
+`performance_tests`' `large_bodies_over_the_response_budget_are_503` and
+`a_disconnected_client_releases_its_response_bytes`.
+
 ## `limit` and locations paging (EDR 1.2, #922)
 
 `params::parse_limit` is the one parser: 1…`MAX_LIMIT` (10000), larger values
@@ -397,7 +425,7 @@ PNG skips it (it plots the newest section). A malformed `limit` is still a 400
 everywhere, as a malformed `z` is. `/locations` without `limit` or a filter must stay byte-identical to
 the unpaged inventory (clients and ETags rely on it); with `limit` it pages
 through `ds_core::collection_search::page_window`, the `/collections`
-arithmetic, under the same `location_budget` writer. That rule is the
+arithmetic, under the same `response_budget::Writer::locations`. That rule is the
 GeoJSON's: the HTML page pages `handlers::LOCATIONS_HTML_PAGE` (100) by
 default (#1138), and its row links carry `location_view_datetime`, never
 the collection's last day on a station series (a station that stopped

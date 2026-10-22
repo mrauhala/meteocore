@@ -112,7 +112,9 @@ must keep immediate sheds and deadline expiries apart.
 not render admission: engine-geotiff's `decode_budget::BUDGET`
 (`MC_GEOTIFF_DECODE_MEMORY_MB`) and engine-zarr's `read_budget::BUDGET`
 (`MC_ZARR_READ_MEMORY_MB`) are instances, and the next engine's budget is
-another one, never a copy (#1067). Keep it apart from `RenderBudget`: it
+another one, never a copy (#1067). Outside the engines, api-edr's
+`response_budget` (`MC_EDR_RESPONSE_MEMORY_MB`, #1041) admits response
+bodies on the same type. Keep it apart from `RenderBudget`: it
 never waits, because its callers hold an executor slot and may hold another
 reservation. `reserve` fails at once with `ResourceExhausted` and counts a
 rejection; `try_reserve`, a batch's probe for one more slot, and

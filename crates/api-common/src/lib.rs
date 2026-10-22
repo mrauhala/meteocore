@@ -117,6 +117,8 @@ pub fn tag_api_kind(router: axum::Router, kind: &'static str) -> axum::Router {
 /// middleware writes as the log line's `error` field (#119). The reason
 /// mirrors the client-visible body, so a 5xx whose body carries only a
 /// generic description (root CLAUDE.md Critical Rule 11) logs only that too.
+/// A 503 `ServerBusy` also carries `Retry-After: 1`, as every API's busy
+/// answer does.
 pub struct JsonError(pub StatusCode, pub Json<Value>);
 
 impl From<(StatusCode, Json<Value>)> for JsonError {
@@ -131,7 +133,13 @@ impl IntoResponse for JsonError {
         let field = |name| body.get(name).and_then(Value::as_str).unwrap_or_default();
         let reason =
             ds_core::error::ErrorReason(format!("{}: {}", field("code"), field("description")));
+        let busy = status == StatusCode::SERVICE_UNAVAILABLE && field("code") == "ServerBusy";
         let mut response = (status, body).into_response();
+        if busy {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
         response.extensions_mut().insert(reason);
         response
     }
@@ -854,6 +862,24 @@ mod tests {
             .get::<ErrorReason>()
             .expect("ErrorReason must be attached so request_logging_middleware can pick it up");
         assert_eq!(reason.0, "NotFound: Collection 'foo' not found");
+    }
+
+    /// A busy 503 says when to retry (EDR's query capacity and response
+    /// budget, #1041); a 503 that retrying cannot fix does not.
+    #[test]
+    fn server_busy_carries_retry_after() {
+        let busy = JsonError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"code": "ServerBusy", "description": "retry later"})),
+        )
+        .into_response();
+        assert_eq!(busy.headers()[header::RETRY_AFTER], "1");
+        let too_large = JsonError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"code": "ResponseLimit", "description": "page it"})),
+        )
+        .into_response();
+        assert!(too_large.headers().get(header::RETRY_AFTER).is_none());
     }
 
     #[test]

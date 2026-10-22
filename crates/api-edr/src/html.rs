@@ -17,9 +17,11 @@
 //! members folded below.
 //! It is written into one buffer reserved up front from the value count
 //! ([`DataPage::render_into`]), so a large page never holds a second copy
-//! of itself or regrows by doubling. The `/locations` list and `items`
-//! render their GeoJSON as a feature table, the list through the same
-//! budgeted writer as its GeoJSON.
+//! of itself or regrows by doubling, and a data page's buffer is admitted
+//! by the EDR response budget at that size before it renders
+//! ([`DataPage::render_admitted`], #1041). The `/locations` list and
+//! `items` render their GeoJSON as a feature table, the list through the
+//! same budgeted writer as its GeoJSON.
 //!
 //! Every value is escaped, and every href goes through the workbench's
 //! `anchor` (`safe_href`).
@@ -28,6 +30,7 @@ use std::fmt::Write as _;
 use std::io;
 
 use api_common::workbench::{self as ui, i18n_text, unit_text, Page, Surface};
+use axum::body::Bytes;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use ds_core::html::{display_coordinate, display_value, escape};
@@ -38,6 +41,7 @@ use crate::geojson::{encode_path_segment, FeatureSummary};
 use crate::response::{
     coverage_response_to_json, LocationRows, LocationsContext, COVERAGE_JSON_MEDIA_TYPE,
 };
+use crate::response_budget::Failure;
 
 /// The `Content-Type` of every HTML data page.
 pub(crate) const CONTENT_TYPE: &str = "text/html; charset=utf-8";
@@ -133,12 +137,37 @@ impl DataPage<'_> {
     /// bytes: never a second copy of the body.
     fn render_into(&self, estimate: usize, body: impl FnOnce(&mut String)) -> String {
         let (head, tail) = self.shell();
-        let mut out = String::with_capacity(head.len() + estimate + tail.len());
-        out.push_str(&head);
-        body(&mut out);
-        out.push_str(&tail);
-        out
+        let capacity = head.len() + estimate + tail.len();
+        fill(&head, &tail, capacity, body)
     }
+
+    /// [`Self::render_into`] admitted by the EDR response budget (#1041):
+    /// the whole buffer is reserved before it is allocated, so a page over
+    /// the budget fails before it renders, and stays charged until the
+    /// body is delivered or dropped.
+    fn render_admitted(
+        &self,
+        estimate: usize,
+        body: impl FnOnce(&mut String),
+    ) -> Result<Bytes, Failure> {
+        let (head, tail) = self.shell();
+        let capacity = head
+            .len()
+            .saturating_add(estimate)
+            .saturating_add(tail.len());
+        let reservation = crate::response_budget::reserve(capacity)?;
+        reservation.into_bytes(fill(&head, &tail, capacity, body).into_bytes())
+    }
+}
+
+/// A page in one buffer of `capacity` bytes: `head`, what `body` writes,
+/// `tail`.
+fn fill(head: &str, tail: &str, capacity: usize, body: impl FnOnce(&mut String)) -> String {
+    let mut out = String::with_capacity(capacity);
+    out.push_str(head);
+    body(&mut out);
+    out.push_str(tail);
+    out
 }
 
 /// The breadcrumb labels below a collection, from a page's URL: a query
@@ -188,21 +217,38 @@ pub(crate) struct Locations {
 }
 
 /// The HTML page of a data query's result: its CoverageJSON, all of it,
-/// and on a station collection which location each coverage is.
+/// and on a station collection which location each coverage is. Admitted
+/// by the EDR response budget at its estimated size before it renders.
 pub(crate) fn coverage_page(
     result: &CoverageResponse,
     page: &DataPage,
     locations: Option<&Locations>,
-) -> String {
-    coverage_html(&coverage_response_to_json(result), page, locations)
+) -> Result<Bytes, Failure> {
+    let doc = coverage_response_to_json(result);
+    let (coverages, estimate) = coverage_layout(&doc, page, locations);
+    page.render_admitted(estimate, |body| {
+        coverage_body(body, &doc, coverages, page, locations)
+    })
 }
 
-fn coverage_html(doc: &Value, page: &DataPage, locations: Option<&Locations>) -> String {
+/// A coverage page's coverages, and the bytes its body takes from above.
+fn coverage_layout<'d>(
+    doc: &'d Value,
+    page: &DataPage,
+    locations: Option<&Locations>,
+) -> (Vec<&'d Value>, usize) {
     let coverages: Vec<&Value> = match doc["coverages"].as_array() {
         Some(coverages) => coverages.iter().collect(),
         None => vec![doc],
     };
     let estimate = body_estimate(doc, &coverages, page) + locations.map_or(0, locations_len);
+    (coverages, estimate)
+}
+
+/// [`coverage_page`]'s page of a document, unadmitted, as a `String`.
+#[cfg(test)]
+fn coverage_html(doc: &Value, page: &DataPage, locations: Option<&Locations>) -> String {
+    let (coverages, estimate) = coverage_layout(doc, page, locations);
     page.render_into(estimate, |body| {
         coverage_body(body, doc, coverages, page, locations)
     })
