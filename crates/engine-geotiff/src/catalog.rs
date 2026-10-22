@@ -381,6 +381,15 @@ pub fn scan_directory(
 /// in 0.14 so 32-bit targets can still describe large objects.
 pub(crate) const MAX_REMOTE_FILE_SIZE: u64 = 50 * 1024 * 1024;
 
+/// Reads in flight while a remote scan reads new files' metadata (#1042),
+/// as many as the STAC preload keeps: enough to overlap round trips
+/// without fanning a backlog out at the store.
+pub(crate) const SCAN_READ_CONCURRENCY: usize = 4;
+
+/// New files whose headers one batch reads before they are parsed (#1042):
+/// a backlog holds at most 32 headers of 512 KiB at a time.
+const SCAN_READ_BATCH: usize = 32;
+
 /// A prefix whose LIST failed during [`scan_remote`], with the error.
 pub type FailedPrefix = (ObjectPath, DataServerError);
 
@@ -422,10 +431,12 @@ pub fn scan_remote(
 }
 
 /// [`scan_remote`] with `read_budget`: the time one scan may spend reading
-/// new files' metadata before it defers the rest to the next poll. Those
-/// reads run one file at a time under the background fetch budget (#1011),
-/// so without a bound a storage stall across many new files would hold the
-/// poll for files × that budget. Already-catalogued files never read.
+/// new files' metadata before it defers the rest to the next poll. Each
+/// read has the background fetch budget (#1011), so without a bound a
+/// storage stall across many new files would hold the poll for files ×
+/// that budget. The reads go newest file first, [`SCAN_READ_CONCURRENCY`]
+/// at a time, so the files a spent budget defers are the oldest (#1042).
+/// Already-catalogued files never read.
 pub(crate) fn scan_remote_within(
     store: &ds_storage::DataStore,
     prefixes: &[ObjectPath],
@@ -477,8 +488,9 @@ pub(crate) fn scan_remote_within(
     ))
 }
 
-/// Build the catalog of the files a remote scan kept, reading each one's
-/// metadata.
+/// Build the catalog of the files a remote scan kept, reading each new
+/// one's metadata (#1042): newest first, in batches of [`SCAN_READ_BATCH`],
+/// until `read_budget` runs out.
 fn load_remote(
     store: &ds_storage::DataStore,
     files: Vec<RemoteFile>,
@@ -486,105 +498,27 @@ fn load_remote(
     collection_id: &str,
     read_budget: std::time::Duration,
 ) -> Catalog {
-    // Parse metadata (range read, falling back to full download)
+    let until = std::time::Instant::now() + read_budget;
     let mut entries = BTreeMap::new();
-    let started = std::time::Instant::now();
-    let mut deferred = 0usize;
 
+    // Reuse cached entry if file size unchanged
+    let mut new_files = Vec::new();
     for file in &files {
-        let datetime = file.time;
-        let key = file.key();
-        let location = &file.object.location;
-        let file_size = file.object.size;
-        let pseudo_path = PathBuf::from(key);
-
-        // Reuse cached entry if file size unchanged
-        if let Some(entry) = existing.get(pseudo_path.as_path()) {
-            if entry.file_size == file_size {
-                entries.insert(datetime, (*entry).clone());
-                continue;
+        match existing.get(Path::new(file.key())) {
+            Some(entry) if entry.file_size == file.object.size => {
+                entries.insert(file.time, (*entry).clone());
             }
+            _ => new_files.push(file),
         }
-
-        // The scan's read budget is spent: leave the remaining new files to
-        // the next poll, which retries them, instead of stalling this one.
-        if started.elapsed() >= read_budget {
-            deferred += 1;
-            continue;
-        }
-
-        // Try COG range read first (header only)
-        match TiffMetadata::from_header_read(store, location, file_size) {
-            Ok(Some((metadata, tile_info))) => {
-                tracing::debug!("[{}] {} — range read OK", collection_id, key);
-                let source = DataSource::remote(store.clone(), location.clone(), tile_info);
-                entries.insert(
-                    datetime,
-                    FileEntry::loaded(pseudo_path, source, metadata, file_size, None, None),
-                );
-                continue;
-            }
-            // The header arrived but is not a COG: download it whole below.
-            Ok(None) => {
-                tracing::warn!(
-                    "[{}] {} — header is not a COG, falling back to full download ({}). \
-                     Convert to COG for faster serving.",
-                    collection_id,
-                    key,
-                    super::format_bytes(file_size)
-                );
-            }
-            // A source that ignores Range answers the header read with the
-            // whole object, which object_store rejects. Only a full download
-            // can serve it, as before #1003.
-            Err(e) if range_not_honoured(&e) => {
-                tracing::warn!(
-                    "[{}] {} — the source ignores range requests, falling back to full download ({})",
-                    collection_id,
-                    key,
-                    super::format_bytes(file_size)
-                );
-            }
-            // The storage failed, not the format (#1003): a full download
-            // would go to the same storage and could stall the same way.
-            // The file stays out of this catalog, so the next scan retries
-            // its header read.
-            Err(e) => {
-                tracing::warn!(
-                    "[{}] {} — header read failed, retrying next poll: {e}",
-                    collection_id,
-                    key
-                );
-                continue;
-            }
-        }
-
-        // Fallback: download the full file. Full downloads are much slower and
-        // cost more on S3. Convert to COG: gdal_translate -of COG input.tif output.tif
-        // The poll runtime (or engine construction) waits on this, not a
-        // request: the background budget lets a stalled attempt retry (#1011).
-        let data = match store.get_with_budget(location, ds_storage::FetchBudget::Background) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("[{}] Failed to download {}: {e}", collection_id, key);
-                continue;
-            }
-        };
-
-        let source = DataSource::from_bytes(data);
-        let metadata = match TiffMetadata::from_source(&source) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("[{}] Skipping {}: {e}", collection_id, key);
-                continue;
-            }
-        };
-
-        entries.insert(
-            datetime,
-            FileEntry::loaded(pseudo_path, source, metadata, file_size, None, None),
-        );
     }
+
+    // Newest first, so the files a spent budget leaves to the next poll are
+    // the oldest: a client wants the latest timestep.
+    new_files.sort_by_key(|file| std::cmp::Reverse(file.time));
+    let deferred: usize = new_files
+        .chunks(SCAN_READ_BATCH)
+        .map(|batch| read_new_files(store, batch, collection_id, until, &mut entries))
+        .sum();
     if deferred > 0 {
         tracing::warn!(
             "[{}] {deferred} new file(s) left to the next poll: this scan spent over {}s reading remote metadata",
@@ -605,6 +539,197 @@ fn load_remote(
         temporal_extent,
         spatial_extent,
     }
+}
+
+/// Read the metadata of `files`, new to the catalog and newest first, into
+/// `entries`: each header by one range read, [`SCAN_READ_CONCURRENCY`] in
+/// flight, then the files a header cannot serve whole. A header read that
+/// has not finished by `until` is cut off, and nothing starts after it.
+/// Returns how many files that left to the next poll.
+fn read_new_files(
+    store: &ds_storage::DataStore,
+    files: &[&RemoteFile],
+    collection_id: &str,
+    until: std::time::Instant,
+    entries: &mut BTreeMap<DateTime<Utc>, FileEntry>,
+) -> usize {
+    if std::time::Instant::now() >= until {
+        return files.len();
+    }
+    // An empty object has no header to read: it goes to the full download,
+    // as a header that does not parse does.
+    let mut whole = Vec::new();
+    let mut headed = Vec::new();
+    let mut reads = Vec::new();
+    for &file in files {
+        match TiffMetadata::header_range(file.object.size) {
+            Some(range) => {
+                reads.push((file.object.location.clone(), range));
+                headed.push(file);
+            }
+            None => whole.push(file),
+        }
+    }
+    // Only the poll scan (and engine construction) reads headers before
+    // cataloguing, so a stalled attempt may retry under the background
+    // budget (#1011).
+    let headers = match store.get_range_many(
+        &reads,
+        SCAN_READ_CONCURRENCY,
+        ds_storage::FetchBudget::Background,
+        until,
+    ) {
+        Ok(headers) => headers,
+        Err(e) => {
+            tracing::warn!(
+                "[{}] {} header read(s) failed, retrying next poll: {e}",
+                collection_id,
+                reads.len()
+            );
+            return 0;
+        }
+    };
+
+    let mut deferred = 0;
+    for (file, header) in headed.into_iter().zip(headers) {
+        let key = file.key();
+        let file_size = file.object.size;
+        match header {
+            // The budget ran out before this read finished.
+            None => deferred += 1,
+            Some(Ok(bytes)) => {
+                match TiffMetadata::from_header_bytes(bytes, &file.object.location) {
+                    Some((metadata, tile_info)) => {
+                        tracing::debug!("[{}] {} — range read OK", collection_id, key);
+                        let source = DataSource::remote(
+                            store.clone(),
+                            file.object.location.clone(),
+                            tile_info,
+                        );
+                        entries.insert(
+                            file.time,
+                            FileEntry::loaded(
+                                PathBuf::from(key),
+                                source,
+                                metadata,
+                                file_size,
+                                None,
+                                None,
+                            ),
+                        );
+                    }
+                    // The header arrived but is not a COG: download it whole below.
+                    None => {
+                        tracing::warn!(
+                            "[{}] {} — header is not a COG, falling back to full download ({}). \
+                         Convert to COG for faster serving.",
+                            collection_id,
+                            key,
+                            super::format_bytes(file_size)
+                        );
+                        whole.push(file);
+                    }
+                }
+            }
+            // A source that ignores Range answers the header read with the
+            // whole object, which object_store rejects. Only a full download
+            // can serve it, as before #1003.
+            Some(Err(e)) if range_not_honoured(&e) => {
+                tracing::warn!(
+                    "[{}] {} — the source ignores range requests, falling back to full download ({})",
+                    collection_id,
+                    key,
+                    super::format_bytes(file_size)
+                );
+                whole.push(file);
+            }
+            // The storage failed, not the format (#1003): a full download
+            // would go to the same storage and could stall the same way.
+            // The file stays out of this catalog, so the next scan retries
+            // its header read.
+            Some(Err(e)) => {
+                tracing::warn!(
+                    "[{}] {} — header read failed, retrying next poll: {e}",
+                    collection_id,
+                    key
+                );
+            }
+        }
+    }
+
+    // Newest first again: the empty objects went in ahead of the rest.
+    whole.sort_by_key(|file| std::cmp::Reverse(file.time));
+    deferred + download_whole(store, &whole, collection_id, until, entries)
+}
+
+/// The fallback of [`read_new_files`]: download `files` whole, newest first,
+/// [`SCAN_READ_CONCURRENCY`] at a time, and parse them into `entries`. Full
+/// downloads are much slower and cost more on S3. Convert to COG:
+/// gdal_translate -of COG input.tif output.tif
+///
+/// No group of downloads starts after `until`, but one that started runs
+/// to its end: the poll runtime (or engine construction) waits on it, not
+/// a request, and the background budget lets a stalled attempt retry
+/// (#1011). Returns how many files that left to the next poll.
+fn download_whole(
+    store: &ds_storage::DataStore,
+    files: &[&RemoteFile],
+    collection_id: &str,
+    until: std::time::Instant,
+    entries: &mut BTreeMap<DateTime<Utc>, FileEntry>,
+) -> usize {
+    for (started, group) in files.chunks(SCAN_READ_CONCURRENCY).enumerate() {
+        if std::time::Instant::now() >= until {
+            return files.len() - started * SCAN_READ_CONCURRENCY;
+        }
+        let paths: Vec<ObjectPath> = group.iter().map(|f| f.object.location.clone()).collect();
+        let downloads = match store.get_many_with_budget(
+            &paths,
+            SCAN_READ_CONCURRENCY,
+            None,
+            ds_storage::FetchBudget::Background,
+        ) {
+            Ok(downloads) => downloads,
+            Err(e) => {
+                tracing::warn!(
+                    "[{}] Failed to download {} file(s): {e}",
+                    collection_id,
+                    group.len()
+                );
+                continue;
+            }
+        };
+        for (file, data) in group.iter().zip(downloads) {
+            let key = file.key();
+            let data = match data {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("[{}] Failed to download {}: {e}", collection_id, key);
+                    continue;
+                }
+            };
+            let source = DataSource::from_bytes(data);
+            let metadata = match TiffMetadata::from_source(&source) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("[{}] Skipping {}: {e}", collection_id, key);
+                    continue;
+                }
+            };
+            entries.insert(
+                file.time,
+                FileEntry::loaded(
+                    PathBuf::from(key),
+                    source,
+                    metadata,
+                    file.object.size,
+                    None,
+                    None,
+                ),
+            );
+        }
+    }
+    0
 }
 
 /// Whether a header range read failed because the source does not honour

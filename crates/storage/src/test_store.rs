@@ -1,6 +1,7 @@
 //! Object stores for tests: one that instruments LISTs, for the concurrent
 //! listing and catalog scan tests; one whose GET bodies stall, for the fetch
-//! budget tests; and one that answers HEADs from scripted metadata, for the
+//! budget tests; one whose GETs are slow, for the batched range read tests;
+//! and one that answers HEADs from scripted metadata, for the
 //! template prober and request limit tests. Also a one-object HTTP server
 //! and a JSON log sink, for the range read and `storage` span tests.
 
@@ -204,6 +205,95 @@ impl ObjectStore for StalledBody {
             attributes,
             extensions,
         })
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Wraps [`InMemory`]: every GET sleeps for `delay` while it counts as in
+/// flight, and records its key when it starts, for the batched range read
+/// tests (#1042).
+#[derive(Debug, Default)]
+pub(crate) struct SlowReads {
+    pub inner: InMemory,
+    pub delay: Duration,
+    /// GETs in flight now, and the most there ever were.
+    pub active: Arc<AtomicUsize>,
+    pub peak: Arc<AtomicUsize>,
+    /// Every key GET, in the order the GETs started.
+    pub started: Mutex<Vec<String>>,
+}
+
+impl std::fmt::Display for SlowReads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SlowReads")
+    }
+}
+
+/// Counts one GET in flight until it finishes or is dropped.
+struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for SlowReads {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        path: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.started.lock().unwrap().push(path.to_string());
+        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        let _in_flight = InFlight(self.active.clone());
+        tokio::time::sleep(self.delay).await;
+        self.inner.get_opts(path, options).await
     }
 
     fn delete_stream(

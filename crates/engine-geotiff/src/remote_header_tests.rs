@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ds_storage::discovery::{FilenameMatcher, ScanSpec};
 use ds_storage::object_store::{
@@ -25,7 +26,9 @@ pub(crate) const FIXTURE: &str = concat!(
 const KEY: &str = "d/radar_20260324T2315Z.tif";
 
 /// An in-memory store whose next `fail_ranges` range reads fail the way a
-/// stalled S3 body does, counting range reads and whole-object GETs. Also
+/// stalled S3 body does, counting range reads and whole-object GETs. Each
+/// GET takes `delay`, and the store records how many were in flight at
+/// most and which keys they read, in the order they started (#1042). Also
 /// the failing store of `tile_fetch_failure_tests` (#1051).
 #[derive(Debug, Default)]
 pub(crate) struct FlakyStore {
@@ -34,19 +37,41 @@ pub(crate) struct FlakyStore {
     /// Answer every range read the way object_store does when an HTTP
     /// origin ignores `Range`.
     ignore_ranges: std::sync::atomic::AtomicBool,
+    delay: Duration,
     range_reads: AtomicUsize,
     full_gets: AtomicUsize,
+    in_flight: AtomicUsize,
+    peak: AtomicUsize,
+    started: Mutex<Vec<String>>,
+}
+
+/// Counts one GET in flight until it finishes or is dropped.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FlakyStore {
     pub(crate) fn with_object(bytes: Vec<u8>) -> Arc<Self> {
-        let store = Self::default();
-        futures::executor::block_on(
-            store
-                .inner
-                .put(&ObjectPath::from(KEY), PutPayload::from(bytes)),
-        )
-        .unwrap();
+        Self::with_objects(&[KEY.to_string()], bytes, Duration::ZERO)
+    }
+
+    /// `bytes` under each of `keys`, every GET taking `delay`.
+    fn with_objects(keys: &[String], bytes: Vec<u8>, delay: Duration) -> Arc<Self> {
+        let store = Self {
+            delay,
+            ..Self::default()
+        };
+        for key in keys {
+            futures::executor::block_on(store.inner.put(
+                &ObjectPath::from(key.as_str()),
+                PutPayload::from(bytes.clone()),
+            ))
+            .unwrap();
+        }
         Arc::new(store)
     }
 
@@ -56,6 +81,16 @@ impl FlakyStore {
             self.range_reads.load(Ordering::SeqCst),
             self.full_gets.load(Ordering::SeqCst),
         )
+    }
+
+    /// The most GETs ever in flight at once.
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+
+    /// The keys GET since the last call, in the order the GETs started.
+    fn take_started(&self) -> Vec<String> {
+        std::mem::take(&mut *self.started.lock().unwrap())
     }
 }
 
@@ -72,30 +107,39 @@ impl ObjectStore for FlakyStore {
         path: &ObjectPath,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
-        if !options.head {
-            if options.range.is_none() {
-                self.full_gets.fetch_add(1, Ordering::SeqCst);
-            } else {
-                self.range_reads.fetch_add(1, Ordering::SeqCst);
-                if self.ignore_ranges.load(Ordering::SeqCst) {
-                    return Err(object_store::Error::Generic {
-                        store: "HTTP",
-                        source: "Received non-partial response when range requested".into(),
-                    });
-                }
-                // Tests drive one read at a time, so load-then-decrement is
-                // race-free here; a count far above the reads a test makes
-                // fails every read, concurrent ones too.
-                let fail = self.fail_ranges.load(Ordering::SeqCst) > 0;
-                if fail {
-                    self.fail_ranges.fetch_sub(1, Ordering::SeqCst);
-                }
-                if fail {
-                    return Err(object_store::Error::Generic {
-                        store: "S3",
-                        source: "error reading response body: operation timed out".into(),
-                    });
-                }
+        if options.head {
+            return self.inner.get_opts(path, options).await;
+        }
+        self.started.lock().unwrap().push(path.to_string());
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        let _in_flight = InFlight(&self.in_flight);
+        match options.range {
+            None => self.full_gets.fetch_add(1, Ordering::SeqCst),
+            Some(_) => self.range_reads.fetch_add(1, Ordering::SeqCst),
+        };
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        if options.range.is_some() {
+            if self.ignore_ranges.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "HTTP",
+                    source: "Received non-partial response when range requested".into(),
+                });
+            }
+            // One decrement per failed read, so concurrent reads fail
+            // exactly `fail_ranges` of them; a count far above the reads a
+            // test makes fails every read.
+            let fail = self
+                .fail_ranges
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if fail {
+                return Err(object_store::Error::Generic {
+                    store: "S3",
+                    source: "error reading response body: operation timed out".into(),
+                });
             }
         }
         self.inner.get_opts(path, options).await
@@ -347,4 +391,113 @@ fn a_spent_read_budget_defers_new_files_to_the_next_poll() {
     let reused = scan(&first, std::time::Duration::ZERO);
     assert!(only_source(&reused).is_some(), "a catalogued file stays");
     assert_eq!(flaky.counts(), (1, 0), "without another read");
+}
+
+/// `count` keys of five-minute frames under prefix `d`, oldest first.
+fn frame_keys(count: usize) -> Vec<String> {
+    let first = chrono::DateTime::parse_from_rfc3339("2026-03-24T23:00:00Z").unwrap();
+    (0..count)
+        .map(|i| {
+            let time = first + chrono::Duration::minutes(5 * i as i64);
+            format!("d/radar_{}.tif", time.format("%Y%m%dT%H%MZ"))
+        })
+        .collect()
+}
+
+/// The catalogued keys, oldest first.
+fn catalogued(catalog: &Catalog) -> Vec<String> {
+    catalog
+        .entries
+        .values()
+        .map(|entry| entry.path.to_str().unwrap().to_string())
+        .collect()
+}
+
+/// `keys` newest first.
+fn newest_first(keys: &[String]) -> Vec<String> {
+    keys.iter().rev().cloned().collect()
+}
+
+/// A scan reads its new files' headers `SCAN_READ_CONCURRENCY` at a time,
+/// newest first, never one after another and never more at once (#1042,
+/// root Critical Rule 9): twelve 150 ms reads take about three rounds,
+/// not twelve.
+#[test]
+fn a_scan_overlaps_its_header_reads_up_to_the_bound() {
+    let keys = frame_keys(12);
+    let delay = Duration::from_millis(150);
+    let flaky = FlakyStore::with_objects(&keys, std::fs::read(FIXTURE).unwrap(), delay);
+    let store = DataStore::new(flaky.clone());
+
+    let started = Instant::now();
+    let catalog = poll(&store, &Catalog::empty());
+    let elapsed = started.elapsed();
+    assert_eq!(catalogued(&catalog), keys);
+    assert_eq!(flaky.counts(), (12, 0));
+    assert_eq!(flaky.peak(), catalog::SCAN_READ_CONCURRENCY);
+    assert!(
+        elapsed < delay * 6,
+        "{elapsed:?}: the header reads did not overlap"
+    );
+    assert_eq!(flaky.take_started(), newest_first(&keys));
+}
+
+/// A scan whose read budget runs out has catalogued the newest files and
+/// leaves the oldest to the next poll (#1042): a client wants the latest
+/// frame. The next poll reads only the files it left.
+#[test]
+fn a_spent_read_budget_leaves_the_oldest_files_to_the_next_poll() {
+    let keys = frame_keys(8);
+    let delay = Duration::from_millis(600);
+    let flaky = FlakyStore::with_objects(&keys, std::fs::read(FIXTURE).unwrap(), delay);
+    let store = DataStore::new(flaky.clone());
+    let matcher = FilenameMatcher::from_template("radar_%Y%m%dT%H%MZ.tif").unwrap();
+    let scan = |previous: &Catalog, budget: Duration| {
+        let index: HashMap<&Path, &FileEntry> = previous
+            .entries
+            .values()
+            .map(|e| (e.path.as_path(), e))
+            .collect();
+        catalog::scan_remote_within(
+            &store,
+            &[ObjectPath::from("d")],
+            &ScanSpec::new(&matcher, "radar"),
+            &index,
+            budget,
+        )
+        .unwrap()
+        .0
+    };
+
+    // Time for one round of four reads: the newest four finish at 600 ms,
+    // the next four are cut off at 900 ms.
+    let first = scan(&Catalog::empty(), Duration::from_millis(900));
+    assert_eq!(catalogued(&first), keys[4..]);
+    assert_eq!(flaky.take_started(), newest_first(&keys));
+
+    let second = scan(&first, Duration::from_secs(60));
+    assert_eq!(catalogued(&second), keys);
+    assert_eq!(flaky.take_started(), newest_first(&keys[..4]));
+}
+
+/// Files a header read cannot serve are downloaded whole, newest first and
+/// `SCAN_READ_CONCURRENCY` at a time, not one after another (#1042).
+#[test]
+fn full_downloads_run_newest_first_up_to_the_bound() {
+    let keys = frame_keys(6);
+    let not_cog = ifd_at_end(std::fs::read(FIXTURE).unwrap());
+    let flaky = FlakyStore::with_objects(&keys, not_cog, Duration::from_millis(100));
+    let store = DataStore::new(flaky.clone());
+
+    let catalog = poll(&store, &Catalog::empty());
+    assert_eq!(catalogued(&catalog), keys);
+    assert!(catalog
+        .entries
+        .values()
+        .all(|entry| matches!(**entry.source().unwrap(), DataSource::InMemory(_))));
+    assert_eq!(flaky.counts(), (6, 6));
+    assert_eq!(flaky.peak(), catalog::SCAN_READ_CONCURRENCY);
+    let started = flaky.take_started();
+    assert_eq!(started[..6], newest_first(&keys), "the header reads");
+    assert_eq!(started[6..], newest_first(&keys), "the downloads");
 }
