@@ -18,9 +18,10 @@ inventory as points.
 - The first four columns are fixed by position: location, latitude,
   longitude, time. Every further column is a parameter named by its header.
 - `CsvEngine::new` builds the station inventory once, in the order the
-  stations first appear in the file, along with the EDR location list and
-  the observation time span. `/locations`, Features `/items` and the
-  Features temporal extent are served from these without scanning the rows.
+  stations first appear in the file, along with the EDR location list, the
+  observation time span and the bounding box of the rows' coordinates.
+  `/locations`, Features `/items`, the temporal extent and the EDR and map
+  spatial extent are served from these without scanning the rows.
 - It also lists the file's distinct observation times once. A
   [station grid](../engine-station-grid/README.md) over the collection
   without a `cadence` takes them as its analysis times; the collection's

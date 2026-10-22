@@ -24,9 +24,12 @@ pub struct CsvEngine {
     /// The EDR location inventory in first-observation order, built once:
     /// `get_locations` hands every request this `Arc` (#1083).
     pub(crate) locations: Arc<LocationSnapshot>,
-    /// First and last observation time, computed once: the Features
-    /// temporal extent is read per request (Critical Rule 10).
+    /// First and last observation time, computed once: the EDR and Features
+    /// temporal extents are read per request (Critical Rule 10, #1249).
     time_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// The bounding box of every row's coordinates, computed once for the
+    /// same reason (#27).
+    spatial_extent: Option<[f64; 4]>,
     /// Every distinct observation time, ascending, built once: a station
     /// grid's analysis times without a `cadence` (#1206).
     instants: Arc<[DateTime<Utc>]>,
@@ -49,22 +52,24 @@ impl CsvEngine {
             .into_iter()
             .map(|index| station_feature(&store.rows[index]))
             .collect();
-        let time_extent = store
-            .rows
-            .iter()
-            .map(|row| row.time)
-            .min()
-            .zip(store.rows.iter().map(|row| row.time).max());
         let mut instants: Vec<DateTime<Utc>> = store.rows.iter().map(|row| row.time).collect();
         instants.sort_unstable();
         instants.dedup();
+        let time_extent = instants.first().copied().zip(instants.last().copied());
+        let spatial_extent = spatial_extent(&store);
         let locations = Arc::new(LocationSnapshot::new(inventory(&store)));
-        let map = StationMap::new(&store, time_extent, StationMapSettings::default());
+        let map = StationMap::new(
+            &store,
+            time_extent,
+            spatial_extent,
+            StationMapSettings::default(),
+        );
         Self {
             store,
             stations,
             locations,
             time_extent,
+            spatial_extent,
             instants: instants.into(),
             map,
         }
@@ -72,7 +77,7 @@ impl CsvEngine {
 
     /// The station-symbol map layers on `settings` (`[csv.map]`, #1204).
     pub fn with_station_map(mut self, settings: StationMapSettings) -> Self {
-        self.map = StationMap::new(&self.store, self.time_extent, settings);
+        self.map = StationMap::new(&self.store, self.time_extent, self.spatial_extent, settings);
         self
     }
 
@@ -299,24 +304,11 @@ impl EdrEngine for CsvEngine {
             .collect()
     }
 
+    /// The span the rows cover, from the load-time snapshot: read per
+    /// request by collection metadata, query validation and a station
+    /// grid's axis (#1249).
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-        let mut min = DateTime::<Utc>::MAX_UTC;
-        let mut max = DateTime::<Utc>::MIN_UTC;
-
-        for row in &self.store.rows {
-            if row.time < min {
-                min = row.time;
-            }
-            if row.time > max {
-                max = row.time;
-            }
-        }
-
-        if min <= max {
-            Some((min, max))
-        } else {
-            None
-        }
+        self.time_extent
     }
 
     fn supported_query_types(&self) -> Vec<String> {
@@ -397,7 +389,7 @@ impl EdrEngine for CsvEngine {
     }
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
-        spatial_extent(&self.store)
+        self.spatial_extent
     }
 }
 
@@ -491,7 +483,7 @@ impl FeatureEngine for CsvEngine {
 }
 
 /// The bounding box of every row's coordinates; `None` for an empty file.
-pub(crate) fn spatial_extent(store: &CsvDataStore) -> Option<[f64; 4]> {
+fn spatial_extent(store: &CsvDataStore) -> Option<[f64; 4]> {
     if store.rows.is_empty() {
         return None;
     }
@@ -885,6 +877,49 @@ mod tests {
         assert_eq!(engine.get_available_times(), None);
         let weather = CsvEngine::new(test_store());
         assert_eq!(weather.observation_instants().unwrap().len(), 31 * 24);
+    }
+
+    /// The temporal and spatial extents are the rows' minima and maxima,
+    /// computed once at load and served from that snapshot, never by a scan
+    /// per request (#1249, #27).
+    #[test]
+    fn extents_are_the_row_bounds_computed_once() {
+        use ds_core::map_engine::MapEngine as _;
+        let mut engine = CsvEngine::new(test_store());
+        let rows = &engine.store.rows;
+        let times = rows.iter().map(|row| row.time);
+        let time_span = times.clone().min().zip(times.max());
+        let mut bbox = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+        for row in rows {
+            bbox[0] = bbox[0].min(row.longitude);
+            bbox[1] = bbox[1].min(row.latitude);
+            bbox[2] = bbox[2].max(row.longitude);
+            bbox[3] = bbox[3].max(row.latitude);
+        }
+        assert!(time_span.is_some());
+        let check = |engine: &CsvEngine| {
+            assert_eq!(engine.get_temporal_extent(), time_span);
+            assert_eq!(engine.temporal_extent(), time_span);
+            assert_eq!(engine.get_spatial_extent(), Some(bbox));
+            assert_eq!(engine.raster_info_shared().spatial_extent, Some(bbox));
+        };
+        check(&engine);
+        // Emptying the rows after load changes nothing: a per-call scan
+        // would now find no extent at all.
+        engine.store.rows.clear();
+        check(&engine);
+
+        // A file of headers only has neither extent, as before.
+        let empty = CsvEngine::new(CsvDataStore {
+            rows: Vec::new(),
+            location_index: HashMap::new(),
+            time_index: HashMap::new(),
+            parameter_names: vec!["temperature".into()],
+            parameter_units: HashMap::new(),
+        });
+        assert_eq!(empty.get_temporal_extent(), None);
+        assert_eq!(empty.temporal_extent(), None);
+        assert_eq!(empty.get_spatial_extent(), None);
     }
 
     /// The x of every coverage, in answer order.
