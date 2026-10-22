@@ -482,10 +482,7 @@ impl<'a> TextReader<'a> {
             })?;
         let line_bytes = &remaining[..nl_pos];
         self.pos += nl_pos + 1;
-        String::from_utf8(line_bytes.to_vec()).map_err(|_| QueryDataError::Parse {
-            offset: start,
-            message: "Invalid UTF-8 in header".into(),
-        })
+        Ok(header_text(line_bytes))
     }
 
     /// Read an NFmiString: `<length> <raw_bytes>` where length is followed by
@@ -523,10 +520,19 @@ impl<'a> TextReader<'a> {
         self.pos += len;
 
         // The string content followed by \n
-        String::from_utf8(bytes.to_vec()).map_err(|_| QueryDataError::Parse {
-            offset: start,
-            message: "Invalid UTF-8 in string".into(),
-        })
+        Ok(header_text(bytes))
+    }
+}
+
+/// A header string, as newbase writes it: 8-bit text, ISO-8859-1 in FMI's
+/// files (`Lämpötila` is `4c e4 6d 70 f6 74 69 6c 61`). Valid UTF-8 reads
+/// as UTF-8, anything else as ISO-8859-1, each byte the code point of its
+/// value, so no string fails the load (#1251). Names are labels: a
+/// parameter is its number.
+fn header_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => bytes.iter().copied().map(char::from).collect(),
     }
 }
 
@@ -1199,6 +1205,75 @@ mod tests {
                 t > -100.0 && t < 100.0,
                 "Temperature {t} out of range (Celsius)"
             );
+        }
+    }
+
+    /// A header string is UTF-8 when it is valid UTF-8, else ISO-8859-1,
+    /// every byte the code point of its value (#1251).
+    #[test]
+    fn header_text_is_utf8_else_latin1() {
+        assert_eq!(header_text(b"L\xe4mp\xf6tila"), "Lämpötila");
+        assert_eq!(header_text("Lämpötila".as_bytes()), "Lämpötila");
+        assert_eq!(
+            header_text(b"2 Metre Temperature (2t)"),
+            "2 Metre Temperature (2t)"
+        );
+        let every_byte: Vec<u8> = (0..=255).collect();
+        assert!(header_text(&every_byte).chars().map(u32::from).eq(0..=255));
+    }
+
+    /// The Kenya fixture with `renames` spliced into its header, parsed
+    /// from memory.
+    fn kenya_renamed(renames: &[(&[u8], &[u8])]) -> Result<QueryData, QueryDataError> {
+        let mut bytes = std::fs::read(test_file()).unwrap();
+        for (from, to) in renames {
+            let at = bytes
+                .windows(from.len())
+                .position(|w| w == *from)
+                .expect("text in the fixture header");
+            bytes.splice(at..at + from.len(), to.iter().copied());
+        }
+        let mut map = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+        map.copy_from_slice(&bytes);
+        QueryData::from_mmap(map.make_read_only().unwrap())
+    }
+
+    /// newbase writes header strings as 8-bit text, ISO-8859-1 in FMI's
+    /// files (#1251). The 2 m temperature named `Lämpötila` in it, its
+    /// producer `ECMWF sää` and a header text line `Sääennuste` load,
+    /// and so does the name in UTF-8. The parameter is still its number,
+    /// its values the same; an ASCII name next to it is unchanged.
+    #[test]
+    fn latin1_header_strings_load() {
+        const T2M: &[u8] = b"\n4\n24 2 Metre Temperature (2t)\n\
+            32700 32700 1 32700 32700 4 %.1f\n240\n13 ECMWF Surface\n";
+        const HEADER_TEXT: &[u8] = b"\n0\n0\n34 NFmiParamDescriptor\n";
+        let original = QueryData::open(&test_file()).unwrap();
+        for name in [&b"9 L\xe4mp\xf6tila"[..], b"11 L\xc3\xa4mp\xc3\xb6tila"] {
+            let param = [
+                b"\n4\n",
+                name,
+                b"\n32700 32700 1 32700 32700 4 %.1f\n240\n9 ECMWF s\xe4\xe4\n",
+            ]
+            .concat();
+            let qd = kenya_renamed(&[
+                (T2M, &param),
+                (
+                    HEADER_TEXT,
+                    b"\n1\n0 10 S\xe4\xe4ennuste\n0\n34 NFmiParamDescriptor\n",
+                ),
+            ])
+            .unwrap();
+            assert_eq!(qd.params[1].name, "Lämpötila");
+            assert_eq!(qd.params[1].producer, "ECMWF sää");
+            assert_eq!(qd.params[1].id, 4);
+            assert_eq!(qd.params[0].name, "Mean Sea Level Pressure (msl)");
+            assert_eq!(qd.params[0].producer, "ECMWF Surface");
+            for name in ["Lämpötila", "LÄMPÖTILA", "4"] {
+                assert_eq!(qd.param_index_by_name(name), Some(1), "{name}");
+            }
+            assert_eq!(qd.param_index_by_name("msl"), Some(0));
+            assert_eq!(qd.grid_values(1, 0, 0), original.grid_values(1, 0, 0));
         }
     }
 

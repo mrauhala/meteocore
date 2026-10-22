@@ -22,7 +22,10 @@ Each file is one model run, and the newest run is the default.
 - **Parsing.** The engine reads the text header (parameters, grid area,
   levels, timesteps, origin time), checks that the data block has the size
   the header implies, and memory-maps the file. Values are read straight
-  from the mapping as little-endian `f32`; `32700` means missing.
+  from the mapping as little-endian `f32`; `32700` means missing. A header
+  string is read as UTF-8 when it is valid UTF-8, else as ISO-8859-1, the
+  8-bit text newbase writes in FMI's files, so a name such as `Lämpötila`
+  loads either way.
 - **Refresh.** A poll reuses every file it has already parsed (matched by
   path) and swaps the run set atomically only when the set of files
   changes. An empty or unreadable directory, or one holding only unloadable
@@ -78,7 +81,8 @@ Each file is one model run, and the newest run is the default.
 - EDR `datetime` selects the run's timesteps inside the interval, both ends
   included; without it every timestep is returned. A window with no
   timestep is a 404.
-- EDR `parameter-name` ignores case. An unknown name is a 400.
+- EDR `parameter-name` ignores the case of ASCII letters. An unknown name
+  is a 400.
 - The area grid uses the source's mean cell size, coarsened to at most 256
   cells per axis. A response holds at most 1 000 000 values across
   timesteps, cells and parameters; more is a 400. The grid has a `t` axis
@@ -179,8 +183,8 @@ cargo test --release -p engine-querydata meps_render_timing -- --ignored --nocap
 
 The tests are unit tests inside the crate:
 
-- `src/parse.rs`: header parsing, grid points checked against PROJ,
-  parameter lookup.
+- `src/parse.rs`: header parsing, ISO-8859-1 header strings, grid points
+  checked against PROJ, parameter lookup.
 - `src/units.rs`: the parameter-number unit table.
 - `src/engine.rs`: EDR position, area and trajectory, map tiles, runs and
   instances, skipping temporary names, data age.
@@ -188,6 +192,8 @@ The tests are unit tests inside the crate:
   the antimeridian.
 - `src/engine/global_tests.rs`: a global lat/lon grid over the pole and
   across the seam.
+- `src/engine/names_tests.rs`: descriptors, short names and ISO-8859-1
+  names in EDR and the map parameter list.
 - `src/engine/sampler_tests.rs`: the engine's render against the shared
   `ds_core::resample::SourceGrid` sampler.
 - `src/engine/units_tests.rs`: units in EDR metadata, coverages and map

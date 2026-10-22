@@ -109,6 +109,11 @@ runtime).
   Both names of one parameter are two ranges, which `DerivedWind` relies on
   (it asks for components by descriptor). Errors stay the shared
   `ds_core::edr_engine::select_parameters` 400.
+- **Header text (#1251):** newbase writes header strings as 8-bit text,
+  ISO-8859-1 in FMI's files (`Lämpötila` = `4c e4 6d 70 f6 74 69 6c 61`).
+  Every string the parser reads goes through `parse::header_text`: UTF-8
+  when valid, else ISO-8859-1. Never decode a header string as strict
+  UTF-8: one Latin-1 byte failed the whole file before any grid was read.
 - **Wind (#897):** `wind_facts` reports each parameter's FMI number and both
   names, built with the run set. `ds_core::wind` pairs `kFmiWindUMS` /
   `kFmiWindVMS` (23/24), or vocabulary short names, into `WindSpeedMS` (or
