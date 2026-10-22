@@ -255,7 +255,10 @@ need no reload pruning.
   the boot spawn block in `main.rs`, `rotate_poll_loops!` in `admin.rs`,
   and the graceful-shutdown block at the end of `main` (bug #442 was a
   missing boot-path spawn for `cap_engines`; the shutdown block had also
-  silently skipped cap, postgis and nowcast).
+  silently skipped cap, postgis and nowcast). An engine whose push-fed
+  state must survive its collection's rebuild implements
+  `take_over(&self, predecessor: &Self)` and is rotated with
+  `rotate_poll_loops!(<field>, take_over)`, as CAP and BUFR are (#1036).
 
 - Raster memory admission uses the process-wide `ds_executor::budget::RENDER_MEMORY`,
   configured by `MC_RENDER_MEMORY_MB` (default 1024 MiB; restart to change).
@@ -352,11 +355,24 @@ Wiring:
   callers need no new argument and tests (which never set it) run without
   persistence.
 - A reload re-reads the key but cannot replace the store: a changed value
-  logs `state_dir_reload_warning` ("restart to apply"). A reload that
-  rebuilds a collection restores from the snapshot the replaced engine last
-  wrote (at most five minutes old); the replaced engine's `shutdown()` then
-  writes its final state, which the new engine overwrites at its next
-  write. An unchanged collection keeps its live engine and state.
+  logs `state_dir_reload_warning` ("restart to apply"). An unchanged
+  collection keeps its live engine and state.
+- **A rebuilt WIS2 collection takes over in memory (#1036).** The new
+  engine is built while the old one still receives, so its build-time
+  restore is only the last periodic snapshot. Once the reload is accepted,
+  `rotate_poll_loops!(cap_engines, take_over)` (and `bufr_engines`) first
+  shuts down every replaced engine: its `shutdown()` ends its ingest under
+  the ingest lock, then flushes. Only then does the new engine of the same
+  id get `take_over(&replaced)`, which copies the replaced engine's state
+  and applies the new config as a restore does, before its poll loop is
+  spawned and before the registry swap, so the swap serves the whole set.
+  The new engine's next write replaces the flush. Keep that order: a
+  take-over before the shutdown misses what arrives in between, and one
+  after the spawn would replace a store the new pipeline already fills.
+  A rejected reload returns before the rotation: nothing is shut down or
+  taken over. The new engine is a new broker session, so what is
+  published between the shutdown and its subscription is missed, as on a
+  restart. No state store is needed for any of this.
 - Graceful shutdown: `shutdown()` on each CAP and BUFR engine (the block at
   the end of `main`) flushes the snapshot, so a redeploy loses nothing and
   the snapshot records when the server went down. A crash loses at most

@@ -189,6 +189,15 @@ impl Wis2Source {
         self.clock_changes.load(Ordering::Relaxed)
     }
 
+    /// Move `from`'s deletion index here: the replaced engine's on a
+    /// reload (#1036), so a `rel=deletion` of a report it received still
+    /// withdraws it. Not in the state snapshot, so a restart loses it.
+    pub(crate) fn take_deletions(&self, from: &Wis2Source) {
+        let produced =
+            std::mem::take(&mut *from.produced.lock().unwrap_or_else(|e| e.into_inner()));
+        *self.produced.lock().unwrap_or_else(|e| e.into_inner()) = produced;
+    }
+
     /// Install a broker status without a pipeline (tests drive it by hand).
     #[cfg(test)]
     pub(crate) fn set_status(&self, status: Arc<Status>) {

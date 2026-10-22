@@ -238,35 +238,20 @@ impl BufrEngine {
         };
         let age = now - decoded.written_at;
         let long_outage = age > src.warmup();
-        src.set_warmup_clock(if long_outage {
+        let clock = if long_outage {
             WarmupClock {
                 filling_since: None,
                 cause: WarmupCause::LongOutage,
             }
         } else {
             decoded.clock
-        });
-        let (reports, stations, dropped) = {
-            let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
-            for (info, rows) in decoded.stations {
-                store.restore_station(info, rows);
-            }
-            // The current retention and max_stations, as a prune tick would.
-            let (rows_dropped, _) = store.prune(now);
-            (store.row_count(), store.station_count(), rows_dropped)
         };
-        let columns = if decoded.columns_dropped.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "; column(s) no longer configured as written, values dropped: {}",
-                decoded.columns_dropped.join(", ")
-            )
-        };
+        let (reports, stations, dropped) = self.install(src, clock, decoded.stations, now);
         tracing::info!(
             "[{id}] bufr/wis2: restored {reports} report(s) at {stations} station(s) from state \
-             snapshot {at} written {} ago ({dropped} past retention or max_stations{columns})",
+             snapshot {at} written {} ago ({dropped} past retention or max_stations{})",
             hours_minutes(age),
+            dropped_columns(&decoded.columns_dropped)
         );
         if long_outage {
             tracing::warn!(
@@ -278,6 +263,71 @@ impl BufrEngine {
             return None;
         }
         Some(age.to_std().unwrap_or(Duration::ZERO))
+    }
+
+    /// Replace the store with `stations` (rows already in this engine's
+    /// column layout) and set the warm-up clock: a snapshot restore and a
+    /// take-over alike. The current `retention` and `max_stations` apply,
+    /// as a prune tick would. Returns `(reports, stations, rows dropped)`.
+    fn install(
+        &self,
+        src: &Wis2Source,
+        clock: WarmupClock,
+        stations: Vec<(StationInfo, persist::Rows)>,
+        now: DateTime<Utc>,
+    ) -> (usize, usize, usize) {
+        src.set_warmup_clock(clock);
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+        store.clear();
+        for (info, rows) in stations {
+            store.restore_station(info, rows);
+        }
+        let (rows_dropped, _) = store.prune(now);
+        (store.row_count(), store.station_count(), rows_dropped)
+    }
+
+    /// Take over the report store of the engine this one replaces (#1036).
+    /// A reload that rebuilds a WIS2 collection builds this engine first,
+    /// and it restores only the last periodic snapshot, while the replaced
+    /// engine keeps receiving until the reload is accepted. The server
+    /// calls this after `predecessor.shutdown()`, which stops its ingest,
+    /// and before this engine's poll loop starts: every report the replaced
+    /// engine held moves over in memory, mapped onto this engine's
+    /// parameter table and pruned to its `retention` and `max_stations` as
+    /// a restore is, with the warm-up clock, the deletion index and the
+    /// version. A state store is not involved; this engine's next write
+    /// puts the store back in it. A no-op unless both engines are WIS2-fed.
+    pub fn take_over(&self, predecessor: &BufrEngine) {
+        let (Source::Wis2(src), Source::Wis2(prev)) = (&self.source, &predecessor.source) else {
+            return;
+        };
+        let now = Utc::now();
+        let carried = {
+            let store = predecessor.store.read().unwrap_or_else(|e| e.into_inner());
+            persist::carry_over(
+                &store,
+                &predecessor.table,
+                &self.table,
+                prev.warmup_clock(),
+                now,
+            )
+        };
+        let (reports, stations, dropped) = self.install(src, carried.clock, carried.stations, now);
+        src.take_deletions(prev);
+        // Continue the replaced engine's version (the content version and
+        // the Features ETag), so none it handed out matches what this
+        // engine serves.
+        self.version.fetch_max(
+            predecessor.version.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.rebuild_snapshot();
+        tracing::info!(
+            "[{}] bufr/wis2: took over {reports} report(s) at {stations} station(s) from the \
+             engine this reload replaced ({dropped} past retention or max_stations{})",
+            self.collection_id,
+            dropped_columns(&carried.columns_dropped)
+        );
     }
 
     /// What the state snapshot's write policy compares: moves whenever the
@@ -491,7 +541,13 @@ impl BufrEngine {
         let mut keys = Vec::new();
         {
             let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
-            for r in &decoded.reports {
+            // Shut down: nothing more lands in the store (see `shutdown`).
+            let reports = if self.shutdown.is_shutdown() {
+                &[][..]
+            } else {
+                &decoded.reports[..]
+            };
+            for r in reports {
                 match store.ingest(r, &self.table, now) {
                     Ingest::Inserted => {
                         self.health
@@ -527,6 +583,9 @@ impl BufrEngine {
     /// existed.
     pub fn remove_reports(&self, keys: &[(String, DateTime<Utc>)]) -> usize {
         let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+        if self.shutdown.is_shutdown() {
+            return 0;
+        }
         let n = keys.iter().filter(|(id, t)| store.remove(id, *t)).count();
         if n > 0 {
             self.dirty.store(true, Ordering::Release);
@@ -598,11 +657,18 @@ impl BufrEngine {
     pub(crate) const SNAPSHOT_INTERVAL: Duration = SNAPSHOT_INTERVAL;
     pub(crate) const PRUNE_INTERVAL: Duration = PRUNE_INTERVAL;
 
-    /// Signal the poll loop to stop. With a state store, also flush the
-    /// snapshot (#1002): a graceful restart loses nothing, and the
-    /// snapshot's `written_at` records when the server went down.
+    /// Signal the poll loop to stop; the store takes no report from here
+    /// on (#1036). With a state store, also flush the snapshot (#1002): a
+    /// graceful restart loses nothing, and the snapshot's `written_at`
+    /// records when the server went down.
     pub fn shutdown(&self) {
-        self.shutdown.shutdown();
+        {
+            // Under the write lock, which every ingest holds while it
+            // checks the signal: an ingest lands either before it or not at
+            // all, never after the flush below or a successor's take-over.
+            let _store = self.store.write().unwrap_or_else(|e| e.into_inner());
+            self.shutdown.shutdown();
+        }
         self.write_state(true);
     }
 
@@ -734,6 +800,19 @@ fn state_policy(warmup: chrono::Duration) -> WritePolicy {
 fn hours_minutes(d: chrono::Duration) -> String {
     let minutes = d.num_minutes().max(0);
     format!("{}h{:02}m", minutes / 60, minutes % 60)
+}
+
+/// The restore log's note on columns whose values were dropped (empty
+/// when none were).
+fn dropped_columns(columns: &[String]) -> String {
+    if columns.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; column(s) no longer configured as written, values dropped: {}",
+            columns.join(", ")
+        )
+    }
 }
 
 /// Whether `station` has at least one report INSIDE `interval`: the one
@@ -1392,6 +1471,75 @@ mod tests {
         put(&b, "C", hours_ago(0), 280.0);
         let writer = b.state.as_ref().unwrap().lock().unwrap();
         assert!(writer.is_due(b.state_revision(), Instant::now(), false));
+    }
+
+    /// #1036: a reload that rebuilds the collection builds the new engine
+    /// while the old one still receives, so the new one restores only the
+    /// last periodic snapshot. The old engine's shutdown ends its ingest,
+    /// and the new one takes over the rest in memory, under its own
+    /// parameter table: nothing that arrived after that write is lost, and
+    /// the new engine's next write, which replaces the old one's shutdown
+    /// flush, holds it.
+    #[test]
+    fn a_rebuild_takes_over_what_arrived_after_the_last_periodic_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wis2_config("P36500D", None);
+        let old = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
+        wis2(&old).mark_filling(hours_ago(30));
+        put(&old, "A", hours_ago(1), 281.35);
+        // The periodic write, then more reports.
+        old.write_state(false);
+        put(&old, "A", hours_ago(0), 282.15);
+        put(&old, "B", hours_ago(0), 270.0);
+
+        // The reload builds the successor first, with a column added.
+        let changed = BufrConfig {
+            parameters: vec![ds_core::config::BufrParameterConfig {
+                name: "new_column".into(),
+                descriptors: vec!["012102".into()],
+                unit: "K".into(),
+                label: None,
+                observed_property: None,
+                period_hours: None,
+            }],
+            ..cfg.clone()
+        };
+        let new = BufrEngine::new_with_state(&changed, ID, file_store(dir.path())).unwrap();
+        assert_eq!(new.gauges(), (1, 1), "the periodic snapshot only");
+
+        // Accepted: the old engine is shut down, then the new one takes over.
+        old.shutdown();
+        new.take_over(&old);
+        assert_eq!(new.gauges(), (2, 3));
+        assert_eq!(rows(&new), rows(&old));
+        assert!(
+            new.data_version() > old.data_version(),
+            "no version the old engine handed out names the new content"
+        );
+        assert_eq!(
+            wis2(&new).warmup_clock(),
+            WarmupClock {
+                filling_since: Some(hours_ago(30)),
+                cause: WarmupCause::ColdStart,
+            }
+        );
+
+        // The old engine takes nothing more after its shutdown.
+        let fixture = std::fs::read(format!(
+            "{}/synop_se-smhi_20260912T0800Z.bufr",
+            fixtures_dir()
+        ))
+        .unwrap();
+        assert_eq!(old.ingest_bytes(&fixture, "late", Utc::now()), 0);
+        assert_eq!(old.gauges(), (2, 3));
+
+        // The new engine's first report moves it; its write holds it all.
+        assert!(new.ingest_bytes(&fixture, "next", Utc::now()) > 0);
+        new.snapshot_if_dirty();
+        new.write_state(false);
+        let restored = BufrEngine::new_with_state(&changed, ID, file_store(dir.path())).unwrap();
+        assert_eq!(restored.gauges(), new.gauges());
+        assert_eq!(rows(&restored), rows(&new));
     }
 
     #[test]

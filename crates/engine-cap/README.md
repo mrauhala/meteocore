@@ -107,6 +107,11 @@ and as a map layer that can be drawn for any time.
   `<state_dir>/<collection id>.cap.state` (at most every five minutes when
   changed, at least hourly, and on shutdown) and restored at start under
   the current config.
+- A reload that rebuilds the collection hands the whole alert set, with
+  its warm-up, to the new engine in memory, under the new config, with
+  or without `state_dir`. The new engine opens a new broker session, so
+  notifications published between the old engine's shutdown and the new
+  subscription are missed.
 - A start without a usable snapshot (every start, without `state_dir`)
   begins empty, and `/health` reports "warming up after cold start: N
   alerts received" for `warmup` after the subscription comes up. A

@@ -306,11 +306,23 @@ at boot and ignores the state store.
   store down for two days keeps the other five.
   Set `warmup` shorter for a shorter outage to show as "warming up after a
   long outage".
-- A reload that rebuilds the collection restores from the last periodic
-  snapshot (≤ 5 min old); the replaced engine's `shutdown()` then writes
-  its final state, which the new engine overwrites at its next write, so
-  the reports the replaced engine received since its last periodic write
-  are lost (as for CAP).
+- **Reload (#1036).** A reload that rebuilds the collection builds the new
+  engine while the old one still receives; its build restores only the
+  last periodic snapshot. After the reload is accepted the server calls
+  `old.shutdown()`, which signals under the store's write lock (every
+  ingest, `ingest_bytes_keyed` and `remove_reports`, checks the signal
+  under that lock, so nothing lands after it) and flushes, then
+  `new.take_over(&old)` before the new poll loop starts:
+  `persist::carry_over` maps the old store onto the new parameter table by
+  whole column definition, the snapshot's mapping without the blob;
+  `install` replaces the store and prunes it to the new `retention` and
+  `max_stations`, as a restore does; the warm-up clock carries over, the
+  `Produced` deletion index moves, and the snapshot `version` continues
+  from the old engine's (it is the content version and the Features ETag:
+  restarting it at 1 would let a version the old engine handed out name
+  different content). The rows are copied, not moved: the old engine
+  serves until the registry swap. In memory, with or without a state
+  store; the new engine's next write replaces the flush.
 
 ## Station symbol layers (`src/map.rs`, #1204)
 

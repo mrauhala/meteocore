@@ -59,6 +59,12 @@ memory, and answers EDR and Features queries from that store.
   restores it under the current `retention` and `max_stations`; an
   unreadable or invalid file means a cold start. A `data_path` source
   re-reads its files instead.
+- **Reload (WIS2 only)**: a reload that rebuilds the collection hands the
+  whole store, its warm-up and the deletion index to the new engine in
+  memory, mapped onto the new parameters, `retention` and `max_stations`,
+  with or without `state_dir`. The new engine opens a new broker session,
+  so notifications published between the old engine's shutdown and the
+  new subscription are missed.
 
 ## What it serves
 

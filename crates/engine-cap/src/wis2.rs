@@ -223,6 +223,9 @@ pub struct Wis2CapSource {
     filling_since: AtomicI64,
     /// [`Self::warmup_cause`] is [`WarmupCause::LongOutage`].
     after_outage: AtomicBool,
+    /// Set by [`Self::seal`], under the accumulator lock: notifications
+    /// are no longer applied.
+    sealed: AtomicBool,
     pub stats: Wis2SourceStats,
 }
 
@@ -235,6 +238,7 @@ impl Wis2CapSource {
             revision: AtomicU64::new(0),
             filling_since: AtomicI64::new(NOT_FILLING),
             after_outage: AtomicBool::new(false),
+            sealed: AtomicBool::new(false),
             stats: Wis2SourceStats::default(),
         }
     }
@@ -303,6 +307,16 @@ impl Wis2CapSource {
         let end =
             validity_end(&e.alert, self.cfg.default_ttl).unwrap_or(e.received + FALLBACK_LIFETIME);
         end + self.cfg.retention_grace < now
+    }
+
+    /// Apply no further notifications (#1036): the engine is shut down, and
+    /// its flush — or, on a reload, the engine that replaces it — takes
+    /// what the accumulator holds now. Set under the accumulator lock, which
+    /// every apply holds while it checks, so an apply lands either before
+    /// the seal or not at all, never after a later [`Self::export`].
+    pub(crate) fn seal(&self) {
+        let _acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
+        self.sealed.store(true, Ordering::Relaxed);
     }
 
     /// A copy of everything a snapshot holds (#1000). Clones under the
@@ -533,10 +547,11 @@ impl Wis2CapSource {
             (None, None, None)
         };
         let mut acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
-        if acc
-            .data_tombstones
-            .get(&n.data_id)
-            .is_some_and(|t| n.pubtime <= t.pubtime)
+        if self.sealed.load(Ordering::Relaxed)
+            || acc
+                .data_tombstones
+                .get(&n.data_id)
+                .is_some_and(|t| n.pubtime <= t.pubtime)
         {
             return;
         }
@@ -699,6 +714,9 @@ impl Wis2CapSource {
     /// `data_id` only drops the stale index entry.
     fn delete(&self, data_id: &str, pubtime: DateTime<Utc>, now: DateTime<Utc>) {
         let mut acc = self.acc.lock().unwrap_or_else(|e| e.into_inner());
+        if self.sealed.load(Ordering::Relaxed) {
+            return;
+        }
         // The resolver downloads concurrently: deletion may finish before the
         // document. Remember it even when no identifier has been indexed yet.
         remember(&mut acc.data_tombstones, data_id.to_owned(), pubtime, now);

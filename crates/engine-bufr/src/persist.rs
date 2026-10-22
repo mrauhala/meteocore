@@ -360,9 +360,7 @@ pub(crate) fn decode(
         if !names.insert(col.name.as_str()) {
             return Err(format!("duplicate column '{}'", col.name));
         }
-        let current = table
-            .index_of(&col.name)
-            .filter(|&j| ColumnRepr::from(&table.params[j]) == *col);
+        let current = current_column(col, table);
         if current.is_none() {
             columns_dropped.push(col.name.clone());
         }
@@ -422,6 +420,68 @@ pub(crate) fn decode(
         stations,
         columns_dropped,
     })
+}
+
+/// The column of `table` with the same definition as `col`; `None` when
+/// the config dropped or redefined it.
+fn current_column(col: &ColumnRepr, table: &ParameterTable) -> Option<usize> {
+    table
+        .index_of(&col.name)
+        .filter(|&j| ColumnRepr::from(&table.params[j]) == *col)
+}
+
+/// A live store written under `from`, mapped onto `to` as [`decode`] maps
+/// a snapshot: what a rebuilt WIS2 collection takes over from the engine
+/// it replaces on a reload (#1036), with no blob in between. The rows are
+/// copied: the replaced engine serves until the registry swap.
+pub(crate) fn carry_over(
+    store: &ObsStore,
+    from: &ParameterTable,
+    to: &ParameterTable,
+    clock: WarmupClock,
+    now: DateTime<Utc>,
+) -> Decoded {
+    let mut columns_dropped = Vec::new();
+    let map: Vec<Option<usize>> = from
+        .params
+        .iter()
+        .map(|p| {
+            let current = current_column(&ColumnRepr::from(p), to);
+            if current.is_none() {
+                columns_dropped.push(p.name.clone());
+            }
+            current
+        })
+        .collect();
+    let same_layout = map.len() == to.len() && map.iter().enumerate().all(|(i, &j)| j == Some(i));
+    let stations = store
+        .stations()
+        .map(|s| {
+            let rows = s
+                .rows
+                .iter()
+                .map(|(&time, row)| {
+                    if same_layout {
+                        return (time, row.clone());
+                    }
+                    let mut mapped = vec![f32::NAN; to.len()].into_boxed_slice();
+                    for (&v, &j) in row.iter().zip(&map) {
+                        if let Some(j) = j {
+                            mapped[j] = v;
+                        }
+                    }
+                    (time, mapped)
+                })
+                .collect();
+            (s.info.clone(), rows)
+        })
+        .collect();
+    Decoded {
+        written_at: now,
+        clock,
+        stations,
+        columns_dropped,
+    }
 }
 
 /// One row string → a dense row of `width` columns through `map`
@@ -676,6 +736,44 @@ mod tests {
         assert!(row[0].is_nan(), "new column: missing in restored rows");
         assert_eq!(row[1], 20_000.0, "visibility: same definition, kept");
         assert!(row[2].is_nan(), "air_temperature: redefined, dropped");
+    }
+
+    /// #1036: a live store handed to a rebuilt engine maps onto its table
+    /// exactly as the store's snapshot would, and under an unchanged table
+    /// arrives as it is.
+    #[test]
+    fn carry_over_maps_columns_as_a_restore_does() {
+        let table = ParameterTable::build(true, &[]);
+        let store = populated(&table);
+        let param = |name: &str, code: &str, unit: &str| BufrParameterConfig {
+            name: name.into(),
+            descriptors: vec![code.into()],
+            unit: unit.into(),
+            label: None,
+            observed_property: None,
+            period_hours: None,
+        };
+        let changed = ParameterTable::build(
+            false,
+            &[
+                param("new_column", "012102", "K"),
+                param("visibility", "020001", "m"),
+                param("air_temperature", "012004", "K"),
+            ],
+        );
+        let carried = carry_over(&store, &table, &changed, clock(), t(12, 12));
+        let bytes = encode("obs", &store, &table, clock(), t(12, 12)).unwrap();
+        let decoded = decode(&bytes, "obs", &changed).unwrap();
+        assert_eq!(carried.columns_dropped, decoded.columns_dropped);
+        assert_eq!(carried.clock, clock());
+        assert_same_store(
+            &restore_into(carried, Duration::hours(24)),
+            &restore_into(decoded, Duration::hours(24)),
+        );
+
+        let unchanged = carry_over(&store, &table, &table, clock(), t(12, 12));
+        assert!(unchanged.columns_dropped.is_empty());
+        assert_same_store(&restore_into(unchanged, Duration::hours(24)), &store);
     }
 
     #[test]

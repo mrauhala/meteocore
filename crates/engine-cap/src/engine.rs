@@ -651,12 +651,49 @@ impl CapEngine {
         self.superseded.load(Ordering::Relaxed) + at_ingest
     }
 
-    /// Signal the poll loop to stop. With a state store, also flush the
+    /// Signal the poll loop to stop. In WIS2 mode the accumulator applies
+    /// nothing more from here on (#1036). With a state store, also flush the
     /// snapshot (#1000): a graceful restart loses nothing, and the
     /// snapshot's `written_at` records when the server went down.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
+        if let Some(src) = self.source.wis2() {
+            src.seal();
+        }
         self.write_snapshot(true);
+    }
+
+    /// Take over the alert set of the engine this one replaces (#1036). A
+    /// reload that rebuilds a WIS2 collection builds this engine first, and
+    /// it restores only the last periodic snapshot, while the replaced
+    /// engine keeps receiving until the reload is accepted. The server
+    /// calls this after `predecessor.shutdown()`, which stops its ingest,
+    /// and before this engine's poll loop starts: everything the replaced
+    /// engine received moves over in memory, with its warm-up clock, under
+    /// this engine's config, as a restore applies it. A state store is not
+    /// involved; this engine's next write puts the set back in it. A no-op
+    /// unless both engines are WIS2-fed.
+    pub fn take_over(&self, predecessor: &CapEngine) {
+        let (Some(src), Some(prev)) = (self.source.wis2(), predecessor.source.wis2()) else {
+            return;
+        };
+        let s = src.restore(prev.export(), Utc::now());
+        tracing::info!(
+            "[{}] cap/wis2: took over {} alert(s) from the engine this reload replaced \
+             ({} expired, {} filtered, {} hint(s) dropped by config, {} tombstone(s))",
+            self.collection_id,
+            s.alerts,
+            s.expired,
+            s.filtered,
+            s.hints_dropped,
+            s.tombstones
+        );
+        if let Err(e) = self.refresh() {
+            tracing::warn!(
+                "[{}] cap/wis2: catalog build after the take-over failed: {e}",
+                self.collection_id
+            );
+        }
     }
 
     /// Write the accumulator snapshot when its write policy says so
@@ -1385,6 +1422,57 @@ mod tests {
         let c = CapEngine::new_with_state(&cfg, "cap-wis2", store(dir.path())).unwrap();
         subscribe(&c);
         assert_eq!(c.live_health_at(now), warming_after_outage(2));
+    }
+
+    /// #1036: a reload that rebuilds the collection builds the new engine
+    /// while the old one still receives, so the new one restores only the
+    /// last periodic snapshot. The old engine's shutdown ends its ingest,
+    /// and the new one takes over the rest in memory: nothing that arrived
+    /// after that write is lost, and the new engine's next write, which
+    /// replaces the old one's shutdown flush, holds it.
+    #[test]
+    fn a_rebuild_takes_over_what_arrived_after_the_last_periodic_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wis2_config(None);
+        let now = Utc::now();
+        let filling_since: DateTime<Utc> = "2026-10-01T00:00:00Z".parse().unwrap();
+        let old = CapEngine::new_with_state(&cfg, "cap-wis2", store(dir.path())).unwrap();
+        old.wis2_source().unwrap().mark_filling(filling_since);
+        push(&old, "early", now);
+        // The periodic write, then more alerts.
+        old.write_snapshot(false);
+        push(&old, "late", now);
+        old.refresh().unwrap();
+
+        // The reload builds the successor first, under a changed config.
+        let changed = CapConfig {
+            poll_interval_secs: 30,
+            ..wis2_config(None)
+        };
+        let new = CapEngine::new_with_state(&changed, "cap-wis2", store(dir.path())).unwrap();
+        assert_eq!(new.feature_count(), 1, "the periodic snapshot only");
+
+        // Accepted: the old engine is shut down, then the new one takes over.
+        old.shutdown();
+        new.take_over(&old);
+        assert_eq!(new.wis2_source().unwrap().len(), 2);
+        assert_eq!(new.feature_count(), 2);
+        assert_eq!(new.data_version(), old.data_version());
+        assert_eq!(
+            new.wis2_source().unwrap().filling_since(),
+            Some(filling_since)
+        );
+        new.wis2_source().unwrap().assert_index_consistent();
+
+        // The old engine applies nothing more after its shutdown.
+        push(&old, "after", now);
+        assert_eq!(old.wis2_source().unwrap().len(), 2);
+
+        // The new engine's first alert moves it; its write holds them all.
+        push(&new, "next", now);
+        new.write_snapshot(false);
+        let restored = CapEngine::new_with_state(&changed, "cap-wis2", store(dir.path())).unwrap();
+        assert_eq!(restored.feature_count(), 3);
     }
 
     #[test]
