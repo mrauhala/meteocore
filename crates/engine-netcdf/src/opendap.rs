@@ -168,9 +168,9 @@ impl DapFile {
         if wanted.is_empty() {
             return Ok(HashMap::new());
         }
-        let projections: Vec<&str> = wanted
+        let projections: Vec<&dap::Projection> = wanted
             .iter()
-            .map(|&i| self.metadata.projections[i].as_str())
+            .map(|&i| &self.metadata.projections[i])
             .collect();
         let (bytes, peak) = wanted
             .iter()
@@ -204,7 +204,7 @@ impl DapFile {
         let mut coordinates = HashMap::new();
         for (&i, projection) in wanted.iter().zip(projections) {
             let var = &self.metadata.variables[i];
-            match found.remove(leaf(projection)) {
+            match found.remove(&projection.leaf) {
                 Some(raw) if raw.len() as u64 == cells(var) => {
                     coordinates.insert(var.name.clone(), raw.into_f64());
                 }
@@ -281,7 +281,7 @@ impl DapFile {
             .fetch(&[(".dods", Some(dap::whole(&[projection])))], max)
             .map_err(|e| e.to_string())?;
         let raw = dap::decode(&reply[0].bytes).and_then(|values| {
-            dap::take(values, leaf(projection)).ok_or("not in the reply".into())
+            dap::take(values, &projection.leaf).ok_or("not in the reply".into())
         })?;
         if raw.len() as u64 != cells(var) {
             return Err(format!("{} values read of {}", raw.len(), cells(var)));
@@ -323,7 +323,7 @@ impl DapFile {
         .map_err(|failure| failure.to_error())?;
         let raw = dap::decode(&reply)
             .and_then(|values| {
-                dap::take(values, leaf(projection)).ok_or_else(|| "not in the reply".into())
+                dap::take(values, &projection.leaf).ok_or_else(|| "not in the reply".into())
             })
             .map_err(invalid)?;
         // DAP2's Byte is unsigned; a signed byte's bits are its own.
@@ -400,11 +400,6 @@ impl DapFile {
             remote::forget_replaced(&self.id, self.ingest, &self.key, &self.changes, mode);
         }
     }
-}
-
-/// The name a projection's values carry in a reply: a Grid's array's.
-fn leaf(projection: &str) -> &str {
-    projection.rsplit('.').next().unwrap_or(projection)
 }
 
 /// A whole read of `var`: its reply's XDR bytes, and its transient peak,

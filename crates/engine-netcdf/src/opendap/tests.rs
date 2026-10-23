@@ -17,7 +17,7 @@ use ds_core::map_engine::{MapEngine, OutputCrs};
 
 use super::*;
 use crate::decode_budget::Budget;
-use crate::ingest::{inspect, FileGrid, Wanted};
+use crate::ingest::{inspect, Dim, FileGrid, Wanted};
 use crate::source::Reader;
 use crate::test_server::{thredds_catalog, Request, TestServer};
 use crate::NetcdfEngine;
@@ -725,6 +725,92 @@ fn whole_reads_are_capped_and_budgeted_before_they_are_asked_for() {
     assert!(error.contains("no room"), "{error}");
     assert!(file.read_failed(), "tried again next poll, never skipped");
     assert!(server.take().is_empty(), "nothing was asked for");
+}
+
+/// A `.` is legal in a netCDF name: a server writing `a.b` serves a
+/// coordinate read at open, a plain array read whole and a Grid's field,
+/// each asked for with its dots escaped (`%252E` in the URL), so the one
+/// `.` the server reads as a separator is the Grid's, and each found in
+/// the reply by its own name.
+#[test]
+fn dotted_names_are_asked_for_and_found_whole() {
+    let server = TestServer::new();
+    let modified = Utc::now();
+    let key = "thredds/dodsC/x/dotted.nc";
+    let put = |suffix: &str, body: Vec<u8>| server.put(&[key, suffix].concat(), body, modified);
+    put(
+        ".dds",
+        b"Dataset {\n    Float64 time[time = 1];\n    Float32 a.b[a.b = 2];\n    \
+          Float32 plain.v[n = 3];\n    Grid {\n     ARRAY:\n        \
+          Float32 g.h[time = 1][y = 2][x = 2];\n     MAPS:\n        Float64 time[time = 1];\n        \
+          Float32 y[y = 2];\n        Float32 x[x = 2];\n    } g.h;\n} dotted.nc;\n"
+            .to_vec(),
+    );
+    put(".das", b"Attributes {\n}\n".to_vec());
+    let floats = |values: &[f32]| -> Vec<u8> {
+        let n = (values.len() as u32).to_be_bytes();
+        let mut xdr = [n, n].concat();
+        values
+            .iter()
+            .for_each(|v| xdr.extend_from_slice(&v.to_be_bytes()));
+        xdr
+    };
+    let mut coordinates = vec![0, 0, 0, 1, 0, 0, 0, 1];
+    coordinates.extend_from_slice(&1_792_756_800f64.to_be_bytes());
+    coordinates.extend(floats(&[10.0, 20.0]));
+    put(
+        ".dods?time,a%252Eb",
+        dods(
+            "    Float64 time[time = 1];\n    Float32 a.b[a.b = 2];\n",
+            &coordinates,
+        ),
+    );
+    put(
+        ".dods?plain%252Ev",
+        dods("    Float32 plain.v[n = 3];\n", &floats(&[1.0, 2.0, 3.0])),
+    );
+    put(
+        ".dods?g%252Eh.g%252Eh%5B0%5D%5B0:1:1%5D%5B0:1:1%5D",
+        dods(
+            "    Structure {\n        Float32 g.h[time = 1][y = 2][x = 2];\n    } g.h;\n",
+            &floats(&[4.0, 5.0, 6.0, 7.0]),
+        ),
+    );
+    let (host, _) = remote::host("dotted", &format!("{}/thredds/dodsC/x/", server.url)).unwrap();
+    let file = DapFile::open(
+        host,
+        &server.url,
+        key,
+        ObjectVersion::sized(1),
+        crate::next_file_id(),
+        Arc::default(),
+        crate::decode_budget::BUDGET.clone(),
+    )
+    .unwrap();
+    let variable = |name: &str| file.variables().iter().find(|v| v.name == name).unwrap();
+    assert_eq!(file.read_all(variable("a.b")).unwrap(), [10.0, 20.0]);
+    assert_eq!(file.read_all(variable("plain.v")).unwrap(), [1.0, 2.0, 3.0]);
+    let read = FieldRead {
+        name: "g.h".into(),
+        dims: vec![Dim::Time, Dim::Whole(2), Dim::Whole(2)],
+        stored: Stored::Float,
+        packing: crate::ingest::Packing {
+            scale: 1.0,
+            offset: 0.0,
+            fill: Vec::new(),
+        },
+        chunk_bytes: 16,
+        field_bytes: 16,
+        levels: Vec::new(),
+    };
+    let field = file.read_field(&read, &read.selection(0, 0)).unwrap();
+    assert_eq!(field, Raw::F32(vec![4.0, 5.0, 6.0, 7.0]));
+    let requests = server.take();
+    assert!(
+        requests.iter().all(|r| r.status == 200),
+        "every request named its variable: {requests:#?}"
+    );
+    assert!(!file.read_failed());
 }
 
 /// The shipped OPeNDAP examples (#1264) are valid and read MET Norway's

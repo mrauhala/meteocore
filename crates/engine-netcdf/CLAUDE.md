@@ -3,9 +3,6 @@
 CF-NetCDF gridded forecasts and analyses (#1067), first for MET Norway's
 MEPS. Read the root `CLAUDE.md` first — Critical Rules 5, 6, 7, 9 and 10
 shape this crate. Today: local directories and remote files read in place
-by HTTP range (thredds.met.no), WMS/Maps/Tiles, EDR position/area/radius/
-trajectory/cube with runs as instances, GetFeatureInfo, derived wind speed, and a CF
-shape this crate. Today: local directories and remote files read in place
 by HTTP range or through OPeNDAP (thredds.met.no; OPeNDAP only for MEPS
 since 2026-10-22, #1264), WMS/Maps/Tiles, EDR position/area/radius/
 trajectory/cube with runs as instances, GetFeatureInfo, derived wind speed, and a CF
@@ -270,8 +267,6 @@ Every catalog is built by a scan and swapped through `ArcSwap`.
 
 ## Open files and metadata — measured
 
-Each catalogued file keeps its `NcFile` (`catalog::OpenFile`) for as long as
-it is catalogued; request paths never open a file. Local files are opened
 Each catalogued file keeps its reader (`catalog::OpenFile::reader`, a
 `source::Reader`: its `NcFile`, or through OPeNDAP its `DapFile`) for as
 long as it is catalogued; request paths never open a file. Local files are opened
@@ -449,8 +444,6 @@ access = "opendap"` reads a remote family through DAP2.
   for a pl file; 254 KB of heap per kept sfc handle serving one variable
   (`tests/live_thredds.rs`), against 820 KB read by range. A failed
   request is `OpenError::Read` (`Opened::Retry`), an unreadable answer
-  `OpenError::Format` (`Skip`). No block cache: a second open of the same
-  request is `OpenError::Read` (`Opened::Retry`), an unreadable answer
   `OpenError::Format` (`Skip`). A reply's cap follows the sizes the DDS
   declares, so every whole read is checked against a hard cap before it
   is asked for: a file's scalars and 1-D coordinates together, or one
@@ -581,7 +574,6 @@ access = "opendap"` reads a remote family through DAP2.
   variable and run.
 - **Metrics** (server `metrics_handler`, while a NetCDF collection is
   loaded): `netcdf_{field,block,chunk}_cache_{hits_total,misses_total,
-  bytes,capacity_bytes}`, `netcdf_read_{reserved_bytes,capacity_bytes,
   bytes,capacity_bytes}` (the chunk cache's include OPeNDAP field replies),
   `netcdf_read_{reserved_bytes,capacity_bytes,
   rejected_total}`, `netcdf_detached_fills_{pending,total,inline_total}`

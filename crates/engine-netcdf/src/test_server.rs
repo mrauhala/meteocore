@@ -585,13 +585,18 @@ impl Dataset {
         let query = percent_decoded(query);
         let mut selected: Vec<(usize, bool, Vec<Slab>)> = Vec::new();
         for projection in query.split(',').filter(|p| !p.is_empty()) {
-            let (name, slabs) = projection
+            let (path, slabs) = projection
                 .split_once('[')
                 .map_or((projection, ""), |(n, rest)| (n, rest));
-            let (name, member) = match name.split_once('.') {
-                Some((grid, member)) if grid == member && self.grids.contains(grid) => (grid, true),
-                Some(_) => return Err(format!("no member '{name}'")),
-                None => (name, false),
+            // Each part of the path its own name, `%XX` decoded: a `.` in a
+            // name comes escaped.
+            let parts: Vec<String> = path.split('.').map(percent_decoded).collect();
+            let (name, member) = match &parts[..] {
+                [grid, member] if grid == member && self.grids.contains(grid) => {
+                    (grid.as_str(), true)
+                }
+                [name] => (name.as_str(), false),
+                _ => return Err(format!("no member '{path}'")),
             };
             let index = self
                 .variables

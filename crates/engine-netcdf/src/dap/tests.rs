@@ -62,11 +62,18 @@ fn thredds_meps_metadata_reads_as_netcdf_variables() {
     );
     assert!(t.dimensions[0].is_unlimited && !t.dimensions[1].is_unlimited);
     assert_eq!(t.dtype, NcType::Float);
+    let projection = |name: &str| {
+        let found = pl.projection(name).unwrap();
+        (found.path.as_str(), found.leaf.as_str())
+    };
     assert_eq!(
-        pl.projection("air_temperature_pl"),
-        Some("air_temperature_pl.air_temperature_pl")
+        projection("air_temperature_pl"),
+        (
+            "air_temperature_pl.air_temperature_pl",
+            "air_temperature_pl"
+        )
     );
-    assert_eq!(pl.projection("x"), Some("x"));
+    assert_eq!(projection("x"), ("x", "x"));
     assert_eq!(attribute(t, "units").as_string().as_deref(), Some("K"));
     assert_eq!(
         attribute(t, "grid_mapping").as_string().as_deref(),
@@ -344,10 +351,18 @@ fn constraints_select_the_exact_hyperslab() {
         ],
     };
     assert_eq!(
-        constraint("t.t", &selection),
+        constraint(&Projection::of(&["t", "t"]), &selection),
         "t.t%5B0%5D%5B12%5D%5B0:1:1068%5D%5B0:1:948%5D"
     );
-    assert_eq!(whole(&["x", "a b", "g.g"]), "x,a%20b,g.g");
+    let projections = [
+        Projection::of(&["x"]),
+        Projection::of(&["a b"]),
+        Projection::of(&["g", "g"]),
+    ];
+    assert_eq!(
+        whole(&projections.iter().collect::<Vec<_>>()),
+        "x,a%2520b,g.g"
+    );
     assert_eq!(xdr_bytes(&NcType::Float, 4), 24);
     assert_eq!(xdr_bytes(&NcType::Short, 4), 24, "widened to 32 bits");
     assert_eq!(xdr_bytes(&NcType::UByte, 5), 16, "padded");
@@ -402,4 +417,73 @@ fn nesting_past_the_cap_is_an_error_not_a_stack_overflow() {
         let error = parse_das(&containers(levels)).unwrap_err();
         assert!(error.contains("32 levels deep"), "{error}");
     }
+}
+
+/// A `.` is legal in a netCDF name. Whether a server writes it as is or
+/// `%`-escaped, it is the name's: the variable is `a.b`, a constraint
+/// escapes it in each part (`%2E`, sent `%252E`) so the one `.` the server
+/// reads as a separator is a Grid's, and a reply's values are found by
+/// the array's own name, never by splitting the projection on its dots.
+#[test]
+fn a_dot_in_a_name_is_the_names() {
+    let dds = "Dataset {\n    Float32 a.b[a.b = 2];\n    Float32 c%2Ed[n = 2];\n    \
+               Grid {\n     ARRAY:\n        Float32 g.h[y = 1][x = 2];\n     MAPS:\n        \
+               Float32 y[y = 1];\n        Float32 x[x = 2];\n    } g.h;\n} d.nc;\n";
+    let das = "Attributes {\n    a.b {\n        String units \"m\";\n    }\n    \
+               c%2Ed {\n        String units \"K\";\n    }\n}\n";
+    let meta = metadata(dds, das).unwrap();
+    let names: Vec<&str> = meta.variables.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, ["a.b", "c.d", "g.h"]);
+    let a = variable(&meta, "a.b");
+    assert!(a.is_coordinate_variable(), "its dimension is its own name");
+    assert_eq!(attribute(a, "units").as_string().as_deref(), Some("m"));
+    assert_eq!(
+        attribute(variable(&meta, "c.d"), "units")
+            .as_string()
+            .as_deref(),
+        Some("K")
+    );
+    let projection = |name: &str| meta.projection(name).unwrap().clone();
+    assert_eq!(
+        projection("a.b"),
+        Projection {
+            path: "a%2Eb".into(),
+            leaf: "a.b".into()
+        }
+    );
+    assert_eq!(projection("c.d").path, "c%2Ed");
+    let grid = projection("g.h");
+    assert_eq!(
+        (grid.path.as_str(), grid.leaf.as_str()),
+        ("g%2Eh.g%2Eh", "g.h")
+    );
+    let selection = NcSliceInfo {
+        selections: vec![
+            NcSliceInfoElem::Index(0),
+            NcSliceInfoElem::Slice {
+                start: 0,
+                end: 2,
+                step: 1,
+            },
+        ],
+    };
+    assert_eq!(
+        constraint(&grid, &selection),
+        "g%252Eh.g%252Eh%5B0%5D%5B0:1:1%5D"
+    );
+    assert_eq!(whole(&[&projection("a.b")]), "a%252Eb");
+
+    let mut data = words(&[2, 2, 1.0f32.to_bits(), 2.0f32.to_bits()]);
+    data.extend(words(&[2, 2, 3.0f32.to_bits(), 4.0f32.to_bits()]));
+    let reply = reply(
+        "    Float32 a.b[a.b = 2];\n    Structure {\n        Float32 g.h[y = 1][x = 2];\n    } g.h;\n",
+        &data,
+    );
+    let values = decode(&reply).unwrap();
+    assert_eq!(
+        take(values.clone(), &projection("a.b").leaf),
+        Some(Raw::F32(vec![1.0, 2.0]))
+    );
+    assert_eq!(take(values, &grid.leaf), Some(Raw::F32(vec![3.0, 4.0])));
+    assert_eq!(unescape("a%2Eb%2"), "a.b%2");
 }

@@ -12,6 +12,14 @@
 //! `Int16` and `UInt16` to 32 bits each; a `Byte` array is its bytes padded
 //! to four, and every array carries its length twice. DAP2's `Byte` is
 //! unsigned: a netCDF signed byte carries `_Unsigned = "false"`.
+//!
+//! Names are netCDF's, which may hold any character, a `.` included. A
+//! server may write them `%`-escaped in a DDS or DAS (`a%2Eb`) or as they
+//! are: both are read unescaped ([`unescape`]). A constraint escapes each
+//! part of a projection on its own ([`identifier`]), so the `.` between a
+//! Grid and its array is the only one the server reads as a separator,
+//! and a reply's values are found by the array's own name
+//! ([`Projection::leaf`]), never by splitting a projection.
 
 use netcdf_reader::{
     NcAttrValue, NcAttribute, NcDimension, NcSliceInfo, NcSliceInfoElem, NcType, NcVariable,
@@ -206,7 +214,7 @@ fn declaration(tokens: &mut Tokens, depth: usize) -> Result<Decl, String> {
     }
     let word = tokens.word()?;
     let named = |tokens: &mut Tokens| -> Result<String, String> {
-        let name = tokens.word()?.to_string();
+        let name = unescape(tokens.word()?);
         tokens.expect(';')?;
         Ok(name)
     };
@@ -236,14 +244,14 @@ fn declaration(tokens: &mut Tokens, depth: usize) -> Result<Decl, String> {
         }
         _ => {
             let ty = DapType::parse(word).ok_or_else(|| format!("unknown type '{word}'"))?;
-            let name = tokens.word()?.to_string();
+            let name = unescape(tokens.word()?);
             let mut dims = Vec::new();
             while tokens.peek()? == Some(Token::Punct('[')) {
                 tokens.next()?;
                 let first = tokens.word()?;
                 let (dim, size) = if tokens.peek()? == Some(Token::Punct('=')) {
                     tokens.next()?;
-                    (Some(first.to_string()), tokens.word()?)
+                    (Some(unescape(first)), tokens.word()?)
                 } else {
                     (None, first)
                 };
@@ -308,7 +316,7 @@ fn container(tokens: &mut Tokens, depth: usize) -> Result<Container, String> {
                     tokens.next()?;
                     found
                         .children
-                        .push((word.to_string(), container(tokens, depth + 1)?));
+                        .push((unescape(word), container(tokens, depth + 1)?));
                     continue;
                 }
                 let name = tokens.word()?;
@@ -329,7 +337,7 @@ fn container(tokens: &mut Tokens, depth: usize) -> Result<Container, String> {
                     .map_err(|e| format!("attribute '{name}': {e}"))?
                 {
                     found.attributes.push(NcAttribute {
-                        name: name.to_string(),
+                        name: unescape(name),
                         value,
                     });
                 }
@@ -382,16 +390,42 @@ fn attribute_value(ty: &str, values: &[String]) -> Result<Option<NcAttrValue>, S
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Metadata {
     pub variables: Vec<NcVariable>,
-    /// Per variable, in `variables`' order: `grid.array` for a Grid's
-    /// array (its maps are not wanted), else its name.
-    pub projections: Vec<String>,
+    /// Per variable, in `variables`' order.
+    pub projections: Vec<Projection>,
 }
 
 impl Metadata {
     /// How a constraint names `name`'s values.
-    pub(crate) fn projection(&self, name: &str) -> Option<&str> {
+    pub(crate) fn projection(&self, name: &str) -> Option<&Projection> {
         let index = self.variables.iter().position(|v| v.name == name)?;
         Some(&self.projections[index])
+    }
+}
+
+/// How a constraint selects a variable's values, and the name they carry
+/// in a reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Projection {
+    /// The path a constraint names, each part escaped ([`identifier`]):
+    /// `grid.array` for a Grid's array (its maps are not wanted), else the
+    /// variable's name.
+    pub path: String,
+    /// The name the values carry in a reply: the array's own, unescaped.
+    pub leaf: String,
+}
+
+impl Projection {
+    /// The projection of the parts of `path`, the values carrying the last
+    /// one's name.
+    fn of(path: &[&str]) -> Self {
+        Self {
+            path: path
+                .iter()
+                .map(|part| identifier(part))
+                .collect::<Vec<_>>()
+                .join("."),
+            leaf: path.last().copied().unwrap_or_default().to_string(),
+        }
     }
 }
 
@@ -410,13 +444,13 @@ pub(crate) fn metadata(dds: &str, das: &str) -> Result<Metadata, String> {
     let mut projections = Vec::new();
     for decl in &decls {
         let (name, ty, dims, projection) = match decl {
-            Decl::Base { ty, name, dims } => (name, *ty, dims, name.clone()),
+            Decl::Base { ty, name, dims } => (name, *ty, dims, Projection::of(&[name])),
             Decl::Grid { name, array, .. } => match &**array {
                 Decl::Base {
                     ty,
                     name: member,
                     dims,
-                } => (name, *ty, dims, [name.as_str(), member].join(".")),
+                } => (name, *ty, dims, Projection::of(&[name, member])),
                 _ => return Err(format!("Grid '{name}' has no array")),
             },
             Decl::Structure { .. } | Decl::Sequence { .. } => continue,
@@ -616,11 +650,11 @@ fn read_base(xdr: &mut Xdr, ty: DapType, dims: &[(Option<String>, u64)]) -> Resu
     })
 }
 
-/// The constraint expression selecting `selection` of `projection`
-/// (`grid.array` or a name), ready for a URL's query: `[i]` for one index,
-/// `[start:stride:stop]` (`stop` inclusive) for a range.
-pub(crate) fn constraint(projection: &str, selection: &NcSliceInfo) -> String {
-    let mut text = query_name(projection);
+/// The constraint expression selecting `selection` of `projection`,
+/// ready for a URL's query: `[i]` for one index, `[start:stride:stop]`
+/// (`stop` inclusive) for a range.
+pub(crate) fn constraint(projection: &Projection, selection: &NcSliceInfo) -> String {
+    let mut text = query_name(&projection.path);
     for elem in &selection.selections {
         let slab = match *elem {
             NcSliceInfoElem::Index(i) => format!("[{i}]"),
@@ -634,16 +668,61 @@ pub(crate) fn constraint(projection: &str, selection: &NcSliceInfo) -> String {
 }
 
 /// Several whole variables, by their projections, as one constraint.
-pub(crate) fn whole(projections: &[&str]) -> String {
+pub(crate) fn whole(projections: &[&Projection]) -> String {
     projections
         .iter()
-        .map(|p| query_name(p))
+        .map(|p| query_name(&p.path))
         .collect::<Vec<_>>()
         .join(",")
 }
 
+/// One name in a constraint: every byte but an ASCII letter or digit, `_`,
+/// `-`, `+` or `/` as `%XX`, which DAP2 servers decode inside an
+/// identifier. So a `.`, `,`, `[` or `%` in a name is the name's, never
+/// the constraint's syntax.
+fn identifier(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || b"_-+/".contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// A name a DDS or DAS writes, its `%XX` escapes decoded: `a%2Eb` is
+/// `a.b`. A `%` not followed by two hex digits is kept.
+pub(crate) fn unescape(name: &str) -> String {
+    if !name.contains('%') {
+        return name.to_string();
+    }
+    let bytes = name.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = name
+            .get(i + 1..i + 3)
+            .filter(|_| bytes[i] == b'%')
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match hex {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// A projection as a query names it: every byte but an unreserved one or
-/// a `.` percent-encoded.
+/// a `.` percent-encoded, so an identifier's `%XX` reaches the server
+/// whole.
 fn query_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for byte in name.bytes() {
