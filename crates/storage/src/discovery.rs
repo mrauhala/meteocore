@@ -66,7 +66,7 @@ pub use template::{
     DEFAULT_MAX_HEADS_PER_POLL, DEFAULT_MIN_AGE, DEFAULT_RUN_GRACE, MAX_TEMPLATE_SLOTS,
     PROBE_CONCURRENCY, SETTLED_RECHECK,
 };
-pub use thredds::CatalogProber;
+pub use thredds::{CatalogProber, FileService};
 
 /// A signed ISO 8601 duration describing how far back (or forward)
 /// from "now" a collection's useful data extends.

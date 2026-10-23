@@ -36,13 +36,12 @@ fn grid() -> FileGrid {
 fn file() -> Arc<OpenFile> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/netcdf-global/global_5deg.nc");
-    let (nc, _) = crate::ingest::open(&path).unwrap();
+    let reader = crate::ingest::open(&path).unwrap();
     Arc::new(OpenFile {
         id: 0,
         path,
         identity: Identity::sized(0),
-        nc,
-        remote: None,
+        reader,
         run: None,
         times: Vec::new(),
         reads: Vec::new(),

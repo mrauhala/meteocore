@@ -24,6 +24,14 @@
 //! catalogs on the way to the runs in the window, opens the newest run's
 //! leads 00-02 found there (about 3.7 MB), and probes the same files by HEAD
 //! (their metadata then comes from the block cache): about 4 MB.
+//!
+//! Since 2026-10-22 thredds.met.no serves MEPS through OPeNDAP only: the
+//! tests above, which read its fileServer, find nothing (403).
+//! `meps_through_opendap_from_thredds` (#1264) reads leads 00-01 of the
+//! newest sfc run through OPeNDAP, found through the catalogs: each file's
+//! DDS, DAS and coordinates (about 160 KB, twice: a second engine measures
+//! the heap a handle holds), one 4 MB field and an EDR position at the
+//! step drawn, from the field cache: about 5 MB.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -367,4 +375,109 @@ fn a_ranged_get_names_the_whole_file() {
     assert_eq!(range, 0..1024);
     assert_eq!(version.size, head.size, "the whole file's size");
     assert!(head.matches(&version));
+}
+
+const OPENDAP: &str = r#"
+access = "opendap"
+data_path = "https://thredds.met.no/thredds/dodsC/meps25epsarchive/"
+catalog_url = "https://thredds.met.no/thredds/catalog/meps25epsarchive/catalog.xml"
+prefix_pattern = "%Y/%m/%d/{run}/member_00/"
+filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"
+run_hours = [0, 3, 6, 9, 12, 15, 18, 21]
+leads = [0, 1]
+time_window = "-PT6H"
+variables = ["air_temperature_2m"]
+max_runs = 1
+"#;
+
+/// MEPS through OPeNDAP (#1264), live: leads 00-01 of the newest sfc run,
+/// found through the catalogs; each file opened by its `.dds`, `.das` and
+/// one `.dods` of coordinates; one 4.06 MB field drawn, uncompressed; an
+/// EDR position at Oslo at the step drawn, read from the field cache. It
+/// prints the requests, bytes and time of each step and the heap a kept
+/// handle holds.
+#[test]
+#[ignore = "reads about 5 MB from thredds.met.no; run by hand"]
+fn meps_through_opendap_from_thredds() {
+    let config: NetcdfConfig = toml::from_str(OPENDAP).unwrap();
+    let started = Instant::now();
+    let engine = NetcdfEngine::new("meps-live-opendap", &config).unwrap();
+    let opened = traffic(&engine);
+    let times = engine.times();
+    println!(
+        "first scan: {:.1} s, {opened:?}, run {:?}, valid times {times:?}",
+        started.elapsed().as_secs_f64(),
+        engine.raster_info().reference_times
+    );
+    assert_eq!(times.len(), 2, "leads 00-01 of the newest published run");
+    assert_eq!(opened.heads, 0, "nothing is HEADed through OPeNDAP");
+
+    let before = ALLOCATED.load(Ordering::Relaxed);
+    let again = NetcdfEngine::new("meps-live-opendap-again", &config).unwrap();
+    let held = ALLOCATED.load(Ordering::Relaxed) - before;
+    println!(
+        "heap held per kept per-lead handle (1 variable served of 221 described): {} bytes; \
+         second open {:?}",
+        held / 2,
+        traffic(&again)
+    );
+    drop(again);
+
+    let extent = engine.raster_info().spatial_extent.unwrap();
+    let before = traffic(&engine);
+    let started = Instant::now();
+    let tile = engine
+        .get_raster_tile(
+            extent,
+            256,
+            256,
+            Some(times[0]),
+            &OutputCrs::Wgs84,
+            Some("air_temperature_2m"),
+            None,
+            None,
+        )
+        .unwrap();
+    let drawn: Vec<f64> = (0..256 * 256)
+        .filter_map(|i| tile.values.value_at(i))
+        .collect();
+    let field = traffic(&engine);
+    println!(
+        "one cold field: {:.1} s, {} GETs, {} bytes, {} of 65536 pixels drawn, {:.1} to \
+         {:.1} °C",
+        started.elapsed().as_secs_f64(),
+        field.gets - before.gets,
+        field.bytes - before.bytes,
+        drawn.len(),
+        drawn.iter().copied().fold(f64::INFINITY, f64::min),
+        drawn.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+    );
+    assert_eq!(field.gets - before.gets, 1, "one .dods");
+    assert!(drawn.iter().all(|c| (-60.0..50.0).contains(c)), "in °C");
+
+    let oslo = {
+        use ds_core::edr_engine::EdrEngine;
+        match engine
+            .query_position(
+                "POINT(10.75 59.91)",
+                Some((times[0], times[0])),
+                Some(&["air_temperature_2m".to_string()]),
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            ds_core::model::CoverageResponse::Single(result) => {
+                result.ranges["air_temperature_2m"].values.clone()
+            }
+            ds_core::model::CoverageResponse::Collection(_) => panic!("one coverage"),
+        }
+    };
+    println!(
+        "EDR position at Oslo at {}: {oslo:?} °C, {:?}",
+        times[0],
+        traffic(&engine)
+    );
+    assert_eq!(traffic(&engine).gets, field.gets, "the field drawn");
+    assert!(oslo[0].is_some_and(|c| (-40.0..40.0).contains(&c)));
 }

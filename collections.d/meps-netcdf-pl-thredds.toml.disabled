@@ -2,6 +2,12 @@
 # place from MET Norway's thredds.met.no by HTTP range (#1067).
 # CC-BY-4.0, MET Norway.
 #
+# Since 2026-10-22 thredds.met.no serves MEPS through OPeNDAP only: every
+# fileServer read of these files, HEAD or range, answers 403, so this
+# collection finds nothing there. `meps-netcdf-pl-opendap.toml.disabled`
+# reads the same files through OPeNDAP; this one is kept for a file server
+# that serves MEPS-like files by range.
+#
 # DISABLED by default: it reads from thredds.met.no, a public server. To run:
 #   1. rename to drop `.disabled`
 #   2. cargo run -p server -- --collections=meps-netcdf-pl-thredds

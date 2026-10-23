@@ -21,7 +21,10 @@
 //!   body that grows past it fails at that chunk;
 //! - retried as object_store retries: a 429, a 5xx or a failed connection
 //!   up to [`ATTEMPTS`] times, each attempt after the host's `Retry-After`,
-//!   within the caller's budget and deadline.
+//!   within the caller's budget and deadline;
+//! - with the query string the mark carries, if any: an OPeNDAP constraint
+//!   expression (#1264). The result is marked [`Sent`], so a caller can
+//!   tell that the query reached the server: any other store ignores it.
 //!
 //! Any other operation, and a GET without [`Document`], is the HTTP store's.
 
@@ -50,11 +53,18 @@ pub(crate) const ATTEMPTS: u32 = 3;
 const BACKOFF: Duration = Duration::from_millis(100);
 
 /// The mark on a GET's [`GetOptions::extensions`] that asks for the whole
-/// object as a document of at most `max_bytes`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// object as a document of at most `max_bytes`, with `query` as the URL's
+/// query string (after the base URL's own, if it has one).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Document {
     pub max_bytes: u64,
+    pub query: Option<String>,
 }
+
+/// The mark on a [`GetResult::extensions`] this layer answered: the
+/// document's query, if any, was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sent;
 
 /// The HTTP store `http`, sending GETs marked [`Document`] itself through
 /// `transport`, the store's own.
@@ -83,14 +93,21 @@ enum Failure {
 impl<S: HttpService + Clone> Documents<S> {
     /// GET `location` whole, at most `max_bytes`, retrying what object_store
     /// would retry.
-    async fn document(&self, location: &Path, document: Document) -> Result<GetResult> {
+    async fn document(&self, location: &Path, document: &Document) -> Result<GetResult> {
         let mut url = self.base_url.clone();
         url.path_segments_mut()
             .map_err(|()| generic(format!("{} cannot have a path", self.base_url)))?
             .extend(location.parts());
+        if let Some(query) = &document.query {
+            let joined = match url.query() {
+                Some(base) if !base.is_empty() => [base, query.as_str()].join("&"),
+                _ => query.clone(),
+            };
+            url.set_query(Some(&joined));
+        }
         let mut attempt = 1;
         loop {
-            match self.attempt(location, &url, document).await {
+            match self.attempt(location, &url, document.max_bytes).await {
                 Ok(result) => return Ok(result),
                 Err(Failure::Retry(e)) if attempt < ATTEMPTS => {
                     let wait = BACKOFF * 2u32.pow(attempt - 1);
@@ -107,12 +124,12 @@ impl<S: HttpService + Clone> Documents<S> {
         }
     }
 
-    /// One GET of `url`, read whole.
+    /// One GET of `url`, read whole, at most `max_bytes`.
     async fn attempt(
         &self,
         location: &Path,
         url: &url::Url,
-        document: Document,
+        max_bytes: u64,
     ) -> std::result::Result<GetResult, Failure> {
         let request: HttpRequest = http::Request::builder()
             .method(http::Method::GET)
@@ -165,11 +182,10 @@ impl<S: HttpService + Clone> Documents<S> {
             .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
         let over = |bytes: u64| {
             Failure::Fail(generic(format!(
-                "document {url} is {bytes} bytes or more, over the {}-byte limit",
-                document.max_bytes
+                "document {url} is {bytes} bytes or more, over the {max_bytes}-byte limit"
             )))
         };
-        if let Some(declared) = declared.filter(|&declared| declared > document.max_bytes) {
+        if let Some(declared) = declared.filter(|&declared| declared > max_bytes) {
             return Err(over(declared));
         }
         let last_modified = headers
@@ -188,13 +204,15 @@ impl<S: HttpService + Clone> Documents<S> {
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|e| Failure::Retry(generic(e)))?;
             let total = (read.len() + chunk.len()) as u64;
-            if total > document.max_bytes {
+            if total > max_bytes {
                 return Err(over(total));
             }
             read.extend_from_slice(&chunk);
         }
         let bytes = read.freeze();
         let size = bytes.len() as u64;
+        let mut extensions = object_store::Extensions::new();
+        extensions.insert(Sent);
         Ok(GetResult {
             payload: GetResultPayload::Stream(
                 futures::stream::once(async move { Ok(bytes) }).boxed(),
@@ -208,7 +226,7 @@ impl<S: HttpService + Clone> Documents<S> {
             },
             range: 0..size,
             attributes: Default::default(),
-            extensions: Default::default(),
+            extensions,
         })
     }
 }
@@ -240,7 +258,7 @@ impl<S: HttpService + Clone> ObjectStore for Documents<S> {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         match options.extensions.get::<Document>() {
-            Some(&document) if !options.head && options.range.is_none() => {
+            Some(document) if !options.head && options.range.is_none() => {
                 self.document(location, document).await
             }
             _ => self.http.get_opts(location, options).await,
@@ -286,6 +304,7 @@ impl<S: HttpService + Clone> ObjectStore for Documents<S> {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
+    use std::sync::Arc;
 
     use object_store::path::Path;
 
@@ -297,7 +316,9 @@ mod tests {
 
     /// A server answering as thredds.met.no answers a catalog: 200 with
     /// `Transfer-Encoding: chunked` and no `Content-Length`, the body in
-    /// chunks of 7 bytes. `/big.xml` is 3000 bytes so; anything else 404.
+    /// chunks of 7 bytes. `/big.xml` is 3000 bytes so; `/x/data.dods` with
+    /// a query is the query it was asked with, `Last-Modified` 2026-10-22
+    /// 21:30; anything else 404.
     fn chunked_server() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -314,9 +335,14 @@ mod tests {
                 }
                 let head = String::from_utf8_lossy(&head).to_string();
                 let path = head.split_whitespace().nth(1).unwrap_or_default();
-                let body: Vec<u8> = match path {
-                    "/catalog.xml" => CATALOG.to_vec(),
-                    "/big.xml" => vec![b'x'; 3000],
+                let mut modified = "";
+                let body: Vec<u8> = match path.split_once('?') {
+                    Some(("/x/data.dods", query)) => {
+                        modified = "Last-Modified: Thu, 22 Oct 2026 21:30:00 GMT\r\n";
+                        query.as_bytes().to_vec()
+                    }
+                    _ if path == "/catalog.xml" => CATALOG.to_vec(),
+                    _ if path == "/big.xml" => vec![b'x'; 3000],
                     _ => {
                         let _ = stream.write_all(
                             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\
@@ -325,10 +351,11 @@ mod tests {
                         continue;
                     }
                 };
-                let mut response =
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/xml;charset=UTF-8\r\n\
-                    Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                        .to_vec();
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml;charset=UTF-8\r\n\
+                     Transfer-Encoding: chunked\r\n{modified}Connection: close\r\n\r\n"
+                )
+                .into_bytes();
                 for chunk in body.chunks(7) {
                     response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
                     response.extend_from_slice(chunk);
@@ -368,5 +395,55 @@ mod tests {
 
         let error = store.get(&paths[0]).unwrap_err().to_string();
         assert!(error.contains("Content-Length"), "{error}");
+    }
+
+    /// An OPeNDAP constraint (#1264) reaches the server as the query string,
+    /// as given, and the response's `Last-Modified` comes back with the
+    /// body; a missing document is `None`. A store that cannot send a query
+    /// fails a request carrying one rather than answering without it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_query_reaches_the_server_and_the_version_comes_back() {
+        use object_store::ObjectStoreExt;
+
+        use crate::{DocumentRequest, FetchedDocument};
+
+        let url = chunked_server();
+        let (store, _) =
+            crate::build_http_store_limited(&[url.as_str(), "x/"].join("/"), 4).unwrap();
+        let query = "t.t%5B0%5D%5B0:1:3%5D,x";
+        let requests = [
+            DocumentRequest {
+                path: Path::from("x/data.dods"),
+                query: Some(query.to_string()),
+            },
+            DocumentRequest {
+                path: Path::from("x/missing.dds"),
+                query: None,
+            },
+        ];
+        let handle = tokio::runtime::Handle::current();
+        let got = tokio::task::block_in_place(|| {
+            store.get_documents_on(&requests, 2, 1024, &handle, FetchBudget::Request)
+        })
+        .unwrap();
+        assert_eq!(
+            got[0].as_ref().unwrap(),
+            &Some(FetchedDocument {
+                bytes: query.as_bytes().to_vec().into(),
+                last_modified: Some("2026-10-22T21:30:00Z".parse().unwrap()),
+                e_tag: None,
+            })
+        );
+        assert_eq!(got[1].as_ref().unwrap(), &None);
+
+        let memory = crate::DataStore::new(Arc::new(object_store::memory::InMemory::new()));
+        let put = object_store::PutPayload::from_static(b"whole");
+        memory.inner().put(&requests[0].path, put).await.unwrap();
+        let got = tokio::task::block_in_place(|| {
+            memory.get_documents_on(&requests[..1], 1, 1024, &handle, FetchBudget::Request)
+        })
+        .unwrap();
+        let error = got[0].as_ref().unwrap_err().to_string();
+        assert!(error.contains("cannot send a query string"), "{error}");
     }
 }

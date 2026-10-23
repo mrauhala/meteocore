@@ -1,0 +1,139 @@
+# MetCoOp MEPS 2.5 km surface forecast, control member, read from MET
+# Norway's thredds.met.no through OPeNDAP (DAP2, #1264), its files found in
+# the server's THREDDS catalogs. CC-BY-4.0, MET Norway.
+#
+# Since 2026-10-22 thredds.met.no serves the MEPS datasets through OPeNDAP
+# only: their catalogs bind them to `dapOnly`, and every fileServer read, by
+# HEAD or range, answers 403. `meps-netcdf-thredds.toml.disabled` and
+# `meps-netcdf-thredds-catalog.toml.disabled` read the fileServer and find
+# nothing there now; this collection serves the same family.
+#
+# DISABLED by default: it reads from thredds.met.no, a public server. To run:
+#   1. rename to drop `.disabled`
+#   2. cargo run -p server -- --collections=meps-netcdf-opendap
+# `meps-netcdf-local` serves the same family from the committed sample.
+#
+# How the files are found: as `meps-netcdf-thredds-catalog` finds them, the
+# template fields naming the files to pick and the catalogs saying which
+# exist, through the catalogs' OpenDAP service. Nothing is HEADed: a file's
+# version is its catalog entry's size and modification date, and a file the
+# catalog shows changed is read again.
+#
+# How a file is read: its `.dds` and `.das` (the variables, their shapes and
+# attributes), then one `.dods` of its coordinates; then one `.dods` per
+# field drawn, asking for that field's exact hyperslab. The server decodes
+# the file, so a field comes uncompressed: THREDDS ignores Accept-Encoding
+# on `.dods`. At most 8 requests go to the host at once, over every
+# collection on it; polls take 2 of them.
+#
+# Traffic (measured 2026-10-23 over a laptop link; to be re-measured from a
+# server's network):
+#   - finding the files: the catalog walk of the catalog example, without
+#     its 67 HEADs per run.
+#   - metadata, per file: its DDS (50 KB), DAS (98 KB) and coordinates
+#     (9.5 KB), 158 KB however many variables are served: some 11 MB per
+#     run, 85 MB a day at 8 runs.
+#   - per field drawn: one 4.06 MB `.dods` the first time any request draws
+#     it, against a 1.5 MB compressed chunk read by range. Fields stay
+#     cached: 512 MB of replies (MC_NETCDF_CHUNK_CACHE_MB, about 126 fields)
+#     and 256 MB decoded (MC_NETCDF_FIELD_CACHE_MB).
+#   - per prewarm variable: about 272 MB per run (67 fields), fetched by the
+#     poll whether or not anyone draws them. Off here.
+#   - per EDR query: the same 4.06 MB `.dods` for each field not yet cached,
+#     so a position series over a whole run is up to 67 of them, 272 MB, and
+#     a wind_speed_10m series, which reads both wind components, up to 134,
+#     544 MB. A query decodes at most MC_NETCDF_EDR_QUERY_MB (544 MiB: one
+#     parameter over one run as the client sees it, including
+#     wind_speed_10m); name the variables with `parameter-name`.
+
+id = "meps-netcdf-opendap"
+title = "MEPS Surface (CF-NetCDF, thredds.met.no OPeNDAP)"
+description = "MetCoOp MEPS 2.5 km surface forecast, control member, read through OPeNDAP from MET Norway's per-lead CF-NetCDF files on thredds.met.no, found through its THREDDS catalogs, on their Lambert conformal conic grid."
+engine_type = "netcdf"
+# EDR position, area and radius, model runs as instances; the WMS layers
+# answer GetFeatureInfo. The 10 m wind's speed is derived from its
+# grid-relative x/y components (`wind_speed_10m`, no direction on this
+# Lambert grid).
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["forecast", "NWP", "MEPS", "NetCDF", "OPeNDAP"]
+
+[license]
+title = "CC-BY-4.0"
+
+[netcdf]
+# Read through OPeNDAP: data_path is the OPeNDAP directory (thredds/dodsC/),
+# and the files are found through catalog_url, which access = "opendap"
+# needs.
+access = "opendap"
+data_path = "https://thredds.met.no/thredds/dodsC/meps25epsarchive/"
+# The catalog of the same directory: thredds/catalog/<dir>/ for
+# thredds/dodsC/<dir>/.
+catalog_url = "https://thredds.met.no/thredds/catalog/meps25epsarchive/catalog.xml"
+# Run directories by date and run hour, then the member: `{run}` is the hour.
+prefix_pattern = "%Y/%m/%d/{run}/member_00/"
+filename_template = "meps_sfc_{lead}_%Y%m%dT{run}Z.nc"
+run_hours = [0, 3, 6, 9, 12, 15, 18, 21]
+leads = [
+     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16,
+    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+    34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+    51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66,
+]
+# Runs started in the last 9 h: the newest two published (about 1.9 h after
+# their run time) are always in it, for `max_runs = 2`.
+time_window = "-PT9H"
+variables = [
+    "air_temperature_2m",
+    "relative_humidity_2m",
+    "x_wind_10m",
+    "y_wind_10m",
+    "wind_speed_of_gust",
+    "air_pressure_at_sea_level",
+    "precipitation_amount_acc",
+    "cloud_area_fraction",
+]
+# Each kept file holds its parsed metadata, about 254 KB through OPeNDAP
+# (measured): 67 leads x 2 runs is some 34 MB of heap.
+max_runs = 2
+poll_interval_secs = 300
+# A file is used once two polls see its catalog entry unchanged, or once its
+# catalog date is 10 min old; a run missing leads is served without them
+# 30 min after it appeared.
+# min_age = "PT10M"
+# run_grace = "PT30M"
+# Fetch the newest run's fields of these variables before anyone asks:
+# about 272 MB per variable and run.
+# prewarm_variables = ["air_temperature_2m"]
+
+[netcdf.titles]
+# Accumulated from the run's start, not per step. Its amount per step is
+# derived as `precipitation_amount`, titled "Precipitation amount (1 h
+# accumulation)": the accumulation less the run's previous lead's, clamped
+# at zero (`derive_per_step = false` turns it off).
+precipitation_amount_acc = "Precipitation accumulated since run start"
+x_wind_10m = "10 m wind along the grid's x axis"
+y_wind_10m = "10 m wind along the grid's y axis"
+
+# Values are served in display units, converted from each variable's CF
+# units: temperature in °C (the files' K), MSLP in hPa (Pa), the
+# accumulated precipitation in mm (kg/m^2), and relative humidity and cloud
+# cover in % (unit "1", whose standard names say they are fractions); wind
+# in m/s as stored. Each layer without an entry below takes the built-in
+# default its name and unit select.
+[wms]
+# The collection's own palette, for a variable no default matches.
+colormap = "temperature"
+
+# Deliberately narrower than the default's ±40 m/s for wind components,
+# so common 10 m winds span the whole palette.
+[[wms.parameters]]
+name = "x_wind_10m"
+colormap = "diverging"
+min = -20.0
+max = 20.0
+
+[[wms.parameters]]
+name = "y_wind_10m"
+colormap = "diverging"
+min = -20.0
+max = 20.0

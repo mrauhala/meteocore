@@ -3,7 +3,7 @@ name = "engine-netcdf"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
-description = "CF-NetCDF gridded forecast engine (local or HTTP-range NetCDF files -> WMS/Maps/Tiles)"
+description = "CF-NetCDF gridded forecast engine (local, HTTP-range or OPeNDAP NetCDF files -> WMS/Maps/Tiles)"
 
 [dependencies]
 ds-core = { path = "../core" }
@@ -14,6 +14,8 @@ ds-storage = { path = "../storage" }
 arc-swap = "1"
 chrono = { version = "0.4", features = ["serde"] }
 hdf5-reader = { version = "0.9.1", default-features = false }
+# The arrays netcdf-reader returns, moved into plain vectors (source.rs).
+ndarray = { version = "0.17", default-features = false, features = ["std"] }
 netcdf-reader = { version = "0.9.1", default-features = false, features = ["netcdf4"] }
 thiserror = "2"
 # The I/O runtime remote reads run on, and `block_in_place` around a field

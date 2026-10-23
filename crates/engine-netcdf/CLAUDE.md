@@ -3,7 +3,8 @@
 CF-NetCDF gridded forecasts and analyses (#1067), first for MET Norway's
 MEPS. Read the root `CLAUDE.md` first — Critical Rules 5, 6, 7, 9 and 10
 shape this crate. Today: local directories and remote files read in place
-by HTTP range (thredds.met.no), WMS/Maps/Tiles, EDR position/area/radius/
+by HTTP range or through OPeNDAP (thredds.met.no; OPeNDAP only for MEPS
+since 2026-10-22, #1264), WMS/Maps/Tiles, EDR position/area/radius/
 trajectory/cube with runs as instances, GetFeatureInfo, derived wind speed, and a CF
 pressure axis as the collection's vertical axis (PR 8, the last of the
 #1067 plan), per-step amounts of run-start accumulations (#1165), and
@@ -208,7 +209,10 @@ when its catalog entry changes or `recheck` is called. Catalogs go through
 streams catalogs chunked without `Content-Length`; they are read with
 `DataStore::get_documents` (ds-storage `document.rs`: the store's own
 throttled transport under all its layers, the 16 MiB cap enforced while
-streaming).
+streaming). With `access = "opendap"` (#1264) the prober is built
+`with_service(FileService::OpenDap)`: keys lie under the catalogs'
+`OpenDAP` base, and nothing is HEADed, a file's `ObjectVersion` being its
+catalog entry's (rounded size, `date type="modified"`); see "OPeNDAP".
 
 The poll (`poll_once`, on `poll_runtime()`, Critical Rule 6) remembers every
 listed file by path and identity (`catalog::Identity`, an `ObjectVersion`:
@@ -263,8 +267,9 @@ Every catalog is built by a scan and swapped through `ArcSwap`.
 
 ## Open files and metadata — measured
 
-Each catalogued file keeps its `NcFile` (`catalog::OpenFile`) for as long as
-it is catalogued; request paths never open a file. Local files are opened
+Each catalogued file keeps its reader (`catalog::OpenFile::reader`, a
+`source::Reader`: its `NcFile`, or through OPeNDAP its `DapFile`) for as
+long as it is catalogued; request paths never open a file. Local files are opened
 over `FileStorage` (positional reads) for NetCDF-4 and classic alike, never
 `NcFile::open`'s mmap, which a file truncated in place would turn into
 SIGBUS. One descriptor per catalogued local file: `max_files` bounds them.
@@ -397,6 +402,119 @@ Read in place by HTTP range, never downloaded whole (decision 4).
   server's network: a follow-up after deploy, which sets the cache and
   budget defaults.
 
+## OPeNDAP (`opendap.rs`, `dap.rs`, `source.rs`) — #1264
+
+thredds.met.no binds `meps25epsarchive` and `mepslatest` to `dapOnly` since
+2026-10-22: every fileServer HEAD or range read answers 403. `[netcdf]
+access = "opendap"` reads a remote family through DAP2.
+
+- **Config** (`ds_core::config::NetcdfAccess`): `"http"` (default) or
+  `"opendap"`, remote only (a load error on a local `data_path`, as is
+  any value but these); `opendap` needs a `catalog_url` and a `data_path`
+  without query or fragment (the query is the constraint). `data_path` is
+  the OPeNDAP directory (`…/thredds/dodsC/<dir>/`); a file is read at
+  `origin/key` plus `.dds`, `.das`, `.dods`.
+- **One seam, `source::Reader`:** `Nc { nc, storage, remote }` or
+  `Dap(DapFile)`, with `variables()`, `hdf5()` (chunk shapes, NetCDF-4
+  only), `read_all(var)` (a whole variable as stored, `f64`),
+  `read_field(read, time, level)` (a `Raw` in the stored type), `warm`,
+  `is_remote`, `read_failed`. Ingest and `field::decode` read only
+  through it, and `Raw::decode` applies packing, fill and the flip for
+  both: never branch ingest, field, EDR or render logic on the backend.
+- **Metadata** (`dap::metadata`): the DDS's top-level arrays, scalars and
+  Grids (by the Grid's name, its array's type and dimensions) become
+  `NcVariable`s with their DAS container's attributes, typed as the DAS
+  says. THREDDS prints a `Float32` in its shortest round-trip form, so
+  `9.96921E36` parsed as `f32` is netCDF's default fill exactly. DAP2's
+  `Byte` is unsigned: `_Unsigned = "false"` makes it `NcType::Byte`, its
+  `UBytes` attributes reinterpreted. `DODS_EXTRA.Unlimited_Dimension`
+  marks the record dimension. Structures and sequences are skipped. A
+  numeric attribute that does not parse fails the file: a dropped
+  `_FillValue` would serve fill as data. The parsers recurse once per
+  nesting level, so structures, Grids and DAS containers nest at most
+  `dap::MAX_DEPTH` (32) levels: deeper is an error, never a stack
+  overflow. Every size a DDS states is the server's word: size arithmetic
+  saturates (`dap::xdr_bytes`, `FieldRead::field_bytes`).
+- **Open** (`DapFile::open`): `.dds` and `.das` in one
+  `get_documents_on` round, then one `.dods` of every numeric scalar and
+  1-D coordinate variable (`dap::whole`), kept as `f64` for `read_all`;
+  any other variable read whole (a curvilinear grid's 2-D latitude and
+  longitude) is one more `.dods`. Measured 2026-10-23: 3 requests, 158 KB
+  for a MEPS sfc file (DDS 50 KB, DAS 98 KB, coordinates 9.5 KB), 23 KB
+  for a pl file; 254 KB of heap per kept sfc handle serving one variable
+  (`tests/live_thredds.rs`), against 820 KB read by range. A failed
+  request is `OpenError::Read` (`Opened::Retry`), an unreadable answer
+  `OpenError::Format` (`Skip`). A reply's cap follows the sizes the DDS
+  declares, so every whole read is checked against a hard cap before it
+  is asked for: a file's scalars and 1-D coordinates together, or one
+  whole scalar or 1-D read, at most `opendap::MAX_COORDINATE_BYTES`
+  (16 MiB in XDR; over it the open is `Format`), a 2-D one
+  `CurvilinearNodes::check_size`, nothing else. A whole read reserves its
+  peak, the reply buffered plus its values decoded and widened to `f64`,
+  from the decode budget first: the coordinates' at open (no room is
+  `OpenError::Busy`, `Opened::Retry`), a scalar or 1-D one in `read_all`
+  (no room marks the file failed, so `Retry`); a 2-D read's is its
+  caller's, `ingest::file_grid`'s `curvilinear_peak_bytes`, as by range.
+  `DapFile` holds the budget it reserves from (`decode_budget::BUDGET`;
+  tests pass their own). No block cache: a second open of the same
+  file reads its metadata again.
+- **Fields:** one `.dods` per field (one level of a pressure axis), its
+  constraint `dap::constraint`: `grid.array` for a Grid's array (THREDDS
+  wraps it in a `Structure`), the name for a plain array, `[i]` per fixed
+  axis and `[start:stride:stop]` (stop inclusive) per grid axis, brackets
+  sent as `%5B`/`%5D`. `dap::decode` follows the reply's own DDS:
+  arrays carry their length twice, `Int16`/`UInt16` are widened to 32
+  bits, a `Byte` array is padded to four bytes, scalars are bare, and
+  variables come in dataset order, not the constraint's. The reply is
+  kept in `remote::CHUNKS` as `Part::Dap(constraint)`
+  (`remote::dap_reply`, single-flight), where a range read keeps its
+  compressed chunk, so prewarm, detached fills, an EDR query's retries
+  and a render and a query of one field behave as by range; a reply
+  without `Data:` is never cached (`dap::check`). `FieldRead.chunk_bytes`
+  is `field_bytes` (no HDF5 view), so the decode budget and the EDR cap
+  count a field as a contiguous one.
+- **Transport:** `DataStore::get_documents_on` (ds-storage `document.rs`):
+  `DocumentRequest { path, query }`, the query appended by the host's
+  `Documents` layer (after the base URL's own), which marks the result
+  `Sent`; any other store fails a queried request. `FetchedDocument`
+  carries `Last-Modified` and ETag; a 404 is `Ok(None)`. Replies stream
+  chunked without `Content-Length` and are read whole, capped at
+  `dap::xdr_bytes` + 64 KiB per field and 16 MiB per DDS or DAS. Driven on
+  `io::handle()` through `io::blocking` under the thread's `Mode`, the
+  host's limit, share, back-off and `storage` span: Critical Rule 7 as by
+  range.
+- **Measured 2026-10-23** (thredds.met.no, laptop on a mobile link):
+  `.dods` comes uncompressed although asked `Accept-Encoding: deflate,
+  gzip`, so a MEPS field is 4.06 MB against a 1.5 MB chunk by range; no
+  `Last-Modified` or ETag on any DAP reply; every reply chunked. Live
+  test: first scan of two files 2.2 s (10 catalogs, 6 GETs, 668 KB with
+  the catalogs), a cold field 1.4 s. Server smoke test: collections
+  loaded in 1.6 s (sfc) and 0.7 s (pl); a cold field outlasted two 3 s
+  render deadlines (503, its detached fill completing) and was then drawn
+  in 0.1 s; an EDR series over two leads with one cold field 4.6 s.
+- **Replaced files:** with no version in DAP replies, a file replaced in
+  place is found by the poll once its catalog entry changes (its run's
+  30 min recheck included); until then reads return the new file's values
+  under the old ingest. A 404 on any DAP request, or a reply whose
+  `Last-Modified` differs from the `.dds`'s (a server that sends one), is
+  `remote::forget_replaced`: chunks and fields dropped, `Changes` told,
+  the content version moved from a request, the read
+  `ReadFailure::Replaced` (503).
+- **Not served:** DAP4, OPeNDAP for local files, server-side point series
+  (#1171), string variables.
+- **Tests:** `dap::tests` (THREDDS's own MEPS DDS, DAS, coordinates and
+  4 × 4 replies, testdata/netcdf-opendap; every XDR type, DAS escapes,
+  types and signed bytes, constraints, a server's error);
+  `opendap::tests` (`test_server`'s DAP2 datasets of the MEPS sfc and pl
+  fixtures, as Grids and as plain arrays, against the files read locally,
+  every parameter, level, run and time and the EDR series; the requests
+  an open and a field cost; replaced and removed files; THREDDS's
+  metadata ingested; the shipped examples); ds-storage
+  `document::tests::a_query_reaches_the_server_and_the_version_comes_back`
+  and `thredds::tests::opendap_files_take_the_catalogs_version_without_a_head`;
+  ds-core `opendap_access_needs_a_catalog`; `tests/live_thredds.rs`
+  `meps_through_opendap_from_thredds` (about 5 MB).
+
 ## Reads (`field.rs`)
 
 - **Only `read_variable_slice::<T>` with an explicit hyperslab** (`FieldRead::
@@ -456,7 +574,8 @@ Read in place by HTTP range, never downloaded whole (decision 4).
   variable and run.
 - **Metrics** (server `metrics_handler`, while a NetCDF collection is
   loaded): `netcdf_{field,block,chunk}_cache_{hits_total,misses_total,
-  bytes,capacity_bytes}`, `netcdf_read_{reserved_bytes,capacity_bytes,
+  bytes,capacity_bytes}` (the chunk cache's include OPeNDAP field replies),
+  `netcdf_read_{reserved_bytes,capacity_bytes,
   rejected_total}`, `netcdf_detached_fills_{pending,total,inline_total}`
   (render fills only: EDR reads count in neither these nor the field
   cache's hits and misses, which measure the renders; they show in the
@@ -752,6 +871,14 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
   run's day from `src/test_server.rs` (its `thredds_catalog` writes the
   other catalogs with `quick_xml::Writer`);
   `remote::tests::a_file_replaced_under_a_catalog_is_headed_again`.
+- `testdata/netcdf-opendap/`: what thredds.met.no's OPeNDAP served on
+  2026-10-23 for `meps_pl_00` (DDS and DAS whole) and `meps_sfc_00`
+  (trimmed to the example's variables) of the 12Z run, each file's
+  coordinates reply, and a 4 × 4 hyperslab of 2 m temperature (48 KB in
+  all, provenance in its README). `src/test_server.rs` also serves any
+  NetCDF fixture as a DAP2 dataset (`TestServer::put_opendap`: `.dds`,
+  `.das`, `.dods` with constraints, chunked, Grids or plain arrays,
+  `Last-Modified` optional).
 - `testdata/netcdf-projections/`: one synthetic file per CF mapping of
   #1167, each its own collection directory (`polar-stereographic/` with
   EPSG:3413's parameters around the North Pole, `laea/` with EPSG:3035's
