@@ -178,7 +178,10 @@ impl FieldRead {
     /// ([`crate::edr`]).
     pub(crate) fn decoded_bytes(&self) -> u64 {
         let (ny, nx) = self.shape();
-        ((ny * nx) as u64 * 4).max(self.chunk_bytes)
+        (ny as u64)
+            .saturating_mul(nx as u64)
+            .saturating_mul(4)
+            .max(self.chunk_bytes)
     }
 
     /// The hyperslab of time step `time` at served level `level` (an index
@@ -705,7 +708,9 @@ fn field(
         fill,
     };
     let (ny, nx) = (shape.ny, shape.nx);
-    let field_bytes = ny * nx * stored.size();
+    // Saturating: an OPeNDAP DDS states any size it likes, and a field
+    // past the decode budget is refused before it is read (`crate::field`).
+    let field_bytes = ny.saturating_mul(nx).saturating_mul(stored.size());
     let chunk_bytes = chunk_bytes(h5, var, stored).unwrap_or(field_bytes);
     let name: Arc<str> = var.name.as_str().into();
     let key = (

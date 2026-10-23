@@ -16,6 +16,7 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs};
 
 use super::*;
+use crate::decode_budget::Budget;
 use crate::ingest::{inspect, FileGrid, Wanted};
 use crate::source::Reader;
 use crate::test_server::{thredds_catalog, Request, TestServer};
@@ -553,6 +554,7 @@ fn thredds_metadata_of_meps_ingests_as_its_files_do() {
             version.clone(),
             crate::next_file_id(),
             Arc::default(),
+            crate::decode_budget::BUDGET.clone(),
         )
         .unwrap();
         let wanted = match family {
@@ -623,6 +625,106 @@ fn thredds_metadata_of_meps_ingests_as_its_files_do() {
             }
         }
     }
+}
+
+/// A DAP2 reply of `dds` declarations and `data`.
+fn dods(dds: &str, data: &[u8]) -> Vec<u8> {
+    let mut reply = format!("Dataset {{\n{dds}}} test.nc;\n\nData:\n").into_bytes();
+    reply.extend_from_slice(data);
+    reply
+}
+
+/// A server's DDS states every size, which is all a reply's cap follows:
+/// each whole read is checked against a hard cap before it is asked for.
+/// A file whose scalars and 1-D coordinates pass `MAX_COORDINATE_BYTES`
+/// (here an axis of 4 billion values, 16 GB) fails its open as a format
+/// error, no `.dods` sent. A whole read of a variable not read at open is
+/// a scalar or 1-D one under the same cap, or a 2-D one of at most
+/// `MAX_NODES`, or nothing. And whole reads reserve their transient peak
+/// from the decode budget first: an open that finds no room is tried
+/// again next poll, a read that finds none fails as a failed read does,
+/// and the budget is given back once the open is done.
+#[test]
+fn whole_reads_are_capped_and_budgeted_before_they_are_asked_for() {
+    let server = TestServer::new();
+    let modified = Utc::now();
+    let base = "thredds/dodsC/x";
+    let (host, _) = remote::host("hostile", &format!("{}/{base}/", server.url)).unwrap();
+    let open = |name: &str, budget: Arc<Budget>| {
+        DapFile::open(
+            host.clone(),
+            &server.url,
+            &[base, name].join("/"),
+            ObjectVersion::sized(1),
+            crate::next_file_id(),
+            Arc::default(),
+            budget,
+        )
+    };
+    let attributes = b"Attributes {\n}\n".to_vec();
+    server.put(
+        &format!("{base}/huge.nc.dds"),
+        b"Dataset {\n    Float64 time[time = 1];\n    Float32 x[x = 4000000000];\n} huge.nc;\n"
+            .to_vec(),
+        modified,
+    );
+    server.put(&format!("{base}/huge.nc.das"), attributes.clone(), modified);
+    let budget = Arc::new(Budget::new(1 << 20));
+    let Err(OpenError::Format(why)) = open("huge.nc", budget.clone()) else {
+        panic!("a 16 GB axis must fail the open");
+    };
+    assert!(
+        why.contains("16000000024 bytes") && why.contains("16 MiB"),
+        "{why}"
+    );
+    let sent: Vec<String> = server.take().into_iter().map(|r| r.path).collect();
+    assert!(sent.iter().all(|path| !path.contains(".dods")), "{sent:?}");
+
+    let dds = "Dataset {\n    Float64 time[time = 1];\n    Float64 big[n = 3000000];\n    \
+               Float64 lat[y = 5000][x = 5000];\n    Float32 cube[a = 2][b = 2][c = 2];\n    \
+               Float64 series[m = 100000];\n} ok.nc;\n";
+    server.put(
+        &format!("{base}/ok.nc.dds"),
+        dds.as_bytes().to_vec(),
+        modified,
+    );
+    server.put(&format!("{base}/ok.nc.das"), attributes, modified);
+    let mut time = vec![0, 0, 0, 1, 0, 0, 0, 1];
+    time.extend_from_slice(&1_792_756_800f64.to_be_bytes());
+    server.put(
+        &format!("{base}/ok.nc.dods?time"),
+        dods("    Float64 time[time = 1];\n", &time),
+        modified,
+    );
+    let Err(OpenError::Busy(why)) = open("ok.nc", Arc::new(Budget::new(16))) else {
+        panic!("no room for its coordinates");
+    };
+    assert!(why.contains("no room"), "{why}");
+    assert!(server.take().iter().all(|r| !r.path.contains(".dods")));
+
+    let file = open("ok.nc", budget.clone()).unwrap();
+    assert_eq!(budget.metrics().0, 0, "the open gave its reservation back");
+    assert_eq!(
+        file.read_all(&file.variables()[0]).unwrap(),
+        [1_792_756_800.0]
+    );
+    server.take();
+    let variable = |name: &str| file.variables().iter().find(|v| v.name == name).unwrap();
+    for (name, why) in [
+        ("big", "24000008 bytes"),
+        ("lat", "more than 16777216"),
+        ("cube", "3 dimensions"),
+    ] {
+        let error = file.read_all(variable(name)).unwrap_err();
+        assert!(error.contains(why), "{name}: {error}");
+    }
+    assert!(!file.read_failed());
+    // 800 KB in XDR, under the cap; buffered, decoded and widened, more
+    // than the 1 MiB budget.
+    let error = file.read_all(variable("series")).unwrap_err();
+    assert!(error.contains("no room"), "{error}");
+    assert!(file.read_failed(), "tried again next poll, never skipped");
+    assert!(server.take().is_empty(), "nothing was asked for");
 }
 
 /// The shipped OPeNDAP examples (#1264) are valid and read MET Norway's

@@ -435,7 +435,11 @@ access = "opendap"` reads a remote family through DAP2.
   `UBytes` attributes reinterpreted. `DODS_EXTRA.Unlimited_Dimension`
   marks the record dimension. Structures and sequences are skipped. A
   numeric attribute that does not parse fails the file: a dropped
-  `_FillValue` would serve fill as data.
+  `_FillValue` would serve fill as data. The parsers recurse once per
+  nesting level, so structures, Grids and DAS containers nest at most
+  `dap::MAX_DEPTH` (32) levels: deeper is an error, never a stack
+  overflow. Every size a DDS states is the server's word: size arithmetic
+  saturates (`dap::xdr_bytes`, `FieldRead::field_bytes`).
 - **Open** (`DapFile::open`): `.dds` and `.das` in one
   `get_documents_on` round, then one `.dods` of every numeric scalar and
   1-D coordinate variable (`dap::whole`), kept as `f64` for `read_all`;
@@ -446,6 +450,20 @@ access = "opendap"` reads a remote family through DAP2.
   (`tests/live_thredds.rs`), against 820 KB read by range. A failed
   request is `OpenError::Read` (`Opened::Retry`), an unreadable answer
   `OpenError::Format` (`Skip`). No block cache: a second open of the same
+  request is `OpenError::Read` (`Opened::Retry`), an unreadable answer
+  `OpenError::Format` (`Skip`). A reply's cap follows the sizes the DDS
+  declares, so every whole read is checked against a hard cap before it
+  is asked for: a file's scalars and 1-D coordinates together, or one
+  whole scalar or 1-D read, at most `opendap::MAX_COORDINATE_BYTES`
+  (16 MiB in XDR; over it the open is `Format`), a 2-D one
+  `CurvilinearNodes::check_size`, nothing else. A whole read reserves its
+  peak, the reply buffered plus its values decoded and widened to `f64`,
+  from the decode budget first: the coordinates' at open (no room is
+  `OpenError::Busy`, `Opened::Retry`), a scalar or 1-D one in `read_all`
+  (no room marks the file failed, so `Retry`); a 2-D read's is its
+  caller's, `ingest::file_grid`'s `curvilinear_peak_bytes`, as by range.
+  `DapFile` holds the budget it reserves from (`decode_budget::BUDGET`;
+  tests pass their own). No block cache: a second open of the same
   file reads its metadata again.
 - **Fields:** one `.dods` per field (one level of a pressure axis), its
   constraint `dap::constraint`: `grid.array` for a Grid's array (THREDDS

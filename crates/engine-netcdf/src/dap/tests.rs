@@ -364,3 +364,42 @@ fn a_reply_without_data_is_the_servers_error() {
     assert!(check(&fixture("meps_sfc_00_20261023T12Z_t2m_4x4.dods")).is_ok());
     assert_eq!(decode(b"<html/>").unwrap_err(), "the reply carries no data");
 }
+
+/// Structures, Grids and attribute containers nest at most [`MAX_DEPTH`]
+/// levels: a hostile document nested deeper is an error, not a parser
+/// recursing until the stack overflows and the process aborts.
+#[test]
+fn nesting_past_the_cap_is_an_error_not_a_stack_overflow() {
+    let structures = |levels: usize| {
+        format!(
+            "Dataset {{\n{}Int32 v;\n{}}} d;\n",
+            "Structure {\n".repeat(levels),
+            "} s;\n".repeat(levels)
+        )
+    };
+    assert!(parse_dds(&structures(MAX_DEPTH)).is_ok());
+    for levels in [MAX_DEPTH + 1, 100_000] {
+        let error = parse_dds(&structures(levels)).unwrap_err();
+        assert!(error.contains("32 levels deep"), "{error}");
+    }
+    let grids = format!(
+        "Dataset {{\n{}Int32 v;\n}} d;\n",
+        "Grid {\n ARRAY:\n".repeat(100_000)
+    );
+    assert!(parse_dds(&grids).unwrap_err().contains("levels deep"));
+    let reply = reply(&structures(100_000)["Dataset {\n".len()..], &[]);
+    assert!(decode(&reply).unwrap_err().contains("levels deep"));
+
+    let containers = |levels: usize| {
+        format!(
+            "Attributes {{\n{}String a \"b\";\n{}}}\n",
+            "c {\n".repeat(levels),
+            "}\n".repeat(levels)
+        )
+    };
+    assert!(parse_das(&containers(MAX_DEPTH)).is_ok());
+    for levels in [MAX_DEPTH + 1, 100_000] {
+        let error = parse_das(&containers(levels)).unwrap_err();
+        assert!(error.contains("32 levels deep"), "{error}");
+    }
+}

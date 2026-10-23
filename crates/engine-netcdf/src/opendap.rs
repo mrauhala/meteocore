@@ -9,6 +9,11 @@
 //!   netcdf-reader's `NcVariable`s ([`dap::metadata`]), so ingest builds
 //!   the same `Variable`s and `Layout` as from a NetCDF file. A 2-D
 //!   coordinate, read only for a curvilinear grid, is one more `.dods`.
+//!   The DDS states every size, so every whole read is checked against a
+//!   hard cap before it is asked for ([`MAX_COORDINATE_BYTES`], and
+//!   `CurvilinearNodes::check_size` for 2-D latitude/longitude) and
+//!   reserves its reply and decode from the decode budget, as a field read
+//!   does: a server declaring a 4-billion-value axis is refused unread.
 //! - **Fields:** one `.dods` per field read, its constraint the exact
 //!   hyperslab ([`dap::constraint`]), decoded from XDR in its stored type.
 //!   The server decodes the file's chunks, so a MEPS field is its 4.06 MB
@@ -39,6 +44,7 @@ use ds_storage::{DocumentRequest, FetchedDocument, ObjectVersion};
 use netcdf_reader::{NcSliceInfo, NcType, NcVariable};
 
 use crate::dap::{self, Metadata};
+use crate::decode_budget::Budget;
 use crate::ingest::{FieldRead, Stored};
 use crate::io::{self, Mode};
 use crate::remote::{self, Changes, FileId, Host, ReadFailure};
@@ -50,6 +56,13 @@ const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Bytes a `.dods` reply may carry beyond its values: its DDS.
 const REPLY_DDS_BYTES: u64 = 64 * 1024;
+
+/// The most bytes, in XDR, a file's scalars and 1-D coordinates may take
+/// together, or one whole read of a scalar or 1-D variable: 16 MiB, two
+/// million `f64` values (MEPS's are 9.5 KB). Checked from the DDS before
+/// the request: the DDS states the sizes the reply's cap would follow, so
+/// without it a server declaring a 4-billion-value axis would be read.
+pub(crate) const MAX_COORDINATE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// One remote file read through OPeNDAP, opened at one version.
 pub(crate) struct DapFile {
@@ -64,6 +77,9 @@ pub(crate) struct DapFile {
     metadata: Metadata,
     /// The scalars and 1-D coordinate variables, read at open, as stored.
     coordinates: HashMap<String, Vec<f64>>,
+    /// What a whole read reserves its transient peak from:
+    /// [`crate::decode_budget::BUDGET`].
+    budget: Arc<Budget>,
     /// The `.dds` reply's `Last-Modified`, where the server sent one.
     served: Option<DateTime<Utc>>,
     replaced: AtomicBool,
@@ -79,12 +95,15 @@ pub(crate) enum OpenError {
     /// The server's answer is not a dataset that can be read: skipped
     /// until the file changes.
     Format(String),
+    /// The decode budget has no room for its coordinates now: tried again
+    /// next poll, as a curvilinear grid's read under budget pressure is.
+    Busy(String),
 }
 
 impl DapFile {
     /// Open `key` under `origin`, listed at `version`, for the ingest
     /// `ingest`: its metadata and coordinates, three requests in two
-    /// rounds.
+    /// rounds. Whole reads reserve from `budget`.
     pub(crate) fn open(
         host: Arc<Host>,
         origin: &str,
@@ -92,6 +111,7 @@ impl DapFile {
         version: ObjectVersion,
         ingest: u64,
         changes: Arc<Changes>,
+        budget: Arc<Budget>,
     ) -> Result<Self, OpenError> {
         let mut file = Self {
             host,
@@ -107,6 +127,7 @@ impl DapFile {
                 projections: Vec::new(),
             },
             coordinates: HashMap::new(),
+            budget,
             served: None,
             replaced: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -133,7 +154,9 @@ impl DapFile {
         Ok(file)
     }
 
-    /// Every numeric scalar and 1-D coordinate variable, in one `.dods`.
+    /// Every numeric scalar and 1-D coordinate variable, in one `.dods`:
+    /// at most [`MAX_COORDINATE_BYTES`] together, checked before the
+    /// request, its transient peak reserved from the budget.
     fn read_coordinates(&self) -> Result<HashMap<String, Vec<f64>>, OpenError> {
         let wanted: Vec<usize> = (0..self.metadata.variables.len())
             .filter(|&i| {
@@ -149,13 +172,25 @@ impl DapFile {
             .iter()
             .map(|&i| self.metadata.projections[i].as_str())
             .collect();
-        let bytes: u64 = wanted
+        let (bytes, peak) = wanted
             .iter()
-            .map(|&i| {
-                let var = &self.metadata.variables[i];
-                dap::xdr_bytes(&var.dtype, cells(var))
-            })
-            .sum();
+            .map(|&i| whole_read(&self.metadata.variables[i]))
+            .fold((0u64, 0u64), |(bytes, peak), (b, p)| {
+                (bytes.saturating_add(b), peak.saturating_add(p))
+            });
+        if bytes > MAX_COORDINATE_BYTES {
+            return Err(OpenError::Format(format!(
+                "its DDS declares {bytes} bytes of scalars and 1-D coordinates, more than the \
+                 {} MiB a file's may take",
+                MAX_COORDINATE_BYTES >> 20
+            )));
+        }
+        let _permit = self.budget.reserve(peak).map_err(|_| {
+            OpenError::Busy(format!(
+                "the NetCDF read budget has no room for the {} KiB its coordinates take now",
+                peak.div_ceil(1024)
+            ))
+        })?;
         let reply = self
             .fetch(
                 &[(".dods", Some(dap::whole(&projections)))],
@@ -195,7 +230,16 @@ impl DapFile {
     }
 
     /// Every value of `var`, as stored: a coordinate read at open, else one
-    /// `.dods` of the whole variable.
+    /// `.dods` of the whole variable. Only a scalar or 1-D variable of at
+    /// most [`MAX_COORDINATE_BYTES`], or a 2-D one of at most
+    /// `ds_core::resample::curvilinear::MAX_NODES` (the 2-D
+    /// latitude/longitude of a curvilinear grid), checked before the
+    /// request. A scalar or 1-D read reserves its transient peak from the
+    /// budget here; a 2-D one's is reserved by its caller, as a range read's
+    /// is (`ingest::file_grid`, `curvilinear_peak_bytes`, whose three times
+    /// the stored size covers the reply and its decode). A full budget fails
+    /// the read as a failed read does, so the file is opened again next
+    /// poll, never skipped.
     pub(crate) fn read_all(&self, var: &NcVariable) -> Result<Vec<f64>, String> {
         if let Some(values) = self.coordinates.get(&var.name) {
             return Ok(values.clone());
@@ -204,7 +248,35 @@ impl DapFile {
             .metadata
             .projection(&var.name)
             .ok_or_else(|| format!("'{}' is not in the dataset", var.name))?;
-        let max = dap::xdr_bytes(&var.dtype, cells(var)) + REPLY_DDS_BYTES;
+        let (xdr, peak) = whole_read(var);
+        let _permit = match var.dimensions[..] {
+            [] | [_] if xdr > MAX_COORDINATE_BYTES => {
+                return Err(format!(
+                    "the DDS declares {xdr} bytes, more than the {} MiB a whole read of a \
+                     scalar or 1-D variable may take",
+                    MAX_COORDINATE_BYTES >> 20
+                ))
+            }
+            [] | [_] => Some(self.budget.reserve(peak).map_err(|_| {
+                self.failed.store(true, Ordering::Relaxed);
+                format!(
+                    "the NetCDF read budget has no room for the {} KiB this read takes now",
+                    peak.div_ceil(1024)
+                )
+            })?),
+            [ref y, ref x] => {
+                ds_core::resample::CurvilinearNodes::check_size(x.size as usize, y.size as usize)?;
+                None
+            }
+            _ => {
+                return Err(format!(
+                    "only scalars, 1-D variables and 2-D latitude/longitude are read whole, \
+                     not its {} dimensions",
+                    var.dimensions.len()
+                ))
+            }
+        };
+        let max = xdr + REPLY_DDS_BYTES;
         let reply = self
             .fetch(&[(".dods", Some(dap::whole(&[projection])))], max)
             .map_err(|e| e.to_string())?;
@@ -237,7 +309,8 @@ impl DapFile {
             .iter()
             .find(|v| v.name == name)
             .map_or(NcType::Double, |v| v.dtype.clone());
-        let max = dap::xdr_bytes(dtype, (ny * nx) as u64) + REPLY_DDS_BYTES;
+        let cells = (ny as u64).saturating_mul(nx as u64);
+        let max = dap::xdr_bytes(dtype, cells).saturating_add(REPLY_DDS_BYTES);
         let invalid = |e: String| DataServerError::Storage(format!("{}: {e}", self.id.url));
         let reply = remote::dap_reply(&self.id, &constraint, || {
             let mut reply = self.fetch(&[(".dods", Some(constraint.clone()))], max)?;
@@ -332,6 +405,20 @@ impl DapFile {
 /// The name a projection's values carry in a reply: a Grid's array's.
 fn leaf(projection: &str) -> &str {
     projection.rsplit('.').next().unwrap_or(projection)
+}
+
+/// A whole read of `var`: its reply's XDR bytes, and its transient peak,
+/// the reply buffered, its values decoded in their stored type and then
+/// widened to `f64`.
+fn whole_read(var: &NcVariable) -> (u64, u64) {
+    let n = cells(var);
+    let xdr = dap::xdr_bytes(&var.dtype, n);
+    let stored = var.dtype.size().map_or(8, |size| size as u64);
+    let decoded = n.saturating_mul(stored).saturating_add(n.saturating_mul(8));
+    (
+        xdr,
+        xdr.saturating_add(REPLY_DDS_BYTES).saturating_add(decoded),
+    )
 }
 
 /// Values of `var`: the product of its dimensions, 1 for a scalar.

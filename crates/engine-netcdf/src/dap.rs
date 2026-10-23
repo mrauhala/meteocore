@@ -166,16 +166,27 @@ impl<'a> Tokens<'a> {
     }
 }
 
+/// How deep a DDS's structures and Grids, or a DAS's containers, may nest.
+/// The parsers recurse once per level: a document nested deeper fails,
+/// rather than a hostile one overflowing the stack. NetCDF's need two.
+pub(crate) const MAX_DEPTH: usize = 32;
+
 /// The declarations of a DDS, `Dataset { … } name;`.
 pub(crate) fn parse_dds(text: &str) -> Result<Vec<Decl>, String> {
     let mut tokens = Tokens::new(text);
     tokens.keyword("Dataset")?;
     tokens.expect('{')?;
-    declarations(&mut tokens).map_err(|e| format!("not a DAP2 DDS: {e}"))
+    declarations(&mut tokens, 0).map_err(|e| format!("not a DAP2 DDS: {e}"))
 }
 
-/// Declarations up to and including the closing `}`.
-fn declarations(tokens: &mut Tokens) -> Result<Vec<Decl>, String> {
+/// The error of a document nested deeper than [`MAX_DEPTH`].
+fn too_deep() -> String {
+    format!("it nests more than {MAX_DEPTH} levels deep")
+}
+
+/// Declarations up to and including the closing `}`, `depth` levels of
+/// structures and Grids deep.
+fn declarations(tokens: &mut Tokens, depth: usize) -> Result<Vec<Decl>, String> {
     let mut decls = Vec::new();
     loop {
         match tokens.peek()? {
@@ -184,12 +195,15 @@ fn declarations(tokens: &mut Tokens) -> Result<Vec<Decl>, String> {
                 return Ok(decls);
             }
             None => return Err("the document ends inside a declaration list".into()),
-            _ => decls.push(declaration(tokens)?),
+            _ => decls.push(declaration(tokens, depth)?),
         }
     }
 }
 
-fn declaration(tokens: &mut Tokens) -> Result<Decl, String> {
+fn declaration(tokens: &mut Tokens, depth: usize) -> Result<Decl, String> {
+    if depth > MAX_DEPTH {
+        return Err(too_deep());
+    }
     let word = tokens.word()?;
     let named = |tokens: &mut Tokens| -> Result<String, String> {
         let name = tokens.word()?.to_string();
@@ -201,10 +215,10 @@ fn declaration(tokens: &mut Tokens) -> Result<Decl, String> {
             tokens.expect('{')?;
             tokens.keyword("ARRAY")?;
             tokens.expect(':')?;
-            let array = Box::new(declaration(tokens)?);
+            let array = Box::new(declaration(tokens, depth + 1)?);
             tokens.keyword("MAPS")?;
             tokens.expect(':')?;
-            let maps = declarations(tokens)?;
+            let maps = declarations(tokens, depth + 1)?;
             Ok(Decl::Grid {
                 name: named(tokens)?,
                 array,
@@ -213,7 +227,7 @@ fn declaration(tokens: &mut Tokens) -> Result<Decl, String> {
         }
         kind @ ("structure" | "sequence") => {
             tokens.expect('{')?;
-            let members = declarations(tokens)?;
+            let members = declarations(tokens, depth + 1)?;
             let name = named(tokens)?;
             Ok(match kind {
                 "structure" => Decl::Structure { name, members },
@@ -276,11 +290,15 @@ pub(crate) fn parse_das(text: &str) -> Result<Container, String> {
     let mut tokens = Tokens::new(text);
     tokens.keyword("Attributes")?;
     tokens.expect('{')?;
-    container(&mut tokens).map_err(|e| format!("not a DAP2 DAS: {e}"))
+    container(&mut tokens, 0).map_err(|e| format!("not a DAP2 DAS: {e}"))
 }
 
-/// A container's contents up to and including its closing `}`.
-fn container(tokens: &mut Tokens) -> Result<Container, String> {
+/// A container's contents up to and including its closing `}`, `depth`
+/// containers deep.
+fn container(tokens: &mut Tokens, depth: usize) -> Result<Container, String> {
+    if depth > MAX_DEPTH {
+        return Err(too_deep());
+    }
     let mut found = Container::default();
     loop {
         match tokens.next()? {
@@ -288,7 +306,9 @@ fn container(tokens: &mut Tokens) -> Result<Container, String> {
             Some(Token::Word(word)) => {
                 if tokens.peek()? == Some(Token::Punct('{')) {
                     tokens.next()?;
-                    found.children.push((word.to_string(), container(tokens)?));
+                    found
+                        .children
+                        .push((word.to_string(), container(tokens, depth + 1)?));
                     continue;
                 }
                 let name = tokens.word()?;
@@ -636,14 +656,15 @@ fn query_name(name: &str) -> String {
     out
 }
 
-/// Bytes a reply of `n` values of `ty` carries in XDR, its DDS aside.
+/// Bytes a reply of `n` values of `ty` carries in XDR, its DDS aside;
+/// `u64::MAX` past it, whatever size a DDS declares.
 pub(crate) fn xdr_bytes(ty: &NcType, n: u64) -> u64 {
-    let width = match ty {
-        NcType::Byte | NcType::UByte => return 8 + n.next_multiple_of(4),
-        NcType::Double => 8,
-        _ => 4,
+    let values = match ty {
+        NcType::Byte | NcType::UByte => n.checked_next_multiple_of(4).unwrap_or(u64::MAX),
+        NcType::Double => n.saturating_mul(8),
+        _ => n.saturating_mul(4),
     };
-    8 + n.saturating_mul(width)
+    values.saturating_add(8)
 }
 
 /// The values of `name` among a reply's, the first by that name.

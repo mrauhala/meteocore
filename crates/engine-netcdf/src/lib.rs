@@ -900,9 +900,12 @@ impl NetcdfEngine {
                     file.identity.clone(),
                     id,
                     self.changes.clone(),
+                    decode_budget::BUDGET.clone(),
                 ) {
                     Ok(dap) => Reader::Dap(dap),
                     Err(OpenError::Read(e)) => return Opened::Retry(e.to_string()),
+                    // The decode budget is full now: the next poll tries again.
+                    Err(OpenError::Busy(e)) => return Opened::Retry(e),
                     Err(OpenError::Format(e)) => return Opened::Skip(e),
                 }
             }
