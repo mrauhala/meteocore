@@ -547,11 +547,13 @@ async fn a_chunked_document_is_read_through_the_hosts_transport() {
 
     let error = store.inner().get(&path).await.unwrap_err().to_string();
     assert!(error.contains("Content-Length"), "{error}");
-    assert_eq!(store.document(&path, 1024).await.unwrap(), CATALOG);
+    let request = crate::DocumentRequest { path, query: None };
+    let read = store.document(&request, 1024).await.unwrap().unwrap();
+    assert_eq!(read.bytes, CATALOG);
     assert_eq!(host.sent().len(), 2, "one request each");
     assert_eq!(requests(HOST), (8, 0, 0), "and the permit given back");
 
-    let error = store.document(&path, 5).await.unwrap_err().to_string();
+    let error = store.document(&request, 5).await.unwrap_err().to_string();
     assert!(error.contains("over the 5-byte limit"), "{error}");
 }
 

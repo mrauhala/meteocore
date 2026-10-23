@@ -8,7 +8,8 @@ Maps, OGC API - Tiles and OGC API - EDR (`engine_type = "netcdf"`).
 Weather models such as MetCoOp MEPS publish each run as a family of
 CF-NetCDF files, often one per lead time, each with many variables and
 over 100 MB. Some publishers expose them only on an HTTP file server that
-cannot be listed. This engine serves such a family as map layers and EDR
+cannot be listed, or only through OPeNDAP, as thredds.met.no serves MEPS
+since 2026-10-22. This engine serves such a family as map layers and EDR
 queries in place: a request reads one 2-D field, and no file is converted
 or downloaded whole.
 
@@ -44,6 +45,26 @@ or downloaded whole.
   (ds-storage's host back-off).
   A retried request's log line names its collection, host and file
   (ds-storage's `storage` span).
+- **OPeNDAP** (`access = "opendap"`, #1264). Remote files read through a
+  DAP2 server, `data_path` its directory (`…/thredds/dodsC/…`), found
+  through the THREDDS catalogs (`catalog_url`, required) by their
+  `OpenDAP` service. Opening a file reads its `.dds` and `.das` (the
+  variables, shapes and attributes, which build the same layout a NetCDF
+  file does) and one `.dods` of its scalars and 1-D coordinates: three
+  requests, about 158 KB for a MEPS sfc file. A field is one `.dods` of
+  its exact hyperslab (time, level, the whole y and x), decoded from XDR
+  in its stored type: 4.06 MB for a MEPS field, since the server sends it
+  uncompressed (THREDDS ignores `Accept-Encoding` there), against a 1.5 MB
+  compressed chunk read by range. The reply is kept in the chunk cache,
+  single-flight, as a chunk is. Replies stream chunked, without
+  `Content-Length`, and are read whole; every request takes the host's
+  request limit and back-off. Nothing is HEADed: a file's version is its
+  catalog entry's, and a file the catalog shows changed is opened again.
+  THREDDS sends no `Last-Modified` with DAP replies, so a file replaced
+  between polls is found by the poll only; a 404 on a read is a file gone,
+  and a server that sends `Last-Modified` has each reply checked against
+  the `.dds`'s, both as a replaced file is handled. No DAP4, and no
+  OPeNDAP for local files.
 - **THREDDS catalogs** (`catalog_url`, #1170). The template fields still
   name the files to pick; the `catalog.xml` of each run directory a poll
   checks says which exist, with a size and a modification time. A poll
@@ -225,7 +246,7 @@ URL-only fields on a local `data_path`, are a load error.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `data_path` | required | Local directory, or an `http(s)://` URL read by range |
+| `data_path` | required | Local directory, or an `http(s)://` URL read by range (or an OPeNDAP directory with `access = "opendap"`) |
 | `filename_template` | every `*.nc` | strftime name with `{run}` (run hour) and `{lead}` (two-digit lead); required for a URL |
 | `variables` | every variable on the first file's grid | Variables served, in order; the first is the default layer |
 | `titles` | `long_name`, else the name | Layer titles by variable name (a table) |
@@ -241,25 +262,29 @@ URL-only fields on a local `data_path`, are a load error.
 | `run_grace` | `PT30M` | URL only: a run missing leads is served without them after this |
 | `prewarm_variables` | `[]` | URL only: variables whose newest-run fields each poll fetches ahead (bottom level) |
 | `derive_per_step` | `true` | Serve `<name>`, the per-step amount of each `<name>_acc` accumulation in kg m-2 or mm (above) |
-| `catalog_url` | none | URL only: the THREDDS `catalog.xml` of `data_path`'s directory (`…/thredds/catalog/<dir>/catalog.xml` for `…/thredds/fileServer/<dir>/`). The catalogs say which files the template names exist, in place of a HEAD per file; the template fields stay required |
+| `catalog_url` | none | URL only: the THREDDS `catalog.xml` of `data_path`'s directory (`…/thredds/catalog/<dir>/catalog.xml` for `…/thredds/fileServer/<dir>/` or `…/thredds/dodsC/<dir>/`). The catalogs say which files the template names exist, in place of a HEAD per file; the template fields stay required |
+| `access` | `"http"` | URL only: `"http"` reads files by HTTP range; `"opendap"` through OPeNDAP (DAP2), `data_path` the OPeNDAP directory, and needs a `catalog_url` and a `data_path` without a query |
 
 Runnable examples: `collections.d/meps-netcdf-local.toml` (MEPS surface
 sample), `collections.d/meps-netcdf-pl-local.toml` (pressure-level
 sample) and `collections.d/netcdf-curvilinear-local.toml` (a synthetic
 curvilinear grid around the North Pole whose fields are each node's own
-column and row). `meps-netcdf-thredds.toml.disabled` and
-`meps-netcdf-pl-thredds.toml.disabled` in the same directory read these
-families from MET Norway's public thredds.met.no and state their traffic;
-`meps-netcdf-thredds-catalog.toml.disabled` finds the surface family's
-files through the server's THREDDS catalogs instead.
+column and row). `meps-netcdf-opendap.toml.disabled` and
+`meps-netcdf-pl-opendap.toml.disabled` in the same directory read these
+families from MET Norway's public thredds.met.no through OPeNDAP, as it
+serves MEPS since 2026-10-22, and state their traffic.
+`meps-netcdf-thredds.toml.disabled`, `meps-netcdf-pl-thredds.toml.disabled`
+and `meps-netcdf-thredds-catalog.toml.disabled` read them by HTTP range
+from its fileServer, by HEAD probing or through its catalogs, which now
+answers 403 for MEPS.
 
 Process-wide environment variables, shared by every NetCDF collection:
 
 | Variable | Default | Bounds |
 |---|---|---|
 | `MC_NETCDF_FIELD_CACHE_MB` | `256` | Decoded fields (~4 MB per MEPS field) |
-| `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote files (~1.5 MB per MEPS field) |
-| `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote files; at least 8 |
+| `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote files read by range (~1.5 MB per MEPS field), and the `.dods` replies of fields read through OPeNDAP (~4.06 MB) |
+| `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote files read by range; at least 8 |
 | `MC_NETCDF_READ_MEMORY_MB` | `1024` | Buffers of field reads in progress; a read that does not fit is a 503 |
 | `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read (steps × levels × variables read × one field; a trajectory counts the (step, level) fields its path reads, a cube the levels its `z` positions take; a per-step amount adds its accumulation at the step before each step), checked before any read; over it a 400. Fits one variable, or a derived wind speed (both components), over a 67-lead MEPS run |
 
@@ -285,9 +310,16 @@ Process-wide environment variables, shared by every NetCDF collection:
   with a 503; the fetch still completes into the cache for the next one.
 - `catalog_url` reads THREDDS catalogs whose tree mirrors the file server's
   (THREDDS `datasetScan`), datasets by their `urlPath` attribute and the
-  catalog's `HTTPServer` service; `access` elements are not read.
+  catalog's `HTTPServer` service (`OpenDAP` with `access = "opendap"`);
+  `access` elements are not read.
+- OPeNDAP: DAP2 only; a dataset's variables are its top-level arrays,
+  scalars and Grids (structures and sequences are not read); string
+  variables are not read. A file read through OPeNDAP keeps no block
+  cache: opened again (a reload, a closed file kept again), it reads its
+  metadata again.
 - Each kept file holds its parsed metadata in memory (about 820 KB for a
-  221-variable MEPS surface file) and, if local, one file descriptor.
+  221-variable MEPS surface file read by range, 254 KB through OPeNDAP)
+  and, if local, one file descriptor.
 
 ## Testing
 
@@ -299,6 +331,10 @@ cargo test -p server --test netcdf_edr   # EDR responses vs. the schemas
 Fixtures under `testdata/`, each with a README and the script that built
 it, or its source: `netcdf-thredds-catalog/` (MET Norway's THREDDS catalog
 of one MEPS day directory, as served, for the `catalog_url` tests);
+`netcdf-opendap/` (what thredds.met.no's OPeNDAP served for two MEPS
+files: DDS, DAS, the coordinates reply and a 4 × 4 hyperslab, for the
+DAP2 format tests; the OPeNDAP collection tests serve the MEPS samples
+through a local DAP2 server and compare them with the files read locally);
 `meps-netcdf/` and `meps-netcdf-pl/` (real MEPS surface and
 pressure-level files cropped to 11 × 10 points, two runs);
 `netcdf-global/` (synthetic global grid without runs, packed and filled

@@ -2,12 +2,15 @@
 //! its grid, valid times and model run, and how to read each served
 //! variable's 2-D field.
 //!
-//! Metadata comes only through `NcFile::variables()`. `variable(name)`
-//! builds a second, separate metadata tree and is never called. Values come
-//! only through slice reads (`read_variable_slice*`): `read_variable*` keeps
-//! every decoded dataset of up to 32 MiB in a `OnceLock` that is never
-//! evicted. The one exception is a scalar `forecast_reference_time`, eight
-//! bytes. See the crate's CLAUDE.md.
+//! Everything is read through a [`Reader`]: a NetCDF file, or a remote one
+//! through OPeNDAP, whose DDS and DAS become the same `NcVariable`s
+//! (#1264). From a NetCDF file, metadata comes only through
+//! `NcFile::variables()`. `variable(name)` builds a second, separate
+//! metadata tree and is never called. Values come only through slice reads
+//! (`read_variable_slice*`): `read_variable*` keeps every decoded dataset
+//! of up to 32 MiB in a `OnceLock` that is never evicted. The one exception
+//! is a scalar `forecast_reference_time`, eight bytes. See the crate's
+//! CLAUDE.md.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -18,9 +21,10 @@ use ds_core::geo::{Crs, GeoTransform};
 use ds_core::resample::CurvilinearNodes;
 
 use crate::decode_budget::BUDGET;
+use crate::source::Reader;
 use netcdf_reader::{
-    DynStorage, FileStorage, NcAttrValue, NcFile, NcFormat, NcOpenOptions, NcSliceInfo,
-    NcSliceInfoElem, NcType, NcVariable,
+    DynStorage, FileStorage, NcAttrValue, NcFile, NcOpenOptions, NcSliceInfo, NcSliceInfoElem,
+    NcType, NcVariable,
 };
 
 /// netCDF's default fill for `float` and `double`, which unwritten values
@@ -31,10 +35,14 @@ const DEFAULT_FILL: f64 = 9.969_209_968_386_869e36;
 /// decoded fields are cached engine-wide ([`crate::field`]), which also
 /// shares one fill between concurrent readers, as the reader's cache does
 /// not.
-pub(crate) fn open(path: &Path) -> Result<(NcFile, DynStorage), String> {
+pub(crate) fn open(path: &Path) -> Result<Reader, String> {
     let storage: DynStorage =
         Arc::new(FileStorage::open(path).map_err(|e| format!("cannot open: {e}"))?);
-    Ok((open_storage(storage.clone())?, storage))
+    Ok(Reader::Nc {
+        nc: open_storage(storage.clone())?,
+        storage,
+        remote: None,
+    })
 }
 
 /// [`open`] over any storage.
@@ -367,22 +375,20 @@ pub(crate) enum Wanted<'a> {
     All,
 }
 
-/// Read `nc`'s grid, times, run and fields. An `Err` is why the file
-/// cannot be served at all ([`Unservable::File`]), or cannot be read now
-/// ([`Unservable::Busy`]).
+/// Read the grid, times, run and fields of the file `reader` reads. An
+/// `Err` is why the file cannot be served at all ([`Unservable::File`]),
+/// or cannot be read now ([`Unservable::Busy`]).
 ///
-/// `storage` is the file's storage, read once more through hdf5-reader for
-/// the chunk shapes, which the NetCDF metadata does not carry.
+/// A NetCDF-4 file's storage is read once more through hdf5-reader for the
+/// chunk shapes, which the NetCDF metadata does not carry
+/// ([`Reader::hdf5`]).
 pub(crate) fn inspect(
-    nc: &NcFile,
-    storage: &DynStorage,
+    reader: &Reader,
     wanted: &Wanted,
     member: u32,
 ) -> Result<Inspected, Unservable> {
-    let variables = nc.variables().map_err(|e| format!("metadata: {e}"))?;
-    let h5 = matches!(nc.format(), NcFormat::Nc4 | NcFormat::Nc4Classic)
-        .then(|| hdf5_reader::Hdf5File::from_storage(storage.clone()).ok())
-        .flatten();
+    let variables = reader.variables()?;
+    let h5 = reader.hdf5();
     let coordinate = |dim: &str| coordinate(variables, dim);
 
     let candidates: Vec<&NcVariable> = match wanted {
@@ -407,7 +413,7 @@ pub(crate) fn inspect(
     let mut fields = Vec::new();
     let mut skipped = Vec::new();
     for var in candidates {
-        let outcome = match field(nc, h5.as_ref(), variables, var, member) {
+        let outcome = match field(reader, h5.as_ref(), variables, var, member) {
             Err(reason) => Err(reason),
             Ok((field, key)) => match &grid {
                 Some((found, _)) if *found != key => {
@@ -417,7 +423,7 @@ pub(crate) fn inspect(
                 Some(_) => Ok(field),
                 None => {
                     let (y, x, placement) = &key;
-                    match file_grid(nc, variables, var, y, x, placement) {
+                    match file_grid(reader, variables, var, y, x, placement) {
                         Ok(found) => {
                             grid = Some((key, found));
                             Ok(field)
@@ -459,8 +465,8 @@ pub(crate) fn inspect(
     };
     let time_var = coordinate(&time_dim)
         .ok_or_else(|| format!("time axis '{time_dim}' has no coordinate variable"))?;
-    let times = times(nc, time_var)?;
-    let run = reference_time(nc, variables)?;
+    let times = times(reader, time_var)?;
+    let run = reference_time(reader, variables)?;
     Ok(Inspected {
         run,
         times,
@@ -650,7 +656,7 @@ fn stated_role(var: &NcVariable) -> AxisRole {
 
 /// Classify `var`'s dimensions and read how its field is stored.
 fn field(
-    nc: &NcFile,
+    reader: &Reader,
     h5: Option<&hdf5_reader::Hdf5File>,
     variables: &[NcVariable],
     var: &NcVariable,
@@ -669,14 +675,14 @@ fn field(
         pressure_unit(variables, dim).is_some()
     })?;
     let (pressure, level_index) = match shape.vertical {
-        Some(i) => pressure_levels(nc, variables, &roles[i].0, roles[i].1)?,
+        Some(i) => pressure_levels(reader, variables, &roles[i].0, roles[i].1)?,
         None => (None, Vec::new()),
     };
     let mut levels = Vec::new();
     for &i in &shape.levels {
         let name = &roles[i].0;
         if let Some(coord) = coordinate(variables, name) {
-            let value = read_coordinate(nc, coord)?;
+            let value = read_coordinate(reader, coord)?;
             levels.push(Level {
                 value: value[0],
                 units: text_attr(coord, "units").unwrap_or_default(),
@@ -859,7 +865,7 @@ fn pressure_unit(variables: &[NcVariable], dim: &str) -> Option<PressureUnit> {
 /// them in hPa from 50 up; a file in Pa (ERA5) gives the same hPa values.
 /// Levels must be finite, positive and distinct.
 fn pressure_levels(
-    nc: &NcFile,
+    reader: &Reader,
     variables: &[NcVariable],
     dim: &str,
     size: u64,
@@ -868,7 +874,7 @@ fn pressure_levels(
     else {
         return Err(format!("pressure axis '{dim}' has no coordinate variable"));
     };
-    let hpa: Vec<f64> = read_coordinate(nc, coord)?
+    let hpa: Vec<f64> = read_coordinate(reader, coord)?
         .into_iter()
         .map(|value| unit.to_hpa(value))
         .collect();
@@ -915,7 +921,7 @@ fn spatial_pair(y: AxisRole, x: AxisRole) -> Option<()> {
 /// ([`curvilinear_peak_bytes`]): when it does not fit, the file is
 /// [`Unservable::Busy`] and opened again next poll.
 fn file_grid(
-    nc: &NcFile,
+    reader: &Reader,
     variables: &[NcVariable],
     var: &NcVariable,
     y: &str,
@@ -948,8 +954,8 @@ fn file_grid(
                     peak.div_ceil(1 << 20)
                 )))
             })?;
-            let lat_values = read_whole(nc, lat_var)?;
-            let lon_values = read_whole(nc, lon_var)?;
+            let lat_values = read_whole(reader, lat_var)?;
+            let lon_values = read_whole(reader, lon_var)?;
             let grid = CurvilinearNodes::new(nx, ny, &lon_values, &lat_values).map_err(named)?;
             return Ok(FileGrid::Curvilinear(Arc::new(grid)));
         }
@@ -970,7 +976,7 @@ fn file_grid(
     let axis = |dim: &str| -> Result<RegularAxis, String> {
         let coord = coordinate(variables, dim)
             .ok_or_else(|| format!("axis '{dim}' has no coordinate variable"))?;
-        let values = read_coordinate(nc, coord)?;
+        let values = read_coordinate(reader, coord)?;
         RegularAxis::from_values(dim, &values, &text_attr(coord, "units").unwrap_or_default())
     };
     let grid =
@@ -998,21 +1004,10 @@ pub(crate) fn curvilinear_peak_bytes(nodes: usize, lat: &NcVariable, lon: &NcVar
 /// with `_FillValue`, `missing_value` (compared in the stored type) and
 /// NaN as NaN: a node without a position. A slice read, so nothing stays
 /// cached in the reader.
-fn read_whole(nc: &NcFile, var: &NcVariable) -> Result<Vec<f64>, String> {
+fn read_whole(reader: &Reader, var: &NcVariable) -> Result<Vec<f64>, String> {
     let stored = Stored::of(var.dtype())
         .ok_or_else(|| format!("coordinate '{}' is not numeric", var.name))?;
-    let selections = var
-        .dimensions
-        .iter()
-        .map(|d| NcSliceInfoElem::Slice {
-            start: 0,
-            end: d.size,
-            step: 1,
-        })
-        .collect();
-    let mut array = nc
-        .read_variable_slice_as_f64(&var.name, &NcSliceInfo { selections })
-        .map_err(|e| format!("coordinate '{}': {e}", var.name))?;
+    let mut values = reader.read_all(var)?;
     let number = |name: &str| var.attribute(name).and_then(|a| a.value.as_f64());
     let fill: Vec<f64> = ["_FillValue", "missing_value"]
         .iter()
@@ -1024,51 +1019,29 @@ fn read_whole(nc: &NcFile, var: &NcVariable) -> Result<Vec<f64>, String> {
         number("scale_factor").unwrap_or(1.0),
         number("add_offset").unwrap_or(0.0),
     );
-    array.mapv_inplace(|v| {
-        if v.is_nan() || fill.contains(&v) {
+    for v in &mut values {
+        *v = if v.is_nan() || fill.contains(v) {
             f64::NAN
         } else {
-            v * scale + offset
-        }
-    });
-    // Row-major as read, without a second copy: a freshly read array is
-    // in standard layout.
-    let len = array.len();
-    Ok(if array.is_standard_layout() {
-        let (mut values, first) = array.into_raw_vec_and_offset();
-        values.drain(..first.unwrap_or(0));
-        values.truncate(len);
-        values
-    } else {
-        array.iter().copied().collect()
-    })
+            *v * scale + offset
+        };
+    }
+    Ok(values)
 }
 
 /// A whole 1-D (or scalar) coordinate variable, CF packing applied: a slice
 /// read, so nothing stays cached in the reader.
-fn read_coordinate(nc: &NcFile, var: &NcVariable) -> Result<Vec<f64>, String> {
-    let read = |e: netcdf_reader::Error| format!("coordinate '{}': {e}", var.name);
-    let values = if var.dimensions.is_empty() {
-        nc.read_variable_as_f64(&var.name).map_err(read)?
-    } else {
-        let selections = var
-            .dimensions
-            .iter()
-            .map(|d| NcSliceInfoElem::Slice {
-                start: 0,
-                end: d.size,
-                step: 1,
-            })
-            .collect();
-        nc.read_variable_slice_as_f64(&var.name, &NcSliceInfo { selections })
-            .map_err(read)?
-    };
+fn read_coordinate(reader: &Reader, var: &NcVariable) -> Result<Vec<f64>, String> {
     let number = |name: &str| var.attribute(name).and_then(|a| a.value.as_f64());
     let (scale, offset) = (
         number("scale_factor").unwrap_or(1.0),
         number("add_offset").unwrap_or(0.0),
     );
-    let values: Vec<f64> = values.iter().map(|v| v * scale + offset).collect();
+    let values: Vec<f64> = reader
+        .read_all(var)?
+        .iter()
+        .map(|v| v * scale + offset)
+        .collect();
     if values.is_empty() {
         return Err(format!("coordinate '{}' is empty", var.name));
     }
@@ -1076,7 +1049,7 @@ fn read_coordinate(nc: &NcFile, var: &NcVariable) -> Result<Vec<f64>, String> {
 }
 
 /// The valid times of the time coordinate `var`.
-fn times(nc: &NcFile, var: &NcVariable) -> Result<Vec<DateTime<Utc>>, String> {
+fn times(reader: &Reader, var: &NcVariable) -> Result<Vec<DateTime<Utc>>, String> {
     let units = text_attr(var, "units")
         .ok_or_else(|| format!("time coordinate '{}' has no units", var.name))?;
     let calendar = text_attr(var, "calendar");
@@ -1087,13 +1060,16 @@ fn times(nc: &NcFile, var: &NcVariable) -> Result<Vec<DateTime<Utc>>, String> {
             calendar.unwrap_or_default()
         ));
     }
-    let raw = read_coordinate(nc, var)?;
+    let raw = read_coordinate(reader, var)?;
     cf::decode_times(&raw, &units).map_err(|e| format!("time coordinate '{}': {e}", var.name))
 }
 
 /// The model run of the file: its `forecast_reference_time` variable,
 /// scalar or 1-D with one value, or `None` without one.
-fn reference_time(nc: &NcFile, variables: &[NcVariable]) -> Result<Option<DateTime<Utc>>, String> {
+fn reference_time(
+    reader: &Reader,
+    variables: &[NcVariable],
+) -> Result<Option<DateTime<Utc>>, String> {
     let Some(var) = variables
         .iter()
         .find(|v| text_attr(v, "standard_name").as_deref() == Some("forecast_reference_time"))
@@ -1101,7 +1077,7 @@ fn reference_time(nc: &NcFile, variables: &[NcVariable]) -> Result<Option<DateTi
         return Ok(None);
     };
     let units = text_attr(var, "units").ok_or_else(|| format!("'{}' has no units", var.name))?;
-    let raw = read_coordinate(nc, var)?;
+    let raw = read_coordinate(reader, var)?;
     if raw.iter().any(|&v| v != raw[0]) {
         return Err(format!(
             "'{}' holds several model runs; a file must hold one",

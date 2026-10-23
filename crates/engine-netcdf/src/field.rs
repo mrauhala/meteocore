@@ -10,7 +10,8 @@
 //! (`block_in_place` on a Tokio worker, root CLAUDE.md Critical Rule 7), so
 //! a waiting async worker does not hold up the runtime.
 //!
-//! A remote file's cold field is filled **detached** (#1067): the request
+//! A remote file's cold field, read by HTTP range or through OPeNDAP, is
+//! filled **detached** (#1067): the request
 //! claims the fill, hands the claim to a task on the I/O runtime that reads
 //! under [`Mode::Detached`] (no request deadline,
 //! [`ds_storage::FetchBudget::Background`]), and waits for it only until its
@@ -32,13 +33,12 @@ use std::time::{Duration, Instant};
 use ds_cache::{ByteBoundedCache, CacheEntry};
 use ds_core::deadline;
 use ds_core::error::DataServerError;
-use netcdf_reader::NcFile;
 
 use crate::catalog::OpenFile;
 use crate::decode_budget::BUDGET;
-use crate::ingest::{FieldRead, Stored};
+use crate::ingest::FieldRead;
 use crate::io::{self, Mode};
-use crate::remote::ReadFailure;
+use crate::source::Reader;
 
 /// A decoded 2-D field: rows north to south, NaN for nodata.
 pub(crate) type Values = Arc<[f32]>;
@@ -282,7 +282,7 @@ pub(crate) fn read(
     // need. On RenderJob's blocking threads `block_in_place` runs the
     // closure as is.
     let result = io::blocking(|| {
-        if file.remote.is_some() {
+        if file.reader.is_remote() {
             fill.detached(&key)
         } else {
             fill.inline(&key)
@@ -335,7 +335,7 @@ pub(crate) fn read_uncached(
         }
     };
     let result = io::blocking(|| {
-        if file.remote.is_none() {
+        if !file.reader.is_remote() {
             return fill(file, index, time, level, flipped, decodes);
         }
         let read = {
@@ -548,7 +548,7 @@ fn fill(
     let read = &file.reads[index];
     let _permit = BUDGET.reserve(peak_bytes(read))?;
     decodes.fetch_add(1, Ordering::Relaxed);
-    decode(&file.nc, read, time, level, flipped).map(Values::from)
+    decode(&file.reader, read, time, level, flipped).map(Values::from)
 }
 
 /// Fetch variable `index` of `file` at step `time`, level `level`, ahead of
@@ -568,84 +568,30 @@ pub(crate) fn prewarm(
         return Ok(false);
     }
     let _permit = BUDGET.reserve(peak_bytes(read))?;
-    decode(&file.nc, read, time, level, flipped).map(|_| true)
+    decode(&file.reader, read, time, level, flipped).map(|_| true)
 }
 
 /// Read and decode one field: the typed hyperslab, CF masking and packing,
 /// and the rows reversed to north-up when the file stores them south-up.
-/// A failed remote read keeps its meaning ([`ReadFailure::to_error`]): a
+/// A failed remote read keeps its meaning ([`Reader::read_field`]): a
 /// deadline, or a replaced file's 503.
 fn decode(
-    nc: &NcFile,
+    reader: &Reader,
     read: &FieldRead,
     time: u32,
     level: usize,
     flipped: bool,
 ) -> Result<Vec<f32>, DataServerError> {
-    let selection = read.selection(time, level);
-    let name = &*read.name;
-    let packing = &read.packing;
+    let raw = reader.read_field(read, time, level)?;
     let (ny, nx) = read.shape();
-    let cells = ny * nx;
-    let fail = |e: netcdf_reader::Error| match ReadFailure::find(&e) {
-        Some(failure) => failure.to_error(),
-        None => {
-            DataServerError::Storage(format!("variable '{name}' step {time} level {level}: {e}"))
-        }
-    };
-    macro_rules! typed {
-        ($t:ty) => {{
-            let array = nc
-                .read_variable_slice::<$t>(name, &selection)
-                .map_err(fail)?;
-            let mut out = Vec::with_capacity(cells);
-            match array.as_slice() {
-                Some(values) if values.len() == cells => {
-                    if flipped {
-                        for row in values.chunks_exact(nx).rev() {
-                            out.extend(row.iter().map(|&v| packing.decode(v as f64)));
-                        }
-                    } else {
-                        out.extend(values.iter().map(|&v| packing.decode(v as f64)));
-                    }
-                }
-                _ => {
-                    out.extend(array.iter().map(|&v| packing.decode(v as f64)));
-                    if out.len() == cells && flipped {
-                        flip_rows(&mut out, nx);
-                    }
-                }
-            }
-            out
-        }};
-    }
-    let values = match read.stored {
-        Stored::Byte => typed!(i8),
-        Stored::UByte => typed!(u8),
-        Stored::Short => typed!(i16),
-        Stored::UShort => typed!(u16),
-        Stored::Int => typed!(i32),
-        Stored::UInt => typed!(u32),
-        Stored::Float => typed!(f32),
-        Stored::Double => typed!(f64),
-    };
-    if values.len() != cells {
+    if raw.len() != ny * nx {
         return Err(DataServerError::Storage(format!(
-            "variable '{name}' step {time} level {level}: read {} values for a {nx} x {ny} field",
-            values.len()
+            "variable '{}' step {time} level {level}: read {} values for a {nx} x {ny} field",
+            read.name,
+            raw.len()
         )));
     }
-    Ok(values)
-}
-
-/// Reverse the rows of a row-major field `nx` wide, in place.
-fn flip_rows(values: &mut [f32], nx: usize) {
-    let ny = values.len() / nx;
-    for top in 0..ny / 2 {
-        let bottom = ny - 1 - top;
-        let (upper, lower) = values.split_at_mut(bottom * nx);
-        upper[top * nx..(top + 1) * nx].swap_with_slice(&mut lower[..nx]);
-    }
+    Ok(raw.decode(&read.packing, flipped, nx))
 }
 
 #[cfg(test)]
@@ -691,16 +637,19 @@ mod tests {
             reads: AtomicU64::new(0),
         });
         let dynamic: DynStorage = storage.clone();
-        let nc = open_storage(dynamic.clone()).unwrap();
+        let reader = Reader::Nc {
+            nc: open_storage(dynamic.clone()).unwrap(),
+            storage: dynamic,
+            remote: None,
+        };
         let names = vec!["wind_speed_of_gust".to_string()];
-        let inspected = inspect(&nc, &dynamic, &Wanted::Listed(&names), 0).unwrap();
+        let inspected = inspect(&reader, &Wanted::Listed(&names), 0).unwrap();
         let flipped = inspected.grid.flipped();
         let file = Arc::new(OpenFile {
             id: crate::next_file_id(),
             path: path.clone(),
             identity: crate::catalog::Identity::sized(0),
-            nc,
-            remote: None,
+            reader,
             run: None,
             times: Vec::new(),
             reads: vec![inspected.fields[0].read.clone()],
@@ -745,13 +694,27 @@ mod tests {
         assert_eq!((RENDER_FILLS.cap, QUERY_READS.cap), (16, 8));
     }
 
+    /// A south-up field's rows are reversed while decoding, its values
+    /// unpacked and its fill NaN, in every stored type.
     #[test]
-    fn flip_rows_reverses_rows_in_place() {
-        let mut values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        flip_rows(&mut values, 2);
-        assert_eq!(values, [5.0, 6.0, 3.0, 4.0, 1.0, 2.0]);
-        let mut even = vec![1.0, 2.0, 3.0, 4.0];
-        flip_rows(&mut even, 1);
-        assert_eq!(even, [4.0, 3.0, 2.0, 1.0]);
+    fn decoding_reverses_rows_and_unpacks() {
+        use crate::ingest::Packing;
+        use crate::source::Raw;
+
+        let packing = Packing {
+            scale: 0.5,
+            offset: 1.0,
+            fill: vec![-1.0],
+        };
+        let flipped = Raw::I16(vec![1, 2, 3, 4, 5, -1]).decode(&packing, true, 2);
+        assert_eq!(
+            (flipped[0], flipped[2..].to_vec()),
+            (3.5, vec![2.5, 3.0, 1.5, 2.0])
+        );
+        assert!(flipped[1].is_nan(), "the fill");
+        let column = Raw::F64(vec![1.0, 2.0, 3.0, 4.0]).decode(&packing, true, 1);
+        assert_eq!(column, [3.0, 2.5, 2.0, 1.5]);
+        let as_stored = Raw::U8(vec![2, 4]).decode(&packing, false, 2);
+        assert_eq!(as_stored, [2.0, 3.0]);
     }
 }

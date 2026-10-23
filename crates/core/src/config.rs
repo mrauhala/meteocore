@@ -2002,15 +2002,43 @@ pub struct NetcdfConfig {
     /// Default: none, HEAD probing.
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
     pub catalog_url: Option<String>,
+    /// Remote only: how the files are read (#1264). `"http"` (the default):
+    /// in place by HTTP range from a file server, `data_path` being its
+    /// directory (`…/thredds/fileServer/…`). `"opendap"`: through OPeNDAP
+    /// (DAP2), `data_path` being the OPeNDAP directory
+    /// (`…/thredds/dodsC/…`), as thredds.met.no serves MEPS since
+    /// 2026-10-22; needs a `catalog_url`, through whose `OpenDAP` service
+    /// the files are found.
+    #[serde(default)]
+    pub access: Option<NetcdfAccess>,
+}
+
+/// How a remote NetCDF collection's files are read ([`NetcdfConfig::access`]).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NetcdfAccess {
+    /// In place by HTTP range, from a file server.
+    #[default]
+    Http,
+    /// Through OPeNDAP (DAP2): metadata from `.dds` and `.das`, values from
+    /// `.dods` hyperslabs.
+    Opendap,
 }
 
 impl NetcdfConfig {
-    /// Whether `data_path` is an `http(s)://` URL, read by HTTP range.
+    /// Whether `data_path` is an `http(s)://` URL, read by HTTP range or
+    /// through OPeNDAP ([`Self::access`]).
     pub fn is_remote(&self) -> bool {
         self.data_path.as_deref().is_some_and(|path| {
             let lower = path.get(..8).unwrap_or(path).to_ascii_lowercase();
             lower.starts_with("http://") || lower.starts_with("https://")
         })
+    }
+
+    /// How the files are read: [`NetcdfAccess::Http`] unless `access` says
+    /// otherwise.
+    pub fn access(&self) -> NetcdfAccess {
+        self.access.unwrap_or_default()
     }
 }
 
@@ -2054,6 +2082,7 @@ pub fn validate_netcdf(id: &str, cfg: &NetcdfConfig) -> Result<(), crate::error:
             ("run_grace", cfg.run_grace.is_some()),
             ("prewarm_variables", !cfg.prewarm_variables.is_empty()),
             ("catalog_url", cfg.catalog_url.is_some()),
+            ("access", cfg.access.is_some()),
         ];
         if let Some((field, _)) = remote_only.iter().find(|(_, set)| *set) {
             return Err(Config(format!(
@@ -2207,6 +2236,21 @@ fn validate_netcdf_remote(
     }
     if let Some(url) = cfg.catalog_url.as_deref() {
         validate_netcdf_catalog_url(id, url)?;
+    }
+    if cfg.access() == NetcdfAccess::Opendap {
+        if cfg.catalog_url.is_none() {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].access = \"opendap\" needs a catalog_url: OPeNDAP \
+                 files are found through the THREDDS catalogs' OpenDAP service, not by HEAD"
+            )));
+        }
+        let data_path = cfg.data_path.as_deref().unwrap_or_default();
+        if data_path.contains(['?', '#']) {
+            return Err(Config(format!(
+                "Collection '{id}': [netcdf].data_path '{data_path}' must have no query or \
+                 fragment with access = \"opendap\": a read's query is its constraint"
+            )));
+        }
     }
     let mut seen = std::collections::HashSet::new();
     for name in &cfg.prewarm_variables {
@@ -8976,7 +9020,7 @@ mod satellite_composite_tests {
 
 #[cfg(test)]
 mod netcdf_tests {
-    use super::{validate_netcdf, NetcdfConfig, ServerConfig};
+    use super::{validate_netcdf, NetcdfAccess, NetcdfConfig, ServerConfig};
 
     fn netcdf(toml: &str) -> Result<NetcdfConfig, toml::de::Error> {
         toml::from_str(toml)
@@ -9144,6 +9188,37 @@ mod netcdf_tests {
         assert!(error(&format!("data_path = \"d\"\n{CATALOG}")).contains("data_path only"));
         assert!(error("data_path = \"d\"\nprewarm_variables = [\"t\"]").contains("only"));
         assert!(error("data_path = \"s3://bucket/meps\"").contains("neither"));
+    }
+
+    /// `access = "opendap"` (#1264) reads an OPeNDAP directory found
+    /// through its THREDDS catalogs: without a catalog_url there is no way
+    /// to find its files, a query in data_path would collide with the
+    /// constraints, and on a local directory, or as any other word, it is
+    /// a load error.
+    #[test]
+    fn opendap_access_needs_a_catalog() {
+        let opendap = REMOTE.replace("fileServer", "dodsC");
+        let with = |base: &str, extra: &str| format!("{base}\n{extra}\naccess = \"opendap\"");
+        let cfg = netcdf(&with(&opendap, CATALOG)).unwrap();
+        assert_eq!(cfg.access(), NetcdfAccess::Opendap);
+        validate_netcdf("meps", &cfg).unwrap();
+        assert_eq!(netcdf(REMOTE).unwrap().access(), NetcdfAccess::Http);
+        let http = netcdf(&format!("{REMOTE}\naccess = \"http\"")).unwrap();
+        assert_eq!(http.access, Some(NetcdfAccess::Http));
+        validate_netcdf("meps", &http).unwrap();
+
+        let message = error(&with(&opendap, ""));
+        assert!(message.contains("needs a catalog_url"), "{message}");
+        let query = opendap.replace("meps25epsarchive/\"", "meps25epsarchive/?x=1\"");
+        let message = error(&with(&query, CATALOG));
+        assert!(message.contains("no query"), "{message}");
+        let message = error("data_path = \"d\"\naccess = \"opendap\"");
+        assert!(
+            message.contains("access applies to an http(s)"),
+            "{message}"
+        );
+        assert!(error("data_path = \"d\"\naccess = \"http\"").contains("data_path only"));
+        assert!(netcdf(&format!("{REMOTE}\naccess = \"dap4\"")).is_err());
     }
 
     #[test]

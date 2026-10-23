@@ -174,6 +174,23 @@ pub enum RangeAnswer {
     Refused(RangeRefusal),
 }
 
+/// One document [`DataStore::get_documents_on`] gets: the object at `path`,
+/// with `query` as its URL's query string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentRequest {
+    pub path: ObjectPath,
+    pub query: Option<String>,
+}
+
+/// A document [`DataStore::get_documents_on`] read, and the version its
+/// response named: `Last-Modified` and ETag, where the server sent them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedDocument {
+    pub bytes: Bytes,
+    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    pub e_tag: Option<String>,
+}
+
 /// Synchronous wrapper around an `ObjectStore`.
 ///
 /// Methods use `tokio::runtime::Handle::current().block_on()` to bridge
@@ -919,42 +936,110 @@ impl DataStore {
         max_bytes: u64,
         budget: FetchBudget,
     ) -> Result<Vec<Result<Bytes, DataServerError>>, DataServerError> {
+        let requests: Vec<DocumentRequest> = paths
+            .iter()
+            .map(|path| DocumentRequest {
+                path: path.clone(),
+                query: None,
+            })
+            .collect();
+        let documents = self.documents(None, &requests, concurrency, max_bytes, budget)?;
+        Ok(documents
+            .into_iter()
+            .zip(paths)
+            .map(|(document, path)| match document {
+                Ok(Some(document)) => Ok(document.bytes),
+                Ok(None) => Err(StorageError::NotFound(path.to_string()).into()),
+                Err(e) => Err(e),
+            })
+            .collect())
+    }
+
+    /// [`Self::get_documents`] of `requests`, each with its own query
+    /// string, such as an OPeNDAP constraint expression (#1264), driven on
+    /// `handle` as [`Self::get_range_on`] is, each with the version its
+    /// response named. A missing document (404) is `Ok(None)`. A query is
+    /// sent by the HTTP stores this crate builds; any other store fails a
+    /// request carrying one, never answering the object without it.
+    #[allow(clippy::type_complexity)]
+    pub fn get_documents_on(
+        &self,
+        requests: &[DocumentRequest],
+        concurrency: usize,
+        max_bytes: u64,
+        handle: &tokio::runtime::Handle,
+        budget: FetchBudget,
+    ) -> Result<Vec<Result<Option<FetchedDocument>, DataServerError>>, DataServerError> {
+        self.documents(Some(handle), requests, concurrency, max_bytes, budget)
+    }
+
+    /// The documents of [`Self::get_documents_on`], on `handle` or the
+    /// ambient runtime.
+    #[allow(clippy::type_complexity)]
+    fn documents(
+        &self,
+        handle: Option<&tokio::runtime::Handle>,
+        requests: &[DocumentRequest],
+        concurrency: usize,
+        max_bytes: u64,
+        budget: FetchBudget,
+    ) -> Result<Vec<Result<Option<FetchedDocument>, DataServerError>>, DataServerError> {
         use futures::StreamExt;
 
         let deadline = ds_core::deadline::current();
         ds_core::deadline::check()?;
-        let mut results: Vec<(usize, Result<Bytes, DataServerError>)> = self.block_on_untimed(
-            futures::stream::iter(paths.iter().enumerate().map(|(i, path)| async move {
+        let gets =
+            futures::stream::iter(requests.iter().enumerate().map(|(i, request)| async move {
                 (
                     i,
-                    within(budget, deadline, self.document(path, max_bytes)).await,
+                    within(budget, deadline, self.document(request, max_bytes)).await,
                 )
             }))
             .buffer_unordered(concurrency.max(1))
-            .collect(),
-        )?;
+            .collect::<Vec<_>>();
+        let mut results = match handle {
+            Some(handle) => handle.block_on(gets),
+            None => self.block_on_untimed(gets)?,
+        };
         results.sort_by_key(|(i, _)| *i);
         let total: u64 = results
             .iter()
-            .filter_map(|(_, r)| r.as_ref().ok())
-            .map(|b| b.len() as u64)
+            .filter_map(|(_, r)| r.as_ref().ok()?.as_ref())
+            .map(|document| document.bytes.len() as u64)
             .sum();
         self.bytes_read.fetch_add(total, Ordering::Relaxed);
         Ok(results.into_iter().map(|(_, r)| r).collect())
     }
 
-    /// One document of [`Self::get_documents`].
-    async fn document(&self, path: &ObjectPath, max_bytes: u64) -> Result<Bytes, DataServerError> {
+    /// One document of [`Self::documents`]; `None` when it is missing.
+    async fn document(
+        &self,
+        request: &DocumentRequest,
+        max_bytes: u64,
+    ) -> Result<Option<FetchedDocument>, DataServerError> {
         use futures::StreamExt;
 
+        let path = &request.path;
         let storage = |e| DataServerError::from(StorageError::from(e));
         let mut extensions = object_store::Extensions::new();
-        extensions.insert(document::Document { max_bytes });
+        extensions.insert(document::Document {
+            max_bytes,
+            query: request.query.clone(),
+        });
         let options = object_store::GetOptions {
             extensions,
             ..Default::default()
         };
-        let result = self.inner.get_opts(path, options).await.map_err(storage)?;
+        let result = match self.inner.get_opts(path, options).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(storage(e)),
+        };
+        if request.query.is_some() && result.extensions.get::<document::Sent>().is_none() {
+            return Err(DataServerError::Storage(format!(
+                "document `{path}`: this store cannot send a query string"
+            )));
+        }
         let over = |bytes: u64| {
             DataServerError::Storage(format!(
                 "document `{path}` is {bytes} bytes or more, over the {max_bytes}-byte limit"
@@ -963,6 +1048,7 @@ impl DataStore {
         if result.meta.size > max_bytes {
             return Err(over(result.meta.size));
         }
+        let version = ObjectVersion::from(&result.meta);
         let mut stream = result.into_stream();
         let mut read = bytes::BytesMut::new();
         while let Some(chunk) = stream.next().await {
@@ -972,7 +1058,11 @@ impl DataStore {
             }
             read.extend_from_slice(&chunk);
         }
-        Ok(read.freeze())
+        Ok(Some(FetchedDocument {
+            bytes: read.freeze(),
+            last_modified: version.last_modified,
+            e_tag: version.e_tag,
+        }))
     }
 
     /// Probe many object keys concurrently with `head`, returning one

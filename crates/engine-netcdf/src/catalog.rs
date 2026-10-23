@@ -15,15 +15,15 @@ use ds_core::units::{cf_display_conversion, DisplayConversion};
 use ds_core::vertical::{VerticalDimension, VerticalKind};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 use ds_storage::ObjectVersion;
-use netcdf_reader::NcFile;
 
 use crate::ingest::{FieldRead, FileGrid, Variable};
-use crate::remote::RemoteFile;
+use crate::source::Reader;
 
 /// Which version of a file the catalog read: its size and modification
 /// time (a local file's mtime, a remote one's `Last-Modified`), and a
-/// remote ETag where the server sends one. A file whose version changes is
-/// another file, ingested again (#1067 decision 7).
+/// remote ETag where the server sends one; through OPeNDAP, its THREDDS
+/// catalog's rounded size and modification date. A file whose version
+/// changes is another file, ingested again (#1067 decision 7).
 pub(crate) type Identity = ObjectVersion;
 
 /// The identity of a local file from its metadata.
@@ -43,9 +43,7 @@ pub(crate) struct OpenFile {
     /// The local path, or the object key of a remote file.
     pub path: PathBuf,
     pub identity: Identity,
-    pub nc: NcFile,
-    /// The storage of a remote file, read by HTTP range.
-    pub remote: Option<Arc<RemoteFile>>,
+    pub reader: Reader,
     pub run: Option<DateTime<Utc>>,
     /// Valid time of each index along the time axis.
     pub times: Vec<DateTime<Utc>>,

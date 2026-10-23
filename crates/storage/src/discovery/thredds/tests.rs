@@ -755,3 +755,66 @@ async fn files_must_be_served_where_data_path_reads() {
         assert!(error.contains(why), "{error}");
     }
 }
+
+/// Through OPeNDAP (#1264), a catalog that serves its files by OPeNDAP only,
+/// as thredds.met.no's MEPS catalogs have since 2026-10-22, lists them
+/// under its `OpenDAP` base, each with the catalog's own version: nothing
+/// is HEADed. A reader's recheck reads the catalog again; the same
+/// catalog names no file to a prober reading by range.
+#[tokio::test(flavor = "multi_thread")]
+async fn opendap_files_take_the_catalogs_version_without_a_head() {
+    const DAP: &str = "thredds/dodsC/meps25epsarchive";
+    let (meta, store) = store_to_the_day();
+    put_run(&meta, 9, &[0, 1], "2026-10-19T09:30:00Z");
+    let member = catalog_key("2026/10/19/09/member_00");
+    let files = [0, 1].map(|lead| {
+        entry(
+            &url_path(&sfc(9, lead)),
+            "167.8",
+            "Mbytes",
+            "2026-10-19T09:30:00Z",
+        )
+    });
+    meta.put_body(&member, catalog_xml(&[], &files, false));
+    let spec = TemplateSpec {
+        base: DAP.into(),
+        ..sfc_spec(&[0, 1], &[9], "-PT3H")
+    };
+    let dap_url = [ORIGIN, DAP, ""].join("/");
+    let mut prober = CatalogProber::new(spec, &catalog_url(), &dap_url)
+        .unwrap()
+        .with_service(FileService::OpenDap);
+    let t0 = at("2026-10-19T10:00:00Z");
+    meta.take_headed();
+    // The sentinel, then the run's other lead.
+    let reports = [0, 1].map(|_| prober.poll(&store, &store, t0).unwrap());
+    assert_eq!(reports.each_ref().map(|r| r.heads), [0, 0]);
+    assert!(meta.take_headed().is_empty());
+    let listed = prober.files();
+    let key = [DAP, sfc(9, 0).as_str()].join("/");
+    assert_eq!(keys(&listed), [key.clone(), [DAP, &sfc(9, 1)].join("/")]);
+    assert_eq!(
+        listed[0].version,
+        ObjectVersion {
+            size: 167_800_000,
+            last_modified: Some(at("2026-10-19T09:30:00Z")),
+            e_tag: None,
+        }
+    );
+    assert_eq!([&reports[0].added[..], &reports[1].added].concat(), listed);
+
+    meta.take_fetched();
+    assert!(prober.recheck(&key));
+    let report = prober.poll(&store, &store, t0).unwrap();
+    assert_eq!((report.catalogs, report.heads), (1, 0));
+    assert_eq!(meta.take_fetched(), [member]);
+    assert_eq!(prober.files(), listed);
+
+    let spec = TemplateSpec {
+        base: DAP.into(),
+        ..sfc_spec(&[0, 1], &[9], "-PT3H")
+    };
+    let mut by_range = CatalogProber::new(spec, &catalog_url(), &dap_url).unwrap();
+    by_range.poll(&store, &store, t0).unwrap();
+    assert!(by_range.files().is_empty(), "no HTTPServer service");
+}

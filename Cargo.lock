@@ -1518,6 +1518,7 @@ dependencies = [
  "ds-poll",
  "ds-storage",
  "hdf5-reader",
+ "ndarray",
  "netcdf-reader",
  "quick-xml 0.42.0",
  "tempfile",

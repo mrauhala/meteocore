@@ -18,6 +18,9 @@
 //! - **Chunks:** a larger read, a chunk, comes whole from [`CHUNKS`]
 //!   (`MC_NETCDF_CHUNK_CACHE_MB`), keyed by identity, offset and length,
 //!   single-flight: N concurrent renders of one cold field make one GET.
+//!   A file read through OPeNDAP keeps each field's `.dods` reply there
+//!   instead ([`dap_reply`], keyed by identity and constraint), the same
+//!   way (#1264).
 //!
 //! Every GET is conditional on the version ingested
 //! ([`ds_storage::DataStore::get_range_if_unmodified_on`]). A file found
@@ -135,8 +138,9 @@ pub(crate) fn origin(url: &str) -> &str {
         .map_or(url, |slash| &url[..after + slash])
 }
 
-/// What a remote file is: its URL and the version ingested. Every cache
-/// keys on it, so a replaced file never reads the old one's bytes.
+/// What a remote file is: its URL and the version ingested (through
+/// OPeNDAP, the version its catalog lists). Every cache keys on it, so a
+/// replaced file never reads the old one's bytes.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct FileId {
     pub url: String,
@@ -152,8 +156,16 @@ struct BlockKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ChunkKey {
     file: Arc<FileId>,
-    offset: u64,
-    len: u64,
+    part: Part,
+}
+
+/// What of a file a [`CHUNKS`] entry holds.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Part {
+    /// The `len` bytes at `offset`.
+    Range { offset: u64, len: u64 },
+    /// The OPeNDAP reply to this constraint.
+    Dap(Arc<str>),
 }
 
 /// The block cache never goes below this: ingest opens up to eight files
@@ -173,7 +185,8 @@ static BLOCKS: LazyLock<ByteBoundedCache<BlockKey, Bytes>> = LazyLock::new(|| {
 });
 
 /// Compressed chunks, `MC_NETCDF_CHUNK_CACHE_MB` (default 512 MiB, about
-/// 340 MEPS fields), shared by every NetCDF collection.
+/// 340 MEPS fields), shared by every NetCDF collection; and the OPeNDAP
+/// replies of fields, uncompressed (about 126 MEPS fields).
 static CHUNKS: LazyLock<ByteBoundedCache<ChunkKey, Bytes>> = LazyLock::new(|| {
     ByteBoundedCache::from_env(
         "MC_NETCDF_CHUNK_CACHE_MB",
@@ -380,8 +393,7 @@ impl RemoteFile {
     fn chunk(&self, offset: u64, len: u64) -> Result<Bytes, ReadFailure> {
         let key = ChunkKey {
             file: self.id.clone(),
-            offset,
-            len,
+            part: Part::Range { offset, len },
         };
         CHUNKS.get_or_insert_with_timeout(
             &key,
@@ -435,34 +447,68 @@ impl RemoteFile {
         }
     }
 
-    /// Drop what was read from this version and report it, once. A request
-    /// or detached fill found it in a file being served: the content
-    /// version moves now. Ingest and prewarm leave that to the poll.
+    /// Drop what was read from this version and report it, once.
     fn found_replaced(&self, mode: Mode) {
         self.failed.store(true, Ordering::Relaxed);
-        if self.replaced.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        tracing::warn!(
-            "{} is no longer the version opened ({} bytes, modified {:?}): dropping what was \
-             read from it, to be read again",
-            self.id.url,
-            self.id.version.size,
-            self.id.version.last_modified
-        );
-        let file = &*self.id;
-        BLOCKS.retain(|key, _| *key.file != *file);
-        CHUNKS.retain(|key, _| *key.file != *file);
-        crate::field::evict_file(self.ingest);
-        self.changes
-            .stale
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((self.key.to_string(), self.id.version.clone()));
-        if mode != Mode::Background {
-            self.changes.bumps.fetch_add(1, Ordering::Relaxed);
+        if !self.replaced.swap(true, Ordering::Relaxed) {
+            forget_replaced(
+                &self.id,
+                self.ingest,
+                self.key.as_ref(),
+                &self.changes,
+                mode,
+            );
         }
     }
+}
+
+/// Drop what was read from `file`, opened by the ingest `ingest` at `key`,
+/// and report it to its collection's poll ([`Changes`]): it is no longer
+/// the version opened. A request or detached fill found it in a file being
+/// served: the content version moves now. Ingest and prewarm leave that to
+/// the poll. Called once per file.
+pub(crate) fn forget_replaced(
+    file: &FileId,
+    ingest: u64,
+    key: &str,
+    changes: &Changes,
+    mode: Mode,
+) {
+    tracing::warn!(
+        "{} is no longer the version opened ({} bytes, modified {:?}): dropping what was \
+         read from it, to be read again",
+        file.url,
+        file.version.size,
+        file.version.last_modified
+    );
+    BLOCKS.retain(|key, _| *key.file != *file);
+    CHUNKS.retain(|key, _| *key.file != *file);
+    crate::field::evict_file(ingest);
+    changes
+        .stale
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((key.to_string(), file.version.clone()));
+    if mode != Mode::Background {
+        changes.bumps.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The OPeNDAP reply of `file` to `constraint` (#1264), from the chunk
+/// cache, or fetched once for every concurrent reader by `fetch`, as a
+/// chunk is: a reply replaces the compressed chunk a range read keeps, so
+/// a query past its deadline still leaves its fields fetched, and a
+/// prewarm fetches what renders then find.
+pub(crate) fn dap_reply(
+    file: &Arc<FileId>,
+    constraint: &str,
+    fetch: impl FnOnce() -> Result<Bytes, ReadFailure>,
+) -> Result<Bytes, ReadFailure> {
+    let key = ChunkKey {
+        file: file.clone(),
+        part: Part::Dap(constraint.into()),
+    };
+    CHUNKS.get_or_insert_with_timeout(&key, wait(), fetch, timed_out)
 }
 
 /// How long a reader waits for another's fetch of a block or chunk: until

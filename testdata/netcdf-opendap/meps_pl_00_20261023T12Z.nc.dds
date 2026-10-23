@@ -1,0 +1,157 @@
+Dataset {
+    Float64 time[time = 1];
+    Float64 forecast_reference_time;
+    Float32 pressure[pressure = 13];
+    Int32 projection_lambert;
+    Float32 x[x = 949];
+    Float32 y[y = 1069];
+    Grid {
+     ARRAY:
+        Float64 longitude[y = 1069][x = 949];
+     MAPS:
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } longitude;
+    Grid {
+     ARRAY:
+        Float64 latitude[y = 1069][x = 949];
+     MAPS:
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } latitude;
+    Grid {
+     ARRAY:
+        Float32 x_wind_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } x_wind_pl;
+    Grid {
+     ARRAY:
+        Float32 y_wind_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } y_wind_pl;
+    Grid {
+     ARRAY:
+        Float32 air_temperature_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } air_temperature_pl;
+    Grid {
+     ARRAY:
+        Float32 specific_humidity_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } specific_humidity_pl;
+    Grid {
+     ARRAY:
+        Float32 mass_fraction_of_cloud_condensed_water_in_air_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } mass_fraction_of_cloud_condensed_water_in_air_pl;
+    Grid {
+     ARRAY:
+        Float32 mass_fraction_of_cloud_ice_in_air_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } mass_fraction_of_cloud_ice_in_air_pl;
+    Grid {
+     ARRAY:
+        Float32 cloud_area_fraction_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } cloud_area_fraction_pl;
+    Grid {
+     ARRAY:
+        Float32 mass_fraction_of_snow_in_air_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } mass_fraction_of_snow_in_air_pl;
+    Grid {
+     ARRAY:
+        Float32 mass_fraction_of_rain_in_air_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } mass_fraction_of_rain_in_air_pl;
+    Grid {
+     ARRAY:
+        Float32 mass_fraction_of_graupel_in_air_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } mass_fraction_of_graupel_in_air_pl;
+    Grid {
+     ARRAY:
+        Float32 turbulent_kinetic_energy_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } turbulent_kinetic_energy_pl;
+    Grid {
+     ARRAY:
+        Float32 geopotential_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } geopotential_pl;
+    Grid {
+     ARRAY:
+        Float32 relative_humidity_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } relative_humidity_pl;
+    Grid {
+     ARRAY:
+        Float32 upward_air_velocity_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } upward_air_velocity_pl;
+    Grid {
+     ARRAY:
+        Float32 ertel_potential_vorticity_pl[time = 1][pressure = 13][y = 1069][x = 949];
+     MAPS:
+        Float64 time[time = 1];
+        Float32 pressure[pressure = 13];
+        Float32 y[y = 1069];
+        Float32 x[x = 949];
+    } ertel_potential_vorticity_pl;
+} meps25epsarchive/2026/10/23/12/member_00/meps_pl_00_20261023T12Z.nc;

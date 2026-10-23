@@ -39,16 +39,24 @@
 //! all the same, failing a catalog at [`MAX_CATALOG_BYTES`] while it
 //! streams.
 //!
-//! # Versions
+//! # Services and versions
+//!
+//! The files are read through one of the catalog's services
+//! ([`FileService`]): its `HTTPServer` by range (the default), or its
+//! `OpenDAP` (#1264: thredds.met.no serves MEPS through OPeNDAP only since
+//! 2026-10-22). A dataset's key is that service's `base` and its `urlPath`.
 //!
 //! A catalog states a file's size with four significant digits
 //! (`71.56 Gbytes`), never its byte count. Its version, that size and the
 //! `date type="modified"`, settles files, but it cannot be the identity
 //! every conditional range read checks
 //! ([`crate::DataStore::get_range_if_unmodified`] compares sizes exactly).
-//! A file is HEADed once when it is listed, and again only when its catalog
-//! version changes or a reader asks ([`CatalogProber::recheck`]), and
-//! [`CatalogProber::files`] carries that HEAD's version.
+//! Read by range, a file is HEADed once when it is listed, and again only
+//! when its catalog version changes or a reader asks
+//! ([`CatalogProber::recheck`]), and [`CatalogProber::files`] carries that
+//! HEAD's version. Read through OPeNDAP, nothing is HEADed: no read
+//! compares sizes, and an OPeNDAP dataset URL is no file to HEAD, so a
+//! file's version is the catalog's.
 //!
 //! # Parsing
 //!
@@ -127,10 +135,41 @@ impl Catalog {
     /// The `base` of the first `HTTPServer` service: the file server the
     /// files are read from by range.
     pub fn file_server_base(&self) -> Option<&str> {
+        self.service_base(FileService::HttpServer)
+    }
+
+    /// The `base` of the first service of `service`'s type.
+    pub fn service_base(&self, service: FileService) -> Option<&str> {
         self.services
             .iter()
-            .find(|service| service.service_type.eq_ignore_ascii_case("HTTPServer"))
-            .map(|service| service.base.as_str())
+            .find(|found| {
+                found
+                    .service_type
+                    .eq_ignore_ascii_case(service.service_type())
+            })
+            .map(|found| found.base.as_str())
+    }
+}
+
+/// The catalog service the files are read through.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FileService {
+    /// `HTTPServer`, read by range: each listed file is HEADed for its
+    /// exact version.
+    #[default]
+    HttpServer,
+    /// `OpenDAP` (DAP2): a file's version is the catalog's, its rounded
+    /// size and modification time, and nothing is HEADed.
+    OpenDap,
+}
+
+impl FileService {
+    /// The service's `serviceType` in a catalog.
+    pub fn service_type(self) -> &'static str {
+        match self {
+            FileService::HttpServer => "HTTPServer",
+            FileService::OpenDap => "OpenDAP",
+        }
     }
 }
 
@@ -399,6 +438,8 @@ struct Walk {
     base: String,
     /// `data_path`'s origin: a catalog's files must be served from it.
     files: url::Origin,
+    /// The service whose `base` the files' keys lie under.
+    service: FileService,
     /// The catalog URL of each directory under the root a `catalogRef`
     /// led to, by its path relative to the root's directory.
     dirs: BTreeMap<String, Url>,
@@ -510,14 +551,15 @@ impl Walk {
                 .map(|_| Err(DataServerError::Storage(why.clone())))
                 .collect()
         };
-        let Some(base) = catalog.file_server_base() else {
+        let kind = self.service.service_type();
+        let Some(base) = catalog.service_base(self.service) else {
             return fail(format!(
-                "catalog {url} names no HTTPServer service: its files cannot be read by range"
+                "catalog {url} names no {kind} service: its files cannot be read through one"
             ));
         };
         let base = match url.join(base) {
             Ok(base) => base,
-            Err(e) => return fail(format!("catalog {url}: HTTPServer base `{base}`: {e}")),
+            Err(e) => return fail(format!("catalog {url}: {kind} base `{base}`: {e}")),
         };
         if base.origin() != self.files {
             return fail(format!(
@@ -561,8 +603,9 @@ impl Walk {
                 self.warned_elsewhere = true;
                 tracing::warn!(
                     "[{}] catalog {url} lists `{found}`, not `{key}`: does data_path name \
-                     the file server directory of catalog_url?",
-                    self.label
+                     the {} directory of catalog_url?",
+                    self.label,
+                    self.service.service_type()
                 );
             }
         }
@@ -760,6 +803,7 @@ impl CatalogProber {
             root,
             root_dir,
             files,
+            service: FileService::HttpServer,
             dirs: BTreeMap::new(),
             max_catalogs: MAX_CATALOGS_PER_POLL,
             warned_elsewhere: false,
@@ -769,6 +813,14 @@ impl CatalogProber {
             walk,
             exact: HashMap::new(),
         })
+    }
+
+    /// This prober, its files read through `service` ([`FileService`]):
+    /// their keys lie under that service's `base`.
+    #[must_use]
+    pub fn with_service(mut self, service: FileService) -> Self {
+        self.walk.service = service;
+        self
     }
 
     pub fn spec(&self) -> &TemplateSpec {
@@ -787,8 +839,12 @@ impl CatalogProber {
 
     /// The settled files of every published slot whose version a HEAD has
     /// found, oldest slot first, each slot's in lead order: with that
-    /// version, the identity a conditional range read checks.
+    /// version, the identity a conditional range read checks. Through
+    /// OPeNDAP, every settled file, with the catalog's version.
     pub fn files(&self) -> Vec<ProbedFile> {
+        if self.walk.service == FileService::OpenDap {
+            return self.prober.files();
+        }
         self.prober
             .files()
             .into_iter()
@@ -817,7 +873,8 @@ impl CatalogProber {
     /// Poll once at `now`: the template prober's poll, its checks answered
     /// by the catalogs `catalogs` reads (a store on `catalog_url`'s
     /// origin), then a HEAD through `files` of each listed file whose
-    /// version is not known yet. Call it where [`DataStore::head`] may be
+    /// version is not known yet (none through OPeNDAP). Call it where
+    /// [`DataStore::head`] may be
     /// called: from the background poll runtime. The report's
     /// [`ProbeReport::checked`] counts the keys looked up,
     /// [`ProbeReport::catalogs`] the catalogs read and
@@ -844,6 +901,7 @@ impl CatalogProber {
         let listed = self.prober.files();
         let unknown: Vec<&ProbedFile> = listed
             .iter()
+            .filter(|_| self.walk.service == FileService::HttpServer)
             .filter(|file| {
                 self.exact
                     .get(&file.key)

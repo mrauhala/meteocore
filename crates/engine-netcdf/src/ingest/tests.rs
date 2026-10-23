@@ -49,8 +49,25 @@ fn counting(path: &str) -> Arc<Counting> {
     })
 }
 
-fn open_fixture(path: &str) -> (NcFile, DynStorage) {
+fn open_fixture(path: &str) -> Reader {
     open(&fixture(path)).unwrap()
+}
+
+/// The NetCDF file a local reader reads.
+fn nc(reader: &Reader) -> &NcFile {
+    match reader {
+        Reader::Nc { nc, .. } => nc,
+        Reader::Dap(_) => unreachable!("a local file"),
+    }
+}
+
+/// A reader over `storage`.
+fn reader(storage: DynStorage) -> Reader {
+    Reader::Nc {
+        nc: open_storage(storage.clone()).unwrap(),
+        storage,
+        remote: None,
+    }
 }
 
 /// What a request's read costs once a file is ingested, measured on the
@@ -64,10 +81,10 @@ fn an_ingested_field_reads_only_its_index_and_chunk() {
     let mut first_reads = Vec::new();
     for warm in [false, true] {
         let storage = counting(MEPS_00);
-        let dynamic: DynStorage = storage.clone();
-        let nc = open_storage(dynamic.clone()).unwrap();
+        let reader = reader(storage.clone());
+        let nc = nc(&reader);
         let names = vec!["air_temperature_2m".to_string()];
-        let inspected = inspect(&nc, &dynamic, &Wanted::Listed(&names), 0).unwrap();
+        let inspected = inspect(&reader, &Wanted::Listed(&names), 0).unwrap();
         if warm {
             for field in &inspected.fields {
                 nc.iter_variable_chunks(&field.read.name).unwrap();
@@ -90,8 +107,8 @@ fn an_ingested_field_reads_only_its_index_and_chunk() {
 
 #[test]
 fn meps_fields_are_lambert_south_up_with_levels_by_value() {
-    let (nc, storage) = open_fixture(MEPS_00);
-    let inspected = inspect(&nc, &storage, &Wanted::All, 0).unwrap();
+    let reader = open_fixture(MEPS_00);
+    let inspected = inspect(&reader, &Wanted::All, 0).unwrap();
     assert_eq!(inspected.fields.len(), 8, "{:?}", inspected.skipped);
     // The 2-D latitude/longitude are not on the grid's time axis.
     let mut skipped: Vec<&str> = inspected.skipped.iter().map(|(n, _)| n.as_str()).collect();
@@ -143,8 +160,8 @@ fn meps_fields_are_lambert_south_up_with_levels_by_value() {
 
 #[test]
 fn a_global_grid_north_up_without_runs_with_packing() {
-    let (nc, storage) = open_fixture("netcdf-global/global_5deg.nc");
-    let inspected = inspect(&nc, &storage, &Wanted::All, 0).unwrap();
+    let reader = open_fixture("netcdf-global/global_5deg.nc");
+    let inspected = inspect(&reader, &Wanted::All, 0).unwrap();
     assert!(inspected.skipped.is_empty(), "{:?}", inspected.skipped);
     assert_eq!(inspected.run, None);
     assert_eq!(inspected.times.len(), 3);
@@ -184,9 +201,9 @@ fn a_global_grid_north_up_without_runs_with_packing() {
 
 #[test]
 fn an_allowlisted_variable_missing_fails_the_file() {
-    let (nc, storage) = open_fixture(MEPS_00);
+    let reader = open_fixture(MEPS_00);
     let names = vec!["air_temperature_2m".to_string(), "snowfall".to_string()];
-    let error = inspect(&nc, &storage, &Wanted::Listed(&names), 0)
+    let error = inspect(&reader, &Wanted::Listed(&names), 0)
         .err()
         .unwrap()
         .to_string();
@@ -363,8 +380,8 @@ const MEPS_PL_00: &str = "meps-netcdf-pl/meps_pl_00_20261015T06Z.nc";
 /// each served level read at its stored index, one level per read.
 #[test]
 fn meps_pressure_level_fields_are_on_the_pressure_axis_bottom_first() {
-    let (nc, storage) = open_fixture(MEPS_PL_00);
-    let inspected = inspect(&nc, &storage, &Wanted::All, 0).unwrap();
+    let reader = open_fixture(MEPS_PL_00);
+    let inspected = inspect(&reader, &Wanted::All, 0).unwrap();
     let mut skipped: Vec<&str> = inspected.skipped.iter().map(|(n, _)| n.as_str()).collect();
     skipped.sort_unstable();
     assert_eq!(
@@ -415,10 +432,12 @@ fn meps_pressure_level_fields_are_on_the_pressure_axis_bottom_first() {
         selection.selections[..2],
         [NcSliceInfoElem::Index(0), NcSliceInfoElem::Index(2)]
     );
-    let values = nc
+    let values = nc(&reader)
         .read_variable_slice::<f32>(&read.name, &selection)
         .unwrap();
-    let all = nc.read_variable_as_f64("air_temperature_pl").unwrap();
+    let all = nc(&reader)
+        .read_variable_as_f64("air_temperature_pl")
+        .unwrap();
     let all: Vec<f64> = all.iter().copied().collect();
     let stored_850: Vec<f64> = all[2 * 110..3 * 110].to_vec();
     let read_850: Vec<f64> = values.iter().map(|&v| f64::from(v)).collect();
@@ -433,8 +452,8 @@ fn meps_pressure_level_fields_are_on_the_pressure_axis_bottom_first() {
 /// 500 hPa (bottom first), exactly.
 #[test]
 fn pressure_levels_in_pa_are_served_in_hpa() {
-    let (nc, storage) = open_fixture("netcdf-pressure-pa/pressure_levels_pa.nc");
-    let inspected = inspect(&nc, &storage, &Wanted::All, 0).unwrap();
+    let reader = open_fixture("netcdf-pressure-pa/pressure_levels_pa.nc");
+    let inspected = inspect(&reader, &Wanted::All, 0).unwrap();
     assert!(inspected.skipped.is_empty(), "{:?}", inspected.skipped);
     assert_eq!(inspected.fields.len(), 3);
     for field in &inspected.fields {
@@ -599,8 +618,8 @@ fn a_hybrid_coordinate_in_pressure_units_is_not_a_pressure_axis() {
             &[("units", "K")],
         ),
     ];
-    let (nc, _) = open_fixture(MEPS_PL_00);
-    let reason = field(&nc, None, &variables, &variables[4], 0)
+    let reader = open_fixture(MEPS_PL_00);
+    let reason = field(&reader, None, &variables, &variables[4], 0)
         .err()
         .unwrap();
     assert_eq!(
@@ -756,8 +775,8 @@ const CURVILINEAR: &str = "netcdf-curvilinear/svalbard_curvilinear.nc";
 /// skipped as MEPS's are.
 #[test]
 fn two_dimensional_latitude_longitude_make_a_curvilinear_grid() {
-    let (nc, storage) = open_fixture(CURVILINEAR);
-    let inspected = inspect(&nc, &storage, &Wanted::All, 0).unwrap();
+    let reader = open_fixture(CURVILINEAR);
+    let inspected = inspect(&reader, &Wanted::All, 0).unwrap();
     let names: Vec<&str> = inspected.fields.iter().map(|f| &*f.variable.name).collect();
     assert_eq!(names, ["column", "row"]);
     let mut skipped: Vec<&str> = inspected.skipped.iter().map(|(n, _)| n.as_str()).collect();
@@ -774,10 +793,9 @@ fn two_dimensional_latitude_longitude_make_a_curvilinear_grid() {
         [Dim::Time, Dim::Whole(28), Dim::Whole(19)]
     );
     let names = vec!["row".to_string()];
-    let again = inspect(&nc, &storage, &Wanted::Listed(&names), 0).unwrap();
+    let again = inspect(&reader, &Wanted::Listed(&names), 0).unwrap();
     assert!(inspected.grid.same(&again.grid));
-    let (meps, meps_storage) = open_fixture(MEPS_00);
-    let meps = inspect(&meps, &meps_storage, &Wanted::All, 0).unwrap();
+    let meps = inspect(&open_fixture(MEPS_00), &Wanted::All, 0).unwrap();
     assert!(!inspected.grid.same(&meps.grid) && !meps.grid.same(&inspected.grid));
 }
 
@@ -874,7 +892,7 @@ fn stated_axes_win_over_auxiliaries_and_names_decide_nothing() {
 #[test]
 fn an_oversized_curvilinear_grid_is_refused_unread() {
     let storage = counting(CURVILINEAR);
-    let nc = open_storage(storage.clone()).unwrap();
+    let reader = reader(storage.clone());
     storage.take();
     let (ny, nx) = (4097, 4096);
     assert!(nx * ny > ds_core::resample::curvilinear::MAX_NODES as u64);
@@ -899,7 +917,8 @@ fn an_oversized_curvilinear_grid_is_refused_unread() {
         lat: "lat".into(),
         lon: "lon".into(),
     };
-    let Err(Unservable::File(reason)) = file_grid(&nc, &variables, &field, "y", "x", &placement)
+    let Err(Unservable::File(reason)) =
+        file_grid(&reader, &variables, &field, "y", "x", &placement)
     else {
         panic!("an oversized grid is a file it cannot serve");
     };

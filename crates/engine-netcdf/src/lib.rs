@@ -12,7 +12,8 @@
 //! ([`catalog::OpenFile`]); a render reads one 2-D field through the
 //! engine-wide field cache ([`field`]) and resamples it with
 //! `ds_core::resample::SourceGrid`. A remote file is read in place by HTTP
-//! range, never downloaded whole. A family on a CF pressure axis (MEPS's
+//! range, never downloaded whole, or through OPeNDAP, one hyperslab per
+//! field ([`opendap`], #1264). A family on a CF pressure axis (MEPS's
 //! `pl` files) serves its levels as the collection's vertical axis, in hPa,
 //! bottom first: one field is one level ([`catalog::Layout::map_level`],
 //! [`catalog::Layout::query_levels`]). A variable accumulated since the run
@@ -21,15 +22,18 @@
 //! ([`catalog::PerStep`], #1165).
 
 mod catalog;
+mod dap;
 pub mod decode_budget;
 mod discover;
 mod edr;
 mod field;
 mod ingest;
 mod io;
+mod opendap;
 mod remote;
 #[cfg(test)]
 mod scan_tests;
+mod source;
 #[cfg(test)]
 mod test_server;
 
@@ -42,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use ds_core::config::NetcdfConfig;
+use ds_core::config::{NetcdfAccess, NetcdfConfig};
 use ds_core::deadline;
 use ds_core::error::DataServerError;
 use ds_core::geo::GeoTransform;
@@ -51,11 +55,11 @@ use ds_core::resample::OutputMap;
 use ds_core::units::DisplayConversion;
 use ds_poll::{FirstTick, Shutdown};
 use ds_storage::discovery::{
-    CatalogProber, FilenameMatcher, ProbeReport, ProbedFile, Schedule, Settling, TemplateProber,
-    TemplateSpec, TimeWindow,
+    CatalogProber, FileService, FilenameMatcher, ProbeReport, ProbedFile, Schedule, Settling,
+    TemplateProber, TemplateSpec, TimeWindow,
 };
 use ds_storage::DataStore;
-use netcdf_reader::{DynStorage, NcFile};
+use netcdf_reader::DynStorage;
 
 pub use field::{detached_fill_metrics, field_cache_metrics};
 pub use remote::{block_cache_metrics, chunk_cache_metrics};
@@ -64,7 +68,9 @@ use catalog::{Catalog, Identity, Layout, OpenFile, Param, Run, RunKey, Selected,
 use discover::{Listed, Names};
 use ingest::{Inspected, Wanted};
 use io::Mode;
+use opendap::{DapFile, OpenError};
 use remote::{Changes, Host, RemoteFile, Tuning};
+use source::Reader;
 
 /// Files one poll opens: new and replaced files, newest first, then
 /// retained files to open again. A directory of many files is opened over
@@ -118,7 +124,8 @@ pub struct NetcdfEngine {
 enum Source {
     /// A local directory, listed.
     Local { dir: PathBuf, names: Names },
-    /// An HTTP server, probed by template and read by range.
+    /// An HTTP server, probed by template (or found in its THREDDS
+    /// catalogs) and read by range or through OPeNDAP.
     Remote(Box<Remote>),
 }
 
@@ -127,6 +134,8 @@ struct Remote {
     host: Arc<Host>,
     /// `https://thredds.met.no`: the files' URLs are this and their keys.
     origin: String,
+    /// How the files are read: by HTTP range, or through OPeNDAP (#1264).
+    access: NetcdfAccess,
     finder: Mutex<Finder>,
     tuning: Tuning,
     /// One run's leads: a poll opens at least this many files.
@@ -202,7 +211,8 @@ pub struct RemoteTraffic {
     pub heads: u64,
     /// THREDDS catalogs this collection's discovery read (`catalog_url`).
     pub catalogs: u64,
-    /// Range GETs made to the host, by every collection on it.
+    /// GETs of file data made to the host, by every collection on it:
+    /// range reads, or OPeNDAP's `.dds`, `.das` and `.dods`.
     pub gets: u64,
     /// Bytes those GETs read.
     pub bytes: u64,
@@ -274,8 +284,7 @@ enum Opened {
 
 struct Ready {
     id: u64,
-    nc: NcFile,
-    remote: Option<Arc<RemoteFile>>,
+    reader: Reader,
     inspected: Inspected,
 }
 
@@ -398,10 +407,16 @@ impl NetcdfEngine {
             None => Finder::Template(Box::new(TemplateProber::new(spec)?)),
             Some(catalog_url) => {
                 // The catalog host's limit and share: thredds.met.no's
-                // catalogs and fileServer are one host, one limit.
+                // catalogs, fileServer and dodsC are one host, one limit.
                 let (catalog_host, _) = remote::host(collection_id, catalog_url)?;
+                let service = match config.access() {
+                    NetcdfAccess::Http => FileService::HttpServer,
+                    NetcdfAccess::Opendap => FileService::OpenDap,
+                };
                 Finder::Catalog {
-                    prober: Box::new(CatalogProber::new(spec, catalog_url, data_path)?),
+                    prober: Box::new(
+                        CatalogProber::new(spec, catalog_url, data_path)?.with_service(service),
+                    ),
                     catalogs: catalog_host.background.clone(),
                 }
             }
@@ -409,6 +424,7 @@ impl NetcdfEngine {
         Ok(Remote {
             host,
             origin: remote::origin(data_path).to_string(),
+            access: config.access(),
             finder: Mutex::new(finder),
             tuning,
             leads: leads.len().max(1),
@@ -871,11 +887,25 @@ impl NetcdfEngine {
     /// parallel.
     fn open_inspect(&self, file: &Listed, wanted: &Wanted) -> Opened {
         let id = next_file_id();
-        let (nc, storage, remote) = match &self.source {
+        let reader = match &self.source {
             Source::Local { .. } => match ingest::open(&file.path) {
-                Ok((nc, storage)) => (nc, storage, None),
+                Ok(reader) => reader,
                 Err(e) => return Opened::Skip(e),
             },
+            Source::Remote(source) if source.access == NetcdfAccess::Opendap => {
+                match DapFile::open(
+                    source.host.clone(),
+                    &source.origin,
+                    &file.path.to_string_lossy(),
+                    file.identity.clone(),
+                    id,
+                    self.changes.clone(),
+                ) {
+                    Ok(dap) => Reader::Dap(dap),
+                    Err(OpenError::Read(e)) => return Opened::Retry(e.to_string()),
+                    Err(OpenError::Format(e)) => return Opened::Skip(e),
+                }
+            }
             Source::Remote(source) => {
                 let remote = Arc::new(RemoteFile::new(
                     source.host.clone(),
@@ -891,21 +921,23 @@ impl NetcdfEngine {
                 }
                 let storage: DynStorage = remote.clone();
                 match ingest::open_storage(storage.clone()) {
-                    Ok(nc) => (nc, storage, Some(remote)),
-                    Err(e) => return verdict(&remote, e),
+                    Ok(nc) => Reader::Nc {
+                        nc,
+                        storage,
+                        remote: Some(remote),
+                    },
+                    Err(e) if remote.read_failed() => return Opened::Retry(e),
+                    Err(e) => return Opened::Skip(e),
                 }
             }
         };
-        let inspected = match ingest::inspect(&nc, &storage, wanted, self.member) {
+        let inspected = match ingest::inspect(&reader, wanted, self.member) {
             Ok(inspected) => inspected,
             // The decode budget is full now (#1174): the next poll tries again.
             Err(ingest::Unservable::Busy(e)) => return Opened::Retry(e),
-            Err(ingest::Unservable::File(e)) => {
-                return match &remote {
-                    Some(remote) => verdict(remote, e),
-                    None => Opened::Skip(e),
-                }
-            }
+            // A failed remote read is tried again; anything else is the file.
+            Err(ingest::Unservable::File(e)) if reader.read_failed() => return Opened::Retry(e),
+            Err(ingest::Unservable::File(e)) => return Opened::Skip(e),
         };
         if inspected.times.is_empty() {
             return Opened::Skip("its time axis is empty".into());
@@ -914,7 +946,7 @@ impl NetcdfEngine {
         // index walked once without reading a chunk. A contiguous variable
         // or a classic file has no index.
         for field in &inspected.fields {
-            if let Err(e) = nc.iter_variable_chunks(&field.read.name) {
+            if let Err(e) = reader.warm(&field.read.name) {
                 tracing::debug!(
                     "[{}] {}: no chunk index for '{}': {e}",
                     self.collection_id,
@@ -925,8 +957,7 @@ impl NetcdfEngine {
         }
         Opened::Ready(Box::new(Ready {
             id,
-            nc,
-            remote,
+            reader,
             inspected,
         }))
     }
@@ -968,8 +999,7 @@ impl NetcdfEngine {
             Opened::Ready(ready) => {
                 let Ready {
                     id,
-                    nc,
-                    remote,
+                    reader,
                     inspected,
                 } = *ready;
                 if let Err(e) = self.fits_layout(&inspected, state) {
@@ -979,8 +1009,7 @@ impl NetcdfEngine {
                     id,
                     path: file.path.clone(),
                     identity: file.identity.clone(),
-                    nc,
-                    remote,
+                    reader,
                     run: inspected.run,
                     times: inspected.times,
                     reads: inspected.fields.into_iter().map(|f| f.read).collect(),
@@ -1550,16 +1579,6 @@ fn sample_step_amount(
 /// Whether the scan's time limit has passed.
 fn past(limits: &Limits) -> bool {
     limits.until.is_some_and(|until| Instant::now() >= until)
-}
-
-/// Why a remote file failed to open: a failed read is tried again next
-/// poll, anything else is the file.
-fn verdict(remote: &RemoteFile, reason: String) -> Opened {
-    if remote.read_failed() {
-        Opened::Retry(reason)
-    } else {
-        Opened::Skip(reason)
-    }
 }
 
 impl Drop for NetcdfEngine {
