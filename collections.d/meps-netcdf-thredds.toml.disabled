@@ -41,7 +41,9 @@
 #     wind_speed_10m series, which reads both wind components, up to 134
 #     GETs, ~200 MB. A query decodes at most MC_NETCDF_EDR_QUERY_MB (544 MiB:
 #     one parameter over one run as the client sees it, including
-#     wind_speed_10m); name the variables with `parameter-name`.
+#     wind_speed_10m) and makes at most MC_NETCDF_EDR_QUERY_READS reads
+#     (200, one per field by range: the byte cap is reached first); name
+#     the variables with `parameter-name`.
 
 id = "meps-netcdf-thredds"
 title = "MEPS Surface (CF-NetCDF, thredds.met.no)"

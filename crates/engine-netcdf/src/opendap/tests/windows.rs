@@ -1,14 +1,21 @@
 //! EDR queries through OPeNDAP read windows of their fields (#1171): one
 //! hyperslab per field, covering the cells its positions sample, never the
 //! whole field unless the window would pass half of it, and the answer is
-//! the one the whole field gives, value for value. Every query here is
-//! asked of the same files read locally, which read whole fields.
+//! the one the whole field gives, value for value. The levels a query asks
+//! of one field at one step are one hyperslab over the stored levels
+//! between them, while that stays cheap: one request per variable and
+//! step, which the read cap counts once. Every query here is asked of the
+//! same files read locally, which read whole fields.
+
+use std::time::{Duration, Instant};
 
 use ds_core::cube::CubeResolution;
+use ds_core::deadline;
 use ds_core::feature::Bbox;
 use ds_core::model::CoverageResponse;
 
 use super::*;
+use crate::edr::Limits;
 
 /// One coverage of an answer: its domain, and its ranges by parameter
 /// (shape and values).
@@ -135,6 +142,7 @@ fn span(slab: &str) -> u64 {
 /// again, every window comes from the chunk cache.
 #[test]
 fn a_position_series_reads_a_window_of_each_field() {
+    let _pool = crate::remote::tests::query_pool_shared();
     let files = sfc_files();
     let (_dir, local) = local(&files, "sfc", SFC_VARIABLES);
     let server = TestServer::new();
@@ -174,6 +182,7 @@ fn a_position_series_reads_a_window_of_each_field() {
 /// trajectory read windows too; and both runs, pinned, alike.
 #[test]
 fn windowed_queries_answer_what_whole_fields_answer() {
+    let _pool = crate::remote::tests::query_pool_shared();
     let files = sfc_files();
     let (_dir, local) = local(&files, "sfc", SFC_VARIABLES);
     let server = TestServer::new();
@@ -289,6 +298,7 @@ fn windowed_queries_answer_what_whole_fields_answer() {
 /// fields not there.
 #[test]
 fn an_area_over_most_of_the_grid_reads_whole_fields() {
+    let _pool = crate::remote::tests::query_pool_shared();
     let files = sfc_files();
     let (_dir, local) = local(&files, "sfc", SFC_VARIABLES);
     let server = TestServer::new();
@@ -337,6 +347,7 @@ fn an_area_over_most_of_the_grid_reads_whole_fields() {
 /// window of every column, answer what the whole fields answer.
 #[test]
 fn windows_keep_packing_fill_and_the_global_seam() {
+    let _pool = crate::remote::tests::query_pool_shared();
     let (_, late) = slots();
     let files = [("netcdf-global/global_5deg.nc", "global", 0, late)];
     let dir = tempfile::tempdir().unwrap();
@@ -403,6 +414,7 @@ fn windows_keep_packing_fill_and_the_global_seam() {
 /// one point its 2 × 2, answered with that reply's cells, re-encoded.
 #[test]
 fn a_point_on_thredds_meps_reads_its_window() {
+    let _pool = crate::remote::tests::query_pool_shared();
     let server = TestServer::new();
     let (_, late) = slots();
     let (dir, name) = place("sfc", 0, late);
@@ -509,4 +521,366 @@ fn a_point_on_thredds_meps_reads_its_window() {
             "{dir}/{name}.dods?{field}%5B501:1:502%5D%5B401:1:402%5D"
         )]
     );
+}
+
+/// The 13-level fixture (testdata/netcdf-pressure-13: MEPS's levels stored
+/// top first, rows south-up, one file of six steps) through OPeNDAP from a
+/// server of its own, and read locally, whole.
+fn thirteen_levels() -> (TestServer, NetcdfEngine, tempfile::TempDir, NetcdfEngine) {
+    let (_, late) = slots();
+    let files = [("netcdf-pressure-13/pressure_13_levels.nc", "pl13", 0, late)];
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        testdata(files[0].0),
+        dir.path().join("pressure_13_levels.nc"),
+    )
+    .unwrap();
+    let local_config: NetcdfConfig = toml::from_str(&format!(
+        "data_path = {:?}",
+        dir.path().display().to_string()
+    ))
+    .unwrap();
+    let local = NetcdfEngine::new("local", &local_config).unwrap();
+    let server = TestServer::new();
+    publish(&server, &files, true, None);
+    let dap = opened(&config(&server, "pl13", &[0], ""));
+    assert_eq!(grid(&dap), (10, 8));
+    assert_eq!(dap.raster_info().vertical.unwrap().levels.len(), 13);
+    server.take();
+    (server, dap, dir, local)
+}
+
+/// No cap.
+const UNCAPPED: Limits = Limits {
+    bytes: u64::MAX,
+    reads: usize::MAX,
+};
+
+/// A position query of `parameters` at `at`, at `z` (every level without),
+/// capped at `limits`.
+fn position(
+    engine: &NetcdfEngine,
+    at: (f64, f64),
+    parameters: &[String],
+    z: Option<&[f64]>,
+    limits: Limits,
+) -> Result<CoverageResponse, DataServerError> {
+    let mut answered = None;
+    engine.positions(&[at], None, Some(parameters), z, None, limits, &mut |r| {
+        answered = Some(r);
+        Ok(())
+    })?;
+    Ok(answered.unwrap())
+}
+
+/// The pressure-axis hyperslab of each read among `reads`.
+fn levels_read(reads: &[(String, Vec<String>)]) -> Vec<&str> {
+    reads.iter().map(|(_, slabs)| slabs[1].as_str()).collect()
+}
+
+/// A position series at all 13 pressure levels over six steps is one
+/// request per variable and step, not one per level: one hyperslab over the
+/// 13 stored levels of the point's 2 × 2 cells, its rows read where they
+/// are stored, south-up. Every level answers what the file read whole
+/// answers, the fill cell's neighbour included. The byte cap counts what
+/// the windows decode (12 reads of 2 × 2 cells × 13 levels × 4 bytes), so
+/// a cap that refuses the same series read whole admits it; the read cap
+/// counts each window of 13 levels once, and over it refuses before any
+/// request. Asked again, every window comes from the chunk cache.
+#[test]
+fn a_series_at_every_level_is_one_request_per_variable_and_step() {
+    let _pool = crate::remote::tests::query_pool_shared();
+    let (server, dap, _dir, local) = thirteen_levels();
+    let at = at_cells(&dap, &[(4.3, 2.6)])[0];
+    let parameters = ["air_temperature_pl", "relative_humidity_pl"].map(String::from);
+    let windows = 12 * 4 * 13 * 4;
+    let ask =
+        |engine: &NetcdfEngine, limits| answer(position(engine, at, &parameters, None, limits));
+
+    let refused = ask(
+        &dap,
+        Limits {
+            bytes: windows,
+            reads: 11,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("12 field reads (6 timesteps × 2 source variables)")
+            && refused.contains("the limit is 11 reads")
+            && !refused.contains("level"),
+        "levels read together are no reads more: {refused}"
+    );
+    let refused = ask(
+        &dap,
+        Limits {
+            bytes: windows - 1,
+            reads: 12,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("156 fields (6 timesteps × 13 levels × 2 source variables, 2496 bytes)"),
+        "{refused}"
+    );
+    assert!(server.take().is_empty(), "refused before any request");
+
+    let through_dap = ask(
+        &dap,
+        Limits {
+            bytes: windows,
+            reads: 12,
+        },
+    );
+    let whole = ask(&local, UNCAPPED);
+    assert_eq!(through_dap, whole);
+    let coverages = through_dap.as_ref().unwrap();
+    assert_eq!(coverages.len(), 6, "a vertical profile per step");
+    for (_, ranges) in coverages {
+        let (shape, values) = &ranges["air_temperature_pl"];
+        assert_eq!(shape, &[13]);
+        let distinct: BTreeSet<u64> = values.iter().map(|v| v.unwrap().to_bits()).collect();
+        assert_eq!(distinct.len(), 13, "every level its own: {values:?}");
+    }
+    let requests = server.take();
+    for variable in ["air_temperature_pl", "relative_humidity_pl"] {
+        let reads = reads_of(&requests, variable);
+        let steps: BTreeSet<&str> = reads.iter().map(|(_, slabs)| slabs[0].as_str()).collect();
+        assert_eq!((reads.len(), steps.len()), (6, 6), "{variable}: {reads:#?}");
+        // Columns 4-5 and rows 2-3 north first: stored rows 4-5 of 8.
+        for (_, slabs) in &reads {
+            assert_eq!(&slabs[1..], ["[0:1:12]", "[4:1:5]", "[4:1:5]"]);
+        }
+    }
+    let refused = ask(
+        &local,
+        Limits {
+            bytes: windows,
+            reads: 12,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("156 fields (6 timesteps × 13 levels × 2 source variables, 49920 bytes)"),
+        "the same series read whole: {refused}"
+    );
+    assert_eq!(
+        ask(
+            &dap,
+            Limits {
+                bytes: windows,
+                reads: 12
+            }
+        ),
+        whole
+    );
+    assert!(
+        server.take().is_empty(),
+        "every window from the chunk cache"
+    );
+}
+
+/// `z` of two levels far apart (1000 and 500 hPa, stored 12 and 7) is one
+/// hyperslab over the stored levels between them, at a point, each level
+/// answering its own values in the order `z` names them; the other order
+/// reads the same hyperslabs, from the chunk cache. Over a window too wide
+/// for the levels between to be cheap, the two levels are read one by one,
+/// each its own window.
+#[test]
+fn levels_far_apart_are_read_together_while_the_window_is_small() {
+    let _pool = crate::remote::tests::query_pool_shared();
+    let (server, dap, _dir, local) = thirteen_levels();
+    let t = ["air_temperature_pl".to_string()];
+    let at = at_cells(&dap, &[(6.5, 4.2)])[0];
+    for z in [[500.0, 1000.0], [1000.0, 500.0]] {
+        let ask = |engine: &NetcdfEngine| answer(position(engine, at, &t, Some(&z), UNCAPPED));
+        let through_dap = ask(&dap);
+        assert_eq!(through_dap, ask(&local), "z {z:?}");
+        for (_, ranges) in through_dap.unwrap() {
+            let values = &ranges["air_temperature_pl"].1;
+            let at_1000 = values[z.iter().position(|&l| l == 1000.0).unwrap()].unwrap();
+            let at_500 = values[z.iter().position(|&l| l == 500.0).unwrap()].unwrap();
+            assert!(
+                ((at_500 - at_1000) - 25.0).abs() < 1e-3,
+                "0.05 K per hPa: {values:?}"
+            );
+        }
+        let reads = reads_of(&server.take(), "air_temperature_pl");
+        if z[0] == 500.0 {
+            assert_eq!(reads.len(), 6, "{reads:#?}");
+            assert!(levels_read(&reads).iter().all(|&slab| slab == "[7:1:12]"));
+        } else {
+            assert!(reads.is_empty(), "the same hyperslabs, cached: {reads:#?}");
+        }
+    }
+    // A quarter of the grid: 2 levels of 20 cells each, against 6 levels
+    // of 20 in one hyperslab.
+    let corners = at_cells(&dap, &[(1.0, 1.0), (4.6, 4.6)]);
+    let area = polygon(&corners);
+    let z = [1000.0, 500.0];
+    let ask = |engine: &NetcdfEngine| {
+        answer(engine.area(&area, None, Some(&t), Some(&z), None, UNCAPPED))
+    };
+    assert_eq!(ask(&dap), ask(&local));
+    let reads = reads_of(&server.take(), "air_temperature_pl");
+    let mut slabs = levels_read(&reads);
+    slabs.sort_unstable();
+    assert_eq!(slabs, ["[12]", "[7]"], "{reads:#?}");
+    assert!(reads
+        .iter()
+        .all(|(_, slabs)| span(&slabs[3]) * span(&slabs[2]) * 2 <= 80));
+}
+
+/// A Z path samples each level at its own samples. A short one's levels
+/// at a step are one read: the window joining their cells stays small. A
+/// path across the grid joins to more than half of it, and its levels are
+/// read one by one, each the window of its own samples. Both answer what
+/// the file read whole answers.
+#[test]
+fn a_z_path_reads_its_levels_together_while_their_window_is_small() {
+    let _pool = crate::remote::tests::query_pool_shared();
+    let (server, dap, _dir, local) = thirteen_levels();
+    let t = ["air_temperature_pl".to_string()];
+    let path = |from: (f64, f64), to: (f64, f64), z: (f64, f64)| {
+        let ends = at_cells(&dap, &[from, to]);
+        format!(
+            "LINESTRING Z({} {} {}, {} {} {})",
+            ends[0].0, ends[0].1, z.0, ends[1].0, ends[1].1, z.1
+        )
+    };
+    let ask = |engine: &NetcdfEngine, path: &str| {
+        answer(engine.trajectory(path, None, Some(&t), None, None, UNCAPPED))
+    };
+
+    let short = path((3.2, 3.3), (4.6, 3.8), (1000.0, 850.0));
+    let through_dap = ask(&dap, &short);
+    assert_eq!(through_dap, ask(&local, &short));
+    assert!(through_dap
+        .unwrap()
+        .iter()
+        .all(|(_, ranges)| ranges["air_temperature_pl"].1.iter().all(Option::is_some)));
+    let reads = reads_of(&server.take(), "air_temperature_pl");
+    assert_eq!(reads.len(), 6, "one read per step: {reads:#?}");
+    for slab in levels_read(&reads) {
+        assert!(
+            slab.contains(":1:") && slab.ends_with(":12]"),
+            "1000 hPa up to 850 at least: {slab}"
+        );
+    }
+
+    let long = path((0.2, 0.3), (9.4, 6.6), (1000.0, 300.0));
+    let through_dap = ask(&dap, &long);
+    assert_eq!(through_dap, ask(&local, &long));
+    let reads = reads_of(&server.take(), "air_temperature_pl");
+    let levels: BTreeSet<&str> = levels_read(&reads).into_iter().collect();
+    assert!(
+        levels.len() > 3 && levels.iter().all(|slab| !slab.contains(':')),
+        "each level read alone: {levels:?}"
+    );
+    assert_eq!(reads.len(), 6 * levels.len(), "{reads:#?}");
+    for (file, slabs) in &reads {
+        let cells = span(&slabs[2]) * span(&slabs[3]);
+        assert!(cells * 2 <= 80, "{file}: {slabs:?} is a window");
+    }
+}
+
+/// Read whole, a field counts its bytes: an area over the whole grid at
+/// every level reads the 13 levels' fields whole, one read each (a window
+/// of them would pass half of what they hold), and both caps count them so.
+#[test]
+fn whole_fields_count_whole() {
+    let _pool = crate::remote::tests::query_pool_shared();
+    let (server, dap, _dir, local) = thirteen_levels();
+    let t = ["air_temperature_pl".to_string()];
+    let [w, s, e, n] = dap.raster_info().spatial_extent.unwrap();
+    let all = format!("POLYGON(({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))");
+    let ask = |engine: &NetcdfEngine, limits| {
+        answer(engine.area(&all, None, Some(&t), None, None, limits))
+    };
+    let fields = 13 * 80 * 4;
+    let refused = ask(
+        &dap,
+        Limits {
+            bytes: fields - 1,
+            reads: 13,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("13 fields (1 timesteps × 13 levels × 1 source variables, 4160 bytes)"),
+        "{refused}"
+    );
+    let refused = ask(
+        &dap,
+        Limits {
+            bytes: fields,
+            reads: 12,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("13 field reads (1 timesteps × 13 levels × 1 source variables)")
+            && refused.contains("fewer pressure levels (z)"),
+        "{refused}"
+    );
+    assert!(server.take().is_empty());
+    assert_eq!(
+        ask(
+            &dap,
+            Limits {
+                bytes: fields,
+                reads: 13
+            }
+        ),
+        ask(&local, UNCAPPED)
+    );
+    let reads = reads_of(&server.take(), "air_temperature_pl");
+    assert_eq!(reads.len(), 13);
+    for (_, slabs) in &reads {
+        assert!(!slabs[1].contains(':'));
+        assert_eq!(&slabs[2..], ["[0:1:7]", "[0:1:9]"]);
+    }
+}
+
+/// A read of 13 levels at once that outlives its query's deadline goes on
+/// and lands in the chunk cache, one entry per hyperslab: retries join the
+/// reads still running and decode the ones landed, and the series is
+/// answered having made the first query's requests only, one per step.
+#[test]
+fn a_read_of_every_level_past_its_deadline_lands_in_the_cache() {
+    let _pool = crate::remote::tests::query_pool();
+    let (server, dap, _dir, local) = thirteen_levels();
+    server.slow_over(0, Duration::from_millis(800));
+    let t = ["air_temperature_pl".to_string()];
+    let at = at_cells(&dap, &[(5.5, 5.5)])[0];
+    let within = |ms: u64| {
+        let _deadline = deadline::enter(Some(Instant::now() + Duration::from_millis(ms)));
+        position(&dap, at, &t, None, UNCAPPED)
+    };
+    let started = Instant::now();
+    let late = within(100);
+    assert!(
+        matches!(late, Err(DataServerError::DeadlineExceeded)),
+        "{late:?}"
+    );
+    let answered = loop {
+        match within(300) {
+            Ok(answered) => break answered,
+            Err(DataServerError::DeadlineExceeded) => {
+                assert!(started.elapsed() < Duration::from_secs(10), "never cached");
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert_eq!(
+        answer(Ok(answered)),
+        answer(position(&local, at, &t, None, UNCAPPED))
+    );
+    let reads = reads_of(&server.take(), "air_temperature_pl");
+    assert_eq!(
+        reads.len(),
+        6,
+        "the first query's requests only: {reads:#?}"
+    );
+    assert!(levels_read(&reads).iter().all(|&slab| slab == "[0:1:12]"));
 }

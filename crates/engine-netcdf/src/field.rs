@@ -28,7 +28,11 @@
 //! A query read through OPeNDAP may read a window of its field rather than
 //! the whole (#1171): the cells its positions sample
 //! (`ds_core::resample::SourceGrid::cells_read`), sampled from the window
-//! alone ([`QueryField::value_at`]) to the value the whole field gives.
+//! alone ([`QueryField::value_at`]) to the value the whole field gives. The
+//! window of several pressure levels of one field at one step is one read:
+//! one hyperslab over the stored levels from the lowest to the highest
+//! asked ([`crate::ingest::Span`]), one reply, one decode of a plane per
+//! level.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -42,12 +46,16 @@ use ds_core::resample::{CellWindow, SourceGrid};
 
 use crate::catalog::OpenFile;
 use crate::decode_budget::BUDGET;
-use crate::ingest::FieldRead;
+use crate::ingest::{FieldRead, Span};
 use crate::io::{self, Mode};
 use crate::source::Reader;
 
 /// A decoded 2-D field: rows north to south, NaN for nodata.
 pub(crate) type Values = Arc<[f32]>;
+
+/// One read's decoded fields: a plane per stored level of its
+/// [`Span`], in stored order; one for a field with one level.
+type Planes = Vec<Values>;
 
 /// A field an EDR or GetFeatureInfo query samples ([`read_uncached`]):
 /// the whole field, or the window of it the query read (#1171).
@@ -183,26 +191,32 @@ pub(crate) static QUERY_READS: DetachedPool = DetachedPool::new(MAX_QUERY_DETACH
 static QUERY_IN_FLIGHT: LazyLock<Mutex<HashMap<QueryKey, Arc<InFlight>>>> =
     LazyLock::new(Mutex::default);
 
-/// What a query read reads: a field, whole or a window of it (#1171). A
-/// window is a read of its own, joined only by a read of the same window.
+/// What a query read reads: a field at one step over the stored levels of
+/// a span, whole (one level) or a window of it (#1171). A window is a read
+/// of its own, joined only by a read of the same window over the same
+/// levels: what one `.dods` constraint selects.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct QueryKey {
-    field: FieldKey,
+    /// The ingest ([`FieldKey::file`]).
+    file: u64,
+    variable: Arc<str>,
+    time: u32,
+    span: Span,
     window: Option<CellWindow>,
 }
 
 /// One detached query read, for the queries that joined it.
 #[derive(Default)]
 struct InFlight {
-    /// `Some(Some(values))` once read, `Some(None)` once failed.
-    outcome: Mutex<Option<Option<Values>>>,
+    /// `Some(Some(planes))` once read, `Some(None)` once failed.
+    outcome: Mutex<Option<Option<Planes>>>,
     done: Condvar,
 }
 
 impl InFlight {
-    /// The read's values, `Ok(None)` if it failed, or `Err(())` if it is
+    /// The read's planes, `Ok(None)` if it failed, or `Err(())` if it is
     /// still running at `end` (30 s without one).
-    fn wait(&self, end: Option<Instant>) -> Result<Option<Values>, ()> {
+    fn wait(&self, end: Option<Instant>) -> Result<Option<Planes>, ()> {
         let wait = end.map_or(Duration::from_secs(30), |end| {
             end.saturating_duration_since(Instant::now())
         });
@@ -222,7 +236,7 @@ impl InFlight {
 struct Settle {
     key: QueryKey,
     flight: Arc<InFlight>,
-    values: Option<Values>,
+    values: Option<Planes>,
 }
 
 impl Drop for Settle {
@@ -300,6 +314,16 @@ fn window_peak_bytes(read: &FieldRead, window: CellWindow) -> u64 {
         .max(1)
 }
 
+/// The transient peak of one read of `span`'s stored levels of `read`,
+/// whole or over `window`, which the read reserves: each level's
+/// ([`peak_bytes`], [`window_peak_bytes`]), so a window over 13 levels
+/// reserves 13 windows' peaks, its reply and planes included.
+fn read_peak_bytes(read: &FieldRead, span: Span, window: Option<CellWindow>) -> u64 {
+    window
+        .map_or_else(|| peak_bytes(read), |w| window_peak_bytes(read, w))
+        .saturating_mul(span.levels())
+}
+
 /// Variable `index` of `file` at time step `time` and served level `level`,
 /// from the cache or decoded once for every concurrent reader. `flipped`
 /// reverses the stored rows to north-up; `decodes` counts the fills this
@@ -343,52 +367,126 @@ pub(crate) fn read(
     result
 }
 
-/// Variable `index` of `file` at step `time` for an EDR query (#1067): the
-/// decoded field when the cache holds it (a frame being drawn), else decoded
-/// for this query alone and not cached, so a series over a whole run never
-/// evicts the frames being drawn. A remote file's compressed chunk still
-/// lands in the chunk cache ([`crate::remote`]), so the same field read
-/// again costs a decode, not a fetch. The lookup is not counted in the
-/// field cache's hits and misses, which measure the renders it serves.
+/// Variable `index` of `file` at step `time` and served levels `levels`
+/// for an EDR query (#1067), one [`QueryField`] per level, in `levels`'
+/// order: the decoded field when the cache holds it (a frame being drawn),
+/// else decoded for this query alone and not cached, so a series over a
+/// whole run never evicts the frames being drawn. A remote file's
+/// compressed chunk still lands in the chunk cache ([`crate::remote`]), so
+/// the same field read again costs a decode, not a fetch. The lookup is not
+/// counted in the field cache's hits and misses, which measure the renders
+/// it serves. Without `window`, `levels` are read one by one, each its
+/// whole field.
 ///
 /// With `window` (#1171, a file read through OPeNDAP), only those cells are
-/// read, in one `.dods` of that hyperslab, kept in the chunk cache under
-/// its own constraint; the field cache's whole field, or a whole reply the
-/// chunk cache holds (a render's, a prewarm's, another query's), is used
-/// instead when there. The result says which it holds
-/// ([`QueryField::window`]).
+/// read, of every level in `levels` at once: one `.dods` of the hyperslab
+/// over the stored levels from the lowest of them to the highest
+/// ([`FieldRead::span`]: the levels between, at window size, cost next to
+/// nothing), kept in the chunk cache under its own constraint. When every
+/// level is held whole, in the field cache or as a whole reply in the
+/// chunk cache (a render's, a prewarm's, another query's), those are used
+/// instead. The result says which it holds ([`QueryField::window`]).
 ///
 /// A remote read is detached, as a render's fill is: it runs on the I/O
 /// runtime under [`Mode::Detached`] (no deadline, the background fetch
 /// budget), and the query waits for it only until its own deadline. A
 /// query that misses its deadline fails, while the reads it started go on
 /// into the chunk cache, so a retry makes progress. A query reading a field
-/// another query's detached read is still reading joins it
-/// ([`QUERY_IN_FLIGHT`]): no slot, no decode of its own; if that read
-/// fails, the joiner reads the field itself, under its deadline, for its
-/// own error. The slot comes from [`QUERY_READS`], never the render fills'
-/// pool; past [`MAX_QUERY_DETACHED_READS`] the read runs here, under the
-/// deadline. Each read reserves its transient peak from the decode budget.
+/// (or a window of the same levels) another query's detached read is still
+/// reading joins it ([`QUERY_IN_FLIGHT`]): no slot, no decode of its own;
+/// if that read fails, the joiner reads it itself, under its deadline, for
+/// its own error. The slot comes from [`QUERY_READS`], never the render
+/// fills' pool; past [`MAX_QUERY_DETACHED_READS`] the read runs here, under
+/// the deadline. Each read reserves its transient peak from the decode
+/// budget, every level of it.
 pub(crate) fn read_uncached(
     file: &Arc<OpenFile>,
     index: usize,
     time: u32,
-    level: usize,
+    levels: &[usize],
     flipped: bool,
     window: Option<CellWindow>,
     decodes: &Arc<AtomicU64>,
-) -> Result<QueryField, DataServerError> {
+) -> Result<Vec<QueryField>, DataServerError> {
     deadline::check()?;
-    let field = field_key(file, index, time, level);
-    if let Some(values) = FIELDS.get_untracked(&field) {
-        return Ok(QueryField {
-            values,
-            window: None,
-        });
-    }
-    // A whole reply in the chunk cache costs a decode; a window, a fetch.
-    let window = window.filter(|_| !file.reader.holds_field(&file.reads[index], time, level));
-    let key = QueryKey { field, window };
+    let read = &file.reads[index];
+    let held: Vec<Option<Values>> = levels
+        .iter()
+        .map(|&level| FIELDS.get_untracked(&field_key(file, index, time, level)))
+        .collect();
+    // Every level held whole costs a decode at most; a window, a fetch.
+    let window = window.filter(|_| {
+        !levels
+            .iter()
+            .zip(&held)
+            .all(|(&level, held)| held.is_some() || file.reader.holds_field(read, time, level))
+    });
+    let Some(window) = window else {
+        return levels
+            .iter()
+            .zip(held)
+            .map(|(&level, held)| {
+                let values = match held {
+                    Some(values) => values,
+                    None => one(read_span(
+                        file,
+                        index,
+                        time,
+                        read.span(&[level]),
+                        flipped,
+                        None,
+                        decodes,
+                    )?)?,
+                };
+                Ok(QueryField {
+                    values,
+                    window: None,
+                })
+            })
+            .collect();
+    };
+    let span = read.span(levels);
+    let planes = read_span(file, index, time, span, flipped, Some(window), decodes)?;
+    levels
+        .iter()
+        .map(|&level| {
+            let values = planes
+                .get(span.plane(read.stored_level(level)))
+                .cloned()
+                .ok_or_else(|| {
+                    DataServerError::Engine(format!(
+                        "variable '{}': level {level} is not in the levels read",
+                        read.name
+                    ))
+                })?;
+            Ok(QueryField {
+                values,
+                window: Some(window),
+            })
+        })
+        .collect()
+}
+
+/// One query read of [`read_uncached`]: `span`'s stored levels of variable
+/// `index` of `file` at step `time`, whole or over `window`, a plane per
+/// level; detached and joined as [`read_uncached`] says for a remote file,
+/// here for a local one.
+fn read_span(
+    file: &Arc<OpenFile>,
+    index: usize,
+    time: u32,
+    span: Span,
+    flipped: bool,
+    window: Option<CellWindow>,
+    decodes: &Arc<AtomicU64>,
+) -> Result<Planes, DataServerError> {
+    let key = QueryKey {
+        file: file.id,
+        variable: file.reads[index].name.clone(),
+        time,
+        span,
+        window,
+    };
     let end = deadline::current();
     let timed_out = || {
         if end.is_some() {
@@ -397,9 +495,9 @@ pub(crate) fn read_uncached(
             DataServerError::Storage("timed out waiting for a NetCDF field read".into())
         }
     };
-    // Every read of this query's (field, window), here or detached.
+    // Every read of this (field, levels, window), here or detached.
     let read_once = move |file: &OpenFile, decodes: &AtomicU64| {
-        fill(file, index, time, level, flipped, window, decodes)
+        fill_span(file, index, time, span, flipped, window, decodes)
     };
     let result = io::blocking(|| {
         if !file.reader.is_remote() {
@@ -423,7 +521,7 @@ pub(crate) fn read_uncached(
             QueryRead::Inline => return read_once(file, decodes),
             QueryRead::Join(flight) => {
                 return match flight.wait(end) {
-                    Ok(Some(values)) => Ok(values),
+                    Ok(Some(planes)) => Ok(planes),
                     // The read joined failed: read here, for this query's
                     // own error, or values if the failure has passed.
                     Ok(None) => read_once(file, decodes),
@@ -461,7 +559,15 @@ pub(crate) fn read_uncached(
         }
     });
     deadline::check()?;
-    result.map(|values| QueryField { values, window })
+    result
+}
+
+/// The one plane of a read of one level.
+fn one(planes: Planes) -> Result<Values, DataServerError> {
+    planes
+        .into_iter()
+        .next()
+        .ok_or_else(|| DataServerError::Engine("a NetCDF field read decoded nothing".into()))
 }
 
 /// The cache key of variable `index` of `file` at step `time`, level
@@ -519,7 +625,6 @@ impl Fill<'_> {
                     self.time,
                     self.level,
                     self.flipped,
-                    None,
                     self.decodes,
                 )
             },
@@ -544,7 +649,6 @@ impl Fill<'_> {
                         self.time,
                         self.level,
                         self.flipped,
-                        None,
                         self.decodes,
                     )?;
                     let _ = guard.insert(values.clone());
@@ -556,7 +660,7 @@ impl Fill<'_> {
                 io::handle().spawn_blocking(move || {
                     let _slot = slot;
                     let _mode = io::enter(Mode::Detached);
-                    match fill(&file, index, time, level, flipped, None, &decodes) {
+                    match fill(&file, index, time, level, flipped, &decodes) {
                         Ok(values) => {
                             let _ = guard.insert(values);
                         }
@@ -594,7 +698,6 @@ impl Fill<'_> {
                     self.time,
                     self.level,
                     self.flipped,
-                    None,
                     self.decodes,
                 )?;
                 let _ = guard.insert(values.clone());
@@ -606,22 +709,37 @@ impl Fill<'_> {
 }
 
 /// Reserve the decode's transient peak and decode variable `index` of
-/// `file` at step `time`, level `level`, whole or over `window`: one cache
-/// fill, or one query read.
+/// `file` at step `time`, served level `level`, whole: one cache fill.
 fn fill(
     file: &OpenFile,
     index: usize,
     time: u32,
     level: usize,
     flipped: bool,
-    window: Option<CellWindow>,
     decodes: &AtomicU64,
 ) -> Result<Values, DataServerError> {
+    let span = file.reads[index].span(&[level]);
+    one(fill_span(file, index, time, span, flipped, None, decodes)?)
+}
+
+/// Reserve the decode's transient peak, every level's, and decode variable
+/// `index` of `file` at step `time` over the stored levels of `span`, whole
+/// or over `window`: one cache fill or one query read, one decode however
+/// many levels it holds.
+fn fill_span(
+    file: &OpenFile,
+    index: usize,
+    time: u32,
+    span: Span,
+    flipped: bool,
+    window: Option<CellWindow>,
+    decodes: &AtomicU64,
+) -> Result<Planes, DataServerError> {
     let read = &file.reads[index];
-    let peak = window.map_or_else(|| peak_bytes(read), |w| window_peak_bytes(read, w));
-    let _permit = BUDGET.reserve(peak)?;
+    let _permit = BUDGET.reserve(read_peak_bytes(read, span, window))?;
     decodes.fetch_add(1, Ordering::Relaxed);
-    decode(&file.reader, read, time, level, flipped, window).map(Values::from)
+    let planes = decode(&file.reader, read, time, span, flipped, window)?;
+    Ok(planes.into_iter().map(Values::from).collect())
 }
 
 /// Fetch variable `index` of `file` at step `time`, level `level`, ahead of
@@ -641,25 +759,27 @@ pub(crate) fn prewarm(
         return Ok(false);
     }
     let _permit = BUDGET.reserve(peak_bytes(read))?;
-    decode(&file.reader, read, time, level, flipped, None).map(|_| true)
+    decode(&file.reader, read, time, read.span(&[level]), flipped, None).map(|_| true)
 }
 
-/// Read and decode one field, or `window` of it: the typed hyperslab, CF
-/// masking and packing, and the rows reversed to north-up when the file
-/// stores them south-up. A failed remote read keeps its meaning
-/// ([`Reader::read_field`]): a deadline, or a replaced file's 503.
+/// Read and decode one field over the stored levels of `span`, or `window`
+/// of it: the typed hyperslab, CF masking and packing, and the rows
+/// reversed to north-up when the file stores them south-up, a plane per
+/// stored level, each decoded as a read of that level alone decodes it. A
+/// failed remote read keeps its meaning ([`Reader::read_field`]): a
+/// deadline, or a replaced file's 503.
 fn decode(
     reader: &Reader,
     read: &FieldRead,
     time: u32,
-    level: usize,
+    span: Span,
     flipped: bool,
     window: Option<CellWindow>,
-) -> Result<Vec<f32>, DataServerError> {
+) -> Result<Vec<Vec<f32>>, DataServerError> {
     let (selection, (ny, nx)) = match window {
-        None => (read.selection(time, level), read.shape()),
+        None => (read.span_selection(time, span), read.shape()),
         Some(window) => (
-            read.window_selection(time, level, window, flipped)
+            read.window_selection(time, span, window, flipped)
                 .ok_or_else(|| {
                     DataServerError::Engine(format!(
                         "variable '{}': window {window:?} is not on its field",
@@ -669,15 +789,22 @@ fn decode(
             (window.height() as usize, window.width() as usize),
         ),
     };
-    let raw = reader.read_field(read, time, level, &selection)?;
-    if raw.len() != ny * nx {
+    let raw = reader.read_field(read, time, span, &selection)?;
+    let plane = ny.saturating_mul(nx);
+    let planes = span.levels() as usize;
+    if raw.len() != plane.saturating_mul(planes) {
         return Err(DataServerError::Storage(format!(
-            "variable '{}' step {time} level {level}: read {} values for a {nx} x {ny} field",
+            "variable '{}' step {time} stored levels {}-{}: read {} values for {planes} levels \
+             of a {nx} x {ny} field",
             read.name,
+            span.first,
+            span.last,
             raw.len()
         )));
     }
-    Ok(raw.decode(&read.packing, flipped, nx))
+    Ok((0..planes)
+        .map(|p| raw.decode_plane(p * plane..(p + 1) * plane, &read.packing, flipped, nx))
+        .collect())
 }
 
 #[cfg(test)]
@@ -782,6 +909,8 @@ mod tests {
 
     /// A window read reserves the whole field's peak in proportion to its
     /// cells (#1171): a 2 × 2 window of an 11 × 10 `f32` field 4/110 of it.
+    /// A read over several stored levels reserves every level's: a window
+    /// over 13 levels 13 windows' peaks, six times its reply's values.
     #[test]
     fn a_window_reserves_its_share_of_the_fields_peak() {
         use crate::ingest::{Dim, Packing, Stored};
@@ -803,6 +932,15 @@ mod tests {
         assert_eq!(window_peak_bytes(&read, window((4, 5), (5, 6))), 6 * 4 * 4);
         assert_eq!(window_peak_bytes(&read, window((0, 9), (0, 10))), 6 * 440);
         assert_eq!(window_peak_bytes(&read, window((3, 3), (3, 3))), 24);
+        let one = Span { first: 4, last: 4 };
+        let thirteen = Span { first: 0, last: 12 };
+        let point = window((4, 5), (5, 6));
+        assert_eq!(read_peak_bytes(&read, one, None), 6 * 440);
+        assert_eq!(read_peak_bytes(&read, one, Some(point)), 6 * 4 * 4);
+        assert_eq!(
+            read_peak_bytes(&read, thirteen, Some(point)),
+            13 * 6 * 4 * 4
+        );
     }
 
     /// A south-up field's rows are reversed while decoding, its values

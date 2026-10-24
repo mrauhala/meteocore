@@ -28,9 +28,14 @@
 //!   that step, both sampled at the sample's position: for an M or ZM path
 //!   the step before each sample's own step, in the run the path reads.
 //!
-//! The query-shape cap ([`super::QUERY_BYTES`]) counts the fields the plan
-//! reads, each (step, level) once per variable, and a per-step amount's
-//! steps before, before any read.
+//! Both query caps ([`super::QUERY_BYTES`], [`super::QUERY_FIELD_READS`]) count
+//! the reads the plan names, each (step, level) field once per variable,
+//! and a per-step amount's steps before, before any read. Through OPeNDAP
+//! a Z path's levels at one step are one read while the window joining
+//! their samples' cells stays worth reading (`super::worth_a_window`):
+//! each level is sampled at its own samples, so a long path's joined
+//! window soon passes half the field, and its levels are then read one by
+//! one, each its window or its field whole.
 
 use std::sync::Arc;
 
@@ -39,21 +44,21 @@ use ds_core::error::DataServerError;
 use ds_core::model::CoverageResponse;
 use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
 
-use super::{layout, on_grid, Positions, Reads, Sampling, Window};
+use super::{layout, on_grid, Limits, Positions, Reads, Sampling, Window};
 use crate::catalog::Step;
 use crate::NetcdfEngine;
 
 impl NetcdfEngine {
-    /// The trajectory query, its decoded bytes capped at `limit`
-    /// ([`super::QUERY_BYTES`] from the trait).
-    pub(super) fn trajectory(
+    /// The trajectory query, its reads capped at `limits` (the configured
+    /// ones from the trait).
+    pub(crate) fn trajectory(
         &self,
         coords: &str,
         datetime: Window,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
         reference_time: Option<DateTime<Utc>>,
-        limit: u64,
+        limits: Limits,
     ) -> Result<CoverageResponse, DataServerError> {
         ds_core::deadline::check()?;
         let path = TrajectoryPath::parse(coords)?;
@@ -154,8 +159,7 @@ impl NetcdfEngine {
         } else {
             "the datetime window"
         };
-        reads.check_fields(&fields, limit, time)?;
-        let values = self.sample_fields(&reads, &fields)?;
+        let values = self.sample_fields(&reads, &fields, limits, time)?;
         plan.into_response(&Self::described(&catalog, layout, &reads.params), &values)
     }
 }

@@ -579,4 +579,4 @@ impl Storage for RemoteFile {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

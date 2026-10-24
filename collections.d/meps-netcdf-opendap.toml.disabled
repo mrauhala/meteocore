@@ -46,10 +46,11 @@
 #     requests, about 29 KB, and a wind_speed_10m series, which reads both
 #     wind components, 134. An area or cube over more than half the grid
 #     reads its fields whole, and a field cached whole is not fetched
-#     again. The query cap still counts whole fields: a query decodes at
-#     most MC_NETCDF_EDR_QUERY_MB (544 MiB: one parameter over one run as
-#     the client sees it, including wind_speed_10m); name the variables
-#     with `parameter-name`.
+#     again. A query makes at most MC_NETCDF_EDR_QUERY_READS reads (200:
+#     three variables over a whole run, 201, are just over it) and decodes
+#     at most MC_NETCDF_EDR_QUERY_MB (544 MiB, a window counted at its
+#     cells, a field read whole at 4.06 MB); name the variables with
+#     `parameter-name`.
 
 id = "meps-netcdf-opendap"
 title = "MEPS Surface (CF-NetCDF, thredds.met.no OPeNDAP)"

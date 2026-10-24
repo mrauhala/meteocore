@@ -184,16 +184,45 @@ impl FieldRead {
             .max(self.chunk_bytes)
     }
 
+    /// The stored index along the pressure axis of served level `level`
+    /// (an index into [`Self::levels`]); 0 for a field with one level.
+    pub(crate) fn stored_level(&self, level: usize) -> u64 {
+        self.levels.get(level).copied().unwrap_or(0)
+    }
+
+    /// The stored levels a read of served levels `levels` covers: from the
+    /// lowest stored index of them to the highest, every level between
+    /// included; one level for one.
+    pub(crate) fn span(&self, levels: &[usize]) -> Span {
+        let stored = levels.iter().map(|&level| self.stored_level(level));
+        Span {
+            first: stored.clone().min().unwrap_or(0),
+            last: stored.max().unwrap_or(0),
+        }
+    }
+
     /// The hyperslab of time step `time` at served level `level` (an index
     /// into [`Self::levels`]; 0 for a field with one level).
     pub(crate) fn selection(&self, time: u32, level: usize) -> NcSliceInfo {
+        self.span_selection(time, self.span(&[level]))
+    }
+
+    /// The hyperslab of time step `time` over the stored levels of `span`:
+    /// the level's index for one level, as [`Self::selection`] selects it,
+    /// else the range of them.
+    pub(crate) fn span_selection(&self, time: u32, span: Span) -> NcSliceInfo {
         let selections = self
             .dims
             .iter()
             .map(|dim| match *dim {
                 Dim::Time => NcSliceInfoElem::Index(u64::from(time)),
                 Dim::Index(i) => NcSliceInfoElem::Index(i),
-                Dim::Level => NcSliceInfoElem::Index(self.levels.get(level).copied().unwrap_or(0)),
+                Dim::Level if span.first == span.last => NcSliceInfoElem::Index(span.first),
+                Dim::Level => NcSliceInfoElem::Slice {
+                    start: span.first,
+                    end: span.last + 1,
+                    step: 1,
+                },
                 Dim::Whole(n) => NcSliceInfoElem::Slice {
                     start: 0,
                     end: n,
@@ -204,15 +233,15 @@ impl FieldRead {
         NcSliceInfo { selections }
     }
 
-    /// [`Self::selection`] of `window`'s cells alone (#1171): its rows and
-    /// columns, rows counted north first as the sampler counts them, so a
-    /// field stored south-up (`flipped`) reads the stored rows they are,
+    /// [`Self::span_selection`] of `window`'s cells alone (#1171): its rows
+    /// and columns, rows counted north first as the sampler counts them, so
+    /// a field stored south-up (`flipped`) reads the stored rows they are,
     /// reversed when decoded. `None` when the field's last two axes are not
     /// its grid's or the window passes their end.
     pub(crate) fn window_selection(
         &self,
         time: u32,
-        level: usize,
+        span: Span,
         window: CellWindow,
         flipped: bool,
     ) -> Option<NcSliceInfo> {
@@ -232,11 +261,34 @@ impl FieldRead {
             end: last + 1,
             step: 1,
         };
-        let mut selection = self.selection(time, level);
+        let mut selection = self.span_selection(time, span);
         let n = selection.selections.len();
         selection.selections[n - 2] = slice(rows);
         selection.selections[n - 1] = slice((u64::from(columns.0), u64::from(columns.1)));
         Some(selection)
+    }
+}
+
+/// The stored pressure levels one read selects, `first..=last`: one level,
+/// or the run of stored levels from the lowest to the highest of several an
+/// EDR query reads in one OPeNDAP hyperslab. `0..=0` for a field with one
+/// level. A read of a span decodes one plane per stored level of it, in
+/// stored order ([`FieldRead::span`], [`Span::plane`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Span {
+    pub first: u64,
+    pub last: u64,
+}
+
+impl Span {
+    /// The stored levels the span covers.
+    pub(crate) fn levels(self) -> u64 {
+        self.last - self.first + 1
+    }
+
+    /// Where the plane of stored level `stored` lies among the span's.
+    pub(crate) fn plane(self, stored: u64) -> usize {
+        (stored - self.first) as usize
     }
 }
 
