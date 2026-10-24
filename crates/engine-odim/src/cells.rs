@@ -28,10 +28,14 @@ use crate::volume_engine::{
     blocking_pixel_handle, pixel_cache_id, read_volume_files, voxel_grid_from_bytes, Catalog,
     PolarVolumeSiteView, Source, VolumeEntry, DEFAULT_VOXEL_DIMS,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use ds_cache::{CacheEntry, CacheFillGuard};
-use ds_core::cells::{extract_cells, track_cells, CellExtractionOptions, CellSet, MAX_TRACK_SCANS};
+use ds_core::cells::{
+    extract_cells, track_cells, CellExtractionOptions, CellSet, StormCell, Track, MAX_TRACK_SCANS,
+};
 use ds_core::error::DataServerError;
+use ds_core::feature::{Geometry, PropertyValue};
+use ds_core::feature_pick::{FeaturePick, PickedFeature, PickedFeatures};
 use ds_core::map_engine::{OutputCrs, RasterTile};
 use ds_core::raster_paint::Canvas;
 use ds_core::volume::{CellProduct, CellQuery, VoxelGrid};
@@ -385,28 +389,7 @@ impl PolarVolumeSiteView {
         time: Option<chrono::DateTime<chrono::Utc>>,
         output_crs: &OutputCrs,
     ) -> Result<RasterTile, DataServerError> {
-        // The overlay's source quantity: corrected reflectivity first, then
-        // total, then any other dBZ-unit moment. The CELLS parameter is only
-        // advertised for sites that have one, so a miss here is a catalog
-        // race, reported as no-data like the other paths.
-        let quantity = {
-            let catalog = self.catalog.load();
-            let meta = catalog.by_site_meta.get(&self.nod).ok_or_else(|| {
-                DataServerError::LocationNotFound(format!(
-                    "[{}] radar site `{}` has no current volumes",
-                    self.collection_id, self.nod
-                ))
-            })?;
-            layer_quantity(&meta.quantities)
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    DataServerError::LocationNotFound(format!(
-                        "[{}] no reflectivity quantity to derive storm cells from",
-                        self.collection_id
-                    ))
-                })?
-        };
-        let query = layer_query(&quantity, time);
+        let query = layer_query(&self.cells_quantity()?, time);
         let handle = blocking_pixel_handle();
         let product = self.cell_product(&query, handle.as_ref())?;
 
@@ -426,6 +409,128 @@ impl PolarVolumeSiteView {
             height,
             values: values.into(),
         })
+    }
+}
+
+impl PolarVolumeSiteView {
+    /// The `CELLS` overlay's source quantity: corrected reflectivity first,
+    /// then total, then any other dBZ-unit moment. The CELLS parameter is
+    /// only advertised for sites that have one, so a miss here is a catalog
+    /// race, reported as no-data like the other paths.
+    fn cells_quantity(&self) -> Result<String, DataServerError> {
+        let catalog = self.catalog.load();
+        let meta = catalog.by_site_meta.get(&self.nod).ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current volumes",
+                self.collection_id, self.nod
+            ))
+        })?;
+        layer_quantity(&meta.quantities)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                DataServerError::LocationNotFound(format!(
+                    "[{}] no reflectivity quantity to derive storm cells from",
+                    self.collection_id
+                ))
+            })
+    }
+
+    /// The storm cells the `CELLS` overlay draws at a picked pixel, for WMS
+    /// GetFeatureInfo (#1100): from the product a tile at `pick.time` draws
+    /// (`layer_query`, the same scan and tracking window, through the same
+    /// [`Self::cell_product`] and its cache), the target scan's cells whose
+    /// footprint outline contains the pixel's centre. Footprints never
+    /// overlap, so that is at most one cell, unless simplification makes
+    /// two outlines touch; then the larger first (label order).
+    ///
+    /// Runs on the query runtime GetFeatureInfo reads on, where
+    /// `block_in_place` is valid, so it passes no `spawn_blocking` handle
+    /// (`blocking_pixel_handle`'s contract).
+    pub(crate) fn pick_cells(
+        &self,
+        pick: &FeaturePick<'_>,
+    ) -> Result<PickedFeatures, DataServerError> {
+        let query = layer_query(&self.cells_quantity()?, pick.time);
+        let product = self.cell_product(&query, None)?;
+        Ok(picked_cells(&product, pick))
+    }
+}
+
+/// The target scan's cells of `product` whose outline holds `pick`'s
+/// centre, each with its track's motion: the Features-style properties of
+/// a tracked cell that the per-site product has.
+fn picked_cells(product: &CellProduct, pick: &FeaturePick<'_>) -> PickedFeatures {
+    let (target_time, target) = product.target();
+    let hits: Vec<(&StormCell, Geometry)> = target
+        .cells
+        .iter()
+        .map(|cell| {
+            let outline = Geometry::Polygon {
+                exterior: cell.footprint.clone(),
+                holes: Vec::new(),
+            };
+            (cell, outline)
+        })
+        .filter(|(_, outline)| pick.hits(outline))
+        .collect();
+    let number_matched = hits.len();
+    let features = hits
+        .into_iter()
+        .take(pick.limit)
+        .map(|(cell, outline)| {
+            let track = product.tracks.track_for(*target_time, cell.label);
+            picked_cell(cell, outline, track, *target_time)
+        })
+        .collect();
+    PickedFeatures {
+        features,
+        number_matched,
+    }
+}
+
+/// One picked cell: its track's id, its outline, and its properties under
+/// the names the nowcast's cell Features use where it has the same fact,
+/// at the precision a reader needs. Severity and significance are the
+/// nowcast tracker's facts and are not served here: the per-site product
+/// has neither.
+fn picked_cell(
+    cell: &StormCell,
+    outline: Geometry,
+    track: Option<&Track>,
+    observed: DateTime<Utc>,
+) -> PickedFeature {
+    fn round(value: f64, places: i32) -> PropertyValue {
+        let scale = 10f64.powi(places);
+        PropertyValue::Float((value * scale).round() / scale)
+    }
+    let motion = track.and_then(Track::speed_direction);
+    let id = track.map_or_else(
+        || format!("{}-{}", observed.format("%Y%m%dT%H%M%SZ"), cell.label),
+        |track| track.id.clone(),
+    );
+    PickedFeature {
+        id,
+        geometry: Arc::new(outline),
+        properties: vec![
+            (
+                "observed".into(),
+                PropertyValue::String(observed.to_rfc3339_opts(SecondsFormat::Secs, true)),
+            ),
+            ("max_dbz".into(), round(cell.max_dbz, 1)),
+            ("area_km2".into(), round(cell.area_km2, 1)),
+            (
+                "speed_ms".into(),
+                motion.map_or(PropertyValue::Null, |(speed, _)| round(speed, 1)),
+            ),
+            (
+                "bearing_deg".into(),
+                motion.map_or(PropertyValue::Null, |(_, bearing)| round(bearing, 0)),
+            ),
+            ("echo_top_m".into(), round(cell.echo_top_m, 0)),
+            ("base_m".into(), round(cell.base_m, 0)),
+            ("volume_km3".into(), round(cell.volume_km3, 1)),
+            ("vil_kg_m2".into(), round(cell.max_vil_kg_m2, 1)),
+        ],
     }
 }
 
@@ -671,6 +776,114 @@ mod tests {
             points,
             motion_ms: Some((1.0, 0.0)),
         }
+    }
+
+    /// WMS GetFeatureInfo on `CELLS` (#1100): the target scan's cell whose
+    /// outline holds the pixel's centre, with its track's id and motion; a
+    /// cell of an earlier scan of the window is neither drawn nor picked.
+    #[test]
+    fn picks_the_cell_whose_outline_holds_the_pixel() {
+        use ds_core::feature::PropertyValue;
+        let target_time = t(10);
+        let earlier = Arc::new(CellSet {
+            time: t(5),
+            quantity: "DBZH".into(),
+            threshold: 35.0,
+            origin: [25.0, 60.0, 100.0],
+            cells: vec![cell(1, 24.5, 60.25)],
+        });
+        let target = Arc::new(CellSet {
+            time: target_time,
+            quantity: "DBZH".into(),
+            threshold: 35.0,
+            origin: [25.0, 60.0, 100.0],
+            cells: vec![cell(1, 25.0, 60.0), cell(2, 24.0, 60.5)],
+        });
+        let product = CellProduct {
+            cell_sets: vec![(t(5), earlier), (target_time, target)],
+            tracks: TrackSet {
+                // Moving east at 1 m/s; cell 2 has no track.
+                tracks: vec![track(0, 10, 1, (25.4, 60.0), (25.0, 60.0))],
+            },
+        };
+        let pick = |lon: f64, lat: f64, limit: usize| FeaturePick {
+            parameter: Some(CELLS_PARAMETER),
+            map: ds_core::feature_pick::PickMap {
+                output_crs: &OutputCrs::Wgs84,
+                wgs84_bbox: [lon - 0.001, lat - 0.001, lon + 0.001, lat + 0.001],
+                width: 1,
+                height: 1,
+            },
+            pixel: (0, 0),
+            point: (lon, lat),
+            time: None,
+            reference_time: None,
+            z: None,
+            limit,
+        };
+        let property = |feature: &PickedFeature, name: &str| {
+            feature
+                .properties
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no {name}"))
+        };
+
+        let picked = picked_cells(&product, &pick(25.1, 60.1, 10));
+        assert_eq!(picked.number_matched, 1);
+        let cell = &picked.features[0];
+        assert_eq!(cell.id, "trk-1");
+        let names: Vec<&str> = cell.properties.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "observed",
+                "max_dbz",
+                "area_km2",
+                "speed_ms",
+                "bearing_deg",
+                "echo_top_m",
+                "base_m",
+                "volume_km3",
+                "vil_kg_m2"
+            ]
+        );
+        assert_eq!(
+            property(cell, "observed"),
+            PropertyValue::String("2026-06-01T12:10:00Z".into())
+        );
+        assert_eq!(property(cell, "max_dbz"), PropertyValue::Float(45.0));
+        assert_eq!(property(cell, "area_km2"), PropertyValue::Float(25.0));
+        assert_eq!(property(cell, "speed_ms"), PropertyValue::Float(1.0));
+        assert_eq!(property(cell, "bearing_deg"), PropertyValue::Float(90.0));
+        assert_eq!(property(cell, "echo_top_m"), PropertyValue::Float(8000.0));
+        assert_eq!(property(cell, "vil_kg_m2"), PropertyValue::Float(10.0));
+        // The outline is the footprint ring.
+        match &*cell.geometry {
+            Geometry::Polygon { exterior, holes } => {
+                assert_eq!(exterior.len(), 5);
+                assert!(holes.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Untracked: an id from the scan and label, and no motion known.
+        let picked = picked_cells(&product, &pick(24.0, 60.5, 10));
+        assert_eq!(picked.features[0].id, "20260601T121000Z-2");
+        assert_eq!(
+            property(&picked.features[0], "speed_ms"),
+            PropertyValue::Null
+        );
+        assert_eq!(
+            property(&picked.features[0], "bearing_deg"),
+            PropertyValue::Null
+        );
+
+        // Between the outlines, where only the earlier scan had a cell.
+        let picked = picked_cells(&product, &pick(24.5, 60.25, 10));
+        assert_eq!(picked.number_matched, 0);
+        assert!(picked.features.is_empty());
     }
 
     /// The orphan-trail fix (#367 user report): a trail is painted only when

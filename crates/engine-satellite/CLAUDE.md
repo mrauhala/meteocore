@@ -236,7 +236,8 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     `CompositeDef::parameters()` to `get_raster_tiles` and composing the
     tiles with `ds_render::CompositeSpec::from(&def)`, whose planes follow
     that order. WMS, Maps and Tiles do exactly that, keyed on
-    `resolve_parameter_time(Some(<composite>))`.
+    `resolve_parameter_time(Some(<composite>))`. WMS GetFeatureInfo reads
+    each band with one EDR position query at that same scan (#1100).
 - **Built-in recipes resolve in ds-core, through one path.**
   `recipe = "airmass"` / `"night_microphysics"` stands for the red, green
   and blue channels written out.

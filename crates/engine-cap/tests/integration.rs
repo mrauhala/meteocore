@@ -831,3 +831,220 @@ fn awareness_codes_select_three_types_across_capitalization_before_paging() {
     query.property_filters = vec![("awareness_type".into(), "3; Thunderstorm".into())];
     assert_eq!(eng.get_features(&query).unwrap().number_matched, 1);
 }
+
+// ---------------------------------------------------------------------------
+// WMS GetFeatureInfo picks (#1100)
+// ---------------------------------------------------------------------------
+
+/// A pick of the pixel centred on `(lon, lat)`, 0.01° square, at `time`.
+fn pick_at(
+    (lon, lat): (f64, f64),
+    time: Option<DateTime<Utc>>,
+    limit: usize,
+) -> ds_core::feature_pick::FeaturePick<'static> {
+    let h = 0.005;
+    ds_core::feature_pick::FeaturePick {
+        parameter: Some("severity"),
+        map: ds_core::feature_pick::PickMap {
+            output_crs: &OutputCrs::Wgs84,
+            wgs84_bbox: [lon - h, lat - h, lon + h, lat + h],
+            width: 1,
+            height: 1,
+        },
+        pixel: (0, 0),
+        point: (lon, lat),
+        time,
+        reference_time: None,
+        z: None,
+        limit,
+    }
+}
+
+fn picked_ids(picked: &ds_core::feature_pick::PickedFeatures) -> Vec<&str> {
+    picked.features.iter().map(|f| f.id.as_str()).collect()
+}
+
+/// The alerts whose areas contain the point, most severe first, each with
+/// its key properties in order; `limit` keeps the first and counts all.
+#[test]
+fn picks_the_alerts_whose_areas_contain_the_point() {
+    let eng = engine(Some("en"));
+    assert!(eng.layer_picks_features("severity"));
+
+    // (25.0, 60.2) lies in the flood polygon (Severe) and the 8 km heat
+    // circle (Extreme): the map draws Extreme there.
+    let picked = eng.pick_features(&pick_at((25.0, 60.2), None, 10)).unwrap();
+    assert_eq!(picked.number_matched, 2);
+    let ids = picked_ids(&picked);
+    assert!(ids[0].contains("helsinki-heat"), "{ids:?}");
+    assert!(ids[1].contains("helsinki-flood"), "{ids:?}");
+
+    let flood = &picked.features[1];
+    let names: Vec<&str> = flood.properties.iter().map(|(n, _)| n.as_str()).collect();
+    // No <expires> in the fixture: the property is left out, not invented.
+    assert_eq!(
+        names,
+        [
+            "event",
+            "severity",
+            "urgency",
+            "certainty",
+            "headline",
+            "onset",
+            "areaDesc",
+            "identifier",
+            "web"
+        ]
+    );
+    let value = |name: &str| {
+        flood
+            .properties
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, v)| v.as_str())
+    };
+    assert_eq!(value("event"), Some("Flood Warning"));
+    // The CAP severity, not the producer parameter of the same name.
+    assert_eq!(value("severity"), Some("Severe"));
+    assert_eq!(value("areaDesc"), Some("Greater Helsinki"));
+    assert_eq!(value("identifier"), Some("urn:test:helsinki-flood-1"));
+    assert_eq!(
+        value("web"),
+        Some("https://meteocore.example/alerts/helsinki-flood-1")
+    );
+    // The geometry is the Features item's.
+    let item = eng.get_feature(&flood.id).unwrap();
+    assert!(matches!(&*flood.geometry, Geometry::Polygon { .. }));
+    assert_eq!(flood.geometry.bbox(), item.geometry.bbox());
+
+    let first = eng.pick_features(&pick_at((25.0, 60.2), None, 1)).unwrap();
+    assert_eq!(first.number_matched, 2);
+    assert_eq!(picked_ids(&first), ids[..1]);
+
+    // Only in the flood polygon; then outside every area.
+    let picked = eng
+        .pick_features(&pick_at((24.92, 60.12), None, 10))
+        .unwrap();
+    assert_eq!(picked.number_matched, 1);
+    assert!(picked_ids(&picked)[0].contains("helsinki-flood"));
+    let picked = eng.pick_features(&pick_at((24.8, 60.4), None, 10)).unwrap();
+    assert_eq!(picked.number_matched, 0);
+    assert!(picked.features.is_empty());
+}
+
+/// The time rule is the map's: an area is picked at an instant exactly when
+/// GetMap draws it then, at the pixel's centre.
+#[test]
+fn picks_follow_the_instant_the_map_draws() {
+    let eng = engine(Some("en"));
+    let storm_bbox = [25.4, 60.9, 26.1, 61.6];
+    // Pixel (35, 35) of a 70 × 70 CRS:84 tile: centre (25.755, 61.245).
+    let (i, j) = (35usize, 35usize);
+    let centre = (
+        25.4 + 0.01 * (i as f64 + 0.5),
+        61.6 - 0.01 * (j as f64 + 0.5),
+    );
+    for (time, drawn) in [
+        (at(2026, 6, 15, 9), false),
+        (at(2026, 6, 15, 10), true),
+        (at(2026, 6, 15, 12), true),
+        (at(2026, 6, 15, 16), true),
+        (at(2026, 6, 15, 17), false),
+    ] {
+        let tile = eng
+            .get_raster_tile(
+                storm_bbox,
+                70,
+                70,
+                Some(time),
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(tile.values.value_at(j * 70 + i).is_some(), drawn, "{time}");
+        let picked = eng.pick_features(&pick_at(centre, Some(time), 10)).unwrap();
+        assert_eq!(picked.number_matched, usize::from(drawn), "{time}");
+        if drawn {
+            assert!(picked_ids(&picked)[0].contains("storm-window"));
+        }
+    }
+}
+
+/// Seam test box 170,10,-170,20: an area either side of 180° is picked at
+/// a point on its side, and a zone polygon stored across 180° unwrapped
+/// (178..182°E, from a geocode lookup) on both sides, at 179.5°E and at
+/// its world copy's 179.5°W, where the map draws it.
+#[test]
+fn picks_areas_on_both_sides_of_the_antimeridian() {
+    let dir = tempfile::tempdir().unwrap();
+    let xml = include_str!("fixtures/helsinki-flood.xml");
+    for (name, polygon) in [
+        ("east", "15,175 15,176 16,176 16,175 15,175"),
+        ("west", "15,-176 15,-175 16,-175 16,-176 15,-176"),
+    ] {
+        let a = xml.find("<polygon>").unwrap() + "<polygon>".len();
+        let b = xml.find("</polygon>").unwrap();
+        let moved = xml
+            .replace(&xml[a..b], polygon)
+            .replace("urn:test:helsinki-flood-1", name);
+        std::fs::write(dir.path().join(name).with_extension("xml"), moved).unwrap();
+    }
+    let unwrapped = r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+      <identifier>unwrapped</identifier><status>Actual</status>
+      <sent>2020-01-01T00:00:00Z</sent>
+      <info><event>Gale warning</event><severity>Moderate</severity>
+        <onset>2020-01-01T00:00:00Z</onset>
+        <area><areaDesc>Dateline</areaDesc>
+          <geocode><valueName>EMMA_ID</valueName><value>XX001</value></geocode>
+        </area></info></alert>"#;
+    std::fs::write(dir.path().join("unwrapped.xml"), unwrapped).unwrap();
+    let zones = tempfile::tempdir().unwrap();
+    let lookup = zones.path().join("zones.geojson");
+    std::fs::write(
+        &lookup,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature",
+          "properties":{"code":"XX001"},"geometry":{"type":"Polygon",
+          "coordinates":[[[178,11],[182,11],[182,12],[178,12],[178,11]]]}}]}"#,
+    )
+    .unwrap();
+    let mut cfg = config_for(dir.path().to_str().unwrap(), None);
+    cfg.geocode_geometry = Some(lookup.to_str().unwrap().to_string());
+    let eng = CapEngine::new(&cfg, "cap").unwrap();
+
+    // The map draws the zone at its copy: 1° pixels over 190..170°W, the
+    // pixel centred on (-179.5, 11.5) is column 10, row 8.
+    let tile = eng
+        .get_raster_tile(
+            [-190.0, 10.0, -170.0, 20.0],
+            20,
+            10,
+            None,
+            &OutputCrs::Wgs84,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(tile.values.value_at(8 * 20 + 10), Some(2.0));
+
+    for (point, expected) in [
+        ((175.5, 15.5), Some("east")),
+        ((-175.5, 15.5), Some("west")),
+        ((-179.5, 11.5), Some("unwrapped")),
+        ((179.5, 11.5), Some("unwrapped")),
+        ((-177.5, 11.5), None),
+        ((179.9, 15.5), None),
+    ] {
+        let picked = eng.pick_features(&pick_at(point, None, 10)).unwrap();
+        let ids = picked_ids(&picked);
+        match expected {
+            Some(name) => {
+                assert_eq!(ids.len(), 1, "{point:?}: {ids:?}");
+                assert!(ids[0].contains(name), "{point:?}: {ids:?}");
+            }
+            None => assert!(ids.is_empty(), "{point:?}: {ids:?}"),
+        }
+    }
+}

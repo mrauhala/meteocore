@@ -19,7 +19,10 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{check_mask_budget, parse_area_coords, QueryPolygon};
+use ds_core::feature::{
+    check_mask_budget, parse_area_coords, Geometry, PropertyValue, QueryPolygon,
+};
+use ds_core::feature_pick::{FeaturePick, PickedFeature, PickedFeatures};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, LocationSnapshot, NdArray, ParameterDescription,
     QueryResult,
@@ -31,10 +34,10 @@ use crate::config::PostgisEngineConfig;
 use crate::health::{Health, HealthSnapshot, HealthStatus, LiveHealth};
 use crate::metadata::{CollectionMeta, LocationsCut, MetadataCache};
 use crate::query::{
-    build_area_set, build_events_area, build_events_window, build_location, build_position,
-    build_stations_in_polygon, first_observation_column, params_as_refs, BuiltQuery, WindowAttrs,
-    DEFAULT_POSITION_RADIUS_M, MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES,
-    MAX_STATIONS_IN_POLYGON, SET_BASED_MAX_WINDOW,
+    build_area_set, build_events_area, build_events_pick, build_events_window, build_location,
+    build_position, build_stations_in_polygon, first_observation_column, params_as_refs,
+    BuiltQuery, WindowAttrs, DEFAULT_POSITION_RADIUS_M, MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS,
+    MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON, SET_BASED_MAX_WINDOW,
 };
 use crate::schema::{EventsShape, ObservationSchema};
 use crate::station_map::StationSymbols;
@@ -543,6 +546,157 @@ impl PostgisEngine {
             &key_refs,
             events,
         )))
+    }
+
+    /// WMS GetFeatureInfo on the events layer (#1100): the events whose
+    /// disc a map frame at `pick.time` draws over the picked pixel. The
+    /// frame's window is the render's, `(end - window, end]` with `end` from
+    /// [`crate::maps::resolve_window_end`]; no data yet is an empty answer.
+    /// The place is [`crate::maps::pick_region`]: the picked pixel grown by
+    /// the disc each strike is drawn as, on the map's grid, so a click
+    /// anywhere on a drawn disc finds its strike. One statement
+    /// ([`build_events_pick`]) on the engine's EDR bridge, `block_in_place`
+    /// on the query runtime GetFeatureInfo reads on, never the map's
+    /// `spawn_blocking` one. Newest first, at most `pick.limit`, every event
+    /// in the region counted. Each event answers its time, its id
+    /// (`id_col`), every configured parameter by name (filtered as EDR
+    /// filters it), its `type` from `cloud_indicator_col` and its
+    /// `peak_current_ka` from `peak_current_col` when declared and no
+    /// parameter already reads that column.
+    pub(crate) fn pick_events(
+        &self,
+        shape: &EventsShape,
+        pick: &FeaturePick<'_>,
+    ) -> Result<PickedFeatures, DataServerError> {
+        self.require_validated()?;
+        let meta = self.load_meta();
+        let Some(end) =
+            crate::maps::resolve_window_end(&meta, pick.time, crate::maps::EVENTS_TIME_STEP)
+        else {
+            return Ok(PickedFeatures::default());
+        };
+        let window = self
+            .config
+            .events_default_window
+            .unwrap_or_else(|| chrono::Duration::hours(crate::config::DEFAULT_EVENTS_WINDOW_HOURS));
+        let source_keys = resolve_source_keys(&self.config, None)?;
+        let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
+        let built = build_events_pick(
+            shape,
+            &self.config.parameters,
+            &footprint_wkt(pick),
+            (end - window, end),
+            &key_refs,
+            pick.limit,
+        )
+        .map_err(|e| DataServerError::Engine(format!("build_events_pick: {e}")))?;
+        let rows = run_single_query_sync(&self.pool, built)?;
+        for row in &rows {
+            self.check_geometry_row(row)?;
+        }
+        let number_matched = match rows.first() {
+            Some(row) => row
+                .try_get::<_, i64>("mc_matched")
+                .map_err(|e| DataServerError::Engine(format!("decode event count: {e}")))?
+                .max(0) as usize,
+            None => 0,
+        };
+        let peak_current_column = shape
+            .peak_current_col
+            .as_deref()
+            .filter(|col| !source_keys.iter().any(|key| key == col));
+        let mut features = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let time: DateTime<Utc> = row
+                .try_get("time")
+                .map_err(|e| DataServerError::Engine(format!("decode event time: {e}")))?;
+            let lon: Option<f64> = row
+                .try_get("lon")
+                .map_err(|e| DataServerError::Engine(format!("decode event lon: {e}")))?;
+            let lat: Option<f64> = row
+                .try_get("lat")
+                .map_err(|e| DataServerError::Engine(format!("decode event lat: {e}")))?;
+            // A degenerate geometry (ST_X of POINT EMPTY) has no position:
+            // counted, as the database counted it, but not listed.
+            let (Some(lon), Some(lat)) = (lon, lat) else {
+                continue;
+            };
+            let id: Option<String> = row
+                .try_get("mc_id")
+                .map_err(|e| DataServerError::Engine(format!("decode event id: {e}")))?;
+            let number =
+                |value: Option<f64>| value.map_or(PropertyValue::Null, PropertyValue::Float);
+            let mut properties = vec![(
+                "time".to_string(),
+                PropertyValue::String(time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+            )];
+            for key in &key_refs {
+                let value: Option<f64> = row
+                    .try_get(*key)
+                    .map_err(|e| DataServerError::Engine(format!("decode event {key}: {e}")))?;
+                properties.push((source_key_to_param_name(&self.config, key), number(value)));
+            }
+            if shape.cloud_indicator_col.is_some() {
+                let value = row
+                    .try_get::<_, Option<f64>>("mc_cloud_indicator")
+                    .map_err(|e| {
+                        DataServerError::Engine(format!("decode event cloud indicator: {e}"))
+                    })?;
+                properties.push(("type".to_string(), strike_type(value)));
+            }
+            if peak_current_column.is_some() {
+                let value = row
+                    .try_get::<_, Option<f64>>("mc_peak_current")
+                    .map_err(|e| {
+                        DataServerError::Engine(format!("decode event peak current: {e}"))
+                    })?;
+                properties.push(("peak_current_ka".to_string(), number(value)));
+            }
+            features.push(PickedFeature {
+                id: id.unwrap_or_default(),
+                geometry: Arc::new(Geometry::Point { x: lon, y: lat }),
+                properties,
+            });
+        }
+        Ok(PickedFeatures {
+            features,
+            number_matched,
+        })
+    }
+}
+
+/// A strike's `type` from its `cloud_indicator_col` value: 0 cloud-to-ground,
+/// 1 intra-cloud, as the README documents the column; any other value as
+/// the number it is, a NULL as null.
+fn strike_type(value: Option<f64>) -> PropertyValue {
+    match value {
+        Some(0.0) => PropertyValue::String("cloud-to-ground".into()),
+        Some(1.0) => PropertyValue::String("intra-cloud".into()),
+        Some(v) => PropertyValue::Float(v),
+        None => PropertyValue::Null,
+    }
+}
+
+/// The pick's region ([`crate::maps::pick_region`]: the picked pixel grown
+/// by the strike disc the map draws) as WKT for `ST_GeomFromText(.., 4326)`:
+/// one polygon, and when it passes ±180 its copy a turn back as a second,
+/// so events stored in −180..=180 on both sides of the antimeridian are
+/// found. A bind value, never SQL text.
+fn footprint_wkt(pick: &FeaturePick<'_>) -> String {
+    let polygon = |ring: &Vec<[f64; 2]>| {
+        let points: Vec<String> = ring
+            .iter()
+            .map(|[lon, lat]| format!("{lon} {lat}"))
+            .collect();
+        format!("(({}))", points.join(","))
+    };
+    let rings = crate::maps::pick_region(pick);
+    match rings.as_slice() {
+        [ring] => format!("POLYGON{}", polygon(ring)),
+        rings => format!(
+            "MULTIPOLYGON({})",
+            rings.iter().map(polygon).collect::<Vec<_>>().join(",")
+        ),
     }
 }
 
@@ -1932,6 +2086,52 @@ mod tests {
         assert!(out.starts_with("POLYGON(("));
         // 5 points: 4 corners + closing repeat.
         assert_eq!(out.matches(',').count(), 4);
+    }
+
+    /// #1100: a pick's region is one polygon of the 13 pixels a strike's
+    /// disc reaches the picked pixel from, two across the antimeridian (its
+    /// copy a turn back), and a strike's `type` follows the documented cloud
+    /// indicator.
+    #[test]
+    fn pick_footprint_wkt_and_strike_type() {
+        let pick = |west: f64, output_crs| FeaturePick {
+            parameter: None,
+            // 1° pixels, the picked one west..west + 1, 0..1°N.
+            map: ds_core::feature_pick::PickMap {
+                output_crs,
+                wgs84_bbox: [west - 5.0, -5.0, west + 5.0, 5.0],
+                width: 10,
+                height: 10,
+            },
+            pixel: (5, 4),
+            point: (ds_core::geo::wrap_lon(west + 0.5), 0.5),
+            time: None,
+            reference_time: None,
+            z: None,
+            limit: 1,
+        };
+        let wgs84 = ds_core::map_engine::OutputCrs::Wgs84;
+        assert_eq!(
+            footprint_wkt(&pick(24.0, &wgs84)),
+            "POLYGON((24 3,25 3,25 2,26 2,26 1,27 1,27 0,26 0,26 -1,25 -1,25 -2,\
+             24 -2,24 -1,23 -1,23 0,22 0,22 1,23 1,23 2,24 2,24 3))"
+        );
+        let seam = footprint_wkt(&pick(179.5, &wgs84));
+        assert!(
+            seam.starts_with("MULTIPOLYGON(((179.5 3,180.5 3,"),
+            "{seam}"
+        );
+        assert!(seam.contains(")),((-180.5 3,-179.5 3,"), "{seam}");
+        assert_eq!(
+            strike_type(Some(0.0)),
+            PropertyValue::String("cloud-to-ground".into())
+        );
+        assert_eq!(
+            strike_type(Some(1.0)),
+            PropertyValue::String("intra-cloud".into())
+        );
+        assert_eq!(strike_type(Some(2.0)), PropertyValue::Float(2.0));
+        assert_eq!(strike_type(None), PropertyValue::Null);
     }
 
     #[test]

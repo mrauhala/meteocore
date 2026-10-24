@@ -1399,6 +1399,181 @@ async fn value_filters_events_shape() {
     exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
 }
 
+const PICK_EVENTS: &str = "
+DROP SCHEMA IF EXISTS __S__ CASCADE;
+CREATE SCHEMA __S__;
+CREATE TABLE __S__.strikes (
+    id bigint PRIMARY KEY,
+    time timestamptz NOT NULL,
+    geom geometry(Point, 4326) NOT NULL,
+    peak_current real,
+    cloud smallint
+);
+INSERT INTO __S__.strikes VALUES
+    (1, '2026-01-01 05:30:00+00', ST_SetSRID(ST_MakePoint(1.002, 1.008), 4326), -12.5, 0),
+    (2, '2026-01-01 05:40:00+00', ST_SetSRID(ST_MakePoint(1.005, 1.005), 4326), 900, 1),
+    (3, '2026-01-01 05:00:00+00', ST_SetSRID(ST_MakePoint(1.003, 1.004), 4326), 5, 0),
+    (4, '2026-01-01 05:50:00+00', ST_SetSRID(ST_MakePoint(1.055, 1.055), 4326), 6, 0),
+    (5, '2026-01-01 06:01:00+00', ST_SetSRID(ST_MakePoint(1.005, 1.005), 4326), 7, 0),
+    (6, '2026-01-01 05:45:00+00', ST_SetSRID(ST_MakePoint(1.007, 1.002), 4326), NULL, NULL),
+    (7, '2026-01-01 05:55:00+00', ST_SetSRID(ST_MakePoint(-179.998, 1.005), 4326), 8, 1);
+CREATE INDEX ON __S__.strikes (time);
+ANALYZE;
+";
+
+/// #1100: WMS GetFeatureInfo on the lightning layer picks the strikes whose
+/// disc a frame draws over the pixel: the frame's half-open window
+/// `(TIME - PT1H, TIME]` (05:00 out, 06:01 out), on 0.01° pixels a disc of
+/// radius 2 around each strike's own pixel (a click on its edge pixel finds
+/// it, one just past does not), newest first, `limit` kept and every strike
+/// counted, each with its time, id, filtered parameter and `type`; a pixel
+/// beside the antimeridian finds the strike stored at -179.998 through the
+/// region's copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_pick_shape() {
+    use ds_core::feature::PropertyValue;
+    use ds_core::feature_pick::{FeaturePick, PickMap};
+    use ds_core::map_engine::{MapEngine, OutputCrs};
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let schema = "mc1100_events";
+    let client = connect(&dsn).await;
+    {
+        let _setup = SETUP.lock().await;
+        exec(&client, schema, "CREATE EXTENSION IF NOT EXISTS postgis;").await;
+        exec(&client, schema, PICK_EVENTS).await;
+    }
+    let mut cfg = config(
+        None,
+        PostgisObservationsConfig {
+            table: Some(format!("{schema}.strikes")),
+            time_col: Some("time".into()),
+            geom_col: Some("geom".into()),
+            id_col: Some("id".into()),
+            cloud_indicator_col: Some("cloud".into()),
+            peak_current_col: Some("peak_current".into()),
+            extent_bbox: Some([-180.0, 0.0, 180.0, 10.0]),
+            ..observations("events")
+        },
+    );
+    cfg.parameters = vec![PostgisParameterConfig {
+        name: "peak_current".into(),
+        label: "Peak current".into(),
+        unit: "kA".into(),
+        observed_property: None,
+        source_key: None,
+        valid_range: Some(vec![-300.0, 300.0]),
+        missing_values: vec![],
+    }];
+    let engine = engine(schema, &cfg).await;
+    assert!(engine.layer_picks_features("lightning_age"));
+
+    // Pixel (i, j) of a 10 × 10 CRS:84 map of 0.01° pixels from `west`°E,
+    // 1.0°N, centred as api-wms centres it; TIME floors to 06:00.
+    let output_crs = OutputCrs::Wgs84;
+    let pick_on = |west: f64, (i, j): (u32, u32), limit: usize| {
+        let bbox = [west, 1.0, west + 0.1, 1.1];
+        let (lon, lat) = output_crs.project_node(
+            bbox,
+            (f64::from(i) + 0.5) / 10.0,
+            (f64::from(j) + 0.5) / 10.0,
+        );
+        FeaturePick {
+            parameter: Some("lightning_age"),
+            map: PickMap {
+                output_crs: &output_crs,
+                wgs84_bbox: bbox,
+                width: 10,
+                height: 10,
+            },
+            pixel: (i, j),
+            point: (ds_core::geo::wrap_lon(lon), lat),
+            time: Some("2026-01-01T06:00:30Z".parse().unwrap()),
+            reference_time: None,
+            z: None,
+            limit,
+        }
+    };
+    let picked_ids = |picked: &ds_core::feature_pick::PickedFeatures| -> Vec<String> {
+        picked.features.iter().map(|f| f.id.clone()).collect()
+    };
+    // Strikes 1, 2 and 6 lie in pixel (0, 9), 1.00..1.01°E, 1.00..1.01°N.
+    let pixel = |west: f64, limit: usize| pick_on(west, (0, 9), limit);
+    let picked = engine.pick_features(&pixel(1.0, 2)).expect("pick");
+    assert_eq!(picked.number_matched, 3, "strikes 2, 6 and 1");
+    let ids: Vec<&str> = picked.features.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(ids, ["6", "2"], "newest first, the limit kept");
+    let all = engine.pick_features(&pixel(1.0, 10)).expect("pick");
+    let strike = all.features.iter().find(|f| f.id == "1").expect("strike 1");
+    assert_eq!(
+        strike.properties,
+        vec![
+            (
+                "time".to_string(),
+                PropertyValue::String("2026-01-01T05:30:00Z".into())
+            ),
+            ("peak_current".to_string(), PropertyValue::Float(-12.5)),
+            (
+                "type".to_string(),
+                PropertyValue::String("cloud-to-ground".into())
+            ),
+        ],
+        "a parameter reads peak_current, so no peak_current_ka"
+    );
+    let two = all.features.iter().find(|f| f.id == "2").unwrap();
+    assert_eq!(
+        two.properties[1].1,
+        PropertyValue::Null,
+        "900 kA is out of range"
+    );
+    assert_eq!(
+        two.properties[2].1,
+        PropertyValue::String("intra-cloud".into())
+    );
+    match &*strike.geometry {
+        ds_core::feature::Geometry::Point { x, y } => {
+            assert!((x - 1.002).abs() < 1e-9 && (y - 1.008).abs() < 1e-9)
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Before the first strike's window: nothing, an empty answer.
+    let mut early = pixel(1.0, 10);
+    early.time = Some("2026-01-01T04:00:00Z".parse().unwrap());
+    let none = engine.pick_features(&early).expect("pick");
+    assert_eq!(none.number_matched, 0);
+    assert!(none.features.is_empty());
+
+    // Strike 4 lies in pixel (5, 4). Its disc reaches two pixels across,
+    // one diagonally: (7, 4) and (5, 2) are its edge pixels, (7, 5) and
+    // (8, 4) just past it.
+    for (pixel, found) in [
+        ((5, 4), true),
+        ((7, 4), true),
+        ((5, 2), true),
+        ((6, 5), true),
+        ((7, 5), false),
+        ((8, 4), false),
+    ] {
+        let picked = engine
+            .pick_features(&pick_on(1.0, pixel, 10))
+            .expect("pick");
+        let expected: Vec<String> = if found { vec!["4".into()] } else { Vec::new() };
+        assert_eq!(picked_ids(&picked), expected, "{pixel:?}");
+    }
+    // The strike stored at -179.998 lies in 180.00..180.01°E, pixel (5, 9)
+    // of the map from 179.95°E. A click on pixel (4, 9), 179.99..180.00°E,
+    // centred east of 180°, finds it through the region's copy.
+    for (pixel, expected) in [((5, 9), vec!["7"]), ((4, 9), vec!["7"]), ((2, 9), vec![])] {
+        let picked = engine
+            .pick_features(&pick_on(179.95, pixel, 10))
+            .expect("pick");
+        assert_eq!(picked_ids(&picked), expected, "{pixel:?}");
+    }
+    exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
+}
+
 #[path = "support/schema_validation.rs"]
 mod schema_validation;
 

@@ -5909,9 +5909,32 @@ impl MapEngine for PolarVolumeSiteView {
     }
 
     /// The CELLS overlay (#367) draws tracked storm cells, not a moment: no
-    /// position query answers it, so WMS GetFeatureInfo does not (#1064).
+    /// position query answers it (#1064); WMS GetFeatureInfo picks its cells
+    /// instead (`pick_features`, #1100).
     fn layer_shows_values(&self, parameter: &str) -> bool {
         parameter != crate::cells::CELLS_PARAMETER
+    }
+
+    /// The CELLS overlay draws storm cells, which WMS GetFeatureInfo picks
+    /// (#1100).
+    fn layer_picks_features(&self, parameter: &str) -> bool {
+        parameter == crate::cells::CELLS_PARAMETER
+    }
+
+    /// The tracked cell whose outline the CELLS overlay draws around the
+    /// picked pixel ([`PolarVolumeSiteView::pick_cells`]).
+    fn pick_features(
+        &self,
+        pick: &ds_core::feature_pick::FeaturePick<'_>,
+    ) -> Result<ds_core::feature_pick::PickedFeatures, DataServerError> {
+        if pick.parameter != Some(crate::cells::CELLS_PARAMETER) {
+            return Err(DataServerError::InvalidParameter(format!(
+                "[{}] only the {} layer draws features to pick",
+                self.collection_id,
+                crate::cells::CELLS_PARAMETER
+            )));
+        }
+        self.pick_cells(pick)
     }
 
     /// The sweep angle `get_raster_tile` draws, through the SAME

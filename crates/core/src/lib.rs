@@ -11,6 +11,7 @@ pub mod error;
 pub mod events;
 pub mod feature;
 pub mod feature_engine;
+pub mod feature_pick;
 pub mod geo;
 pub mod geopotential;
 pub mod health;

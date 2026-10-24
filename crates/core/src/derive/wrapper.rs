@@ -11,6 +11,7 @@ use crate::cube::CubeResolution;
 use crate::edr_engine::{EdrEngine, ItemRadius, LocationFilter, TrajectoryShape};
 use crate::error::DataServerError;
 use crate::feature::{Bbox, DatetimeInterval, Feature, MAX_AREA_VALUES};
+use crate::feature_pick::{FeaturePick, PickedFeatures};
 use crate::instances::RunInfo;
 use crate::map_engine::{
     CompositeDef, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile, RasterValues,
@@ -884,6 +885,21 @@ impl MapEngine for Derived {
     /// query derives too; every other layer is the wrapped engine's.
     fn layer_shows_values(&self, parameter: &str) -> bool {
         self.plan().get(parameter).is_some() || self.map.layer_shows_values(parameter)
+    }
+
+    /// A derived parameter shows values and draws no features; every other
+    /// layer is the wrapped engine's.
+    fn layer_picks_features(&self, parameter: &str) -> bool {
+        self.plan().get(parameter).is_none() && self.map.layer_picks_features(parameter)
+    }
+
+    fn pick_features(&self, pick: &FeaturePick<'_>) -> Result<PickedFeatures, DataServerError> {
+        if pick.parameter.is_some_and(|p| self.plan().get(p).is_some()) {
+            return Err(DataServerError::InvalidParameter(
+                "a derived parameter draws no features to pick".into(),
+            ));
+        }
+        self.map.pick_features(pick)
     }
 
     /// A derived parameter is drawn from its inputs at the `z` it is passed,

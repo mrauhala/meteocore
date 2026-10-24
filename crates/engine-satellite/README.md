@@ -74,7 +74,9 @@ than all of them, and the newest scan without a time; before a product's
 first scan the tile is empty. **RGB composites** are layers of their own,
 not parameters (WMS `<collection>/<composite>`, Maps and Tiles
 `parameter-name=<composite>`). Every band a composite reads comes from the
-same scan, and its time axis holds only the scans every band has.
+same scan, and its time axis holds only the scans every band has. WMS
+GetFeatureInfo answers a composite with each band's value at that scan,
+read by the EDR position query.
 
 **EDR.** `position` is a time series of the pixel under the point (off the
 disk: 404). `area` is a CRS84 grid at the finest selected product's nadir

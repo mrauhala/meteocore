@@ -22,6 +22,8 @@ use api_wms::WmsState;
 use ds_core::config::CollectionConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
+use ds_core::feature::{Geometry, PropertyValue};
+use ds_core::feature_pick::{FeaturePick, PickedFeature, PickedFeatures};
 use ds_core::map_engine::{
     CompositeChannel, CompositeDef, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile,
 };
@@ -696,13 +698,13 @@ async fn a_point_outside_the_map_is_invalid_point() {
     assert!(engine.calls().is_empty());
 }
 
-/// An overlay, an RGB composite and a collection without a position query
-/// are not queryable.
+/// An overlay, and a collection without a position query, its RGB
+/// composite included, are not queryable.
 #[tokio::test]
 async fn layers_no_position_query_answers_are_layer_not_queryable() {
     let engine = Nwp::new(Answer::Value(1.0));
     let app = router(engine.clone());
-    for layer in ["nwp/outline", "nwp/rgb", "plain", "plain/t2m"] {
+    for layer in ["nwp/outline", "plain", "plain/t2m", "plain/rgb"] {
         let reply = get(&app, &gfi(layer, 0, 0, "")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{layer}");
         assert_eq!(
@@ -1056,9 +1058,10 @@ async fn capabilities_advertise_get_feature_info_and_queryable_layers() {
     for (layer, queryable) in [
         ("nwp/t2m", "1"),
         ("nwp/outline", "0"),
-        ("nwp/rgb", "0"),
+        ("nwp/rgb", "1"),
         ("plain/t2m", "0"),
         ("plain/outline", "0"),
+        ("plain/rgb", "0"),
     ] {
         assert_eq!(
             layers.get(layer).map(String::as_str),
@@ -1285,7 +1288,11 @@ async fn every_query_layer_is_shown_and_queryable() {
             "nwp/t2m,plain/t2m",
             "LayerNotQueryable",
         ),
-        ("nwp/t2m,nwp/rgb", "nwp/t2m,nwp/rgb", "LayerNotQueryable"),
+        (
+            "nwp/t2m,nwp/outline",
+            "nwp/t2m,nwp/outline",
+            "LayerNotQueryable",
+        ),
     ] {
         let reply = get(&app, &gfi_layers(layers, query_layers, "")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{query_layers}");
@@ -1394,4 +1401,810 @@ fn several_query_layers_share_one_deadline() {
         .await;
         assert_eq!(two.status, StatusCode::SERVICE_UNAVAILABLE, "{}", two.body);
     });
+}
+
+// ---------------------------------------------------------------------------
+// RGB composites and layers that draw features (#1100)
+// ---------------------------------------------------------------------------
+
+/// A satellite-like collection: bands `ir` (every hour) and `cloud` (hours
+/// 0 and 2), an RGB composite `rgb` of both, on the scans both have, and a
+/// position query answering each band's value at exactly the instant asked.
+struct Sat {
+    /// Whether the bands share any scan; without one the composite has
+    /// nothing to draw.
+    shared: bool,
+    calls: Mutex<Vec<Call>>,
+}
+
+impl Sat {
+    fn new(shared: bool) -> Arc<Self> {
+        Arc::new(Self {
+            shared,
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn axis(&self, parameter: &str) -> Vec<DateTime<Utc>> {
+        let hours: &[usize] = match (parameter, self.shared) {
+            ("ir", true) => &[0, 1, 2],
+            ("ir", false) => &[1],
+            ("cloud", true) => &[0, 2],
+            ("cloud", false) => &[0, 2],
+            _ => &[],
+        };
+        hours.iter().map(|&h| at(TIMES[h])).collect()
+    }
+}
+
+impl MapEngine for Sat {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<DateTime<Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        Ok(RasterTile {
+            width,
+            height,
+            values: vec![Some(250.0); (width * height) as usize].into(),
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        let parameter = |name: &str| ParameterInfo {
+            name: name.into(),
+            title: name.into(),
+            unit: "K".into(),
+        };
+        RasterInfo {
+            native_crs: "CRS:84".into(),
+            spatial_extent: Some([0.0, 40.0, 40.0, 80.0]),
+            times: TIMES.iter().map(|t| at(t)).collect(),
+            parameter: "ir".into(),
+            unit: "K".into(),
+            parameters: vec![parameter("ir"), parameter("cloud")],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+            native_grid: None,
+        }
+    }
+
+    fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
+        let axis = match parameter {
+            "rgb" => {
+                let cloud = self.axis("cloud");
+                self.axis("ir")
+                    .into_iter()
+                    .filter(|t| cloud.contains(t))
+                    .collect()
+            }
+            other => self.axis(other),
+        };
+        Some(axis.into())
+    }
+
+    fn resolve_parameter_time(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        match parameter {
+            Some("rgb") => self.resolve_parameters_time(&["ir", "cloud"], time, reference_time),
+            other => {
+                let axis = self.axis(other.unwrap_or("ir"));
+                match time {
+                    None => axis.last().copied(),
+                    Some(time) => axis.into_iter().rev().find(|&t| t <= time),
+                }
+            }
+        }
+    }
+
+    fn composites(&self) -> Arc<[CompositeDef]> {
+        let channel = |parameter: &str, minus: Option<&str>| CompositeChannel {
+            parameter: parameter.into(),
+            minus: minus.map(str::to_string),
+            min: 200.0,
+            max: 300.0,
+            gamma: 1.0,
+        };
+        Arc::from([CompositeDef {
+            name: "rgb".into(),
+            title: "RGB".into(),
+            channels: [
+                channel("ir", Some("cloud")),
+                channel("cloud", None),
+                channel("ir", None),
+            ],
+        }])
+    }
+}
+
+impl EdrEngine for Sat {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
+    }
+
+    fn query_location(
+        &self,
+        _location_id: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::LocationNotFound("none".into()))
+    }
+
+    fn get_parameters(&self) -> Vec<String> {
+        vec!["ir".into(), "cloud".into()]
+    }
+
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        Some((at(TIMES[0]), at(TIMES[2])))
+    }
+
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        Some([0.0, 40.0, 40.0, 80.0])
+    }
+
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["position".into()]
+    }
+
+    /// A one-step series of each requested band at the instant asked: `ir`
+    /// 250.5 K, `cloud` 230.25 K, a band without that scan null.
+    fn query_position(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        self.calls.lock().unwrap().push(Call {
+            coords: coords.into(),
+            datetime,
+            parameters: parameters.map(<[String]>::to_vec),
+            z: z.map(<[f64]>::to_vec),
+            reference_time,
+        });
+        let (lat, lon) = ds_core::feature::parse_point_coords(coords)?;
+        let time = datetime.expect("an instant").0;
+        let mut descriptions = HashMap::new();
+        let mut ranges = HashMap::new();
+        for band in parameters.unwrap_or_default() {
+            let value = match band.as_str() {
+                "ir" => 250.5,
+                "cloud" => 230.25,
+                other => panic!("no band {other}"),
+            };
+            descriptions.insert(
+                band.clone(),
+                ParameterDescription {
+                    label: band.clone(),
+                    unit: "K".into(),
+                    observed_property: band.clone(),
+                    standard_name: None,
+                },
+            );
+            ranges.insert(
+                band.clone(),
+                NdArray {
+                    shape: vec![1],
+                    axis_names: vec!["t".into()],
+                    values: vec![self.axis(band).contains(&time).then_some(value)],
+                },
+            );
+        }
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::PointSeries {
+                x: lon,
+                y: lat,
+                t: vec![time],
+                z: None,
+            },
+            parameters: descriptions,
+            ranges,
+        }))
+    }
+}
+
+/// One pick an engine received, its fields owned.
+#[derive(Debug, Clone)]
+struct Picked {
+    parameter: Option<String>,
+    point: (f64, f64),
+    footprint: [[f64; 2]; 4],
+    time: Option<DateTime<Utc>>,
+    limit: usize,
+}
+
+/// An alert layer: one parameter, `severity`, drawing areas, which it picks
+/// from a fixed list of three (or none, or an error), honouring the limit.
+struct Alerts {
+    answer: PickAnswer,
+    content_version: u64,
+    picks: Mutex<Vec<Picked>>,
+}
+
+#[derive(Clone, Copy)]
+enum PickAnswer {
+    Three,
+    Nothing,
+    NotFound,
+    Busy,
+}
+
+impl Alerts {
+    fn new(answer: PickAnswer) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            content_version: 0,
+            picks: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn picks(&self) -> Vec<Picked> {
+        self.picks.lock().unwrap().clone()
+    }
+}
+
+impl MapEngine for Alerts {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<DateTime<Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        Ok(RasterTile {
+            width,
+            height,
+            values: vec![Some(3.0); (width * height) as usize].into(),
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "CRS:84".into(),
+            spatial_extent: Some([0.0, 40.0, 40.0, 80.0]),
+            times: TIMES.iter().map(|t| at(t)).collect(),
+            parameter: "severity".into(),
+            unit: String::new(),
+            parameters: Vec::new(),
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+            native_grid: None,
+        }
+    }
+
+    fn content_version(&self) -> u64 {
+        self.content_version
+    }
+
+    fn layer_picks_features(&self, parameter: &str) -> bool {
+        parameter == "severity"
+    }
+
+    fn pick_features(&self, pick: &FeaturePick<'_>) -> Result<PickedFeatures, DataServerError> {
+        self.picks.lock().unwrap().push(Picked {
+            parameter: pick.parameter.map(str::to_string),
+            point: pick.point,
+            footprint: pick.footprint(),
+            time: pick.time,
+            limit: pick.limit,
+        });
+        let alert = |id: &str, event: &str, severity: &str| PickedFeature {
+            id: id.into(),
+            geometry: Arc::new(Geometry::Polygon {
+                exterior: vec![[10.0, 59.0], [11.0, 59.0], [11.0, 60.0], [10.0, 59.0]],
+                holes: Vec::new(),
+            }),
+            properties: vec![
+                ("event".into(), PropertyValue::String(event.into())),
+                ("severity".into(), PropertyValue::String(severity.into())),
+                (
+                    "headline".into(),
+                    PropertyValue::String(format!("{event}\nsecond line")),
+                ),
+                (
+                    "awareness".into(),
+                    PropertyValue::List(vec![
+                        PropertyValue::Integer(3),
+                        PropertyValue::String("orange".into()),
+                    ]),
+                ),
+                ("radius_km".into(), PropertyValue::Null),
+            ],
+        };
+        match self.answer {
+            PickAnswer::Three => {
+                let all = [
+                    alert("cap:wind", "Wind <b>warning</b> & co", "Extreme"),
+                    alert("cap:flood", "Flood warning", "Severe"),
+                    alert("cap:heat", "Heat warning", "Moderate"),
+                ];
+                Ok(PickedFeatures {
+                    number_matched: all.len(),
+                    features: all.into_iter().take(pick.limit).collect(),
+                })
+            }
+            PickAnswer::Nothing => Ok(PickedFeatures::default()),
+            PickAnswer::NotFound => Err(DataServerError::LocationNotFound("gone".into())),
+            PickAnswer::Busy => Err(DataServerError::ResourceExhausted),
+        }
+    }
+}
+
+/// A WMS of `sat` (with its position engine), `alerts` (no position
+/// engine; it picks), `nwp` and `nodata-sat`, whose bands share no scan.
+fn layers_router(sat: Arc<Sat>, alerts: Arc<Alerts>) -> axum::Router {
+    let nwp = Nwp::new(Answer::Value(271.5));
+    let lonely = Sat::new(false);
+    let mut styles = HashMap::new();
+    for layer in [
+        "sat",
+        "sat/ir",
+        "sat/cloud",
+        "lonely",
+        "lonely/ir",
+        "lonely/cloud",
+        "alerts",
+        "nwp",
+        "nwp/t2m",
+        "nwp/outline",
+    ] {
+        styles.insert(layer.to_string(), style());
+    }
+    let point_engines: HashMap<String, Arc<dyn EdrEngine>> = HashMap::from([
+        ("sat".to_string(), sat.clone() as Arc<dyn EdrEngine>),
+        ("lonely".to_string(), lonely.clone() as Arc<dyn EdrEngine>),
+        ("nwp".to_string(), nwp.clone() as Arc<dyn EdrEngine>),
+    ]);
+    api_wms::router(Arc::new(ArcSwap::from_pointee(WmsState {
+        engines: HashMap::from([
+            ("sat".to_string(), sat as Arc<dyn MapEngine>),
+            ("lonely".to_string(), lonely as Arc<dyn MapEngine>),
+            ("alerts".to_string(), alerts as Arc<dyn MapEngine>),
+            ("nwp".to_string(), nwp as Arc<dyn MapEngine>),
+        ]),
+        point_engines,
+        collections: HashMap::from([
+            ("sat".to_string(), collection("sat")),
+            ("lonely".to_string(), collection("lonely")),
+            ("alerts".to_string(), collection("alerts")),
+            ("nwp".to_string(), collection("nwp")),
+        ]),
+        styles,
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
+        base_url: String::new(),
+        trust_proxy_headers: false,
+    })))
+}
+
+/// Capabilities mark an RGB composite whose collection answers position
+/// queries, and a layer whose engine picks features, `queryable="1"`.
+#[tokio::test]
+async fn capabilities_mark_composites_and_feature_layers_queryable() {
+    let app = layers_router(Sat::new(true), Alerts::new(PickAnswer::Three));
+    let xml = get(&app, "SERVICE=WMS&REQUEST=GetCapabilities").await.body;
+    let layers = queryable_layers(&xml);
+    for (layer, queryable) in [
+        ("sat/ir", "1"),
+        ("sat/rgb", "1"),
+        ("lonely/rgb", "1"),
+        ("alerts", "1"),
+        ("nwp/outline", "0"),
+    ] {
+        assert_eq!(
+            layers.get(layer).map(String::as_str),
+            Some(queryable),
+            "{layer}: {layers:?}"
+        );
+    }
+}
+
+/// An RGB composite answers each band's value, from one position query of
+/// its bands at the scan the composite is drawn from: TIME 01:00 draws the
+/// 00:00 scan, the latest both bands have. One value feature, text block
+/// and table per band.
+#[tokio::test]
+async fn a_composite_answers_each_band_at_its_scan() {
+    let sat = Sat::new(true);
+    let app = layers_router(sat.clone(), Alerts::new(PickAnswer::Three));
+    let query = |format: &str| {
+        gfi(
+            "sat/rgb",
+            0,
+            0,
+            &format!("&TIME=2026-10-01T01:00:00Z&INFO_FORMAT={format}"),
+        )
+    };
+    let reply = get(&app, &query("application/json")).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let calls = sat.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "one position query for every band");
+    assert_eq!(calls[0].datetime, Some((at(TIMES[0]), at(TIMES[0]))));
+    assert_eq!(
+        calls[0].parameters.as_deref(),
+        Some(&["ir".to_string(), "cloud".to_string()][..])
+    );
+    assert_close(point(&calls[0].coords), (10.5, 59.5));
+    let body = json(&reply);
+    assert!(body.get("layers").is_none(), "{body}");
+    let properties: Vec<_> = body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["properties"].clone())
+        .collect();
+    assert_eq!(
+        properties,
+        [
+            serde_json::json!({
+                "layer": "sat/rgb", "parameter": "ir", "value": 250.5, "unit": "K",
+                "time": "2026-10-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "layer": "sat/rgb", "parameter": "cloud", "value": 230.25, "unit": "K",
+                "time": "2026-10-01T00:00:00Z"
+            }),
+        ]
+    );
+    assert_eq!(
+        body["features"][1]["geometry"]["coordinates"],
+        serde_json::json!([10.5, 59.5])
+    );
+
+    let reply = get(&app, &query("text/plain")).await;
+    assert_eq!(
+        reply.body,
+        "layer: sat/rgb\nparameter: ir\nvalue: 250.5\nunit: K\ntime: 2026-10-01T00:00:00Z\n\
+         lon: 10.5\nlat: 59.5\n\nlayer: sat/rgb\nparameter: cloud\nvalue: 230.25\nunit: K\n\
+         time: 2026-10-01T00:00:00Z\nlon: 10.5\nlat: 59.5\n"
+    );
+    let reply = get(&app, &query("text/html")).await;
+    assert_eq!(reply.body.matches("<caption>sat/rgb</caption>").count(), 2);
+    assert!(reply
+        .body
+        .contains("<tr><th>parameter</th><td>cloud</td></tr>"));
+    // Every band answered at an explicit TIME: pinned, as GetMap pins it.
+    assert_eq!(reply.cache_control, "public, max-age=86400, immutable");
+}
+
+/// Bands that share no scan: GetMap draws the empty image, and
+/// GetFeatureInfo answers every band null without a query.
+#[tokio::test]
+async fn a_composite_without_a_shared_scan_is_an_empty_answer() {
+    let app = layers_router(Sat::new(true), Alerts::new(PickAnswer::Three));
+    let reply = get(
+        &app,
+        &gfi("lonely/rgb", 0, 0, "&INFO_FORMAT=application/json"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let body = json(&reply);
+    let values: Vec<_> = body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["properties"]["parameter"].clone(),
+                f["properties"]["value"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        [
+            (serde_json::json!("ir"), serde_json::Value::Null),
+            (serde_json::json!("cloud"), serde_json::Value::Null)
+        ]
+    );
+    assert_eq!(reply.cache_control, "public, max-age=60, must-revalidate");
+}
+
+/// A layer that draws features answers the features its engine picks at
+/// the pixel: the pixel's centre and ground area, the frame's time, at most
+/// `FEATURE_COUNT` (1 by default, at most `MAX_FEATURE_COUNT`), and how
+/// many there are. JSON lists each with its id, geometry and properties in
+/// the engine's order, and the counts under `layers`.
+#[tokio::test]
+async fn a_feature_layer_answers_the_features_picked_at_the_pixel() {
+    let alerts = Alerts::new(PickAnswer::Three);
+    let app = layers_router(Sat::new(true), alerts.clone());
+    let reply = get(
+        &app,
+        &gfi(
+            "alerts",
+            0,
+            0,
+            "&TIME=2026-10-01T01:00:00Z&INFO_FORMAT=application/json",
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let picks = alerts.picks();
+    assert_eq!(picks.len(), 1);
+    let pick = &picks[0];
+    assert_eq!(pick.parameter.as_deref(), Some("severity"));
+    assert_close(pick.point, (10.5, 59.5));
+    // Pixel (0, 0) of the 20 × 10 map of 10–30°E, 50–60°N: 1° square.
+    assert_eq!(
+        pick.footprint,
+        [[10.0, 60.0], [11.0, 60.0], [11.0, 59.0], [10.0, 59.0]]
+    );
+    assert_eq!(pick.time, Some(at(TIMES[1])));
+    assert_eq!(pick.limit, 1, "FEATURE_COUNT defaults to 1");
+
+    let body = json(&reply);
+    assert_eq!(
+        body["features"],
+        serde_json::json!([{
+            "type": "Feature",
+            "id": "cap:wind",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[10.0, 59.0], [11.0, 59.0], [11.0, 60.0], [10.0, 59.0]]]
+            },
+            "properties": {
+                "layer": "alerts",
+                "event": "Wind <b>warning</b> & co",
+                "severity": "Extreme",
+                "headline": "Wind <b>warning</b> & co\nsecond line",
+                "awareness": [3, "orange"],
+                "radius_km": null
+            }
+        }])
+    );
+    // The layer first, then the properties in the engine's order.
+    let features = &reply.body[..reply.body.find("\"layers\"").unwrap()];
+    let at = |key: &str| features.find(&format!("\"{key}\":")).unwrap();
+    let order = [
+        "layer",
+        "event",
+        "severity",
+        "headline",
+        "awareness",
+        "radius_km",
+    ];
+    assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "{features}");
+    assert_eq!(
+        body["layers"],
+        serde_json::json!([{
+            "layer": "alerts", "parameter": "severity", "time": "2026-10-01T01:00:00Z",
+            "numberMatched": 3, "numberReturned": 1
+        }])
+    );
+    // A feature at an explicit TIME, content never revised: pinned.
+    assert_eq!(reply.cache_control, "public, max-age=86400, immutable");
+
+    for (count, limit, returned) in [("10", 10, 3), ("1000", 50, 3)] {
+        let reply = get(
+            &app,
+            &gfi(
+                "alerts",
+                0,
+                0,
+                &format!("&FEATURE_COUNT={count}&INFO_FORMAT=application/json"),
+            ),
+        )
+        .await;
+        assert_eq!(alerts.picks().last().unwrap().limit, limit, "{count}");
+        let body = json(&reply);
+        assert_eq!(body["features"].as_array().unwrap().len(), returned);
+        assert_eq!(body["layers"][0]["numberMatched"], 3);
+        assert_eq!(body["layers"][0]["numberReturned"], returned);
+        let ids: Vec<&str> = body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["cap:wind", "cap:flood", "cap:heat"]);
+    }
+    assert_eq!(api_wms::feature_info::MAX_FEATURE_COUNT, 50);
+}
+
+/// `text/plain` writes the layer's fields, its counts, then each feature
+/// as `id:` and its properties, one line each; HTML a table for the layer
+/// and one per feature, every text escaped.
+#[tokio::test]
+async fn a_feature_layer_in_the_text_formats() {
+    let app = layers_router(Sat::new(true), Alerts::new(PickAnswer::Three));
+    let reply = get(&app, &gfi("alerts", 0, 0, "&FEATURE_COUNT=2")).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(
+        reply.body,
+        "layer: alerts\nparameter: severity\ntime: 2026-10-01T02:00:00Z\nlon: 10.5\nlat: 59.5\n\
+         matched: 3\nreturned: 2\n\
+         id: cap:wind\nevent: Wind <b>warning</b> & co\nseverity: Extreme\n\
+         headline: Wind <b>warning</b> & co second line\nawareness: 3, orange\nradius_km: null\n\
+         id: cap:flood\nevent: Flood warning\nseverity: Severe\n\
+         headline: Flood warning second line\nawareness: 3, orange\nradius_km: null\n"
+    );
+
+    let reply = get(
+        &app,
+        &gfi("alerts", 0, 0, "&FEATURE_COUNT=2&INFO_FORMAT=text/html"),
+    )
+    .await;
+    assert_eq!(reply.content_type, "text/html; charset=utf-8");
+    assert!(
+        reply.body.contains("<caption>alerts</caption>"),
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains("<tr><th>matched</th><td>3</td></tr>"),
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains("<caption>cap:wind</caption>"),
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply
+            .body
+            .contains("<tr><th>event</th><td>Wind &lt;b&gt;warning&lt;/b&gt; &amp; co</td></tr>"),
+        "{}",
+        reply.body
+    );
+    assert!(!reply.body.contains("<b>"), "{}", reply.body);
+    assert_eq!(reply.body.matches("<table>").count(), 3, "{}", reply.body);
+}
+
+/// No feature at the pixel, or no data any more, is an empty answer: 200,
+/// no feature, the counts zero, and revalidated. A busy engine is 503.
+#[tokio::test]
+async fn no_feature_at_the_pixel_is_an_empty_answer() {
+    for answer in [PickAnswer::Nothing, PickAnswer::NotFound] {
+        let app = layers_router(Sat::new(true), Alerts::new(answer));
+        let query = gfi(
+            "alerts",
+            0,
+            0,
+            "&TIME=2026-10-01T01:00:00Z&INFO_FORMAT=application/json",
+        );
+        let reply = get(&app, &query).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let body = json(&reply);
+        assert_eq!(body["features"], serde_json::json!([]));
+        assert_eq!(body["layers"][0]["numberMatched"], 0);
+        assert_eq!(body["layers"][0]["numberReturned"], 0);
+        assert_eq!(reply.cache_control, "public, max-age=60, must-revalidate");
+        let text = get(&app, &query.replace("application/json", "text/plain")).await;
+        assert!(
+            text.body.ends_with("matched: 0\nreturned: 0\n"),
+            "{}",
+            text.body
+        );
+    }
+    let reply = get(
+        &layers_router(Sat::new(true), Alerts::new(PickAnswer::Busy)),
+        &gfi("alerts", 0, 0, ""),
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.body
+    );
+}
+
+/// The pixel's ground area is the map's: continuous across the
+/// antimeridian on the seam test box, Web Mercator rows in EPSG:3857, and
+/// no pick at all for a pixel past a pole.
+#[tokio::test]
+async fn the_picked_footprint_follows_the_map() {
+    let alerts = Alerts::new(PickAnswer::Three);
+    let app = layers_router(Sat::new(true), alerts.clone());
+    let seam = |i: u32| gfi("alerts", i, 0, "").replace("BBOX=10,50,30,60", "BBOX=170,10,190,20");
+    // Pixel 10 of 170..190°E spans 180..181°E: its centre wraps to 179.5°W.
+    get(&app, &seam(10)).await;
+    let pick = alerts.picks().pop().unwrap();
+    assert_close(pick.point, (-179.5, 19.5));
+    assert_eq!(pick.footprint[0], [-180.0, 20.0]);
+    assert_eq!(pick.footprint[2], [-179.0, 19.0]);
+    get(&app, &seam(9)).await;
+    let pick = alerts.picks().pop().unwrap();
+    assert_close(pick.point, (179.5, 19.5));
+    assert_eq!(pick.footprint[1], [180.0, 20.0]);
+
+    // EPSG:3857: 2 × 2 pixels over 0..20 000 m by 0..20 000 m.
+    let merc = gfi("alerts", 1, 0, "")
+        .replace(
+            "CRS=CRS:84&BBOX=10,50,30,60",
+            "CRS=EPSG:3857&BBOX=0,0,20000,20000",
+        )
+        .replace("WIDTH=20&HEIGHT=10", "WIDTH=2&HEIGHT=2");
+    let reply = get(&app, &merc).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let pick = alerts.picks().pop().unwrap();
+    let lat = |y: f64| ds_core::web_mercator::y_to_lat(y);
+    let lon = |x: f64| ds_core::web_mercator::x_to_lon(x);
+    let [top_left, _, bottom_right, _] = pick.footprint;
+    assert!((top_left[0] - lon(10_000.0)).abs() < 1e-9, "{top_left:?}");
+    assert!((top_left[1] - lat(20_000.0)).abs() < 1e-9, "{top_left:?}");
+    assert!(
+        (bottom_right[0] - lon(20_000.0)).abs() < 1e-9,
+        "{bottom_right:?}"
+    );
+    assert!(
+        (bottom_right[1] - lat(10_000.0)).abs() < 1e-9,
+        "{bottom_right:?}"
+    );
+
+    // A CRS:84 pixel centre past the north pole: nothing to pick.
+    let before = alerts.picks().len();
+    let reply = get(
+        &app,
+        &gfi("alerts", 0, 0, "&INFO_FORMAT=application/json")
+            .replace("BBOX=10,50,30,60", "BBOX=10,80,30,100"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(alerts.picks().len(), before);
+    assert_eq!(json(&reply)["layers"][0]["numberMatched"], 0);
+}
+
+/// A value layer, an RGB composite and a feature layer in one request:
+/// each answers in its own way, in `QUERY_LAYERS` order.
+#[tokio::test]
+async fn value_composite_and_feature_layers_answer_together() {
+    let app = layers_router(Sat::new(true), Alerts::new(PickAnswer::Three));
+    let reply = get(
+        &app,
+        &gfi_layers(
+            "nwp/t2m,sat/rgb,alerts",
+            "alerts,nwp/t2m,sat/rgb",
+            "&INFO_FORMAT=application/json",
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let body = json(&reply);
+    let answers: Vec<(String, Option<String>)> = body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["properties"]["layer"].as_str().unwrap().to_string(),
+                f["properties"]["parameter"].as_str().map(str::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        [
+            ("alerts".to_string(), None),
+            ("nwp/t2m".to_string(), Some("t2m".to_string())),
+            ("sat/rgb".to_string(), Some("ir".to_string())),
+            ("sat/rgb".to_string(), Some("cloud".to_string())),
+        ]
+    );
+    assert_eq!(body["layers"].as_array().unwrap().len(), 1);
 }

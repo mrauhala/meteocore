@@ -14,6 +14,7 @@ use ds_core::config::{CapConfig, Wis2Config, CAP_WIS2_MIN_POLL_INTERVAL_SECS};
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, Feature, FeaturePage, FeatureQuery, PropertyValue};
+use ds_core::feature_pick::{FeaturePick, PickedFeature, PickedFeatures};
 use ds_core::health::{LiveStatus, WarmupCause};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::state::{
@@ -1017,9 +1018,81 @@ impl MapEngine for CapEngine {
         // cost is O(times), bounded by the 256-entry TIME cap.
         (*self.snapshot().info).clone()
     }
+
+    /// The one layer draws alert areas, which WMS GetFeatureInfo picks
+    /// (#1100).
+    fn layer_picks_features(&self, _parameter: &str) -> bool {
+        true
+    }
+
+    fn pick_features(&self, pick: &FeaturePick<'_>) -> Result<PickedFeatures, DataServerError> {
+        Ok(self.pick(pick))
+    }
 }
 
+/// The properties a picked alert answers with, in this order (#1100): what,
+/// how bad, when, where, and which alert, as its Features item names them.
+const PICK_PROPERTIES: &[&str] = &[
+    "event",
+    "severity",
+    "urgency",
+    "certainty",
+    "headline",
+    "onset",
+    "expires",
+    "areaDesc",
+    "identifier",
+    "web",
+];
+
 impl CapEngine {
+    /// [`MapEngine::pick_features`]: the areas the map draws at the picked
+    /// pixel. The render's rule: active at the instant (`None` ⇒ the
+    /// snapshot's `as_of`, as [`Self::render`] substitutes), at a world copy
+    /// in view, and filled where its polygons contain the pixel's centre.
+    /// Most severe first, the one drawn on top (`Combine::Max`), equal
+    /// severities in record order. A geocode-only area is not drawn and not
+    /// picked.
+    fn pick(&self, pick: &FeaturePick<'_>) -> PickedFeatures {
+        let cat = self.snapshot();
+        let t = pick.time.unwrap_or(cat.as_of);
+        let mut hits: Vec<usize> = cat
+            .query_point(pick.point)
+            .into_iter()
+            .filter(|&i| {
+                let rec = &cat.records[i];
+                rec.window.active_at(t) && pick.hits(&rec.geometry)
+            })
+            .collect();
+        hits.sort_by(|&a, &b| {
+            cat.records[b]
+                .severity_code
+                .total_cmp(&cat.records[a].severity_code)
+        });
+        let features = hits
+            .iter()
+            .take(pick.limit)
+            .map(|&i| {
+                let rec = &cat.records[i];
+                PickedFeature {
+                    id: rec.id.clone(),
+                    geometry: Arc::clone(&rec.geometry),
+                    properties: PICK_PROPERTIES
+                        .iter()
+                        .filter_map(|&name| {
+                            rec.properties
+                                .get(name)
+                                .map(|value| (name.to_string(), value.clone()))
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        PickedFeatures {
+            features,
+            number_matched: hits.len(),
+        }
+    }
     /// [`MapEngine::get_raster_tile`] with the per-render area cap as a
     /// parameter, so a test can exceed it with a handful of alerts.
     fn render(

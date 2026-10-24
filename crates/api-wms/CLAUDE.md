@@ -236,6 +236,7 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   `<Abstract>` of the channels, the `time` dimension from
   `parameter_times(<composite>)` (the scans every band has) and one style,
   `default` (`ds_render::COMPOSITE_STYLE`), with a LegendURL.
+  `queryable` comes from `composite_is_queryable`.
 - **Styles**: any other `STYLES` is `StyleNotDefined`, on GetMap and
   GetLegendGraphic. An unknown `coll/<name>` lists composites among the
   valid names.
@@ -380,7 +381,11 @@ centre of pixel `(I, J)`, never a 1×1 `get_raster_tile` or a meta-tile
 pixel: the same engine call answers EDR `position`, so the two report the
 same value (the source value, sampled as the engine's position query does:
 bilinear for GRIB, QueryData, Zarr and NetCDF, while a projected GetMap resamples
-meta-tiles by nearest neighbour).
+meta-tiles by nearest neighbour). An RGB composite answers each band's
+value from one position query of its bands at the composite's resolved
+scan. A layer whose engine `layer_picks_features` answers the features
+`MapEngine::pick_features` returns for the pixel: CAP alerts, ODIM
+`CELLS`, PostGIS events (#1100).
 
 - **Engines.** `WmsState::point_engines` holds the `EdrEngine` of every WMS
   collection whose engine answers position queries
@@ -392,13 +397,25 @@ meta-tiles by nearest neighbour).
   `apis` only decides whether EDR routes are published. The capability is
   read once per load, never per request: `supported_query_types` builds a
   `Vec`.
-- **Queryable.** `layer_is_queryable`: the collection has a point engine and
-  the layer shows its parameter's own values
-  (`MapEngine::layer_shows_values`, O(1)). RGB composites, overlays (ODIM
-  `CELLS`) and collections without a position query (CAP, PostGIS events,
-  nowcast) are `queryable="0"` and answer `LayerNotQueryable`.
-  GetCapabilities and the handler use the same function, so the attribute
-  and the answer cannot disagree. Never decide it with a probe query.
+- **Queryable.** `layer_is_queryable`: the engine picks the layer's features
+  (`MapEngine::layer_picks_features`, O(1)), or the collection has a point
+  engine and the layer shows its parameter's own values
+  (`MapEngine::layer_shows_values`, O(1)). An RGB composite uses
+  `composite_is_queryable`: a point engine, and every band shows values.
+  Station symbols and nowcast layers are `queryable="0"` and answer
+  `LayerNotQueryable`. GetCapabilities and the handler use the same
+  functions, so the attribute and the answer cannot disagree. Never decide
+  it with a probe query.
+- **Composites and features (#1100).** A composite's bands are read at
+  `ResolvedLayer::time`, the scan GetMap passes `get_raster_tiles`; `None`
+  reads nothing and answers null. A feature layer gets a
+  `ds_core::feature_pick::FeaturePick`: the pixel centre, the map's grid
+  (`PickMap`) and pixel, from which the engine maps the pixel's ground area
+  (`FeaturePick::footprint`, or `grown_ring` for symbols wider than a pixel;
+  corners through `project_node`, continuous across 180°), the resolved time
+  and run, the layer's `ELEVATION`, and `min(FEATURE_COUNT,
+  MAX_FEATURE_COUNT = 50)`. The engine selects with its render's rule, on
+  the query runtime. Never re-derive an engine's selection here.
 - **Map part.** `validate_get_feature_info` runs `validate_get_map`, and the
   handler resolves it through `handlers::resolve_layers`, GetMap's own
   layer, style, dimension, time, run and content-version resolution. Never
@@ -457,14 +474,20 @@ meta-tiles by nearest neighbour).
   `Internal`, its detail only in the log (Critical Rule 11).
 - **Formats.** `params::INFO_FORMATS` is the one list capabilities
   advertises and `InfoFormat::parse` accepts; an omitted `INFO_FORMAT` is
-  `text/plain`. JSON is a GeoJSON FeatureCollection, one Point feature per
-  queried layer, through `axum::Json` (serde, no new dependency). HTML is
+  `text/plain`. JSON is a GeoJSON FeatureCollection through `axum::Json`
+  (serde, no new dependency): a Point feature per value read, one per band
+  of a composite, and each picked feature with its id, own geometry and
+  ordered properties (`layer` first); feature layers are also listed in the
+  foreign member `layers` (time, `numberMatched`, `numberReturned`). Text
+  writes a feature layer's fields, `matched:`/`returned:`, then `id:` and
+  one line per property, line breaks as spaces. HTML is
   written with quick-xml like every other markup here, which escapes every
   label and value (`check_geo_safety.sh` rejects hand-built markup in this
   crate).
 - **Caching.** `cache_control_value`, as GetMap: `immutable` only for an
-  explicit `TIME` that resolved, with `content_version` 0, and only for a
-  value. A null answer always revalidates: GeoTIFF and GRIB answer a failed
+  explicit `TIME` that resolved, with `content_version` 0, and only for an
+  answer: every value and band non-null, or at least one feature. An empty
+  answer always revalidates: GeoTIFF and GRIB answer a failed
   read with a null sample, and GetMap never pins a failed render either. No
   server-side cache: one point read is cheaper than a cache entry.
 

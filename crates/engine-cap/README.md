@@ -178,8 +178,9 @@ MeteoAlarm warnings topic.
 
 ## Limits
 
-- No EDR, no WMS GetFeatureInfo (the layer is not queryable), no `sortby`,
-  one map layer per collection, and no CAP signature (XML-DSig) check.
+- No EDR, no `sortby`, one map layer per collection, and no CAP signature
+  (XML-DSig) check. WMS GetFeatureInfo answers the alerts active at the
+  frame's instant whose areas hold the pixel's centre, most severe first.
 - HTTP redirects are refused; configure the final feed and document URLs.
   Each poll refetches the feed and every linked document.
 - No WIS2 Global Cache backfill: an empty start fills only as producers

@@ -854,6 +854,76 @@ pub fn build_events_area(
     Ok(BuiltQuery::new(sql, params).with_row_limit(3, source_keys.len().max(1)))
 }
 
+/// Events-shape pick for WMS GetFeatureInfo on the lightning layer (#1100):
+/// the events of the map's half-open window `(start, end]`, the window
+/// [`build_events_window`] draws a frame from, inside one pixel's footprint
+/// (`footprint_wkt`, a bind). Each row is one event: `time`, its
+/// coordinates, its id as text (`mc_id`), one cast column per requested
+/// source key (value filters applied, #1210; their binds follow the
+/// `LIMIT`'s), the declared attribute columns as `mc_cloud_indicator` /
+/// `mc_peak_current` (own aliases, so a parameter reading the same column
+/// does not collide), and `mc_matched`, every event in the footprint,
+/// counted before `LIMIT $4` keeps the newest.
+pub fn build_events_pick(
+    shape: &EventsShape,
+    parameters: &[ValidatedParameter],
+    footprint_wkt: &str,
+    time_range: (DateTime<Utc>, DateTime<Utc>),
+    source_keys: &[&str],
+    row_limit: usize,
+) -> Result<BuiltQuery, BuildError> {
+    if footprint_wkt.trim().is_empty() {
+        return Err(BuildError::EmptyPolygonWkt);
+    }
+    let table = fq_table(&shape.table)?;
+    let time_col = quote_ident(&shape.time_col)?;
+    let geom = quote_ident(&shape.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let geometry_check = crate::validation::geometry_check(&geom);
+    let id = quote_ident(&shape.id_col)?;
+    let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
+    let tz = shape.time_col_tz.as_deref();
+    let mut params = vec![
+        SqlParam::Timestamp(time_range.0),
+        SqlParam::Timestamp(time_range.1),
+        SqlParam::Text(footprint_wkt.to_string()),
+        SqlParam::Int(row_limit as i64),
+    ];
+
+    let mut projection = format!("{time_select} AS time, {coordinates}, {id}::text AS mc_id");
+    for key in source_keys {
+        let col = quote_ident(key)?;
+        let value = filtered_value(&col, value_filter(parameters, key), &mut params);
+        projection.push_str(&format!(", {value} AS {col}"));
+    }
+    for (col, alias) in [
+        (&shape.cloud_indicator_col, "mc_cloud_indicator"),
+        (&shape.peak_current_col, "mc_peak_current"),
+    ] {
+        if let Some(name) = col {
+            projection.push_str(&format!(
+                ", {}::double precision AS {alias}",
+                quote_ident(name)?
+            ));
+        }
+    }
+    projection.push_str(&format!(
+        ", count(*) OVER () AS mc_matched, {geometry_check} AS mc_geometry_valid"
+    ));
+    let rhs_lo = time_filter_rhs("$1", tz);
+    let rhs_hi = time_filter_rhs("$2", tz);
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{projection} \
+         FROM {table} \
+         WHERE {time_col} > {rhs_lo} AND {time_col} <= {rhs_hi} \
+         AND {geom} && ST_GeomFromText($3, 4326) \
+         AND ST_Intersects({geom}, ST_GeomFromText($3, 4326)) \
+         ORDER BY {time_col} DESC, {id} LIMIT $4"
+    ));
+    Ok(BuiltQuery::new(sql, params))
+}
+
 /// Whether an events window selects the optional per-event attribute columns
 /// (#616). Only the `EventSource` join reads them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2588,6 +2658,101 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, BuildError::EmptyPolygonWkt));
+    }
+
+    /// #1100: the GetFeatureInfo pick reads the map's half-open window inside
+    /// the footprint, newest first, with every event counted before the
+    /// `LIMIT`, the id as text, the parameters (filters after the `LIMIT`)
+    /// and the attribute columns under aliases of their own.
+    #[test]
+    fn events_pick_reads_the_map_window_inside_the_footprint() {
+        let mut current = param("peak_current", "Peak current", "kA", "pc", "peak_current");
+        current.filter = ValueFilter {
+            range: Some((-300.0, 300.0)),
+            missing: Vec::new(),
+        };
+        let q = build_events_pick(
+            &lightning_shape_with(Some("cloud_indicator"), Some("peak_current")),
+            &[current],
+            "POLYGON((24 60,25 60,25 59,24 59,24 60))",
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            &["peak_current"],
+            6,
+        )
+        .unwrap();
+        // The map's window: start excluded, end included.
+        assert!(
+            q.sql.contains("\"time\" > ($1 AT TIME ZONE 'UTC')"),
+            "{}",
+            q.sql
+        );
+        assert!(
+            q.sql.contains("\"time\" <= ($2 AT TIME ZONE 'UTC')"),
+            "{}",
+            q.sql
+        );
+        assert!(q.sql.contains("\"the_geom\" && ST_GeomFromText($3, 4326)"));
+        assert!(q
+            .sql
+            .contains("ST_Intersects(\"the_geom\", ST_GeomFromText($3, 4326))"));
+        assert!(q.sql.contains("\"id\"::text AS mc_id"), "{}", q.sql);
+        assert!(q.sql.contains(
+            "CASE WHEN \"peak_current\"::double precision >= $5 AND \"peak_current\"::double precision <= $6 THEN \"peak_current\"::double precision END AS \"peak_current\""
+        ), "{}", q.sql);
+        assert!(q
+            .sql
+            .contains("\"cloud_indicator\"::double precision AS mc_cloud_indicator"));
+        assert!(q
+            .sql
+            .contains("\"peak_current\"::double precision AS mc_peak_current"));
+        assert!(
+            q.sql.contains("count(*) OVER () AS mc_matched"),
+            "{}",
+            q.sql
+        );
+        assert!(
+            q.sql.ends_with("ORDER BY \"time\" DESC, \"id\" LIMIT $4"),
+            "{}",
+            q.sql
+        );
+        assert_eq!(
+            q.params[..4],
+            [
+                SqlParam::Timestamp(t(2026, 7, 11, 17)),
+                SqlParam::Timestamp(t(2026, 7, 11, 18)),
+                SqlParam::Text("POLYGON((24 60,25 60,25 59,24 59,24 60))".into()),
+                SqlParam::Int(6),
+            ]
+        );
+        assert_eq!(
+            q.params[4..],
+            [SqlParam::Float(-300.0), SqlParam::Float(300.0)]
+        );
+        assert_eq!(q.sql.matches("SELECT").count(), 1);
+
+        // No attribute columns declared: none selected.
+        let bare = build_events_pick(
+            &lightning_shape(),
+            &[],
+            "POLYGON((24 60,25 60,25 59,24 59,24 60))",
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            &[],
+            6,
+        )
+        .unwrap();
+        assert!(!bare.sql.contains("mc_cloud_indicator"));
+        assert!(!bare.sql.contains("mc_peak_current"));
+        assert!(matches!(
+            build_events_pick(
+                &lightning_shape(),
+                &[],
+                " ",
+                (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+                &[],
+                6,
+            ),
+            Err(BuildError::EmptyPolygonWkt)
+        ));
     }
 
     #[test]

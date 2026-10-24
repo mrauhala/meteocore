@@ -357,6 +357,24 @@ impl Catalog {
         idx
     }
 
+    /// Record indices whose bbox holds the point `(lon, lat)`, or holds it a
+    /// turn east or west: an area stored with longitudes past ±180 is drawn
+    /// at its world copies, so a point in −180..=180 finds it there
+    /// (geometry areas only).
+    pub fn query_point(&self, (lon, lat): (f64, f64)) -> Vec<usize> {
+        let mut idx: Vec<usize> = [0.0, 360.0, -360.0]
+            .into_iter()
+            .flat_map(|k| {
+                self.tree
+                    .locate_in_envelope_intersecting(&AABB::from_point([lon - k, lat]))
+                    .map(|e| e.index)
+            })
+            .collect();
+        idx.sort_unstable();
+        idx.dedup();
+        idx
+    }
+
     /// Advance the default render time without changing retained content. Used
     /// after source I/O failures so stale data cannot freeze alert expiry.
     pub fn at_time(&self, as_of: DateTime<Utc>) -> Self {

@@ -194,6 +194,21 @@ impl MapEngine for Mock {
         Some(hour(9))
     }
 
+    /// `2t` stands in for a layer that draws features (#1100).
+    fn layer_picks_features(&self, parameter: &str) -> bool {
+        parameter == "2t"
+    }
+
+    fn pick_features(
+        &self,
+        _pick: &crate::feature_pick::FeaturePick<'_>,
+    ) -> Result<crate::feature_pick::PickedFeatures, DataServerError> {
+        Ok(crate::feature_pick::PickedFeatures {
+            features: Vec::new(),
+            number_matched: 7,
+        })
+    }
+
     fn resolve_elevation(
         &self,
         parameter: Option<&str>,
@@ -503,6 +518,40 @@ fn a_height_resolves_as_its_geopotential() {
     // The wind speed keeps the plural selection over u and v together.
     assert_eq!(rt("10si"), Some(hour(9)));
     assert_eq!(t("10si"), Some(hour(9)));
+}
+
+/// #1100: the wrapper forwards the wrapped engine's feature picks, and a
+/// derived parameter, which shows values, draws none.
+#[test]
+fn feature_picks_are_the_wrapped_engines() {
+    let mock = Mock::new();
+    let (derived, _) = wrap(&mock, Derivations::ALL);
+    assert!(derived.layer_picks_features("2t"));
+    assert!(!derived.layer_picks_features("gh"));
+    assert!(!derived.layer_picks_features("10u"));
+    let pick = |parameter| crate::feature_pick::FeaturePick {
+        parameter: Some(parameter),
+        map: crate::feature_pick::PickMap {
+            output_crs: &OutputCrs::Wgs84,
+            wgs84_bbox: [0.0, 0.0, 1.0, 1.0],
+            width: 1,
+            height: 1,
+        },
+        pixel: (0, 0),
+        point: (0.5, 0.5),
+        time: None,
+        reference_time: None,
+        z: None,
+        limit: 1,
+    };
+    assert_eq!(
+        derived.pick_features(&pick("2t")).unwrap().number_matched,
+        7
+    );
+    assert!(matches!(
+        derived.pick_features(&pick("gh")),
+        Err(DataServerError::InvalidParameter(_))
+    ));
 }
 
 /// EDR: the height is computed from the geopotential the engine returns,

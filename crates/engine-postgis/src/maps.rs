@@ -37,6 +37,7 @@ use std::sync::{Arc, OnceLock};
 use chrono::{DateTime, Duration, Utc};
 use ds_cache::ByteBoundedCache;
 use ds_core::error::DataServerError;
+use ds_core::feature_pick::{FeaturePick, PickedFeatures};
 use ds_core::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile};
 use tokio_postgres::Row;
 
@@ -73,6 +74,30 @@ use ds_core::station_map::quantize_time;
 /// lightning markers stay marker-sized rather than scaling with the map
 /// (the #504 symbol-size question, resolved to the cheap option).
 const SYMBOL_RADIUS_PX: i64 = 2;
+
+/// Whether a strike's disc, drawn around the strike's own pixel, covers the
+/// pixel `(dx, dy)` away from it: the one home of the disc's shape, which
+/// [`splat_strikes`] paints and a WMS GetFeatureInfo pick grows the picked
+/// pixel by ([`pick_region`], #1100).
+fn disc_covers(dx: i64, dy: i64) -> bool {
+    dx * dx + dy * dy <= SYMBOL_RADIUS_PX * SYMBOL_RADIUS_PX
+}
+
+/// The ground area holding every strike whose drawn disc covers the picked
+/// pixel, as WMS GetFeatureInfo picks them (#1100): the pixels the disc
+/// reaches the picked pixel from, on the map's own grid
+/// ([`FeaturePick::grown_ring`], row half-widths from [`disc_covers`]),
+/// then, across the antimeridian, its copy a turn back. A click anywhere on
+/// a drawn disc finds its strike, and a click past it does not.
+pub(crate) fn pick_region(pick: &FeaturePick<'_>) -> Vec<Vec<[f64; 2]>> {
+    let half_width = |dy: i64| {
+        (0..=SYMBOL_RADIUS_PX)
+            .rev()
+            .find(|&dx| disc_covers(dx, dy))
+            .unwrap_or(0)
+    };
+    FeaturePick::with_turn_copies(pick.grown_ring(SYMBOL_RADIUS_PX as u32, half_width))
+}
 
 /// Hard cap on strikes fetched per window — bounds the cache entry and the
 /// splat loop. `ORDER BY time DESC` in the fetch means a truncated window
@@ -365,7 +390,7 @@ pub(crate) fn splat_strikes(
         let age_min = (window_end - s.time).num_seconds().max(0) as f64 / 60.0;
         for dy in -SYMBOL_RADIUS_PX..=SYMBOL_RADIUS_PX {
             for dx in -SYMBOL_RADIUS_PX..=SYMBOL_RADIUS_PX {
-                if dx * dx + dy * dy > SYMBOL_RADIUS_PX * SYMBOL_RADIUS_PX {
+                if !disc_covers(dx, dy) {
                     continue; // disc, not square
                 }
                 let (px, py) = (cx + dx, cy + dy);
@@ -467,6 +492,25 @@ impl MapEngine for PostgisEngine {
     fn layer_shows_values(&self, _parameter: &str) -> bool {
         self.config().events().is_some()
     }
+
+    /// The events layer draws strikes, which WMS GetFeatureInfo picks
+    /// (#1100); a station layer's markers are not picked.
+    fn layer_picks_features(&self, _parameter: &str) -> bool {
+        self.config().events().is_some()
+    }
+
+    /// The strikes a frame at `pick.time` draws inside the picked pixel's
+    /// footprint ([`PostgisEngine::pick_events`]). Runs on the query runtime,
+    /// through the engine's `block_in_place` bridge, not this module's
+    /// `spawn_blocking` one.
+    fn pick_features(&self, pick: &FeaturePick<'_>) -> Result<PickedFeatures, DataServerError> {
+        match self.config().events() {
+            Some(shape) => self.pick_events(shape, pick),
+            None => Err(DataServerError::InvalidParameter(
+                "a station layer draws no features to pick".into(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -502,6 +546,75 @@ mod tests {
             weight >= allocated,
             "weight {weight} B under-counts a {allocated} B allocation"
         );
+    }
+
+    /// #1100: a WMS GetFeatureInfo pick finds a strike exactly when the
+    /// render paints the picked pixel with its disc: a click on the disc's
+    /// edge pixel, not its own, finds it, and a click just past the disc
+    /// does not. Checked against `splat_strikes` itself, every strike pixel
+    /// within four of the picked one, in CRS:84 and EPSG:3857.
+    #[test]
+    fn a_pick_holds_the_strikes_whose_disc_covers_the_pixel() {
+        use ds_core::feature::Geometry;
+        use ds_core::feature_pick::{FeaturePick, PickMap};
+        let end = ts("2026-07-11T20:00:00Z");
+        let bbox = [24.0, 59.0, 26.0, 61.0];
+        for output_crs in [OutputCrs::Wgs84, OutputCrs::WebMercator] {
+            // Pixel (10, 10) of a 20 × 20 map, centred as api-wms centres it.
+            let (lon, lat) = output_crs.project_node(bbox, 10.5 / 20.0, 10.5 / 20.0);
+            let pick = FeaturePick {
+                parameter: Some(LIGHTNING_AGE_PARAMETER),
+                map: PickMap {
+                    output_crs: &output_crs,
+                    wgs84_bbox: bbox,
+                    width: 20,
+                    height: 20,
+                },
+                pixel: (10, 10),
+                point: (lon, lat),
+                time: Some(end),
+                reference_time: None,
+                z: None,
+                limit: 10,
+            };
+            let rings = pick_region(&pick);
+            assert_eq!(rings.len(), 1);
+            let region = Geometry::Polygon {
+                exterior: rings[0].clone(),
+                holes: Vec::new(),
+            };
+            let mut found = Vec::new();
+            for dy in -4..=4i64 {
+                for dx in -4..=4i64 {
+                    // A strike at the centre of the pixel (dx, dy) away.
+                    let (x, y) = ((10 + dx) as f64 + 0.5, (10 + dy) as f64 + 0.5);
+                    let (s_lon, s_lat) = output_crs.project_node(bbox, x / 20.0, y / 20.0);
+                    let strike = Strike {
+                        time: end,
+                        lon: s_lon,
+                        lat: s_lat,
+                    };
+                    let tile = splat_strikes(&[strike], end, bbox, 20, 20, &output_crs);
+                    let painted = tile.values.value_at(10 * 20 + 10).is_some();
+                    assert_eq!(
+                        region.contains(s_lon, s_lat),
+                        painted,
+                        "{output_crs:?} ({dx}, {dy})"
+                    );
+                    if painted {
+                        found.push((dx, dy));
+                    }
+                }
+            }
+            assert_eq!(found.len(), 13, "{output_crs:?}");
+            // The disc's edge pixels pick it; the pixels just past do not.
+            for edge in [(2, 0), (-2, 0), (0, 2), (0, -2), (1, 1)] {
+                assert!(found.contains(&edge), "{edge:?}");
+            }
+            for outside in [(3, 0), (2, 1), (1, 2), (2, 2)] {
+                assert!(!found.contains(&outside), "{outside:?}");
+            }
+        }
     }
 
     #[test]

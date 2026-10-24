@@ -368,6 +368,12 @@ memory. Things that differ from the pull sources:
   with alpha; codes sit exactly on the 0–4 stops — no inter-code blending).
   Set `[wms] colormap = "cap_severity"`.
 - `raster_info()` is O(1) from a prebuilt `Arc<RasterInfo>` in the snapshot.
+- **GetFeatureInfo picks (#1100).** `layer_picks_features` is `true`.
+  `pick_features` takes `Catalog::query_point` candidates (the point and its
+  copies a turn east and west), keeps those `active_at` the pick's time
+  (`None` ⇒ `as_of`, as `render`) whose geometry `FeaturePick::hits`, most
+  severe first, and answers each item's `PICK_PROPERTIES`. Keep that
+  selection the render's.
 - `spatial_extent()` = union of resolved geometry bboxes;
   `FeatureEngine::temporal_extent()` = `[min start, max end]` of alert
   windows (open bounds clamp to `as_of`), so the collection JSON advertises
