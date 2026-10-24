@@ -21,6 +21,12 @@
 //!   fields are linear in lat/lon and stored in K, Pa and kg m-2 s-1,
 //!   served in °C, hPa and mm/h (#1213).
 //!
+//! - Satellite: `testdata/goes19-abi`, two GOES-19 crops served with an
+//!   RGB composite of both (#1100): each band's value at the scan the
+//!   composite is drawn from is EDR position's for that band.
+//! - CAP: engine-cap's fixtures, an alert layer without an EDR side, which
+//!   answers the alerts its engine picks at the pixel (#1100).
+//!
 //! No collection lists `edr` for the WMS: the WMS state carries the
 //! engine's EDR side in `point_engines`, as the server wires it.
 //!
@@ -1096,4 +1102,268 @@ async fn edr_and_get_feature_info_share_one_query_runtime() {
         "{budget:?}"
     );
     assert!(get_feature_info.deadline.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// RGB composites and layers that draw features (#1100), on real engines
+// ---------------------------------------------------------------------------
+
+const C13: &str = "OR_ABI-L2-CMIPF-M6C13_G19_s20262681900199_e20262681909519_c20262681909592.nc";
+const ACHT: &str = "OR_ABI-L2-ACHTF-M6_G19_s20262681900199_e20262681909507_c20262681912337.nc";
+
+/// The GOES-19 crops of `testdata/goes19-abi` as a satellite collection:
+/// band 13 at 19:00 and 19:10, cloud top temperature at 19:00 and 19:20,
+/// and the RGB composite `ir_cloud` of both, whose only shared scan is
+/// 19:00.
+fn goes() -> (
+    Apis,
+    Arc<engine_satellite::SatelliteEngine>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("ABI-L2/2026/268/19");
+    std::fs::create_dir_all(&nested).unwrap();
+    for (fixture, minutes) in [(C13, ["1900", "1910"]), (ACHT, ["1900", "1920"])] {
+        for hhmm in minutes {
+            let name = fixture.replace("_s20262681900199_", &format!("_s2026268{hhmm}199_"));
+            std::fs::copy(testdata("goes19-abi").join(fixture), nested.join(name)).unwrap();
+        }
+    }
+    let config: ds_core::config::SatelliteConfig = toml::from_str(&format!(
+        r#"
+        data_path = '{}'
+
+        [[products]]
+        parameter = "ir_10_3"
+        title = "IR 10.3"
+        unit = "K"
+        product = "ABI-L2-CMIPF"
+        band = 13
+        variable = "CMI"
+
+        [[products]]
+        parameter = "cloud_top_temperature"
+        title = "Cloud top temperature"
+        unit = "K"
+        product = "ABI-L2-ACHTF"
+        variable = "TEMP"
+
+        [[composites]]
+        name = "ir_cloud"
+        title = "IR and cloud top"
+        red = {{ parameter = "ir_10_3", minus = "cloud_top_temperature", min = -10, max = 40 }}
+        green = {{ parameter = "cloud_top_temperature", min = 330.0, max = 180.0 }}
+        blue = {{ parameter = "ir_10_3", min = 330.0, max = 180.0 }}
+        "#,
+        dir.path().display()
+    ))
+    .unwrap();
+    let engine = Arc::new(engine_satellite::SatelliteEngine::new("goes", &config).unwrap());
+    engine.poll_once();
+    let apis = apis(
+        "goes",
+        "satellite",
+        engine.clone(),
+        &["ir_10_3", "cloud_top_temperature"],
+    );
+    (apis, engine, dir)
+}
+
+/// The first point of a 1° grid over the collection's extent where the
+/// position query of `band` at `time` has a value.
+fn a_point_with(
+    engine: &engine_satellite::SatelliteEngine,
+    band: &str,
+    time: DateTime<Utc>,
+) -> (f64, f64) {
+    let [west, south, east, north] = engine.raster_info().spatial_extent.unwrap();
+    let mut lat = south.ceil();
+    while lat < north {
+        let mut lon = west.ceil();
+        while lon < east {
+            let answer = engine.query_position(
+                &format!("POINT({lon} {lat})"),
+                Some((time, time)),
+                Some(&[band.to_string()][..]),
+                None,
+                None,
+            );
+            if let Ok(CoverageResponse::Single(coverage)) = answer {
+                if coverage.ranges[band].values[0].is_some() {
+                    return (lon, lat);
+                }
+            }
+            lon += 1.0;
+        }
+        lat += 1.0;
+    }
+    panic!("no {band} value in the extent")
+}
+
+/// An RGB composite answers each band's value at the scan the composite is
+/// drawn from: TIME 19:10 draws 19:00, the only scan both bands have, and
+/// each band's value is EDR position's for that band there. The crops lie
+/// apart, so a point holds one band's value and the other's null, each
+/// pinned to its own EDR answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_satellite_composite_reads_each_band_at_the_scan_drawn() {
+    let (Apis { wms, edr }, engine, _dir) = goes();
+    let scan: DateTime<Utc> = "2026-09-25T19:00:00Z".parse().unwrap();
+    let capabilities = get(&wms, "/?SERVICE=WMS&REQUEST=GetCapabilities")
+        .await
+        .body;
+    assert!(
+        capabilities.contains("<Layer queryable=\"1\" opaque=\"1\"><Name>goes/ir_cloud</Name>"),
+        "{capabilities}"
+    );
+    for band in ["ir_10_3", "cloud_top_temperature"] {
+        let (lon, lat) = a_point_with(&engine, band, scan);
+        let d = 0.003;
+        let reply = get(
+            &wms,
+            &format!(
+                "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&LAYERS=goes/ir_cloud\
+                 &STYLES=&CRS=CRS:84&BBOX={},{},{},{}&WIDTH=3&HEIGHT=3\
+                 &QUERY_LAYERS=goes/ir_cloud&I=1&J=1&INFO_FORMAT=application/json\
+                 &TIME=2026-09-25T19:10:00Z",
+                lon - d,
+                lat - d,
+                lon + d,
+                lat + d
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let features = json(&reply)["features"].as_array().unwrap().clone();
+        let bands: Vec<&str> = features
+            .iter()
+            .map(|f| f["properties"]["parameter"].as_str().unwrap())
+            .collect();
+        assert_eq!(bands, ["ir_10_3", "cloud_top_temperature"]);
+        for feature in &features {
+            let properties = &feature["properties"];
+            assert_eq!(properties["layer"], "goes/ir_cloud");
+            assert_eq!(properties["time"], "2026-09-25T19:00:00Z");
+            assert_eq!(properties["unit"], "K");
+            let parameter = properties["parameter"].as_str().unwrap();
+            let coordinates = &feature["geometry"]["coordinates"];
+            let at = (
+                coordinates[0].as_f64().unwrap(),
+                coordinates[1].as_f64().unwrap(),
+            );
+            let reply = get(
+                &edr,
+                &format!(
+                    "/collections/goes/position?coords=POINT({}%20{})&parameter-name={parameter}\
+                     &datetime=2026-09-25T19:00:00Z",
+                    at.0, at.1
+                ),
+            )
+            .await;
+            let position = match reply.status {
+                // No scan of this band reaches the point.
+                StatusCode::NOT_FOUND => Value::Null,
+                StatusCode::OK => json(&reply)["ranges"][parameter]["values"][0].clone(),
+                other => panic!("{other}: {}", reply.body),
+            };
+            assert_eq!(properties["value"], position, "{parameter} at {at:?}");
+            if parameter == band {
+                assert!(properties["value"].is_number(), "{band}: {properties}");
+            }
+        }
+    }
+}
+
+/// The CAP fixtures as an alert layer, which has no EDR side: its engine
+/// picks the alerts whose areas contain the pixel's centre, active at the
+/// frame's instant, most severe first, with the properties its Features
+/// items carry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cap_layer_answers_the_alerts_at_the_pixel() {
+    let config: ds_core::config::CapConfig = serde_json::from_value(serde_json::json!({
+        "data_path": PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../engine-cap/tests/fixtures")
+            .to_str()
+            .unwrap(),
+        "language": "en",
+    }))
+    .unwrap();
+    let cap = Arc::new(engine_cap::CapEngine::new(&config, "alerts").unwrap());
+    let wms = api_wms::router(Arc::new(ArcSwap::from_pointee(api_wms::WmsState {
+        engines: HashMap::from([("alerts".to_string(), cap.clone() as Arc<dyn MapEngine>)]),
+        point_engines: HashMap::new(),
+        collections: HashMap::from([("alerts".to_string(), collection("alerts", "cap", "wms"))]),
+        styles: HashMap::from([("alerts".to_string(), style())]),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(64)),
+        base_url: String::new(),
+        trust_proxy_headers: false,
+    })));
+    let capabilities = get(&wms, "/?SERVICE=WMS&REQUEST=GetCapabilities")
+        .await
+        .body;
+    assert!(
+        capabilities.contains("<Layer queryable=\"1\" opaque=\"1\"><Name>alerts</Name>"),
+        "{capabilities}"
+    );
+
+    // A 3 × 3 map centred on (25.0, 60.2): in the Helsinki flood polygon
+    // (Severe) and the 8 km heat circle (Extreme).
+    let query = |extra: &str| {
+        format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&LAYERS=alerts&STYLES=\
+             &CRS=CRS:84&BBOX=24.997,60.197,25.003,60.203&WIDTH=3&HEIGHT=3\
+             &QUERY_LAYERS=alerts&I=1&J=1{extra}"
+        )
+    };
+    let reply = get(
+        &wms,
+        &query("&INFO_FORMAT=application/json&FEATURE_COUNT=5"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let body = json(&reply);
+    let features = body["features"].as_array().unwrap();
+    let events: Vec<&str> = features
+        .iter()
+        .map(|f| f["properties"]["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(events, ["Extreme Heat Warning", "Flood Warning"]);
+    assert_eq!(body["layers"][0]["numberMatched"], 2);
+    for feature in features {
+        let id = feature["id"].as_str().unwrap();
+        let item = ds_core::feature_engine::FeatureEngine::get_feature(cap.as_ref(), id).unwrap();
+        for (name, value) in feature["properties"].as_object().unwrap() {
+            if name == "layer" {
+                assert_eq!(value, "alerts");
+                continue;
+            }
+            let expected = item.properties[name].as_str().unwrap();
+            assert_eq!(value, expected, "{id}: {name}");
+        }
+        assert_eq!(feature["geometry"]["type"], "Polygon", "{id}");
+    }
+
+    // Without FEATURE_COUNT, the most severe, and the count of all.
+    let reply = get(&wms, &query("")).await;
+    assert!(
+        reply
+            .body
+            .starts_with("layer: alerts\nparameter: severity\n"),
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains("\nmatched: 2\nreturned: 1\n"),
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply
+            .body
+            .contains("\nevent: Extreme Heat Warning\nseverity: Extreme\n"),
+        "{}",
+        reply.body
+    );
 }

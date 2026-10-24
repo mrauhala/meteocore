@@ -1016,6 +1016,152 @@ fn pvol_cells_raster_layer() {
     assert!(far.is_empty(), "off-coverage viewport is transparent");
 }
 
+/// WMS GetFeatureInfo on the `CELLS` layer (#1100) over the real FMI Vihti
+/// storm: picking the pixel a cell's marker is centred on answers that
+/// cell, with the track id and attributes of the product the layer draws;
+/// a pixel far from every cell answers nothing. Skips when the uncommitted
+/// fixture is absent.
+#[test]
+fn pvol_cells_pick_answers_the_cell_the_layer_draws() {
+    use ds_core::feature_pick::FeaturePick;
+    use ds_core::volume::{CellQuery, VolumeEngine};
+    use engine_odim::cells::CELLS_PARAMETER;
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/radar-fmi-pvol/202605191050_fivih_PVOL.h5");
+    if !fixture.exists() {
+        eprintln!("skipping pvol_cells_pick_answers_the_cell_the_layer_draws: fixture absent");
+        return;
+    }
+    let data_dir = fixture.parent().unwrap().to_str().unwrap();
+    let config = OdimConfig {
+        filename_template: None,
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: None,
+        unit: None,
+        nodata: None,
+        gain: None,
+        offset: None,
+        poll_interval_secs: 30,
+        max_files: None,
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+        time_window: None,
+        discovery: None,
+        cadence_secs: None,
+        resampling: Default::default(),
+        prewarm_sweeps: 1,
+    };
+    let engine = engine_odim::PolarVolumeEngine::new("fivih-cells-pick", Some(data_dir), &config)
+        .expect("PolarVolumeEngine::new");
+    let view = engine.site_view("fivih", "fivih-cells-pick-fivih");
+    assert!(view.layer_picks_features(CELLS_PARAMETER));
+    assert!(!view.layer_picks_features("DBZH"));
+
+    // The product the layer draws: DBZH at the engine's default grid, six
+    // scans tracked behind (one volume here).
+    let product = view
+        .read_cells(&CellQuery {
+            quantity: Some("DBZH".into()),
+            track_scans: 6,
+            ..CellQuery::default()
+        })
+        .expect("read_cells");
+    let (time, set) = product.target();
+
+    // A 512 × 512 CRS:84 map over the coverage, as the layer test draws it.
+    let bbox = [19.5, 57.6, 29.5, 63.6];
+    let tile = view
+        .get_raster_tile(
+            bbox,
+            512,
+            512,
+            None,
+            &OutputCrs::Wgs84,
+            Some(CELLS_PARAMETER),
+            None,
+            None,
+        )
+        .expect("CELLS raster");
+    let output_crs = OutputCrs::Wgs84;
+    let pick = |(lon, lat): (f64, f64)| {
+        let h = 10.0 / 512.0 / 2.0;
+        FeaturePick {
+            parameter: Some(CELLS_PARAMETER),
+            map: ds_core::feature_pick::PickMap {
+                output_crs: &output_crs,
+                wgs84_bbox: [lon - h, lat - h, lon + h, lat + h],
+                width: 1,
+                height: 1,
+            },
+            pixel: (0, 0),
+            point: (lon, lat),
+            time: Some(*time),
+            reference_time: None,
+            z: None,
+            limit: 5,
+        }
+    };
+    let mut checked = 0;
+    for cell in &set.cells {
+        // The pixel the layer centres the cell's `+` marker on.
+        let i = ((cell.centroid[0] - bbox[0]) / 10.0 * 512.0).round();
+        let j = ((bbox[3] - cell.centroid[1]) / 6.0 * 512.0).round();
+        let centre = (
+            bbox[0] + (i + 0.5) * 10.0 / 512.0,
+            bbox[3] - (j + 0.5) * 6.0 / 512.0,
+        );
+        let outline = Geometry::Polygon {
+            exterior: cell.footprint.clone(),
+            holes: Vec::new(),
+        };
+        if !outline.contains(centre.0, centre.1) {
+            continue;
+        }
+        // The layer paints the cell's marker there, at its max dBZ.
+        let painted = tile.values.value_at(j as usize * 512 + i as usize);
+        assert!(painted.is_some(), "marker of cell {}", cell.label);
+
+        let picked = view.pick_features(&pick(centre)).expect("pick");
+        assert_eq!(picked.number_matched, 1, "cell {}", cell.label);
+        let feature = &picked.features[0];
+        let track = product
+            .tracks
+            .track_for(*time, cell.label)
+            .expect("tracked");
+        assert_eq!(feature.id, track.id);
+        let max_dbz = feature
+            .properties
+            .iter()
+            .find(|(n, _)| n == "max_dbz")
+            .and_then(|(_, v)| v.as_f64())
+            .unwrap();
+        assert!(
+            (max_dbz - cell.max_dbz).abs() <= 0.05,
+            "{max_dbz} vs {}",
+            cell.max_dbz
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "some cell's centroid pixel lies inside its outline"
+    );
+
+    // Far from every cell, inside the coverage: nothing.
+    let picked = view.pick_features(&pick((20.0, 58.0))).expect("pick");
+    assert_eq!(picked.number_matched, 0);
+    // The moments draw values, not features.
+    assert!(view
+        .pick_features(&FeaturePick {
+            parameter: Some("DBZH"),
+            ..pick((20.0, 58.0))
+        })
+        .is_err());
+}
+
 /// Regression guard for SMHI signed-integer PVOL: SMHI ships its moments as
 /// **signed `i16`** (DBZH `gain=0.01`, sentinels `nodata=-32768` /
 /// `undetect=-32767` — only representable as signed), which the original

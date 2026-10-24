@@ -254,6 +254,11 @@ the frame follows the newest step, updated on refresh. Each window is one
 read, cached (`MC_LIGHTNING_STRIKE_CACHE_MB`, default 32) and capped at the
 newest 200 000 events.
 
+WMS GetFeatureInfo answers the events of the frame's window whose drawn
+disc covers the clicked pixel, newest first, with their time, id, the
+configured parameters, `type` and `peak_current_ka`: one statement per
+request, on the EDR bridge, with every such event counted.
+
 A nowcast `lightning_source` reads the same table. Optional
 `cloud_indicator_col` (0 cloud-to-ground, 1 intra-cloud), `peak_current_col`
 (signed kA) and `coverage_bbox` (where detection is guaranteed) feed it.

@@ -17,7 +17,8 @@ names.
 - One route, `GET /wms` (`/wms/` works too), dispatching on `REQUEST`.
 - The server registers each `wms` collection's `MapEngine` in `WmsState`,
   and its `EdrEngine` when EDR position queries answer the values its
-  layers show (for GetFeatureInfo). A reload swaps the state atomically.
+  layers show (for GetFeatureInfo; a layer that draws features answers it
+  through its `MapEngine`). A reload swaps the state atomically.
   The crate depends on `ds-core`, `ds-render` and `ds-executor`, never on
   an engine crate.
 - GetMap resolves each layer's style, timestep, model run and level before
@@ -53,7 +54,7 @@ In QGIS, add a WMS/WMTS connection with the URL `http://localhost:8000/wms`.
 |---|---|
 | `GetCapabilities` | The capabilities document, `text/xml` |
 | `GetMap` | A PNG, JPEG or WebP image of up to five layers |
-| `GetFeatureInfo` | Each queried layer's value at a pixel: text, GeoJSON or HTML |
+| `GetFeatureInfo` | What each queried layer shows at a pixel: a value, an RGB composite's band values, or the features drawn there; text, GeoJSON or HTML |
 | `GetLegendGraphic` | A legend image, or the legend as JSON |
 
 A missing `REQUEST` is `MissingParameterValue`, any other value
@@ -201,21 +202,57 @@ latitude-first. When in doubt, use `CRS:84`.
 
 ## GetFeatureInfo
 
-The value of each queried layer at a pixel of the map, for QGIS's identify
+What each queried layer shows at a pixel of the map, for QGIS's identify
 tool or a click in a web map:
 
 ```
 http://localhost:8000/wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&LAYERS=radar&QUERY_LAYERS=radar&STYLES=&CRS=CRS:84&BBOX=10,67,12,69&WIDTH=256&HEIGHT=256&I=137&J=140&INFO_FORMAT=application/json
 ```
 
-The value is the collection's EDR position query at the centre of pixel
-(`I`, `J`), so GetFeatureInfo and `/edr/collections/{id}/position` answer
-the same value at the same point, time, run and level. It is the source
-value as the engine samples it (bilinear for GRIB, QueryData, Zarr and
-NetCDF; a station grid's analysis cell under the point), not the pixel's
-colour: a projected GetMap is assembled by nearest neighbour. The answer
-names the value's unit, the one EDR serves: GRIB, Zarr and NetCDF convert
-a temperature stored in K to °C and a pressure in Pa to hPa.
+A layer answers in one of three ways, each from the engine call that
+answers the same question elsewhere:
+
+- **A value.** The collection's EDR position query at the centre of pixel
+  (`I`, `J`), so GetFeatureInfo and `/edr/collections/{id}/position` answer
+  the same value at the same point, time, run and level. It is the source
+  value as the engine samples it (bilinear for GRIB, QueryData, Zarr and
+  NetCDF; a station grid's analysis cell under the point), not the pixel's
+  colour: a projected GetMap is assembled by nearest neighbour. The answer
+  names the value's unit, the one EDR serves: GRIB, Zarr and NetCDF convert
+  a temperature stored in K to °C and a pressure in Pa to hPa.
+- **An RGB composite** (`{collection}/{composite}`) answers each band's
+  value at the point, with its band name and unit: one position query of
+  its bands at the scan the composite is drawn from, the latest scan every
+  band has at or before `TIME`. Bands that share no scan answer null, and
+  nothing is read, as GetMap draws the empty image.
+- **A layer that draws features** answers the features the map draws at
+  the pixel, picked by its engine with the rule its render draws them by:
+  - CAP alerts: the alerts active at the frame's instant (`TIME`, else
+    now) whose areas contain the pixel's centre, most severe first, with
+    `event`, `severity`, `urgency`, `certainty`, `headline`, `onset`,
+    `expires`, `areaDesc`, `identifier` and `web` as the Features item has
+    them (a field the alert lacks is left out), and the item's id and
+    area.
+  - The ODIM per-site `CELLS` overlay: the tracked storm cell of the scan
+    the layer draws whose outline contains the pixel's centre, with its
+    track id and outline, `observed`, `max_dbz`, `area_km2`, `speed_ms` and
+    `bearing_deg` (null before the track has moved), `echo_top_m`,
+    `base_m`, `volume_km3` and `vil_kg_m2`. Severity and significance are
+    the nowcast tracker's, which a site's cells do not have.
+  - PostGIS events (lightning): the strikes of the frame's window,
+    `default_datetime` up to `TIME` (start excluded), whose drawn disc
+    covers the pixel. The map draws each strike as a disc of radius two
+    pixels around its own pixel, so the pick holds the pixels that disc
+    reaches the clicked one from, on the map's grid, their corners mapped
+    as the map's nodes are: a click anywhere on a drawn disc finds the
+    strike, and a click past it does not. A region across the antimeridian
+    holds strikes on both sides. Newest first, with `time`, the id, every
+    configured parameter, `type` (`cloud-to-ground` or `intra-cloud`, from
+    `cloud_indicator_col`) and `peak_current_ka` (from `peak_current_col`,
+    unless a parameter reads that column).
+
+  At most `FEATURE_COUNT` features per layer, most relevant first, and the
+  answer states how many there are.
 
 | Parameter | Required | Values |
 |---|---|---|
@@ -223,7 +260,7 @@ a temperature stored in K to °C and a pressure in Pa to hPa.
 | `QUERY_LAYERS` | yes | Layers of `LAYERS`, answered in this order, each once. One `LAYERS` does not name is `LayerNotDefined`; one that is not queryable is `LayerNotQueryable`, checked before any layer is read |
 | `I`, `J` | yes | The pixel's column (0 to `WIDTH` − 1) and row (0 at the top). Anything else, negative or non-integer included, is `InvalidPoint` |
 | `INFO_FORMAT` | no | `text/plain` (default), `application/json`, `text/html`; anything else `InvalidFormat` |
-| `FEATURE_COUNT` | no | A positive integer, default 1. A layer has one value at a point, so any count returns it |
+| `FEATURE_COUNT` | no | A positive integer, default 1 (WMS 1.3.0 §7.4.3.7): the most features a layer that draws features reports, at most 50. A value and a composite's bands answer whatever the count |
 
 Each layer is read at the time, model run and level GetMap draws it at: an
 omitted `TIME` is the layer's default, and a `TIME` between timesteps is the
@@ -233,8 +270,10 @@ is not always `ELEVATION` or the first advertised level (GRIB without
 sweep that carries the quantity). The answer reports the resolved time, and
 the run and level when the layer has them.
 
-`application/json` is a GeoJSON FeatureCollection, one Point per queried
-layer. Over the configuration example below, that request answers:
+`application/json` is a GeoJSON FeatureCollection: a Point for each value
+read, one per queried layer and one per band of a composite, and each
+picked feature with its id, its own geometry and its properties, `layer`
+first. Over the configuration example below, the request above answers:
 
 ```json
 {
@@ -253,28 +292,69 @@ layer. Over the configuration example below, that request answers:
 }
 ```
 
-`reference_time` and `elevation` join the properties when the layer has
-them. `text/plain` writes `layer:` and then one `name: value` line per field,
-`lon` and `lat` included; `text/html` is one escaped table per layer.
+`reference_time` and `elevation` join a value's properties when the layer
+has them. A layer that draws features is also listed under the foreign
+member `layers`, with its time and how many features it has at the pixel
+(`numberMatched`) and the answer holds (`numberReturned`). A CAP alert
+answers:
+
+```json
+{
+  "type": "FeatureCollection",
+  "features": [{
+    "type": "Feature",
+    "id": "cap:22:test@meteocore.exampleurn:test:helsinki-flood-1.0.0",
+    "geometry": {"type": "Polygon", "coordinates": [[[24.9, 60.1], [25.1, 60.1], [25.1, 60.3], [24.9, 60.3], [24.9, 60.1]]]},
+    "properties": {
+      "layer": "alerts",
+      "event": "Flood Warning",
+      "severity": "Severe",
+      "urgency": "Expected",
+      "certainty": "Likely",
+      "headline": "Flood Warning for Helsinki region",
+      "onset": "2020-01-01T00:00:00Z",
+      "areaDesc": "Greater Helsinki",
+      "identifier": "urn:test:helsinki-flood-1",
+      "web": "https://meteocore.example/alerts/helsinki-flood-1"
+    }
+  }],
+  "layers": [{
+    "layer": "alerts", "parameter": "severity", "time": "2026-10-24T12:00:00Z",
+    "numberMatched": 1, "numberReturned": 1
+  }]
+}
+```
+
+`text/plain` writes, per value, `layer:` and then one `name: value` line
+per field, `lon` and `lat` included; per layer that draws features, the
+layer's fields, `matched:` and `returned:`, then each feature as `id:` and
+one line per property, a line break inside a value written as a space.
+`text/html` is one escaped table per value, and per layer that draws
+features a table of its fields and one per feature.
 
 - **No data is an answer.** A nodata pixel, or a point outside the data, is
-  JSON `value: null` and `nodata` in the text formats. A pixel centre that
-  is not on the Earth (past a pole, or outside an `EPSG:3067` / `EPSG:3035`
-  valid area) also has a null `geometry`, and no engine is asked.
-- **Queryable layers.** A layer is `queryable="1"` when its collection's
-  engine answers EDR position queries for the values the layer shows,
-  whether or not the collection lists `edr`. RGB composites, the ODIM
-  per-site `CELLS` overlay, CAP, PostGIS events (lightning), station
-  symbols (CSV, BUFR, PostGIS) and nowcast layers are `queryable="0"` and answer
-  `LayerNotQueryable`. A station marker shows the station's latest value
-  within `max_age`, which a position query, an exact instant at the
-  nearest station, does not answer.
-- **Execution.** The queries wait in GetMap's render queue and run on the
-  query runtime EDR uses, one layer after another, under one deadline of
-  their own, `MC_FEATURE_INFO_TIMEOUT_MS` (10 s), which also covers the
-  wait for a render slot. Overload or expiry is 503 with `Retry-After: 1`.
-  An engine failure is HTTP 500 with a generic message, its detail only in
-  the server log, and the layers after it are not read.
+  JSON `value: null` and `nodata` in the text formats; a layer that draws
+  nothing at the pixel answers no feature and `numberMatched` 0. A pixel
+  centre that is not on the Earth (past a pole, or outside an `EPSG:3067`
+  / `EPSG:3035` valid area) also has a null `geometry`, and no engine is
+  asked.
+- **Queryable layers.** A layer is `queryable="1"` when its engine picks
+  the features it draws (CAP alerts, the ODIM per-site `CELLS` overlay,
+  PostGIS events), when it is an RGB composite of a collection whose engine
+  answers EDR position queries, or when that engine answers them for the
+  values the layer shows, whether or not the collection lists `edr`.
+  Station symbols (CSV, BUFR, PostGIS) and nowcast layers are
+  `queryable="0"` and answer `LayerNotQueryable`. A station marker shows
+  the station's latest value within `max_age`, which a position query, an
+  exact instant at the nearest station, does not answer; a nowcast layer's
+  extrapolated reflectivity has no position query yet.
+- **Execution.** The reads, position queries and feature picks alike, wait
+  in GetMap's render queue and run on the query runtime EDR uses, one layer
+  after another, under one deadline of their own,
+  `MC_FEATURE_INFO_TIMEOUT_MS` (10 s), which also covers the wait for a
+  render slot. Overload or expiry is 503 with `Retry-After: 1`. An engine
+  failure is HTTP 500 with a generic message, its detail only in the server
+  log, and the layers after it are not read.
 
 ## GetLegendGraphic
 
@@ -358,7 +438,7 @@ only in the server log.
 |---|---|
 | GetMap with a `TIME` that resolved, on content never revised in place | `public, max-age=86400, immutable` |
 | GetMap otherwise (no `TIME`, CAP alerts, BUFR and PostGIS station symbols, station grids, the error image) | `public, max-age=60, must-revalidate` |
-| GetFeatureInfo | As GetMap, and a null value always revalidates |
+| GetFeatureInfo | As GetMap, and an empty answer (a null value or band, no feature) always revalidates |
 | GetLegendGraphic | `public, max-age=86400` |
 
 ## Limits and admission

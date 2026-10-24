@@ -447,10 +447,14 @@ not guarantee monotonic improvement. This baseline does not enable #642.
   `[[wms.parameters]] name = "CELLS"`. `time` selects the scan (TIME
   animation works); `z` is ignored. 3D Tiles `representation=cells` +
   Features output are follow-ups of #367.
-- Not queryable: `MapEngine::layer_shows_values` is `false` for `CELLS`, so
-  WMS GetFeatureInfo, which reads values with the site's EDR position
-  query, marks the layer `queryable="0"` and answers `LayerNotQueryable`
-  (#1064). Every moment layer is queryable.
+- Queryable by its features (#1100): `layer_shows_values` is `false` for
+  `CELLS` and `layer_picks_features` is `true`. WMS GetFeatureInfo calls
+  `pick_features` → `pick_cells`: the target scan's cell whose outline holds
+  the pixel centre, from `cell_product(&layer_query(..), None)`, the tiles'
+  product and cache, with no `spawn_blocking` handle since it runs on the
+  query runtime. It serves what the per-site product has, never the
+  nowcast's severity or significance. Every moment layer is queryable by
+  value.
 
 ## File discovery
 

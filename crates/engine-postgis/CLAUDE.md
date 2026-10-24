@@ -369,6 +369,18 @@ in step when changing this lifecycle.
   optional and independently validated. `EventSource::covers` checks full
   containment; absent config returns unknown. Never substitute `extent_bbox`
   or observed strike positions: neither guarantees detection coverage.
+- **GetFeatureInfo picks on the events shape (#1100).** `pick_events` reads
+  the map's window (`resolve_window_end`, `(end − window, end]`) inside
+  `maps::pick_region`: the picked pixel grown by the strike disc the map
+  draws, the pixels `disc_covers` reaches it from on the map's grid
+  (`FeaturePick::grown_ring`), and its copy a turn back across ±180. A click
+  anywhere on a drawn disc finds the strike. `disc_covers` is the one home
+  of the disc's shape: `splat_strikes` and the pick both use it, so never
+  copy the radius. One `build_events_pick` statement: `count(*) OVER ()`
+  gives the total before `LIMIT`, attribute columns use `mc_` aliases, and
+  value filters apply as in EDR. It runs through `run_single_query_sync`
+  (`block_in_place` on the query runtime), never `maps.rs`'s
+  `spawn_blocking` bridge. Station layers do not pick.
 
 ## Database tests (`tests/db.rs`, #1062)
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::error::DataServerError;
+use crate::feature_pick::{FeaturePick, PickedFeatures};
 use crate::geo::Crs;
 use crate::vertical::VerticalDimension;
 
@@ -1154,12 +1155,48 @@ pub trait MapEngine: Send + Sync {
     ///
     /// WMS GetFeatureInfo reads a layer's value with the collection's EDR
     /// position query (#1064), so it answers only for such layers: an
-    /// overlay layer is `queryable="0"` and answers `LayerNotQueryable`.
+    /// overlay layer is `queryable="0"` and answers `LayerNotQueryable`,
+    /// unless it draws features [`Self::pick_features`] picks (#1100).
     /// Default `true`. **O(1)**, no I/O: GetCapabilities reads it for every
     /// layer (Critical Rule 10).
     fn layer_shows_values(&self, parameter: &str) -> bool {
         let _ = parameter;
         true
+    }
+
+    /// Whether the layer of `parameter` draws features, such as alert
+    /// areas, storm-cell outlines or lightning strikes, that
+    /// [`Self::pick_features`] answers for at a pixel (#1100).
+    ///
+    /// WMS GetFeatureInfo then answers for the layer with the features the
+    /// map draws at the clicked pixel instead of a position query's value,
+    /// and marks it `queryable="1"`. Default `false`. **O(1)**, no I/O:
+    /// GetCapabilities reads it for every layer (Critical Rule 10). An
+    /// engine that returns `true` MUST override [`Self::pick_features`].
+    fn layer_picks_features(&self, parameter: &str) -> bool {
+        let _ = parameter;
+        false
+    }
+
+    /// The features the layer of `pick.parameter` draws at the picked
+    /// pixel, selected by the rule [`Self::get_raster_tile`] draws them
+    /// with at `pick.time` (and `pick.reference_time`, `pick.z`), most
+    /// relevant first, at most `pick.limit` of them and all of them
+    /// counted. Nothing there is an empty answer; `LocationNotFound` and
+    /// the other no-data errors are read as one too.
+    ///
+    /// Runs as an EDR query does: on ds-executor's query runtime, where
+    /// `block_in_place` is valid and a `spawn_blocking` bridge is not, under
+    /// the request's deadline (`ds_core::deadline`). Engines return domain
+    /// types; the API layer writes the formats.
+    ///
+    /// Default: `InvalidParameter`, for a layer
+    /// [`Self::layer_picks_features`] does not claim.
+    fn pick_features(&self, pick: &FeaturePick<'_>) -> Result<PickedFeatures, DataServerError> {
+        let _ = pick;
+        Err(DataServerError::InvalidParameter(
+            "this layer draws no features to pick".into(),
+        ))
     }
 
     /// The vertical level [`Self::get_raster_tile`] draws `parameter` at

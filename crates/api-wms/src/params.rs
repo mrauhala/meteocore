@@ -105,10 +105,13 @@ pub const INFO_FORMATS: &[&str] = &["text/plain", "application/json", "text/html
 pub enum InfoFormat {
     /// `text/plain`: one `name: value` line per field.
     Text,
-    /// `application/json`: a GeoJSON FeatureCollection, one Point feature
-    /// per queried layer at the sampled position.
+    /// `application/json`: a GeoJSON FeatureCollection: a Point feature
+    /// per value read at the sampled position (one per queried layer, one
+    /// per band of an RGB composite), and each feature a layer draws there
+    /// with its own geometry (#1100).
     Json,
-    /// `text/html`: one table per queried layer.
+    /// `text/html`: one table per value read, and per layer that draws
+    /// features, one for the layer and one per feature.
     Html,
 }
 
@@ -274,8 +277,11 @@ pub struct GetFeatureInfoParams {
     /// The queried pixel's row, `0..map.height`, 0 at the top.
     pub j: u32,
     pub info_format: InfoFormat,
-    /// `FEATURE_COUNT`, 1 when omitted. Every queried layer has one value
-    /// at a point, so any count reports it.
+    /// `FEATURE_COUNT`, 1 when omitted (§7.4.3.7): the most features a
+    /// layer that draws features reports, up to
+    /// [`crate::feature_info::MAX_FEATURE_COUNT`]; the answer states how
+    /// many there are. A layer's value, or a composite's band values, are
+    /// one answer whatever the count (#1100).
     pub feature_count: u32,
 }
 

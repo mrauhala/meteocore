@@ -116,9 +116,11 @@ available.
   beam, which api-edr emits as `meteocore:beamCoverage`.
 - **`CELLS`** (sites with a dBZ moment): storm cells at 35 dBZ, drawn as
   footprint outlines and centroid markers at each cell's peak dBZ, with
-  tracks over the six previous scans. `ELEVATION` is ignored, and WMS
-  GetFeatureInfo does not query the layer. The poll loop builds cell sets
-  ahead of the tiles. It builds a new volume's set from the bytes the scan
+  tracks over the six previous scans. `ELEVATION` is ignored. WMS
+  GetFeatureInfo answers the tracked cell whose outline holds the pixel's
+  centre in the scan the layer draws, with its track id, motion, area and
+  peak dBZ, from the product the tiles draw. The poll loop builds cell
+  sets ahead of the tiles. It builds a new volume's set from the bytes the scan
   already downloaded, and fills the newest seven-scan window of every site
   when it starts and after each poll: at most 32 volumes per poll, four
   downloads at a time. The tiles of a cold window build its volumes in

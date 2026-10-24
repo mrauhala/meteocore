@@ -485,6 +485,13 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    `MapEngine::layer_shows_values` (O(1)) to return `false` for it.
    Otherwise WMS advertises it `queryable="1"` and answers with nodata or
    a 400 (#1064).
+   **If a layer draws features** (alert areas, cell outlines, strikes),
+   override `MapEngine::layer_picks_features` (O(1)) and `pick_features`
+   with the SAME selection `get_raster_tile` draws them by (time rule, world
+   copies), returning `ds_core::feature_pick` types. It runs on the query
+   runtime, where `block_in_place` is valid. WMS GetFeatureInfo then answers
+   those features (#1100). A forwarding wrapper (`ds_core::derive::Derived`)
+   must forward both.
    **If a `FeatureEngine`'s features carry time**, apply
    `FeatureQuery::datetime` as OGC `datetime`: keep the features whose
    temporal geometry intersects the interval (an instant is `start == end`,

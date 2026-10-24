@@ -8,7 +8,7 @@ use ds_core::map_engine::{default_request_time, MapEngine, RasterInfo};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
-use crate::feature_info::layer_is_queryable;
+use crate::feature_info::{composite_is_queryable, layer_is_queryable};
 use crate::params;
 use ds_render::{CompositeSpec, StyleInfo};
 
@@ -39,7 +39,9 @@ const LEGEND_URL_FORMAT: &str = "image/png";
 ///
 /// `point_engines` are the collections whose engine answers position
 /// queries ([`crate::handlers::WmsState::point_engines`]): their layers that
-/// show a parameter's own values are `queryable="1"` (#1064).
+/// show a parameter's own values (#1064) and their RGB composites (#1100)
+/// are `queryable="1"`, as are the layers that draw features their engine
+/// picks (#1100).
 ///
 /// Uses quick-xml Writer to ensure all text content is properly escaped.
 /// Never builds XML via format!() or string concatenation (XML injection risk).
@@ -312,15 +314,18 @@ fn write_parent_layer(
             let default = default_request_time(engine, info, Some(&composite.name));
             (times, default)
         });
+        let spec = CompositeSpec::from(composite);
+        let queryable = composite_is_queryable(point_engines, id, engine, &spec.parameters);
         write_composite_layer(
             writer,
             &child_layer_name,
             &child_title,
-            &CompositeSpec::from(composite),
+            &spec,
             base_url,
             own_times
                 .as_ref()
                 .map(|(times, default)| (&times[..], *default)),
+            queryable,
         );
     }
 
@@ -329,8 +334,9 @@ fn write_parent_layer(
 
 /// Write an RGB composite's child layer: its name and title, an abstract
 /// naming what each channel reads, its own `time` dimension and its one
-/// style, `default`, with a LegendURL to the channel-list legend. Never
-/// queryable: no position query answers a composite (#1064).
+/// style, `default`, with a LegendURL to the channel-list legend.
+/// `queryable`: GetFeatureInfo answers each band's value there
+/// ([`composite_is_queryable`], #1100).
 fn write_composite_layer(
     writer: &mut Writer<Vec<u8>>,
     layer_name: &str,
@@ -338,9 +344,10 @@ fn write_composite_layer(
     spec: &CompositeSpec,
     base_url: &str,
     own_times: Option<OwnTimes<'_>>,
+    queryable: bool,
 ) {
     let mut layer = BytesStart::new("Layer");
-    layer.push_attribute(("queryable", "0"));
+    layer.push_attribute(("queryable", if queryable { "1" } else { "0" }));
     layer.push_attribute(("opaque", "1"));
     let _ = writer.write_event(Event::Start(layer));
 
