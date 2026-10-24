@@ -182,6 +182,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
     Arc::new(ArcSwap::from_pointee(EdrState {

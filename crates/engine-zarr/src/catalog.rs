@@ -58,8 +58,8 @@ pub struct Variable {
     decoded: Option<DecodedArray>,
     /// The unit values are served in (#1213): the display unit of the CF
     /// `units` attribute where `ds_core::units::cf_display_conversion` has a
-    /// rule (K → °C, Pa → hPa, kg m-2 → mm, kg m-2 s-1 → mm/h, m2 s-2 →
-    /// gpm, in any spelling; `1` → % where the `standard_name` is a
+    /// rule (K → °C, Pa → hPa, kg m-2 → mm, kg m-2 s-1 → mm/h, in any
+    /// spelling; `1` → % where the `standard_name` is a
     /// fraction: `relative_humidity`, any `…_area_fraction` or `…_area_fraction_in_atmosphere_layer`), else `units`
     /// as the store spells it. Every report of the unit reads this:
     /// `RasterInfo`, EDR descriptions and coverages, wind facts.

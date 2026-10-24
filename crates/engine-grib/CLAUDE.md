@@ -115,8 +115,11 @@ unlike GeoTIFF's one band per collection.
   (`src/units.rs`) plus per-center overlays for local parameter numbers
   192–254.
 - Display conversions are mechanical: K→°C, Pa→hPa, kg m⁻²→mm,
-  kg m⁻² s⁻¹→mm/h (× 3600, PRATE / ECMWF `tprate`, #1213), m² s⁻²→gpm,
-  proportion→%. Colormap ranges use display units. The string-keyed twin
+  kg m⁻² s⁻¹→mm/h (× 3600, PRATE / ECMWF `tprate`, #1213),
+  proportion→%. Geopotential (m² s⁻²) has no rule: ÷ g₀ it is geopotential
+  height, another quantity, which `ds_core::geopotential` derives as a
+  parameter of its own (#948); never serve it as a display unit of `z`.
+  Colormap ranges use display units. The string-keyed twin
   of this table lives in `ds_core::units::display_conversion` (used by
   engine-bufr, engine-netcdf and engine-zarr); keep the two rule for rule.
   The units test
@@ -460,9 +463,13 @@ ones only in the legacy layout.
 
 ## Wind components (#897)
 
-- `ds_core::wind::DerivedWind` (wired in `server/src/admin.rs`) derives
-  speed and direction from u/v pairs; this engine only reports facts
-  (`WindSource`). Never compute a derived field here.
+- `ds_core::derive::Derived` (wired in `server/src/admin.rs`) derives
+  speed and direction from u/v pairs, and geopotential height from `z`
+  (0/3/4) where the view has no `gh` (0/3/5) at that level (#948); this
+  engine only reports facts (`WindSource`: triple, level, served unit for
+  every parameter). Never compute a derived field here.
+  `geopotential_tests` pins z in m² s⁻², `gh` = z / g₀ on EDR and the map,
+  the skip when `gh` exists, and a single-level `z`'s terrain height.
 - Read GRIB2 flag table 3.3 bit 5 (`0x08`, Section 3 octet 55) from **every**
   message, in both the header probe (`metadata::read_metadata`) and the
   decode (`reader::uv_frame`), into `MessageMetadata::uv_frame` /

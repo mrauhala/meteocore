@@ -302,10 +302,23 @@ pub struct CollectionConfig {
     /// the collection out. Any other engine type rejects the key at load.
     #[serde(default)]
     pub derive_wind: Option<bool>,
+    /// Geopotential height derived from geopotential where the collection
+    /// has no height at that level (#948, `ds_core::geopotential`). Unset
+    /// or `true` derives it for the engines whose sources identify
+    /// geopotential (`grib`, `zarr`, `netcdf`); `false` opts the collection
+    /// out. Any other engine type rejects the key at load.
+    #[serde(default)]
+    pub derive_geopotential_height: Option<bool>,
 }
 
 /// The engine types whose collections derive wind from u/v components.
 pub const DERIVE_WIND_ENGINES: [&str; 4] = ["grib", "querydata", "zarr", "netcdf"];
+
+/// The engine types whose collections derive geopotential height from
+/// geopotential: their sources state it by GRIB triple or CF
+/// `standard_name`. QueryData does not: FMI's `GeopHeight` (2) holds gpm or
+/// m² s⁻² by producer, and no newbase number fixes geopotential's unit.
+pub const DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES: [&str; 3] = ["grib", "zarr", "netcdf"];
 
 impl CollectionConfig {
     /// Whether this collection serves wind derived from u/v components:
@@ -313,6 +326,15 @@ impl CollectionConfig {
     /// `derive_wind = false`.
     pub fn derives_wind(&self) -> bool {
         DERIVE_WIND_ENGINES.contains(&self.engine_type.as_str()) && self.derive_wind != Some(false)
+    }
+
+    /// Whether this collection serves geopotential height derived from
+    /// geopotential: on by default for
+    /// [`DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES`], off with
+    /// `derive_geopotential_height = false`.
+    pub fn derives_geopotential_height(&self) -> bool {
+        DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES.contains(&self.engine_type.as_str())
+            && self.derive_geopotential_height != Some(false)
     }
 
     /// The collection's default WebP quality, `[wms] webp_quality`: what a
@@ -4560,6 +4582,16 @@ impl ServerConfig {
                     collection.engine_type
                 )));
             }
+            if collection.derive_geopotential_height.is_some()
+                && !DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES.contains(&collection.engine_type.as_str())
+            {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': 'derive_geopotential_height' applies only to engine \
+                     types {}, not '{}'",
+                    DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES.join(", "),
+                    collection.engine_type
+                )));
+            }
 
             // GeoTIFF engine requires geotiff config section
             if collection.engine_type == "geotiff" && collection.geotiff.is_none() {
@@ -6064,6 +6096,65 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         );
         let toml = "[server]\nhost=\"h\"\nport=1\n[[collections]]\nid=\"c\"\ntitle=\"t\"\n\
                     description=\"d\"\nengine_type=\"grib\"\nderive_wind=\"no\"\n";
+        assert!(toml::from_str::<ServerConfig>(toml).is_err());
+    }
+
+    /// `derive_geopotential_height` (#948): on by default for the engines
+    /// whose sources identify geopotential, off with `false` (wind stays
+    /// on); rejected where it would do nothing, QueryData included.
+    #[test]
+    fn derive_geopotential_height_defaults_on_and_opts_out_per_collection() {
+        let grib = grib_collection("data_path = \"/data\"\n");
+        assert_eq!(grib.collections[0].derive_geopotential_height, None);
+        assert!(grib.collections[0].derives_geopotential_height());
+        let off = collection_with(
+            "engine_type = \"grib\"\nderive_geopotential_height = false\n\
+             [collections.grib]\ndata_path = \"/data\"\n",
+        );
+        assert!(!off.collections[0].derives_geopotential_height());
+        assert!(
+            off.collections[0].derives_wind(),
+            "each derivation opts out alone"
+        );
+        assert!(off.validate().is_ok());
+        for engine in ["netcdf", "zarr"] {
+            let on = collection_with(&format!("engine_type = \"{engine}\"\n"));
+            assert!(on.collections[0].derives_geopotential_height(), "{engine}");
+        }
+        // Unset, the key changes nothing on any other engine: those
+        // collections validate and load as before, QueryData included.
+        for extra in [
+            "engine_type = \"querydata\"\ndata_path = \"/data\"\n",
+            "engine_type = \"geotiff\"\n[collections.geotiff]\n\
+             filename_template = \"r_%Y%m%dT%H%MZ.tif\"\nparameter = \"r\"\nunit = \"dBZ\"\n",
+            "",
+        ] {
+            let cfg = collection_with(extra);
+            assert_eq!(cfg.collections[0].derive_geopotential_height, None);
+            assert!(!cfg.collections[0].derives_geopotential_height());
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{extra:?} must load without the key: {e}"));
+        }
+        for (engine, section) in [("querydata", "data_path = \"/data\"\n"), ("csv", "")] {
+            let cfg = collection_with(&format!(
+                "engine_type = \"{engine}\"\n{section}derive_geopotential_height = true\n"
+            ));
+            assert!(
+                !cfg.collections[0].derives_geopotential_height(),
+                "{engine}"
+            );
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(
+                    "'derive_geopotential_height' applies only to engine types grib, zarr, \
+                     netcdf, not '"
+                ),
+                "{engine}: {err}"
+            );
+        }
+        let toml = "[server]\nhost=\"h\"\nport=1\n[[collections]]\nid=\"c\"\ntitle=\"t\"\n\
+                    description=\"d\"\nengine_type=\"grib\"\n\
+                    derive_geopotential_height=\"no\"\n";
         assert!(toml::from_str::<ServerConfig>(toml).is_err());
     }
 

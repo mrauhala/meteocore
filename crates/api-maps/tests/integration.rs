@@ -167,6 +167,7 @@ fn build_state_with_engine_and_wms(
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
     let cmap = Arc::new(LutColorMap::from_builtin(
@@ -241,6 +242,7 @@ fn build_router_with_tilesets(apis: Vec<String>, map_tilesets: bool) -> axum::Ro
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -363,6 +365,7 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
     let state = Arc::new(ArcSwap::from_pointee(MapsState {
@@ -418,6 +421,7 @@ fn router_with(
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
     let state = Arc::new(ArcSwap::from_pointee(MapsState {
@@ -1576,6 +1580,7 @@ fn build_empty_router() -> axum::Router {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -1712,6 +1717,7 @@ fn build_multi_param_router() -> axum::Router {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -2363,6 +2369,7 @@ mod searchable {
                     csv: None,
                     preview: None,
                     derive_wind: None,
+                    derive_geopotential_height: None,
                 },
             );
         }
@@ -2847,6 +2854,7 @@ fn build_router_with_engine_and_styles(
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -3995,6 +4003,7 @@ mod composites {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         };
         let state = Arc::new(ArcSwap::from_pointee(MapsState {
             engines: HashMap::from([("radar".to_string(), engine)]),

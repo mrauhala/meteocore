@@ -496,8 +496,14 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    CF `standard_name`, FMI number, the u/v frame, the level) and how the
    grid's axes lie (`GridAxes`). Report a frame only from source metadata,
    never assumed. Add the engine type to `config::DERIVE_WIND_ENGINES` and
-   register it through `wind_wrapped` in `server/src/admin.rs`; the shared
-   `DerivedWind` wrapper does the rest (#897).
+   register it through `derived_wrapped` in `server/src/admin.rs`; the
+   shared `ds_core::derive::Derived` wrapper does the rest (#897).
+   **If the engine's parameters can be geopotential**, report in the same
+   `WindFacts` every parameter's GRIB triple or CF `standard_name`, its
+   level and its served unit; add the engine type to
+   `config::DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES`, and the wrapper derives
+   geopotential height where the collection has none (#948). Never serve
+   geopotential divided by g₀ under its own name: that is another quantity.
    **If the engine reads a regular grid**, set `RasterInfo.native_grid`
    (`NativeGrid::from_geo_transform`/`from_edges`) once per load or poll.
    Give an EPSG code only when the source states it (a GeoKey, or an exact
@@ -771,8 +777,9 @@ one never implies the other.
   `degC` → `°C`); a scale factor or free text stays as written. Every
   unit-keyed match goes through it — `display_conversion` (engine-bufr;
   engine-grib's enum-keyed `default_display` is its twin, rule for rule:
-  K → °C, Pa → hPa, kg m-2 → mm, kg m-2 s-1 → mm/h × 3600, m2 s-2 → gpm,
-  proportion → %), `cf_display_conversion` (engine-netcdf #1209 and
+  K → °C, Pa → hPa, kg m-2 → mm, kg m-2 s-1 → mm/h × 3600, proportion → %;
+  a rule changes the unit, never the quantity, so geopotential's m2 s-2
+  has none, #948), `cf_display_conversion` (engine-netcdf #1209 and
   engine-zarr #1213: the same rules, plus CF's `1` → % × 100 only when the
   variable's `standard_name` is `relative_humidity` or ends in `_area_fraction` or `_area_fraction_in_atmosphere_layer`; every other `1` — specific_humidity,
   land_binary_mask, no standard name — is served as stored),
@@ -926,9 +933,10 @@ one never implies the other.
   (`WindPlan`: `10u`/`10v` → `10si`/`10wdir`, `u`/`v` → `ws`/`wdir`,
   `UGRD`/`VGRD` → `WIND`/`WDIR`, FMI → `WindSpeedMS`/`WindDirection`, CF
   stores by `standard_name`; skipped when the collection already has the
-  quantity at that level). `DerivedWind` wraps an engine's `MapEngine` +
-  `EdrEngine` in the server's registry wiring (`admin::wind_wrapped`, like
-  the nowcast wraps its source): speed on every API, direction in EDR only
+  quantity at that level). `ds_core::derive::Derived` (`DerivedWind` is its
+  wind-only form) wraps an engine's `MapEngine` + `EdrEngine` in the
+  server's registry wiring (`admin::derived_wrapped`, like the nowcast
+  wraps its source): speed on every API, direction in EDR only
   (no cyclic palette). It derives **after sampling** — two component reads
   with identical bbox/size/time/z/run, combined per value, never a derived
   field interpolated — and resolves time/run/content as the components do
@@ -936,6 +944,30 @@ one never implies the other.
   u and v, intersected axes; #507/#521/#1026).
   Per collection `derive_wind = false` opts out. Engines report facts
   (`WindSource`); they never compute derived fields themselves.
+- **`ds_core::derive`** — the one wrapper for every derived parameter
+  (#897, #948): `Derived::with(id, engine, Derivations, DerivationLog)`
+  plans each derivation from the engine's `WindFacts` snapshot (named for
+  wind; it carries every parameter's GRIB triple, CF `standard_name`,
+  level and served unit) into `DerivedParameter { inputs, formula }` and
+  serves them over `MapEngine` + `EdrEngine`. A parameter derived from one
+  input resolves time, run, level and axis through that input's own
+  single-parameter methods; one from several through the plural ones over
+  them, as wind does. A new derivation (#898) adds a `Formula`, a planner
+  called from `Plan::build` and a `Derivations` flag with its config
+  opt-out, never a second wrapper.
+- **`ds_core::geopotential`** — geopotential height derived from
+  geopotential (#948): `height` = Φ / `STANDARD_GRAVITY` (9.80665) in gpm.
+  Geopotential is identified only by metadata (GRIB 0/3/4, CF
+  `geopotential`) in m² s⁻²; a name alone never derives (`z` is often a
+  vertical coordinate). Named in the source's vocabulary (`HeightPlan`:
+  `z` → `gh`, wgrib2 `GP` → `HGT`, CF by inserting `height` after the
+  `geopotential` token, `geopotential_pl` → `geopotential_height_pl`);
+  skipped where the collection has geopotential height at that level
+  (GRIB 0/3/5, CF `geopotential_height`, or a `gh`/`HGT` name without
+  metadata). A scalar with the `gh` default style, served on every API. A
+  single-level `z` gives the terrain height by the same rule. Per
+  collection `derive_geopotential_height = false` opts out
+  (`config::DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES`: grib, zarr, netcdf).
 - **`ds_core::native_grid`** — `NativeGrid` (#1237) and `crs_wkt2`, the one
   WKT2 form per `Crs` variant, PROJ-checked and pinned in tests.
   `ogc_extent::build_extent` emits `storageCrsBbox` and a cell-centred
@@ -952,15 +984,15 @@ one never implies the other.
 | CSV | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (locations, area, radius), Features; WMS/Maps/Tiles station symbol layers when opted in (`[csv.map]`, or any map API in `apis`; #1204), drawn through `ds_render::station_symbols`, `content_version` 0 (static until reload) |
 | GeoJSON | `FeatureEngine` | Features, Tiles (MVT) |
 | GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
-| GRIB | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM), WMS, Maps, Tiles; derived wind speed + direction from u/v (`ds_core::wind`); hour-window aggregates on their own time axes (#1005) |
+| GRIB | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM), WMS, Maps, Tiles; derived wind speed + direction from u/v (`ds_core::wind`); geopotential in m² s⁻² and its height derived where a view lacks one (`z` → `gh`, `ds_core::geopotential`, #948); hour-window aggregates on their own time axes (#1005) |
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; derived wind speed from u/v, direction on lat/lon areas (newbase's grid-relative convention) |
-| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP; derived wind speed + direction from CF-identified u/v; values and units in display units from CF `units` and `standard_name` through `ds_core::units::cf_display_conversion` (°C, hPa, mm, mm/h, gpm, % for a CF fraction in unit 1; plain Zarr and Icechunk, #1213) |
+| Zarr | `EdrEngine` + `MapEngine` | EDR (position, area, radius, trajectory), WMS, Maps, Tiles; local + S3/HTTP; derived wind speed + direction from CF-identified u/v; derived geopotential height from CF `geopotential` (#948); values and units in display units from CF `units` and `standard_name` through `ds_core::units::cf_display_conversion` (°C, hPa, mm, mm/h, % for a CF fraction in unit 1; plain Zarr and Icechunk, #1213) |
 | Nowcast | `MapEngine` + `FeatureEngine` + `EdrEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544); EDR (area only) — the per-generation motion field as `motion_u`/`motion_v` m/s + `motion_quality` on a CoverageJSON Grid, generations as instances (#661). Reflectivity via EDR = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (position, locations, area), Features; station shapes also WMS/Maps/Tiles when opted in (`[postgis.map]`, or `wms`/`maps` in `apis`): one symbol layer per parameter, each station a marker coloured by its latest value within `max_age` on `time_step` frames, most extreme on top (#1063); events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles, GK2A AMI L1B and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
-| NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM, cube) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, projected x/y with a CF `grid_mapping`, or a curvilinear grid of 2-D lat/lon placed by an inverse lookup over its nodes, #1174); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields, or fields on one pressure axis (`RasterInfo.vertical`: hPa, bottom first; WMS `ELEVATION`, Maps/Tiles `elevation`, EDR `z`; a map without one draws the bottom level, EDR without `z` reads every level; the MEPS `pl` family is a collection of its own). EDR samples each point, area or cube cell, or trajectory sample as the map draws it (one projection per point; CRS84 area and cube grids, a cube's native cells never coarsened), runs as instances, GetFeatureInfo through position at the level drawn; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (steps × levels × variables; a trajectory or cube counts only the fields it reads); derived wind speed from CF `x_wind`/`y_wind`, per pressure level (no direction on MEPS's Lambert grid); per-step amounts of run-start `_acc` accumulations in mm, e.g. `precipitation_amount` (#1165); values and units in display units from CF `units` and `standard_name` through `ds_core::units::cf_display_conversion` (°C, hPa, mm, gpm, % for a CF fraction in unit 1; #1209) |
+| NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM, cube) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, projected x/y with a CF `grid_mapping`, or a curvilinear grid of 2-D lat/lon placed by an inverse lookup over its nodes, #1174); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields, or fields on one pressure axis (`RasterInfo.vertical`: hPa, bottom first; WMS `ELEVATION`, Maps/Tiles `elevation`, EDR `z`; a map without one draws the bottom level, EDR without `z` reads every level; the MEPS `pl` family is a collection of its own). EDR samples each point, area or cube cell, or trajectory sample as the map draws it (one projection per point; CRS84 area and cube grids, a cube's native cells never coarsened), runs as instances, GetFeatureInfo through position at the level drawn; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` (steps × levels × variables; a trajectory or cube counts only the fields it reads); derived wind speed from CF `x_wind`/`y_wind`, per pressure level (no direction on MEPS's Lambert grid); derived geopotential height from CF `geopotential`, `geopotential_pl` → `geopotential_height_pl` per level (#948); per-step amounts of run-start `_acc` accumulations in mm, e.g. `precipitation_amount` (#1165); values and units in display units from CF `units` and `standard_name` through `ds_core::units::cf_display_conversion` (°C, hPa, mm, % for a CF fraction in unit 1; geopotential as stored in m² s⁻²; #1209, #948) |
 | BUFR | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count); WMS/Maps/Tiles station symbol layers when opted in (`[bufr.map]`, or any map API in `apis`; #1204), `content_version` = the metadata snapshot version. Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
 | Station grid | `MapEngine` + `EdrEngine` + `FeatureEngine` (derived: wraps a CSV, BUFR or PostGIS stations collection's `EdrEngine`) | WMS, Maps, Tiles (one layer per parameter), EDR (position, area, radius, cube without `z`) — one time slice of the source's observations (latest per station within `max_age`, one area query) interpolated by IDW, ADW or nearest onto a CRS84 analysis grid (#1082); great-circle neighbours via a 3-D k-d tree (seam and poles); grids cached per (parameter, time, revision of its input) in `MC_STATION_GRID_CACHE_MB`, computed on a dedicated pool under the request deadline (503, never partial); `cadence` axis, or the source's `observation_instants` (CSV, BUFR; #1206); content_version moves with revised input fingerprints, which the poll re-checks for the latest `precompute` times and a bounded round-robin of older cached ones; EDR samples the grid the maps draw; Features (`features` in `apis`) — each station's leave-one-out residual per parameter and analysis time, computed with the grid and cached with it; `/items` never waits (a cold analysis is a 503 with `Retry-After`), no EDR `items`; optional lapse-rate correction over a terrain collection (`elevation_source`, −6.5 K/km by default only for a source-identified air temperature), a land/sea mask collection (`land_mask_source`, nodata outside in maps and EDR) and `exclude_where` station exclusions, the terrain and mask sampled once per engine by the poll (no analysis time until then) (#1206) |
 
@@ -1116,11 +1148,14 @@ time_window = "PT12H"
 
 # grib / querydata / zarr / netcdf collections derive wind speed (and, where the
 # source states the u/v frame, direction) from u/v components (#897).
+# grib / zarr / netcdf collections derive geopotential height from
+# geopotential where they have none at that level (#948).
 [[collections]]
 id = "nwp"
 engine_type = "grib"
 apis = ["edr", "wms", "maps", "tiles"]
 derive_wind = false     # opt out (default on); a load error on other engines
+# derive_geopotential_height = false   # likewise; querydata rejects it
 [collections.grib]
 data_path = "testdata/grib-local"
 

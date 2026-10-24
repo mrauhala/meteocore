@@ -1818,7 +1818,7 @@ pub struct ServerState {
     /// Live poll-loop engines by collection id — the reuse pool the next
     /// incremental reload draws from (#574).
     pub engine_handles: RwLock<HashMap<String, EngineHandle>>,
-    /// Live derived-wind wrappers (#897), keyed like
+    /// Live derived-parameter wrappers (#897, #948), keyed like
     /// [`LoadResult::wind_by_id`]: a reused engine keeps its wrapper.
     pub wind_handles: RwLock<WindHandles>,
 }
@@ -1863,13 +1863,15 @@ pub struct LoadResult {
     /// Every successfully built (or reused) poll-loop engine, keyed by
     /// collection id — the reuse pool for the NEXT incremental reload (#574).
     pub engines_by_id: HashMap<String, EngineHandle>,
-    /// Every derived-wind wrapper (#897) by configured collection id, then
-    /// by registered id (a GRIB source registers one per level family).
+    /// Every derived-parameter wrapper (wind #897, geopotential height
+    /// #948) by configured collection id, then by registered id (a GRIB
+    /// source registers one per level family).
     pub wind_by_id: WindHandles,
 }
 
-/// Derived-wind wrappers by configured collection id, then registered id.
-pub type WindHandles = HashMap<String, HashMap<String, Arc<ds_core::wind::DerivedWind>>>;
+/// Derived-parameter wrappers by configured collection id, then registered
+/// id. Named for wind, the first derivation.
+pub type WindHandles = HashMap<String, HashMap<String, Arc<ds_core::derive::Derived>>>;
 
 /// Parameters by NetCDF collection id ([`LoadResult::netcdf_parameters`]).
 pub type NetcdfParameters = HashMap<String, Vec<ds_core::map_engine::ParameterInfo>>;
@@ -2034,9 +2036,10 @@ fn station_grid_auxiliary(
 #[derive(Default)]
 pub struct EngineReuse {
     pub engines: HashMap<String, EngineHandle>,
-    /// The derived-wind wrappers of those engines (#897). A reused engine
-    /// keeps them: the registered `Arc` stays the same (a nowcast's source
-    /// identity), and the once-per-pair load log is not repeated.
+    /// The derived-parameter wrappers of those engines (#897, #948). A
+    /// reused engine keeps them: the registered `Arc` stays the same (a
+    /// nowcast's source identity), and the once-per-candidate load log is
+    /// not repeated.
     pub wind: WindHandles,
 }
 
@@ -2878,7 +2881,7 @@ pub fn load_collections(
 
                 querydata_engines.push(engine.clone());
 
-                let (map_engine, edr_engine) = wind_wrapped(
+                let (map_engine, edr_engine) = derived_wrapped(
                     &collection.id,
                     collection,
                     &engine,
@@ -3049,7 +3052,7 @@ pub fn load_collections(
                             format!("{} ({})", collection.description, family.label());
                     }
                     let collection = &view_config;
-                    let (map_engine, edr_engine) = wind_wrapped(
+                    let (map_engine, edr_engine) = derived_wrapped(
                         &source_id,
                         collection,
                         &engine,
@@ -3193,7 +3196,7 @@ pub fn load_collections(
 
                 zarr_engines.push(engine.clone());
 
-                let (map_engine, edr_engine) = wind_wrapped(
+                let (map_engine, edr_engine) = derived_wrapped(
                     &collection.id,
                     collection,
                     &engine,
@@ -3203,7 +3206,7 @@ pub fn load_collections(
                 );
 
                 // Per-parameter-layer styles (one WMS/Maps/Tiles layer per Zarr
-                // variable, and per derived wind speed).
+                // variable, and per derived wind speed or geopotential height).
                 let raster_info = map_engine.raster_info();
                 let raster_params = raster_info.parameters;
 
@@ -3465,12 +3468,13 @@ pub fn load_collections(
                 netcdf_engines.push(engine.clone());
 
                 // One WMS/Maps/Tiles layer per variable, and the wind speed
-                // derived from u/v components (#897). The layers come from
+                // derived from u/v components (#897) and the geopotential
+                // height derived from geopotential (#948). The layers come from
                 // the files, so a fresh engine has none until the immediate
                 // first tick of its poll loop; the recovery loop then
                 // registers the collection again with their styles. It
                 // compares the engine's own variables, so those are kept.
-                let (map_engine, edr_engine) = wind_wrapped(
+                let (map_engine, edr_engine) = derived_wrapped(
                     &collection.id,
                     collection,
                     &engine,
@@ -5156,17 +5160,21 @@ fn register_point_engine(
     }
 }
 
-/// The `MapEngine` and `EdrEngine` a collection registers (#897): its engine
-/// wrapped in [`ds_core::wind::DerivedWind`], which adds wind speed and
-/// direction derived from u/v components, or the engine itself when the
-/// collection opts out (`derive_wind = false`).
+/// The `MapEngine` and `EdrEngine` a collection registers: its engine
+/// wrapped in [`ds_core::derive::Derived`], which adds wind speed and
+/// direction derived from u/v components (#897) and geopotential height
+/// derived from geopotential (#948), or the engine itself when the
+/// collection opts out of both (`derive_wind = false`,
+/// `derive_geopotential_height = false`).
 ///
 /// A reused engine (`reused_engine`) keeps its wrapper: the registered `Arc`
 /// then survives an incremental reload like the engine does (a nowcast
-/// checks its source's identity), and the per-pair load log is not
-/// repeated. A GRIB source registers one wrapper per level family, all
-/// under its configured collection id (`source_id`) in `built`.
-fn wind_wrapped<E>(
+/// checks its source's identity), and the per-candidate load log is not
+/// repeated. A changed opt-out changes the collection's config, so its
+/// engine and wrapper are rebuilt. A GRIB source registers one wrapper per
+/// level family, all under its configured collection id (`source_id`) in
+/// `built`.
+fn derived_wrapped<E>(
     source_id: &str,
     collection: &CollectionConfig,
     engine: &Arc<E>,
@@ -5183,7 +5191,11 @@ where
         + ds_core::wind::WindSource
         + 'static,
 {
-    if !collection.derives_wind() {
+    let derive = ds_core::derive::Derivations {
+        wind: collection.derives_wind(),
+        geopotential_height: collection.derives_geopotential_height(),
+    };
+    if !derive.any() {
         return (engine.clone(), engine.clone());
     }
     let reused = reused_engine
@@ -5195,10 +5207,11 @@ where
         })
         .flatten();
     let wind = reused.unwrap_or_else(|| {
-        Arc::new(ds_core::wind::DerivedWind::new(
+        Arc::new(ds_core::derive::Derived::with(
             collection.id.clone(),
             engine.clone(),
-            wind_log(),
+            derive,
+            derived_log(),
         ))
     });
     built
@@ -5208,11 +5221,13 @@ where
     (wind.clone(), wind)
 }
 
-/// The derived-wind load log (#897): one line per u/v pair, saying what was
+/// The derived-parameter load log: one line per candidate, a u/v pair
+/// (`Collection 'x': wind u/v: …`, #897) or a geopotential
+/// (`Collection 'x': geopotential height z: …`, #948), saying what was
 /// derived, or what was not and why.
-fn wind_log() -> ds_core::wind::OutcomeLog {
-    Arc::new(|collection: &str, outcome: &ds_core::wind::PairOutcome| {
-        info!("Collection '{collection}': wind {outcome}");
+fn derived_log() -> ds_core::derive::DerivationLog {
+    Arc::new(|collection: &str, outcome: &ds_core::derive::Outcome| {
+        info!("Collection '{collection}': {outcome}");
     })
 }
 
@@ -8117,6 +8132,7 @@ mod tests {
             station_grid: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         }
     }
 
@@ -9893,10 +9909,11 @@ prewarm_sweeps = 0
     /// #1067 PR 8, #1209: the shipped local MEPS pressure-level example,
     /// loaded over its committed sample. The layers advertise the pressure
     /// axis (WMS ELEVATION, EDR `z`), and every layer, the derived
-    /// `wind_speed_pl` included, takes the built-in default its name and
-    /// served unit select: the temperature in °C, geopotential in gpm,
-    /// relative humidity in %, the wind on twice the surface scale, for the
-    /// jet.
+    /// `wind_speed_pl` and `geopotential_height_pl` included, takes the
+    /// built-in default its name and served unit select: the temperature in
+    /// °C, geopotential as stored in m^2/s^2 and its height in gpm over the
+    /// same heights (#948), relative humidity in %, the wind on twice the
+    /// surface scale, for the jet.
     #[test]
     fn meps_netcdf_pressure_level_example_serves_its_levels_and_styles() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -9930,16 +9947,78 @@ prewarm_sweeps = 0
             ("x_wind_pl", ("diverging", -80.0, 80.0)),
             ("y_wind_pl", ("diverging", -80.0, 80.0)),
             ("wind_speed_pl", ("wind_speed", 0.0, 80.0)),
-            ("geopotential_pl", ("viridis", 0.0, 21_000.0)),
+            (
+                "geopotential_pl",
+                (
+                    "viridis",
+                    0.0,
+                    21_000.0 * ds_core::geopotential::STANDARD_GRAVITY,
+                ),
+            ),
+            ("geopotential_height_pl", ("viridis", 0.0, 21_000.0)),
             ("relative_humidity_pl", ("humidity", 0.0, 100.0)),
         ] {
             assert_eq!(style(name), expected, "{name}");
         }
+        let units: HashMap<String, String> = info
+            .parameters
+            .iter()
+            .map(|p| (p.name.clone(), p.unit.clone()))
+            .collect();
+        assert_eq!(units["geopotential_pl"], "m^2/s^2");
+        assert_eq!(units["geopotential_height_pl"], "gpm");
+        assert!(loaded.edr_state.engines[id]
+            .get_parameters()
+            .contains(&"geopotential_height_pl".to_string()));
         let parent = &styles[id]["default"];
         assert_eq!(
             (parent.palette.name.as_str(), parent.min, parent.max),
             ("temperature", -90.0, 50.0)
         );
+    }
+
+    /// #948: each derivation is its own opt-out. Without the height the
+    /// MEPS pressure levels still derive their wind speed; with neither, no
+    /// wrapper is registered.
+    #[test]
+    fn meps_netcdf_pressure_levels_opt_out_of_each_derivation() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text =
+            std::fs::read_to_string(root.join("collections.d/meps-netcdf-pl-local.toml")).unwrap();
+        let mut collection: CollectionConfig = toml::from_str(&text).unwrap();
+        collection.netcdf.as_mut().unwrap().data_path = Some(
+            root.join("testdata/meps-netcdf-pl")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let id = "meps-netcdf-pl-local";
+        collection.derive_geopotential_height = Some(false);
+        let loaded = load_with_reuse(std::slice::from_ref(&collection), Default::default());
+        let names: Vec<String> = loaded.wms_state.engines[id]
+            .raster_info()
+            .parameters
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(names.contains(&"wind_speed_pl".to_string()), "{names:?}");
+        assert!(names.contains(&"geopotential_pl".to_string()));
+        assert!(!names.contains(&"geopotential_height_pl".to_string()));
+        assert!(!loaded.edr_state.engines[id]
+            .get_parameters()
+            .contains(&"geopotential_height_pl".to_string()));
+        assert!(!loaded
+            .wms_state
+            .styles
+            .contains_key(&format!("{id}/geopotential_height_pl")));
+        assert_eq!(loaded.wind_by_id[id].len(), 1);
+
+        collection.derive_wind = Some(false);
+        let plain = load_with_reuse(&[collection], Default::default());
+        assert!(plain.wind_by_id.is_empty());
+        assert!(!plain
+            .wms_state
+            .styles
+            .contains_key(&format!("{id}/wind_speed_pl")));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

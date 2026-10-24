@@ -6,7 +6,7 @@
 //! queries with bilinear interpolation, CF time-axis decoding, CF packing
 //! (`scale_factor`/`add_offset`/`_FillValue`), values served in the display
 //! unit of each array's CF `units` and `standard_name`
-//! (`ds_core::units::cf_display_conversion`: °C, hPa, mm, mm/h, gpm; #1213;
+//! (`ds_core::units::cf_display_conversion`: °C, hPa, mm, mm/h; #1213;
 //! % for a fraction in unit `1`), byte-range chunk reads with an
 //! LRU cache, Map/Tiles/WMS rendering, and chunk-shape diagnostics. Projected
 //! source grids / per-item-CRS sources (Phase 4) are not implemented yet.

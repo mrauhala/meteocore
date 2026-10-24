@@ -49,8 +49,8 @@ memory, and answers EDR and Features queries from that store.
   own metadata does not list them.
 - **Units**: each parameter names its Table B unit, served in the shared
   display units of `ds_core::units`: K as °C, Pa as hPa, `kg m-2` as mm,
-  `kg m-2 s-1` as mm/h, `m2 s-2` as gpm and a WMO proportion as %. Other
-  units are served as given.
+  `kg m-2 s-1` as mm/h and a WMO proportion as %. Other units, geopotential's
+  `m2 s-2` among them, are served as given.
 - **WIS2 deletions**: a `rel=deletion` notification removes the rows its
   `data_id` produced. The last 200 000 `data_id`s are remembered.
 - **Persistence (WIS2 only)**: with `[server] state_dir` set, the store is

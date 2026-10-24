@@ -290,7 +290,8 @@ set of builders and follow Requirement 7 of the Metocean EDR profile:
   its unit.
 - The unit is the unit of the values served. GRIB, BUFR, Zarr and NetCDF
   convert values and unit from the source's: K → °C, Pa → hPa, kg m⁻² → mm,
-  kg m⁻² s⁻¹ → mm/h, m² s⁻² → gpm, a proportion → %. Zarr and NetCDF also
+  kg m⁻² s⁻¹ → mm/h, a proportion → %. Geopotential stays in m² s⁻²: its
+  height is another quantity, a derived parameter. Zarr and NetCDF also
   serve CF's `1` as % when the `standard_name` is a fraction
   (`relative_humidity`, `…_area_fraction`). Other units are served as the
   source spells them. GRIB, Zarr and NetCDF maps draw the same converted
@@ -302,8 +303,8 @@ set of builders and follow Requirement 7 of the Metocean EDR profile:
   UCUM-typed for a UCUM unit, else a plain string (`dBZ`, `gpm`).
 - `observedProperty.id` is the NERC CF standard-name URI when the engine
   knows the name (Zarr and NetCDF from `standard_name`, BUFR's built-in
-  parameters, and derived wind), otherwise the engine's observed-property
-  name.
+  parameters, derived wind and derived geopotential height), otherwise the
+  engine's observed-property name.
 - A parameter with its own time axis (satellite products, GRIB windows that
   some steps lack) carries its own `extent.temporal`.
 
@@ -318,6 +319,20 @@ components also serve wind speed and, where the source states the component
 frame and the grid allows it, direction (`ds_core::wind`). The derived
 parameters work like native ones in every query and count against the same
 value budget. `derive_wind = false` turns this off for a collection.
+
+### Derived geopotential height
+
+GRIB, Zarr and NetCDF collections that publish geopotential (GRIB 0/3/4, CF
+`geopotential`, in m² s⁻²) but no geopotential height at that level also
+serve the height, geopotential ÷ g₀ (9.80665 m s⁻²) in gpm, named in the
+source's vocabulary: ECMWF `z` → `gh`, wgrib2 `GP` → `HGT`, MEPS
+`geopotential_pl` → `geopotential_height_pl`. A single-level collection's
+surface geopotential gives the surface's height. It is computed from the
+geopotential sampled at each point, resolves time, run and level as the
+geopotential does, carries the CF `geopotential_height` observed property,
+and counts against the same value budget. Collections that ship the height
+(`gh`, `HGT`) get no second one. `derive_geopotential_height = false` turns
+this off for a collection.
 
 ### Per-step amounts
 

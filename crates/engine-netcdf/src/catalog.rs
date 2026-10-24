@@ -59,7 +59,7 @@ pub(crate) struct Layout {
     /// from its CF `units` and `standard_name` through
     /// `ds_core::units::cf_display_conversion`, the rules of engine-bufr
     /// and engine-grib: K to °C, Pa to hPa, kg m-2 to mm, kg m-2 s-1 to
-    /// mm/h, m2 s-2 to gpm, in any spelling, and CF's `1` to % where the
+    /// mm/h, in any spelling, and CF's `1` to % where the
     /// standard name is a fraction (`relative_humidity`, any
     /// `…_area_fraction`). `None` for a unit without a rule (m/s, `1` of
     /// any other quantity), served as stored. Every value the engine serves
@@ -156,7 +156,7 @@ impl Layout {
     }
 
     /// The unit variable `index` is served in: its display unit (`°C`,
-    /// `hPa`, `mm`, `gpm`, `%`), else its `units` as the file spells them.
+    /// `hPa`, `mm`, `mm/h`, `%`), else its `units` as the file spells them.
     pub(crate) fn unit(&self, index: usize) -> &str {
         served_unit(&self.variables[index], self.display[index])
     }

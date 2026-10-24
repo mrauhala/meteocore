@@ -75,8 +75,9 @@ y_wind_pl = "Wind along the grid's y axis"
 geopotential_pl = "Geopotential"
 relative_humidity_pl = "Relative humidity"
 
-# Values are served in display units: temperature in °C, geopotential in gpm
-# (m2 s-2 / 9.80665) and relative humidity in %; the wind components in m/s
-# as stored. Each layer takes the built-in default its name and unit select.
+# Values are served in display units: temperature in °C and relative
+# humidity in %; the wind components in m/s and geopotential in m2 s-2 as
+# stored, its height derived in gpm (`geopotential_height_pl`). Each layer
+# takes the built-in default its name and unit select.
 [wms]
 colormap = "temperature"

@@ -557,6 +557,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
 | `csv` | no | — | `engine_type = "csv"` only: `[collections.csv.map]`, the [station symbol layers](#station-symbol-layers). Any other key is a load error. |
 | `derive_wind` | no | on | `grib`, `querydata`, `zarr` and `netcdf` only: serve wind speed and direction derived from u/v components (see [Derived wind](#derived-wind-speed-and-direction)). `false` opts out; the key on any other engine type is a load error. |
+| `derive_geopotential_height` | no | on | `grib`, `zarr` and `netcdf` only: serve geopotential height derived from geopotential where the collection has none at that level (see [Derived geopotential height](#derived-geopotential-height)). `false` opts out; the key on any other engine type is a load error. |
 
 ### Per-File Collection Configs
 
@@ -997,8 +998,9 @@ Unit conversion is driven by the WMO `(discipline, category, parameter_number)` 
 | kg m⁻² | mm | ×1 (accumulated liquid-equivalent, WMO standard triples) |
 | kg m⁻² s⁻¹ | mm/h | ×3600 (precipitation rate, e.g. PRATE, ECMWF `tprate`) |
 | m (metres of water) | mm | ×1000 (ECMWF local params 193/198/254) |
-| m² s⁻² | gpm | ÷9.80665 |
 | proportion (0–1) | % | ×100 |
+
+Geopotential (`z`, m² s⁻²) is served as stored: divided by g₀ it is geopotential height, another quantity, which the collection gets as a [derived parameter](#derived-geopotential-height) where it has none.
 
 Adding a new provider only requires new center-overlay entries if it uses local parameter numbers 192–254. Providers that use standard WMO triples (ECMWF IFS, NOAA GFS) are handled automatically.
 
@@ -1219,7 +1221,7 @@ Plain-Zarr generations isolate cache entries; they are not transactional snapsho
 
 **Forecast (reference + lead) handling:** when a store has a CF `forecast_reference_time` axis (model run) **and** a `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/ICON-EU), the engine uses the **latest run** and exposes valid time (= run + lead) as the time axis. Selecting older runs (EDR instances / WMS `reference_time`) is tracked in [#337](https://github.com/mrauhala/meteocore/issues/337).
 
-**Units:** values are served in display units, as GRIB's, BUFR's and NetCDF's are: each array's CF `units`, in any spelling, goes through `ds_core::units::cf_display_conversion` (K as °C, Pa as hPa, kg m⁻² as mm, kg m⁻² s⁻¹ as mm/h, m² s⁻² as gpm, and CF's dimensionless `1` as % where the array's `standard_name` is a fraction: `relative_humidity` or any `…_area_fraction` or `…_area_fraction_in_atmosphere_layer`), on every API and on plain Zarr and Icechunk alike, and the converted unit is reported (legends, EDR, GetFeatureInfo). A unit without a rule, such as m/s, a store's `degree_Celsius`, or `1` with any other standard name or none, is served as stored. Layers without a style of their own take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
+**Units:** values are served in display units, as GRIB's, BUFR's and NetCDF's are: each array's CF `units`, in any spelling, goes through `ds_core::units::cf_display_conversion` (K as °C, Pa as hPa, kg m⁻² as mm, kg m⁻² s⁻¹ as mm/h, and CF's dimensionless `1` as % where the array's `standard_name` is a fraction: `relative_humidity` or any `…_area_fraction` or `…_area_fraction_in_atmosphere_layer`), on every API and on plain Zarr and Icechunk alike, and the converted unit is reported (legends, EDR, GetFeatureInfo). A unit without a rule, such as m/s, geopotential's m² s⁻², a store's `degree_Celsius`, or `1` with any other standard name or none, is served as stored. Layers without a style of their own take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
 
 #### Data Source Modes
 
@@ -1366,6 +1368,28 @@ stereographic, rotated lat/lon) until grid-relative components can be turned
 to true north. MEPS NetCDF's `x_wind`/`y_wind` are grid-relative on its
 Lambert grid likewise: speed only. The server logs, per u/v pair, what was derived or why not.
 `derive_wind = false` turns it off for a collection.
+
+### Derived geopotential height
+
+Geopotential (m² s⁻²) and geopotential height (gpm) are two quantities:
+geopotential is served as stored, and a GRIB, Zarr or NetCDF collection with
+geopotential but no geopotential height at a level also serves the height,
+geopotential ÷ g₀ (9.80665 m s⁻², #948, `ds_core::geopotential`). The source
+must identify geopotential, by its GRIB parameter (0/3/4) or CF
+`standard_name`, and state its unit as m² s⁻²; a name alone is not enough.
+The height is named in the source's own vocabulary: ECMWF `z` → `gh`,
+wgrib2 `GP` → `HGT`, and CF stores by inserting `height` after the
+`geopotential` token (`geopotential` → `geopotential_height`, MEPS NetCDF
+`geopotential_pl` → `geopotential_height_pl` per pressure level). It is a
+WMS/Maps/Tiles layer with the built-in geopotential-height style (`viridis`,
+0–21 000 gpm) and an EDR parameter with the CF `geopotential_height`
+observed property, sampled from the geopotential at each pixel or point and
+resolved in time, run and level as the geopotential is. A single-level
+collection's surface geopotential gives the surface's height (terrain height
+in gpm). Collections that ship the height at the level, such as the ECMWF
+pressure levels' `gh` and GFS's `HGT`, get no second one. The server logs,
+per geopotential, what was derived or why not.
+`derive_geopotential_height = false` turns it off for a collection.
 
 ### Satellite
 
@@ -1529,7 +1553,7 @@ poll_interval_secs = 60
 precipitation_amount_acc = "Precipitation accumulated since run start"
 ```
 
-`apis` defaults to `["edr"]`; the examples serve all four, `["edr", "wms", "maps", "tiles"]`. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs). Values are served in display units, as GRIB's and BUFR's are: each variable's CF `units`, in any spelling, converted after sampling on every API (K as °C, Pa as hPa, kg m⁻² as mm, kg m⁻² s⁻¹ as mm/h, m² s⁻² as gpm, and CF's `1` as % where the `standard_name` is a fraction: `relative_humidity` or any `…_area_fraction` or `…_area_fraction_in_atmosphere_layer`, so MEPS's relative humidity and cloud cover are in %), and reported in the converted unit; a unit without a rule, such as m/s, or `1` with any other standard name or none, is served as stored. Layers the example does not style take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
+`apis` defaults to `["edr"]`; the examples serve all four, `["edr", "wms", "maps", "tiles"]`. The collection reads its directory when it loads; one loaded over an empty directory gains its layers and their styles within 30 s of the poll that finds its first files. `collections.d/meps-netcdf-local.toml` is a runnable example on a committed sample of seven MEPS files (every 100th grid point of two runs). Values are served in display units, as GRIB's and BUFR's are: each variable's CF `units`, in any spelling, converted after sampling on every API (K as °C, Pa as hPa, kg m⁻² as mm, kg m⁻² s⁻¹ as mm/h, and CF's `1` as % where the `standard_name` is a fraction: `relative_humidity` or any `…_area_fraction` or `…_area_fraction_in_atmosphere_layer`, so MEPS's relative humidity and cloud cover are in %), and reported in the converted unit; a unit without a rule, such as m/s, geopotential's m² s⁻², or `1` with any other standard name or none, is served as stored. Layers the example does not style take the per-parameter default their name and served unit select (see [Styling](#styling-shared-with-maps-and-tiles)).
 
 **Remote files.** An `http(s)://` `data_path` is a server whose files are found by name and read in place, never downloaded whole: by HTTP range from a file server that cannot be listed, or through OPeNDAP (`access = "opendap"`, below), as thredds.met.no serves MEPS since 2026-10-22.
 
@@ -1563,6 +1587,8 @@ variables = ["air_temperature_2m"]
 **Pressure levels.** A collection has one vertical axis, so a family on pressure levels, such as MEPS's per-lead `pl` files (13 levels, 1000 to 50 hPa), is a collection of its own, apart from the surface family. Its levels are `VerticalKind::Pressure` in hPa, listed bottom first (the largest pressure first): the WMS `ELEVATION` dimension (`units="hPa"`), Maps/Tiles `elevation` and EDR `z`, matched exactly, so a level the collection lacks is a 400 (on WMS GetMap, the error image). A map without one draws the first, bottom level, and GetFeatureInfo reports and reads that level. EDR `z` takes a level, a list, an interval or `Rn/min/step`, and without `z` reads every level: one level is a `PointSeries` with a one-value `z` axis, several a `VerticalProfile` per step; an area puts the levels on a `z` axis (`[t, z, y, x]`). Each level is a field of its own, read, cached and counted by the query cap alone, so name the levels a query needs. With an allowlist every listed variable must be on the same levels; without one the largest group of the first file's fields on the same levels wins, single-level fields on a tie. Height above ground and hybrid model levels are not served. `collections.d/meps-netcdf-pl-local.toml` is a runnable example on a committed sample (`testdata/meps-netcdf-pl`: five MEPS pl files at 1000, 850, 500 and 300 hPa); `collections.d/meps-netcdf-pl-thredds.toml.disabled` reads the family from thredds.met.no, with its traffic stated: 1.23 MB of metadata per file measured serving one variable, about 1.5 MB serving the example's five, ~1.4 MB per field first drawn, and a field is one variable at one level, 13 per variable and lead. `prewarm_variables` fetches the bottom level only.
 
 **Derived wind.** u/v components that their CF `standard_name` identifies give a wind speed on every API: MEPS's `x_wind_10m`/`y_wind_10m` give `wind_speed_10m`, and on pressure levels `x_wind_pl`/`y_wind_pl` give `wind_speed_pl`, both components read at the one level asked for. MEPS's components are relative to its Lambert grid, so they give no direction until they are turned to true north (#897); `derive_wind = false` turns it off.
+
+**Derived geopotential height.** A variable whose `standard_name` is `geopotential` is served as stored, in m² s⁻², and gives its height in gpm on every API: MEPS's `geopotential_pl` gives `geopotential_height_pl`, read at the one level asked for (#948); `derive_geopotential_height = false` turns it off.
 
 **Per-step precipitation.** A variable named `<name>_acc` in kg m⁻² or mm, MET Norway's accumulation since the run start, also gives `<name>`, the amount of each step: MEPS's `precipitation_amount_acc` gives `precipitation_amount`, titled `Precipitation amount (1 h accumulation)`, in mm. It is the accumulation at the step less the accumulation at the run's step before, clamped at zero, and a run's first step, which has none before it, is its own accumulation. It has the accumulation's runs and steps on every API (WMS layer `coll/precipitation_amount`, Maps/Tiles `parameter-name=precipitation_amount`, every EDR query: along a trajectory each sample takes its own step's step before) and the per-step precipitation style, `precipitation` over 0–50 mm. Each of the two fields is sampled and converted before they are differenced, so a pixel and an EDR value agree, and each lead's field is read once: the step a map just drew is the next step's step before. When the steps differ in length, as in a run missing a lead, the title gives the shortest and longest. An `_acc` in another unit is not derived, nor one whose `<name>` the files carry; `derive_per_step = false` in `[netcdf]` turns it off.
 
@@ -1646,7 +1672,7 @@ precompute = 3              # latest times computed ahead and re-checked, per pa
 poll_interval_secs = 60
 # Corrections (#1206): raster collections of the same config, named by id.
 # parameters = [{ name = "temperature", lapse_rate = -6.5 }, { name = "wind_speed", land_mask = false }]
-# elevation_source = "terrain"      # heights in m, km, ft or gpm
+# elevation_source = "terrain"      # heights in m, km, ft or gpm, or geopotential in m2 s-2
 # land_mask_source = "land"         # a fraction (1) or a percentage (%)
 # exclude_where = { exclude_from_gridding = true }   # station properties
 ```
@@ -2036,9 +2062,10 @@ grid-relative `x_wind`/`y_wind`/`x_wind_10m`/`y_wind_10m` (±40 m/s,
 one range serves every level, and the jet at 300–250 hPa reaches 60–80 m/s;
 their derived `wind_speed_pl` takes `wind_speed` over 0–80 m/s), vertical
 velocity `w` (±2 Pa/s; geometric ±1 m/s), vorticity `vo` (±2·10⁻⁴ s⁻¹) and
-divergence `d` (±1·10⁻⁴ s⁻¹). `viridis` covers geopotential `z`/`gh`/
-`geopotential_pl` (0–21 000 gpm or 0–206 000 m² s⁻², every pressure level up
-to 50 hPa), surface pressure `sp`
+divergence `d` (±1·10⁻⁴ s⁻¹). `viridis` covers geopotential height
+`gh`/`HGT`/`geopotential_height_pl` (0–21 000 gpm, every pressure level up
+to 50 hPa) and geopotential `z`/`GP`/`geopotential_pl` (the same heights
+× g₀, 0–205 940 m² s⁻²), surface pressure `sp`
 (500–1050 hPa, apart from MSLP), specific humidity `q` (0–0.02 kg/kg or
 0–20 g/kg, never the relative-humidity percent range) and total column
 water vapour `tcwv` (0–70 mm); snowfall `sf` (mm) takes `precipitation`.

@@ -400,6 +400,7 @@ fn mk_collection(
         csv: None,
         preview: None,
         derive_wind: None,
+        derive_geopotential_height: None,
     }
 }
 

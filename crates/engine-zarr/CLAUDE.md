@@ -104,7 +104,8 @@ pool: they do not use the Icechunk runtime bridge.
 - **Display units (#1213):** `Variable::display` is the
   `ds_core::units::cf_display_conversion` of the array's CF `units` and
   `standard_name`, built once per catalog (K → °C, Pa → hPa, kg m-2 → mm,
-  kg m-2 s-1 → mm/h, m2 s-2 → gpm, any spelling; `1` → % only when the
+  kg m-2 s-1 → mm/h, any spelling; geopotential's m2 s-2 as stored, its
+  height a derived parameter, #948; `1` → % only when the
   standard name is `relative_humidity` or ends in `_area_fraction` or `_area_fraction_in_atmosphere_layer`; no name tables). `Variable::units` is the SERVED
   unit,
   so `RasterInfo`, EDR descriptions/coverages and `WindFacts` all report it;

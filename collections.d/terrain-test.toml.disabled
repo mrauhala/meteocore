@@ -13,7 +13,8 @@
 #     <dir>/dem_20000101T0000Z.tif
 # Any non-derived raster collection serves: a COG, a Zarr or NetCDF
 # orography, a GRIB surface height. Its unit must say how heights are given:
-# m, km, ft or gpm. A collection of several parameters needs the station
+# m, km, ft or gpm, or geopotential in m2 s-2 (a GRIB surface z, read as
+# z / g0). A collection of several parameters needs the station
 # grid's `elevation_parameter`.
 id = "terrain-test"
 title = "Synthetic Test Terrain"

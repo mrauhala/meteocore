@@ -560,6 +560,29 @@ fn valley_analysis_follows_the_terrain() {
     assert_eq!(parameter, None, "a single-parameter collection");
 }
 
+/// A terrain stated as geopotential in m2 s-2 (an NWP surface `z`, as
+/// engine-grib serves it, #948) loads, and reads as its geopotential height
+/// Φ / g₀, the gpm its derived `gh` serves: the analysis is the metre
+/// terrain's.
+#[test]
+fn a_geopotential_terrain_reads_as_its_height() {
+    use ds_core::geopotential::STANDARD_GRAVITY;
+    let source = Source::new(valley_stations());
+    let mut corrected = config(vec!["t2m".into()]);
+    corrected.elevation_source = Some("dem".into());
+    let z = Raster::new(&[("z", "m2 s-2")], |lon, _| {
+        Some(valley_terrain(lon) * STANDARD_GRAVITY)
+    });
+    let engine = build("valley-z", &source, &corrected, Some(z), None)
+        .expect("a geopotential terrain loads");
+    engine.poll_once();
+    assert!(engine.has_data());
+    for (lon, lat, want, _) in VALLEY {
+        let got = at(&engine, "t2m", lon, lat).unwrap();
+        assert!((got - want).abs() < 1e-4, "({lon}, {lat}): {got} vs {want}");
+    }
+}
+
 /// The source's stated height wins over the terrain, and a difference of
 /// more than 100 m is logged once. A station with neither is left out of
 /// the corrected parameter only; a cell over terrain nodata is nodata in

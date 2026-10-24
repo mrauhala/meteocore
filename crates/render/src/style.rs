@@ -1480,10 +1480,11 @@ mod tests {
     }
 
     /// #1067 PR 8: MEPS's pressure-level layers, as engine-netcdf reports
-    /// them with the speed `DerivedWind` adds (geopotential in gpm, #1209):
+    /// them with the speed and the geopotential height `ds_core::derive`
+    /// adds (geopotential as stored in m^2/s^2, the height in gpm, #948):
     /// the jet's 50–70 m/s components and speeds draw colours of their own,
     /// which the surface scale's ±40 / 0–40 m/s would merge into its end
-    /// colour.
+    /// colour, and one level draws one colour as geopotential and as height.
     #[test]
     fn meps_pressure_level_winds_resolve_the_jet() {
         let ctx = StyleContext::with_builtins();
@@ -1500,7 +1501,8 @@ mod tests {
                 "m/s",
             ),
             ("wind_speed_pl", "Wind speed", "m/s"),
-            ("geopotential_pl", "Geopotential pressure levels", "gpm"),
+            ("geopotential_pl", "Geopotential pressure levels", "m^2/s^2"),
+            ("geopotential_height_pl", "Geopotential height", "gpm"),
         ]
         .map(|(name, title, unit)| ds_core::map_engine::ParameterInfo {
             name: name.into(),
@@ -1512,7 +1514,8 @@ mod tests {
             .unwrap();
         let style = |name: &str| &maps[&format!("c1/{name}")]["default"];
         type Case = (&'static str, &'static str, (f64, f64), &'static [f64]);
-        let cases: [Case; 4] = [
+        const G0: f64 = ds_core::geopotential::STANDARD_GRAVITY;
+        let cases: [Case; 5] = [
             (
                 "x_wind_pl",
                 "diverging",
@@ -1533,6 +1536,12 @@ mod tests {
             ),
             (
                 "geopotential_pl",
+                "viridis",
+                (0.0, 21_000.0 * G0),
+                &[100.0 * G0, 1_500.0 * G0, 5_500.0 * G0, 9_200.0 * G0],
+            ),
+            (
+                "geopotential_height_pl",
                 "viridis",
                 (0.0, 21_000.0),
                 &[100.0, 1_500.0, 5_500.0, 9_200.0],

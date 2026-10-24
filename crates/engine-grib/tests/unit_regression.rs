@@ -79,9 +79,9 @@ fn ecmwf_unit_conversion_snapshot() {
         // 10u / 10v: (98, 0, 2, 2) and (98, 0, 2, 3) m s-1 → identity
         ("u-component of wind", (98, 0, 2, 2), "m s-1", 12.5, 12.5),
         ("v-component of wind", (98, 0, 2, 3), "m s-1", -3.2, -3.2),
-        // z: (98, 0, 3, 4) Geopotential m² s⁻² → gpm (divide by g = 9.80665)
-        // 9806.65 m²/s² = 1000 gpm
-        ("Geopotential", (98, 0, 3, 4), "gpm", 9806.65, 1000.0),
+        // z: (98, 0, 3, 4) Geopotential m² s⁻² → identity (#948; the
+        // removed table served gpm, geopotential height under z's name).
+        ("Geopotential", (98, 0, 3, 4), "m2 s-2", 9806.65, 9806.65),
         // Precipitation rate: (98, 0, 1, 7) kg m-2 s-1 → mm/h (× 3600,
         // #1213; the removed table served the raw rate).
         ("Precipitation rate", (98, 0, 1, 7), "mm/h", 1e-4, 0.36),
@@ -146,17 +146,18 @@ fn cloud_cover_asymmetry_regression() {
 ///   ECMWF `z` is (0, 3, 4) Geopotential in m² s⁻².
 ///   GFS `HGT` is (0, 3, 5) Geopotential height in gpm.
 ///
-/// Both should produce gpm output, but only the Geopotential one divides
-/// by gravity.
+/// They are two quantities, each served in its own unit (#948): dividing
+/// geopotential by gravity gives the height, a derived parameter of its
+/// own (`ds_core::geopotential`), never geopotential in another unit.
 #[test]
 fn geopotential_asymmetry_regression() {
-    // Geopotential (m²/s²) — must divide by g
+    // Geopotential (m²/s²) — served as stored
     let geo = lookup(0, 0, 3, 4).expect("Geopotential must be in table");
     assert_eq!(geo.source_unit, SourceUnit::M2PerS2);
     let geo_disp = default_display(geo.source_unit);
-    assert_eq!(geo_disp.display_unit, "gpm");
-    // 9806.65 m²/s² = 1000 gpm
-    assert!((geo_disp.convert(9806.65) - 1000.0).abs() < 0.01);
+    assert_eq!(geo_disp.display_unit, "m2 s-2");
+    assert!(!geo_disp.has_conversion());
+    assert!((geo_disp.convert(9806.65) - 9806.65).abs() < 1e-9);
 
     // Geopotential height (gpm) — already in gpm, identity
     let ght = lookup(0, 0, 3, 5).expect("Geopotential height must be in table");

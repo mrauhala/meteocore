@@ -152,9 +152,9 @@ directions on the ground are unknown); earth-relative ones give speed and
 direction.
 
 **Display units.** Each variable's CF `units`, in any spelling, picks the
-unit it is served in: K as °C, Pa as hPa, kg m-2 as mm, kg m-2 s-1 as mm/h,
-m2 s-2 as gpm. CF's dimensionless `1` is served as % when the variable's
-`standard_name` is a fraction: `relative_humidity`, or a name ending in
+unit it is served in: K as °C, Pa as hPa, kg m-2 as mm, kg m-2 s-1 as mm/h;
+geopotential's m2 s-2 as stored. CF's dimensionless `1` is served as % when
+the variable's `standard_name` is a fraction: `relative_humidity`, or a name ending in
 `_area_fraction` or `_area_fraction_in_atmosphere_layer`, such as
 `cloud_area_fraction`. Any other unit, such as m/s or the `1` of
 `specific_humidity`, is served as stored. Values are sampled from the stored
@@ -212,6 +212,12 @@ variable without one, by a known name such as `u`/`v` (frame unknown).
 Direction is EDR-only and needs earth-relative components, or
 grid-relative ones on a latitude/longitude grid. `derive_wind = false`
 opts out.
+
+**Derived geopotential height.** A variable whose `standard_name` is
+`geopotential`, in m2 s-2, gives its height ÷ g₀ in gpm on every API,
+unless the collection has a `geopotential_height` at that level: MEPS's
+`geopotential_pl` gives `geopotential_height_pl`, per level.
+`derive_geopotential_height = false` opts out.
 
 **Per-step amounts.** A variable named `<name>_acc` in kg m-2 or mm,
 MET Norway's accumulation since the run start (MEPS
