@@ -187,14 +187,22 @@ static BLOCKS: LazyLock<ByteBoundedCache<BlockKey, Bytes>> = LazyLock::new(|| {
 /// Compressed chunks, `MC_NETCDF_CHUNK_CACHE_MB` (default 512 MiB, about
 /// 340 MEPS fields), shared by every NetCDF collection; and the OPeNDAP
 /// replies of fields, uncompressed (about 126 MEPS fields), and of the
-/// windows EDR queries read (#1171), each under its own constraint and
-/// weighted by its size (428 bytes for a 2 × 2 MEPS window).
+/// windows EDR queries read (#1171, several variables' in one reply,
+/// #1274), each under its own constraint and weighted by its size and its
+/// constraint's (428 bytes and about 80 for a 2 × 2 MEPS window: a
+/// request of 16 variables' windows has a constraint of over 1 KB).
 static CHUNKS: LazyLock<ByteBoundedCache<ChunkKey, Bytes>> = LazyLock::new(|| {
     ByteBoundedCache::from_env(
         "MC_NETCDF_CHUNK_CACHE_MB",
         512,
         3 * ds_cache::MIB / 2,
-        |key, bytes| bytes.len() as u64 + key.file.url.len() as u64 + 96,
+        |key, bytes| {
+            let constraint = match &key.part {
+                Part::Range { .. } => 0,
+                Part::Dap(constraint) => constraint.len(),
+            };
+            (bytes.len() + key.file.url.len() + constraint) as u64 + 96
+        },
     )
 });
 

@@ -30,7 +30,11 @@
 //! of what their fields whole hold. A 13-level MEPS series over a 67-lead
 //! run is 67 requests, not 871: thredds.met.no answers a 2 × 2 window of
 //! one level in about 0.27 s and of all 13 in about 0.53 s (measured from a
-//! server's network, 2026-10-24).
+//! server's network, 2026-10-24). And the windows of several variables at
+//! one step are one request (#1274), one hyperslab each, at most
+//! [`MAX_REQUEST_PLANES`] planes (variables × the levels of their
+//! hyperslabs) per request: a six-variable surface meteogram over a MEPS
+//! run is 67 requests, not 402.
 //!
 //! A per-step amount (#1165) is sampled from its run-start accumulation at
 //! each step and at the run's step before, at the same positions, and the
@@ -70,7 +74,7 @@ type Window = Option<(DateTime<Utc>, DateTime<Utc>)>;
 
 /// The most decoded bytes one EDR query may read, `MC_NETCDF_EDR_QUERY_MB`
 /// (default 544 MiB): every read the query plans counted at what it
-/// decodes ([`Job::bytes`]), from the metadata, before any read. A whole
+/// decodes ([`Member::bytes`]), from the metadata, before any read. A whole
 /// field counts [`crate::ingest::FieldRead::decoded_bytes`] (4.06 MB for
 /// MEPS), a window read through OPeNDAP its cells × the levels of its
 /// hyperslab × 4 bytes (a MEPS point's 2 × 2 cells over 13 levels, 208).
@@ -94,22 +98,38 @@ const DEFAULT_QUERY_MB: u64 = 544;
 
 /// The most field reads one EDR query may make, `MC_NETCDF_EDR_QUERY_READS`
 /// (default 200), counted from its plan before any read, for every access:
-/// a whole field of one level is one read, a window of one level one, and
-/// a window of several levels of one field at one step, read in one
-/// OPeNDAP hyperslab, one. One variable at every MEPS pressure level over a
-/// 67-lead run is 67 reads through OPeNDAP, a derived wind speed (both
-/// components) at every level 134. At the measured 0.55 s at most per
-/// 13-level window request, four at a time, 200 reads take about 27 s:
-/// inside the 30 s EDR deadline. Three variables over a whole run (201
-/// reads) are just over it. Read whole (a local file, by HTTP range, a
-/// window past half the field), [`QUERY_BYTES`] binds first: 140 MEPS
-/// fields. `0` refuses every query that reads a field. Not
-/// [`field::QUERY_READS`], the pool a query's detached reads run in.
+/// a whole field of one level is one read, and through OPeNDAP one request
+/// is one read, however many windows it holds: the levels of a variable
+/// at a step in one hyperslab, and the windows of several variables at a
+/// step in one constraint, up to [`MAX_REQUEST_PLANES`] planes. A
+/// six-variable surface meteogram over a 67-lead MEPS run is 67 reads; one
+/// variable at every pressure level over the run 67, a derived wind speed
+/// (both components, a request each) at every level 134. At about 0.55 s
+/// at most per request (a 13-level window, or 16 planes), four at a time,
+/// 200 reads take about 27 s: inside the 30 s EDR deadline. Three
+/// variables at every level over a whole run (201 reads, each 13-level
+/// variable a request of its own) are just over it. Read whole (a local
+/// file, by HTTP range, a window past half the field), [`QUERY_BYTES`]
+/// binds first: 140 MEPS fields. `0` refuses every query that reads a
+/// field. Not [`field::QUERY_READS`], the pool a query's detached reads run
+/// in.
 pub(crate) static QUERY_FIELD_READS: LazyLock<usize> =
     LazyLock::new(|| env_count("MC_NETCDF_EDR_QUERY_READS", DEFAULT_QUERY_FIELD_READS));
 
 /// [`QUERY_FIELD_READS`]' default.
 const DEFAULT_QUERY_FIELD_READS: usize = 200;
+
+/// The most planes one OPeNDAP request of a query reads (#1274): the
+/// windows of several variables at one step are one request while their
+/// planes, each variable's stored levels in its hyperslab, add up to at
+/// most this. Measured from a server near thredds.met.no on 2026-10-24, 2 ×
+/// 2 windows of MEPS `pl` files: a request costs about 0.25 s plus 0.016 s
+/// per plane (1 variable × 1 level 0.23-0.34 s, 3 × 1 0.35-0.42 s, 1 × 13
+/// 0.49-0.59 s, 5 × 13 1.1-1.6 s). At 16 planes a request takes about as
+/// long as the 13-level requests [`QUERY_FIELD_READS`]' default was sized
+/// for: sixteen single-level variables share a request, while a 13-level
+/// variable fills one alone.
+pub(crate) const MAX_REQUEST_PLANES: u64 = 16;
 
 /// A count from the environment, parsed as `ds_cache::env_mb` parses a
 /// size: trimmed, `default` when unset or not a number.
@@ -179,6 +199,79 @@ fn worth_a_window(window: CellWindow, levels: u64, asked: usize, source: &Source
     let (columns, rows) = source.size();
     let field = u64::from(columns) * u64::from(rows);
     window.cells().saturating_mul(levels).saturating_mul(2) <= field.saturating_mul(asked as u64)
+}
+
+/// The reads of `planned`, each a variable's read at a step: a whole
+/// field is a read of its own; the windows of one step (one file, one time
+/// index) are packed into requests ([`pack`], #1274), each holding a
+/// variable at most once and at most [`MAX_REQUEST_PLANES`] planes. A
+/// step's windows are sorted by variable index (then stored level) before
+/// packing, so the same query always makes the same requests: it joins
+/// their in-flight reads and finds their replies cached. A query asking a
+/// subset of the variables makes requests of its own.
+fn requests_of(planned: Vec<(DateTime<Utc>, Step, Member)>) -> Vec<Job> {
+    let mut jobs = Vec::new();
+    // Each step's windows, the steps in the order first planned.
+    let mut steps: Vec<(DateTime<Utc>, Step, Vec<Member>)> = Vec::new();
+    let mut at: HashMap<DateTime<Utc>, usize> = HashMap::new();
+    for (valid, step, member) in planned {
+        if member.window.is_none() {
+            jobs.push(Job {
+                valid,
+                step,
+                members: vec![member],
+            });
+            continue;
+        }
+        let s = *at.entry(valid).or_insert_with(|| {
+            steps.push((valid, step, Vec::new()));
+            steps.len() - 1
+        });
+        steps[s].2.push(member);
+    }
+    for (valid, step, mut members) in steps {
+        let first = |member: &Member| step.file.reads[member.index].span(&member.levels).first;
+        members.sort_by_key(|member| (member.index, first(member)));
+        let sizes: Vec<(usize, u64)> = members
+            .iter()
+            .map(|member| (member.index, member.planes(&step)))
+            .collect();
+        let mut members: Vec<Option<Member>> = members.into_iter().map(Some).collect();
+        for request in pack(&sizes) {
+            jobs.push(Job {
+                valid,
+                step: step.clone(),
+                members: request
+                    .into_iter()
+                    .filter_map(|i| members[i].take())
+                    .collect(),
+            });
+        }
+    }
+    jobs
+}
+
+/// `members`, each a `(variable index, planes)`, packed into requests in
+/// their order, first fit: each joins the first request that does not hold
+/// its variable yet and has room for its planes ([`MAX_REQUEST_PLANES`] in
+/// all), else starts one. A variable of more planes is a request alone. A
+/// request's positions into `members`, ascending.
+fn pack(members: &[(usize, u64)]) -> Vec<Vec<usize>> {
+    let mut requests: Vec<(u64, Vec<usize>)> = Vec::new();
+    for (i, &(index, planes)) in members.iter().enumerate() {
+        let room = requests.iter_mut().find(|(held, request)| {
+            held.saturating_add(planes) <= MAX_REQUEST_PLANES
+                && request.iter().all(|&j| members[j].0 != index)
+        });
+        match room {
+            Some((held, request)) => {
+                *held += planes;
+                request.push(i);
+            }
+            None => requests.push((planes, vec![i])),
+        }
+    }
+    requests.into_iter().map(|(_, request)| request).collect()
 }
 
 /// One query's field reads: the selected parameters at the selected steps
@@ -263,14 +356,23 @@ impl Sampling<'_> {
 /// for a field not read.
 type Slots = Option<(usize, Option<usize>)>;
 
-/// One read a query makes ([`field::read_uncached`]): variable `index` at
-/// one step, at one served level, whole or a window of it, or at several
-/// levels whose window is read in one hyperslab over their stored levels;
-/// and the requests of each level, each a positions list and the slot of
-/// its samples.
+/// One read a query makes ([`field::read_uncached`]) at one step: one
+/// member, a variable's field whole; or through OPeNDAP one request of the
+/// windows of one or more variables, each over its own levels (#1274).
 struct Job {
     valid: DateTime<Utc>,
     step: Step,
+    /// By ascending variable index, each variable at most once: the order
+    /// of the request's constraint, so the same members always make the
+    /// same request.
+    members: Vec<Member>,
+}
+
+/// One variable a [`Job`] reads: variable `index` at one served level,
+/// whole or a window of it, or at several levels whose window is read in
+/// one hyperslab over their stored levels; and the requests of each level,
+/// each a positions list and the slot of its samples.
+struct Member {
     index: usize,
     /// Served levels, distinct, in the order first asked; one unless the
     /// read is a window of several.
@@ -280,22 +382,28 @@ struct Job {
     asked: Vec<Vec<(usize, Positions)>>,
 }
 
-impl Job {
-    /// The bytes the read decodes, from the metadata: a whole field its
-    /// [`crate::ingest::FieldRead::decoded_bytes`] (the `f32` field, or its
-    /// chunk when larger), a window its cells × the stored levels its
-    /// hyperslab spans × the 4 bytes of an `f32` decoded.
-    fn bytes(&self) -> u64 {
-        let read = &self.step.file.reads[self.index];
+impl Member {
+    /// The bytes the read of it at `step` decodes, from the metadata: a
+    /// whole field its [`crate::ingest::FieldRead::decoded_bytes`] (the
+    /// `f32` field, or its chunk when larger), a window its cells × the
+    /// stored levels its hyperslab spans × the 4 bytes of an `f32` decoded.
+    fn bytes(&self, step: &Step) -> u64 {
+        let read = &step.file.reads[self.index];
         match self.window {
             None => read
                 .decoded_bytes()
                 .saturating_mul(self.levels.len() as u64),
             Some(window) => window
                 .cells()
-                .saturating_mul(read.span(&self.levels).levels())
+                .saturating_mul(self.planes(step))
                 .saturating_mul(std::mem::size_of::<f32>() as u64),
         }
+    }
+
+    /// The planes the read of it at `step` holds: the stored levels its
+    /// hyperslab spans.
+    fn planes(&self, step: &Step) -> u64 {
+        step.file.reads[self.index].span(&self.levels).levels()
     }
 }
 
@@ -318,17 +426,21 @@ impl Plan {
         let mut pairs = HashSet::new();
         let mut variables = HashSet::new();
         let mut groups = HashSet::new();
+        let mut members = 0;
         let mut bytes = 0u64;
         for job in &self.jobs {
-            fields += job.levels.len();
             steps.insert(job.valid);
-            variables.insert(job.index);
-            groups.insert((job.index, job.valid));
-            for &level in &job.levels {
-                levels.insert(level);
-                pairs.insert((job.valid, level));
+            for member in &job.members {
+                members += 1;
+                fields += member.levels.len();
+                variables.insert(member.index);
+                groups.insert((member.index, job.valid));
+                for &level in &member.levels {
+                    levels.insert(level);
+                    pairs.insert((job.valid, level));
+                }
+                bytes = bytes.saturating_add(member.bytes(&job.step));
             }
-            bytes = bytes.saturating_add(job.bytes());
         }
         Tally {
             fields,
@@ -337,6 +449,7 @@ impl Plan {
             pairs: pairs.len(),
             variables: variables.len(),
             groups: groups.len(),
+            members,
             reads: self.jobs.len(),
             bytes,
         }
@@ -357,9 +470,13 @@ struct Tally {
     variables: usize,
     /// Distinct (variable, timestep) read.
     groups: usize,
-    /// Reads ([`Job`]s): a window of several levels is one.
+    /// Variables read, one per read of each ([`Member`]s): a window of
+    /// several levels is one.
+    members: usize,
+    /// Reads ([`Job`]s): a window of several levels is one, and so is a
+    /// request of the windows of several variables.
     reads: usize,
-    /// Bytes decoded ([`Job::bytes`]).
+    /// Bytes decoded ([`Member::bytes`]).
     bytes: u64,
 }
 
@@ -369,9 +486,8 @@ impl Tally {
     /// 400 `QueryTooLarge` naming what the query would read, the limit and
     /// how to narrow it; `time` names what to narrow for fewer steps.
     fn check(&self, limits: Limits, time: &str) -> Result<(), DataServerError> {
-        // Every level of a variable's step in one read: fewer levels make
-        // no fewer reads.
-        let batched = self.reads == self.groups;
+        // Every level of a variable's step in one read.
+        let batched = self.members == self.groups;
         let narrow = |levels_help: bool| {
             if levels_help {
                 ", name fewer parameters or fewer pressure levels (z)"
@@ -412,12 +528,20 @@ impl Tally {
                     self.variables,
                 )
             };
+            // Where each step is one read, holding every variable and
+            // level it reads (#1274), only fewer steps make fewer reads.
+            // Otherwise fewer variables do too, and on pressure levels fewer
+            // levels: read one by one each is a read, read together each is
+            // a plane, and a request holds MAX_REQUEST_PLANES.
+            let narrow = if self.reads > self.steps {
+                narrow(self.levels > 1)
+            } else {
+                ""
+            };
             return Err(DataServerError::QueryTooLarge(format!(
                 "Query would make {} field reads ({shape}); the limit is {} reads — narrow \
-                 {time}{}. {DERIVED}",
-                self.reads,
-                limits.reads,
-                narrow(self.levels > 1 && !batched),
+                 {time}{narrow}. {DERIVED}",
+                self.reads, limits.reads,
             )));
         }
         Ok(())
@@ -576,7 +700,9 @@ impl NetcdfEngine {
     /// at its own, and its levels join only while the joined window stays
     /// worth it. Otherwise each level is a read of its own, a window while
     /// worth it, else the field whole; a file that reads no windows (local,
-    /// by HTTP range) reads every field whole, one level per read.
+    /// by HTTP range) reads every field whole, one level per read. Then the
+    /// windows of one step, of every variable, are one request
+    /// ([`requests_of`], #1274), up to [`MAX_REQUEST_PLANES`] planes each.
     fn plan_reads(reads: &Reads, fields: &[Sampling]) -> Plan {
         let layout = reads.layout;
         // The fields to read, each once: its step, variable and level, and
@@ -684,29 +810,33 @@ impl NetcdfEngine {
                         )
                 });
             if let Some(window) = joined {
-                jobs.push(Job {
+                jobs.push((
                     valid,
                     step,
-                    index,
-                    levels: served,
-                    window: Some(window),
-                    asked: levels.into_iter().map(|(_, asked)| asked).collect(),
-                });
+                    Member {
+                        index,
+                        levels: served,
+                        window: Some(window),
+                        asked: levels.into_iter().map(|(_, asked)| asked).collect(),
+                    },
+                ));
                 continue;
             }
             for ((level, asked), window) in levels.into_iter().zip(windows) {
-                jobs.push(Job {
+                jobs.push((
                     valid,
-                    step: step.clone(),
-                    index,
-                    levels: vec![level],
-                    window: window.filter(|&w| worth_a_window(w, 1, 1, &layout.source)),
-                    asked: vec![asked],
-                });
+                    step.clone(),
+                    Member {
+                        index,
+                        levels: vec![level],
+                        window: window.filter(|&w| worth_a_window(w, 1, 1, &layout.source)),
+                        asked: vec![asked],
+                    },
+                ));
             }
         }
         Plan {
-            jobs,
+            jobs: requests_of(jobs),
             requests,
             slots,
         }
@@ -735,34 +865,48 @@ impl NetcdfEngine {
                 ds_executor::query_runtime(),
                 jobs.into_iter(),
                 move |job: Job| {
-                    let index = job.index;
-                    let read = field::read_uncached(
-                        &job.step.file,
-                        index,
-                        job.step.index,
-                        &job.levels,
-                        flipped,
-                        job.window,
-                        &decodes,
-                    )?;
+                    let read = {
+                        let members: Vec<field::Member> = job
+                            .members
+                            .iter()
+                            .map(|member| field::Member {
+                                index: member.index,
+                                levels: &member.levels,
+                                window: member.window,
+                            })
+                            .collect();
+                        field::read_uncached(
+                            &job.step.file,
+                            job.step.index,
+                            &members,
+                            flipped,
+                            &decodes,
+                        )?
+                    };
                     // Sampled from the stored field, then converted to the
                     // unit served, as the map converts each pixel (#1209).
                     let shared = &shared;
                     let sampled = read
                         .iter()
-                        .zip(job.asked)
-                        .flat_map(|(field, asked)| {
-                            asked.into_iter().map(move |(slot, positions)| {
-                                let values = positions
-                                    .iter()
-                                    .map(|position| {
-                                        position
-                                            .and_then(|p| field.value_at(&shared.source, p))
-                                            .map(|raw| shared.to_display(index, raw))
+                        .zip(job.members)
+                        .flat_map(|(fields, member)| {
+                            let index = member.index;
+                            fields
+                                .iter()
+                                .zip(member.asked)
+                                .flat_map(move |(field, asked)| {
+                                    asked.into_iter().map(move |(slot, positions)| {
+                                        let values = positions
+                                            .iter()
+                                            .map(|position| {
+                                                position
+                                                    .and_then(|p| field.value_at(&shared.source, p))
+                                                    .map(|raw| shared.to_display(index, raw))
+                                            })
+                                            .collect::<Vec<_>>();
+                                        (slot, values)
                                     })
-                                    .collect::<Vec<_>>();
-                                (slot, values)
-                            })
+                                })
                         })
                         .collect::<Vec<_>>();
                     Ok(sampled)
@@ -1347,16 +1491,22 @@ mod tests {
             pairs,
             variables,
             groups: steps * variables,
+            members: pairs * variables,
             reads: pairs * variables,
             bytes: field * (pairs * variables) as u64,
         }
     }
 
     /// The same fields read through OPeNDAP as windows of `cells` cells,
-    /// every level of a variable's step in one read.
+    /// every level of a variable's step in one hyperslab, and the
+    /// variables of a step in requests of at most [`MAX_REQUEST_PLANES`]
+    /// planes ([`pack`]).
     fn windows(steps: usize, levels: usize, variables: usize, cells: u64) -> Tally {
+        let step: Vec<(usize, u64)> = (0..variables).map(|v| (v, levels as u64)).collect();
+        let per_step = pack(&step).len();
         Tally {
-            reads: steps * variables,
+            members: steps * variables,
+            reads: steps * per_step,
             bytes: cells * levels as u64 * 4 * (steps * variables) as u64,
             ..whole(steps, levels, variables, 0)
         }
@@ -1431,11 +1581,12 @@ mod tests {
 
     /// The read cap (`MC_NETCDF_EDR_QUERY_READS`, default 200) counts each
     /// read once, a window of every level of a variable's step one: three
-    /// variables at every level over a whole MEPS run are 201 reads, one
-    /// over the default, a 400 naming the reads and the limit that does
-    /// not ask for fewer levels, which would not make fewer reads. Levels
-    /// read one by one are reads each, and then fewer levels help. Read
-    /// whole, the byte cap refuses first.
+    /// variables at every level over a whole MEPS run are 201 reads (each
+    /// 13-level variable a request of its own), one over the default, a 400
+    /// naming the reads and the limit that asks for fewer parameters or
+    /// fewer levels: at 8 levels the three share requests. Levels read one
+    /// by one are reads each, and then fewer levels help too. Read whole,
+    /// the byte cap refuses first.
     #[test]
     fn the_read_cap_counts_each_read_once() {
         let ok = |tally: Tally| tally.check(DEFAULTS, "the datetime window");
@@ -1444,13 +1595,16 @@ mod tests {
         assert_eq!(
             message,
             "Query would make 201 field reads (67 timesteps × 3 source variables); the limit \
-             is 200 reads — narrow the datetime window or name fewer parameters. A derived \
-             parameter reads each variable it is derived from: a wind speed reads both wind \
-             components, and a per-step amount its accumulation at the step before as well"
+             is 200 reads — narrow the datetime window, name fewer parameters or fewer \
+             pressure levels (z). A derived parameter reads each variable it is derived from: \
+             a wind speed reads both wind components, and a per-step amount its accumulation \
+             at the step before as well"
         );
+        ok(windows(67, 8, 3, 4)).unwrap();
         // Each level a read of its own (windows past what a hyperslab over
         // their levels is worth).
         let apart = Tally {
+            members: 20 * 13,
             reads: 20 * 13,
             ..windows(20, 13, 1, 4)
         };
@@ -1460,11 +1614,12 @@ mod tests {
                 && message.contains("fewer pressure levels (z)"),
             "{message}"
         );
-        // Fixture-sized fields read whole: 48 reads over a limit of 40.
+        // Fixture-sized fields read whole: 48 reads over a limit of 40,
+        // one a step, so only fewer steps make fewer.
         let message = too_large(whole(48, 1, 1, 440).check(reads(40), "the path's time span"));
         assert!(
             message.contains("48 field reads (48 timesteps × 1 source variables)")
-                && message.contains("the limit is 40 reads — narrow the path's time span or"),
+                && message.contains("the limit is 40 reads — narrow the path's time span. A"),
             "{message}"
         );
         // Over both: the bytes are named first.
@@ -1476,6 +1631,62 @@ mod tests {
         // What a refusal says of sizes under a MiB.
         assert_eq!(size(13_936), "13936 bytes");
         assert_eq!(size(DEFAULTS.bytes), "544 MiB");
+    }
+
+    /// Through OPeNDAP the windows of several variables at one step are one
+    /// read (#1274): a six-variable surface meteogram over a 67-lead MEPS
+    /// run is 67 reads, not 402, and fits the default. Sixteen single-level
+    /// variables share a request; forty are three a step, 201 reads over a
+    /// run, a 400 that asks for fewer parameters. A series of one request a
+    /// step longer than the cap can only be narrowed in time.
+    #[test]
+    fn a_meteogram_is_one_read_per_step() {
+        let ok = |tally: Tally| tally.check(DEFAULTS, "the datetime window");
+        let meteogram = windows(67, 1, 6, 4);
+        assert_eq!((meteogram.fields, meteogram.reads), (402, 67));
+        ok(meteogram).unwrap();
+        assert_eq!(windows(67, 1, 16, 4).reads, 67);
+        assert_eq!(windows(67, 1, 17, 4).reads, 134);
+        let message = too_large(ok(windows(67, 1, 40, 4)));
+        assert!(
+            message.contains("201 field reads (67 timesteps of 40 source variables)")
+                && message.contains("narrow the datetime window or name fewer parameters.")
+                && !message.contains("level"),
+            "{message}"
+        );
+        let message = too_large(ok(windows(201, 1, 6, 4)));
+        assert!(
+            message.contains("201 field reads (201 timesteps of 6 source variables)")
+                && message.contains("narrow the datetime window. A derived"),
+            "{message}"
+        );
+    }
+
+    /// A step's windows are packed into requests first fit, in order: each
+    /// variable at most once a request, at most 16 planes. Single-level
+    /// variables share requests of 16; a 13-level variable fills one, a
+    /// single-level one taking the room left; one past 16 planes is a
+    /// request alone; a variable's levels read one by one (a Z path's) go to
+    /// requests of their own, each joined by another variable's level.
+    #[test]
+    fn requests_hold_each_variable_once_and_at_most_16_planes() {
+        let singles: Vec<(usize, u64)> = (0..20).map(|v| (v, 1)).collect();
+        let packed = pack(&singles);
+        assert_eq!(packed.len(), 2);
+        assert_eq!(packed[0], (0..16).collect::<Vec<_>>());
+        assert_eq!(packed[1], (16..20).collect::<Vec<_>>());
+        assert_eq!(
+            pack(&[(0, 13), (1, 13), (2, 1), (3, 1), (4, 1), (5, 1)]),
+            [vec![0, 2, 3, 4], vec![1, 5]]
+        );
+        assert_eq!(pack(&[(0, 20), (1, 1)]), [vec![0], vec![1]]);
+        assert_eq!(
+            pack(&[(0, 1), (0, 1), (0, 1), (1, 1), (1, 1)]),
+            [vec![0, 3], vec![1, 4], vec![2]]
+        );
+        assert_eq!(pack(&[(0, 8), (1, 8)]), [vec![0, 1]]);
+        assert_eq!(pack(&[(0, 9), (1, 8)]), [vec![0], vec![1]]);
+        assert!(pack(&[]).is_empty());
     }
 
     /// The engine over `testdata/<dir>` with its family's file names and

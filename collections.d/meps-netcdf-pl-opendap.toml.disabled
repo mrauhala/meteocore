@@ -26,17 +26,20 @@
 #   - per field drawn: one 4.06 MB `.dods` of one level the first time any
 #     request draws it. A field is one variable at one level and lead: 13
 #     per variable and lead, so a layer is 871 fields over a run.
-#   - per EDR query: one `.dods` per variable and lead, covering the levels
-#     asked (the stored levels from the lowest asked to the highest) over
-#     only the cells the query samples: at a point 2 x 2 cells, about
+#   - per EDR query: one `.dods` per lead for the variables it reads, each
+#     covering the levels asked (the stored levels from the lowest asked
+#     to the highest) over only the cells the query samples, up to 16
+#     planes (variables x levels) a request: at a point 2 x 2 cells, about
 #     0.27 s at one level and 0.53 s at all 13 (measured 2026-10-24 from a
-#     server's network). An area over more than half the grid reads each
-#     level's field whole. A query without `z` reads every level: a
-#     position series over a whole run at all 13 levels is admitted, 67
-#     requests, about 9 s, within MC_NETCDF_EDR_QUERY_READS (200 reads; a
-#     wind_speed_pl series, both components, is 134). Read whole, the same
-#     series would be 871 fields (3.5 GB), past MC_NETCDF_EDR_QUERY_MB
-#     (544 MiB).
+#     server's network), so a variable at all 13 levels fills a request
+#     alone, while two at up to 8 levels share one. An area over more than
+#     half the grid reads each level's field whole. A query without `z`
+#     reads every level: a position series over a whole run at all 13
+#     levels is admitted, 67 requests, about 9 s, within
+#     MC_NETCDF_EDR_QUERY_READS (200 requests; a wind_speed_pl series,
+#     both components, is 134, and three variables, 201, are refused:
+#     name fewer levels with `z`). Read whole, the same series would be
+#     871 fields (3.5 GB), past MC_NETCDF_EDR_QUERY_MB (544 MiB).
 
 id = "meps-netcdf-pl-opendap"
 title = "MEPS Pressure Levels (CF-NetCDF, thredds.met.no OPeNDAP)"
