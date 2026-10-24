@@ -16,9 +16,10 @@ use crate::map_engine::{
     CompositeDef, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile, RasterValues,
 };
 use crate::model::{
-    CoverageResponse, LocationSnapshot, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
+    QueryResult,
 };
-use crate::vertical::VerticalDimension;
+use crate::vertical::{VerticalDimension, VerticalKind};
 use crate::wind::{OutcomeLog, WindFacts, WindSource};
 
 type Times = Arc<[DateTime<Utc>]>;
@@ -26,21 +27,26 @@ type Datetime = Option<(DateTime<Utc>, DateTime<Utc>)>;
 type OutcomeKey = (&'static str, String, String);
 
 /// An engine with parameters derived from its own (wind speed and direction
-/// from u/v components, #897; geopotential height from geopotential, #948).
+/// from u/v components, #897; geopotential height from geopotential, #948;
+/// relative humidity and dew point from their ingredients, #898).
 /// Every `MapEngine` and `EdrEngine` method delegates to the wrapped
 /// engine; the derived parameters are added on top:
 ///
 /// - **Map APIs**: the derived parameters a palette can draw
-///   ([`super::Formula::on_map`]: wind speed, geopotential height), as
-///   extra `RasterInfo::parameters`. A derived tile is its input tiles of
-///   the same request (bbox, size, time, z, run), combined per pixel: no
-///   second projection, and the engine's own sampling.
+///   ([`super::Formula::on_map`]: wind speed, geopotential height, relative
+///   humidity, dew point), as extra `RasterInfo::parameters`. A derived
+///   tile is its input tiles of the same request (bbox, size, time, z,
+///   run), combined per pixel: no second projection, and the engine's own
+///   sampling. A formula that reads the level's pressure
+///   ([`super::Formula::reads_level_pressure`]) takes the isobaric level
+///   the engine draws its first input at ([`MapEngine::resolve_elevation`]).
 /// - **EDR**: every derived parameter in `parameter_names` and every
 ///   query. The inputs are queried in place of the derived names and
 ///   combined per value; inputs the client did not ask for are dropped
 ///   again. The response, derived values included, must fit the shared
 ///   value budget ([`MAX_AREA_VALUES`]); it is counted before anything is
-///   derived.
+///   derived. A formula that reads the level's pressure takes each value's
+///   level from the coverage's `z`.
 ///
 /// Time, run and content resolve as the inputs do (root `CLAUDE.md`,
 /// adding-an-engine step 7). A parameter derived from one input resolves
@@ -209,6 +215,12 @@ impl Derived {
             };
             (time, reference_time)
         };
+        // The pressure of the level the inputs are drawn at, in Pa.
+        let pressure = if d.formula.reads_level_pressure() {
+            Some(self.level_pressure(d, names[0], z, time, reference_time)?)
+        } else {
+            None
+        };
         let pixels = width as usize * height as usize;
         let input = |name: &str| {
             let tile = self.map.get_raster_tile(
@@ -258,6 +270,9 @@ impl Derived {
                 samples.clear();
                 samples.extend(converted.iter().map(|values| Some(values[i])));
                 samples.push(value);
+                if pressure.is_some() {
+                    samples.push(pressure);
+                }
                 d.value(&samples).map_or(f32::NAN, |value| value as f32)
             })
             .collect();
@@ -266,6 +281,40 @@ impl Derived {
             height,
             values: RasterValues::F32 { data, nodata: None },
         })
+    }
+
+    /// The pressure, in Pa, of the isobaric level the engine draws `input`
+    /// at for this request: its own level selection
+    /// ([`MapEngine::resolve_elevation`]), in hPa on a pressure axis.
+    fn level_pressure(
+        &self,
+        d: &DerivedParameter,
+        input: &str,
+        z: Option<f64>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<f64, DataServerError> {
+        let isobaric = self
+            .map
+            .raster_info_shared()
+            .vertical
+            .as_ref()
+            .is_some_and(|v| v.kind == VerticalKind::Pressure);
+        isobaric
+            .then(|| {
+                self.map
+                    .resolve_elevation(Some(input), z, time, reference_time)
+            })
+            .flatten()
+            .filter(|hpa| hpa.is_finite() && *hpa > 0.0)
+            .map(|hpa| hpa * 100.0)
+            .ok_or_else(|| {
+                DataServerError::Engine(format!(
+                    "'{}' needs the pressure of the level it is drawn at, and the collection \
+                     has no pressure level there",
+                    d.name
+                ))
+            })
     }
 
     /// The timesteps several inputs share: cached until any axis snapshot
@@ -471,7 +520,15 @@ impl EdrSelection {
             let Some(first) = ranges.iter().flatten().next().copied() else {
                 continue;
             };
-            let range = if ranges.iter().all(Option::is_some) {
+            // The pressure of each value's level, in Pa: none known gives
+            // missing values.
+            let pressures = if d.formula.reads_level_pressure() {
+                level_pressures(&result.domain, first)
+            } else {
+                None
+            };
+            let pressure_missing = d.formula.reads_level_pressure() && pressures.is_none();
+            let range = if ranges.iter().all(Option::is_some) && !pressure_missing {
                 let ranges: Vec<&NdArray> = ranges.into_iter().flatten().collect();
                 if ranges
                     .iter()
@@ -491,12 +548,16 @@ impl EdrSelection {
                         .map(|i| {
                             samples.clear();
                             samples.extend(ranges.iter().map(|r| r.values[i]));
+                            if let Some(pressures) = &pressures {
+                                samples.push(Some(pressures[i]));
+                            }
                             d.value(&samples)
                         })
                         .collect(),
                 }
             } else {
-                // An input missing throughout: missing values.
+                // An input missing throughout, or no level pressure:
+                // missing values.
                 NdArray {
                     shape: first.shape.clone(),
                     axis_names: first.axis_names.clone(),
@@ -512,6 +573,49 @@ impl EdrSelection {
         }
         Ok(())
     }
+}
+
+/// The pressure, in Pa, of each value's level in a range over `domain`: the
+/// domain's isobaric `z` (hPa), one level for every value, or one along the
+/// range's `z` axis, or one per trajectory node. `None` when the domain has
+/// no isobaric level for some value.
+fn level_pressures(domain: &DomainDescription, range: &NdArray) -> Option<Vec<f64>> {
+    let (z, node_z) = match domain {
+        DomainDescription::Point { z, .. }
+        | DomainDescription::PointSeries { z, .. }
+        | DomainDescription::Grid { z, .. } => (z.as_ref(), None),
+        DomainDescription::VerticalProfile { z, .. } | DomainDescription::Section { z, .. } => {
+            (Some(z), None)
+        }
+        DomainDescription::Trajectory { node_z, z, .. } => (z.as_ref(), node_z.as_ref()),
+    };
+    let n = range.values.len();
+    let hpa: Vec<f64> = match node_z {
+        Some(node_z) => {
+            if node_z.kind != VerticalKind::Pressure || node_z.values.len() != n {
+                return None;
+            }
+            node_z.values.clone()
+        }
+        None => {
+            let z = z.filter(|z| z.kind == VerticalKind::Pressure)?;
+            match range.axis_names.iter().position(|axis| axis == "z") {
+                Some(axis) => {
+                    let len = *range.shape.get(axis)?;
+                    if len != z.values.len() || range.shape.len() != range.axis_names.len() {
+                        return None;
+                    }
+                    let stride: usize = range.shape[axis + 1..].iter().product();
+                    (0..n).map(|i| z.values[(i / stride) % len]).collect()
+                }
+                None if z.values.len() == 1 => vec![z.values[0]; n],
+                None => return None,
+            }
+        }
+    };
+    hpa.iter()
+        .all(|p| p.is_finite() && *p > 0.0)
+        .then(|| hpa.into_iter().map(|p| p * 100.0).collect())
 }
 
 fn description(d: &DerivedParameter) -> ParameterDescription {

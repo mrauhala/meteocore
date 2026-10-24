@@ -247,6 +247,7 @@ fn surface_z_gives_the_terrain_height_next_to_wind() {
     let height_only = Derivations {
         wind: false,
         geopotential_height: true,
+        humidity: false,
     };
     let (height, _) = wrap("ifs", &engine, height_only);
     let names = height.get_parameters();

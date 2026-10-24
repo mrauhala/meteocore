@@ -386,8 +386,8 @@ meta-tiles by nearest neighbour).
   (`feature_info::answers_position`, `supported_query_types` containing
   `position`). The server registers it whatever the collection's `apis`
   list (`admin::register_point_engine`, the `derived_wrapped` EDR side for
-  GRIB/QueryData/Zarr/NetCDF, so a derived wind speed or geopotential
-  height is queryable); `edr` in
+  GRIB/QueryData/Zarr/NetCDF, so a derived wind speed, geopotential
+  height, relative humidity or dew point is queryable); `edr` in
   `apis` only decides whether EDR routes are published. The capability is
   read once per load, never per request: `supported_query_types` builds a
   `Vec`.

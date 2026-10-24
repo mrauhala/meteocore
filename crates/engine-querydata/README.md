@@ -114,6 +114,16 @@ convention that u and v are relative to the grid. Direction is therefore
 derived only on lat/lon areas; rotated lat/lon, stereographic and LCC areas
 get speed only. `derive_wind = false` turns this off.
 
+### Derived relative humidity and dew point
+
+A temperature (FMI 4, °C) with a dew point (10, °C) gains a relative
+humidity over liquid water, in %, and one with a relative humidity (13, %)
+gains a dew point in °C, on every API, unless the file has that quantity
+already. The ingredients are found by FMI number and the result named in
+the temperature's vocabulary: `Temperature` → `Humidity` or `DewPoint`,
+ECMWF's `2t` → `2r` or `2d`. A specific humidity has no number with a
+fixed unit and gives nothing. `derive_humidity = false` turns this off.
+
 ## Configuration
 
 ```toml
@@ -125,6 +135,7 @@ engine_type = "querydata"
 data_path = "testdata/ecmwf-kenya"   # required: a local directory of .sqd files
 apis = ["edr", "wms", "maps", "tiles"]
 # derive_wind = false                # opt out of derived wind
+# derive_humidity = false            # opt out of derived humidity
 
 [collections.querydata]              # optional; every field has a default
 wms_parameter = "2t"                 # default: the file's first parameter
@@ -200,6 +211,9 @@ The tests are unit tests inside the crate:
   parameters.
 - `src/engine/wind_tests.rs`: derived wind, on fixture copies whose
   descriptors are renamed to u/v components.
+- `src/engine/moisture_tests.rs`: derived relative humidity and dew
+  point, on fixture copies whose precipitation is renamed to a dew point
+  or a relative humidity.
 
 Both fixtures are `qdcrop` subsets of FMI open data, described in
 [`testdata/QUERYDATA_FIXTURES.md`](../../testdata/QUERYDATA_FIXTURES.md):

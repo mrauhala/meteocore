@@ -850,6 +850,12 @@ of each request, so the speed is per level
 (`tests/integration.rs` `derived_wind_pairs_the_components_level_by_level`;
 a Pa file with earth-relative `u`/`v` on lat/lon gives `ws` and `wdir` per
 level, `pressure_in_pa_is_served_in_hpa_with_wind_direction_per_level`).
+The same facts carry `vertical: Some(Pressure)` for a variable on the
+pressure axis, so `ds_core::moisture` (#898) pairs `air_temperature_*`
+with `relative_humidity_*`, `dew_point_temperature_*` or, on that axis,
+`specific_humidity_*` by swapping the token: MEPS gains
+`dew_point_temperature_2m` and `dew_point_temperature_pl`
+(`derived_dew_point_from_temperature_and_relative_humidity`).
 
 ## Per-step amounts (#1165)
 
@@ -904,8 +910,9 @@ appended leads and new runs move nothing.
 
 `engine_type = "netcdf"`, allowlist `["edr", "wms", "maps", "tiles"]` (the
 default `apis` works). Registered through `derived_wrapped` (in
-`DERIVE_WIND_ENGINES` and `DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES`;
-`derive_wind = false`, `derive_geopotential_height = false` opt out), its EDR side
+`DERIVE_WIND_ENGINES`, `DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES` and
+`DERIVE_HUMIDITY_ENGINES`; `derive_wind = false`,
+`derive_geopotential_height = false`, `derive_humidity = false` opt out), its EDR side
 through `register_point_engine` for GetFeatureInfo whether or not it lists
 `edr`. `netcdf_parameters` keeps the engine's own variables, which the
 recovery loop compares, while the styles are resolved for the wrapper's

@@ -58,7 +58,8 @@ engine_type = "netcdf"
 # EDR position, area and radius, model runs as instances; the WMS layers
 # answer GetFeatureInfo at the level drawn. The wind speed on each level is
 # derived from its grid-relative x/y components (`wind_speed_pl`, no
-# direction on this Lambert grid).
+# direction on this Lambert grid), and the dew point from the temperature and
+# relative humidity (`dew_point_temperature_pl`, in °C).
 apis = ["edr", "wms", "maps", "tiles"]
 keywords = ["forecast", "NWP", "MEPS", "NetCDF", "pressure levels"]
 

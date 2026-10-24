@@ -59,7 +59,8 @@ engine_type = "netcdf"
 # EDR position, area and radius, model runs as instances; the WMS layers
 # answer GetFeatureInfo. The 10 m wind's speed is derived from its
 # grid-relative x/y components (`wind_speed_10m`, no direction on this
-# Lambert grid).
+# Lambert grid), and the 2 m dew point from the temperature and relative
+# humidity (`dew_point_temperature_2m`, in °C).
 apis = ["edr", "wms", "maps", "tiles"]
 keywords = ["forecast", "NWP", "MEPS", "NetCDF", "OPeNDAP"]
 

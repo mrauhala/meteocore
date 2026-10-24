@@ -234,6 +234,16 @@ unless the collection has a `geopotential_height` at that level: MEPS's
 `geopotential_pl` gives `geopotential_height_pl`, per level.
 `derive_geopotential_height = false` opts out.
 
+**Derived relative humidity and dew point.** Variables identified by CF
+`standard_name` at one level give the quantity the collection lacks there,
+named by swapping the `air_temperature` token: `air_temperature` with
+`dew_point_temperature` gives the relative humidity over liquid water, in
+%; with `relative_humidity` the dew point, in the temperature's °C (MEPS's
+`air_temperature_2m` → `dew_point_temperature_2m`, `air_temperature_pl` →
+`dew_point_temperature_pl` per level); with `specific_humidity` on the
+pressure axis both, from each level's pressure. `derive_humidity = false`
+opts out.
+
 **Per-step amounts.** A variable named `<name>_acc` in kg m-2 or mm,
 MET Norway's accumulation since the run start (MEPS
 `precipitation_amount_acc`, and `rainfall_`, `snowfall_` and

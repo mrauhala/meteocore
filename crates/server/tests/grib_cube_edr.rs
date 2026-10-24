@@ -80,6 +80,7 @@ fn app() -> axum::Router {
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        derive_humidity: None,
     };
     let state = api_edr::handlers::EdrState {
         engines: HashMap::from([(ID.to_string(), Arc::new(view) as Arc<dyn EdrEngine>)]),

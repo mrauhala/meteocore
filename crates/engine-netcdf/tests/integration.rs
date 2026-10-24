@@ -2672,3 +2672,149 @@ fn a_thredds_catalog_finds_what_probing_finds() {
         "nothing to check until the run's recheck"
     );
 }
+
+/// MEPS has temperature and relative humidity but no dew point: the dew
+/// point is derived (#898), at 2 m and level by level on pressure levels,
+/// named in MET Norway's vocabulary and served in the °C the temperature
+/// is. Each value is the formula over the temperature and relative
+/// humidity of the same request, sampled first; the relative humidity is
+/// taken as over liquid water.
+#[test]
+fn derived_dew_point_from_temperature_and_relative_humidity() {
+    use ds_core::derive::{DerivationLog, Derivations, Derived, Outcome};
+    use ds_core::moisture::dew_point_from_relative_humidity;
+    use ds_core::wind::WindSource;
+    let dew_point =
+        |t: f64, rh: f64| dew_point_from_relative_humidity(t + 273.15, rh).unwrap() - 273.15;
+    let wrap = |id: &str, engine: Arc<NetcdfEngine>| {
+        let logged = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = logged.clone();
+        let log: DerivationLog = Arc::new(move |_: &str, outcome: &Outcome| {
+            if let Outcome::Moisture(m) = outcome {
+                sink.lock().unwrap().push(m.to_string());
+            }
+        });
+        let derived = Derived::with(id, engine, Derivations::ALL, log);
+        let logged = logged.lock().unwrap().clone();
+        (derived, logged)
+    };
+    let six = at("2026-10-15T06:00:00Z");
+    let cell = met_cell((4, 0));
+    let point = format!("POINT({} {})", cell.0, cell.1);
+
+    // 2 m.
+    let engine = Arc::new(meps());
+    let (derived, logged) = wrap("meps", engine.clone());
+    assert_eq!(
+        logged,
+        [
+            "air_temperature_2m: no relative humidity: the collection already has \
+          'relative_humidity_2m'; derived dew point 'dew_point_temperature_2m' from \
+          'air_temperature_2m' and 'relative_humidity_2m'"
+        ]
+    );
+    let info = MapEngine::raster_info(&derived);
+    let td = info
+        .parameters
+        .iter()
+        .find(|p| p.name == "dew_point_temperature_2m")
+        .unwrap();
+    assert_eq!(
+        (td.title.as_str(), td.unit.as_str()),
+        ("Dew point temperature (2 m)", "°C")
+    );
+    let query = |engine: &dyn EdrEngine, parameters: &[&str]| -> QueryResult {
+        match engine
+            .query_position(
+                &point,
+                Some((six, six)),
+                Some(&names(parameters)),
+                None,
+                Some(six),
+            )
+            .unwrap()
+        {
+            CoverageResponse::Single(result) => result,
+            CoverageResponse::Collection(_) => panic!("one series"),
+        }
+    };
+    let inputs = query(
+        engine.as_ref(),
+        &["air_temperature_2m", "relative_humidity_2m"],
+    );
+    let (t, rh) = (
+        inputs.ranges["air_temperature_2m"].values[0].unwrap(),
+        inputs.ranges["relative_humidity_2m"].values[0].unwrap(),
+    );
+    let result = query(&derived, &["dew_point_temperature_2m"]);
+    let value = result.ranges["dew_point_temperature_2m"].values[0].unwrap();
+    assert!((value - dew_point(t, rh)).abs() < 1e-9, "{value}");
+    assert!(value < t && value > t - 30.0, "{value} vs {t}");
+    let description = &result.parameters["dew_point_temperature_2m"];
+    assert_eq!(description.unit, "°C");
+    assert_eq!(
+        description.standard_name.as_deref(),
+        Some("dew_point_temperature")
+    );
+    let drawn = |engine: &dyn MapEngine, parameter: &str, z: Option<f64>| {
+        value_at_level(engine, cell, parameter, six, z)
+            .unwrap()
+            .unwrap()
+    };
+    let want = dew_point(
+        drawn(engine.as_ref(), "air_temperature_2m", None),
+        drawn(engine.as_ref(), "relative_humidity_2m", None),
+    );
+    let got = drawn(&derived, "dew_point_temperature_2m", None);
+    assert!((got - want).abs() < 1e-3, "{got} {want}");
+
+    // Pressure levels: one dew point per level, the level the request
+    // asks for.
+    let pl = Arc::new(meps_pl());
+    let t_facts = pl
+        .wind_facts()
+        .parameters
+        .iter()
+        .find(|p| p.name == "air_temperature_pl")
+        .map(|p| (p.level.clone(), p.vertical))
+        .unwrap();
+    assert_eq!(t_facts, (None, Some(VerticalKind::Pressure)));
+    let (derived, logged) = wrap("meps-pl", pl.clone());
+    assert_eq!(
+        logged,
+        [
+            "air_temperature_pl: no relative humidity: the collection already has \
+          'relative_humidity_pl'; derived dew point 'dew_point_temperature_pl' from \
+          'air_temperature_pl' and 'relative_humidity_pl'"
+        ]
+    );
+    let profile = |engine: &dyn EdrEngine, parameters: &[&str]| -> QueryResult {
+        let CoverageResponse::Collection(profiles) = engine
+            .query_position(
+                &point,
+                Some((six, six)),
+                Some(&names(parameters)),
+                Some(&[300.0, 850.0]),
+                Some(six),
+            )
+            .unwrap()
+        else {
+            panic!("a profile");
+        };
+        profiles.into_iter().next().unwrap()
+    };
+    let inputs = profile(pl.as_ref(), &["air_temperature_pl", "relative_humidity_pl"]);
+    let result = profile(&derived, &["dew_point_temperature_pl"]);
+    for (i, hpa) in [300.0, 850.0].into_iter().enumerate() {
+        let t = inputs.ranges["air_temperature_pl"].values[i].unwrap();
+        let rh = inputs.ranges["relative_humidity_pl"].values[i].unwrap();
+        let value = result.ranges["dew_point_temperature_pl"].values[i].unwrap();
+        assert!((value - dew_point(t, rh)).abs() < 1e-9, "{hpa}: {value}");
+        let want = dew_point(
+            drawn(pl.as_ref(), "air_temperature_pl", Some(hpa)),
+            drawn(pl.as_ref(), "relative_humidity_pl", Some(hpa)),
+        );
+        let got = drawn(&derived, "dew_point_temperature_pl", Some(hpa));
+        assert!((got - want).abs() < 1e-3, "{hpa}: {got} {want}");
+    }
+}
