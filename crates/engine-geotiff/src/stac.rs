@@ -46,6 +46,18 @@ pub enum StacListing {
     Stopped,
 }
 
+/// What a HEAD of a STAC asset answered ([`StacClient::head_asset_async`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetHead {
+    /// The size its `Content-Length` states. 0 when it states none, or when
+    /// the HEAD answered a client error other than 404 or a 501 (a URL
+    /// signed for GET only answers HEAD with 403): the loader then downloads
+    /// the asset whole.
+    Size(u64),
+    /// 404: the asset is gone (#1119).
+    NotFound,
+}
+
 /// Extent metadata from a STAC collection (no item fetching needed).
 #[derive(Debug, Clone)]
 pub struct StacExtent {
@@ -564,22 +576,33 @@ impl StacClient {
     // (breaking Ceph RGW URLs with colons in the path).
 
     /// Fetch the file size via a HEAD request.
-    pub fn head_asset(&self, url: &str) -> Result<u64, DataServerError> {
+    pub fn head_asset(&self, url: &str) -> Result<AssetHead, DataServerError> {
         self.block_on(self.head_asset_async(url))
     }
 
     /// Async [`head_asset`](Self::head_asset), for callers already on a
-    /// runtime (the poll-cycle metadata preload, #90).
-    pub async fn head_asset_async(&self, url: &str) -> Result<u64, DataServerError> {
+    /// runtime (the poll-cycle metadata preload, #90). A HEAD that gets no
+    /// answer, or a server error, is an `Err`: a full download would go to
+    /// the same failing host (#1025). 501 Not Implemented is no failure: the
+    /// origin does not serve HEAD.
+    pub async fn head_asset_async(&self, url: &str) -> Result<AssetHead, DataServerError> {
         let resp = self.http.head(url).send().await.map_err(|e| {
             tracing::warn!("HEAD failed for '{}': {}", url, e);
             DataServerError::Engine("Failed to fetch remote file metadata".into())
         })?;
-        if !resp.status().is_success() {
-            tracing::warn!("HEAD returned {} for '{}'", resp.status(), url);
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(AssetHead::NotFound);
+        }
+        if status.is_server_error() && status != reqwest::StatusCode::NOT_IMPLEMENTED {
+            tracing::warn!("HEAD returned {} for '{}'", status, url);
             return Err(DataServerError::Engine(
                 "Failed to fetch remote file metadata".into(),
             ));
+        }
+        if !status.is_success() {
+            tracing::warn!("HEAD returned {} for '{}'", status, url);
+            return Ok(AssetHead::Size(0));
         }
         let size = resp
             .headers()
@@ -587,7 +610,7 @@ impl StacClient {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
-        Ok(size)
+        Ok(AssetHead::Size(size))
     }
 
     /// Fetch a byte range from an asset URL.

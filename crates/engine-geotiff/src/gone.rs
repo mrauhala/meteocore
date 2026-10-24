@@ -1,13 +1,16 @@
-//! Remote objects a tile read found gone after the scan (#1074).
+//! Remote objects a tile read found gone after the scan (#1074), and STAC
+//! items whose metadata load found the asset gone before its header was
+//! ever read (#1119).
 //!
 //! A range read that the store refuses for good, with a 404 or a range past
 //! the object's end, marks the object's [`ObjectHealth`], which every clone
-//! of its catalog entry shares. Every catalog accessor skips a marked entry
-//! at once ([`FileEntry::is_gone`]), so its timestep leaves `resolve_time`,
-//! `get_raster_tile`, `RasterInfo` and EDR without the request path building
-//! a catalog. The next catalog swap removes the entry through
-//! [`GoneObjects::screen`], which keeps it so that a listing still naming
-//! the same object does not bring it back:
+//! of its catalog entry shares: the loaded source's, or a STAC stub's when
+//! its header load meets the refusal. Every catalog accessor skips a marked
+//! entry at once ([`FileEntry::is_gone`]), so its timestep leaves
+//! `resolve_time`, `get_raster_tile`, `RasterInfo` and EDR without the
+//! request path building a catalog. The next catalog swap removes the entry
+//! through [`GoneObjects::screen`], which keeps it so that a listing still
+//! naming the same object does not bring it back:
 //!
 //! - An object-store scan reuses a kept entry for a key it lists with the
 //!   same size, without reading the header, and the screen removes it again.

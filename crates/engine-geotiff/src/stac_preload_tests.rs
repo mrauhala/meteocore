@@ -1,7 +1,8 @@
 //! STAC metadata loading against a mock STAC API whose assets are the
 //! committed TM35FIN COG fixture, served with Range support: the poll-cycle
-//! preload (#90), a query's bounded, concurrent cold loads (#889), and the
-//! budgets and listing cap checked before them (#1075).
+//! preload (#90), a query's bounded, concurrent cold loads (#889), the
+//! budgets and listing cap checked before them (#1075), an item whose asset
+//! is gone (#1119) and a header read that fails (#1025).
 
 use super::*;
 use ds_core::map_engine::{MapEngine, OutputCrs};
@@ -32,9 +33,31 @@ struct MockOptions {
     filter_datetime: bool,
     /// Answer this item's asset requests with 404.
     missing: Option<usize>,
+    /// Answer this item's asset requests with 503.
+    failing: Option<usize>,
     /// Serve `/items` in pages of the request's `limit`, each linking the
     /// next, as a STAC API does.
     paged: bool,
+    /// Give each item the fixture's `file:size`, so a load reads the header
+    /// range first instead of a HEAD.
+    sized: bool,
+    /// How the asset host answers range requests at first
+    /// ([`MockStac::range_fault`]).
+    range_fault: Option<RangeFault>,
+}
+
+/// How a mock asset host answers range requests, while it serves whole
+/// GETs as before.
+#[derive(Debug, Clone, Copy)]
+enum RangeFault {
+    /// 503.
+    Unavailable,
+    /// A 206 whose body stops after 1 KiB, short of its `Content-Length`.
+    CutShort,
+    /// 403.
+    Forbidden,
+    /// The whole object, 200, as an origin that ignores `Range` answers.
+    Ignored,
 }
 
 /// The asset requests a mock STAC host served, and the most it had in
@@ -42,6 +65,10 @@ struct MockOptions {
 #[derive(Default)]
 struct AssetLoad {
     requests: AtomicUsize,
+    /// GETs without a `Range` header: whole-object downloads.
+    full_gets: AtomicUsize,
+    /// The requests per asset path.
+    paths: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
 }
@@ -53,6 +80,43 @@ struct MockStac {
     assets: Arc<AssetLoad>,
     /// The `/items` pages it served.
     pages: Arc<AtomicUsize>,
+    /// How the asset host answers range requests now; `None` serves them.
+    range_fault: Arc<std::sync::Mutex<Option<RangeFault>>>,
+}
+
+/// The answer of a mock asset host whose range requests meet `fault`, or
+/// `None` to serve the request as it is.
+fn faulty_range_answer(
+    fault: RangeFault,
+    request: &mut axum::extract::Request,
+) -> Option<axum::response::Response> {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+    match fault {
+        RangeFault::Unavailable => Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+        RangeFault::Forbidden => Some(StatusCode::FORBIDDEN.into_response()),
+        RangeFault::CutShort => {
+            let size = std::fs::metadata(FIXTURE).unwrap().len();
+            let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+                Ok(bytes::Bytes::from(vec![0u8; 1024])),
+                Err(std::io::Error::other("connection cut")),
+            ];
+            let response = axum::http::Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_LENGTH, size)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes 0-{}/{size}", size - 1),
+                )
+                .body(axum::body::Body::from_stream(futures::stream::iter(chunks)))
+                .unwrap();
+            Some(response)
+        }
+        RangeFault::Ignored => {
+            request.headers_mut().remove(header::RANGE);
+            None
+        }
+    }
 }
 
 /// [`mock_stac`] shaped by `options`, whose asset host counts its requests
@@ -62,8 +126,12 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         delay,
         filter_datetime,
         missing,
+        failing,
         paged,
+        sized,
+        range_fault,
     } = options;
+    let fixture_size = std::fs::metadata(FIXTURE).unwrap().len();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let t0: DateTime<Utc> = "2026-04-06T04:00:00Z".parse().unwrap();
@@ -75,13 +143,16 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let feature = serde_json::json!({
+                let mut feature = serde_json::json!({
                     "type": "Feature",
                     "id": format!("item-{i}"),
                     "properties": { "datetime": t.to_rfc3339() },
                     // No `file:size`: the loader HEADs the asset first.
                     "assets": { "data": { "href": format!("{base}/data/item-{i}.tif") } },
                 });
+                if sized {
+                    feature["assets"]["data"]["file:size"] = fixture_size.into();
+                }
                 (*t, feature)
             })
             .collect(),
@@ -133,6 +204,9 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         }
     };
     let missing = missing.map(|i| format!("/data/item-{i}.tif"));
+    let failing = failing.map(|i| format!("/data/item-{i}.tif"));
+    let range_fault = Arc::new(std::sync::Mutex::new(range_fault));
+    let faults = Arc::clone(&range_fault);
     let collection = serde_json::json!({
         "extent": {
             "spatial": { "bbox": [[19.0, 59.0, 32.0, 70.5]] },
@@ -147,18 +221,39 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
             tower_http::services::ServeFile::new(FIXTURE),
         )
         .layer(axum::middleware::from_fn(
-            move |request: axum::extract::Request, next: axum::middleware::Next| {
+            move |mut request: axum::extract::Request, next: axum::middleware::Next| {
                 let load = Arc::clone(&load);
                 let missing = missing.clone();
+                let failing = failing.clone();
+                let ranged = request.headers().contains_key(axum::http::header::RANGE);
+                let fault = (*faults.lock().unwrap()).filter(|_| ranged);
                 async move {
                     load.requests.fetch_add(1, Ordering::SeqCst);
+                    *load
+                        .paths
+                        .lock()
+                        .unwrap()
+                        .entry(request.uri().path().to_string())
+                        .or_default() += 1;
+                    if request.method() == axum::http::Method::GET && !ranged {
+                        load.full_gets.fetch_add(1, Ordering::SeqCst);
+                    }
                     let now = load.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     load.max_in_flight.fetch_max(now, Ordering::SeqCst);
                     tokio::time::sleep(delay).await;
-                    let response = if missing.as_deref() == Some(request.uri().path()) {
+                    let path = Some(request.uri().path());
+                    let response = if missing.as_deref() == path {
                         axum::response::IntoResponse::into_response(
                             axum::http::StatusCode::NOT_FOUND,
                         )
+                    } else if failing.as_deref() == path {
+                        axum::response::IntoResponse::into_response(
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        )
+                    } else if let Some(answer) =
+                        fault.and_then(|fault| faulty_range_answer(fault, &mut request))
+                    {
+                        answer
                     } else {
                         next.run(request).await
                     };
@@ -181,6 +276,7 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         times,
         assets,
         pages,
+        range_fault,
     }
 }
 
@@ -439,6 +535,25 @@ fn asset_requests(mock: &MockStac) -> usize {
     mock.assets.requests.load(Ordering::SeqCst)
 }
 
+fn full_gets(mock: &MockStac) -> usize {
+    mock.assets.full_gets.load(Ordering::SeqCst)
+}
+
+/// The asset requests for item `i` so far.
+fn item_requests(mock: &MockStac, i: usize) -> usize {
+    let paths = mock.assets.paths.lock().unwrap();
+    paths
+        .get(&format!("/data/item-{i}.tif"))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The source the catalog entry at `time` reads its tiles from.
+fn source_at(engine: &GeoTiffEngine, time: DateTime<Utc>) -> Arc<reader::DataSource> {
+    let catalog = engine.catalog.load();
+    Arc::clone(catalog.entries[&time].source().expect("loaded"))
+}
+
 /// #889: a query over cold STAC items loads their metadata concurrently,
 /// at most `STAC_PRELOAD_CONCURRENCY` in flight, never one item after
 /// another on the request worker.
@@ -571,11 +686,13 @@ fn cold_stac_budget_allows_the_cap() {
 
 /// #889: the first failed cold load fails the query, and the loads still
 /// in flight are dropped with their claims released, so a later query can
-/// claim and load those items.
+/// claim and load those items. A server error fails the load with the 503
+/// a tile read gives, without a whole download (#1025); an asset that is
+/// gone does not fail it (#1119, below).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_cold_load_fails_the_query_and_releases_every_claim() {
     let options = MockOptions {
-        missing: Some(2),
+        failing: Some(2),
         ..MockOptions::default()
     };
     let mock = mock_stac_with(6, options).await;
@@ -584,9 +701,10 @@ async fn a_failed_cold_load_fails_the_query_and_releases_every_claim() {
 
     let err = query_position(&engine, (times[0], times[5]))
         .await
-        .expect_err("an item whose asset is missing fails the query");
-    assert!(matches!(err, DataServerError::Engine(_)), "{err:?}");
+        .expect_err("an item whose asset host fails fails the query");
+    assert!(matches!(err, DataServerError::ResourceExhausted), "{err:?}");
     assert!(!engine.is_metadata_loaded(&times[2]));
+    assert_eq!(full_gets(&mock), 0, "no whole download after a failed HEAD");
     assert!(
         engine.loading_in_flight.paths.lock().unwrap().is_empty(),
         "no claim outlives the query"
@@ -595,11 +713,147 @@ async fn a_failed_cold_load_fails_the_query_and_releases_every_claim() {
     for window in [(times[3], times[5]), (times[0], times[1])] {
         query_position(&engine, window)
             .await
-            .expect("a window without the missing item loads");
+            .expect("a window without the failing item loads");
     }
     let mut loaded = times.clone();
     loaded.remove(2);
     assert_eq!(loaded_times(&engine), loaded);
+}
+
+/// #1119: an item whose asset answers 404 to its first read is read once,
+/// then dropped. The query answers without it, and no later query or poll
+/// reads the asset again while the listing names the same href and size:
+/// the item's own window finds nothing, twice, the second time through a
+/// fresh stub of the same listing. With `file:size` the first read is the
+/// header range read; without, it is the HEAD.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_item_whose_asset_is_gone_is_read_once_then_dropped() {
+    for sized in [true, false] {
+        let options = MockOptions {
+            missing: Some(2),
+            sized,
+            ..MockOptions::default()
+        };
+        let mock = mock_stac_with(6, options).await;
+        let times = mock.times.clone();
+        let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+        let window = (times[0], times[5]);
+        let mut live = times.clone();
+        live.remove(2);
+
+        let response = query_position(&engine, window)
+            .await
+            .expect("an item whose asset is gone fails no query");
+        assert_eq!(series_times(response), live, "sized {sized}");
+        assert_eq!(item_requests(&mock, 2), 1, "sized {sized}: read once");
+        assert_eq!(engine.raster_info().times, live, "sized {sized}");
+        assert_eq!(engine.resolve_time(Some(times[2]), None), Some(times[1]));
+
+        let response = query_position(&engine, window).await.unwrap();
+        assert_eq!(series_times(response), live, "sized {sized}");
+        for _ in 0..2 {
+            let err = query_position(&engine, (times[2], times[2]))
+                .await
+                .expect_err("the item's own window holds nothing");
+            assert!(
+                matches!(err, DataServerError::LocationNotFound(_)),
+                "sized {sized}: {err:?}"
+            );
+        }
+        engine.poll_cycle().await;
+        assert_eq!(
+            engine
+                .catalog
+                .load()
+                .entries
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            live,
+            "sized {sized}: the listing that names it adds nothing"
+        );
+        assert_eq!(
+            item_requests(&mock, 2),
+            1,
+            "sized {sized}: never read again"
+        );
+        assert_eq!(full_gets(&mock), 0, "sized {sized}");
+    }
+}
+
+/// #1025: a header read that fails, a 503, a body cut short or a 403, fails
+/// this load without downloading the asset whole: the query is the 503 a
+/// tile read gives for the same failures (`ResourceExhausted`, #1051,
+/// #1074), the item stays a stub, and no whole-object GET reaches the host.
+/// Once the reads succeed, the next query loads the item by range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_header_read_fails_the_load_without_a_full_download() {
+    for fault in [
+        RangeFault::Unavailable,
+        RangeFault::CutShort,
+        RangeFault::Forbidden,
+    ] {
+        let options = MockOptions {
+            sized: true,
+            range_fault: Some(fault),
+            ..MockOptions::default()
+        };
+        let mock = mock_stac_with(1, options).await;
+        let time = mock.times[0];
+        let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+
+        let err = query_position(&engine, (time, time))
+            .await
+            .expect_err("the load fails");
+        assert!(
+            matches!(err, DataServerError::ResourceExhausted),
+            "{fault:?}: {err:?}"
+        );
+        assert_eq!(asset_requests(&mock), 1, "{fault:?}: the header read only");
+        assert_eq!(full_gets(&mock), 0, "{fault:?}: no whole download");
+        assert!(
+            !engine.is_metadata_loaded(&time),
+            "{fault:?}: a stub, not gone"
+        );
+
+        *mock.range_fault.lock().unwrap() = None;
+        let response = query_position(&engine, (time, time))
+            .await
+            .expect("the next load reads the header");
+        assert_eq!(series_times(response), vec![time]);
+        assert_eq!(full_gets(&mock), 0, "{fault:?}");
+        assert!(
+            matches!(
+                *source_at(&engine, time),
+                reader::DataSource::HttpDirect { .. }
+            ),
+            "{fault:?}: read by range"
+        );
+    }
+}
+
+/// #1025: an origin that ignores `Range` still takes the whole download, as
+/// before: only that, or a header that does not parse, can serve the item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_origin_ignoring_range_still_takes_the_full_download() {
+    let options = MockOptions {
+        sized: true,
+        range_fault: Some(RangeFault::Ignored),
+        ..MockOptions::default()
+    };
+    let mock = mock_stac_with(1, options).await;
+    let time = mock.times[0];
+    let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+
+    let response = query_position(&engine, (time, time))
+        .await
+        .expect("the whole download serves it");
+    assert_eq!(series_times(response), vec![time]);
+    assert_eq!(full_gets(&mock), 1);
+    assert!(matches!(
+        *source_at(&engine, time),
+        reader::DataSource::InMemory(_)
+    ));
 }
 
 /// #889 review: no cold load starts once the request deadline has passed.

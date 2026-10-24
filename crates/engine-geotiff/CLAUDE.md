@@ -70,7 +70,15 @@ apply here.
   full-download fallback. On a failed read the scan leaves the file out of
   the catalog, so the next poll reads its header again. A timeout is not a
   non-COG, and a full download from the same stalled storage only stalls
-  longer. `from_header_read` is the one-object form, for tests.
+  longer. `from_header_read` is the one-object form, for tests. The STAC
+  loader's direct-HTTP header read (`from_http_header_read`, #1025) makes
+  the same split as `HttpHeaderRead`: `NotCog` and `RangeIgnored` (a 200)
+  download whole; `Err` (no answer, a 5xx, a body cut short) or a 401/403
+  fails that load with the tile reads' 503, and the next request loads
+  again. So does a HEAD (`StacClient::head_asset_async`) without answer or
+  with a 5xx other than 501; its other non-404 statuses, such as a
+  GET-only signed URL's 403, still mean an unknown size and a full
+  download.
 - **Remote metadata pass (#1042):** `catalog::load_remote` reads new files'
   headers newest first through `DataStore::get_range_many`,
   `SCAN_READ_CONCURRENCY` (4) in flight, in batches of `SCAN_READ_BATCH`
@@ -130,8 +138,9 @@ apply here.
   window's cold items: that is N sequential round trips on the request
   worker. Its one loop is the wait afterwards for the items another loader
   held, bounded by that loader's claims.
-- Every loader shares `fetch_stac_entry_metadata` and the
-  `loading_in_flight` single-flight set. The preload and a query's
+- Every loader shares `fetch_stac_entry_metadata`, `settle_stac_load`
+  (install, or drop a gone asset, #1119) and the `loading_in_flight`
+  single-flight set. The preload and a query's
   concurrent loads claim through `claim_and_load_stac_entry`, which
   `try_claim`s without parking: a future parked on the condvar would stall
   every other load of its `block_on`. The preload skips an item someone else
@@ -280,6 +289,14 @@ depends on the kind:
   atomic. `note_object_health` runs after each read (a drop guard on the
   map path), logs a WARN once per object and refreshes the `RasterInfo`
   snapshot.
+- **Gone before the header was read (#1119):** a STAC stub's metadata load
+  types its HEAD and header read as tile reads are typed
+  (`http_range_refusal`, one home). A 404, a 416 or an object shorter than
+  the listed `file:size` is set by `settle_stac_load` in the stub's own
+  `ObjectHealth` (`FileState::Stub { health }`), so the entry is gone at
+  once and the screen keeps it by href and size like any gone object.
+  `is_metadata_loaded` counts a gone stub as nothing to load. The map that
+  met it draws nodata; an EDR query answers without the timestep.
 - **Removal:** the next catalog swap screens the catalog
   (`gone::GoneObjects::screen`, from `do_scan` before the `max_files` trim,
   from `store_stac_catalog`, and in `ensure_entries_loaded` before a query
