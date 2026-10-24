@@ -264,7 +264,8 @@ impl Layout {
     }
 }
 
-/// The wind facts of a layout (#897, #1067 decision 6): each variable's CF
+/// The facts of a layout the derived parameters read (wind #897 and #1067
+/// decision 6, geopotential height #948, humidity #898): each variable's CF
 /// `standard_name` says whether it is a component and in which frame
 /// (`x_wind`/`y_wind`: along the grid's axes; `eastward_wind`/
 /// `northward_wind`: along east and north), its single level is the
@@ -272,7 +273,9 @@ impl Layout {
 /// variable on the pressure axis has no pairing level (`level: None`, as
 /// `ParameterFacts` asks of a parameter spanning the vertical axis):
 /// `DerivedWind` reads u and v at the one `z` it is asked for, so
-/// `x_wind_pl`/`y_wind_pl` pair level by level (#1067 PR 8). MEPS's
+/// `x_wind_pl`/`y_wind_pl` pair level by level (#1067 PR 8), and its
+/// `vertical` says the level is a pressure, which a humidity derived from
+/// specific humidity reads (#898). MEPS's
 /// Lambert grid is `GridAxes::Rotated`, so its grid-relative 10 m wind
 /// gives a speed and no direction until the components are turned by the
 /// convergence angle (a follow-up on #897); a curvilinear grid's are
@@ -307,6 +310,9 @@ pub(crate) fn wind_facts(
                         .map_or(VectorFrame::Unknown, VectorFrame::from_standard_name),
                     level_label: level.clone(),
                     level,
+                    // The pressure axis: a humidity from specific humidity
+                    // reads the level's pressure (#898).
+                    vertical: v.pressure.is_some().then_some(VerticalKind::Pressure),
                     unit: served_unit(v, display).to_string(),
                     ..ParameterFacts::new(v.name.to_string())
                 }

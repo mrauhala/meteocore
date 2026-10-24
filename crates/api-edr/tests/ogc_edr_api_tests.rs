@@ -222,6 +222,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
     Arc::new(ArcSwap::from_pointee(EdrState {
@@ -2223,6 +2224,7 @@ mod metadata_extras {
                 preview: None,
                 derive_wind: None,
                 derive_geopotential_height: None,
+                derive_humidity: None,
             },
         );
         Arc::new(ArcSwap::from_pointee(EdrState {

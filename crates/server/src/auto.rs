@@ -401,6 +401,7 @@ fn mk_collection(
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        derive_humidity: None,
     }
 }
 

@@ -103,6 +103,7 @@ fn build_empty_router() -> axum::Router {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -328,6 +329,7 @@ fn build_failing_router() -> axum::Router {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -544,6 +546,7 @@ fn build_populated_state_with_wms(
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -942,6 +945,7 @@ fn build_counting_router_versioned(
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -1219,6 +1223,7 @@ fn build_snapping_router_with(
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -1681,6 +1686,7 @@ fn site_collection_config(id: &str) -> CollectionConfig {
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        derive_humidity: None,
     }
 }
 
@@ -1979,6 +1985,7 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -2337,6 +2344,7 @@ fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -2420,6 +2428,7 @@ fn capabilities_emit_reference_time_dimension_for_forecast() {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -2496,6 +2505,7 @@ fn capabilities_omit_reference_time_dimension_for_non_forecast() {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -2833,6 +2843,7 @@ fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
     let cmap = Arc::new(LutColorMap::from_builtin(
@@ -3026,6 +3037,7 @@ fn build_advancing_router() -> AdvancingFixture {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -4424,6 +4436,7 @@ mod per_parameter_times {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         };
         let style = StyleInfo {
             name: "default".to_string(),
@@ -5327,6 +5340,7 @@ mod composites {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         };
         let style = StyleInfo {
             name: "default".to_string(),
@@ -6096,6 +6110,7 @@ fn archive_capabilities() -> String {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();

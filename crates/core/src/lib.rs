@@ -19,6 +19,7 @@ pub mod http_cache;
 pub mod instances;
 pub mod map_engine;
 pub mod model;
+pub mod moisture;
 pub mod native_grid;
 pub mod ogc_extent;
 pub mod openapi;

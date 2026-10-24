@@ -405,6 +405,7 @@ fn derivations_are_opted_out_one_by_one() {
     let height = Derivations {
         wind: false,
         geopotential_height: true,
+        humidity: false,
     };
     let (height, logged) = wrap(&mock, height);
     assert_eq!(height.get_parameters(), ["10u", "10v", "z", "2t", "gh"]);
@@ -422,6 +423,7 @@ fn derivations_are_opted_out_one_by_one() {
     let none = Derivations {
         wind: false,
         geopotential_height: false,
+        humidity: false,
     };
     assert!(!none.any());
     let (plain, logged) = wrap(&mock, none);

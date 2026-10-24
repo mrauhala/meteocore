@@ -12,6 +12,8 @@ pub mod index;
 mod message_cache;
 mod metadata;
 #[cfg(test)]
+mod moisture_tests;
+#[cfg(test)]
 mod parameter_times_tests;
 mod position;
 pub mod reader;

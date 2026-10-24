@@ -16,6 +16,7 @@ use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
     QueryResult,
 };
+use ds_core::moisture::MoistureRole;
 use ds_core::temp_files;
 use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindRole, WindSource};
@@ -881,9 +882,9 @@ fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id
     RunSet { runs, wind }
 }
 
-/// What a run states about its wind components (#897): each parameter's
-/// FMI number, the unit that number fixes (#1211), its map and EDR names,
-/// and the frame of its u/v.
+/// What a run states about its wind components (#897) and humidity
+/// ingredients (#898): each parameter's FMI number, the unit that number
+/// fixes (#1211), its map and EDR names, and the frame of its u/v.
 ///
 /// The format has no u/v frame flag (neither the header, a parameter
 /// descriptor nor an area class carries one), so the frame is FMI newbase's
@@ -906,11 +907,15 @@ fn wind_facts(data: &QueryData) -> WindFacts {
                 let name = map_name(&p.name);
                 ParameterFacts {
                     edr_name: (name != p.name).then(|| p.name.clone()),
-                    // Only a wind number asserts a role. Any other id says
-                    // nothing about wind, so the name may still pair it by
-                    // the source vocabulary (`10u`/`10v` from a converter
-                    // that kept GRIB short names but not FMI's numbers).
-                    fmi_param: WindRole::from_fmi_param(p.id).map(|_| p.id),
+                    // Only a wind or humidity number asserts a role (FMI
+                    // 4 temperature, 10 dew point, 13 relative humidity,
+                    // #898). Any other id says nothing, so the name may
+                    // still pair it by the source vocabulary (`10u`/`10v`
+                    // from a converter that kept GRIB short names but not
+                    // FMI's numbers).
+                    fmi_param: (WindRole::from_fmi_param(p.id).is_some()
+                        || MoistureRole::from_fmi_param(p.id).is_some())
+                    .then_some(p.id),
                     // newbase's convention, see above.
                     frame: VectorFrame::Grid,
                     unit: units::unit(p.id).to_string(),
@@ -2012,6 +2017,8 @@ mod tests {
 mod footprint_tests;
 #[cfg(test)]
 mod global_tests;
+#[cfg(test)]
+mod moisture_tests;
 #[cfg(test)]
 mod names_tests;
 #[cfg(test)]

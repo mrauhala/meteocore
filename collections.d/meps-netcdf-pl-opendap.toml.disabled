@@ -77,7 +77,9 @@ relative_humidity_pl = "Relative humidity"
 
 # Values are served in display units: temperature in °C and relative
 # humidity in %; the wind components in m/s and geopotential in m2 s-2 as
-# stored, its height derived in gpm (`geopotential_height_pl`). Each layer
-# takes the built-in default its name and unit select.
+# stored, its height derived in gpm (`geopotential_height_pl`), and the dew
+# point derived in °C from the temperature and relative humidity
+# (`dew_point_temperature_pl`). Each layer takes the built-in default its
+# name and unit select.
 [wms]
 colormap = "temperature"

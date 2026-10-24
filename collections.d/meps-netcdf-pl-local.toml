@@ -8,8 +8,9 @@ engine_type = "netcdf"
 # radius, model runs as instances; the WMS layers answer GetFeatureInfo at
 # the level drawn. The wind speed on each level is derived from its
 # grid-relative x/y components (`wind_speed_pl`, no direction on this
-# Lambert grid), and the geopotential height from the geopotential
-# (`geopotential_height_pl`, in gpm).
+# Lambert grid), the geopotential height from the geopotential
+# (`geopotential_height_pl`, in gpm), and the dew point from the temperature
+# and relative humidity (`dew_point_temperature_pl`, in °C).
 apis = ["edr", "wms", "maps", "tiles"]
 keywords = ["forecast", "NWP", "MEPS", "NetCDF", "pressure levels"]
 
@@ -48,8 +49,8 @@ relative_humidity_pl = "Relative humidity"
 # x/y wind components over ±80 m/s and the derived speed over 0-80 m/s
 # (twice the surface scale, for the jet at 300-250 hPa), the derived
 # geopotential height over 0-21 000 gpm and the geopotential over the same
-# heights times g0, and relative humidity on the percent palette over
-# 0-100 %.
+# heights times g0, relative humidity on the percent palette over 0-100 %,
+# and the derived dew point on the temperature palette.
 [wms]
 # The collection's own palette, for a variable no default matches: the
 # temperature palette over its own -90…50 °C, the first variable's.

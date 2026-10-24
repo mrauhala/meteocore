@@ -50,7 +50,8 @@ engine_type = "netcdf"
 # EDR position, area and radius, model runs as instances; the WMS layers
 # answer GetFeatureInfo. The 10 m wind's speed is derived from its
 # grid-relative x/y components (`wind_speed_10m`, no direction on this
-# Lambert grid).
+# Lambert grid), and the 2 m dew point from the temperature and relative
+# humidity (`dew_point_temperature_2m`, in °C).
 apis = ["edr", "wms", "maps", "tiles"]
 keywords = ["forecast", "NWP", "MEPS", "NetCDF"]
 
@@ -112,7 +113,8 @@ y_wind_10m = "10 m wind along the grid's y axis"
 # default its name and unit select: temperature over -90…50 °C, pressure
 # over 950…1050 hPa, wind speed for the gusts, 0-200 mm for the
 # accumulated precipitation, 0-50 mm for the hourly precipitation derived
-# from it (`precipitation_amount`), and relative humidity and cloud cover on
+# from it (`precipitation_amount`), the derived dew point on the temperature
+# palette, and relative humidity and cloud cover on
 # the percent palettes over 0-100 %.
 [wms]
 # The collection's own palette, for a variable no default matches: the

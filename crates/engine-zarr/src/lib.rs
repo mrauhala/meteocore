@@ -875,6 +875,8 @@ mod tests {
 }
 
 #[cfg(test)]
+mod moisture_tests;
+#[cfg(test)]
 mod refresh_tests;
 #[cfg(test)]
 mod wind_tests;

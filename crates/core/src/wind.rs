@@ -283,6 +283,11 @@ pub struct ParameterFacts {
     /// Human-readable level, appended to derived titles
     /// (`"10 m above ground"`).
     pub level_label: Option<String>,
+    /// The kind of the collection's vertical axis, for a parameter that
+    /// spans it (`level` is `None`): a derivation reads an isobaric level's
+    /// pressure from the request's level ([`crate::moisture`], #898).
+    /// `None` for a parameter at one level, or a source without levels.
+    pub vertical: Option<crate::vertical::VerticalKind>,
     /// Unit of the served values; empty when unknown.
     pub unit: String,
 }
@@ -346,8 +351,8 @@ impl ParameterFacts {
 
 /// Everything a source asserts that the derivations need: one snapshot,
 /// rebuilt at load and poll refresh (Critical Rule 10), never per request.
-/// Named for wind, the first derivation; geopotential height (#948) reads
-/// the same facts.
+/// Named for wind, the first derivation; geopotential height (#948) and
+/// humidity (#898) read the same facts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindFacts {
     pub grid: GridAxes,

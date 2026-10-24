@@ -5162,10 +5162,11 @@ fn register_point_engine(
 
 /// The `MapEngine` and `EdrEngine` a collection registers: its engine
 /// wrapped in [`ds_core::derive::Derived`], which adds wind speed and
-/// direction derived from u/v components (#897) and geopotential height
-/// derived from geopotential (#948), or the engine itself when the
-/// collection opts out of both (`derive_wind = false`,
-/// `derive_geopotential_height = false`).
+/// direction derived from u/v components (#897), geopotential height
+/// derived from geopotential (#948), and relative humidity and dew point
+/// derived from their ingredients (#898), or the engine itself when the
+/// collection opts out of all three (`derive_wind = false`,
+/// `derive_geopotential_height = false`, `derive_humidity = false`).
 ///
 /// A reused engine (`reused_engine`) keeps its wrapper: the registered `Arc`
 /// then survives an incremental reload like the engine does (a nowcast
@@ -5194,6 +5195,7 @@ where
     let derive = ds_core::derive::Derivations {
         wind: collection.derives_wind(),
         geopotential_height: collection.derives_geopotential_height(),
+        humidity: collection.derives_humidity(),
     };
     if !derive.any() {
         return (engine.clone(), engine.clone());
@@ -5222,9 +5224,10 @@ where
 }
 
 /// The derived-parameter load log: one line per candidate, a u/v pair
-/// (`Collection 'x': wind u/v: …`, #897) or a geopotential
-/// (`Collection 'x': geopotential height z: …`, #948), saying what was
-/// derived, or what was not and why.
+/// (`Collection 'x': wind u/v: …`, #897), a geopotential
+/// (`Collection 'x': geopotential height z: …`, #948) or a temperature's
+/// level (`Collection 'x': humidity 2t: …`, #898), saying what was derived
+/// from what, or what was not and why.
 fn derived_log() -> ds_core::derive::DerivationLog {
     Arc::new(|collection: &str, outcome: &ds_core::derive::Outcome| {
         info!("Collection '{collection}': {outcome}");
@@ -8136,6 +8139,7 @@ mod tests {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         }
     }
 
@@ -8222,7 +8226,8 @@ mod tests {
 
     /// #897: u/v components give a derived speed on every API, styled with
     /// the built-in `wind_speed` default; a collection opts out with
-    /// `derive_wind = false`; a reused engine keeps its wrapper. The
+    /// `derive_wind = false`, and with `derive_humidity = false` (#898) too
+    /// registers no wrapper; a reused engine keeps its wrapper. The
     /// direction is EDR only. No committed `.sqd` carries wind: the Kenya
     /// (lat/lon) fixture's msl and 2t become FMI's u and v (newbase
     /// `kFmiWindUMS = 23`, `kFmiWindVMS = 24`).
@@ -8247,6 +8252,9 @@ mod tests {
                 "id": "kenya", "title": "Kenya", "description": "u/v",
                 "engine_type": "querydata", "apis": ["edr", "wms", "maps", "tiles"],
                 "data_path": dir.path(), "derive_wind": derive_wind,
+                // Opted out of wind is opted out of every derivation
+                // QueryData has.
+                "derive_humidity": derive_wind.filter(|&on| !on),
             }))
             .unwrap()
         };
@@ -9822,8 +9830,9 @@ prewarm_sweeps = 0
     /// served unit select (the temperature in °C, MSLP in hPa, the
     /// run-start accumulation in mm, relative humidity and cloud cover in %
     /// from the files' unit `1` and fraction standard names, the gusts,
-    /// and the per-step precipitation derived from the run-start
-    /// accumulation (#1165), on the per-step precipitation palette), the
+    /// the per-step precipitation derived from the run-start accumulation
+    /// (#1165), on the per-step precipitation palette, and the dew point
+    /// derived from the temperature and relative humidity, in °C, #898), the
     /// wind components keep their narrower entries, and the collection's
     /// own style is the temperature palette over its own range. WMS, Maps,
     /// Tiles and EDR all list the per-step layer.
@@ -9856,6 +9865,8 @@ prewarm_sweeps = 0
             ("relative_humidity_2m", ("humidity", 0.0, 100.0)),
             ("cloud_area_fraction", ("cloud_cover", 0.0, 100.0)),
             ("precipitation_amount", ("precipitation", 0.0, 50.0)),
+            // Derived from the temperature and relative humidity (#898).
+            ("dew_point_temperature_2m", ("temperature", -90.0, 50.0)),
             // Configured by the example.
             ("x_wind_10m", ("diverging", -20.0, 20.0)),
             ("y_wind_10m", ("diverging", -20.0, 20.0)),
@@ -9904,6 +9915,7 @@ prewarm_sweeps = 0
             ("relative_humidity_2m", "%"),
             ("cloud_area_fraction", "%"),
             ("wind_speed_10m", "m/s"),
+            ("dew_point_temperature_2m", "°C"),
         ] {
             assert_eq!(units[name], unit, "{name}");
         }
@@ -9912,7 +9924,8 @@ prewarm_sweeps = 0
     /// #1067 PR 8, #1209: the shipped local MEPS pressure-level example,
     /// loaded over its committed sample. The layers advertise the pressure
     /// axis (WMS ELEVATION, EDR `z`), and every layer, the derived
-    /// `wind_speed_pl` and `geopotential_height_pl` included, takes the
+    /// `wind_speed_pl`, `geopotential_height_pl` and
+    /// `dew_point_temperature_pl` (#898) included, takes the
     /// built-in default its name and served unit select: the temperature in
     /// °C, geopotential as stored in m^2/s^2 and its height in gpm over the
     /// same heights (#948), relative humidity in %, the wind on twice the
@@ -9960,6 +9973,7 @@ prewarm_sweeps = 0
             ),
             ("geopotential_height_pl", ("viridis", 0.0, 21_000.0)),
             ("relative_humidity_pl", ("humidity", 0.0, 100.0)),
+            ("dew_point_temperature_pl", ("temperature", -90.0, 50.0)),
         ] {
             assert_eq!(style(name), expected, "{name}");
         }
@@ -9970,6 +9984,7 @@ prewarm_sweeps = 0
             .collect();
         assert_eq!(units["geopotential_pl"], "m^2/s^2");
         assert_eq!(units["geopotential_height_pl"], "gpm");
+        assert_eq!(units["dew_point_temperature_pl"], "°C");
         assert!(loaded.edr_state.engines[id]
             .get_parameters()
             .contains(&"geopotential_height_pl".to_string()));
@@ -9980,9 +9995,9 @@ prewarm_sweeps = 0
         );
     }
 
-    /// #948: each derivation is its own opt-out. Without the height the
-    /// MEPS pressure levels still derive their wind speed; with neither, no
-    /// wrapper is registered.
+    /// #948, #898: each derivation is its own opt-out. Without the height
+    /// the MEPS pressure levels still derive their wind speed and dew
+    /// point; with none, no wrapper is registered.
     #[test]
     fn meps_netcdf_pressure_levels_opt_out_of_each_derivation() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -10013,7 +10028,17 @@ prewarm_sweeps = 0
             .wms_state
             .styles
             .contains_key(&format!("{id}/geopotential_height_pl")));
+        assert!(names.contains(&"dew_point_temperature_pl".to_string()));
         assert_eq!(loaded.wind_by_id[id].len(), 1);
+
+        collection.derive_humidity = Some(false);
+        let no_humidity = load_with_reuse(std::slice::from_ref(&collection), Default::default());
+        assert!(!no_humidity.edr_state.engines[id]
+            .get_parameters()
+            .contains(&"dew_point_temperature_pl".to_string()));
+        assert!(no_humidity.edr_state.engines[id]
+            .get_parameters()
+            .contains(&"wind_speed_pl".to_string()));
 
         collection.derive_wind = Some(false);
         let plain = load_with_reuse(&[collection], Default::default());

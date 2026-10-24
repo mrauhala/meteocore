@@ -303,8 +303,8 @@ set of builders and follow Requirement 7 of the Metocean EDR profile:
   UCUM-typed for a UCUM unit, else a plain string (`dBZ`, `gpm`).
 - `observedProperty.id` is the NERC CF standard-name URI when the engine
   knows the name (Zarr and NetCDF from `standard_name`, BUFR's built-in
-  parameters, derived wind and derived geopotential height), otherwise the
-  engine's observed-property name.
+  parameters, derived wind, geopotential height, relative humidity and dew
+  point), otherwise the engine's observed-property name.
 - A parameter with its own time axis (satellite products, GRIB windows that
   some steps lack) carries its own `extent.temporal`.
 
@@ -333,6 +333,26 @@ geopotential does, carries the CF `geopotential_height` observed property,
 and counts against the same value budget. Collections that ship the height
 (`gh`, `HGT`) get no second one. `derive_geopotential_height = false` turns
 this off for a collection.
+
+### Derived relative humidity and dew point
+
+GRIB, QueryData, Zarr and NetCDF collections that have a temperature and a
+dew point, relative humidity or, on pressure levels, specific humidity at a
+level, but not relative humidity or dew point there, also serve the missing
+one (`ds_core::moisture`). Relative humidity is in % (QUDT `PERCENT`) and
+over liquid water at all temperatures, as its label and `description` say
+("Relative humidity over water"); dew point is in the unit the
+temperature is served in (`DEG_C` or `K`). They carry the CF
+`relative_humidity` and `dew_point_temperature` observed properties. Each
+value is computed from the ingredients sampled at the point, with the IFS
+Tetens formula over water; a path from specific humidity takes each value's
+pressure from the coverage's `z`. Relative humidity is clamped to 0–100 %
+and dew point to at most the temperature. Names follow the source:
+ECMWF `2t`/`2d` → `2r`, pressure-level `t`/`q` → `r` and `dpt`, wgrib2
+`RH`/`DPT`, FMI `Humidity`/`DewPoint`, MEPS `dew_point_temperature_2m` and
+`dew_point_temperature_pl`. They resolve time, run and level as their
+ingredients do, and count against the same value budget.
+`derive_humidity = false` turns this off for a collection.
 
 ### Per-step amounts
 
@@ -374,6 +394,13 @@ steps before included, and the `MC_NETCDF_EDR_QUERY_MB` cap counts them.
 CAP and GeoJSON collections have no `EdrEngine`. Radius and location lists
 need no engine code of their own; items serve the engine's own
 `FeatureEngine`.
+
+| Derived parameter | Engines |
+|---|---|
+| wind speed and direction | GRIB, QueryData, Zarr, NetCDF |
+| geopotential height | GRIB, Zarr, NetCDF |
+| relative humidity and dew point | GRIB, QueryData, Zarr, NetCDF; from specific humidity on GRIB and NetCDF pressure levels |
+| per-step amount | NetCDF |
 
 | Engine | Area and engine notes |
 |---|---|
