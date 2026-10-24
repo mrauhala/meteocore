@@ -54,7 +54,7 @@ jobs:
     # more often before the repo-wide 10 GiB limit evicts entries),
     # keys on Cargo.lock + rustc version + workspace members.
     - name: Rust cache
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
     - name: Viewer loading and state tests
       run: node --test crates/api-3dtiles/tests/viewer.test.cjs
@@ -138,7 +138,7 @@ jobs:
       # Composite action (no Node runtime): fetches a prebuilt cargo-audit
       # binary in seconds rather than `cargo install`-ing it from source.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
         with:
           tool: cargo-audit
 
@@ -174,7 +174,7 @@ jobs:
 
       # Same composite action as cargo-audit above, with the version pinned.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
         with:
           tool: cargo-deny@0.20.2
 
