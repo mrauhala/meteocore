@@ -102,6 +102,54 @@ pub fn parameter_message(
     bytes
 }
 
+/// `bytes` (a [`message`]) as ECMWF's: originating centre 98, which local
+/// parameter numbers 192–254 resolve against.
+pub fn from_ecmwf(mut bytes: Vec<u8>) -> Vec<u8> {
+    // Section 1 starts at 16; the centre is its octets 6–7.
+    bytes[21..23].copy_from_slice(&98u16.to_be_bytes());
+    bytes
+}
+
+/// `bytes` (a [`message`]) with its product statistically processed over
+/// one time range of `hours` from the reference time, as ECMWF encodes an
+/// accumulation: product definition template `template`, 8 (deterministic)
+/// or 11 (an ensemble member), with Code Table 4.10 type `process`
+/// (1 = accumulation). The interval ends within the reference day.
+pub fn statistically_processed(
+    mut bytes: Vec<u8>,
+    template: u16,
+    process: u8,
+    hours: u8,
+) -> Vec<u8> {
+    assert!(hours < 24);
+    // Section 4 starts at 109 and holds template 4.0's 34 octets.
+    let s4 = 109;
+    assert_eq!((bytes[s4 + 4], &bytes[s4 + 7..s4 + 9]), (4, &[0, 0][..]));
+    let mut extra = match template {
+        8 => Vec::new(),
+        // Template 4.1's octets 35–37: type of ensemble forecast,
+        // perturbation number, number of forecasts in the ensemble.
+        11 => vec![3, 1, 50],
+        other => panic!("template 4.{other} is not an interval template"),
+    };
+    // The interval's end: 2026-04-05, `hours`:00:00 UTC.
+    extra.extend(2026u16.to_be_bytes());
+    extra.extend([4, 5, hours, 0, 0]);
+    extra.push(1); // one time range
+    extra.extend(0u32.to_be_bytes()); // no missing values
+    extra.extend([process, 2, 1]); // over successive forecast hours
+    extra.extend(u32::from(hours).to_be_bytes());
+    extra.push(255); // no increment between fields
+    extra.extend(0u32.to_be_bytes());
+    let length = 34 + extra.len();
+    bytes.splice(s4 + 34..s4 + 34, extra);
+    u32_at(&mut bytes, s4, length as u32);
+    bytes[s4 + 7..s4 + 9].copy_from_slice(&template.to_be_bytes());
+    let total = bytes.len() as u64;
+    bytes[8..16].copy_from_slice(&total.to_be_bytes());
+    bytes
+}
+
 pub struct TestSource {
     pub dir: PathBuf,
 }

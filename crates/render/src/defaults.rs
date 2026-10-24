@@ -990,6 +990,47 @@ mod tests {
         );
     }
 
+    /// ECMWF `tcw` and `cp` (and AIFS `tp` and `sf`, encoded like `cp`)
+    /// take their defaults as engine-grib serves them once their headers
+    /// are read (#886): the name, the label it composes for a surface field
+    /// and the display unit, as `display_units_tests::
+    /// tcw_and_cp_are_named_and_served_in_mm` pins them. `cp` reaches the
+    /// precipitation rule through its label; its short name alone, as
+    /// served before its metadata is known, matches nothing.
+    #[test]
+    fn ecmwf_column_water_and_precipitation_take_their_defaults_as_grib_serves_them() {
+        let d = builtin();
+        let precipitation = ("precipitation", (0.0, 50.0));
+        for (name, title, unit, (palette, range)) in [
+            (
+                "tcw",
+                "Total column water (surface)",
+                "mm",
+                ("viridis", (0.0, 70.0)),
+            ),
+            (
+                "cp",
+                "Convective precipitation (surface)",
+                "mm",
+                precipitation,
+            ),
+            ("tp", "Total precipitation (surface)", "mm", precipitation),
+            (
+                "sf",
+                "Snowfall water equivalent (surface)",
+                "mm",
+                precipitation,
+            ),
+        ] {
+            let m = d
+                .match_default(name, title, Some(unit))
+                .unwrap_or_else(|| panic!("no default for {name} / {title} / {unit}"));
+            assert_eq!(m.palette, palette, "{name} / {title}");
+            assert_eq!(m.range, Some(range), "{name} / {title}");
+        }
+        assert_eq!(d.match_default("cp", "cp", None), None);
+    }
+
     /// The relative humidity and dew point `ds_core::moisture` derives
     /// (#898), by every name and title it gives them, in % and in the °C or
     /// K of their temperature, take the humidity and temperature defaults.

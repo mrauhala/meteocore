@@ -1163,7 +1163,13 @@ impl GribEngine {
 
         let (discipline, category, number) = message.triple;
         let centre = message.centre;
-        let mut meta = match units::lookup(centre, discipline, category, number) {
+        let mut meta = match units::lookup_with_statistic(
+            centre,
+            discipline,
+            category,
+            number,
+            message.statistic,
+        ) {
             Some(info) => ParamMetadata {
                 base_label: info.label.to_string(),
                 source_unit: info.source_unit,
@@ -2440,6 +2446,7 @@ mod tests {
                     centre: 7,
                     first_surface_type: 1,
                     first_surface_value: None,
+                    statistic: None,
                     uv_frame: ds_core::wind::VectorFrame::Earth,
                 }),
             );

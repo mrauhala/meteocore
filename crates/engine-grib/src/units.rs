@@ -10,6 +10,10 @@
 //! per-center overlay first. ECMWF (center 98) is the only local overlay
 //! currently populated.
 //!
+//! A message's statistical processing can change the quantity: a rate
+//! accumulated over the product's time interval is an amount
+//! ([`lookup_with_statistic`], #886).
+//!
 /// A canonical source unit as encoded in the GRIB2 message.
 ///
 /// The variant names reflect the WMO unit string that appears in Code Table
@@ -117,6 +121,50 @@ pub struct ParamInfo {
     pub source_unit: SourceUnit,
 }
 
+/// Code Table 4.10 code 1: accumulation.
+pub const ACCUMULATION: u8 = 1;
+
+/// Look up the parameter a message carries: its triple, read with the
+/// message's statistical processing (Code Table 4.10, from product
+/// definition template 4.8 or 4.11; `None` for an instantaneous product).
+///
+/// An accumulation of a rate is the amount it accumulates: ECMWF's AIFS
+/// encodes `tp`, `cp` and `sf` as the WMO rates 0/1/52, 0/1/37 and 0/1/53
+/// accumulated over the step's window, which eccodes defines as Total
+/// precipitation, Convective precipitation and Snowfall water equivalent in
+/// kg m-2 (paramIds 228228, 228143, 228144). Those triples resolve to the
+/// amount here; every other message, and every other statistic, to
+/// [`lookup`].
+pub fn lookup_with_statistic(
+    center: u16,
+    discipline: u8,
+    category: u8,
+    number: u8,
+    statistic: Option<u8>,
+) -> Option<ParamInfo> {
+    if statistic == Some(ACCUMULATION) {
+        if let Some(info) = accumulated_lookup(discipline, category, number) {
+            return Some(info);
+        }
+    }
+    lookup(center, discipline, category, number)
+}
+
+/// The amount a WMO Code Table 4.2 rate accumulates to, labelled and in the
+/// unit eccodes gives the triple with `typeOfStatisticalProcessing = 1`.
+fn accumulated_lookup(discipline: u8, category: u8, number: u8) -> Option<ParamInfo> {
+    let label = match (discipline, category, number) {
+        (0, 1, 37) => "Convective precipitation",
+        (0, 1, 52) => "Total precipitation",
+        (0, 1, 53) => "Snowfall water equivalent",
+        _ => return None,
+    };
+    Some(ParamInfo {
+        label,
+        source_unit: SourceUnit::KgPerM2,
+    })
+}
+
 /// Look up a parameter by its WMO triple (plus originating center for local
 /// extensions in the 192-254 range).
 ///
@@ -165,7 +213,15 @@ fn standard_lookup(discipline: u8, category: u8, number: u8) -> Option<ParamInfo
             "Water equivalent of accumulated snow depth",
             SourceUnit::KgPerM2,
         ),
+        (0, 1, 37) => ("Convective precipitation rate", SourceUnit::KgPerM2PerS),
+        // WMO: "Total column water (Vertically integrated total water
+        // (vapour + cloud water/cloud ice))". ECMWF `tcw`.
+        (0, 1, 51) => ("Total column water", SourceUnit::KgPerM2),
         (0, 1, 52) => ("Total precipitation rate", SourceUnit::KgPerM2PerS),
+        (0, 1, 53) => (
+            "Total snowfall rate water equivalent",
+            SourceUnit::KgPerM2PerS,
+        ),
         (0, 1, 64) => ("Total column integrated water vapour", SourceUnit::KgPerM2),
 
         // Category 2: momentum
@@ -270,6 +326,8 @@ fn local_lookup(center: u16, discipline: u8, category: u8, number: u8) -> Option
         // ECMWF local precipitation and snow fields. ECMWF reports these
         // in metres of water equivalent; we auto-display in mm.
         (98, 0, 1, 193) => ("Total precipitation", SourceUnit::MetresOfWater),
+        // IFS `cp`, accumulated like 193 and 198 (eccodes paramId 143).
+        (98, 0, 1, 195) => ("Convective precipitation", SourceUnit::MetresOfWater),
         (98, 0, 1, 198) => ("Snowfall (water equivalent)", SourceUnit::MetresOfWater),
         (98, 0, 1, 254) => ("Snow depth", SourceUnit::MetresOfWater),
 
@@ -600,6 +658,122 @@ mod tests {
         let info = lookup(0, 0, 1, 8).expect("total precipitation must resolve");
         assert_eq!(info.label, "Total precipitation");
         assert_eq!(info.source_unit, SourceUnit::KgPerM2);
+    }
+
+    // ---- #886: tcw and cp, as ECMWF open data encodes them ----
+    //
+    // Checked against the live 2026-10-24 00Z run, step 6, by reading only
+    // the headers (sections 0-4) of each message. IFS (master tables 32):
+    // `tcw` is 0/1/51 in template 4.0, ground to the top of the atmosphere,
+    // no local table; `cp` is ECMWF local 0/1/195 (local tables 1) in
+    // template 4.8, accumulated over 0-6 h. AIFS (master tables 36, no
+    // local tables): `tcw` the same 0/1/51; `cp` WMO 0/1/37, Convective
+    // precipitation rate, in template 4.8 with Code Table 4.10 type 1,
+    // accumulation, over 0-6 h, which eccodes 2.47 reads as paramId 228143,
+    // Convective precipitation in kg m-2. AIFS `tp` (0/1/52) and `sf`
+    // (0/1/53) are encoded the same way.
+
+    /// Total column water, ECMWF `tcw` (eccodes paramId 136): kg m-2,
+    /// served in mm. A WMO number, so every centre reads it alike.
+    #[test]
+    fn lookup_total_column_water() {
+        for center in [98u16, 7, 0] {
+            let info = lookup(center, 0, 1, 51).expect("tcw must resolve");
+            assert_eq!(info.label, "Total column water");
+            assert_eq!(info.source_unit, SourceUnit::KgPerM2);
+            let display = default_display(info.source_unit);
+            assert_eq!(display.display_unit, "mm");
+            assert!(!display.has_conversion());
+            // An instantaneous field: no statistic changes it.
+            let same = lookup_with_statistic(center, 0, 1, 51, None).unwrap();
+            assert_eq!(
+                (same.label, same.source_unit),
+                (info.label, info.source_unit)
+            );
+        }
+    }
+
+    /// WMO 0/1/37 as published, an instantaneous rate (eccodes `cpr`),
+    /// is served in mm/h like every other kg m-2 s-1 rate (#1213), and so
+    /// is its average or maximum over a window.
+    #[test]
+    fn lookup_convective_precipitation_rate() {
+        for statistic in [None, Some(0), Some(2)] {
+            let info = lookup_with_statistic(98, 0, 1, 37, statistic).unwrap();
+            assert_eq!(info.label, "Convective precipitation rate", "{statistic:?}");
+            assert_eq!(info.source_unit, SourceUnit::KgPerM2PerS);
+            let display = default_display(info.source_unit);
+            assert_eq!(display.display_unit, "mm/h");
+            assert!((display.convert(2.5e-4) - 0.9).abs() < 1e-12);
+        }
+    }
+
+    /// AIFS `cp`: the rate 0/1/37 accumulated over the step's window is
+    /// the amount, Convective precipitation in kg m-2 (eccodes paramId
+    /// 228143), served in mm unscaled — never the rate's × 3600 mm/h.
+    #[test]
+    fn accumulated_convective_precipitation_rate_is_an_amount() {
+        for center in [98u16, 7] {
+            let info = lookup_with_statistic(center, 0, 1, 37, Some(ACCUMULATION)).unwrap();
+            assert_eq!(info.label, "Convective precipitation");
+            assert_eq!(info.source_unit, SourceUnit::KgPerM2);
+            let display = default_display(info.source_unit);
+            assert_eq!(display.display_unit, "mm");
+            assert_eq!(display.convert(3.5), 3.5);
+        }
+    }
+
+    /// IFS `cp`: ECMWF local 0/1/195 (eccodes paramId 143), always an
+    /// accumulation, in metres of water: × 1000 to mm, like `tp` (193).
+    #[test]
+    fn ifs_convective_precipitation_is_metres_of_water() {
+        for statistic in [Some(ACCUMULATION), None] {
+            let info = lookup_with_statistic(98, 0, 1, 195, statistic).unwrap();
+            assert_eq!(info.label, "Convective precipitation");
+            assert_eq!(info.source_unit, SourceUnit::MetresOfWater);
+            let display = default_display(info.source_unit);
+            assert_eq!(display.display_unit, "mm");
+            assert!((display.convert(0.0035) - 3.5).abs() < 1e-12);
+        }
+        // Another centre's 195 is its own local number.
+        assert!(lookup_with_statistic(7, 0, 1, 195, Some(ACCUMULATION)).is_none());
+    }
+
+    /// AIFS `tp` and `sf` share `cp`'s encoding: accumulated rates 0/1/52
+    /// and 0/1/53 are the amounts eccodes names (paramIds 228228, 228144),
+    /// in mm. Instantaneous, 0/1/52 stays IFS `tprate` in mm/h.
+    #[test]
+    fn accumulated_precipitation_and_snowfall_rates_are_amounts() {
+        for (number, rate, amount) in [
+            (52, "Total precipitation rate", "Total precipitation"),
+            (
+                53,
+                "Total snowfall rate water equivalent",
+                "Snowfall water equivalent",
+            ),
+        ] {
+            let info = lookup_with_statistic(98, 0, 1, number, Some(ACCUMULATION)).unwrap();
+            assert_eq!(
+                (info.label, info.source_unit),
+                (amount, SourceUnit::KgPerM2)
+            );
+            assert_eq!(default_display(info.source_unit).display_unit, "mm");
+            let info = lookup_with_statistic(98, 0, 1, number, None).unwrap();
+            assert_eq!(
+                (info.label, info.source_unit),
+                (rate, SourceUnit::KgPerM2PerS)
+            );
+            assert_eq!(default_display(info.source_unit).display_unit, "mm/h");
+        }
+        // An amount accumulated is still that amount, and an ECMWF local
+        // accumulation keeps its own entry.
+        let tp = lookup_with_statistic(7, 0, 1, 8, Some(ACCUMULATION)).unwrap();
+        assert_eq!(
+            (tp.label, tp.source_unit),
+            ("Total precipitation", SourceUnit::KgPerM2)
+        );
+        let tp = lookup_with_statistic(98, 0, 1, 193, Some(ACCUMULATION)).unwrap();
+        assert_eq!(tp.source_unit, SourceUnit::MetresOfWater);
     }
 
     #[test]

@@ -138,6 +138,16 @@ unlike GeoTIFF's one band per collection.
 - **Per-provider vocabularies are not needed.** A new provider only needs
   overlay entries if it uses local parameter numbers. ECMWF-`tcc` vs
   GFS-`TCDC`, `z` vs `HGT` are handled by construction (different triples).
+- A rate accumulated over the product's interval is an amount, so the
+  triple alone does not name it (#886): AIFS `cp`/`tp`/`sf` are the WMO
+  rates 0/1/37, 0/1/52, 0/1/53 in template 4.8 with Code Table 4.10
+  type 1, which eccodes reads as kg m⁻² (paramIds 228143/228228/228144).
+  `MessageMetadata::statistic` (templates 4.8/4.11, one time range, read in
+  `from_product` so probe and decode agree) feeds
+  `units::lookup_with_statistic`, which maps those to the amount before
+  the plain table; IFS `tprate` (0/1/52, template 4.0) stays mm/h. Add an
+  `accumulated_lookup` entry only from eccodes' definition of the triple
+  with `typeOfStatisticalProcessing = 1`, never from a short name.
 
 ## Model runs (#337)
 
