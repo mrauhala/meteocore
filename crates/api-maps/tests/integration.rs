@@ -5546,3 +5546,351 @@ mod workbench_form {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// OGC API - Maps Background: bgcolor, transparent, void-color,
+// void-transparent (#894)
+// ---------------------------------------------------------------------------
+
+mod background {
+    use super::*;
+
+    /// No data in the west half of every map, 0.5 in the east half.
+    struct HalfEngine;
+
+    impl MapEngine for HalfEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            let values: Vec<Option<f64>> = (0..width * height)
+                .map(|i| (i % width >= width / 2).then_some(0.5))
+                .collect();
+            Ok(RasterTile {
+                width,
+                height,
+                values: values.into(),
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            MockMapEngine::make_info()
+        }
+    }
+
+    /// The per-API service and the shared root over one [`HalfEngine`]
+    /// collection, `radar`.
+    fn surfaces() -> [axum::Router; 2] {
+        let state = build_state_with_engine_and_wms(Arc::new(HalfEngine), None);
+        let per_api = api_maps::router(state.clone());
+        let shared = api_common::shared::router(api_common::shared::SharedApi::new(
+            "",
+            vec![Arc::new(api_maps::MapsBlock::new(state))],
+            vec![],
+        ));
+        [per_api, shared]
+    }
+
+    struct Reply {
+        status: StatusCode,
+        content_type: String,
+        x_cache: String,
+        body: Vec<u8>,
+    }
+
+    async fn fetch(app: &axum::Router, uri: &str) -> Reply {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .map_or(String::new(), |v| v.to_str().unwrap().to_owned())
+        };
+        let (content_type, x_cache) = (header("content-type"), header("x-cache"));
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        Reply {
+            status,
+            content_type,
+            x_cache,
+            body: body.to_vec(),
+        }
+    }
+
+    /// The RGBA pixels of a PNG, row by row.
+    fn pixels(png_bytes: &[u8]) -> Vec<[u8; 4]> {
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+        decoder.set_transformations(png::Transformations::EXPAND);
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0u8; reader.output_buffer_size().expect("png buffer size")];
+        let frame = reader.next_frame(&mut buf).unwrap();
+        let data = &buf[..frame.buffer_size()];
+        match frame.color_type {
+            png::ColorType::Rgba => data.as_chunks::<4>().0.to_vec(),
+            png::ColorType::Rgb => data
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|&[r, g, b]| [r, g, b, 255])
+                .collect(),
+            other => panic!("unexpected decoded PNG colour type: {other:?}"),
+        }
+    }
+
+    const MAP: &str = "/collections/radar/map?bbox=10,55,30,70&width=8&height=4";
+    const STYLED: &str = "/collections/radar/styles/default/map?bbox=10,55,30,70&width=8&height=4";
+
+    /// The colour the default style draws 0.5 in: the east half's pixel of
+    /// a default map, which is opaque.
+    async fn data_colour(app: &axum::Router) -> [u8; 4] {
+        let reply = fetch(app, MAP).await;
+        let colour = pixels(&reply.body)[7];
+        assert_eq!(colour[3], 255, "{colour:?}");
+        colour
+    }
+
+    /// Requirement 7 `/req/background/transparent-definition` C–E and
+    /// Requirement 10 `/req/background/map-success` A, D: without a
+    /// `bgcolor` the map is transparent, and its areas with no data have
+    /// opacity 0; `transparent=false` or a `bgcolor` makes them exactly the
+    /// `bgcolor` (default white) at full opacity; `transparent=true` with a
+    /// `bgcolor` gives them its colour at opacity 0. Drawn pixels never
+    /// change. On every map route of both surfaces.
+    #[tokio::test]
+    async fn no_data_areas_take_the_bgcolor_and_transparency() {
+        for app in surfaces() {
+            let data = data_colour(&app).await;
+            for route in [MAP, STYLED] {
+                for (query, empty) in [
+                    ("", [0, 0, 0, 0]),
+                    ("&transparent=true", [0, 0, 0, 0]),
+                    ("&transparent=FALSE", [255, 255, 255, 255]),
+                    ("&bgcolor=0x336699", [0x33, 0x66, 0x99, 255]),
+                    ("&bgcolor=%23336699", [0x33, 0x66, 0x99, 255]),
+                    ("&bgcolor=SteelBlue", [0x46, 0x82, 0xb4, 255]),
+                    (
+                        "&bgcolor=0x336699&transparent=false",
+                        [0x33, 0x66, 0x99, 255],
+                    ),
+                    ("&bgcolor=red&transparent=true", [255, 0, 0, 0]),
+                    // The void parameters change nothing on the Earth.
+                    ("&void-color=blue&void-transparent=false", [0, 0, 0, 0]),
+                ] {
+                    let uri = format!("{route}{query}");
+                    let reply = fetch(&app, &uri).await;
+                    assert_eq!(reply.status, StatusCode::OK, "{uri}");
+                    assert_eq!(reply.content_type, "image/png", "{uri}");
+                    let pixels = pixels(&reply.body);
+                    assert_eq!(pixels.len(), 32, "{uri}");
+                    for (i, pixel) in pixels.iter().enumerate() {
+                        let expected = if i % 8 < 4 { empty } else { data };
+                        assert_eq!(*pixel, expected, "{uri}: pixel {i}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The background keys the rendered cache: an opaque and a transparent
+    /// map of one view never share an entry, and one colour spelt two ways
+    /// does.
+    #[tokio::test]
+    async fn the_background_keys_the_rendered_cache() {
+        // A fresh cache for each surface: the two share one state.
+        for surface in 0..2 {
+            let app = surfaces()[surface].clone();
+            let transparent = fetch(&app, MAP).await;
+            assert_eq!(transparent.x_cache, "MISS");
+            let opaque = fetch(&app, &format!("{MAP}&transparent=false")).await;
+            assert_eq!(opaque.x_cache, "MISS", "served the transparent entry");
+            assert_ne!(opaque.body, transparent.body);
+            for query in ["&transparent=false", "&bgcolor=white", "&bgcolor=0xFFFFFF"] {
+                let again = fetch(&app, &format!("{MAP}{query}")).await;
+                assert_eq!(again.x_cache, "HIT", "{query}");
+                assert_eq!(again.body, opaque.body, "{query}");
+            }
+            let clear = fetch(&app, &format!("{MAP}&bgcolor=white&transparent=true")).await;
+            assert_eq!(clear.x_cache, "MISS");
+            assert_eq!(fetch(&app, MAP).await.body, transparent.body);
+        }
+    }
+
+    /// JPEG has no alpha: its areas with no data are the `bgcolor`, white by
+    /// default, whatever `transparent` says (`/req/background/
+    /// bgcolor-definition` C).
+    #[tokio::test]
+    async fn jpeg_is_opaque_on_the_bgcolor() {
+        for app in surfaces() {
+            let data = data_colour(&app).await;
+            let expected = |empty: [u8; 4]| {
+                let rgba: Vec<u8> = (0..32)
+                    .flat_map(|i| if i % 8 < 4 { empty } else { data })
+                    .collect();
+                ds_render::encode_jpeg(&rgba, 8, 4, 85).unwrap()
+            };
+            for (query, empty) in [
+                ("", [255, 255, 255, 255]),
+                ("&transparent=true", [255, 255, 255, 255]),
+                ("&bgcolor=red", [255, 0, 0, 255]),
+                ("&bgcolor=red&transparent=true", [255, 0, 0, 255]),
+            ] {
+                let uri = format!("{MAP}&f=image/jpeg{query}");
+                let reply = fetch(&app, &uri).await;
+                assert_eq!(reply.status, StatusCode::OK, "{uri}");
+                assert_eq!(reply.content_type, "image/jpeg", "{uri}");
+                assert_eq!(reply.body, expected(empty), "{uri}");
+            }
+        }
+    }
+
+    /// Requirement 10 B, C: the rows of a CRS84 map past the North Pole are
+    /// outside the CRS, painted with `void-color` and `void-transparent`,
+    /// which default to `bgcolor` and `transparent`. A map wholly past the
+    /// pole is all void.
+    #[tokio::test]
+    async fn void_areas_take_the_void_color_and_transparency() {
+        // Rows 0–1 centre at 97.5° and 92.5°N, rows 2–3 inside.
+        let past_pole = "/collections/radar/map?bbox=10,80,30,100&width=8&height=4";
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        for app in surfaces() {
+            let data = data_colour(&app).await;
+            for (query, void, empty) in [
+                ("", [0, 0, 0, 0], [0, 0, 0, 0]),
+                ("&bgcolor=blue", blue, blue),
+                ("&bgcolor=blue&void-color=red", red, blue),
+                ("&void-color=red&void-transparent=false", red, [0, 0, 0, 0]),
+                ("&void-color=red", [255, 0, 0, 0], [0, 0, 0, 0]),
+                ("&bgcolor=blue&void-transparent=true", [0, 0, 255, 0], blue),
+                (
+                    "&transparent=false&void-color=0xFF0000&void-transparent=TRUE",
+                    [255, 0, 0, 0],
+                    [255, 255, 255, 255],
+                ),
+            ] {
+                let uri = format!("{past_pole}{query}");
+                let reply = fetch(&app, &uri).await;
+                assert_eq!(reply.status, StatusCode::OK, "{uri}");
+                for (i, pixel) in pixels(&reply.body).iter().enumerate() {
+                    let expected = match (i / 8, i % 8) {
+                        (0 | 1, _) => void,
+                        (_, column) if column < 4 => empty,
+                        _ => data,
+                    };
+                    assert_eq!(*pixel, expected, "{uri}: pixel {i}");
+                }
+            }
+            let beyond = "/collections/radar/map?bbox=10,95,30,110&width=8&height=4";
+            for (query, void) in [
+                ("&void-color=red&void-transparent=false", red),
+                ("&bgcolor=blue&void-color=red", red),
+                ("&bgcolor=blue", blue),
+            ] {
+                let uri = format!("{beyond}{query}");
+                let reply = fetch(&app, &uri).await;
+                assert_eq!(reply.status, StatusCode::OK, "{uri}");
+                assert_eq!(reply.x_cache, "EMPTY", "{uri}");
+                assert_eq!(pixels(&reply.body), vec![void; 32], "{uri}");
+            }
+        }
+    }
+
+    /// An invalid value is a JSON 400 naming the valid forms, never ignored.
+    #[tokio::test]
+    async fn invalid_values_are_400_naming_the_valid_forms() {
+        let colour = |name: &str, value: &str| {
+            format!(
+                "{name} '{value}' must be a hexadecimal colour 0xRRGGBB (or #RRGGBB) or a W3C \
+                 web colour name, such as 0x336699, white or SteelBlue"
+            )
+        };
+        for app in surfaces() {
+            for route in [MAP, STYLED] {
+                for (query, description) in [
+                    (
+                        "transparent=yes",
+                        "transparent 'yes' must be true or false".to_owned(),
+                    ),
+                    (
+                        "void-transparent=1",
+                        "void-transparent '1' must be true or false".to_owned(),
+                    ),
+                    ("bgcolor=0xFFF", colour("bgcolor", "0xFFF")),
+                    ("bgcolor=0xFF336699", colour("bgcolor", "0xFF336699")),
+                    ("bgcolor=ultraviolet", colour("bgcolor", "ultraviolet")),
+                    ("void-color=336699", colour("void-color", "336699")),
+                ] {
+                    let uri = format!("{route}&{query}");
+                    let (status, json) = get_on(app.clone(), &uri).await;
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+                    assert_eq!(json["code"], "BadRequest", "{uri}");
+                    assert_eq!(json["description"], description, "{uri}");
+                }
+            }
+        }
+    }
+
+    /// The Background class is declared, and every map operation lists its
+    /// four parameters with the standard's schemas (Requirements 6–9 A).
+    #[tokio::test]
+    async fn background_class_and_parameters_are_declared() {
+        for (app, prefix) in [
+            (surfaces()[0].clone(), "/maps"),
+            (surfaces()[1].clone(), ""),
+        ] {
+            let (_, json) = get_on(app.clone(), "/conformance").await;
+            assert!(
+                json["conformsTo"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c == api_maps::handlers::MAPS_BACKGROUND),
+                "{prefix}: {json}"
+            );
+            let (_, doc) = get_on(app, "/api").await;
+            let parameters = &doc["components"]["parameters"];
+            for name in ["bgcolor", "void-color"] {
+                assert_eq!(
+                    parameters[name]["schema"],
+                    serde_json::json!({"type": "string", "default": "0xFFFFFF"}),
+                    "{name}"
+                );
+            }
+            for name in ["transparent", "void-transparent"] {
+                assert_eq!(
+                    parameters[name]["schema"],
+                    serde_json::json!({"type": "boolean", "default": true}),
+                    "{name}"
+                );
+            }
+            for name in ["bgcolor", "transparent", "void-color", "void-transparent"] {
+                assert_eq!(parameters[name]["name"], name);
+                assert_eq!(parameters[name]["in"], "query");
+                assert_eq!(parameters[name]["style"], "form", "{name}");
+                assert_eq!(parameters[name]["explode"], false, "{name}");
+                for path in [
+                    format!("{prefix}/collections/radar/map"),
+                    format!("{prefix}/collections/radar/styles/{{styleId}}/map"),
+                ] {
+                    let listed = doc["paths"][&path]["get"]["parameters"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::json!({
+                            "$ref": format!("#/components/parameters/{name}")
+                        }));
+                    assert!(listed, "{path}: {name}");
+                }
+            }
+        }
+    }
+}

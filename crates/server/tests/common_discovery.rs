@@ -2385,6 +2385,7 @@ async fn render_parameters_are_advertised_and_declared_on_every_raster_surface()
 }
 
 const MAPS_TILESETS: &str = "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets";
+const MAPS_BACKGROUND: &str = "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/background";
 const TILES_DATETIME: &str = "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/datetime";
 
 /// [`app`] for a raster surface ("maps", "tiles" or "shared"), every
@@ -2505,6 +2506,10 @@ async fn map_tiles_beside_every_map(app: &Router, prefix: &str) -> Result<usize,
 ///   schemas on every tile, map and vector (#794), and Map Tilesets Maps'
 ///   Scaling parameters on map tiles (`/req/tilesets/tiles-parameters`), and
 ///   the per-API Tiles document stays valid OpenAPI.
+/// - OGC API - Maps "Background" (#894): declared wherever Maps serves
+///   maps, every map operation declares its four parameters with the
+///   standard's schemas, and with Map Tilesets so does every map tile
+///   (`/req/tilesets/tiles-parameters`).
 #[tokio::test]
 async fn declared_map_tile_classes_match_what_each_surface_serves() {
     let schema: Value =
@@ -2522,6 +2527,7 @@ async fn declared_map_tile_classes_match_what_each_surface_serves() {
         };
         assert_eq!(declares(MAPS_TILESETS), surface == "shared", "{surface}");
         assert_eq!(declares(TILES_DATETIME), surface != "maps", "{surface}");
+        assert_eq!(declares(MAPS_BACKGROUND), surface != "tiles", "{surface}");
 
         let beside = map_tiles_beside_every_map(&app, &prefix).await;
         if declares(MAPS_TILESETS) {
@@ -2593,7 +2599,62 @@ async fn declared_map_tile_classes_match_what_each_surface_serves() {
                 for name in ["width", "height", "scale-denominator"] {
                     assert!(parameter(name).is_some(), "{path} lacks {name}");
                 }
+                if declares(MAPS_BACKGROUND) {
+                    background_parameters_declared(&parameter, path);
+                }
             }
         }
+        // Background `/req/background/*-definition` A on every map
+        // operation, the collection's and each style's.
+        let maps: Vec<_> = api["paths"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.ends_with("/map"))
+            .collect();
+        assert_eq!(
+            maps.len(),
+            if surface == "tiles" { 0 } else { 12 },
+            "{surface}"
+        );
+        for (path, item) in maps {
+            assert!(declares(MAPS_BACKGROUND), "{surface}");
+            let parameter = |name: &str| {
+                item["get"]["parameters"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| match p["$ref"].as_str() {
+                        Some(r) => api.pointer(r.strip_prefix('#').unwrap()).unwrap(),
+                        None => p,
+                    })
+                    .find(|p| p["name"] == name && p["in"] == "query")
+                    .cloned()
+            };
+            background_parameters_declared(&parameter, path);
+        }
+    }
+}
+
+/// The four Background parameters with the schemas OGC 20-058 Requirements
+/// 6–9 A give them, found by `parameter` on the operation at `path`.
+fn background_parameters_declared(parameter: &dyn Fn(&str) -> Option<Value>, path: &str) {
+    for (name, schema) in [
+        ("bgcolor", json!({"type": "string", "default": "0xFFFFFF"})),
+        ("transparent", json!({"type": "boolean", "default": true})),
+        (
+            "void-color",
+            json!({"type": "string", "default": "0xFFFFFF"}),
+        ),
+        (
+            "void-transparent",
+            json!({"type": "boolean", "default": true}),
+        ),
+    ] {
+        let declared = parameter(name).unwrap_or_else(|| panic!("{path} lacks {name}"));
+        assert_eq!(declared["schema"], schema, "{path}: {name}");
+        assert_eq!(declared["style"], "form", "{path}: {name}");
+        assert_eq!(declared["explode"], false, "{path}: {name}");
+        assert_eq!(declared["required"], false, "{path}: {name}");
     }
 }

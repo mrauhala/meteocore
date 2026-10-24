@@ -128,9 +128,10 @@ under the request as resolved (`CacheKey`): the style layer and style name
 layer and `coll/<default>`, share entries (#1133); the meta-tile
 `TileKeyPrefix` keys the same pair. Maps keys the same way into the same
 instance, so a WMS view and a Maps request whose keys match (CRS code,
-envelope, size, style, parameter, time, and no background: a WMS PNG or
-WebP with `TRANSPARENT=TRUE`) share one entry, whichever render path
-filled it; Tiles keys its TileMatrixSet id as the CRS. Every successful non-empty render is
+envelope, size, style, parameter, time and background: a WMS PNG or WebP
+with `TRANSPARENT=TRUE` and a default Maps map, or `TRANSPARENT=FALSE`
+and `transparent=false` on one colour) share one entry, whichever render
+path filled it; Tiles keys its TileMatrixSet id as the CRS. Every successful non-empty render is
 inserted on its first render, a meta-tiled viewport included; empty and
 error images never are. Measured on a day of a live deployment's GetMaps
 (85 000, every one an EPSG:3857 viewport, none tile-shaped):

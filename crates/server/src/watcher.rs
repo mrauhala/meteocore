@@ -522,7 +522,7 @@ max = 1050.0
             z: None,
             reference_time: None,
             content_version: 1,
-            background: None,
+            background: Default::default(),
         };
         cache.insert(
             key.clone(),

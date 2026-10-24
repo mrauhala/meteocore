@@ -26,10 +26,11 @@ engine type: it looks up the `MapEngine` by the collection id in the URL.
   image bytes, and a matching `If-None-Match` gets a 304.
 - On a miss, `ds-executor` admits the render (a render slot and an
   output-memory reservation, within a deadline). A blocking worker then calls
-  `get_raster_tile` (or `get_raster_tiles` for an RGB composite), colours and
-  encodes with `ds-render`.
-- A view with no data returns an empty image in the requested format
-  (transparent; white in JPEG) with `x-cache: EMPTY`.
+  `get_raster_tile` (or `get_raster_tiles` for an RGB composite), colours,
+  paints the background (`ds_render::encode_map`) and encodes with
+  `ds-render`.
+- A view with no data returns an empty image in the requested format, its
+  background (transparent by default, white in JPEG), with `x-cache: EMPTY`.
 
 ## Endpoints
 
@@ -65,9 +66,10 @@ collection. The extent describes the native grid
 `/tiles/collections/{id}/tiles` when the Tiles service renders the collection.
 
 `/conformance` lists the OGC API - Common classes and these OGC API - Maps
-1.0 classes: `core`, `collection-map`, `styled-map`, `spatial-subsetting`,
-`scaling`, `datetime`, `crs`, `png`, `jpeg`. Map Tilesets is declared at the
-shared root by api-tiles, which serves those tiles.
+1.0 classes: `core`, `collection-map`, `styled-map`, `background`,
+`spatial-subsetting`, `scaling`, `datetime`, `crs`, `png`, `jpeg`. Map
+Tilesets is declared at the shared root by api-tiles, which serves those
+tiles, with the Scaling and Background parameters.
 
 ## Map parameters
 
@@ -84,7 +86,9 @@ shared root by api-tiles, which serves those tiles.
 | `quality` | 1–100 for JPEG (default 85) and WebP (100 is lossless; default `[wms] webp_quality`, else lossless). A 400 with PNG. |
 | `parameter-name` | A parameter or RGB composite from `parameter_names`. An unknown name is a 400 listing the valid ones; a collection without a parameter list ignores it. |
 | `elevation` | One vertical level. A 400 on a collection without a vertical dimension. |
-| `transparent` | Accepted and ignored: there is no opaque-background option. |
+| `bgcolor` | Background colour: `0xRRGGBB`, `#RRGGBB` or a W3C web colour name, any case. Default white. |
+| `transparent` | `true` or `false`, any case. Default `true` without `bgcolor`, else `false`. |
+| `void-color`, `void-transparent` | The same for the parts of the map outside its CRS. Default `bgcolor` and `transparent`. |
 
 - **Area.** At most one of `bbox`, a spatial `subset` and `center`. Without
   any, the map covers the collection's extent; a collection with no extent yet
@@ -99,6 +103,16 @@ shared root by api-tiles, which serves those tiles.
   instant to one of its time steps (a parameter's own axis when it has one).
   An interval renders the latest step inside it, and is a 404 when it holds
   none. Without a time, the engine's default time is used, else the latest.
+- **Background.** Transparent, the map keeps its alpha: areas with no data
+  have opacity 0, in the `bgcolor`'s colour when one is given. Opaque, the
+  map is composited onto `bgcolor`: areas with no data take it, and
+  semi-transparent colours blend onto it. JPEG has no alpha and is always
+  opaque. The void is the rows of a CRS84 or EPSG:4326 map past a pole, and
+  what lies past EPSG:3067's or EPSG:3035's projection area; an engine
+  draws nothing there. Only when `void-color` or `void-transparent` set it
+  apart does the render map those pixels, a bisection per row
+  (`OutputCrs::earth_columns`). The background keys the rendered cache, so
+  an opaque and a transparent map of one view never share an entry.
 - **Headers.** `Content-Crs`, `Content-Bbox` (the rendered corners in the
   CRS's axis order), `Content-Datetime` (the instant rendered, on collections
   with a time axis), `ETag` and `x-cache` (`HIT`, `MISS` or `EMPTY`).

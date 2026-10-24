@@ -615,6 +615,72 @@ pub fn quality_parameter(jpeg_default: u8) -> Value {
     })
 }
 
+/// The names of the OGC API - Maps Background parameters, in the order the
+/// image routes list them ([`background_parameters`]).
+pub const BACKGROUND_PARAMETERS: [&str; 4] =
+    ["bgcolor", "transparent", "void-color", "void-transparent"];
+
+/// The OGC API - Maps Background parameters of the Maps and Tiles image
+/// routes, keyed by name ([`BACKGROUND_PARAMETERS`]). Each is the
+/// standard's OpenAPI fragment (OGC 20-058 `/req/background/*-definition`
+/// A) verbatim, its description followed by this server's rules. The colour
+/// defaults are quoted strings, as in the published schemas
+/// (`schemas.opengis.net/ogcapi/maps/part1/1.0`): an unquoted YAML
+/// `0xFFFFFF` is a number. One definition so the blocks of the shared root
+/// declare one component per name. `ds_render::parse_background` reads them
+/// (#894).
+pub fn background_parameters() -> serde_json::Map<String, Value> {
+    const FORMS: &str = "This server takes `0xRRGGBB` or `#RRGGBB` (`%23RRGGBB` in a URL), hexadecimal digits of either case, or one of the 148 named colours of CSS Color Module Level 4, in any case; anything else is a 400.";
+    const BOOLEAN: &str = "`true` or `false`, in any case; anything else is a 400.";
+    let parameter = |name: &str, description: String, schema: Value| {
+        json!({
+            "name": name,
+            "in": "query",
+            "description": description,
+            "required": false,
+            "style": "form",
+            "explode": false,
+            "schema": schema
+        })
+    };
+    let color = json!({"type": "string", "default": "0xFFFFFF"});
+    let boolean = json!({"type": "boolean", "default": true});
+    [
+        parameter(
+            "bgcolor",
+            format!(
+                "Hexadecimal red-green-blue color value (0-255) or case-insensitive W3C web color name for the\nbackground color (default=0xFFFFFF). For a six digit hexadecimal value, the first and second\ndigits specify the intensity of red. The third and fourth digits specify the intensity of\ngreen. The fifth and sixth digits specify the intensity of blue.\n\n{FORMS} An opaque map, with `transparent=false` or in `image/jpeg`, which has no alpha, is composited onto this colour: areas with no data take it, and semi-transparent colours blend onto it. A transparent map gives its areas with no data this colour at opacity 0 when `bgcolor` is given, and leaves them as rendered, fully transparent, otherwise."
+            ),
+            color.clone(),
+        ),
+        parameter(
+            "transparent",
+            format!(
+                "(defaults to `true` without a `bgcolor` specified, but to `false` when a `bgcolor` is used).\n\n{BOOLEAN} `true` keeps the map's alpha: areas with no data are fully transparent. `false` composites the map onto `bgcolor`. An `image/jpeg` map, which has no alpha, is always opaque."
+            ),
+            boolean.clone(),
+        ),
+        parameter(
+            "void-color",
+            format!(
+                "Hexadecimal red-green-blue color value (0-255) or case-insensitive W3C web color name for the\ncolor of parts of the map outside of the valid CRS / projection areas (default=0xFFFFFF). For a six digit hexadecimal value, the first and second\ndigits specify the intensity of red. The third and fourth digits specify the intensity of\ngreen. The fifth and sixth digits specify the intensity of blue.\n\n{FORMS} Those parts are the rows of a CRS84 or EPSG:4326 map past a pole, and the parts of an EPSG:3067 or EPSG:3035 map past its projection's valid area; Web Mercator maps and map tiles have none. They are painted as areas with no data are, in this colour and as `void-transparent` says. Without it, the `bgcolor`, specified or default, is used."
+            ),
+            color,
+        ),
+        parameter(
+            "void-transparent",
+            format!(
+                "(defaults to the same value, specified or default, as `transparent`).\n\n{BOOLEAN} Whether the parts of the map outside the valid area of its CRS, those `void-color` describes, are transparent, as `transparent` says of areas with no data."
+            ),
+            boolean,
+        ),
+    ]
+    .into_iter()
+    .zip(BACKGROUND_PARAMETERS)
+    .map(|(parameter, name)| (name.to_owned(), parameter))
+    .collect()
+}
+
 /// The `legend` schema of the Maps and Tiles legend routes: a parameter
 /// style's palette legend (`ds_render::legend_json`), or an RGB composite's
 /// channel list (`ds_render::composite_legend_json`, #819). One definition
