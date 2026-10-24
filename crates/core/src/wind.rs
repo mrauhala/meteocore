@@ -12,8 +12,11 @@
 //!
 //! Engines only report what their source asserts about each parameter
 //! ([`WindSource`] → [`WindFacts`]): the GRIB2 resolution-and-component flag,
-//! a CF `standard_name`, an FMI parameter number. [`DerivedWind`] wraps an
-//! engine's `MapEngine` + `EdrEngine` and serves the planned parameters.
+//! a CF `standard_name`, an FMI parameter number. The facts snapshot is
+//! shared by every derivation ([`crate::derive`], #948), so it describes
+//! every parameter, not only the components. [`crate::derive::Derived`]
+//! wraps an engine's `MapEngine` + `EdrEngine` and serves the planned
+//! parameters; [`DerivedWind`] is its wind-only form.
 //!
 //! **Derive after sampling.** The components are sampled with the engine's
 //! normal interpolation, at the output pixel or EDR point, and combined per
@@ -26,11 +29,19 @@ use std::sync::{Arc, LazyLock};
 
 use crate::geo::Crs;
 
-mod derived;
 #[cfg(test)]
 mod tests;
 
-pub use derived::{DerivedWind, OutcomeLog};
+/// The derived-parameter wrapper; [`DerivedWind::new`] derives wind only
+/// (#897), [`crate::derive::Derived::with`] every derivation a collection
+/// turns on.
+pub use crate::derive::Derived as DerivedWind;
+
+/// Reports one pair's outcome: `(collection id, outcome)`. Called for every
+/// pair when the wrapper is built, then only when a pair's outcome changes
+/// (a refreshed snapshot that now states the frame, a new run without a
+/// component). ds-core has no logging dependency; the server logs.
+pub type OutcomeLog = Arc<dyn Fn(&str, &PairOutcome) + Send + Sync>;
 
 /// CF standard name of a derived speed.
 pub const WIND_SPEED: &str = "wind_speed";
@@ -333,8 +344,10 @@ impl ParameterFacts {
     }
 }
 
-/// Everything a source asserts that wind derivation needs: one snapshot,
+/// Everything a source asserts that the derivations need: one snapshot,
 /// rebuilt at load and poll refresh (Critical Rule 10), never per request.
+/// Named for wind, the first derivation; geopotential height (#948) reads
+/// the same facts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindFacts {
     pub grid: GridAxes,
@@ -354,11 +367,13 @@ impl WindFacts {
     }
 }
 
-/// An engine that can say what its source asserts about its wind
-/// components. Implemented by the engines [`DerivedWind`] wraps.
+/// An engine that can say what its source asserts about its parameters:
+/// the wind components, and every other parameter a derivation reads
+/// ([`crate::derive`]). Implemented by the engines
+/// [`crate::derive::Derived`] wraps.
 pub trait WindSource: Send + Sync {
     /// The current snapshot. **O(1)**: an `Arc` clone of a snapshot built
-    /// when the engine loads or refreshes its metadata. [`DerivedWind`]
+    /// when the engine loads or refreshes its metadata. The wrapper
     /// rebuilds its plan only when the returned `Arc` changes.
     fn wind_facts(&self) -> Arc<WindFacts>;
 }

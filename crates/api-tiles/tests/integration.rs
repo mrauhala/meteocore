@@ -156,6 +156,7 @@ fn build_state_with_wms(wms: Option<ds_core::config::WmsConfig>) -> api_tiles::A
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -243,6 +244,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
     let cmap = Arc::new(LutColorMap::from_builtin(
@@ -1160,6 +1162,7 @@ fn build_empty_router() -> axum::Router {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -1298,6 +1301,7 @@ fn build_multi_param_router() -> axum::Router {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -1853,6 +1857,7 @@ mod mvt {
                 csv: None,
                 preview: None,
                 derive_wind: None,
+                derive_geopotential_height: None,
             },
         );
 
@@ -1948,6 +1953,7 @@ mod mvt {
                 csv: None,
                 preview: None,
                 derive_wind: None,
+                derive_geopotential_height: None,
             },
         );
 
@@ -2339,6 +2345,7 @@ mod temporal_grid_jitter {
                 csv: None,
                 preview: None,
                 derive_wind: None,
+                derive_geopotential_height: None,
             },
         );
         let state = Arc::new(ArcSwap::from_pointee(TilesState {
@@ -2517,6 +2524,7 @@ mod metadata_extras {
                 csv: None,
                 preview: None,
                 derive_wind: None,
+                derive_geopotential_height: None,
             },
         );
         let state = Arc::new(ArcSwap::from_pointee(TilesState {
@@ -2869,6 +2877,7 @@ fn build_param_layer_router_with(
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -3925,6 +3934,7 @@ mod composites {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         };
         let state = Arc::new(ArcSwap::from_pointee(TilesState {
             map_engines: HashMap::from([("radar".to_string(), engine)]),

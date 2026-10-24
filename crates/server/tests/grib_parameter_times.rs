@@ -132,6 +132,7 @@ fn collection(dir: &Path, api: &str) -> CollectionConfig {
         csv: None,
         preview: None,
         derive_wind: None,
+        derive_geopotential_height: None,
     }
 }
 

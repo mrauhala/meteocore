@@ -63,10 +63,14 @@
 //! | `Pa` | `hPa` | × 0.01 |
 //! | `kg m-2` | `mm` | identity (1 kg m⁻² of water ≈ 1 mm) |
 //! | `kg m-2 s-1` | `mm/h` | × 3600 (a precipitation rate: 1 kg m⁻² s⁻¹ of water ≈ 1 mm s⁻¹) |
-//! | `m2 s-2` | `gpm` | ÷ 9.80665 |
 //! | `Proportion`, `proportion`, `(0 - 1)` (WMO's fraction) | `%` | × 100 |
 //! | `1` with a fraction's CF `standard_name` ([`cf_display_conversion`]) | `%` | × 100 |
 //! | anything else | unchanged | identity |
+//!
+//! Every rule changes the unit a quantity is written in, never the
+//! quantity. Geopotential (`m2 s-2`) therefore has none: divided by g₀ it
+//! is geopotential height, another quantity (#948), which
+//! `crate::geopotential` derives as a parameter of its own.
 //!
 //! CF's dimensionless `1` alone has no rule: it names many quantities
 //! besides a fraction (`specific_humidity`, a `land_binary_mask` flag,
@@ -463,11 +467,6 @@ pub fn display_conversion(source_unit: &str) -> Option<DisplayConversion> {
             scale: 3600.0,
             offset: 0.0,
         },
-        "m2 s-2" => DisplayConversion {
-            unit: "gpm",
-            scale: 1.0 / 9.80665,
-            offset: 0.0,
-        },
         // WMO Code Table 4.2's words for a fraction in [0, 1].
         "Proportion" | "proportion" | "(0 - 1)" => FRACTION_AS_PERCENT,
         _ => return None,
@@ -543,8 +542,8 @@ impl QudtUnit {
 /// then keep the unit string as it is.
 ///
 /// Deliberately absent: `dBZ` (QUDT's `DeciB_Z` is the acoustic Z-weighted
-/// sound level, not radar reflectivity), `gpm`, `deg/km`, the CF
-/// dimensionless `1` and BUFR code-table "units".
+/// sound level, not radar reflectivity), `gpm` (QUDT has no geopotential
+/// metre), `deg/km`, the CF dimensionless `1` and BUFR code-table "units".
 pub fn qudt_unit(unit: &str) -> Option<QudtUnit> {
     let (id, symbol) = match canonical_unit(unit).as_ref() {
         "K" => ("K", "K"),
@@ -957,8 +956,7 @@ mod tests {
     }
 
     /// `display_conversion` reads every spelling of its source units: a
-    /// UDUNITS `kg/m^2` is millimetres and `m^2/s^2` geopotential metres,
-    /// as `kg m-2` and `m2 s-2` always were.
+    /// UDUNITS `kg/m^2` is millimetres, as `kg m-2` always was.
     #[test]
     fn display_conversion_reads_every_spelling() {
         for (spellings, unit) in [
@@ -968,7 +966,6 @@ mod tests {
                 &["kg m-2", "kg m**-2", "kg/m^2", "kg/m2", "kg.m-2", "kg/m²"][..],
                 "mm",
             ),
-            (&["m2 s-2", "m**2 s**-2", "m^2/s^2", "m2/s2"][..], "gpm"),
             (
                 &[
                     "kg m-2 s-1",
@@ -993,7 +990,8 @@ mod tests {
                 assert_eq!(display_conversion(spelling), Some(rule), "{spelling:?}");
             }
         }
-        // Display units and unruled units pass through, in any spelling.
+        // Display units and unruled units pass through, in any spelling:
+        // geopotential among them (#948).
         for unit in [
             "degC",
             "degree_Celsius",
@@ -1002,6 +1000,11 @@ mod tests {
             "percent",
             "mm/h",
             "mm h-1",
+            "m2 s-2",
+            "m**2 s**-2",
+            "m^2/s^2",
+            "m2/s2",
+            "m²/s²",
         ] {
             assert_eq!(display_conversion(unit), None, "{unit:?}");
         }
@@ -1115,10 +1118,28 @@ mod tests {
     }
 
     #[test]
-    fn every_mechanical_display_unit_but_gpm_has_a_qudt_entry() {
+    fn every_mechanical_display_unit_has_a_qudt_entry() {
         for source in ["K", "Pa", "kg m-2", "kg m-2 s-1", "Proportion"] {
             let display = display_conversion(source).unwrap().unit;
             assert!(qudt_unit(display).is_some(), "{display}");
+        }
+    }
+
+    /// Geopotential is served as stored, in m² s⁻², which QUDT names in
+    /// every spelling a source writes it (#948).
+    #[test]
+    fn geopotential_keeps_its_unit_and_qudt_entry() {
+        for unit in ["m2 s-2", "m**2 s**-2", "m^2/s^2", "m²/s²", "m2.s-2"] {
+            assert_eq!(display_conversion(unit), None, "{unit}");
+            assert_eq!(cf_display_conversion(unit, Some("geopotential")), None);
+            assert_eq!(
+                qudt_unit(unit),
+                Some(QudtUnit {
+                    id: "M2-PER-SEC2",
+                    symbol: "m²/s²"
+                }),
+                "{unit}"
+            );
         }
     }
 
@@ -1132,7 +1153,6 @@ mod tests {
         assert!((pa.convert(101_530.0) - 1015.3).abs() < 1e-9);
         let mm = display_conversion("kg m-2").unwrap();
         assert_eq!((mm.unit, mm.has_conversion()), ("mm", false));
-        assert_eq!(display_conversion("m2 s-2").unwrap().unit, "gpm");
         // A precipitation rate: 1 mm/h is 1/3600 kg m-2 s-1.
         let rate = display_conversion("kg m-2 s-1").unwrap();
         assert_eq!(rate.unit, "mm/h");
@@ -1145,6 +1165,7 @@ mod tests {
         // `1` is not a fraction by definition.
         for u in [
             "m s-1",
+            "m2 s-2",
             "%",
             "1",
             "deg",

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, ParameterDescription, QueryResult, VerticalCoord,
 };
-use ds_core::units::{is_ucum, qudt_unit, UCUM_TYPE};
+use ds_core::units::qudt_unit;
 use serde::ser::{SerializeMap, Serializer};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -101,36 +101,6 @@ fn cf_standard_name_uri(desc: &ParameterDescription) -> Option<String> {
     bare.then(|| format!("{CF_STANDARD_NAME_BASE}{name}"))
 }
 
-/// The `unit` object, or `None` when the engine knows no unit. A unit QUDT
-/// has an entry for carries its QUDT identifier and `qudt:symbol`
-/// (Metocean Requirement 7E, a custom `type` EDR 1.2 `/req/edr/rc-parameters`
-/// G allows). Any other keeps the engine's string: typed
-/// `https://www.opengis.net/def/uom/UCUM/` when it is UCUM (`deg/km`, `1`),
-/// else a plain-string symbol with no scheme (`dBZ`, `gpm`, BUFR code
-/// tables), since G reserves the UCUM type for UCUM. Valid in both EDR 1.1
-/// and CoverageJSON, whose `symbol` is a string or a `{value, type}` object.
-fn build_unit(unit: &str) -> Option<Value> {
-    let unit = unit.trim();
-    if unit.is_empty() {
-        return None;
-    }
-    let typed = |value: &str, kind: String| {
-        let mut symbol = Map::with_capacity(2);
-        symbol.insert("value".into(), Value::String(value.into()));
-        symbol.insert("type".into(), Value::String(kind));
-        Value::Object(symbol)
-    };
-    let symbol = match qudt_unit(unit) {
-        Some(q) => typed(q.symbol, q.uri()),
-        None if is_ucum(unit) => typed(unit, UCUM_TYPE.to_string()),
-        None => Value::String(unit.into()),
-    };
-    let mut m = Map::with_capacity(2);
-    m.insert("label".into(), i18n(unit));
-    m.insert("symbol".into(), symbol);
-    Some(Value::Object(m))
-}
-
 fn i18n(text: &str) -> Value {
     let mut m = Map::with_capacity(1);
     m.insert("en".into(), Value::String(text.into()));
@@ -167,7 +137,7 @@ pub fn collection_parameter_json(desc: &ParameterDescription) -> Value {
         Value::String(parameter_label(desc).into_owned()),
     );
     param.insert("description".into(), Value::String(description));
-    if let Some(unit) = build_unit(&desc.unit) {
+    if let Some(unit) = api_common::unit_json(&desc.unit) {
         param.insert("unit".into(), unit);
     }
     param.insert("observedProperty".into(), observed);
@@ -182,7 +152,7 @@ pub(crate) fn build_parameter(desc: &ParameterDescription) -> Value {
     let mut param = Map::with_capacity(4);
     param.insert("type".into(), Value::String("Parameter".into()));
     param.insert("description".into(), i18n(&description));
-    if let Some(unit) = build_unit(&desc.unit) {
+    if let Some(unit) = api_common::unit_json(&desc.unit) {
         param.insert("unit".into(), unit);
     }
     param.insert(

@@ -30,7 +30,7 @@ or map window. Nothing is converted or copied first.
   or infinite values, are null.
 - **Units.** Values are served in the display unit of the array's CF
   `units`, in any spelling: K → °C, Pa → hPa, kg m⁻² → mm, kg m⁻² s⁻¹ →
-  mm/h, m² s⁻² → gpm, proportion → %, and CF's `1` → % when the array's
+  mm/h, proportion → %, and CF's `1` → % when the array's
   `standard_name` is `relative_humidity` or ends in `_area_fraction` (or
   `_area_fraction_in_atmosphere_layer`). Other units are served as the store
   spells them. Every API, derived wind included, reads the converted
@@ -94,6 +94,12 @@ grid, never per pixel.
 (`eastward_wind`/`northward_wind` or `x_wind`/`y_wind`); `wind_u_10m` gives
 `wind_speed_10m` and `wind_direction_10m`. Speed is served on every API,
 direction in EDR only. `derive_wind = false` on the collection opts out.
+
+**Derived geopotential height.** An array whose `standard_name` is
+`geopotential` (in m² s⁻², served as stored) gives its height ÷ g₀ in gpm on
+every API, unless the store has a `geopotential_height` at that level:
+`geopotential` → `geopotential_height`, ERA5's `z` → `gh`.
+`derive_geopotential_height = false` on the collection opts out.
 
 ## Configuration
 

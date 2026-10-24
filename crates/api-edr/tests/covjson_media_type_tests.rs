@@ -181,6 +181,7 @@ fn router() -> axum::Router {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
     api_edr::router(Arc::new(ArcSwap::from_pointee(EdrState {

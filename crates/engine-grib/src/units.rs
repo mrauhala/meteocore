@@ -311,9 +311,12 @@ impl DisplayConversion {
 /// - `Pascal` → `hPa` (scale 0.01, offset 0)
 /// - `KgPerM2` → `mm` (scale 1, offset 0) — water-depth equivalent
 /// - `KgPerM2PerS` → `mm/h` (scale 3600, offset 0) — a precipitation rate
-/// - `M2PerS2` → `gpm` (scale 1/9.80665, offset 0)
 /// - `Proportion` → `%` (scale 100, offset 0)
 /// - Everything else → identity with a canonical source-unit string.
+///
+/// Geopotential (`M2PerS2`) keeps its unit: divided by g₀ it would be
+/// geopotential height, another quantity, which `ds_core::geopotential`
+/// derives as a parameter of its own (#948).
 pub fn default_display(source: SourceUnit) -> DisplayConversion {
     match source {
         SourceUnit::KelvinDifference => DisplayConversion {
@@ -377,10 +380,9 @@ pub fn default_display(source: SourceUnit) -> DisplayConversion {
             scale: 1.0,
             offset: 0.0,
         },
-        // Geopotential → geopotential metres: divide by g₀ = 9.80665 m s-2.
         SourceUnit::M2PerS2 => DisplayConversion {
-            display_unit: "gpm",
-            scale: 1.0 / 9.80665,
+            display_unit: "m2 s-2",
+            scale: 1.0,
             offset: 0.0,
         },
         SourceUnit::Gpm => DisplayConversion {
@@ -677,14 +679,17 @@ mod tests {
         assert!((d.convert(5.0) - 5.0).abs() < 1e-12);
     }
 
+    /// Geopotential is served as geopotential, in m² s⁻² (#948); its
+    /// height is a derived parameter, never a display unit.
     #[test]
-    fn display_geopotential_to_gpm() {
+    fn display_geopotential_keeps_its_unit() {
         let d = default_display(SourceUnit::M2PerS2);
-        assert_eq!(d.display_unit, "gpm");
-        // 1 / 9.80665 ≈ 0.1019716
-        assert!((d.scale - 0.101_971_6).abs() < 1e-6);
-        assert_eq!(d.offset, 0.0);
-        assert!((d.convert(9806.65) - 1000.0).abs() < 0.01);
+        assert_eq!(d.display_unit, "m2 s-2");
+        assert!(!d.has_conversion());
+        assert_eq!(d.convert(57_600.0), 57_600.0);
+        // Geopotential height is already in gpm.
+        let h = default_display(lookup(0, 0, 3, 5).unwrap().source_unit);
+        assert_eq!((h.display_unit, h.has_conversion()), ("gpm", false));
     }
 
     #[test]
@@ -798,10 +803,6 @@ mod tests {
             "kg.m-2",
             "kg/m2",
             "kg/m²",
-            "m2 s-2",
-            "m**2 s**-2",
-            "m^2/s^2",
-            "m² s⁻²",
             "kg m-2 s-1",
             "kg/(m2 s)",
             "kg m⁻² s⁻¹",
@@ -819,8 +820,26 @@ mod tests {
             );
         }
         for spelling in [
-            "m s-1", "m/s", "%", "J/kg", "W m-2", "kg kg-1", "s-1", "/s", "degC", "°C", "hPa",
-            "mm", "m", "gpm", "Numeric", "1",
+            "m s-1",
+            "m/s",
+            "%",
+            "J/kg",
+            "W m-2",
+            "kg kg-1",
+            "s-1",
+            "/s",
+            "degC",
+            "°C",
+            "hPa",
+            "mm",
+            "m",
+            "gpm",
+            "Numeric",
+            "1",
+            "m2 s-2",
+            "m**2 s**-2",
+            "m^2/s^2",
+            "m² s⁻²",
         ] {
             assert_eq!(ds_core::units::display_conversion(spelling), None);
             assert!(

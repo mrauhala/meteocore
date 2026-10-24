@@ -510,12 +510,8 @@ pub fn parameter_names(
             "type": "Parameter",
             "observedProperty": {"label": {"en": label(&p.name, &p.title)}}
         });
-        let unit = p.unit.trim();
-        if !unit.is_empty() {
-            entry["unit"] = json!({
-                "label": {"en": unit},
-                "symbol": {"value": unit, "type": "http://www.opengis.net/def/uom/UCUM/"}
-            });
+        if let Some(unit) = unit_json(&p.unit) {
+            entry["unit"] = unit;
         }
         if let Some(extent) = extent(&p.name) {
             entry["extent"] = extent;
@@ -543,6 +539,31 @@ pub fn parameter_names(
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     Some(Value::Object(entries.into_iter().collect()))
+}
+
+/// The EDR `unit` object of a parameter served in `unit`, or `None` when
+/// the engine knows no unit: one rule for EDR's `parameter_names` and
+/// CoverageJSON and the Maps/Tiles [`parameter_names`]. A unit QUDT has an
+/// entry for carries its QUDT identifier and `qudt:symbol` (Metocean
+/// Requirement 7E, a custom `type` EDR 1.2 `/req/edr/rc-parameters` G
+/// allows). Any other keeps the engine's string: typed
+/// `https://www.opengis.net/def/uom/UCUM/` when it is UCUM (`deg/km`, `1`),
+/// else a plain-string symbol with no scheme (`dBZ`, `gpm`, BUFR code
+/// tables), since G reserves the UCUM type for UCUM. Valid in both EDR 1.1
+/// and CoverageJSON, whose `symbol` is a string or a `{value, type}` object.
+pub fn unit_json(unit: &str) -> Option<Value> {
+    let unit = unit.trim();
+    if unit.is_empty() {
+        return None;
+    }
+    let symbol = match ds_core::units::qudt_unit(unit) {
+        Some(q) => json!({"value": q.symbol, "type": q.uri()}),
+        None if ds_core::units::is_ucum(unit) => {
+            json!({"value": unit, "type": ds_core::units::UCUM_TYPE})
+        }
+        None => Value::String(unit.into()),
+    };
+    Some(json!({"label": {"en": unit}, "symbol": symbol}))
 }
 
 /// The `parameter-name` query parameter of the Maps and Tiles render routes,
@@ -791,6 +812,49 @@ mod tests {
         assert_eq!(names["t"]["unit"]["symbol"]["value"], "K");
         assert_eq!(names["x"]["observedProperty"]["label"]["en"], "x");
         assert!(names["x"].get("unit").is_none());
+    }
+
+    /// The Maps/Tiles units follow EDR's rule (#948): QUDT where QUDT has
+    /// the unit, UCUM-typed only for UCUM, else a plain string. `gpm` and
+    /// `dBZ` are no UCUM codes, so they are never typed as one.
+    #[test]
+    fn parameter_names_type_units_as_edr_does() {
+        let names = parameter_names(
+            &raster(&[
+                ("z", "Geopotential", "m2 s-2"),
+                ("gh", "Geopotential height", "gpm"),
+                ("t", "Temperature", "°C"),
+                ("lapse", "Lapse rate", "deg/km"),
+                ("dbz", "Reflectivity", "dBZ"),
+            ]),
+            &[],
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(
+            names["z"]["unit"],
+            json!({"label": {"en": "m2 s-2"}, "symbol": {"value": "m²/s²",
+                "type": "https://qudt.org/vocab/unit/M2-PER-SEC2"}})
+        );
+        assert_eq!(
+            names["gh"]["unit"],
+            json!({"label": {"en": "gpm"}, "symbol": "gpm"})
+        );
+        assert_eq!(names["dbz"]["unit"]["symbol"], "dBZ");
+        assert_eq!(
+            names["t"]["unit"]["symbol"]["type"],
+            "https://qudt.org/vocab/unit/DEG_C"
+        );
+        assert_eq!(
+            names["lapse"]["unit"]["symbol"],
+            json!({"value": "deg/km", "type": "https://www.opengis.net/def/uom/UCUM/"})
+        );
+        for name in ["z", "gh", "t", "lapse", "dbz"] {
+            assert_ne!(
+                names[name]["unit"]["symbol"]["type"], "http://www.opengis.net/def/uom/UCUM/",
+                "{name}"
+            );
+        }
     }
 
     /// RGB composites (#819) are listed with the parameters, in name order:

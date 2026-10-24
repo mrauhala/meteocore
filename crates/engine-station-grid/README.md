@@ -212,8 +212,9 @@ cadence = "PT1H"
   every 5 s. They are not sampled again: a new terrain needs the grid
   rebuilt, by a reload that rebuilds the terrain collection or by a
   restart.
-- **Units.** Heights must state `m`, `km`, `ft` or `gpm` (read as metres);
-  a mask `1`, `proportion` or no unit (inside from 0.5) or `%` (inside from
+- **Units.** Heights must state `m`, `km`, `ft` or `gpm` (read as metres),
+  or be geopotential in `m2 s-2`, any spelling, such as an NWP surface `z`,
+  read as its geopotential height z ÷ g₀; a mask `1`, `proportion` or no unit (inside from 0.5) or `%` (inside from
   50). Anything else, or a collection of several parameters without
   `elevation_parameter` / `land_mask_parameter`, fails the grid at load
   (for a remote collection, when first sampled: it then stays degraded).

@@ -102,6 +102,7 @@ fn router(engine: Arc<SatelliteEngine>, dir: &Path) -> axum::Router {
         csv: None,
         preview: None,
         derive_wind: None,
+        derive_geopotential_height: None,
     };
     let state = Arc::new(ArcSwap::from_pointee(api_edr::handlers::EdrState {
         engines: HashMap::from([("goes19-fd".to_string(), engine as Arc<dyn EdrEngine>)]),

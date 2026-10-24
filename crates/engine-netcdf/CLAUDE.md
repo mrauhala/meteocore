@@ -627,8 +627,8 @@ and every other unit-keyed match read them through
   from each variable's CF `units` and `standard_name` through
   `ds_core::units::cf_display_conversion`: the rules engine-bufr uses and
   engine-grib's `default_display` twins (K → °C, Pa → hPa, kg m-2 → mm
-  identity, kg m-2 s-1 → mm/h × 3600 #1213, m2 s-2 → gpm, in any
-  spelling), plus CF's `1` → % × 100 when the standard name is
+  identity, kg m-2 s-1 → mm/h × 3600 #1213, in any spelling; geopotential's
+  m2 s-2 is served as stored, #948), plus CF's `1` → % × 100 when the standard name is
   `relative_humidity` or ends in `_area_fraction` or `_area_fraction_in_atmosphere_layer` (MEPS relative humidity and cloud cover). A unit without a rule
   (m/s, `%`, `1` with any other standard name or none) is `None` and served
   as stored. Never a name table: the standard name is source metadata, the
@@ -652,7 +652,8 @@ and every other unit-keyed match read them through
 - **Styles:** MEPS takes the defaults by served unit: temperature
   `temperature` −90…50 °C, MSLP `pressure` 950–1050 hPa, the run-start
   accumulation `precipitation_accumulation` 0–200 mm, geopotential
-  `viridis` 0–21 000 gpm, relative humidity and cloud cover `humidity` and
+  `viridis` 0–21 000 gpm × g₀ in m^2/s^2 and its derived
+  `geopotential_height_pl` 0–21 000 gpm (#948), relative humidity and cloud cover `humidity` and
   `cloud_cover` 0–100 (served in %). The shipped examples keep only the ±20 m/s
   surface wind components and a collection-level `temperature` palette with
   no range.
@@ -765,8 +766,10 @@ values), and the level (`"10 m"`: the single level's value and
 units) as the pairing level; the grid's `GridAxes::of(crs)`. MEPS's Lambert
 grid is `Rotated`, so `x_wind_10m`/`y_wind_10m` give `wind_speed_10m` and no
 direction (decision 6; rotation by the convergence angle is a follow-up on
-#897). The server wraps the engine in `DerivedWind` (`wind_wrapped`), which
-derives on every API from the components' own reads. Components on the
+#897). The server wraps the engine in `ds_core::derive::Derived`
+(`derived_wrapped`), which derives on every API from the components' own
+reads; a `geopotential` variable gives its height the same way
+(`geopotential_pl` → `geopotential_height_pl`, #948). Components on the
 pressure axis (`x_wind_pl`/`y_wind_pl`) have no pairing level, as
 `ParameterFacts::level` asks of a parameter spanning the vertical axis:
 they pair into `wind_speed_pl`, and `DerivedWind` reads both at the one `z`
@@ -827,8 +830,9 @@ appended leads and new runs move nothing.
 ## Server wiring
 
 `engine_type = "netcdf"`, allowlist `["edr", "wms", "maps", "tiles"]` (the
-default `apis` works). Registered through `wind_wrapped` (in
-`DERIVE_WIND_ENGINES`; `derive_wind = false` opts out), its EDR side
+default `apis` works). Registered through `derived_wrapped` (in
+`DERIVE_WIND_ENGINES` and `DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES`;
+`derive_wind = false`, `derive_geopotential_height = false` opt out), its EDR side
 through `register_point_engine` for GetFeatureInfo whether or not it lists
 `edr`. `netcdf_parameters` keeps the engine's own variables, which the
 recovery loop compares, while the styles are resolved for the wrapper's

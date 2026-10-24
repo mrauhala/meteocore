@@ -18,13 +18,16 @@
 //!   whose source states no height takes the terrain at its position.
 //! - Units come from the collection's own metadata: heights in `m`, `km`,
 //!   `ft` or `gpm` (geopotential metres, read as metres: they differ by
-//!   under 0.1 % at the surface), a mask as a fraction (`1`, `proportion`,
-//!   no unit: inside from 0.5) or in `%` (inside from 50). Anything else is a
-//!   load error, never a guess.
+//!   under 0.1 % at the surface), or geopotential in `m2 s-2` in any
+//!   spelling (a GRIB `z` surface field), read as its geopotential height
+//!   Φ / g₀, the gpm its derived `gh` serves (#948); a mask as a fraction
+//!   (`1`, `proportion`, no unit: inside from 0.5) or in `%` (inside from
+//!   50). Anything else is a load error, never a guess.
 
 use std::sync::Arc;
 
 use ds_core::geo::EARTH_RADIUS_M;
+use ds_core::geopotential::STANDARD_GRAVITY;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo};
 use ds_core::units::canonical_unit;
 
@@ -245,7 +248,7 @@ fn check(info: &RasterInfo, source: &RasterSource) -> Result<Option<Reading>, St
         Kind::Elevation => metres_per_unit(unit).ok_or_else(|| {
             format!(
                 "{key} '{id}' states its heights ('{name}') in '{unit}'; they must be in m, km, \
-                 ft or gpm"
+                 ft or gpm, or be geopotential in m2 s-2"
             )
         })?,
         Kind::LandMask => mask_threshold(unit).ok_or_else(|| {
@@ -270,9 +273,12 @@ fn names(listed: &[(&str, &str)]) -> String {
 }
 
 /// Metres per unit of a stated height unit; `None` for anything else.
+/// Geopotential (`m2 s-2`, any spelling) reads as geopotential height,
+/// Φ / g₀ in gpm, which is read as metres like `gpm` itself.
 pub(crate) fn metres_per_unit(unit: &str) -> Option<f64> {
     match canonical_unit(unit).as_ref() {
         "m" | "metre" | "metres" | "meter" | "meters" | "gpm" => Some(1.0),
+        "m2 s-2" => Some(1.0 / STANDARD_GRAVITY),
         "km" => Some(1000.0),
         "ft" | "foot" | "feet" => Some(0.3048),
         _ => None,
@@ -597,7 +603,22 @@ mod tests {
         assert_eq!(metres_per_unit("ft"), Some(0.3048));
         assert_eq!(metres_per_unit("gpm"), Some(1.0));
         assert_eq!(metres_per_unit(""), None);
-        assert_eq!(metres_per_unit("m2 s-2"), None);
+        // Geopotential, in every spelling ds_core reads as m2 s-2: its
+        // height, Φ / g₀ (#948). 9806.65 m2 s-2 is 1000 m.
+        for spelling in [
+            "m2 s-2",
+            "m**2 s**-2",
+            "m^2/s^2",
+            "m2/s2",
+            "m²/s²",
+            " m2.s-2 ",
+        ] {
+            let factor = metres_per_unit(spelling).unwrap_or_else(|| panic!("{spelling:?}"));
+            assert_eq!(factor, 1.0 / STANDARD_GRAVITY, "{spelling:?}");
+            assert!((9806.65 * factor - 1000.0).abs() < 1e-9, "{spelling:?}");
+        }
+        assert_eq!(metres_per_unit("m2 s-1"), None);
+        assert_eq!(metres_per_unit("m s-2"), None);
         assert_eq!(mask_threshold("1"), Some(0.5));
         assert_eq!(mask_threshold(""), Some(0.5));
         assert_eq!(mask_threshold("percent"), Some(50.0));

@@ -131,14 +131,18 @@ disk, no TOML needed.
   the asymmetry explicit, naming the watched dirs. Keep them writable only by
   trusted principals; avoid shared/NFS mounts for them.
 
-## Derived wind (#897)
+## Derived parameters (#897, #948)
 
-`wind_wrapped` registers grib/querydata/zarr engines (each GRIB level view
-too) wrapped in `ds_core::wind::DerivedWind` unless the collection sets
-`derive_wind = false`; styles are resolved from the wrapper's `RasterInfo`,
-so a derived speed layer gets the built-in `wind_speed` default. The
-wrapper logs one INFO line per u/v pair (`Collection 'x': wind u/v: …`) at
-load and when a pair's outcome changes. Wrappers live in
+`derived_wrapped` registers grib/querydata/zarr/netcdf engines (each GRIB
+level view too) wrapped in `ds_core::derive::Derived::with`, with the
+collection's `Derivations`: wind unless `derive_wind = false`, geopotential
+height (grib/zarr/netcdf) unless `derive_geopotential_height = false`; with
+both off the engine registers unwrapped. Styles are resolved from the
+wrapper's `RasterInfo`, so a derived speed layer gets the built-in
+`wind_speed` default and a derived height the `gh` default. The wrapper
+logs one INFO line per candidate (`Collection 'x': wind u/v: …`,
+`Collection 'x': geopotential height z: …`) at load and when its outcome
+changes. Wrappers live in
 `LoadResult::wind_by_id` / `ServerState::wind_handles` (configured id →
 registered id): a reused engine keeps its wrappers through `EngineReuse::wind`,
 so the registered `Arc` is the same after an incremental reload (a nowcast

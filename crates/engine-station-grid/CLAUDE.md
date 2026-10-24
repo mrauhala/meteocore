@@ -108,7 +108,10 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
   `(i + ½)/width`); a box across 180° goes unwrapped, `east > 180`, as the
   map APIs pass it. The terrain covers the grid widened by whole cells to
   the search radius (`rasters::dem_grid`), for stations outside the grid.
-  Units only from the collection's metadata: heights `m`/`km`/`ft`/`gpm`, a
+  Units only from the collection's metadata: heights `m`/`km`/`ft`/`gpm`, or
+  geopotential `m2 s-2` in any spelling (an NWP surface `z`, served in
+  m² s⁻² since #948), read as Φ / `ds_core::geopotential::STANDARD_GRAVITY`,
+  the gpm a derived `gh` serves (never a second 9.80665), a
   mask `1`/`proportion`/none (inside from 0.5) or `%` (from 50); anything
   else, or several parameters without `*_parameter`, is an error, never a
   guess. Their bytes count with one grid against the cache at load.

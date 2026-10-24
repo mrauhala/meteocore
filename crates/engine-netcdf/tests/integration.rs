@@ -69,14 +69,14 @@ fn stored(file: &str, variable: &str) -> Vec<Vec<f64>> {
 /// A stored value of `variable` in the committed MEPS fixtures as the
 /// engine serves it (#1209), each conversion written out here rather than
 /// taken from `ds_core::units`: temperatures from K to °C, MSLP from Pa to
-/// hPa, geopotential from m^2/s^2 to gpm, and the fractions in unit 1 whose
-/// standard name is `relative_humidity` or `cloud_area_fraction` to %. The
-/// precipitation's kg/m^2 is mm unchanged, and m/s has no rule.
+/// hPa, and the fractions in unit 1 whose standard name is
+/// `relative_humidity` or `cloud_area_fraction` to %. The precipitation's
+/// kg/m^2 is mm unchanged, and m/s and geopotential's m^2/s^2 (#948) have
+/// no rule.
 fn served(variable: &str, stored: f64) -> f64 {
     match variable {
         "air_temperature_2m" | "air_temperature_pl" => stored - 273.15,
         "air_pressure_at_sea_level" => stored / 100.0,
-        "geopotential_pl" => stored / 9.80665,
         "relative_humidity_2m" | "relative_humidity_pl" | "cloud_area_fraction" => stored * 100.0,
         _ => stored,
     }
@@ -950,7 +950,8 @@ fn values_are_served_in_display_units() {
     let u = wind.parameters.iter().find(|p| p.name == "x_wind_10m");
     assert_eq!(u.map(|p| p.unit.as_str()), Some("m/s"));
 
-    // Geopotential in m^2/s^2 as gpm, on a pressure level.
+    // Geopotential as stored, in m^2/s^2, on a pressure level (#948): its
+    // height is a derived parameter, never a display unit.
     let pl = meps_pl();
     let ten = at("2026-10-15T10:00:00Z");
     let cell = met_cell((j, i));
@@ -961,12 +962,15 @@ fn values_are_served_in_display_units() {
         .unwrap()
         .unwrap();
     assert!(
-        (drawn - stored / 9.80665).abs() < 1e-2,
-        "{drawn} gpm, stored {stored} m^2/s^2"
+        (drawn - stored).abs() < 1e-1,
+        "{drawn} m^2/s^2, stored {stored} m^2/s^2"
     );
-    assert!((5000.0..6000.0).contains(&drawn), "500 hPa near 5.5 km");
+    assert!(
+        (49_000.0..59_000.0).contains(&drawn),
+        "500 hPa near 5.5 km, times g0"
+    );
     let unit = &pl.get_parameter_descriptions()["geopotential_pl"].unit;
-    assert_eq!(unit, "gpm");
+    assert_eq!(unit, "m^2/s^2");
 
     // Relative humidity in unit 1 as %, on a pressure level.
     assert_eq!(stored_unit(pl_file, "relative_humidity_pl"), "1");
@@ -1482,7 +1486,7 @@ fn pressure_levels_are_the_vertical_axis() {
             "relative_humidity_pl"
         ]
     );
-    assert_eq!(info.parameters[3].unit, "gpm");
+    assert_eq!(info.parameters[3].unit, "m^2/s^2");
     assert_eq!(
         info.reference_times,
         [at("2026-10-15T06:00:00Z"), at("2026-10-15T09:00:00Z")]

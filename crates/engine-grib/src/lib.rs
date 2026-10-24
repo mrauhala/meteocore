@@ -6,6 +6,8 @@ mod diagnostics;
 mod discovery;
 #[cfg(test)]
 mod display_units_tests;
+#[cfg(test)]
+mod geopotential_tests;
 pub mod index;
 mod message_cache;
 mod metadata;

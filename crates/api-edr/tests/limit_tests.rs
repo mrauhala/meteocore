@@ -258,6 +258,7 @@ fn app(per_point: usize) -> App {
         csv: None,
         preview: None,
         derive_wind: None,
+        derive_geopotential_height: None,
     };
     let state = Arc::new(ArcSwap::from_pointee(EdrState {
         engines: HashMap::from([("obs".to_string(), engine)]),

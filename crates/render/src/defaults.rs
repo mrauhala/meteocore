@@ -53,6 +53,13 @@ const CLOUD_CONTAINS: &[&str] = &["cloudcover", "cloudiness", "totalcloud"];
 /// `low_/medium_/high_type_…` and `convective_…` layers, `fog_area_fraction`.
 const CF_CLOUD_CONTAINS: &[&str] = &["cloudareafraction", "fogareafraction"];
 
+/// Geopotential height's one range for every pressure level, gpm: 1000 hPa
+/// up to 50 hPa (~20.6 km).
+const GEOPOTENTIAL_HEIGHT_MAX: f64 = 21_000.0;
+/// The same height as geopotential, m² s⁻²: a level draws one colour as
+/// `z` and as the `gh` derived from it (#948).
+const GEOPOTENTIAL_MAX: f64 = GEOPOTENTIAL_HEIGHT_MAX * ds_core::geopotential::STANDARD_GRAVITY;
+
 /// First match wins — order the specific before the generic.
 static RULES: &[DefaultRule] = &[
     // Radar reflectivity — data-valued palette (stops carry dBZ).
@@ -274,24 +281,31 @@ static RULES: &[DefaultRule] = &[
     },
     // Geopotential / geopotential height. The matcher never sees the level,
     // so one range serves every pressure level: 0–21 000 gpm spans 1000 hPa
-    // up to 50 hPa (~20.6 km), and 206 000 m2 s-2 is the same height as
-    // geopotential. Names only: a "Geopotential height anomaly" title is
-    // signed and must not match. MEPS's `geopotential_pl` (#1067 PR 8) is
-    // stored in m^2/s^2 and served in gpm (#1209).
+    // up to 50 hPa (~20.6 km), and that height times g₀ (~205 940 m2 s-2)
+    // as geopotential. Names only: a "Geopotential height anomaly" title is
+    // signed and must not match. Geopotential is served in m² s⁻² (#948):
+    // MEPS's `geopotential_pl` (#1067 PR 8) as stored, m^2/s^2, ECMWF's `z`
+    // likewise; their derived heights (`geopotential_height_pl`, `gh`) are
+    // in gpm.
     DefaultRule {
         names: &[
             "z",
             "gh",
+            "gp",
             "hgt",
             "fi",
             "zg",
             "geopotential",
             "geopotentialheight",
             "geopotentialpl",
+            "geopotentialheightpl",
         ],
         contains: &[],
         palette: "viridis",
-        unit_ranges: &[(&["gpm", "m"], 0.0, 21_000.0), (&["m2s2"], 0.0, 206_000.0)],
+        unit_ranges: &[
+            (&["gpm", "m"], 0.0, GEOPOTENTIAL_HEIGHT_MAX),
+            (&["m2s2"], 0.0, GEOPOTENTIAL_MAX),
+        ],
         fallback_range: None,
     },
     // Surface pressure: elevated terrain reaches ~500 hPa, so it needs a far
@@ -672,6 +686,38 @@ mod tests {
         assert_eq!(air.palette, "temperature");
     }
 
+    /// #948: every name a derived geopotential height gets renders with the
+    /// geopotential-height default over 0–21 000 gpm, as the native heights
+    /// it never duplicates do; the geopotential it is derived from, in
+    /// m² s⁻², over the same heights times g₀.
+    #[test]
+    fn derived_geopotential_heights_get_the_height_default() {
+        let d = builtin();
+        for (name, title) in [
+            ("gh", "Geopotential height"),
+            ("gh", "Geopotential height (surface)"),
+            ("HGT", "Geopotential height (surface)"),
+            ("geopotential_height", "Geopotential height"),
+            ("geopotential_height_pl", "Geopotential height"),
+        ] {
+            let m = d
+                .match_default(name, title, Some("gpm"))
+                .unwrap_or_else(|| panic!("no default for {name}"));
+            assert_eq!(m.palette, "viridis", "{name}");
+            assert_eq!(m.range, Some((0.0, GEOPOTENTIAL_HEIGHT_MAX)), "{name}");
+        }
+        for (name, unit) in [
+            ("z", "m2 s-2"),
+            // wgrib2's abbreviation.
+            ("GP", "m2 s-2"),
+            ("geopotential_pl", "m^2/s^2"),
+        ] {
+            let m = d.match_default(name, "Geopotential", Some(unit)).unwrap();
+            assert_eq!(m.range, Some((0.0, GEOPOTENTIAL_MAX)), "{name}");
+        }
+        assert!((GEOPOTENTIAL_MAX - 205_939.65).abs() < 1e-6);
+    }
+
     /// #897: every name and title a derived wind speed gets, and the native
     /// speeds it never duplicates, render as wind speed over 0–40 m/s. A
     /// derived direction is no map layer and matches nothing.
@@ -834,7 +880,13 @@ mod tests {
                 "z",
                 "Geopotential",
                 "m**2 s**-2",
-                ("viridis", (0.0, 206_000.0)),
+                ("viridis", (0.0, GEOPOTENTIAL_MAX)),
+            ),
+            (
+                "z",
+                "Geopotential",
+                "m2 s-2",
+                ("viridis", (0.0, GEOPOTENTIAL_MAX)),
             ),
             (
                 "q",
@@ -1089,7 +1141,7 @@ mod tests {
                 "",
                 &["m2 s-2", "m**2 s**-2", "m^2/s^2", "m²/s²"][..],
                 "viridis",
-                (0.0, 206_000.0),
+                (0.0, GEOPOTENTIAL_MAX),
             ),
             (
                 "tcwv",
@@ -1345,8 +1397,9 @@ mod tests {
 
     /// #1067 PR 8: MEPS's pressure-level variables, with the titles and units
     /// engine-netcdf reports for them (testdata/meps-netcdf-pl; temperature
-    /// in °C, geopotential in gpm and relative humidity in %, #1209, and in
-    /// the files' K, m^2/s^2 and 1). Their wind
+    /// in °C and relative humidity in %, #1209, and in the files' K and 1;
+    /// geopotential as stored, m^2/s^2, #948, and in gpm, and the height
+    /// derived from it in gpm). Their wind
     /// components and the speed derived from them span ±80 / 0–80 m/s, twice
     /// the surface scale, for the jet; temperature, geopotential and
     /// relative humidity keep their all-levels ranges. The surface
@@ -1402,7 +1455,14 @@ mod tests {
                 "Geopotential pressure levels",
                 "m^2/s^2",
                 "viridis",
-                Some((0.0, 206_000.0)),
+                Some((0.0, GEOPOTENTIAL_MAX)),
+            ),
+            (
+                "geopotential_height_pl",
+                "Geopotential height",
+                "gpm",
+                "viridis",
+                Some((0.0, 21_000.0)),
             ),
             (
                 "relative_humidity_pl",
@@ -1733,7 +1793,7 @@ mod tests {
                 "Geopotential",
                 Some("m**2 s**-2"),
                 "viridis",
-                Some((0.0, 206_000.0)),
+                Some((0.0, GEOPOTENTIAL_MAX)),
             ),
             // QueryData: FMI names, their numbers' units.
             (

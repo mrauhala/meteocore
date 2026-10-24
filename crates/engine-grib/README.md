@@ -39,9 +39,9 @@ level type) exposes every parameter; each retained run is an EDR instance.
   precipitation and snow in metres of water). Display conversions: K → °C
   (temperature differences stay K), Pa → hPa, kg m⁻² → mm, kg m⁻² s⁻¹ →
   mm/h (× 3600, precipitation rates such as `PRATE` and ECMWF `tprate`),
-  metres of water → mm, m² s⁻² → gpm (÷ 9.80665), proportion → %; other
-  units pass unchanged. An unknown triple is labelled by its short name,
-  unitless.
+  metres of water → mm, proportion → %; other units pass unchanged.
+  Geopotential (`z`, `GP`) stays in m² s⁻²: its height is another
+  quantity. An unknown triple is labelled by its short name, unitless.
 
 ## What it serves
 
@@ -80,6 +80,12 @@ compares engines.
   or grid-relative flag. The server's shared wrapper derives speed (`10si`,
   `WIND`, …) on every API and direction in EDR, unless the collection sets
   `derive_wind = false`.
+- **Geopotential height.** A view with geopotential (0/3/4) in m² s⁻² and
+  no geopotential height (0/3/5) at that level gets one derived, z ÷ g₀ in
+  gpm, on every API: `z` → `gh`, wgrib2 `GP` → `HGT`. On a single-level
+  view `z` is the surface geopotential and `gh` the terrain height. The
+  ECMWF pressure levels ship `gh` and get no second one.
+  `derive_geopotential_height = false` opts out.
 
 ## Configuration
 

@@ -102,6 +102,7 @@ fn build_empty_router() -> axum::Router {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -326,6 +327,7 @@ fn build_failing_router() -> axum::Router {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -541,6 +543,7 @@ fn build_populated_state_with_wms(
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -938,6 +941,7 @@ fn build_counting_router_versioned(
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -1214,6 +1218,7 @@ fn build_snapping_router_with(
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -1675,6 +1680,7 @@ fn site_collection_config(id: &str) -> CollectionConfig {
         csv: None,
         preview: None,
         derive_wind: None,
+        derive_geopotential_height: None,
     }
 }
 
@@ -1972,6 +1978,7 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -2329,6 +2336,7 @@ fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -2411,6 +2419,7 @@ fn capabilities_emit_reference_time_dimension_for_forecast() {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -2486,6 +2495,7 @@ fn capabilities_omit_reference_time_dimension_for_non_forecast() {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -2822,6 +2832,7 @@ fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
     let cmap = Arc::new(LutColorMap::from_builtin(
@@ -3014,6 +3025,7 @@ fn build_advancing_router() -> AdvancingFixture {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
 
@@ -4411,6 +4423,7 @@ mod per_parameter_times {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         };
         let style = StyleInfo {
             name: "default".to_string(),
@@ -5313,6 +5326,7 @@ mod composites {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         };
         let style = StyleInfo {
             name: "default".to_string(),
@@ -6081,6 +6095,7 @@ fn archive_capabilities() -> String {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();

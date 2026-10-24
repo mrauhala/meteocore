@@ -108,7 +108,8 @@ descriptor is encoded in (`K`, `Pa`, `kg m-2`, `m s-1`, …); the shared
 `ds_core::units::display_conversion` rule for that unit, in any spelling
 (`ds_core::units::canonical_unit`: an override's `kg/m2` or `kelvin` is
 `kg m-2` or `K`) — the same table engine-grib applies (K → °C, Pa → hPa,
-kg m-2 → mm, kg m-2 s-1 → mm/h × 3600, m2 s-2 → gpm, WMO's
+kg m-2 → mm, kg m-2 s-1 → mm/h × 3600 (geopotential's m2 s-2 has no rule,
+#948), WMO's
 `Proportion`/`(0 - 1)` → % × 100; anything else unchanged, served as
 spelled) —
 is applied at row extraction, so the store

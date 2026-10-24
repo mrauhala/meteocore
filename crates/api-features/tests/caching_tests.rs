@@ -161,6 +161,7 @@ fn build_router() -> axum::Router {
             csv: None,
             preview: None,
             derive_wind: None,
+            derive_geopotential_height: None,
         },
     );
     engines.insert("areas".to_string(), Arc::clone(&AREAS));
