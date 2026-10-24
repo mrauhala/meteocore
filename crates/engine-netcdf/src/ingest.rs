@@ -18,7 +18,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use ds_core::cf::{self, AxisRole, CfAttr, PressureUnit, RegularAxis};
 use ds_core::geo::{Crs, GeoTransform};
-use ds_core::resample::CurvilinearNodes;
+use ds_core::resample::{CellWindow, CurvilinearNodes};
 
 use crate::decode_budget::BUDGET;
 use crate::source::Reader;
@@ -202,6 +202,41 @@ impl FieldRead {
             })
             .collect();
         NcSliceInfo { selections }
+    }
+
+    /// [`Self::selection`] of `window`'s cells alone (#1171): its rows and
+    /// columns, rows counted north first as the sampler counts them, so a
+    /// field stored south-up (`flipped`) reads the stored rows they are,
+    /// reversed when decoded. `None` when the field's last two axes are not
+    /// its grid's or the window passes their end.
+    pub(crate) fn window_selection(
+        &self,
+        time: u32,
+        level: usize,
+        window: CellWindow,
+        flipped: bool,
+    ) -> Option<NcSliceInfo> {
+        let (ny, nx) = self.shape();
+        let (ny, nx) = (ny as u64, nx as u64);
+        let (rows, columns) = (window.rows, window.columns);
+        if u64::from(rows.1) >= ny || u64::from(columns.1) >= nx {
+            return None;
+        }
+        let rows = if flipped {
+            (ny - 1 - u64::from(rows.1), ny - 1 - u64::from(rows.0))
+        } else {
+            (u64::from(rows.0), u64::from(rows.1))
+        };
+        let slice = |(start, last): (u64, u64)| NcSliceInfoElem::Slice {
+            start,
+            end: last + 1,
+            step: 1,
+        };
+        let mut selection = self.selection(time, level);
+        let n = selection.selections.len();
+        selection.selections[n - 2] = slice(rows);
+        selection.selections[n - 1] = slice((u64::from(columns.0), u64::from(columns.1)));
+        Some(selection)
     }
 }
 

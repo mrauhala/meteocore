@@ -77,16 +77,18 @@ impl Reader {
         }
     }
 
-    /// Variable `read` at step `time` and served level `level`, in its
-    /// stored type. A failed remote read keeps its meaning
-    /// ([`ReadFailure::to_error`]): a deadline, or a replaced file's 503.
+    /// Variable `read` at step `time` and served level `level` over
+    /// `selection` (its whole field, [`FieldRead::selection`], or a window
+    /// of it, [`FieldRead::window_selection`]), in its stored type. A
+    /// failed remote read keeps its meaning ([`ReadFailure::to_error`]): a
+    /// deadline, or a replaced file's 503.
     pub(crate) fn read_field(
         &self,
         read: &FieldRead,
         time: u32,
         level: usize,
+        selection: &NcSliceInfo,
     ) -> Result<Raw, DataServerError> {
-        let selection = read.selection(time, level);
         match self {
             Reader::Nc { nc, .. } => {
                 let name = &*read.name;
@@ -99,7 +101,7 @@ impl Reader {
                 macro_rules! typed {
                     ($t:ty, $variant:ident) => {
                         Raw::$variant(into_vec(
-                            nc.read_variable_slice::<$t>(name, &selection)
+                            nc.read_variable_slice::<$t>(name, selection)
                                 .map_err(fail)?,
                         ))
                     };
@@ -115,7 +117,29 @@ impl Reader {
                     Stored::Double => typed!(f64, F64),
                 })
             }
-            Reader::Dap(dap) => dap.read_field(read, &selection),
+            Reader::Dap(dap) => dap.read_field(read, selection),
+        }
+    }
+
+    /// Whether a window of a field costs less to read than the field, so an
+    /// EDR query reads only the cells it samples (#1171): through OPeNDAP
+    /// the server cuts the hyperslab, a 2 × 2 window of a MEPS field being
+    /// 428 bytes against 4.06 MB. A NetCDF file is read by chunk, whatever
+    /// the window (MEPS keeps a field in one chunk), so its queries read
+    /// whole fields.
+    pub(crate) fn reads_windows(&self) -> bool {
+        matches!(self, Reader::Dap(_))
+    }
+
+    /// Whether the whole field of `read` at step `time`, level `level` was
+    /// fetched already and is in the chunk cache: an OPeNDAP reply a
+    /// render, a prewarm or another query left. A query then decodes it
+    /// rather than fetch a window of it. Always `false` for a NetCDF file,
+    /// which reads no windows.
+    pub(crate) fn holds_field(&self, read: &FieldRead, time: u32, level: usize) -> bool {
+        match self {
+            Reader::Nc { .. } => false,
+            Reader::Dap(dap) => dap.holds(read, &read.selection(time, level)),
         }
     }
 

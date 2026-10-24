@@ -40,6 +40,12 @@
 //!   field (bilinear, nearest at a nodata neighbour, the half cell past the
 //!   outer cell edges). The footprint guard walks the grid's extent
 //!   ([`CurvilinearGrid::footprint_envelope`]), as for a projected grid.
+//! - **Windows** (#1171): [`SourceGrid::cells_read`] is the window of cells
+//!   [`SourceGrid::value_at`] reads at a point query's position, and
+//!   [`SourceGrid::value_in`] samples a field read over such a window
+//!   alone, bit for bit as `value_at` samples the whole field: an engine
+//!   whose source can serve part of a field (engine-netcdf through
+//!   OPeNDAP) reads only what its positions need.
 //!
 //! The output is [`RasterValues::F32`]: interpolation runs in `f64` and only
 //! the stored value is narrowed, with NaN for nodata. An engine serving
@@ -384,29 +390,119 @@ impl SourceGrid {
         self.locate(col, row).is_some()
     }
 
+    /// The cells [`Self::value_at`] may read at `position`
+    /// ([`Self::position`]): the four around it that lie on the grid, the
+    /// nearest of them included, as an inclusive window; `None` off the
+    /// grid ([`Self::covers`]). On a global grid the column one past the
+    /// last is the first, so a position between them reads a window of
+    /// every column. Widened over several positions by
+    /// [`CellWindow::union`], it is the part of a field a point query
+    /// needs, which [`Self::value_in`] samples as `value_at` samples the
+    /// whole field.
+    pub fn cells_read(&self, (col, row): (f64, f64)) -> Option<CellWindow> {
+        let (col, global) = self.locate(col, row)?;
+        let ([c0, c1], [r0, r1]) = self.corners(col, row, global);
+        let bounds = |a: Option<i64>, b: Option<i64>| {
+            let (lo, hi) = match (a, b) {
+                (Some(a), Some(b)) => (a.min(b), a.max(b)),
+                (Some(a), None) | (None, Some(a)) => (a, a),
+                (None, None) => return None,
+            };
+            Some((lo as u32, hi as u32))
+        };
+        Some(CellWindow {
+            columns: bounds(c0, c1)?,
+            rows: bounds(r0, r1)?,
+        })
+    }
+
+    /// [`Self::value_at`] of a field read only over `window`: `values` are
+    /// the window's cells, row-major (`window.width() × window.height()`,
+    /// its first row the northernmost), with `nodata` as their sentinel.
+    /// Wherever `window` holds [`Self::cells_read`] of `position`, the
+    /// value is `value_at`'s on the whole field, bit for bit: the same
+    /// cells in the same arithmetic. `None` where `value_at` is, for values
+    /// of the wrong length, and for a position whose cells lie outside
+    /// `window`.
+    pub fn value_in(
+        &self,
+        window: CellWindow,
+        values: &[f32],
+        nodata: Option<f32>,
+        position: (f64, f64),
+    ) -> Option<f64> {
+        if values.len() as u64 != window.cells() || !window.holds(self.cells_read(position)?) {
+            return None;
+        }
+        let (c0, r0) = (window.columns.0 as usize, window.rows.0 as usize);
+        let width = window.width() as usize;
+        self.sample_cells(position.0, position.1, |c, r| {
+            RasterValues::decode_f32(values[(r - r0) * width + (c - c0)], nodata)
+        })
+    }
+
     /// The value at fractional source position `(col, row)`
     /// ([`centred`]): bilinear, or the nearest cell's where a neighbour is
     /// nodata or off the grid; `None` off the grid (beyond the half cell
     /// past its edges, [`Self::locate`]) or where the mapping is undefined.
     fn sample(&self, values: &[f32], nodata: Option<f32>, col: f64, row: f64) -> Option<f64> {
+        let nx = self.width as usize;
+        self.sample_cells(col, row, |c, r| {
+            RasterValues::decode_f32(values[r * nx + c], nodata)
+        })
+    }
+
+    /// Column `c` of the grid, `None` off it; a global grid's column one
+    /// past its last is its first. Every cell [`Self::sample_cells`] reads
+    /// and [`Self::cells_read`] bounds goes through it.
+    #[inline]
+    fn column(&self, c: i64, global: bool) -> Option<i64> {
+        let nx = i64::from(self.width);
+        if global && c >= nx {
+            Some(0)
+        } else {
+            (0..nx).contains(&c).then_some(c)
+        }
+    }
+
+    /// The columns and rows of the four cells around `(col, row)`, the
+    /// column already moved by [`Self::locate`] (`global` its grid's), each
+    /// `None` off the grid ([`Self::column`]): the cells
+    /// [`Self::sample_cells`] reads, its nearest cell among them, which
+    /// [`Self::cells_read`] bounds.
+    #[inline]
+    fn corners(&self, col: f64, row: f64, global: bool) -> ([Option<i64>; 2], [Option<i64>; 2]) {
+        let ny = i64::from(self.height);
+        let (col0, row0) = (col.floor() as i64, row.floor() as i64);
+        let row = |r: i64| (0..ny).contains(&r).then_some(r);
+        (
+            [self.column(col0, global), self.column(col0 + 1, global)],
+            [row(row0), row(row0 + 1)],
+        )
+    }
+
+    /// [`Self::sample`] over cells read by `cell(column, row)`, each on the
+    /// grid and among [`Self::corners`] (the same `floor` and
+    /// [`Self::column`]): the whole field's for a map or [`Self::value_at`],
+    /// a window's for [`Self::value_in`].
+    #[inline]
+    fn sample_cells(
+        &self,
+        col: f64,
+        row: f64,
+        cell: impl Fn(usize, usize) -> Option<f64>,
+    ) -> Option<f64> {
         let (col, global) = self.locate(col, row)?;
         let nx = i64::from(self.width);
         let ny = i64::from(self.height);
         let col0 = col.floor() as i64;
         let row0 = row.floor() as i64;
-        let column = |c: i64| {
-            if global && c >= nx {
-                Some(0)
-            } else {
-                (0..nx).contains(&c).then_some(c)
-            }
-        };
         let at = |c: Option<i64>, r: i64| {
             let c = c.filter(|_| (0..ny).contains(&r))?;
-            RasterValues::decode_f32(values[(r * nx + c) as usize], nodata)
+            cell(c as usize, r as usize)
         };
         let (dx, dy) = (col - col0 as f64, row - row0 as f64);
-        let (c0, c1) = (column(col0), column(col0 + 1));
+        let (c0, c1) = (self.column(col0, global), self.column(col0 + 1, global));
         match (
             at(c0, row0),
             at(c1, row0),
@@ -421,7 +517,7 @@ impl SourceGrid {
             _ => {
                 let nearest = |f: f64, n: i64| ((f + 0.5).floor() as i64).clamp(0, n - 1);
                 let nc = if global {
-                    column((col + 0.5).floor() as i64)
+                    self.column((col + 0.5).floor() as i64, true)
                 } else {
                     Some(nearest(col, nx))
                 };
@@ -472,6 +568,55 @@ impl SourceGrid {
             return None;
         }
         Some((col, global))
+    }
+}
+
+/// An inclusive window of a [`SourceGrid`]'s cells, row 0 north as
+/// [`SourceGrid::value_at`] counts rows: the cells a point query reads
+/// ([`SourceGrid::cells_read`] of each position, joined by
+/// [`Self::union`]), so an engine that can read part of a field reads only
+/// these and samples them with [`SourceGrid::value_in`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CellWindow {
+    /// The first and last column.
+    pub columns: (u32, u32),
+    /// The first and last row.
+    pub rows: (u32, u32),
+}
+
+impl CellWindow {
+    /// The smallest window holding both.
+    pub fn union(self, other: Self) -> Self {
+        CellWindow {
+            columns: (
+                self.columns.0.min(other.columns.0),
+                self.columns.1.max(other.columns.1),
+            ),
+            rows: (self.rows.0.min(other.rows.0), self.rows.1.max(other.rows.1)),
+        }
+    }
+
+    /// Columns in the window.
+    pub fn width(&self) -> u32 {
+        self.columns.1 - self.columns.0 + 1
+    }
+
+    /// Rows in the window.
+    pub fn height(&self) -> u32 {
+        self.rows.1 - self.rows.0 + 1
+    }
+
+    /// Cells in the window: the length of its values.
+    pub fn cells(&self) -> u64 {
+        u64::from(self.width()) * u64::from(self.height())
+    }
+
+    /// Whether `other` lies within this window.
+    pub fn holds(&self, other: CellWindow) -> bool {
+        self.columns.0 <= other.columns.0
+            && other.columns.1 <= self.columns.1
+            && self.rows.0 <= other.rows.0
+            && other.rows.1 <= self.rows.1
     }
 }
 

@@ -186,7 +186,9 @@ static BLOCKS: LazyLock<ByteBoundedCache<BlockKey, Bytes>> = LazyLock::new(|| {
 
 /// Compressed chunks, `MC_NETCDF_CHUNK_CACHE_MB` (default 512 MiB, about
 /// 340 MEPS fields), shared by every NetCDF collection; and the OPeNDAP
-/// replies of fields, uncompressed (about 126 MEPS fields).
+/// replies of fields, uncompressed (about 126 MEPS fields), and of the
+/// windows EDR queries read (#1171), each under its own constraint and
+/// weighted by its size (428 bytes for a 2 × 2 MEPS window).
 static CHUNKS: LazyLock<ByteBoundedCache<ChunkKey, Bytes>> = LazyLock::new(|| {
     ByteBoundedCache::from_env(
         "MC_NETCDF_CHUNK_CACHE_MB",
@@ -509,6 +511,17 @@ pub(crate) fn dap_reply(
         part: Part::Dap(constraint.into()),
     };
     CHUNKS.get_or_insert_with_timeout(&key, wait(), fetch, timed_out)
+}
+
+/// Whether `file`'s OPeNDAP reply to `constraint` is in the chunk cache
+/// now, without a recency bump or a count: an EDR query decodes a whole
+/// field a render, a prewarm or another query left there rather than fetch
+/// a window of it (#1171).
+pub(crate) fn dap_cached(file: &Arc<FileId>, constraint: &str) -> bool {
+    CHUNKS.contains_key(&ChunkKey {
+        file: file.clone(),
+        part: Part::Dap(constraint.into()),
+    })
 }
 
 /// How long a reader waits for another's fetch of a block or chunk: until

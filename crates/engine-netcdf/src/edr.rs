@@ -17,6 +17,14 @@
 //! the query alone. Trajectories ([`trajectory`]) and cubes ([`cube`]) read
 //! only the fields they sample, and the cap counts exactly those.
 //!
+//! Through OPeNDAP a query reads only the window of each field its
+//! positions sample (#1171): the cells around every position on the grid
+//! ([`SourceGrid::cells_read`]), joined into one hyperslab per field, at
+//! most half the field ([`worth_a_window`]), and samples the window to the
+//! value the whole field gives ([`field::QueryField::value_at`]). A 67-lead
+//! MEPS series at a point reads 67 replies of 428 bytes, not 67 of
+//! 4.06 MB.
+//!
 //! A per-step amount (#1165) is sampled from its run-start accumulation at
 //! each step and at the run's step before, at the same positions, and the
 //! samples differenced ([`crate::catalog::step_amount`]), as the map
@@ -40,7 +48,7 @@ use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
     QueryResult, VerticalCoord,
 };
-use ds_core::resample::SourceGrid;
+use ds_core::resample::{CellWindow, SourceGrid};
 use ds_core::vertical::VerticalDimension;
 
 use crate::catalog::{step_amount, Catalog, Layout, Param, Run, Step};
@@ -82,6 +90,30 @@ type Positions = Arc<Vec<Option<(f64, f64)>>>;
 fn on_grid(source: &SourceGrid, lon: f64, lat: f64) -> Option<(f64, f64)> {
     let position = source.position(lon, lat);
     source.covers(position).then_some(position)
+}
+
+/// The cells sampling `positions` reads (#1171): each position's
+/// [`SourceGrid::cells_read`], joined; `None` with none on the grid.
+fn cells_read(source: &SourceGrid, positions: &Positions) -> Option<CellWindow> {
+    positions
+        .iter()
+        .flatten()
+        .filter_map(|&position| source.cells_read(position))
+        .reduce(CellWindow::union)
+}
+
+/// Whether a query reads `window` of a field on `source` rather than the
+/// whole field (#1171): while it is at most half the field's cells. A
+/// whole field's reply, kept in the chunk cache, serves every later query
+/// and map of the field, a window's only the same window again; with no
+/// telling whether the field will be wanted whole, reading a window and
+/// then the field costs window + field, and the window alone saves only
+/// while it is under half the field. Point queries are far under it (a
+/// MEPS point is 2 × 2 of 949 × 1069 cells); an area or a cube passes it
+/// over more than half the grid, and reads the field whole.
+fn worth_a_window(window: CellWindow, source: &SourceGrid) -> bool {
+    let (columns, rows) = source.size();
+    window.cells().saturating_mul(2) <= u64::from(columns) * u64::from(rows)
 }
 
 /// One query's field reads: the selected parameters at the selected steps
@@ -277,6 +309,9 @@ impl NetcdfEngine {
     /// many parameters and fields sample it (an accumulation and its
     /// per-step amount, or the step before one step that is another step),
     /// and sampled once at each distinct list of positions asked of it.
+    /// Through OPeNDAP the read is one window covering every position asked
+    /// of the field (#1171, [`worth_a_window`]), each distinct positions
+    /// list's cells found once.
     /// Fields are read through `ds_executor::field_jobs`, four at a time,
     /// each job under the query's deadline; a failed read fails the query,
     /// never a null: a replaced file or the decode budget is a 503, the
@@ -349,12 +384,38 @@ impl NetcdfEngine {
             let flipped = layout.grid.flipped();
             let shared = layout.clone();
             let decodes: Arc<AtomicU64> = self.decodes.clone();
+            // Each field's window, where its file reads windows (#1171):
+            // each positions list's cells, keyed by the list's address,
+            // found once however many fields sample it.
+            let mut cells: HashMap<*const (), Option<CellWindow>> = HashMap::new();
+            let jobs: Vec<_> = to_read
+                .into_iter()
+                .map(|(step, index, level, asked)| {
+                    let window = step
+                        .file
+                        .reader
+                        .reads_windows()
+                        .then(|| {
+                            asked
+                                .iter()
+                                .filter_map(|(_, positions)| {
+                                    *cells
+                                        .entry(Arc::as_ptr(positions).cast())
+                                        .or_insert_with(|| cells_read(&layout.source, positions))
+                                })
+                                .reduce(CellWindow::union)
+                        })
+                        .flatten()
+                        .filter(|&window| worth_a_window(window, &layout.source));
+                    (step, index, level, asked, window)
+                })
+                .collect();
             ds_executor::field_jobs::run_field_jobs(
                 ds_executor::query_runtime(),
-                to_read.into_iter(),
-                move |(step, index, level, asked)| {
-                    let values = field::read_uncached(
-                        &step.file, index, step.index, level, flipped, &decodes,
+                jobs.into_iter(),
+                move |(step, index, level, asked, window)| {
+                    let field = field::read_uncached(
+                        &step.file, index, step.index, level, flipped, window, &decodes,
                     )?;
                     // Sampled from the stored field, then converted to the
                     // unit served, as the map converts each pixel (#1209).
@@ -365,7 +426,7 @@ impl NetcdfEngine {
                                 .iter()
                                 .map(|position| {
                                     position
-                                        .and_then(|p| shared.source.value_at(&values, None, p))
+                                        .and_then(|p| field.value_at(&shared.source, p))
                                         .map(|raw| shared.to_display(index, raw))
                                 })
                                 .collect::<Vec<_>>();
@@ -1146,6 +1207,23 @@ mod tests {
             none.err()
         );
         assert_eq!(engine.field_decodes(), 0, "nothing read");
+    }
+
+    /// A query reads a window of a field while it is at most half the
+    /// field's cells (#1171), and the field whole past that.
+    #[test]
+    fn a_window_is_read_up_to_half_the_field() {
+        use ds_core::geo::{Crs, GeoTransform};
+        let gt = GeoTransform::from_cell_centres(0.0, 1.0, 10.0, -1.0, 10, 11, Crs::Wgs84);
+        let source = SourceGrid::new(gt.unwrap());
+        let window = |columns: u32, rows: u32| CellWindow {
+            columns: (0, columns - 1),
+            rows: (0, rows - 1),
+        };
+        assert!(worth_a_window(window(2, 2), &source));
+        assert!(worth_a_window(window(5, 11), &source), "55 of 110 cells");
+        assert!(!worth_a_window(window(8, 7), &source), "56 of 110");
+        assert!(!worth_a_window(window(10, 11), &source));
     }
 
     /// One fixture field: 11 × 10 `f32`.

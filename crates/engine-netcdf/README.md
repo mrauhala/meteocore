@@ -56,7 +56,16 @@ or downloaded whole.
   in its stored type: 4.06 MB for a MEPS field, since the server sends it
   uncompressed (THREDDS ignores `Accept-Encoding` there), against a 1.5 MB
   compressed chunk read by range. The reply is kept in the chunk cache,
-  single-flight, as a chunk is. Replies stream chunked, without
+  single-flight, as a chunk is. An EDR or GetFeatureInfo query reads only
+  the window of each field it samples (#1171): one `.dods` of the cells
+  around its points or area cells, a 2 × 2 window of a MEPS field being
+  428 bytes against 4.06 MB (0.10 s against 0.25 s from a server's
+  network, 2026-10-24), so a 67-lead position series is about 29 KB per
+  variable instead of 272 MB. Windows are kept in the chunk cache under
+  their own constraints; the values are the ones the whole field gives. A
+  window over half the field reads the field whole, and a field a render,
+  a prewarm or another query left cached whole is sampled whole, without a
+  request. Maps read whole fields. Replies stream chunked, without
   `Content-Length`, and are read whole; every request takes the host's
   request limit and back-off. Nothing is HEADed: a file's version is its
   catalog entry's, and a file the catalog shows changed is opened again.
@@ -191,7 +200,8 @@ apart from its surface family (MEPS `sfc`).
 - Each field is read once per query for all points, four at a time, and
   is not added to the field cache. A trajectory or cube reads only the
   fields it samples, and a field it samples nowhere on the grid is not
-  read.
+  read. Through OPeNDAP the read is the window of the field the query
+  samples (see OPeNDAP above); the query cap still counts whole fields.
 
 **Derived wind.** Components are identified by CF `standard_name`
 (`x_wind`/`y_wind` and `grid_eastward_wind`/`grid_northward_wind` are
@@ -283,7 +293,7 @@ Process-wide environment variables, shared by every NetCDF collection:
 | Variable | Default | Bounds |
 |---|---|---|
 | `MC_NETCDF_FIELD_CACHE_MB` | `256` | Decoded fields (~4 MB per MEPS field) |
-| `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote files read by range (~1.5 MB per MEPS field), and the `.dods` replies of fields read through OPeNDAP (~4.06 MB) |
+| `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote files read by range (~1.5 MB per MEPS field), and the `.dods` replies of fields read through OPeNDAP (~4.06 MB) and of the windows EDR queries read (428 bytes at a point) |
 | `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote files read by range; at least 8 |
 | `MC_NETCDF_READ_MEMORY_MB` | `1024` | Buffers of field reads in progress; a read that does not fit is a 503 |
 | `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read (steps × levels × variables read × one field; a trajectory counts the (step, level) fields its path reads, a cube the levels its `z` positions take; a per-step amount adds its accumulation at the step before each step), checked before any read; over it a 400. Fits one variable, or a derived wind speed (both components), over a 67-lead MEPS run |

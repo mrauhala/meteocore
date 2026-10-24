@@ -26,11 +26,13 @@
 #   - per field drawn: one 4.06 MB `.dods` of one level the first time any
 #     request draws it. A field is one variable at one level and lead: 13
 #     per variable and lead, so a layer is 871 fields over a run.
-#   - per EDR query: the same `.dods` for each field not yet cached. A query
-#     without `z` reads every level: a position series over a whole run at
-#     all 13 levels is 871 fields (3.5 GB), past the query cap
-#     (MC_NETCDF_EDR_QUERY_MB, 544 MiB) and refused with a 400 that names
-#     the levels; ask for the levels you need with `z`.
+#   - per EDR query: one `.dods` per field of only the cells the query
+#     samples (a point: 2 x 2 cells of one level, 428 bytes), the whole
+#     field for an area over more than half the grid. A query without `z`
+#     reads every level, and the query cap counts whole fields: a position
+#     series over a whole run at all 13 levels is 871 fields (3.5 GB
+#     whole), past MC_NETCDF_EDR_QUERY_MB (544 MiB) and refused with a 400
+#     that names the levels; ask for the levels you need with `z`.
 
 id = "meps-netcdf-pl-opendap"
 title = "MEPS Pressure Levels (CF-NetCDF, thredds.met.no OPeNDAP)"

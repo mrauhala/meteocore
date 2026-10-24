@@ -447,6 +447,61 @@ fn meps_pressure_level_fields_are_on_the_pressure_axis_bottom_first() {
     }
 }
 
+/// A window's selection (#1171) reads the stored rows its cells are: a
+/// window of the south-up MEPS fixture, decoded north-up, holds the same
+/// cells as the whole field decoded north-up; selected as stored
+/// (unflipped), the same cells as the whole field as stored. A window past
+/// the field selects nothing.
+#[test]
+fn a_window_reads_the_cells_of_the_whole_field() {
+    let reader = open_fixture("meps-netcdf/meps_sfc_00_20261015T06Z.nc");
+    let names = vec!["air_temperature_2m".to_string()];
+    let inspected = inspect(&reader, &Wanted::Listed(&names), 0).unwrap();
+    assert!(inspected.grid.flipped(), "MEPS stores its rows south-up");
+    let read = &inspected.fields[0].read;
+    let (ny, nx) = read.shape();
+    assert_eq!((ny, nx), (11, 10));
+    let windows = [
+        CellWindow {
+            columns: (4, 5),
+            rows: (5, 6),
+        },
+        CellWindow {
+            columns: (0, 9),
+            rows: (0, 0),
+        },
+        CellWindow {
+            columns: (7, 9),
+            rows: (8, 10),
+        },
+    ];
+    for flipped in [true, false] {
+        let whole = reader
+            .read_field(read, 0, 0, &read.selection(0, 0))
+            .unwrap()
+            .decode(&read.packing, flipped, nx);
+        for window in windows {
+            let selection = read.window_selection(0, 0, window, flipped).unwrap();
+            let part = reader.read_field(read, 0, 0, &selection).unwrap().decode(
+                &read.packing,
+                flipped,
+                window.width() as usize,
+            );
+            let cut: Vec<f32> = (window.rows.0..=window.rows.1)
+                .flat_map(|row| {
+                    (window.columns.0..=window.columns.1)
+                        .map(move |col| (row as usize, col as usize))
+                })
+                .map(|(row, col)| whole[row * nx + col])
+                .collect();
+            assert_eq!(part, cut, "{window:?}, flipped {flipped}");
+        }
+    }
+    let past = |columns, rows| read.window_selection(0, 0, CellWindow { columns, rows }, true);
+    assert!(past((0, 9), (0, 11)).is_none());
+    assert!(past((0, 10), (0, 0)).is_none());
+}
+
 /// A pressure axis stored in Pa, top first, is served in hPa bottom first:
 /// stored 50000, 85000, 100000 Pa (top first) are served as 1000, 850,
 /// 500 hPa (bottom first), exactly.
