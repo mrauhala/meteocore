@@ -419,19 +419,27 @@ impl DataStore {
         ranges: &[Range<usize>],
     ) -> Result<Option<Vec<Bytes>>, DataServerError> {
         let ranges: Vec<Range<u64>> = ranges.iter().cloned().map(to_u64).collect();
-        let result = self.block_on_with(handle, FetchBudget::Request, async {
-            let fetch = |range| self.inner.get_range(path, range);
-            match object_store::coalesce_ranges(&ranges, fetch, 0).await {
-                Ok(parts) => Ok(Some(parts)),
-                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(e) => Err(e),
-            }
-        })?;
-        if let Some(parts) = &result {
-            let total: usize = parts.iter().map(Bytes::len).sum();
-            self.bytes_read.fetch_add(total as u64, Ordering::Relaxed);
-        }
-        Ok(result)
+        self.block_on_with(handle, FetchBudget::Request, self.ranges_opt(path, &ranges))
+    }
+
+    /// The byte `ranges` of the object at `path`, one buffer per range in
+    /// input order, or `None` when it is missing; counted in
+    /// [`Self::bytes_read`]. Each range is a GET of its own, up to ten at
+    /// once, and only ranges that overlap or touch are merged.
+    async fn ranges_opt(
+        &self,
+        path: &ObjectPath,
+        ranges: &[Range<u64>],
+    ) -> Result<Option<Vec<Bytes>>, object_store::Error> {
+        let fetch = |range| self.inner.get_range(path, range);
+        let parts = match object_store::coalesce_ranges(ranges, fetch, 0).await {
+            Ok(parts) => parts,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let total: usize = parts.iter().map(Bytes::len).sum();
+        self.bytes_read.fetch_add(total as u64, Ordering::Relaxed);
+        Ok(Some(parts))
     }
 
     /// Like [`Self::get_range`], but a refusal that no retry can change is a
@@ -631,20 +639,20 @@ impl DataStore {
         path: &ObjectPath,
         handle: Option<&tokio::runtime::Handle>,
     ) -> Result<Option<Bytes>, DataServerError> {
-        let result = self.block_on_with(handle, FetchBudget::Request, self.whole_opt(path))?;
-        if let Some(b) = &result {
-            self.bytes_read.fetch_add(b.len() as u64, Ordering::Relaxed);
-        }
-        Ok(result)
+        self.block_on_with(handle, FetchBudget::Request, self.whole_opt(path))
     }
 
-    /// The whole object at `path`, or `None` when it is missing.
+    /// The whole object at `path`, or `None` when it is missing; counted in
+    /// [`Self::bytes_read`].
     async fn whole_opt(&self, path: &ObjectPath) -> Result<Option<Bytes>, object_store::Error> {
-        match self.inner.get(path).await {
-            Ok(res) => Ok(Some(res.bytes().await?)),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e),
-        }
+        let bytes = match self.inner.get(path).await {
+            Ok(res) => res.bytes().await?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        self.bytes_read
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(Some(bytes))
     }
 
     /// Start [`Self::get_opt`] of `path` as a task on `handle`'s runtime and
@@ -668,11 +676,49 @@ impl DataStore {
     /// runs the task only while something drives it, so the reads would not
     /// progress while the caller works.
     pub fn start_get_opt(&self, path: &ObjectPath, handle: &tokio::runtime::Handle) -> PendingGet {
+        self.start(path, handle, |store, object| async move {
+            store.whole_opt(&object).await
+        })
+    }
+
+    /// Start [`Self::get_ranges_opt`] of `path` as a task on `handle`'s
+    /// runtime and return at once, as [`Self::start_get_opt`] starts a
+    /// whole-object read (#1261): a walk over many objects reads the next
+    /// ones' byte ranges while it works on the current one. Each range is a
+    /// GET of its own, up to ten at once, and only ranges that overlap or
+    /// touch are merged. [`PendingGet::wait`] returns one buffer per range,
+    /// in input order, `None` for a missing object; the read's limits, its
+    /// sharing and its abort on the last drop are those of
+    /// [`Self::start_get_opt`].
+    pub fn start_get_ranges_opt(
+        &self,
+        path: &ObjectPath,
+        ranges: &[Range<usize>],
+        handle: &tokio::runtime::Handle,
+    ) -> PendingGet<Vec<Bytes>> {
+        let ranges: Vec<Range<u64>> = ranges.iter().cloned().map(to_u64).collect();
+        self.start(path, handle, |store, object| async move {
+            store.ranges_opt(&object, &ranges).await
+        })
+    }
+
+    /// Run `read` of `path` as a task on `handle`'s runtime under
+    /// [`FetchBudget::Request`], unless the request deadline has passed.
+    fn start<T, F>(
+        &self,
+        path: &ObjectPath,
+        handle: &tokio::runtime::Handle,
+        read: impl FnOnce(DataStore, ObjectPath) -> F,
+    ) -> PendingGet<T>
+    where
+        T: Clone + Send + Sync + 'static,
+        F: std::future::Future<Output = Result<Option<T>, object_store::Error>> + Send + 'static,
+    {
         use futures::FutureExt;
         debug_assert_eq!(
             handle.runtime_flavor(),
             tokio::runtime::RuntimeFlavor::MultiThread,
-            "start_get_opt needs a multi-thread runtime"
+            "a started read needs a multi-thread runtime"
         );
         if ds_core::deadline::check().is_err() {
             return PendingGet {
@@ -680,27 +726,15 @@ impl DataStore {
                 read: PendingRead::Expired,
             };
         }
-        let store = self.clone();
-        let object = path.clone();
-        let task = handle.spawn(async move {
-            let result = within(FetchBudget::Request, None, async {
-                store
-                    .whole_opt(&object)
-                    .await
-                    .map_err(|e| DataServerError::from(StorageError::from(e)))
-            })
-            .await?;
-            if let Some(b) = &result {
-                store
-                    .bytes_read
-                    .fetch_add(b.len() as u64, Ordering::Relaxed);
-            }
-            Ok(result)
-        });
+        let read = read(self.clone(), path.clone());
+        let task = handle.spawn(within(FetchBudget::Request, None, async move {
+            read.await
+                .map_err(|e| DataServerError::from(StorageError::from(e)))
+        }));
         let abort = task.abort_handle();
         let result = async move {
             match task.await {
-                Ok(Ok(bytes)) => Ok(bytes),
+                Ok(Ok(read)) => Ok(read),
                 Ok(Err(DataServerError::Storage(e))) => Err(e),
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(e) => Err(format!("read task failed: {e}")),
@@ -1331,38 +1365,40 @@ fn block_on_ambient<F: std::future::Future>(future: F) -> Result<F::Output, Data
     }
 }
 
-/// A whole-object read running on a runtime ahead of the synchronous code
-/// that needs its bytes, from [`DataStore::start_get_opt`]. Collect it with
-/// [`Self::wait`], from as many threads as hold it (#1127); dropping it
-/// aborts the read, so its last holder going away unread stops it.
+/// A read running on a runtime ahead of the synchronous code that needs its
+/// bytes: a whole object (`T = Bytes`) from [`DataStore::start_get_opt`], or
+/// byte ranges (`T = Vec<Bytes>`) from [`DataStore::start_get_ranges_opt`].
+/// Collect it with [`Self::wait`], from as many threads as hold it (#1127);
+/// dropping it aborts the read, so its last holder going away unread stops
+/// it.
 #[must_use = "dropping a PendingGet aborts its read"]
-pub struct PendingGet {
+pub struct PendingGet<T = Bytes> {
     path: ObjectPath,
-    read: PendingRead,
+    read: PendingRead<T>,
 }
 
 /// What a started read ends with, cloned to each waiter: the bytes, `None`
 /// for a missing object, or the failure's message. Every failure of the
 /// read itself is a [`DataServerError::Storage`], which is not `Clone`.
-type ReadOutcome = Result<Option<Bytes>, String>;
+type ReadOutcome<T> = Result<Option<T>, String>;
 
-enum PendingRead {
+enum PendingRead<T> {
     /// The request deadline had passed when the read was asked for, so it
     /// was never sent.
     Expired,
     Running {
         /// The task's outcome, which every waiter polls.
-        result: futures::future::Shared<futures::future::BoxFuture<'static, ReadOutcome>>,
+        result: futures::future::Shared<futures::future::BoxFuture<'static, ReadOutcome<T>>>,
         abort: tokio::task::AbortHandle,
     },
 }
 
-impl PendingGet {
-    /// Wait for the read and return what [`DataStore::get_opt`] would have:
-    /// `Ok(None)` for a missing object, and `Err` for every other failure.
-    /// The wait is limited by the request deadline in scope on this thread,
-    /// `DeadlineExceeded` when it passes; the read goes on for any other
-    /// holder.
+impl<T: Clone> PendingGet<T> {
+    /// Wait for the read and return what [`DataStore::get_opt`] (or
+    /// [`DataStore::get_ranges_opt`]) would have: `Ok(None)` for a missing
+    /// object, and `Err` for every other failure. The wait is limited by the
+    /// request deadline in scope on this thread, `DeadlineExceeded` when it
+    /// passes; the read goes on for any other holder.
     ///
     /// `handle` picks the bridge by the caller's context, as
     /// [`DataStore::get_opt_on`] and [`DataStore::get_opt`] do: `Some` drives
@@ -1372,7 +1408,7 @@ impl PendingGet {
     pub fn wait(
         &self,
         handle: Option<&tokio::runtime::Handle>,
-    ) -> Result<Option<Bytes>, DataServerError> {
+    ) -> Result<Option<T>, DataServerError> {
         let result = match &self.read {
             PendingRead::Expired => return Err(DataServerError::DeadlineExceeded),
             PendingRead::Running { result, .. } => result.clone(),
@@ -1404,7 +1440,7 @@ impl PendingGet {
     }
 }
 
-impl Drop for PendingGet {
+impl<T> Drop for PendingGet<T> {
     fn drop(&mut self) {
         if let PendingRead::Running { abort, .. } = &self.read {
             abort.abort();
@@ -1412,7 +1448,7 @@ impl Drop for PendingGet {
     }
 }
 
-impl std::fmt::Debug for PendingGet {
+impl<T> std::fmt::Debug for PendingGet<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingGet")
             .field("path", &self.path)
@@ -2305,6 +2341,72 @@ mod deadline_tests {
                 .wait(None)
         });
         assert!(matches!(read.await.unwrap(), Ok(Some(_))));
+    }
+
+    /// #1261: `start_get_ranges_opt` runs `get_ranges_opt` as a task, as
+    /// `start_get_opt` runs `get_opt`: reads started before the first is
+    /// collected overlap, each comes back one buffer per range in input
+    /// order and counted, a missing object is `Ok(None)`, and a read asked
+    /// for past the deadline is never sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn started_ranged_reads_overlap_and_answer_as_get_ranges_opt() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        use object_store::ObjectStoreExt;
+        use std::time::{Duration, Instant};
+        let inner = object_store::memory::InMemory::new();
+        let data: Vec<u8> = (0..=255).collect();
+        for key in ["a.h5", "b.h5"] {
+            let payload = object_store::PutPayload::from(data.clone());
+            inner.put(&ObjectPath::from(key), payload).await.unwrap();
+        }
+        let delay = Duration::from_millis(200);
+        let config = ThrottleConfig {
+            wait_get_per_call: delay,
+            ..ThrottleConfig::default()
+        };
+        let store = DataStore::new(Arc::new(ThrottledStore::new(inner, config)));
+        let handle = tokio::runtime::Handle::current();
+        let on_worker = (store.clone(), handle.clone());
+        let ranges = [200..203, 4..6];
+        tokio::task::spawn_blocking(move || {
+            let start =
+                |key: &str| store.start_get_ranges_opt(&ObjectPath::from(key), &ranges, &handle);
+            let started = Instant::now();
+            let reads = ["a.h5", "b.h5", "missing.h5"].map(start);
+            for read in &reads[..2] {
+                let parts = read.wait(Some(&handle)).unwrap().unwrap();
+                assert_eq!(parts, [&[200u8, 201, 202][..], &[4, 5][..]]);
+            }
+            assert!(reads[2].wait(Some(&handle)).unwrap().is_none());
+            assert!(!reads[2].failed(), "a missing object is not a failed read");
+            assert!(
+                started.elapsed() < delay * 3,
+                "three reads of two ranges each overlapped: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(store.bytes_read(), 10);
+
+            let _scope = ds_core::deadline::enter(Some(Instant::now()));
+            let read = start("a.h5");
+            assert!(read.failed());
+            assert!(matches!(
+                read.wait(Some(&handle)),
+                Err(DataServerError::DeadlineExceeded)
+            ));
+            assert_eq!(store.bytes_read(), 10, "an expired read is not sent");
+        })
+        .await
+        .unwrap();
+
+        // A runtime worker collects through `block_in_place` (`None`).
+        let (store, handle) = on_worker;
+        let read = tokio::spawn(async move {
+            store
+                .start_get_ranges_opt(&ObjectPath::from("b.h5"), &[0..2, 9..10], &handle)
+                .wait(None)
+        });
+        let parts = read.await.unwrap().unwrap().unwrap();
+        assert_eq!(parts, [&[0u8, 1][..], &[9][..]]);
     }
 }
 

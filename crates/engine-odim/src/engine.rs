@@ -42,6 +42,7 @@ use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
 
+use ds_storage::bytes::Bytes;
 use ds_storage::discovery::{
     expand_prefix_for_range, expand_prefix_pattern, validate_prefix_pattern, FilenameMatcher,
     Schedule, Settling, TemplateProber, TemplateSpec, TimeWindow, MAX_TEMPLATE_SLOTS,
@@ -279,9 +280,9 @@ fn template_prober(
 /// `scan_remote` already filters by size at list time, but an object
 /// can grow between listing and fetching — the `head` closes that gap
 /// so a runaway object can't be pulled unbounded into memory.
-fn fetch_bytes(location: &Location) -> Result<Vec<u8>, DataServerError> {
+fn fetch_bytes(location: &Location) -> Result<Bytes, DataServerError> {
     match location {
-        Location::Local(path) => std::fs::read(path).map_err(|e| {
+        Location::Local(path) => std::fs::read(path).map(Bytes::from).map_err(|e| {
             DataServerError::Engine(format!(
                 "failed to read ODIM file `{}`: {e}",
                 path.display()
@@ -297,7 +298,7 @@ fn fetch_bytes(location: &Location) -> Result<Vec<u8>, DataServerError> {
                     crate::catalog::MAX_REMOTE_FILE_SIZE
                 )));
             }
-            store.get(&object).map(|b| b.to_vec())
+            store.get(&object)
         }
     }
 }

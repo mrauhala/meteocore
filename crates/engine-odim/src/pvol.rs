@@ -27,9 +27,10 @@
 //! into the engine, `MapEngine`, EDR, or the server.
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use ds_storage::bytes::Bytes;
 use hdf5_reader::{Attribute, Hdf5File};
 
-use crate::reader::{RawPixels, ReadError};
+use crate::reader::{open_bytes, BytesStorage, RawPixels, ReadError};
 
 /// Radar site metadata parsed from `/where` plus the `/what/source`
 /// identifier string.
@@ -165,14 +166,15 @@ fn read_moment_array(
     crate::reader::read_raw_pixels_2d(&ds, nrays, nbins, path)
 }
 
-/// Parse an ODIM_H5 polar volume from a byte slice. The whole file
-/// must fit in memory — typical PVOL files are 10–30 MB.
+/// Parse an ODIM_H5 polar volume from its fetched bytes, opened without a
+/// copy ([`open_bytes`]): the parse copies only the metadata it reads. The
+/// whole file must fit in memory — typical PVOL files are 10–30 MB.
 ///
 /// Sweeps are returned sorted by elevation angle ascending. A volume
 /// with zero `/datasetN` groups, or a sweep with zero moments, is an
 /// error ([`ReadError::NoSweeps`] / [`ReadError::NoMoments`]).
-pub fn read_polar_volume(bytes: &[u8]) -> Result<PolarVolume, ReadError> {
-    let file = Hdf5File::from_bytes(bytes).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
+pub fn read_polar_volume(bytes: &Bytes) -> Result<PolarVolume, ReadError> {
+    let file = open_bytes(bytes)?;
 
     // Closure-based attribute helpers — `Group` isn't pub-exported by
     // `hdf5-reader`, so each helper resolves the group by path.
@@ -391,12 +393,12 @@ fn read_moment(
 /// `nrays`/`nbins` come from the owning sweep. Used by the engine's
 /// bounded pixel cache so the full sweep stack is never resident.
 pub fn read_moment_pixels(
-    bytes: &[u8],
+    bytes: &Bytes,
     dataset_path: &str,
     nrays: usize,
     nbins: usize,
 ) -> Result<RawPixels, ReadError> {
-    let file = Hdf5File::from_bytes(bytes).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
+    let file = open_bytes(bytes)?;
     read_moment_array(&file, dataset_path, nrays, nbins)
 }
 
@@ -404,7 +406,7 @@ pub fn read_moment_pixels(
 ///
 /// The batch companion to [`read_moment_pixels`], for the engine's poll-time
 /// pixel pre-warm: priming N moments of a freshly-downloaded volume with one
-/// `from_bytes` structure parse instead of N. Each request is
+/// structure parse instead of N. Each request is
 /// `(dataset_path, nrays, nbins)`; the returned vec has one
 /// `(dataset_path, RawPixels)` entry per **successfully** decoded request, in
 /// input order. A moment that fails to decode is skipped — logged at `debug!`
@@ -413,19 +415,14 @@ pub fn read_moment_pixels(
 /// mark) — so it's diagnosable without flooding production logs. Only a failure
 /// to open the file at all is an error (it would fail every moment identically).
 pub fn read_moments_pixels<'a>(
-    bytes: &[u8],
+    bytes: &Bytes,
     requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
 ) -> Result<Vec<(String, RawPixels)>, ReadError> {
-    let mut out = Vec::new();
-    visit_moments_pixels(bytes, requests, |path, result| match result {
-        Ok(px) => out.push((path.to_string(), px)),
-        Err(e) => tracing::debug!("read_moments_pixels: skipping moment `{path}`: {e}"),
-    })?;
-    Ok(out)
+    read_moments_pixels_in(BytesStorage::new(bytes), requests)
 }
 
-/// [`read_moments_pixels`] over a random-access `storage`: the byte ranges a
-/// cold miss fetched (#1047).
+/// [`read_moments_pixels`] over a random-access `storage`: the whole file in
+/// memory ([`BytesStorage`]), or the byte ranges a cold miss fetched (#1047).
 pub(crate) fn read_moments_pixels_in<'a>(
     storage: hdf5_reader::storage::DynStorage,
     requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
@@ -442,35 +439,26 @@ pub(crate) fn read_moments_pixels_in<'a>(
 /// outside the caller's bounded cache. A corrupt optional sibling does not
 /// prevent the requested moment from being returned.
 pub fn visit_moments_pixels<'a>(
-    bytes: &[u8],
+    bytes: &Bytes,
     requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
     visit: impl FnMut(&str, Result<RawPixels, ReadError>),
 ) -> Result<(), ReadError> {
-    let file = Hdf5File::from_bytes(bytes).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
-    visit_file_moments(&file, requests, visit);
-    Ok(())
+    visit_moments_pixels_in(BytesStorage::new(bytes), requests, visit)
 }
 
-/// [`visit_moments_pixels`] over a random-access `storage` rather than the
-/// whole file in memory: the byte ranges a cold miss fetched (#1047).
+/// [`visit_moments_pixels`] over a random-access `storage`: the whole file
+/// in memory ([`BytesStorage`]), or the byte ranges a cold miss fetched
+/// (#1047).
 pub(crate) fn visit_moments_pixels_in<'a>(
     storage: hdf5_reader::storage::DynStorage,
     requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
-    visit: impl FnMut(&str, Result<RawPixels, ReadError>),
+    mut visit: impl FnMut(&str, Result<RawPixels, ReadError>),
 ) -> Result<(), ReadError> {
     let file = Hdf5File::from_storage(storage).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
-    visit_file_moments(&file, requests, visit);
-    Ok(())
-}
-
-fn visit_file_moments<'a>(
-    file: &Hdf5File,
-    requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
-    mut visit: impl FnMut(&str, Result<RawPixels, ReadError>),
-) {
     for (path, nrays, nbins) in requests {
-        visit(path, read_moment_array(file, path, nrays, nbins));
+        visit(path, read_moment_array(&file, path, nrays, nbins));
     }
+    Ok(())
 }
 
 /// Combine ODIM's split `/what/date` (`YYYYMMDD`) and `/what/time`
@@ -496,18 +484,20 @@ fn parse_odim_timestamp(date: &str, time: &str) -> Result<DateTime<Utc>, ReadErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+
+    /// The committed polar volume (`testdata/make_pvol_cold_batch.py`).
+    const COLD_BATCH: &[u8] = include_bytes!("../../../testdata/pvol-cold-batch.h5");
 
     #[test]
     fn batch_continues_after_bad_sibling() {
-        let bytes = include_bytes!("../../../testdata/pvol-cold-batch.h5");
+        let bytes = Bytes::from_static(COLD_BATCH);
         let requests = [
             ("/dataset1/data1/data", 4, 8),
             ("/missing", 4, 8),
             ("/dataset2/data2/data", 4, 8),
         ];
         let mut results = Vec::new();
-        visit_moments_pixels(bytes, requests, |path, result| {
+        visit_moments_pixels(&bytes, requests, |path, result| {
             results.push((path.to_owned(), result.is_ok()));
         })
         .unwrap();
@@ -566,95 +556,105 @@ mod tests {
         assert_eq!(plc.as_deref(), Some("Vimpeli"));
     }
 
-    /// End-to-end read of the real FMI Anjalankoski polar volume.
-    ///
-    /// The 15 MB fixture is **not committed to git**, so the test
-    /// skips gracefully when it is absent — CI stays green; a local
-    /// checkout with the fixture exercises the full reader.
+    /// End-to-end read of the committed polar volume: the metadata a scan
+    /// parses and every moment's array, each `n * 10 + m` for `/datasetN/dataM`.
+    /// The real FMI, SMHI and DMI volumes are not committed: when present,
+    /// `fixture_volumes_decode_identically_from_their_byte_ranges` decodes
+    /// every moment of each.
     #[test]
-    fn reads_fmi_anjalankoski_pvol_fixture() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../testdata/radar-fmi-pvol/202605150000_fianj_PVOL.h5");
-        if !path.exists() {
-            eprintln!("skipping reads_fmi_anjalankoski_pvol_fixture: fixture absent at {path:?}");
-            return;
-        }
-
-        let bytes = std::fs::read(&path).expect("read fixture bytes");
-        let vol = read_polar_volume(&bytes).expect("parse FMI PVOL fixture");
-
-        // 13 elevation sweeps, sorted ascending by elevation angle.
-        assert_eq!(vol.sweeps.len(), 13, "expected 13 elevation sweeps");
-        assert!(
-            (vol.sweeps[0].elangle - 0.3).abs() < 0.05,
-            "lowest sweep elangle should be ~0.3°, got {}",
-            vol.sweeps[0].elangle
+    fn reads_the_committed_pvol_fixture() {
+        use chrono::TimeZone;
+        let bytes = Bytes::from_static(COLD_BATCH);
+        let vol = read_polar_volume(&bytes).expect("parse the committed PVOL fixture");
+        assert_eq!(vol.object, "PVOL");
+        assert_eq!(
+            vol.time,
+            Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 0).unwrap()
         );
-        for w in vol.sweeps.windows(2) {
-            assert!(
-                w[0].elangle <= w[1].elangle,
-                "sweeps must be elangle-ascending: {} then {}",
-                w[0].elangle,
-                w[1].elangle
+        assert_eq!(vol.site.nod.as_deref(), Some("test"));
+        assert_eq!(
+            (vol.site.plc.as_deref(), vol.site.wmo.as_deref()),
+            (None, None)
+        );
+        assert_eq!(
+            (vol.site.lon, vol.site.lat, vol.site.height),
+            (24.5, 60.3, 100.0)
+        );
+        assert_eq!(vol.file_len, COLD_BATCH.len() as u64);
+        let elangles: Vec<f64> = vol.sweeps.iter().map(|s| s.elangle).collect();
+        assert_eq!(elangles, [0.5, 1.0]);
+        for (n, sweep) in (1u8..).zip(&vol.sweeps) {
+            assert_eq!(
+                (
+                    sweep.nrays,
+                    sweep.nbins,
+                    sweep.rscale,
+                    sweep.rstart,
+                    sweep.a1gate
+                ),
+                (4, 8, 1000.0, 0.0, 0)
             );
-        }
-
-        // Every sweep has 360 azimuth rays. Range-bin counts vary by
-        // elevation (the real FMI volume uses fewer/coarser bins on
-        // higher sweeps), so only the lowest sweep is pinned to 500.
-        for (i, sweep) in vol.sweeps.iter().enumerate() {
-            eprintln!(
-                "sweep {i}: elangle={:.2} nrays={} nbins={} moments={}",
-                sweep.elangle,
-                sweep.nrays,
-                sweep.nbins,
-                sweep.moments.len()
-            );
-            assert_eq!(sweep.nrays, 360, "sweep {i} nrays");
-            assert!(!sweep.moments.is_empty(), "sweep {i} has moments");
-        }
-        assert_eq!(vol.sweeps[0].nbins, 500, "lowest sweep nbins");
-
-        // The lowest sweep carries 16 moments including TH and ZDR.
-        let sweep0 = &vol.sweeps[0];
-        assert_eq!(sweep0.moments.len(), 16, "sweep[0] moment count");
-        let quantities: Vec<&str> = sweep0.moments.iter().map(|m| m.quantity.as_str()).collect();
-        assert!(
-            quantities.contains(&"TH"),
-            "sweep[0] should expose TH, got {quantities:?}"
-        );
-        assert!(
-            quantities.contains(&"ZDR"),
-            "sweep[0] should expose ZDR, got {quantities:?}"
-        );
-
-        // Pixel arrays are read lazily — verify `read_moment_pixels` decodes
-        // each moment's `/datasetN/dataM/data` at the declared
-        // `(nrays, nbins)` for every sweep/moment pair.
-        for sweep in &vol.sweeps {
-            for m in &sweep.moments {
-                let px = read_moment_pixels(&bytes, &m.dataset_path, sweep.nrays, sweep.nbins)
-                    .unwrap_or_else(|e| panic!("read pixels for {}: {e}", m.quantity));
+            let quantities: Vec<&str> = sweep.moments.iter().map(|m| m.quantity.as_str()).collect();
+            assert_eq!(quantities, ["DBZH", "VRAD"]);
+            for (m, moment) in (1u8..).zip(&sweep.moments) {
+                let path = format!("/dataset{n}/data{m}/data");
+                assert_eq!(moment.dataset_path, path);
                 assert_eq!(
-                    px.shape(),
-                    (sweep.nrays, sweep.nbins),
-                    "moment {} array shape vs sweep grid",
-                    m.quantity
+                    (moment.gain, moment.offset, moment.nodata, moment.undetect),
+                    (0.5, -32.0, 255.0, 0.0)
                 );
+                let px = read_moment_pixels(&bytes, &path, sweep.nrays, sweep.nbins).unwrap();
+                let RawPixels::U8(px) = px else {
+                    panic!("{path}: u8 storage expected");
+                };
+                assert_eq!(px.dim(), (4, 8), "{path}");
+                assert!(px.iter().all(|&v| v == n * 10 + m), "{path}: {px:?}");
+            }
+        }
+    }
+
+    /// #1261: a file opened from shared bytes ([`BytesStorage`]) decodes as
+    /// the copying `Hdf5File::from_bytes` open does, every moment of the
+    /// committed volume and the chunked composite alike, and the reader is
+    /// handed only what it reads: decoding the composite's one dataset from
+    /// a 4 MiB file copies less than its 36 kB of HDF5.
+    #[test]
+    fn shared_bytes_decode_as_a_copy_and_copy_only_what_is_read() {
+        use crate::layout::tests::{one_moment_volume, padded, same_pixels, COMP, COMP_DATA};
+        let bytes = Bytes::from_static(COLD_BATCH);
+        let copied = Hdf5File::from_bytes(&bytes).unwrap();
+        let vol = read_polar_volume(&bytes).unwrap();
+        for sweep in &vol.sweeps {
+            for moment in &sweep.moments {
+                let path = moment.dataset_path.as_str();
+                let shared = read_moment_pixels(&bytes, path, sweep.nrays, sweep.nbins).unwrap();
+                let copy = read_moment_array(&copied, path, sweep.nrays, sweep.nbins).unwrap();
+                assert!(same_pixels(&shared, &copy), "{path}");
             }
         }
 
-        // Radar site identifiers + antenna position.
-        assert_eq!(vol.site.nod.as_deref(), Some("fianj"));
+        let bytes = padded(COMP, 4 << 20);
+        let volume = one_moment_volume(&bytes, COMP_DATA);
+        let (nrays, nbins) = (volume.sweeps[0].nrays, volume.sweeps[0].nbins);
+        let copy = read_moment_array(
+            &Hdf5File::from_bytes(&bytes).unwrap(),
+            COMP_DATA,
+            nrays,
+            nbins,
+        )
+        .unwrap();
+        let storage = BytesStorage::new(&bytes);
+        let mut shared = None;
+        visit_moments_pixels_in(storage.clone(), [(COMP_DATA, nrays, nbins)], |_, r| {
+            shared = Some(r)
+        })
+        .unwrap();
+        assert!(same_pixels(&shared.unwrap().unwrap(), &copy));
+        let served = storage.served.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
-            (vol.site.lat - 60.9039).abs() < 0.01,
-            "site lat ~60.9039, got {}",
-            vol.site.lat
-        );
-        assert!(
-            (vol.site.lon - 27.1081).abs() < 0.01,
-            "site lon ~27.1081, got {}",
-            vol.site.lon
+            served > 0 && served < COMP.len() as u64,
+            "{served} of {} bytes handed to the reader",
+            bytes.len()
         );
     }
 }
