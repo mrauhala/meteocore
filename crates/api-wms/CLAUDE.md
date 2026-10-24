@@ -155,6 +155,12 @@ error images never are. Measured on a day of a live deployment's GetMaps
   so halving from 512 MB costs at most that share. A miss on a meta-tiled
   view usually costs assembly and encoding (~40 ms), not an engine read:
   give spare memory to `metatile_cache_mb`.
+- **Hot allocation.** The same replay with `quick_cache`'s hot ring lowered
+  from its 0.97 default (`ByteBoundedCache::new_with_hot_allocation`): at
+  256 MB, 0.5 and 0.25 stayed near the default's ~2 300 hits; at 512 MB,
+  0.25 served ~2 765 against ~2 200. `RenderedCache` keeps the default. A
+  deployment raising `rendered_cache_mb` for heavy Tiles traffic could gain
+  from 0.25: replay that size before shipping it (#1016, #1055).
 - A hit ratio of a few % with the fill pinned at 100 % is expected with
   viewport clients and is not a sizing signal.
 - **Layer lists are never cached** (#1181): a GetMap of several layers

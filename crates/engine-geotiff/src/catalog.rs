@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_storage::discovery::{self, FilenameMatcher, PendingFile, RemoteFile, RemoteScan, ScanSpec};
 use ds_storage::object_store::path::Path as ObjectPath;
+use ds_storage::object_store::ObjectMeta;
 use ds_storage::ObjectVersion;
 
 use crate::reader::{DataSource, ObjectHealth, TiffMetadata};
@@ -58,6 +59,13 @@ pub struct FileEntry {
     /// 1-second-resolution filesystems (HFS+/APFS/FAT/some NFS) — see #253
     /// round-3 finding.
     pub inode: Option<u64>,
+    /// The version a remote object-store listing named for the object: its
+    /// size, `Last-Modified` and ETag (#1055). `None` for local files and
+    /// STAC items. The scan reuses the entry only for a listing that can
+    /// name the same version ([`FileEntry::lists_as`]), so an object
+    /// overwritten in place with other bytes, even of the same size, has
+    /// its header read again.
+    pub listed: Option<ObjectVersion>,
     pub state: FileState,
 }
 
@@ -76,6 +84,7 @@ impl FileEntry {
             file_size,
             mtime,
             inode,
+            listed: None,
             state: FileState::Loaded {
                 metadata: Arc::new(metadata),
                 source: Arc::new(source),
@@ -90,11 +99,52 @@ impl FileEntry {
             file_size,
             mtime: None,
             inode: None,
+            listed: None,
             state: FileState::Stub {
                 stub,
                 health: ObjectHealth::default(),
             },
         }
+    }
+
+    /// This entry, for an object a remote listing named as `version`
+    /// ([`FileEntry::listed`]).
+    pub(crate) fn listed_as(mut self, version: ObjectVersion) -> Self {
+        self.listed = Some(version);
+        self
+    }
+
+    /// Whether a remote listing's `object` can be the object this entry
+    /// read ([`same_version`], #1055). The scan reuses the entry, without
+    /// reading the header, only then.
+    pub(crate) fn lists_as(&self, object: &ObjectMeta) -> bool {
+        self.file_size == object.size
+            && self
+                .listed
+                .as_ref()
+                .is_none_or(|version| same_version(version, &ObjectVersion::from(object)))
+    }
+
+    /// Whether `other` holds the object this entry holds: the same path and
+    /// size, and the same listed version, mtime and inode where both carry
+    /// one. A timestep a poll finds holding another object was republished
+    /// (#1055): a new object under another key won its timestamp, or the
+    /// object was overwritten in place.
+    pub(crate) fn same_object(&self, other: &FileEntry) -> bool {
+        fn agree<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+            match (a, b) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+        }
+        self.path == other.path
+            && self.file_size == other.file_size
+            && match (&self.listed, &other.listed) {
+                (Some(a), Some(b)) => same_version(a, b),
+                _ => true,
+            }
+            && agree(&self.mtime, &other.mtime)
+            && agree(&self.inode, &other.inode)
     }
 
     /// Whether this entry has full GeoTIFF metadata loaded.
@@ -159,6 +209,24 @@ impl FileEntry {
     }
 }
 
+/// Whether two listings can name the same version of an object (#1055): the
+/// same size, and the same ETag where both name one, else the same
+/// `Last-Modified` where both name one. The ETag comes first because it
+/// names the bytes: an object written again with the same bytes, as a
+/// mirror that uploads its last hour again on every run does, keeps its
+/// ETag on S3 and stays the same object, so its new `Last-Modified` neither
+/// costs a header read nor moves `content_version`.
+fn same_version(a: &ObjectVersion, b: &ObjectVersion) -> bool {
+    a.size == b.size
+        && match (&a.e_tag, &b.e_tag) {
+            (Some(a), Some(b)) => a == b,
+            _ => match (a.last_modified, b.last_modified) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            },
+        }
+}
+
 /// Immutable snapshot of discovered GeoTIFF files, sorted by timestamp.
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -208,6 +276,39 @@ impl Catalog {
                 .map(|(ts, _)| *ts),
             None => self.live().next_back().map(|(ts, _)| *ts),
         }
+    }
+
+    /// The entries, newest first, at timesteps `previous` did not hold or
+    /// held another object at ([`FileEntry::same_object`]): what a poll
+    /// discovered, a frame republished under a catalogued timestep included
+    /// (#1055). The STAC preload and the pre-warm take their frames from it.
+    pub(crate) fn fresh_since<'a>(
+        &'a self,
+        previous: &'a Catalog,
+    ) -> impl Iterator<Item = (&'a DateTime<Utc>, &'a FileEntry)> + 'a {
+        self.entries.iter().rev().filter(|(timestamp, entry)| {
+            previous
+                .entries
+                .get(timestamp)
+                .is_none_or(|before| !before.same_object(entry))
+        })
+    }
+
+    /// The timesteps both `previous` and this catalog hold, each with
+    /// another object here (#1055), newest first: frames republished since
+    /// `previous`, whose renders were cached from the object they replaced.
+    pub(crate) fn republished_since(&self, previous: &Catalog) -> Vec<DateTime<Utc>> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|(timestamp, entry)| {
+                previous
+                    .entries
+                    .get(timestamp)
+                    .is_some_and(|before| !before.same_object(entry))
+            })
+            .map(|(timestamp, _)| *timestamp)
+            .collect()
     }
 
     /// Trim to keep only the most recent `max` entries by timestamp.
@@ -428,7 +529,10 @@ pub type FailedPrefix = (ObjectPath, DataServerError);
 /// leaves the file out of this catalog, so the next scan retries it (#1003).
 ///
 /// `existing` provides a path-based index of entries already in the catalog.
-/// Files with unchanged size reuse their cached entry (no re-download).
+/// A file listed with the version its entry read reuses that entry, without
+/// a header read ([`FileEntry::lists_as`]): the same size, and the same ETag
+/// or, without one, the same `Last-Modified`, where the store lists them.
+/// Any other version is a new object and is read again (#1055).
 ///
 /// Returns the catalog and the prefixes whose LIST failed; whether a
 /// failure fails the scan is the caller's call.
@@ -518,11 +622,11 @@ fn load_remote(
     let until = std::time::Instant::now() + read_budget;
     let mut entries = BTreeMap::new();
 
-    // Reuse cached entry if file size unchanged
+    // Reuse the entry of an object listed as the version it read (#1055).
     let mut new_files = Vec::new();
     for file in &files {
         match existing.get(Path::new(file.key())) {
-            Some(entry) if entry.file_size == file.object.size => {
+            Some(entry) if entry.lists_as(&file.object) => {
                 entries.insert(file.time, (*entry).clone());
             }
             _ => new_files.push(file),
@@ -632,7 +736,8 @@ fn read_new_files(
                                 file_size,
                                 None,
                                 None,
-                            ),
+                            )
+                            .listed_as(ObjectVersion::from(&file.object)),
                         );
                     }
                     // The header arrived but is not a COG: download it whole below.
@@ -742,7 +847,8 @@ fn download_whole(
                     file.object.size,
                     None,
                     None,
-                ),
+                )
+                .listed_as(ObjectVersion::from(&file.object)),
             );
         }
     }
@@ -1497,5 +1603,73 @@ mod tests {
             first_lock_ptr, second_lock_ptr,
             "inode change must rebuild the DataSource even when size+mtime are unchanged"
         );
+    }
+
+    /// #1055: two listings name one version when the sizes agree and the
+    /// ETags do, or, without an ETag on both, the modification times.
+    #[test]
+    fn listings_compare_the_etag_before_the_modification_time() {
+        let at = |secs| DateTime::<Utc>::from_timestamp(secs, 0);
+        let version = |size, last_modified, e_tag: Option<&str>| ObjectVersion {
+            size,
+            last_modified,
+            e_tag: e_tag.map(str::to_string),
+        };
+        let listed = version(10, at(1), Some("a"));
+        assert!(
+            same_version(&listed, &version(10, at(2), Some("a"))),
+            "the same bytes written again"
+        );
+        assert!(!same_version(&listed, &version(10, at(1), Some("b"))));
+        assert!(!same_version(&listed, &version(11, at(1), Some("a"))));
+        assert!(
+            !same_version(&listed, &version(10, at(2), None)),
+            "without an ETag the modification time decides"
+        );
+        assert!(
+            same_version(&listed, &version(10, None, None)),
+            "with neither, the size"
+        );
+    }
+
+    /// #1055: a poll discovered the timesteps the previous catalog did not
+    /// hold and those it held with another object, a STAC stub with another
+    /// href or size too; only the latter were republished.
+    #[test]
+    fn fresh_since_takes_new_and_republished_timesteps() {
+        let t = |minute: i64| DateTime::<Utc>::from_timestamp(minute * 60, 0).unwrap();
+        let stub = |href: &str, size| {
+            FileEntry::stac_stub(
+                PathBuf::from(href),
+                size,
+                StacStub {
+                    bbox: None,
+                    asset_url: href.to_string(),
+                },
+            )
+        };
+        let catalog = |entries: Vec<(DateTime<Utc>, FileEntry)>| Catalog {
+            entries: entries.into_iter().collect(),
+            temporal_extent: None,
+            spatial_extent: None,
+        };
+        let previous = catalog(vec![
+            (t(0), stub("a", 1)),
+            (t(1), stub("b", 1)),
+            (t(2), stub("c", 1)),
+        ]);
+        let current = catalog(vec![
+            (t(0), stub("a", 1)),
+            (t(1), stub("b2", 1)),
+            (t(2), stub("c", 2)),
+            (t(3), stub("d", 1)),
+        ]);
+        let fresh: Vec<_> = current
+            .fresh_since(&previous)
+            .map(|(time, _)| *time)
+            .collect();
+        assert_eq!(fresh, [t(3), t(2), t(1)]);
+        assert_eq!(current.republished_since(&previous), [t(2), t(1)]);
+        assert!(current.republished_since(&current).is_empty());
     }
 }

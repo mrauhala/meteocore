@@ -22,6 +22,8 @@ tiles a request touches, so a remote COG is not downloaded whole.
   a poll lists newer items, a request lists older windows on demand.
 - **Metadata.** Each new file's header is read once: tiling, overviews,
   georeferencing, nodata (`GDAL_NODATA`) and scale/offset (GDAL metadata).
+  A remote object is read again when the listing names another version of
+  it: another size, ETag or, without an ETag, `Last-Modified`.
   A remote file is read by a 512 KiB range request; when those bytes are
   not a COG this reader handles, or the origin ignores `Range`, the file is
   downloaded whole. A header read that fails is never followed by a full
@@ -44,6 +46,15 @@ tiles a request touches, so a remote COG is not downloaded whole.
   that finds new remote frames reads the tiles of the newest four into the
   tile cache, coarsest level first and up to `MC_COG_PREWARM_MB` each, so
   their first views mostly skip the storage round trip.
+- **Republished frames.** A timestep can get a new file: a new object
+  under another key that wins the timestamp, a remote object overwritten
+  in place, or a local file replaced by rename. Cached tiles are keyed on
+  the file's identity, so the new file never serves the old one's tiles,
+  and a remote one is pre-warmed like a new frame. The poll also moves the
+  collection's `content_version`, so the rendered and meta-tile caches
+  stop serving the renders made before, and explicit-time responses are
+  no longer `immutable`. A STAC source keeps the item it catalogued first
+  for a timestamp.
 - **Remote failures.** A failed tile fetch is retried twice, then the
   request fails with 503, never a nodata gap. An object gone after the
   scan (404, 416, or shorter than the range) draws nodata for that request

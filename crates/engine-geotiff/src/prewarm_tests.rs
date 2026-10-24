@@ -87,8 +87,9 @@ fn remote_engine(local: &TempDir, remote: &TempDir) -> GeoTiffEngine {
     engine
 }
 
-/// Every non-empty tile of a frame, as `(ifd, chunk)`, all levels.
-fn frame_tiles(metadata: &TiffMetadata, source: &DataSource) -> Vec<(u16, u32)> {
+/// Every non-empty tile of a frame, as `(ifd, layout generation, chunk)`,
+/// all levels.
+fn frame_tiles(metadata: &TiffMetadata, source: &DataSource) -> Vec<(u16, u64, u32)> {
     let DataSource::Remote { tile_info, .. } = source else {
         panic!("remote source expected");
     };
@@ -104,7 +105,7 @@ fn frame_tiles(metadata: &TiffMetadata, source: &DataSource) -> Vec<(u16, u32)> 
                 .iter()
                 .enumerate()
                 .filter(|(_, &count)| count > 0)
-                .map(move |(chunk, _)| (ifd, chunk as u32))
+                .map(move |(chunk, _)| (ifd, info.generation, chunk as u32))
         })
         .collect()
 }
@@ -117,10 +118,10 @@ fn cached_tiles(engine: &GeoTiffEngine, time: DateTime<Utc>) -> (usize, usize) {
     let tiles = frame_tiles(entry.metadata().unwrap(), entry.source().unwrap());
     let cached = tiles
         .iter()
-        .filter(|(ifd, chunk)| {
+        .filter(|(ifd, generation, chunk)| {
             engine
                 .tile_cache
-                .contains_untracked(&entry.path, *chunk, *ifd)
+                .contains_untracked(&entry.path, *generation, *chunk, *ifd)
         })
         .count();
     (cached, tiles.len())
@@ -304,7 +305,10 @@ async fn the_cap_keeps_coarse_levels_and_warm_tiles_serve_reads_without_io() {
         fetched,
         "warm overviews read no storage"
     );
-    assert!(!cache.contains_untracked(&path, 0, 0));
+    let DataSource::Remote { tile_info, .. } = source.as_ref() else {
+        panic!("remote source expected");
+    };
+    assert!(!cache.contains_untracked(&path, tile_info.generation, 0, 0));
     for (ov, warm) in metadata.overviews.iter().zip(&warm_reads) {
         let cold = reader::read_bbox_overview(
             &source,
@@ -603,4 +607,187 @@ async fn benchmark_first_view_over_latency() {
         frames.len()
     );
     timed("pre-warmed first view", &|| view(&warmed));
+}
+
+// ---- Frames republished under a catalogued timestamp (#1055) ----
+
+/// The frame at `time` rendered over `bbox`, as values.
+fn view(engine: &GeoTiffEngine, bbox: [f64; 4], time: DateTime<Utc>) -> Vec<Option<f64>> {
+    engine
+        .get_raster_tile(
+            bbox,
+            400,
+            220,
+            Some(time),
+            &OutputCrs::Wgs84,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .values
+        .iter_values()
+        .collect()
+}
+
+/// `bytes` published as `key` under `remote/d`, as a bucket.
+fn put(remote: &TempDir, key: &str, bytes: &[u8]) {
+    let path = remote.0.join("d").join(key);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn fixture(frame: &str) -> Vec<u8> {
+    std::fs::read(fixture_dir().join(frame)).unwrap()
+}
+
+/// What a fresh engine renders over `bbox` for `bytes` published as
+/// `FRAMES[0]`: the view a republished frame must give.
+fn fresh_view(bytes: &[u8], bbox: [f64; 4]) -> Vec<Option<f64>> {
+    let (local, remote) = (
+        TempDir::new("republish_fresh_local"),
+        TempDir::new("republish_fresh_remote"),
+    );
+    put(&remote, FRAMES[0], bytes);
+    let engine = remote_engine(&local, &remote);
+    engine.poll_once();
+    view(&engine, bbox, frame_time(FRAMES[0]))
+}
+
+/// #1055: an object overwritten in place with a new size has its header
+/// read again, and the poll warms it, so its first view reads no storage
+/// and draws the new bytes, never the tiles cached from the old ones. The
+/// version moves once, so the API layers' rendered and meta-tile caches no
+/// longer serve the old image. A later poll that finds it unchanged does
+/// neither again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_object_overwritten_in_place_is_warmed_and_renders_its_new_tiles() {
+    let (local, remote) = (
+        TempDir::new("republish_local"),
+        TempDir::new("republish_remote"),
+    );
+    let (old, new) = (fixture(FRAMES[0]), fixture(FRAMES[1]));
+    assert_ne!(old.len(), new.len());
+    put(&remote, FRAMES[0], &old);
+    let engine = remote_engine(&local, &remote);
+    engine.poll_once();
+    let time = frame_time(FRAMES[0]);
+    let bbox = engine.catalog.load().spatial_extent.unwrap();
+    let before = view(&engine, bbox, time);
+    assert_eq!(engine.content_version(), 0);
+
+    put(&remote, FRAMES[0], &new);
+    engine.poll_cycle().await;
+    let (cached, total) = cached_tiles(&engine, time);
+    assert!(total > 0);
+    assert_eq!(
+        cached, total,
+        "every level of the republished frame is warm"
+    );
+    assert_eq!(
+        engine.content_version(),
+        1,
+        "renders cached from the old object are not served"
+    );
+    let read = engine.storage_bytes_read();
+    let after = view(&engine, bbox, time);
+    assert_eq!(
+        engine.storage_bytes_read(),
+        read,
+        "the first view reads nothing from storage"
+    );
+    assert_ne!(after, before);
+    assert_eq!(after, fresh_view(&new, bbox), "the new object's pixels");
+
+    let previous = engine.catalog.load_full();
+    engine.poll_once();
+    assert!(engine.prewarm_new_frames(&previous).await.is_empty());
+    assert_eq!(
+        engine.content_version(),
+        1,
+        "an unchanged object moves nothing"
+    );
+}
+
+/// #1055: an object overwritten in place with bytes of the same size is a
+/// new object too: its listing names another `Last-Modified` and ETag, so
+/// the scan reads its header again instead of reusing the old layout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_size_overwrite_is_read_again() {
+    let (local, remote) = (
+        TempDir::new("republish_same_size_local"),
+        TempDir::new("republish_same_size_remote"),
+    );
+    let (old, mut new) = (fixture(FRAMES[1]), fixture(FRAMES[0]));
+    // Bytes past the last tile are never read: the same frame, padded to
+    // the size of the object it replaces.
+    assert!(new.len() < old.len());
+    new.resize(old.len(), 0);
+    put(&remote, FRAMES[0], &old);
+    let engine = remote_engine(&local, &remote);
+    engine.poll_once();
+    let time = frame_time(FRAMES[0]);
+    let bbox = engine.catalog.load().spatial_extent.unwrap();
+    let before = view(&engine, bbox, time);
+
+    put(&remote, FRAMES[0], &new);
+    engine.poll_cycle().await;
+    assert_eq!(engine.content_version(), 1);
+    let after = view(&engine, bbox, time);
+    assert_ne!(after, before);
+    assert_eq!(after, fresh_view(&new, bbox), "the new object's pixels");
+}
+
+/// #1055: a new object under another key that wins a catalogued timestamp
+/// (the scan keeps the greatest key per timestamp) is warmed like a new
+/// frame and moves the version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_key_for_a_catalogued_timestamp_is_warmed() {
+    let (local, remote) = (
+        TempDir::new("republish_key_local"),
+        TempDir::new("republish_key_remote"),
+    );
+    let (old, new) = (fixture(FRAMES[0]), fixture(FRAMES[1]));
+    put(&remote, FRAMES[0], &old);
+    let engine = remote_engine(&local, &remote);
+    engine.poll_once();
+    let time = frame_time(FRAMES[0]);
+    let bbox = engine.catalog.load().spatial_extent.unwrap();
+    let before = view(&engine, bbox, time);
+
+    let key = format!("v2/{}", FRAMES[0]);
+    put(&remote, &key, &new);
+    engine.poll_cycle().await;
+    assert_eq!(
+        engine.catalog.load().entries[&time].path,
+        PathBuf::from(format!("d/{key}"))
+    );
+    let (cached, total) = cached_tiles(&engine, time);
+    assert_eq!(cached, total, "the new object is warm");
+    assert_eq!(engine.content_version(), 1);
+    let after = view(&engine, bbox, time);
+    assert_ne!(after, before);
+    assert_eq!(after, fresh_view(&new, bbox), "the new object's pixels");
+}
+
+/// #1055: a local file replaced under its name, by the atomic rename the
+/// engine asks publishers for, moves the version too: the rendered and
+/// meta-tile caches would otherwise keep the old file's image. A poll that
+/// finds it unchanged does not.
+#[test]
+fn a_local_file_replaced_under_its_name_moves_the_version() {
+    let dir = TempDir::new("republish_local_file");
+    let path = dir.0.join(FRAMES[0]);
+    std::fs::write(&path, fixture(FRAMES[0])).unwrap();
+    let engine = GeoTiffEngine::new("republish", dir.0.to_str(), &config()).unwrap();
+    engine.poll_once();
+    assert_eq!(engine.content_version(), 0);
+
+    let staged = dir.0.join("staged.tmp");
+    std::fs::write(&staged, fixture(FRAMES[1])).unwrap();
+    std::fs::rename(&staged, &path).unwrap();
+    engine.poll_once();
+    assert_eq!(engine.content_version(), 1);
+    engine.poll_once();
+    assert_eq!(engine.content_version(), 1);
 }

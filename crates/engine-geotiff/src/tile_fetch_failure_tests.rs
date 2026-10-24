@@ -104,11 +104,6 @@ fn cached_tiles(engine: &GeoTiffEngine) -> usize {
     let DataSource::Remote { tile_info, .. } = &**entry.source().unwrap() else {
         panic!("a remote source");
     };
-    let scope = crate::decoded_cache::FileScope::remote(
-        entry.path.to_string_lossy().as_ref(),
-        engine.tile_cache.namespace(),
-        engine.band_index,
-    );
     let levels = std::iter::once((0, tile_info)).chain(
         metadata
             .overviews
@@ -116,12 +111,21 @@ fn cached_tiles(engine: &GeoTiffEngine) -> usize {
             .map(|ov| (ov.ifd_index as u16, ov.tile_info.as_ref().unwrap())),
     );
     levels
-        .flat_map(|(ifd, info)| (0..info.tile_byte_counts.len() as u32).map(move |c| (ifd, c)))
-        .filter(|&(ifd, chunk)| {
+        .flat_map(|(ifd, info)| {
+            let scope = crate::decoded_cache::FileScope::remote(
+                entry.path.to_string_lossy().as_ref(),
+                engine.tile_cache.namespace(),
+                info.generation,
+                engine.band_index,
+            );
+            (0..info.tile_byte_counts.len() as u32)
+                .map(move |c| (ifd, info.generation, scope.clone(), c))
+        })
+        .filter(|(ifd, generation, scope, chunk)| {
             engine
                 .tile_cache
-                .contains_untracked(&entry.path, chunk, ifd)
-                || crate::decoded_cache::contains(&scope, ifd, chunk)
+                .contains_untracked(&entry.path, *generation, *chunk, *ifd)
+                || crate::decoded_cache::contains(scope, *ifd, *chunk)
         })
         .count()
 }

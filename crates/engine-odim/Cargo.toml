@@ -21,6 +21,8 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
 [dev-dependencies]
+# The stalled store and paused-clock harness of the fetch-budget tests (#1055).
+ds-storage = { path = "../storage", features = ["test-util"] }
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
 # 3D Tiles encoding for the gen_3dtiles example + VolumeEngine integration test.

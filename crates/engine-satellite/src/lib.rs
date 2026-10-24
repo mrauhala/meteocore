@@ -11,6 +11,8 @@
 //! sample the overview built at ingest.
 
 mod ami;
+#[cfg(test)]
+mod budget_tests;
 mod cache;
 mod frame;
 mod mercator;
@@ -57,6 +59,15 @@ use source::Source;
 /// Bootstrapping a window of many scans spreads over a few polls instead of
 /// one long sequential download (Critical Rule 9).
 const MAX_INGEST_PER_POLL: usize = 4;
+
+/// Time one poll may spend ingesting new scans (#1055), as long as the
+/// GeoTIFF scan's metadata read budget: no ingest starts after it, and one
+/// that started runs to its end, each file within the background fetch
+/// budget. The scans left over wait for the next poll. Without it, a source
+/// that stalls every body held one product for `MAX_INGEST_PER_POLL` ×
+/// 120 s, and the catalog with every product's new scans waited for all of
+/// them.
+const INGEST_BUDGET: Duration = ds_storage::DataStore::BACKGROUND_TIMEOUT;
 
 /// Scans one EDR query may download because the cache evicted them (a
 /// 2 km full disk is ~25 MB): checked before the first fetch, so an
@@ -354,9 +365,9 @@ impl SatelliteEngine {
 
     /// List every product and drop the scans that left the window, from
     /// the catalog and from memory. Then ingest up to
-    /// [`MAX_INGEST_PER_POLL`] new scans per product, newest first, and
-    /// spend what is left of that on in-window scans the cache evicted
-    /// ([`Self::keep_resident`]).
+    /// [`MAX_INGEST_PER_POLL`] new scans per product, newest first, within
+    /// [`INGEST_BUDGET`], and spend what is left of the per-product cap on
+    /// in-window scans the cache evicted ([`Self::keep_resident`]).
     pub fn poll_once(&self) {
         let now = Utc::now();
         let window = self.window.as_ref().map(|w| w.to_range(now));
@@ -412,13 +423,22 @@ impl SatelliteEngine {
         // Scans that left the window leave memory before new ones arrive,
         // so the room a new scan takes comes from a dead scan, not a live one.
         self.sweep(&frames);
+        // The runtime's clock, so a test with paused time moves it too.
+        let until = tokio::time::Instant::now() + INGEST_BUDGET;
+        let mut deferred = 0;
         let mut downloads = vec![0; self.products.len()];
         for (index, new) in pending.iter().enumerate() {
             let Some(new) = new else {
                 continue;
             };
+            // Deferred scans keep their share of the cap, so the
+            // re-downloads after the catalog never take their place.
             downloads[index] = new.len();
             for scan in new {
+                if tokio::time::Instant::now() >= until {
+                    deferred += 1;
+                    continue;
+                }
                 match self.ingest(index, scan.time, &scan.paths) {
                     Ok(frame) => {
                         if extents[index].is_none() {
@@ -447,6 +467,14 @@ impl SatelliteEngine {
                     ),
                 }
             }
+        }
+        if deferred > 0 {
+            tracing::warn!(
+                "[{}] {deferred} new scan(s) left to the next poll: this poll spent over {}s \
+                 ingesting",
+                self.collection_id,
+                INGEST_BUDGET.as_secs()
+            );
         }
         let listed: Vec<bool> = pending.iter().map(Option::is_some).collect();
         let polled_at = if listed.iter().all(|&l| l) {

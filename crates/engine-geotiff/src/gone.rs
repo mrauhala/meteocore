@@ -12,10 +12,11 @@
 //! through [`GoneObjects::screen`], which keeps it so that a listing still
 //! naming the same object does not bring it back:
 //!
-//! - An object-store scan reuses a kept entry for a key it lists with the
-//!   same size, without reading the header, and the screen removes it again.
-//!   A key the listing no longer names, or names with another size, ends the
-//!   record.
+//! - An object-store scan reuses a kept entry for a key it lists as the
+//!   same version (`FileEntry::lists_as`: the size, then the ETag or else
+//!   `Last-Modified`), without reading the header, and the screen removes
+//!   it again. A key the listing no longer names, or names as another
+//!   version, ends the record.
 //! - A STAC listing that still names the item's asset href with the same
 //!   `file:size` adds a stub, which the screen removes. Another href or size
 //!   is a new object.
@@ -79,7 +80,7 @@ impl GoneObjects {
     }
 
     /// The kept entries, for an object-store scan's reuse index: a key
-    /// listed with the same size reuses one instead of reading its header.
+    /// listed as the same version reuses one instead of reading its header.
     pub(crate) fn kept_entries(&self) -> Vec<FileEntry> {
         let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         records

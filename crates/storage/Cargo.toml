@@ -32,6 +32,12 @@ percent-encoding = "2"
 # own transport.
 http = "1"
 
+[features]
+# `test_util`: a store whose GET bodies stall and a paused-clock harness, for
+# the fetch-budget tests of crates that read through a `DataStore` (#1055).
+# Enabled only on dev-dependencies.
+test-util = ["tokio/test-util"]
+
 [dev-dependencies]
 tempfile = "3"
 # Paused virtual time for the fetch-budget tests (#1011): a 120 s budget is

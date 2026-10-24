@@ -179,7 +179,9 @@ Violating these has caused production incidents. Never break them.
      120 s), so object_store's own retry of a stalled 30 s attempt can run.
      Anything a request can wait on, a single-flight cache fill included,
      keeps `FetchBudget::Request` (30 s or the render deadline). See
-     `crates/storage/README.md` (#1011).
+     `crates/storage/README.md` (#1011). A new budgeted call gets a test over
+     `ds_storage::test_util::{StalledBody, run_stalled}` (feature `test-util`,
+     dev-dependencies only) that fails when its budget is swapped (#1055).
    - Never wait on a runtime worker for work that needs that runtime: a
      `std` lock or condvar, or a single-flight cache wait (`quick_cache`
      placeholders park the thread), whose holder downloads through this
@@ -1419,7 +1421,8 @@ no `url` are rejected.
   HTTP 503 only when all collections failed. `data_age_secs` (and the
   `collection_data_age_seconds` gauge) is now minus the newest data a
   collection serves, never the time since its last poll (#1007); see
-  `crates/server/CLAUDE.md`.
+  `crates/server/CLAUDE.md`. A collection holding no data has no age and
+  `collection_has_data` 0 (#1055).
 - **Metrics:** `GET /metrics` — Prometheus format. Path labels use route
   patterns, never raw URLs (cardinality explosion).
 - **Grafana dashboards live in this repo:**

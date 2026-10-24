@@ -456,9 +456,12 @@ async fn poll_prewarms_the_tiles_of_new_stac_items() {
             {
                 tiles += 1;
                 assert!(
-                    engine
-                        .tile_cache
-                        .contains_untracked(&entry.path, chunk as u32, ifd),
+                    engine.tile_cache.contains_untracked(
+                        &entry.path,
+                        info.generation,
+                        chunk as u32,
+                        ifd
+                    ),
                     "{time}: IFD {ifd} tile {chunk} warm"
                 );
             }

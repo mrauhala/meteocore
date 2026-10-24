@@ -35,7 +35,7 @@ pub mod fuzz_exports {
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -231,6 +231,9 @@ pub struct GeoTiffEngine {
     /// Remote objects a tile read found gone after the scan, and the
     /// `content_version` that moves when one's timestep comes back (#1074).
     gone: gone::GoneObjects,
+    /// How many catalog swaps found a catalogued timestep holding another
+    /// object (#1055), the other half of `content_version`.
+    republished: AtomicU64,
     /// Rate limit for the WARN about forbidden tile ranges (#1074).
     forbidden_warnings: gone::ForbiddenWarnings,
 }
@@ -488,6 +491,27 @@ impl GeoTiffEngine {
                 self.collection_id
             );
         }
+    }
+
+    /// Move `content_version` after a catalog swap that found catalogued
+    /// timesteps holding another object (#1055), newest first: a new object
+    /// under another key won the timestamp, or the object was overwritten in
+    /// place. Renders cached under those timesteps show the object replaced.
+    /// After the store, never before it: a request that read the new version
+    /// must render from the new catalog, or it would cache the old object's
+    /// pixels under that version.
+    fn note_republished(&self, republished: &[DateTime<Utc>]) {
+        let Some(latest) = republished.first() else {
+            return;
+        };
+        self.republished.fetch_add(1, Ordering::SeqCst);
+        tracing::info!(
+            "[{}] {} catalogued timestep(s) hold a new object (latest {}): renders cached \
+             before are no longer served",
+            self.collection_id,
+            republished.len(),
+            latest.to_rfc3339()
+        );
     }
 
     /// Act on what a read of the entry at `timestamp` learned about its
@@ -775,6 +799,7 @@ impl GeoTiffEngine {
             stac_last_attempt: Mutex::new(None),
             catalog_updated_at: Mutex::new(Some(Utc::now())),
             gone: gone::GoneObjects::default(),
+            republished: AtomicU64::new(0),
             forbidden_warnings: gone::ForbiddenWarnings::default(),
         };
 
@@ -867,9 +892,9 @@ impl GeoTiffEngine {
     /// `current` is the previous catalog, used to reuse metadata for unchanged files.
     fn do_scan(&self, current: &Catalog) -> Result<Catalog, DataServerError> {
         // Build path-based index from current catalog (references only, no
-        // cloning), and the entries removed as gone: a key still listed with
-        // the same size reuses one rather than reading its header, and the
-        // screen below removes it again (#1074).
+        // cloning), and the entries removed as gone: a key still listed as
+        // the same version reuses one rather than reading its header, and the
+        // screen below removes it again (#1074, #1055).
         let kept = self.gone.kept_entries();
         let path_index: HashMap<&Path, &catalog::FileEntry> = kept
             .iter()
@@ -1249,11 +1274,12 @@ impl GeoTiffEngine {
     /// Preload metadata for the STAC items this poll cycle discovered (#90),
     /// so the first request for a new timestep doesn't fetch the asset header
     /// on a request worker. Entries absent from `previous` (the snapshot from
-    /// before the scan) are candidates, newest first, capped at
-    /// `STAC_PRELOAD_MAX_ITEMS` with `STAC_PRELOAD_CONCURRENCY` fetches in
-    /// flight, within `STAC_PRELOAD_BUDGET`. Async on the poll runtime: no
-    /// `block_in_place`, no sequential round trips. Anything skipped, failed
-    /// or cut off by the budget keeps the lazy
+    /// before the scan), or holding another item there
+    /// ([`Catalog::fresh_since`], #1055), are candidates, newest first,
+    /// capped at `STAC_PRELOAD_MAX_ITEMS` with `STAC_PRELOAD_CONCURRENCY`
+    /// fetches in flight, within `STAC_PRELOAD_BUDGET`. Async on the poll
+    /// runtime: no `block_in_place`, no sequential round trips. Anything
+    /// skipped, failed or cut off by the budget keeps the lazy
     /// [`ensure_metadata`](Self::ensure_metadata) fallback.
     async fn preload_stac_metadata(&self, previous: &Catalog) {
         let StoreMode::RemoteStac { client } = &self.store_mode else {
@@ -1262,10 +1288,7 @@ impl GeoTiffEngine {
         let targets: Vec<StacLoadTarget> = {
             let catalog = self.catalog.load();
             catalog
-                .entries
-                .iter()
-                .rev()
-                .filter(|(ts, _)| !previous.entries.contains_key(*ts))
+                .fresh_since(previous)
                 .filter_map(stac_load_target)
                 .take(STAC_PRELOAD_MAX_ITEMS)
                 .collect()
@@ -1611,12 +1634,13 @@ impl GeoTiffEngine {
     }
 
     /// Read the encoded tiles of the newest remote frames absent from
-    /// `previous` into the tile cache (#1004), so the first view of a new
-    /// frame decodes from memory instead of paying a storage round trip per
-    /// meta-tile. At most `PREWARM_MAX_FRAMES` frames, within the per-frame
-    /// cap of [`prewarm::frame_cap`] and `PREWARM_BUDGET`; runs on the poll
-    /// runtime with bounded concurrency, see [`prewarm`]. Returns the paths
-    /// of the frames it had tiles to fetch for.
+    /// `previous`, or republished since it ([`Catalog::fresh_since`], #1055),
+    /// into the tile cache (#1004), so the first view of a new frame decodes
+    /// from memory instead of paying a storage round trip per meta-tile. At
+    /// most `PREWARM_MAX_FRAMES` frames, within the per-frame cap of
+    /// [`prewarm::frame_cap`] and `PREWARM_BUDGET`; runs on the poll runtime
+    /// with bounded concurrency, see [`prewarm`]. Returns the paths of the
+    /// frames it had tiles to fetch for.
     async fn prewarm_new_frames(&self, previous: &Catalog) -> Vec<PathBuf> {
         if matches!(self.store_mode, StoreMode::Local { .. }) || self.shutdown.is_shutdown() {
             return Vec::new();
@@ -1628,10 +1652,7 @@ impl GeoTiffEngine {
         let plans: Vec<prewarm::FramePlan> = {
             let catalog = self.catalog.load();
             catalog
-                .entries
-                .iter()
-                .rev()
-                .filter(|(ts, _)| !previous.entries.contains_key(*ts))
+                .fresh_since(previous)
                 .filter_map(|(_, entry)| {
                     prewarm::plan_frame(
                         &entry.path,
@@ -1751,7 +1772,9 @@ impl GeoTiffEngine {
                 }
 
                 self.consecutive_poll_failures.store(0, Ordering::Relaxed);
+                let republished = new_catalog.republished_since(&current);
                 self.catalog.store(Arc::new(new_catalog));
+                self.note_republished(&republished);
                 // Rebuild the cached RasterInfo off the request path (#211).
                 self.refresh_raster_info();
                 // Stamp the poll age only when the scan found files: an
@@ -2549,10 +2572,14 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
 
     fn content_version(&self) -> u64 {
         // 0 until a timestep dropped because its object was gone holds a new
-        // object (#1074). Renders cached under that timestep before may show
-        // the gap the dropping request drew, or the timestep the time
-        // snapped to while it was gone.
-        self.gone.version()
+        // object (#1074), or a poll finds a catalogued timestep holding
+        // another object (#1055). Renders cached under that timestep before
+        // may show the gap the dropping request drew, the timestep the time
+        // snapped to while it was gone, or the object it replaced. Both
+        // counters only grow, so their sum moves whenever either does.
+        self.gone
+            .version()
+            .wrapping_add(self.republished.load(Ordering::SeqCst))
     }
 }
 

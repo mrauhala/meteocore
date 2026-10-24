@@ -10,6 +10,8 @@ mod error;
 mod gauge;
 #[cfg(test)]
 mod test_store;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 mod throttle;
 mod traced;
 
@@ -318,7 +320,7 @@ impl DataStore {
         path: &ObjectPath,
         budget: FetchBudget,
     ) -> Result<Bytes, DataServerError> {
-        let result = self.block_on_with(None, budget, self.whole(path))?;
+        let result = self.block_on_with(None, budget, Some(path), self.whole(path))?;
         self.bytes_read
             .fetch_add(result.len() as u64, Ordering::Relaxed);
         Ok(result)
@@ -348,7 +350,12 @@ impl DataStore {
         range: Range<usize>,
         budget: FetchBudget,
     ) -> Result<Bytes, DataServerError> {
-        let result = self.block_on_with(None, budget, self.inner.get_range(path, to_u64(range)))?;
+        let result = self.block_on_with(
+            None,
+            budget,
+            Some(path),
+            self.inner.get_range(path, to_u64(range)),
+        )?;
         self.bytes_read
             .fetch_add(result.len() as u64, Ordering::Relaxed);
         Ok(result)
@@ -382,7 +389,7 @@ impl DataStore {
         handle: &tokio::runtime::Handle,
         budget: FetchBudget,
     ) -> Result<Bytes, DataServerError> {
-        let result = self.block_on_with(Some(handle), budget, async {
+        let result = self.block_on_with(Some(handle), budget, Some(path), async {
             self.inner.get_range(path, to_u64(range)).await
         })?;
         self.bytes_read
@@ -429,7 +436,7 @@ impl DataStore {
     ) -> Result<ReadAnswer<Vec<Bytes>>, DataServerError> {
         let ranges: Vec<Range<u64>> = ranges.iter().cloned().map(to_u64).collect();
         let read = self.ranges_or_refusal(path, &ranges);
-        self.block_on_with(handle, FetchBudget::Request, read)
+        self.block_on_with(handle, FetchBudget::Request, Some(path), read)
     }
 
     /// The byte `ranges` of the object at `path`, one buffer per range in
@@ -485,7 +492,7 @@ impl DataStore {
     ) -> Result<RangeAnswer, DataServerError> {
         let end = range.end as u64;
         let options = object_store::GetOptions::new().with_range(Some(to_u64(range)));
-        let answer = self.block_on_result(handle, FetchBudget::Request, async {
+        let answer = self.block_on_result(handle, FetchBudget::Request, Some(path), async {
             let storage = |e| DataServerError::from(StorageError::from(e));
             let result = match self.inner.get_opts(path, options).await {
                 Ok(result) => result,
@@ -562,7 +569,7 @@ impl DataStore {
             if_match: version.e_tag.clone().filter(|tag| !tag.starts_with("W/")),
             ..Default::default()
         };
-        let read = self.block_on_result(handle, budget, async {
+        let read = self.block_on_result(handle, budget, Some(path), async {
             let storage = |e| DataServerError::from(StorageError::from(e));
             let result = match self.inner.get_opts(path, options).await {
                 Ok(result) => result,
@@ -596,7 +603,12 @@ impl DataStore {
         path: &ObjectPath,
         handle: &tokio::runtime::Handle,
     ) -> Result<Bytes, DataServerError> {
-        let result = self.block_on_with(Some(handle), FetchBudget::Request, self.whole(path))?;
+        let result = self.block_on_with(
+            Some(handle),
+            FetchBudget::Request,
+            Some(path),
+            self.whole(path),
+        )?;
         self.bytes_read
             .fetch_add(result.len() as u64, Ordering::Relaxed);
         Ok(result)
@@ -610,7 +622,7 @@ impl DataStore {
     /// List objects under a prefix.
     #[allow(clippy::needless_question_mark)]
     pub fn list(&self, prefix: &ObjectPath) -> Result<Vec<ObjectMeta>, DataServerError> {
-        self.block_on(async {
+        self.block_on(prefix, async {
             use futures::TryStreamExt;
             Ok(self.inner.list(Some(prefix)).try_collect().await?)
         })
@@ -619,7 +631,7 @@ impl DataStore {
     /// Get object metadata (size, last modified, etc.).
     #[allow(clippy::needless_question_mark)]
     pub fn head(&self, path: &ObjectPath) -> Result<ObjectMeta, DataServerError> {
-        self.block_on(async { Ok(self.inner.head(path).await?) })
+        self.block_on(path, async { Ok(self.inner.head(path).await?) })
     }
 
     /// Like [`Self::get`], but a **missing** object (`NotFound` / HTTP 404)
@@ -627,7 +639,7 @@ impl DataStore {
     /// (an unwritten chunk, an optional metadata file) as "use the fill value"
     /// / "not present", so the engine needs this distinction.
     pub fn get_opt(&self, path: &ObjectPath) -> Result<Option<Bytes>, DataServerError> {
-        self.block_on_with(None, FetchBudget::Request, async {
+        self.block_on_with(None, FetchBudget::Request, Some(path), async {
             let bytes = match self.inner.get(path).await {
                 Ok(res) => res.bytes().await?,
                 Err(object_store::Error::NotFound { .. }) => return Ok(None),
@@ -649,7 +661,12 @@ impl DataStore {
     /// from "this read failed" without matching error strings. Under
     /// [`FetchBudget::Request`].
     pub fn get_or_refusal(&self, path: &ObjectPath) -> Result<ReadAnswer, DataServerError> {
-        self.block_on_with(None, FetchBudget::Request, self.whole_or_refusal(path))
+        self.block_on_with(
+            None,
+            FetchBudget::Request,
+            Some(path),
+            self.whole_or_refusal(path),
+        )
     }
 
     /// [`Self::get_or_refusal`] driven on an explicitly-provided runtime
@@ -662,6 +679,7 @@ impl DataStore {
         self.block_on_with(
             Some(handle),
             FetchBudget::Request,
+            Some(path),
             self.whole_or_refusal(path),
         )
     }
@@ -756,10 +774,14 @@ impl DataStore {
             };
         }
         let read = read(self.clone(), path.clone());
-        let task = handle.spawn(within(FetchBudget::Request, None, async move {
-            read.await
-                .map_err(|e| DataServerError::from(StorageError::from(e)))
-        }));
+        let object = path.clone();
+        let task = handle.spawn(async move {
+            within(FetchBudget::Request, None, Some(&object), async move {
+                read.await
+                    .map_err(|e| DataServerError::from(StorageError::from(e)))
+            })
+            .await
+        });
         let abort = task.abort_handle();
         let result = async move {
             match task.await {
@@ -786,7 +808,7 @@ impl DataStore {
         &self,
         prefix: &ObjectPath,
     ) -> Result<(Vec<ObjectMeta>, Vec<ObjectPath>), DataServerError> {
-        self.block_on(async {
+        self.block_on(prefix, async {
             let res = self.inner.list_with_delimiter(Some(prefix)).await?;
             Ok((res.objects, res.common_prefixes))
         })
@@ -962,7 +984,7 @@ impl DataStore {
                         if tokio::time::Instant::now() >= until {
                             return (i, None);
                         }
-                        let read = within(budget, deadline, async {
+                        let read = within(budget, deadline, Some(path), async {
                             self.inner
                                 .get_range(path, to_u64(range.clone()))
                                 .await
@@ -1055,7 +1077,13 @@ impl DataStore {
             futures::stream::iter(requests.iter().enumerate().map(|(i, request)| async move {
                 (
                     i,
-                    within(budget, deadline, self.document(request, max_bytes)).await,
+                    within(
+                        budget,
+                        deadline,
+                        Some(&request.path),
+                        self.document(request, max_bytes),
+                    )
+                    .await,
                 )
             }))
             .buffer_unordered(concurrency.max(1))
@@ -1221,7 +1249,7 @@ impl DataStore {
                             Ok(r) => r.map_err(|e| DataServerError::from(StorageError::from(e))),
                             Err(_) if deadline.is_some() => Err(DataServerError::DeadlineExceeded),
                             Err(_) => Err(DataServerError::Storage(format!(
-                                "Request timed out after {}s",
+                                "Request for `{p}` timed out after {}s",
                                 Self::REQUEST_TIMEOUT.as_secs()
                             ))),
                         };
@@ -1255,11 +1283,11 @@ impl DataStore {
     /// temporary runtime otherwise (for use in non-async contexts like startup).
     /// All operations are subject to [`FetchBudget::Request`]'s 30-second
     /// timeout to prevent hung connections.
-    fn block_on<F, T>(&self, future: F) -> Result<T, DataServerError>
+    fn block_on<F, T>(&self, object: &ObjectPath, future: F) -> Result<T, DataServerError>
     where
         F: std::future::Future<Output = Result<T, object_store::Error>>,
     {
-        self.block_on_with(None, FetchBudget::Request, future)
+        self.block_on_with(None, FetchBudget::Request, Some(object), future)
     }
 
     /// Drive `future` to completion on the appropriate runtime — like
@@ -1286,17 +1314,18 @@ impl DataStore {
     /// handle: this yields an async worker or runs directly on a blocking-pool
     /// worker. With no handle it creates a temporary runtime (tests / CLI).
     /// The future is limited to the request deadline in scope, else to
-    /// `budget` ([`within`]).
+    /// `budget` ([`within`]), whose timeout names `object`.
     fn block_on_with<F, T>(
         &self,
         handle: Option<&tokio::runtime::Handle>,
         budget: FetchBudget,
+        object: Option<&ObjectPath>,
         future: F,
     ) -> Result<T, DataServerError>
     where
         F: std::future::Future<Output = Result<T, object_store::Error>>,
     {
-        self.block_on_result(handle, budget, async {
+        self.block_on_result(handle, budget, object, async {
             future
                 .await
                 .map_err(|e| DataServerError::from(StorageError::from(e)))
@@ -1307,6 +1336,7 @@ impl DataStore {
         &self,
         handle: Option<&tokio::runtime::Handle>,
         budget: FetchBudget,
+        object: Option<&ObjectPath>,
         future: F,
     ) -> Result<T, DataServerError>
     where
@@ -1314,7 +1344,7 @@ impl DataStore {
     {
         let deadline = ds_core::deadline::current();
         ds_core::deadline::check()?;
-        let timed = within(budget, deadline, future);
+        let timed = within(budget, deadline, object, future);
         match handle {
             Some(h) => h.block_on(timed),
             None => self.block_on_untimed(timed)?,
@@ -1355,10 +1385,13 @@ impl std::fmt::Debug for DataStore {
 }
 
 /// `future`, limited to the request `deadline` when one is in scope (an
-/// expiry is [`DataServerError::DeadlineExceeded`]), else to `budget`.
+/// expiry is [`DataServerError::DeadlineExceeded`]), else to `budget`. A
+/// timeout names `object`, the key or prefix the operation reads, so its
+/// log line can be tied to a collection (#1055).
 async fn within<F, T>(
     budget: FetchBudget,
     deadline: Option<std::time::Instant>,
+    object: Option<&ObjectPath>,
     future: F,
 ) -> Result<T, DataServerError>
 where
@@ -1371,10 +1404,13 @@ where
     match tokio::time::timeout_at(end, future).await {
         Ok(result) => result,
         Err(_) if deadline.is_some() => Err(DataServerError::DeadlineExceeded),
-        Err(_) => Err(DataServerError::Storage(format!(
-            "Request timed out after {}s",
-            budget.timeout().as_secs()
-        ))),
+        Err(_) => Err(DataServerError::Storage(match object {
+            Some(object) => format!(
+                "Request for `{object}` timed out after {}s",
+                budget.timeout().as_secs()
+            ),
+            None => format!("Request timed out after {}s", budget.timeout().as_secs()),
+        })),
     }
 }
 
@@ -2178,7 +2214,7 @@ mod deadline_tests {
             ));
             let dropped = Dropped(cancelled.clone());
             let result: Result<(), _> =
-                store.block_on_with(Some(&handle), FetchBudget::Request, async {
+                store.block_on_with(Some(&handle), FetchBudget::Request, None, async {
                     let _dropped = dropped;
                     std::future::pending().await
                 });
@@ -2186,14 +2222,14 @@ mod deadline_tests {
             assert!(cancelled.load(Ordering::SeqCst));
             // Expired requests must not start another source operation/retry.
             let result: Result<(), _> =
-                store.block_on_with(Some(&handle), FetchBudget::Request, async {
+                store.block_on_with(Some(&handle), FetchBudget::Request, None, async {
                     panic!("expired I/O was polled")
                 });
             assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
             drop(scope);
             assert!(ds_core::deadline::current().is_none());
             let result: Result<u8, _> =
-                store.block_on_with(Some(&handle), FetchBudget::Request, async {
+                store.block_on_with(Some(&handle), FetchBudget::Request, None, async {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     Ok(42)
                 });
@@ -2519,6 +2555,7 @@ mod deadline_tests {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+    use crate::test_util::{self, StalledBody};
     use object_store::{BackoffConfig, ClientConfigKey, ClientOptions, PutPayload};
     use std::time::Duration;
 
@@ -2540,89 +2577,105 @@ mod budget_tests {
         assert_eq!(FetchBudget::Request.timeout(), Duration::from_secs(30));
     }
 
-    /// A store whose first attempt stalls until object_store's per-attempt
-    /// timeout, then backs off and lets the retry deliver the rest in 1 s.
-    async fn stalled_store(path: &ObjectPath) -> DataStore {
-        let inner = object_store::memory::InMemory::new();
-        inner
-            .put(path, PutPayload::from_static(b"0123456789"))
-            .await
-            .unwrap();
-        let stall = DataStore::ATTEMPT_TIMEOUT
-            + BackoffConfig::default().init_backoff
-            + Duration::from_secs(1);
-        DataStore::new(Arc::new(crate::test_store::StalledBody { inner, stall }))
+    /// `scan.nc` holding ten bytes, every GET of it stalling
+    /// [`test_util::STALL`]: past the request budget, within the background
+    /// one.
+    fn stalled_store() -> (Arc<StalledBody>, DataStore, ObjectPath) {
+        let path = ObjectPath::from("scan.nc");
+        let stalled = StalledBody::with_objects([(path.as_ref(), &b"0123456789"[..])]);
+        let store = DataStore::new(stalled.clone());
+        (stalled, store, path)
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_stalled_get_completes_on_the_background_budget_only() {
-        let path = ObjectPath::from("scan.nc");
-        let store = stalled_store(&path).await;
-        let get = |budget| {
-            within(budget, None, async {
-                store
-                    .whole(&path)
-                    .await
-                    .map_err(|e| DataServerError::from(StorageError::from(e)))
-            })
-        };
+    /// A budgeted entry point called the way a caller on a runtime calls it.
+    type Read = fn(&DataStore, &ObjectPath, FetchBudget) -> Result<Bytes, DataServerError>;
 
-        let started = tokio::time::Instant::now();
-        assert_eq!(
-            get(FetchBudget::Background).await.unwrap(),
-            &b"0123456789"[..]
-        );
-        assert!(started.elapsed() > DataStore::ATTEMPT_TIMEOUT);
+    /// The public entry points that take a budget (#1055).
+    const BUDGETED: [(&str, Read); 3] = [
+        ("get_with_budget", |store, path, budget| {
+            store.get_with_budget(path, budget)
+        }),
+        ("get_range_with_budget", |store, path, budget| {
+            store.get_range_with_budget(path, 0..10, budget)
+        }),
+        ("get_many_with_budget", |store, path, budget| {
+            store
+                .get_many_with_budget(std::slice::from_ref(path), 1, Some(10), budget)?
+                .remove(0)
+        }),
+    ];
 
-        match get(FetchBudget::Request).await {
-            Err(DataServerError::Storage(message)) => {
-                assert_eq!(message, "Request timed out after 30s")
+    /// `read` of a stalled `scan.nc` under `budget`, through the public
+    /// entry point on a paused clock ([`test_util::run_stalled`]).
+    fn stalled_read(read: Read, budget: FetchBudget) -> Result<Bytes, DataServerError> {
+        let (stalled, store, path) = stalled_store();
+        let result = test_util::run_stalled(&stalled, move || read(&store, &path, budget));
+        assert_eq!(stalled.stalled(), 1, "the read stalled once");
+        result
+    }
+
+    /// #1011, #1055: each public entry point keeps the budget it is given.
+    /// A GET stalled for longer than the request budget completes under
+    /// the background budget and times out under the request budget, its
+    /// error naming the object. An entry point that dropped its budget for
+    /// the other one fails one of the two.
+    #[test]
+    fn budgeted_entry_points_keep_their_budget() {
+        for (name, read) in BUDGETED {
+            assert_eq!(
+                stalled_read(read, FetchBudget::Background).unwrap(),
+                &b"0123456789"[..],
+                "{name}: the background budget outlasts the stall"
+            );
+            match stalled_read(read, FetchBudget::Request) {
+                Err(DataServerError::Storage(message)) => assert!(
+                    message.ends_with("`scan.nc` timed out after 30s"),
+                    "{name}: {message}"
+                ),
+                other => panic!("{name}: the request budget must time out, got {other:?}"),
             }
-            other => panic!("the request budget must time out, got {other:?}"),
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_stalled_batch_object_completes_on_the_background_budget_only() {
-        let path = ObjectPath::from("volume.h5");
-        let store = stalled_store(&path).await;
-        let paths = [path.clone()];
-
-        let fetched = store
-            .fetch_many(&paths, 1, Some(10), FetchBudget::Background)
-            .await;
-        assert_eq!(fetched[0].as_ref().unwrap(), &b"0123456789"[..]);
-
-        let fetched = store
-            .fetch_many(&paths, 1, None, FetchBudget::Request)
-            .await;
-        match &fetched[0] {
-            Err(DataServerError::Storage(message)) => {
-                assert_eq!(message, "fetch of `volume.h5` timed out after 30s")
+    /// The entry points without a budget take the request budget, and
+    /// their timeouts name the object too (#1055).
+    #[test]
+    fn unbudgeted_entry_points_take_the_request_budget() {
+        let reads: [(&str, Read); 3] = [
+            ("get", |store, path, _| store.get(path)),
+            ("get_range", |store, path, _| store.get_range(path, 0..10)),
+            ("get_many", |store, path, _| {
+                store
+                    .get_many(std::slice::from_ref(path), 1, None)?
+                    .remove(0)
+            }),
+        ];
+        for (name, read) in reads {
+            match stalled_read(read, FetchBudget::Background) {
+                Err(DataServerError::Storage(message)) => assert!(
+                    message.ends_with("`scan.nc` timed out after 30s"),
+                    "{name}: {message}"
+                ),
+                other => panic!("{name}: the request budget must time out, got {other:?}"),
             }
-            other => panic!("the request budget must time out, got {other:?}"),
         }
     }
 
     /// A request deadline in scope still bounds a background fetch.
-    #[tokio::test(start_paused = true)]
-    async fn a_request_deadline_bounds_the_background_budget() {
-        let path = ObjectPath::from("scan.nc");
-        let store = stalled_store(&path).await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let result = within(FetchBudget::Background, Some(deadline), async {
-            store
-                .whole(&path)
-                .await
-                .map_err(|e| DataServerError::from(StorageError::from(e)))
-        })
-        .await;
+    #[test]
+    fn a_request_deadline_bounds_the_background_budget() {
+        let (stalled, store, path) = stalled_store();
+        let result = test_util::run_stalled(&stalled, move || {
+            let _deadline =
+                ds_core::deadline::enter(Some(std::time::Instant::now() + Duration::from_secs(5)));
+            store.get_with_budget(&path, FetchBudget::Background)
+        });
         assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
     }
 
-    /// The public entry points pass their budget through and count bytes.
+    /// The public entry points count the bytes they read.
     #[tokio::test(flavor = "multi_thread")]
-    async fn budgeted_entry_points_fetch_and_count_bytes() {
+    async fn budgeted_entry_points_count_bytes() {
         let inner = object_store::memory::InMemory::new();
         let path = ObjectPath::from("scan.nc");
         inner

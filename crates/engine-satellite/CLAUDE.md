@@ -75,13 +75,18 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     next poll. The poll's re-download keeps `FetchBudget::Request`: it holds
     the scan's single-flight fill, which a request may be waiting on. So do
     the request-time fetches.
+    - `src/budget_tests.rs` pins each fetch budget and the ingest bound over
+    `ds_storage::test_util::StalledBody` on a paused clock (#1055).
   - `tests/refetch.rs` runs both call sites with zero-size caches (`0` also
     turns re-downloading off). `tests/window_capacity.rs`, on a 1 MB cache,
     pins the thrash guard, its WARN and the recovery; `lib.rs` tests pin the
     sweep, the re-download and instance-scoped keys.
 - **Downloads are capped per poll** (`MAX_INGEST_PER_POLL` per product: new
   scans first, newest first, then re-downloads): bootstrapping a window
-  spreads over polls (Critical Rule 9).
+  spreads over polls (Critical Rule 9). No ingest starts once the poll has
+  spent `INGEST_BUDGET` (120 s) ingesting; one that started runs to its end,
+  the rest wait for the next poll and keep their share of the cap (#1055).
+  It reads `tokio::time::Instant`, so a paused-clock test moves it.
 - **No footprint guard.** `Crs::Geostationary::forward` is NaN behind the
   Earth, so no coarse projection cell can alias far-away output onto the
   disk; `ProjectionGrid` refines cells on the limb (#821). The collection

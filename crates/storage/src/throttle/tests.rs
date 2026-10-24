@@ -299,7 +299,7 @@ async fn a_retry_after_past_the_deadline_or_budget_fails_there() {
     let (store, path) = limited("http://deadline.backoff.test/x", 8, &host);
     let (store, path) = (&store, &path);
     let head = |budget, deadline| {
-        crate::within(budget, deadline, async move {
+        crate::within(budget, deadline, None, async move {
             store
                 .inner()
                 .head(path)

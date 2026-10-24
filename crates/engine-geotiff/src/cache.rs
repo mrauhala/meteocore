@@ -1,6 +1,10 @@
 //! In-memory tile cache for remote COG byte-range reads.
 //!
-//! Caches **compressed** tile bytes keyed by (file path, chunk index).
+//! Caches **compressed** tile bytes keyed by (file path, layout generation,
+//! IFD, chunk index). The generation is the header read's
+//! [`RemoteTileInfo::generation`](crate::reader::RemoteTileInfo::generation):
+//! an object republished under its path is read again by the scan, and its
+//! new layout never meets the tiles of the bytes it replaced (#1055).
 //! Decompression is ~0.2ms vs 50-200ms for an S3 range read, so caching
 //! compressed bytes gives 58x better memory efficiency than decoded tiles.
 //! The WMS meta-tile loop still decodes each hot tile several times per
@@ -19,6 +23,8 @@ use ds_cache::ByteBoundedCache;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TileCacheKey {
     file_path: Arc<str>,
+    /// The header read the tile's offset came from (#1055).
+    generation: u64,
     chunk_index: u32,
     /// IFD index (0 = full resolution, 1+ = overview levels).
     /// Prevents cache collisions between full-res and overview tiles.
@@ -51,19 +57,27 @@ impl TileCache {
         }
     }
 
-    /// Process-unique id of this cache. Keys here are only an object path,
-    /// unique within one engine's store; the process-global decoded-chunk
-    /// cache adds this id so engines whose stores share an object path never
-    /// share decoded pixels, and a rebuilt engine starts a fresh namespace.
+    /// Process-unique id of this cache. Keys here are an object path and a
+    /// layout generation, unique within one engine's store; the
+    /// process-global decoded-chunk cache adds this id so engines whose
+    /// stores share an object path never share decoded pixels, and a rebuilt
+    /// engine starts a fresh namespace.
     pub(crate) fn namespace(&self) -> u64 {
         self.namespace
     }
 
-    /// Look up a cached compressed tile.
+    /// Look up a cached compressed tile of the layout `generation` read.
     /// `ifd_index` distinguishes full-resolution (0) from overview tiles (1+).
-    pub fn get(&self, file_path: &Path, chunk_index: u32, ifd_index: u16) -> Option<Bytes> {
+    pub fn get(
+        &self,
+        file_path: &Path,
+        generation: u64,
+        chunk_index: u32,
+        ifd_index: u16,
+    ) -> Option<Bytes> {
         let key = TileCacheKey {
             file_path: Arc::from(file_path.to_string_lossy().as_ref()),
+            generation,
             chunk_index,
             ifd_index,
         };
@@ -74,22 +88,32 @@ impl TileCache {
     pub(crate) fn contains_untracked(
         &self,
         file_path: &Path,
+        generation: u64,
         chunk_index: u32,
         ifd_index: u16,
     ) -> bool {
         let key = TileCacheKey {
             file_path: Arc::from(file_path.to_string_lossy().as_ref()),
+            generation,
             chunk_index,
             ifd_index,
         };
         self.inner.contains_key(&key)
     }
 
-    /// Insert compressed tile bytes into the cache.
+    /// Insert compressed tile bytes of the layout `generation` read.
     /// `ifd_index` distinguishes full-resolution (0) from overview tiles (1+).
-    pub fn insert(&self, file_path: &Path, chunk_index: u32, ifd_index: u16, data: Bytes) {
+    pub fn insert(
+        &self,
+        file_path: &Path,
+        generation: u64,
+        chunk_index: u32,
+        ifd_index: u16,
+        data: Bytes,
+    ) {
         let key = TileCacheKey {
             file_path: Arc::from(file_path.to_string_lossy().as_ref()),
+            generation,
             chunk_index,
             ifd_index,
         };
@@ -128,9 +152,9 @@ mod tests {
         let path = Path::new("test/file.tif");
         let data = Bytes::from(vec![1u8; 100]);
 
-        assert!(cache.get(path, 0, 0).is_none());
-        cache.insert(path, 0, 0, data.clone());
-        assert_eq!(cache.get(path, 0, 0).unwrap(), data);
+        assert!(cache.get(path, 1, 0, 0).is_none());
+        cache.insert(path, 1, 0, 0, data.clone());
+        assert_eq!(cache.get(path, 1, 0, 0).unwrap(), data);
 
         let (hits, misses) = cache.stats();
         assert_eq!(hits, 1);
@@ -144,12 +168,29 @@ mod tests {
         let full_res = Bytes::from(vec![1u8; 100]);
         let overview = Bytes::from(vec![2u8; 50]);
 
-        cache.insert(path, 0, 0, full_res.clone());
-        cache.insert(path, 0, 1, overview.clone());
+        cache.insert(path, 1, 0, 0, full_res.clone());
+        cache.insert(path, 1, 0, 1, overview.clone());
 
         // Same chunk_index, different IFD — must return different data
-        assert_eq!(cache.get(path, 0, 0).unwrap(), full_res);
-        assert_eq!(cache.get(path, 0, 1).unwrap(), overview);
+        assert_eq!(cache.get(path, 1, 0, 0).unwrap(), full_res);
+        assert_eq!(cache.get(path, 1, 0, 1).unwrap(), overview);
+    }
+
+    /// #1055: an object republished under its path is read again, and the
+    /// tiles of its new layout never hit the bytes it replaced.
+    #[test]
+    fn cache_separates_layout_generations() {
+        let cache = TileCache::new(1024 * 1024);
+        let path = Path::new("test/file.tif");
+        let old = Bytes::from(vec![1u8; 100]);
+        cache.insert(path, 1, 0, 0, old.clone());
+
+        assert!(cache.get(path, 2, 0, 0).is_none());
+        assert!(!cache.contains_untracked(path, 2, 0, 0));
+        let new = Bytes::from(vec![2u8; 100]);
+        cache.insert(path, 2, 0, 0, new.clone());
+        assert_eq!(cache.get(path, 2, 0, 0).unwrap(), new);
+        assert_eq!(cache.get(path, 1, 0, 0).unwrap(), old);
     }
 
     #[test]
@@ -159,13 +200,13 @@ mod tests {
         let path = Path::new("test/file.tif");
 
         for i in 0..20 {
-            cache.insert(path, i, 0, Bytes::from(vec![0u8; 100]));
+            cache.insert(path, 1, i, 0, Bytes::from(vec![0u8; 100]));
         }
 
         // Some earlier entries should have been evicted
         let mut found = 0;
         for i in 0..20 {
-            if cache.get(path, i, 0).is_some() {
+            if cache.get(path, 1, i, 0).is_some() {
                 found += 1;
             }
         }
@@ -181,7 +222,7 @@ mod tests {
     fn zero_capacity_cache_stores_nothing() {
         let cache = TileCache::new(0);
         let path = Path::new("test/file.tif");
-        cache.insert(path, 0, 0, Bytes::from(vec![1u8; 100]));
-        assert!(cache.get(path, 0, 0).is_none());
+        cache.insert(path, 1, 0, 0, Bytes::from(vec![1u8; 100]));
+        assert!(cache.get(path, 1, 0, 0).is_none());
     }
 }

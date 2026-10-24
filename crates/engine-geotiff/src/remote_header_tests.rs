@@ -620,3 +620,27 @@ fn full_downloads_run_newest_first_up_to_the_bound() {
     assert_eq!(started[..6], newest_first(&keys), "the header reads");
     assert_eq!(started[6..], newest_first(&keys), "the downloads");
 }
+
+/// #1011, #1055: the poll scan reads a header, and downloads a non-COG
+/// whole, under the background budget. A GET whose body stalls past the
+/// request budget still has its file catalogued, by range or from the
+/// download; under the request budget the file would wait for the next
+/// poll.
+#[test]
+fn the_header_read_and_the_full_download_take_the_background_budget() {
+    use ds_storage::test_util::{run_stalled, StalledBody};
+    let cog = std::fs::read(FIXTURE).unwrap();
+    for (bytes, by_range) in [(ifd_at_end(cog.clone()), false), (cog, true)] {
+        let stalled = StalledBody::with_objects([(KEY, bytes)]);
+        let store = DataStore::new(stalled.clone());
+        let catalog = run_stalled(&stalled, move || poll(&store, &Catalog::empty()));
+        let source = only_source(&catalog).expect("the stalled file is catalogued");
+        assert_eq!(
+            matches!(*source, DataSource::Remote { .. }),
+            by_range,
+            "{source:?}"
+        );
+        // The header read, then for the non-COG the download.
+        assert_eq!(stalled.stalled(), if by_range { 1 } else { 2 });
+    }
+}

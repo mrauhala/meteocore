@@ -61,6 +61,10 @@ disk, no TOML needed.
 - **Symlinks are followed** (`is_dir`/`is_file` resolve them). Same trust
   model as `collections_dir`: whoever can write the scan root controls what
   is served.
+- **Temporary names are skipped (#1055):** hidden folders (rsync's
+  `.~tmp~`) and files `ds_core::temp_files::is_temporary` names, in the root
+  and each folder; the root itself is never judged. A hidden `.name.geojson`
+  would otherwise clash with `name.geojson`'s id and fail the config.
 
 ## Reload & the collections_dir watcher
 
@@ -245,10 +249,13 @@ need no reload pruning.
   poll last found data. It grows while the source is unreachable, empty or
   unloadable, the old data kept. Both growing: the source fails. Only
   `data_age_secs` growing: the feeder delivers nothing new.
-- The gauge is set each scrape by `refresh_data_age_gauge`, which removes
-  only the series of a collection that stopped reporting an age (reloaded
-  away, data gone), never the family. Alert per collection: a 5-minute radar
-  and a 6-hourly model run need different thresholds.
+- The gauges are set each scrape by `refresh_data_age_gauge`.
+  `collection_data_ages` lists every collection of those engines, with no age
+  while it holds none: never loaded, or all of it aged out. Such a collection
+  has no `collection_data_age_seconds` series and `collection_has_data` 0;
+  the others have 1 (#1055). A reloaded-away collection loses both series;
+  only those are removed, never the family. Alert per collection on the age,
+  thresholds per feed, and on `collection_has_data == 0`.
 
 ## Operational notes
 

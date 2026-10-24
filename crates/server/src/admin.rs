@@ -385,6 +385,16 @@ static COLLECTION_DATA_AGE_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     )
 });
 
+// Whether a collection whose engine reports a data age holds data (#1055):
+// a series for each such collection, data or not, so an alert sees one that
+// never loaded or whose data all aged out, which has no age series.
+static COLLECTION_HAS_DATA: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "collection_has_data",
+        "1 while a collection whose engine reports a data age holds data, 0 when it holds none",
+    )
+});
+
 static HTTP_RESPONSE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
@@ -6806,17 +6816,17 @@ pub(crate) fn refresh_health_gauges(state: &ServerState) -> HealthCounts {
 ///   files without runs.
 /// - Nowcast: the latest generation's anchor frame.
 ///
-/// Other engines, and one with no data yet, are absent. An age is negative
-/// when the newest data lies in the future. One function so the endpoint and
-/// the gauge cannot drift: O(collections) snapshot reads, no I/O, each lock
-/// taken and released on its own.
-pub(crate) fn collection_data_ages(state: &ServerState) -> Vec<(String, i64)> {
+/// Every collection of these engines is listed, with `None` while it holds
+/// no data: it never loaded any, or all of it aged out of a satellite
+/// `time_window` or a BUFR `retention` (#1055). Other engines are absent.
+/// An age is negative when the newest data lies in the future. One function
+/// so the endpoint and the gauges cannot drift: O(collections) snapshot
+/// reads, no I/O, each lock taken and released on its own.
+pub(crate) fn collection_data_ages(state: &ServerState) -> Vec<(String, Option<i64>)> {
     let now = chrono::Utc::now();
     let mut ages = Vec::new();
     let mut push = |id: &str, age: Option<chrono::Duration>| {
-        if let Some(age) = age {
-            ages.push((id.to_owned(), age.num_seconds()));
-        }
+        ages.push((id.to_owned(), age.map(|age| age.num_seconds())));
     };
     for e in state
         .geotiff_engines
@@ -6869,30 +6879,49 @@ pub(crate) fn collection_data_ages(state: &ServerState) -> Vec<(String, i64)> {
     ages
 }
 
-/// Set `collection_data_age_seconds` from [`collection_data_ages`], the
-/// `/health` source, and drop the series of every collection that stopped
-/// reporting an age (removed by a reload, or its data gone). Only those are
-/// removed, never the whole family, so a concurrent scrape cannot gather it
-/// half filled. Every `/metrics` scrape calls this; returns what it set.
-pub(crate) fn refresh_data_age_gauge(state: &ServerState) -> Vec<(String, i64)> {
-    static REPORTED: Mutex<std::collections::BTreeSet<String>> =
-        Mutex::new(std::collections::BTreeSet::new());
+/// Set `collection_data_age_seconds` and `collection_has_data` from
+/// [`collection_data_ages`], the `/health` source. A collection holding no
+/// data has `collection_has_data` 0 and no age series (#1055); a collection
+/// a reload removed has neither. Only those series are removed, never the
+/// whole family, so a concurrent scrape cannot gather it half filled. Every
+/// `/metrics` scrape calls this; returns what it set.
+pub(crate) fn refresh_data_age_gauge(state: &ServerState) -> Vec<(String, Option<i64>)> {
+    use std::collections::BTreeSet;
+    /// The collections with an age series, and those with a
+    /// `collection_has_data` series.
+    static REPORTED: Mutex<(BTreeSet<String>, BTreeSet<String>)> =
+        Mutex::new((BTreeSet::new(), BTreeSet::new()));
     // Read the ages under the lock: two scrapes racing a reload must not let
     // the older read set a removed collection's series again after the newer
     // one dropped it.
     let mut reported = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+    let (aged, listed) = &mut *reported;
     let ages = collection_data_ages(state);
-    let live: std::collections::BTreeSet<String> = ages.iter().map(|(id, _)| id.clone()).collect();
-    for gone in reported.difference(&live) {
-        // Err = no such series.
+    let with_age: BTreeSet<String> = ages
+        .iter()
+        .filter(|(_, age)| age.is_some())
+        .map(|(id, _)| id.clone())
+        .collect();
+    let with_flag: BTreeSet<String> = ages.iter().map(|(id, _)| id.clone()).collect();
+    // Err = no such series.
+    for gone in aged.difference(&with_age) {
         let _ = COLLECTION_DATA_AGE_SECONDS.remove_label_values(&[gone.as_str()]);
     }
-    for (id, age) in &ages {
-        COLLECTION_DATA_AGE_SECONDS
-            .with_label_values(&[id.as_str()])
-            .set(*age);
+    for gone in listed.difference(&with_flag) {
+        let _ = COLLECTION_HAS_DATA.remove_label_values(&[gone.as_str()]);
     }
-    *reported = live;
+    for (id, age) in &ages {
+        if let Some(age) = age {
+            COLLECTION_DATA_AGE_SECONDS
+                .with_label_values(&[id.as_str()])
+                .set(*age);
+        }
+        COLLECTION_HAS_DATA
+            .with_label_values(&[id.as_str()])
+            .set(i64::from(age.is_some()));
+    }
+    *aged = with_age;
+    *listed = with_flag;
     ages
 }
 
@@ -6905,7 +6934,10 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     // `data_age_secs` comes from the source the `/metrics` gauge reads;
     // `poll_age_secs` is the time since the last poll that found data, for
     // the engines that track it (GeoTIFF, QueryData; #1007).
-    let data_ages: HashMap<String, i64> = collection_data_ages(&state).into_iter().collect();
+    let data_ages: HashMap<String, i64> = collection_data_ages(&state)
+        .into_iter()
+        .filter_map(|(id, age)| Some((id, age?)))
+        .collect();
     let mut poll_ages: HashMap<String, i64> = HashMap::new();
     let mut temporal_info: HashMap<String, serde_json::Value> = HashMap::new();
 
@@ -12443,6 +12475,8 @@ colormap = "no_such_map"
     /// #1007 harness: a local GeoTIFF and a QueryData collection over the
     /// committed fixtures, with the time of the newest data each serves:
     /// the GeoTIFF's newest timestep and the QueryData run's origin time.
+    /// Also `age-empty`, a GeoTIFF collection over an empty directory, which
+    /// holds no data (#1055).
     fn data_age_state() -> (
         tempfile::TempDir,
         super::AdminState,
@@ -12450,11 +12484,18 @@ colormap = "no_such_map"
     ) {
         let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
         let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(
             &config_path,
             format!(
                 "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                 [[collections]]\nid = \"age-empty\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 data_path = \"{}\"\nengine_type = \"geotiff\"\n\
+                 apis = [\"wms\"]\n\
+                 [collections.geotiff]\nfilename_template = \"radar_tm35_%Y%m%dT%H%MZ.tif\"\n\
+                 parameter = \"reflectivity\"\nunit = \"dBZ\"\n\
                  [[collections]]\nid = \"age-geotiff\"\ntitle = \"t\"\ndescription = \"d\"\n\
                  data_path = \"{testdata}/radar-tm35fin\"\nengine_type = \"geotiff\"\n\
                  apis = [\"wms\"]\n\
@@ -12462,7 +12503,8 @@ colormap = "no_such_map"
                  parameter = \"reflectivity\"\nunit = \"dBZ\"\n\
                  [[collections]]\nid = \"age-querydata\"\ntitle = \"t\"\ndescription = \"d\"\n\
                  data_path = \"{testdata}/ecmwf-kenya\"\nengine_type = \"querydata\"\n\
-                 apis = [\"edr\"]\n"
+                 apis = [\"edr\"]\n",
+                empty.display()
             ),
         )
         .unwrap();
@@ -12481,16 +12523,23 @@ colormap = "no_such_map"
 
     /// The `collection_data_age_seconds` series of `/metrics`, by collection.
     fn data_age_series() -> HashMap<String, i64> {
+        collection_series("collection_data_age_seconds")
+    }
+
+    /// The series of the per-collection gauge `family` in `/metrics`, by
+    /// collection.
+    fn collection_series(family: &str) -> HashMap<String, i64> {
         use super::Encoder as _;
         let mut text = Vec::new();
         super::TextEncoder::new()
             .encode(&super::REGISTRY.gather(), &mut text)
             .unwrap();
+        let prefix = format!("{family}{{collection=\"");
         String::from_utf8(text)
             .unwrap()
             .lines()
             .filter_map(|line| {
-                let rest = line.strip_prefix("collection_data_age_seconds{collection=\"")?;
+                let rest = line.strip_prefix(prefix.as_str())?;
                 let (id, value) = rest.split_once("\"} ")?;
                 Some((id.to_owned(), value.parse().unwrap()))
             })
@@ -12500,11 +12549,13 @@ colormap = "no_such_map"
     /// #1007: `/health` `data_age_secs` and the `collection_data_age_seconds`
     /// gauge are now minus the newest data the collection serves, not the
     /// time since its last poll, which `poll_age_secs` reports; a
-    /// collection that leaves the registry drops its series.
+    /// collection that leaves the registry drops its series. #1055: every
+    /// collection of those engines has a `collection_has_data` series, 0
+    /// for one without data, which has no age.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn data_age_is_the_newest_data_in_health_and_the_gauge() {
         let (_dir, state, newest) = data_age_state();
-        assert_eq!(state.geotiff_engines.read().unwrap().len(), 1);
+        assert_eq!(state.geotiff_engines.read().unwrap().len(), 2);
         assert_eq!(state.querydata_engines.read().unwrap().len(), 1);
 
         let before = chrono::Utc::now();
@@ -12531,7 +12582,7 @@ colormap = "no_such_map"
                 "{id}: poll_age_secs {poll_age}"
             );
 
-            let gauge = set.iter().find(|(c, _)| c == id).map(|(_, age)| *age);
+            let gauge = set.iter().find(|(c, _)| c == id).and_then(|(_, age)| *age);
             assert!(
                 gauge.is_some_and(|age| ages.contains(&age)),
                 "{id}: {gauge:?}"
@@ -12539,8 +12590,24 @@ colormap = "no_such_map"
             assert_eq!(series.get(id).copied(), gauge, "{id} in /metrics");
         }
 
-        // A reload removes the GeoTIFF collection: its series goes with it,
-        // the other stays.
+        // The collection without data: no age anywhere, `collection_has_data`
+        // 0 where the others have 1.
+        let empty = json["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "age-empty")
+            .expect("a /health entry for age-empty");
+        assert!(empty["data_age_secs"].is_null(), "{empty}");
+        assert!(set.contains(&("age-empty".to_owned(), None)), "{set:?}");
+        assert!(!series.contains_key("age-empty"), "{series:?}");
+        let has_data = collection_series("collection_has_data");
+        for (id, flag) in [("age-empty", 0), ("age-geotiff", 1), ("age-querydata", 1)] {
+            assert_eq!(has_data.get(id), Some(&flag), "{id}: {has_data:?}");
+        }
+
+        // A reload removes the GeoTIFF collections: their series go with
+        // them, the other stays.
         state.geotiff_engines.write().unwrap().clear();
         let set = super::refresh_data_age_gauge(&state);
         assert_eq!(
@@ -12550,6 +12617,11 @@ colormap = "no_such_map"
         let series = data_age_series();
         assert!(!series.contains_key("age-geotiff"), "{series:?}");
         assert!(series.contains_key("age-querydata"), "{series:?}");
+        let has_data = collection_series("collection_has_data");
+        assert_eq!(
+            has_data.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["age-querydata"]
+        );
     }
 }
 
