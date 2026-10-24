@@ -37,5 +37,6 @@ pub use cells::cell_set_cache_metrics;
 pub use engine::{composite_cache_metrics, EngineError, OdimEngine};
 pub use pixel_cache::PixelCache;
 pub use volume_engine::{
-    pixel_cache_metrics, voxel_grid_cache_metrics, PolarVolumeEngine, PolarVolumeSiteView,
+    pixel_cache_metrics, voxel_grid_cache_metrics, AbortReason, PolarVolumeEngine,
+    PolarVolumeSiteView,
 };

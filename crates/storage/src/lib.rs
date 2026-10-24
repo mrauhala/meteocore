@@ -137,10 +137,12 @@ pub enum RangeRead {
     Changed,
 }
 
-/// Why a store refused a range read in a way that no retry of the same read
-/// can change (#1074). [`DataStore::get_range_or_refusal`] answers it as
-/// data, not as an error, so a caller tells "the object is gone" from "this
-/// read failed" without matching error text.
+/// Why a store refused a read in a way that no retry of the same read can
+/// change (#1074). The `_or_refusal` reads ([`DataStore::get_range_or_refusal`],
+/// [`DataStore::get_or_refusal`], [`DataStore::get_ranges_or_refusal`] and
+/// their started forms, #1046) answer it as data, not as an error, so a
+/// caller tells "the object is gone" or "these credentials may not read it"
+/// from "this read failed" without matching error text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeRefusal {
     /// 404: no object under the key.
@@ -164,15 +166,19 @@ impl std::fmt::Display for RangeRefusal {
     }
 }
 
-/// What [`DataStore::get_range_or_refusal`] read.
+/// What a read that answers a lasting refusal as data read: one range, the
+/// whole object, or one buffer per range of several (#1074, #1046).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
-pub enum RangeAnswer {
-    /// The bytes of the range.
-    Read(Bytes),
-    /// The store refused the range for good.
+pub enum ReadAnswer<T = Bytes> {
+    /// The bytes read.
+    Read(T),
+    /// The store refused the read for good.
     Refused(RangeRefusal),
 }
+
+/// What [`DataStore::get_range_or_refusal`] read.
+pub type RangeAnswer = ReadAnswer<Bytes>;
 
 /// One document [`DataStore::get_documents_on`] gets: the object at `path`,
 /// with `query` as its URL's query string.
@@ -389,57 +395,60 @@ impl DataStore {
     /// own, up to ten at once (object_store's `coalesce_ranges`), and only
     /// ranges that overlap or touch are merged: the caller decides which
     /// near ranges are worth one GET. object_store's own `get_ranges` would
-    /// merge any within 1 MiB. A missing object is `Ok(None)`, as in
-    /// [`Self::get_opt`]; every other failure, the deadline included, is an
-    /// `Err`. A range past the object's end may come back short, so a
-    /// caller that needs the exact length checks it.
-    pub fn get_ranges_opt(
+    /// merge any within 1 MiB. A refusal no retry changes is
+    /// [`ReadAnswer::Refused`], as in [`Self::get_or_refusal`]: a missing
+    /// object, a key these credentials may not read, a range past the end
+    /// that the store answers 416. Every other failure, the deadline
+    /// included, is an `Err`. A range past the object's end may instead come
+    /// back short, so a caller that needs the exact length checks it.
+    pub fn get_ranges_or_refusal(
         &self,
         path: &ObjectPath,
         ranges: &[Range<usize>],
-    ) -> Result<Option<Vec<Bytes>>, DataServerError> {
-        self.get_ranges_opt_with(None, path, ranges)
+    ) -> Result<ReadAnswer<Vec<Bytes>>, DataServerError> {
+        self.get_ranges_or_refusal_with(None, path, ranges)
     }
 
-    /// [`Self::get_ranges_opt`] driven on an explicitly-provided runtime
-    /// `Handle`, as [`Self::get_opt_on`] is to [`Self::get_opt`].
-    pub fn get_ranges_opt_on(
+    /// [`Self::get_ranges_or_refusal`] driven on an explicitly-provided
+    /// runtime `Handle`, as [`Self::get_or_refusal_on`] is to
+    /// [`Self::get_or_refusal`].
+    pub fn get_ranges_or_refusal_on(
         &self,
         path: &ObjectPath,
         ranges: &[Range<usize>],
         handle: &tokio::runtime::Handle,
-    ) -> Result<Option<Vec<Bytes>>, DataServerError> {
-        self.get_ranges_opt_with(Some(handle), path, ranges)
+    ) -> Result<ReadAnswer<Vec<Bytes>>, DataServerError> {
+        self.get_ranges_or_refusal_with(Some(handle), path, ranges)
     }
 
-    fn get_ranges_opt_with(
+    fn get_ranges_or_refusal_with(
         &self,
         handle: Option<&tokio::runtime::Handle>,
         path: &ObjectPath,
         ranges: &[Range<usize>],
-    ) -> Result<Option<Vec<Bytes>>, DataServerError> {
+    ) -> Result<ReadAnswer<Vec<Bytes>>, DataServerError> {
         let ranges: Vec<Range<u64>> = ranges.iter().cloned().map(to_u64).collect();
-        self.block_on_with(handle, FetchBudget::Request, self.ranges_opt(path, &ranges))
+        let read = self.ranges_or_refusal(path, &ranges);
+        self.block_on_with(handle, FetchBudget::Request, read)
     }
 
     /// The byte `ranges` of the object at `path`, one buffer per range in
-    /// input order, or `None` when it is missing; counted in
+    /// input order, or the store's lasting refusal; counted in
     /// [`Self::bytes_read`]. Each range is a GET of its own, up to ten at
     /// once, and only ranges that overlap or touch are merged.
-    async fn ranges_opt(
+    async fn ranges_or_refusal(
         &self,
         path: &ObjectPath,
         ranges: &[Range<u64>],
-    ) -> Result<Option<Vec<Bytes>>, object_store::Error> {
+    ) -> Result<ReadAnswer<Vec<Bytes>>, object_store::Error> {
         let fetch = |range| self.inner.get_range(path, range);
         let parts = match object_store::coalesce_ranges(ranges, fetch, 0).await {
             Ok(parts) => parts,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => return refusal_or(e),
         };
         let total: usize = parts.iter().map(Bytes::len).sum();
         self.bytes_read.fetch_add(total as u64, Ordering::Relaxed);
-        Ok(Some(parts))
+        Ok(ReadAnswer::Read(parts))
     }
 
     /// Like [`Self::get_range`], but a refusal that no retry can change is a
@@ -618,45 +627,59 @@ impl DataStore {
     /// (an unwritten chunk, an optional metadata file) as "use the fill value"
     /// / "not present", so the engine needs this distinction.
     pub fn get_opt(&self, path: &ObjectPath) -> Result<Option<Bytes>, DataServerError> {
-        self.get_opt_with(path, None)
+        self.block_on_with(None, FetchBudget::Request, async {
+            let bytes = match self.inner.get(path).await {
+                Ok(res) => res.bytes().await?,
+                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            self.bytes_read
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            Ok(Some(bytes))
+        })
     }
 
-    /// [`Self::get_opt`] driven on an explicitly-provided runtime `Handle`, as
-    /// [`Self::get_on`] is to [`Self::get`]. A missing object is `Ok(None)`;
-    /// every other failure (deadline, network, 5xx) stays an `Err`, so a
-    /// caller tells "the object is gone" from "this read failed" without
-    /// matching error strings.
-    pub fn get_opt_on(
+    /// Like [`Self::get`], but a refusal that no retry of the read can
+    /// change is a [`ReadAnswer::Refused`] rather than an error (#1046), as
+    /// [`Self::get_range_or_refusal`] answers one for a range: a missing
+    /// object (404) and a key these credentials may not read (401/403). S3
+    /// answers 403 for a missing key when the caller may not list the
+    /// bucket. Every other failure (deadline, network, 5xx) stays an `Err`,
+    /// so a caller tells "the object is gone" or "it is not ours to read"
+    /// from "this read failed" without matching error strings. Under
+    /// [`FetchBudget::Request`].
+    pub fn get_or_refusal(&self, path: &ObjectPath) -> Result<ReadAnswer, DataServerError> {
+        self.block_on_with(None, FetchBudget::Request, self.whole_or_refusal(path))
+    }
+
+    /// [`Self::get_or_refusal`] driven on an explicitly-provided runtime
+    /// `Handle`, as [`Self::get_on`] is to [`Self::get`].
+    pub fn get_or_refusal_on(
         &self,
         path: &ObjectPath,
         handle: &tokio::runtime::Handle,
-    ) -> Result<Option<Bytes>, DataServerError> {
-        self.get_opt_with(path, Some(handle))
+    ) -> Result<ReadAnswer, DataServerError> {
+        self.block_on_with(
+            Some(handle),
+            FetchBudget::Request,
+            self.whole_or_refusal(path),
+        )
     }
 
-    fn get_opt_with(
-        &self,
-        path: &ObjectPath,
-        handle: Option<&tokio::runtime::Handle>,
-    ) -> Result<Option<Bytes>, DataServerError> {
-        self.block_on_with(handle, FetchBudget::Request, self.whole_opt(path))
-    }
-
-    /// The whole object at `path`, or `None` when it is missing; counted in
-    /// [`Self::bytes_read`].
-    async fn whole_opt(&self, path: &ObjectPath) -> Result<Option<Bytes>, object_store::Error> {
+    /// The whole object at `path`, or the store's lasting refusal; counted
+    /// in [`Self::bytes_read`].
+    async fn whole_or_refusal(&self, path: &ObjectPath) -> Result<ReadAnswer, object_store::Error> {
         let bytes = match self.inner.get(path).await {
             Ok(res) => res.bytes().await?,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => return refusal_or(e),
         };
         self.bytes_read
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        Ok(Some(bytes))
+        Ok(ReadAnswer::Read(bytes))
     }
 
-    /// Start [`Self::get_opt`] of `path` as a task on `handle`'s runtime and
-    /// return at once; [`PendingGet::wait`] collects it. Reads started before
+    /// Start [`Self::get_or_refusal`] of `path` as a task on `handle`'s
+    /// runtime and return at once; [`PendingGet::wait`] collects it. Reads started before
     /// the first is collected run concurrently, so synchronous code walking
     /// many objects can start the next few while it works on the current
     /// one, instead of paying one round trip per object in turn (root
@@ -675,22 +698,26 @@ impl DataStore {
     /// `handle` must be a multi-thread runtime: a current-thread runtime
     /// runs the task only while something drives it, so the reads would not
     /// progress while the caller works.
-    pub fn start_get_opt(&self, path: &ObjectPath, handle: &tokio::runtime::Handle) -> PendingGet {
+    pub fn start_get_or_refusal(
+        &self,
+        path: &ObjectPath,
+        handle: &tokio::runtime::Handle,
+    ) -> PendingGet {
         self.start(path, handle, |store, object| async move {
-            store.whole_opt(&object).await
+            store.whole_or_refusal(&object).await
         })
     }
 
-    /// Start [`Self::get_ranges_opt`] of `path` as a task on `handle`'s
-    /// runtime and return at once, as [`Self::start_get_opt`] starts a
-    /// whole-object read (#1261): a walk over many objects reads the next
-    /// ones' byte ranges while it works on the current one. Each range is a
-    /// GET of its own, up to ten at once, and only ranges that overlap or
-    /// touch are merged. [`PendingGet::wait`] returns one buffer per range,
-    /// in input order, `None` for a missing object; the read's limits, its
-    /// sharing and its abort on the last drop are those of
-    /// [`Self::start_get_opt`].
-    pub fn start_get_ranges_opt(
+    /// Start [`Self::get_ranges_or_refusal`] of `path` as a task on
+    /// `handle`'s runtime and return at once, as
+    /// [`Self::start_get_or_refusal`] starts a whole-object read (#1261): a
+    /// walk over many objects reads the next ones' byte ranges while it
+    /// works on the current one. Each range is a GET of its own, up to ten
+    /// at once, and only ranges that overlap or touch are merged.
+    /// [`PendingGet::wait`] returns one buffer per range, in input order, or
+    /// the store's lasting refusal; the read's limits, its sharing and its
+    /// abort on the last drop are those of [`Self::start_get_or_refusal`].
+    pub fn start_get_ranges_or_refusal(
         &self,
         path: &ObjectPath,
         ranges: &[Range<usize>],
@@ -698,7 +725,7 @@ impl DataStore {
     ) -> PendingGet<Vec<Bytes>> {
         let ranges: Vec<Range<u64>> = ranges.iter().cloned().map(to_u64).collect();
         self.start(path, handle, |store, object| async move {
-            store.ranges_opt(&object, &ranges).await
+            store.ranges_or_refusal(&object, &ranges).await
         })
     }
 
@@ -712,7 +739,9 @@ impl DataStore {
     ) -> PendingGet<T>
     where
         T: Clone + Send + Sync + 'static,
-        F: std::future::Future<Output = Result<Option<T>, object_store::Error>> + Send + 'static,
+        F: std::future::Future<Output = Result<ReadAnswer<T>, object_store::Error>>
+            + Send
+            + 'static,
     {
         use futures::FutureExt;
         debug_assert_eq!(
@@ -1349,6 +1378,16 @@ where
     }
 }
 
+/// A failed read of an `_or_refusal` method: a refusal no retry of the read
+/// can change ([`error::range_refusal`]) as data, any other failure as the
+/// error it is.
+fn refusal_or<T>(e: object_store::Error) -> Result<ReadAnswer<T>, object_store::Error> {
+    match error::range_refusal(&e) {
+        Some(refusal) => Ok(ReadAnswer::Refused(refusal)),
+        None => Err(e),
+    }
+}
+
 /// Drive `future` to completion from synchronous code on the ambient
 /// runtime: a multi-threaded async worker yields via `block_in_place`, a
 /// blocking-pool worker runs it directly, and a foreign thread without a
@@ -1366,21 +1405,21 @@ fn block_on_ambient<F: std::future::Future>(future: F) -> Result<F::Output, Data
 }
 
 /// A read running on a runtime ahead of the synchronous code that needs its
-/// bytes: a whole object (`T = Bytes`) from [`DataStore::start_get_opt`], or
-/// byte ranges (`T = Vec<Bytes>`) from [`DataStore::start_get_ranges_opt`].
-/// Collect it with [`Self::wait`], from as many threads as hold it (#1127);
-/// dropping it aborts the read, so its last holder going away unread stops
-/// it.
+/// bytes: a whole object (`T = Bytes`) from
+/// [`DataStore::start_get_or_refusal`], or byte ranges (`T = Vec<Bytes>`)
+/// from [`DataStore::start_get_ranges_or_refusal`]. Collect it with
+/// [`Self::wait`], from as many threads as hold it (#1127); dropping it
+/// aborts the read, so its last holder going away unread stops it.
 #[must_use = "dropping a PendingGet aborts its read"]
 pub struct PendingGet<T = Bytes> {
     path: ObjectPath,
     read: PendingRead<T>,
 }
 
-/// What a started read ends with, cloned to each waiter: the bytes, `None`
-/// for a missing object, or the failure's message. Every failure of the
+/// What a started read ends with, cloned to each waiter: the bytes or the
+/// store's lasting refusal, or the failure's message. Every failure of the
 /// read itself is a [`DataServerError::Storage`], which is not `Clone`.
-type ReadOutcome<T> = Result<Option<T>, String>;
+type ReadOutcome<T> = Result<ReadAnswer<T>, String>;
 
 enum PendingRead<T> {
     /// The request deadline had passed when the read was asked for, so it
@@ -1394,21 +1433,23 @@ enum PendingRead<T> {
 }
 
 impl<T: Clone> PendingGet<T> {
-    /// Wait for the read and return what [`DataStore::get_opt`] (or
-    /// [`DataStore::get_ranges_opt`]) would have: `Ok(None)` for a missing
-    /// object, and `Err` for every other failure. The wait is limited by the
-    /// request deadline in scope on this thread, `DeadlineExceeded` when it
-    /// passes; the read goes on for any other holder.
+    /// Wait for the read and return what [`DataStore::get_or_refusal`] (or
+    /// [`DataStore::get_ranges_or_refusal`]) would have: the bytes or the
+    /// store's lasting refusal, and `Err` for every other failure. The wait
+    /// is limited by the request deadline in scope on this thread,
+    /// `DeadlineExceeded` when it passes; the read goes on for any other
+    /// holder.
     ///
     /// `handle` picks the bridge by the caller's context, as
-    /// [`DataStore::get_opt_on`] and [`DataStore::get_opt`] do: `Some` drives
-    /// the wait with `handle.block_on`, for a `spawn_blocking` worker or a
-    /// foreign thread; `None` uses `block_in_place` around the ambient
-    /// runtime, for a multi-thread runtime worker.
+    /// [`DataStore::get_or_refusal_on`] and [`DataStore::get_or_refusal`]
+    /// do: `Some` drives the wait with `handle.block_on`, for a
+    /// `spawn_blocking` worker or a foreign thread; `None` uses
+    /// `block_in_place` around the ambient runtime, for a multi-thread
+    /// runtime worker.
     pub fn wait(
         &self,
         handle: Option<&tokio::runtime::Handle>,
-    ) -> Result<Option<T>, DataServerError> {
+    ) -> Result<ReadAnswer<T>, DataServerError> {
         let result = match &self.read {
             PendingRead::Expired => return Err(DataServerError::DeadlineExceeded),
             PendingRead::Running { result, .. } => result.clone(),
@@ -1431,7 +1472,8 @@ impl<T: Clone> PendingGet<T> {
 
     /// Whether the read is known to have failed: it ended with an error a
     /// waiter has seen, or it was never sent. A caller that wants the object
-    /// starts another read rather than waiting for this one.
+    /// starts another read rather than waiting for this one. A read the
+    /// store refused has not failed: the refusal is its answer.
     pub fn failed(&self) -> bool {
         match &self.read {
             PendingRead::Expired => true,
@@ -2161,46 +2203,88 @@ mod deadline_tests {
         .unwrap();
     }
 
-    /// `get_opt_on` keeps "the object is gone" (`Ok(None)`) apart from "this
-    /// read failed" (`Err`): an expired deadline is `DeadlineExceeded`, never
-    /// a missing object, so a caller can negatively cache only the former.
+    /// The bytes of a read that must not have been refused.
+    fn read<T>(answer: ReadAnswer<T>) -> T {
+        match answer {
+            ReadAnswer::Read(bytes) => bytes,
+            ReadAnswer::Refused(refusal) => panic!("refused: {refusal}"),
+        }
+    }
+
+    /// #1046: `get_or_refusal[_on]` answers "the object is gone" and "these
+    /// credentials may not read it" as refusals, apart from "this read
+    /// failed" (`Err`): a 5xx is an error, and an expired deadline is
+    /// `DeadlineExceeded`, never a refusal, so a caller can negatively cache
+    /// only the former. The ranged read answers the same refusals.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_opt_on_separates_missing_from_deadline() {
-        use object_store::ObjectStoreExt;
-        let inner = object_store::memory::InMemory::new();
-        let present = ObjectPath::from("present.h5");
-        inner
-            .put(&present, object_store::PutPayload::from_static(b"data"))
-            .await
-            .unwrap();
-        let store = DataStore::new(Arc::new(inner));
+    async fn get_or_refusal_separates_refusals_from_failures() {
+        use crate::test_store::MetaStore;
+        let meta = MetaStore::default();
+        meta.put_body("present.h5", &b"data"[..]);
+        for key in ["forbidden.h5", "failing.h5"] {
+            meta.set(key, 4, None);
+        }
+        meta.forbidden.lock().unwrap().insert("forbidden.h5".into());
+        meta.failing.lock().unwrap().insert("failing.h5".into());
+        let store = DataStore::new(Arc::new(meta));
+        let (missing, present) = (
+            ObjectPath::from("missing.h5"),
+            ObjectPath::from("present.h5"),
+        );
+        let (forbidden, failing) = (
+            ObjectPath::from("forbidden.h5"),
+            ObjectPath::from("failing.h5"),
+        );
+        assert_eq!(read(store.get_or_refusal(&present).unwrap()), &b"data"[..]);
+        assert_eq!(
+            store.get_or_refusal(&forbidden).unwrap(),
+            ReadAnswer::Refused(RangeRefusal::Forbidden)
+        );
+        assert_eq!(
+            store
+                .get_ranges_or_refusal(&forbidden, &[0..2, 3..4])
+                .unwrap(),
+            ReadAnswer::Refused(RangeRefusal::Forbidden)
+        );
+        assert!(matches!(
+            store.get_or_refusal(&failing),
+            Err(DataServerError::Storage(_))
+        ));
+        assert!(
+            matches!(store.get_opt(&forbidden), Err(DataServerError::Storage(_))),
+            "`get_opt` keeps a refusal other than a missing object an error"
+        );
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            let missing = ObjectPath::from("missing.h5");
-            assert!(store.get_opt_on(&missing, &handle).unwrap().is_none());
             assert_eq!(
-                store.get_opt_on(&present, &handle).unwrap().as_deref(),
-                Some(&b"data"[..])
+                store.get_or_refusal_on(&missing, &handle).unwrap(),
+                ReadAnswer::Refused(RangeRefusal::NotFound)
+            );
+            assert_eq!(
+                store.get_or_refusal_on(&forbidden, &handle).unwrap(),
+                ReadAnswer::Refused(RangeRefusal::Forbidden)
+            );
+            assert_eq!(
+                read(store.get_or_refusal_on(&present, &handle).unwrap()),
+                &b"data"[..]
             );
             let _scope = ds_core::deadline::enter(Some(std::time::Instant::now()));
-            assert!(matches!(
-                store.get_opt_on(&missing, &handle),
-                Err(DataServerError::DeadlineExceeded)
-            ));
-            assert!(matches!(
-                store.get_opt_on(&present, &handle),
-                Err(DataServerError::DeadlineExceeded)
-            ));
+            for path in [&missing, &present, &forbidden] {
+                assert!(matches!(
+                    store.get_or_refusal_on(path, &handle),
+                    Err(DataServerError::DeadlineExceeded)
+                ));
+            }
         })
         .await
         .unwrap();
     }
 
-    /// #1047: `get_ranges_opt[_on]` returns each range's bytes in input
-    /// order and counts them, keeps a missing object (`Ok(None)`) apart from
-    /// a failed read, and answers an expired deadline without reading.
+    /// #1047: `get_ranges_or_refusal[_on]` returns each range's bytes in
+    /// input order and counts them, keeps a missing object (a refusal) apart
+    /// from a failed read, and answers an expired deadline without reading.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_ranges_opt_reads_ranges_and_separates_missing_from_deadline() {
+    async fn get_ranges_or_refusal_reads_ranges_and_separates_missing_from_deadline() {
         use object_store::ObjectStoreExt;
         let inner = object_store::memory::InMemory::new();
         let present = ObjectPath::from("present.h5");
@@ -2212,24 +2296,26 @@ mod deadline_tests {
         let store = DataStore::new(Arc::new(inner));
         let handle = tokio::runtime::Handle::current();
         let ranges = [200..203, 4..6];
-        let parts = store.get_ranges_opt(&present, &ranges).unwrap().unwrap();
+        let parts = read(store.get_ranges_or_refusal(&present, &ranges).unwrap());
         assert_eq!(parts, [&[200u8, 201, 202][..], &[4, 5][..]]);
         assert_eq!(store.bytes_read(), 5);
         tokio::task::spawn_blocking(move || {
             let missing = ObjectPath::from("missing.h5");
-            assert!(store
-                .get_ranges_opt_on(&missing, &ranges, &handle)
-                .unwrap()
-                .is_none());
-            let parts = store.get_ranges_opt_on(&present, &ranges, &handle).unwrap();
-            assert_eq!(parts.unwrap()[1].as_ref(), &[4, 5]);
+            assert_eq!(
+                store
+                    .get_ranges_or_refusal_on(&missing, &ranges, &handle)
+                    .unwrap(),
+                ReadAnswer::Refused(RangeRefusal::NotFound)
+            );
+            let parts = store.get_ranges_or_refusal_on(&present, &ranges, &handle);
+            assert_eq!(read(parts.unwrap())[1].as_ref(), &[4, 5]);
             let _scope = ds_core::deadline::enter(Some(std::time::Instant::now()));
             assert!(matches!(
-                store.get_ranges_opt_on(&missing, &ranges, &handle),
+                store.get_ranges_or_refusal_on(&missing, &ranges, &handle),
                 Err(DataServerError::DeadlineExceeded)
             ));
             assert!(matches!(
-                store.get_ranges_opt(&present, &ranges),
+                store.get_ranges_or_refusal(&present, &ranges),
                 Err(DataServerError::DeadlineExceeded)
             ));
         })
@@ -2237,9 +2323,10 @@ mod deadline_tests {
         .unwrap();
     }
 
-    /// #999: reads started with `start_get_opt` run concurrently on the
-    /// runtime and are collected in any order; a missing object stays
-    /// `Ok(None)`, apart from a failed read, which `failed` reports. #1127:
+    /// #999: reads started with `start_get_or_refusal` run concurrently on
+    /// the runtime and are collected in any order; a missing or forbidden
+    /// object is a refusal, apart from a failed read, which `failed`
+    /// reports (#1046). #1127:
     /// threads holding one read share its GET; a waiter's deadline ends its
     /// own wait, not the read; and a read asked for past the deadline is
     /// never sent.
@@ -2251,16 +2338,20 @@ mod deadline_tests {
             delay: Duration::from_millis(200),
             ..MetaStore::default()
         });
-        for key in ["a", "b", "c", "failing"] {
+        for key in ["a", "b", "c", "failing", "forbidden"] {
             meta.set(key, 0, None);
         }
         meta.failing.lock().unwrap().insert("failing".to_string());
+        meta.forbidden
+            .lock()
+            .unwrap()
+            .insert("forbidden".to_string());
         let store = DataStore::new(meta.clone());
         let handle = tokio::runtime::Handle::current();
         let on_worker = (store.clone(), handle.clone());
         tokio::task::spawn_blocking(move || {
-            let start = |key: &str| store.start_get_opt(&ObjectPath::from(key), &handle);
-            let reads: Vec<_> = ["a", "b", "c", "missing", "failing"]
+            let start = |key: &str| store.start_get_or_refusal(&ObjectPath::from(key), &handle);
+            let reads: Vec<_> = ["a", "b", "c", "missing", "failing", "forbidden"]
                 .into_iter()
                 .map(start)
                 .collect();
@@ -2272,28 +2363,37 @@ mod deadline_tests {
             results.reverse();
             assert_eq!(
                 meta.peak.load(Ordering::SeqCst),
-                5,
+                6,
                 "every read was in flight before the first was collected"
             );
             for result in &results[..3] {
-                assert_eq!(result.as_ref().unwrap().as_deref(), Some(&b""[..]));
+                assert_eq!(result.as_ref().unwrap(), &ReadAnswer::Read(Bytes::new()));
             }
-            assert!(matches!(results[3], Ok(None)), "missing: {:?}", results[3]);
+            assert!(
+                matches!(results[3], Ok(ReadAnswer::Refused(RangeRefusal::NotFound))),
+                "missing: {:?}",
+                results[3]
+            );
             assert!(
                 matches!(results[4], Err(DataServerError::Storage(_))),
                 "a failed read is an error, not a missing object: {:?}",
                 results[4]
             );
+            assert!(
+                matches!(results[5], Ok(ReadAnswer::Refused(RangeRefusal::Forbidden))),
+                "forbidden: {:?}",
+                results[5]
+            );
             let failed: Vec<_> = reads.iter().map(PendingGet::failed).collect();
-            assert_eq!(failed, [false, false, false, false, true]);
+            assert_eq!(failed, [false, false, false, false, true, false]);
             drop(reads);
 
             meta.gets.store(0, Ordering::SeqCst);
-            let read = start("a");
+            let shared = start("a");
             std::thread::scope(|scope| {
                 for _ in 0..3 {
                     scope.spawn(|| {
-                        assert_eq!(read.wait(Some(&handle)).unwrap().as_deref(), Some(&b""[..]));
+                        assert_eq!(read(shared.wait(Some(&handle)).unwrap()), &b""[..]);
                     });
                 }
             });
@@ -2303,25 +2403,25 @@ mod deadline_tests {
                 "three waiters, one GET"
             );
 
-            let read = start("b");
+            let slow = start("b");
             let scope = ds_core::deadline::enter(Some(Instant::now() + Duration::from_millis(50)));
             assert!(matches!(
-                read.wait(Some(&handle)),
+                slow.wait(Some(&handle)),
                 Err(DataServerError::DeadlineExceeded)
             ));
             drop(scope);
             assert_eq!(
-                read.wait(Some(&handle)).unwrap().as_deref(),
-                Some(&b""[..]),
+                read(slow.wait(Some(&handle)).unwrap()),
+                &b""[..],
                 "the read went on past the first waiter's deadline"
             );
 
             meta.gets.store(0, Ordering::SeqCst);
             let _scope = ds_core::deadline::enter(Some(Instant::now()));
-            let read = start("a");
-            assert!(read.failed(), "an expired read is not joined");
+            let expired = start("a");
+            assert!(expired.failed(), "an expired read is not joined");
             assert!(matches!(
-                read.wait(Some(&handle)),
+                expired.wait(Some(&handle)),
                 Err(DataServerError::DeadlineExceeded)
             ));
             assert_eq!(
@@ -2335,21 +2435,21 @@ mod deadline_tests {
 
         // A runtime worker collects through `block_in_place` (`None`).
         let (store, handle) = on_worker;
-        let read = tokio::spawn(async move {
+        let collected = tokio::spawn(async move {
             store
-                .start_get_opt(&ObjectPath::from("b"), &handle)
+                .start_get_or_refusal(&ObjectPath::from("b"), &handle)
                 .wait(None)
         });
-        assert!(matches!(read.await.unwrap(), Ok(Some(_))));
+        assert!(matches!(collected.await.unwrap(), Ok(ReadAnswer::Read(_))));
     }
 
-    /// #1261: `start_get_ranges_opt` runs `get_ranges_opt` as a task, as
-    /// `start_get_opt` runs `get_opt`: reads started before the first is
-    /// collected overlap, each comes back one buffer per range in input
-    /// order and counted, a missing object is `Ok(None)`, and a read asked
-    /// for past the deadline is never sent.
+    /// #1261: `start_get_ranges_or_refusal` runs `get_ranges_or_refusal` as
+    /// a task, as `start_get_or_refusal` runs `get_or_refusal`: reads
+    /// started before the first is collected overlap, each comes back one
+    /// buffer per range in input order and counted, a missing object is a
+    /// refusal, and a read asked for past the deadline is never sent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn started_ranged_reads_overlap_and_answer_as_get_ranges_opt() {
+    async fn started_ranged_reads_overlap_and_answer_as_get_ranges_or_refusal() {
         use object_store::throttle::{ThrottleConfig, ThrottledStore};
         use object_store::ObjectStoreExt;
         use std::time::{Duration, Instant};
@@ -2369,15 +2469,19 @@ mod deadline_tests {
         let on_worker = (store.clone(), handle.clone());
         let ranges = [200..203, 4..6];
         tokio::task::spawn_blocking(move || {
-            let start =
-                |key: &str| store.start_get_ranges_opt(&ObjectPath::from(key), &ranges, &handle);
+            let start = |key: &str| {
+                store.start_get_ranges_or_refusal(&ObjectPath::from(key), &ranges, &handle)
+            };
             let started = Instant::now();
             let reads = ["a.h5", "b.h5", "missing.h5"].map(start);
-            for read in &reads[..2] {
-                let parts = read.wait(Some(&handle)).unwrap().unwrap();
+            for ranged in &reads[..2] {
+                let parts = read(ranged.wait(Some(&handle)).unwrap());
                 assert_eq!(parts, [&[200u8, 201, 202][..], &[4, 5][..]]);
             }
-            assert!(reads[2].wait(Some(&handle)).unwrap().is_none());
+            assert_eq!(
+                reads[2].wait(Some(&handle)).unwrap(),
+                ReadAnswer::Refused(RangeRefusal::NotFound)
+            );
             assert!(!reads[2].failed(), "a missing object is not a failed read");
             assert!(
                 started.elapsed() < delay * 3,
@@ -2387,10 +2491,10 @@ mod deadline_tests {
             assert_eq!(store.bytes_read(), 10);
 
             let _scope = ds_core::deadline::enter(Some(Instant::now()));
-            let read = start("a.h5");
-            assert!(read.failed());
+            let expired = start("a.h5");
+            assert!(expired.failed());
             assert!(matches!(
-                read.wait(Some(&handle)),
+                expired.wait(Some(&handle)),
                 Err(DataServerError::DeadlineExceeded)
             ));
             assert_eq!(store.bytes_read(), 10, "an expired read is not sent");
@@ -2400,12 +2504,12 @@ mod deadline_tests {
 
         // A runtime worker collects through `block_in_place` (`None`).
         let (store, handle) = on_worker;
-        let read = tokio::spawn(async move {
+        let collected = tokio::spawn(async move {
             store
-                .start_get_ranges_opt(&ObjectPath::from("b.h5"), &[0..2, 9..10], &handle)
+                .start_get_ranges_or_refusal(&ObjectPath::from("b.h5"), &[0..2, 9..10], &handle)
                 .wait(None)
         });
-        let parts = read.await.unwrap().unwrap().unwrap();
+        let parts = read(collected.await.unwrap().unwrap());
         assert_eq!(parts, [&[0u8, 1][..], &[9][..]]);
     }
 }

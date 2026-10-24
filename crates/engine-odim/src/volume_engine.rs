@@ -81,6 +81,7 @@ use ds_storage::discovery::{
     expand_prefix_for_range, expand_prefix_pattern, list_prefixes, validate_prefix_pattern,
     TimeWindow,
 };
+use ds_storage::{RangeRefusal, ReadAnswer};
 
 use crate::catalog::MAX_REMOTE_FILE_SIZE;
 use crate::engine::EngineError;
@@ -124,6 +125,49 @@ pub(crate) fn pixel_cache() -> &'static PixelCache {
 /// `/metrics`) makes the degradation observable (PR #290 review).
 static PIXEL_READ_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Cumulative lazy pixel reads that failed their request instead (#993,
+/// #1046), by [`AbortReason`]: `pvol_pixel_read_aborts_total` in `/metrics`.
+/// Without it a cut-off read shows only in the engine-agnostic render
+/// deadline counter or as an EDR 504, and a storage failure only in the log.
+static PIXEL_READ_ABORTS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Why a pixel read failed its request (#1046).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortReason {
+    /// The request deadline passed first: during the read, or waiting for
+    /// another request's load of the file.
+    Deadline,
+    /// The store failed in a way a retry can heal, or refused the file
+    /// (401/403, a local file this process may not read).
+    Storage,
+}
+
+impl AbortReason {
+    pub const ALL: [Self; 2] = [Self::Deadline, Self::Storage];
+
+    /// The `reason` label of `pvol_pixel_read_aborts_total`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline",
+            Self::Storage => "storage",
+        }
+    }
+}
+
+/// Count a pixel read that fails its request with `e` (#1046) and return it.
+/// Call once per failed read, where the read's error becomes the request's.
+fn aborted(e: DataServerError) -> DataServerError {
+    let reason = match e {
+        DataServerError::DeadlineExceeded => AbortReason::Deadline,
+        _ => AbortReason::Storage,
+    };
+    PIXEL_READ_ABORTS[reason as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    e
+}
+
 /// Snapshot of the process-global PVOL pixel cache for `/metrics`.
 /// `inserts` + `entries` make eviction pressure observable (#476):
 /// evictions ≈ increase(inserts) − delta(entries).
@@ -131,12 +175,16 @@ pub struct PixelCacheMetrics {
     /// Standard hits/misses/bytes/capacity snapshot.
     pub cache: ds_cache::CacheMetrics,
     /// Cumulative inserts (request-time decodes, their background sibling
-    /// decodes, and poll-time pre-warm).
+    /// decodes, cut-off reads finished in the background, and poll-time
+    /// pre-warm).
     pub inserts: u64,
     /// Resident entry count.
     pub entries: u64,
     /// Cumulative failed lazy pixel reads (degraded to nodata).
     pub read_failures: u64,
+    /// Cumulative lazy pixel reads that failed their request instead, in
+    /// [`AbortReason::ALL`] order.
+    pub read_aborts: [u64; 2],
 }
 
 /// Snapshot of the process-global PVOL pixel cache for `/metrics`.
@@ -152,6 +200,9 @@ pub fn pixel_cache_metrics() -> PixelCacheMetrics {
         inserts: PIXEL_CACHE.inserts(),
         entries: PIXEL_CACHE.len() as u64,
         read_failures: PIXEL_READ_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+        read_aborts: AbortReason::ALL.map(|reason| {
+            PIXEL_READ_ABORTS[reason as usize].load(std::sync::atomic::Ordering::Relaxed)
+        }),
     }
 }
 
@@ -546,10 +597,11 @@ enum PixelReadError {
 }
 
 impl PixelReadError {
-    /// Classify a storage-bridge error. A missing object never reaches here
-    /// (`get_opt*` returns it as `Ok(None)`), so every error is one a retry
-    /// can heal: the deadline stays itself, anything else is the transient
-    /// `ResourceExhausted` with the detail logged, not sent to the client.
+    /// Classify a storage-bridge error. A refusal never reaches here (the
+    /// `_or_refusal` reads answer a missing or forbidden object as data), so
+    /// every error is one a retry can heal: the deadline stays itself,
+    /// anything else is the transient `ResourceExhausted` with the detail
+    /// logged, not sent to the client.
     fn from_storage(file_id: &str, e: DataServerError) -> Self {
         match e {
             e @ (DataServerError::DeadlineExceeded | DataServerError::ResourceExhausted) => {
@@ -560,6 +612,35 @@ impl PixelReadError {
                 PixelReadError::Abort(DataServerError::ResourceExhausted)
             }
         }
+    }
+}
+
+/// How long a volume file the store refused stays refused (#1046): reads of
+/// it meanwhile fail at once, with no request to the store and no log line.
+/// A refusal is the credentials' or the deployment's, not the data's, so it
+/// is never bad data (no nodata a tile cache would keep) and is asked again
+/// once this passes, when the cause may be fixed.
+const REFUSAL_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// A read of the volume file `cache_id` the store refused for good (#1046):
+/// remembered for [`REFUSAL_RETRY_AFTER`], logged once per period, and the
+/// request's `ResourceExhausted` (503), as a storage failure is.
+fn refused(cache_id: &str, file_id: &str, why: impl std::fmt::Display) -> PixelReadError {
+    if PIXEL_CACHE.refuse(cache_id, std::time::Instant::now() + REFUSAL_RETRY_AFTER) {
+        tracing::warn!(
+            "PVOL pixel read of `{file_id}` refused ({why}); its reads fail for the next {}s",
+            REFUSAL_RETRY_AFTER.as_secs()
+        );
+    }
+    PixelReadError::Abort(DataServerError::ResourceExhausted)
+}
+
+/// Fail at once a read of a file the store refused within the last
+/// [`REFUSAL_RETRY_AFTER`] (#1046), without asking the store again.
+fn check_refusal(cache_id: &str) -> Result<(), PixelReadError> {
+    match PIXEL_CACHE.is_refused(cache_id) {
+        true => Err(PixelReadError::Abort(DataServerError::ResourceExhausted)),
+        false => Ok(()),
     }
 }
 
@@ -651,7 +732,9 @@ mod file_fetches {
 /// read never touches a runtime, so the handle is irrelevant there.
 ///
 /// A missing file or object is [`PixelReadError::Bad`]; a deadline or any
-/// other storage failure is [`PixelReadError::Abort`] (#993).
+/// other storage failure is [`PixelReadError::Abort`] (#993), and so is a
+/// refusal, which is remembered ([`refused`], #1046). A shared read the
+/// deadline cuts off is finished on `finish`'s runtime ([`RemoteRead::wait`]).
 ///
 /// The shared read comes back with the bytes: hold it until they are
 /// decoded, so that a request needing the file meanwhile joins it.
@@ -659,7 +742,10 @@ fn fetch_file_bytes<'a>(
     source: &'a Source,
     file_id: &'a str,
     handle: Option<&tokio::runtime::Handle>,
+    finish: Finish<'_>,
 ) -> Result<(Bytes, Option<RemoteRead<'a>>), PixelReadError> {
+    let cache_id = pixel_cache_id(source, file_id);
+    check_refusal(&cache_id)?;
     match source {
         Source::Local { .. } => {
             #[cfg(test)]
@@ -671,51 +757,62 @@ fn fetch_file_bytes<'a>(
         }
         Source::Remote { store, .. } => {
             if let Some(runtime) = shared_read_runtime(handle) {
-                let cache_id = pixel_cache_id(source, file_id).into_owned();
-                let mut read = RemoteRead::start(store, cache_id, file_id, runtime);
-                return Ok((read.wait(handle)?, Some(read)));
+                let mut read = RemoteRead::start(store, cache_id.into_owned(), file_id, runtime);
+                return Ok((read.wait(handle, finish)?, Some(read)));
             }
             #[cfg(test)]
             file_fetches::record(file_id);
             use ds_storage::object_store::path::Path as ObjectPath;
             let object = ObjectPath::from(file_id);
             let bytes = match handle {
-                Some(h) => store.get_opt_on(&object, h),
-                None => store.get_opt(&object),
+                Some(h) => store.get_or_refusal_on(&object, h),
+                None => store.get_or_refusal(&object),
             };
-            Ok((classify_remote_read(file_id, bytes)?, None))
+            Ok((classify_remote_read(&cache_id, file_id, bytes)?, None))
         }
     }
 }
 
 /// A failed read of a local volume file as the pixel reader sees it (#993):
-/// a missing file is unusable data, any other failure the request's.
+/// a missing file is unusable data; a file this process may not read, or a
+/// directory, is refused for good (#1046); any other failure is the
+/// request's.
 fn local_read_error(file_id: &str, e: std::io::Error) -> PixelReadError {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        PixelReadError::Bad(format!("read `{file_id}`: {e}"))
-    } else {
-        PixelReadError::from_storage(file_id, DataServerError::Io(e))
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => PixelReadError::Bad(format!("read `{file_id}`: {e}")),
+        // A local file's cache id is its path (`pixel_cache_id`).
+        ErrorKind::PermissionDenied | ErrorKind::IsADirectory | ErrorKind::NotADirectory => {
+            refused(file_id, file_id, e)
+        }
+        _ => PixelReadError::from_storage(file_id, DataServerError::Io(e)),
     }
 }
 
 /// Read the byte ranges `plan` names of one volume file: the cold-miss read
 /// of moments whose spans a scan recorded (#1047). A local file is read
 /// range by range; a remote object with a GET per range, all at once
-/// (`DataStore::get_ranges_opt`), never one GET per chunk. `Ok(None)` when
-/// the file no longer matches the scan that recorded the spans (another
-/// length, a range that comes back short): the caller then reads the whole
-/// file.
+/// (`DataStore::start_get_ranges_or_refusal`), never one GET per chunk.
+/// `Ok(None)` when the file no longer matches the scan that recorded the
+/// spans (another length, a range that comes back short): the caller then
+/// reads the whole file.
 ///
-/// Classified as the whole-file read is (#993): a missing file or object
-/// is [`PixelReadError::Bad`], a deadline or any other storage failure
-/// [`PixelReadError::Abort`]. `handle` picks the async→sync bridge as for
-/// [`fetch_file_bytes`]'s unshared read.
+/// Classified as the whole-file read is (#993, #1046): a missing file or
+/// object is [`PixelReadError::Bad`], a deadline, a refusal or any other
+/// storage failure [`PixelReadError::Abort`]. A remote read runs as a task
+/// on [`shared_read_runtime`], so one the deadline cuts off is finished on
+/// `finish`'s runtime ([`finish_in_background`]); on a thread with no
+/// multi-thread runtime it is read in place, `handle` picking the
+/// async→sync bridge as for [`fetch_file_bytes`]'s unshared read.
 fn fetch_spans(
     source: &Source,
     file_id: &str,
     plan: &ReadPlan,
     handle: Option<&tokio::runtime::Handle>,
+    finish: Finish<'_>,
 ) -> Result<Option<Arc<SpanStorage>>, PixelReadError> {
+    let cache_id = pixel_cache_id(source, file_id);
+    check_refusal(&cache_id)?;
     #[cfg(test)]
     file_fetches::record_ranged(file_id, plan.bytes());
     match source {
@@ -727,11 +824,22 @@ fn fetch_spans(
         Source::Remote { store, .. } => {
             let object = ds_storage::object_store::path::Path::from(file_id);
             let ranges = object_ranges(plan);
-            let read = match handle {
-                Some(h) => store.get_ranges_opt_on(&object, &ranges, h),
-                None => store.get_ranges_opt(&object, &ranges),
+            let read = match shared_read_runtime(handle) {
+                Some(runtime) => {
+                    let read = store.start_get_ranges_or_refusal(&object, &ranges, &runtime);
+                    let got = read.wait(handle);
+                    if matches!(got, Err(DataServerError::DeadlineExceeded)) {
+                        let plan = plan.clone();
+                        finish.hand_off(&cache_id, Unfinished::Ranges { plan, read });
+                    }
+                    got
+                }
+                None => match handle {
+                    Some(h) => store.get_ranges_or_refusal_on(&object, &ranges, h),
+                    None => store.get_ranges_or_refusal(&object, &ranges),
+                },
             };
-            classify_ranged_read(file_id, plan, read)
+            classify_ranged_read(&cache_id, file_id, plan, read)
         }
     }
 }
@@ -745,20 +853,34 @@ fn object_ranges(plan: &ReadPlan) -> Vec<std::ops::Range<usize>> {
 }
 
 /// A remote read of `plan`'s ranges as the pixel reader sees it, classified
-/// as the whole-file read is (#993): a missing object is unusable data, any
-/// other failure the request's. Shared by [`fetch_spans`] and a walk's
-/// ranged read ahead ([`AheadRead::wait`], #1261).
+/// as the whole-file read is (#993, #1046): a missing object is unusable
+/// data, a refusal is remembered ([`refused`]), any other failure is the
+/// request's, and an object now shorter than a range (a 416) is a file
+/// changed since its scan, read whole instead. Shared by [`fetch_spans`]
+/// and a walk's ranged read ahead ([`AheadRead::wait`], #1261).
 fn classify_ranged_read(
+    cache_id: &str,
     file_id: &str,
     plan: &ReadPlan,
-    read: Result<Option<Vec<Bytes>>, DataServerError>,
+    read: Result<ReadAnswer<Vec<Bytes>>, DataServerError>,
 ) -> Result<Option<Arc<SpanStorage>>, PixelReadError> {
     match read {
-        Ok(Some(parts)) => Ok(span_storage(file_id, plan, Some(parts))),
-        Ok(None) => Err(PixelReadError::Bad(format!(
-            "get `{file_id}`: object not found"
-        ))),
+        Ok(ReadAnswer::Read(parts)) => Ok(span_storage(file_id, plan, Some(parts))),
+        Ok(ReadAnswer::Refused(RangeRefusal::Truncated)) => Ok(span_storage(file_id, plan, None)),
+        Ok(ReadAnswer::Refused(refusal)) => Err(refusal_error(cache_id, file_id, refusal)),
         Err(e) => Err(PixelReadError::from_storage(file_id, e)),
+    }
+}
+
+/// A store's refusal of a volume file read as the pixel reader sees it
+/// (#1046): a missing object is unusable data, a forbidden one is
+/// [`refused`] for a while.
+fn refusal_error(cache_id: &str, file_id: &str, refusal: RangeRefusal) -> PixelReadError {
+    match refusal {
+        RangeRefusal::Forbidden => refused(cache_id, file_id, refusal),
+        RangeRefusal::NotFound | RangeRefusal::Truncated => {
+            PixelReadError::Bad(format!("get `{file_id}`: {refusal}"))
+        }
     }
 }
 
@@ -854,8 +976,13 @@ impl<'a> RemoteRead<'a> {
     /// joined read that failed is the failure of the request that started
     /// it: this one reads once more, starting its own read or joining one
     /// started since, as a miss inside the per-file lock reads again after
-    /// another's failed load.
-    fn wait(&mut self, handle: Option<&tokio::runtime::Handle>) -> Result<Bytes, PixelReadError> {
+    /// another's failed load. A read the deadline cuts off goes on, finished
+    /// on `finish`'s runtime for the requests that follow (#1046).
+    fn wait(
+        &mut self,
+        handle: Option<&tokio::runtime::Handle>,
+        finish: Finish<'_>,
+    ) -> Result<Bytes, PixelReadError> {
         let mut bytes = self.read.read.wait(handle);
         if self.read.joined && matches!(bytes, Err(DataServerError::Storage(_))) {
             tracing::debug!(
@@ -867,7 +994,11 @@ impl<'a> RemoteRead<'a> {
                 .join_or_start_read(&self.cache_id, || start_get(store, file_id, runtime));
             bytes = self.read.read.wait(handle);
         }
-        classify_remote_read(self.file_id, bytes)
+        if matches!(bytes, Err(DataServerError::DeadlineExceeded)) {
+            let read = Unfinished::Whole(self.read.read.clone());
+            finish.hand_off(&self.cache_id, read);
+        }
+        classify_remote_read(&self.cache_id, self.file_id, bytes)
     }
 }
 
@@ -880,24 +1011,137 @@ fn start_get(
     #[cfg(test)]
     file_fetches::record(file_id);
     let object = ds_storage::object_store::path::Path::from(file_id);
-    store.start_get_opt(&object, runtime)
+    store.start_get_or_refusal(&object, runtime)
 }
 
-/// A remote whole-file read as the pixel reader sees it (#993): a missing
-/// object is unusable data, any other failure the request's. Shared by
-/// [`fetch_file_bytes`]'s unshared read and [`RemoteRead::wait`], so both
-/// classify alike.
+/// A remote whole-file read as the pixel reader sees it (#993, #1046): a
+/// missing object is unusable data, a refusal is remembered ([`refused`]),
+/// any other failure is the request's. Shared by [`fetch_file_bytes`]'s
+/// unshared read and [`RemoteRead::wait`], so both classify alike.
 fn classify_remote_read(
+    cache_id: &str,
     file_id: &str,
-    read: Result<Option<Bytes>, DataServerError>,
+    read: Result<ReadAnswer, DataServerError>,
 ) -> Result<Bytes, PixelReadError> {
     match read {
-        Ok(Some(b)) => Ok(b),
-        Ok(None) => Err(PixelReadError::Bad(format!(
-            "get `{file_id}`: object not found"
-        ))),
+        Ok(ReadAnswer::Read(b)) => Ok(b),
+        Ok(ReadAnswer::Refused(refusal)) => Err(refusal_error(cache_id, file_id, refusal)),
         Err(e) => Err(PixelReadError::from_storage(file_id, e)),
     }
+}
+
+/// Most cold reads the request deadline cut off that the background runtime
+/// finishes at once (#1046), and so the most volume files, or byte ranges of
+/// them, kept downloading after their requests returned: at most four
+/// `MAX_REMOTE_FILE_SIZE` (64 MiB) files. A cut-off read beyond this is
+/// dropped, as before.
+const MAX_FINISHING_READS: usize = 4;
+
+/// Where and for what a cold read the request deadline cuts off is finished
+/// (#1046): the background runtime, and the moments the request wanted from
+/// the read, which [`finish_in_background`] decodes into the pixel cache.
+#[derive(Clone, Copy)]
+struct Finish<'f> {
+    /// The background (poll) runtime ([`background_runtime`]); `None` drops
+    /// a cut-off read as before.
+    runtime: Option<&'f tokio::runtime::Handle>,
+    wanted: &'f [MomentRequest<'f>],
+}
+
+impl Finish<'_> {
+    /// Hand `read` of the file `cache_id`, which the request deadline cut
+    /// off, to [`finish_in_background`]. Whether it was taken.
+    fn hand_off(self, cache_id: &str, read: Unfinished) -> bool {
+        finish_in_background(self.runtime, cache_id, read, self.wanted)
+    }
+}
+
+/// A started read the request deadline cut off while it ran (#1046).
+enum Unfinished {
+    /// A whole volume file, shared with the requests that join it (#1127).
+    Whole(Arc<ds_storage::PendingGet>),
+    /// The byte ranges of `plan`.
+    Ranges {
+        plan: ReadPlan,
+        read: ds_storage::PendingGet<Vec<Bytes>>,
+    },
+}
+
+/// Finish on the background runtime a cold read the request deadline cut
+/// off (#1046), instead of dropping it: before, a frame whose download took
+/// longer than the deadline failed on every retry, each starting the same
+/// read again. The read itself goes on where it started (async I/O on the
+/// request's runtime, bounded by `FetchBudget::Request` alone); a blocking
+/// task on the background runtime waits for it and decodes the moments the
+/// request wanted (`wanted`, those not resident by then) into the pixel
+/// cache, so a retry finds them there. A whole file's bytes are registered
+/// in [`PixelCache::held_bytes`] while that decode runs, so a request needing
+/// the file meanwhile decodes from them, and its shared read stays joinable
+/// until then: a retry arriving during the download joins it rather than
+/// downloading again. Both are let go after the last insert (#994's
+/// ordering). A read that fails, or is refused, decodes nothing and marks
+/// nothing bad: the next request reads and classifies for itself.
+///
+/// At most one per file and [`MAX_FINISHING_READS`] at once; `false`, and
+/// the read dropped as before, beyond that, with no background runtime or
+/// pixel cache, or for a read that never ran (asked for past the deadline)
+/// or has failed.
+fn finish_in_background(
+    runtime: Option<&tokio::runtime::Handle>,
+    cache_id: &str,
+    read: Unfinished,
+    wanted: &[MomentRequest<'_>],
+) -> bool {
+    let Some(runtime) = runtime else {
+        return false;
+    };
+    let failed = match &read {
+        Unfinished::Whole(read) => read.failed(),
+        Unfinished::Ranges { read, .. } => read.failed(),
+    };
+    if failed || wanted.is_empty() || PIXEL_CACHE.capacity() == 0 {
+        return false;
+    }
+    let Some(claim) = PIXEL_CACHE.claim_finish(cache_id, MAX_FINISHING_READS) else {
+        return false;
+    };
+    let cache_id = cache_id.to_owned();
+    let wanted: Vec<(String, usize, usize)> = wanted
+        .iter()
+        .map(|&(path, nrays, nbins)| (path.to_owned(), nrays, nbins))
+        .collect();
+    let background = runtime.clone();
+    // A runtime that has shut down drops the closure, the read and the
+    // claim with it.
+    drop(runtime.spawn_blocking(move || {
+        let _claim = claim;
+        let inserted = match read {
+            Unfinished::Whole(read) => {
+                let inserted = match read.wait(Some(&background)) {
+                    Ok(ReadAnswer::Read(bytes)) => {
+                        let _held =
+                            PIXEL_CACHE.hold_bytes(&cache_id, bytes.clone(), MAX_HELD_FILES);
+                        decode_into_cache(&cache_id, &bytes, &wanted)
+                    }
+                    _ => 0,
+                };
+                // Joinable until the last insert: see above.
+                drop(read);
+                inserted
+            }
+            Unfinished::Ranges { plan, read } => match read.wait(Some(&background)) {
+                Ok(ReadAnswer::Read(parts)) => SpanStorage::new(&plan, parts)
+                    .map_or(0, |storage| {
+                        decode_spans_into_cache(&cache_id, &Arc::new(storage), &wanted)
+                    }),
+                _ => 0,
+            },
+        };
+        tracing::debug!(
+            "PVOL read of `{cache_id}` the deadline cut off finished: {inserted} moment(s) cached"
+        );
+    }));
+    true
 }
 
 /// Read whole volume files for a background build off the request path
@@ -966,43 +1210,91 @@ enum ReadAhead<'r> {
         arrays: Permit,
     },
     /// No download to start: the batch reads nothing, or bytes a
-    /// background sibling decode holds, or the source is local.
+    /// background decode holds, or the source is local, or the store
+    /// refused the file a moment ago.
     Unneeded,
     /// The budget has no room for the read now.
     NoRoom,
 }
 
-/// A download a walk started ahead of reaching a volume (#999, #1261).
+/// A download a walk started ahead of reaching a volume (#999, #1261), and
+/// the batch's cold moments it is for, which a read the deadline cuts off is
+/// finished for (#1046).
 enum AheadRead<'r> {
     /// The whole file: the batch's cold moments have no [`ReadPlan`]. Shared
     /// with the other requests that need the file (#1127).
-    Whole(RemoteRead<'r>),
+    Whole {
+        read: RemoteRead<'r>,
+        wanted: Vec<(String, usize, usize)>,
+    },
     /// The byte ranges the decode of the batch's cold moments reads
     /// (#1047). Not shared: these ranges are this batch's.
     Ranges {
         file_id: &'r str,
+        cache_id: String,
         plan: ReadPlan,
-        /// The dataset paths of the moments whose decode the ranges hold.
-        covers: Vec<String>,
-        read: ds_storage::PendingGet<Vec<Bytes>>,
+        /// The moments whose decode the ranges hold.
+        wanted: Vec<(String, usize, usize)>,
+        /// Taken by the one wait.
+        read: Option<ds_storage::PendingGet<Vec<Bytes>>>,
     },
+}
+
+/// `wanted` as moment requests.
+fn requests_of(wanted: &[(String, usize, usize)]) -> Vec<MomentRequest<'_>> {
+    wanted
+        .iter()
+        .map(|(path, nrays, nbins)| (path.as_str(), *nrays, *nbins))
+        .collect()
 }
 
 impl AheadRead<'_> {
     /// Wait for the download, within this thread's request deadline, and
-    /// classify it as the batch's own read would be (#993).
-    fn wait(&mut self, handle: Option<&tokio::runtime::Handle>) -> Fetched {
+    /// classify it as the batch's own read would be (#993). One the
+    /// deadline cuts off is finished on `background` (#1046).
+    fn wait(
+        &mut self,
+        handle: Option<&tokio::runtime::Handle>,
+        background: Option<&tokio::runtime::Handle>,
+    ) -> Fetched {
         match self {
-            AheadRead::Whole(read) => Fetched::Whole(read.wait(handle)),
+            AheadRead::Whole { read, wanted } => {
+                let wanted = requests_of(wanted);
+                let finish = Finish {
+                    runtime: background,
+                    wanted: &wanted,
+                };
+                Fetched::Whole(read.wait(handle, finish))
+            }
             AheadRead::Ranges {
                 file_id,
+                cache_id,
                 plan,
-                covers,
+                wanted,
                 read,
-            } => Fetched::Ranges {
-                covers: std::mem::take(covers),
-                spans: classify_ranged_read(file_id, plan, read.wait(handle)),
-            },
+            } => {
+                let covers = wanted.iter().map(|(path, _, _)| path.clone()).collect();
+                let got = match read.take() {
+                    Some(read) => {
+                        let got = read.wait(handle);
+                        if matches!(got, Err(DataServerError::DeadlineExceeded)) {
+                            let wanted = requests_of(wanted);
+                            let finish = Finish {
+                                runtime: background,
+                                wanted: &wanted,
+                            };
+                            let plan = plan.clone();
+                            finish.hand_off(cache_id, Unfinished::Ranges { plan, read });
+                        }
+                        got
+                    }
+                    None => Err(DataServerError::Engine("a read ahead waited twice".into())),
+                };
+                Fetched::Ranges {
+                    covers,
+                    spans: classify_ranged_read(cache_id, file_id, plan, got),
+                }
+            }
         }
     }
 }
@@ -1021,14 +1313,15 @@ enum Fetched {
 }
 
 /// A failed batch read as the batch's loader answers it (#993): the
-/// deadline or a transient failure fails the request, and unusable data
-/// leaves every missing moment out, to be marked bad.
+/// deadline or a transient failure fails the request, counted ([`aborted`],
+/// #1046), and unusable data leaves every missing moment out, to be marked
+/// bad.
 fn batch_failure(
     file_id: &str,
     e: PixelReadError,
 ) -> Result<Vec<(String, RawPixels)>, DataServerError> {
     match e {
-        PixelReadError::Abort(e) => Err(e),
+        PixelReadError::Abort(e) => Err(aborted(e)),
         PixelReadError::Bad(e) => {
             tracing::warn!("PVOL batch pixel read failed for `{file_id}`: {e}");
             Ok(Vec::new())
@@ -1055,6 +1348,44 @@ fn decode_spans(
         .map_err(|e| PixelReadError::Bad(e.to_string()))
 }
 
+/// Decode `wanted` from the byte ranges `storage` holds into the pixel cache
+/// (#1046), skipping any resident by now, in one HDF5 open. A read the
+/// deadline cut off, finished: nothing is inserted when the decode reads
+/// outside the ranges, and a moment that does not decode is skipped and
+/// marked nothing, as [`decode_into_cache`] does. Returns the arrays
+/// inserted.
+fn decode_spans_into_cache(
+    cache_id: &str,
+    storage: &Arc<SpanStorage>,
+    wanted: &[(String, usize, usize)],
+) -> usize {
+    let pending: Vec<MomentRequest<'_>> = requests_of(wanted)
+        .into_iter()
+        .filter(|(path, _, _)| !PIXEL_CACHE.contains(cache_id, path))
+        .collect();
+    if pending.is_empty() {
+        return 0;
+    }
+    let decoded = crate::pvol::read_moments_pixels_in(storage.clone(), pending);
+    if storage.missed() {
+        tracing::debug!("PVOL finished ranged read of `{cache_id}` misses spans; nothing cached");
+        return 0;
+    }
+    match decoded {
+        Ok(decoded) => {
+            let inserted = decoded.len();
+            for (path, raw) in decoded {
+                PIXEL_CACHE.insert(cache_id, &path, Arc::new(raw));
+            }
+            inserted
+        }
+        Err(e) => {
+            tracing::debug!("PVOL finished ranged read of `{cache_id}` skipped: {e}");
+            0
+        }
+    }
+}
+
 /// Lazy-pixel access context threaded through the samplers: just the file
 /// source, used to re-fetch a volume's bytes on a [`PIXEL_CACHE`] miss.
 /// The catalog holds only metadata, so a moment's `RawPixels` is fetched
@@ -1075,26 +1406,44 @@ struct Pixels<'a> {
     moments: Option<&'a MomentPixels>,
 }
 
-/// Most volume files whose downloaded bytes background sibling decodes may
-/// hold at once (#994). Each file is up to `MAX_REMOTE_FILE_SIZE`; a burst of
-/// cold misses beyond this skips the speculation, never the requested moment.
-const MAX_BACKGROUND_SIBLING_DECODES: usize = 4;
+/// Most volume files whose downloaded bytes background decodes may hold at
+/// once ([`PixelCache::held_bytes`]): cold-miss sibling decodes (#994) and
+/// cut-off reads being finished (#1046) together. Each file is up to
+/// `MAX_REMOTE_FILE_SIZE`; a burst of cold misses beyond this skips the
+/// speculation, never the requested moment, and a finished read beyond it
+/// decodes without lending its bytes.
+const MAX_HELD_FILES: usize = 4;
 
-/// The background (poll) runtime that cold-miss sibling decodes run on
-/// (#994). [`PolarVolumeEngine::poll_loop`], which the server always runs on
-/// that runtime, registers it. Until a poll loop has started there is none,
-/// and a cold miss decodes only the moment it was asked for.
-static SIBLING_DECODE_RUNTIME: std::sync::RwLock<Option<tokio::runtime::Handle>> =
+/// The background (poll) runtime that cold-miss sibling decodes (#994) and
+/// the finishing of cut-off reads (#1046) run on.
+/// [`PolarVolumeEngine::poll_loop`], which the server always runs on that
+/// runtime, registers it. Until a poll loop has started there is none: a
+/// cold miss decodes only the moment it was asked for, and a read the
+/// deadline cuts off is dropped.
+static BACKGROUND_RUNTIME: std::sync::RwLock<Option<tokio::runtime::Handle>> =
     std::sync::RwLock::new(None);
 
-fn set_sibling_decode_runtime(handle: tokio::runtime::Handle) {
-    *SIBLING_DECODE_RUNTIME
+fn set_background_runtime(handle: tokio::runtime::Handle) {
+    *BACKGROUND_RUNTIME
         .write()
         .unwrap_or_else(|e| e.into_inner()) = Some(handle);
 }
 
-fn sibling_decode_runtime() -> Option<tokio::runtime::Handle> {
-    SIBLING_DECODE_RUNTIME
+#[cfg(test)]
+thread_local! {
+    /// A test's background runtime for the reads on this thread, in place
+    /// of the process-wide one, which no unit test registers.
+    static TEST_BACKGROUND_RUNTIME: std::cell::RefCell<Option<tokio::runtime::Handle>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The registered background runtime, if any. Read on cold paths only.
+fn background_runtime() -> Option<tokio::runtime::Handle> {
+    #[cfg(test)]
+    if let Some(handle) = TEST_BACKGROUND_RUNTIME.with(|test| test.borrow().clone()) {
+        return Some(handle);
+    }
+    BACKGROUND_RUNTIME
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
@@ -1207,12 +1556,13 @@ fn sibling_requests(
     requests
 }
 
-/// Decode `siblings` from a volume file's `bytes` into the pixel cache,
-/// skipping any a request decoded meanwhile. Speculative: a sibling that does
-/// not decode is skipped and marks nothing bad; its own read decides that.
-/// Returns the number of arrays inserted.
-fn decode_siblings(cache_id: &str, bytes: &Bytes, siblings: &[(String, usize, usize)]) -> usize {
-    let pending = siblings
+/// Decode `moments` from a volume file's `bytes` into the pixel cache off
+/// the request path, skipping any a request decoded meanwhile: a cold miss's
+/// siblings (#994), or the moments a read the deadline cut off was for
+/// (#1046). A moment that does not decode is skipped and marks nothing bad;
+/// its own read decides that. Returns the number of arrays inserted.
+fn decode_into_cache(cache_id: &str, bytes: &Bytes, moments: &[(String, usize, usize)]) -> usize {
+    let pending = moments
         .iter()
         .filter(|(path, _, _)| !PIXEL_CACHE.contains(cache_id, path))
         .map(|(path, nrays, nbins)| (path.as_str(), *nrays, *nbins));
@@ -1222,10 +1572,10 @@ fn decode_siblings(cache_id: &str, bytes: &Bytes, siblings: &[(String, usize, us
             PIXEL_CACHE.insert(cache_id, path, Arc::new(raw));
             inserted += 1;
         }
-        Err(e) => tracing::debug!("PVOL sibling decode skipped `{path}`: {e}"),
+        Err(e) => tracing::debug!("PVOL background decode skipped `{path}`: {e}"),
     });
     if let Err(e) = visited {
-        tracing::debug!("PVOL sibling decode of `{cache_id}` skipped: {e}");
+        tracing::debug!("PVOL background decode of `{cache_id}` skipped: {e}");
     }
     inserted
 }
@@ -1235,8 +1585,8 @@ fn decode_siblings(cache_id: &str, bytes: &Bytes, siblings: &[(String, usize, us
 /// stay registered in [`PixelCache::held_bytes`] until the decode's last
 /// insert, so a miss on the same file meanwhile reads them instead of
 /// downloading the file again. One decode per file and at most
-/// [`MAX_BACKGROUND_SIBLING_DECODES`] at once; past that, or with no runtime,
-/// nothing is decoded ahead. Returns whether a decode was spawned.
+/// [`MAX_HELD_FILES`] held at once; past that, or with no runtime, nothing
+/// is decoded ahead. Returns whether a decode was spawned.
 fn spawn_sibling_decode(
     background: Option<&tokio::runtime::Handle>,
     cache_id: &str,
@@ -1249,16 +1599,14 @@ fn spawn_sibling_decode(
     if siblings.is_empty() {
         return false;
     }
-    let Some(held) =
-        PIXEL_CACHE.hold_bytes(cache_id, bytes.clone(), MAX_BACKGROUND_SIBLING_DECODES)
-    else {
+    let Some(held) = PIXEL_CACHE.hold_bytes(cache_id, bytes.clone(), MAX_HELD_FILES) else {
         return false;
     };
     let cache_id = cache_id.to_owned();
     let bytes = bytes.clone();
     // A runtime that has shut down drops the closure, which releases `held`.
     drop(runtime.spawn_blocking(move || {
-        decode_siblings(&cache_id, &bytes, &siblings);
+        decode_into_cache(&cache_id, &bytes, &siblings);
         drop(held);
     }));
     true
@@ -1349,7 +1697,9 @@ impl<'a> Pixels<'a> {
         }
         let reserve = |bytes: u64| budget.map(|budget| budget.reserve(bytes)).transpose();
         let mut arrays = None;
-        let (pixels, failures) = PIXEL_CACHE.load_many(&cache_id, &requests, |missing, held| {
+        let mut loaded = false;
+        let load = PIXEL_CACHE.load_many(&cache_id, &requests, |missing, held| {
+            loaded = true;
             let fetched = fetched.filter(|fetched| match fetched {
                 Fetched::Whole(_) => true,
                 Fetched::Ranges { covers, .. } => missing
@@ -1386,9 +1736,17 @@ impl<'a> Pixels<'a> {
             } else {
                 None
             };
+            // A read of the file the deadline cuts off is finished in the
+            // background for these moments (#1046). Looked up only to read.
+            let reads = plan.is_some() || whole.is_none();
+            let background = reads.then(background_runtime).flatten();
+            let finish = Finish {
+                runtime: background.as_ref(),
+                wanted: missing,
+            };
             if let Some(plan) = plan {
                 let _ranges = reserve(plan.bytes())?;
-                match self.moments_from_spans(file_id, &plan, missing) {
+                match self.moments_from_spans(file_id, &plan, missing, finish) {
                     Ok(Some(pixels)) => return Ok(pixels),
                     Ok(None) => {}
                     Err(e) => return batch_failure(file_id, e),
@@ -1403,10 +1761,12 @@ impl<'a> Pixels<'a> {
             let mut download = None;
             let bytes = match whole {
                 Some(bytes) => bytes,
-                None => fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
-                    download = read;
-                    bytes
-                }),
+                None => fetch_file_bytes(self.source, file_id, self.handle, finish).map(
+                    |(bytes, read)| {
+                        download = read;
+                        bytes
+                    },
+                ),
             };
             let decoded = bytes.and_then(|bytes| {
                 crate::pvol::read_moments_pixels(&bytes, missing.iter().copied())
@@ -1416,7 +1776,10 @@ impl<'a> Pixels<'a> {
                 Ok(pixels) => Ok(pixels),
                 Err(e) => batch_failure(file_id, e),
             }
-        })?;
+        });
+        // Without the loader run, the error is the deadline passing while
+        // another request loaded the file: a cut-off read too (#1046).
+        let (pixels, failures) = load.map_err(|e| if loaded { e } else { aborted(e) })?;
         if failures > 0 {
             PIXEL_READ_FAILURES.fetch_add(failures as u64, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!("PVOL batch pixel read for `{file_id}`: {failures} missing moment(s)");
@@ -1464,8 +1827,9 @@ impl<'a> Pixels<'a> {
         file_id: &str,
         plan: &ReadPlan,
         missing: &[MomentRequest<'_>],
+        finish: Finish<'_>,
     ) -> Result<Option<Vec<(String, RawPixels)>>, PixelReadError> {
-        let Some(storage) = fetch_spans(self.source, file_id, plan, self.handle)? else {
+        let Some(storage) = fetch_spans(self.source, file_id, plan, self.handle, finish)? else {
             return Ok(None);
         };
         decode_spans(file_id, &storage, missing)
@@ -1529,10 +1893,17 @@ impl<'a> Pixels<'a> {
             })
             .map(|&(s, m)| (m, (m.dataset_path.as_str(), s.nrays, s.nbins)))
             .unzip();
-        if cold.is_empty() || PIXEL_CACHE.held_bytes(&cache_id).is_some() {
+        if cold.is_empty()
+            || PIXEL_CACHE.held_bytes(&cache_id).is_some()
+            || PIXEL_CACHE.is_refused(&cache_id)
+        {
             return ReadAhead::Unneeded;
         }
         let plan = ReadPlan::new(volume, cold);
+        let wanted = requests
+            .iter()
+            .map(|&(path, nrays, nbins)| (path.to_owned(), nrays, nbins))
+            .collect();
         let (Some(fetched), Some(arrays)) = (
             budget.try_reserve(plan.as_ref().map_or(volume.file_len, ReadPlan::bytes)),
             budget.try_reserve(requests_bytes(&requests)),
@@ -1547,13 +1918,14 @@ impl<'a> Pixels<'a> {
                     file_fetches::record_ahead(file_id);
                 }
                 let object = ds_storage::object_store::path::Path::from(file_id);
-                let read = store.start_get_ranges_opt(&object, &object_ranges(&plan), runtime);
-                let covers = requests.iter().map(|&(path, _, _)| path.to_owned());
+                let ranges = object_ranges(&plan);
+                let read = store.start_get_ranges_or_refusal(&object, &ranges, runtime);
                 AheadRead::Ranges {
                     file_id,
+                    cache_id: cache_id.into_owned(),
                     plan,
-                    covers: covers.collect(),
-                    read,
+                    wanted,
+                    read: Some(read),
                 }
             }
             None => {
@@ -1563,7 +1935,7 @@ impl<'a> Pixels<'a> {
                 if !read.read.joined {
                     file_fetches::record_ahead(file_id);
                 }
-                AheadRead::Whole(read)
+                AheadRead::Whole { read, wanted }
             }
         };
         ReadAhead::Started {
@@ -1618,7 +1990,7 @@ impl<'a> Pixels<'a> {
         if let Some(moments) = self.moments {
             return Ok(moments.get(&moment.dataset_path).cloned());
         }
-        let background = sibling_decode_runtime();
+        let background = background_runtime();
         self.moment_with(file_id, volume, moment, nrays, nbins, background.as_ref())
     }
 
@@ -1649,10 +2021,10 @@ impl<'a> Pixels<'a> {
         if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
             return Ok(None);
         }
-        PIXEL_CACHE.with_file_load(&cache_id, || {
-            // Held bytes before the cache recheck: a sibling decode releases
-            // them only after its last insert, so when none are held the
-            // recheck below already sees everything it decoded.
+        let loaded = PIXEL_CACHE.with_file_load(&cache_id, || {
+            // Held bytes before the cache recheck: a background decode
+            // releases them only after its last insert, so when none are
+            // held the recheck below already sees everything it decoded.
             let held = PIXEL_CACHE.held_bytes(&cache_id);
             if let Some(p) = PIXEL_CACHE.get(&cache_id, &moment.dataset_path) {
                 return Ok(Some(p));
@@ -1662,11 +2034,18 @@ impl<'a> Pixels<'a> {
             }
             PIXEL_CACHE.record_miss();
             let path = moment.dataset_path.as_str();
-            // The moment's byte ranges first (#1047), unless a sibling decode
-            // holds the whole file.
+            // A read the deadline cuts off is finished in the background,
+            // for this moment (#1046).
+            let wanted = [(path, nrays, nbins)];
+            let finish = Finish {
+                runtime: background,
+                wanted: &wanted,
+            };
+            // The moment's byte ranges first (#1047), unless a background
+            // decode holds the whole file.
             let ranged = match &held {
                 Some(_) => Ok(None),
-                None => self.moment_from_spans(file_id, volume, moment, nrays, nbins),
+                None => self.moment_from_spans(file_id, volume, moment, nrays, nbins, finish),
             };
             let decoded = ranged.and_then(|raw| {
                 if let Some(raw) = raw {
@@ -1678,12 +2057,12 @@ impl<'a> Pixels<'a> {
                 let mut download = None;
                 let bytes = match held {
                     Some(bytes) => Ok(bytes),
-                    None => {
-                        fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
+                    None => fetch_file_bytes(self.source, file_id, self.handle, finish).map(
+                        |(bytes, read)| {
                             download = read;
                             bytes
-                        })
-                    }
+                        },
+                    ),
                 };
                 bytes.and_then(|bytes| {
                     let mut result = None;
@@ -1702,7 +2081,7 @@ impl<'a> Pixels<'a> {
             match decoded {
                 Ok(pixels) => Ok(Some(pixels)),
                 // Not the data's fault: fail this request, remember nothing.
-                Err(PixelReadError::Abort(e)) => Err(e),
+                Err(PixelReadError::Abort(e)) => Err(aborted(e)),
                 Err(PixelReadError::Bad(e)) => {
                     // Count + log once per key; subsequent cells short-circuit on
                     // `is_known_bad` above.
@@ -1713,7 +2092,10 @@ impl<'a> Pixels<'a> {
                     Ok(None)
                 }
             }
-        })?
+        });
+        // The deadline passed while another request loaded the file (#1200):
+        // a cut-off read too (#1046).
+        loaded.map_err(aborted)?
     }
 
     /// A cold single-moment miss read by byte range (#1047): the spans the
@@ -1732,11 +2114,12 @@ impl<'a> Pixels<'a> {
         moment: &PolarMoment,
         nrays: usize,
         nbins: usize,
+        finish: Finish<'_>,
     ) -> Result<Option<RawPixels>, PixelReadError> {
         let Some(plan) = ReadPlan::new(volume, [moment]) else {
             return Ok(None);
         };
-        let Some(storage) = fetch_spans(self.source, file_id, &plan, self.handle)? else {
+        let Some(storage) = fetch_spans(self.source, file_id, &plan, self.handle, finish)? else {
             return Ok(None);
         };
         let path = moment.dataset_path.as_str();
@@ -1957,7 +2340,7 @@ fn scan_source(
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
     max_files: Option<usize>,
     depth: ScanDepth,
-    prewarm_sweeps: usize,
+    prewarm: &Prewarm,
     cells_after: Option<&Catalog>,
 ) -> Result<Catalog, EngineError> {
     match source {
@@ -1982,14 +2365,8 @@ fn scan_source(
             // file whose name carries no parseable timestamp falls through
             // to the post-parse volume-time filter.
             pending.retain(|p| within_window_by_name(&p.id, time_filter));
-            let mut by_site = build_catalog(
-                collection_id,
-                pending,
-                source,
-                cache,
-                prewarm_sweeps,
-                cells_after,
-            );
+            let mut by_site =
+                build_catalog(collection_id, pending, source, cache, prewarm, cells_after);
             retain_within(&mut by_site, time_filter);
             Ok(derive_catalog(by_site, cache, max_files))
         }
@@ -2001,14 +2378,8 @@ fn scan_source(
         } => {
             let (pending, time_filter) =
                 enumerate_remote(collection_id, store, prefix_pattern, time_window, depth)?;
-            let mut by_site = build_catalog(
-                collection_id,
-                pending,
-                source,
-                cache,
-                prewarm_sweeps,
-                cells_after,
-            );
+            let mut by_site =
+                build_catalog(collection_id, pending, source, cache, prewarm, cells_after);
             // A `time_window` also bounds the timestamps kept: the
             // object listing can include volumes just outside the
             // window (the prefix is a whole UTC day).
@@ -2314,7 +2685,7 @@ fn build_catalog(
     pending: Vec<PendingFile>,
     source: &Source,
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
-    prewarm_sweeps: usize,
+    prewarm: &Prewarm,
     cells_after: Option<&Catalog>,
 ) -> HashMap<String, Vec<VolumeEntry>> {
     use ds_storage::object_store::path::Path as ObjectPath;
@@ -2362,7 +2733,7 @@ fn build_catalog(
                         // nothing — `PIXEL_CACHE` is process-global and local
                         // cache ids (bare paths) are reload-stable, so the
                         // `contains` skip inside `prewarm_pixels` no-ops it.
-                        prewarm_pixels(source, &id, &v, &bytes, prewarm_sweeps);
+                        prewarm_pixels(source, &id, &v, &bytes, prewarm);
                         if newest_of_site(cells_after, &v) {
                             crate::cells::warm_from_bytes(source, &id, &v, &bytes);
                         }
@@ -2425,7 +2796,7 @@ fn build_catalog(
                         // of this newly-fetched volume is a cache hit instead
                         // of a cold S3 read on a render permit (#461; the
                         // local arm does the same — #472).
-                        prewarm_pixels(source, id, &v, &bytes, prewarm_sweeps);
+                        prewarm_pixels(source, id, &v, &bytes, prewarm);
                         if newest_of_site(cells_after, &v) {
                             crate::cells::warm_from_bytes(source, id, &v, &bytes);
                         }
@@ -2527,13 +2898,13 @@ fn prewarm_pixels(
     file_id: &str,
     volume: &PolarVolume,
     bytes: &Bytes,
-    n_sweeps: usize,
+    prewarm: &Prewarm,
 ) {
-    if n_sweeps == 0 || PIXEL_CACHE.capacity() == 0 {
+    if prewarm.sweeps == 0 || PIXEL_CACHE.capacity() == 0 {
         return;
     }
     let cache_id = pixel_cache_id(source, file_id);
-    let requests: Vec<(&str, usize, usize)> = prewarm_requests(volume, n_sweeps)
+    let requests: Vec<(&str, usize, usize)> = prewarm_requests(volume, prewarm)
         .into_iter()
         // Skip moments a request (or an earlier poll) already cached, so a
         // re-fetched trimmed volume doesn't re-decode every poll. Advisory, not
@@ -2560,8 +2931,42 @@ fn prewarm_pixels(
     }
 }
 
-/// The moments [`prewarm_pixels`] decodes: the lowest `n_sweeps` sweeps
-/// (sweeps are stored elevation-ascending), and of those only the volume's
+/// What each scan pre-decodes into the pixel cache ([`prewarm_pixels`]):
+/// the lowest `sweeps` sweeps (`[odim] prewarm_sweeps`, #461/#472) of the
+/// configured quantities (`[odim] prewarm_quantities`, #1046).
+#[derive(Clone, Debug)]
+pub(crate) struct Prewarm {
+    /// Lowest sweeps decoded per volume; `0` disables the pre-warm.
+    sweeps: usize,
+    /// The quantities to decode; `None` is the volume's default quantity.
+    quantities: Option<Arc<[String]>>,
+}
+
+impl Prewarm {
+    /// The pre-warm `config` asks for. An empty quantity name is an error.
+    fn from_config(config: &ds_core::config::OdimConfig) -> Result<Self, EngineError> {
+        let quantities = config.prewarm_quantities.as_deref();
+        if quantities.is_some_and(|q| q.iter().any(|q| q.trim().is_empty())) {
+            return Err(EngineError::EmptyPrewarmQuantity);
+        }
+        Ok(Prewarm {
+            sweeps: config.prewarm_sweeps,
+            quantities: quantities.map(Arc::from),
+        })
+    }
+
+    /// The default quantity of the lowest `sweeps` sweeps.
+    fn default_quantity(sweeps: usize) -> Self {
+        Prewarm {
+            sweeps,
+            quantities: None,
+        }
+    }
+}
+
+/// The moments [`prewarm_pixels`] decodes: the lowest `prewarm.sweeps`
+/// sweeps (sweeps are stored elevation-ascending), and of those only the
+/// configured quantities (#1046) that the volume carries, else the volume's
 /// default quantity ([`default_quantity_of`]), which is what an unqualified
 /// WMS/Maps/Tiles layer renders: the base-reflectivity animation view.
 ///
@@ -2569,26 +2974,32 @@ fn prewarm_pixels(
 /// about a dozen, so warming them all wrote several times the bytes any
 /// animation reads and pushed the reflectivity frames out of the pixel
 /// cache. Other quantities, other WMS layers and EDR read lazily on first
-/// use and are cached from then on.
-fn prewarm_requests(volume: &PolarVolume, n_sweeps: usize) -> Vec<(&str, usize, usize)> {
-    let mut quantities: Vec<&str> = volume
+/// use and are cached from then on; a collection whose clients animate
+/// another quantity names it in `prewarm_quantities`.
+fn prewarm_requests<'v>(
+    volume: &'v PolarVolume,
+    prewarm: &Prewarm,
+) -> Vec<(&'v str, usize, usize)> {
+    let mut present: Vec<&str> = volume
         .sweeps
         .iter()
         .flat_map(|s| s.moments.iter().map(|m| m.quantity.as_str()))
         .collect();
-    quantities.sort_unstable();
-    quantities.dedup();
-    let Some(quantity) = default_quantity_of(&quantities) else {
-        return Vec::new();
+    present.sort_unstable();
+    present.dedup();
+    let default = default_quantity_of(&present);
+    let warmed = |quantity: &str| match &prewarm.quantities {
+        Some(listed) => listed.iter().any(|q| q == quantity),
+        None => default == Some(quantity),
     };
     volume
         .sweeps
         .iter()
-        .take(n_sweeps)
+        .take(prewarm.sweeps)
         .flat_map(|s| {
             s.moments
                 .iter()
-                .filter(move |m| m.quantity == quantity)
+                .filter(|m| warmed(&m.quantity))
                 .map(move |m| (m.dataset_path.as_str(), s.nrays, s.nbins))
         })
         .collect()
@@ -2947,10 +3358,10 @@ pub struct PolarVolumeEngine {
     /// Resampling method for the per-site Cartesian render, propagated to every
     /// [`PolarVolumeSiteView`] this engine spawns (`OdimConfig.resampling`).
     resampling: ResamplingMethod,
-    /// Number of lowest sweeps whose pixels each poll pre-decodes into the
-    /// pixel cache for a freshly-fetched **remote** volume (`OdimConfig.
-    /// prewarm_sweeps`; `0` disables). See [`prewarm_pixels`].
-    prewarm_sweeps: usize,
+    /// What each poll pre-decodes into the pixel cache for a freshly-read
+    /// volume (`OdimConfig.prewarm_sweeps`, `0` disables, and
+    /// `prewarm_quantities`). See [`prewarm_pixels`].
+    prewarm: Prewarm,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
 }
@@ -2977,6 +3388,7 @@ impl PolarVolumeEngine {
         config: &ds_core::config::OdimConfig,
     ) -> Result<Self, EngineError> {
         let source = Arc::new(build_source(collection_id, data_path, config)?);
+        let prewarm = Prewarm::from_config(config)?;
 
         // An unbounded local source catalogs every `.h5` the directory
         // holds (~288 volumes/site/day at 5-min cadence) and advertises
@@ -3011,7 +3423,7 @@ impl PolarVolumeEngine {
             &parse_cache,
             config.max_files,
             ScanDepth::Bootstrap,
-            config.prewarm_sweeps,
+            &prewarm,
             None,
         )?;
         if catalog.by_site.is_empty() {
@@ -3046,7 +3458,7 @@ impl PolarVolumeEngine {
             parse_cache,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             resampling: config.resampling,
-            prewarm_sweeps: config.prewarm_sweeps,
+            prewarm,
             shutdown: Shutdown::new(),
         })
     }
@@ -3057,7 +3469,7 @@ impl PolarVolumeEngine {
     pub async fn poll_loop(&self) {
         // This loop runs on the background runtime: cold pixel misses hand
         // their sibling decodes to it (#994).
-        set_sibling_decode_runtime(tokio::runtime::Handle::current());
+        set_background_runtime(tokio::runtime::Handle::current());
         // The construction scan built no cell sets: warm the newest `CELLS`
         // windows now rather than one poll interval later (#1155).
         self.warm_cells();
@@ -3099,7 +3511,7 @@ impl PolarVolumeEngine {
             &parse_cache,
             None,
             ScanDepth::Full,
-            1,
+            &Prewarm::default_quantity(1),
             None,
         )?;
         Ok(Self {
@@ -3110,7 +3522,7 @@ impl PolarVolumeEngine {
             parse_cache,
             poll_interval: Duration::from_secs(30),
             resampling: ResamplingMethod::default(),
-            prewarm_sweeps: 1,
+            prewarm: Prewarm::default_quantity(1),
             shutdown: Shutdown::new(),
         })
     }
@@ -3146,7 +3558,7 @@ impl PolarVolumeEngine {
             &self.parse_cache,
             self.max_files,
             ScanDepth::Full,
-            self.prewarm_sweeps,
+            &self.prewarm,
             Some(&prev),
         ) {
             Ok(catalog) => {
@@ -3775,6 +4187,8 @@ fn walk_volumes<'v, S, T>(
     mut sample: impl FnMut(&'v VolumeEntry, S, Pixels) -> Result<T, DataServerError>,
 ) -> Result<Vec<T>, DataServerError> {
     let runtime = pix.read_ahead_runtime(entries.len());
+    // Where a read ahead the deadline cuts off is finished (#1046).
+    let background = runtime.as_ref().and_then(|_| background_runtime());
     let mut rest = entries
         .iter()
         .map(|&entry| (entry, prepare(entry)))
@@ -3824,7 +4238,9 @@ fn walk_volumes<'v, S, T>(
         // A whole-file download stays joinable until its moments are
         // decoded, so a request that needs the file meanwhile does not
         // download it again (#1127); what it fetched stays reserved as long.
-        let fetched = download.as_mut().map(|(read, _)| read.wait(pix.handle));
+        let fetched = download
+            .as_mut()
+            .map(|(read, _)| read.wait(pix.handle, background.as_ref()));
         let (batch, _charged) =
             pix.prefetch(&entry.id, &entry.volume, targets, fetched, Some(budget))?;
         drop(download);
@@ -4855,6 +5271,14 @@ fn site_trajectory(
     }
 }
 
+/// The 404 of a point query (position, location, area at the antenna)
+/// whose every level was dropped: no sample was a value or clear air
+/// (`PixelClass::Masked`). Names each way a sample is masked (#1046).
+const NOT_MEASURED: &str = "this radar has no measurement at the sampled position for the \
+     requested elevation angle(s)/parameter(s): the position is outside the selected \
+     sweep's range, the sweep does not carry the parameter, the volume flags the gate as \
+     nodata, or the sweep's data could not be read";
+
 /// Wrap one site's coverages: a request pinned to exactly one level is a
 /// single `PointSeries` (`Single`); every other shape is a `Collection`.
 fn finalize_single_site(
@@ -4862,19 +5286,16 @@ fn finalize_single_site(
     levels: &Option<Vec<f64>>,
 ) -> Result<CoverageResponse, DataServerError> {
     // No plottable coverage — every profile/level was dropped because the
-    // radar never *measured* the point there (out of the selected sweep's
-    // range, or the sweep lacks the requested quantity; clear air is a
-    // measurement and is NOT dropped). An empty `CoverageCollection` is
-    // invalid CoverageJSON and would serve HTTP 200 for what is really
-    // "never observed", so surface a 404. Checked first so it covers both
-    // the single-level and multi-coverage shapes.
+    // radar has no measurement of the point there: out of the selected
+    // sweep's range, the sweep lacks the requested quantity, the gate is
+    // `nodata`, or the moment is known bad (a missing file or a failed
+    // decode reads as nodata). Clear air is a measurement and is NOT
+    // dropped. An empty `CoverageCollection` is invalid CoverageJSON and
+    // would serve HTTP 200 for what is really "not observed", so surface a
+    // 404. Checked first so it covers both the single-level and
+    // multi-coverage shapes.
     if covs.is_empty() {
-        return Err(DataServerError::LocationNotFound(
-            "this radar never measured the requested position at the requested \
-             elevation angle(s)/parameter(s) — outside the selected sweep's range, \
-             or the sweep does not carry the parameter"
-                .into(),
-        ));
+        return Err(DataServerError::LocationNotFound(NOT_MEASURED.into()));
     }
     if matches!(levels, Some(l) if l.len() == 1) {
         // A single pinned level yields exactly one (non-null) coverage.
@@ -5548,7 +5969,7 @@ fn volume_point_cloud(
     pix: Pixels,
     quantity: &str,
     min_value: Option<f64>,
-) -> VolumePointCloud {
+) -> Result<VolumePointCloud, DataServerError> {
     let site = &volume.site;
     let center = geodetic_to_ecef(site.lon, site.lat, site.height);
 
@@ -5590,8 +6011,10 @@ fn volume_point_cloud(
         };
         // A 3D render resolves its quantity up front (`volume_moments`, which
         // fails the request on a deadline or transient read), so this lookup
-        // never fetches; an absent moment is unusable data.
-        let Ok(Some(pixels)) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
+        // never fetches and an absent moment is unusable data. A caller
+        // without that batch would read here: its deadline or storage
+        // failure fails the cloud, never an empty one a cache keeps (#1046).
+        let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins)? else {
             continue;
         };
         let deg_per_ray = 360.0 / sweep.nrays as f64;
@@ -5658,13 +6081,13 @@ fn volume_point_cloud(
     } else {
         [west, south, east, north, min_h, max_h]
     };
-    VolumePointCloud {
+    Ok(VolumePointCloud {
         rtc_center: center,
         region,
         points,
         quantity: quantity.to_string(),
         unit: quantities::quantity_unit(quantity).to_string(),
-    }
+    })
 }
 
 /// Default voxel grid resolution `[n_radius, n_angle, n_height]`: 1° azimuth
@@ -5718,7 +6141,8 @@ enum ColumnTarget {
 
 /// Resolve one `(slant_range, elevation)` target to its [`ColumnTarget`] —
 /// the azimuth-independent prefix of [`slant_cell`] + [`sample_slant_cell`], guard for
-/// guard, so the two stay behaviourally identical.
+/// guard, so the two stay behaviourally identical. A read that fails its
+/// request is the error (#1046).
 fn resolve_column(
     volume: &PolarVolume,
     file_id: &str,
@@ -5727,35 +6151,37 @@ fn resolve_column(
     quantity: &str,
     slant_range_m: f64,
     elangle_deg: f64,
-) -> ColumnTarget {
+) -> Result<ColumnTarget, DataServerError> {
     let Some(sweep) = nearest_sweep(volume, elangle_deg) else {
-        return ColumnTarget::Masked;
+        return Ok(ColumnTarget::Masked);
     };
     if sweep.nrays == 0 || sweep.nbins == 0 {
-        return ColumnTarget::Masked;
+        return Ok(ColumnTarget::Masked);
     }
     let (min_el, max_el) = envelope;
     if !elangle_deg.is_finite()
         || elangle_deg < min_el - SWEEP_ENVELOPE_TOL_DEG
         || elangle_deg > max_el + SWEEP_ENVELOPE_TOL_DEG
     {
-        return ColumnTarget::Masked;
+        return Ok(ColumnTarget::Masked);
     }
     if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
-        return ColumnTarget::Masked;
+        return Ok(ColumnTarget::Masked);
     }
     let Some(moment) = sweep.moments.iter().find(|m| m.quantity == *quantity) else {
-        return ColumnTarget::Masked;
+        return Ok(ColumnTarget::Masked);
     };
     let bin = ((slant_range_m - sweep.rstart) / sweep.rscale).floor() as i64;
     if bin < 0 || bin >= sweep.nbins as i64 {
-        return ColumnTarget::Masked;
+        return Ok(ColumnTarget::Masked);
     }
-    // Prefetched by `volume_moments` like the point cloud's: never a fetch.
-    let Ok(Some(pixels)) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins) else {
-        return ColumnTarget::Masked;
+    // Prefetched by `volume_moments` like the point cloud's: never a fetch,
+    // and an absent moment is unusable data. Without that batch a deadline
+    // or storage failure fails the grid, never an empty one (#1046).
+    let Some(pixels) = pix.moment(file_id, volume, moment, sweep.nrays, sweep.nbins)? else {
+        return Ok(ColumnTarget::Masked);
     };
-    ColumnTarget::Gate {
+    Ok(ColumnTarget::Gate {
         pixels,
         nrays: sweep.nrays,
         bin: bin as usize,
@@ -5763,7 +6189,7 @@ fn resolve_column(
         offset: moment.offset,
         nodata: moment.nodata,
         undetect: moment.undetect,
-    }
+    })
 }
 
 fn voxel_grid_from_volume(
@@ -5825,7 +6251,7 @@ fn voxel_grid_from_volume(
             let (slant, el) = ground_height_to_slant(ground, height);
             resolve_column(volume, file_id, pix, envelope, quantity, slant, el)
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let mut values = vec![f32::NAN; total];
     let mut valid = 0usize; // counted here to avoid a second O(N) pass
@@ -6067,7 +6493,7 @@ impl VolumeEngine for PolarVolumeSiteView {
             moments: Some(&moments),
             ..pix
         };
-        let cloud = volume_point_cloud(&entry.volume, &entry.id, pix, &quantity, min_value);
+        let cloud = volume_point_cloud(&entry.volume, &entry.id, pix, &quantity, min_value)?;
 
         // No echoes (every cell nodata, or below `min_value`) ⇒ 404, matching
         // the other engines' "no data in window" convention, so the API layer
@@ -6390,11 +6816,7 @@ impl EdrEngine for PolarVolumeSiteView {
         // means the antenna point was never *measured* at any requested
         // level (clear air is a measurement and survives as nulls).
         if covs.is_empty() {
-            return Err(DataServerError::LocationNotFound(
-                "this radar never measured the sampled position at the requested \
-                 elevation angle(s)/parameter(s)"
-                    .into(),
-            ));
+            return Err(DataServerError::LocationNotFound(NOT_MEASURED.into()));
         }
         Ok(CoverageResponse::Collection(covs))
     }
@@ -7263,7 +7685,13 @@ mod tests {
             "moment must be cold before pre-warm"
         );
 
-        prewarm_pixels(&source, file_id, &volume, &bytes, 1);
+        prewarm_pixels(
+            &source,
+            file_id,
+            &volume,
+            &bytes,
+            &Prewarm::default_quantity(1),
+        );
 
         assert!(
             pixel_cache().contains(&cid, &lowest),
@@ -7281,7 +7709,13 @@ mod tests {
         // n_sweeps = 0 is the disable switch: a fresh id warms nothing.
         let file_id0 = "prewarm-461-zero/202605191050_fivih_PVOL.h5";
         let cid0 = pixel_cache_id(&source, file_id0);
-        prewarm_pixels(&source, file_id0, &volume, &bytes, 0);
+        prewarm_pixels(
+            &source,
+            file_id0,
+            &volume,
+            &bytes,
+            &Prewarm::default_quantity(0),
+        );
         assert!(
             !pixel_cache().contains(&cid0, &lowest),
             "n_sweeps = 0 must pre-warm nothing"
@@ -7298,7 +7732,13 @@ mod tests {
         let local_id = "/prewarm-472-local/202605191050_fivih_PVOL.h5";
         let local_cid = pixel_cache_id(&local, local_id);
         assert!(!pixel_cache().contains(&local_cid, &lowest));
-        prewarm_pixels(&local, local_id, &volume, &bytes, 1);
+        prewarm_pixels(
+            &local,
+            local_id,
+            &volume,
+            &bytes,
+            &Prewarm::default_quantity(1),
+        );
         assert!(
             pixel_cache().contains(&local_cid, &lowest),
             "a local source must pre-warm its lowest sweep (#472)"
@@ -7342,7 +7782,7 @@ mod tests {
     fn prewarm_requests_take_only_the_default_quantity() {
         let volume = two_quantity_volume(25.0, 60.0);
         let paths = |n| -> Vec<&str> {
-            prewarm_requests(&volume, n)
+            prewarm_requests(&volume, &Prewarm::default_quantity(n))
                 .into_iter()
                 .map(|(path, _, _)| path)
                 .collect()
@@ -7358,13 +7798,56 @@ mod tests {
         let mut th = volume.clone();
         th.sweeps[0].moments[1].quantity = "TH".to_string();
         th.sweeps[1].moments[1].quantity = "TH".to_string();
-        let th_paths: Vec<&str> = prewarm_requests(&th, 1)
+        let th_paths: Vec<&str> = prewarm_requests(&th, &Prewarm::default_quantity(1))
             .into_iter()
             .map(|(path, _, _)| path)
             .collect();
         assert_eq!(th_paths, vec!["/dataset1/data2/data"]);
         assert_eq!(default_quantity_of(&["CCORH", "VRADH"]), Some("CCORH"));
         assert_eq!(default_quantity_of::<&str>(&[]), None);
+    }
+
+    /// #1046: `prewarm_quantities` names the quantities warmed, each at the
+    /// lowest `prewarm_sweeps` sweeps; one a volume lacks is skipped, an
+    /// empty list warms nothing, and an empty name is a load error.
+    #[test]
+    fn prewarm_requests_take_the_configured_quantities() {
+        let volume = two_quantity_volume(25.0, 60.0);
+        let paths = |sweeps: usize, quantities: &[&str]| -> Vec<&str> {
+            let prewarm = Prewarm {
+                sweeps,
+                quantities: Some(quantities.iter().map(|q| q.to_string()).collect()),
+            };
+            let mut paths: Vec<&str> = prewarm_requests(&volume, &prewarm)
+                .into_iter()
+                .map(|(path, _, _)| path)
+                .collect();
+            paths.sort_unstable();
+            paths
+        };
+        assert_eq!(paths(1, &["CCORH"]), vec!["/dataset1/data1/data"]);
+        assert_eq!(
+            paths(2, &["DBZH", "CCORH"]),
+            vec![
+                "/dataset1/data1/data",
+                "/dataset1/data2/data",
+                "/dataset2/data1/data",
+                "/dataset2/data2/data"
+            ]
+        );
+        assert!(paths(1, &["VRADH"]).is_empty(), "a quantity it lacks");
+        assert!(paths(1, &[]).is_empty(), "an empty list");
+        assert!(paths(0, &["DBZH"]).is_empty(), "`prewarm_sweeps = 0`");
+
+        let mut config = empty_config();
+        config.prewarm_quantities = Some(vec!["DBZH".into(), " ".into()]);
+        assert!(matches!(
+            Prewarm::from_config(&config),
+            Err(EngineError::EmptyPrewarmQuantity)
+        ));
+        config.prewarm_quantities = None;
+        let prewarm = Prewarm::from_config(&config).unwrap();
+        assert!(prewarm.quantities.is_none(), "unset: the default quantity");
     }
 
     /// The bare-layer render (no parameter) draws the advertised default
@@ -7909,6 +8392,7 @@ mod tests {
             inner: Arc::new(inner),
             gets: Mutex::default(),
             fail_first: Mutex::default(),
+            forbidden: Mutex::default(),
         });
         let source = Source::Remote {
             store: ds_storage::DataStore::new(counted.clone()),
@@ -8431,11 +8915,14 @@ mod tests {
     /// An object store that counts the GETs of each key it is asked for
     /// (#1127), and fails the first GET of each key in `fail_first` once
     /// the store under it has answered: the read then takes its full time.
+    /// A key in `forbidden` is refused as S3 refuses a key these
+    /// credentials may not read, a 403 (#1046).
     #[derive(Debug)]
     struct CountingStore {
         inner: Arc<dyn ds_storage::object_store::ObjectStore>,
         gets: Mutex<HashMap<String, usize>>,
         fail_first: Mutex<std::collections::HashSet<String>>,
+        forbidden: Mutex<std::collections::HashSet<String>>,
     }
 
     impl CountingStore {
@@ -8449,6 +8936,16 @@ mod tests {
         fn fail_next(&self, file_id: &str) {
             let key = ds_storage::object_store::path::Path::from(file_id).to_string();
             self.fail_first.lock().unwrap().insert(key);
+        }
+
+        /// Refuse every GET of the volume file `file_id` with a 403, or stop.
+        fn forbid(&self, file_id: &str, forbidden: bool) {
+            let key = ds_storage::object_store::path::Path::from(file_id).to_string();
+            let mut keys = self.forbidden.lock().unwrap();
+            match forbidden {
+                true => keys.insert(key),
+                false => keys.remove(&key),
+            };
         }
     }
 
@@ -8485,6 +8982,12 @@ mod tests {
         ) -> ds_storage::object_store::Result<ds_storage::object_store::GetResult> {
             let key = location.to_string();
             *self.gets.lock().unwrap().entry(key.clone()).or_default() += 1;
+            if self.forbidden.lock().unwrap().contains(&key) {
+                return Err(ds_storage::object_store::Error::PermissionDenied {
+                    path: key,
+                    source: "Access Denied".into(),
+                });
+            }
             let result = self.inner.get_opts(location, options).await;
             if self.fail_first.lock().unwrap().remove(&key) {
                 return Err(ds_storage::object_store::Error::Generic {
@@ -8588,6 +9091,7 @@ mod tests {
             inner: Arc::new(ThrottledStore::new(inner, config)),
             gets: Mutex::default(),
             fail_first: Mutex::default(),
+            forbidden: Mutex::default(),
         });
         let source = Source::Remote {
             store: ds_storage::DataStore::new(counted.clone()),
@@ -9415,10 +9919,398 @@ mod tests {
         assert_eq!(file_fetches::count(failing), 2);
         assert_eq!(counted.gets(&volumes[1].id), 1);
         assert!(matches!(
-            other.wait(Some(runtime)),
+            other.wait(
+                Some(runtime),
+                Finish {
+                    runtime: None,
+                    wanted: &[]
+                }
+            ),
             Err(PixelReadError::Abort(DataServerError::ResourceExhausted))
         ));
         assert_none_marked_bad(&source, &volumes);
+    }
+
+    /// The cumulative aborted reads for `reason` (#1046), process-wide:
+    /// other tests running at once count too, so compare with `>=`.
+    fn aborts(reason: AbortReason) -> u64 {
+        PIXEL_READ_ABORTS[reason as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Use `runtime` as the background runtime of the reads on this thread
+    /// until the guard drops (#1046): a pooled thread must not keep it.
+    struct TestBackground;
+
+    impl TestBackground {
+        fn enter(runtime: &tokio::runtime::Handle) -> Self {
+            TEST_BACKGROUND_RUNTIME.with(|test| *test.borrow_mut() = Some(runtime.clone()));
+            TestBackground
+        }
+    }
+
+    impl Drop for TestBackground {
+        fn drop(&mut self) {
+            TEST_BACKGROUND_RUNTIME.with(|test| *test.borrow_mut() = None);
+        }
+    }
+
+    /// How long a read of the #1046 tests takes at the store, against the
+    /// request deadline that cuts it off.
+    const SLOW_READ: Duration = Duration::from_millis(400);
+    const CUT_OFF: Duration = Duration::from_millis(50);
+
+    /// Wait until `done`, at most ten seconds.
+    fn eventually(what: &str, done: impl Fn() -> bool) {
+        let start = std::time::Instant::now();
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(10), "{what}: never");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A map render's cold read of `entry`'s first moment, as
+    /// `get_raster_tile` runs it: on the query runtime's blocking pool with
+    /// the explicit handle, with `background` finishing what its `deadline`
+    /// (from now) cuts off.
+    fn render_read(
+        source: &Arc<Source>,
+        entry: &VolumeEntry,
+        deadline: Option<Duration>,
+        background: Option<&tokio::runtime::Handle>,
+    ) -> Result<Option<Arc<RawPixels>>, DataServerError> {
+        let runtime = query_runtime();
+        let handle = runtime.handle().clone();
+        let (source, entry) = (source.clone(), entry.clone());
+        let background = background.cloned();
+        runtime
+            .block_on(runtime.spawn_blocking(move || {
+                let _deadline =
+                    ds_core::deadline::enter(deadline.map(|d| std::time::Instant::now() + d));
+                let pix = Pixels {
+                    moments: None,
+                    source: &source,
+                    handle: Some(&handle),
+                };
+                let sweep = &entry.volume.sweeps[0];
+                let moment = &sweep.moments[0];
+                pix.moment_with(
+                    &entry.id,
+                    &entry.volume,
+                    moment,
+                    sweep.nrays,
+                    sweep.nbins,
+                    background.as_ref(),
+                )
+            }))
+            .unwrap()
+    }
+
+    /// #1046: a map render's whole-file read that the request deadline cuts
+    /// off goes on in the background, which decodes the moment the render
+    /// wanted: the retry finds it without a second download, where before
+    /// every retry started the same read again and a frame whose download
+    /// outlasts the deadline never rendered. The cut-off read counts as a
+    /// deadline abort and marks nothing bad.
+    #[test]
+    fn a_read_the_deadline_cuts_off_is_finished_for_the_retry() {
+        let (source, volumes, store) = counted_remote_volumes(1, SLOW_READ, None);
+        let entry = &volumes[0];
+        let cache_id = pixel_cache_id(&source, &entry.id).into_owned();
+        let path = entry.volume.sweeps[0].moments[0].dataset_path.clone();
+        let background = test_background_runtime().handle();
+        let cut_off = aborts(AbortReason::Deadline);
+        let read = render_read(&source, entry, Some(CUT_OFF), Some(background));
+        assert!(
+            matches!(read, Err(DataServerError::DeadlineExceeded)),
+            "{read:?}"
+        );
+        assert!(
+            aborts(AbortReason::Deadline) > cut_off,
+            "counted as a deadline abort"
+        );
+        assert!(!pixel_cache().is_known_bad(&cache_id, &path));
+        eventually("the finished read's moment", || {
+            pixel_cache().contains(&cache_id, &path)
+        });
+        eventually("the finish let go of the file", || {
+            pixel_cache().held_bytes(&cache_id).is_none()
+        });
+        let raw = render_read(&source, entry, None, None).unwrap();
+        assert!(raw.is_some(), "the retry reads the moment");
+        assert_eq!(file_fetches::count(&entry.id), 1, "one download");
+        assert_eq!(store.gets(&entry.id), 1, "one GET at the store");
+    }
+
+    /// #1046: a retry while the cut-off read is still downloading joins it
+    /// (#1127) instead of downloading the file again, and with no
+    /// background runtime the cut-off read is dropped as before.
+    #[test]
+    fn a_retry_joins_the_read_the_deadline_cut_off() {
+        let (source, volumes, store) = counted_remote_volumes(2, SLOW_READ, None);
+        let background = test_background_runtime().handle();
+        let finished = &volumes[0];
+        let read = render_read(&source, finished, Some(CUT_OFF), Some(background));
+        assert!(
+            matches!(read, Err(DataServerError::DeadlineExceeded)),
+            "{read:?}"
+        );
+        assert!(render_read(&source, finished, None, None)
+            .unwrap()
+            .is_some());
+        assert_eq!(store.gets(&finished.id), 1, "the retry joined the read");
+
+        let dropped = &volumes[1];
+        let read = render_read(&source, dropped, Some(CUT_OFF), None);
+        assert!(
+            matches!(read, Err(DataServerError::DeadlineExceeded)),
+            "{read:?}"
+        );
+        assert!(render_read(&source, dropped, None, None).unwrap().is_some());
+        assert_eq!(
+            store.gets(&dropped.id),
+            2,
+            "no background runtime: read again"
+        );
+    }
+
+    /// #1046: a cold read of a moment's byte ranges (#1047) that the
+    /// deadline cuts off is finished the same way: the retry is a cache hit,
+    /// with no second ranged read and no whole-file read.
+    #[test]
+    fn a_ranged_read_the_deadline_cuts_off_is_finished_for_the_retry() {
+        let (bytes, volume, whole) = ranged_volume();
+        let (source, volumes, store) = counted_remote_copies(&bytes, &volume, 1, SLOW_READ, None);
+        let entry = &volumes[0];
+        let moment = &entry.volume.sweeps[0].moments[0];
+        let plan = ReadPlan::new(&entry.volume, [moment]).expect("a plan");
+        let cache_id = pixel_cache_id(&source, &entry.id).into_owned();
+        let background = test_background_runtime().handle();
+        let read = render_read(&source, entry, Some(CUT_OFF), Some(background));
+        assert!(
+            matches!(read, Err(DataServerError::DeadlineExceeded)),
+            "{read:?}"
+        );
+        eventually("the finished ranged read's moment", || {
+            pixel_cache().contains(&cache_id, &moment.dataset_path)
+        });
+        let raw = render_read(&source, entry, None, None).unwrap().unwrap();
+        assert!(crate::layout::tests::same_pixels(&raw, &whole));
+        assert_eq!(file_fetches::ranged(&entry.id), 1, "one ranged read");
+        assert_eq!(file_fetches::count(&entry.id), 0, "no whole-file read");
+        assert_eq!(store.gets(&entry.id), plan.ranges().len());
+    }
+
+    /// #1046: a batch read (the 3D read; an EDR walk's batch is the same
+    /// loader) that the deadline cuts off is finished for every moment the
+    /// batch wanted, with the background runtime the poll loop registers.
+    #[test]
+    fn a_batch_read_the_deadline_cuts_off_is_finished_for_the_retry() {
+        let (source, volumes, store) = counted_remote_volumes(1, SLOW_READ, None);
+        let entry = volumes[0].clone();
+        let quantity = entry.volume.sweeps[0].moments[0].quantity.clone();
+        let cache_id = pixel_cache_id(&source, &entry.id).into_owned();
+        let runtime = query_runtime();
+        let handle = runtime.handle().clone();
+        let batch = move |deadline: Option<Duration>| {
+            let (source, entry, quantity, handle) = (
+                source.clone(),
+                entry.clone(),
+                quantity.clone(),
+                handle.clone(),
+            );
+            move || {
+                let _background = TestBackground::enter(test_background_runtime().handle());
+                let _deadline =
+                    ds_core::deadline::enter(deadline.map(|d| std::time::Instant::now() + d));
+                let pix = Pixels {
+                    moments: None,
+                    source: &source,
+                    handle: Some(&handle),
+                };
+                pix.volume_moments(&entry.volume, &entry.id, &quantity)
+                    .map(|moments| moments.len())
+            }
+        };
+        let read = runtime
+            .block_on(runtime.spawn_blocking(batch(Some(CUT_OFF))))
+            .unwrap();
+        assert!(
+            matches!(read, Err(DataServerError::DeadlineExceeded)),
+            "{read:?}"
+        );
+        let wanted: Vec<_> = volumes[0]
+            .volume
+            .sweeps
+            .iter()
+            .flat_map(|s| &s.moments)
+            .filter(|m| m.quantity == volumes[0].volume.sweeps[0].moments[0].quantity)
+            .map(|m| m.dataset_path.clone())
+            .collect();
+        assert_eq!(wanted.len(), 2, "fixture shape");
+        eventually("the finished batch's moments", || {
+            wanted.iter().all(|p| pixel_cache().contains(&cache_id, p))
+        });
+        let read = runtime
+            .block_on(runtime.spawn_blocking(batch(None)))
+            .unwrap();
+        assert_eq!(read.unwrap(), 2);
+        assert_eq!(store.gets(&volumes[0].id), 1, "one GET at the store");
+    }
+
+    /// #993, #1046: a store failure a retry can heal (a 5xx) fails the read
+    /// end to end, through `Pixels::moment` and through `polar_sample`, as a
+    /// counted storage abort (503), marks nothing bad, and the retry reads.
+    #[test]
+    fn storage_failures_fail_reads_end_to_end_and_a_retry_reads() {
+        let bytes = Bytes::from_static(COLD_BATCH);
+        let volume = crate::pvol::read_polar_volume(&bytes).unwrap();
+        let sweep = &volume.sweeps[0];
+        let moment = &sweep.moments[0];
+
+        let (source, key, store) = counted_remote(&bytes);
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        store.fail_next(&key);
+        let failed = aborts(AbortReason::Storage);
+        let read = pix.moment(&key, &volume, moment, sweep.nrays, sweep.nbins);
+        assert!(
+            matches!(read, Err(DataServerError::ResourceExhausted)),
+            "{read:?}"
+        );
+        assert!(
+            aborts(AbortReason::Storage) > failed,
+            "counted as a storage abort"
+        );
+        let cache_id = pixel_cache_id(&source, &key);
+        assert!(!pixel_cache().is_known_bad(&cache_id, &moment.dataset_path));
+        let read = pix.moment(&key, &volume, moment, sweep.nrays, sweep.nbins);
+        assert!(read.unwrap().is_some(), "the retry reads");
+        assert_eq!(store.gets(&key), 2);
+
+        let (source, key, store) = counted_remote(&bytes);
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let (lon, lat) = (volume.site.lon, volume.site.lat);
+        let render = || {
+            polar_sample(
+                &volume,
+                &key,
+                pix,
+                &moment.quantity,
+                [lon - 0.5, lat - 0.5, lon + 0.5, lat + 0.5],
+                8,
+                8,
+                &OutputCrs::Wgs84,
+                None,
+                ResamplingMethod::Nearest,
+            )
+        };
+        store.fail_next(&key);
+        assert!(matches!(render(), Err(DataServerError::ResourceExhausted)));
+        let cache_id = pixel_cache_id(&source, &key);
+        assert!(!pixel_cache().is_known_bad(&cache_id, &moment.dataset_path));
+        render().expect("the retry renders");
+        assert_eq!(store.gets(&key), 2);
+    }
+
+    /// #1046: a store that refuses a volume file for good (an S3 403, also
+    /// what S3 answers for a missing key without `s3:ListBucket`) fails the
+    /// read as a storage failure, never as nodata a tile cache would keep,
+    /// and is not asked again for `REFUSAL_RETRY_AFTER`: the renders
+    /// meanwhile fail at once. Once it passes, the file is read again.
+    #[test]
+    fn a_refused_volume_fails_at_once_until_the_refusal_expires() {
+        let bytes = Bytes::from_static(COLD_BATCH);
+        let volume = crate::pvol::read_polar_volume(&bytes).unwrap();
+        let sweep = &volume.sweeps[0];
+        let moment = &sweep.moments[0];
+        let (source, key, store) = counted_remote(&bytes);
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let cache_id = pixel_cache_id(&source, &key).into_owned();
+        store.forbid(&key, true);
+        let read = pix.moment(&key, &volume, moment, sweep.nrays, sweep.nbins);
+        assert!(
+            matches!(read, Err(DataServerError::ResourceExhausted)),
+            "{read:?}"
+        );
+        assert!(!pixel_cache().is_known_bad(&cache_id, &moment.dataset_path));
+        assert!(pixel_cache().is_refused(&cache_id));
+        assert_eq!(store.gets(&key), 1);
+        let (lon, lat) = (volume.site.lon, volume.site.lat);
+        let render = polar_sample(
+            &volume,
+            &key,
+            pix,
+            &moment.quantity,
+            [lon - 0.5, lat - 0.5, lon + 0.5, lat + 0.5],
+            8,
+            8,
+            &OutputCrs::Wgs84,
+            None,
+            ResamplingMethod::Nearest,
+        );
+        assert!(matches!(render, Err(DataServerError::ResourceExhausted)));
+        assert_eq!(store.gets(&key), 1, "a refused file is not asked again");
+
+        store.forbid(&key, false);
+        assert!(!pixel_cache().refuse(&cache_id, std::time::Instant::now()));
+        let read = pix.moment(&key, &volume, moment, sweep.nrays, sweep.nbins);
+        assert!(
+            read.unwrap().is_some(),
+            "read again once the refusal expired"
+        );
+        assert_eq!(store.gets(&key), 2);
+
+        // A local file this process may not read, here a directory, alike.
+        let dir = tempfile::tempdir().unwrap();
+        let local = Source::Local {
+            data_dir: dir.path().to_path_buf(),
+            time_window: None,
+        };
+        let pix = Pixels {
+            moments: None,
+            source: &local,
+            handle: None,
+        };
+        let not_a_file = dir.path().to_str().unwrap().to_owned();
+        let read = pix.moment(&not_a_file, &volume, moment, sweep.nrays, sweep.nbins);
+        assert!(
+            matches!(read, Err(DataServerError::ResourceExhausted)),
+            "{read:?}"
+        );
+        assert!(pixel_cache().is_refused(&not_a_file));
+        assert!(!pixel_cache().is_known_bad(&not_a_file, &moment.dataset_path));
+    }
+
+    /// #1046: the 3D samplers read their moments from the batch
+    /// `volume_moments` resolved; without it a read cut off by the deadline
+    /// fails the point cloud and the voxel grid instead of leaving them
+    /// empty (an empty grid would be cached).
+    #[test]
+    fn three_d_samplers_fail_on_a_read_error_without_their_batch() {
+        let (source, key, volume) = remote_fixture();
+        let pix = Pixels {
+            moments: None,
+            source: &source,
+            handle: None,
+        };
+        let quantity = volume.sweeps[0].moments[0].quantity.clone();
+        let _deadline = expired_deadline();
+        let cloud = volume_point_cloud(&volume, &key, pix, &quantity, None);
+        assert!(matches!(cloud, Err(DataServerError::DeadlineExceeded)));
+        // 50 m height cells: the low ones reach the fixture's 8 km sweeps.
+        let grid = voxel_grid_from_volume(&volume, &key, pix, &quantity, Some([8, 4, 400]));
+        assert!(matches!(grid, Err(DataServerError::DeadlineExceeded)));
     }
 
     /// A runtime of `workers` workers that is never dropped (#1200): a test
@@ -10293,6 +11185,7 @@ mod tests {
             cadence_secs: None,
             resampling: Default::default(),
             prewarm_sweeps: 1,
+            prewarm_quantities: None,
         }
     }
 
@@ -11432,6 +12325,50 @@ mod tests {
         ));
     }
 
+    /// #1046: a pinned-level position whose gate the volume flags `nodata`,
+    /// or whose sweep could not be read (known bad, sampled as nodata), is
+    /// the same 404 as one out of range, and its message names both causes.
+    #[test]
+    fn site_view_z_level_nodata_and_unreadable_404_names_each_cause() {
+        let query = |view: &PolarVolumeSiteView| {
+            EdrEngine::query_position(
+                view,
+                "POINT(25.0 60.1)",
+                None,
+                Some(&["DBZH".to_string()]),
+                Some(&[0.5]),
+                None,
+            )
+        };
+        let vol = synthetic_volume(25.0, 60.0);
+        let (nrays, nbins) = (vol.sweeps[0].nrays, vol.sweeps[0].nbins);
+        let nodata = unique_file_id();
+        pixel_cache().insert(
+            &nodata,
+            SYNTHETIC_DS,
+            Arc::new(RawPixels::U16(Array2::from_elem((nrays, nbins), 65_535u16))),
+        );
+        let unreadable = unique_file_id();
+        pixel_cache().mark_bad(&unreadable, SYNTHETIC_DS);
+        for id in [nodata, unreadable] {
+            let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+            let entry = VolumeEntry {
+                id,
+                volume: Arc::new(vol.clone()),
+            };
+            by_site.insert("fivih".to_string(), vec![entry]);
+            let view = site_view_for(by_site, "fivih");
+            match query(&view) {
+                Err(DataServerError::LocationNotFound(message)) => {
+                    assert!(message.contains("flags the gate as nodata"), "{message}");
+                    assert!(message.contains("could not be read"), "{message}");
+                    assert!(message.contains("outside the selected sweep's range"));
+                }
+                other => panic!("expected a 404, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
     /// A z-pinned query at a point the radar *measured* but where every gate
     /// is `undetect` (clear air — no precipitation for the whole window) is
     /// HTTP 200 with null values, NOT a 404: the radar looked and saw
@@ -11554,7 +12491,7 @@ mod tests {
             parse_cache: Arc::new(Mutex::new(HashMap::new())),
             poll_interval: Duration::from_secs(30),
             resampling: ResamplingMethod::default(),
-            prewarm_sweeps: 1,
+            prewarm: Prewarm::default_quantity(1),
             shutdown: Shutdown::new(),
         }
     }

@@ -1035,8 +1035,25 @@ static PVOL_PIXEL_CACHE_INSERTS: LazyLock<DeltaCounter> = LazyLock::new(|| {
 static PVOL_PIXEL_READ_FAILURES: LazyLock<DeltaCounter> = LazyLock::new(|| {
     DeltaCounter::new(
         "pvol_pixel_read_failures_total",
-        "PVOL lazy pixel reads that found no usable data (missing file, decode failure) and degraded to nodata; deadline and transient storage failures fail the request instead and are not counted",
+        "PVOL lazy pixel reads that found no usable data (missing file, decode failure) and degraded to nodata; reads that fail the request instead are pvol_pixel_read_aborts_total",
     )
+});
+
+/// By `reason` (#1046): the PVOL pixel reads that failed their request
+/// rather than reading as nodata, which `pvol_pixel_read_failures_total`
+/// does not count (#993).
+static PVOL_PIXEL_READ_ABORTS: LazyLock<[DeltaCounter; 2]> = LazyLock::new(|| {
+    engine_odim::AbortReason::ALL.map(|reason| {
+        DeltaCounter::labelled(
+            "pvol_pixel_read_aborts_total",
+            "PVOL lazy pixel reads that failed their request (503, EDR 504) instead of reading \
+             as nodata. reason: deadline = the request deadline passed during the read or \
+             while waiting for another request's load of the file, storage = a failure a retry \
+             can heal or a refusal (401/403, a local file this process may not read)",
+            "reason",
+            reason.as_str(),
+        )
+    })
 });
 
 // PVOL EDR read admission (#1041): the bytes an EDR walk's volume batches
@@ -7161,6 +7178,9 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         PVOL_PIXEL_CACHE_METRICS.update(pixel.cache, Some(pixel.entries));
         PVOL_PIXEL_CACHE_INSERTS.feed(pixel.inserts);
         PVOL_PIXEL_READ_FAILURES.feed(pixel.read_failures);
+        for (counter, aborts) in PVOL_PIXEL_READ_ABORTS.iter().zip(pixel.read_aborts) {
+            counter.feed(aborts);
+        }
         let (used, limit, rejected) = engine_odim::read_budget::metrics();
         PVOL_READ_USED.set(used.min(i64::MAX as u64) as i64);
         PVOL_READ_LIMIT.set(limit.min(i64::MAX as u64) as i64);
@@ -10760,11 +10780,13 @@ prewarm_sweeps = 0
 
     /// Immediate sheds and deadline expiries are told apart (#147): memory
     /// rejections by `reason`, deadline expiries by `stage`, each family one
-    /// set of labelled series with no unlabelled leftover.
+    /// set of labelled series with no unlabelled leftover. So are the PVOL
+    /// pixel reads that fail their request (#1046).
     #[test]
     fn render_rejections_are_attributed_by_reason_and_stage() {
         std::sync::LazyLock::force(&super::RENDER_DEADLINES);
         std::sync::LazyLock::force(&super::RENDER_MEMORY_REJECTED);
+        std::sync::LazyLock::force(&super::PVOL_PIXEL_READ_ABORTS);
         use super::Encoder as _;
         let mut text = Vec::new();
         super::TextEncoder::new()
@@ -10781,6 +10803,11 @@ prewarm_sweeps = 0
                 "render_budget_rejected_total",
                 "reason",
                 ["oversize", "deadline"],
+            ),
+            (
+                "pvol_pixel_read_aborts_total",
+                "reason",
+                ["deadline", "storage"],
             ),
         ] {
             for value in values {

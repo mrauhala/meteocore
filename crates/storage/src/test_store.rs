@@ -328,7 +328,8 @@ impl ObjectStore for SlowReads {
 type Metadata = BTreeMap<String, (u64, Option<DateTime<Utc>>)>;
 
 /// Answers HEADs, and GETs with an empty body, from scripted metadata: a
-/// key without an entry in `objects` is NotFound, a key in `failing` fails.
+/// key without an entry in `objects` is NotFound, a key in `failing` fails,
+/// and a key in `forbidden` is a permission refusal (an S3 403).
 /// A key with a `bodies` entry (a THREDDS catalog) is GET as that body.
 /// Records every key HEADed and every key GET, counts every GET, and counts
 /// the operations in flight while each sleeps `delay`.
@@ -337,6 +338,7 @@ pub(crate) struct MetaStore {
     pub objects: Mutex<Metadata>,
     pub bodies: Mutex<BTreeMap<String, bytes::Bytes>>,
     pub failing: Mutex<HashSet<String>>,
+    pub forbidden: Mutex<HashSet<String>>,
     pub headed: Mutex<Vec<String>>,
     pub fetched: Mutex<Vec<String>>,
     pub delay: Duration,
@@ -426,6 +428,12 @@ impl ObjectStore for MetaStore {
             return Err(object_store::Error::Generic {
                 store: "MetaStore",
                 source: "server unavailable".into(),
+            });
+        }
+        if self.forbidden.lock().unwrap().contains(&key) {
+            return Err(object_store::Error::PermissionDenied {
+                path: key,
+                source: "access denied".into(),
             });
         }
         let Some((size, last_modified)) = self.objects.lock().unwrap().get(&key).copied() else {
