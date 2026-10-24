@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use bytes::Bytes;
@@ -33,7 +33,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::cache::{ContentKey, ContentKind, CONTENT_CACHE};
-use crate::error::Tiles3dError;
+use crate::error::{JsonQuery, Tiles3dError};
 use crate::quantity::{self, QuantityStyles};
 
 /// Default isosurface threshold (dBZ) when a request names none — a light-rain
@@ -533,7 +533,7 @@ pub async fn get_viewer_js(headers: HeaderMap) -> Response {
 /// `GET /collections/{id}/tileset.json`
 pub async fn get_tileset(
     Path(id): Path<String>,
-    Query(params): Query<TilesetParams>,
+    JsonQuery(params): JsonQuery<TilesetParams>,
     State(state): State<AppState>,
 ) -> Result<Response, Tiles3dError> {
     let state = state.load_full();
@@ -687,7 +687,7 @@ fn check_quantity(
 pub async fn get_content(
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(params): Query<ContentParams>,
+    JsonQuery(params): JsonQuery<ContentParams>,
     State(state): State<AppState>,
 ) -> Result<Response, Tiles3dError> {
     let state = state.load_full();
@@ -776,7 +776,7 @@ pub async fn get_content(
 pub async fn get_content_glb(
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(params): Query<GlbContentParams>,
+    JsonQuery(params): JsonQuery<GlbContentParams>,
     State(state): State<AppState>,
 ) -> Result<Response, Tiles3dError> {
     let state = state.load_full();
@@ -970,7 +970,7 @@ pub struct VoxelParams {
 /// `…/voxel/`; the content URI carries the resolved quantity/time/resolution.
 pub async fn get_voxel_tileset(
     Path(id): Path<String>,
-    Query(params): Query<VoxelParams>,
+    JsonQuery(params): JsonQuery<VoxelParams>,
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Response, Tiles3dError> {
@@ -1112,7 +1112,7 @@ fn is_root_voxel_tile(tile: &str) -> bool {
 pub async fn get_voxel_content(
     headers: HeaderMap,
     Path((id, tile)): Path<(String, String)>,
-    Query(params): Query<VoxelParams>,
+    JsonQuery(params): JsonQuery<VoxelParams>,
     State(state): State<AppState>,
 ) -> Result<Response, Tiles3dError> {
     let state = state.load_full();
@@ -1221,7 +1221,7 @@ fn json_only(pairs: &[(String, String)], what: &str) -> Result<(), Tiles3dError>
 /// `GET /` — API landing document.
 pub async fn landing_page(
     State(state): State<AppState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    JsonQuery(pairs): JsonQuery<Vec<(String, String)>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, Tiles3dError> {
     json_only(&pairs, "the 3D Tiles landing document")?;
@@ -1241,7 +1241,7 @@ pub async fn landing_page(
 /// `GET /collections` — list 3D-Tiles-capable collections.
 pub async fn collections(
     State(state): State<AppState>,
-    Query(pairs): Query<Vec<(String, String)>>,
+    JsonQuery(pairs): JsonQuery<Vec<(String, String)>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, Tiles3dError> {
     json_only(&pairs, "the 3D Tiles collection list")?;

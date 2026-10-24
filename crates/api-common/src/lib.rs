@@ -212,9 +212,9 @@ impl<S: Send + Sync> FromRequestParts<S> for CollectionRequest {
 /// parameter gets, not axum's plain-text one. A struct-shaped query fails
 /// before the handler runs on a parameter given twice (`width=1&width=2`);
 /// the description is axum's, which names it (#1073). Every struct-shaped
-/// query of the Maps, Tiles, EDR and Features routes and of the shared
-/// root's Common routes extracts with it, so none answers in plain text
-/// (#1121).
+/// query of the Maps, Tiles, EDR and Features routes, of the shared root's
+/// Common routes and of the server's `/preview` manifest extracts with it,
+/// so none answers in plain text (#1121, #1123).
 pub struct JsonQuery<T>(pub T);
 
 impl<T, S> FromRequestParts<S> for JsonQuery<T>
@@ -225,20 +225,23 @@ where
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        match Query::<T>::from_request_parts(parts, state).await {
-            Ok(Query(value)) => Ok(Self(value)),
-            Err(rejection) => {
-                let message = rejection.body_text();
-                // An HTML error page names the parameter (#1132); the JSON
-                // body is unchanged.
-                let detail = errors::ErrorDetail {
-                    parameter: errors::rejected_field(&message).map(str::to_owned),
-                    ..Default::default()
-                };
-                Err(detail.attach(bad_request(&message)))
-            }
-        }
+        Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Query(value)| Self(value))
+            .map_err(query_rejection)
     }
+}
+
+/// The JSON 400 of a query string axum's [`Query`] rejects, in axum's
+/// wording. An HTML error page names the parameter (#1132); the JSON body
+/// is unchanged.
+fn query_rejection(rejection: QueryRejection) -> Response {
+    let message = rejection.body_text();
+    let detail = errors::ErrorDetail {
+        parameter: errors::rejected_field(&message).map(str::to_owned),
+        ..Default::default()
+    };
+    detail.attach(bad_request(&message))
 }
 
 fn bad_request(description: &str) -> Response {
@@ -247,6 +250,30 @@ fn bad_request(description: &str) -> Response {
         Json(json!({"code": "BadRequest", "description": description})),
     )
     .into_response()
+}
+
+/// The OpenAPI response of a JSON 400 whose cause `description` names: the
+/// `{"code", "description"}` body, or the error as a page for a request
+/// that asked for HTML (#1132).
+pub fn bad_request_response(description: &str) -> Value {
+    json!({
+        "description": description,
+        "content": {
+            "application/json": {"schema": {"type": "object", "required": ["code", "description"], "properties": {
+                "code": {"type": "string"}, "description": {"type": "string"}
+            }}},
+            "text/html": {"schema": {"type": "string"}}
+        }
+    })
+}
+
+/// The OpenAPI 400 of a content-negotiated metadata resource (a landing
+/// page, conformance, a collection): an unsupported or repeated `f`, as
+/// EDR documents it (#1123).
+pub fn format_error_response() -> Value {
+    bad_request_response(
+        "Unsupported or repeated `f`. A request that asked for HTML gets the error as a page.",
+    )
 }
 
 /// One API adapter's view of a collection. Metadata retains API-specific fields;
@@ -713,15 +740,7 @@ pub fn collection_operation() -> Value {
                     "text/html": {"schema": {"type": "string"}}
                 }
             },
-            "400": {
-                "description": "Unsupported, duplicate or invalid collection query parameter. An HTML request gets the catalog form again, with the field at fault marked.",
-                "content": {
-                    "application/json": {"schema": {"type": "object", "required": ["code", "description"], "properties": {
-                        "code": {"type": "string"}, "description": {"type": "string"}
-                    }}},
-                    "text/html": {"schema": {"type": "string"}}
-                }
-            }
+            "400": bad_request_response("Unsupported, duplicate or invalid collection query parameter. An HTML request gets the catalog form again, with the field at fault marked.")
         }
     })
 }

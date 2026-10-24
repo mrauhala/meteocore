@@ -251,7 +251,9 @@ wraps the shared root, EDR, Features, Maps and Tiles routers. When a request
 asks for HTML, a JSON 4xx or 5xx becomes a workbench page with the same
 status. The page names the parameter at fault, when known. It links back to
 the catalog, and to the collection when the failed resource lies below one.
-A 5xx page shows a generic sentence, never the body.
+A 5xx page shows a generic sentence, never the body. The page and a JSON
+error passing through both carry `Vary: accept`, merged into any `Vary`
+already set, so a shared cache keeps the two apart.
 
 A request asks for HTML when the first `f` in its query is `html`. With no
 `f`, or an empty one, it asks for HTML when `Accept` ranks `text/html` above
@@ -264,7 +266,9 @@ a heading, a message, a hint, and accepted values shown as links.
 `errors::not_found` is the server's 404 fallback: an HTML page for a
 browser, an empty 404 otherwise. `errors::json_only_get` returns 400 for any
 `f` other than JSON on routes that only serve JSON (style lists, tilesets,
-tile matrix sets).
+tile matrix sets). It and `errors::format_only_get`, for `/api`, wrap routes
+whose handler reads no query: they take `f` and nothing else, so another
+parameter, or `f` given twice, is a 400 naming `f`.
 
 ## Map request helpers
 

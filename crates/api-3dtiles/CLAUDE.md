@@ -31,7 +31,9 @@ drives the collection JSON's `representations` array → the viewer's toggle.
 - Isosurface accepts `?threshold=20,35,50` (comma list, ≤5 values,
   sorted+deduped into the canonical `content.uri`); a list on `echotop` is
   a 400.
-- Bad threshold/resolution → 400; empty result → 404.
+- Bad threshold/resolution → 400; empty result → 404. Queries extract with
+  `error::JsonQuery`, never axum's `Query`: a repeated or mistyped parameter
+  is this API's `{"error"}` JSON 400 (#1123).
 
 ## Routes (mounted at `/3dtiles`)
 

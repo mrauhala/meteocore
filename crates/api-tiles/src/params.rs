@@ -112,6 +112,37 @@ pub fn reject_unknown_parameters(
     }
 }
 
+/// A tile's `{tileMatrix}/{tileRow}/{tileCol}` path segments as numbers.
+/// The routes extract them as text, so a segment that is not a number is
+/// this JSON 400 naming it, not the framework's plain-text one (#1123).
+/// `/req/core/tc-error` A lets a tile outside the tile matrix set be a 400
+/// or a 404; the range checks after this one keep theirs: a zoom level
+/// above [`MAX_ZOOM_LEVEL`] is a 400, a row or column outside the matrix a
+/// 404.
+pub fn tile_indices(
+    tile_matrix: &str,
+    tile_row: &str,
+    tile_col: &str,
+) -> Result<(u32, u64, u64), TilesError> {
+    let zoom = tile_matrix.parse::<u32>().map_err(|_| {
+        TilesError::BadRequest(format!(
+            "Invalid tileMatrix '{tile_matrix}': must be a zoom level, an integer from 0 to {MAX_ZOOM_LEVEL}"
+        ))
+    })?;
+    let index = |name: &str, what: &str, value: &str| {
+        value.parse::<u64>().map_err(|_| {
+            TilesError::BadRequest(format!(
+                "Invalid {name} '{value}': must be a {what} index of the tile matrix, a non-negative integer"
+            ))
+        })
+    };
+    Ok((
+        zoom,
+        index("tileRow", "row", tile_row)?,
+        index("tileCol", "column", tile_col)?,
+    ))
+}
+
 impl TileQueryParams {
     /// Whether the client requested a Mapbox Vector Tile via `?f=mvt`.
     pub fn is_mvt(&self) -> bool {

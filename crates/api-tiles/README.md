@@ -62,8 +62,10 @@ plus:
 
 - Tile paths are zoom, row (y), column (x). `WebMercatorQuad` (EPSG:3857) and
   `WorldCRS84Quad` (CRS84, 2 × 1 at zoom 0) use 256 × 256 tiles, zooms 0–24.
+  A segment that is not a non-negative integer is a 400 naming it.
 - Tile matrix sets, tileset lists and tilesets are JSON only (`f=html` is a
-  400). A request that asks for HTML gets its errors as an HTML page.
+  400) and take no parameter but `f` (another one is a 400). A request that
+  asks for HTML gets its errors as an HTML page.
 - The legend is JSON by default (palette stops, range, interpolation) or a
   180 × 300 PNG with `f=png`. `parameter-name` selects a parameter's style;
   for an RGB composite the legend lists the channels.

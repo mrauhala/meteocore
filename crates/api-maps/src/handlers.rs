@@ -531,6 +531,7 @@ pub(crate) fn collection_openapi_paths(
                 "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Collection metadata"},
+                    "400": api_common::format_error_response(),
                     "404": {"description": "Collection not found"}
                 }
             }
@@ -840,7 +841,8 @@ pub async fn api_definition(
                 "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
                 "responses": {
-                    "200": {"description": "Landing page"}
+                    "200": {"description": "Landing page"},
+                    "400": api_common::format_error_response()
                 }
             }
         },
@@ -851,7 +853,8 @@ pub async fn api_definition(
                 "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
                 "responses": {
-                    "200": {"description": "Conformance classes"}
+                    "200": {"description": "Conformance classes"},
+                    "400": api_common::format_error_response()
                 }
             }
         },
