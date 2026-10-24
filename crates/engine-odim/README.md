@@ -49,10 +49,13 @@ available.
   kilobytes in four to seven GETs run at once. The whole file is read when
   a moment is not stored in chunks, or when the read would take more than
   ten ranges or more than half the file, as an all-quantity EDR profile
-  does. A request that reads several moments of one file reads it once,
-  and concurrent requests that need the same remote volume share one
-  download. A request waits for a download or decode that another request
-  started only until its own deadline.
+  does. An EDR query over several remote volumes reads the next three
+  ahead while it samples one, by the same rule. A file in memory is
+  decoded in place, copying only what the decoder reads. A request that
+  reads several moments of one file reads it once, and concurrent requests
+  that need the whole of the same remote volume share one download. A
+  request waits for a download or decode that another request started only
+  until its own deadline.
 - **EDR read memory.** The volumes an EDR query (or a WMS GetFeatureInfo)
   reads are admitted by one process-wide budget, `MC_PVOL_READ_MEMORY_MB`
   (default 1024). Before a volume's file is read, the query reserves the
@@ -60,10 +63,10 @@ available.
   four bytes a sample, until it moves on to the next volume; moments
   already cached cost nothing. A profile of every quantity of a 41 MB FMI
   volume (160 moments) reserves about 155 MB of moments plus the file. A
-  query reading ahead reserves each volume's file and moments when its
-  download starts and reads no further ahead than the budget allows. A
-  volume that does not fit is a 503. Map, 3D Tiles and storm-cell reads
-  are not counted.
+  query reading ahead reserves what each volume's read fetches, its byte
+  ranges or the file, and its moments when the read starts, and reads no
+  further ahead than the budget allows. A volume that does not fit is a
+  503. Map, 3D Tiles and storm-cell reads are not counted.
 - **Read errors.** A missing or undecodable polar volume reads as no data
   and is remembered as bad. A passed deadline or a storage failure fails
   the request, so no cache keeps an empty frame: a storage failure is a

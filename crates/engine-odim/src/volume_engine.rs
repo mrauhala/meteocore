@@ -568,8 +568,8 @@ impl PixelReadError {
 /// than joins ([`RemoteRead::start`]); and of those a walk started ahead
 /// (`Pixels::start_read`). Tests pin with them how many times a volume file
 /// is downloaded (#994, #1127) and that a walk read it ahead (#999). Reads
-/// of byte ranges ([`fetch_spans`], #1047) are counted apart, with their
-/// bytes.
+/// of byte ranges ([`fetch_spans`], #1047, and a walk's ranged read ahead,
+/// #1261) are counted apart, with their bytes.
 #[cfg(test)]
 mod file_fetches {
     use std::collections::HashMap;
@@ -604,7 +604,7 @@ mod file_fetches {
     }
 
     /// A download a walk started ahead of reaching the file, already
-    /// counted as a fetch.
+    /// counted as a fetch, or as a ranged read when it reads byte ranges.
     pub(super) fn record_ahead(file_id: &str) {
         bump(&AHEAD, file_id);
     }
@@ -718,35 +718,63 @@ fn fetch_spans(
 ) -> Result<Option<Arc<SpanStorage>>, PixelReadError> {
     #[cfg(test)]
     file_fetches::record_ranged(file_id, plan.bytes());
-    let fetched = match source {
-        Source::Local { .. } => read_local_ranges(file_id, plan)?,
+    match source {
+        Source::Local { .. } => Ok(span_storage(
+            file_id,
+            plan,
+            read_local_ranges(file_id, plan)?,
+        )),
         Source::Remote { store, .. } => {
             let object = ds_storage::object_store::path::Path::from(file_id);
-            let ranges: Vec<_> = plan
-                .ranges()
-                .iter()
-                .map(|r| r.start as usize..r.end as usize)
-                .collect();
+            let ranges = object_ranges(plan);
             let read = match handle {
                 Some(h) => store.get_ranges_opt_on(&object, &ranges, h),
                 None => store.get_ranges_opt(&object, &ranges),
             };
-            match read {
-                Ok(Some(parts)) => Some(parts),
-                Ok(None) => {
-                    return Err(PixelReadError::Bad(format!(
-                        "get `{file_id}`: object not found"
-                    )))
-                }
-                Err(e) => return Err(PixelReadError::from_storage(file_id, e)),
-            }
+            classify_ranged_read(file_id, plan, read)
         }
-    };
+    }
+}
+
+/// `plan`'s ranges as `DataStore` takes them.
+fn object_ranges(plan: &ReadPlan) -> Vec<std::ops::Range<usize>> {
+    plan.ranges()
+        .iter()
+        .map(|r| r.start as usize..r.end as usize)
+        .collect()
+}
+
+/// A remote read of `plan`'s ranges as the pixel reader sees it, classified
+/// as the whole-file read is (#993): a missing object is unusable data, any
+/// other failure the request's. Shared by [`fetch_spans`] and a walk's
+/// ranged read ahead ([`AheadRead::wait`], #1261).
+fn classify_ranged_read(
+    file_id: &str,
+    plan: &ReadPlan,
+    read: Result<Option<Vec<Bytes>>, DataServerError>,
+) -> Result<Option<Arc<SpanStorage>>, PixelReadError> {
+    match read {
+        Ok(Some(parts)) => Ok(span_storage(file_id, plan, Some(parts))),
+        Ok(None) => Err(PixelReadError::Bad(format!(
+            "get `{file_id}`: object not found"
+        ))),
+        Err(e) => Err(PixelReadError::from_storage(file_id, e)),
+    }
+}
+
+/// The storage over the `fetched` ranges of `plan`, or `None` when the file
+/// no longer matches the scan that recorded them (another length, a range
+/// that came back short): the caller then reads the whole file.
+fn span_storage(
+    file_id: &str,
+    plan: &ReadPlan,
+    fetched: Option<Vec<Bytes>>,
+) -> Option<Arc<SpanStorage>> {
     let storage = fetched.and_then(|parts| SpanStorage::new(plan, parts));
     if storage.is_none() {
         tracing::debug!("PVOL `{file_id}` changed since its scan; reading the whole file");
     }
-    Ok(storage.map(Arc::new))
+    storage.map(Arc::new)
 }
 
 /// [`fetch_spans`] of a local file: `None` when its length is not the one
@@ -913,8 +941,8 @@ pub(crate) fn read_volume_files(
 /// Most volume files an EDR walk over several volumes downloads at once,
 /// and so the most volumes it holds fetched or decoded (#999): the volume it
 /// samples plus the reads running ahead of it. A cold hour of 5-minute S3
-/// volumes then costs three rounds of whole-file GETs instead of twelve in
-/// turn (root CLAUDE.md Critical Rule 9), and a walk's peak memory stays at
+/// volumes then costs three rounds of GETs instead of twelve in turn (root
+/// CLAUDE.md Critical Rule 9), and a walk's peak memory stays at
 /// four volumes however long its window: at most 4 × `MAX_REMOTE_FILE_SIZE`
 /// (64 MiB) of downloaded bytes per query, times the EDR queries admitted at
 /// once (`ds_executor::query_workers()`), plus a cross-section's cell
@@ -926,13 +954,14 @@ const MAX_WALK_VOLUMES_IN_FLIGHT: usize = 4;
 const _: () = assert!(MAX_WALK_VOLUMES_IN_FLIGHT == 4);
 
 /// What a walk does about one volume's file before reaching it
-/// ([`Pixels::start_read`], #999, #1041).
+/// ([`Pixels::start_read`], #999, #1041, #1261).
 enum ReadAhead<'r> {
     /// Downloading, with the PVOL read budget its batch holds reserved.
     Started {
-        read: RemoteRead<'r>,
-        /// The whole file, until the batch has decoded from it.
-        file: Permit,
+        read: AheadRead<'r>,
+        /// The bytes it downloads, the plan's ranges or the whole file,
+        /// until the batch has decoded from them.
+        fetched: Permit,
         /// The arrays the batch decodes, for as long as the batch is held.
         arrays: Permit,
     },
@@ -941,6 +970,89 @@ enum ReadAhead<'r> {
     Unneeded,
     /// The budget has no room for the read now.
     NoRoom,
+}
+
+/// A download a walk started ahead of reaching a volume (#999, #1261).
+enum AheadRead<'r> {
+    /// The whole file: the batch's cold moments have no [`ReadPlan`]. Shared
+    /// with the other requests that need the file (#1127).
+    Whole(RemoteRead<'r>),
+    /// The byte ranges the decode of the batch's cold moments reads
+    /// (#1047). Not shared: these ranges are this batch's.
+    Ranges {
+        file_id: &'r str,
+        plan: ReadPlan,
+        /// The dataset paths of the moments whose decode the ranges hold.
+        covers: Vec<String>,
+        read: ds_storage::PendingGet<Vec<Bytes>>,
+    },
+}
+
+impl AheadRead<'_> {
+    /// Wait for the download, within this thread's request deadline, and
+    /// classify it as the batch's own read would be (#993).
+    fn wait(&mut self, handle: Option<&tokio::runtime::Handle>) -> Fetched {
+        match self {
+            AheadRead::Whole(read) => Fetched::Whole(read.wait(handle)),
+            AheadRead::Ranges {
+                file_id,
+                plan,
+                covers,
+                read,
+            } => Fetched::Ranges {
+                covers: std::mem::take(covers),
+                spans: classify_ranged_read(file_id, plan, read.wait(handle)),
+            },
+        }
+    }
+}
+
+/// What a walk downloaded ahead of a volume's batch, as the batch's loader
+/// takes it ([`Pixels::load_moments_from`]).
+enum Fetched {
+    /// The whole file.
+    Whole(Result<Bytes, PixelReadError>),
+    /// Byte ranges holding the decode of the moments `covers` names; `None`
+    /// when the file changed since its scan.
+    Ranges {
+        covers: Vec<String>,
+        spans: Result<Option<Arc<SpanStorage>>, PixelReadError>,
+    },
+}
+
+/// A failed batch read as the batch's loader answers it (#993): the
+/// deadline or a transient failure fails the request, and unusable data
+/// leaves every missing moment out, to be marked bad.
+fn batch_failure(
+    file_id: &str,
+    e: PixelReadError,
+) -> Result<Vec<(String, RawPixels)>, DataServerError> {
+    match e {
+        PixelReadError::Abort(e) => Err(e),
+        PixelReadError::Bad(e) => {
+            tracing::warn!("PVOL batch pixel read failed for `{file_id}`: {e}");
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Decode a batch's `missing` moments from the byte ranges `storage` holds
+/// (#1047), in one HDF5 open. `Ok(None)` when the decode read outside them:
+/// the caller reads the whole file. A moment that does not decode is left
+/// out, as from the whole file.
+fn decode_spans(
+    file_id: &str,
+    storage: &Arc<SpanStorage>,
+    missing: &[MomentRequest<'_>],
+) -> Result<Option<Vec<(String, RawPixels)>>, PixelReadError> {
+    let decoded = crate::pvol::read_moments_pixels_in(storage.clone(), missing.iter().copied());
+    if storage.missed() {
+        tracing::warn!("PVOL batch of `{file_id}` read outside its spans; reading the file");
+        return Ok(None);
+    }
+    decoded
+        .map(Some)
+        .map_err(|e| PixelReadError::Bad(e.to_string()))
 }
 
 /// Lazy-pixel access context threaded through the samplers: just the file
@@ -1099,7 +1211,7 @@ fn sibling_requests(
 /// skipping any a request decoded meanwhile. Speculative: a sibling that does
 /// not decode is skipped and marks nothing bad; its own read decides that.
 /// Returns the number of arrays inserted.
-fn decode_siblings(cache_id: &str, bytes: &[u8], siblings: &[(String, usize, usize)]) -> usize {
+fn decode_siblings(cache_id: &str, bytes: &Bytes, siblings: &[(String, usize, usize)]) -> usize {
     let pending = siblings
         .iter()
         .filter(|(path, _, _)| !PIXEL_CACHE.contains(cache_id, path))
@@ -1198,27 +1310,33 @@ impl<'a> Pixels<'a> {
     }
 
     /// [`Self::load_moments`], decoding any missing moment from `fetched`
-    /// when the file was already downloaded ahead of this call (#999):
-    /// bytes a background sibling decode holds come first, then `fetched`,
-    /// and only with neither is the file downloaded here. Unused when every
-    /// moment turns out resident or known bad by now, a failed read
-    /// included: the batch then needs no bytes, as it would not have
-    /// fetched any.
+    /// when the walk downloaded the file, or its byte ranges, ahead of this
+    /// call (#999, #1261): bytes a background sibling decode holds come
+    /// first, then `fetched`, and only with neither is the file read here.
+    /// Unused when every moment turns out resident or known bad by now, a
+    /// failed read included: the batch then needs no bytes, as it would not
+    /// have fetched any. Ranges read ahead that do not hold a moment the
+    /// batch misses now (one evicted since the read started) are not used,
+    /// and ranges the decode reads outside of, or of a file whose length
+    /// changed, are answered with the whole file.
     ///
     /// With a `budget` (an EDR walk's batch, #1041) the batch reserves what
     /// it reads before reading it, once it knows which moments are missing:
     /// their decoded arrays ([`sweep_bytes`]), returned with them to be held
     /// as long as they are, and the bytes it fetches (the ranges of a
     /// [`ReadPlan`], else the whole file) until they are decoded. Resident
-    /// moments, and bytes downloaded ahead or held, cost nothing here. A
-    /// reservation that does not fit fails the batch with
-    /// `ResourceExhausted` before anything is read, and marks nothing bad.
+    /// moments and held bytes cost nothing here, nor does a read ahead the
+    /// batch uses: the read reserved its bytes and arrays when it started
+    /// ([`Self::start_read`]), and for ranges that turn out unusable only
+    /// the whole file read instead is reserved here. A reservation that
+    /// does not fit fails the batch with `ResourceExhausted` before anything
+    /// more is read, and marks nothing bad.
     fn load_moments_from<'v>(
         &self,
         file_id: &str,
         volume: &PolarVolume,
         targets: impl IntoIterator<Item = (&'v Sweep, &'v PolarMoment)>,
-        fetched: Option<Result<Bytes, PixelReadError>>,
+        fetched: Option<Fetched>,
         budget: Option<&Arc<Budget>>,
     ) -> Result<(MomentPixels, Option<Permit>), DataServerError> {
         let cache_id = pixel_cache_id(self.source, file_id);
@@ -1232,8 +1350,37 @@ impl<'a> Pixels<'a> {
         let reserve = |bytes: u64| budget.map(|budget| budget.reserve(bytes)).transpose();
         let mut arrays = None;
         let (pixels, failures) = PIXEL_CACHE.load_many(&cache_id, &requests, |missing, held| {
-            arrays = reserve(requests_bytes(missing))?;
-            let unread = held.is_none() && fetched.is_none();
+            let fetched = fetched.filter(|fetched| match fetched {
+                Fetched::Whole(_) => true,
+                Fetched::Ranges { covers, .. } => missing
+                    .iter()
+                    .all(|(path, _, _)| covers.iter().any(|c| c == path)),
+            });
+            if fetched.is_none() {
+                arrays = reserve(requests_bytes(missing))?;
+            }
+            // The whole file in hand: a sibling decode's, else one read ahead.
+            let mut whole = held.map(Ok);
+            let mut unread = whole.is_none();
+            match fetched {
+                Some(Fetched::Whole(bytes)) => {
+                    whole = whole.or(Some(bytes));
+                    unread = false;
+                }
+                Some(Fetched::Ranges { spans, .. }) if whole.is_none() => {
+                    unread = false;
+                    let decoded = spans.and_then(|spans| match spans {
+                        Some(storage) => decode_spans(file_id, &storage, missing),
+                        None => Ok(None),
+                    });
+                    match decoded {
+                        Ok(Some(pixels)) => return Ok(pixels),
+                        Ok(None) => {}
+                        Err(e) => return batch_failure(file_id, e),
+                    }
+                }
+                _ => {}
+            }
             let plan = if unread {
                 batch_plan(volume, &moments, missing)
             } else {
@@ -1244,29 +1391,22 @@ impl<'a> Pixels<'a> {
                 match self.moments_from_spans(file_id, &plan, missing) {
                     Ok(Some(pixels)) => return Ok(pixels),
                     Ok(None) => {}
-                    Err(PixelReadError::Abort(e)) => return Err(e),
-                    Err(PixelReadError::Bad(e)) => {
-                        tracing::warn!("PVOL batch pixel read failed for `{file_id}`: {e}");
-                        return Ok(Vec::new());
-                    }
+                    Err(e) => return batch_failure(file_id, e),
                 }
             }
-            let _file = if unread {
+            let _file = if whole.is_none() {
                 reserve(volume.file_len)?
             } else {
                 None
             };
             // Held until the moments are decoded (#1127).
             let mut download = None;
-            let bytes = match (held, fetched) {
-                (Some(bytes), _) => Ok(bytes),
-                (None, Some(fetched)) => fetched,
-                (None, None) => {
-                    fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
-                        download = read;
-                        bytes
-                    })
-                }
+            let bytes = match whole {
+                Some(bytes) => bytes,
+                None => fetch_file_bytes(self.source, file_id, self.handle).map(|(bytes, read)| {
+                    download = read;
+                    bytes
+                }),
             };
             let decoded = bytes.and_then(|bytes| {
                 crate::pvol::read_moments_pixels(&bytes, missing.iter().copied())
@@ -1274,11 +1414,7 @@ impl<'a> Pixels<'a> {
             });
             match decoded {
                 Ok(pixels) => Ok(pixels),
-                Err(PixelReadError::Abort(e)) => Err(e),
-                Err(PixelReadError::Bad(e)) => {
-                    tracing::warn!("PVOL batch pixel read failed for `{file_id}`: {e}");
-                    Ok(Vec::new())
-                }
+                Err(e) => batch_failure(file_id, e),
             }
         })?;
         if failures > 0 {
@@ -1295,20 +1431,19 @@ impl<'a> Pixels<'a> {
     /// already carries a batch (it then answers every read itself).
     /// Sample through [`Self::batched`] with the result.
     ///
-    /// `fetched` is the file's download when the walk started it ahead
-    /// ([`Self::start_read`], collected by [`RemoteRead::wait`]; #999), else
-    /// `None` and the batch downloads it if it needs it.
+    /// `fetched` is what the walk downloaded ahead, the file or its byte
+    /// ranges ([`Self::start_read`], collected by [`AheadRead::wait`]; #999,
+    /// #1261), else `None` and the batch reads what it needs.
     ///
-    /// With a `budget` the batch reserves what it reads
-    /// ([`Self::load_moments_from`], #1041) and the permit comes back with
-    /// it: hold it as long as the batch. A walk passes none for a file it
-    /// read ahead, whose batch it reserved with the download.
+    /// With a `budget` the batch reserves what it reads and a read ahead
+    /// did not ([`Self::load_moments_from`], #1041), and the permit comes
+    /// back with it: hold it as long as the batch.
     fn prefetch<'v>(
         &self,
         file_id: &str,
         volume: &PolarVolume,
         targets: impl IntoIterator<Item = (&'v Sweep, &'v PolarMoment)>,
-        fetched: Option<Result<Bytes, PixelReadError>>,
+        fetched: Option<Fetched>,
         budget: Option<&Arc<Budget>>,
     ) -> Result<(Option<MomentPixels>, Option<Permit>), DataServerError> {
         if self.moments.is_some() {
@@ -1333,14 +1468,7 @@ impl<'a> Pixels<'a> {
         let Some(storage) = fetch_spans(self.source, file_id, plan, self.handle)? else {
             return Ok(None);
         };
-        let decoded = crate::pvol::read_moments_pixels_in(storage.clone(), missing.iter().copied());
-        if storage.missed() {
-            tracing::warn!("PVOL batch of `{file_id}` read outside its spans; reading the file");
-            return Ok(None);
-        }
-        decoded
-            .map(Some)
-            .map_err(|e| PixelReadError::Bad(e.to_string()))
+        decode_spans(file_id, &storage, missing)
     }
 
     /// The runtime a walk over `volumes` volumes starts its downloads on
@@ -1361,20 +1489,23 @@ impl<'a> Pixels<'a> {
         shared_read_runtime(self.handle)
     }
 
-    /// Download the remote `file_id` of `volume` on `runtime` when the batch
-    /// for `targets` will read it: some target is neither resident nor known
-    /// bad, and no background sibling decode holds the file's bytes. Another
-    /// request's download of the file is joined, not repeated (#1127).
-    /// [`ReadAhead::Unneeded`] when nothing needs downloading, and for a
-    /// local source.
+    /// Download what the batch for `targets` will read of the remote
+    /// `file_id` of `volume`, on `runtime`, when it will read anything: some
+    /// target is neither resident nor known bad, and no background sibling
+    /// decode holds the file's bytes. That is the byte ranges the decode of
+    /// those cold targets reads when they have a [`ReadPlan`] (#1047, #1261),
+    /// else the whole file, joining another request's download of it rather
+    /// than repeating it (#1127). [`ReadAhead::Unneeded`] when nothing needs
+    /// downloading, and for a local source.
     ///
     /// Before it starts, the read reserves from `budget` what its batch will
-    /// hold (#1041): the whole file, which a read ahead downloads, and the
-    /// arrays of the cold targets ([`sweep_bytes`]). A download joined from
-    /// another request counts again, as either may outlive the other.
-    /// [`ReadAhead::NoRoom`], counting no rejection, when they do not fit
-    /// now: the volume is then read when the walk reaches it, as without a
-    /// runtime, and its batch reserves for itself.
+    /// hold (#1041): the bytes it downloads, the plan's ranges or the whole
+    /// file, and the arrays of the cold targets ([`sweep_bytes`]). A
+    /// download joined from another request counts again, as either may
+    /// outlive the other. [`ReadAhead::NoRoom`], counting no rejection, when
+    /// they do not fit now: nothing is started, the volume is read when the
+    /// walk reaches it, as without a runtime, and its batch reserves for
+    /// itself.
     fn start_read<'r>(
         &self,
         budget: &Arc<Budget>,
@@ -1390,29 +1521,56 @@ impl<'a> Pixels<'a> {
             return ReadAhead::Unneeded;
         };
         let cache_id = pixel_cache_id(self.source, file_id);
-        let cold: Vec<MomentRequest<'_>> = targets
+        let (cold, requests): (Vec<&PolarMoment>, Vec<MomentRequest<'_>>) = targets
             .iter()
             .filter(|(_, m)| {
                 !PIXEL_CACHE.contains(&cache_id, &m.dataset_path)
                     && !PIXEL_CACHE.is_known_bad(&cache_id, &m.dataset_path)
             })
-            .map(|(s, m)| (m.dataset_path.as_str(), s.nrays, s.nbins))
-            .collect();
+            .map(|&(s, m)| (m, (m.dataset_path.as_str(), s.nrays, s.nbins)))
+            .unzip();
         if cold.is_empty() || PIXEL_CACHE.held_bytes(&cache_id).is_some() {
             return ReadAhead::Unneeded;
         }
-        let (Some(file), Some(arrays)) = (
-            budget.try_reserve(volume.file_len),
-            budget.try_reserve(requests_bytes(&cold)),
+        let plan = ReadPlan::new(volume, cold);
+        let (Some(fetched), Some(arrays)) = (
+            budget.try_reserve(plan.as_ref().map_or(volume.file_len, ReadPlan::bytes)),
+            budget.try_reserve(requests_bytes(&requests)),
         ) else {
             return ReadAhead::NoRoom;
         };
-        let read = RemoteRead::start(store, cache_id.into_owned(), file_id, runtime.clone());
-        #[cfg(test)]
-        if !read.read.joined {
-            file_fetches::record_ahead(file_id);
+        let read = match plan {
+            Some(plan) => {
+                #[cfg(test)]
+                {
+                    file_fetches::record_ranged(file_id, plan.bytes());
+                    file_fetches::record_ahead(file_id);
+                }
+                let object = ds_storage::object_store::path::Path::from(file_id);
+                let read = store.start_get_ranges_opt(&object, &object_ranges(&plan), runtime);
+                let covers = requests.iter().map(|&(path, _, _)| path.to_owned());
+                AheadRead::Ranges {
+                    file_id,
+                    plan,
+                    covers: covers.collect(),
+                    read,
+                }
+            }
+            None => {
+                let read =
+                    RemoteRead::start(store, cache_id.into_owned(), file_id, runtime.clone());
+                #[cfg(test)]
+                if !read.read.joined {
+                    file_fetches::record_ahead(file_id);
+                }
+                AheadRead::Whole(read)
+            }
+        };
+        ReadAhead::Started {
+            read,
+            fetched,
+            arrays,
         }
-        ReadAhead::Started { read, file, arrays }
     }
 
     /// This context reading from `batch` (a [`Self::prefetch`] result) when
@@ -2368,7 +2526,7 @@ fn prewarm_pixels(
     source: &Source,
     file_id: &str,
     volume: &PolarVolume,
-    bytes: &[u8],
+    bytes: &Bytes,
     n_sweeps: usize,
 ) {
     if n_sweeps == 0 || PIXEL_CACHE.capacity() == 0 {
@@ -3576,16 +3734,18 @@ fn level_target<'v>(
 /// reads exactly those from the volume's batch ([`Pixels::prefetch`]: one
 /// GET and one HDF5 open per file, #994).
 ///
-/// Up to [`MAX_WALK_VOLUMES_IN_FLIGHT`] volumes are prepared ahead, and the
-/// remote files among them that the batch will read are downloaded
+/// Up to [`MAX_WALK_VOLUMES_IN_FLIGHT`] volumes are prepared ahead, and what
+/// the batches of the remote files among them will read is downloaded
 /// concurrently on the runtime ([`Pixels::read_ahead_runtime`]) through
 /// `ds_storage`'s started reads — async tasks, never a thread per file
-/// (root CLAUDE.md Critical Rules 7 and 9). A file another request is
-/// downloading is joined instead ([`RemoteRead`], #1127). Each volume is
-/// still decoded and sampled on the caller's thread, in order, from the same
-/// batch as a sequential walk reads, and dropped before the next download
-/// starts, so the results are the sequential walk's and at most that many
-/// volumes are fetched or decoded at once.
+/// (root CLAUDE.md Critical Rules 7 and 9): the byte ranges the decode of
+/// the volume's cold moments reads when they have a [`ReadPlan`] (#1261),
+/// else the whole file, joined instead when another request is downloading
+/// it ([`RemoteRead`], #1127). Each volume is still decoded and sampled on
+/// the caller's thread, in order, from the same batch as a sequential walk
+/// reads, and dropped before the next download starts, so the results are
+/// the sequential walk's and at most that many volumes are fetched or
+/// decoded at once.
 ///
 /// The first error ends the walk and is its result, as before (#993): the
 /// request deadline, checked before each volume and bounding every wait for
@@ -3596,13 +3756,15 @@ fn level_target<'v>(
 ///
 /// Every volume's batch is charged to `budget` (the PVOL read budget,
 /// [`crate::read_budget::BUDGET`], #1041) before its file is read: the
-/// bytes fetched until they are decoded, the arrays decoded until the walk
-/// moves on to the next volume. A read ahead reserves both when it starts
-/// ([`Pixels::start_read`]), so its batch needs nothing more once the walk
-/// reaches it. One with no room now is not started, and the walk reads no
-/// further ahead until the volumes before it are sampled: a volume behind
-/// never holds what one before it needs. A batch with nothing read ahead,
-/// such a volume once it is at the front included, reserves as it reads
+/// bytes fetched (the ranges, else the whole file) until they are decoded,
+/// the arrays decoded until the walk moves on to the next volume. A read
+/// ahead reserves both when it starts ([`Pixels::start_read`]), so its
+/// batch needs nothing more once the walk reaches it, unless its ranges
+/// turn out unusable and the batch reads the whole file. One with no room
+/// now is not started, and the walk reads no further ahead until the
+/// volumes before it are sampled: a volume behind never holds what one
+/// before it needs. A batch with nothing read ahead, such a volume once it
+/// is at the front included, reserves as it reads
 /// ([`Pixels::load_moments_from`]); when that does not fit, the walk ends
 /// with `ResourceExhausted` (503), the one rejection the budget counts.
 fn walk_volumes<'v, S, T>(
@@ -3634,7 +3796,11 @@ fn walk_volumes<'v, S, T>(
                 None => ReadAhead::Unneeded,
             };
             let (read, stop) = match read {
-                ReadAhead::Started { read, file, arrays } => (Some((read, file, arrays)), false),
+                ReadAhead::Started {
+                    read,
+                    fetched,
+                    arrays,
+                } => (Some((read, fetched, arrays)), false),
                 ReadAhead::Unneeded => (None, false),
                 // Tried again once the volumes before it free their share.
                 ReadAhead::NoRoom if !ahead.is_empty() => break,
@@ -3651,19 +3817,19 @@ fn walk_volumes<'v, S, T>(
         let Some((entry, targets, state, read)) = ahead.pop_front() else {
             break;
         };
-        let (mut download, arrays) = match read {
-            Some((read, file, arrays)) => (Some((read, file)), Some(arrays)),
+        let (mut download, _arrays) = match read {
+            Some((read, fetched, arrays)) => (Some((read, fetched)), Some(arrays)),
             None => (None, None),
         };
-        // The download stays joinable until its moments are decoded, so a
-        // request that needs the file meanwhile does not download it again
-        // (#1127); its bytes stay reserved as long.
+        // A whole-file download stays joinable until its moments are
+        // decoded, so a request that needs the file meanwhile does not
+        // download it again (#1127); what it fetched stays reserved as long.
         let fetched = download.as_mut().map(|(read, _)| read.wait(pix.handle));
-        let charge = arrays.is_none().then_some(budget);
-        let (batch, _charged) = pix.prefetch(&entry.id, &entry.volume, targets, fetched, charge)?;
+        let (batch, _charged) =
+            pix.prefetch(&entry.id, &entry.volume, targets, fetched, Some(budget))?;
         drop(download);
         out.push(sample(entry, state, pix.batched(&batch))?);
-        // The batch, and `arrays` or `_charged` with it, are released here.
+        // The batch, and `_arrays` and `_charged` with it, are released here.
     }
     Ok(out)
 }
@@ -5857,7 +6023,7 @@ pub(crate) fn voxel_grid_from_bytes(
     volume: &PolarVolume,
     quantity: &str,
     dims: [usize; 3],
-    bytes: &[u8],
+    bytes: &Bytes,
 ) -> Result<(VoxelGrid, usize), DataServerError> {
     let requests = volume.sweeps.iter().flat_map(|sweep| {
         sweep
@@ -7061,7 +7227,7 @@ mod tests {
             eprintln!("skipping prewarm_primes_lowest_sweep_only: pixel cache disabled");
             return;
         }
-        let bytes = std::fs::read(&fixture).expect("read fivih fixture");
+        let bytes = Bytes::from(std::fs::read(&fixture).expect("read fivih fixture"));
         let volume = crate::pvol::read_polar_volume(&bytes).expect("parse fivih volume");
         assert!(
             volume.sweeps.len() > 1,
@@ -7286,7 +7452,7 @@ mod tests {
     /// and its path (the local file id).
     fn local_fixture() -> (tempfile::TempDir, PolarVolume, String) {
         let bytes = include_bytes!("../../../testdata/pvol-cold-batch.h5");
-        let volume = crate::pvol::read_polar_volume(bytes).unwrap();
+        let volume = crate::pvol::read_polar_volume(&Bytes::from_static(bytes)).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("volume.h5");
         std::fs::write(&path, bytes).unwrap();
@@ -7481,12 +7647,12 @@ mod tests {
     /// them instead of fetching the file again.
     #[test]
     fn cold_miss_reads_held_bytes_instead_of_fetching() {
-        let bytes = include_bytes!("../../../testdata/pvol-cold-batch.h5");
-        let volume = crate::pvol::read_polar_volume(bytes).unwrap();
+        let bytes = Bytes::from_static(include_bytes!("../../../testdata/pvol-cold-batch.h5"));
+        let volume = crate::pvol::read_polar_volume(&bytes).unwrap();
         // No such file: a fetch would fail and mark the moment bad.
         let id = unique_file_id();
         let held = pixel_cache()
-            .hold_bytes(&id, Bytes::from_static(bytes), usize::MAX)
+            .hold_bytes(&id, bytes.clone(), usize::MAX)
             .unwrap();
         let moment = &volume.sweeps[1].moments[0];
         let raw = test_pixels()
@@ -7603,7 +7769,7 @@ mod tests {
     fn remote_fixture() -> (Source, String, PolarVolume) {
         use ds_storage::object_store::{ObjectStoreExt, PutPayload};
         let bytes: &'static [u8] = include_bytes!("../../../testdata/pvol-cold-batch.h5");
-        let volume = crate::pvol::read_polar_volume(bytes).unwrap();
+        let volume = crate::pvol::read_polar_volume(&Bytes::from_static(bytes)).unwrap();
         let key = unique_file_id();
         let inner = ds_storage::object_store::memory::InMemory::new();
         tokio::runtime::Builder::new_current_thread()
@@ -7888,7 +8054,8 @@ mod tests {
 
         // Contiguous storage: no spans, no ranged read.
         let cold_batch = include_bytes!("../../../testdata/pvol-cold-batch.h5");
-        let mut contiguous = crate::pvol::read_polar_volume(cold_batch).unwrap();
+        let mut contiguous =
+            crate::pvol::read_polar_volume(&Bytes::from_static(cold_batch)).unwrap();
         crate::layout::probe(&Bytes::from_static(cold_batch), &mut contiguous);
         let path = dir.path().join("contiguous.h5");
         std::fs::write(&path, cold_batch).unwrap();
@@ -8378,9 +8545,21 @@ mod tests {
         delay: Duration,
         missing: Option<usize>,
     ) -> (Arc<Source>, Arc<Vec<VolumeEntry>>, Arc<CountingStore>) {
+        let bytes = Bytes::from_static(COLD_BATCH);
+        let volume = crate::pvol::read_polar_volume(&bytes).unwrap();
+        counted_remote_copies(&bytes, &volume, n, delay, missing)
+    }
+
+    /// [`counted_remote_volumes`] of the file `bytes`, parsed as `volume`.
+    fn counted_remote_copies(
+        bytes: &Bytes,
+        volume: &PolarVolume,
+        n: usize,
+        delay: Duration,
+        missing: Option<usize>,
+    ) -> (Arc<Source>, Arc<Vec<VolumeEntry>>, Arc<CountingStore>) {
         use ds_storage::object_store::throttle::{ThrottleConfig, ThrottledStore};
         use ds_storage::object_store::{ObjectStoreExt, PutPayload};
-        let volume = crate::pvol::read_polar_volume(COLD_BATCH).unwrap();
         let inner = ds_storage::object_store::memory::InMemory::new();
         let put = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -8390,7 +8569,7 @@ mod tests {
                 let id = unique_file_id();
                 if missing != Some(i) {
                     let key = ds_storage::object_store::path::Path::from(id.as_str());
-                    put.block_on(inner.put(&key, PutPayload::from_static(COLD_BATCH)))
+                    put.block_on(inner.put(&key, PutPayload::from(bytes.clone())))
                         .unwrap();
                 }
                 let mut volume = volume.clone();
@@ -8795,9 +8974,21 @@ mod tests {
         deadline: Option<std::time::Instant>,
     ) -> (BudgetedProfiles, Arc<Vec<VolumeEntry>>) {
         let (source, volumes) = throttled_remote_volumes(n, delay, None);
-        let (walk_budget, walk_entries) = (budget.clone(), volumes.clone());
+        let profiles = budgeted_profiles_on_worker(source, volumes.clone(), budget, deadline);
+        (profiles, volumes)
+    }
+
+    /// [`budgeted_profiles`] over `volumes` of `source` on a query runtime
+    /// worker, as EDR runs it, under `deadline`.
+    fn budgeted_profiles_on_worker(
+        source: Arc<Source>,
+        volumes: Arc<Vec<VolumeEntry>>,
+        budget: &Arc<Budget>,
+        deadline: Option<std::time::Instant>,
+    ) -> BudgetedProfiles {
+        let (walk_budget, walk_entries) = (budget.clone(), volumes);
         let runtime = query_runtime();
-        let profiles = runtime
+        runtime
             .block_on(runtime.spawn(async move {
                 let _deadline = ds_core::deadline::enter(deadline);
                 let pix = Pixels {
@@ -8808,8 +8999,7 @@ mod tests {
                 let entries: Vec<&VolumeEntry> = walk_entries.iter().collect();
                 budgeted_profiles(&walk_budget, pix, &entries)
             }))
-            .unwrap();
-        (profiles, volumes)
+            .unwrap()
     }
 
     /// #1041: a walk reading ahead (#999) reserves each volume's file and
@@ -8822,7 +9012,7 @@ mod tests {
     #[test]
     fn read_ahead_walks_read_no_further_ahead_than_the_budget_holds() {
         let n = 6;
-        let volume = crate::pvol::read_polar_volume(COLD_BATCH).unwrap();
+        let volume = crate::pvol::read_polar_volume(&Bytes::from_static(COLD_BATCH)).unwrap();
         let (file, arrays) = (volume.file_len, all_arrays_bytes(&volume));
         let one = file + arrays;
 
@@ -8867,6 +9057,215 @@ mod tests {
         let ((result, _), _) = budgeted_remote_profiles(12, READ_DELAY, &budget, Some(deadline));
         assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
         assert_eq!(budget.metrics(), (0, 1 << 30, 0));
+    }
+
+    /// `n` remote copies of [`ranged_volume`], counted and each GET waiting
+    /// `delay` ([`counted_remote_copies`]), sited where the cold-batch
+    /// fixture is so that [`run_walk`]'s points and paths sample it, every
+    /// gate a value; and the plan of its one moment.
+    fn ranged_remote_volumes(
+        n: usize,
+        delay: Duration,
+    ) -> (
+        Arc<Source>,
+        Arc<Vec<VolumeEntry>>,
+        Arc<CountingStore>,
+        ReadPlan,
+    ) {
+        let (bytes, mut volume, _) = ranged_volume();
+        (volume.site.lon, volume.site.lat) = (24.5, 60.3);
+        volume.time = DateTime::UNIX_EPOCH;
+        let moment = &mut volume.sweeps[0].moments[0];
+        (moment.nodata, moment.undetect) = (-2.0, -1.0);
+        let plan = ReadPlan::new(&volume, &volume.sweeps[0].moments).expect("a plan");
+        let (source, volumes, store) = counted_remote_copies(&bytes, &volume, n, delay, None);
+        (source, volumes, store, plan)
+    }
+
+    /// #1261: a walk over volumes whose moments have a byte-range plan reads
+    /// ahead only those ranges, never the whole file: a GET per range, as
+    /// many bytes as the plan, each volume read ahead once, and still at
+    /// most four volumes at a time (wall time ≈ ceil(V/4) GET delays, as in
+    /// `walks_download_volumes_concurrently_at_most_four_at_once`). The
+    /// answers are the sequential walk's, which reads the same ranges as it
+    /// reaches each volume.
+    #[test]
+    fn walks_read_ahead_only_their_moments_byte_ranges() {
+        for walk in [Walk::Series, Walk::Profiles, Walk::Section] {
+            let n = 6;
+            let (source, volumes, _, plan) = ranged_remote_volumes(n, Duration::ZERO);
+            let sequential = run_walk(walk, source, volumes.clone(), None, None)
+                .unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+            assert!(!sequential.is_empty(), "{walk:?}: the walk samples data");
+            for e in volumes.iter() {
+                assert_eq!(file_fetches::ranged(&e.id), 1, "{walk:?}");
+                assert_eq!(file_fetches::ahead(&e.id), 0, "{walk:?}: read as it went");
+            }
+
+            let (source, volumes, store, _) = ranged_remote_volumes(n, Duration::ZERO);
+            let results = run_walk(
+                walk,
+                source.clone(),
+                volumes.clone(),
+                Some(query_runtime()),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+            assert_eq!(fingerprint(&results), fingerprint(&sequential), "{walk:?}");
+            for e in volumes.iter() {
+                assert_eq!(file_fetches::ahead(&e.id), 1, "{walk:?}: read ahead");
+                assert_eq!(file_fetches::ranged(&e.id), 1, "{walk:?}: its ranges");
+                assert_eq!(file_fetches::count(&e.id), 0, "{walk:?}: no whole file");
+                assert_eq!(store.gets(&e.id), plan.ranges().len(), "{walk:?}");
+            }
+            assert_eq!(bytes_read(&source), n as u64 * plan.bytes(), "{walk:?}");
+
+            let n: usize = 17;
+            let rounds = n.div_ceil(MAX_WALK_VOLUMES_IN_FLIGHT) as u32;
+            let (source, volumes, _, _) = ranged_remote_volumes(n, READ_DELAY);
+            let started = std::time::Instant::now();
+            run_walk(walk, source, volumes, Some(query_runtime()), None)
+                .unwrap_or_else(|e| panic!("{walk:?}: {e}"));
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= READ_DELAY * rounds,
+                "{walk:?}: {elapsed:?}: more than {MAX_WALK_VOLUMES_IN_FLIGHT} volumes in flight"
+            );
+            assert!(
+                elapsed < READ_DELAY * n as u32 / 2,
+                "{walk:?}: {elapsed:?}: the ranged reads did not overlap"
+            );
+        }
+    }
+
+    /// #1261 within #1041: a ranged read ahead reserves the ranges it
+    /// fetches and its moments' arrays, not the whole file. With room for
+    /// one volume's ranges and arrays every volume is still read ahead, one
+    /// at a time, rejecting nothing; with less, nothing is read ahead, the
+    /// front volume's own read does not fit either, and the walk is a 503
+    /// before any GET.
+    #[test]
+    fn a_ranged_read_ahead_reserves_its_ranges_not_the_file() {
+        let n = 6;
+        let (_, volumes, _, plan) = ranged_remote_volumes(1, Duration::ZERO);
+        let sweep = &volumes[0].volume.sweeps[0];
+        let arrays = sweep_bytes(sweep.nrays, sweep.nbins);
+        let one = plan.bytes() + arrays;
+        assert!(plan.bytes() * 50 < volumes[0].volume.file_len, "{plan:?}");
+
+        let budget = Arc::new(Budget::new(1 << 30));
+        let (source, volumes, _, _) = ranged_remote_volumes(n, Duration::ZERO);
+        let (result, held) = budgeted_profiles_on_worker(source, volumes.clone(), &budget, None);
+        assert_eq!(result.expect("fits").len(), n);
+        let ahead = |k: u64| arrays + k * one;
+        assert_eq!(held, [3, 3, 3, 2, 1, 0].map(ahead).to_vec());
+        assert_eq!(budget.metrics(), (0, 1 << 30, 0));
+
+        let budget = Arc::new(Budget::new(one));
+        let (source, volumes, store, _) = ranged_remote_volumes(n, Duration::ZERO);
+        let (result, held) = budgeted_profiles_on_worker(source, volumes.clone(), &budget, None);
+        assert_eq!(result.expect("one volume at a time").len(), n);
+        assert_eq!(held, vec![arrays; n], "nothing read ahead behind it");
+        assert_eq!(budget.metrics(), (0, one, 0), "no rejection counted");
+        for e in volumes.iter() {
+            assert_eq!(file_fetches::ahead(&e.id), 1, "`{}`", e.id);
+            assert_eq!(file_fetches::count(&e.id), 0, "`{}`", e.id);
+            assert_eq!(store.gets(&e.id), plan.ranges().len(), "`{}`", e.id);
+        }
+
+        let budget = Arc::new(Budget::new(one - 1));
+        let (source, volumes, store, _) = ranged_remote_volumes(n, Duration::ZERO);
+        let (result, held) = budgeted_profiles_on_worker(source, volumes.clone(), &budget, None);
+        assert!(
+            matches!(result, Err(DataServerError::ResourceExhausted)),
+            "got {:?}",
+            result.map(|r| r.len())
+        );
+        assert!(held.is_empty());
+        assert_eq!(budget.metrics(), (0, one - 1, 1));
+        for e in volumes.iter() {
+            assert_eq!(file_fetches::ahead(&e.id), 0, "`{}`", e.id);
+            assert_eq!(store.gets(&e.id), 0, "`{}`", e.id);
+        }
+    }
+
+    /// #1261: ranges read ahead that no longer cover a moment the batch
+    /// misses (one evicted since the read started) are not used, and the
+    /// batch reads as one with nothing read ahead; unusable ranges, a file
+    /// changed since its scan or a decode outside them, are answered with
+    /// the whole file. The pixels are the whole-file decode's either way,
+    /// and nothing is marked bad.
+    #[test]
+    fn a_batch_answers_unusable_ranges_read_ahead_from_its_own_read() {
+        use crate::layout::tests::{same_pixels, truncate_last_span};
+        let (bytes, volume, whole) = ranged_volume();
+        let sweep = &volume.sweeps[0];
+        let moment = &sweep.moments[0];
+        let plan = ReadPlan::new(&volume, [moment]).expect("a plan");
+        let path = moment.dataset_path.as_str();
+        let spans_of = |plan: &ReadPlan| {
+            let parts = plan
+                .ranges()
+                .iter()
+                .map(|r| bytes.slice(r.start as usize..r.end as usize))
+                .collect();
+            let spans = SpanStorage::new(plan, parts).map(Arc::new);
+            assert!(spans.is_some());
+            spans
+        };
+        let batch = |fetched: Fetched| {
+            let (source, key, store) = counted_remote(&bytes);
+            let pix = Pixels {
+                moments: None,
+                source: &source,
+                handle: None,
+            };
+            let budget = Arc::new(Budget::new(1 << 30));
+            let (pixels, _) = pix
+                .load_moments_from(
+                    &key,
+                    &volume,
+                    [(sweep, moment)],
+                    Some(fetched),
+                    Some(&budget),
+                )
+                .unwrap();
+            assert!(same_pixels(&pixels[path], &whole));
+            assert!(!pixel_cache().is_known_bad(&pixel_cache_id(&source, &key), path));
+            (key, store)
+        };
+
+        // Usable ranges: decoded from them, nothing more read.
+        let (key, store) = batch(Fetched::Ranges {
+            covers: vec![path.to_owned()],
+            spans: Ok(spans_of(&plan)),
+        });
+        assert_eq!(store.gets(&key), 0);
+
+        // Ranges of other moments: the batch reads its own ranges.
+        let (key, store) = batch(Fetched::Ranges {
+            covers: vec!["/another/moment".to_owned()],
+            spans: Ok(spans_of(&plan)),
+        });
+        assert_eq!(store.gets(&key), plan.ranges().len());
+        assert_eq!(file_fetches::count(&key), 0);
+
+        // The file changed since its scan: the whole file.
+        let (key, store) = batch(Fetched::Ranges {
+            covers: vec![path.to_owned()],
+            spans: Ok(None),
+        });
+        assert_eq!((store.gets(&key), file_fetches::count(&key)), (1, 1));
+
+        // A decode outside the ranges: the whole file.
+        let mut truncated = volume.clone();
+        truncate_last_span(&mut truncated.sweeps[0].moments[0]);
+        let short = ReadPlan::new(&truncated, &truncated.sweeps[0].moments).expect("a plan");
+        let (key, store) = batch(Fetched::Ranges {
+            covers: vec![path.to_owned()],
+            spans: Ok(spans_of(&short)),
+        });
+        assert_eq!((store.gets(&key), file_fetches::count(&key)), (1, 1));
     }
 
     /// #1041: the EDR walks charge the process-wide budget, sized by

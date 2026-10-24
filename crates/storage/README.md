@@ -39,9 +39,10 @@ decides whether that retry gets to run, so a whole-object fetch names its
 request can wait on the result, directly or through a single-flight cache
 fill. `start_get_opt` is a `FetchBudget::Request` read too: it runs ahead on
 the runtime (#999), and several threads can wait for it behind an `Arc`
-(#1127). Each `PendingGet::wait` is limited by its own thread's request
-deadline, so one request's deadline never cuts off a read another waits on;
-the read is aborted when its last holder drops it.
+(#1127). `start_get_ranges_opt` starts `get_ranges_opt` the same way, one
+buffer per range (#1261). Each `PendingGet::wait` is limited by its own
+thread's request deadline, so one request's deadline never cuts off a read
+another waits on; the read is aborted when its last holder drops it.
 
 `get_range_many` takes the budget too: one byte range of each of many
 objects on one storage-bridge call, at most `concurrency` in flight, one

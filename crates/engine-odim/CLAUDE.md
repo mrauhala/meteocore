@@ -148,9 +148,11 @@ around `ds-storage` calls (Critical Rules 6–7).
   the batch until the walk moves on, and the bytes it fetches
   (`ReadPlan::bytes`, else `file_len`, the whole file again when a ranged
   read falls back) until they are decoded. Resident moments and held
-  bytes cost nothing. A read ahead (`start_read`) reserves the whole file
-  and its cold targets' arrays with `try_reserve` when its download
-  starts, so its batch needs nothing more. One with no room is not
+  bytes cost nothing. A read ahead (`start_read`) reserves what it
+  downloads (its cold targets' `ReadPlan` ranges, else the whole file,
+  #1261) and their arrays with `try_reserve` when it starts, so its batch
+  needs nothing more; ranges that turn out unusable reserve the whole-file
+  read made instead. One with no room is not
   started, counts no rejection, and stops the topping up until the
   volumes before it are sampled: a volume behind never holds what the one
   before it needs, and the front then reserves as it reads. A walk thus
@@ -162,6 +164,7 @@ around `ds-storage` calls (Critical Rules 6–7).
   and `Pixels::moment` (maps) pass no budget. Pinned by
   `a_batch_reserves_its_arrays_and_file_before_reading_them`,
   `a_ranged_batch_reserves_its_ranges_not_the_file`,
+  `a_ranged_read_ahead_reserves_its_ranges_not_the_file`,
   `read_ahead_walks_read_no_further_ahead_than_the_budget_holds` and
   `edr_walks_charge_the_budget_mc_pvol_read_memory_mb_sizes` (a child
   process at `MC_PVOL_READ_MEMORY_MB=0`).
@@ -170,9 +173,14 @@ around `ds-storage` calls (Critical Rules 6–7).
   `site_trajectory` go through `walk_volumes`: `prepare` names each
   volume's moments first (`profile_targets`, `level_target`,
   `section_plan`), and for up to `MAX_WALK_VOLUMES_IN_FLIGHT` (4) volumes,
-  the one being sampled included, the remote files their batch will read
-  (a target neither resident nor known bad, no held bytes) download
-  concurrently through `DataStore::start_get_opt`: async tasks on the
+  the one being sampled included, what their batch will read of the
+  remote files (a target neither resident nor known bad, no held bytes)
+  downloads concurrently: the cold targets' `ReadPlan` ranges through
+  `DataStore::start_get_ranges_opt` (#1261), else the whole file through
+  `DataStore::start_get_opt`. A batch uses ranges read ahead only when
+  they hold every moment it misses, else it reads as if nothing were read
+  ahead; unusable ranges (file length changed, decode outside them) fall
+  back to the whole file. Reads ahead are async tasks on the
   runtime that runs the query (`Pixels::handle` for a cross-section on the
   blocking pool, else the query runtime worker's own), never a rayon pool,
   a thread per file or a new `Runtime` (root Critical Rules 7 and 9). Each
@@ -193,11 +201,13 @@ around `ds-storage` calls (Critical Rules 6–7).
   loop `Pixels::prefetch` over remote volumes outside `walk_volumes`.
   Pinned by `walks_download_volumes_concurrently_at_most_four_at_once`
   (wall time ≈ ceil(V/4) GET delays, each file once),
-  `read_ahead_walks_answer_as_the_sequential_walk` and
-  `read_ahead_walk_stops_at_the_deadline`.
+  `read_ahead_walks_answer_as_the_sequential_walk`,
+  `read_ahead_walk_stops_at_the_deadline`,
+  `walks_read_ahead_only_their_moments_byte_ranges` and
+  `a_batch_answers_unusable_ranges_read_ahead_from_its_own_read`.
 - **Concurrent requests share a volume file's download (#1127).** Every
-  remote whole-file read of the pixel path, a walk's read ahead and a miss
-  inside the per-file lock alike (`fetch_file_bytes`, on a thread with a
+  remote whole-file read of the pixel path, a walk's whole-file read ahead
+  and a miss inside the per-file lock alike (`fetch_file_bytes`, on a thread with a
   multi-thread runtime), is a `RemoteRead`: it joins the download of the
   file another request holds, registered by source-qualified cache id in
   `PixelCache` (`join_or_start_read`), or starts one that others join. The
@@ -212,7 +222,8 @@ around `ds-storage` calls (Critical Rules 6–7).
   read or one started since: the failure is the starter's (503/504), not
   the joiner's, and nothing is marked bad. Pinned by
   `concurrent_cold_walks_download_each_volume_once` (GETs counted at the
-  store) and `a_joined_download_that_fails_is_read_again`.
+  store) and `a_joined_download_that_fails_is_read_again`. Ranged reads
+  (`fetch_spans`, a walk's ranged read ahead) are not shared.
 - **A request waiting for the per-file lock leaves its runtime running
   (#1200).** `PixelCache::with_file_load` takes a free lock at once. A
   request that finds another's load of the file in flight waits inside
@@ -244,8 +255,8 @@ around `ds-storage` calls (Critical Rules 6–7).
   also reads the whole file; neither is ever bad data. #993 holds: a
   missing object is `Bad`, a deadline or other failure `Abort`, with no
   whole-file retry. A ranged single-moment miss decodes no sibling. Walks
-  over several remote volumes still read whole files ahead (#999, #1127):
-  reading ranges ahead needs an async ranged start, a follow-up. A cold
+  over several remote volumes read their batches' plans ahead the same way
+  (#1261). A cold
   base-sweep DBZH miss reads 0.46 % of the 41.4 MB FMI volume in 7 ranges,
   1.37 % of a 25.5 MB SMHI volume in 4 and 3.9 % of a 1.2 MB DMI volume in
   4. Pinned by `layout::tests`, `cold_miss_reads_only_the_moments_byte_ranges`,
@@ -254,6 +265,13 @@ around `ds-storage` calls (Critical Rules 6–7).
   `a_batch_reads_byte_ranges_or_the_whole_file` and, when the uncommitted
   radar fixtures are present, `fixture_volumes_decode_identically_from_their_byte_ranges`,
   which decodes every moment from exactly its recorded reads.
+- **Fetched files decode in place (#1261).** Open fetched `Bytes` with
+  `reader::open_bytes` (`BytesStorage`), never `Hdf5File::from_bytes`,
+  which copies the whole file twice (`to_vec`, then `Arc<[u8]>`).
+  hdf5-reader 0.9 has no public zero-copy `StorageBuffer`, so each read
+  copies only its range: a metadata parse or a one-moment decode copies
+  kilobytes, not 20–40 MB. Pinned by
+  `shared_bytes_decode_as_a_copy_and_copy_only_what_is_read`.
 - **Cold single-moment misses (#293, #994):** only a map render reads one
   moment at a time. A `Pixels::moment` miss reads the moment's byte ranges
   (previous bullet) or else fetches the source-qualified file once, decodes
@@ -485,7 +503,9 @@ not guarantee monotonic improvement. This baseline does not enable #642.
   should bound unbounded sources.
 - Local test fixture: `testdata/radar-fmi-pvol/` (fivih = Vihti). Several
   radar fixtures are large and intentionally NOT committed — tests skip with
-  an eprintln when a fixture is absent.
+  an eprintln when a fixture is absent. The committed polar volume is
+  `testdata/pvol-cold-batch.h5` (contiguous, so it has no byte-range plan),
+  pinned end to end by `reads_the_committed_pvol_fixture`.
 
 ## Startup errors (#190)
 

@@ -43,12 +43,71 @@
 //!
 //! See [[project_odim_engine_plan]] for the full multi-phase plan.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use ds_core::geo::Crs;
-use hdf5_reader::{Attribute, Dataset, Datatype, Hdf5File};
+use ds_storage::bytes::Bytes;
+use hdf5_reader::error::{Error as Hdf5Error, Result as Hdf5Result};
+use hdf5_reader::{Attribute, Dataset, Datatype, Hdf5File, Storage, StorageBuffer};
 use ndarray::Array2;
 
 use crate::proj;
+
+/// An HDF5 [`Storage`] over a whole file's fetched bytes, shared rather than
+/// copied (#1261). `Hdf5File::from_bytes` copies the file into a buffer of
+/// its own, twice (into a `Vec`, then into an `Arc<[u8]>`): 20–40 MB per
+/// polar volume, for a metadata parse or a one-moment decode alike. This
+/// storage copies only the ranges the reader asks for, as
+/// [`crate::layout::SpanStorage`] does for fetched ranges: hdf5-reader 0.9
+/// builds a `StorageBuffer` from an owned `Vec` only. A parse then copies
+/// the metadata it reads, and a decode the chunks of the moments it decodes.
+pub(crate) struct BytesStorage {
+    bytes: Bytes,
+    /// Bytes handed to the reader.
+    #[cfg(test)]
+    pub(crate) served: std::sync::atomic::AtomicU64,
+}
+
+impl BytesStorage {
+    pub(crate) fn new(bytes: &Bytes) -> Arc<Self> {
+        Arc::new(BytesStorage {
+            bytes: bytes.clone(),
+            #[cfg(test)]
+            served: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
+impl Storage for BytesStorage {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn read_range(&self, offset: u64, len: usize) -> Hdf5Result<StorageBuffer> {
+        let range = usize::try_from(offset)
+            .ok()
+            .and_then(|start| Some(start..start.checked_add(len)?))
+            .filter(|range| range.end <= self.bytes.len());
+        let Some(range) = range else {
+            return Err(Hdf5Error::UnexpectedEof {
+                offset,
+                needed: len as u64,
+                available: self.len().saturating_sub(offset),
+            });
+        };
+        #[cfg(test)]
+        self.served
+            .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(StorageBuffer::from_vec(self.bytes[range].to_vec()))
+    }
+}
+
+/// Open the HDF5 file `bytes` hold without copying it ([`BytesStorage`]).
+pub(crate) fn open_bytes(bytes: &Bytes) -> Result<Hdf5File, ReadError> {
+    Hdf5File::from_storage(BytesStorage::new(bytes))
+        .map_err(|e| ReadError::OpenFailed(e.to_string()))
+}
 
 /// Errors from [`read_composite`].
 #[derive(Debug, thiserror::Error)]
@@ -456,11 +515,11 @@ fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
     [w, s, e, n]
 }
 
-/// Parse an ODIM_H5 composite from a byte slice. The whole file must
-/// fit in memory — typical COMP files are 2–20 MB, which is fine.
-/// For S3-backed sources, fetch into `Bytes` first.
-pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
-    let file = Hdf5File::from_bytes(bytes).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
+/// Parse an ODIM_H5 composite from its fetched bytes, opened without a
+/// copy ([`open_bytes`]). The whole file must fit in memory — typical COMP
+/// files are 2–20 MB, which is fine.
+pub fn read_composite(bytes: &Bytes) -> Result<OdimComposite, ReadError> {
+    let file = open_bytes(bytes)?;
 
     // Closure-based helpers — `Group` isn't pub-exported by
     // `hdf5-reader 0.1.4` so we can't take a `&Group` by name. Each

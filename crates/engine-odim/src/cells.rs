@@ -35,6 +35,7 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::{OutputCrs, RasterTile};
 use ds_core::raster_paint::Canvas;
 use ds_core::volume::{CellProduct, CellQuery, VoxelGrid};
+use ds_storage::bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -439,7 +440,7 @@ fn warm_one(
     file_id: &str,
     volume: &PolarVolume,
     quantity: &str,
-    bytes: &[u8],
+    bytes: &Bytes,
 ) -> bool {
     let query = layer_query(quantity, None);
     let dims = query.dims.unwrap_or(DEFAULT_VOXEL_DIMS);
@@ -471,7 +472,7 @@ pub(crate) fn warm_from_bytes(
     source: &Source,
     file_id: &str,
     volume: &PolarVolume,
-    bytes: &[u8],
+    bytes: &Bytes,
 ) -> bool {
     let mut quantities: Vec<&str> = volume
         .sweeps

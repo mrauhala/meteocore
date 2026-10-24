@@ -8,8 +8,8 @@ pub(crate) use ds_executor::budget::{ByteBudget as Budget, BytePermit as Permit}
 /// shared by every polar-volume site and EDR query, WMS GetFeatureInfo's
 /// position query included. Charged per volume of a walk
 /// (`volume_engine::walk_volumes`) before its file is read: the bytes it
-/// fetches (a read ahead's whole file, else its moments' byte ranges or the
-/// whole file) until they are decoded, and the arrays its batch decodes, at
+/// fetches (its moments' byte ranges, else the whole file, read ahead or
+/// not) until they are decoded, and the arrays its batch decodes, at
 /// four bytes a sample, until the walk moves on to the next volume. Moments
 /// already resident in the pixel cache cost nothing. Map, 3D Tiles and
 /// storm-cell reads are not charged. A reservation that does not fit fails

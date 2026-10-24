@@ -14,7 +14,7 @@ fn main() {
         .expect("usage: volume_stats <file.h5> [QUANTITY]");
     let want = args.next().unwrap_or_else(|| "DBZH".to_string());
 
-    let bytes = fs::read(&path).expect("read file");
+    let bytes = ds_storage::bytes::Bytes::from(fs::read(&path).expect("read file"));
     let vol = read_polar_volume(&bytes).expect("parse volume");
 
     println!("file:   {path}");
