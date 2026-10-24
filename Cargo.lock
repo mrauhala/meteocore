@@ -200,6 +200,7 @@ dependencies = [
  "ds-render",
  "http-body-util",
  "jsonschema",
+ "png",
  "serde",
  "serde_json",
  "tokio",

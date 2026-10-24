@@ -69,6 +69,15 @@ pub struct TileQueryParams {
     /// it sets the image's size over the tile's area.
     #[serde(rename = "scale-denominator")]
     pub scale_denominator: Option<String>,
+    /// The Maps Background parameters map tiles take (Map Tilesets
+    /// `/req/tilesets/tiles-parameters`, #894), as on a map. Strings, so a
+    /// bad value gets a JSON 400 naming the valid forms.
+    pub transparent: Option<String>,
+    pub bgcolor: Option<String>,
+    #[serde(rename = "void-color")]
+    pub void_color: Option<String>,
+    #[serde(rename = "void-transparent")]
+    pub void_transparent: Option<String>,
 }
 
 /// Every query parameter a map tile accepts; any other is a 400 naming
@@ -83,6 +92,10 @@ pub const MAP_TILE_PARAMETERS: &[&str] = &[
     "parameter-name",
     "elevation",
     "quality",
+    "bgcolor",
+    "transparent",
+    "void-color",
+    "void-transparent",
 ];
 
 /// Every query parameter a vector tile accepts.
@@ -195,6 +208,9 @@ pub struct ValidatedTileParams {
     /// Vertical level, parsed from the `elevation` query parameter.
     pub z: Option<f64>,
     pub scaling: TileScaling,
+    /// `bgcolor`, `transparent`, `void-color` and `void-transparent` in
+    /// [`Self::format`] ([`ds_render::parse_background`]).
+    pub background: ds_render::Background,
 }
 
 fn bad(message: impl Into<String>) -> TilesError {
@@ -228,6 +244,17 @@ impl TileQueryParams {
         // QUALITY — JPEG/WebP only; a value on PNG is an error, not ignored.
         let quality = ds_render::parse_quality("quality", self.quality.as_deref(), format)
             .map_err(TilesError::BadRequest)?;
+        // The Maps Background parameters, as on a map (#894).
+        let background = ds_render::parse_background(
+            ds_render::BackgroundQuery {
+                transparent: self.transparent.as_deref(),
+                bgcolor: self.bgcolor.as_deref(),
+                void_color: self.void_color.as_deref(),
+                void_transparent: self.void_transparent.as_deref(),
+            },
+            format,
+        )
+        .map_err(TilesError::BadRequest)?;
 
         let time = self.time(subsets)?;
 
@@ -269,6 +296,7 @@ impl TileQueryParams {
             parameter_name,
             z,
             scaling,
+            background,
         })
     }
 }
@@ -638,6 +666,54 @@ mod tests {
             panic!("expected BadRequest")
         };
         assert!(msg.starts_with("Unknown query parameter 'bbox'. Supported: f, datetime, subset"));
+    }
+
+    /// #894: map tiles take the Maps Background parameters as a map does
+    /// (`ds_render::parse_background`); vector tiles reject them.
+    #[test]
+    fn map_tiles_take_the_background_parameters() {
+        use ds_render::{Background, Fill};
+        assert_eq!(
+            validate(&TileQueryParams::default()).unwrap().background,
+            Background::default()
+        );
+        let params = TileQueryParams {
+            transparent: Some("false".into()),
+            bgcolor: Some("navy".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate(&params).unwrap().background,
+            Background::uniform(Fill::Opaque([0, 0, 0x80]))
+        );
+        let params = TileQueryParams {
+            format: Some("image/jpeg".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate(&params).unwrap().background,
+            Background::uniform(Fill::Opaque([255; 3]))
+        );
+        let params = TileQueryParams {
+            bgcolor: Some("0x12345".into()),
+            ..Default::default()
+        };
+        assert!(message(validate(&params)).starts_with("bgcolor '0x12345' must be a hexadecimal"));
+        let params = TileQueryParams {
+            void_transparent: Some("maybe".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            message(validate(&params)),
+            "void-transparent 'maybe' must be true or false"
+        );
+        let vector = TileQueryParams::default()
+            .validate_vector(Some("f=mvt&bgcolor=white"), &NO_SUBSET)
+            .map(|_| ());
+        let Err(TilesError::BadRequest(msg)) = vector else {
+            panic!("bgcolor on a vector tile: {vector:?}");
+        };
+        assert_eq!(msg, "'bgcolor' is not supported for vector tiles");
     }
 
     /// `LEGEND_PARAMETERS` is exactly the `LegendQueryParams` fields: the

@@ -768,7 +768,7 @@ pub async fn wms_handler(
                     // TRANSPARENT=FALSE / BGCOLOR (and JPEG) change the
                     // encoded bytes; the meta-tile key stays background-free,
                     // so opaque and transparent views share cached RGBA tiles.
-                    background: params.background,
+                    background: params.background.into(),
                 }),
                 _ => None,
             };

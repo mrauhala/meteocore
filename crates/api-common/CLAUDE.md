@@ -45,7 +45,10 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   `shared_conformance`, never in its per-API list: Maps "Map Tilesets" needs
   `{map}/tiles`, which only the shared root has (Tiles declares it there, #946).
   `common_discovery` pins each declaration against the links and OpenAPI
-  parameters it requires. Tiles DateTime covers map and vector tiles; both
+  parameters it requires. Maps Background is declared on both surfaces, so
+  Map Tilesets makes the shared root's map tiles take its four parameters
+  too (`api_common::background_parameters`, one component per name).
+  Tiles DateTime covers map and vector tiles; both
   parse time through `subset`, and vector tiles hand it to the engine as
   `FeatureQuery::datetime`.
 - `workbench/map.js` prints a property number by the rule of

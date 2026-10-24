@@ -327,6 +327,85 @@ impl OutputCrs {
             bbox: [west, edge(end), east, edge(top)],
         })
     }
+
+    /// The pixels of a `width`×`height` output image over `wgs84_bbox`
+    /// whose centres lie on the Earth ([`Self::position_on_earth`]): per
+    /// row, north first, the run of columns that do, empty for a row with
+    /// none. `None` when every pixel does, the usual case. The rest of the
+    /// image lies outside the CRS's valid area, the part OGC API - Maps
+    /// paints with `void-color` (#894). An engine draws nothing there.
+    ///
+    /// Web Mercator answers `None`: its latitudes stay inside (−90°, 90°).
+    /// Geographic output is cut by row, at the poles
+    /// ([`Self::domain_rows`]). A projected output's valid area is
+    /// symmetric about a centre and narrows away from it
+    /// ([`crate::geo::outside_projection_domain`]), so the pixels of a row
+    /// on the Earth are a run around the column nearest that centre, found
+    /// by bisection: at most `1 + 2·log2(width)` points a row, never one per
+    /// pixel (root CLAUDE.md Critical Rule 5). When the four corner pixels
+    /// lie on the Earth, every pixel does, and that answers `None`.
+    pub fn earth_columns(
+        &self,
+        wgs84_bbox: [f64; 4],
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<std::ops::Range<u32>>> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        match self {
+            OutputCrs::WebMercator => None,
+            OutputCrs::Wgs84 => {
+                let rows = self.domain_rows(wgs84_bbox, height).map(|d| d.rows);
+                if rows == Some(0..height) {
+                    return None;
+                }
+                let rows = rows.unwrap_or(0..0);
+                Some(
+                    (0..height)
+                        .map(|row| if rows.contains(&row) { 0..width } else { 0..0 })
+                        .collect(),
+                )
+            }
+            OutputCrs::Projected { crs, bbox } => {
+                let on_earth = |column: u32, row: u32| {
+                    let fx = (f64::from(column) + 0.5) / f64::from(width);
+                    let fy = (f64::from(row) + 0.5) / f64::from(height);
+                    self.position_on_earth(wgs84_bbox, fx, fy).is_some()
+                };
+                let (last_column, last_row) = (width - 1, height - 1);
+                let corners = [
+                    (0, 0),
+                    (last_column, 0),
+                    (0, last_row),
+                    (last_column, last_row),
+                ];
+                if corners.iter().all(|&(c, r)| on_earth(c, r)) {
+                    return None;
+                }
+                let (centre_e, _) = crate::geo::projection_domain_centre(crs)?;
+                let [min_e, _, max_e, _] = *bbox;
+                // The column whose centre lies nearest the area's centre:
+                // the one holding it, or the image's edge column (a NaN
+                // from a degenerate box casts to column 0).
+                let nearest = ((centre_e - min_e) / (max_e - min_e) * f64::from(width))
+                    .floor()
+                    .clamp(0.0, f64::from(last_column)) as u32;
+                Some(
+                    (0..height)
+                        .map(|row| {
+                            if !on_earth(nearest, row) {
+                                return 0..0;
+                            }
+                            let start = first_in(0, nearest, |c| on_earth(c, row));
+                            let end = first_in(nearest + 1, width, |c| !on_earth(c, row));
+                            start..end
+                        })
+                        .collect(),
+                )
+            }
+        }
+    }
 }
 
 /// The projected metres `(e, n)` of the output position `(fx, fy)` in the
@@ -366,7 +445,13 @@ fn footprint_pixels(
 /// The first of `0..height` for which `pred` holds, `height` when none
 /// does; `pred` must be false for a prefix of the rows and true after it.
 fn first_row(height: u32, pred: impl Fn(u32) -> bool) -> u32 {
-    let (mut lo, mut hi) = (0, height);
+    first_in(0, height, pred)
+}
+
+/// The first of `lo..hi` for which `pred` holds, `hi` when none does;
+/// `pred` must be false for a prefix of the range and true after it.
+fn first_in(lo: u32, hi: u32, pred: impl Fn(u32) -> bool) -> u32 {
+    let (mut lo, mut hi) = (lo, hi);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         if pred(mid) {
@@ -2015,6 +2100,73 @@ mod tests {
                 "{bbox:?}"
             );
         }
+    }
+
+    /// #894: `earth_columns` marks exactly the pixels whose centres lie on
+    /// the Earth, checked here against every pixel's `position_on_earth`:
+    /// rows past a pole of a geographic box, and the parts of a projected
+    /// box past the LAEA disk or Transverse Mercator's area. An image wholly
+    /// on the Earth, and every Web Mercator image, is `None`.
+    #[test]
+    fn earth_columns_are_the_pixels_on_the_earth() {
+        let laea = projected_output_crs("EPSG:3035").unwrap();
+        let tm = projected_output_crs("EPSG:3067").unwrap();
+        let projected = |crs: &Crs, bbox| OutputCrs::Projected {
+            crs: crs.clone(),
+            bbox,
+        };
+        let past_pole = [-10.0, 80.0, 10.0, 100.0];
+        for (out, bbox) in [
+            (OutputCrs::Wgs84, FINLAND_WGS84),
+            (OutputCrs::Wgs84, [-180.0, -90.0, 180.0, 90.0]),
+            (OutputCrs::WebMercator, past_pole),
+            (projected(&laea, [4.0e6, 3.0e6, 4.5e6, 3.5e6]), [0.0; 4]),
+            (projected(&tm, [-1.2e5, 6.3e6, 8.8e5, 7.9e6]), [0.0; 4]),
+        ] {
+            assert_eq!(out.earth_columns(bbox, 40, 30), None, "{out:?}");
+        }
+        assert_eq!(OutputCrs::Wgs84.earth_columns(past_pole, 0, 30), None);
+
+        let (width, height) = (48, 40);
+        let mut partial = 0;
+        for (out, bbox) in [
+            (OutputCrs::Wgs84, past_pole),
+            (OutputCrs::Wgs84, [-180.0, -100.0, 180.0, 100.0]),
+            (OutputCrs::Wgs84, [-10.0, 95.0, 10.0, 110.0]),
+            // Across the disk's rim, and wider than the disk.
+            (projected(&laea, [1.6e7, 2.2e6, 1.8e7, 4.2e6]), [0.0; 4]),
+            (projected(&laea, [-3.0e7, -3.0e7, 3.0e7, 3.0e7]), [0.0; 4]),
+            // Across the North Pole, the area's east edge, and wider than
+            // the area; wholly past its east edge.
+            (projected(&tm, [0.0, 9.0e6, 1.0e6, 1.1e7]), [0.0; 4]),
+            (projected(&tm, [1.0e7, -1.0e6, 1.1e7, 1.0e6]), [0.0; 4]),
+            (projected(&tm, [-3.0e7, -3.0e7, 3.0e7, 3.0e7]), [0.0; 4]),
+            (projected(&tm, [1.1e7, 6.5e6, 1.2e7, 7.0e6]), [0.0; 4]),
+        ] {
+            let rows = out
+                .earth_columns(bbox, width, height)
+                .unwrap_or_else(|| panic!("{out:?} {bbox:?}: no pixel is off the Earth"));
+            assert_eq!(rows.len(), height as usize);
+            for (row, columns) in (0..height).zip(&rows) {
+                for column in 0..width {
+                    let fx = (f64::from(column) + 0.5) / f64::from(width);
+                    let fy = (f64::from(row) + 0.5) / f64::from(height);
+                    assert_eq!(
+                        columns.contains(&column),
+                        out.position_on_earth(bbox, fx, fy).is_some(),
+                        "{out:?} {bbox:?}: pixel {column}, {row}"
+                    );
+                }
+            }
+            if rows
+                .iter()
+                .any(|r| !r.is_empty() && r.len() < width as usize)
+            {
+                partial += 1;
+            }
+        }
+        // Rows cut inside a row, not only whole rows, were checked.
+        assert!(partial >= 3, "{partial}");
     }
 
     /// A point's position is `project_node`'s when the point lies on the

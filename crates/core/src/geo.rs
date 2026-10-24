@@ -784,10 +784,26 @@ pub fn area_edge_points(crs: &Crs, bbox: [f64; 4]) -> Vec<(f64, f64)> {
 /// of [`wgs84_envelope`], it also sees an area the bbox encloses. `false`
 /// for every other variant, none of which is an output CRS.
 pub fn outside_projection_domain(crs: &Crs, bbox: [f64; 4]) -> bool {
-    let (centre_e, centre_n) = match *crs {
+    let Some((centre_e, centre_n)) = projection_domain_centre(crs) else {
+        return false;
+    };
+    let [min_e, min_n, max_e, max_n] = bbox;
+    // `max` then `min`, not `clamp`, which panics on an inverted range.
+    let e = centre_e.max(min_e).min(max_e);
+    let n = centre_n.max(min_n).min(max_n);
+    !maps_to_earth(crs, e, n)
+}
+
+/// The centre `(e, n)` of a projected output CRS's valid area, in its
+/// metres, about which [`outside_projection_domain`] describes that area:
+/// the false origin of LAEA, and for Transverse Mercator the equator's
+/// northing on the central meridian. `None` for every other variant, none
+/// of which is a projected output CRS.
+pub fn projection_domain_centre(crs: &Crs) -> Option<(f64, f64)> {
+    match *crs {
         Crs::LambertAzimuthalEqualArea {
             false_e, false_n, ..
-        } => (false_e, false_n),
+        } => Some((false_e, false_n)),
         Crs::TransverseMercator {
             lat0,
             k0,
@@ -795,17 +811,12 @@ pub fn outside_projection_domain(crs: &Crs, bbox: [f64; 4]) -> bool {
             false_n,
             figure,
             ..
-        } => (
+        } => Some((
             false_e,
             tm_equator_northing(&TmSeries::of(&figure), lat0, k0, false_n),
-        ),
-        _ => return false,
-    };
-    let [min_e, min_n, max_e, max_n] = bbox;
-    // `max` then `min`, not `clamp`, which panics on an inverted range.
-    let e = centre_e.max(min_e).min(max_e);
-    let n = centre_n.max(min_n).min(max_n);
-    !maps_to_earth(crs, e, n)
+        )),
+        _ => None,
+    }
 }
 
 /// Whether the projected point `(e, n)` lies in `crs`'s valid area: it

@@ -650,7 +650,7 @@ pub(crate) fn collection_openapi_paths(
 
 /// OpenAPI components (parameters, schemas) referenced by the Maps paths.
 pub(crate) fn openapi_components() -> serde_json::Value {
-    json!({
+    let mut components = json!({
         "parameters": {
             // The standard's own OpenAPI fragments (OGC 20-058 requirement
             // texts; `subset` and `center` from its building blocks), copied
@@ -762,13 +762,6 @@ pub(crate) fn openapi_components() -> serde_json::Value {
                 "style": "form",
                 "explode": false
             },
-            "transparent": {
-                "name": "transparent",
-                "in": "query",
-                "required": false,
-                "schema": {"type": "string"},
-                "description": "Transparency support"
-            },
             "f": {
                 "name": "f",
                 "in": "query",
@@ -821,7 +814,12 @@ pub(crate) fn openapi_components() -> serde_json::Value {
                 }
             }
         }
-    })
+    });
+    // The Background parameters, one definition with map tiles' (#894).
+    if let Some(parameters) = components["parameters"].as_object_mut() {
+        parameters.extend(api_common::background_parameters());
+    }
+    components
 }
 
 /// GET {mount}/api — OpenAPI 3.0.3 definition. Path keys include the mount.
@@ -938,7 +936,14 @@ pub(crate) const CONFORMANCE: &[&str] = &[
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
     "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
+    MAPS_BACKGROUND,
 ];
+
+/// OGC API - Maps "Background" (`/req/background`, #894): `bgcolor`,
+/// `transparent`, `void-color` and `void-transparent` on every map route,
+/// and, through Map Tilesets `/req/tilesets/tiles-parameters`, on the map
+/// tiles of the shared root, which api-tiles serves.
+pub const MAPS_BACKGROUND: &str = "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/background";
 
 /// GET {mount}/conformance
 pub async fn conformance(
@@ -1383,6 +1388,10 @@ async fn render_map(
     let format = validated
         .format
         .with_quality(validated.quality, config.webp_quality());
+    // `bgcolor`, `transparent`, `void-color`, `void-transparent` (#894). It
+    // keys the rendered cache, so an opaque and a transparent map of one
+    // view never share an entry.
+    let background = validated.background;
 
     // An RGB composite (#819) has no style map: its colours come from its
     // channels, and its one style is `default`.
@@ -1535,8 +1544,10 @@ async fn render_map(
         // Content revised in place under the same instant (a push-fed alert
         // set) must not hit a stale entry.
         content_version: engine.content_version(),
-        // No opaque-background option on this API: output keeps its alpha.
-        background: None,
+        // The default (transparent, no `bgcolor`) keys as WMS
+        // `TRANSPARENT=TRUE` does, and `transparent=false` as WMS's opaque
+        // `BGCOLOR`, so those views keep sharing entries.
+        background,
     };
 
     let cache_control = cache_control_value(
@@ -1634,11 +1645,16 @@ async fn render_map(
     let render_parameter = effective_parameter;
     let render_z = validated.z;
 
-    // An all-nodata view's image: transparent (white in JPEG, which has no
-    // alpha), encoded once per (w, h, format) and shared across
-    // WMS/Maps/Tiles (#171). The job finishes it too (#1093), so the request
-    // worker only reads the result.
-    let empty = move || ds_render::empty_tile(width, height, format);
+    // An all-nodata view's image: its background, solid, encoded once per
+    // (w, h, fill, format) and shared across WMS/Maps/Tiles (#171), unless
+    // its `void-color` or `void-transparent` paint part of it apart (#894).
+    // The job finishes it too (#1093), so the request worker only reads the
+    // result.
+    let empty_crs = output_crs.clone();
+    let empty = move || {
+        let earth = background.earth_columns(&empty_crs, bbox, width, height);
+        ds_render::empty_map(width, height, background, earth.as_deref(), format)
+    };
     let render_result = job
         .run(render_job(memory_permit, empty, move || {
             let mut phases = phases;
@@ -1671,11 +1687,21 @@ async fn render_map(
                     };
                     phases.add(RenderPhase::Engine, engine_start.elapsed());
                     let encode_start = std::time::Instant::now();
-                    let bytes = ds_render::render_composite_tiles(&tiles, spec, format, None)?;
-                    if bytes.is_some() {
-                        phases.add(RenderPhase::Encode, encode_start.elapsed());
-                    }
-                    return Ok((bytes, phases));
+                    let Some(mut rgba) = ds_render::render_composite_tiles_rgba(&tiles, spec)?
+                    else {
+                        return Ok((None, phases));
+                    };
+                    let earth = background.earth_columns(&output_crs, bbox, width, height);
+                    let bytes = ds_render::encode_map(
+                        &mut rgba,
+                        width,
+                        height,
+                        format,
+                        background,
+                        earth.as_deref(),
+                    )?;
+                    phases.add(RenderPhase::Encode, encode_start.elapsed());
+                    return Ok((Some(bytes), phases));
                 }
             };
 
@@ -1706,7 +1732,17 @@ async fn render_map(
                 return Ok((None, phases));
             }
             let encode_start = std::time::Instant::now();
-            let bytes = ds_render::render_tile(&tile, colormap.as_ref(), format)?;
+            let mut rgba = ds_render::render_tile_rgba(&tile, colormap.as_ref())?;
+            // Only a background whose void fill differs maps the Earth.
+            let earth = background.earth_columns(&output_crs, bbox, width, height);
+            let bytes = ds_render::encode_map(
+                &mut rgba,
+                width,
+                height,
+                format,
+                background,
+                earth.as_deref(),
+            )?;
             phases.add(RenderPhase::Encode, encode_start.elapsed());
             Ok((Some(bytes), phases))
         }))

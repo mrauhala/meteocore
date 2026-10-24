@@ -16,9 +16,10 @@ rendered on demand by the collection's engine, then cached.
 - The tile matrix set's math turns a tile address into a WGS84 bounding box.
 - **Map tiles**: the box goes to `MapEngine::get_raster_tile` (or
   `get_raster_tiles` for an RGB composite), rendered in EPSG:3857 for
-  WebMercatorQuad or CRS84 for WorldCRS84Quad. `ds-render` colours and encodes
-  the result. An all-nodata tile skips encoding and gets a shared empty image
-  (transparent; white in JPEG).
+  WebMercatorQuad or CRS84 for WorldCRS84Quad. `ds-render` colours, paints
+  the background and encodes the result. An all-nodata tile skips encoding
+  and gets a shared empty image of its background (transparent by default;
+  white in JPEG).
 - **Vector tiles**: the box becomes a `FeatureQuery` on the collection's
   `FeatureEngine`. `ds-mvt` encodes the features into one layer named after
   the collection id (extent 4096), with every feature property.
@@ -87,6 +88,7 @@ pages come from [api-common](../api-common/README.md).
 | `parameter-name` | A parameter or RGB composite; unknown: 400 listing valid names (single-band: ignored) | 400 |
 | `elevation` | Vertical level; 400 on a collection without one | 400 |
 | `quality` | 1–100 for JPEG and WebP; 400 for PNG | 400 |
+| `bgcolor`, `transparent`, `void-color`, `void-transparent` | The Maps Background parameters, as on a map ([api-maps](../api-maps/README.md#map-parameters)); a tile never reaches outside its CRS, so the void ones change no pixel | 400 |
 
 Any other query parameter, or `datetime` with `subset`, is a 400.
 
@@ -121,7 +123,9 @@ Any other query parameter, or `datetime` with `subset`, is a 400.
 OGC API - Common (core, landing-page, oas30, collections, json, html), Tiles
 (core, tileset, tilesets-list, geodata-tilesets, datetime, png, jpeg, mvt) and
 TMS 2.0 (tilematrixset, json-tilematrixset). The shared root adds Maps
-`tilesets`, as its map tiles sit under the map resource.
+`tilesets`, as its map tiles sit under the map resource and take the
+parameters of the Maps Scaling and Background classes the Maps block
+declares.
 
 ## Configuration
 
@@ -169,7 +173,6 @@ tiles) and `collections.d/zarr-era5-t2m-local.toml` (Zarr, map tiles).
 - Collection tilesets only; no dataset (multi-collection) tilesets.
 - Forecast collections render the engine's latest model run; there is no
   `reference_time` parameter.
-- Map tiles take no background colour or transparency parameter.
 - Vector tiles carry every property in one layer: no property selection or
   styling. Their cache is 128 MB and not configurable.
 

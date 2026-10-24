@@ -3279,6 +3279,103 @@ async fn shared_root_map_tiles_match_the_per_api_service() {
     );
 }
 
+/// #894: map tiles take the OGC API - Maps Background parameters, which Map
+/// Tilesets `/req/tilesets/tiles-parameters` asks of the shared root's
+/// `{map}/tiles` once Background is declared, and the per-API service's map
+/// tiles take them too. Areas with no data take the `bgcolor` and
+/// `transparent` a map gives them; the background keys the rendered cache;
+/// a bad value is a JSON 400 naming the valid forms.
+#[tokio::test]
+async fn map_tiles_take_the_maps_background_parameters() {
+    use ds_render::{encode_jpeg, encode_png};
+    let solid = |pixel: [u8; 4]| pixel.repeat(256 * 256);
+    let empty = build_empty_router();
+    for (query, expected) in [
+        ("", encode_png(&solid([0, 0, 0, 0]), 256, 256)),
+        (
+            "?transparent=false",
+            encode_png(&solid([255, 255, 255, 255]), 256, 256),
+        ),
+        (
+            "?bgcolor=0xFF0000",
+            encode_png(&solid([255, 0, 0, 255]), 256, 256),
+        ),
+        (
+            "?bgcolor=red&transparent=true",
+            encode_png(&solid([255, 0, 0, 0]), 256, 256),
+        ),
+        (
+            "?f=image/jpeg&bgcolor=navy",
+            encode_jpeg(&solid([0, 0, 0x80, 255]), 256, 256, 85),
+        ),
+        // A tile never reaches past its CRS: the void parameters paint
+        // nothing.
+        (
+            "?void-color=red&void-transparent=false",
+            encode_png(&solid([0, 0, 0, 0]), 256, 256),
+        ),
+    ] {
+        let uri = format!("/collections/empty/tiles/WebMercatorQuad/0/0/0{query}");
+        let (status, headers, body) = get_raw_on(empty.clone(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(headers["x-cache"], "EMPTY", "{uri}");
+        assert_eq!(body, expected.unwrap(), "{uri}");
+    }
+
+    for (shared, paths) in [
+        (
+            false,
+            [
+                "/collections/radar/tiles/WebMercatorQuad/1/0/1",
+                "/collections/radar/styles/default/tiles/WorldCRS84Quad/1/0/1",
+            ],
+        ),
+        (
+            true,
+            [
+                "/collections/radar/map/tiles/WebMercatorQuad/1/0/1",
+                "/collections/radar/styles/default/map/tiles/WorldCRS84Quad/1/0/1",
+            ],
+        ),
+    ] {
+        // A fresh rendered cache for each surface.
+        let app = if shared {
+            shared_router(build_state())
+        } else {
+            api_tiles::router(build_state())
+        };
+        for path in paths {
+            let (status, headers, transparent) = get_raw_on(app.clone(), path).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(headers["x-cache"], "MISS", "{path}");
+            let opaque = format!("{path}?transparent=false&bgcolor=white");
+            let (status, headers, body) = get_raw_on(app.clone(), &opaque).await;
+            assert_eq!(status, StatusCode::OK, "{opaque}");
+            assert_eq!(headers["x-cache"], "MISS", "{opaque}: shared an entry");
+            // Every pixel is drawn and opaque: the same image, keyed apart.
+            assert_eq!(body, transparent, "{opaque}");
+            let (_, headers, _) = get_raw_on(app.clone(), &format!("{path}?bgcolor=white")).await;
+            assert_eq!(headers["x-cache"], "HIT", "{path}");
+
+            for (query, description) in [
+                ("transparent=no", "transparent 'no' must be true or false"),
+                (
+                    "bgcolor=0xFFFF",
+                    "bgcolor '0xFFFF' must be a hexadecimal colour 0xRRGGBB (or #RRGGBB) or a \
+                     W3C web colour name, such as 0x336699, white or SteelBlue",
+                ),
+            ] {
+                let uri = format!("{path}?{query}");
+                let (status, _, body) = get_raw_on(app.clone(), &uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+                let json: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["code"], "BadRequest", "{uri}");
+                assert_eq!(json["description"], description, "{uri}");
+            }
+        }
+    }
+}
+
 /// Styled map tilesets: one list per style, each tileset naming its style and
 /// linking to its own resource; an unknown style is 404.
 #[tokio::test]
@@ -4645,7 +4742,8 @@ mod map_tile_parameters {
                     description.starts_with("Unknown query parameter '")
                         && description.ends_with(
                             "Supported: f, datetime, subset, width, height, scale-denominator, \
-                             parameter-name, elevation, quality"
+                             parameter-name, elevation, quality, bgcolor, transparent, \
+                             void-color, void-transparent"
                         ),
                     "{uri}: {description}"
                 );

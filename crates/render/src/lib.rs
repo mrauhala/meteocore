@@ -1,3 +1,4 @@
+pub mod background;
 pub mod colormap;
 pub mod composite;
 pub mod defaults;
@@ -14,6 +15,9 @@ pub mod rasterize;
 pub mod station_symbols;
 pub mod style;
 
+pub use background::{
+    parse_background, web_color, Background, BackgroundQuery, Fill, DEFAULT_BGCOLOR,
+};
 pub use colormap::{
     parse_hex_color, BuiltinColormap, ColorMap, ColorStop, IntegerLutColorMap, LinearColorMap,
     LutColorMap, OverlayColorMap, SymbolColorMap,
@@ -224,12 +228,15 @@ pub struct CacheKey {
     /// alert set) gets a fresh entry instead of serving the stale one
     /// forever. `0` for engines whose timesteps are immutable.
     pub content_version: u64,
-    /// Opaque background the encoded image was composited over (WMS
-    /// `TRANSPARENT=FALSE` / `BGCOLOR`, and JPEG's always-opaque output);
-    /// `None` keeps the alpha channel. Part of the key because it changes the
-    /// encoded bytes — the meta-tile pixel cache stays background-free, so
-    /// transparent and opaque views share its RGBA tiles.
-    pub background: Option<[u8; 3]>,
+    /// How the encoded image painted its empty pixels ([`Background`]): an
+    /// opaque colour it was composited over (WMS `TRANSPARENT=FALSE` /
+    /// `BGCOLOR`, Maps `transparent=false`, and JPEG's always-opaque
+    /// output), the alpha kept (the default), or the OGC API - Maps
+    /// `bgcolor` and void fills (#894). Part of the key because it changes
+    /// the encoded bytes — the meta-tile pixel cache stays background-free,
+    /// so transparent and opaque views share its RGBA tiles. WMS builds it
+    /// from its `Option<[u8; 3]>` with `.into()`.
+    pub background: Background,
 }
 
 /// Quantize a vertical level for use in a [`CacheKey`] — millidegrees /
@@ -321,10 +328,25 @@ impl CacheKey {
             fnv1a_mix(&mut h, b"|v");
             fnv1a_mix(&mut h, &self.content_version.to_le_bytes());
         }
-        // Likewise only when set, so a transparent key keeps its old ETag.
-        if let Some(bg) = self.background {
-            fnv1a_mix(&mut h, b"|bg");
-            fnv1a_mix(&mut h, &bg);
+        // Likewise only when set, so a transparent key keeps its old ETag,
+        // and an opaque one the ETag it had as an `Option<[u8; 3]>`.
+        match self.background {
+            Background {
+                fill: Fill::Keep,
+                void: Fill::Keep,
+            } => {}
+            Background {
+                fill: Fill::Opaque(bg),
+                void: Fill::Opaque(void),
+            } if bg == void => {
+                fnv1a_mix(&mut h, b"|bg");
+                fnv1a_mix(&mut h, &bg);
+            }
+            Background { fill, void } => {
+                fnv1a_mix(&mut h, b"|bk");
+                fnv1a_mix(&mut h, &fill.etag_bytes());
+                fnv1a_mix(&mut h, &void.etag_bytes());
+            }
         }
         // The encoder quality, only when it is not the format's default
         // (JPEG 85, lossless WebP), so default-quality keys keep theirs.
@@ -438,10 +460,10 @@ enum SolidImage {
 /// failed area of a map visible without hiding the layers under it.
 const ERROR_TILE_RGBA: [u8; 4] = [255, 0, 0, 100];
 
-/// `(image, width, height, background, format)` of a memoized solid image.
-/// The format carries its encoder quality, so a PNG, a JPEG and a lossy and a
+/// `(image, width, height, fill, format)` of a memoized solid image. The
+/// format carries its encoder quality, so a PNG, a JPEG and a lossy and a
 /// lossless WebP of one size are four entries (#1091).
-type SolidImageKey = (SolidImage, u32, u32, Option<[u8; 3]>, ImageFormat);
+type SolidImageKey = (SolidImage, u32, u32, Fill, ImageFormat);
 
 /// Byte budget of [`SOLID_IMAGE_CACHE`]. A solid lossless WebP stays a few
 /// dozen bytes at any size, but the other formats grow with the pixel count.
@@ -514,7 +536,53 @@ pub fn background_tile(
     background: Option<[u8; 3]>,
     format: ImageFormat,
 ) -> Result<CachedRendered, DataServerError> {
-    solid_image(SolidImage::Empty, width, height, background, format)
+    filled_tile(width, height, Fill::from(background), format)
+}
+
+/// [`background_tile`] for any [`Fill`]: the all-nodata image of a map whose
+/// every pixel takes `fill`, as an OGC API - Maps `bgcolor` paints it
+/// (#894). Memoized per `(width, height, fill, format)`; call it from a
+/// blocking worker.
+pub fn filled_tile(
+    width: u32,
+    height: u32,
+    fill: Fill,
+    format: ImageFormat,
+) -> Result<CachedRendered, DataServerError> {
+    solid_image(SolidImage::Empty, width, height, fill, format)
+}
+
+/// The all-nodata image of a map painted with `background` (#894): the
+/// memoized [`filled_tile`] of its fill, or of its void fill when no pixel
+/// lies on the Earth. `earth` is, per row, the columns on the Earth
+/// (`ds_core::map_engine::OutputCrs::earth_columns`), `None` when all are.
+/// Only an image whose void and other pixels differ, both present, is
+/// painted and encoded here, unmemoized: the OGC API - Maps `void-color` or
+/// `void-transparent` over a map reaching past its CRS. Call it from a
+/// blocking worker.
+pub fn empty_map(
+    width: u32,
+    height: u32,
+    background: Background,
+    earth: Option<&[std::ops::Range<u32>]>,
+    format: ImageFormat,
+) -> Result<CachedRendered, DataServerError> {
+    let solid = match earth {
+        Some(rows) if !background.is_uniform() => rows
+            .iter()
+            .all(std::ops::Range::is_empty)
+            .then_some(background.void),
+        _ => Some(background.fill),
+    };
+    match solid {
+        Some(fill) => filled_tile(width, height, fill, format),
+        None => {
+            let mut rgba = vec![0u8; width as usize * height as usize * 4];
+            Ok(CachedRendered::new(Bytes::from(encode_map(
+                &mut rgba, width, height, format, background, earth,
+            )?)))
+        }
+    }
 }
 
 /// The WMS error tile: a `width`×`height` image of semi-transparent red that
@@ -535,7 +603,13 @@ pub fn error_tile(
     background: Option<[u8; 3]>,
     format: ImageFormat,
 ) -> Result<CachedRendered, DataServerError> {
-    solid_image(SolidImage::Error, width, height, background, format)
+    solid_image(
+        SolidImage::Error,
+        width,
+        height,
+        Fill::from(background),
+        format,
+    )
 }
 
 /// One [`SOLID_IMAGE_CACHE`] entry, encoded by [`encode_rgba`] on a miss.
@@ -545,17 +619,22 @@ fn solid_image(
     image: SolidImage,
     width: u32,
     height: u32,
-    background: Option<[u8; 3]>,
+    fill: Fill,
     format: ImageFormat,
 ) -> Result<CachedRendered, DataServerError> {
-    SOLID_IMAGE_CACHE.get_or_insert_with(&(image, width, height, background, format), || {
+    SOLID_IMAGE_CACHE.get_or_insert_with(&(image, width, height, fill, format), || {
         let pixel = match image {
             SolidImage::Empty => [0u8; 4],
             SolidImage::Error => ERROR_TILE_RGBA,
         };
         let mut rgba = pixel.repeat(width as usize * height as usize);
-        Ok(CachedRendered::new(Bytes::from(encode_rgba(
-            &mut rgba, width, height, format, background,
+        Ok(CachedRendered::new(Bytes::from(encode_map(
+            &mut rgba,
+            width,
+            height,
+            format,
+            Background::uniform(fill),
+            None,
         )?)))
     })
 }
@@ -722,9 +801,22 @@ pub fn encode_rgba(
     format: ImageFormat,
     background: Option<[u8; 3]>,
 ) -> Result<Vec<u8>, DataServerError> {
-    if let Some(bg) = background {
-        flatten_onto(rgba, bg);
-    }
+    encode_map(rgba, width, height, format, background.into(), None)
+}
+
+/// [`encode_rgba`] for any [`Background`]: the image painted with it
+/// ([`Background::paint`], `earth` per row the columns on the Earth, `None`
+/// when all are), then encoded. The OGC API - Maps routes encode through
+/// it, with their `bgcolor`, `transparent` and void fills (#894).
+pub fn encode_map(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    format: ImageFormat,
+    background: Background,
+    earth: Option<&[std::ops::Range<u32>]>,
+) -> Result<Vec<u8>, DataServerError> {
+    background.paint(rgba, width, earth);
     match format {
         ImageFormat::Png => encode::encode_png(rgba, width, height),
         ImageFormat::Jpeg { quality } => encode::encode_jpeg(rgba, width, height, quality),
@@ -1220,7 +1312,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 0,
-            background: None,
+            background: Background::default(),
         };
         let cache = RenderedCache::new(1);
         cache.insert(
@@ -1649,6 +1741,55 @@ mod tests {
         assert!(decoded
             .chunks_exact(channels)
             .all(|p| p[..3] == bg && (channels == 3 || p[3] == 255)));
+    }
+
+    /// #894: the all-nodata image of an OGC API - Maps background. Uniform,
+    /// or with every pixel on the Earth or none, it is the memoized solid
+    /// image of the one fill that shows; with void pixels painted apart, it
+    /// is painted row by row, those rows' columns off the Earth in the void
+    /// fill.
+    #[test]
+    fn empty_map_paints_the_fill_and_the_void() {
+        let png = ImageFormat::Png;
+        let (w, h) = (4, 2);
+        let red = [255, 0, 0];
+        let blue = [0, 0, 255];
+        let split = Background {
+            fill: Fill::Opaque(red),
+            void: Fill::Clear(blue),
+        };
+        let solid = |fill| filled_tile(w, h, fill, png).unwrap().etag().to_owned();
+        for (background, earth, shown) in [
+            (
+                Background::uniform(Fill::Clear(red)),
+                None,
+                Fill::Clear(red),
+            ),
+            (split, None, Fill::Opaque(red)),
+            (split, Some(vec![0..0, 0..0]), Fill::Clear(blue)),
+            (
+                Background::uniform(Fill::Opaque(blue)),
+                Some(vec![0..2, 0..0]),
+                Fill::Opaque(blue),
+            ),
+        ] {
+            let image = empty_map(w, h, background, earth.as_deref(), png).unwrap();
+            assert_eq!(image.etag(), solid(shown), "{background:?} {earth:?}");
+        }
+        // Row 0 on the Earth in columns 1..3, row 1 off it.
+        let image = empty_map(w, h, split, Some(&[1..3, 0..0]), png).unwrap();
+        let mut expected = vec![0u8; (w * h * 4) as usize];
+        split.paint(&mut expected, w, Some(&[1..3, 0..0]));
+        assert_eq!(image.bytes().as_ref(), encode_png(&expected, w, h).unwrap());
+        let pixels: Vec<&[u8]> = expected.chunks(4).collect();
+        assert_eq!(pixels[0], [0, 0, 255, 0]);
+        assert_eq!(pixels[1], [255, 0, 0, 255]);
+        assert_eq!(pixels[4], [0, 0, 255, 0]);
+        // A uniform keep is the transparent empty tile itself.
+        assert_eq!(
+            filled_tile(w, h, Fill::Keep, png).unwrap().etag(),
+            empty_tile(w, h, png).unwrap().etag()
+        );
     }
 
     /// The #206 correctness property: colorizing a `U8` tile through the
@@ -2090,7 +2231,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 0,
-            background: None,
+            background: Background::default(),
         };
         let mut later = base.clone();
         later.time = Some(
@@ -2116,7 +2257,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 0,
-            background: None,
+            background: Background::default(),
         };
         let mut other = base.clone();
         other.parameter = Some("10u".into());
@@ -2149,7 +2290,7 @@ mod tests {
                     .with_timezone(&chrono::Utc),
             ),
             content_version: 0,
-            background: None,
+            background: Background::default(),
         };
         let mut other = base.clone();
         other.reference_time = Some(
@@ -2186,7 +2327,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 1,
-            background: None,
+            background: Background::default(),
         };
         let mut revised = base.clone();
         revised.content_version = 2;
@@ -2226,16 +2367,40 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 0,
-            background: None,
+            background: Background::default(),
         };
         let mut opaque = base.clone();
-        opaque.background = Some([0x33, 0x66, 0x99]);
+        opaque.background = Some([0x33, 0x66, 0x99]).into();
         let mut white = base.clone();
-        white.background = Some([255, 255, 255]);
-        assert_ne!(base, opaque);
-        assert_ne!(opaque, white);
-        assert_ne!(base.etag(), opaque.etag());
-        assert_ne!(opaque.etag(), white.etag());
+        white.background = Some([255, 255, 255]).into();
+        // The OGC API - Maps fills (#894): a transparent map with a
+        // `bgcolor`, and void fills apart from the rest.
+        let with = |background| CacheKey {
+            background,
+            ..base.clone()
+        };
+        let red = [255, 0, 0];
+        let clear = with(Background::uniform(Fill::Clear(red)));
+        let void_clear = with(Background {
+            fill: Fill::Opaque(red),
+            void: Fill::Clear(red),
+        });
+        let void_opaque = with(Background {
+            fill: Fill::Keep,
+            void: Fill::Opaque(red),
+        });
+        let keys = [&base, &opaque, &white, &clear, &void_clear, &void_opaque];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+                assert_ne!(a.etag(), b.etag(), "{a:?} {b:?}");
+            }
+        }
+        // WMS's `Some(rgb)` is the uniform opaque fill: one key for both.
+        assert_eq!(
+            white,
+            with(Background::uniform(Fill::Opaque(red.map(|_| 255))))
+        );
         let cache = RenderedCache::new(1);
         cache.insert(
             base.clone(),
@@ -2264,7 +2429,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 0,
-            background: None,
+            background: Background::default(),
         };
         // Pinned after introducing the `reference_time` field (cache-bust event).
         assert_eq!(key.etag(), "\"92a1d2349689898e\"");
@@ -2304,7 +2469,7 @@ mod tests {
             z: None,
             reference_time: None,
             content_version: 0,
-            background: None,
+            background: Background::default(),
         };
         let q80 = CacheKey {
             format: ImageFormat::Webp { quality: 80 },
@@ -2457,7 +2622,7 @@ mod tests {
                 z: None,
                 reference_time: None,
                 content_version: 0,
-                background: None,
+                background: Background::default(),
             };
             let cached = CachedRendered::new(Bytes::from(encoded));
             let weight = weigh_cached(&key, &cached);

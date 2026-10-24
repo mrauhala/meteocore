@@ -85,7 +85,14 @@ pub struct MapQueryParams {
     pub height: Option<String>,
     pub crs: Option<String>,
     pub datetime: Option<String>,
+    /// The Background parameters (`/req/background`, #894): strings, so a
+    /// bad value gets a JSON 400 naming the valid forms.
     pub transparent: Option<String>,
+    pub bgcolor: Option<String>,
+    #[serde(rename = "void-color")]
+    pub void_color: Option<String>,
+    #[serde(rename = "void-transparent")]
+    pub void_transparent: Option<String>,
     #[serde(rename = "f")]
     pub format: Option<String>,
     #[serde(rename = "bbox-crs")]
@@ -127,7 +134,10 @@ pub const MAP_PARAMETERS: &[&str] = &[
     "scale-denominator",
     "crs",
     "datetime",
+    "bgcolor",
     "transparent",
+    "void-color",
+    "void-transparent",
     "f",
     "quality",
     "elevation",
@@ -236,6 +246,10 @@ pub struct MapRequest {
     pub parameter_name: Option<String>,
     /// Vertical level, parsed from the `elevation` query parameter.
     pub z: Option<f64>,
+    /// How the map paints its areas with no data and those outside its
+    /// CRS: `bgcolor`, `transparent`, `void-color` and `void-transparent`
+    /// in [`Self::format`] ([`ds_render::parse_background`]).
+    pub background: ds_render::Background,
 }
 
 /// The map a request renders over a collection.
@@ -306,6 +320,17 @@ impl MapQueryParams {
         // QUALITY — JPEG/WebP only; a value on PNG is an error, not ignored.
         let quality = ds_render::parse_quality("quality", self.quality.as_deref(), format)
             .map_err(MapsError::BadRequest)?;
+        // BACKGROUND — Requirements Class "Background" (#894).
+        let background = ds_render::parse_background(
+            ds_render::BackgroundQuery {
+                transparent: self.transparent.as_deref(),
+                bgcolor: self.bgcolor.as_deref(),
+                void_color: self.void_color.as_deref(),
+                void_transparent: self.void_transparent.as_deref(),
+            },
+            format,
+        )
+        .map_err(MapsError::BadRequest)?;
 
         let crs = present(&self.crs)
             .map(|value| parse_crs("CRS", value))
@@ -433,6 +458,7 @@ impl MapQueryParams {
             quality,
             parameter_name,
             z,
+            background,
         })
     }
 }
@@ -865,6 +891,9 @@ mod tests {
             crs,
             datetime,
             transparent,
+            bgcolor,
+            void_color,
+            void_transparent,
             format,
             bbox_crs,
             center,
@@ -882,6 +911,9 @@ mod tests {
             crs,
             datetime,
             transparent,
+            bgcolor,
+            void_color,
+            void_transparent,
             format,
             bbox_crs,
             center,
@@ -1252,6 +1284,70 @@ mod tests {
             query.validate(&NONE),
             Err(MapsError::BadRequest(_))
         ));
+    }
+
+    /// #894: the Background parameters resolve with the format
+    /// (`ds_render::parse_background`), and a bad value is a 400 naming the
+    /// valid forms.
+    #[test]
+    fn background_parameters_resolve_with_the_format() {
+        use ds_render::{Background, Fill};
+        let red = [255, 0, 0];
+        let resolve = |format: Option<&str>, set: &dyn Fn(&mut MapQueryParams)| {
+            let mut query = query_with_crs("CRS:84");
+            query.format = format.map(str::to_owned);
+            set(&mut query);
+            query.validate(&NONE).map(|request| request.background)
+        };
+        assert_eq!(resolve(None, &|_| {}).unwrap(), Background::default());
+        assert_eq!(
+            resolve(None, &|q| q.transparent = Some("false".into())).unwrap(),
+            Background::uniform(Fill::Opaque([255; 3]))
+        );
+        assert_eq!(
+            resolve(None, &|q| q.bgcolor = Some("Red".into())).unwrap(),
+            Background::uniform(Fill::Opaque(red))
+        );
+        assert_eq!(
+            resolve(Some("image/webp"), &|q| {
+                q.bgcolor = Some("0xFF0000".into());
+                q.transparent = Some("TRUE".into());
+            })
+            .unwrap(),
+            Background::uniform(Fill::Clear(red))
+        );
+        assert_eq!(
+            resolve(Some("image/jpeg"), &|q| q.transparent = Some("true".into())).unwrap(),
+            Background::uniform(Fill::Opaque([255; 3]))
+        );
+        assert_eq!(
+            resolve(None, &|q| q.void_color = Some("red".into())).unwrap(),
+            Background {
+                fill: Fill::Keep,
+                void: Fill::Clear(red)
+            }
+        );
+        for (set, message) in [
+            (
+                &(|q: &mut MapQueryParams| q.transparent = Some("no".into()))
+                    as &dyn Fn(&mut MapQueryParams),
+                "transparent 'no' must be true or false",
+            ),
+            (
+                &|q: &mut MapQueryParams| q.void_transparent = Some("0".into()),
+                "void-transparent '0' must be true or false",
+            ),
+            (
+                &|q: &mut MapQueryParams| q.bgcolor = Some("0xFF00".into()),
+                "bgcolor '0xFF00' must be a hexadecimal colour 0xRRGGBB (or #RRGGBB) or a W3C \
+                 web colour name, such as 0x336699, white or SteelBlue",
+            ),
+        ] {
+            match resolve(None, set) {
+                Err(MapsError::BadRequest(got)) => assert_eq!(got, message),
+                other => panic!("{message}: {other:?}"),
+            }
+        }
     }
 
     #[test]

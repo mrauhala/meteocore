@@ -44,7 +44,7 @@ baselines, with implementation gaps and evidence for standards experimentation.
 |-------|--------|-------------|
 | `api-edr` | [OGC API - EDR 1.2](https://www.opengis.net/doc/IS/ogcapi-edr-1/1.2) | ogcapi-common-1: core, landing-page, oas30; ogcapi-common-2: collections, json, html; ogcapi-edr-1 1.2: core, collections, queries, instances, json, geojson, edr-geojson, covjson, html, oas30, each also as 1.1 except instances ([status](crates/api-edr/README.md)) |
 | `api-features` | [OGC API - Features 1.0](https://docs.ogc.org/is/17-069r4/17-069r4.html) | core, oas30, geojson |
-| `api-maps` | [OGC API - Maps 1.0](https://docs.ogc.org/is/20-058/20-058.html) | core, collection-map, styled-map, spatial-subsetting, scaling, datetime, crs, png, jpeg |
+| `api-maps` | [OGC API - Maps 1.0](https://docs.ogc.org/is/20-058/20-058.html) | core, collection-map, styled-map, background, spatial-subsetting, scaling, datetime, crs, png, jpeg |
 | `api-tiles` | [OGC API - Tiles 1.0](https://docs.ogc.org/is/20-057/20-057.html) | ogcapi-tiles-1: core, tileset, tilesets-list, geodata-tilesets, datetime, png, jpeg, mvt; tms 2.0: tilematrixset, json-tilematrixset; at the shared root also ogcapi-maps-1: tilesets |
 | `api-wms` | [OGC WMS 1.3.0](https://portal.ogc.org/files/?artifact_id=14416) | GetCapabilities, GetMap, GetFeatureInfo, GetLegendGraphic |
 | `api-3dtiles` | [OGC 3D Tiles 1.1](https://docs.ogc.org/cs/22-025r4/22-025r4.html) | point clouds (`.pnts`), glTF mesh content (`.glb` — isosurface + echo-top), cylindrical voxels (`.glb`, `EXT_primitive_voxels` draft); bundled CesiumJS viewer SPA |
@@ -406,8 +406,8 @@ the shared root serves all three):
 ### Map requests (OGC API - Maps)
 
 `/collections/{id}/map` and `/collections/{id}/styles/{styleId}/map` take the
-Maps Part 1 core, spatial subsetting, scaling, date-time and CRS parameters
-(#945):
+Maps Part 1 core, background, spatial subsetting, scaling, date-time and CRS
+parameters (#945, #894):
 
 - **Area**: at most one of `bbox` (with `bbox-crs`), a spatial `subset` such as
   `subset=Lon(19:32),Lat(59:70)` (with `subset-crs`; `E`/`N` in a projected
@@ -428,14 +428,22 @@ Maps Part 1 core, spatial subsetting, scaling, date-time and CRS parameters
 - **Time**: `datetime` (an instant or an interval) or `subset=time(…)`. An
   instant snaps to an available time step; an interval renders the latest one
   inside it, and is a 404 when it holds none.
+- **Background**: a map is transparent where it has no data unless
+  `transparent=false` or a `bgcolor` (`0xRRGGBB`, `#RRGGBB` or a W3C colour
+  name, default white) makes it opaque on that colour; `transparent=true`
+  with a `bgcolor` gives those areas its colour at opacity 0. JPEG is always
+  opaque. `void-color` and `void-transparent` paint the parts of the map
+  outside its CRS (past a pole in CRS84, past the projection's area in
+  EPSG:3067 and EPSG:3035) and default to `bgcolor` and `transparent`.
 - **Headers**: every map carries `Content-Crs`, `Content-Bbox` (the rendered
   corners, in the CRS's axis order) and, on a collection with a temporal
   extent, `Content-Datetime` (the instant rendered).
 - **Anything else** is a 400 naming the accepted parameters: `bbox`,
   `bbox-crs`, `subset`, `subset-crs`, `center`, `center-crs`, `width`,
-  `height`, `scale-denominator`, `crs`, `datetime`, `transparent`, `f`,
-  `quality`, `elevation`, `parameter-name` (#954). Names are case-sensitive,
-  and a cache-buster such as `_` is rejected too.
+  `height`, `scale-denominator`, `crs`, `datetime`, `bgcolor`, `transparent`,
+  `void-color`, `void-transparent`, `f`, `quality`, `elevation`,
+  `parameter-name` (#954). Names are case-sensitive, and a cache-buster such
+  as `_` is rejected too.
 
 ### Map tile requests (OGC API - Tiles, Maps Map Tilesets)
 
@@ -456,9 +464,13 @@ service, take (#946):
   area (one alone keeps square pixels); `scale-denominator` derives the size
   from the scale at the tile's centre, and is a 400 with `width` or `height`.
   Sizes are capped as for maps: 8000 a side, 64 000 000 in all.
+- **Background** (Maps Background, which Map Tilesets requires on map
+  tiles too): `bgcolor`, `transparent`, `void-color` and `void-transparent`,
+  as on a map (#894). No tile reaches outside its CRS.
 - **Anything else** is a 400 naming the accepted parameters: `f`, `datetime`,
   `subset`, `width`, `height`, `scale-denominator`, `parameter-name`,
-  `elevation`, `quality`.
+  `elevation`, `quality`, `bgcolor`, `transparent`, `void-color`,
+  `void-transparent`.
 
 Vector tiles, `/collections/{id}/tiles/{tms}/{z}/{row}/{col}` at the shared
 root and `?f=mvt` on the per-API service, take the same `datetime` and
@@ -2242,7 +2254,10 @@ map CRS. The collection page shows the resolution, for example "2.5 km ×
 | `elevation` | no | the engine's default level | One vertical level as a number: a radar elevation angle in degrees, or a pressure or model level. Each engine sets its default and how a level is matched. On a collection with no vertical dimension, or not a finite number: 400. |
 | `f` | no | `image/png` | `image/png`, `image/jpeg`, or `image/webp` |
 | `parameter-name` | no | engine default | Selects a parameter on multi-parameter raster engines (GRIB, multi-param QueryData), or an RGB composite of a satellite collection, which renders with the `default` style only (another style is 404). The valid names are the keys of the collection's `parameter_names`. Without it, a multi-parameter collection's default parameter is drawn with that parameter's own style, so the map and the style legend are the ones naming it gives. Single-parameter engines ignore the value. Unknown names against a multi-parameter engine return 400. Non-OGC for OGC API - Maps today, but the `/preview` SPA dropdown depends on it. |
-| `transparent` | no | — | Accepted but currently a no-op |
+| `bgcolor` | no | `0xFFFFFF` | The background colour: `0xRRGGBB`, `#RRGGBB` (`%23` in a URL) or a W3C web colour name such as `SteelBlue`, any case. With it, the map is opaque unless `transparent=true`. Anything else is a 400. |
+| `transparent` | no | `true` without `bgcolor`, else `false` | `true` keeps the map's alpha: areas with no data are fully transparent, in the `bgcolor`'s colour when one is given. `false` composites the map onto `bgcolor`: areas with no data take it and semi-transparent colours blend onto it. JPEG, which has no alpha, is always opaque. Not `true` or `false` (any case): 400. |
+| `void-color` | no | `bgcolor` | The colour of the parts of the map outside its CRS: rows past a pole in CRS84 or EPSG:4326, and what lies past the projection's area in EPSG:3067 or EPSG:3035. Web Mercator has none. Forms as `bgcolor`. |
+| `void-transparent` | no | `transparent` | Whether those parts are transparent, as `transparent` says of areas with no data. |
 | `quality` | no | see description | MeteoCore extension: encoder quality, an integer from 1 to 100, for `image/webp` and `image/jpeg`. WebP 1–99 is lossy, 100 lossless; without it WebP uses the collection's `[wms] webp_quality`, else lossless. JPEG defaults to 85. With `image/png`, or out of range: 400. |
 
 Any other query parameter, a misspelling such as `heigth` included, is a 400 naming these, on the per-API routes and at the shared root alike. So is one given twice, such as `width=1&width=2`; only `subset` repeats. The style legend, `…/styles/{styleId}/legend`, takes `f` (`json`, the default, or `png`) and `parameter-name`, under the same rules. On the metadata routes, the landing page, `/conformance` and `/collections/{id}`, an `f` given twice is the same 400, per API and at the shared root, and `/collections` answers a repeated discovery parameter so too. The styles list is served only as JSON: it takes `f` as `json` or `application/json`, and any other value, `html` and `png` included, is a 400 naming the supported format. Each of these 400s is JSON, or an HTML page when the request asked for HTML: the first `f` is `html`, or there is no `f` and `Accept` ranks `text/html` first ([#1132](https://github.com/mrauhala/meteocore/issues/1132)).
@@ -2251,7 +2266,7 @@ Any other query parameter, a misspelling such as `heigth` included, is a 400 nam
 
 ### Responses
 
-PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. Each successful response carries:
+PNG/WebP responses are RGBA, transparent where there is no data unless the background parameters make them opaque. JPEG is RGB. Each successful response carries:
 
 - `Content-Type: image/png|image/jpeg|image/webp`
 - `Content-Crs:` OGC URI of the output CRS
@@ -2273,7 +2288,7 @@ PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. E
 
 ### Conformance Classes
 
-`core`, `collection-map`, `styled-map`, `spatial-subsetting`, `scaling`, `datetime`, `crs`, `png`, `jpeg`. WebP is implemented but no `webp` conformance class is declared (none exists in the OGC API - Maps 1.0 spec). Map Tilesets (`tilesets`) is declared at the shared root only, where map tiles sit under the map resource (`/collections/{id}/map/tiles`); this per-API service links map tilesets in `/tiles` instead.
+`core`, `collection-map`, `styled-map`, `background`, `spatial-subsetting`, `scaling`, `datetime`, `crs`, `png`, `jpeg`. WebP is implemented but no `webp` conformance class is declared (none exists in the OGC API - Maps 1.0 spec). Map Tilesets (`tilesets`) is declared at the shared root only, where map tiles sit under the map resource (`/collections/{id}/map/tiles`); this per-API service links map tilesets in `/tiles` instead.
 
 ## OGC API - Tiles
 
@@ -2323,7 +2338,7 @@ Raster requests resolve a style (the `default` style for the unstyled route, or 
 1. TMS → bbox conversion (Mercator math for `WebMercatorQuad`, linear lon/lat for `WorldCRS84Quad`).
 2. ETag check / rendered-cache check.
 3. On miss: acquire render permit (timed out → 503), call `MapEngine::get_raster_tile()` with the TMS-derived `output_crs`, colorize, encode.
-4. Empty (all-nodata) tiles return a memoized empty image of the tile's size in the requested format and quality, with `X-Cache: EMPTY` and that `Content-Type`: transparent in PNG and WebP, white in JPEG, which has no alpha. No cache insert.
+4. Empty (all-nodata) tiles return a memoized empty image of the tile's size in the requested format and quality, with `X-Cache: EMPTY` and that `Content-Type`: its background, transparent in PNG and WebP by default, white in JPEG, which has no alpha, or the `bgcolor`. No cache insert.
 
 Successful responses include `Content-Type`, `Content-Crs` (OGC URI for the TMS's CRS), `ETag`, `Cache-Control` (`max-age=86400, immutable` when a time instant is requested, `max-age=60, must-revalidate` otherwise), `OGCAPI-datetime` (the instant rendered, on a collection with a temporal extent) and `X-Cache: HIT|MISS|EMPTY`. The rendered cache keys on the time step rendered, so every selection resolving to one step shares its tile.
 
@@ -2344,7 +2359,7 @@ When `?f=mvt` (or `?f=application/vnd.mapbox-vector-tile`) is requested against 
 
 ### Conformance Classes
 
-`ogcapi-tiles-1`: `core`, `tileset`, `tilesets-list`, `geodata-tilesets`, `datetime`, `png`, `jpeg`, `mvt`. `tms-2.0`: `tilematrixset`, `json-tilematrixset`. WebP is implemented but has no conformance class. DateTime covers map and vector tiles ([#794](https://github.com/mrauhala/meteocore/issues/794)). At the shared root the Tiles block also declares OGC API - Maps `tilesets`: map tiles sit under the map resource there and take the Maps Scaling parameters.
+`ogcapi-tiles-1`: `core`, `tileset`, `tilesets-list`, `geodata-tilesets`, `datetime`, `png`, `jpeg`, `mvt`. `tms-2.0`: `tilematrixset`, `json-tilematrixset`. WebP is implemented but has no conformance class. DateTime covers map and vector tiles ([#794](https://github.com/mrauhala/meteocore/issues/794)). At the shared root the Tiles block also declares OGC API - Maps `tilesets`: map tiles sit under the map resource there and take the Maps Scaling and Background parameters.
 
 ## Caching
 
