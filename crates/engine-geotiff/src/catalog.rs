@@ -294,6 +294,25 @@ impl Catalog {
         })
     }
 
+    /// Carry into this catalog, which a poll's scan built from `current`,
+    /// the loads that finished during the scan: an entry this catalog holds
+    /// as a stub takes the loaded state `current` has at its timestep, only
+    /// when both name the same object ([`FileEntry::same_object`]: for a
+    /// STAC item its asset href and `file:size`, as the gone screen keys
+    /// it). A stub of another object at that timestep, an item republished
+    /// under it, stays a stub: the old object's header and tile layout
+    /// would serve stale tiles, and the stub loads afresh (#1055). Cheap:
+    /// the states are `Arc`s.
+    pub(crate) fn keep_loads_from(&mut self, current: &Catalog) {
+        for (timestamp, before) in &current.entries {
+            if let Some(entry) = self.entries.get_mut(timestamp) {
+                if before.is_loaded() && !entry.is_loaded() && entry.same_object(before) {
+                    entry.state = before.state.clone();
+                }
+            }
+        }
+    }
+
     /// The timesteps both `previous` and this catalog hold, each with
     /// another object here (#1055), newest first: frames republished since
     /// `previous`, whose renders were cached from the object they replaced.
@@ -1671,5 +1690,49 @@ mod tests {
         assert_eq!(fresh, [t(3), t(2), t(1)]);
         assert_eq!(current.republished_since(&previous), [t(2), t(1)]);
         assert!(current.republished_since(&current).is_empty());
+    }
+
+    /// #1055: a poll keeps a load that finished during its scan for the
+    /// same object only. A stub with another href or size at that
+    /// timestep, an item republished under it, stays a stub.
+    #[test]
+    fn a_poll_keeps_loads_of_the_same_object_only() {
+        let t = |minute: i64| DateTime::<Utc>::from_timestamp(minute * 60, 0).unwrap();
+        let stub = |href: &str, size| {
+            FileEntry::stac_stub(
+                PathBuf::from(href),
+                size,
+                StacStub {
+                    bbox: None,
+                    asset_url: href.to_string(),
+                },
+            )
+        };
+        let loaded = |href: &str, size| {
+            let mut entry = stub(href, size);
+            entry.set_loaded(
+                Arc::new(dummy_metadata()),
+                Arc::new(DataSource::from_bytes(Vec::<u8>::new())),
+            );
+            entry
+        };
+        let catalog = |entries: Vec<(DateTime<Utc>, FileEntry)>| Catalog {
+            entries: entries.into_iter().collect(),
+            temporal_extent: None,
+            spatial_extent: None,
+        };
+        let current = catalog(vec![
+            (t(0), loaded("a", 1)),
+            (t(1), loaded("b", 1)),
+            (t(2), loaded("c", 1)),
+        ]);
+        let mut scanned = catalog(vec![
+            (t(0), stub("a", 1)),
+            (t(1), stub("b2", 1)),
+            (t(2), stub("c", 2)),
+        ]);
+        scanned.keep_loads_from(&current);
+        let loads: Vec<bool> = scanned.entries.values().map(FileEntry::is_loaded).collect();
+        assert_eq!(loads, [true, false, false]);
     }
 }

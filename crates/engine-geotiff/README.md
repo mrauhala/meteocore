@@ -53,8 +53,12 @@ tiles a request touches, so a remote COG is not downloaded whole.
   and a remote one is pre-warmed like a new frame. The poll also moves the
   collection's `content_version`, so the rendered and meta-tile caches
   stop serving the renders made before, and explicit-time responses are
-  no longer `immutable`. A STAC source keeps the item it catalogued first
-  for a timestamp.
+  no longer `immutable`. A STAC listing adds items only at timestamps the
+  catalog does not hold, so an item republished under a held timestamp
+  joins once the old one has left, for example when its asset was found
+  gone. An item with another asset href or `file:size` is then a new
+  object: it loads its own header, never the old item's, and is treated
+  as above.
 - **Remote failures.** A failed tile fetch is retried twice, then the
   request fails with 503, never a nodata gap. An object gone after the
   scan (404, 416, or shorter than the range) draws nodata for that request

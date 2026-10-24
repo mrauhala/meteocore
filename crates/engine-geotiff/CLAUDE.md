@@ -144,15 +144,18 @@ apply here.
   held, bounded by that loader's claims.
 - Every loader shares `fetch_stac_entry_metadata`, `settle_stac_load`
   (install, or drop a gone asset, #1119) and the `loading_in_flight`
-  single-flight set. The preload and a query's
-  concurrent loads claim through `claim_and_load_stac_entry`, which
-  `try_claim`s without parking: a future parked on the condvar would stall
-  every other load of its `block_on`. The preload skips an item someone else
-  is loading. A query waits for such items (`ensure_metadata`) only after its
-  own loads finish, holding no claim, so two loaders never wait on each
-  other; it loads an item itself only when that loader gave it up. Install
-  through `install_stac_metadata`, whose `rcu` keeps concurrent loaders from
-  dropping each other's update.
+  single-flight set. The preload and a query's concurrent loads claim
+  through `claim_and_load_stac_entry`, which `try_claim`s without parking: a
+  future parked on the condvar would stall every other load of its
+  `block_on`. The preload skips an item someone else is loading. A query
+  waits for such items (`ensure_metadata`) only after its own loads finish,
+  holding no claim, so two loaders never wait on each other; it loads an
+  item itself only when that loader gave it up. Install through
+  `install_stac_metadata`, whose `rcu` keeps concurrent loaders from
+  dropping each other's update. A poll keeps a load that finished during its
+  scan only for the same object (`Catalog::keep_loads_from`: href and
+  `file:size`); a stub of another item at that timestep stays a stub and
+  loads afresh (#1055).
 
 ## Decode admission
 

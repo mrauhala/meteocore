@@ -1723,79 +1723,8 @@ impl GeoTiffEngine {
 
     fn poll_once(&self) {
         let current = self.catalog.load();
-        let result = self.do_scan(&current);
-
-        match result {
-            Ok(mut new_catalog) => {
-                let old_count = current.entries.len();
-
-                // Merge loaded metadata from current catalog into new catalog.
-                // Prevents race where lazy loads completed between scan-start
-                // and catalog-swap are overwritten by stubs.
-                // This is correct: Arc-cloning state is cheap (pointer bump).
-                for (timestamp, current_entry) in &current.entries {
-                    if current_entry.is_loaded() {
-                        if let Some(new_entry) = new_catalog.entries.get_mut(timestamp) {
-                            if !new_entry.is_loaded() {
-                                new_entry.state = current_entry.state.clone();
-                            }
-                        }
-                    }
-                }
-
-                let count = new_catalog.entries.len();
-                let total_bytes: u64 = new_catalog.entries.values().map(|e| e.file_size).sum();
-
-                if count == 0 && old_count > 0 {
-                    let failures = self
-                        .consecutive_poll_failures
-                        .fetch_add(1, Ordering::Relaxed)
-                        + 1;
-                    if failures >= 10 {
-                        tracing::error!(
-                            "[{}] Poll returned 0 files for {} consecutive cycles (was {}). \
-                             Data source may be permanently unavailable. Serving stale data.",
-                            self.collection_id,
-                            failures,
-                            old_count
-                        );
-                    } else {
-                        tracing::warn!(
-                            "[{}] Poll returned 0 files (was {}, {} consecutive). \
-                             Keeping old catalog. Check data source connectivity and filename pattern.",
-                            self.collection_id,
-                            old_count,
-                            failures
-                        );
-                    }
-                    return;
-                }
-
-                self.consecutive_poll_failures.store(0, Ordering::Relaxed);
-                let republished = new_catalog.republished_since(&current);
-                self.catalog.store(Arc::new(new_catalog));
-                self.note_republished(&republished);
-                // Rebuild the cached RasterInfo off the request path (#211).
-                self.refresh_raster_info();
-                // Stamp the poll age only when the scan found files: an
-                // empty scan over a catalog that was already empty must not
-                // reset it (#1007).
-                if count > 0 {
-                    *self
-                        .catalog_updated_at
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
-                }
-                let (hits, misses) = self.tile_cache.stats();
-                tracing::debug!(
-                    "[{}] Poll: {} files ({}), tile cache: {} hits / {} misses",
-                    self.collection_id,
-                    count,
-                    format_bytes(total_bytes),
-                    hits,
-                    misses
-                );
-            }
+        match self.do_scan(&current) {
+            Ok(new_catalog) => self.install_scan(&current, new_catalog),
             Err(e) => {
                 let failures = self
                     .consecutive_poll_failures
@@ -1816,6 +1745,71 @@ impl GeoTiffEngine {
                 }
             }
         }
+    }
+
+    /// Store `new_catalog`, the catalog a poll's scan built over `current`:
+    /// unless it found no file where `current` held some, which keeps
+    /// `current` and counts a failure. Moves `content_version` for the
+    /// timesteps it finds republished (#1055) after the store.
+    fn install_scan(&self, current: &Catalog, mut new_catalog: Catalog) {
+        let old_count = current.entries.len();
+
+        // A load that finished during the scan stays loaded, for the same
+        // object only (#1055).
+        new_catalog.keep_loads_from(current);
+
+        let count = new_catalog.entries.len();
+        let total_bytes: u64 = new_catalog.entries.values().map(|e| e.file_size).sum();
+
+        if count == 0 && old_count > 0 {
+            let failures = self
+                .consecutive_poll_failures
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if failures >= 10 {
+                tracing::error!(
+                    "[{}] Poll returned 0 files for {} consecutive cycles (was {}). \
+                     Data source may be permanently unavailable. Serving stale data.",
+                    self.collection_id,
+                    failures,
+                    old_count
+                );
+            } else {
+                tracing::warn!(
+                    "[{}] Poll returned 0 files (was {}, {} consecutive). \
+                     Keeping old catalog. Check data source connectivity and filename pattern.",
+                    self.collection_id,
+                    old_count,
+                    failures
+                );
+            }
+            return;
+        }
+
+        self.consecutive_poll_failures.store(0, Ordering::Relaxed);
+        let republished = new_catalog.republished_since(current);
+        self.catalog.store(Arc::new(new_catalog));
+        self.note_republished(&republished);
+        // Rebuild the cached RasterInfo off the request path (#211).
+        self.refresh_raster_info();
+        // Stamp the poll age only when the scan found files: an
+        // empty scan over a catalog that was already empty must not
+        // reset it (#1007).
+        if count > 0 {
+            *self
+                .catalog_updated_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
+        }
+        let (hits, misses) = self.tile_cache.stats();
+        tracing::debug!(
+            "[{}] Poll: {} files ({}), tile cache: {} hits / {} misses",
+            self.collection_id,
+            count,
+            format_bytes(total_bytes),
+            hits,
+            misses
+        );
     }
 }
 
