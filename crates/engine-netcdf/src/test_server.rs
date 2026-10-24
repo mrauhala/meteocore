@@ -115,6 +115,21 @@ impl TestServer {
             .insert(path.trim_start_matches('/').to_string(), Arc::new(dataset));
     }
 
+    /// The `.dods` body the OPeNDAP dataset at `/path` answers the
+    /// constraint `query` with, as sent (its DDS, `Data:`, the values), or
+    /// the server's error; nothing logged.
+    pub fn dods(&self, path: &str, query: &str) -> Result<Vec<u8>, String> {
+        let dataset = self
+            .state
+            .lock()
+            .unwrap()
+            .datasets
+            .get(path.trim_start_matches('/'))
+            .cloned()
+            .ok_or_else(|| format!("no dataset at {path}"))?;
+        dataset.data(query)
+    }
+
     /// Stop serving the OPeNDAP dataset at `/path`: a 404 from then on.
     pub fn remove_opendap(&self, path: &str) {
         self.state
@@ -586,9 +601,11 @@ impl Dataset {
         (200, response)
     }
 
-    /// The `.dods` reply to a constraint: the projections' declarations in
-    /// dataset order (a Grid's array projected as `g.g` inside a
-    /// Structure, as THREDDS answers), `Data:`, then their values in XDR.
+    /// The `.dods` reply to a constraint of one or more comma-separated
+    /// projections: their declarations in dataset order, whatever the
+    /// constraint's (a Grid's array projected as `g.g` inside a Structure
+    /// of its own, as THREDDS answers: testdata/netcdf-opendap), `Data:`,
+    /// then their values in XDR, in the same order.
     fn data(&self, query: &str) -> Result<Vec<u8>, String> {
         let query = percent_decoded(query);
         let mut selected: Vec<(usize, bool, Vec<Slab>)> = Vec::new();

@@ -22,7 +22,10 @@
 //!   ([`remote::dap_reply`]), single-flight, where a range read keeps its
 //!   compressed chunk. An EDR query reads only the window of a field it
 //!   samples (#1171, [`crate::field::read_uncached`]): a reply of its own,
-//!   428 bytes for a point's 2 × 2 cells of a MEPS field.
+//!   428 bytes for a point's 2 × 2 cells of a MEPS field. The windows of
+//!   several variables at one step are one request (#1274,
+//!   [`DapFile::read_fields`]): one projection each in the constraint, one
+//!   reply listing them in dataset order.
 //! - **Requests** go through the host's stores ([`Host`]): its request
 //!   limit and 429 back-off, its `storage` span, under the calling thread's
 //!   [`Mode`], on the I/O runtime ([`io::blocking`]). THREDDS streams every
@@ -291,28 +294,54 @@ impl DapFile {
         Ok(raw.into_f64())
     }
 
-    /// Variable `read`'s hyperslab `selection`, in its stored type: one
-    /// `.dods`, from the chunk cache or fetched once for every concurrent
-    /// reader. A whole field and each window of it (#1171) are replies of
-    /// their own, cached under their own constraints, each capped at the
-    /// size of what it selects.
+    /// Variable `read`'s hyperslab `selection`, in its stored type: one of
+    /// [`Self::read_fields`].
+    #[cfg(test)]
     pub(crate) fn read_field(
         &self,
         read: &FieldRead,
         selection: &NcSliceInfo,
     ) -> Result<Raw, DataServerError> {
-        let name = &*read.name;
-        let projection = self.metadata.projection(name).ok_or_else(|| {
-            DataServerError::Storage(format!("{}: no variable '{name}'", self.id.url))
-        })?;
-        let constraint = dap::constraint(projection, selection);
-        let dtype = &self
-            .metadata
-            .variables
-            .iter()
-            .find(|v| v.name == name)
-            .map_or(NcType::Double, |v| v.dtype.clone());
-        let max = dap::xdr_bytes(dtype, dap::selected(selection)).saturating_add(REPLY_DDS_BYTES);
+        let mut raws = self.read_fields(&[(read, selection)])?;
+        Ok(raws.remove(0))
+    }
+
+    /// Each of `reads`, a variable's hyperslab, in its stored type, in
+    /// `reads`' order: one `.dods` whose constraint projects each
+    /// hyperslab, comma-separated in `reads`' order, from the chunk cache
+    /// or fetched once for every concurrent reader. A whole field, each
+    /// window of it (#1171) and each set of windows read together (#1274)
+    /// are replies of their own, cached under their own constraints, each
+    /// capped at the size of what it selects, plus one DDS.
+    ///
+    /// A DAP2 reply lists its variables in dataset order, whatever the
+    /// constraint's (THREDDS, measured 2026-10-24): each read's values are
+    /// found by its array's name ([`dap::Projection::leaf`]), the reads of
+    /// one name in dataset order.
+    pub(crate) fn read_fields(
+        &self,
+        reads: &[(&FieldRead, &NcSliceInfo)],
+    ) -> Result<Vec<Raw>, DataServerError> {
+        let mut found: Vec<(usize, &dap::Projection)> = Vec::with_capacity(reads.len());
+        let mut constraints = Vec::with_capacity(reads.len());
+        let mut max = REPLY_DDS_BYTES;
+        for &(read, selection) in reads {
+            let name = &*read.name;
+            let position = self
+                .metadata
+                .variables
+                .iter()
+                .position(|v| v.name == name)
+                .ok_or_else(|| {
+                    DataServerError::Storage(format!("{}: no variable '{name}'", self.id.url))
+                })?;
+            let projection = &self.metadata.projections[position];
+            constraints.push(dap::constraint(projection, selection));
+            let dtype = &self.metadata.variables[position].dtype;
+            max = max.saturating_add(dap::xdr_bytes(dtype, dap::selected(selection)));
+            found.push((position, projection));
+        }
+        let constraint = constraints.join(",");
         let invalid = |e: String| DataServerError::Storage(format!("{}: {e}", self.id.url));
         let reply = remote::dap_reply(&self.id, &constraint, || {
             let mut reply = self.fetch(&[(".dods", Some(constraint.clone()))], max)?;
@@ -323,16 +352,31 @@ impl DapFile {
             Ok(bytes)
         })
         .map_err(|failure| failure.to_error())?;
-        let raw = dap::decode(&reply)
-            .and_then(|values| {
-                dap::take(values, &projection.leaf).ok_or_else(|| "not in the reply".into())
-            })
-            .map_err(invalid)?;
-        // DAP2's Byte is unsigned; a signed byte's bits are its own.
-        Ok(match (read.stored, raw) {
-            (Stored::Byte, Raw::U8(bytes)) => Raw::I8(bytes.into_iter().map(|b| b as i8).collect()),
-            (_, raw) => raw,
-        })
+        let mut values: Vec<Option<(String, Raw)>> = dap::decode(&reply)
+            .map_err(invalid)?
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut order: Vec<usize> = (0..reads.len()).collect();
+        order.sort_by_key(|&i| found[i].0);
+        let mut raws: Vec<Option<Raw>> = (0..reads.len()).map(|_| None).collect();
+        for i in order {
+            let leaf = &found[i].1.leaf;
+            let raw = values
+                .iter_mut()
+                .find(|value| value.as_ref().is_some_and(|(name, _)| name == leaf))
+                .and_then(Option::take)
+                .map(|(_, raw)| raw)
+                .ok_or_else(|| invalid(format!("'{leaf}' is not in the reply")))?;
+            // DAP2's Byte is unsigned; a signed byte's bits are its own.
+            raws[i] = Some(match (reads[i].0.stored, raw) {
+                (Stored::Byte, Raw::U8(bytes)) => {
+                    Raw::I8(bytes.into_iter().map(|b| b as i8).collect())
+                }
+                (_, raw) => raw,
+            });
+        }
+        Ok(raws.into_iter().flatten().collect())
     }
 
     /// Whether the reply of `read`'s hyperslab `selection` is in the chunk

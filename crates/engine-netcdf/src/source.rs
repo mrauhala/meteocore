@@ -79,9 +79,9 @@ impl Reader {
 
     /// Variable `read` at step `time`, the stored levels of `span`, over
     /// `selection` (its whole field, [`FieldRead::selection`], or a window
-    /// of it, [`FieldRead::window_selection`]), in its stored type. A
-    /// failed remote read keeps its meaning ([`ReadFailure::to_error`]): a
-    /// deadline, or a replaced file's 503.
+    /// of it, [`FieldRead::window_selection`]), in its stored type: one of
+    /// [`Self::read_fields`].
+    #[cfg(test)]
     pub(crate) fn read_field(
         &self,
         read: &FieldRead,
@@ -89,36 +89,34 @@ impl Reader {
         span: Span,
         selection: &NcSliceInfo,
     ) -> Result<Raw, DataServerError> {
+        let mut raws = self.read_fields(time, &[(read, span, selection)])?;
+        Ok(raws.remove(0))
+    }
+
+    /// Each of `reads` at step `time`: a variable, the stored levels of its
+    /// span, over its selection (its whole field, [`FieldRead::selection`],
+    /// or a window of it, [`FieldRead::window_selection`]), in its stored
+    /// type, in `reads`' order. Through OPeNDAP one request for all of
+    /// them (#1274, [`DapFile::read_fields`]); from a NetCDF file one slice
+    /// read each. A failed remote read keeps its meaning
+    /// ([`ReadFailure::to_error`]): a deadline, or a replaced file's 503.
+    pub(crate) fn read_fields(
+        &self,
+        time: u32,
+        reads: &[(&FieldRead, Span, &NcSliceInfo)],
+    ) -> Result<Vec<Raw>, DataServerError> {
         match self {
-            Reader::Nc { nc, .. } => {
-                let name = &*read.name;
-                let fail = |e: netcdf_reader::Error| match ReadFailure::find(&e) {
-                    Some(failure) => failure.to_error(),
-                    None => DataServerError::Storage(format!(
-                        "variable '{name}' step {time} stored levels {}-{}: {e}",
-                        span.first, span.last
-                    )),
-                };
-                macro_rules! typed {
-                    ($t:ty, $variant:ident) => {
-                        Raw::$variant(into_vec(
-                            nc.read_variable_slice::<$t>(name, selection)
-                                .map_err(fail)?,
-                        ))
-                    };
-                }
-                Ok(match read.stored {
-                    Stored::Byte => typed!(i8, I8),
-                    Stored::UByte => typed!(u8, U8),
-                    Stored::Short => typed!(i16, I16),
-                    Stored::UShort => typed!(u16, U16),
-                    Stored::Int => typed!(i32, I32),
-                    Stored::UInt => typed!(u32, U32),
-                    Stored::Float => typed!(f32, F32),
-                    Stored::Double => typed!(f64, F64),
-                })
+            Reader::Nc { nc, .. } => reads
+                .iter()
+                .map(|&(read, span, selection)| read_slice(nc, read, time, span, selection))
+                .collect(),
+            Reader::Dap(dap) => {
+                let slabs: Vec<(&FieldRead, &NcSliceInfo)> = reads
+                    .iter()
+                    .map(|&(read, _, selection)| (read, selection))
+                    .collect();
+                dap.read_fields(&slabs)
             }
-            Reader::Dap(dap) => dap.read_field(read, selection),
         }
     }
 
@@ -177,6 +175,43 @@ impl Reader {
             Reader::Dap(dap) => dap.read_failed(),
         }
     }
+}
+
+/// Variable `read` of `nc` at step `time`, the stored levels of `span`,
+/// over `selection`, in its stored type: one typed slice read.
+fn read_slice(
+    nc: &NcFile,
+    read: &FieldRead,
+    time: u32,
+    span: Span,
+    selection: &NcSliceInfo,
+) -> Result<Raw, DataServerError> {
+    let name = &*read.name;
+    let fail = |e: netcdf_reader::Error| match ReadFailure::find(&e) {
+        Some(failure) => failure.to_error(),
+        None => DataServerError::Storage(format!(
+            "variable '{name}' step {time} stored levels {}-{}: {e}",
+            span.first, span.last
+        )),
+    };
+    macro_rules! typed {
+        ($t:ty, $variant:ident) => {
+            Raw::$variant(into_vec(
+                nc.read_variable_slice::<$t>(name, selection)
+                    .map_err(fail)?,
+            ))
+        };
+    }
+    Ok(match read.stored {
+        Stored::Byte => typed!(i8, I8),
+        Stored::UByte => typed!(u8, U8),
+        Stored::Short => typed!(i16, I16),
+        Stored::UShort => typed!(u16, U16),
+        Stored::Int => typed!(i32, I32),
+        Stored::UInt => typed!(u32, U32),
+        Stored::Float => typed!(f32, F32),
+        Stored::Double => typed!(f64, F64),
+    })
 }
 
 /// A read's values in their stored type, row-major.

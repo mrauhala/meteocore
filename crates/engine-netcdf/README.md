@@ -69,9 +69,16 @@ or downloaded whole.
   over a 67-lead run is 67 requests, about 9 s, not 871. Levels are read
   together while that reads at most half of what their fields hold whole:
   a Z trajectory, whose levels sample different cells, or levels far apart
-  over a wide area, are read level by level. Windows are kept in the chunk
-  cache under their own constraints; the values are the ones the whole
-  field gives. A window over half the field reads the field whole, and a
+  over a wide area, are read level by level. The windows of several
+  variables at one step are one `.dods` too (#1274), each variable its own
+  hyperslab in the constraint, up to 16 planes (variables × the levels of
+  their hyperslabs) a request: measured from a server's network
+  (2026-10-24), a request costs about 0.25 s plus 0.016 s per plane, so a
+  six-variable surface meteogram over a 67-lead run is 67 requests, not
+  402, and a 13-level variable fills a request alone. Windows are kept in
+  the chunk cache under their own constraints, a request of several
+  variables under the whole constraint: a query of a subset of them makes
+  requests of its own. The values are the ones the whole field gives. A window over half the field reads the field whole, and a
   field a render, a prewarm or another query left cached whole is sampled
   whole, without a request. Maps read whole fields. Replies stream
   chunked, without `Content-Length`, and are read whole; every request
@@ -210,8 +217,8 @@ apart from its surface family (MEPS `sfc`).
   and is not added to the field cache. A trajectory or cube reads only the
   fields it samples, and a field it samples nowhere on the grid is not
   read. Through OPeNDAP the read is the window of the field the query
-  samples, the levels of a variable's step in one read (see OPeNDAP
-  above).
+  samples, the levels of a variable's step in one read, and the windows of
+  a step's variables in one request (see OPeNDAP above).
 - Two caps, checked from the metadata before any read, refuse a larger
   query with a 400 naming what it would read and how to narrow it:
   `MC_NETCDF_EDR_QUERY_MB` on what its reads decode (a whole field its
@@ -328,7 +335,7 @@ Process-wide environment variables, shared by every NetCDF collection:
 | `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote files read by range; at least 8 |
 | `MC_NETCDF_READ_MEMORY_MB` | `1024` | Buffers of field reads in progress; a read that does not fit is a 503 |
 | `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read, checked from the metadata before any read: each read at what it decodes, a whole field its size (4.06 MB for MEPS), a window read through OPeNDAP its cells × the levels of its hyperslab × 4 bytes. Only the fields read count: a trajectory the (step, level) fields its path reads, a cube the levels its `z` positions take, a per-step amount its accumulation at the step before each step too. Over it a 400. Read whole, fits one variable, or a derived wind speed (both components), over a 67-lead MEPS run, but not one variable at all 13 pressure levels (871 fields) |
-| `MC_NETCDF_EDR_QUERY_READS` | `200` | Field reads one EDR query may make, counted from the same plan before any read, for every access: a field of one level is one read, and through OPeNDAP the window of every level asked of a variable at one step is one. Over it a 400. Through OPeNDAP, one variable at every MEPS pressure level over a 67-lead run is 67 reads and a derived wind speed 134; three variables over a run, 201, are just over it. 200 window reads of 13 levels, four at a time at up to 0.55 s each, take about 27 s, inside the 30 s EDR deadline. Read whole, `MC_NETCDF_EDR_QUERY_MB` binds first (140 MEPS fields) |
+| `MC_NETCDF_EDR_QUERY_READS` | `200` | Field reads one EDR query may make, counted from the same plan before any read, for every access: a field of one level is one read, and through OPeNDAP one request is one, holding the window of every level asked of a variable at one step and the windows of up to 16 planes of a step's variables. Over it a 400. Through OPeNDAP, a six-variable surface meteogram over a 67-lead MEPS run is 67 reads, one variable at every pressure level over the run 67 and a derived wind speed 134; three variables at every level, 201, are just over it. 200 requests of up to 16 planes, four at a time at up to 0.55 s each, take about 27 s, inside the 30 s EDR deadline. Read whole, `MC_NETCDF_EDR_QUERY_MB` binds first (140 MEPS fields) |
 
 ## Limits
 
@@ -374,8 +381,8 @@ Fixtures under `testdata/`, each with a README and the script that built
 it, or its source: `netcdf-thredds-catalog/` (MET Norway's THREDDS catalog
 of one MEPS day directory, as served, for the `catalog_url` tests);
 `netcdf-opendap/` (what thredds.met.no's OPeNDAP served for two MEPS
-files: DDS, DAS, the coordinates reply and a 4 × 4 hyperslab, for the
-DAP2 format tests; the OPeNDAP collection tests serve the MEPS samples
+files: DDS, DAS, the coordinates reply, a 4 × 4 hyperslab and the 2 × 2
+windows of two variables in one reply, for the DAP2 format tests; the OPeNDAP collection tests serve the MEPS samples
 through a local DAP2 server and compare them with the files read locally);
 `meps-netcdf/` and `meps-netcdf-pl/` (real MEPS surface and
 pressure-level files cropped to 11 × 10 points, two runs);

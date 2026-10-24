@@ -39,18 +39,20 @@
 #     and 256 MB decoded (MC_NETCDF_FIELD_CACHE_MB).
 #   - per prewarm variable: about 272 MB per run (67 fields), fetched by the
 #     poll whether or not anyone draws them. Off here.
-#   - per EDR query: one `.dods` per field of only the cells the query
-#     samples. At a point that is 2 x 2 cells, 428 bytes against the
-#     field's 4.06 MB (0.10 s against 0.25 s, measured 2026-10-24 from a
-#     server's network): a position series over a whole run is 67 such
-#     requests, about 29 KB, and a wind_speed_10m series, which reads both
-#     wind components, 134. An area or cube over more than half the grid
+#   - per EDR query: only the cells the query samples, every variable it
+#     reads at one lead in one `.dods` (up to 16 a request). At a point
+#     that is 2 x 2 cells, 428 bytes for one variable against the field's
+#     4.06 MB (0.10 s against 0.25 s, measured 2026-10-24 from a server's
+#     network; a request of several variables about 0.25 s plus 0.016 s
+#     per variable): a position series over a whole run is 67 such
+#     requests, about 29 KB per variable, for one parameter, a
+#     wind_speed_10m (both wind components) or a meteogram of every
+#     variable served here. An area or cube over more than half the grid
 #     reads its fields whole, and a field cached whole is not fetched
-#     again. A query makes at most MC_NETCDF_EDR_QUERY_READS reads (200:
-#     three variables over a whole run, 201, are just over it) and decodes
-#     at most MC_NETCDF_EDR_QUERY_MB (544 MiB, a window counted at its
-#     cells, a field read whole at 4.06 MB); name the variables with
-#     `parameter-name`.
+#     again. A query makes at most MC_NETCDF_EDR_QUERY_READS requests
+#     (200) and decodes at most MC_NETCDF_EDR_QUERY_MB (544 MiB, a window
+#     counted at its cells, a field read whole at 4.06 MB); name the
+#     variables with `parameter-name`.
 
 id = "meps-netcdf-opendap"
 title = "MEPS Surface (CF-NetCDF, thredds.met.no OPeNDAP)"

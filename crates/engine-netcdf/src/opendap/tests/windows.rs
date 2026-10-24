@@ -3,9 +3,10 @@
 //! whole field unless the window would pass half of it, and the answer is
 //! the one the whole field gives, value for value. The levels a query asks
 //! of one field at one step are one hyperslab over the stored levels
-//! between them, while that stays cheap: one request per variable and
-//! step, which the read cap counts once. Every query here is asked of the
-//! same files read locally, which read whole fields.
+//! between them, while that stays cheap; and the windows of several
+//! variables at one step are one request of at most 16 planes (#1274),
+//! which the read cap counts once. Every query here is asked of the same
+//! files read locally, which read whole fields.
 
 use std::time::{Duration, Instant};
 
@@ -107,21 +108,56 @@ fn polygon(corners: &[(f64, f64)]) -> String {
     format!("POLYGON(({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))")
 }
 
-/// The `.dods` reads of `variable` among `requests`: each one's file name
-/// and its hyperslabs, `[i]` or `[start:stride:stop]` per axis.
+/// A constraint's projections, brackets decoded.
+fn projections(query: &str) -> Vec<String> {
+    query
+        .split(',')
+        .map(|p| p.replace("%5B", "[").replace("%5D", "]"))
+        .collect()
+}
+
+/// The `.dods` reads of `variable` among `requests`, one per projection of
+/// it in a request's constraint: each one's file name and its hyperslabs,
+/// `[i]` or `[start:stride:stop]` per axis.
 fn reads_of(requests: &[Request], variable: &str) -> Vec<(String, Vec<String>)> {
-    let grid = format!("{variable}.{variable}");
+    let grid = &format!("{variable}.{variable}");
     requests
         .iter()
         .filter_map(|r| {
             let (file, query) = r.path.split_once(".dods?")?;
-            let query = query.replace("%5B", "[").replace("%5D", "]");
-            let slabs = query
-                .strip_prefix(&grid)
-                .or_else(|| query.strip_prefix(variable))
-                .filter(|slabs| slabs.starts_with('['))?;
             let file = file.rsplit('/').next()?.to_string();
-            Some((file, slabs.split_inclusive(']').map(String::from).collect()))
+            Some((file, projections(query)))
+        })
+        .flat_map(|(file, projections)| {
+            projections.into_iter().filter_map(move |projection| {
+                let slabs = projection
+                    .strip_prefix(grid.as_str())
+                    .or_else(|| projection.strip_prefix(variable))
+                    .filter(|slabs| slabs.starts_with('['))?;
+                Some((
+                    file.clone(),
+                    slabs.split_inclusive(']').map(String::from).collect(),
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Each `.dods` request among `requests`: its file name and the variables
+/// its constraint projects, in the constraint's order.
+fn requested(requests: &[Request]) -> Vec<(String, Vec<String>)> {
+    requests
+        .iter()
+        .filter_map(|r| {
+            let (file, query) = r.path.split_once(".dods?")?;
+            let variables = projections(query)
+                .iter()
+                .map(|projection| {
+                    let path = projection.split('[').next().unwrap_or_default();
+                    path.split('.').next().unwrap_or_default().to_string()
+                })
+                .collect();
+            Some((file.rsplit('/').next()?.to_string(), variables))
         })
         .collect()
 }
@@ -581,12 +617,14 @@ fn levels_read(reads: &[(String, Vec<String>)]) -> Vec<&str> {
 /// A position series at all 13 pressure levels over six steps is one
 /// request per variable and step, not one per level: one hyperslab over the
 /// 13 stored levels of the point's 2 × 2 cells, its rows read where they
-/// are stored, south-up. Every level answers what the file read whole
-/// answers, the fill cell's neighbour included. The byte cap counts what
-/// the windows decode (12 reads of 2 × 2 cells × 13 levels × 4 bytes), so
-/// a cap that refuses the same series read whole admits it; the read cap
-/// counts each window of 13 levels once, and over it refuses before any
-/// request. Asked again, every window comes from the chunk cache.
+/// are stored, south-up; two variables of 13 planes each are past the 16 a
+/// request holds. Every level answers what the file read whole answers, the
+/// fill cell's neighbour included. The byte cap counts what the windows
+/// decode (12 reads of 2 × 2 cells × 13 levels × 4 bytes), so a cap that
+/// refuses the same series read whole admits it; the read cap counts each
+/// window of 13 levels once, and over it refuses before any request, asking
+/// for fewer levels too, with which the two would share a request. Asked
+/// again, every window comes from the chunk cache.
 #[test]
 fn a_series_at_every_level_is_one_request_per_variable_and_step() {
     let _pool = crate::remote::tests::query_pool_shared();
@@ -608,7 +646,7 @@ fn a_series_at_every_level_is_one_request_per_variable_and_step() {
     assert!(
         refused.contains("12 field reads (6 timesteps × 2 source variables)")
             && refused.contains("the limit is 11 reads")
-            && !refused.contains("level"),
+            && refused.contains("fewer pressure levels (z)"),
         "levels read together are no reads more: {refused}"
     );
     let refused = ask(
@@ -883,4 +921,397 @@ fn a_read_of_every_level_past_its_deadline_lands_in_the_cache() {
         "the first query's requests only: {reads:#?}"
     );
     assert!(levels_read(&reads).iter().all(|&slab| slab == "[0:1:12]"));
+}
+
+/// The sfc fixture's variables listed in reverse of the files' order: a
+/// request's constraint names them in the layout's order, the reverse of
+/// the reply's, which follows the dataset's as THREDDS's does.
+const SFC_REVERSED: &str = r#"variables = ["cloud_area_fraction", "precipitation_amount_acc",
+    "air_pressure_at_sea_level", "wind_speed_of_gust", "y_wind_10m", "x_wind_10m",
+    "relative_humidity_2m", "air_temperature_2m"]"#;
+
+/// The variables of [`SFC_REVERSED`], in its order.
+const SFC_REVERSED_NAMES: [&str; 8] = [
+    "cloud_area_fraction",
+    "precipitation_amount_acc",
+    "air_pressure_at_sea_level",
+    "wind_speed_of_gust",
+    "y_wind_10m",
+    "x_wind_10m",
+    "relative_humidity_2m",
+    "air_temperature_2m",
+];
+
+/// The read cap alone, at `reads`.
+fn reads(reads: usize) -> Limits {
+    Limits {
+        bytes: u64::MAX,
+        reads,
+    }
+}
+
+/// A position series of every parameter (eight variables and the per-step
+/// precipitation) is one request per step (#1274), not one per variable:
+/// the 2 × 2 windows of the eight variables in one constraint, in the
+/// layout's order, answered in the dataset's. It answers what the files
+/// read whole answer, and each parameter what its series read alone
+/// answers, value for value. The read cap counts each request once: three
+/// reads, refused at two before any request. Asked again, every reply
+/// comes from the chunk cache.
+#[test]
+fn a_series_of_several_variables_is_one_request_per_step() {
+    let _pool = crate::remote::tests::query_pool_shared();
+    let files = sfc_files();
+    let (_dir, local) = local(&files, "sfc", SFC_REVERSED);
+    let server = TestServer::new();
+    publish(&server, &files, true, None);
+    let dap = opened(&config(&server, "sfc", &[0, 1, 2], SFC_REVERSED));
+    server.take();
+    let at = at_cells(&dap, &[(4.3, 5.6)])[0];
+    let every = dap.get_parameters();
+    assert_eq!(every.len(), 9, "{every:?}");
+    let refused = answer(position(&dap, at, &every, None, reads(2))).unwrap_err();
+    assert!(
+        refused.contains("3 field reads (3 timesteps of 8 source variables)")
+            && refused.contains("the limit is 2 reads — narrow the datetime window. A"),
+        "{refused}"
+    );
+    assert!(server.take().is_empty(), "refused before any request");
+
+    let through_dap = answer(position(&dap, at, &every, None, reads(3)));
+    assert_eq!(
+        through_dap,
+        answer(position(&local, at, &every, None, UNCAPPED))
+    );
+    let log = server.take();
+    let requests = requested(&log);
+    let leads: BTreeSet<&str> = requests.iter().map(|(file, _)| file.as_str()).collect();
+    assert_eq!((requests.len(), leads.len()), (3, 3), "{requests:#?}");
+    for (_, variables) in &requests {
+        assert_eq!(variables, &SFC_REVERSED_NAMES);
+    }
+    for variable in SFC_REVERSED_NAMES {
+        for (_, slabs) in reads_of(&log, variable) {
+            assert_eq!(slabs, ["[0]", "[0]", "[4:1:5]", "[4:1:5]"], "{variable}");
+        }
+    }
+    let coverage = &through_dap.as_ref().unwrap()[0].1;
+    let sampled = coverage.values().flat_map(|r| &r.1).flatten().count();
+    assert_eq!(sampled, 9 * 3, "every parameter at every step");
+
+    // Each parameter alone: a request of one variable a step, the same
+    // values.
+    for parameter in &every {
+        let alone = answer(position(
+            &dap,
+            at,
+            std::slice::from_ref(parameter),
+            None,
+            UNCAPPED,
+        ))
+        .unwrap();
+        assert_eq!(alone[0].1[parameter], coverage[parameter], "{parameter}");
+    }
+    let requests = requested(&server.take());
+    assert_eq!(requests.len(), 8 * 3, "{requests:#?}");
+    assert!(requests.iter().all(|(_, variables)| variables.len() == 1));
+    assert_eq!(
+        answer(position(&dap, at, &every, None, reads(3))),
+        through_dap
+    );
+    assert!(server.take().is_empty(), "every reply from the chunk cache");
+}
+
+/// A request holds at most 16 planes: two variables of 8 levels each (z
+/// 1000 to 300 hPa, stored 5 to 12) are one request a step, of 9 levels (to
+/// 250 hPa) a request each, as at all 13. Each answers what the file read
+/// whole answers, and the read cap counts the requests made: one refusal
+/// asks for fewer steps alone, the other for fewer levels too.
+#[test]
+fn a_request_holds_at_most_16_planes() {
+    let _pool = crate::remote::tests::query_pool_shared();
+    let (server, dap, _dir, local) = thirteen_levels();
+    let at = at_cells(&dap, &[(4.3, 2.6)])[0];
+    let parameters = ["air_temperature_pl", "relative_humidity_pl"].map(String::from);
+    let eight = [1000.0, 925.0, 850.0, 800.0, 700.0, 500.0, 400.0, 300.0];
+    let nine = [
+        1000.0, 925.0, 850.0, 800.0, 700.0, 500.0, 400.0, 300.0, 250.0,
+    ];
+    for (z, per_step, slab, refusal) in [
+        (
+            &eight[..],
+            1,
+            "[5:1:12]",
+            "6 field reads (6 timesteps of 2 source variables); the limit is 5 reads — narrow \
+             the datetime window. A",
+        ),
+        (
+            &nine[..],
+            2,
+            "[4:1:12]",
+            "12 field reads (6 timesteps × 2 source variables); the limit is 11 reads — narrow \
+             the datetime window, name fewer parameters or fewer pressure levels (z)",
+        ),
+    ] {
+        let ask = |engine: &NetcdfEngine, limits| {
+            answer(position(engine, at, &parameters, Some(z), limits))
+        };
+        let refused = ask(&dap, reads(6 * per_step - 1)).unwrap_err();
+        assert!(refused.contains(refusal), "{refused}");
+        assert!(server.take().is_empty(), "refused before any request");
+        assert_eq!(ask(&dap, reads(6 * per_step)), ask(&local, UNCAPPED));
+        let log = server.take();
+        let requests = requested(&log);
+        assert_eq!(requests.len(), 6 * per_step, "{requests:#?}");
+        assert!(
+            requests
+                .iter()
+                .all(|(_, variables)| variables.len() == 2 / per_step),
+            "{requests:#?}"
+        );
+        for variable in &parameters {
+            let reads = reads_of(&log, variable);
+            assert_eq!(reads.len(), 6, "{variable}: {reads:#?}");
+            assert!(levels_read(&reads).iter().all(|&levels| levels == slab));
+        }
+    }
+}
+
+/// A request of several variables that outlives its query's deadline goes
+/// on and lands in the chunk cache, one entry for its constraint: retries
+/// join it while it runs and decode it once landed, and the series is
+/// answered having made the first query's requests only, one per step.
+#[test]
+fn a_request_of_several_variables_past_its_deadline_lands_in_the_cache() {
+    let _pool = crate::remote::tests::query_pool();
+    let files = sfc_files();
+    let (_dir, local) = local(&files, "sfc", SFC_VARIABLES);
+    let server = TestServer::new();
+    publish(&server, &files, true, None);
+    let dap = opened(&config(&server, "sfc", &[0, 1, 2], SFC_VARIABLES));
+    server.take();
+    server.slow_over(0, Duration::from_millis(800));
+    let parameters = [
+        "air_temperature_2m",
+        "relative_humidity_2m",
+        "wind_speed_of_gust",
+    ]
+    .map(String::from);
+    let at = at_cells(&dap, &[(4.3, 5.6)])[0];
+    let within = |ms: u64| {
+        let _deadline = deadline::enter(Some(Instant::now() + Duration::from_millis(ms)));
+        position(&dap, at, &parameters, None, UNCAPPED)
+    };
+    let started = Instant::now();
+    let late = within(100);
+    assert!(
+        matches!(late, Err(DataServerError::DeadlineExceeded)),
+        "{late:?}"
+    );
+    let answered = loop {
+        match within(300) {
+            Ok(answered) => break answered,
+            Err(DataServerError::DeadlineExceeded) => {
+                assert!(started.elapsed() < Duration::from_secs(10), "never cached");
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert_eq!(
+        answer(Ok(answered)),
+        answer(position(&local, at, &parameters, None, UNCAPPED))
+    );
+    let requests = requested(&server.take());
+    assert_eq!(
+        requests.len(),
+        3,
+        "the first query's requests only: {requests:#?}"
+    );
+    assert!(requests.iter().all(|(_, variables)| variables.len() == 3));
+}
+
+/// A request is keyed by every variable it holds: a series of a subset of
+/// another series' variables makes requests of its own, and the whole set
+/// asked again none. A variable a map drew whole at a step is left out of
+/// that step's request and sampled from the field drawn.
+#[test]
+fn a_subset_of_the_variables_makes_requests_of_its_own() {
+    let _pool = crate::remote::tests::query_pool_shared();
+    let files = sfc_files();
+    let (_dir, local) = local(&files, "sfc", SFC_VARIABLES);
+    let server = TestServer::new();
+    publish(&server, &files, true, None);
+    let dap = opened(&config(&server, "sfc", &[0, 1, 2], SFC_VARIABLES));
+    server.take();
+    let at = at_cells(&dap, &[(4.3, 5.6)])[0];
+    let ask = |engine: &NetcdfEngine, parameters: &[String]| {
+        answer(position(engine, at, parameters, None, UNCAPPED))
+    };
+    let three = [
+        "air_temperature_2m",
+        "relative_humidity_2m",
+        "cloud_area_fraction",
+    ]
+    .map(String::from);
+    let all = ask(&dap, &three);
+    assert_eq!(all, ask(&local, &three));
+    let requests = requested(&server.take());
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().all(|(_, variables)| variables == &three));
+
+    let two = &three[..2];
+    let some = ask(&dap, two);
+    assert_eq!(some, ask(&local, two));
+    for parameter in two {
+        assert_eq!(
+            some.as_ref().unwrap()[0].1[parameter],
+            all.as_ref().unwrap()[0].1[parameter]
+        );
+    }
+    let requests = requested(&server.take());
+    assert_eq!(requests.len(), 3, "requests of their own: {requests:#?}");
+    assert!(requests.iter().all(|(_, variables)| variables == two));
+    assert_eq!(ask(&dap, &three), all);
+    assert!(server.take().is_empty(), "the whole set's replies cached");
+
+    // A map of 2 m temperature at the newest run's second step.
+    let run = dap.get_instances().pop().unwrap();
+    let extent = dap.raster_info().spatial_extent.unwrap();
+    dap.get_raster_tile(
+        extent,
+        8,
+        8,
+        Some(run.valid_times[1]),
+        &OutputCrs::Wgs84,
+        Some("air_temperature_2m"),
+        None,
+        Some(run.reference_time),
+    )
+    .unwrap();
+    assert_eq!(requested(&server.take()).len(), 1, "the field whole");
+    let pair = [&three[0], &three[2]].map(String::clone);
+    assert_eq!(ask(&dap, &pair), ask(&local, &pair));
+    let mut requests = requested(&server.take());
+    requests.sort();
+    let drawn = |file: &str| file.starts_with("meps_sfc_01_");
+    assert_eq!(requests.len(), 3, "{requests:#?}");
+    for (file, variables) in &requests {
+        let expected: &[String] = if drawn(file) { &pair[1..] } else { &pair };
+        assert_eq!(variables, expected, "{file}");
+    }
+}
+
+/// What thredds.met.no answered for two variables in one request
+/// (testdata/netcdf-opendap, fetched 2026-10-24): the 2 × 2 windows of
+/// relative humidity and 2 m temperature, asked in that order, came back
+/// in dataset order, temperature first, each Grid's array in a Structure of
+/// its own, the temperatures those of the captured 4 × 4 reply there. The
+/// test server answers the same constraint over the MEPS fixture with the
+/// same declarations in the same order. A point query of both on
+/// THREDDS's MEPS metadata (the layout lists humidity first) asks for
+/// exactly that constraint and answers each variable what its own captured
+/// cells give.
+#[test]
+fn two_variables_on_thredds_meps_are_one_request() {
+    let _pool = crate::remote::tests::query_pool_shared();
+    let captured = |file: &str| std::fs::read(testdata(&format!("netcdf-opendap/{file}"))).unwrap();
+    let stem = "meps_sfc_00_20261023T12Z";
+    let reply = captured(&format!("{stem}_rh_t2m_2x2.dods"));
+    let values = dap::decode(&reply).unwrap();
+    let names: Vec<&str> = values.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["air_temperature_2m", "relative_humidity_2m"]);
+    let floats = |raw: Option<Raw>| match raw {
+        Some(Raw::F32(values)) => values,
+        other => panic!("{other:?}"),
+    };
+    let kelvin = floats(dap::take(
+        dap::decode(&captured(&format!("{stem}_t2m_4x4.dods"))).unwrap(),
+        "air_temperature_2m",
+    ));
+    assert_eq!(
+        floats(dap::take(values.clone(), "air_temperature_2m")),
+        [5, 6, 9, 10].map(|i| kelvin[i])
+    );
+    let humidity = floats(dap::take(values, "relative_humidity_2m"));
+
+    let window = |rows: &str, columns: &str| format!("%5B0%5D%5B0%5D%5B{rows}%5D%5B{columns}%5D");
+    let both = |window: &str| {
+        format!(
+            "relative_humidity_2m.relative_humidity_2m{window},\
+             air_temperature_2m.air_temperature_2m{window}"
+        )
+    };
+    let dds = |reply: &[u8]| {
+        let at = reply.windows(7).position(|w| w == b"\nData:\n").unwrap();
+        dap::parse_dds(std::str::from_utf8(&reply[..at]).unwrap()).unwrap()
+    };
+    let server = TestServer::new();
+    let (_, late) = slots();
+    let fixture = dataset("sfc", 0, late);
+    let bytes = std::fs::read(testdata("meps-netcdf/meps_sfc_00_20261015T09Z.nc")).unwrap();
+    server.put_opendap(&fixture, bytes, true, None);
+    let mock = server.dods(&fixture, &both(&window("0:1:1", "0:1:1")));
+    assert_eq!(dds(&mock.unwrap()), dds(&reply));
+    server.remove_opendap(&fixture);
+
+    let (dir, name) = place("sfc", 0, late);
+    let key = format!("{DAP}/{dir}/{name}");
+    let run: DateTime<Utc> = "2026-10-23T12:00:00Z".parse().unwrap();
+    for suffix in [".dds", ".das"] {
+        server.put(
+            &format!("{key}{suffix}"),
+            captured(&format!("{stem}.nc{suffix}")),
+            run,
+        );
+    }
+    server.put(
+        &format!("{key}.dods?{SFC_COORDINATES}"),
+        captured(&format!("{stem}_coordinates.dods")),
+        run,
+    );
+    let constraint = both(&window("501:1:502", "401:1:402"));
+    server.put(&format!("{key}.dods?{constraint}"), reply, run);
+    catalogs(&server, &[(dir.clone(), name.clone(), 166_700_000)]);
+    let config = config(
+        &server,
+        "sfc",
+        &[0],
+        r#"variables = ["relative_humidity_2m", "air_temperature_2m"]"#,
+    );
+    let engine = NetcdfEngine::new("thredds", &config).unwrap();
+    assert_eq!(engine.raster_info().reference_times, [run]);
+    server.take();
+
+    let one = at_cells(&engine, &[(401.4, 566.3)])[0];
+    let parameters = ["air_temperature_2m", "relative_humidity_2m"].map(String::from);
+    let answered =
+        answer(engine.query_position(&point(one), None, Some(&parameters), None, None)).unwrap();
+    assert_eq!(
+        dap_requests(&server.take()),
+        [format!("{dir}/{name}.dods?{constraint}")]
+    );
+    // Each variable's whole field as a render would hold it: north-up, NaN
+    // but for its captured cells (stored row r is row 1068 - r).
+    let catalog = engine.catalog.load_full();
+    let layout = catalog.layout.as_ref().unwrap();
+    let expected = |name: &str, cells: &[f32], first: (usize, usize), width: usize| {
+        let mut whole = vec![f32::NAN; 949 * 1069];
+        for (i, &value) in cells.iter().enumerate() {
+            let (row, col) = (1068 - (first.0 + i / width), first.1 + i % width);
+            whole[row * 949 + col] = value;
+        }
+        let index = layout.source_of(layout.param(name).unwrap());
+        let position = layout.source.position(one.0, one.1);
+        let raw = layout.source.value_at(&whole, None, position).unwrap();
+        vec![Some(layout.to_display(index, raw))]
+    };
+    let coverage = &answered[0].1;
+    assert_eq!(
+        coverage["air_temperature_2m"].1,
+        expected("air_temperature_2m", &kelvin, (500, 400), 4)
+    );
+    assert_eq!(
+        coverage["relative_humidity_2m"].1,
+        expected("relative_humidity_2m", &humidity, (501, 401), 2)
+    );
 }
