@@ -28,7 +28,10 @@ pub fn router(state: AppState) -> Router {
     response_budget::init();
     let router = Router::new()
         .route("/", get(handlers::landing_page))
-        .route("/api", get(handlers::api_definition))
+        .route(
+            "/api",
+            api_common::errors::format_only_get(handlers::api_definition),
+        )
         .route("/api/docs", get(handlers::api_docs))
         .route("/api/docs/{asset}", get(handlers::api_docs_asset))
         .route("/conformance", get(handlers::conformance))

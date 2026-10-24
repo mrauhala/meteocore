@@ -861,6 +861,147 @@ async fn html_requests_get_errors_as_pages_on_every_surface() {
             media(&headers).starts_with("application/json"),
             "{surface} {path}"
         );
+        // Its handler reads no query, so it takes `f` and nothing else:
+        // another parameter, or `f` twice, is the JSON 400 naming `f`,
+        // never a 200 that ignored it (#1123).
+        for (query, description) in [
+            (
+                "f=json&datetime=2024-01-01T00:00:00Z",
+                "Unknown query parameter 'datetime'. Supported: f",
+            ),
+            (
+                "f=json&f=json",
+                "Failed to deserialize query string: duplicate field `f`",
+            ),
+        ] {
+            let (status, headers, body) = get(&app, &format!("{url}?{query}"), None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{surface} {path}?{query}");
+            assert!(
+                media(&headers).starts_with("application/json"),
+                "{surface} {path}?{query}"
+            );
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                body,
+                json!({"code": "BadRequest", "description": description}),
+                "{surface} {path}?{query}"
+            );
+        }
+    }
+}
+
+/// The routes that read no query string answer a parameter they do not take
+/// with the JSON 400 naming `f`, the one they take (#1123): `/api` keeps
+/// serving its one representation whatever `f` says. A tile path segment
+/// that is not a number is the JSON 400 naming it, never the framework's
+/// plain-text one; tiles outside the matrix keep their 400 and 404.
+#[tokio::test]
+async fn query_less_routes_and_tile_paths_answer_the_json_400() {
+    async fn bad_request(app: &Router, url: &str) -> String {
+        let (status, headers, body) = get(app, url, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
+        assert!(
+            headers[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json"),
+            "{url}"
+        );
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["code"], "BadRequest", "{url}");
+        body["description"].as_str().unwrap().to_owned()
+    }
+
+    for surface in SURFACES {
+        let (app, prefix) = app(surface);
+        for query in ["", "?f=json", "?f=html"] {
+            let (status, _, _) = get(&app, &format!("{prefix}/api{query}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{surface} /api{query}");
+        }
+        assert_eq!(
+            bad_request(&app, &format!("{prefix}/api?f=json&limit=1")).await,
+            "Unknown query parameter 'limit'. Supported: f",
+            "{surface}"
+        );
+    }
+
+    let c = "/collections/c-match";
+    for (surface, path, description) in [
+        (
+            "tiles",
+            format!("{c}/tiles/WebMercatorQuad/abc/0/0"),
+            "Invalid tileMatrix 'abc': must be a zoom level, an integer from 0 to 24",
+        ),
+        (
+            "tiles",
+            format!("{c}/tiles/WebMercatorQuad/0/x/0?f=mvt"),
+            "Invalid tileRow 'x': must be a row index of the tile matrix, a non-negative integer",
+        ),
+        (
+            "tiles",
+            format!("{c}/styles/default/tiles/WebMercatorQuad/0/0/-1"),
+            "Invalid tileCol '-1': must be a column index of the tile matrix, a non-negative integer",
+        ),
+        (
+            "shared",
+            format!("{c}/map/tiles/WebMercatorQuad/99999999999/0/0"),
+            "Invalid tileMatrix '99999999999': must be a zoom level, an integer from 0 to 24",
+        ),
+        (
+            "shared",
+            format!("{c}/styles/default/map/tiles/WebMercatorQuad/0/1.5/0"),
+            "Invalid tileRow '1.5': must be a row index of the tile matrix, a non-negative integer",
+        ),
+        (
+            "shared",
+            format!("{c}/tiles/WebMercatorQuad/0/0/abc"),
+            "Invalid tileCol 'abc': must be a column index of the tile matrix, a non-negative integer",
+        ),
+    ] {
+        let (app, prefix) = app(surface);
+        let url = format!("{prefix}{path}");
+        assert_eq!(bad_request(&app, &url).await, description, "{url}");
+    }
+    let (app, prefix) = app("tiles");
+    let tiles = format!("{prefix}{c}/tiles/WebMercatorQuad");
+    assert_eq!(
+        bad_request(&app, &format!("{tiles}/25/0/0")).await,
+        "Zoom level 25 exceeds maximum of 24"
+    );
+    let (status, _, body) = get(&app, &format!("{tiles}/0/1/0"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// The landing page, conformance and collection operations document the
+/// JSON 400 an unsupported or repeated `f` gets, as EDR's do (#1123).
+#[tokio::test]
+async fn metadata_operations_document_the_format_400() {
+    for surface in ["maps", "tiles", "features", "shared"] {
+        let (app, prefix) = app(surface);
+        let api = get_json(&app, &format!("{prefix}/api")).await;
+        let m = prefix.strip_prefix("/base").unwrap();
+        let mut paths = vec![
+            format!("{m}/"),
+            format!("{m}/conformance"),
+            format!("{m}/collections/c-match"),
+        ];
+        if surface == "shared" {
+            paths.push("/collections/{collectionId}".into());
+        }
+        for path in paths {
+            let rejected = &api["paths"][&path]["get"]["responses"]["400"];
+            assert_eq!(
+                rejected["content"]["application/json"]["schema"]["required"],
+                json!(["code", "description"]),
+                "{surface} {path}"
+            );
+            assert!(
+                rejected["content"]["text/html"].is_object(),
+                "{surface} {path}"
+            );
+        }
+        let (status, _, body) = get(&app, &format!("{prefix}/conformance?f=xml"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{surface}: {body}");
     }
 }
 

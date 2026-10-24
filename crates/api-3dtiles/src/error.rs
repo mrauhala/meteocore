@@ -1,9 +1,35 @@
 //! Error type for the 3D Tiles API, mapped to HTTP responses.
 
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{FromRequestParts, Query};
+use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
+
+/// axum's [`Query`] whose rejection is this API's JSON 400, not axum's
+/// plain-text one (#1123): a parameter given twice (`quantity=a&quantity=b`)
+/// or a value of the wrong type (`min_value=x`) fails before the handler
+/// runs, with axum's description, which names the parameter. The 3D Tiles
+/// counterpart of `api_common::JsonQuery`, in this API's `{"error": …}`
+/// error shape rather than the OGC APIs' `{"code", "description"}`.
+pub struct JsonQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for JsonQuery<T>
+where
+    Query<T>: FromRequestParts<S, Rejection = QueryRejection>,
+    S: Send + Sync,
+{
+    type Rejection = Tiles3dError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Query(value)| Self(value))
+            .map_err(|rejection| Tiles3dError::BadRequest(rejection.body_text()))
+    }
+}
 
 /// HTTP-facing error for the 3D Tiles API.
 #[derive(Debug, Clone)]

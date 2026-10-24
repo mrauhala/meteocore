@@ -28,9 +28,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// (e.g. a GRIB new-run probe doing dozens of sequential byte-range reads)
 /// starve the worker pool and spike WMS latency for every collection (#221).
 /// Isolating polls on their own runtime keeps that blocking off the request
-/// path. `block_in_place` still works here because this is a multi-thread
-/// runtime; it would panic on a `spawn_blocking` pool thread, which is why we
-/// use a separate runtime rather than wrapping the sync scan in `spawn_blocking`.
+/// path. `block_in_place` works here because this is a multi-thread runtime;
+/// it panics only in current-thread execution or a `LocalSet`, not on a
+/// `spawn_blocking` thread (Critical Rule 7). The poll bodies call `ds-storage`
+/// through the ambient runtime handle, which Rule 7 keeps to runtime workers
+/// (a `spawn_blocking` worker must use the explicit-runtime APIs, `get_on`),
+/// so the sync scans run as tasks on this runtime rather than inside
+/// `spawn_blocking`.
 ///
 /// The runtime lives in a `OnceLock` for the whole process. On exit it is
 /// leaked (statics are not dropped), so poll tasks are aborted rather than

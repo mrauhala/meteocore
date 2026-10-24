@@ -136,6 +136,15 @@ reject a query parameter outside the list their OpenAPI operations document
 with a 400 naming that list, as map tiles already did. No Common classes
 change.
 
+Query-less routes (2026-10-24, [#1123](https://github.com/mrauhala/meteocore/issues/1123)):
+`/api` and the JSON-only resources (Maps styles list; Tiles tile matrix sets,
+tileset lists and tilesets), per API and at the shared root, take `f` and
+nothing else: another parameter, or `f` given twice, is the JSON 400 naming
+`f`. `/api` serves OpenAPI JSON whatever `f` says. A tile path segment that is
+not a non-negative integer is a JSON 400 naming it. The landing page,
+conformance and collection operations document the 400 of an unsupported or
+repeated `f`. No Common classes change.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively;
 the shared root's are relative to `/`.
 Part 4 rows concern **collection discovery**, not querying the contents of a

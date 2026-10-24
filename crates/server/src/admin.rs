@@ -5749,8 +5749,11 @@ pub async fn reload_handler(
     // Run the (blocking) reload on the background runtime so it never parks a
     // request-serving worker — same as the collections_dir watcher. Use
     // `spawn` (an async task on a poll-runtime worker), NOT `spawn_blocking`:
-    // engine construction calls `ds-storage`'s `block_in_place`, which panics
-    // on a spawn_blocking pool thread but is valid on a multi-thread worker.
+    // engine construction calls `ds-storage` through the ambient runtime
+    // handle, and Critical Rule 7 keeps that to runtime workers; a
+    // `spawn_blocking` worker must use the explicit-runtime APIs (`get_on`).
+    // The `block_in_place` inside is valid on a multi-thread worker; it panics
+    // only in current-thread execution or a `LocalSet`.
     let state2 = state.clone();
     let outcome = crate::poll_runtime()
         .spawn(async move { do_reload(&state2) })

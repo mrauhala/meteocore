@@ -83,7 +83,8 @@ one `rel=3dtiles` link per representation, the viewer (`alternate`), and the
 collection's HTML page in the shared OGC API or EDR (`related`) when it has
 one.
 
-Errors are JSON `{"error": "…"}`: 400 for a bad parameter, an unsupported
+Errors are JSON `{"error": "…"}`: 400 for a bad parameter (one given twice
+or of the wrong type included), an unsupported
 representation or a threshold too low to mesh; 404 for an unknown collection
 or no data for the request; 503 with `Retry-After: 1` when the queue is full
 or the 30 s deadline passed. A 500 never carries internal detail.

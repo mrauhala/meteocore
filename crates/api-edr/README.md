@@ -68,7 +68,7 @@ Part 1 `core` and Part 2 `collections` with `https://` URIs, the form EDR
 | Route | Answers |
 |---|---|
 | `/`, `/conformance` | landing page, conformance |
-| `/api`, `/api/docs` | OpenAPI 3.0 document, Swagger UI (assets embedded, no CDN) |
+| `/api`, `/api/docs` | OpenAPI 3.0 document, Swagger UI (assets embedded, no CDN). `/api` takes only `f`: another parameter, or `f` given twice, is a 400 |
 | `/collections`, `/collections/{id}` | catalog with Common search and paging ([api-common](../api-common/README.md)), collection document |
 | `/collections/{id}/locations` | GeoJSON list of named locations |
 | `/collections/{id}/locations/{locId}` | data at one location, or at a comma-separated list |
@@ -254,7 +254,7 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
 
 - **Errors.** JSON errors are `{code, description}`. A request that asked for
   HTML (`f=html`, or `Accept` ranking `text/html` first) gets the error as a
-  page with the same status. 500s carry no details. `/api` lists every
+  page with the same status; both carry `Vary: accept`. 500s carry no details. `/api` lists every
   status each operation answers: 304, 400, 404 and 500, plus 503 and 504 on
   data queries, `/locations` and `items`, and 204 on `/locations/{locId}`.
 - **Caching.** Every 200 carries `Cache-Control` and a strong ETag, and

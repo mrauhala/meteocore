@@ -12,8 +12,9 @@
 
 use std::collections::BTreeSet;
 
+use api_common::JsonQuery;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
@@ -228,7 +229,7 @@ impl ManifestParams {
 /// `GET /preview/manifest.json` — aggregated collection inventory for the UI.
 pub async fn manifest_handler(
     State(state): State<AdminState>,
-    Query(params): Query<ManifestParams>,
+    JsonQuery(params): JsonQuery<ManifestParams>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let (offset, limit) = params.resolved();
@@ -1424,7 +1425,8 @@ mod tests {
 
     #[tokio::test]
     async fn manifest_handler_honours_proxy_headers() {
-        use axum::extract::{Query, State};
+        use api_common::JsonQuery;
+        use axum::extract::State;
         // Regression guard (#12): the preview manifest's tile URL templates must
         // follow reverse-proxy forwarding headers when trust_proxy_headers is on
         // — this is the /preview/manifest.json endpoint that was initially missed.
@@ -1462,9 +1464,13 @@ mod tests {
             axum::http::HeaderValue::from_static("https"),
         );
 
-        let resp = manifest_handler(State(state), Query(ManifestParams::default()), req_headers)
-            .await
-            .into_response();
+        let resp = manifest_handler(
+            State(state),
+            JsonQuery(ManifestParams::default()),
+            req_headers,
+        )
+        .await
+        .into_response();
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -3181,7 +3187,8 @@ mod tests {
 
     #[tokio::test]
     async fn manifest_handler_emits_no_store_cache_control() {
-        use axum::extract::{Query, State};
+        use api_common::JsonQuery;
+        use axum::extract::State;
         // `manifest_handler` returns live `ArcSwap` state; caches must not
         // hold it across an `/admin/collections/reload`.
         let state = make_state(
@@ -3193,7 +3200,7 @@ mod tests {
         );
         let resp = manifest_handler(
             State(state),
-            Query(ManifestParams::default()),
+            JsonQuery(ManifestParams::default()),
             axum::http::HeaderMap::new(),
         )
         .await
@@ -3207,6 +3214,44 @@ mod tests {
             "nosniff",
             "manifest_handler must mirror nosniff applied by serve_asset"
         );
+    }
+
+    /// A paging parameter that does not parse, or one given twice, is the
+    /// JSON 400 every API answers, not axum's plain-text one (#1123).
+    #[tokio::test]
+    async fn manifest_rejects_a_bad_query_with_the_json_400() {
+        use tower::ServiceExt;
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            empty_tiles(),
+            empty_wms(),
+        );
+        let app = axum::Router::new().route(
+            "/preview/manifest.json",
+            axum::routing::get(manifest_handler).with_state(state),
+        );
+        for (query, field) in [("limit=abc", "limit"), ("offset=1&offset=2", "offset")] {
+            let request = axum::http::Request::builder()
+                .uri(format!("/preview/manifest.json?{query}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/json",
+                "{query}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "BadRequest", "{query}");
+            let description = body["description"].as_str().unwrap();
+            assert!(description.contains(field), "{query}: {description}");
+        }
     }
 
     #[tokio::test]
