@@ -258,8 +258,9 @@ const STAC_PRELOAD_BUDGET: Duration = Duration::from_secs(60);
 const STAC_REQUEST_MAX_COLD_ITEMS: usize = 400;
 
 /// One STAC stub to load: its timestamp, its single-flight path, its asset
-/// URL and its size from the STAC item (0 when unknown).
-type StacLoadTarget = (DateTime<Utc>, PathBuf, String, u64);
+/// URL, its size from the STAC item (0 when unknown) and the stub's
+/// `ObjectHealth`, where a load that finds the asset gone records it (#1119).
+type StacLoadTarget = (DateTime<Utc>, PathBuf, String, u64, reader::ObjectHealth);
 
 /// The load target of a catalog entry that is still a STAC stub.
 fn stac_load_target(
@@ -271,7 +272,17 @@ fn stac_load_target(
         entry.path.clone(),
         stub.asset_url.clone(),
         entry.file_size,
+        entry.health()?.clone(),
     ))
+}
+
+/// What a STAC metadata load read ([`GeoTiffEngine::fetch_stac_entry_metadata`]).
+enum AssetRead {
+    /// The asset's metadata and the source its tiles are read from.
+    Loaded(Box<(reader::TiffMetadata, reader::DataSource)>),
+    /// A refusal that shows the asset gone (#1119): a 404, a 416, or an
+    /// object shorter than the header range the listing's size asked for.
+    Gone(ds_storage::RangeRefusal),
 }
 
 /// What [`GeoTiffEngine::claim_and_load_stac_entry`] did with one STAC stub.
@@ -279,6 +290,8 @@ fn stac_load_target(
 enum StacLoad {
     /// This call fetched and installed the metadata.
     Loaded,
+    /// This call found the asset gone: the item has left the catalog (#1119).
+    Gone,
     /// Nothing to do: the metadata was in already, or the entry is gone.
     AlreadyLoaded,
     /// Another loader held the item's claim and had not finished it.
@@ -986,16 +999,35 @@ impl GeoTiffEngine {
     /// (bypassing object_store which URL-encodes path components and breaks
     /// servers like Ceph RGW that use colons in paths).
     ///
-    /// Tries COG range read first (512KB header), falls back to full download.
+    /// Reads the 512 KiB header by range (after a HEAD when the item states
+    /// no `file:size`). Only a header that does not parse, an origin that
+    /// ignores `Range` and an unknown size fall back to a full download. A
+    /// header read that fails or is forbidden (401/403), and a HEAD without
+    /// answer or with a server error, fail this load instead (#1025): a full
+    /// download would go to the same storage. They fail it with
+    /// `ResourceExhausted`, the 503 a tile read gives for the same failures
+    /// (#1051, #1074), with the detail in the log only. A 404, 416 or an
+    /// object shorter than the range is [`AssetRead::Gone`] (#1119), for the
+    /// caller to drop the item.
     async fn fetch_stac_entry_metadata(
         &self,
         stac_client: &stac::StacClient,
         asset_url: &str,
         file_size: u64,
-    ) -> Result<(reader::TiffMetadata, reader::DataSource), DataServerError> {
+    ) -> Result<AssetRead, DataServerError> {
         // Get actual file size if not known from STAC
         let actual_size = if file_size == 0 {
-            stac_client.head_asset_async(asset_url).await.unwrap_or(0)
+            // `head_asset_async` logs the failure's detail.
+            let head = stac_client
+                .head_asset_async(asset_url)
+                .await
+                .map_err(|_| DataServerError::ResourceExhausted)?;
+            match head {
+                stac::AssetHead::Size(size) => size,
+                stac::AssetHead::NotFound => {
+                    return Ok(AssetRead::Gone(ds_storage::RangeRefusal::NotFound))
+                }
+            }
         } else {
             file_size
         };
@@ -1012,21 +1044,51 @@ impl GeoTiffEngine {
         // that fetches tiles on demand via byte-range reads.
         let http = stac_client.http_client();
         if actual_size > 0 {
-            if let Some((metadata, tile_info)) =
-                reader::TiffMetadata::from_http_header_read(&http, asset_url, actual_size).await
-            {
-                tracing::debug!(
-                    "[{}] STAC COG range read '{}' (header only, {} tiles)",
+            match reader::TiffMetadata::from_http_header_read(&http, asset_url, actual_size).await {
+                Ok(reader::HttpHeaderRead::Cog(header)) => {
+                    let (metadata, tile_info) = *header;
+                    tracing::debug!(
+                        "[{}] STAC COG range read '{}' (header only, {} tiles)",
+                        self.collection_id,
+                        asset_url,
+                        tile_info.tile_offsets.len()
+                    );
+                    let source = reader::DataSource::http(asset_url.to_string(), http, tile_info);
+                    return Ok(AssetRead::Loaded(Box::new((metadata, source))));
+                }
+                Ok(reader::HttpHeaderRead::NotCog) => tracing::debug!(
+                    "[{}] STAC asset '{}' has no COG header this reader handles",
                     self.collection_id,
-                    asset_url,
-                    tile_info.tile_offsets.len()
-                );
-                let source = reader::DataSource::http(asset_url.to_string(), http, tile_info);
-                return Ok((metadata, source));
+                    asset_url
+                ),
+                Ok(reader::HttpHeaderRead::RangeIgnored) => tracing::debug!(
+                    "[{}] STAC asset host of '{}' ignores range requests",
+                    self.collection_id,
+                    asset_url
+                ),
+                Ok(reader::HttpHeaderRead::Refused(ds_storage::RangeRefusal::Forbidden)) => {
+                    tracing::warn!(
+                        "[{}] STAC header read of '{}' forbidden (401/403); check the storage \
+                         credentials",
+                        self.collection_id,
+                        asset_url
+                    );
+                    return Err(DataServerError::ResourceExhausted);
+                }
+                Ok(reader::HttpHeaderRead::Refused(gone)) => return Ok(AssetRead::Gone(gone)),
+                Err(e) => {
+                    tracing::warn!(
+                        "[{}] STAC header read of '{}' failed, not downloading it whole: {e}",
+                        self.collection_id,
+                        asset_url
+                    );
+                    return Err(DataServerError::ResourceExhausted);
+                }
             }
         }
 
-        // Fallback: download the full file into memory (non-COG or range read failed)
+        // Fallback: download the full file into memory (not a COG header this
+        // reader handles, the origin ignores Range, or the size is unknown).
         tracing::debug!(
             "[{}] STAC downloading '{}' ({})",
             self.collection_id,
@@ -1038,7 +1100,7 @@ impl GeoTiffEngine {
         let source = reader::DataSource::from_bytes(data);
         let metadata = reader::TiffMetadata::from_source(&source)?;
 
-        Ok((metadata, source))
+        Ok(AssetRead::Loaded(Box::new((metadata, source))))
     }
 
     /// Load GeoTIFF metadata for a STAC stub entry on the calling thread, for
@@ -1048,7 +1110,7 @@ impl GeoTiffEngine {
         &self,
         asset_url: &str,
         file_size: u64,
-    ) -> Result<(reader::TiffMetadata, reader::DataSource), DataServerError> {
+    ) -> Result<AssetRead, DataServerError> {
         let stac_client = match &self.store_mode {
             StoreMode::RemoteStac { client } => client,
             _ => {
@@ -1061,12 +1123,48 @@ impl GeoTiffEngine {
     }
 
     /// Check if a catalog entry's metadata is already loaded.
-    /// Returns `true` if loaded or entry doesn't exist (nothing to do).
+    /// Returns `true` if loaded, if a load found its asset gone (#1119) or if
+    /// the entry doesn't exist (nothing to do).
     fn is_metadata_loaded(&self, timestamp: &DateTime<Utc>) -> bool {
         let catalog = self.catalog.load();
         match catalog.entries.get(timestamp) {
-            Some(entry) => entry.is_loaded(),
+            Some(entry) => entry.is_loaded() || entry.is_gone(),
             None => true, // Entry doesn't exist — nothing to load
+        }
+    }
+
+    /// Settle one STAC stub's load: install the metadata it read, or drop
+    /// the item when it found the asset gone (#1119). The refusal is set in
+    /// the stub's `ObjectHealth`, which every clone of the entry shares, so
+    /// every catalog accessor skips the entry at once
+    /// ([`catalog::FileEntry::is_gone`]), as for a tile read that finds its
+    /// object gone (#1074). The next catalog swap removes the entry and
+    /// keeps it, by href and listed size, so a listing that still names it
+    /// adds no stub to load ([`gone::GoneObjects::screen`]).
+    fn settle_stac_load(
+        &self,
+        (timestamp, path, _, _, health): &StacLoadTarget,
+        read: AssetRead,
+    ) -> StacLoad {
+        match read {
+            AssetRead::Loaded(loaded) => {
+                let (metadata, source) = *loaded;
+                self.install_stac_metadata(timestamp, metadata, source);
+                StacLoad::Loaded
+            }
+            AssetRead::Gone(refusal) => {
+                health.refused(refusal);
+                if health.take_gone().is_some() {
+                    tracing::warn!(
+                        "[{}] Metadata load of {}: {refusal}. Timestep {} leaves the catalog.",
+                        self.collection_id,
+                        path.display(),
+                        timestamp.to_rfc3339()
+                    );
+                    self.refresh_raster_info();
+                }
+                StacLoad::Gone
+            }
         }
     }
 
@@ -1103,19 +1201,16 @@ impl GeoTiffEngine {
     }
 
     /// Load metadata for a stub entry and update the catalog.
-    fn do_load_metadata(
-        &self,
-        timestamp: &DateTime<Utc>,
-        asset_url: &str,
-        file_size: u64,
-    ) -> Result<(), DataServerError> {
-        let (metadata, source) = self.load_stac_entry_metadata(asset_url, file_size)?;
-        self.install_stac_metadata(timestamp, metadata, source);
+    fn do_load_metadata(&self, target: &StacLoadTarget) -> Result<(), DataServerError> {
+        let read = self.load_stac_entry_metadata(&target.2, target.3)?;
+        self.settle_stac_load(target, read);
         Ok(())
     }
 
     /// Ensure a single entry's metadata is loaded. No-op if already loaded.
     /// Uses `loading_in_flight` to prevent concurrent loads for the same entry.
+    /// An entry whose asset the load finds gone leaves the catalog (#1119);
+    /// that is no error.
     fn ensure_metadata(&self, timestamp: &DateTime<Utc>) -> Result<(), DataServerError> {
         // Fast path: check if already loaded
         if self.is_metadata_loaded(timestamp) {
@@ -1123,18 +1218,17 @@ impl GeoTiffEngine {
         }
 
         // Get the stub info we need before acquiring the in-flight lock
-        let (path, asset_url, file_size) = {
+        let target = {
             let catalog = self.catalog.load();
-            let entry = match catalog.entries.get(timestamp) {
-                Some(e) => e,
-                None => return Ok(()),
+            let Some(entry) = catalog.entries.get_key_value(timestamp) else {
+                return Ok(());
             };
-            let stub = match entry.stac_stub_info() {
-                Some(s) => s,
+            match stac_load_target(entry) {
+                Some(target) => target,
                 None => return Ok(()), // Not a stub, but metadata is None — shouldn't happen
-            };
-            (entry.path.clone(), stub.asset_url.clone(), entry.file_size)
+            }
         };
+        let path = &target.1;
 
         // Single-flight: park until any in-flight load of this path finishes,
         // then atomically either observe its result or claim the load. The
@@ -1143,13 +1237,13 @@ impl GeoTiffEngine {
         // the claim and wakes waiters on drop — success, error, or panic.
         let _guard = match self
             .loading_in_flight
-            .wait_then_claim(&path, || self.is_metadata_loaded(timestamp))
+            .wait_then_claim(path, || self.is_metadata_loaded(timestamp))
         {
             None => return Ok(()),
             Some(guard) => guard,
         };
 
-        self.do_load_metadata(timestamp, &asset_url, file_size)
+        self.do_load_metadata(&target)
     }
 
     /// Preload metadata for the STAC items this poll cycle discovered (#90),
@@ -1230,24 +1324,24 @@ impl GeoTiffEngine {
     async fn claim_and_load_stac_entry(
         &self,
         client: &stac::StacClient,
-        (timestamp, path, asset_url, file_size): StacLoadTarget,
+        target: StacLoadTarget,
     ) -> Result<StacLoad, DataServerError> {
+        let (timestamp, path, asset_url, file_size, _) = &target;
         let Some(_guard) = self
             .loading_in_flight
-            .try_claim(&path, || self.is_metadata_loaded(&timestamp))
+            .try_claim(path, || self.is_metadata_loaded(timestamp))
         else {
-            return Ok(if self.is_metadata_loaded(&timestamp) {
+            return Ok(if self.is_metadata_loaded(timestamp) {
                 StacLoad::AlreadyLoaded
             } else {
                 StacLoad::HeldElsewhere
             });
         };
-        let (metadata, source) = self
-            .fetch_stac_entry_metadata(client, &asset_url, file_size)
+        let read = self
+            .fetch_stac_entry_metadata(client, asset_url, *file_size)
             .await?;
-        // Installed before the guard drops, so woken waiters see it.
-        self.install_stac_metadata(&timestamp, metadata, source);
-        Ok(StacLoad::Loaded)
+        // Settled before the guard drops, so woken waiters see it.
+        Ok(self.settle_stac_load(&target, read))
     }
 
     /// Load the metadata of the STAC stubs in `datetime` for a query (#889).
@@ -1261,7 +1355,9 @@ impl GeoTiffEngine {
     /// preload or another request is loading is waited for afterwards, when
     /// this query holds no claim, so two loaders never wait on each other.
     /// The first failed load fails the query, as the sequential loop did; the
-    /// loads still in flight are dropped and release their claims.
+    /// loads still in flight are dropped and release their claims. A load
+    /// that finds its asset gone is no failure: the item leaves the catalog,
+    /// so the query answers without it (#1119).
     fn load_cold_stac_entries(
         &self,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -2156,6 +2252,20 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             .get_key_value(&target_timestamp)
             .ok_or_else(|| DataServerError::Engine("Entry disappeared after loading".into()))?;
 
+        let [west, south, east, north] = bbox;
+        let total_pixels = (width as usize) * (height as usize);
+
+        // A STAC item whose asset its load found gone (#1119) has nothing to
+        // read. This request draws nodata, as one whose tile read finds the
+        // object gone does (#1074); the item has left every accessor, so
+        // later requests select another timestep.
+        if entry.is_gone() && !entry.is_loaded() {
+            return Ok(ds_core::map_engine::RasterTile {
+                width,
+                height,
+                values: ds_core::map_engine::RasterValues::F64(vec![None; total_pixels]),
+            });
+        }
         let metadata = entry
             .metadata()
             .ok_or_else(|| DataServerError::Engine("Entry metadata not loaded".into()))?;
@@ -2169,9 +2279,6 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             timestamp: target_timestamp,
             entry,
         };
-
-        let [west, south, east, north] = bbox;
-        let total_pixels = (width as usize) * (height as usize);
 
         // Domain guard against "ghost" echoes. The coarse projection grid
         // only approximates the output→source mapping; at low zoom / extreme

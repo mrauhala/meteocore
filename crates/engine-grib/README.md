@@ -42,6 +42,11 @@ level type) exposes every parameter; each retained run is an EDR instance.
   metres of water → mm, proportion → %; other units pass unchanged.
   Geopotential (`z`, `GP`) stays in m² s⁻²: its height is another
   quantity. An unknown triple is labelled by its short name, unitless.
+  A rate accumulated over a time interval (template 4.8 or 4.11, Code
+  Table 4.10 type 1) is the amount, as eccodes reads it: AIFS `tp`, `cp`
+  and `sf` (0/1/52, 0/1/37, 0/1/53) are Total precipitation, Convective
+  precipitation and Snowfall water equivalent in kg m⁻² → mm, while
+  IFS `tprate`, the same 0/1/52 unprocessed, stays a rate in mm/h.
 
 ## What it serves
 

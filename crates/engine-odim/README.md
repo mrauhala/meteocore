@@ -41,9 +41,10 @@ available.
   the rest of the window.
 - **Lazy polar pixels.** Pixel arrays are decoded per moment on first use
   into a shared byte-bounded cache (`MC_PVOL_PIXEL_CACHE_MB`, default
-  1024). Each scan pre-decodes the default quantity of the lowest
-  `prewarm_sweeps` sweeps of every volume it reads, so the first map of a
-  new volume is a cache hit. The scan also records the byte ranges of the
+  1024). Each scan pre-decodes the default quantity, or the
+  `prewarm_quantities`, of the lowest `prewarm_sweeps` sweeps of every
+  volume it reads, so the first map of a new volume is a cache hit. The
+  scan also records the byte ranges of the
   file each moment's decode reads, so a cold read fetches only those: for
   a base-sweep reflectivity map of a 20–40 MB volume, a few hundred
   kilobytes in four to seven GETs run at once. The whole file is read when
@@ -55,7 +56,10 @@ available.
   reads several moments of one file reads it once, and concurrent requests
   that need the whole of the same remote volume share one download. A
   request waits for a download or decode that another request started only
-  until its own deadline.
+  until its own deadline. A remote read the deadline cuts off goes on in
+  the background, which decodes the moments the request wanted into the
+  cache, at most four reads at once: the retry finds them there, or joins
+  the download still running, instead of starting it again.
 - **EDR read memory.** The volumes an EDR query (or a WMS GetFeatureInfo)
   reads are admitted by one process-wide budget, `MC_PVOL_READ_MEMORY_MB`
   (default 1024). Before a volume's file is read, the query reserves the
@@ -71,6 +75,11 @@ available.
   and is remembered as bad. A passed deadline or a storage failure fails
   the request, so no cache keeps an empty frame: a storage failure is a
   503, a deadline a 503 in the map and 3D Tiles APIs and a 504 in EDR. A
+  volume the store refuses (401/403), or a local file the server may not
+  read, fails as a storage failure and is not read again for a minute.
+  `/metrics` counts the reads that read as no data in
+  `pvol_pixel_read_failures_total` and those that failed their request in
+  `pvol_pixel_read_aborts_total{reason="deadline"|"storage"}`. A
   composite that fails to load is a gap in an EDR series and an error for
   a map.
 - **Maps** find each output pixel's source cell through a coarse
@@ -105,7 +114,9 @@ available.
 - **`position`**: without `z`, one vertical profile (value per sweep angle)
   per volume; with `z`, one time series per angle. A point beyond the
   radar's range is a 404. Clear air is a measurement and returns nulls; a
-  point never observed at the requested angles is a 404.
+  point with no measurement at the requested angles is a 404: out of the
+  sweep's range, a sweep without the parameter, a gate flagged nodata, or
+  a sweep that could not be read.
 - **`locations`** lists the antenna (id = `NOD`). **`area`** and
   **`radius`** return the `position` coverages at the antenna when it lies
   inside the area, else 404.
@@ -196,6 +207,7 @@ max_files = 24
 | `cadence_secs` | — | `odim`, template | Spacing of probed timestamps; required in template mode |
 | `resampling` | `"nearest"` | `odim-volume` | Map render: `"nearest"` or `"bilinear"` (EDR and 3D Tiles always use nearest) |
 | `prewarm_sweeps` | `1` | `odim-volume` | Lowest sweeps pre-decoded per volume; `0` disables |
+| `prewarm_quantities` | default quantity | `odim-volume` | Quantities pre-decoded at those sweeps, e.g. `["DBZH", "VRADH"]`; one a volume lacks is skipped. Size `MC_PVOL_PIXEL_CACHE_MB` to about twice sites × retained volumes × sweeps × quantities × one sweep |
 
 Example collections in `collections.d/`: `radar-eu-composite-dbzh-s3-h5`
 (public S3 bucket), `radar-de-composite-dbzh-http-h5` (HTTP template

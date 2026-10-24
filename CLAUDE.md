@@ -141,7 +141,7 @@ Violating these has caused production incidents. Never break them.
      `get_range_on`, `get_range_on_with_budget`,
      `get_range_if_unmodified_on`). Do not rely on an ambient runtime handle.
      To overlap whole-object reads from synchronous code, start them with
-     `DataStore::start_get_opt` and collect each with
+     `DataStore::start_get_or_refusal` and collect each with
      `PendingGet::wait(Some(handle))`, bounding how many you start (#999).
      Several threads may wait for one read behind an `Arc` (#1127): each
      wait is bounded by its own thread's deadline, and the last holder

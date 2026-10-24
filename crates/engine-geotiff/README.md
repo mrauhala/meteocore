@@ -23,8 +23,11 @@ tiles a request touches, so a remote COG is not downloaded whole.
 - **Metadata.** Each new file's header is read once: tiling, overviews,
   georeferencing, nodata (`GDAL_NODATA`) and scale/offset (GDAL metadata).
   A remote file is read by a 512 KiB range request; when those bytes are
-  not a COG this reader handles, the file is downloaded whole. A poll
-  reads its new files four at a time, newest first, for at most two
+  not a COG this reader handles, or the origin ignores `Range`, the file is
+  downloaded whole. A header read that fails is never followed by a full
+  download: a scanned file waits for the next poll; a STAC item's request
+  is a 503, as a failed tile read is, and the next request loads it again.
+  A poll reads its new files four at a time, newest first, for at most two
   minutes, and leaves the files it did not reach to the next poll, so a
   backlog never holds back the latest frame.
 - **Reading.** A request reads only the tiles that cover its window; a map
@@ -44,7 +47,10 @@ tiles a request touches, so a remote COG is not downloaded whole.
 - **Remote failures.** A failed tile fetch is retried twice, then the
   request fails with 503, never a nodata gap. An object gone after the
   scan (404, 416, or shorter than the range) draws nodata for that request
-  and leaves the catalog. A 401 or 403 is a 503, and the timestep stays.
+  and leaves the catalog. So does a STAC item whose asset is gone before
+  its header is read, after that one read; a listing that still names the
+  same href and `file:size` does not bring it back. A 401 or 403 is a 503,
+  on a tile read or a STAC item's header read, and the timestep stays.
 
 ## What it serves
 

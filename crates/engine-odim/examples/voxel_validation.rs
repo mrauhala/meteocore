@@ -117,6 +117,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         cadence_secs: None,
         resampling: Default::default(),
         prewarm_sweeps: 0,
+        prewarm_quantities: None,
     };
     let engine = PolarVolumeEngine::new("voxel-validation", isolated.path().to_str(), &config)?;
     let sites = engine.sites();

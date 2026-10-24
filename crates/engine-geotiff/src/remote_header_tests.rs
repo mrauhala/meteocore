@@ -1,7 +1,9 @@
 //! A storage error on a remote COG's header read is not a non-COG (#1003):
 //! the scan leaves the file out of the catalog, without downloading it
 //! whole, and the next poll reads its header again. Only a header that
-//! arrives but does not parse takes the full-download fallback.
+//! arrives but does not parse takes the full-download fallback. A STAC
+//! asset's header read over direct HTTP makes the same distinction (#1025)
+//! and types a refusal as tile reads do (#1119).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,7 +19,8 @@ use ds_storage::DataStore;
 use futures::stream::BoxStream;
 
 use crate::catalog::{self, Catalog, FileEntry};
-use crate::reader::{DataSource, TiffMetadata};
+use crate::reader::{DataSource, HttpHeaderRead, TiffMetadata};
+use ds_storage::RangeRefusal;
 
 pub(crate) const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -353,6 +356,122 @@ async fn object_store_reports_an_origin_ignoring_range_as_range_not_honoured() {
         .get_range(&path, 0..1024)
         .expect_err("a 200 answer to a range request is an error");
     assert!(catalog::range_not_honoured(&err), "unexpected error: {err}");
+}
+
+/// The STAC header read over direct HTTP (#1025, #1119), against an origin
+/// with one path per answer. A header that parses is a COG; bytes that do
+/// not, and a 200 for the whole object, take the full download; a 404, 403,
+/// 416 or an object shorter than the listed size is a typed refusal; a 503
+/// and a body cut short are failed reads, never a full download.
+#[tokio::test(flavor = "multi_thread")]
+async fn http_header_read_tells_a_failed_read_and_a_refusal_from_a_non_cog() {
+    use axum::http::{header, HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    const SMALL: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/radar-tm35fin/radar_tm35_20260406T0640Z.tif"
+    );
+    let cog = std::fs::read(FIXTURE).unwrap();
+    let size = cog.len() as u64;
+    let small = std::fs::metadata(SMALL).unwrap().len();
+    // A 206 of `bytes`' first `n` bytes, the `Range: bytes=0-(n-1)` asked.
+    fn partial(bytes: &[u8], headers: &HeaderMap) -> Response {
+        let range = headers[header::RANGE].to_str().unwrap();
+        let last: usize = range.strip_prefix("bytes=0-").unwrap().parse().unwrap();
+        let total = bytes.len();
+        (
+            StatusCode::PARTIAL_CONTENT,
+            [(header::CONTENT_RANGE, format!("bytes 0-{last}/{total}"))],
+            bytes[..=last].to_vec(),
+        )
+            .into_response()
+    }
+    let whole = cog.clone();
+    let garbage = vec![0x55u8; cog.len()];
+    let app = axum::Router::new()
+        .route_service("/cog", tower_http::services::ServeFile::new(FIXTURE))
+        .route_service("/small", tower_http::services::ServeFile::new(SMALL))
+        .route(
+            "/not-cog",
+            axum::routing::get(
+                move |headers: HeaderMap| async move { partial(&garbage, &headers) },
+            ),
+        )
+        .route(
+            "/ignores-range",
+            axum::routing::get(move || async move { whole }),
+        )
+        .route(
+            "/gone",
+            axum::routing::get(|| async { StatusCode::NOT_FOUND }),
+        )
+        .route(
+            "/forbidden",
+            axum::routing::get(|| async { StatusCode::FORBIDDEN }),
+        )
+        .route(
+            "/unsatisfiable",
+            axum::routing::get(|| async { StatusCode::RANGE_NOT_SATISFIABLE }),
+        )
+        .route(
+            "/unavailable",
+            axum::routing::get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        )
+        .route(
+            "/cut-short",
+            axum::routing::get(move || async move {
+                let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+                    Ok(bytes::Bytes::from(vec![0u8; 1024])),
+                    Err(std::io::Error::other("connection cut")),
+                ];
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_LENGTH, crate::reader::HEADER_READ_SIZE)
+                    .body(axum::body::Body::from_stream(futures::stream::iter(chunks)))
+                    .unwrap()
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let http = reqwest::Client::new();
+    let read = |path: &str, size: u64| {
+        let (http, url) = (http.clone(), format!("{base}{path}"));
+        async move { TiffMetadata::from_http_header_read(&http, &url, size).await }
+    };
+
+    assert!(matches!(
+        read("/cog", size).await,
+        Ok(HttpHeaderRead::Cog(..))
+    ));
+    assert!(matches!(
+        read("/small", small).await,
+        Ok(HttpHeaderRead::Cog(..))
+    ));
+    assert!(matches!(
+        read("/not-cog", size).await,
+        Ok(HttpHeaderRead::NotCog)
+    ));
+    assert!(matches!(read("/cog", 0).await, Ok(HttpHeaderRead::NotCog)));
+    assert!(matches!(
+        read("/ignores-range", size).await,
+        Ok(HttpHeaderRead::RangeIgnored)
+    ));
+    for (path, listed, refusal) in [
+        ("/gone", size, RangeRefusal::NotFound),
+        ("/forbidden", size, RangeRefusal::Forbidden),
+        ("/unsatisfiable", size, RangeRefusal::Truncated),
+        // The listing says 4 KiB more than the object holds.
+        ("/small", small + 4096, RangeRefusal::Truncated),
+    ] {
+        match read(path, listed).await {
+            Ok(HttpHeaderRead::Refused(r)) => assert_eq!(r, refusal, "{path}"),
+            other => panic!("{path}: expected {refusal:?}, got {other:?}"),
+        }
+    }
+    for path in ["/unavailable", "/cut-short"] {
+        assert!(read(path, size).await.is_err(), "{path}: a failed read");
+    }
 }
 
 /// A scan whose metadata read budget is spent leaves new files to the next

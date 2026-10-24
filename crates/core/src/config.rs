@@ -2895,6 +2895,18 @@ pub struct OdimConfig {
     /// of which holds pre-warmed entries until they are read.
     #[serde(default = "default_prewarm_sweeps")]
     pub prewarm_sweeps: usize,
+
+    /// The quantities whose lowest `prewarm_sweeps` sweeps each poll
+    /// pre-decodes (`engine_type = "odim-volume"`, #1046), e.g. `["DBZH",
+    /// "VRADH"]` for clients that animate Doppler velocity as well. Unset:
+    /// the volume's default quantity only (`DBZH`, else `TH`, else the
+    /// first), the one an unqualified layer renders (#992). A quantity a
+    /// volume lacks is skipped; an empty list warms nothing; an empty name is
+    /// a load error. Each quantity warmed adds its sweeps to the pre-warm
+    /// working set: size `MC_PVOL_PIXEL_CACHE_MB` to about twice sites ×
+    /// retained volumes × `prewarm_sweeps` × quantities × one sweep (#476).
+    #[serde(default)]
+    pub prewarm_quantities: Option<Vec<String>>,
 }
 
 /// Default lowest-sweep pre-warm depth: the base tilt (the common animation
