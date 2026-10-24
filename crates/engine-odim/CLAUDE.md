@@ -136,10 +136,35 @@ around `ds-storage` calls (Critical Rules 6–7).
   The batch's arrays outlive LRU eviction until the walk moves on to the
   next volume, so an EDR walk over every quantity (no `parameter-name`:
   `resolve_quantities` returns them all) holds one decoded volume per
-  request, every quantity × sweep it samples, while it samples: on the
-  order of 60–100 MB for an FMI volume, times the EDR queries running at
-  once. No budget counts it yet: the EDR response budget (#1041) counts
-  response bodies only.
+  request, every quantity × sweep it samples, while it samples: 78 MB of
+  arrays for a 41 MB FMI volume (160 moments), times the EDR queries
+  running at once. The PVOL read budget counts it (next bullet).
+- **EDR walks reserve their reads (#1041).** `read_budget::BUDGET`
+  (`MC_PVOL_READ_MEMORY_MB`, default 1024 MiB, a `ByteBudget`) admits
+  every volume of `walk_volumes` before its file is read. A batch with
+  nothing read ahead reserves inside `load_moments_from`'s loader, once
+  `load_many` has named the missing moments: their arrays at `sweep_bytes`
+  (4 B/sample, twice FMI's u16 arrays: 155 MB for that volume), held with
+  the batch until the walk moves on, and the bytes it fetches
+  (`ReadPlan::bytes`, else `file_len`, the whole file again when a ranged
+  read falls back) until they are decoded. Resident moments and held
+  bytes cost nothing. A read ahead (`start_read`) reserves the whole file
+  and its cold targets' arrays with `try_reserve` when its download
+  starts, so its batch needs nothing more. One with no room is not
+  started, counts no rejection, and stops the topping up until the
+  volumes before it are sampled: a volume behind never holds what the one
+  before it needs, and the front then reserves as it reads. A walk thus
+  reserves at most four volumes, about 750 MB for an all-quantity FMI walk
+  reading ahead. A joined download (#1127) counts again for each holder.
+  A reservation that does not fit fails the batch with `ResourceExhausted`
+  (503) before it reads, marking nothing bad. Only EDR walks charge it,
+  GetFeatureInfo's position query included: `volume_moments` (3D Tiles)
+  and `Pixels::moment` (maps) pass no budget. Pinned by
+  `a_batch_reserves_its_arrays_and_file_before_reading_them`,
+  `a_ranged_batch_reserves_its_ranges_not_the_file`,
+  `read_ahead_walks_read_no_further_ahead_than_the_budget_holds` and
+  `edr_walks_charge_the_budget_mc_pvol_read_memory_mb_sizes` (a child
+  process at `MC_PVOL_READ_MEMORY_MB=0`).
 - **EDR walks over several volumes download ahead (#999).** The profiles
   and `level_series` of `site_coverages` and the sections of
   `site_trajectory` go through `walk_volumes`: `prepare` names each

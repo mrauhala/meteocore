@@ -1039,6 +1039,23 @@ static PVOL_PIXEL_READ_FAILURES: LazyLock<DeltaCounter> = LazyLock::new(|| {
     )
 });
 
+// PVOL EDR read admission (#1041): the bytes an EDR walk's volume batches
+// fetch and decode, process-global like the GeoTIFF/Zarr budgets.
+static PVOL_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "pvol_read_reserved_bytes",
+        "Reserved PVOL EDR read memory: volume bytes fetched and moments decoded",
+    )
+});
+static PVOL_READ_LIMIT: LazyLock<IntGauge> =
+    LazyLock::new(|| int_gauge("pvol_read_capacity_bytes", "PVOL EDR read memory capacity"));
+static PVOL_READ_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "pvol_read_rejected_total",
+        "PVOL EDR reads rejected by memory admission",
+    )
+});
+
 // 3D Tiles encoded-content cache — global, the final `.pnts`/`.glb` bytes per
 // (collection, product, quantity, time, params, data-version), so repeats and
 // `If-None-Match` revalidations skip the engine read + encode entirely.
@@ -7123,6 +7140,10 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         PVOL_PIXEL_CACHE_METRICS.update(pixel.cache, Some(pixel.entries));
         PVOL_PIXEL_CACHE_INSERTS.feed(pixel.inserts);
         PVOL_PIXEL_READ_FAILURES.feed(pixel.read_failures);
+        let (used, limit, rejected) = engine_odim::read_budget::metrics();
+        PVOL_READ_USED.set(used.min(i64::MAX as u64) as i64);
+        PVOL_READ_LIMIT.set(limit.min(i64::MAX as u64) as i64);
+        PVOL_READ_REJECTED.feed(rejected);
 
         // Voxel-grid + storm-cell set caches: same process-global shape.
         PVOL_VOXEL_GRID_CACHE_METRICS.update(engine_odim::voxel_grid_cache_metrics(), None);

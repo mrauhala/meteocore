@@ -53,6 +53,17 @@ available.
   and concurrent requests that need the same remote volume share one
   download. A request waits for a download or decode that another request
   started only until its own deadline.
+- **EDR read memory.** The volumes an EDR query (or a WMS GetFeatureInfo)
+  reads are admitted by one process-wide budget, `MC_PVOL_READ_MEMORY_MB`
+  (default 1024). Before a volume's file is read, the query reserves the
+  bytes it fetches until they are decoded, and the moments it decodes, at
+  four bytes a sample, until it moves on to the next volume; moments
+  already cached cost nothing. A profile of every quantity of a 41 MB FMI
+  volume (160 moments) reserves about 155 MB of moments plus the file. A
+  query reading ahead reserves each volume's file and moments when its
+  download starts and reads no further ahead than the budget allows. A
+  volume that does not fit is a 503. Map, 3D Tiles and storm-cell reads
+  are not counted.
 - **Read errors.** A missing or undecodable polar volume reads as no data
   and is remembered as bad. A passed deadline or a storage failure fails
   the request, so no cache keeps an empty frame: a storage failure is a
