@@ -464,12 +464,17 @@ ones only in the legacy layout.
 ## Wind components (#897)
 
 - `ds_core::derive::Derived` (wired in `server/src/admin.rs`) derives
-  speed and direction from u/v pairs, and geopotential height from `z`
-  (0/3/4) where the view has no `gh` (0/3/5) at that level (#948); this
-  engine only reports facts (`WindSource`: triple, level, served unit for
-  every parameter). Never compute a derived field here.
+  speed and direction from u/v pairs, geopotential height from `z`
+  (0/3/4) where the view has no `gh` (0/3/5) at that level (#948), and
+  relative humidity and dew point from 0/0/0 with 0/0/6, 0/1/1 or, on a
+  pressure view, 0/1/0 (#898); this engine only reports facts
+  (`WindSource`: triple, level, served unit for every parameter, and
+  `vertical` = the view's `vertical_kind()`, whose level a humidity from
+  `q` reads as its pressure). Never compute a derived field here.
   `geopotential_tests` pins z in m² s⁻², `gh` = z / g₀ on EDR and the map,
-  the skip when `gh` exists, and a single-level `z`'s terrain height.
+  the skip when `gh` exists, and a single-level `z`'s terrain height;
+  `moisture_tests` pins `2t`/`2d` → `2r`, a pressure view's `t`/`q` → `r`
+  and `dpt` per level, and no second `RH`/`DPT` or single-level `SPFH`.
 - Read GRIB2 flag table 3.3 bit 5 (`0x08`, Section 3 octet 55) from **every**
   message, in both the header probe (`metadata::read_metadata`) and the
   decode (`reader::uv_frame`), into `MessageMetadata::uv_frame` /

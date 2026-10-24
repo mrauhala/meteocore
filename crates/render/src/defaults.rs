@@ -108,9 +108,12 @@ static RULES: &[DefaultRule] = &[
     // Temperature / dew point — unit-gated: NEVER guess K vs °C. One range
     // for every level, −90…50 °C, so a colour means the same temperature
     // from the surface to the stratosphere. The kelvin range is the same
-    // span, so the °C palette rescales onto it exactly.
+    // span, so the °C palette rescales onto it exactly. `dpt` is ECMWF's
+    // and wgrib2's dew point, the name a derived one takes (#898).
     DefaultRule {
-        names: &["t", "2t", "t2m", "tmp", "tt", "td", "2d", "d2m", "skt"],
+        names: &[
+            "t", "2t", "t2m", "tmp", "tt", "td", "2d", "d2m", "dpt", "skt",
+        ],
         contains: &["temperature", "dewpoint"],
         palette: "temperature",
         unit_ranges: &[
@@ -985,6 +988,58 @@ mod tests {
             d.match_default("5WAVA", "Geopotential height anomaly", Some("gpm")),
             None
         );
+    }
+
+    /// The relative humidity and dew point `ds_core::moisture` derives
+    /// (#898), by every name and title it gives them, in % and in the °C or
+    /// K of their temperature, take the humidity and temperature defaults.
+    #[test]
+    fn derived_humidity_takes_the_humidity_and_temperature_defaults() {
+        let d = builtin();
+        let rh = "Relative humidity over water";
+        for (name, title) in [
+            ("2r", format!("{rh} (2 m above ground)")),
+            ("r", rh.to_string()),
+            ("r2", rh.to_string()),
+            ("RH", format!("{rh} (2 m above ground)")),
+            ("Humidity", rh.to_string()),
+            ("relative_humidity_2m", format!("{rh} (2 m)")),
+            ("relative_humidity_pl", rh.to_string()),
+        ] {
+            assert_eq!(
+                d.match_default(name, &title, Some("%")),
+                Some(ResolvedDefault {
+                    palette: "humidity".into(),
+                    range: Some((0.0, 100.0)),
+                }),
+                "{name}"
+            );
+        }
+        for (name, title) in [
+            ("2d", "Dew point temperature (2 m above ground)"),
+            ("dpt", "Dew point temperature"),
+            ("DPT", "Dew point temperature (2 m above ground)"),
+            ("DewPoint", "Dew point temperature"),
+            ("dew_point_temperature_2m", "Dew point temperature (2 m)"),
+            ("dew_point_temperature_pl", "Dew point temperature"),
+        ] {
+            for (unit, range) in [("°C", (-90.0, 50.0)), ("K", (183.15, 323.15))] {
+                assert_eq!(
+                    d.match_default(name, title, Some(unit)),
+                    Some(ResolvedDefault {
+                        palette: "temperature".into(),
+                        range: Some(range),
+                    }),
+                    "{name} in {unit}"
+                );
+            }
+            // By name alone too, whatever the title.
+            assert_eq!(
+                d.match_default(name, "", Some("°C")).map(|r| r.palette),
+                Some("temperature".into()),
+                "{name}"
+            );
+        }
     }
 
     /// Relative humidity keeps its percent and fraction ranges, and a

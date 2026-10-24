@@ -86,6 +86,15 @@ compares engines.
   view `z` is the surface geopotential and `gh` the terrain height. The
   ECMWF pressure levels ship `gh` and get no second one.
   `derive_geopotential_height = false` opts out.
+- **Relative humidity and dew point.** Where a view has temperature (0/0/0)
+  and a dew point (0/0/6), relative humidity (0/1/1) or, on a pressure
+  view, specific humidity (0/1/0) at a level, but not the other quantity,
+  it is derived on every API from the served units: `2t`/`2d` → `2r`;
+  pressure-level `t`/`q` → `r` and `dpt`, from each level's pressure;
+  wgrib2 `TMP` with `DPT`, `RH` or `SPFH` → `RH` or `DPT`. Relative
+  humidity is over liquid water. GFS's 2 m `RH` and `DPT` are native and
+  get no second one; specific humidity at a single level gives nothing (it
+  would need the surface pressure). `derive_humidity = false` opts out.
 
 ## Configuration
 

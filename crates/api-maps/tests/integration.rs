@@ -168,6 +168,7 @@ fn build_state_with_engine_and_wms(
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
     let cmap = Arc::new(LutColorMap::from_builtin(
@@ -243,6 +244,7 @@ fn build_router_with_tilesets(apis: Vec<String>, map_tilesets: bool) -> axum::Ro
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -366,6 +368,7 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
     let state = Arc::new(ArcSwap::from_pointee(MapsState {
@@ -422,6 +425,7 @@ fn router_with(
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
     let state = Arc::new(ArcSwap::from_pointee(MapsState {
@@ -1581,6 +1585,7 @@ fn build_empty_router() -> axum::Router {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -1718,6 +1723,7 @@ fn build_multi_param_router() -> axum::Router {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -2370,6 +2376,7 @@ mod searchable {
                     preview: None,
                     derive_wind: None,
                     derive_geopotential_height: None,
+                    derive_humidity: None,
                 },
             );
         }
@@ -2855,6 +2862,7 @@ fn build_router_with_engine_and_styles(
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
 
@@ -4004,6 +4012,7 @@ mod composites {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         };
         let state = Arc::new(ArcSwap::from_pointee(MapsState {
             engines: HashMap::from([("radar".to_string(), engine)]),

@@ -130,5 +130,11 @@ runtime).
   lat/lon area grid-relative is earth-relative: speed and direction. On
   LCC, stereographic and rotated lat/lon areas (`GridAxes::Rotated`) speed
   only, until `ds_core::wind` can turn components to true north.
+- **Humidity (#898):** `wind_facts` also sets `fmi_param` for 4
+  (Temperature, °C), 10 (DewPoint, °C) and 13 (Humidity, %), and only
+  for those and the wind numbers, so a vocabulary name still pairs a
+  parameter without one. `ds_core::moisture` pairs them by number and
+  names the result in the temperature's vocabulary (`Humidity`/`DewPoint`,
+  or `2r`/`2d` for `2t`); `engine/moisture_tests.rs`.
 - Config: `wms_parameter`, `poll_interval_secs` (default 30), `max_runs`
   (default 4; set 1 for latest-only).

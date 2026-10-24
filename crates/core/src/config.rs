@@ -309,6 +309,16 @@ pub struct CollectionConfig {
     /// out. Any other engine type rejects the key at load.
     #[serde(default)]
     pub derive_geopotential_height: Option<bool>,
+    /// Relative humidity and dew point derived from their ingredients where
+    /// the collection has none at that level (#898, `ds_core::moisture`):
+    /// relative humidity from temperature and dew point, dew point from
+    /// temperature and relative humidity, and both from temperature and
+    /// specific humidity on pressure levels. Unset or `true` derives them
+    /// for the engines whose sources identify the ingredients (`grib`,
+    /// `querydata`, `zarr`, `netcdf`); `false` opts the collection out. Any
+    /// other engine type rejects the key at load.
+    #[serde(default)]
+    pub derive_humidity: Option<bool>,
 }
 
 /// The engine types whose collections derive wind from u/v components.
@@ -319,6 +329,12 @@ pub const DERIVE_WIND_ENGINES: [&str; 4] = ["grib", "querydata", "zarr", "netcdf
 /// `standard_name`. QueryData does not: FMI's `GeopHeight` (2) holds gpm or
 /// m² s⁻² by producer, and no newbase number fixes geopotential's unit.
 pub const DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES: [&str; 3] = ["grib", "zarr", "netcdf"];
+
+/// The engine types whose collections derive relative humidity and dew
+/// point: their sources identify temperature, dew point and humidity by
+/// GRIB triple, CF `standard_name` or FMI parameter number, and state their
+/// units.
+pub const DERIVE_HUMIDITY_ENGINES: [&str; 4] = ["grib", "querydata", "zarr", "netcdf"];
 
 impl CollectionConfig {
     /// Whether this collection serves wind derived from u/v components:
@@ -335,6 +351,14 @@ impl CollectionConfig {
     pub fn derives_geopotential_height(&self) -> bool {
         DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES.contains(&self.engine_type.as_str())
             && self.derive_geopotential_height != Some(false)
+    }
+
+    /// Whether this collection serves relative humidity and dew point
+    /// derived from their ingredients: on by default for
+    /// [`DERIVE_HUMIDITY_ENGINES`], off with `derive_humidity = false`.
+    pub fn derives_humidity(&self) -> bool {
+        DERIVE_HUMIDITY_ENGINES.contains(&self.engine_type.as_str())
+            && self.derive_humidity != Some(false)
     }
 
     /// The collection's default WebP quality, `[wms] webp_quality`: what a
@@ -4592,6 +4616,16 @@ impl ServerConfig {
                     collection.engine_type
                 )));
             }
+            if collection.derive_humidity.is_some()
+                && !DERIVE_HUMIDITY_ENGINES.contains(&collection.engine_type.as_str())
+            {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': 'derive_humidity' applies only to engine types {}, \
+                     not '{}'",
+                    DERIVE_HUMIDITY_ENGINES.join(", "),
+                    collection.engine_type
+                )));
+            }
 
             // GeoTIFF engine requires geotiff config section
             if collection.engine_type == "geotiff" && collection.geotiff.is_none() {
@@ -6155,6 +6189,51 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         let toml = "[server]\nhost=\"h\"\nport=1\n[[collections]]\nid=\"c\"\ntitle=\"t\"\n\
                     description=\"d\"\nengine_type=\"grib\"\n\
                     derive_geopotential_height=\"no\"\n";
+        assert!(toml::from_str::<ServerConfig>(toml).is_err());
+    }
+
+    /// `derive_humidity` (#898): on by default for the engines whose
+    /// sources identify temperature and humidity, QueryData included, off
+    /// with `false` (the other derivations stay on); rejected where it
+    /// would do nothing.
+    #[test]
+    fn derive_humidity_defaults_on_and_opts_out_per_collection() {
+        let grib = grib_collection("data_path = \"/data\"\n");
+        assert_eq!(grib.collections[0].derive_humidity, None);
+        assert!(grib.collections[0].derives_humidity());
+        let off = collection_with(
+            "engine_type = \"grib\"\nderive_humidity = false\n\
+             [collections.grib]\ndata_path = \"/data\"\n",
+        );
+        assert!(!off.collections[0].derives_humidity());
+        assert!(off.collections[0].derives_wind());
+        assert!(off.collections[0].derives_geopotential_height());
+        assert!(off.validate().is_ok());
+        for engine in ["netcdf", "zarr"] {
+            let on = collection_with(&format!("engine_type = \"{engine}\"\n"));
+            assert!(on.collections[0].derives_humidity(), "{engine}");
+        }
+        let qd = collection_with("engine_type = \"querydata\"\ndata_path = \"/data\"\n");
+        assert!(qd.collections[0].derives_humidity());
+        assert!(qd.validate().is_ok());
+        let geotiff = collection_with(
+            "engine_type = \"geotiff\"\n[collections.geotiff]\n\
+             filename_template = \"r_%Y%m%dT%H%MZ.tif\"\nparameter = \"r\"\nunit = \"dBZ\"\n",
+        );
+        assert!(!geotiff.collections[0].derives_humidity());
+        assert!(geotiff.validate().is_ok(), "unset, the key changes nothing");
+        let csv = collection_with("derive_humidity = true\n");
+        assert!(!csv.collections[0].derives_humidity());
+        let err = csv.validate().unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "'derive_humidity' applies only to engine types grib, querydata, zarr, \
+                 netcdf, not 'csv'"
+            ),
+            "{err}"
+        );
+        let toml = "[server]\nhost=\"h\"\nport=1\n[[collections]]\nid=\"c\"\ntitle=\"t\"\n\
+                    description=\"d\"\nengine_type=\"grib\"\nderive_humidity=\"no\"\n";
         assert!(toml::from_str::<ServerConfig>(toml).is_err());
     }
 

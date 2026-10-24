@@ -151,11 +151,14 @@ impl GribEngine {
             .insert((url.to_owned(), entry.offset), geometry);
         true
     }
-    /// What each parameter's metadata states for wind derivation (#897):
-    /// its WMO triple and GRIB2 component flag, read by the header probe or
-    /// a decode (`Unknown` until then), and the canonical level it is served
-    /// at. All of it from the newest run that has the parameter (#1026), so
-    /// a component only an older run still has pairs at its own level.
+    /// What each parameter's metadata states for the derived parameters
+    /// (wind #897, geopotential height #948, humidity #898): its WMO triple
+    /// and GRIB2 component flag, read by the header probe or a decode
+    /// (`Unknown` until then), its served unit, and the canonical level it
+    /// is served at, or the view's vertical axis it spans (a pressure
+    /// view's level is the pressure a humidity from `q` reads). All of it
+    /// from the newest run that has the parameter (#1026), so a component
+    /// only an older run still has pairs at its own level.
     fn build_wind_facts(&self, catalog: &Catalog) -> WindFacts {
         let keys = catalog.advertised_keys();
         // A pressure or model-level view's parameters span its vertical
@@ -181,6 +184,7 @@ impl GribEngine {
                     frame: meta.uv_frame,
                     level,
                     level_label,
+                    vertical: self.vertical_kind(),
                     unit: meta.display.display_unit.to_string(),
                     ..ParameterFacts::new(name)
                 }

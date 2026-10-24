@@ -558,6 +558,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `csv` | no | — | `engine_type = "csv"` only: `[collections.csv.map]`, the [station symbol layers](#station-symbol-layers). Any other key is a load error. |
 | `derive_wind` | no | on | `grib`, `querydata`, `zarr` and `netcdf` only: serve wind speed and direction derived from u/v components (see [Derived wind](#derived-wind-speed-and-direction)). `false` opts out; the key on any other engine type is a load error. |
 | `derive_geopotential_height` | no | on | `grib`, `zarr` and `netcdf` only: serve geopotential height derived from geopotential where the collection has none at that level (see [Derived geopotential height](#derived-geopotential-height)). `false` opts out; the key on any other engine type is a load error. |
+| `derive_humidity` | no | on | `grib`, `querydata`, `zarr` and `netcdf` only: serve relative humidity and dew point derived from their ingredients where the collection has none at that level (see [Derived relative humidity and dew point](#derived-relative-humidity-and-dew-point)). `false` opts out; the key on any other engine type is a load error. |
 
 ### Per-File Collection Configs
 
@@ -1391,6 +1392,54 @@ pressure levels' `gh` and GFS's `HGT`, get no second one. The server logs,
 per geopotential, what was derived or why not.
 `derive_geopotential_height = false` turns it off for a collection.
 
+### Derived relative humidity and dew point
+
+A GRIB, QueryData, Zarr or NetCDF collection that has the ingredients of
+relative humidity or dew point at a level, but not the parameter, also
+serves it (#898, `ds_core::moisture`):
+
+| Derived | From, in order of preference |
+|---|---|
+| relative humidity, % | temperature and dew point; temperature and specific humidity on pressure levels |
+| dew point, in the temperature's unit | specific humidity on pressure levels (temperature for the bound); temperature and relative humidity |
+
+The ingredients must be at one level: `2t` pairs with `2d`, `t` at 850 hPa
+with `q` at 850 hPa, never a single level with a pressure level. Specific
+humidity needs the air's pressure, which is the level's own value on
+pressure levels (hPa → Pa); at a single level it would be the surface
+pressure (never mean sea-level pressure), and on model levels it needs the
+hybrid coefficients, so neither is derived. Each ingredient is identified by
+its GRIB parameter (0/0/0, 0/0/6, 0/1/1, 0/1/0), CF `standard_name` or FMI
+number, and its unit is the one served: K or °C, % or CF `1`, kg/kg or g/kg.
+An ingredient whose unit is unknown refuses the derivation.
+
+Relative humidity is relative to liquid water at all temperatures, as WMO
+defines it, and its title says so ("Relative humidity over water"); dew
+point is over water by definition. Both use one formula, the
+ECMWF IFS Tetens constants over water (611.21 Pa, 17.502, 32.19 K), so they
+invert each other exactly. A native relative humidity a dew point is derived
+from is taken as over water; a dew point prefers specific humidity, which
+needs no such assumption (ECMWF's pressure-level `r` is over ice below
+−23 °C). Relative humidity is clamped to 0–100 % and dew point to at most
+the temperature; specific or relative humidity of zero or less gives 0 % and
+no dew point.
+
+The names follow the source's vocabulary: ECMWF `2t`/`2d` → `2r` and, on
+pressure levels, `t`/`q` → `r` and `dpt`; ERA5 netCDF `t2m`/`d2m` → `r2`;
+wgrib2 `TMP` with `DPT`, `RH` or `SPFH` → `RH`, `DPT`; FMI `Temperature`
+with `DewPoint` or `Humidity` → `Humidity`, `DewPoint`; CF stores by
+swapping the `air_temperature` token (`air_temperature_2m` →
+`relative_humidity_2m`, `dew_point_temperature_2m`; MEPS
+`air_temperature_pl` → `dew_point_temperature_pl` per pressure level).
+Relative humidity is a WMS/Maps/Tiles layer with the built-in `humidity`
+style (0–100 %), dew point one with the temperature style, and both are EDR
+parameters with the CF `relative_humidity` / `dew_point_temperature`
+observed property, computed from the ingredients sampled at each pixel or
+point and resolved in time, run and level as they are. A quantity the
+collection already has at the level (GFS's `RH` and `DPT`) is not derived
+again. The server logs, per temperature's level, what was derived from what,
+or why not. `derive_humidity = false` turns it off for a collection.
+
 ### Satellite
 
 Geostationary satellite imagery (`engine_type = "satellite"`, epic #819). One collection is one satellite and sector; each `[[satellite.products]]` entry (an ABI band, or an L2 field such as cloud top temperature) is a parameter with **its own time axis**: WMS child layers advertise their own `time` dimension, and Maps/Tiles resolve `datetime` per `parameter-name`. The collection's temporal extent is the union.
@@ -1589,6 +1638,8 @@ variables = ["air_temperature_2m"]
 **Derived wind.** u/v components that their CF `standard_name` identifies give a wind speed on every API: MEPS's `x_wind_10m`/`y_wind_10m` give `wind_speed_10m`, and on pressure levels `x_wind_pl`/`y_wind_pl` give `wind_speed_pl`, both components read at the one level asked for. MEPS's components are relative to its Lambert grid, so they give no direction until they are turned to true north (#897); `derive_wind = false` turns it off.
 
 **Derived geopotential height.** A variable whose `standard_name` is `geopotential` is served as stored, in m² s⁻², and gives its height in gpm on every API: MEPS's `geopotential_pl` gives `geopotential_height_pl`, read at the one level asked for (#948); `derive_geopotential_height = false` turns it off.
+
+**Derived dew point.** A temperature and relative humidity that their CF `standard_name` identifies at one level give the dew point, in the °C the temperature is served in, on every API: MEPS's `air_temperature_2m`/`relative_humidity_2m` give `dew_point_temperature_2m`, and on pressure levels `air_temperature_pl`/`relative_humidity_pl` give `dew_point_temperature_pl`, read at the one level asked for; a `dew_point_temperature` gives the relative humidity, and a `specific_humidity` on the pressure axis both (#898); `derive_humidity = false` turns it off.
 
 **Per-step precipitation.** A variable named `<name>_acc` in kg m⁻² or mm, MET Norway's accumulation since the run start, also gives `<name>`, the amount of each step: MEPS's `precipitation_amount_acc` gives `precipitation_amount`, titled `Precipitation amount (1 h accumulation)`, in mm. It is the accumulation at the step less the accumulation at the run's step before, clamped at zero, and a run's first step, which has none before it, is its own accumulation. It has the accumulation's runs and steps on every API (WMS layer `coll/precipitation_amount`, Maps/Tiles `parameter-name=precipitation_amount`, every EDR query: along a trajectory each sample takes its own step's step before) and the per-step precipitation style, `precipitation` over 0–50 mm. Each of the two fields is sampled and converted before they are differenced, so a pixel and an EDR value agree, and each lead's field is read once: the step a map just drew is the next step's step before. When the steps differ in length, as in a run missing a lead, the title gives the shortest and longest. An `_acc` in another unit is not derived, nor one whose `<name>` the files carry; `derive_per_step = false` in `[netcdf]` turns it off.
 

@@ -1,6 +1,8 @@
 //! Parameters a collection serves derived from its own: wind speed and
-//! direction from u/v components ([`crate::wind`], #897) and geopotential
-//! height from geopotential ([`crate::geopotential`], #948).
+//! direction from u/v components ([`crate::wind`], #897), geopotential
+//! height from geopotential ([`crate::geopotential`], #948), and relative
+//! humidity and dew point from their ingredients ([`crate::moisture`],
+//! #898).
 //!
 //! One wrapper, [`Derived`], serves every derivation over an engine's
 //! `MapEngine` + `EdrEngine`, so the time, run, level and cache-key rules
@@ -24,6 +26,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::geopotential::{HeightOutcome, HeightPlan};
+use crate::moisture::{MoistureOutcome, MoisturePlan, Recipe};
 use crate::wind::{DerivedKind, PairOutcome, WindFacts, WindPlan};
 
 #[cfg(test)]
@@ -33,13 +36,16 @@ mod wrapper;
 pub use wrapper::Derived;
 
 /// Which derivations a collection serves. Each is a per-collection opt-out
-/// in config (`derive_wind`, `derive_geopotential_height`).
+/// in config (`derive_wind`, `derive_geopotential_height`,
+/// `derive_humidity`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Derivations {
     /// Wind speed and direction from u/v components.
     pub wind: bool,
     /// Geopotential height from geopotential.
     pub geopotential_height: bool,
+    /// Relative humidity and dew point from their ingredients.
+    pub humidity: bool,
 }
 
 impl Derivations {
@@ -47,16 +53,18 @@ impl Derivations {
     pub const WIND: Derivations = Derivations {
         wind: true,
         geopotential_height: false,
+        humidity: false,
     };
     /// Every derivation.
     pub const ALL: Derivations = Derivations {
         wind: true,
         geopotential_height: true,
+        humidity: true,
     };
 
     /// Whether any derivation is on.
     pub fn any(self) -> bool {
-        self.wind || self.geopotential_height
+        self.wind || self.geopotential_height || self.humidity
     }
 }
 
@@ -71,6 +79,11 @@ pub enum Formula {
     WindDirection,
     /// Φ / g₀ ([`crate::geopotential::height`]); input geopotential.
     GeopotentialHeight,
+    /// Relative humidity or dew point ([`Recipe::value`]); inputs
+    /// temperature and a dew point, relative humidity or specific humidity,
+    /// then, for specific humidity, the level's pressure in Pa, which the
+    /// wrapper appends ([`Formula::reads_level_pressure`]).
+    Moisture(Recipe),
 }
 
 impl Formula {
@@ -81,6 +94,7 @@ impl Formula {
             (Formula::WindSpeed, &[u, v]) => crate::wind::speed(u, v),
             (Formula::WindDirection, &[u, v]) => crate::wind::from_direction(u, v),
             (Formula::GeopotentialHeight, &[z]) => crate::geopotential::height(z),
+            (Formula::Moisture(recipe), samples) => recipe.value(samples),
             _ => None,
         }
     }
@@ -92,7 +106,15 @@ impl Formula {
             Formula::WindSpeed => crate::wind::WIND_SPEED,
             Formula::WindDirection => crate::wind::WIND_FROM_DIRECTION,
             Formula::GeopotentialHeight => crate::geopotential::GEOPOTENTIAL_HEIGHT,
+            Formula::Moisture(recipe) => recipe.quantity().standard_name(),
         }
+    }
+
+    /// Whether its last sample is the pressure of the level its inputs are
+    /// read at, in Pa, which the wrapper appends: from the request's
+    /// isobaric level on a map, from the coverage's `z` in EDR.
+    pub fn reads_level_pressure(self) -> bool {
+        matches!(self, Formula::Moisture(recipe) if recipe.reads_level_pressure())
     }
 
     /// Whether the map APIs serve it: a scalar a palette can draw. A
@@ -106,6 +128,7 @@ impl Formula {
         match self {
             Formula::WindSpeed | Formula::WindDirection => "wind",
             Formula::GeopotentialHeight => "geopotential height",
+            Formula::Moisture(recipe) => recipe.quantity().noun(),
         }
     }
 
@@ -114,6 +137,7 @@ impl Formula {
         match self {
             Formula::WindSpeed | Formula::WindDirection => "wind component",
             Formula::GeopotentialHeight => "geopotential",
+            Formula::Moisture(_) => "humidity input",
         }
     }
 }
@@ -165,6 +189,8 @@ pub enum Outcome {
     Wind(PairOutcome),
     /// A geopotential.
     GeopotentialHeight(HeightOutcome),
+    /// A temperature's level, with its humidity ingredients.
+    Moisture(MoistureOutcome),
 }
 
 impl Outcome {
@@ -174,17 +200,21 @@ impl Outcome {
         match self {
             Outcome::Wind(pair) => ("wind", &pair.u, &pair.v),
             Outcome::GeopotentialHeight(h) => ("geopotential height", &h.geopotential, ""),
+            Outcome::Moisture(m) => ("humidity", &m.temperature, ""),
         }
     }
 }
 
 impl fmt::Display for Outcome {
     /// `wind 10u/10v: derived speed '10si' and direction '10wdir'`,
-    /// `geopotential height z: derived 'gh'`.
+    /// `geopotential height z: derived 'gh'`, `humidity 2t: derived
+    /// relative humidity '2r' from '2t' and '2d'; no dew point: the
+    /// collection already has '2d'`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Outcome::Wind(pair) => write!(f, "wind {pair}"),
             Outcome::GeopotentialHeight(height) => write!(f, "geopotential height {height}"),
+            Outcome::Moisture(moisture) => write!(f, "humidity {moisture}"),
         }
     }
 }
@@ -205,8 +235,9 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Plan every derivation `derive` turns on, wind first: a name one
-    /// derivation takes is taken for the next.
+    /// Plan every derivation `derive` turns on, wind first, then
+    /// geopotential height, then humidity: a name one derivation takes is
+    /// taken for the next.
     pub fn build(facts: &WindFacts, derive: Derivations) -> Plan {
         let mut plan = Plan::default();
         if derive.wind {
@@ -241,6 +272,21 @@ impl Plan {
                     .into_iter()
                     .map(Outcome::GeopotentialHeight),
             );
+        }
+        if derive.humidity {
+            let claimed: HashSet<String> = plan.derived.iter().map(|d| d.name.clone()).collect();
+            let moisture = MoisturePlan::build(facts, &claimed);
+            plan.derived
+                .extend(moisture.derived.into_iter().map(|m| DerivedParameter {
+                    name: m.name,
+                    formula: Formula::Moisture(m.recipe),
+                    inputs: m.inputs,
+                    edr_inputs: m.edr_inputs,
+                    title: m.title,
+                    unit: m.unit,
+                }));
+            plan.outcomes
+                .extend(moisture.outcomes.into_iter().map(Outcome::Moisture));
         }
         plan
     }

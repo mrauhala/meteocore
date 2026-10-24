@@ -173,6 +173,7 @@ fn build_router() -> axum::Router {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            derive_humidity: None,
         },
     );
     api_edr::router(Arc::new(ArcSwap::from_pointee(EdrState {

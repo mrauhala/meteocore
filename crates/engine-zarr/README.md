@@ -101,6 +101,16 @@ every API, unless the store has a `geopotential_height` at that level:
 `geopotential` → `geopotential_height`, ERA5's `z` → `gh`.
 `derive_geopotential_height = false` on the collection opts out.
 
+**Derived relative humidity and dew point.** An `air_temperature` with a
+`dew_point_temperature` gives the relative humidity over liquid water, in
+%, and one with a `relative_humidity` the dew point, in the temperature's
+served unit, on every API, unless the store has that quantity already:
+ERA5's `t2m`/`d2m` → `r2`, `air_temperature_2m` with
+`relative_humidity_2m` → `dew_point_temperature_2m`. The store has no
+vertical axis, so every array counts as one level, and specific humidity
+gives nothing (it needs a pressure). `derive_humidity = false` on the
+collection opts out.
+
 ## Configuration
 
 ```toml

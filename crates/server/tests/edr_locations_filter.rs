@@ -69,6 +69,7 @@ fn collection(id: &str, engine_type: &str) -> CollectionConfig {
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        derive_humidity: None,
     }
 }
 
