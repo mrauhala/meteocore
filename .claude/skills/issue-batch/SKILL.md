@@ -151,10 +151,12 @@ On watch events:
   semantic merge back to the PR's own agent (SendMessage): say what main
   added and which interaction it must decide, e.g. a new output format against
   a query type the other PR added, and tell it not to push.
-- **claude-review fails with "did not post the required summary":** the
-  reviewer ran out of allowed tools or turns, which is common on large PRs.
-  It is not a clean review. `gh run rerun <run> --failed` (the next push
-  also re-runs it), and meanwhile read the key paths yourself.
+- **claude-review fails with "did not post the required summary":** both
+  attempts (the job retries once by itself) ended without a summary; the
+  log lists each attempt's turns and denied tools. It is not a clean
+  review. `gh run rerun <run> --failed` (the next push also re-runs it),
+  and meanwhile read the key paths yourself. "Failed on its first turn"
+  is usually the account usage limit: rerun once it resets.
 - **CodeQL `rust/cleartext-logging` on a test:** usually a value
   interpolated into an assert message. Drop the interpolation and reply on
   the alert.

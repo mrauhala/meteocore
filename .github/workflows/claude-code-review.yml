@@ -46,53 +46,172 @@ jobs:
           # Full history so the action can diff the PR against the base branch.
           fetch-depth: 0
 
+      # Claude returns its summary as structured output and the next step
+      # posts it with the marker, so a run that completes always leaves a
+      # summary: runs that had to post it themselves sometimes ended without
+      # one (#796). This step may fail, e.g. at the usage limit; the next
+      # step decides between posting, one retry, and failing the job.
       - name: Run Claude Code Review
         id: review
+        continue-on-error: true
         uses: anthropics/claude-code-action@ed670b4cf9de2a5a570d130d2f6197b9e543cd64 # v1
-        with:
+        with: &review-inputs
           # A scoped workflow token avoids the App token service's default-
           # branch workflow-identity check (which skips reviews of workflow PRs).
           github_token: ${{ github.token }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # In agent mode `--allowedTools` is the WHOLE allowlist — the
           # action adds nothing to it — and a headless run denies every
-          # tool outside it. The previous list held only the four
-          # commenting/diff tools, so the reviewer could not Read/Grep the
-          # code it was reviewing: every run showed 10–30 permission
-          # denials, finished in two turns, and usually posted nothing
-          # (its verdict ended up as hidden text output). Grant the
-          # read-only exploration tools plus read-only git/gh, the inline
-          # comment MCP tool, and `gh pr comment` for the summary.
+          # tool outside it. Grant the read-only exploration tools plus
+          # read-only git/gh and the inline comment MCP tool. The summary
+          # needs no tool: `--json-schema` makes Claude end with it as
+          # structured output, which the workflow posts.
           claude_args: |
-            --allowedTools "Read,Glob,Grep,LS,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr checks:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment"
+            --allowedTools "Read,Glob,Grep,LS,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr checks:*),mcp__github_inline_comment__create_inline_comment"
+            --json-schema '{"type":"object","properties":{"summary":{"type":"string","description":"The top-level review summary, in Markdown"}},"required":["summary"],"additionalProperties":false}'
           prompt: |
             Review this pull request for correctness, security, and
             compliance with CLAUDE.md (root and the per-crate files it
             points to). Read the changed files and the code they touch,
             not just the diff. Add inline comments on specific problem
-            lines, then ALWAYS post exactly one top-level PR comment via
-            `gh pr comment`: either a concise summary of the findings, or
-            "No issues found" with a one-line note of what you checked.
-            A run that posts nothing is indistinguishable from a broken
-            reviewer — never end without the top-level comment. Flag real
-            issues only; do not nitpick style.
-            Include this marker in the top-level summary comment:
-            <!-- meteocore-review:${{ github.event.pull_request.head.sha }} -->
+            lines. Flag real issues only; do not nitpick style.
+
+            Finish by returning the top-level review summary as the
+            structured output `summary`: either a concise summary of the
+            findings, or "No issues found" with a one-line note of what
+            you checked. The workflow posts it to the PR, so do not post
+            it yourself and do not add a `meteocore-review` marker to it.
+
+            Tools: Read, Grep, Glob and LS read and search the checkout;
+            Bash runs `git diff`, `git log`, `git show`, `git blame`,
+            `gh pr diff`, `gh pr view` and `gh pr checks`. Building or
+            testing (cargo), `gh api`, web access and writing files are
+            denied: do not try them, each denied call only wastes a turn.
             REPO: ${{ github.repository }}
             PR_NUMBER: ${{ github.event.pull_request.number }}
+            HEAD_SHA: ${{ github.event.pull_request.head.sha }}
 
-      - name: Verify review execution and summary
+      # Prints the attempt's turns and denied tools, then posts its summary,
+      # or asks for one retry, or fails. Only tool names, the program of a
+      # denied Bash command (plus the subcommand of git, gh or cargo) and
+      # its shape reach the log: tool inputs, file contents and Claude's
+      # text stay hidden, as the action intends (this repository's logs
+      # are public).
+      - name: Post review summary
+        id: post
+        shell: bash
+        env:
+          ATTEMPT: 1
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: &post-summary |
+          # The action's fixed path, in case a failed run left the output unset.
+          execution_file=${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}
+          result=null
+          if [ -s "$execution_file" ]; then
+            # Both attempts write the same path: move this attempt's record
+            # aside, so a retry that dies before running cannot report it.
+            record="$RUNNER_TEMP/claude-review-attempt-$ATTEMPT.json"
+            mv "$execution_file" "$record"
+            result=$(jq -c 'map(select(.type == "result")) | last' "$record" || echo null)
+          fi
+
+          if [ "$result" != null ]; then
+            jq -r --arg attempt "$ATTEMPT" '
+              def safe($re): if test($re) then . else "?" end;
+              def denial:
+                (.tool_name // "" | tostring | safe("^[A-Za-z0-9_.:-]{1,80}$")) as $tool
+                | if $tool != "Bash" then $tool else
+                    (.tool_input.command // "" | tostring) as $c
+                    | [$c | splits("\\s+") | select(length > 0)] as $w
+                    | ($w[0] // "" | safe("^[A-Za-z0-9_./+-]{1,24}$")) as $cmd
+                    | [$cmd, (select($cmd == "git" or $cmd == "gh" or $cmd == "cargo")
+                        | $w[1] // empty | select(test("^[a-z][a-z-]{0,15}$")))] as $head
+                    | [if ($c | test("\\$\\(|`")) then "subst" else empty end,
+                       if ($c | test("<<")) then "heredoc" else empty end,
+                       if ($c | test("&&|\\|\\||;")) then "chain" else empty end,
+                       if ($c | test("[^|]\\|[^|]")) then "pipe" else empty end,
+                       if ($c | test(">")) then "redirect" else empty end,
+                       if ($c | test("\n")) then "multiline" else empty end] as $shape
+                    | "Bash: " + ($head | join(" "))
+                      + (if $shape == [] then "" else " [" + ($shape | join(",")) + "]" end)
+                  end;
+              "Review attempt \($attempt): subtype=\(.subtype | tostring | safe("^[a-z_]{1,40}$"))"
+                + " is_error=\(.is_error) turns=\(.num_turns) cost_usd=\(.total_cost_usd)"
+                + " permission_denials=\(.permission_denials // [] | length)",
+              (.permission_denials // [] | map(denial) | group_by(.)
+                | map([length, .[0]]) | sort_by(-.[0]) | .[]
+                | "  denied \(.[0])x \(.[1])")
+            ' <<<"$result" || echo "::warning::Could not summarize the execution record."
+          fi
+
+          summary=""
+          if [ "$REVIEW_OUTCOME" = success ] && [ "$result" != null ]; then
+            # The marker is the workflow's: defuse any that Claude copied
+            # from earlier summaries, which would confuse marker readers.
+            summary=$(jq -r '.structured_output.summary // "" | tostring
+              | gsub("meteocore-review:(?<s>[0-9a-f]+)"; "meteocore-review: \(.s)")
+              | .[:60000]' <<<"$result")
+          fi
+          if [ -n "${summary//[[:space:]]/}" ]; then
+            body="$RUNNER_TEMP/claude-review-summary.md"
+            printf '%s\n\n<!-- meteocore-review:%s -->\n' "$summary" "$HEAD_SHA" > "$body"
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$body"
+            exit 0
+          fi
+
+          if [ "$result" = null ]; then
+            echo "::error::Claude did not report a result; the review did not run."
+            exit 1
+          fi
+          # A retry cannot help a run that failed before doing any work:
+          # the usage limit ends a run in its first turn, at no cost.
+          if jq -e '(.is_error == true or .subtype != "success") and (.num_turns // 0) <= 1' <<<"$result" > /dev/null; then
+            echo "::error::Claude failed on its first turn, which is the account usage limit or an authentication or API error; not retried."
+            exit 1
+          fi
+          if [ "$ATTEMPT" = 1 ]; then
+            echo "::warning::Claude ran but returned no review summary; retrying the review once."
+            echo "retry=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::Claude ran but did not post the required summary for this commit, on the retry either."
+          exit 1
+
+      - name: Retry Claude Code Review
+        id: review_retry
+        if: steps.post.outputs.retry == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@ed670b4cf9de2a5a570d130d2f6197b9e543cd64 # v1
+        with: *review-inputs
+
+      - name: Post retried review summary
+        if: steps.post.outputs.retry == 'true'
+        shell: bash
+        env:
+          ATTEMPT: 2
+          REVIEW_OUTCOME: ${{ steps.review_retry.outcome }}
+          EXECUTION_FILE: ${{ steps.review_retry.outputs.execution_file }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: *post-summary
+
+      # The contract the merge tooling reads: a bot comment carrying this
+      # commit's marker.
+      - name: Verify review summary
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if [ -z "$EXECUTION_FILE" ] || [ ! -s "$EXECUTION_FILE" ]; then
-            echo "::error::Claude did not produce an execution record; the review did not run."
-            exit 1
-          fi
           marker="<!-- meteocore-review:${HEAD_SHA} -->"
           count=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" |
             jq -s --arg marker "$marker" '[.[][] | select(.user.type == "Bot" and (.body | contains($marker)))] | length')
