@@ -711,7 +711,8 @@ pub async fn api_definition(
             json!({"get": {"summary": summary, "operationId": operation_id,
                 "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
-                "responses": {"200": {"description": summary}}}}),
+                "responses": {"200": {"description": summary},
+                              "400": api_common::format_error_response()}}}),
         );
     }
     paths.insert(
@@ -739,6 +740,7 @@ pub async fn api_definition(
                             "description": "Collection metadata",
                             "content": {"application/json": {}}
                         },
+                        "400": api_common::format_error_response(),
                         "404": {"description": "Collection not found"}
                     }
                 }

@@ -57,7 +57,7 @@ while the engines stay free of HTTP and JSON.
 | Route | Formats | Notes |
 |---|---|---|
 | `/features/` | JSON, HTML | landing page |
-| `/features/api` | OpenAPI 3.0 | hand-written; the collection, items and item operations of every collection |
+| `/features/api` | OpenAPI 3.0 | hand-written; the collection, items and item operations of every collection. Takes only `f`: another parameter, or `f` given twice, is a 400 |
 | `/features/api/docs` | HTML | Swagger UI from embedded assets under `/features/api/docs/`; no CDN |
 | `/features/conformance` | JSON, HTML | |
 | `/features/collections` | JSON, HTML | collections that have a feature engine; Common collection search |

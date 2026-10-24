@@ -203,7 +203,7 @@ pub fn router(api: SharedApi) -> Router {
     let api: AppState = Arc::new(api);
     let common = Router::new()
         .route("/", get(landing_page))
-        .route("/api", get(api_definition))
+        .route("/api", crate::errors::format_only_get(api_definition))
         .route("/api/docs", get(api_docs))
         .route("/api/docs/{asset}", get(api_docs_asset))
         .route("/conformance", get(conformance))
@@ -419,7 +419,8 @@ pub fn openapi_document(api: &SharedApi) -> Value {
             json!({"get": {"summary": summary, "operationId": operation_id,
                 "tags": [openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
-                "responses": {"200": {"description": summary}}}}),
+                "responses": {"200": {"description": summary},
+                              "400": crate::format_error_response()}}}),
         );
     }
     paths.insert(
@@ -437,6 +438,7 @@ pub fn openapi_document(api: &SharedApi) -> Value {
                 format_parameter()
             ],
             "responses": {"200": {"description": "Collection description"},
+                          "400": crate::format_error_response(),
                           "404": {"description": "Collection not found"}}}}),
     );
     let mut components = Map::new();

@@ -508,6 +508,40 @@ async fn non_finite_min_value_is_400() {
     }
 }
 
+/// A parameter given twice, or a value of the wrong type, fails before the
+/// handler runs: this API's JSON 400 naming it, never axum's plain-text one
+/// (#1123), on every route that reads a query.
+#[tokio::test]
+async fn malformed_query_is_the_json_400() {
+    let c = "/collections/radar-fivih";
+    for (query, field) in [
+        ("tileset.json?quantity=DBZH&quantity=VRADH", "quantity"),
+        ("tileset.json?min_value=x", "min_value"),
+        ("content.pnts?min_value=x", "min_value"),
+        ("content.pnts?datetime=a&datetime=b", "datetime"),
+        ("content.glb?resolution=low&resolution=med", "resolution"),
+        ("voxel/tileset.json?quantity=a&quantity=b", "quantity"),
+        (
+            "voxel/content/0/0/0/0.glb?resolution=a&resolution=b",
+            "resolution",
+        ),
+    ] {
+        let (status, body, headers) = get(&format!("{c}/{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        assert_eq!(
+            headers[axum::http::header::CONTENT_TYPE],
+            "application/json",
+            "{query}"
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error = v["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("Failed to deserialize query string") && error.contains(field),
+            "{query}: {error}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn tileset_carries_min_value_into_content_uri() {
     let (status, body, _h) =
