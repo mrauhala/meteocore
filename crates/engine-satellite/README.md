@@ -29,8 +29,10 @@ while the window fits in memory, no request reads the bucket.
   to the minute, so `19:00` finds the scan that started about 20 s later;
   a GK2A scan's is the nominal slot its file name carries.
 - **Ingest.** Each new scan is downloaded whole, newest first, at most 4
-  per product per poll. The compressed file stays in memory together with
-  an overview of every 4th pixel built at ingest. A Himawari scan's 88
+  per product per poll, and none starts once the poll has spent two
+  minutes ingesting: the rest wait for the next poll, so a stalled source
+  does not hold the catalog. The compressed file stays in memory together
+  with an overview of every 4th pixel built at ingest. A Himawari scan's 88
   tiles are fetched 16 at a time and placed on one lattice from their
   coordinates. A tiled scan waits until it has as many tiles as earlier
   scans, a newer scan appears, or 15 minutes after its start.

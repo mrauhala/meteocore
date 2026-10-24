@@ -9267,7 +9267,7 @@
         "spec": {
           "id": 5,
           "title": "Stale feeds",
-          "description": "Collections whose newest data is older than 1.5 times their own peak age of the day before, and older than 15 min. Data age is a sawtooth with each feed's cadence, so a fixed threshold cannot fit a radar and a model run; yesterday's peak can. Collections younger than a day are not counted.",
+          "description": "Collections whose newest data is older than 1.5 times their own peak age of the day before, and older than 15 min. Data age is a sawtooth with each feed's cadence, so a fixed threshold cannot fit a radar and a model run; yesterday's peak can. Collections younger than a day are not counted. Also counted: collections that hold no data at all (collection_has_data 0), which have no data age: one that never loaded any, or whose data all aged out of its window.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -9286,7 +9286,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "count((max by (collection) (collection_data_age_seconds{job=~\"$job\", collection=~\"$collection\"}) > 1.5 * max by (collection) (max_over_time(collection_data_age_seconds{job=~\"$job\", collection=~\"$collection\"}[1d] offset 1d))) > 900) or vector(0)",
+                        "expr": "(count((max by (collection) (collection_data_age_seconds{job=~\"$job\", collection=~\"$collection\"}) > 1.5 * max by (collection) (max_over_time(collection_data_age_seconds{job=~\"$job\", collection=~\"$collection\"}[1d] offset 1d))) > 900) or vector(0)) + (count(max by (collection) (collection_has_data{job=~\"$job\", collection=~\"$collection\"}) == 0) or vector(0))",
                         "legendFormat": "stale",
                         "range": true,
                         "instant": false,
@@ -9879,7 +9879,7 @@
         "spec": {
           "id": 45,
           "title": "Data age by collection",
-          "description": "Seconds since the newest data each collection serves (/health data_age_secs): GeoTIFF newest timestep, QueryData and NetCDF newest run, BUFR newest report, satellite newest scan, nowcast anchor frame. A sawtooth with the feed's cadence is normal. Bad: a line climbing past its usual peak. Negative = the newest data lies in the future. Click a series to filter the dashboard to it.",
+          "description": "Seconds since the newest data each collection serves (/health data_age_secs): GeoTIFF newest timestep, QueryData and NetCDF newest run, BUFR newest report, satellite newest scan, nowcast anchor frame. A sawtooth with the feed's cadence is normal. Bad: a line climbing past its usual peak. Negative = the newest data lies in the future. Click a series to filter the dashboard to it. A collection holding no data has no line; the Stale feeds stat counts it.",
           "links": [],
           "data": {
             "kind": "QueryGroup",

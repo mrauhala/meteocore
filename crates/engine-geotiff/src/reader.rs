@@ -102,6 +102,24 @@ pub struct RemoteTileInfo {
     pub predictor: u16,
     pub tile_width: u32,
     pub tile_height: u32,
+    /// Process-unique id of the header read this layout came from
+    /// ([`RemoteTileInfo::next_generation`]). The compressed and decoded
+    /// tile caches key a remote tile on it next to the object path, so an
+    /// object republished under its path, whose header the scan then reads
+    /// again, never meets the tiles cached from the bytes it replaced
+    /// (#1055). Clones share it.
+    pub generation: u64,
+}
+
+/// Source of [`RemoteTileInfo::generation`]; never reused within a process.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+impl RemoteTileInfo {
+    /// A new [`RemoteTileInfo::generation`], for a layout just read from a
+    /// header.
+    pub fn next_generation() -> u64 {
+        NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 /// Backing bytes for a [`Decoder`] — either heap-owned (downloaded payload) or
@@ -1164,6 +1182,7 @@ fn extract_tile_info(
         predictor,
         tile_width: metadata.tile_width,
         tile_height: metadata.tile_height,
+        generation: RemoteTileInfo::next_generation(),
     })
 }
 
@@ -1213,6 +1232,7 @@ fn extract_tile_info_at_level(
         predictor,
         tile_width,
         tile_height,
+        generation: RemoteTileInfo::next_generation(),
     })
 }
 
@@ -1383,16 +1403,19 @@ fn decode_raw_band(
 }
 
 /// Decoded-chunk cache scope for a remote object read through `cache`'s
-/// engine (#468). `None` without a tile cache: nothing names the namespace.
+/// engine (#468), in the layout `tile_info` came from (#1055). `None`
+/// without a tile cache: nothing names the namespace.
 fn remote_scope(
     cache: Option<&crate::cache::TileCache>,
     file_path: &Path,
+    tile_info: &RemoteTileInfo,
     band_index: usize,
 ) -> Option<crate::decoded_cache::FileScope> {
     cache.map(|c| {
         crate::decoded_cache::FileScope::remote(
             file_path.to_string_lossy().as_ref(),
             c.namespace(),
+            tile_info.generation,
             band_index,
         )
     })
@@ -1423,7 +1446,7 @@ fn read_remote_chunk(
         metadata,
         chunk_index,
         cache,
-        remote_scope(cache, file_path, band_index).as_ref(),
+        remote_scope(cache, file_path, tile_info, band_index).as_ref(),
         file_path,
         band_index,
         ifd_index,
@@ -1509,8 +1532,10 @@ fn read_encoded_chunk(
         )))
     })?;
 
-    // Check cache for compressed bytes (keyed by file + chunk + IFD level)
-    let compressed = match cache.and_then(|c| c.get(file_path, chunk_index, ifd_index)) {
+    // Check cache for compressed bytes (keyed by file, layout, chunk and IFD level)
+    let generation = tile_info.generation;
+    let cached = cache.and_then(|c| c.get(file_path, generation, chunk_index, ifd_index));
+    let compressed = match cached {
         Some(cached) => cached,
         None => {
             let fetched = fetch_range(offset..end)?;
@@ -1524,7 +1549,13 @@ fn read_encoded_chunk(
                 ))));
             }
             if let Some(c) = cache {
-                c.insert(file_path, chunk_index, ifd_index, fetched.clone());
+                c.insert(
+                    file_path,
+                    generation,
+                    chunk_index,
+                    ifd_index,
+                    fetched.clone(),
+                );
             }
             fetched
         }
@@ -1733,7 +1764,7 @@ fn read_http_chunk(
         metadata,
         chunk_index,
         cache,
-        remote_scope(cache, file_path, band_index).as_ref(),
+        remote_scope(cache, file_path, tile_info, band_index).as_ref(),
         file_path,
         band_index,
         ifd_index,
@@ -2600,7 +2631,9 @@ fn read_bbox_tiles(
         // across queueing (an evicted entry would then outlive its budget).
         let hit = batch_limit > 1
             && (decoded.is_some_and(|d| crate::decoded_cache::contains(d, ifd_index, chunk))
-                || cache.is_some_and(|c| c.contains_untracked(file_path, chunk, ifd_index)));
+                || cache.is_some_and(|c| {
+                    c.contains_untracked(file_path, tile_info.generation, chunk, ifd_index)
+                }));
         if hit || count == 0 {
             jobs.push(Job::Single(i));
         } else {
@@ -2633,7 +2666,8 @@ fn read_bbox_tiles(
                     &|range| {
                         // Recheck planned misses after admission/queueing, also
                         // preserving the established cache-backed retry path.
-                        if let Some(bytes) = cache.and_then(|c| c.get(file_path, chunk, ifd_index))
+                        if let Some(bytes) = cache
+                            .and_then(|c| c.get(file_path, tile_info.generation, chunk, ifd_index))
                         {
                             return Ok(bytes);
                         }
@@ -2653,7 +2687,13 @@ fn read_bbox_tiles(
                             )));
                         }
                         if let Some(cache) = cache {
-                            cache.insert(file_path, chunk, ifd_index, bytes.clone());
+                            cache.insert(
+                                file_path,
+                                tile_info.generation,
+                                chunk,
+                                ifd_index,
+                                bytes.clone(),
+                            );
                         }
                         Ok(bytes)
                     },
@@ -2749,7 +2789,7 @@ fn read_bbox_parallel(
         tile_info,
         metadata,
         cache,
-        remote_scope(cache, file_path, band_index).as_ref(),
+        remote_scope(cache, file_path, tile_info, band_index).as_ref(),
         file_path,
         band_index,
         ifd_index,
@@ -2838,7 +2878,7 @@ fn read_bbox_parallel_http(
         tile_info,
         metadata,
         cache,
-        remote_scope(cache, file_path, band_index).as_ref(),
+        remote_scope(cache, file_path, tile_info, band_index).as_ref(),
         file_path,
         band_index,
         ifd_index,
@@ -3587,6 +3627,7 @@ mod tests {
             predictor: 1,
             tile_width: 1,
             tile_height: 1,
+            generation: 0,
         };
         // Encoded input + raw decode (+1 overrun probe) + one-band native output.
         assert_eq!(remote_chunk_layout(&info, 1, 0).unwrap(), (1, 4, 0, 1));
@@ -3754,7 +3795,7 @@ mod tests {
                 "batch limit {batch_limit}: retried before failing"
             );
             assert!(
-                !cache.contains_untracked(file, 2, 0),
+                !cache.contains_untracked(file, info.generation, 2, 0),
                 "nothing is cached for the failed tile"
             );
         }
@@ -3892,6 +3933,7 @@ mod tests {
             predictor: 1,
             tile_width: 1,
             tile_height: 1,
+            generation: 0,
         };
         let store =
             ds_storage::DataStore::new(Arc::new(ds_storage::object_store::memory::InMemory::new()));
@@ -4310,6 +4352,7 @@ mod tests {
             predictor: 1,
             tile_width: 8,
             tile_height: 8,
+            generation: 0,
         };
         let mut bytes = vec![255; 268];
         for (i, &start) in info.tile_offsets.iter().enumerate() {
@@ -4331,7 +4374,13 @@ mod tests {
         };
         // A cached middle tile must not be re-fetched: its 64-byte hole
         // exceeds the allowed overfetch ratio for these tiny tiles.
-        cache.insert(file, 1, 0, Bytes::copy_from_slice(&bytes[68..132]));
+        cache.insert(
+            file,
+            info.generation,
+            1,
+            0,
+            Bytes::copy_from_slice(&bytes[68..132]),
+        );
         let result = read_bbox_tiles(
             &coords,
             &info,
@@ -4442,7 +4491,7 @@ mod tests {
                 // This read outlives the deadline: the others land first, as
                 // on a store, then the storage bridge reports the deadline.
                 let waited = std::time::Instant::now();
-                while (0..3).any(|chunk| !cache.contains_untracked(file, chunk, 0))
+                while (0..3).any(|chunk| !cache.contains_untracked(file, info.generation, chunk, 0))
                     && waited.elapsed() < std::time::Duration::from_secs(10)
                 {
                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -4470,11 +4519,11 @@ mod tests {
         );
         for chunk in 0..3 {
             assert!(
-                cache.contains_untracked(file, chunk, 0),
+                cache.contains_untracked(file, info.generation, chunk, 0),
                 "tile {chunk} kept"
             );
         }
-        assert!(!cache.contains_untracked(file, 3, 0));
+        assert!(!cache.contains_untracked(file, info.generation, 3, 0));
 
         calls.lock().unwrap().clear();
         let retry = |range: std::ops::Range<usize>| {

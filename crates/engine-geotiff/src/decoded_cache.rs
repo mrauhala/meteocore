@@ -19,9 +19,13 @@
 //! the LRU. Same single-flight + byte-bounded LRU shape as `engine-odim`'s
 //! `COMPOSITE_CACHE` (#212). A local chunk keeps all bands interleaved.
 //!
-//! Remote keys are `(path, namespace, band, ifd, chunk)`: an object is
-//! trusted to be path-immutable exactly as the compressed cache trusts it,
-//! and the namespace is that engine's [`crate::cache::TileCache::namespace`].
+//! Remote keys are `(path, namespace, generation, band, ifd, chunk)`, the
+//! namespace being that engine's [`crate::cache::TileCache::namespace`] and
+//! the generation the header read's
+//! [`RemoteTileInfo::generation`](crate::reader::RemoteTileInfo::generation),
+//! as in the compressed cache: an object republished under its path is read
+//! again by the scan, and never meets the chunks of the bytes it replaced
+//! (#1055).
 //! A remote chunk holds only the engine's band, so a two-band OPERA Float32
 //! tile costs 1 MB rather than 2. Remote reads use plain [`get`] + [`insert`]
 //! instead of the single-flight: a miss's fill includes the fetch, and
@@ -86,9 +90,13 @@ impl FileIdentity {
 enum Origin {
     /// A local file's content identity; the chunk has every band.
     Local(FileIdentity),
-    /// A remote object in one engine's compressed-cache namespace; the chunk
-    /// has only `band`.
-    Remote { namespace: u64, band: usize },
+    /// A remote object in one engine's compressed-cache namespace, as the
+    /// header read `generation` laid it out; the chunk has only `band`.
+    Remote {
+        namespace: u64,
+        generation: u64,
+        band: usize,
+    },
 }
 
 /// Cache scope for one source file: its path plus the origin its chunks are
@@ -109,11 +117,21 @@ impl FileScope {
     }
 
     /// A remote object read through the engine whose compressed cache has
-    /// `namespace`; its chunks hold only `band`.
-    pub(crate) fn remote(file: impl Into<Arc<str>>, namespace: u64, band: usize) -> Self {
+    /// `namespace`, in the layout of the header read `generation`; its
+    /// chunks hold only `band`.
+    pub(crate) fn remote(
+        file: impl Into<Arc<str>>,
+        namespace: u64,
+        generation: u64,
+        band: usize,
+    ) -> Self {
         FileScope {
             file: file.into(),
-            origin: Origin::Remote { namespace, band },
+            origin: Origin::Remote {
+                namespace,
+                generation,
+                band,
+            },
         }
     }
 }
@@ -318,17 +336,19 @@ mod tests {
     }
 
     /// #468: remote chunks are keyed by object path, engine namespace and
-    /// band, and never collide with a local file at the same path.
+    /// band, and never collide with a local file at the same path. #1055:
+    /// nor with the chunks of an earlier layout of the same object.
     #[test]
-    fn remote_scope_keys_path_namespace_and_band() {
+    fn remote_scope_keys_path_namespace_generation_and_band() {
         let file = "decoded_cache_test/remote.tif";
         // `TileCache` namespaces count up from 1; stay clear of them.
         let ns = u64::MAX - 1;
         let scopes = [
-            FileScope::remote(file, ns, 0),
-            FileScope::remote(file, ns - 1, 0),
-            FileScope::remote(file, ns, 1),
-            FileScope::remote("decoded_cache_test/other.tif", ns, 0),
+            FileScope::remote(file, ns, 1, 0),
+            FileScope::remote(file, ns - 1, 1, 0),
+            FileScope::remote(file, ns, 2, 0),
+            FileScope::remote(file, ns, 1, 1),
+            FileScope::remote("decoded_cache_test/other.tif", ns, 1, 0),
             FileScope::new(
                 file,
                 FileIdentity {

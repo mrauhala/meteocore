@@ -18,6 +18,12 @@
 //! same [`ServerConfig::validate`](ds_core::config::ServerConfig::validate) as
 //! TOML collections (so e.g. duplicate ids are rejected uniformly).
 //!
+//! **Temporary names are skipped** (#1055): a hidden folder, such as rsync
+//! `--delay-updates`' `.~tmp~` staging folder, and a file
+//! [`ds_core::temp_files::is_temporary`] names (a hidden `.name`, a `.tmp` or
+//! `.part` upload). The root itself is never judged: it is the configured
+//! location.
+//!
 //! **Symlinks are followed** (`is_dir`/`is_file` resolve them): a symlinked
 //! subdirectory or data file is scanned like a real one — operators commonly
 //! symlink data into a serving directory. This is the same trust model as
@@ -25,6 +31,7 @@
 //! server serves, so keep it writable only by trusted principals.
 
 use ds_core::config::{CollectionConfig, GribConfig, QueryDataConfig, ZarrConfig};
+use ds_core::temp_files;
 use std::path::Path;
 
 /// Scan each root directory and return the synthesized collection configs.
@@ -65,8 +72,10 @@ fn scan_one_root(root: &Path) -> Result<Vec<CollectionConfig>, String> {
     for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
         if path.is_dir() {
-            subdirs.push(path);
-        } else if path.is_file() {
+            if !temp_files::is_hidden(&file_name(&path)) {
+                subdirs.push(path);
+            }
+        } else if path.is_file() && !is_temporary_file(&path) {
             loose_files.push(path);
         }
     }
@@ -98,7 +107,7 @@ fn classify_dir(dir: &Path, id_hint: &str) -> Vec<CollectionConfig> {
     let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_file())
+            .filter(|p| p.is_file() && !is_temporary_file(p))
             .collect(),
         Err(e) => {
             tracing::warn!("--auto-collections: cannot read {}: {e}", dir.display());
@@ -448,6 +457,15 @@ fn warn_ignored_leaf(dir: &Path, winner: &str) {
     );
 }
 
+/// Whether `path` names a file being written that the engines skip
+/// ([`temp_files::is_temporary`]): a hidden `.name`, or a `.tmp` or `.part`
+/// upload. Classifying it would make a collection of its own (a hidden
+/// `.name.geojson`), or decide its folder's engine on a file the engine then
+/// skips (a hidden `.run.sqd`).
+fn is_temporary_file(path: &Path) -> bool {
+    temp_files::is_temporary(&file_name(path))
+}
+
 fn has_ext(path: &Path, ext: &str) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -718,6 +736,46 @@ mod tests {
         let csv = cfgs.iter().find(|c| c.id == "weather").unwrap();
         assert_eq!(csv.apis, vec!["edr".to_string(), "features".to_string()]);
         assert!(csv.data_path.as_deref().unwrap().ends_with("weather.csv"));
+    }
+
+    /// #1055: hidden folders and the files a publisher writes before
+    /// renaming them into place are not data. A hidden `.name.geojson`
+    /// would make a collection whose id clashes with `name.geojson`'s, and
+    /// a hidden `.run.sqd` would make its folder a QueryData collection
+    /// whose engine skips that file.
+    #[test]
+    fn hidden_folders_and_temporary_files_are_skipped() {
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        // rsync --delay-updates' staging folder, holding a whole transfer.
+        let staging = r.join(".~tmp~");
+        fs::create_dir(&staging).unwrap();
+        touch(&staging, "regions.geojson");
+        touch(&staging, "20260405T180000Z_meps.sqd");
+        touch(r, "regions.geojson");
+        touch(r, ".regions.geojson");
+        touch(r, ".stations.csv");
+        touch(r, "weather.csv.tmp");
+        touch(r, "weather.csv");
+        // A folder whose only QueryData file is still being written.
+        let obs = r.join("obs");
+        fs::create_dir(&obs).unwrap();
+        touch(&obs, ".20260405T180000Z_meps.sqd");
+        touch(&obs, "synop.csv");
+        touch(&obs, ".synop.csv");
+        touch(&obs, "metar.csv.part");
+
+        let cfgs = scan_roots(&[r.to_str().unwrap().to_string()]);
+        let mut got = ids(&cfgs);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("regions".to_string(), "geojson".to_string()),
+                ("synop".to_string(), "csv".to_string()),
+                ("weather".to_string(), "csv".to_string()),
+            ]
+        );
     }
 
     #[test]

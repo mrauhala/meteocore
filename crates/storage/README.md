@@ -53,6 +53,18 @@ in flight or never started, so a poll keeps what arrived and leaves the
 rest to the next one. GeoTIFF's remote scan reads new files' COG headers
 through it, newest first.
 
+A budget that runs out is a `Storage` error naming the object or prefix,
+``Request for `key` timed out after 30s``, or ``fetch of `key` …`` from a
+batch (#1055).
+
+The `test-util` feature, for dev-dependencies only, exports
+`test_util::StalledBody`, an in-memory store whose GET bodies stall, and
+`test_util::run_stalled`, which runs a synchronous call through it on a
+paused clock and moves the clock 60 s past each stalled GET: longer than
+the request budget, shorter than the background one. A test pins with them
+which budget a caller passes (#1055); the engines' own tests use them for
+the GeoTIFF scan, the satellite ingest and refetches, and the PVOL scan.
+
 # Catalog discovery
 
 `discovery` holds what every engine that polls one file per timestep needs:

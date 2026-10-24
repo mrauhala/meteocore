@@ -55,7 +55,10 @@ apply here.
   `.~tmp~/` (#1029); the local scan never descends into a folder. The
   engine keeps its post-processing:
   the pending-file readiness check and metadata reuse (local), header reads
-  (remote). The readiness check is the shared
+  (remote). A remote entry is reused only for a listing that names its
+  version (`FileEntry::lists_as`: the size, then the ETag, else
+  `Last-Modified`, #1055), so an object overwritten in place is read again.
+  The readiness check is the shared
   `ds_storage::discovery::PendingFile` over the file's size
   (`ObjectVersion::sized`, #1067): a file that appears between polls is
   catalogued once two more polls see its size unchanged, and the initial
@@ -96,7 +99,8 @@ apply here.
 - Startup reads only the collection extent. Each `poll_cycle` adds items
   newer than the newest entry as stubs (the first poll: the last hour), then
   `preload_stac_metadata` fetches the header/IFD of the ones it just
-  discovered, on the poll runtime: newest `STAC_PRELOAD_MAX_ITEMS` only,
+  discovered or found holding another item (`Catalog::fresh_since`, #1055),
+  on the poll runtime: newest `STAC_PRELOAD_MAX_ITEMS` only,
   `STAC_PRELOAD_CONCURRENCY` in flight, async reqwest end to end. Never loop
   the sync `load_stac_entry_metadata` there: that is N sequential blocking
   round trips (root Critical Rule 9).
@@ -140,15 +144,18 @@ apply here.
   held, bounded by that loader's claims.
 - Every loader shares `fetch_stac_entry_metadata`, `settle_stac_load`
   (install, or drop a gone asset, #1119) and the `loading_in_flight`
-  single-flight set. The preload and a query's
-  concurrent loads claim through `claim_and_load_stac_entry`, which
-  `try_claim`s without parking: a future parked on the condvar would stall
-  every other load of its `block_on`. The preload skips an item someone else
-  is loading. A query waits for such items (`ensure_metadata`) only after its
-  own loads finish, holding no claim, so two loaders never wait on each
-  other; it loads an item itself only when that loader gave it up. Install
-  through `install_stac_metadata`, whose `rcu` keeps concurrent loaders from
-  dropping each other's update.
+  single-flight set. The preload and a query's concurrent loads claim
+  through `claim_and_load_stac_entry`, which `try_claim`s without parking: a
+  future parked on the condvar would stall every other load of its
+  `block_on`. The preload skips an item someone else is loading. A query
+  waits for such items (`ensure_metadata`) only after its own loads finish,
+  holding no claim, so two loaders never wait on each other; it loads an
+  item itself only when that loader gave it up. Install through
+  `install_stac_metadata`, whose `rcu` keeps concurrent loaders from
+  dropping each other's update. A poll keeps a load that finished during its
+  scan only for the same object (`Catalog::keep_loads_from`: href and
+  `file:size`); a stub of another item at that timestep stays a stub and
+  loads afresh (#1055).
 
 ## Decode admission
 
@@ -171,7 +178,10 @@ engine-zarr.
 
 - **Tile cache:** compressed bytes in an LRU (default 256 MB), **remote
   sources only** — local files get compressed bytes free from the mmap/page
-  cache.
+  cache. Keyed by object path, layout generation, IFD and chunk: the
+  generation (`RemoteTileInfo::generation`) is unique per header read, so an
+  object republished under its path and read again never meets the tiles of
+  the bytes it replaced (#1055).
 - **Rendered image cache** (default 256 MB, `[wms] rendered_cache_mb`) shared
   across WMS/Maps/Tiles; see `crates/api-wms/CLAUDE.md`.
 - **Decoded-chunk cache (#463, #468):** process-global byte-bounded LRU of
@@ -183,9 +193,9 @@ engine-zarr.
   Local keys are `(path, mtime, size, inode, ifd, chunk)` — inode included
   because mtime+size alone miss a same-size same-second atomic rename
   (#253) — so a replacement can't serve stale pixels. Remote keys are
-  `(path, TileCache namespace, band, ifd, chunk)`: path-immutable like the
-  compressed cache, per engine, one band only (a 2-band OPERA Float32 tile
-  is 1 MB). Remote reads are deliberately NOT single-flight: a fill includes
+  `(path, TileCache namespace, layout generation, band, ifd, chunk)`: the
+  generation as in the compressed cache, per engine, one band only (a
+  2-band OPERA Float32 tile is 1 MB). Remote reads are deliberately NOT single-flight: a fill includes
   the range fetch, and a fetch-pool worker must not wait on another
   request's I/O. Nodata + scale/offset (and a local chunk's band
   extraction) are applied at copy time for the intersecting window only.
@@ -216,7 +226,8 @@ engine-zarr.
   (`docs/performance/cog-first-frame.md`). `prewarm_new_frames` therefore
   reads the encoded tiles of the frames a poll discovers (object store and
   STAC) into the compressed tile cache: the newest `PREWARM_MAX_FRAMES`
-  absent from the previous catalog, levels coarsest first while the frame
+  absent from the previous catalog or holding another object there
+  (`Catalog::fresh_since`, #1055), levels coarsest first while the frame
   stays within `prewarm::frame_cap` (`MC_COG_PREWARM_MB`, default 32 MiB,
   0 off, at most 1/8 of the tile cache), coalesced by `range_batch::plan`,
   4 reads in flight on the poll runtime's blocking pool through the
@@ -301,14 +312,14 @@ depends on the kind:
   (`gone::GoneObjects::screen`, from `do_scan` before the `max_files` trim,
   from `store_stac_catalog`, and in `ensure_entries_loaded` before a query
   counts its window's cold items), removes the entry and keeps it, keyed by
-  path (object key or asset href) and size, the identity the scan's own
-  reuse compares. An object-store listing that still names the key with
-  that size reuses the kept entry without a header read, and the screen
-  removes it again; a key the complete listing no longer names, or names
-  with another size, ends the record. A STAC listing that still names the
-  href with that `file:size` adds a stub, which the screen removes; a new
-  href or size is a new object. A same-size rewrite under the same key is
-  not told apart, as on the scan's reuse path.
+  path (object key or asset href) and size. An object-store listing that
+  still names the key as the same version (`FileEntry::lists_as`, #1055)
+  reuses the kept entry without a header read, and the screen removes it
+  again; a key the complete listing no longer names, or names as another
+  version, ends the record and the new object is read. A STAC listing that
+  still names the href with that `file:size` adds a stub, which the screen
+  removes; a new href or size is a new object. A same-size STAC rewrite
+  under the same href is not told apart: its listing carries no version.
 - **Nothing left:** a map or map tile over an empty catalog, before the
   first file or after every file is gone, has no timestep to select.
   `get_raster_tile` answers `LocationNotFound("No data available for this
@@ -320,6 +331,12 @@ depends on the kind:
   under the timestep may hold the gap, or the frame the time snapped to.
   Do not move it on every drop: a rolling-window bucket deletes frames all
   the time, and each move leaves every render the collection cached unread.
+  It also moves once per poll that finds a catalogued timestep holding
+  another object (`Catalog::republished_since`, #1055): a new key winning
+  the timestamp, an object overwritten in place, a local file replaced by
+  rename. That move comes right after the catalog store, never before, or a
+  request reading the new version could cache the old object's pixels under
+  it. The version is the sum of the two counters.
 - **Forbidden (401/403):** the read fails with `ResourceExhausted`, a 503
   in every API, without retries. It is the server's credentials or a
   policy, not the data: a nodata tile would mislead and would stay in the

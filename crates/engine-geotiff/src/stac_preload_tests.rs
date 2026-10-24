@@ -456,9 +456,12 @@ async fn poll_prewarms_the_tiles_of_new_stac_items() {
             {
                 tiles += 1;
                 assert!(
-                    engine
-                        .tile_cache
-                        .contains_untracked(&entry.path, chunk as u32, ifd),
+                    engine.tile_cache.contains_untracked(
+                        &entry.path,
+                        info.generation,
+                        chunk as u32,
+                        ifd
+                    ),
                     "{time}: IFD {ifd} tile {chunk} warm"
                 );
             }
@@ -1132,4 +1135,106 @@ async fn a_max_files_catalog_lists_the_window_in_full() {
         .expect("the trimmed window is within the cap");
     assert_eq!(series_times(response), times[count - 10..].to_vec());
     assert_eq!(mock.pages.load(Ordering::SeqCst), 6);
+}
+
+/// #1055: a STAC timestep whose item a scan finds republished under it, with
+/// another asset href, while the old item's load finished during that scan,
+/// stays a stub. It loads afresh, renders the new asset's tiles, and moves
+/// `content_version`. Carrying the old item's loaded header over would draw
+/// the replaced asset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stac_item_republished_under_its_timestep_loads_afresh() {
+    let radar = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/radar");
+    let (old_file, new_file) = (
+        radar.join("radar_20260324T2315Z.tif"),
+        radar.join("radar_20260324T2320Z.tif"),
+    );
+    let app = axum::Router::new()
+        .route_service(
+            "/data/old.tif",
+            tower_http::services::ServeFile::new(&old_file),
+        )
+        .route_service(
+            "/data/new.tif",
+            tower_http::services::ServeFile::new(&new_file),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let engine = || {
+        Arc::new(stac_engine_with_cache(
+            format!("{base}/collections/radar/items"),
+            format!("{base}/data/"),
+            64,
+        ))
+    };
+    let stub = |name: &str, file: &Path| {
+        let href = format!("{base}/data/{name}");
+        catalog::FileEntry::stac_stub(
+            PathBuf::from(&href),
+            std::fs::metadata(file).unwrap().len(),
+            catalog::StacStub {
+                bbox: None,
+                asset_url: href,
+            },
+        )
+    };
+    let time: DateTime<Utc> = "2026-03-24T23:15:00Z".parse().unwrap();
+    let with = |entry| {
+        let mut catalog = Catalog::empty();
+        catalog.entries.insert(time, entry);
+        Arc::new(catalog)
+    };
+    let view = |engine: &Arc<GeoTiffEngine>, bbox| {
+        let engine = Arc::clone(engine);
+        tokio::task::spawn_blocking(move || -> Vec<Option<f64>> {
+            engine
+                .get_raster_tile(
+                    bbox,
+                    64,
+                    64,
+                    Some(time),
+                    &OutputCrs::Wgs84,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .values
+                .iter_values()
+                .collect()
+        })
+    };
+
+    let republished = engine();
+    republished.catalog.store(with(stub("old.tif", &old_file)));
+    republished.preload_stac_metadata(&Catalog::empty()).await;
+    assert!(republished.is_metadata_loaded(&time));
+    let bbox = republished.catalog.load().spatial_extent.unwrap();
+    let before = view(&republished, bbox).await.unwrap();
+
+    // The scan lists the new item where the old one, loaded, still is.
+    let current = republished.catalog.load_full();
+    let mut scanned = (*current).clone();
+    scanned.entries.insert(time, stub("new.tif", &new_file));
+    republished.install_scan(&current, scanned);
+    assert!(
+        !republished.is_metadata_loaded(&time),
+        "the new item is not given the old item's header"
+    );
+    assert_eq!(republished.content_version(), 1);
+
+    republished.preload_stac_metadata(&current).await;
+    assert!(republished.is_metadata_loaded(&time));
+    let after = view(&republished, bbox).await.unwrap();
+    assert_ne!(after, before);
+
+    let fresh = engine();
+    fresh.catalog.store(with(stub("new.tif", &new_file)));
+    fresh.preload_stac_metadata(&Catalog::empty()).await;
+    assert_eq!(
+        after,
+        view(&fresh, bbox).await.unwrap(),
+        "the new asset's pixels"
+    );
 }

@@ -171,8 +171,10 @@ add a per-collection `[wms]` colormap with `min`/`max` (or auto-scaling lands,
 [#320](https://github.com/mrauhala/meteocore/issues/320)).
 
 Pointing `--auto-collections` directly at a single Zarr store (rather than its
-parent) also works. **Symlinks are followed** — a symlinked subdirectory or data
-file is scanned like a real one (operators commonly symlink data into a serving
+parent) also works. Hidden folders, such as rsync's `.~tmp~` staging folder,
+and files still being written (a hidden `.name`, `*.tmp`, `*.part`) are
+skipped. **Symlinks are followed** — a symlinked subdirectory or data file is
+scanned like a real one (operators commonly symlink data into a serving
 directory). This is the same trust model as `collections_dir`: whoever can write
 the scan root controls what is served, so keep it writable only by trusted
 principals.
@@ -2485,7 +2487,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 
 | Field | Meaning |
 |-------|---------|
-| `data_age_secs` | Now minus the newest data the collection serves: the newest timestep (GeoTIFF), the newest run's origin time (QueryData), the newest report (BUFR), the newest scan (satellite), the latest generation's anchor frame (nowcast). The `collection_data_age_seconds` gauge reports the same value. It keeps growing when a feeder stalls even though the old files are still found |
+| `data_age_secs` | Now minus the newest data the collection serves: the newest timestep (GeoTIFF), the newest run's origin time (QueryData), the newest report (BUFR), the newest scan (satellite), the latest generation's anchor frame (nowcast). The `collection_data_age_seconds` gauge reports the same value. It keeps growing when a feeder stalls even though the old files are still found. Absent while the collection holds no data, which `collection_has_data` 0 reports |
 | `poll_age_secs` | GeoTIFF and QueryData: time since the last poll that found data. It grows while the source is unreachable or empty |
 
 ### Prometheus Metrics
@@ -2508,7 +2510,8 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `collections_healthy` | gauge | — | Collections in ready state |
 | `collections_degraded` | gauge | — | Collections in degraded state |
 | `collections_failed` | gauge | — | Collections in failed state |
-| `collection_data_age_seconds` | gauge | collection | Seconds since the newest data a collection serves, its `/health` `data_age_secs`; only collections that report one |
+| `collection_data_age_seconds` | gauge | collection | Seconds since the newest data a collection serves, its `/health` `data_age_secs`; only collections that hold data |
+| `collection_has_data` | gauge | collection | 1 while a collection whose engine reports a data age (GeoTIFF, QueryData, BUFR, satellite, NetCDF, nowcast) holds data, 0 when it holds none: it never loaded any, or all of it aged out of a satellite `time_window` or a BUFR `retention`. Alert on it next to the data age, which has no series then |
 
 **GeoTIFF tile cache** (per-collection, compressed byte cache for remote COGs):
 

@@ -77,6 +77,9 @@ fn parse_frame_cap(raw: Option<&str>) -> usize {
 /// file, each with its absolute byte range.
 struct Read {
     ifd: u16,
+    /// The level layout's [`RemoteTileInfo::generation`], which the tile
+    /// cache keys on with the path (#1055).
+    generation: u64,
     range: Range<usize>,
     tiles: Vec<(u32, Range<usize>)>,
 }
@@ -180,12 +183,13 @@ pub(crate) fn plan_frame(
         let misses: Vec<(usize, Range<usize>)> = tiles
             .iter()
             .enumerate()
-            .filter(|(_, (chunk, _))| !cache.contains_untracked(path, *chunk, ifd))
+            .filter(|(_, (chunk, _))| !cache.contains_untracked(path, info.generation, *chunk, ifd))
             .map(|(i, (_, range))| (i, range.clone()))
             .collect();
         for batch in range_batch::plan(misses, range_batch::MAX_TILES) {
             plan.reads.push(Read {
                 ifd,
+                generation: info.generation,
                 range: batch.range,
                 tiles: batch.tiles.iter().map(|&i| tiles[i].clone()).collect(),
             });
@@ -357,7 +361,7 @@ async fn warm_read(
         // LRU while its weigher charges the slice.
         let tile = Bytes::copy_from_slice(&bytes[start..start + range.len()]);
         payload += tile.len();
-        cache.insert(&plan.path, *chunk, read.ifd, tile);
+        cache.insert(&plan.path, read.generation, *chunk, read.ifd, tile);
     }
     ReadResult::Warmed {
         tiles: read.tiles.len(),
