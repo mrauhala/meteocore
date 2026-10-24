@@ -178,6 +178,7 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
         centre: metadata.centre,
         first_surface_type: metadata.first_surface_type,
         first_surface_value: metadata.first_surface_value,
+        statistic: metadata.statistic,
         uv_frame,
     })
 }

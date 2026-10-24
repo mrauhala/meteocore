@@ -1,5 +1,7 @@
 use super::*;
-use crate::test_support::{message, store::TestStore, TestSource};
+use crate::test_support::{
+    message, parameter_message, statistically_processed, store::TestStore, TestSource,
+};
 use crate::{
     catalog::{Catalog, ForecastRun, StepFile},
     reader, GribEngine,
@@ -110,6 +112,47 @@ async fn header_discovery_does_not_require_decodable_values() {
         read_metadata(&store, &path, &entry(None)).unwrap(),
         expected
     );
+}
+
+/// The statistical process of an interval product (#886), which tells AIFS
+/// `cp`, the accumulated rate 0/1/37, from the rate: read alike by the
+/// header probe and the decode, in templates 4.8 and 4.11, and absent from
+/// an instantaneous product (template 4.0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headers_read_the_statistical_process_of_an_interval_product() {
+    let rate = || parameter_message(1, 37, 0x30, 1.0, [0; 4], 1, 0);
+    let mut cases = vec![(rate(), None)];
+    for (template, process) in [(8, 1), (11, 1), (8, 0), (8, 2)] {
+        let bytes = statistically_processed(rate(), template, process, 6);
+        cases.push((bytes, Some(process)));
+    }
+    for (bytes, statistic) in cases {
+        let decoded = MessageMetadata::from(&reader::decode_message(&bytes, "cp").unwrap());
+        assert_eq!((decoded.triple, decoded.statistic), ((0, 1, 37), statistic));
+        let (_, store, path) = source(&bytes).await;
+        assert_eq!(read_metadata(&store, &path, &entry(None)).unwrap(), decoded);
+    }
+}
+
+/// Only one time range names the process: nested ranges, or a template
+/// truncated before it, give none.
+#[test]
+fn nested_or_truncated_time_ranges_have_no_statistic() {
+    let rate = parameter_message(1, 37, 0x30, 1.0, [0; 4], 1, 0);
+    let bytes = statistically_processed(rate, 8, 1, 6);
+    // Section 4 is bytes 109..167; its payload follows its 5-octet header.
+    let payload = &bytes[114..167];
+    let statistic = |payload: &[u8]| {
+        let product = grib::ProdDefinition::from_payload(payload.into()).unwrap();
+        MessageMetadata::from_product(0, 98, &product)
+            .unwrap()
+            .statistic
+    };
+    assert_eq!(statistic(payload), Some(1));
+    let mut nested = payload.to_vec();
+    nested[42 - 6] = 2; // octet 42: number of time ranges
+    assert_eq!(statistic(&nested), None);
+    assert_eq!(statistic(&payload[..47 - 6]), None);
 }
 
 #[test]

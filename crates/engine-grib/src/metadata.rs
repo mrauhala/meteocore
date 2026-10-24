@@ -66,6 +66,9 @@ pub(crate) struct MessageMetadata {
     pub centre: u16,
     pub first_surface_type: u8,
     pub first_surface_value: Option<f64>,
+    /// Code Table 4.10 statistical process over the product's time interval
+    /// ([`statistic`]); `None` for an instantaneous product.
+    pub statistic: Option<u8>,
     pub geometry: Option<GridGeometry>,
     /// GRIB2 flag table 3.3 bit 5 of the message's grid section (#897).
     pub uv_frame: VectorFrame,
@@ -78,6 +81,7 @@ impl From<&DecodedGrid> for MessageMetadata {
             centre: grid.centre,
             first_surface_type: grid.first_surface_type,
             first_surface_value: grid.first_surface_value,
+            statistic: grid.statistic,
             geometry: GridGeometry::new(
                 grid.ni,
                 grid.nj,
@@ -137,10 +141,36 @@ impl MessageMetadata {
             centre,
             first_surface_type,
             first_surface_value,
+            statistic: statistic(product),
             geometry: None,
             uv_frame: VectorFrame::Unknown,
         })
     }
+}
+
+/// The type of statistical processing (Code Table 4.10: 0 average,
+/// 1 accumulation, 2 maximum, ...) of a product defined over a time
+/// interval, product definition templates 4.8 (deterministic) and 4.11
+/// (ensemble member), with a single time range. `None` for an instantaneous
+/// product, another template or nested time ranges: the units table reads
+/// it only to tell an accumulated rate from the rate itself (#886).
+///
+/// The grib crate has no accessor for it. Template octets are 1-based from
+/// the start of Section 4, whose first five octets precede the payload. The
+/// interval's end year sits at octet 35 in 4.8 and at octet 38 in 4.11,
+/// after 4.1's three ensemble octets; the number of time ranges seven octets
+/// later, and the first range's statistical process twelve octets later.
+fn statistic(product: &grib::ProdDefinition) -> Option<u8> {
+    let end_year_octet = match product.prod_tmpl_num() {
+        8 => 35,
+        11 => 38,
+        _ => return None,
+    };
+    let payload = product.iter().as_slice();
+    let octet = |n: usize| payload.get(n - 6).copied();
+    (octet(end_year_octet + 7)? == 1)
+        .then(|| octet(end_year_octet + 12))
+        .flatten()
 }
 
 fn invalid(reason: &str) -> DataServerError {
