@@ -144,8 +144,9 @@ pub fn pages(
 
 /// `router` with every JSON error answered as an HTML page when the request
 /// asked for HTML. `api` is the workbench kind and `mount` the path the
-/// router is mounted at below the external base URL. JSON requests, and
-/// responses that are not JSON errors, pass through untouched.
+/// router is mounted at below the external base URL. A JSON error that
+/// passes through carries `Vary: accept` as the page does, since the same
+/// URL can answer either (#1123); other responses pass through untouched.
 pub fn html_errors(
     router: Router,
     api: &'static str,
@@ -168,7 +169,11 @@ async fn html_error(
     pages: &dyn ErrorPages,
 ) -> Response {
     if wanted(request.uri().query(), request.headers()) != Wanted::Html {
-        return next.run(request).await;
+        let mut response = next.run(request).await;
+        if is_json_error(&response) {
+            vary_accept(response.headers_mut());
+        }
+        return response;
     }
     // The path below the router's mount: links are `root` (base URL +
     // mount) and this path, as every handler builds them, so a proxy
@@ -176,15 +181,10 @@ async fn html_error(
     let uri = request.uri().clone();
     let headers = request.headers().clone();
     let response = next.run(request).await;
-    let status = response.status();
-    let json = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|media| media.starts_with("application/json"));
-    if !(status.is_client_error() || status.is_server_error()) || !json {
+    if !is_json_error(&response) {
         return response;
     }
+    let status = response.status();
     let (mut parts, body) = response.into_parts();
     let body: Value = axum::body::to_bytes(body, MAX_ERROR_BODY)
         .await
@@ -217,10 +217,47 @@ async fn html_error(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
-    parts
-        .headers
-        .append(header::VARY, HeaderValue::from_static("accept"));
+    vary_accept(&mut parts.headers);
     Response::from_parts(parts, Body::from(html))
+}
+
+/// A 4xx or 5xx with a JSON body: the error [`html_errors`] turns into a
+/// page for a request that asked for HTML.
+fn is_json_error(response: &Response) -> bool {
+    let status = response.status();
+    (status.is_client_error() || status.is_server_error())
+        && response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|media| media.starts_with("application/json"))
+}
+
+/// Add `accept` to `headers`' `Vary`, merged into the value already there
+/// (one header, never a second `accept`). A `Vary: *` already covers it.
+fn vary_accept(headers: &mut HeaderMap) {
+    let existing: Vec<String> = headers
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+        .collect();
+    if existing
+        .iter()
+        .any(|token| token == "*" || token.eq_ignore_ascii_case("accept"))
+    {
+        return;
+    }
+    let merged = existing
+        .into_iter()
+        .chain(std::iter::once("accept".to_owned()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Ok(value) = HeaderValue::from_str(&merged) {
+        headers.insert(header::VARY, value);
+    }
 }
 
 /// One failed request, as its HTML page describes it.
@@ -386,8 +423,31 @@ pub fn json_only_format(f: Option<&str>, what: &str) -> Result<(), String> {
     }
 }
 
-/// A GET route for a resource served only as JSON (#1132). A request whose
-/// `f` names another format, `html` included, is the 400
+/// The only query parameter of a route whose handler reads no query.
+const FORMAT_ONLY: &[&str] = &["f"];
+
+/// The `f` of a request to a route whose only query parameter is `f`
+/// (#1123). A parameter of another name is the 400 naming `f`, worded as
+/// on every route that rejects unknown parameters (root CLAUDE.md "Adding a
+/// new API endpoint" rule 3), and its HTML page marks it; `f` given twice
+/// is the 400 [`crate::JsonQuery`] answers.
+fn format_only(uri: &Uri) -> Result<Option<String>, Box<Response>> {
+    if let Some(name) = crate::subset::unknown_parameter(uri.query(), FORMAT_ONLY) {
+        let message = crate::subset::unknown_parameter_message(&name, FORMAT_ONLY);
+        let detail = ErrorDetail {
+            parameter: Some(name),
+            ..Default::default()
+        };
+        return Err(Box::new(detail.attach(crate::bad_request(&message))));
+    }
+    axum::extract::Query::<ds_core::html::FormatParams>::try_from_uri(uri)
+        .map(|axum::extract::Query(params)| params.f)
+        .map_err(|rejection| Box::new(crate::query_rejection(rejection)))
+}
+
+/// A GET route for a resource served only as JSON (#1132). It takes `f`
+/// and no other parameter, which [`format_only`] rejects (#1123). A request
+/// whose `f` names another format, `html` included, is the 400
 /// [`json_only_format`] words, naming the one format the resource has, as
 /// the legend's is; any other request reaches `handler` unchanged. `what`
 /// names the resource ("tile matrix sets").
@@ -397,16 +457,42 @@ where
     T: 'static,
     S: Clone + Send + Sync + 'static,
 {
+    format_only_route(handler, Some(what))
+}
+
+/// A GET route whose handler reads no query and serves one representation
+/// whatever `f` says: the OpenAPI document at `/api`, which Common lists
+/// with an `f`. Any other parameter, or `f` given twice, is the 400
+/// [`format_only`] words (#1123).
+pub fn format_only_get<H, T, S>(handler: H) -> axum::routing::MethodRouter<S>
+where
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    format_only_route(handler, None)
+}
+
+/// `handler` behind [`format_only`], and behind [`json_only_format`] for
+/// the resource `json_only` names.
+fn format_only_route<H, T, S>(
+    handler: H,
+    json_only: Option<&'static str>,
+) -> axum::routing::MethodRouter<S>
+where
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+{
     axum::routing::get(handler).layer(axum::middleware::from_fn(
         move |request: Request, next: Next| async move {
-            let f = request.uri().query().and_then(|query| {
-                form_urlencoded::parse(query.as_bytes())
-                    .find(|(key, _)| key == "f")
-                    .map(|(_, value)| value.into_owned())
-            });
-            match json_only_format(f.as_deref(), what) {
-                Ok(()) => next.run(request).await,
-                Err(message) => crate::bad_request(&message),
+            let f = match format_only(request.uri()) {
+                Ok(f) => f,
+                Err(response) => return *response,
+            };
+            match json_only.map(|what| json_only_format(f.as_deref(), what)) {
+                Some(Err(message)) => crate::bad_request(&message),
+                _ => next.run(request).await,
             }
         },
     ))
@@ -414,8 +500,8 @@ where
 
 /// Declare on the OpenAPI path item `item` that its GET is a
 /// [`json_only_get`] route (#1132): the optional `f` it takes, `json` or
-/// `application/json`, and the 400 any other value gets, a page for a
-/// request that asked for HTML.
+/// `application/json`, and the 400 any other value, any other parameter or
+/// a repeated `f` gets (#1123), a page for a request that asked for HTML.
 pub fn declare_json_only(item: &mut Value) {
     let get = &mut item["get"];
     let format = serde_json::json!({
@@ -429,17 +515,9 @@ pub fn declare_json_only(item: &mut Value) {
         Some(parameters) => parameters.push(format),
         None => get["parameters"] = Value::Array(vec![format]),
     }
-    get["responses"]["400"] = serde_json::json!({
-        "description": "Unsupported format: the resource is served only as JSON. A request that asked for HTML gets the error as a page.",
-        "content": {
-            "application/json": {"schema": {
-                "type": "object",
-                "required": ["code", "description"],
-                "properties": {"code": {"type": "string"}, "description": {"type": "string"}}
-            }},
-            "text/html": {"schema": {"type": "string"}}
-        }
-    });
+    get["responses"]["400"] = crate::bad_request_response(
+        "Unsupported format, as the resource is served only as JSON; a query parameter other than `f`; or `f` given twice. A request that asked for HTML gets the error as a page.",
+    );
 }
 
 #[cfg(test)]
@@ -507,6 +585,72 @@ mod tests {
             Response::from_parts(parts, Body::empty()),
             String::from_utf8(bytes.to_vec()).unwrap(),
         )
+    }
+
+    /// A JSON error from a route that can also answer it as a page varies on
+    /// `Accept`, so a shared cache never serves one client the other's
+    /// representation (#1123). `accept` joins a `Vary` already there, once;
+    /// successes and non-JSON errors are left as they are.
+    #[tokio::test]
+    async fn json_errors_vary_on_accept() {
+        let error = |vary: Option<&'static str>| {
+            move || async move {
+                let mut response = crate::bad_request("Unknown parameter 'x'");
+                if let Some(vary) = vary {
+                    response
+                        .headers_mut()
+                        .insert(header::VARY, HeaderValue::from_static(vary));
+                }
+                response
+            }
+        };
+        let app = Router::new().nest(
+            "/edr",
+            html_errors(
+                Router::new()
+                    .route("/plain", get(error(None)))
+                    .route("/origin", get(error(Some("Origin"))))
+                    .route("/accept", get(error(Some("Accept-Encoding, Accept"))))
+                    .route("/star", get(error(Some("*"))))
+                    .route("/ok", get(|| async { Json(json!({"ok": true})) }))
+                    .route(
+                        "/text",
+                        get(|| async { (StatusCode::BAD_REQUEST, "plain") }),
+                    ),
+                "edr",
+                "/edr",
+                Arc::new(Pages),
+            ),
+        );
+        let vary = |response: &Response| -> Vec<String> {
+            response
+                .headers()
+                .get_all(header::VARY)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_owned())
+                .collect()
+        };
+        for (uri, expected) in [
+            ("/edr/plain", vec!["accept"]),
+            ("/edr/plain?f=json", vec!["accept"]),
+            ("/edr/origin", vec!["Origin, accept"]),
+            ("/edr/accept", vec!["Accept-Encoding, Accept"]),
+            ("/edr/star", vec!["*"]),
+            ("/edr/ok", vec![]),
+            ("/edr/text", vec![]),
+        ] {
+            let (response, _) = fetch(&app, uri, None).await;
+            assert_eq!(vary(&response), expected, "{uri}");
+        }
+        // The page for an HTML request varies once too.
+        let (response, _) = fetch(&app, "/edr/accept?f=html", None).await;
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(vary(&response), ["Accept-Encoding, Accept"]);
+        let (response, _) = fetch(&app, "/edr/plain", Some("text/html")).await;
+        assert_eq!(vary(&response), ["accept"]);
     }
 
     /// The representation is the request's first `f`, else `Accept`; an `f`
@@ -730,6 +874,68 @@ mod tests {
             body,
             r#"{"code":"BadRequest","description":"Format 'png' is not supported for tile matrix sets. Supported: json"}"#
         );
+    }
+
+    /// A route whose handler reads no query takes `f` and nothing else: an
+    /// unknown parameter is the JSON 400 naming `f`, not a 200 that ignored
+    /// it, and a repeated `f` the 400 `JsonQuery` answers (#1123). An HTML
+    /// request gets the page marking the parameter.
+    #[tokio::test]
+    async fn format_only_routes_reject_other_and_repeated_parameters() {
+        let handler = || async { Json(json!({"ok": true})) };
+        let app = html_errors(
+            Router::new()
+                .route(
+                    "/tileMatrixSets",
+                    json_only_get(handler, "tile matrix sets"),
+                )
+                .route("/api", format_only_get(handler)),
+            "tiles",
+            "",
+            Arc::new(Pages),
+        );
+        for uri in ["/tileMatrixSets?f=json", "/api", "/api?f=html", "/api?"] {
+            let (response, body) = fetch(&app, uri, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(body, r#"{"ok":true}"#, "{uri}");
+        }
+        for path in ["/tileMatrixSets", "/api"] {
+            for (query, description) in [
+                (
+                    "f=json&foo=1",
+                    "Unknown query parameter 'foo'. Supported: f",
+                ),
+                (
+                    "datetime=2026",
+                    "Unknown query parameter 'datetime'. Supported: f",
+                ),
+                (
+                    "f=json&f=json",
+                    "Failed to deserialize query string: duplicate field `f`",
+                ),
+            ] {
+                let uri = format!("{path}?{query}");
+                let (response, body) = fetch(&app, &uri, None).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+                let body: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(
+                    body,
+                    json!({"code": "BadRequest", "description": description}),
+                    "{uri}"
+                );
+            }
+            let uri = format!("{path}?foo=%3Cb%3E");
+            let (response, html) = fetch(&app, &uri, Some("text/html")).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert!(
+                html.contains("Unknown query parameter &#39;foo&#39;"),
+                "{html}"
+            );
+            assert!(
+                html.contains("Parameter <code>foo</code>: <code>&lt;b&gt;</code>"),
+                "{html}"
+            );
+        }
     }
 
     /// The OpenAPI of a JSON-only route declares its `f` and its 400,

@@ -541,7 +541,11 @@ Same pattern for api-edr, api-features, api-maps, api-tiles:
    engine actually supports and return 400 naming the valid options.
    Extract a struct-shaped query with `api_common::JsonQuery`, never axum's
    `Query`, so a malformed or repeated parameter is the JSON 400, not
-   axum's plain text (#1121).
+   axum's plain text (#1121). A route whose handler reads no query is no
+   exception: route it with `api_common::errors::json_only_get` (JSON-only
+   resources) or `format_only_get` (`/api`), which take `f` only (#1123).
+   Extract a numeric path segment as `String` and parse it in the handler
+   (`api_tiles::params::tile_indices`): axum's `Path` rejection is plain text.
 4. **When a parameter comes from a standard, copy its schema verbatim** into
    `api_definition()` — including `style`/`explode` for array parameters,
    which is what makes the comma-separated form normative rather than

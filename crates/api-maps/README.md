@@ -40,12 +40,12 @@ collection fields, links, conformance classes and OpenAPI paths.
 | Path | Returns |
 |---|---|
 | `/` | Landing page (JSON or HTML) |
-| `/api`, `/api/docs` | OpenAPI 3.0 definition, Swagger UI |
+| `/api`, `/api/docs` | OpenAPI 3.0 definition (any parameter but `f` is a 400), Swagger UI |
 | `/conformance` | Conformance classes (JSON or HTML) |
 | `/collections` | Collections with a map engine (JSON or HTML) |
 | `/collections/{id}` | Collection description (JSON or HTML) |
 | `/collections/{id}/map` | Map in the `default` style |
-| `/collections/{id}/styles` | Style list (JSON only; `f=html` is a 400) |
+| `/collections/{id}/styles` | Style list (JSON only; `f=html` or any parameter but `f` is a 400) |
 | `/collections/{id}/styles/{styleId}/map` | Map in a named style |
 | `/collections/{id}/styles/{styleId}/legend` | Legend, JSON (default) or PNG |
 

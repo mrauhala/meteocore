@@ -103,6 +103,11 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   override on an enhanced element needs `:not([hidden])` (the `.js
   .enhanced` rules are `!important`). The fixture starts at
   `<div class="map-panel map-raster">`.
+- A route whose handler reads no query is `errors::json_only_get` or
+  `errors::format_only_get` (`/api`), never a bare `get`: `f` only, and
+  another parameter or a repeated `f` is the 400 naming `f` (#1123). Every
+  JSON 4xx/5xx through `html_errors` carries `Vary: accept`, merged into
+  any `Vary` it has.
 - Update README.md here, affected API READMEs and docs/ogc-api-common-matrix.md.
   Run cross-API contracts (`cargo test -p server --test common_discovery`) and the
   affected API suites. Do not require identical real production catalogs.

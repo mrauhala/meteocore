@@ -1034,7 +1034,9 @@ fn pvol_smhi_signed_i16_moment_decodes() {
         eprintln!("skipping pvol_smhi_signed_i16_moment_decodes: fixture absent at {fixture:?}");
         return;
     }
-    let bytes = std::fs::read(&fixture).expect("read SMHI PVOL fixture bytes");
+    let bytes = ds_storage::bytes::Bytes::from(
+        std::fs::read(&fixture).expect("read SMHI PVOL fixture bytes"),
+    );
     let volume = engine_odim::pvol::read_polar_volume(&bytes).expect("parse SMHI PVOL fixture");
     assert_eq!(volume.site.nod.as_deref(), Some("sekrn"), "Kiruna NOD");
 
@@ -1245,7 +1247,8 @@ fn pvol_engine_remote_scan_discovers_fmi_volume() {
     // (9 distinct angles, 0.3°–9°, with low-elevation split cuts) —
     // assert that directly from the parsed fixture so the remote-scan
     // path below is verified against a known volume shape.
-    let bytes = std::fs::read(&fixture).expect("read PVOL fixture bytes");
+    let bytes =
+        ds_storage::bytes::Bytes::from(std::fs::read(&fixture).expect("read PVOL fixture bytes"));
     let volume = engine_odim::pvol::read_polar_volume(&bytes).expect("parse PVOL fixture");
     assert_eq!(volume.site.nod.as_deref(), Some("fivih"));
     assert!(

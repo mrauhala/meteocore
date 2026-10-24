@@ -45,7 +45,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if std::fs::metadata(&path)?.len() > 256 * 1024 * 1024 {
         return Err("input exceeds the offline 256 MiB file limit".into());
     }
-    let bytes = std::fs::read(&path)?;
+    let bytes = ds_storage::bytes::Bytes::from(std::fs::read(&path)?);
     let volume = read_polar_volume(&bytes)?;
     let requested: Vec<_> = volume
         .sweeps

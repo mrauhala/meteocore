@@ -632,6 +632,7 @@ pub(crate) fn collection_openapi_paths(
                 "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Collection metadata"},
+                    "400": api_common::format_error_response(),
                     "404": {"description": "Collection not found"}
                 }
             }
@@ -1050,7 +1051,10 @@ pub async fn api_definition(
                 "operationId": "getLandingPage",
                 "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
-                "responses": { "200": {"description": "Landing page"} }
+                "responses": {
+                    "200": {"description": "Landing page"},
+                    "400": api_common::format_error_response()
+                }
             }
         },
         format!("{m}/conformance"): {
@@ -1059,7 +1063,10 @@ pub async fn api_definition(
                 "operationId": "getConformance",
                 "tags": [api_common::openapi_tags::DISCOVERY],
                 "parameters": [format_parameter()],
-                "responses": { "200": {"description": "Conformance classes"} }
+                "responses": {
+                    "200": {"description": "Conformance classes"},
+                    "400": api_common::format_error_response()
+                }
             }
         },
         format!("{m}/collections"): {"get": api_common::collection_operation()}
@@ -1779,11 +1786,19 @@ pub async fn vector_tileset(
 /// GET /collections/{id}/map/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
 pub async fn map_tile(
     headers: HeaderMap,
-    Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
+    Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
     JsonQuery(params): JsonQuery<TileQueryParams>,
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Response, TilesError> {
+    let (tile_matrix, tile_row, tile_col) =
+        params::tile_indices(&tile_matrix, &tile_row, &tile_col)?;
     if params.is_mvt() {
         return Err(TilesError::BadRequest(format!(
             "Map tiles are images; vector tiles are served at /collections/{id}/tiles/…"
@@ -1810,11 +1825,19 @@ pub async fn map_tile(
 /// — Mapbox Vector Tiles only; `f` may be omitted or name MVT.
 pub async fn vector_tile(
     headers: HeaderMap,
-    Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
+    Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
     JsonQuery(params): JsonQuery<TileQueryParams>,
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<Response, TilesError> {
+    let (tile_matrix, tile_row, tile_col) =
+        params::tile_indices(&tile_matrix, &tile_row, &tile_col)?;
     if params.format.is_some() && !params.is_mvt() {
         return Err(TilesError::BadRequest(format!(
             "Vector tiles are served as {MVT_CONTENT_TYPE}; map tiles are at /collections/{id}/map/tiles/…"
@@ -2074,11 +2097,19 @@ async fn render_vector_tile(
 /// registry; the former through `MapEngine` as before.
 pub async fn get_tile(
     headers: HeaderMap,
-    Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
+    Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
     JsonQuery(params): JsonQuery<TileQueryParams>,
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, TilesError> {
+    let (tile_matrix, tile_row, tile_col) =
+        params::tile_indices(&tile_matrix, &tile_row, &tile_col)?;
     if params.is_mvt() {
         // As the shared root's vector route: a time, and no map tile
         // parameter (`quality`, sizes, …) or unknown one (#605).
@@ -2280,14 +2311,16 @@ pub async fn get_styled_tile(
         String,
         String,
         String,
-        u32,
-        u64,
-        u64,
+        String,
+        String,
+        String,
     )>,
     JsonQuery(params): JsonQuery<TileQueryParams>,
     RawQuery(query): RawQuery,
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, TilesError> {
+    let (tile_matrix, tile_row, tile_col) =
+        params::tile_indices(&tile_matrix, &tile_row, &tile_col)?;
     if params.is_mvt() {
         return Err(TilesError::BadRequest(
             "Vector tiles (?f=mvt) are not styled — request via /collections/{id}/tiles/...".into(),

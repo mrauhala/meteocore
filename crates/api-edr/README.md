@@ -68,7 +68,7 @@ Part 1 `core` and Part 2 `collections` with `https://` URIs, the form EDR
 | Route | Answers |
 |---|---|
 | `/`, `/conformance` | landing page, conformance |
-| `/api`, `/api/docs` | OpenAPI 3.0 document, Swagger UI (assets embedded, no CDN) |
+| `/api`, `/api/docs` | OpenAPI 3.0 document, Swagger UI (assets embedded, no CDN). `/api` takes only `f`: another parameter, or `f` given twice, is a 400 |
 | `/collections`, `/collections/{id}` | catalog with Common search and paging ([api-common](../api-common/README.md)), collection document |
 | `/collections/{id}/locations` | GeoJSON list of named locations |
 | `/collections/{id}/locations/{locId}` | data at one location, or at a comma-separated list |
@@ -254,7 +254,7 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
 
 - **Errors.** JSON errors are `{code, description}`. A request that asked for
   HTML (`f=html`, or `Accept` ranking `text/html` first) gets the error as a
-  page with the same status. 500s carry no details. `/api` lists every
+  page with the same status; both carry `Vary: accept`. 500s carry no details. `/api` lists every
   status each operation answers: 304, 400, 404 and 500, plus 503 and 504 on
   data queries, `/locations` and `items`, and 204 on `/locations/{locId}`.
 - **Caching.** Every 200 carries `Cache-Control` and a strong ETag, and
@@ -383,7 +383,7 @@ need no engine code of their own; items serve the engine's own
 | GRIB | native grid nodes over the bbox; `datetime` matches steps exactly; without `datetime`, the last step of the latest run that has every named parameter. Cube on the `<id>-pressure` and `<id>-model` views that `[grib] level_types` creates |
 | QueryData, Zarr, ODIM composite, Satellite | grid over the bbox, at most 256 cells per axis, cells outside the polygon null. Zarr reads at most 8 variables per area query. Satellite: each product has its own time axis, an instant matches only a scan at exactly that time, RGB composites are not EDR parameters, and a query fetches at most 8 evicted scans and decodes at most 133 million pixels of image blocks (1024 GOES-R 2 km strips or 70 GK2A chunks) |
 | NetCDF | CRS84 grid at the source's mean cell size, at most 256 cells per axis, over lat/lon or CF Lambert conformal conic, geostationary, polar and oblique stereographic, Lambert azimuthal equal-area and transverse Mercator grids, each on the earth figure it states, projected x/y in metres or kilometres, and curvilinear grids of 2-D latitude/longitude, each point placed by an inverse lookup over the nodes (a polar grid's extent reaches its pole, one across the antimeridian is `west > east`); pressure levels through `z`. Trajectory and cube sample each point like position; an M path reads the run that covers its earliest time; a cube has a `t` axis and, on pressure levels, a `z` axis, and its native cells are the area's without the 256 cap. Before any read, a query is held to `MC_NETCDF_EDR_QUERY_MB` (default 544 MiB) of what its reads decode, a whole field its size and a window its cells, and to `MC_NETCDF_EDR_QUERY_READS` (default 200) reads, counting only the fields it reads: a trajectory's planned (step, level) fields, a cube's steps × the levels its positions take. Through OPeNDAP a query reads only the window of each field its points or cells sample, or the whole field when the window passes half of it, the levels it asks of a variable at one step in one request over the stored levels between them, while that reads at most half of what they hold whole (a Z path's levels, sampled at different cells, often read one by one); the values are the whole field's. A 13-level position series over a 67-lead MEPS run is 67 requests and fits both caps; read whole, it is 871 fields and past the bytes |
-| ODIM PVOL site | polar sampling of each volume; `/locations` lists the site; trajectory is a vertical cross-section. The volume files a query reads and the moments it decodes are admitted by `MC_PVOL_READ_MEMORY_MB` (default 1024 MiB); one that does not fit is a 503 `ServerBusy` |
+| ODIM PVOL site | polar sampling of each volume; `/locations` lists the site; trajectory is a vertical cross-section. A query over several volumes reads up to four at once, each the byte ranges of the moments it samples, or the whole file when those are most of it. What a query reads and the moments it decodes are admitted by `MC_PVOL_READ_MEMORY_MB` (default 1024 MiB); a volume that does not fit is a 503 `ServerBusy` |
 | PostGIS stations | stations inside the polygon, one series each; `/locations` holds at most `max_locations` stations (default 200 000); a value outside its parameter's `valid_range` or equal to one of its `missing_values` is a null, its time kept; see [engine-postgis](../engine-postgis/README.md) |
 | PostGIS events | events inside the polygon as `Point` coverages, with the same `valid_range` and `missing_values` nulls |
 | BUFR | stations inside the polygon over the in-memory retention window; position is the nearest station within `position_radius_km` (default 25 km) |
