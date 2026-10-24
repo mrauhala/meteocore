@@ -472,6 +472,7 @@ const STAC_FIXTURE: &str = concat!(
 /// A STAC API over two items five minutes apart whose assets are the
 /// TM35FIN fixture. The newer item's href is `newer_asset`; an asset path
 /// in `gone` answers 404. Counts the requests per asset path.
+/// [`MockStac::start_with`] gives the items a `file:size`.
 struct MockStac {
     items_url: String,
     allowlist: String,
@@ -483,6 +484,13 @@ struct MockStac {
 
 impl MockStac {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// `sized`: each item states the fixture's `file:size`, so a metadata
+    /// load reads the header range first, without a HEAD.
+    async fn start_with(sized: bool) -> Self {
+        let size = sized.then(|| std::fs::metadata(STAC_FIXTURE).unwrap().len());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let times = [at("2026-04-06T06:35:00Z"), at("2026-04-06T06:40:00Z")];
@@ -502,11 +510,15 @@ impl MockStac {
                 .zip(hrefs)
                 .enumerate()
                 .map(|(i, (t, href))| {
+                    let mut asset = serde_json::json!({ "href": href });
+                    if let Some(size) = size {
+                        asset["file:size"] = size.into();
+                    }
                     serde_json::json!({
                         "type": "Feature",
                         "id": format!("item-{i}"),
                         "properties": { "datetime": t.to_rfc3339() },
-                        "assets": { "data": { "href": href } },
+                        "assets": { "data": asset },
                     })
                 })
                 .collect();
@@ -662,6 +674,60 @@ async fn a_stac_item_with_a_gone_asset_stays_out_until_its_listing_changes() {
     assert!(engine.is_metadata_loaded(&t1));
     assert_eq!(engine.content_version(), 1);
     assert_eq!(engine.resolve_time(None, None), Some(t1));
+    assert!(!render_stac(&engine, t1).await.values.is_all_nodata());
+    assert!(stac.requests("/data/item-1-v2.tif") > 0);
+}
+
+/// #1119: a STAC item whose asset was gone before its header was ever read
+/// answers 404 to that first read, the header range read of a map request.
+/// It is read once, then dropped: the request draws nodata and the timestep
+/// leaves at once. No later map, poll or on-demand STAC fetch reads the
+/// asset again while the listing names the same href and size. Another
+/// href is a new object, catalogued again, and `content_version` moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stac_item_gone_before_its_header_is_read_is_read_once_then_dropped() {
+    let stac = MockStac::start_with(true).await;
+    let [t0, t1] = stac.times;
+    stac.gone.lock().unwrap().push("/data/item-1.tif".into());
+    let engine = Arc::new(stac.engine());
+    assert!(engine.catalog.load().entries.is_empty());
+
+    // The render lists the items on demand and loads the one it selects.
+    assert!(render_stac(&engine, t1).await.values.is_all_nodata());
+    assert_eq!(stac.requests("/data/item-1.tif"), 1, "read once");
+    assert_eq!(engine.resolve_time(None, None), Some(t0));
+    assert_eq!(engine.raster_info().times, [t0]);
+    assert!(!render_stac(&engine, t1).await.values.is_all_nodata());
+
+    engine.poll_cycle().await;
+    assert_eq!(times(&engine), [t0], "the listed item stays out");
+    let StoreMode::RemoteStac { client } = &engine.store_mode else {
+        unreachable!()
+    };
+    let fetched = catalog::fetch_stac_range(
+        client,
+        &engine.catalog.load(),
+        (t0 - chrono::Duration::hours(1), t1),
+        "gone-stac",
+    )
+    .unwrap();
+    engine.store_stac_catalog(fetched);
+    assert_eq!(times(&engine), [t0], "and out of a request's STAC fetch");
+    engine.poll_cycle().await;
+    assert_eq!(times(&engine), [t0], "and out of the next poll's listing");
+    assert!(!render_stac(&engine, t1).await.values.is_all_nodata());
+    assert_eq!(
+        stac.requests("/data/item-1.tif"),
+        1,
+        "nothing reads the gone asset again"
+    );
+    assert_eq!(engine.content_version(), 0);
+
+    *stac.newer_asset.lock().unwrap() = "/data/item-1-v2.tif".into();
+    engine.poll_cycle().await;
+    assert_eq!(times(&engine), [t0, t1], "a new href is a new object");
+    assert!(engine.is_metadata_loaded(&t1));
+    assert_eq!(engine.content_version(), 1);
     assert!(!render_stac(&engine, t1).await.values.is_all_nodata());
     assert!(stac.requests("/data/item-1-v2.tif") > 0);
 }

@@ -129,7 +129,8 @@ type MmapCache = Arc<OnceLock<Result<(Arc<Mmap>, crate::decoded_cache::FileIdent
 /// What tile reads learned about a remote object after the scan catalogued
 /// it (#1074): whether the store refused one of its ranges for good. Clones
 /// of a [`DataSource`] share it, as every clone of its catalog entry shares
-/// the source, so the engine sees what any read found.
+/// the source, so the engine sees what any read found. A STAC stub holds
+/// one too, for the header read of its metadata load (#1119).
 #[derive(Debug, Clone, Default)]
 pub struct ObjectHealth(Arc<HealthState>);
 
@@ -611,6 +612,23 @@ pub struct OverviewLevel {
     pub tile_info: Option<RemoteTileInfo>,
 }
 
+/// What [`TiffMetadata::from_http_header_read`] found in a STAC asset's
+/// header range (#1025, #1119).
+#[derive(Debug)]
+pub enum HttpHeaderRead {
+    /// A COG header: the metadata and the tile layout to read by range.
+    Cog(Box<(TiffMetadata, RemoteTileInfo)>),
+    /// The bytes arrived but are not a COG header this reader handles, or
+    /// the object is empty: only a full download can serve it.
+    NotCog,
+    /// The origin answered the whole object (200), ignoring `Range`: only a
+    /// full download can serve it.
+    RangeIgnored,
+    /// The origin refused the range for good, typed as tile reads type it
+    /// (#1074): 404, 401/403, 416 or an object shorter than the range.
+    Refused(RangeRefusal),
+}
+
 /// Parsed metadata from a GeoTIFF file's IFD headers.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -846,37 +864,62 @@ impl TiffMetadata {
         Some((metadata, tile_info))
     }
 
-    /// Parse metadata from a partial HTTP header read (COG range read via reqwest).
-    ///
-    /// Similar to `from_header_read` but uses a raw reqwest HTTP client instead
-    /// of object_store. Used for STAC assets where object_store URL-encodes path
-    /// components, breaking servers like Ceph RGW.
+    /// Read and parse the header of a STAC asset by one range request of
+    /// [`Self::header_range`] through a raw reqwest client: object_store
+    /// URL-encodes path components, which breaks servers like Ceph RGW.
     ///
     /// Async so the poll-cycle STAC preload (#90) can run several reads
     /// concurrently; the request-path loader bridges it with one `block_on`.
     ///
-    /// Returns `None` if parsing fails (caller should fall back to full download).
+    /// As on the object-store scan (#1003), a read that fails is not a
+    /// header that does not parse (#1025). `Err` is a failed read: no
+    /// answer, a status that is neither a refusal nor a success, a body cut
+    /// short. The caller fails this load, since a full download would go to
+    /// the same storage. Only [`HttpHeaderRead::NotCog`] and
+    /// [`HttpHeaderRead::RangeIgnored`] take the full-download fallback. A
+    /// refusal is typed as a tile read types it ([`http_range_refusal`],
+    /// #1074), so the loader can drop an item whose asset is gone (#1119).
     pub async fn from_http_header_read(
         http: &reqwest::Client,
         url: &str,
         file_size: u64,
-    ) -> Option<(Self, RemoteTileInfo)> {
-        let read_size = HEADER_READ_SIZE.min(file_size as usize);
-        if read_size == 0 {
-            return None;
-        }
-        let range_header = format!("bytes=0-{}", read_size - 1);
+    ) -> Result<HttpHeaderRead, DataServerError> {
+        let Some(range) = Self::header_range(file_size) else {
+            return Ok(HttpHeaderRead::NotCog);
+        };
         let resp = http
             .get(url)
-            .header(reqwest::header::RANGE, &range_header)
+            .header(reqwest::header::RANGE, format!("bytes=0-{}", range.end - 1))
             .send()
             .await
-            .ok()?;
-        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            return None;
+            .map_err(|e| DataServerError::Engine(format!("HTTP header read failed: {e}")))?;
+        if let Some(refusal) = http_range_refusal(&resp, &range) {
+            return Ok(HttpHeaderRead::Refused(refusal));
         }
-        let header_bytes = resp.bytes().await.ok()?;
-        Self::parse_header(header_bytes, format!("<http:{}>", url))
+        match resp.status() {
+            reqwest::StatusCode::PARTIAL_CONTENT => {}
+            // The whole object instead of the range.
+            reqwest::StatusCode::OK => return Ok(HttpHeaderRead::RangeIgnored),
+            status => {
+                return Err(DataServerError::Engine(format!(
+                    "HTTP header read returned {status}"
+                )))
+            }
+        }
+        let header_bytes = read_range_body(resp, range.len()).await?;
+        if header_bytes.len() != range.len() {
+            return Err(DataServerError::Engine(format!(
+                "HTTP header read cut short: requested {} bytes, got {}",
+                range.len(),
+                header_bytes.len()
+            )));
+        }
+        Ok(
+            match Self::parse_header(header_bytes, format!("<http:{}>", url)) {
+                Some(header) => HttpHeaderRead::Cog(Box::new(header)),
+                None => HttpHeaderRead::NotCog,
+            },
+        )
     }
 
     /// Apply scale/offset to convert raw value to physical value.
@@ -1550,26 +1593,13 @@ fn read_http_range_answer(
     let range_header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
     let url_owned = url.to_string();
     let fut = async {
-        let mut resp = http
+        let resp = http
             .get(&url_owned)
             .header(reqwest::header::RANGE, &range_header)
             .send()
             .await
             .map_err(|e| DataServerError::Engine(format!("HTTP range read failed: {e}")))?;
-        let refusal = match resp.status() {
-            reqwest::StatusCode::NOT_FOUND => Some(RangeRefusal::NotFound),
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                Some(RangeRefusal::Forbidden)
-            }
-            reqwest::StatusCode::RANGE_NOT_SATISFIABLE => Some(RangeRefusal::Truncated),
-            reqwest::StatusCode::PARTIAL_CONTENT
-                if content_range_total(resp.headers()).is_some_and(|n| n < range.end as u64) =>
-            {
-                Some(RangeRefusal::Truncated)
-            }
-            _ => None,
-        };
-        if let Some(refusal) = refusal {
+        if let Some(refusal) = http_range_refusal(&resp, &range) {
             return Ok(RangeAnswer::Refused(refusal));
         }
         if !resp.status().is_success() {
@@ -1579,25 +1609,7 @@ fn read_http_range_answer(
             )));
         }
         let limit = range.end.saturating_sub(range.start);
-        if resp.content_length().is_some_and(|n| n > limit as u64) {
-            return Err(DataServerError::Engine(
-                "HTTP range body exceeds requested size".into(),
-            ));
-        }
-        let mut data = Vec::with_capacity(limit);
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| DataServerError::Engine(format!("Failed to read body: {e}")))?
-        {
-            if chunk.len() > limit - data.len() {
-                return Err(DataServerError::Engine(
-                    "HTTP range body exceeds requested size".into(),
-                ));
-            }
-            data.extend_from_slice(&chunk);
-        }
-        Ok(RangeAnswer::Read(Bytes::from(data)))
+        Ok(RangeAnswer::Read(read_range_body(resp, limit).await?))
     };
     let fut = async {
         if let Some(deadline) = deadline {
@@ -1612,6 +1624,58 @@ fn read_http_range_answer(
         Some(h) => h.block_on(fut),
         None => block_on_async(fut),
     }
+}
+
+/// The refusal no retry can change in an HTTP answer to a request for
+/// `range` (#1074), as the object store's
+/// [`ds_storage::DataStore::get_range_or_refusal`] types it: a 404, a
+/// 401/403, a 416, or a 206 whose `Content-Range` names a total size that
+/// ends before the range. One home for tile reads and STAC header reads.
+fn http_range_refusal(
+    resp: &reqwest::Response,
+    range: &std::ops::Range<usize>,
+) -> Option<RangeRefusal> {
+    match resp.status() {
+        reqwest::StatusCode::NOT_FOUND => Some(RangeRefusal::NotFound),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            Some(RangeRefusal::Forbidden)
+        }
+        reqwest::StatusCode::RANGE_NOT_SATISFIABLE => Some(RangeRefusal::Truncated),
+        reqwest::StatusCode::PARTIAL_CONTENT
+            if content_range_total(resp.headers()).is_some_and(|n| n < range.end as u64) =>
+        {
+            Some(RangeRefusal::Truncated)
+        }
+        _ => None,
+    }
+}
+
+/// The body of an HTTP answer to a range request, at most `limit` bytes,
+/// streamed with that cap even when the origin omits `Content-Length` or
+/// ignores `Range`: more is an error.
+async fn read_range_body(
+    mut resp: reqwest::Response,
+    limit: usize,
+) -> Result<Bytes, DataServerError> {
+    if resp.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(DataServerError::Engine(
+            "HTTP range body exceeds requested size".into(),
+        ));
+    }
+    let mut data = Vec::with_capacity(limit);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| DataServerError::Engine(format!("Failed to read body: {e}")))?
+    {
+        if chunk.len() > limit - data.len() {
+            return Err(DataServerError::Engine(
+                "HTTP range body exceeds requested size".into(),
+            ));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(data))
 }
 
 /// The object's total size a `Content-Range: bytes a-b/total` header names.
@@ -4142,9 +4206,13 @@ mod tests {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap();
-        let (meta, info) = TiffMetadata::from_http_header_read(&http, &url, size)
+        let HttpHeaderRead::Cog(header) = TiffMetadata::from_http_header_read(&http, &url, size)
             .await
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("MC_COG_BENCH_URL must name a COG served by range");
+        };
+        let (meta, info) = *header;
         let handle = tokio::runtime::Handle::current();
         let calls = AtomicUsize::new(0);
         let transferred = AtomicUsize::new(0);

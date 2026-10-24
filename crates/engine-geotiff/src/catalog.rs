@@ -8,7 +8,7 @@ use ds_storage::discovery::{self, FilenameMatcher, PendingFile, RemoteFile, Remo
 use ds_storage::object_store::path::Path as ObjectPath;
 use ds_storage::ObjectVersion;
 
-use crate::reader::{DataSource, TiffMetadata};
+use crate::reader::{DataSource, ObjectHealth, TiffMetadata};
 
 /// Lightweight stub for STAC entries that haven't had their GeoTIFF metadata loaded yet.
 #[derive(Debug, Clone)]
@@ -26,7 +26,12 @@ pub struct StacStub {
 #[derive(Debug, Clone)]
 pub enum FileState {
     /// STAC stub: only STAC metadata available, GeoTIFF not yet loaded.
-    Stub { stub: StacStub },
+    /// `health` is what its metadata load learned about the asset (#1119),
+    /// shared by every clone of the entry as a loaded source's is.
+    Stub {
+        stub: StacStub,
+        health: ObjectHealth,
+    },
     /// Fully loaded with GeoTIFF metadata and data source.
     Loaded {
         metadata: Arc<TiffMetadata>,
@@ -85,7 +90,10 @@ impl FileEntry {
             file_size,
             mtime: None,
             inode: None,
-            state: FileState::Stub { stub },
+            state: FileState::Stub {
+                stub,
+                health: ObjectHealth::default(),
+            },
         }
     }
 
@@ -110,20 +118,29 @@ impl FileEntry {
         }
     }
 
-    /// Whether a tile read found this entry's remote object gone after the
-    /// scan (#1074): a 404, or a range past its end. Every catalog accessor
-    /// skips such an entry, and the next catalog swap removes it
-    /// ([`crate::gone`]).
+    /// Whether a read found this entry's remote object gone: a tile read
+    /// after the scan (#1074), or a STAC item's metadata load before its
+    /// header was ever read (#1119). A 404, or a range past its end. Every
+    /// catalog accessor skips such an entry, and the next catalog swap
+    /// removes it ([`crate::gone`]).
     pub fn is_gone(&self) -> bool {
-        self.source()
-            .and_then(|source| source.health())
-            .is_some_and(|health| health.gone().is_some())
+        self.health().is_some_and(|health| health.gone().is_some())
+    }
+
+    /// What reads learned about the entry's remote object: its tile reads'
+    /// once loaded (#1074), its metadata load's while a STAC stub (#1119).
+    /// `None` for a local or in-memory source.
+    pub(crate) fn health(&self) -> Option<&ObjectHealth> {
+        match &self.state {
+            FileState::Loaded { source, .. } => source.health(),
+            FileState::Stub { health, .. } => Some(health),
+        }
     }
 
     /// Get the STAC stub if this is a stub entry.
     pub fn stac_stub_info(&self) -> Option<&StacStub> {
         match &self.state {
-            FileState::Stub { stub } => Some(stub),
+            FileState::Stub { stub, .. } => Some(stub),
             FileState::Loaded { .. } => None,
         }
     }
@@ -168,7 +185,7 @@ impl Catalog {
         self.spatial_extent = compute_spatial_union(self.entries.values());
     }
 
-    /// The entries no tile read has found gone (#1074), oldest first.
+    /// The entries no read has found gone (#1074, #1119), oldest first.
     pub fn live(&self) -> impl DoubleEndedIterator<Item = (&DateTime<Utc>, &FileEntry)> {
         self.entries.iter().filter(|(_, entry)| !entry.is_gone())
     }
@@ -217,7 +234,7 @@ fn compute_spatial_union<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Op
         FileState::Loaded { metadata, .. } => {
             ds_core::geo::crs84_extent(metadata.geo_transform.bbox_with_poles())
         }
-        FileState::Stub { stub } => stub.bbox,
+        FileState::Stub { stub, .. } => stub.bbox,
     }))
 }
 
