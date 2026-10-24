@@ -121,7 +121,8 @@ Map tile classes (2026-10-01, [#946](https://github.com/mrauhala/meteocore/issue
 `/conformance` at the shared root is the blocks' union plus the classes a
 block holds only in the shared layout. Tiles adds OGC API - Maps "Map
 Tilesets" there, where map tiles sit under the map resource
-(`…/map/tiles`, linked `tilesets-map`) and take the Maps Scaling parameters.
+(`…/map/tiles`, linked `tilesets-map`) and take the Maps Scaling and
+Background parameters.
 The per-API Maps service, whose `tilesets-map` link points into `/tiles`, does
 not declare it. Tiles DateTime is declared on `/tiles` and at the shared root;
 it covers map and vector tiles, which select features as Features' `datetime`

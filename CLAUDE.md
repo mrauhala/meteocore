@@ -327,6 +327,12 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   RGB composites live in `ds_render::composite` (#819): per-channel range
   with `min > max` = inverted, EUMETSAT gamma, band differences, and
   colour-bar-free legends (`composite_legend_json`, `render_composite_legend`).
+  Map backgrounds live in `ds_render::background` (#894): `Background`
+  (a fill and a void `Fill`) is `CacheKey.background`; WMS converts its
+  `Option<[u8; 3]>` with `.into()`, Maps and map tiles parse `bgcolor`,
+  `transparent`, `void-color`, `void-transparent` with `parse_background`
+  and encode with `encode_map`/`empty_map`. The void (pixels off the CRS)
+  is `OutputCrs::earth_columns`, computed only when the void fill differs.
   `ds-mvt` and `ds-3dtiles` are likewise framework-free byte encoders,
   mirroring `ds-render`.
 - **Byte-bounded LRU caches go through `ds-cache`** (#480):

@@ -813,6 +813,10 @@ pub(crate) fn collection_openapi_paths(
                         {"$ref": "#/components/parameters/tile-width"},
                         {"$ref": "#/components/parameters/tile-height"},
                         {"$ref": "#/components/parameters/tile-scale-denominator"},
+                        {"$ref": "#/components/parameters/bgcolor"},
+                        {"$ref": "#/components/parameters/transparent"},
+                        {"$ref": "#/components/parameters/void-color"},
+                        {"$ref": "#/components/parameters/void-transparent"},
                         {
                             "name": "f",
                             "in": "query",
@@ -934,17 +938,21 @@ pub(crate) fn tile_matrix_set_openapi_paths(m: &str) -> serde_json::Map<String, 
 
 /// Map-tile-only parameter components, after `datetime`, `tile-subset`
 /// and `elevation`, which the per-API mixed tile path lists for both kinds.
-pub(crate) const MAP_TILE_COMPONENTS: [&str; 5] = [
+pub(crate) const MAP_TILE_COMPONENTS: [&str; 9] = [
     "parameter-name",
     "quality",
     "tile-width",
     "tile-height",
     "tile-scale-denominator",
+    "bgcolor",
+    "transparent",
+    "void-color",
+    "void-transparent",
 ];
 
 /// OpenAPI components referenced by the per-API layout's paths.
 pub(crate) fn openapi_components() -> serde_json::Value {
-    json!({
+    let mut components = json!({
         "parameters": {
             // OGC API - Tiles `/req/collections/rc-datetime-definition`, the
             // Tiles OpenAPI fragment's text and this server's rules.
@@ -1030,7 +1038,14 @@ pub(crate) fn openapi_components() -> serde_json::Value {
         "schemas": {
             "legend": api_common::legend_schema()
         }
-    })
+    });
+    // The Maps Background parameters map tiles take (Map Tilesets
+    // `/req/tilesets/tiles-parameters`, #894): the very components the Maps
+    // block declares, so the shared root keeps one definition per name.
+    if let Some(parameters) = components["parameters"].as_object_mut() {
+        parameters.extend(api_common::background_parameters());
+    }
+    components
 }
 
 /// GET {mount}/api — OpenAPI 3.0.3 definition. Path keys include the mount.
@@ -1174,9 +1189,11 @@ pub const MAPS_TILESETS: &str = "http://www.opengis.net/spec/ogcapi-maps-1/1.0/c
 ///   (`/req/tilesets/desc-links`), and each style its
 ///   `…/styles/{styleId}/map/tiles`. Map tiles honour the parameters of
 ///   every declared Maps class that `/req/tilesets/tiles-parameters` lists:
-///   Scaling's `width`, `height` and `scale-denominator`. Spatial
-///   Subsetting asks only for a vertical `h`/`z` subset, and only where the
-///   spatial extent is three-dimensional, which none is here; Background,
+///   Scaling's `width`, `height` and `scale-denominator`, and Background's
+///   `bgcolor`, `transparent`, `void-color` and `void-transparent` (#894;
+///   no tile reaches outside its CRS, so the void ones change no pixel).
+///   Spatial Subsetting asks only for a vertical `h`/`z` subset, and only
+///   where the spatial extent is three-dimensional, which none is here;
 ///   Display Resolution and General Subsetting are not declared.
 ///
 /// The per-API `/maps` service has no `{map}/tiles` (its `tilesets-map`
@@ -2441,6 +2458,8 @@ async fn render_tile(
     let format = validated
         .format
         .with_quality(validated.quality, config.webp_quality());
+    // The Maps Background parameters (#894); they key the rendered cache.
+    let background = validated.background;
 
     // An RGB composite (#819) has no style map: its colours come from its
     // channels, and its one style is `default`.
@@ -2606,8 +2625,7 @@ async fn render_tile(
         // Content revised in place under the same instant (a push-fed alert
         // set) must not hit a stale entry.
         content_version: engine.content_version(),
-        // No opaque-background option on this API: output keeps its alpha.
-        background: None,
+        background,
     };
 
     let cache_control = cache_control_value(
@@ -2700,19 +2718,22 @@ async fn render_tile(
     let render_z = validated.z;
 
     // An all-nodata tile's image, in the requested format at its quality
-    // like a populated tile (#1091). A default-size PNG reuses the global
+    // like a populated tile (#1091), painted with its background (#894). A
+    // default-size PNG with the default background reuses the global
     // `EMPTY_TILE_CACHED`, so its FNV-1a hash is computed once per process
-    // instead of per request; another format, or a tile the Scaling
-    // parameters sized, gets an empty image of its own format and size from
-    // the same shared memo. The job finishes it too (#1093), so the request
-    // worker only reads the result.
+    // instead of per request; another format, size or background gets an
+    // empty image of its own from the same shared memo. The job finishes it
+    // too (#1093), so the request worker only reads the result.
+    let empty_crs = output_crs.clone();
     let empty = move || {
         if format == ds_render::ImageFormat::Png
             && (width, height) == (params::TILE_SIZE, params::TILE_SIZE)
+            && background == ds_render::Background::default()
         {
             Ok(EMPTY_TILE_CACHED.clone())
         } else {
-            ds_render::empty_tile(width, height, format)
+            let earth = background.earth_columns(&empty_crs, bbox, width, height);
+            ds_render::empty_map(width, height, background, earth.as_deref(), format)
         }
     };
     let render_result = job
@@ -2743,11 +2764,21 @@ async fn render_tile(
                     )?;
                     phases.add(RenderPhase::Engine, engine_start.elapsed());
                     let encode_start = std::time::Instant::now();
-                    let bytes = ds_render::render_composite_tiles(&tiles, spec, format, None)?;
-                    if bytes.is_some() {
-                        phases.add(RenderPhase::Encode, encode_start.elapsed());
-                    }
-                    return Ok((bytes, phases));
+                    let Some(mut rgba) = ds_render::render_composite_tiles_rgba(&tiles, spec)?
+                    else {
+                        return Ok((None, phases));
+                    };
+                    let earth = background.earth_columns(&output_crs, bbox, width, height);
+                    let bytes = ds_render::encode_map(
+                        &mut rgba,
+                        width,
+                        height,
+                        format,
+                        background,
+                        earth.as_deref(),
+                    )?;
+                    phases.add(RenderPhase::Encode, encode_start.elapsed());
+                    return Ok((Some(bytes), phases));
                 }
             };
 
@@ -2773,7 +2804,17 @@ async fn render_tile(
             }
 
             let encode_start = std::time::Instant::now();
-            let bytes = ds_render::render_tile(&tile, colormap.as_ref(), format)?;
+            let mut rgba = ds_render::render_tile_rgba(&tile, colormap.as_ref())?;
+            // Only a background whose void fill differs maps the Earth.
+            let earth = background.earth_columns(&output_crs, bbox, width, height);
+            let bytes = ds_render::encode_map(
+                &mut rgba,
+                width,
+                height,
+                format,
+                background,
+                earth.as_deref(),
+            )?;
             phases.add(RenderPhase::Encode, encode_start.elapsed());
             Ok((Some(bytes), phases))
         }))
