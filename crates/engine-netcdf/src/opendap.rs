@@ -20,7 +20,9 @@
 //!   of `Float32`, uncompressed: THREDDS ignores `Accept-Encoding` on
 //!   `.dods` (measured). The reply is kept in the chunk cache
 //!   ([`remote::dap_reply`]), single-flight, where a range read keeps its
-//!   compressed chunk.
+//!   compressed chunk. An EDR query reads only the window of a field it
+//!   samples (#1171, [`crate::field::read_uncached`]): a reply of its own,
+//!   428 bytes for a point's 2 × 2 cells of a MEPS field.
 //! - **Requests** go through the host's stores ([`Host`]): its request
 //!   limit and 429 back-off, its `storage` span, under the calling thread's
 //!   [`Mode`], on the I/O runtime ([`io::blocking`]). THREDDS streams every
@@ -291,7 +293,9 @@ impl DapFile {
 
     /// Variable `read`'s hyperslab `selection`, in its stored type: one
     /// `.dods`, from the chunk cache or fetched once for every concurrent
-    /// reader.
+    /// reader. A whole field and each window of it (#1171) are replies of
+    /// their own, cached under their own constraints, each capped at the
+    /// size of what it selects.
     pub(crate) fn read_field(
         &self,
         read: &FieldRead,
@@ -302,15 +306,13 @@ impl DapFile {
             DataServerError::Storage(format!("{}: no variable '{name}'", self.id.url))
         })?;
         let constraint = dap::constraint(projection, selection);
-        let (ny, nx) = read.shape();
         let dtype = &self
             .metadata
             .variables
             .iter()
             .find(|v| v.name == name)
             .map_or(NcType::Double, |v| v.dtype.clone());
-        let cells = (ny as u64).saturating_mul(nx as u64);
-        let max = dap::xdr_bytes(dtype, cells).saturating_add(REPLY_DDS_BYTES);
+        let max = dap::xdr_bytes(dtype, dap::selected(selection)).saturating_add(REPLY_DDS_BYTES);
         let invalid = |e: String| DataServerError::Storage(format!("{}: {e}", self.id.url));
         let reply = remote::dap_reply(&self.id, &constraint, || {
             let mut reply = self.fetch(&[(".dods", Some(constraint.clone()))], max)?;
@@ -331,6 +333,16 @@ impl DapFile {
             (Stored::Byte, Raw::U8(bytes)) => Raw::I8(bytes.into_iter().map(|b| b as i8).collect()),
             (_, raw) => raw,
         })
+    }
+
+    /// Whether the reply of `read`'s hyperslab `selection` is in the chunk
+    /// cache now: no request, no recency bump.
+    pub(crate) fn holds(&self, read: &FieldRead, selection: &NcSliceInfo) -> bool {
+        self.metadata
+            .projection(&read.name)
+            .is_some_and(|projection| {
+                remote::dap_cached(&self.id, &dap::constraint(projection, selection))
+            })
     }
 
     /// One round of requests, `(suffix, query)` each, at most `max_bytes`

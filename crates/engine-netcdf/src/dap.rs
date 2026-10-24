@@ -667,6 +667,19 @@ pub(crate) fn constraint(projection: &Projection, selection: &NcSliceInfo) -> St
     text
 }
 
+/// Values `selection` selects: one per index, each range's count, the
+/// product saturating, whatever sizes the selection names.
+pub(crate) fn selected(selection: &NcSliceInfo) -> u64 {
+    selection.selections.iter().fold(1u64, |n, elem| {
+        n.saturating_mul(match *elem {
+            NcSliceInfoElem::Index(_) => 1,
+            NcSliceInfoElem::Slice { start, end, step } => {
+                end.saturating_sub(start).div_ceil(step.max(1))
+            }
+        })
+    })
+}
+
 /// Several whole variables, by their projections, as one constraint.
 pub(crate) fn whole(projections: &[&Projection]) -> String {
     projections

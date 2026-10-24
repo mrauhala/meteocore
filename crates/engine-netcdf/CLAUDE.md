@@ -398,9 +398,10 @@ Read in place by HTTP range, never downloaded whole (decision 4).
   smoke test (two variables, the same three files) loaded the collection
   in 1.7-2.0 s with 1.31 MB per file, drew a cold GetMap in about 1 s
   (384 × 512 EPSG:3857 over Norway; 355 × 600 EPSG:3067 over Finland,
-  every pixel drawn) and map tiles of the same field in 25-30 ms. Not yet measured from a
-  server's network: a follow-up after deploy, which sets the cache and
-  budget defaults.
+  every pixel drawn) and map tiles of the same field in 25-30 ms. By range
+  not measured from a server's network: thredds.met.no serves MEPS through
+  OPeNDAP only since 2026-10-22. Its OPeNDAP numbers from a server's
+  network, and the cache defaults kept, are under "OPeNDAP" (#1171).
 
 ## OPeNDAP (`opendap.rs`, `dap.rs`, `source.rs`) — #1264
 
@@ -473,6 +474,36 @@ access = "opendap"` reads a remote family through DAP2.
   without `Data:` is never cached (`dap::check`). `FieldRead.chunk_bytes`
   is `field_bytes` (no HDF5 view), so the decode budget and the EDR cap
   count a field as a contiguous one.
+- **EDR windows (#1171):** an EDR or GetFeatureInfo query through OPeNDAP
+  reads only the cells it samples. `edr::sample_fields` joins each
+  field's positions' `SourceGrid::cells_read` (the four cells `value_at`
+  reads, the nearest included; ds-core `resample::sampler`) into one
+  `CellWindow` per field, each distinct positions list's once;
+  `FieldRead::window_selection` makes it the stored hyperslab (rows
+  reversed for a south-up grid), and `field::QueryField::value_at`
+  samples it through `SourceGrid::value_in`: the same cells in the same
+  arithmetic as `value_at` on the whole field, bit for bit
+  (`sampler::tests::a_window_samples_what_the_whole_field_samples`).
+  `Reader::reads_windows` is true for `Dap` only: a NetCDF file reads a
+  whole chunk whatever the window, and the range path stays as it is. A
+  window over half the field's cells (`edr::worth_a_window`) reads the
+  field whole: a whole reply serves every later query and map of the
+  field, a window only itself, so past half a window then the field
+  costs more than the field. `read_uncached` takes a `FIELDS` hit, or a
+  whole reply in `CHUNKS` (`Reader::holds_field`, `remote::dap_cached`:
+  no request, no recency bump), before fetching a window. A window is a
+  reply of its own in `CHUNKS` (keyed by its constraint, weighted by its
+  bytes, an error reply never cached by `dap::check`), a
+  `QUERY_IN_FLIGHT` key of its own (`QueryKey { field, window }`), and
+  reserves the whole field's decode peak in proportion to its cells
+  (`field::window_peak_bytes`). Fan-out is unchanged: `run_field_jobs`
+  four at a time, detached on `QUERY_READS`. The query cap still counts
+  whole fields (`FieldRead::decoded_bytes`). Measured 2026-10-24 from a
+  server's network: a whole MEPS field 4 066 402 bytes in 0.25 s, a
+  2 × 2 window 428 bytes in 0.10 s, so a 67-lead series is about 29 KB
+  per variable instead of 272 MB. Cache defaults kept (512/256/64 MB):
+  EDR no longer churns `CHUNKS` with whole fields, while renders and
+  prewarm still fill it with them.
 - **Transport:** `DataStore::get_documents_on` (ds-storage `document.rs`):
   `DocumentRequest { path, query }`, the query appended by the host's
   `Documents` layer (after the base URL's own), which marks the result
@@ -500,8 +531,9 @@ access = "opendap"` reads a remote family through DAP2.
   `remote::forget_replaced`: chunks and fields dropped, `Changes` told,
   the content version moved from a request, the read
   `ReadFailure::Replaced` (503).
-- **Not served:** DAP4, OPeNDAP for local files, server-side point series
-  (#1171), string variables.
+- **Not served:** DAP4, OPeNDAP for local files, string variables. MEPS
+  stores one lead per file, so a series is one request per lead whatever
+  is asked: the EDR windows above, never one request per series.
 - **Tests:** `dap::tests` (THREDDS's own MEPS DDS, DAS, coordinates and
   4 × 4 replies, testdata/netcdf-opendap; every XDR type, DAS escapes,
   types and signed bytes, constraints, a server's error);
@@ -509,7 +541,12 @@ access = "opendap"` reads a remote family through DAP2.
   fixtures, as Grids and as plain arrays, against the files read locally,
   every parameter, level, run and time and the EDR series; the requests
   an open and a field cost; replaced and removed files; THREDDS's
-  metadata ingested; the shipped examples); ds-storage
+  metadata ingested; the shipped examples; `opendap::tests::windows`,
+  the EDR windows of #1171: a series reading one 2 × 2 window per lead,
+  every query shape against the files read locally, the half-field
+  fallback and a whole field cached sampled whole, packing, fill and the
+  global seam, and THREDDS's own MEPS metadata and 4 × 4 reply answering
+  a window's exact constraint); ds-storage
   `document::tests::a_query_reaches_the_server_and_the_version_comes_back`
   and `thredds::tests::opendap_files_take_the_catalogs_version_without_a_head`;
   ds-core `opendap_access_needs_a_catalog`; `tests/live_thredds.rs`
@@ -724,7 +761,8 @@ cube is an area's steps and cells, never coarsened, sampled bilinearly,
   Every read reserves the decode budget; a failed read fails the query,
   never a null: a replaced file or the budget is `ResourceExhausted` (503),
   the deadline `DeadlineExceeded` (504), any other remote failure
-  `Storage` (an opaque 500 in EDR).
+  `Storage` (an opaque 500 in EDR). Through OPeNDAP the read is the
+  window of the field the query samples (see "OPeNDAP", EDR windows).
 - **Query-shape cap** (`QUERY_BYTES`, `MC_NETCDF_EDR_QUERY_MB`, default 544
   MiB): steps × levels × the sum over the variables of
   `FieldRead::decoded_bytes`
@@ -875,7 +913,8 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
   2026-10-23 for `meps_pl_00` (DDS and DAS whole) and `meps_sfc_00`
   (trimmed to the example's variables) of the 12Z run, each file's
   coordinates reply, and a 4 × 4 hyperslab of 2 m temperature (48 KB in
-  all, provenance in its README). `src/test_server.rs` also serves any
+  all, provenance in its README; `opendap::tests::windows` answers EDR
+  windows of the sfc file with it, #1171). `src/test_server.rs` also serves any
   NetCDF fixture as a DAP2 dataset (`TestServer::put_opendap`: `.dds`,
   `.das`, `.dods` with constraints, chunked, Grids or plain arrays,
   `Last-Modified` optional).

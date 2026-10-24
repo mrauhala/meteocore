@@ -956,3 +956,156 @@ fn a_map_position_is_where_the_map_samples() {
     assert_eq!(period(&regional), None);
     assert_eq!(period(&meps_shaped()), None);
 }
+
+/// The cells of `values`, a `width`-column field, inside `window`.
+fn cut(values: &[f32], width: u32, window: CellWindow) -> Vec<f32> {
+    (window.rows.0..=window.rows.1)
+        .flat_map(|row| {
+            (window.columns.0..=window.columns.1)
+                .map(move |col| values[(row * width + col) as usize])
+        })
+        .collect()
+}
+
+/// `cells_read` (#1171) is the window of the four cells around a position
+/// that lie on the grid: two by two inside, one column or row at an edge's
+/// half-cell margin, one cell at a corner's, nothing off the grid. On a
+/// global grid, between the last column and the first, it spans every
+/// column; on a regional lat/lon grid a turn away, the same cells.
+#[test]
+fn cells_read_is_the_neighbourhood_value_at_reads() {
+    let window = |columns, rows| Some(CellWindow { columns, rows });
+    let grid = three_by_three(lambert(63.3, 15.0));
+    assert_eq!(grid.cells_read((0.5, 0.5)), window((0, 1), (0, 1)));
+    assert_eq!(grid.cells_read((1.0, 1.0)), window((1, 2), (1, 2)));
+    assert_eq!(grid.cells_read((-1.0, 1.0)), window((0, 0), (1, 2)));
+    assert_eq!(grid.cells_read((1.2, -0.9)), window((1, 2), (0, 0)));
+    assert_eq!(grid.cells_read((2.99, 2.99)), window((2, 2), (2, 2)));
+    assert_eq!(grid.cells_read((-1.01, 1.0)), None);
+    assert_eq!(grid.cells_read((1.0, f64::NAN)), None);
+    let regional = three_by_three(Crs::Wgs84);
+    for turn in [-360.0, 0.0, 360.0] {
+        assert_eq!(
+            regional.cells_read((0.5 + turn, 1.5)),
+            window((0, 1), (1, 2))
+        );
+    }
+    let global = SourceGrid::new(lat_lon(0.5, 1.0, 89.5, -1.0, 360, 180));
+    assert_eq!(global.cells_read((359.5, 10.0)), window((0, 359), (10, 11)));
+    assert_eq!(global.cells_read((-0.5, 10.0)), window((0, 359), (10, 11)));
+    assert_eq!(global.cells_read((20.25, 10.0)), window((20, 21), (10, 11)));
+    let union = CellWindow {
+        columns: (0, 1),
+        rows: (4, 5),
+    }
+    .union(CellWindow {
+        columns: (7, 8),
+        rows: (2, 2),
+    });
+    assert_eq!(
+        union,
+        CellWindow {
+            columns: (0, 8),
+            rows: (2, 5)
+        }
+    );
+    assert_eq!((union.width(), union.height(), union.cells()), (9, 4, 36));
+}
+
+/// A field read over a window alone samples, bit for bit, what the whole
+/// field samples (#1171): `value_in` over `cells_read` of a position, or
+/// any window holding it, is `value_at` on the whole field, at positions
+/// swept over each grid and its half-cell margins and past them, with
+/// nodata holes (NaN, and a sentinel) forcing the nearest-cell fallback,
+/// on a projected grid, a regional and a global lat/lon one (across its
+/// seam and a turn away). A window that misses a position's cells, or
+/// values of the wrong length, read nothing.
+#[test]
+fn a_window_samples_what_the_whole_field_samples() {
+    let grids = [
+        ("lambert 3x3", three_by_three(lambert(63.3, 15.0)), None),
+        ("meps-shaped", SourceGrid::new(meps_shaped()), None),
+        (
+            "regional lat/lon",
+            SourceGrid::new(lat_lon(5.0, 0.25, 70.0, -0.25, 80, 60)),
+            Some(-9999.0f32),
+        ),
+        (
+            "global lat/lon",
+            SourceGrid::new(lat_lon(0.5, 1.0, 89.5, -1.0, 360, 180)),
+            None,
+        ),
+    ];
+    // A deterministic sweep: a linear congruential generator.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    for (label, grid, nodata) in grids {
+        let (width, height) = grid.size();
+        let mut values: Vec<f32> = (0..width * height)
+            .map(|i| ((i * 7919) % 1013) as f32 * 0.37 - 50.0)
+            .collect();
+        for (i, value) in values.iter_mut().enumerate() {
+            if i % 7 == 3 {
+                *value = nodata.unwrap_or(f32::NAN);
+            }
+        }
+        let (nx, ny) = (f64::from(width), f64::from(height));
+        let mut positions: Vec<(f64, f64)> = (0..4000)
+            .map(|_| (next() * (nx + 3.0) - 1.5, next() * (ny + 3.0) - 1.5))
+            .collect();
+        for &col in &[-1.0, -0.5, 0.0, nx - 1.0, nx - 0.5, nx - 0.01] {
+            for &row in &[-1.0, -0.5, 0.0, ny - 1.0, ny - 0.01] {
+                positions.push((col, row));
+                positions.push((col + 360.0, row));
+            }
+        }
+        let mut sampled = 0;
+        for (i, &position) in positions.iter().enumerate() {
+            let whole = grid.value_at(&values, nodata, position);
+            let Some(window) = grid.cells_read(position) else {
+                assert!(!grid.covers(position), "{label}: {position:?}");
+                assert_eq!(whole, None, "{label}: {position:?}");
+                continue;
+            };
+            assert!(window.cells() <= 4 || window.width() == width, "{label}");
+            let bits = |v: Option<f64>| v.map(f64::to_bits);
+            let part = cut(&values, width, window);
+            let read = grid.value_in(window, &part, nodata, position);
+            assert_eq!(
+                bits(read),
+                bits(whole),
+                "{label}: {position:?} in {window:?}"
+            );
+            // Any window holding it: here the union with another position's.
+            let other = positions[(i * 31 + 17) % positions.len()];
+            if let Some(more) = grid.cells_read(other).map(|w| w.union(window)) {
+                let read = grid.value_in(more, &cut(&values, width, more), nodata, position);
+                assert_eq!(bits(read), bits(whole), "{label}: {position:?} in {more:?}");
+            }
+            sampled += usize::from(whole.is_some());
+        }
+        assert!(sampled > 1000, "{label}: {sampled} values sampled");
+    }
+
+    let grid = three_by_three(lambert(63.3, 15.0));
+    let values: Vec<f32> = (0..9).map(|v| v as f32).collect();
+    let window = grid.cells_read((0.5, 0.5)).unwrap();
+    let part = cut(&values, 3, window);
+    assert_eq!(grid.value_in(window, &part, None, (0.5, 0.5)), Some(2.0));
+    assert_eq!(
+        grid.value_in(window, &part, None, (1.5, 0.5)),
+        None,
+        "outside"
+    );
+    assert_eq!(grid.value_in(window, &part[1..], None, (0.5, 0.5)), None);
+    assert_eq!(
+        grid.value_in(window, &part, None, (5.0, 0.5)),
+        None,
+        "off the grid"
+    );
+}

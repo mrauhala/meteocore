@@ -37,7 +37,7 @@ pub mod curvilinear;
 pub mod sampler;
 
 pub use curvilinear::{CurvilinearGrid, CurvilinearNodes};
-pub use sampler::{OutputMap, SourceGrid};
+pub use sampler::{CellWindow, OutputMap, SourceGrid};
 
 /// Initial node spacing, in output pixels. The adaptive refinement in
 /// [`ProjectionGrid::build`] only ever *increases* density from here, so this

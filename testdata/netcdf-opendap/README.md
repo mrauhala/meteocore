@@ -22,4 +22,6 @@ asked for `Accept-Encoding: deflate, gzip`. The same files' fileServer URLs
 answered 403 (`Service Not Allowed: HTTPServer not enabled for dataset`).
 
 `src/dap/tests.rs` parses and decodes these; `src/opendap/tests.rs` serves
-them as captured and ingests them as a MEPS file is ingested.
+them as captured and ingests them as a MEPS file is ingested;
+`src/opendap/tests/windows.rs` answers the windows EDR point queries ask
+for (#1171) with the 4 × 4 reply and with cells of it, re-encoded.

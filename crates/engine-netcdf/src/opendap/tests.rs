@@ -22,6 +22,8 @@ use crate::source::Reader;
 use crate::test_server::{thredds_catalog, Request, TestServer};
 use crate::NetcdfEngine;
 
+mod windows;
+
 const CATALOGS: &str = "thredds/catalog/meps25epsarchive";
 const DAP: &str = "thredds/dodsC/meps25epsarchive";
 
@@ -59,24 +61,34 @@ fn dataset(family: &str, lead: u32, slot: DateTime<Utc>) -> String {
 type Published = (&'static str, &'static str, u32, DateTime<Utc>);
 
 /// Serve `files` as OPeNDAP datasets (Grids when `grids`, replies carrying
-/// `last_modified` when given), with THREDDS catalogs from the archive
-/// root down to each slot's `member_00`, listing them as modified an hour
-/// ago, all chunked.
+/// `last_modified` when given), with their THREDDS catalogs ([`catalogs`]).
 fn publish(
     server: &TestServer,
     files: &[Published],
     grids: bool,
     last_modified: Option<DateTime<Utc>>,
 ) {
+    let mut listed = Vec::new();
+    for &(fixture, family, lead, slot) in files {
+        let bytes = std::fs::read(testdata(fixture)).unwrap();
+        let (dir, name) = place(family, lead, slot);
+        listed.push((dir, name, bytes.len()));
+        server.put_opendap(&dataset(family, lead, slot), bytes, grids, last_modified);
+    }
+    catalogs(server, &listed);
+}
+
+/// THREDDS catalogs from the archive root down to each of `files`'
+/// directories, `(directory, name, bytes)`, listing them as modified an
+/// hour ago, all chunked.
+fn catalogs(server: &TestServer, files: &[(String, String, usize)]) {
     server.chunk_whole_gets();
     let modified = (Utc::now() - chrono::Duration::hours(1))
         .duration_trunc(chrono::Duration::seconds(1))
         .unwrap();
     type Listing = (BTreeSet<String>, Vec<(String, String, String)>);
     let mut tree: BTreeMap<String, Listing> = BTreeMap::new();
-    for &(fixture, family, lead, slot) in files {
-        let bytes = std::fs::read(testdata(fixture)).unwrap();
-        let (dir, name) = place(family, lead, slot);
+    for (dir, name, bytes) in files {
         let parts: Vec<&str> = dir.split('/').collect();
         for depth in 0..parts.len() {
             tree.entry(parts[..depth].join("/"))
@@ -85,11 +97,10 @@ fn publish(
                 .insert(parts[depth].to_string());
         }
         tree.entry(dir.clone()).or_default().1.push((
-            ["meps25epsarchive", &dir, &name].join("/"),
-            format!("{:.2}", bytes.len() as f64 / 1000.0),
+            ["meps25epsarchive", dir, name].join("/"),
+            format!("{:.2}", *bytes as f64 / 1000.0),
             modified.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         ));
-        server.put_opendap(&dataset(family, lead, slot), bytes, grids, last_modified);
     }
     for (dir, (children, listed)) in tree {
         let refs: Vec<String> = children
@@ -508,6 +519,14 @@ fn a_replaced_or_removed_file_is_found_by_its_next_read() {
     }
 }
 
+/// What an open of THREDDS's trimmed MEPS sfc file asks for in its third
+/// request: every scalar and 1-D coordinate, in DDS order.
+const SFC_COORDINATES: &str = "time,forecast_reference_time,mean_sea_level,surface,\
+    height_above_msl,height0,height1,height2,height3,height4,height5,height6,grib2_vLevel14,\
+    grib2_vLevel16,local_vertical_level_192,isotherm_0C_level,isotherm_0C_level_from_above,\
+    adiabatic_condensation_level,maximum_wind_level,tropopause,top_of_atmosphere,\
+    projection_lambert,x,y";
+
 /// thredds.met.no's own metadata of a MEPS file (testdata/netcdf-opendap,
 /// fetched 2026-10-23: the DDS, DAS and coordinates reply its open reads),
 /// served as captured, ingests as the NetCDF file does: the variables on
@@ -523,14 +542,7 @@ fn thredds_metadata_of_meps_ingests_as_its_files_do() {
     };
     let run: DateTime<Utc> = "2026-10-23T12:00:00Z".parse().unwrap();
     for (family, coordinates) in [
-        (
-            "sfc",
-            "time,forecast_reference_time,mean_sea_level,surface,height_above_msl,height0,\
-             height1,height2,height3,height4,height5,height6,grib2_vLevel14,grib2_vLevel16,\
-             local_vertical_level_192,isotherm_0C_level,isotherm_0C_level_from_above,\
-             adiabatic_condensation_level,maximum_wind_level,tropopause,top_of_atmosphere,\
-             projection_lambert,x,y",
-        ),
+        ("sfc", SFC_COORDINATES),
         (
             "pl",
             "time,forecast_reference_time,pressure,projection_lambert,x,y",
