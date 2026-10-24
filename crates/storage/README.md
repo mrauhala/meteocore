@@ -35,12 +35,13 @@ decides whether that retry gets to run, so a whole-object fetch names its
 
 `get_with_budget`, `get_range_with_budget`, `get_range_on_with_budget`,
 `get_range_if_unmodified` and `get_many_with_budget` take the budget; `get`,
-`get_range`, `get_range_on`, `get_range_or_refusal` and `get_many` are the request budget. Don't pass the background budget where a
+`get_range`, `get_range_on`, `get_range_or_refusal`, `get_or_refusal`,
+`get_ranges_or_refusal` and `get_many` are the request budget. Don't pass the background budget where a
 request can wait on the result, directly or through a single-flight cache
-fill. `start_get_opt` is a `FetchBudget::Request` read too: it runs ahead on
-the runtime (#999), and several threads can wait for it behind an `Arc`
-(#1127). `start_get_ranges_opt` starts `get_ranges_opt` the same way, one
-buffer per range (#1261). Each `PendingGet::wait` is limited by its own
+fill. `start_get_or_refusal` is a `FetchBudget::Request` read too: it runs
+ahead on the runtime (#999), and several threads can wait for it behind an
+`Arc` (#1127). `start_get_ranges_or_refusal` starts `get_ranges_or_refusal`
+the same way, one buffer per range (#1261). Each `PendingGet::wait` is limited by its own
 thread's request deadline, so one request's deadline never cuts off a read
 another waits on; the read is aborted when its last holder drops it.
 
@@ -200,7 +201,7 @@ HTTP check. `get_range_if_unmodified_on` drives the read on a supplied
 runtime handle.
 
 `get_range_or_refusal` (and `_on`) reads a byte range without a version and
-answers a refusal no retry can change as `RangeAnswer::Refused`, not an
+answers a refusal no retry can change as `ReadAnswer::Refused`, not an
 error (#1074): `RangeRefusal::NotFound` for a 404, `Forbidden` for a 401 or
 403, and `Truncated` for a 416 or a response whose total size ends before
 the range. object_store types only some of these; a 416, and a 403 from its
@@ -209,14 +210,21 @@ HTTP store, carry the status only in the text of a private error, which
 Every other failure stays an `Err`. engine-geotiff's tile reads use it to
 tell a gone object from a failed read.
 
-`get_ranges_opt` (and `_on`) reads several byte ranges of one object under
-the request budget: one GET per range, up to ten at once, through
+`get_or_refusal` (and `_on`) reads a whole object the same way (#1046): a
+404 is `NotFound` and a 401 or 403 `Forbidden`, which S3 also answers for a
+missing key when the caller may not list the bucket. The PVOL engine tells
+a gone volume from one its credentials may not read with it. `get_opt`,
+for Zarr, keeps a missing object `Ok(None)` and every other failure an
+`Err`.
+
+`get_ranges_or_refusal` (and `_on`) reads several byte ranges of one object
+under the request budget: one GET per range, up to ten at once, through
 object_store's `coalesce_ranges`. Only ranges that overlap or touch are
 merged, so the caller decides which near ranges are worth one GET;
-object_store's own `get_ranges` would merge any within 1 MiB. A missing
-object is `Ok(None)`, as in `get_opt`, and a range past the end may come
-back short, so the caller checks lengths. The PVOL engine reads the byte
-spans of a moment's decode with it (#1047).
+object_store's own `get_ranges` would merge any within 1 MiB. Refusals are
+answered as by `get_or_refusal`, a 416 as `Truncated`, and a range past the
+end may also come back short, so the caller checks lengths. The PVOL engine
+reads the byte spans of a moment's decode with it (#1047).
 
 # Request limits
 

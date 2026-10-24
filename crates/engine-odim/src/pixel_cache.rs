@@ -6,7 +6,7 @@
 //! stack of a whole radar network is never resident at once. Mirrors the
 //! GeoTIFF/GRIB `quick_cache` byte-weighted caches.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::Instant;
@@ -52,7 +52,7 @@ const PIXEL_CACHE_HOT_ALLOCATION: f64 = 0.5;
 
 /// Count cap on the negative (known-bad) cache. Bounds the memory a burst of
 /// distinct failing keys can pin; entries age out by LRU so a transient
-/// failure is retried once evicted.
+/// failure is retried once evicted. Also the cap on remembered refusals.
 const NEGATIVE_CAPACITY_ITEMS: usize = 4096;
 
 /// Thread-safe, byte-bounded LRU of decoded moment arrays.
@@ -84,6 +84,16 @@ pub struct PixelCache {
     /// are never kept here. Dead entries are pruned on the next
     /// registration.
     reads: Mutex<Reads>,
+    /// Volume files the store refused for good (#1046): a 401/403, or a
+    /// local file this process may not read. Keyed like `loading`, each
+    /// until the instant it may be read again, so the requests meanwhile
+    /// fail at once instead of reading it again. Count-bounded like
+    /// `negative`.
+    refused: Cache<Arc<str>, Instant>,
+    /// Files whose read the request deadline cut off and a background task
+    /// is finishing (#1046), keyed like `loading`: at most one per file,
+    /// and their number capped by the caller of [`Self::claim_finish`].
+    finishing: Mutex<HashSet<String>>,
 }
 
 /// A volume file download from [`PixelCache::join_or_start_read`].
@@ -186,8 +196,27 @@ fn start_read(reads: &mut Reads, file_id: &str, start: impl FnOnce() -> PendingG
     }
 }
 
+/// A file's claim on finishing its cut-off read in the background (#1046),
+/// from [`PixelCache::claim_finish`]; dropping it lets the file be claimed
+/// again.
+pub(crate) struct FinishClaim<'a> {
+    cache: &'a PixelCache,
+    file_id: String,
+}
+
+impl Drop for FinishClaim<'_> {
+    fn drop(&mut self) {
+        self.cache
+            .finishing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.file_id);
+    }
+}
+
 /// One file's bytes registered in [`PixelCache::held_bytes`] for the life of
-/// a background sibling decode (#994). Dropping it unregisters them; the
+/// a background decode: a cold miss's siblings (#994), or the moments of a
+/// read the request deadline cut off (#1046). Dropping it unregisters them; the
 /// decoder drops it only after its last insert, so a miss that finds no held
 /// bytes is guaranteed to see every array the decode produced.
 pub(crate) struct HeldBytes<'a> {
@@ -225,7 +254,41 @@ impl PixelCache {
             loading: Mutex::new(HashMap::new()),
             held: Mutex::new(HashMap::new()),
             reads: Mutex::new(HashMap::new()),
+            refused: Cache::new(NEGATIVE_CAPACITY_ITEMS),
+            finishing: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Remember that the store refused `file_id` for good (#1046), until
+    /// `until`. `true` when it was not refused already, so the caller logs
+    /// a refusal once per period rather than once per request.
+    pub(crate) fn refuse(&self, file_id: &str, until: Instant) -> bool {
+        let newly = !self.is_refused(file_id);
+        self.refused.insert(Arc::from(file_id), until);
+        newly
+    }
+
+    /// Whether a refusal of `file_id` is still remembered: a read of it
+    /// then fails at once, without asking the store (#1046).
+    pub(crate) fn is_refused(&self, file_id: &str) -> bool {
+        self.refused
+            .get(file_id)
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Claim the finishing of `file_id`'s cut-off read (#1046): `None`, and
+    /// nothing claimed, when another read of the file is being finished
+    /// (one per file) or `max` files are, which bounds the reads, and their
+    /// bytes, kept alive after their requests returned.
+    pub(crate) fn claim_finish(&self, file_id: &str, max: usize) -> Option<FinishClaim<'_>> {
+        let mut finishing = self.finishing.lock().unwrap_or_else(|e| e.into_inner());
+        if finishing.len() >= max || !finishing.insert(file_id.to_owned()) {
+            return None;
+        }
+        Some(FinishClaim {
+            cache: self,
+            file_id: file_id.to_owned(),
+        })
     }
 
     /// Join the download of `file_id` another request holds, or else begin
@@ -252,8 +315,8 @@ impl PixelCache {
             .cloned()
     }
 
-    /// Register `bytes` as `file_id`'s held copy for a background sibling
-    /// decode (#994). `None`, and nothing registered, when that file already
+    /// Register `bytes` as `file_id`'s held copy for a background decode
+    /// (#994, #1046). `None`, and nothing registered, when that file already
     /// has a decode in flight (single flight per file) or `max_held` files are
     /// already held, which bounds the downloaded bytes kept alive after their
     /// requests returned.
@@ -315,7 +378,25 @@ impl PixelCache {
             Option<Bytes>,
         ) -> Result<Vec<(String, RawPixels)>, DataServerError>,
     ) -> Result<(MomentPixels, usize), DataServerError> {
+        self.load_many_rechecked(file_id, requests, || {}, load)
+    }
+
+    /// [`Self::load_many`], running `rechecked` once the cache recheck has
+    /// found what is missing and before anything is loaded: what a
+    /// background decode finishing just then looks like to the batch. A
+    /// test seam for the #994 ordering, a no-op otherwise.
+    fn load_many_rechecked(
+        &self,
+        file_id: &str,
+        requests: &[MomentRequest<'_>],
+        rechecked: impl FnOnce(),
+        load: impl FnOnce(
+            &[MomentRequest<'_>],
+            Option<Bytes>,
+        ) -> Result<Vec<(String, RawPixels)>, DataServerError>,
+    ) -> Result<(MomentPixels, usize), DataServerError> {
         self.with_file_load(file_id, || {
+            // Before the recheck: see `load_many`.
             let held = self.held_bytes(file_id);
             let mut pixels = HashMap::new();
             let mut missing = Vec::new();
@@ -330,6 +411,7 @@ impl PixelCache {
                     missing.push((path, nrays, nbins));
                 }
             }
+            rechecked();
             let mut failures = 0;
             if !missing.is_empty() {
                 for (path, raw) in load(&missing, held)? {
@@ -548,7 +630,7 @@ mod tests {
         let start = || {
             starts.fetch_add(1, Ordering::Relaxed);
             let object = ds_storage::object_store::path::Path::from("volume");
-            store.start_get_opt(&object, runtime.handle())
+            store.start_get_or_refusal(&object, runtime.handle())
         };
         let cache = PixelCache::new(1);
         let first = cache.join_or_start_read("volume", start);
@@ -849,6 +931,77 @@ mod tests {
         load("other");
         assert_eq!(seen[0].as_deref(), Some(&b"held"[..]));
         assert!(seen[1].is_none());
+    }
+
+    /// #994 review, #1046: the batch snapshots the held bytes before its
+    /// cache recheck. A background decode that finishes just after the
+    /// recheck found `/a` missing (its last insert, then its bytes go) must
+    /// still leave the loader its bytes: snapshotted after the recheck they
+    /// would be gone, and the loader would download the file again.
+    #[test]
+    fn batch_snapshots_held_bytes_before_its_recheck() {
+        let cache = PixelCache::new(1);
+        let guard = cache
+            .hold_bytes("volume", Bytes::from_static(b"held"), 1)
+            .unwrap();
+        let decode_finishes = || {
+            cache.insert("volume", "/a", Arc::new(raw()));
+            drop(guard);
+        };
+        let mut seen = None;
+        cache
+            .load_many_rechecked(
+                "volume",
+                &[("/a", 2, 2)],
+                decode_finishes,
+                |missing, held| {
+                    seen = Some(held);
+                    Ok::<_, DataServerError>(
+                        missing
+                            .iter()
+                            .map(|(path, _, _)| (path.to_string(), raw()))
+                            .collect(),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(cache.held_bytes("volume").is_none(), "the decode let go");
+        assert_eq!(
+            seen.expect("the recheck missed `/a`").as_deref(),
+            Some(&b"held"[..]),
+            "the snapshot precedes the recheck"
+        );
+    }
+
+    /// #1046: a refusal is remembered until its instant, logged once per
+    /// period, and kept per file.
+    #[test]
+    fn refusals_are_remembered_until_they_expire() {
+        use std::time::Duration;
+        let cache = PixelCache::new(1);
+        assert!(!cache.is_refused("volume"));
+        let later = Instant::now() + Duration::from_secs(60);
+        assert!(cache.refuse("volume", later), "a new refusal");
+        assert!(cache.is_refused("volume"));
+        assert!(!cache.refuse("volume", later), "already refused");
+        assert!(!cache.is_refused("other"));
+        assert!(cache.refuse("expired", Instant::now()));
+        assert!(!cache.is_refused("expired"), "read again once it expires");
+        assert!(cache.refuse("expired", later), "and refused anew");
+    }
+
+    /// #1046: one finish per file, at most `max` files, released on drop.
+    #[test]
+    fn finish_claims_are_single_flight_bounded_and_released_on_drop() {
+        let cache = PixelCache::new(1);
+        let a = cache.claim_finish("a", 2).expect("first claim");
+        assert!(cache.claim_finish("a", 2).is_none(), "one per file");
+        let b = cache.claim_finish("b", 2).expect("second file");
+        assert!(cache.claim_finish("c", 2).is_none(), "at most `max` files");
+        drop(a);
+        assert!(cache.claim_finish("a", 2).is_some());
+        drop(b);
+        assert!(cache.finishing.lock().unwrap().is_empty());
     }
 
     /// #993: a load that fails (a deadline or transient fetch error) is the

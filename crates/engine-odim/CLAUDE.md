@@ -97,8 +97,10 @@ around `ds-storage` calls (Critical Rules 6–7).
   reclaimed off-peak, #472) decodes the lowest `prewarm_sweeps` sweeps'
   **default quantity only** (`prewarm_requests`: `DBZH`, else `TH`, else
   the first — `default_quantity_of`, the same rule as the advertised
-  `default_quantity` and the bare-layer render, #992) straight from those
-  bytes on the background runtime into `PIXEL_CACHE`. Warming every moment
+  `default_quantity` and the bare-layer render, #992), or the quantities
+  `[odim] prewarm_quantities` lists (#1046, `Prewarm`: one a volume lacks
+  is skipped, an empty name is `EmptyPrewarmQuantity`), straight from
+  those bytes on the background runtime into `PIXEL_CACHE`. Warming every moment
   of the base sweep wrote ~a dozen arrays per volume and evicted the
   reflectivity frames; other quantities and EDR read lazily. Best-effort +
   additive (never marks known-bad; `PixelCache::contains` skips
@@ -176,8 +178,9 @@ around `ds-storage` calls (Critical Rules 6–7).
   the one being sampled included, what their batch will read of the
   remote files (a target neither resident nor known bad, no held bytes)
   downloads concurrently: the cold targets' `ReadPlan` ranges through
-  `DataStore::start_get_ranges_opt` (#1261), else the whole file through
-  `DataStore::start_get_opt`. A batch uses ranges read ahead only when
+  `DataStore::start_get_ranges_or_refusal` (#1261), else the whole file
+  through `DataStore::start_get_or_refusal`. A batch uses ranges read
+  ahead only when
   they hold every moment it misses, else it reads as if nothing were read
   ahead; unusable ranges (file length changed, decode outside them) fall
   back to the whole file. Reads ahead are async tasks on the
@@ -215,7 +218,8 @@ around `ds-storage` calls (Critical Rules 6–7).
   keeps it until the file's moments are decoded, so a request arriving
   meanwhile joins instead of downloading again; the last holder dropping
   it aborts it, and no bytes outlive their holders. A started read
-  (`DataStore::start_get_opt`) is bounded by `FetchBudget::Request` alone
+  (`DataStore::start_get_or_refusal`) is bounded by `FetchBudget::Request`
+  alone
   and each wait by its own thread's deadline, so one request's deadline
   never cuts off a read another waits on. A read that failed is not
   joined, and a request whose joined read failed reads once more, its own
@@ -245,7 +249,8 @@ around `ds-storage` calls (Critical Rules 6–7).
   `PolarVolume::file_len`). A cold miss with no held and no read-ahead
   bytes builds a `ReadPlan` over the moments it needs and fetches only
   those ranges (`fetch_spans`: local reads after a length check; remote
-  `DataStore::get_ranges_opt[_on]`, a GET per range, at most ten at once,
+  `DataStore::start_get_ranges_or_refusal` as a task on `shared_read_runtime`,
+  else `get_ranges_or_refusal[_on]`, a GET per range, at most ten at once,
   without object_store's 1 MiB merge), then decodes through `SpanStorage`.
   No plan means the whole file: a moment not stored in chunks (contiguous
   or compact, like `testdata/pvol-cold-batch.h5`), more than
@@ -285,10 +290,11 @@ around `ds-storage` calls (Critical Rules 6–7).
   is the price, watch `pvol_pixel_cache_inserts_total`. It runs off the
   request path (`spawn_sibling_decode`) as `spawn_blocking` on the
   background poll runtime, which `PolarVolumeEngine::poll_loop` registers
-  (`set_sibling_decode_runtime`); before any poll loop starts, nothing is
+  (`set_background_runtime`); before any poll loop starts, nothing is
   decoded ahead. While it runs, the downloaded bytes are registered in
   `PixelCache::held_bytes` (single flight per file, at most
-  `MAX_BACKGROUND_SIBLING_DECODES` files) and a miss on that file — single
+  `MAX_HELD_FILES` files, shared with finished reads) and a miss on that
+  file — single
   or batch — decodes from them instead of downloading again; the guard is
   dropped only after the last insert, so a miss that finds no held bytes
   then sees every decoded sibling. Both paths snapshot held bytes BEFORE
@@ -307,10 +313,36 @@ around `ds-storage` calls (Critical Rules 6–7).
   nodata. Every sampler propagates it (`?`), so WMS/Maps/Tiles answer 503 and
   the meta-tile / rendered caches store nothing (they cache only `Ok` tiles),
   and EDR walks over volumes stop at the first such error (504/503). A
-  missing remote object is told apart through `DataStore::get_opt[_on]`
-  (typed `NotFound`), never by matching error strings. A cold fetch the
-  deadline cuts off is discarded; finishing it in the background is not
-  implemented.
+  missing remote object is told apart through
+  `DataStore::get_or_refusal[_on]` and the other `_or_refusal` reads
+  (`RangeRefusal::NotFound`), never by matching error strings. A refusal
+  (#1046: `Forbidden`, a 401/403; a local
+  `PermissionDenied`/`IsADirectory`/`NotADirectory`) is not the data's fault
+  either: `Abort(ResourceExhausted)`, never `mark_bad`, and
+  `PixelCache::refuse` remembers it for `REFUSAL_RETRY_AFTER` (60 s), so
+  reads of the file meanwhile fail at once with no store request or log line
+  (`check_refusal`). Pinned by
+  `a_refused_volume_fails_at_once_until_the_refusal_expires`.
+- **A read the deadline cuts off is finished (#1046).** A started read whose
+  wait the request deadline ends (`RemoteRead::wait`, `fetch_spans`,
+  `AheadRead::wait`) is handed with the moments the request wanted
+  (`Finish`) to `finish_in_background`: a blocking task on the background
+  runtime waits for it and decodes them into `PIXEL_CACHE`, a whole file's
+  bytes held in `held_bytes` and its read kept joinable until the last
+  insert, so a retry joins the download or hits the cache. One per file
+  (`claim_finish`), `MAX_FINISHING_READS` (4) at once, nothing without a
+  registered runtime; a failed or refused read decodes nothing and marks
+  nothing bad. Finished reads are not charged to the PVOL read budget; the
+  cap bounds them. Pinned by
+  `a_read_the_deadline_cuts_off_is_finished_for_the_retry`,
+  `a_retry_joins_the_read_the_deadline_cut_off`,
+  `a_ranged_read_the_deadline_cuts_off_is_finished_for_the_retry` and
+  `a_batch_read_the_deadline_cuts_off_is_finished_for_the_retry`.
+- **Aborted reads are counted (#1046).** `aborted()` counts each read whose
+  error becomes the request's (`moment_with`, `batch_failure`, and a
+  deadline while waiting for another's file load) by `AbortReason`:
+  `pvol_pixel_read_aborts_total{reason}`, plotted on the PVOL pixel cache
+  churn panel next to `pvol_pixel_read_failures_total` (nodata reads only).
 - Undetect vs nodata: `RawPixels::sample_class` (`src/reader.rs`)
   distinguishes `Value`/`Undetect`/`Masked` — clear air (`undetect`) is a
   measurement, the cone of silence (`nodata`) is not. `voxel_grid_from_volume`
@@ -347,7 +379,9 @@ around `ds-storage` calls (Critical Rules 6–7).
   retains decoded Arcs so eviction or a disabled cache cannot cause rereads
   inside its sampling loop. Unusable moments keep the known-bad policy; a
   deadline or storage failure fails `volume_moments` (#993), so the voxel-grid
-  cache never keeps an empty grid for it.
+  cache never keeps an empty grid for it. `volume_point_cloud` and
+  `resolve_column` propagate a read `Err` too (#1046), so a caller without
+  the batch cannot turn a deadline into nodata.
 
 
 Encoder-side rules live in `crates/ds-3dtiles/CLAUDE.md`; API routes/caching

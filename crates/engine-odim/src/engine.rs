@@ -411,6 +411,12 @@ pub enum EngineError {
     TemplateNeedsCadence,
     #[error("ODIM `discovery = \"template\"` only applies to an `http(s)://` `data_path` source")]
     TemplateNeedsHttp,
+    #[error(
+        "ODIM `prewarm_quantities` holds an empty quantity name — list ODIM \
+         quantity codes such as \"DBZH\", or set `prewarm_sweeps = 0` to disable \
+         the pre-warm"
+    )]
+    EmptyPrewarmQuantity,
 }
 
 impl OdimEngine {
@@ -483,6 +489,13 @@ impl OdimEngine {
         {
             tracing::warn!(
                 "[{collection_id}] `prewarm_sweeps` is set but has no effect on an \
+                 `odim` (COMP) collection — it only applies to the `odim-volume` \
+                 (PVOL) engine's poll-time pixel pre-warm"
+            );
+        }
+        if config.prewarm_quantities.is_some() {
+            tracing::warn!(
+                "[{collection_id}] `prewarm_quantities` is set but has no effect on an \
                  `odim` (COMP) collection — it only applies to the `odim-volume` \
                  (PVOL) engine's poll-time pixel pre-warm"
             );
@@ -1348,6 +1361,7 @@ mod tests {
             cadence_secs: None,
             resampling: Default::default(),
             prewarm_sweeps: 1,
+            prewarm_quantities: None,
         }
     }
 
