@@ -7,9 +7,12 @@ apis = ["edr", "wms", "maps", "tiles"]
 [geotiff]
 endpoint = "https://s3-eu-west-1.amazonaws.com"
 bucket = "fmi-opendata-radar-geotiff"
+# Since 2026-09-01 FMI names the national composite `…_finland_cappi_…`
+# (it was `…_composite_cappi_…`); the day's `finrad/` folder holds only it,
+# 288 files a day (#863).
 prefix_pattern = "%Y/%m/%d/finrad/"
 time_window = "-PT2H"
-filename_template = "%Y%m%d%H%M_composite_cappi_600_dbzh_finrad_qc.tif"
+filename_template = "%Y%m%d%H%M_finland_cappi_600_dbzh_finrad_qc.tif"
 parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 300
