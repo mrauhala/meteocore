@@ -299,6 +299,7 @@ fn assert_serve_alike(dap: &NetcdfEngine, local: &NetcdfEngine) {
 /// variable itself.
 #[test]
 fn an_opendap_collection_serves_what_its_files_serve() {
+    let _pool = crate::remote::tests::query_pool_shared();
     let files = sfc_files();
     let (_dir, local) = local(&files, "sfc", SFC_VARIABLES);
     for grids in [true, false] {
@@ -331,6 +332,7 @@ fn an_opendap_collection_serves_what_its_files_serve() {
 /// top first).
 #[test]
 fn pressure_levels_are_read_level_by_level() {
+    let _pool = crate::remote::tests::query_pool_shared();
     let files = pl_files();
     let variables = r#"variables = ["air_temperature_pl", "x_wind_pl", "y_wind_pl",
         "geopotential_pl", "relative_humidity_pl"]"#;
@@ -375,6 +377,7 @@ fn dap_requests(requests: &[Request]) -> Vec<String> {
 /// query past its deadline still leaves its fields fetched.
 #[test]
 fn an_open_is_three_requests_and_a_field_one() {
+    let _pool = crate::remote::tests::query_pool_shared();
     let (_, late) = slots();
     let server = TestServer::new();
     publish(

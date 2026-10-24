@@ -42,7 +42,8 @@ struct State {
     /// OPeNDAP datasets by path, answered at `<path>.dds` and the rest.
     datasets: HashMap<String, Arc<Dataset>>,
     log: Vec<Request>,
-    /// GETs of more than this many bytes wait this long before answering.
+    /// Ranged GETs of more than this many bytes, and `.dods` replies, wait
+    /// this long before answering.
     slow: Option<(u64, Duration)>,
     /// Whole (unranged) GETs are answered chunked.
     chunked: bool,
@@ -130,7 +131,8 @@ impl TestServer {
         self.state.lock().unwrap().chunked = true;
     }
 
-    /// Delay GETs of more than `bytes` by `delay`.
+    /// Delay ranged GETs of more than `bytes`, and `.dods` replies of more
+    /// than `bytes`, by `delay`.
     pub fn slow_over(&self, bytes: u64, delay: Duration) {
         self.state.lock().unwrap().slow = Some((bytes, delay));
     }
@@ -198,6 +200,12 @@ fn serve(mut stream: std::net::TcpStream, state: &Mutex<State>) {
     });
     if let Some((suffix, dataset)) = dap {
         let (status, response) = dataset.answer(suffix, query);
+        let slow = state.lock().unwrap().slow;
+        if let Some((over, delay)) = slow {
+            if suffix == ".dods" && response.len() as u64 > over {
+                std::thread::sleep(delay);
+            }
+        }
         state.lock().unwrap().log.push(Request {
             method,
             path,

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use ds_core::error::DataServerError;
 use netcdf_reader::{DynStorage, NcFile, NcFormat, NcSliceInfo, NcSliceInfoElem, NcVariable};
 
-use crate::ingest::{FieldRead, Packing, Stored};
+use crate::ingest::{FieldRead, Packing, Span, Stored};
 use crate::opendap::DapFile;
 use crate::remote::{ReadFailure, RemoteFile};
 
@@ -77,7 +77,7 @@ impl Reader {
         }
     }
 
-    /// Variable `read` at step `time` and served level `level` over
+    /// Variable `read` at step `time`, the stored levels of `span`, over
     /// `selection` (its whole field, [`FieldRead::selection`], or a window
     /// of it, [`FieldRead::window_selection`]), in its stored type. A
     /// failed remote read keeps its meaning ([`ReadFailure::to_error`]): a
@@ -86,7 +86,7 @@ impl Reader {
         &self,
         read: &FieldRead,
         time: u32,
-        level: usize,
+        span: Span,
         selection: &NcSliceInfo,
     ) -> Result<Raw, DataServerError> {
         match self {
@@ -95,7 +95,8 @@ impl Reader {
                 let fail = |e: netcdf_reader::Error| match ReadFailure::find(&e) {
                     Some(failure) => failure.to_error(),
                     None => DataServerError::Storage(format!(
-                        "variable '{name}' step {time} level {level}: {e}"
+                        "variable '{name}' step {time} stored levels {}-{}: {e}",
+                        span.first, span.last
                     )),
                 };
                 macro_rules! typed {
@@ -227,8 +228,23 @@ impl Raw {
 
     /// The CF-decoded field ([`Packing::decode`]: packing, and fill or NaN
     /// as NaN), its rows reversed when `flipped` (a field `nx` wide).
+    #[cfg(test)]
     pub(crate) fn decode(&self, packing: &Packing, flipped: bool, nx: usize) -> Vec<f32> {
-        each!(self, values => decode(values, packing, flipped, nx))
+        self.decode_plane(0..self.len(), packing, flipped, nx)
+    }
+
+    /// The CF-decoded field of the values in `plane` ([`Packing::decode`]:
+    /// packing, and fill or NaN as NaN), its rows reversed when `flipped`
+    /// (a field `nx` wide): a read's one field, or one level's of a read
+    /// over several stored levels, each its own plane of rows.
+    pub(crate) fn decode_plane(
+        &self,
+        plane: std::ops::Range<usize>,
+        packing: &Packing,
+        flipped: bool,
+        nx: usize,
+    ) -> Vec<f32> {
+        each!(self, values => decode(&values[plane], packing, flipped, nx))
     }
 }
 
@@ -237,7 +253,7 @@ fn widen<T: Into<f64>>(values: Vec<T>) -> Vec<f64> {
     values.into_iter().map(Into::into).collect()
 }
 
-/// [`Raw::decode`] of values of one type.
+/// [`Raw::decode_plane`] of values of one type.
 fn decode<T: Copy + Into<f64>>(
     values: &[T],
     packing: &Packing,

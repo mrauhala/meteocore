@@ -477,16 +477,17 @@ fn a_window_reads_the_cells_of_the_whole_field() {
     ];
     for flipped in [true, false] {
         let whole = reader
-            .read_field(read, 0, 0, &read.selection(0, 0))
+            .read_field(read, 0, read.span(&[0]), &read.selection(0, 0))
             .unwrap()
             .decode(&read.packing, flipped, nx);
         for window in windows {
-            let selection = read.window_selection(0, 0, window, flipped).unwrap();
-            let part = reader.read_field(read, 0, 0, &selection).unwrap().decode(
-                &read.packing,
-                flipped,
-                window.width() as usize,
-            );
+            let selection = read
+                .window_selection(0, read.span(&[0]), window, flipped)
+                .unwrap();
+            let part = reader
+                .read_field(read, 0, read.span(&[0]), &selection)
+                .unwrap()
+                .decode(&read.packing, flipped, window.width() as usize);
             let cut: Vec<f32> = (window.rows.0..=window.rows.1)
                 .flat_map(|row| {
                     (window.columns.0..=window.columns.1)
@@ -497,9 +498,70 @@ fn a_window_reads_the_cells_of_the_whole_field() {
             assert_eq!(part, cut, "{window:?}, flipped {flipped}");
         }
     }
-    let past = |columns, rows| read.window_selection(0, 0, CellWindow { columns, rows }, true);
+    let past = |columns, rows| {
+        read.window_selection(0, read.span(&[0]), CellWindow { columns, rows }, true)
+    };
     assert!(past((0, 9), (0, 11)).is_none());
     assert!(past((0, 10), (0, 0)).is_none());
+}
+
+/// A window over several stored levels (an EDR query's levels of one
+/// field, read in one hyperslab) selects the run of stored levels from the
+/// lowest asked to the highest, and holds plane by plane, in stored order,
+/// each level's window as a read of that level alone gives it, rows
+/// reversed within each plane of the south-up fixture.
+#[test]
+fn a_window_over_several_levels_holds_each_levels_window() {
+    let reader = open_fixture(MEPS_PL_00);
+    let names = vec!["air_temperature_pl".to_string()];
+    let inspected = inspect(&reader, &Wanted::Listed(&names), 0).unwrap();
+    let read = &inspected.fields[0].read;
+    let flipped = inspected.grid.flipped();
+    assert!(flipped);
+    // Served 1000 and 500 hPa, stored 3 and 1 of 300, 500, 850, 1000.
+    let span = read.span(&[2, 0]);
+    assert_eq!(span, Span { first: 1, last: 3 });
+    assert_eq!((span.levels(), span.plane(3), span.plane(1)), (3, 2, 0));
+    let window = CellWindow {
+        columns: (3, 5),
+        rows: (6, 7),
+    };
+    let selection = read.window_selection(0, span, window, flipped).unwrap();
+    assert_eq!(
+        selection.selections[1],
+        NcSliceInfoElem::Slice {
+            start: 1,
+            end: 4,
+            step: 1
+        }
+    );
+    let raw = reader.read_field(read, 0, span, &selection).unwrap();
+    let plane = window.cells() as usize;
+    assert_eq!(raw.len(), 3 * plane);
+    for served in 0..4 {
+        let stored = read.stored_level(served);
+        if !(span.first..=span.last).contains(&stored) {
+            continue;
+        }
+        let one = read.span(&[served]);
+        let alone = reader
+            .read_field(
+                read,
+                0,
+                one,
+                &read.window_selection(0, one, window, flipped).unwrap(),
+            )
+            .unwrap()
+            .decode(&read.packing, flipped, 3);
+        let p = span.plane(stored);
+        let part = raw.decode_plane(p * plane..(p + 1) * plane, &read.packing, flipped, 3);
+        assert_eq!(part, alone, "served level {served}, stored {stored}");
+    }
+    assert_eq!(
+        read.selection(0, 1).selections[1],
+        NcSliceInfoElem::Index(2),
+        "one level is its index"
+    );
 }
 
 /// A pressure axis stored in Pa, top first, is served in hPa bottom first:

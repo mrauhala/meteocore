@@ -100,8 +100,10 @@ curvilinear grids placed by 2-D latitude/longitude (#1174).
   even for one (`[t, z, y, x]`).
 - **Per-level everything:** `FieldKey.level` is the served index, so the
   field cache, single-flight, detached fills and the decode budget work per
-  level; the EDR cap counts steps × levels × variables. Prewarm fetches
-  index 0 only (13 MEPS levels would be 1.3 GB per variable and run).
+  level. The one exception: an EDR query through OPeNDAP reads the levels it
+  asks of a variable at one step as one window over their stored span
+  (`ingest::Span`, see "OPeNDAP", EDR windows). Prewarm fetches index 0 only
+  (13 MEPS levels would be 1.3 GB per variable and run).
 - **Not served:** height above ground (`VerticalKind::Height` is above
   MSL) and hybrid levels (`ModelLevel` expects ordinal levels).
 
@@ -459,7 +461,8 @@ access = "opendap"` reads a remote family through DAP2.
   `DapFile` holds the budget it reserves from (`decode_budget::BUDGET`;
   tests pass their own). No block cache: a second open of the same
   file reads its metadata again.
-- **Fields:** one `.dods` per field (one level of a pressure axis), its
+- **Fields:** one `.dods` per field (one level of a pressure axis; an EDR
+  window may span several, below), its
   constraint `dap::constraint`: `grid.array` for a Grid's array (THREDDS
   wraps it in a `Structure`), the name for a plain array, `[i]` per fixed
   axis and `[start:stride:stop]` (stop inclusive) per grid axis, brackets
@@ -472,10 +475,10 @@ access = "opendap"` reads a remote family through DAP2.
   compressed chunk, so prewarm, detached fills, an EDR query's retries
   and a render and a query of one field behave as by range; a reply
   without `Data:` is never cached (`dap::check`). `FieldRead.chunk_bytes`
-  is `field_bytes` (no HDF5 view), so the decode budget and the EDR cap
-  count a field as a contiguous one.
+  is `field_bytes` (no HDF5 view), so the decode budget and the EDR byte
+  cap count a whole field as a contiguous one.
 - **EDR windows (#1171):** an EDR or GetFeatureInfo query through OPeNDAP
-  reads only the cells it samples. `edr::sample_fields` joins each
+  reads only the cells it samples. `edr::NetcdfEngine::plan_reads` joins each
   field's positions' `SourceGrid::cells_read` (the four cells `value_at`
   reads, the nearest included; ds-core `resample::sampler`) into one
   `CellWindow` per field, each distinct positions list's once;
@@ -489,21 +492,37 @@ access = "opendap"` reads a remote family through DAP2.
   window over half the field's cells (`edr::worth_a_window`) reads the
   field whole: a whole reply serves every later query and map of the
   field, a window only itself, so past half a window then the field
-  costs more than the field. `read_uncached` takes a `FIELDS` hit, or a
-  whole reply in `CHUNKS` (`Reader::holds_field`, `remote::dap_cached`:
-  no request, no recency bump), before fetching a window. A window is a
-  reply of its own in `CHUNKS` (keyed by its constraint, weighted by its
-  bytes, an error reply never cached by `dap::check`), a
-  `QUERY_IN_FLIGHT` key of its own (`QueryKey { field, window }`), and
-  reserves the whole field's decode peak in proportion to its cells
-  (`field::window_peak_bytes`). Fan-out is unchanged: `run_field_jobs`
-  four at a time, detached on `QUERY_READS`. The query cap still counts
-  whole fields (`FieldRead::decoded_bytes`). Measured 2026-10-24 from a
-  server's network: a whole MEPS field 4 066 402 bytes in 0.25 s, a
-  2 × 2 window 428 bytes in 0.10 s, so a 67-lead series is about 29 KB
-  per variable instead of 272 MB. Cache defaults kept (512/256/64 MB):
-  EDR no longer churns `CHUNKS` with whole fields, while renders and
-  prewarm still fill it with them.
+  costs more than the field.
+- **Levels in one request:** the levels a query asks of one variable at one
+  step are one job: one `.dods` over the stored levels from the lowest asked
+  to the highest (`FieldRead::span`; a contiguous range, never a DAP stride;
+  `[i]` for one level, so a one-level constraint is as before), over the
+  window joining theirs, while `worth_a_window(window, span levels, asked,
+  …)` holds (cells × span levels × 2 ≤ field cells × asked). Position, area
+  and cube levels share one window; a Z trajectory's levels each sample
+  their own cells and join only while that test holds, else each level is
+  its own window or whole field. The reply decodes to one plane per stored
+  level (`Raw::decode_plane`, each flipped alone), each level sampled
+  through `value_in` bit for bit
+  (`ingest::tests::a_window_over_several_levels_holds_each_levels_window`,
+  `opendap::tests::windows` over testdata/netcdf-pressure-13). Measured
+  2026-10-24 from a server near thredds.met.no: a 2 × 2 window 0.27 s at one
+  level, 0.53 s at all 13, so a 13-level series over a 67-lead run is 67
+  requests (~9 s), not 871 (~60 s).
+- **Caching windows:** `read_uncached` uses `FIELDS` hits or whole replies
+  in `CHUNKS` (`Reader::holds_field`, `remote::dap_cached`: no request, no
+  recency bump) only when every level of the job is held whole, else it
+  fetches the window. A window is a reply of its own in `CHUNKS` (keyed by
+  its constraint, levels included, weighted by its bytes, an error reply
+  never cached by `dap::check`), a `QUERY_IN_FLIGHT` key of its own
+  (`QueryKey { file, variable, time, span, window }`), and reserves each
+  level's share of the whole field's decode peak (`field::read_peak_bytes`).
+  Fan-out: `run_field_jobs`, four jobs at a time, detached on
+  `field::QUERY_READS`. Measured 2026-10-24 from a server's network: a whole
+  MEPS field 4 066 402 bytes in 0.25 s, a 2 × 2 window 428 bytes in 0.10 s,
+  so a 67-lead series is about 29 KB per variable instead of 272 MB. Cache
+  defaults kept (512/256/64 MB): EDR no longer churns `CHUNKS` with whole
+  fields, while renders and prewarm still fill it with them.
 - **Transport:** `DataStore::get_documents_on` (ds-storage `document.rs`):
   `DocumentRequest { path, query }`, the query appended by the host's
   `Documents` layer (after the base URL's own), which marks the result
@@ -532,8 +551,9 @@ access = "opendap"` reads a remote family through DAP2.
   the content version moved from a request, the read
   `ReadFailure::Replaced` (503).
 - **Not served:** DAP4, OPeNDAP for local files, string variables. MEPS
-  stores one lead per file, so a series is one request per lead whatever
-  is asked: the EDR windows above, never one request per series.
+  stores one lead per file, so a series is one request per lead and
+  variable, every level asked in it: the EDR windows above, never one
+  request per series.
 - **Tests:** `dap::tests` (THREDDS's own MEPS DDS, DAS, coordinates and
   4 × 4 replies, testdata/netcdf-opendap; every XDR type, DAS escapes,
   types and signed bytes, constraints, a server's error);
@@ -546,7 +566,10 @@ access = "opendap"` reads a remote family through DAP2.
   every query shape against the files read locally, the half-field
   fallback and a whole field cached sampled whole, packing, fill and the
   global seam, and THREDDS's own MEPS metadata and 4 × 4 reply answering
-  a window's exact constraint); ds-storage
+  a window's exact constraint; over testdata/netcdf-pressure-13, one
+  request per variable and step at every level, both caps refusing before
+  any request, non-adjacent `z`, a Z path batched or per level, whole
+  fields counted whole, a batch outliving its deadline); ds-storage
   `document::tests::a_query_reaches_the_server_and_the_version_comes_back`
   and `thredds::tests::opendap_files_take_the_catalogs_version_without_a_head`;
   ds-core `opendap_access_needs_a_catalog`; `tests/live_thredds.rs`
@@ -732,8 +755,9 @@ cube is an area's steps and cells, never coarsened, sampled bilinearly,
   A point or cell off the grid (`SourceGrid::covers`, the rule `value_at`
   applies) is dropped before sampling, and a query with none on the grid
   reads no field: `POINT(-100 10)` on remote MEPS costs no fetch.
-- **Field jobs:** one per (variable, step, level) field `sample_fields`
-  needs, each read once however many parameters and `Sampling`s need it (a
+- **Field jobs:** `NetcdfEngine::plan_reads` plans every read before any
+  (`edr::Plan`): each (variable, step, level) field `sample_fields` needs,
+  read once however many parameters and `Sampling`s need it (a
   per-step amount adds its accumulation at the run's step before each
   `Sampling.valid`, #1165), sampled once per distinct positions list
   (position, area and cube share one position set, step-major `[t][z]`, a
@@ -742,9 +766,12 @@ cube is an area's steps and cells, never coarsened, sampled bilinearly,
   `ds_executor::field_jobs::run_field_jobs` (engine-grib's scheduler, moved
   there): four at once as tasks on the query runtime (fallback
   `ds_executor::query_runtime()` outside any runtime), each re-entering
-  the query's deadline. Each job reads its field and returns only the
-  samples at every point: one read per field for all points.
-- **Reads:** `field::read_uncached`: a `FIELDS` hit (a frame a render just
+  the query's deadline. One `edr::Job` per read: a field of one level, or
+  through OPeNDAP a window of several levels of a variable's step. Each
+  job returns only the samples at every point: one read per field for all
+  points.
+- **Reads:** `field::read_uncached` (a job's levels, one `QueryField`
+  each): a `FIELDS` hit (a frame a render just
   drew) is used; a miss is decoded for the query and **not inserted**, so
   a series over a run never evicts the frames being drawn; the lookup is
   not counted in `netcdf_field_cache_*`. A remote miss runs detached on
@@ -757,35 +784,43 @@ cube is an area's steps and cells, never coarsened, sampled bilinearly,
   joins it (`field::QUERY_IN_FLIGHT`): no slot, no decode, no GET; a failed
   read leaves the joiner to read for its own error. Retries used to fill
   the 8-slot pool and push cold reads inline, where the deadline cut their
-  GETs off (`retries_join_the_reads_a_late_query_left_running`). Remote
-  tests that pin GETs take `remote::tests::QUERY_POOL`.
+  GETs off (`retries_join_the_reads_a_late_query_left_running`). Tests
+  that pin GETs under a deadline take `remote::tests::query_pool()` (the
+  pool alone, a `RwLock` write); the other OPeNDAP query tests take
+  `query_pool_shared()`.
   Every read reserves the decode budget; a failed read fails the query,
   never a null: a replaced file or the budget is `ResourceExhausted` (503),
   the deadline `DeadlineExceeded` (504), any other remote failure
   `Storage` (an opaque 500 in EDR). Through OPeNDAP the read is the
   window of the field the query samples (see "OPeNDAP", EDR windows).
-- **Query-shape cap** (`QUERY_BYTES`, `MC_NETCDF_EDR_QUERY_MB`, default 544
-  MiB): steps × levels × the sum over the variables of
-  `FieldRead::decoded_bytes`
-  (the `f32` field, or its chunk when larger), from the first step's file,
-  before any read; over it a 400 `QueryTooLarge` naming the fields, the
-  MiB and the limit. Trajectory and cube count only the fields they read
-  (`Reads::check_fields`, `check_field_reads`: distinct (step, level)
-  pairs per variable; a cube steps × the levels its z positions take); a
-  per-step amount's steps before count too (`Reads::steps_read`, and
-  `check_fields`' pairs). The default admits one parameter over one MEPS run
-  as the client sees it, including a derived wind speed (decided on
-  #1067, twice the issue's 272 MiB). It counts the variables the engine
-  reads, and `DerivedWind` asks for both components of a derived speed: a
-  `wind_speed_10m` series over a whole run is 134 × 4.06 MB, 519 MiB, and
-  three variables over a run (201 fields) are a 400, as is one variable
-  over a run at all 13 MEPS pressure levels (871 fields; the message names
-  the levels and asks for fewer, `edr::tests::the_cap_counts_pressure_levels`);
-  every doc of the cap says so (root and engine READMEs, api-edr's matrix,
-  the pixel-budget row, the thredds examples). Then `check_area_budget` (values) and, for
-  areas, `check_mask_budget`. Measured live 2026-10-17 (laptop link, debug
-  build, `tests/live_thredds.rs`): a 3-lead series whose first field a map
-  had drawn, 2 GETs, 3.1 MB, 3.6 s.
+- **Query caps** (from the plan's `edr::Tally`, before any read, bytes
+  checked first; over either a 400 `QueryTooLarge`): `QUERY_BYTES`
+  (`MC_NETCDF_EDR_QUERY_MB`, 544 MiB) on what the planned reads decode,
+  `edr::Job::bytes` (a whole field `FieldRead::decoded_bytes`, the `f32`
+  field or its chunk when larger; a window its cells × span levels × 4 B);
+  `QUERY_FIELD_READS` (`MC_NETCDF_EDR_QUERY_READS`, 200; not
+  `field::QUERY_READS`, the pool) on the jobs, a window of several levels
+  being one. Only fields read count (a trajectory's planned pairs, a cube's
+  steps × the levels its z positions take, a per-step amount's steps before,
+  nothing off the grid). The byte message names the fields, `edr::shape`
+  (timesteps × levels × variables, pairs for a trajectory, "of" when a
+  per-step amount reads steps the others do not) and the sizes; the read
+  message asks for fewer levels only when they are not read together. Read
+  whole, the byte default admits one parameter over one MEPS run as the
+  client sees it, including a derived wind speed (decided on #1067:
+  `DerivedWind` reads both components, 134 × 4.06 MB, 519 MiB); three
+  variables over a run (201 fields) are a 400, as is one variable at all 13
+  levels read whole (871 fields,
+  `edr::tests::the_cap_counts_pressure_levels`); 140 MEPS fields at most.
+  Through OPeNDAP windows hardly count and the read cap binds: 13 levels × a
+  run is 67 reads, a derived wind speed 134, three variables 201 (a 400); ≤
+  0.55 s per 13-level request, four at once, 200 reads ~27 s. Every doc of
+  the caps says so (root and engine READMEs, api-edr's matrix, the
+  pixel-budget rows, the thredds and OPeNDAP examples). `check_area_budget`
+  and, for areas, `check_mask_budget` come first: the plan needs the
+  positions. Measured live 2026-10-17 (laptop link, debug build,
+  `tests/live_thredds.rs`): a 3-lead series whose first field a map had
+  drawn, 2 GETs, 3.1 MB, 3.6 s.
 - **Metadata:** parameters from the layout and the catalog's `RasterInfo`
   (titles, served units: `Layout::unit`), CF `standard_name` →
   `observedProperty.id`;
@@ -906,6 +941,12 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
 - `testdata/netcdf-pressure-pa/`: synthetic, a Pa pressure axis (50000,
   85000, 100000) on a 1° lat/lon grid, two steps, no run, earth-relative
   `u`/`v` and `t`, each value a formula of its indices (`make_cdl.py`).
+- `testdata/netcdf-pressure-13/`: synthetic, MEPS's 13 pressure levels in
+  hPa stored top first, an 8 × 10 0.5° lat/lon grid stored south-up, one run
+  of six hourly steps in one file, `air_temperature_pl` (one fill cell) and
+  `relative_humidity_pl` as formulas of their indices (`make_cdl.py`);
+  `opendap::tests::windows` reads its levels' windows through the mock DAP2
+  server.
 - `testdata/netcdf-global/`: synthetic 5° global grid, north-up, three
   steps, no run; a packed `short` variable with a fill box.
 - `testdata/netcdf-remote/`: two synthetic MEPS-like per-lead files (one
@@ -992,7 +1033,7 @@ has read them, reusing the engine and evicting any tiles drawn meanwhile.
   points sharing each field read and nothing cached, area and radius
   masking and `t` axes, instances, the derived speed against the stored
   components, and queries on the query runtime and a GetFeatureInfo job.
-  `edr::tests` pin the query-shape cap; the server's
+  `edr::tests` pin both query caps; the server's
   `wms_get_feature_info` test reads a pixel at a fixture cell. Pressure
   levels: `ingest::tests` (the axis by units, hPa bottom first, Pa
   converted, one vertical axis per collection), `tests/integration.rs`

@@ -28,10 +28,11 @@
 //! A per-step amount (#1165) is an area's: each cell's accumulation at the
 //! step less the accumulation at the run's step before, both sampled there.
 //!
-//! Both caps come before any read: `check_cube_budget` on the response's
-//! values, then [`super::QUERY_BYTES`] on the fields decoded, steps (a
-//! per-step amount's steps before included) × read levels × variables. A
-//! bbox outside the grid is a 404 and reads nothing.
+//! Every cap comes before any read: `check_cube_budget` on the response's
+//! values, then [`super::QUERY_BYTES`] and [`super::QUERY_FIELD_READS`] on the
+//! reads planned: steps (a per-step amount's steps before included) × read
+//! levels × variables, the levels of a step read together where the cube
+//! reads windows. A bbox outside the grid is a 404 and reads nothing.
 
 use std::sync::Arc;
 
@@ -41,14 +42,14 @@ use ds_core::error::DataServerError;
 use ds_core::feature::Bbox;
 use ds_core::model::{CoverageResponse, DomainDescription, NdArray, QueryResult, VerticalCoord};
 
-use super::{check_query_bytes, on_grid, Positions, Sampling, Window};
+use super::{on_grid, Limits, Positions, Sampling, Window};
 use crate::NetcdfEngine;
 
 impl NetcdfEngine {
-    /// The cube query, its decoded bytes capped at `limit`
-    /// ([`super::QUERY_BYTES`] from the trait).
-    #[allow(clippy::too_many_arguments)] // the trait's selectors plus the cap
-    pub(super) fn cube(
+    /// The cube query, its reads capped at `limits` (the configured ones
+    /// from the trait).
+    #[allow(clippy::too_many_arguments)] // the trait's selectors plus the caps
+    pub(crate) fn cube(
         &self,
         bbox: &Bbox,
         datetime: Window,
@@ -56,7 +57,7 @@ impl NetcdfEngine {
         z: Option<&[f64]>,
         resolution: CubeResolution,
         reference_time: Option<DateTime<Utc>>,
-        limit: u64,
+        limits: Limits,
     ) -> Result<CoverageResponse, DataServerError> {
         ds_core::deadline::check()?;
         let catalog = self.catalog.load_full();
@@ -121,9 +122,9 @@ impl NetcdfEngine {
         let nx = resolution.x.unwrap_or_else(|| cells(width, res_lon));
         let ny = resolution.y.unwrap_or_else(|| cells(height, res_lat));
         let (nt, nz) = (reads.steps.len(), z_source.len());
-        // Both caps before anything that grows with them is allocated.
+        // The values before anything that grows with them is allocated;
+        // the reads once planned, before any of them.
         check_cube_budget(nt, nz, ny, nx, reads.params.len())?;
-        check_query_bytes(reads.steps_read(), used.len(), &reads.field_bytes(), limit)?;
         if !bbox.intersects_bbox(&extent) {
             return Err(DataServerError::LocationNotFound(
                 "The bbox lies outside the collection's spatial extent".into(),
@@ -171,7 +172,7 @@ impl NetcdfEngine {
                 })
             })
             .collect();
-        let sampled = self.sample_fields(&reads, &fields)?;
+        let sampled = self.sample_fields(&reads, &fields, limits, "the datetime window")?;
         let plane = nx * ny;
         let ranges = reads
             .params

@@ -9,7 +9,7 @@
 //! does a MEPS file's, and each 15 KB field chunk is a chunk read, as a
 //! 1.5 MB MEPS chunk is.
 
-use std::sync::{Arc, Barrier, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Barrier, LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, DurationRound, Utc};
@@ -30,13 +30,22 @@ const TUNING: Tuning = Tuning {
 
 /// Taken by every test whose queries read through the process-wide query
 /// pool ([`crate::field::QUERY_READS`], 8 slots): the slow-server ones hold
-/// their slots for most of a second, and a test that pins its GETs needs
-/// the pool to itself. Past the pool a read runs inline under its query's
-/// deadline, and a GET the deadline cuts off is fetched again.
-static QUERY_POOL: Mutex<()> = Mutex::new(());
+/// their slots for most of a second, and a test that pins its GETs under a
+/// deadline needs the pool to itself ([`query_pool`]). Past the pool a read
+/// runs inline under its query's deadline, and a GET the deadline cuts off
+/// is fetched again. Tests whose queries have no deadline share it
+/// ([`query_pool_shared`]): an inline read of theirs completes.
+static QUERY_POOL: RwLock<()> = RwLock::new(());
 
-fn query_pool() -> MutexGuard<'static, ()> {
-    QUERY_POOL.lock().unwrap_or_else(|e| e.into_inner())
+/// The query pool to this test alone ([`QUERY_POOL`]).
+pub(crate) fn query_pool() -> RwLockWriteGuard<'static, ()> {
+    QUERY_POOL.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The query pool shared with the other tests that share it, never with
+/// one that has it alone ([`QUERY_POOL`]).
+pub(crate) fn query_pool_shared() -> RwLockReadGuard<'static, ()> {
+    QUERY_POOL.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The fixture's run and its two leads' valid times.
