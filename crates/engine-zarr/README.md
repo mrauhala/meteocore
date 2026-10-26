@@ -15,7 +15,17 @@ or map window. Nothing is converted or copied first.
 ## How it works
 
 - **Format.** The `zarrs` crate parses metadata and decodes chunks (gzip,
-  zstd, Blosc, CRC32C, sharding, transpose); CF rules are applied here.
+  Blosc, CRC32C, sharding, transpose); zstd is engine-zarr's own codec. CF
+  rules are applied here.
+- **zstd.** engine-zarr registers its own `zstd` codec for Zarr V3 and V2,
+  and zarrs' `zstd` feature is off. That feature pins the zstd 0.13 line,
+  which has RustSec advisories with no 0.13 fix (RUSTSEC-2026-0391 and
+  0395 to 0406), and its decoder ignores the chunk's size. The plugin reads
+  and writes the same metadata as zarrs' codec, `level` and `checksum`, and
+  for V2 also numcodecs' level-only form. It decodes through the same
+  bounded path as gzip and Blosc, below. Legacy zstd frames, the pre-v0.8
+  formats from before 2016, are not decoded in plain builds; an Icechunk
+  build decodes them, since Icechunk enables zstd's `legacy` feature.
 - **Catalog.** The engine lists the root group's arrays one level deep. A
   1-D array named after its own dimension is a coordinate variable; every
   other array on the latitude/longitude grid is a parameter, in name order.
@@ -202,7 +212,7 @@ grid with `msl` (Pa), `mtpr` (kg m⁻² s⁻¹), `t2m` (K, `float32`) and
 `t2m_packed` (K, `int16`, packed, a 2 × 2 block of fill cells in the first
 step), served in hPa, mm/h and °C. Every field is linear in latitude and
 longitude, so bilinear results are exact. `tests/integration.rs` queries it
-and writes forecast and antimeridian stores to temporary directories.
+and writes forecast, antimeridian and zstd stores to temporary directories.
 `tests/icechunk.rs` writes a local repository; its `#[ignore]`d probes read
 the live public ones. Unit tests in `src/` cover codec caps, memory
 admission, caches, refresh and unit conversion.

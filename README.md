@@ -495,6 +495,7 @@ port = 8000
 # base_url = "https://api.example.com"  # optional, for absolute links behind a proxy
 # collections_dir = "collections.d"     # optional, load per-collection .toml files from directory
 # metatile_cache_mb = 1024              # optional, global WMS meta-tile cache (MB); 0 disables meta-tiling
+# rendered_cache_mb = 256               # optional, global rendered-image cache (MB) shared by WMS/Maps/Tiles; 0 disables it
 # render_concurrency = 24              # optional, render CPU slots (default 2× CPUs, min 8); restart to change
 # state_dir = "/var/lib/meteocore"      # optional, writable dir for engine state snapshots (WIS2 CAP alert sets, WIS2 BUFR report stores)
 
@@ -537,7 +538,6 @@ max_files = 24
 
 [collections.wms]
 colormap = "radar_dbz"          # built-in colormap (or use color_stops for custom)
-# rendered_cache_mb = 256       # optional, default 256 MB
 # webp_quality = 80             # optional, default WebP quality 1-100 (100 = lossless,
                                 # the default); lossy suits continuous-tone layers
 ```
@@ -554,6 +554,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `watch_collections_dir` | no | `false` | Auto-reload when files in `collections_dir` are added, changed, or removed. Debounced; runs on the background runtime. See trust-model note in [Per-File Collection Configs](#per-file-collection-configs). |
 | `watch_debounce_ms` | no | `500` | Coalesce-window in milliseconds for the filesystem watcher (only used when `watch_collections_dir = true`). |
 | `metatile_cache_mb` | no | `1024` | Size (MB) of the global EPSG:3857/3067/3035 meta-tile cache. Server-wide, not per-collection. `0` disables meta-tiling (projected GetMap reverts to a direct render; reload-reversible). Consumed by WMS today; Maps/Tiles will share it when meta-tiling extends to them. |
+| `rendered_cache_mb` | no | `256` | Size (MB) of the rendered-image cache: encoded images WMS, Maps and Tiles serve again on a repeated request. Server-wide, not per-collection. `0` disables it. Unset, the deprecated per-collection `[wms] rendered_cache_mb` still sizes it: the largest value among the WMS, Maps and Tiles collections, with a warning. When both are set, this key wins and the collection keys are ignored with a warning. A reload re-reads it: a changed size starts an empty cache, an unchanged one keeps the warm cache. |
 | `state_dir` | no | — | Writable directory for engine state snapshots. A WIS2-fed CAP collection keeps its alert set (alerts, zone polygons, withdrawals) in `<state_dir>/<collection id>.cap.state`: written atomically at most every five minutes when it changed, at least hourly when it did not, and on graceful shutdown; restored when the collection is built (alerts that expired meanwhile are dropped). Without it, every restart starts the alert set empty and the collection reports `degraded` ("warming up after cold start: N alerts received") for `[cap.wis2] warmup` (default `PT24H`). A snapshot older than `warmup` (the server was down that long) keeps its alerts but restarts the warm-up ("warming up after a long outage"). A WIS2-fed BUFR collection likewise keeps its report store in `<state_dir>/<collection id>.bufr.state` (gzip-compressed JSON, about 8 MB for a global SYNOP store of 270k reports), on the same schedule; restore drops reports older than `retention`. The shutdown flush encodes the whole store, about 0.25 s per 270k reports: a 7-day `retention` over the default `max_stations` of 50 000 hourly stations is about 8.4M reports, roughly 8 s and 235 MB. Docker kills a container 10 s after asking it to stop, and the server drains its open requests before it flushes, so give a large store a longer stop timeout (`stop_grace_period` in Compose, `docker stop -t <seconds>`). The collections flush side by side, so the largest store sets the time; each flush logs its duration and size at INFO (`state snapshot flushed in …`). A flush cut short keeps the previous snapshot, losing at most the last five minutes of reports. Without `state_dir`, a restart empties the store and the collection reports "warming up after cold start: N reports received" for `[bufr.wis2] warmup`, which defaults to the shorter of the collection's `retention` and `PT24H` (with a longer retention, the older part of the window is still filling when the warm-up ends; set `warmup` to the retention to wait for a full window). A reload that rebuilds either kind of collection does not go through the snapshot: the new engine takes over the replaced one's set in memory. A `data_path` BUFR source re-reads its files and needs no snapshot. Resolved relative to the config file's directory; created at boot. The Docker image provides `/var/lib/meteocore` owned by its non-root user, so a named volume mounted there is writable. A failed write is a rate-limited warning, never a load error; a corrupt snapshot is a cold start. Fixed at boot: restart to change. |
 | `render_concurrency` | no | 2× CPUs, min 8 | Render CPU slots shared by WMS, Maps, Tiles and 3D Tiles; `MC_RENDER_QUEUE_CAPACITY` defaults to 3× this. Lower it for CPU-bound deployments, raise it when renders mostly wait on remote reads. Must be 1–512. Fixed at boot: a reload cannot resize the slots and logs a warning instead; restart to change. The effective value is logged at startup and exported as `render_semaphore_total`. |
 
@@ -2238,7 +2239,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 | `max` | no | from colormap | Maximum value for the default style's range |
 | `styles` | no | — | Array of named styles |
 | `parameters` | no | — | Per-parameter default-style overrides (multi-parameter engines) |
-| `rendered_cache_mb` | no | `256` | Shared rendered-image cache size in MB. Set to 0 to disable. (Global cache; lives under `[wms]` for backward compatibility — see note.) |
+| `rendered_cache_mb` | no | — | Deprecated: set `[server] rendered_cache_mb` instead. The rendered-image cache is one server-wide cache; this key sizes it only while the `[server]` key is unset, and then the largest value among the WMS, Maps and Tiles collections wins. Either case logs a warning. |
 | `webp_quality` | no | lossless | Default quality, 1–100, for this collection's `image/webp` maps and tiles in WMS, Maps and Tiles: 1–99 lossy, 100 lossless. A request's own `QUALITY` / `quality` wins, including 100 for lossless. Not applied to JPEG. Validated at load. Collection-level only; style bundles do not carry it. |
 
 ### Limits
@@ -2421,11 +2422,11 @@ When `?f=mvt` (or `?f=application/vnd.mapbox-vector-tile`) is requested against 
 
 Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG/JPEG/WebP bytes. Shared across WMS, Maps, and Tiles APIs.
 
-- Default size: 256 MB (configurable via `rendered_cache_mb`). On a live deployment's WMS traffic, a replay of a day's repeated requests gained nothing from 512 MB, and most hits reuse an image rendered within the last 25 minutes, which 256 MB holds ([#1010](https://github.com/mrauhala/meteocore/issues/1010)).
+- Default size: 256 MB, configured server-wide via **`[server] rendered_cache_mb`**; `0` disables it. The deprecated per-collection `[wms] rendered_cache_mb` still sizes it while the `[server]` key is unset: the largest value among the WMS, Maps and Tiles collections wins, so the order of the collections cannot change it ([#1028](https://github.com/mrauhala/meteocore/issues/1028)). On a live deployment's WMS traffic, a replay of a day's repeated requests gained nothing from 512 MB, and most hits reuse an image rendered within the last 25 minutes, which 256 MB holds ([#1010](https://github.com/mrauhala/meteocore/issues/1010)).
 - Every successful render is inserted on its first render. Hits come from views requested again: a fixed display cycling its animation frames, a client's default view, Tiles `z/x/y`, and a `TIME` that resolves to a timestep already rendered for the same view, such as a frame not ingested yet. With viewport WMS clients a few % is expected; the meta-tile cache below holds the work they share.
 - Cache key: quantized bbox (6 decimal places) + layer + style + format with its encoder quality + width + height + CRS + time + parameter
 - Lock-free concurrent LRU (uses `quick_cache`)
-- No TTL — immutable data. Cache invalidated on collection reload.
+- No TTL — immutable data. A reload keeps the warm cache while its size is unchanged and evicts only the entries of the collections it rebuilds; a new size, or a change to the global style inputs, starts it empty.
 - Error tiles and empty tiles (all nodata) are NOT cached.
 - MVT vector tiles use a separate `VectorTileCache` (content-derived ETag, `Cache-Control: max-age=300`); they are NOT subject to `rendered_cache_mb`.
 

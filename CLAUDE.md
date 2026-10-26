@@ -1059,6 +1059,11 @@ port = 8000
 # render_concurrency = 24               # optional, render CPU slots shared by WMS/Maps/Tiles/3D Tiles
                                         # (default 2× CPUs, min 8; 1..=512). Fixed at boot: a reload
                                         # cannot resize the slots (logs a WARN), restart to change.
+# rendered_cache_mb = 256               # optional, rendered-image cache (MB) shared by WMS/Maps/Tiles;
+                                        # 0 disables. Unset: the largest deprecated per-collection
+                                        # [wms] rendered_cache_mb among WMS/Maps/Tiles collections
+                                        # (logs a WARN), else 256. Re-read on reload; an unchanged
+                                        # size keeps the warm cache.
 # colormaps_dir = "colormaps.d"  # optional, directory of palette files loaded as
                                  # named colormaps (name = file stem). Formats:
                                  # .toml (ColormapDef), GMT .cpt, GRLevelX .pal,

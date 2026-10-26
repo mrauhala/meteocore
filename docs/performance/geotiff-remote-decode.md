@@ -21,8 +21,8 @@ remote sources.
   could finish.
 - Every warm frame must miss the rendered-image and meta-tile caches but hit
   the compressed tile cache, as a new style, zoom level or an evicted
-  meta-tile does in production. So `[wms] rendered_cache_mb = 0` and
-  `[server] metatile_cache_mb = 1`: meta-tiling stays on (capacity > 0) but
+  meta-tile does in production. So `[server] rendered_cache_mb = 0` and
+  `metatile_cache_mb = 1`: meta-tiling stays on (capacity > 0) but
   retains almost nothing. Every warm frame below re-rendered all of its
   meta-tiles.
 - Requests: `GET /wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=radar-eu-composite-dbzh-s3-cog&STYLES=&CRS=EPSG:3857&FORMAT=image/png&TRANSPARENT=TRUE&TIME=2026-09-28T09:40:00Z&WIDTH=1920&HEIGHT=1080&BBOX=…`
@@ -116,10 +116,9 @@ tiles whose decoded chunk was evicted, and it still prevents refetching.
 
 ## Reproducing
 
-1. In a scratch copy of `config.toml`, add `metatile_cache_mb = 1` under
-   `[server]` and point `collections_dir` at a directory holding a copy of
-   `radar-eu-composite-dbzh-s3-cog.toml` with `rendered_cache_mb = 0` added
-   under `[wms]`.
+1. In a scratch copy of `config.toml`, add `metatile_cache_mb = 1` and
+   `rendered_cache_mb = 0` under `[server]` and point `collections_dir` at
+   a directory holding a copy of `radar-eu-composite-dbzh-s3-cog.toml`.
 2. To get per-request phase logs, set `SLOW_RENDER_LOG_MS` in
    `crates/api-wms/src/handlers.rs` to 0 temporarily, then
    `cargo build --release -p server`.

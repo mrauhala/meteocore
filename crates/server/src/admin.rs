@@ -2330,6 +2330,7 @@ pub fn load_collections(
     base_url: &str,
     trust_proxy_headers: bool,
     metatile_cache_mb: u64,
+    rendered_cache_mb: u64,
     reuse: ReusableCaches,
     mut engine_reuse: EngineReuse,
 ) -> LoadResult {
@@ -4979,20 +4980,12 @@ pub fn load_collections(
         &mut edr_styles,
     );
 
-    // Determine rendered cache size from first WMS collection config, or the
-    // same default a `[wms]` block without `rendered_cache_mb` gets (#1010).
-    let rendered_cache_mb = map_collections
-        .values()
-        .chain(maps_collections.values())
-        .filter_map(|c| c.wms.as_ref())
-        .map(|w| w.rendered_cache_mb)
-        .next()
-        .unwrap_or(ds_core::config::DEFAULT_RENDERED_CACHE_MB);
-
-    // Meta-tile pixel cache size (#202) is a server-wide setting
-    // (`[server] metatile_cache_mb`) — the cache is global to all WMS
-    // collections, so it is passed in as a single value (no per-collection
-    // aggregation). `0` disables meta-tiling.
+    // Both render cache sizes are server-wide settings, passed in as single
+    // values: the meta-tile pixel cache (#202, `[server] metatile_cache_mb`,
+    // `0` disables meta-tiling) and the rendered-image cache (#1028), which
+    // the caller resolves once per accepted config with
+    // `ServerConfig::rendered_cache_mb` and logs its warnings, so a recovery
+    // pass neither re-derives nor re-logs it.
 
     // Slot count fixed at boot by `init_render_concurrency` (`[server]
     // render_concurrency`, else 2× cores, min 8); the slots survive reloads.
@@ -5890,6 +5883,12 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     ) {
         tracing::warn!("{warning}");
     }
+    // A reload re-reads `[server] rendered_cache_mb` and the deprecated
+    // `[wms]` fallback like `metatile_cache_mb` (#1028): `AcceptedLoad::new`
+    // takes the size, its warnings are logged once here.
+    for warning in config.rendered_cache_mb().1 {
+        tracing::warn!("{warning}");
+    }
 
     // Rebuild the palette registry (built-ins + [[colormaps]] +
     // colormaps_dir) and run the same colormap-name validation as startup:
@@ -5936,6 +5935,8 @@ pub struct AcceptedLoad {
     base_url: String,
     trust_proxy_headers: bool,
     metatile_cache_mb: u64,
+    /// Resolved from `[server]` or the deprecated `[wms]` fallback (#1028).
+    rendered_cache_mb: u64,
     mcp_enabled: bool,
     fingerprint: u64,
 }
@@ -5953,6 +5954,7 @@ impl AcceptedLoad {
             base_url: config.server.base_url(),
             trust_proxy_headers: config.server.trust_proxy_headers,
             metatile_cache_mb: config.server.metatile_cache_mb,
+            rendered_cache_mb: config.rendered_cache_mb().0,
             mcp_enabled: config.mcp.as_ref().is_some_and(|m| m.enabled),
             fingerprint,
         }
@@ -6213,6 +6215,7 @@ fn apply_load(
         &config.base_url,
         config.trust_proxy_headers,
         config.metatile_cache_mb,
+        config.rendered_cache_mb,
         reuse,
         engine_reuse,
     );
@@ -8126,6 +8129,7 @@ mod tests {
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -8324,6 +8328,7 @@ mod tests {
                 "http://x",
                 false,
                 0,
+                ds_core::config::DEFAULT_RENDERED_CACHE_MB,
                 super::ReusableCaches::default(),
                 reuse,
             )
@@ -8409,6 +8414,7 @@ mod tests {
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -8604,6 +8610,7 @@ mod tests {
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -8697,6 +8704,7 @@ mod tests {
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -8759,6 +8767,7 @@ mod tests {
                 "http://x",
                 false,
                 0,
+                ds_core::config::DEFAULT_RENDERED_CACHE_MB,
                 super::ReusableCaches::default(),
                 reuse,
             )
@@ -8859,6 +8868,7 @@ mod tests {
                 "http://x",
                 false,
                 0,
+                ds_core::config::DEFAULT_RENDERED_CACHE_MB,
                 super::ReusableCaches::default(),
                 super::EngineReuse::default(),
             )
@@ -9001,6 +9011,7 @@ mod tests {
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -9056,6 +9067,7 @@ prewarm_sweeps = 0
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -9322,6 +9334,7 @@ prewarm_sweeps = 0
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -9354,6 +9367,7 @@ prewarm_sweeps = 0
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -9381,6 +9395,7 @@ prewarm_sweeps = 0
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -9407,6 +9422,7 @@ prewarm_sweeps = 0
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -9445,6 +9461,7 @@ prewarm_sweeps = 0
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -9459,10 +9476,10 @@ prewarm_sweeps = 0
 
     // --- reload preserves the warm render caches (ReusableCaches) ---
 
-    /// #1010: with no `[wms]` block to size it, the rendered-image cache gets
-    /// the same default as a `[wms]` block that omits `rendered_cache_mb`.
+    /// #1028: `load_collections` sizes the rendered-image cache from the one
+    /// server-wide value it is handed, never from a collection's `[wms]` block.
     #[test]
-    fn rendered_cache_defaults_without_a_wms_block() {
+    fn rendered_cache_is_sized_by_the_server_wide_value() {
         let result = super::load_collections(
             &ds_render::StyleContext::with_builtins(),
             &[],
@@ -9470,12 +9487,37 @@ prewarm_sweeps = 0
             "http://x",
             false,
             64,
+            32,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
+        assert_eq!(result.wms_state.rendered_cache.capacity(), 32 * 1024 * 1024);
+    }
+
+    /// #1028: the accepted load that reloads and recovery passes rebuild from
+    /// carries the resolved size: `[server] rendered_cache_mb` over the
+    /// deprecated `[wms]` key, else the largest `[wms]` value, else the default.
+    #[test]
+    fn accepted_load_resolves_the_rendered_cache_size() {
+        let config = |server: &str, wms: &[u64]| -> ds_core::config::ServerConfig {
+            let mut text = format!("[server]\nhost = \"127.0.0.1\"\nport = 8000\n{server}\n");
+            for (i, mb) in wms.iter().enumerate() {
+                text.push_str(&format!(
+                    "[[collections]]\nid = \"c{i}\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                     apis = [\"tiles\"]\n[collections.wms]\nrendered_cache_mb = {mb}\n"
+                ));
+            }
+            toml::from_str(&text).unwrap()
+        };
+        let accepted = |config: &ds_core::config::ServerConfig| {
+            super::AcceptedLoad::new(config, ds_render::StyleContext::with_builtins(), 0)
+                .rendered_cache_mb
+        };
+        assert_eq!(accepted(&config("rendered_cache_mb = 64", &[512])), 64);
+        assert_eq!(accepted(&config("", &[128, 512])), 512);
         assert_eq!(
-            result.wms_state.rendered_cache.capacity(),
-            ds_core::config::DEFAULT_RENDERED_CACHE_MB * 1024 * 1024
+            accepted(&config("", &[])),
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB
         );
     }
 
@@ -9490,6 +9532,7 @@ prewarm_sweeps = 0
             "http://x",
             false,
             64,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -9506,6 +9549,7 @@ prewarm_sweeps = 0
             "http://x",
             false,
             64,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches {
                 rendered: Some(rendered0.clone()),
                 tile: Some(tile0.clone()),
@@ -9536,6 +9580,7 @@ prewarm_sweeps = 0
             "http://x",
             false,
             128,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches {
                 rendered: Some(rendered0.clone()),
                 tile: Some(tile0.clone()),
@@ -9555,6 +9600,37 @@ prewarm_sweeps = 0
             Arc::ptr_eq(&vector0, &third.tiles_state.vector_tile_cache),
             "vector cache unchanged → reused"
         );
+
+        // Reload with a CHANGED rendered-image size (#1028) → that cache is
+        // rebuilt at the new size; the unchanged meta-tile cache is reused.
+        let tile1 = third.wms_state.tile_cache.clone();
+        let fourth = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[],
+            &[],
+            "http://x",
+            false,
+            128,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB * 2,
+            super::ReusableCaches {
+                rendered: Some(rendered0.clone()),
+                tile: Some(tile1.clone()),
+                vector: Some(vector0.clone()),
+            },
+            super::EngineReuse::default(),
+        );
+        assert!(
+            !Arc::ptr_eq(&rendered0, &fourth.wms_state.rendered_cache),
+            "rendered cache rebuilt on size change"
+        );
+        assert_eq!(
+            fourth.wms_state.rendered_cache.capacity(),
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB * 2 * 1024 * 1024
+        );
+        assert!(
+            Arc::ptr_eq(&tile1, &fourth.wms_state.tile_cache),
+            "tile cache unchanged → reused"
+        );
     }
 
     // --- incremental reload: engine reuse by config diff (#574) ---
@@ -9571,6 +9647,7 @@ prewarm_sweeps = 0
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             reuse,
         )
@@ -10401,6 +10478,7 @@ prewarm_sweeps = 0
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -10438,6 +10516,7 @@ prewarm_sweeps = 0
                 "http://x",
                 false,
                 0,
+                ds_core::config::DEFAULT_RENDERED_CACHE_MB,
                 super::ReusableCaches::default(),
                 super::EngineReuse::default(),
             );
@@ -11525,6 +11604,7 @@ colormap = "radar_dbz"
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -11580,6 +11660,7 @@ max = 30.0
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -11680,6 +11761,7 @@ max = 30.0
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -11793,6 +11875,7 @@ max = 30.0
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -11936,6 +12019,7 @@ colormap = "no_such_map"
             "http://x",
             false,
             0,
+            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
             super::EngineReuse::default(),
         );
@@ -12018,6 +12102,7 @@ colormap = "no_such_map"
                 "http://x",
                 false,
                 0,
+                ds_core::config::DEFAULT_RENDERED_CACHE_MB,
                 super::ReusableCaches::default(),
                 super::EngineReuse::default(),
             )

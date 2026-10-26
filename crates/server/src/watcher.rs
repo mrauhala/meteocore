@@ -400,6 +400,7 @@ pub(crate) mod tests {
             &config.server.base_url(),
             config.server.trust_proxy_headers,
             config.server.metatile_cache_mb,
+            config.rendered_cache_mb().0,
             ReusableCaches::default(),
             EngineReuse::default(),
         );

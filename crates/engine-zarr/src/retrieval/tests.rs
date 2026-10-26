@@ -1,9 +1,12 @@
 use super::*;
-use crate::{codec_limits::bounded_array, read_budget::Budget};
+use crate::{
+    codec_limits::{bounded_array, ZstdCodec},
+    read_budget::Budget,
+};
 use std::sync::Arc;
 use zarrs::{
     array::{
-        codec::{GzipCodec, ShardingCodecBuilder, ZstdCodec},
+        codec::{GzipCodec, ShardingCodecBuilder},
         data_type, ArrayBuilder, FromArrayBytes,
     },
     filesystem::FilesystemStore,
