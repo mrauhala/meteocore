@@ -20,8 +20,9 @@ inventory as points.
 - `CsvEngine::new` builds the station inventory once, in the order the
   stations first appear in the file, along with the EDR location list, the
   observation time span and the bounding box of the rows' coordinates.
-  `/locations`, Features `/items`, the temporal extent and the EDR and map
-  spatial extent are served from these without scanning the rows.
+  `/locations`, Features `/items`, the stations an `area` or `radius`
+  tests, the temporal extent and the spatial extent of EDR, Features and
+  the map layers are served from these without scanning the rows.
 - It also lists the file's distinct observation times once. A
   [station grid](../engine-station-grid/README.md) over the collection
   without a `cadence` takes them as its analysis times; the collection's
@@ -42,7 +43,7 @@ inventory as points.
 | EDR | `area` (WKT `POLYGON` or `west,south,east,north`) | one series per station inside the area that has data in the window |
 | EDR | `radius` | the circle as a 64-vertex geodesic polygon, then answered as `area` |
 | EDR | `items` | the station features below, whenever the collection lists `edr` |
-| Features | `/items`, `/items/{featureId}` | one Point per station, properties `name`, `latitude`, `longitude` |
+| Features | `/items`, `/items/{featureId}` | one Point per station, properties `name`, `latitude`, `longitude`; the collection's extent is the rows' bounding box and time span |
 | WMS, Maps, Tiles | map | one station symbol layer per parameter: each station a marker coloured by its latest value within `max_age` |
 
 - EDR `datetime` selects rows whose time falls in the window, both ends
@@ -148,9 +149,16 @@ cargo bench -p engine-csv   # criterion benchmarks over testdata/weather.csv
 
 The unit tests live in `src/loader.rs` (time parsing, offset reporting) and
 `src/engine.rs` (paging, filters, `datetime`, parameter selection, area and
-radius). They use two fixtures:
+radius). They use three fixtures:
 
 - `tests/fixtures/station_history.csv`: five rows, three stations, one of
   which moves and one of which has no second hour.
+- `tests/fixtures/area_stations.csv`: eleven interleaved rows, six
+  stations, two parameters with empty cells. Three start inside the area
+  test's polygon, one of them moving out; three start outside, one of them
+  moving in.
 - `testdata/weather.csv` at the workspace root: hourly observations from
   193 Finnish weather stations for January 2026, about 143 000 rows.
+
+`cargo test -p server --test station_grid_features` checks the Features
+collection's extent over HTTP, on `testdata/weather.csv`.

@@ -2,7 +2,9 @@
 //! API, end to end: the real CSV fixture (`testdata/weather.csv`), the
 //! station-grid engine over it, and the `/features` router. Values are the
 //! engine's independent reference
-//! (`crates/engine-station-grid/tests/reference/loo_reference.py`).
+//! (`crates/engine-station-grid/tests/reference/loo_reference.py`). The
+//! CSV source's own station collection is checked there too: its metadata
+//! carries the rows' bounding box (#1262).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,11 +28,15 @@ fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn engine() -> Arc<StationGridEngine> {
-    let csv = engine_csv::CsvEngine::new(
+fn weather() -> engine_csv::CsvEngine {
+    engine_csv::CsvEngine::new(
         engine_csv::CsvDataStore::load(repo().join("testdata/weather.csv").to_str().unwrap())
             .unwrap(),
-    );
+    )
+}
+
+fn engine() -> Arc<StationGridEngine> {
+    let csv = weather();
     let config = StationGridConfig {
         source: "weather".into(),
         parameters: vec!["temperature".into()],
@@ -66,14 +72,21 @@ fn engine() -> Arc<StationGridEngine> {
 }
 
 fn app(engine: Arc<StationGridEngine>) -> axum::Router {
-    let collection: CollectionConfig = serde_json::from_value(serde_json::json!({
-        "id": "t2m-loo", "title": "Temperature analysis", "description": "",
-        "engine_type": "station-grid", "apis": ["features"],
-    }))
-    .unwrap();
+    features_app(
+        serde_json::json!({
+            "id": "t2m-loo", "title": "Temperature analysis", "description": "",
+            "engine_type": "station-grid", "apis": ["features"],
+        }),
+        engine,
+    )
+}
+
+/// The `/features` router over one collection.
+fn features_app(collection: Value, engine: Arc<dyn FeatureEngine>) -> axum::Router {
+    let collection: CollectionConfig = serde_json::from_value(collection).unwrap();
     api_features::router(Arc::new(ArcSwap::from_pointee(FeaturesState {
-        engines: HashMap::from([("t2m-loo".to_string(), engine as Arc<dyn FeatureEngine>)]),
-        collections: HashMap::from([("t2m-loo".to_string(), collection)]),
+        engines: HashMap::from([(collection.id.clone(), engine)]),
+        collections: HashMap::from([(collection.id.clone(), collection)]),
         base_url: "https://example.org".into(),
         trust_proxy_headers: false,
         vector_tileset_ids: Default::default(),
@@ -237,4 +250,47 @@ async fn residuals_are_served_as_features() {
         .as_str()
         .unwrap();
     assert!(end.starts_with("2026-01-31T23:00:00"), "{end}");
+}
+
+/// A CSV station collection's Features metadata carries the bounding box of
+/// its rows, the one its EDR collection and map layers report (#1262), and
+/// collection search filters on it.
+#[tokio::test]
+async fn csv_station_collection_reports_the_rows_bbox() {
+    let csv = Arc::new(weather());
+    // The rows' minima and maxima, from Python's `csv` module over the file.
+    let bbox = [19.1314, 59.7736, 30.9747, 70.082];
+    assert_eq!(csv.get_spatial_extent(), Some(bbox));
+    let app = features_app(
+        serde_json::json!({
+            "id": "weather", "title": "Weather", "description": "",
+            "engine_type": "csv", "apis": ["edr", "features"],
+        }),
+        csv,
+    );
+
+    let (status, _, collection) = get(&app, "/collections/weather").await;
+    assert_eq!(status, StatusCode::OK, "{collection}");
+    assert_eq!(
+        collection["extent"]["spatial"]["bbox"],
+        serde_json::json!([bbox])
+    );
+    let start = collection["extent"]["temporal"]["interval"][0][0]
+        .as_str()
+        .unwrap();
+    assert!(start.starts_with("2026-01-01T00:00:00"), "{start}");
+
+    // Without an extent the collection matched every `bbox`; now only a
+    // box that meets the stations does.
+    for (filter, listed) in [("bbox=24,60,25,61", true), ("bbox=0,0,1,1", false)] {
+        let (status, _, found) = get(&app, &format!("/collections?{filter}")).await;
+        assert_eq!(status, StatusCode::OK, "{filter}: {found}");
+        let ids: Vec<&str> = found["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids == ["weather"], listed, "{filter}: {ids:?}");
+    }
 }
