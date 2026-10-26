@@ -24,11 +24,11 @@ use ds_core::model::{
     QueryResult,
 };
 use ds_core::state::{
-    collection_key, StateError, StateStore, StateWriter, WriteOutcome, WritePolicy,
+    collection_key, hours_minutes, StateError, StateStore, StateWriter, WriteOutcome, WritePolicy,
 };
 use ds_poll::{FirstTick, Shutdown};
 
-use crate::decode::{DecodeError, Decoder};
+use crate::decode::{is_nil_bulletin, DecodeError, Decoder};
 use crate::health::Health;
 use crate::metadata::Snapshot;
 use crate::params::ParameterTable;
@@ -48,19 +48,6 @@ pub const MAX_RESPONSE_VALUES: usize = 500_000;
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
 /// How often expired rows / surplus stations are pruned.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
-/// WIS2 mode with a state store (#1002): a changed store is written to the
-/// state snapshot at most this often. Checked on every
-/// [`SNAPSHOT_INTERVAL`] tick; `shutdown()` flushes the rest. The same
-/// policy as engine-cap's accumulator.
-const STATE_WRITE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// An unchanged store is rewritten at least this often — or every quarter
-/// of a shorter `warmup`, never more often than [`STATE_WRITE_INTERVAL`]
-/// — so a restore can tell from the snapshot's `written_at` how long the
-/// server was down ([`state_policy`]).
-const STATE_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
-/// A failing state write (read-only or full disk) is retried every
-/// [`STATE_WRITE_INTERVAL`] but WARNs at most this often.
-const STATE_WARN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 pub(crate) enum Source {
     Local(Mutex<LocalSource>),
@@ -178,7 +165,10 @@ impl BufrEngine {
             let mut writer = StateWriter::new(
                 store,
                 collection_key(collection_id, persist::KIND),
-                state_policy(w.warmup()),
+                // A changed store at most every five minutes, checked on
+                // every `SNAPSHOT_INTERVAL` tick (`shutdown()` flushes the
+                // rest); an unchanged one every quarter of the warm-up.
+                WritePolicy::for_warmup(w.warmup().to_std().unwrap_or_default()),
             );
             restored_age = engine.restore_state(&mut writer, Utc::now());
             engine.state = Some(Mutex::new(writer));
@@ -238,6 +228,8 @@ impl BufrEngine {
         };
         let age = now - decoded.written_at;
         let long_outage = age > src.warmup();
+        // A snapshot from the future (clock skew) is as good as new.
+        let age_std = age.to_std().unwrap_or_default();
         let clock = if long_outage {
             WarmupClock {
                 filling_since: None,
@@ -250,7 +242,7 @@ impl BufrEngine {
         tracing::info!(
             "[{id}] bufr/wis2: restored {reports} report(s) at {stations} station(s) from state \
              snapshot {at} written {} ago ({dropped} past retention or max_stations{})",
-            hours_minutes(age),
+            hours_minutes(age_std),
             dropped_columns(&decoded.columns_dropped)
         );
         if long_outage {
@@ -258,11 +250,11 @@ impl BufrEngine {
                 "[{id}] bufr/wis2: the state snapshot is older than warmup ({}): reports \
                  published during the outage are missing — the warm-up restarts and /health \
                  reports degraded until it ends",
-                hours_minutes(src.warmup())
+                hours_minutes(src.warmup().to_std().unwrap_or_default())
             );
             return None;
         }
-        Some(age.to_std().unwrap_or(Duration::ZERO))
+        Some(age_std)
     }
 
     /// Replace the store with `stations` (rows already in this engine's
@@ -343,16 +335,23 @@ impl BufrEngine {
     }
 
     /// Write the store's state snapshot when its write policy says so
-    /// ([`state_policy`]; `force` always writes). Never fails the caller: a
-    /// failed write keeps the previous snapshot and is logged, as a WARN at
-    /// most every [`STATE_WARN_INTERVAL`]. The encode reads the store under
-    /// its read lock — requests keep reading; the only writer is this
-    /// engine's own poll loop, which is the caller (the shutdown flush may
-    /// wait for the loop's last write).
-    pub(crate) fn write_state(&self, force: bool) {
+    /// ([`WritePolicy::for_warmup`]; `force` always writes). Never fails the
+    /// caller: a failed write keeps the previous snapshot and is logged, as
+    /// a WARN at most every [`WritePolicy::WARN_INTERVAL`]. A forced write,
+    /// the shutdown flush, is logged at INFO with its duration and size: it
+    /// is what a container's stop timeout has to cover (#1043). The encode
+    /// reads the store under its read lock — requests keep reading; the only
+    /// writer is this engine's own poll loop, which is the caller (the
+    /// shutdown flush may wait for the loop's last write, and its duration
+    /// includes that wait).
+    ///
+    /// Returns what the write policy did, `None` without a state store (and
+    /// in `data_path` mode, which never persists).
+    pub(crate) fn write_state(&self, force: bool) -> Option<WriteOutcome> {
         let (Some(writer), Source::Wis2(src)) = (&self.state, &self.source) else {
-            return;
+            return None;
         };
+        let started = Instant::now();
         let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
         let mut reports = 0;
         let outcome = writer.write_if_due(self.state_revision(), Instant::now(), force, || {
@@ -367,26 +366,32 @@ impl BufrEngine {
             )
             .map_err(StateError::Encode)
         });
-        match outcome {
+        let id = &self.collection_id;
+        match &outcome {
             WriteOutcome::NotDue => {}
+            WriteOutcome::Written { bytes } if force => tracing::info!(
+                "[{id}] bufr/wis2: state snapshot flushed in {:.1?}: {reports} report(s), \
+                 {bytes} bytes to {}",
+                started.elapsed(),
+                writer.describe()
+            ),
             WriteOutcome::Written { bytes } => tracing::debug!(
-                "[{}] bufr/wis2: state snapshot written: {reports} report(s), {bytes} bytes to {}",
-                self.collection_id,
+                "[{id}] bufr/wis2: state snapshot written: {reports} report(s), {bytes} bytes \
+                 to {}",
                 writer.describe()
             ),
             WriteOutcome::Failed { error, warn: true } => tracing::warn!(
-                "[{}] bufr/wis2: cannot write state snapshot {}: {error} — the previous one \
+                "[{id}] bufr/wis2: cannot write state snapshot {}: {error} — the previous one \
                  stays; retrying every {} min, this warning repeats at most every {} min",
-                self.collection_id,
                 writer.describe(),
-                STATE_WRITE_INTERVAL.as_secs() / 60,
-                STATE_WARN_INTERVAL.as_secs() / 60
+                WritePolicy::WRITE_INTERVAL.as_secs() / 60,
+                WritePolicy::WARN_INTERVAL.as_secs() / 60
             ),
-            WriteOutcome::Failed { error, warn: false } => tracing::debug!(
-                "[{}] bufr/wis2: state snapshot write failed again: {error}",
-                self.collection_id
-            ),
+            WriteOutcome::Failed { error, warn: false } => {
+                tracing::debug!("[{id}] bufr/wis2: state snapshot write failed again: {error}")
+            }
         }
+        Some(outcome)
     }
 
     /// Hand the station map layers their style facts (#1204): each
@@ -513,13 +518,24 @@ impl BufrEngine {
     /// per `data_id` so a later `rel=deletion` can withdraw exactly those
     /// rows — plus how many reports decoded and the per-message failures
     /// (counted here, returned for the caller to log). `Err` only when the
-    /// bytes hold no BUFR message at all.
+    /// bytes hold no BUFR message at all and are not a NIL bulletin: that
+    /// is an empty outcome, counted in `Health::nil_bulletins_total`.
     pub fn ingest_bytes_keyed(
         &self,
         bytes: &[u8],
         label: &str,
         now: DateTime<Utc>,
     ) -> Result<IngestOutcome, DecodeError> {
+        if is_nil_bulletin(bytes) {
+            // The centre had no report to send: its own ingest result, not
+            // a decode failure, so a NIL-sending centre neither moves the
+            // failure counter nor the WIS2 failure WARNs (#1043).
+            self.health
+                .nil_bulletins_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("[{}] bufr: '{label}' is a NIL bulletin", self.collection_id);
+            return Ok(IngestOutcome::default());
+        }
         let decoded = match self.decoder.decode(bytes) {
             Ok(d) => d,
             Err(e) => {
@@ -778,28 +794,6 @@ fn wis2_warmup(
         Some(_) => warmup,
         None => warmup.min(retention),
     })
-}
-
-/// The state snapshot write policy of a WIS2 collection with warm-up
-/// `warmup` (#1002), engine-cap's: a changed store at most every
-/// [`STATE_WRITE_INTERVAL`], an unchanged one at least every quarter of the
-/// warm-up, clamped to [`STATE_WRITE_INTERVAL`] ..=
-/// [`STATE_REFRESH_INTERVAL`]. The refresh keeps `written_at` close to the
-/// server's last breath even when the feed is quiet, so the long-outage
-/// check in [`BufrEngine::restore_state`] errs by at most that much.
-fn state_policy(warmup: chrono::Duration) -> WritePolicy {
-    let quarter = warmup.to_std().unwrap_or(Duration::ZERO) / 4;
-    WritePolicy {
-        min_interval: STATE_WRITE_INTERVAL,
-        refresh_interval: quarter.clamp(STATE_WRITE_INTERVAL, STATE_REFRESH_INTERVAL),
-        warn_interval: STATE_WARN_INTERVAL,
-    }
-}
-
-/// `26h05m` (negative ⇒ `0h00m`).
-fn hours_minutes(d: chrono::Duration) -> String {
-    let minutes = d.num_minutes().max(0);
-    format!("{}h{:02}m", minutes / 60, minutes % 60)
 }
 
 /// The restore log's note on columns whose values were dropped (empty
@@ -1611,17 +1605,39 @@ mod tests {
         assert_eq!(f.gauges(), (0, 0));
     }
 
+    /// Every write is attempted and fails, the first one WARNs, and the
+    /// engine serves on. The outcomes are checked, so a write that was
+    /// never attempted fails the test (#1043).
     #[test]
     fn unwritable_state_dir_never_fails_the_engine() {
         let dir = tempfile::tempdir().unwrap();
+        // A regular file where the state directory should be.
         let blocker = dir.path().join("state");
         std::fs::write(&blocker, b"").unwrap();
         let e = BufrEngine::new_with_state(&wis2_config("PT24H", None), ID, file_store(&blocker))
             .unwrap();
         put(&e, "A", hours_ago(0), 280.0);
-        e.write_state(false);
+        // Nothing was written yet: the periodic write is due, and fails.
+        assert!(matches!(
+            e.write_state(false),
+            Some(WriteOutcome::Failed {
+                error: StateError::Io(_),
+                warn: true
+            })
+        ));
+        // The retry waits for the write interval; the shutdown flush does
+        // not, and fails without a second warning.
+        assert!(matches!(e.write_state(false), Some(WriteOutcome::NotDue)));
+        assert!(matches!(
+            e.write_state(true),
+            Some(WriteOutcome::Failed {
+                error: StateError::Io(_),
+                warn: false
+            })
+        ));
         e.shutdown();
         assert_eq!(e.gauges(), (1, 1));
+        assert!(blocker.is_file());
     }
 
     #[test]
@@ -1636,6 +1652,7 @@ mod tests {
         let e = BufrEngine::new_with_state(&cfg, ID, file_store(dir.path())).unwrap();
         assert!(e.gauges().1 > 0, "fixtures scanned");
         assert!(e.state.is_none());
+        assert!(e.write_state(true).is_none());
         e.shutdown();
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
@@ -1843,20 +1860,5 @@ mod tests {
         assert_ne!(e.state_revision(), revision);
         e.write_state(true);
         assert_eq!(decode_file(dir.path(), &e).clock.filling_since, Some(t0));
-    }
-
-    #[test]
-    fn state_policy_refreshes_within_a_quarter_of_the_warmup() {
-        let refresh = |h: i64| state_policy(chrono::Duration::hours(h)).refresh_interval;
-        assert_eq!(refresh(24), STATE_REFRESH_INTERVAL);
-        assert_eq!(refresh(2), Duration::from_secs(30 * 60));
-        assert_eq!(
-            state_policy(chrono::Duration::minutes(10)).refresh_interval,
-            STATE_WRITE_INTERVAL
-        );
-        assert_eq!(
-            state_policy(chrono::Duration::hours(2)).min_interval,
-            STATE_WRITE_INTERVAL
-        );
     }
 }

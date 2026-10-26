@@ -726,9 +726,16 @@ fn dwd_local_template_and_supplement_merge() {
 #[test]
 fn failures_are_counted_by_kind() {
     use engine_bufr::decode::FailureKind;
+    use std::sync::atomic::Ordering;
     let e = engine();
-    // A NIL bulletin (cy-dom) is not BUFR at all.
+    // A NIL bulletin, the centre's word that it has no report to send, is
+    // counted on its own, not as a failure (#1043); with line ends too.
     assert_eq!(e.ingest_bytes(b"NIL", "nil", t0800()), 0);
+    assert_eq!(e.ingest_bytes(b"NIL\r\r\n", "nil-crlf", t0800()), 0);
+    assert_eq!(e.health.nil_bulletins_total.load(Ordering::Relaxed), 2);
+    assert_eq!(e.health.decode_failures_total(), 0);
+    // Any other payload without BUFR magic is not BUFR.
+    assert_eq!(e.ingest_bytes(b"NIL=", "text", t0800()), 0);
     // A message cut short inside its data section.
     let jma = regression("jp-jma_307080_master-v13.bufr");
     let start = jma.windows(4).position(|w| w == b"BUFR").unwrap();
@@ -746,7 +753,8 @@ fn failures_are_counted_by_kind() {
     assert_eq!(e.health.decode_failures(FailureKind::UnknownDescriptor), 1);
     assert_eq!(e.health.decode_failures_total(), 3);
     let counters = e.health.counters();
-    assert_eq!(counters[7..], [1, 1, 1, 0, 0]);
+    assert_eq!(counters[7], 2, "NIL bulletins");
+    assert_eq!(counters[8..], [1, 1, 1, 0, 0]);
 }
 
 // ---------------------------------------------------------------------------

@@ -947,97 +947,49 @@ async fn main() {
 
     server_state.recovery_shutdown.shutdown();
     let _reload_guard = server_state.reload_lock.lock().await;
-    // Signal all polling loops to stop
-    let geotiff = server_state
-        .geotiff_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in geotiff.iter() {
-        engine.shutdown();
+    // The engines holding push-fed state (WIS2 CAP and BUFR) flush a state
+    // snapshot in `shutdown()`: a blocking encode and save each, under
+    // their own key through their own writer, sharing nothing but the
+    // store, whose saves are atomic per key. They run side by side on the
+    // blocking pool, so the slowest flush, not the sum of them, is what the
+    // container's stop timeout must cover (#1043). As before, nothing bounds
+    // the wait but that timeout: a flush cut short keeps the previous
+    // snapshot.
+    let mut flushes = Vec::new();
+    macro_rules! flush_state {
+        ($($field:ident),* $(,)?) => {$(
+            for engine in server_state.$field.read().unwrap_or_else(|e| e.into_inner()).iter() {
+                let engine = engine.clone();
+                flushes.push(tokio::task::spawn_blocking(move || engine.shutdown()));
+            }
+        )*};
     }
-    let querydata = server_state
-        .querydata_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in querydata.iter() {
-        engine.shutdown();
+    flush_state!(cap_engines, bufr_engines);
+    // Signal every other polling loop to stop.
+    macro_rules! signal_shutdown {
+        ($($field:ident),* $(,)?) => {$(
+            for engine in server_state.$field.read().unwrap_or_else(|e| e.into_inner()).iter() {
+                engine.shutdown();
+            }
+        )*};
     }
-    let grib = server_state
-        .grib_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in grib.iter() {
-        engine.shutdown();
-    }
-    let zarr = server_state
-        .zarr_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in zarr.iter() {
-        engine.shutdown();
-    }
-    let satellite = server_state
-        .satellite_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in satellite.iter() {
-        engine.shutdown();
-    }
-    let netcdf = server_state
-        .netcdf_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in netcdf.iter() {
-        engine.shutdown();
-    }
-    let odim = server_state
-        .odim_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in odim.iter() {
-        engine.shutdown();
-    }
-    let odim_volume = server_state
-        .odim_volume_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in odim_volume.iter() {
-        engine.shutdown();
-    }
-    let cap = server_state
-        .cap_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in cap.iter() {
-        engine.shutdown();
-    }
-    let bufr = server_state
-        .bufr_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in bufr.iter() {
-        engine.shutdown();
-    }
-    let postgis = server_state
-        .postgis_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in postgis.iter() {
-        engine.shutdown();
-    }
-    let nowcast = server_state
-        .nowcast_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in nowcast.iter() {
-        engine.shutdown();
-    }
-    let station_grid = server_state
-        .station_grid_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    for engine in station_grid.iter() {
-        engine.shutdown();
+    signal_shutdown!(
+        geotiff_engines,
+        querydata_engines,
+        grib_engines,
+        zarr_engines,
+        satellite_engines,
+        netcdf_engines,
+        odim_engines,
+        odim_volume_engines,
+        postgis_engines,
+        nowcast_engines,
+        station_grid_engines,
+    );
+    for flush in flushes {
+        if let Err(e) = flush.await {
+            error!("State snapshot flush did not finish: {e}");
+        }
     }
     info!("Server shut down gracefully");
 }

@@ -16260,7 +16260,7 @@
         "spec": {
           "id": 110,
           "title": "BUFR ingest per hour",
-          "description": "In the trailing hour: files or payloads fetched; reports ingested (new station-time rows), replaced (corrections), out_of_window (clock skew or a stale feed), skipped (no station id, position or time); decode failures by kind (error = malformed BUFR, unsupported = a decoder gap: a steady rate from one centre means its template needs the decoder extended); failed source scans.",
+          "description": "In the trailing hour: files or payloads fetched; reports ingested (new station-time rows), replaced (corrections), out_of_window (clock skew or a stale feed), skipped (no station id, position or time), nil (NIL bulletins: a centre with no report to send, not a failure); decode failures by kind (error = malformed BUFR, unsupported = a decoder gap: a steady rate from one centre means its template needs the decoder extended); failed source scans.",
           "links": [],
           "data": {
             "kind": "QueryGroup",

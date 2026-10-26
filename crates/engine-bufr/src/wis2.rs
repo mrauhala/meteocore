@@ -736,6 +736,31 @@ mod tests {
         assert!(e.is_loaded());
     }
 
+    /// #1043: a NIL bulletin is the centre's word that it has no report to
+    /// send. It is counted on its own, never as a decode failure: no WARN,
+    /// nothing for the hourly summary. It decodes no report either, so it
+    /// does not mark the feed probed.
+    #[test]
+    fn nil_bulletin_is_neither_a_failure_nor_a_warning() {
+        let e = engine();
+        let Source::Wis2(src) = e.source() else {
+            panic!()
+        };
+        src.apply(&e, resolved("cy/nil", Some(b"NIL".to_vec())));
+        src.apply(&e, resolved("cy/nil-crlf", Some(b"NIL\r\r\n".to_vec())));
+        assert_eq!(e.health.files_total.load(Ordering::Relaxed), 2);
+        assert_eq!(e.health.nil_bulletins_total.load(Ordering::Relaxed), 2);
+        assert_eq!(e.health.decode_failures_total(), 0);
+        assert!(src.warned.lock().unwrap().is_empty());
+        assert!(src.failures.lock().unwrap().is_empty());
+        assert!(src.produced.lock().unwrap().by_data_id.is_empty());
+        assert!(!e.is_loaded());
+        // Other text without BUFR magic is still a `not_bufr` failure.
+        src.apply(&e, resolved("cy/text", Some(b"NIL=".to_vec())));
+        assert_eq!(e.health.decode_failures(FailureKind::NotBufr), 1);
+        assert_eq!(src.warned.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn live_status_state_machine() {
         let e = engine();

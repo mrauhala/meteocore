@@ -27,7 +27,7 @@ live decode failure fixed in #1008; its README names the cause of each).
   an `Err`. Pinned by `concatenated_file_keeps_the_good_messages_around_a_bad_one`.
 - Every failure has a `FailureKind` (`DecodeError::kind`), counted per
   message in `bufr_decode_failures_total{reason, kind}`: `kind` is
-  `not_bufr` (no BUFR magic: NIL bulletins), `truncated` (`failed to fill
+  `not_bufr` (no BUFR magic: text, an error page), `truncated` (`failed to fill
   whole buffer`: an element read with the wrong width ran past the data
   section, or a short message), `unknown_descriptor` (no table entry: an
   unregistered local element), `invalid` or `unsupported`; `reason` keeps
@@ -36,6 +36,15 @@ live decode failure fixed in #1008; its README names the cause of each).
   with its `data_id` (a sample to fetch from a Global Cache) and an hourly
   per-centre summary (`decode failures in the last 60 min: …`); the metric
   stays per collection, since centres are unbounded.
+- **NIL bulletins are not failures (#1043).** A payload whose text is
+  `NIL` once whitespace and control characters are trimmed (a centre with
+  no report to send) is recognised before decoding
+  (`decode::is_nil_bulletin`, checked first in `ingest_bytes_keyed`),
+  counted in `Health::nil_bulletins_total` →
+  `bufr_reports_total{result="nil"}`, logged at DEBUG only, never WARNed
+  or put in the hourly summary. Exact match: `nil`, `NIL=` and other text
+  stay `not_bufr`. It decodes no report, so it does not mark a WIS2 feed
+  probed.
 - `ds-bufr` supports compressed character fields and delayed replication,
   operators 203 (uncompressed), 204 and 208, and numeric widths through 64
   bits (#693, #1008). Regression fixtures in `testdata/bufr-decoder/` are
@@ -240,8 +249,9 @@ at boot and ignores the state store.
   runtime from the 10 s snapshot tick when `state_revision()` moved (the
   metadata `version`, bumped after every store change, plus the warm-up
   clock starting), at most every five minutes, an unchanged store every
-  quarter of `warmup` (5 min–1 h, `state_policy`), and always from
-  `shutdown()`. The encode runs under the store's READ lock, straight from
+  quarter of `warmup` (5 min–1 h, `ds_core::state::WritePolicy::for_warmup`,
+  shared with engine-cap), and always from `shutdown()`, which logs the
+  flush's duration and size at INFO (#1043). The encode runs under the store's READ lock, straight from
   the rows (no copy): requests keep reading, and the only writer is the
   same poll loop.
 - Restored by `new_with_state` before the first metadata build, so the

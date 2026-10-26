@@ -62,7 +62,8 @@ pub struct ObsReport {
 /// so a failure rate can be attributed without reading logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FailureKind {
-    /// No `BUFR` magic at all: a NIL bulletin, text, an error page.
+    /// No `BUFR` magic at all: text, an error page. A NIL bulletin is not
+    /// a failure ([`is_nil_bulletin`]).
     NotBufr,
     /// The reader ran past the end of the data section or message
     /// (`failed to fill whole buffer`): an element read with the wrong
@@ -104,6 +105,22 @@ impl FailureKind {
             _ => "error",
         }
     }
+}
+
+/// Whether `bytes` is a NIL bulletin: the text `NIL` and nothing else
+/// but whitespace and control characters (line ends, a GTS envelope's
+/// SOH/ETX). A centre publishes one when it has no report to send, so it
+/// is not a decode failure; the engine recognises it before decoding
+/// (#1043). Any other payload without `BUFR` magic is
+/// [`DecodeError::NotBufr`].
+pub fn is_nil_bulletin(bytes: &[u8]) -> bool {
+    let filler = |b: &u8| b.is_ascii_whitespace() || b.is_ascii_control();
+    let start = bytes.iter().position(|b| !filler(b)).unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !filler(b))
+        .map_or(start, |i| i + 1);
+    &bytes[start..end] == b"NIL"
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -745,6 +762,38 @@ mod tests {
         let d = Decoder::new();
         assert!(matches!(d.decode(b"hello"), Err(DecodeError::NotBufr)));
         assert_eq!(DecodeError::NotBufr.kind(), FailureKind::NotBufr);
+    }
+
+    #[test]
+    fn nil_bulletins_are_the_text_nil_alone() {
+        for nil in [
+            &b"NIL"[..],
+            b"NIL\n",
+            b" \tNIL\r\r\n",
+            b"\x01\r\r\nNIL\r\r\n\x03",
+            b"\0NIL\x7f",
+        ] {
+            assert!(is_nil_bulletin(nil), "{nil:?}");
+        }
+        for other in [
+            &b""[..],
+            b" \r\n",
+            b"nil",
+            b"NIL=",
+            b"NILNIL",
+            b"N I L",
+            b"NIL REPORT",
+            b"\xc2\xa0NIL",
+            b"BUFR",
+        ] {
+            assert!(!is_nil_bulletin(other), "{other:?}");
+        }
+        let fixture = std::fs::read(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/bufr-synop/").to_string()
+                + "synop_se-smhi_20260912T0800Z.bufr",
+        )
+        .unwrap();
+        assert!(!is_nil_bulletin(&fixture));
     }
 
     #[test]
