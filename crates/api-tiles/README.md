@@ -161,7 +161,7 @@ colormap = "radar_dbz"        # the `default` style
 |---|---|---|
 | `[server] base_url`, `trust_proxy_headers` | none, `false` | Absolute links in metadata |
 | `[server] render_concurrency` | 2 × CPUs, min 8 | Render slots shared with WMS and Maps |
-| `[wms] rendered_cache_mb` | 256 | Rendered-image cache size, read from a WMS or Maps collection |
+| `[server] rendered_cache_mb` | 256 | Rendered-image cache size, shared with WMS and Maps. Unset, the deprecated `[wms] rendered_cache_mb` sizes it: the largest value among the WMS, Maps and Tiles collections |
 | `MC_RENDER_TIMEOUT_MS` | 3000 | Queue and render deadline, MVT encoding included |
 | `MC_RENDER_MEMORY_MB` | 1024 | Output-memory budget for map renders |
 

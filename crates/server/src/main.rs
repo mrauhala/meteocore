@@ -482,6 +482,13 @@ async fn main() {
             .state_dir_path(std::path::Path::new(&config_path)),
     );
 
+    // `[server] rendered_cache_mb`, else the deprecated `[wms]` fallback over
+    // the effective collections (#1028).
+    let (rendered_cache_mb, rendered_cache_warnings) = config.rendered_cache_mb();
+    for warning in &rendered_cache_warnings {
+        tracing::warn!("{warning}");
+    }
+
     let result = admin::load_collections(
         &style_ctx,
         &config.collections,
@@ -489,6 +496,7 @@ async fn main() {
         &base_url,
         config.server.trust_proxy_headers,
         config.server.metatile_cache_mb,
+        rendered_cache_mb,
         // Startup builds the render caches fresh; reloads reuse them.
         admin::ReusableCaches::default(),
         // Startup has no live engines to reuse; incremental reloads do (#574).

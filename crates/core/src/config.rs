@@ -97,6 +97,15 @@ pub struct ServerSettings {
     /// render), reversible via config reload.
     #[serde(default = "default_metatile_cache_mb")]
     pub metatile_cache_mb: u64,
+    /// Size in MB of the rendered-image cache: the encoded images WMS, Maps
+    /// and Tiles serve again on a repeated request (#1028). A single
+    /// server-wide cache, like `metatile_cache_mb`. Unset (default): the
+    /// deprecated per-collection `[wms] rendered_cache_mb`, else
+    /// [`DEFAULT_RENDERED_CACHE_MB`], as [`select_rendered_cache_mb`]
+    /// decides. `0` disables the cache. A reload re-reads it: a changed size
+    /// starts an empty cache, an unchanged one keeps the warm one.
+    #[serde(default)]
+    pub rendered_cache_mb: Option<u64>,
     /// Watch the config directories for changes and auto-reload — no manual
     /// `POST /admin/collections/reload` needed: `collections_dir` when `.toml`
     /// files are added, edited, or removed, and `colormaps_dir` when palette
@@ -187,6 +196,7 @@ impl ServerConfig {
                 collections_dir: None,
                 colormaps_dir: None,
                 metatile_cache_mb: default_metatile_cache_mb(),
+                rendered_cache_mb: None,
                 watch_collections_dir: false,
                 watch_debounce_ms: default_watch_debounce_ms(),
                 trust_proxy_headers: false,
@@ -777,14 +787,13 @@ pub struct WmsConfig {
     /// Parameters not listed here use the top-level `colormap`/`min`/`max`.
     #[serde(default)]
     pub parameters: Vec<WmsParameterConfig>,
-    /// Rendered image cache size in MB. Default:
-    /// [`DEFAULT_RENDERED_CACHE_MB`].
-    ///
-    /// NOTE: like the meta-tile cache, this is actually a *global* shared cache,
-    /// not per-collection; it lives here for backward compatibility. New global
-    /// cache knobs (e.g. `[server] metatile_cache_mb`) go under `[server]`.
-    #[serde(default = "default_rendered_cache_mb")]
-    pub rendered_cache_mb: u64,
+    /// Deprecated: the rendered-image cache size in MB, now
+    /// `[server] rendered_cache_mb` (#1028). The cache is one server-wide
+    /// cache, not per-collection. Read only while the `[server]` key is
+    /// unset, and then the largest value among the WMS, Maps and Tiles
+    /// collections wins ([`select_rendered_cache_mb`]).
+    #[serde(default)]
+    pub rendered_cache_mb: Option<u64>,
     /// Default WebP quality for this collection's WMS, Maps and Tiles
     /// images, 1–100: 1–99 is lossy WebP at that quality, 100 lossless.
     /// Applies when a WebP request names no `QUALITY` / `quality`; an
@@ -851,8 +860,9 @@ pub struct ColorStop {
     pub color: String,
 }
 
-/// Default size of the shared rendered-image cache, in MB, when no
-/// collection's `[wms] rendered_cache_mb` sets it (#1010).
+/// Default size of the shared rendered-image cache, in MB, when neither
+/// `[server] rendered_cache_mb` nor a collection's deprecated
+/// `[wms] rendered_cache_mb` sets it (#1010, #1028).
 ///
 /// Sized on a day of WMS GetMaps from a live deployment (85 000 requests,
 /// all viewports; 4 % repeated an earlier request exactly). Replaying those
@@ -863,8 +873,92 @@ pub struct ColorStop {
 /// metatile_cache_mb`) is the one whose hit rate grows with memory.
 pub const DEFAULT_RENDERED_CACHE_MB: u64 = 256;
 
-fn default_rendered_cache_mb() -> u64 {
-    DEFAULT_RENDERED_CACHE_MB
+/// The rendered-image cache size in MB, and the WARN lines for the caller to
+/// log about how it was chosen (#1028).
+///
+/// `server` (`[server] rendered_cache_mb`) is the size when set. Otherwise
+/// the deprecated `[wms] rendered_cache_mb` of the collections that serve
+/// WMS, Maps or Tiles sizes it: the largest value, so neither the order of
+/// the collections nor which of them loaded can change it. With neither,
+/// [`DEFAULT_RENDERED_CACHE_MB`].
+///
+/// Warnings: with `server` set, one saying any collection keys are ignored.
+/// Otherwise a deprecation notice whenever a collection sets the key, and a
+/// second when the collections disagree, naming the size chosen.
+pub fn select_rendered_cache_mb(
+    server: Option<u64>,
+    collections: &[CollectionConfig],
+) -> (u64, Vec<String>) {
+    let mut keyed: Vec<(&str, u64)> = collections
+        .iter()
+        .filter(|c| {
+            c.apis
+                .iter()
+                .any(|api| matches!(api.as_str(), "wms" | "maps" | "tiles"))
+        })
+        .filter_map(|c| Some((c.id.as_str(), c.wms.as_ref()?.rendered_cache_mb?)))
+        .collect();
+    keyed.sort_unstable();
+    let ids: Vec<&str> = keyed.iter().map(|&(id, _)| id).collect();
+    let mut sizes: Vec<u64> = keyed.iter().map(|&(_, mb)| mb).collect();
+    sizes.sort_unstable();
+    sizes.dedup();
+
+    if let Some(mb) = server {
+        let warnings = if ids.is_empty() {
+            Vec::new()
+        } else {
+            vec![format!(
+                "[server] rendered_cache_mb = {mb} sizes the rendered-image cache; the \
+                 deprecated [wms] rendered_cache_mb of {} is ignored, remove it",
+                quoted_collection_ids(&ids)
+            )]
+        };
+        return (mb, warnings);
+    }
+    let Some(&largest) = sizes.last() else {
+        return (DEFAULT_RENDERED_CACHE_MB, Vec::new());
+    };
+    let mut warnings = vec![format!(
+        "[wms] rendered_cache_mb is deprecated, set by {}: the rendered-image cache is one \
+         server-wide cache, size it with [server] rendered_cache_mb instead",
+        quoted_collection_ids(&ids)
+    )];
+    if sizes.len() > 1 {
+        let listed: Vec<String> = sizes.iter().map(u64::to_string).collect();
+        warnings.push(format!(
+            "[wms] rendered_cache_mb differs between collections: {} MB; using the largest, \
+             {largest} MB",
+            listed.join(", ")
+        ));
+    }
+    (largest, warnings)
+}
+
+/// `collection 'a'`, `collections 'a', 'b'`, or the first few ids of a long
+/// list and how many more, for a WARN line.
+fn quoted_collection_ids(ids: &[&str]) -> String {
+    const SHOWN: usize = 5;
+    let noun = if ids.len() == 1 {
+        "collection"
+    } else {
+        "collections"
+    };
+    let shown: Vec<String> = ids.iter().take(SHOWN).map(|id| format!("'{id}'")).collect();
+    let more = ids.len().saturating_sub(SHOWN);
+    if more == 0 {
+        format!("{noun} {}", shown.join(", "))
+    } else {
+        format!("{noun} {} and {more} more", shown.join(", "))
+    }
+}
+
+impl ServerConfig {
+    /// [`select_rendered_cache_mb`] over this config: `[server]
+    /// rendered_cache_mb` and the collections.
+    pub fn rendered_cache_mb(&self) -> (u64, Vec<String>) {
+        select_rendered_cache_mb(self.server.rendered_cache_mb, &self.collections)
+    }
 }
 
 fn default_metatile_cache_mb() -> u64 {
@@ -7283,17 +7377,167 @@ description = "X"
         assert_eq!(config.collections[0].webp_quality(), None);
     }
 
-    /// #1010: the rendered-image cache defaults to 256 MB; a collection can
-    /// still size it.
+    /// #1010, #1028: the rendered-image cache defaults to 256 MB. Both the
+    /// `[server]` key and the deprecated `[wms]` key parse, and an unset one
+    /// stays distinguishable from a set one.
     #[test]
-    fn wms_rendered_cache_defaults_to_256_mb() {
-        let cfg = collection_with("[collections.wms]\n");
-        let wms = cfg.collections[0].wms.as_ref().unwrap();
-        assert_eq!(wms.rendered_cache_mb, 256);
+    fn rendered_cache_mb_keys_parse_and_default_to_unset() {
         assert_eq!(DEFAULT_RENDERED_CACHE_MB, 256);
+        let cfg = collection_with("[collections.wms]\n");
+        assert_eq!(cfg.server.rendered_cache_mb, None);
+        assert_eq!(
+            cfg.collections[0].wms.as_ref().unwrap().rendered_cache_mb,
+            None
+        );
+        assert_eq!(cfg.rendered_cache_mb(), (DEFAULT_RENDERED_CACHE_MB, vec![]));
         let cfg = collection_with("[collections.wms]\nrendered_cache_mb = 512\n");
         let wms = cfg.collections[0].wms.as_ref().unwrap();
-        assert_eq!(wms.rendered_cache_mb, 512);
+        assert_eq!(wms.rendered_cache_mb, Some(512));
+        assert_eq!(
+            ServerConfig::default_for_auto().server.rendered_cache_mb,
+            None
+        );
+
+        let cfg: ServerConfig =
+            toml::from_str("[server]\nhost=\"127.0.0.1\"\nport=8000\nrendered_cache_mb = 64\n")
+                .unwrap();
+        assert_eq!(cfg.server.rendered_cache_mb, Some(64));
+        assert_eq!(cfg.rendered_cache_mb(), (64, vec![]));
+    }
+
+    /// A collection serving `apis`, with `[wms] rendered_cache_mb = mb` when
+    /// `mb` is set.
+    fn cache_keyed(id: &str, apis: &[&str], mb: Option<u64>) -> CollectionConfig {
+        let wms = mb.map_or_else(String::new, |mb| {
+            format!("[wms]\nrendered_cache_mb = {mb}\n")
+        });
+        toml::from_str(&format!(
+            "id = \"{id}\"\ntitle = \"t\"\ndescription = \"d\"\napis = {apis:?}\n{wms}"
+        ))
+        .unwrap()
+    }
+
+    /// #1028: the first `[wms]` block found once sized the cache, out of a
+    /// HashMap, so the size could change between boots. The largest wins
+    /// now, whatever the order.
+    #[test]
+    fn rendered_cache_mb_does_not_depend_on_collection_order() {
+        let a = cache_keyed("a", &["wms"], Some(128));
+        let b = cache_keyed("b", &["maps"], Some(512));
+        let c = cache_keyed("c", &["wms", "tiles"], Some(256));
+        let forward = select_rendered_cache_mb(None, &[a.clone(), b.clone(), c.clone()]);
+        assert_eq!(forward.0, 512);
+        for order in [
+            [c.clone(), b.clone(), a.clone()],
+            [b.clone(), a.clone(), c.clone()],
+            [a.clone(), c.clone(), b.clone()],
+        ] {
+            assert_eq!(select_rendered_cache_mb(None, &order), forward);
+        }
+    }
+
+    #[test]
+    fn server_rendered_cache_mb_wins_over_collection_keys() {
+        let collections = [
+            cache_keyed("a", &["wms"], Some(512)),
+            cache_keyed("b", &["tiles"], Some(1024)),
+            cache_keyed("plain", &["wms"], None),
+        ];
+        let (mb, warnings) = select_rendered_cache_mb(Some(64), &collections);
+        assert_eq!(mb, 64);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("ignored") && warnings[0].contains("collections 'a', 'b'"),
+            "{warnings:?}"
+        );
+        // Zero is a size too: it disables the cache, whatever the collections say.
+        assert_eq!(select_rendered_cache_mb(Some(0), &collections).0, 0);
+        // No collection key, nothing to warn about.
+        let plain = [cache_keyed("plain", &["wms"], None)];
+        assert_eq!(select_rendered_cache_mb(Some(64), &plain), (64, vec![]));
+    }
+
+    #[test]
+    fn largest_collection_rendered_cache_mb_wins_without_server_key() {
+        let (mb, warnings) = select_rendered_cache_mb(
+            None,
+            &[
+                cache_keyed("small", &["wms"], Some(128)),
+                cache_keyed("large", &["maps"], Some(512)),
+                cache_keyed("plain", &["wms"], None),
+            ],
+        );
+        assert_eq!(mb, 512);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("deprecated")
+                && warnings[0].contains("[server] rendered_cache_mb")
+                && warnings[0].contains("collections 'large', 'small'"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("128, 512 MB") && warnings[1].contains("the largest, 512 MB"),
+            "{warnings:?}"
+        );
+
+        // Agreeing blocks: only the deprecation notice.
+        let (mb, warnings) = select_rendered_cache_mb(
+            None,
+            &[
+                cache_keyed("a", &["wms"], Some(128)),
+                cache_keyed("b", &["maps"], Some(128)),
+            ],
+        );
+        assert_eq!(mb, 128);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("deprecated"), "{warnings:?}");
+    }
+
+    #[test]
+    fn tiles_only_collection_rendered_cache_mb_counts() {
+        let (mb, warnings) = select_rendered_cache_mb(
+            None,
+            &[
+                cache_keyed("wms", &["wms"], None),
+                cache_keyed("tiles", &["tiles"], Some(1024)),
+            ],
+        );
+        assert_eq!(mb, 1024);
+        assert!(warnings[0].contains("collection 'tiles'"), "{warnings:?}");
+        // A collection serving none of WMS, Maps or Tiles renders no images.
+        let edr = [cache_keyed("edr", &["edr"], Some(1024))];
+        assert_eq!(
+            select_rendered_cache_mb(None, &edr),
+            (DEFAULT_RENDERED_CACHE_MB, vec![])
+        );
+    }
+
+    #[test]
+    fn no_rendered_cache_mb_anywhere_gives_the_default() {
+        assert_eq!(
+            select_rendered_cache_mb(None, &[]),
+            (DEFAULT_RENDERED_CACHE_MB, vec![])
+        );
+        let plain = [
+            cache_keyed("a", &["wms", "maps", "tiles"], None),
+            cache_keyed("b", &["edr"], None),
+        ];
+        assert_eq!(
+            select_rendered_cache_mb(None, &plain),
+            (DEFAULT_RENDERED_CACHE_MB, vec![])
+        );
+    }
+
+    #[test]
+    fn rendered_cache_mb_warning_shortens_a_long_collection_list() {
+        let many: Vec<CollectionConfig> = (1..=7)
+            .map(|i| cache_keyed(&format!("c{i}"), &["wms"], Some(256)))
+            .collect();
+        let (_, warnings) = select_rendered_cache_mb(None, &many);
+        assert!(
+            warnings[0].contains("collections 'c1', 'c2', 'c3', 'c4', 'c5' and 2 more"),
+            "{warnings:?}"
+        );
     }
 
     #[test]
