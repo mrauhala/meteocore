@@ -266,7 +266,7 @@ need no reload pruning.
   on reload (`admin.rs`), with `shutdown()` called on the old engines at
   reload. When adding an engine with a poll loop, wire ALL THREE places:
   the boot spawn block in `main.rs`, `rotate_poll_loops!` in `admin.rs`,
-  and the graceful-shutdown block at the end of `main` (bug #442 was a
+  and the graceful-shutdown lists at the end of `main` (`signal_shutdown!`, or `flush_state!` for an engine whose `shutdown()` flushes state) (bug #442 was a
   missing boot-path spawn for `cap_engines`; the shutdown block had also
   silently skipped cap, postgis and nowcast). An engine whose push-fed
   state must survive its collection's rebuild implements
@@ -351,6 +351,9 @@ re-read their source and ignore the store. The plumbing is
   quarter of `warmup`, 5 min–1 h) so the snapshot's own timestamp says when
   the server was last alive; always write when forced (the shutdown flush);
   report failures at most every `warn_interval` (15 min).
+  `WritePolicy::for_warmup(warmup)` is that timing (`WRITE_INTERVAL`,
+  `REFRESH_CAP`, `WARN_INTERVAL`; `state::hours_minutes` for log lines):
+  a new warm-up engine (#1023) uses it, never a copy.
 - **Adding a backend** (Redis, …): implement `StateStore` and select it in
   `admin::init_state_store` by a NEW `[server]` key (e.g. a backend name
   plus its URL), keeping `state_dir` as the file backend. Engines and the
@@ -386,10 +389,16 @@ Wiring:
   taken over. The new engine is a new broker session, so what is
   published between the shutdown and its subscription is missed, as on a
   restart. No state store is needed for any of this.
-- Graceful shutdown: `shutdown()` on each CAP and BUFR engine (the block at
-  the end of `main`) flushes the snapshot, so a redeploy loses nothing and
-  the snapshot records when the server went down. A crash loses at most
-  the last five minutes.
+- Graceful shutdown: at the end of `main`, `flush_state!` runs each CAP
+  and BUFR engine's `shutdown()` concurrently on the blocking pool (each
+  flushes its own key, so the slowest flush, not the sum, sets the stop
+  time) while `signal_shutdown!` stops the other engines; then it waits
+  for every flush, bounded only by the container's stop timeout. Each
+  flush logs its duration and size at INFO. A redeploy loses nothing and
+  the snapshot records when the server went down; a crash, or a flush the
+  stop timeout kills, loses at most the last five minutes (the previous
+  snapshot stays). A large BUFR store takes seconds to encode: size
+  `stop_grace_period` / `docker stop -t` from that INFO line (#1043).
 - Deployment: the directory needs a writable mount (the image's `/data` is
   the config mount, often read-only). The image creates
   `/var/lib/meteocore` owned by its non-root `dataserver` user, so a named

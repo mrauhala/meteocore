@@ -926,7 +926,8 @@ static BUFR_FILES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 static BUFR_REPORTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     pg_int_counter(
         "bufr_reports_total",
-        "Decoded station reports, by result (ingested, replaced, out_of_window, skipped)",
+        "Decoded station reports, by result (ingested, replaced, out_of_window, skipped), and \
+         NIL bulletins, a centre's word that it has no report to send (nil)",
         &["collection", "result"],
     )
 });
@@ -7739,7 +7740,12 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             BUFR_REPORTS_TOTAL
                 .with_label_values(&[cid, "skipped"])
                 .inc_by(d[6]);
-            for (kind, n) in engine_bufr::decode::FailureKind::ALL.iter().zip(&d[7..]) {
+            // Not a decode failure (#1043): a NIL bulletin decodes nothing
+            // because there is nothing to decode.
+            BUFR_REPORTS_TOTAL
+                .with_label_values(&[cid, "nil"])
+                .inc_by(d[7]);
+            for (kind, n) in engine_bufr::decode::FailureKind::ALL.iter().zip(&d[8..]) {
                 BUFR_DECODE_FAILURES_TOTAL
                     .with_label_values(&[cid, kind.reason(), kind.label()])
                     .inc_by(*n);

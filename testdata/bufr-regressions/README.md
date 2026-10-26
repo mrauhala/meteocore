@@ -24,5 +24,7 @@ producer's; only the packing is ecCodes'.
 | `de-dwd_local-v8.bufr` | one message of a de-dwd `bda01,synop_bufr_GER` bulletin, local table version 8 | `Table B entry not found` for 004215 | DWD local elements beyond those registered before |
 | `de-dwd_synop-and-supplement.bufr` | the SYNOP message (local version 0) and the national supplement (local version 8) of station 10022 from one de-dwd bulletin, subset 1 of each, concatenated in bulletin order | `Table B entry not found` for 020193 | the supplement starts with DWD local 020193; decoded, it must merge with the SYNOP report rather than replace it |
 
-cy-dom also publishes `NIL` bulletins, three bytes of text, which stay
-`not a BUFR message` (`kind="not_bufr"`); the tests use an inline `b"NIL"`.
+cy-dom also publishes `NIL` bulletins, three bytes of text saying it has
+no report to send. They are recognised before decoding and counted as
+`bufr_reports_total{result="nil"}`, not as decode failures; the tests use
+an inline `b"NIL"`.

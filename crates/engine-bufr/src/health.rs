@@ -6,9 +6,9 @@ use ds_core::health::LiveStatus;
 
 use crate::decode::FailureKind;
 
-/// Length of [`Health::counters`]: seven ingest counters, then one decode
+/// Length of [`Health::counters`]: eight ingest counters, then one decode
 /// failure counter per [`FailureKind::ALL`] entry.
-pub const COUNTERS: usize = 7 + FailureKind::ALL.len();
+pub const COUNTERS: usize = 8 + FailureKind::ALL.len();
 
 #[derive(Debug, Default)]
 pub struct Health {
@@ -24,6 +24,9 @@ pub struct Health {
     pub reports_replaced_total: AtomicU64,
     pub reports_out_of_window_total: AtomicU64,
     pub subsets_skipped_total: AtomicU64,
+    /// NIL bulletins: payloads saying the centre has no report to send
+    /// (`decode::is_nil_bulletin`). Not decode failures (#1043).
+    pub nil_bulletins_total: AtomicU64,
     /// Messages (or whole payloads without a BUFR message) that failed,
     /// indexed by [`FailureKind`] in [`FailureKind::ALL`] order.
     decode_failures: [AtomicU64; FailureKind::ALL.len()],
@@ -90,10 +93,11 @@ impl Health {
 
     /// Monotonic counters in a fixed order (see `admin.rs` metrics):
     /// scans, scan failures, files, ingested, replaced, out of window,
-    /// subsets skipped, then decode failures per [`FailureKind::ALL`].
+    /// subsets skipped, NIL bulletins, then decode failures per
+    /// [`FailureKind::ALL`].
     pub fn counters(&self) -> [u64; COUNTERS] {
         let mut out = [0; COUNTERS];
-        out[..7].copy_from_slice(&[
+        out[..8].copy_from_slice(&[
             self.scans_total.load(Ordering::Relaxed),
             self.scan_failures_total.load(Ordering::Relaxed),
             self.files_total.load(Ordering::Relaxed),
@@ -101,8 +105,9 @@ impl Health {
             self.reports_replaced_total.load(Ordering::Relaxed),
             self.reports_out_of_window_total.load(Ordering::Relaxed),
             self.subsets_skipped_total.load(Ordering::Relaxed),
+            self.nil_bulletins_total.load(Ordering::Relaxed),
         ]);
-        for (slot, kind) in out[7..].iter_mut().zip(FailureKind::ALL) {
+        for (slot, kind) in out[8..].iter_mut().zip(FailureKind::ALL) {
             *slot = self.decode_failures(kind);
         }
         out

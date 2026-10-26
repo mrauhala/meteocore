@@ -18,7 +18,9 @@
 //!   only when the engine's state revision moved, at most once per
 //!   interval, rewrite an unchanged state now and then so the snapshot's own
 //!   timestamp says when the server was last alive, and surface failures at
-//!   a bounded rate.
+//!   a bounded rate. [`WritePolicy::for_warmup`] is the timing every
+//!   warm-up engine shares (CAP and BUFR today): one copy, not one per
+//!   engine.
 //!
 //! The snapshot format, its timestamp and the logging belong to the engine.
 //! Persistence is best effort: a failed write keeps the previous snapshot
@@ -238,6 +240,46 @@ pub struct WritePolicy {
     pub refresh_interval: Duration,
     /// Failures are reported (`warn: true`) at most once per this interval.
     pub warn_interval: Duration,
+}
+
+impl WritePolicy {
+    /// [`Self::for_warmup`]'s minimum interval: a changed state is written
+    /// at most every five minutes, and a failed write retried as often.
+    pub const WRITE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+    /// [`Self::for_warmup`]'s longest refresh interval: an unchanged state
+    /// is rewritten at least hourly.
+    pub const REFRESH_CAP: Duration = Duration::from_secs(3600);
+    /// [`Self::for_warmup`]'s warn interval: a failing write (read-only or
+    /// full disk) WARNs at most every 15 minutes.
+    pub const WARN_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+    /// The write policy of an engine whose state refills over `warmup`
+    /// after a cold start (the WIS2 CAP accumulator, the WIS2 BUFR report
+    /// store): a changed state at most every [`Self::WRITE_INTERVAL`], an
+    /// unchanged one at least every quarter of `warmup`, clamped to
+    /// [`Self::WRITE_INTERVAL`] ..= [`Self::REFRESH_CAP`], failures warned
+    /// at most every [`Self::WARN_INTERVAL`].
+    ///
+    /// Such an engine treats a snapshot written longer than `warmup` ago
+    /// as a long outage and restarts its warm-up. The refresh keeps the
+    /// snapshot's own timestamp close to the server's last breath even when
+    /// the feed is quiet, so that check errs by at most a quarter of the
+    /// warm-up.
+    pub fn for_warmup(warmup: Duration) -> Self {
+        WritePolicy {
+            min_interval: Self::WRITE_INTERVAL,
+            refresh_interval: (warmup / 4).clamp(Self::WRITE_INTERVAL, Self::REFRESH_CAP),
+            warn_interval: Self::WARN_INTERVAL,
+        }
+    }
+}
+
+/// `26h05m`: a duration in whole hours and minutes (seconds dropped), for
+/// the log lines that say how old a snapshot is or how long a warm-up
+/// lasts.
+pub fn hours_minutes(d: Duration) -> String {
+    let minutes = d.as_secs() / 60;
+    format!("{}h{:02}m", minutes / 60, minutes % 60)
 }
 
 /// What [`StateWriter::write_if_due`] did.
@@ -558,6 +600,39 @@ mod tests {
             w.write_if_due(2, t0 + 93 * MINUTE, false, ok),
             WriteOutcome::Written { .. }
         ));
+    }
+
+    #[test]
+    fn state_policy_refreshes_within_a_quarter_of_the_warmup() {
+        let hours = |h: u64| Duration::from_secs(h * 3600);
+        let day = WritePolicy::for_warmup(hours(24));
+        assert_eq!(day.min_interval, 5 * MINUTE);
+        assert_eq!(day.refresh_interval, 60 * MINUTE, "capped at an hour");
+        assert_eq!(day.warn_interval, 15 * MINUTE);
+        assert_eq!(
+            WritePolicy::for_warmup(hours(2)).refresh_interval,
+            30 * MINUTE
+        );
+        for short in [10 * MINUTE, Duration::ZERO] {
+            let p = WritePolicy::for_warmup(short);
+            assert_eq!(
+                p.refresh_interval,
+                5 * MINUTE,
+                "never more often than the write interval"
+            );
+            assert_eq!(p.min_interval, 5 * MINUTE);
+        }
+    }
+
+    #[test]
+    fn hours_minutes_drops_the_seconds() {
+        assert_eq!(hours_minutes(Duration::ZERO), "0h00m");
+        assert_eq!(hours_minutes(Duration::from_secs(59)), "0h00m");
+        assert_eq!(hours_minutes(50 * MINUTE), "0h50m");
+        assert_eq!(
+            hours_minutes(26 * 60 * MINUTE + 5 * MINUTE + Duration::from_secs(59)),
+            "26h05m"
+        );
     }
 
     #[test]

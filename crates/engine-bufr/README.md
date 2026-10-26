@@ -23,7 +23,10 @@ memory, and answers EDR and Features queries from that store.
     Most SYNOP notifications carry the BUFR message inline; others are
     downloaded from the notification's link.
 - **Decoding** uses [`ds-bufr`](../ds-bufr/README.md). A file may hold
-  several messages; one that fails to decode is counted and skipped.
+  several messages; one that fails to decode is counted and skipped. A NIL
+  bulletin (the text `NIL` alone: the centre has no report to send) is
+  counted as `bufr_reports_total{result="nil"}`, not as a decode failure;
+  any other payload without BUFR magic is a `not_bufr` failure.
 - **Extraction** is by Table B descriptor, not by template, so any SYNOP or
   SHIP template works:
   - station id: the WIGOS id (`001125`–`001128`), else the block and
@@ -55,7 +58,10 @@ memory, and answers EDR and Features queries from that store.
   `data_id` produced. The last 200 000 `data_id`s are remembered.
 - **Persistence (WIS2 only)**: with `[server] state_dir` set, the store is
   saved as gzip-compressed JSON to `<state_dir>/<collection id>.bufr.state`
-  at most every five minutes when it changed, and at shutdown. A restart
+  at most every five minutes when it changed, and at shutdown. The
+  shutdown flush logs its duration and size at INFO; a large store needs a
+  container stop timeout longer than Docker's 10 s (see `state_dir` under
+  [Server Config Fields](../../README.md#server-config-fields)). A restart
   restores it under the current `retention` and `max_stations`; an
   unreadable or invalid file means a cold start. A `data_path` source
   re-reads its files instead.
@@ -172,8 +178,10 @@ curl 'localhost:8000/features/collections/obs-bufr-local/items?bbox=10,55,30,70'
   by default the shorter of `retention` and `PT24H`.
 - `/metrics`: `bufr_stations`, `bufr_reports_stored`,
   `bufr_scans_total{result}`, `bufr_files_total`,
-  `bufr_reports_total{result}`, `bufr_decode_failures_total{reason,kind}`,
-  and the shared `wis2_*` families.
+  `bufr_reports_total{result}` (`ingested`, `replaced`, `out_of_window`,
+  `skipped`, and `nil` for NIL bulletins),
+  `bufr_decode_failures_total{reason,kind}`, and the shared `wis2_*`
+  families.
 
 ## Limits
 

@@ -18,7 +18,7 @@ use ds_core::feature_pick::{FeaturePick, PickedFeature, PickedFeatures};
 use ds_core::health::{LiveStatus, WarmupCause};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::state::{
-    collection_key, StateError, StateStore, StateWriter, WriteOutcome, WritePolicy,
+    collection_key, hours_minutes, StateError, StateStore, StateWriter, WriteOutcome, WritePolicy,
 };
 use ds_render::rasterize::{fill_polygon, Combine};
 use ds_wis2::{Fetcher, Resolved, Status as Wis2Status, StatusSnapshot as Wis2StatusSnapshot};
@@ -56,18 +56,6 @@ const WIS2_DIRTY_REBUILD: Duration = Duration::from_secs(CAP_WIS2_MIN_POLL_INTER
 /// fetcher's own concurrency cap), applied in arrival order; beyond it the
 /// pipeline channel backs up and the broker queues, as before.
 const WIS2_HINT_INFLIGHT: usize = 8;
-/// WIS2 mode with a state store (#1000): a changed accumulator is
-/// snapshotted at most this often. Checked on every [`WIS2_DIRTY_REBUILD`]
-/// tick; `shutdown()` flushes the rest.
-const SNAPSHOT_WRITE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// An unchanged accumulator is rewritten at least this often — or every
-/// quarter of a shorter `warmup`, never more often than
-/// [`SNAPSHOT_WRITE_INTERVAL`] — so a restore can tell from the snapshot's
-/// `written_at` how long the server was down ([`snapshot_policy`]).
-const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
-/// A failing snapshot write (read-only or full disk) is retried every
-/// [`SNAPSHOT_WRITE_INTERVAL`] but WARNs at most this often.
-const SNAPSHOT_WARN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// What `LiveStatus::WarmingUp` counts.
 const WARMUP_ITEMS: &str = "alerts";
 
@@ -215,7 +203,11 @@ impl CapEngine {
                 let mut writer = StateWriter::new(
                     store,
                     collection_key(collection_id, persist::KIND),
-                    snapshot_policy(w.warmup),
+                    // A changed accumulator at most every five minutes,
+                    // checked on every `WIS2_DIRTY_REBUILD` tick
+                    // (`shutdown()` flushes the rest); an unchanged one
+                    // every quarter of the warm-up.
+                    WritePolicy::for_warmup(w.warmup.to_std().unwrap_or_default()),
                 );
                 restored = restore_snapshot(
                     src,
@@ -596,7 +588,7 @@ impl CapEngine {
                                 tracing::warn!("[{}] cap: rebuild failed: {e}", self.collection_id);
                             }
                         }
-                        // At most every five minutes (see `snapshot_policy`);
+                        // At most every five minutes (the write policy);
                         // a blocking store call is fine on the poll runtime,
                         // which is the only place this loop runs.
                         self.write_snapshot(false);
@@ -698,13 +690,20 @@ impl CapEngine {
     }
 
     /// Write the accumulator snapshot when its write policy says so
-    /// ([`snapshot_policy`]; `force` always writes). Never fails the caller:
-    /// a failed write keeps the previous snapshot and is logged, as a WARN
-    /// at most every [`SNAPSHOT_WARN_INTERVAL`].
-    fn write_snapshot(&self, force: bool) {
+    /// ([`WritePolicy::for_warmup`]; `force` always writes). Never fails the
+    /// caller: a failed write keeps the previous snapshot and is logged, as
+    /// a WARN at most every [`WritePolicy::WARN_INTERVAL`]. A forced write,
+    /// the shutdown flush, is logged at INFO with its duration and size: it
+    /// is what a container's stop timeout has to cover (#1043); the duration
+    /// includes waiting for a periodic write already under way.
+    ///
+    /// Returns what the write policy did, `None` without a state store (and
+    /// for directory or feed sources, which never persist).
+    fn write_snapshot(&self, force: bool) -> Option<WriteOutcome> {
         let (Some(writer), Some(src)) = (&self.snapshots, self.source.wis2()) else {
-            return;
+            return None;
         };
+        let started = Instant::now();
         let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
         let mut alerts = 0;
         let outcome = writer.write_if_due(src.revision(), Instant::now(), force, || {
@@ -713,46 +712,35 @@ impl CapEngine {
             persist::encode(&self.collection_id, state, Utc::now())
                 .map_err(|e| StateError::Encode(e.to_string()))
         });
-        match outcome {
+        let id = &self.collection_id;
+        match &outcome {
             WriteOutcome::NotDue => {}
+            WriteOutcome::Written { bytes } if force => tracing::info!(
+                "[{id}] cap/wis2: state snapshot flushed in {:.1?}: {alerts} alert(s), {bytes} \
+                 bytes to {}",
+                started.elapsed(),
+                writer.describe()
+            ),
             WriteOutcome::Written { bytes } => tracing::debug!(
-                "[{}] cap/wis2: state snapshot written: {alerts} alert(s), {bytes} bytes to {}",
-                self.collection_id,
+                "[{id}] cap/wis2: state snapshot written: {alerts} alert(s), {bytes} bytes to {}",
                 writer.describe()
             ),
             WriteOutcome::Failed { error, warn: true } => tracing::warn!(
-                "[{}] cap/wis2: cannot write state snapshot {}: {error} — the previous one \
+                "[{id}] cap/wis2: cannot write state snapshot {}: {error} — the previous one \
                  stays; retrying every {} min, this warning repeats at most every {} min",
-                self.collection_id,
                 writer.describe(),
-                SNAPSHOT_WRITE_INTERVAL.as_secs() / 60,
-                SNAPSHOT_WARN_INTERVAL.as_secs() / 60
+                WritePolicy::WRITE_INTERVAL.as_secs() / 60,
+                WritePolicy::WARN_INTERVAL.as_secs() / 60
             ),
-            WriteOutcome::Failed { error, warn: false } => tracing::debug!(
-                "[{}] cap/wis2: state snapshot write failed again: {error}",
-                self.collection_id
-            ),
+            WriteOutcome::Failed { error, warn: false } => {
+                tracing::debug!("[{id}] cap/wis2: state snapshot write failed again: {error}")
+            }
         }
+        Some(outcome)
     }
 
     fn snapshot(&self) -> arc_swap::Guard<Arc<Catalog>> {
         self.catalog.load()
-    }
-}
-
-/// The snapshot write policy of a collection with `[cap.wis2] warmup`
-/// (#1000): a changed accumulator at most every
-/// [`SNAPSHOT_WRITE_INTERVAL`], an unchanged one at least every quarter of
-/// the warm-up, clamped to [`SNAPSHOT_WRITE_INTERVAL`] ..=
-/// [`SNAPSHOT_REFRESH_INTERVAL`]. The refresh keeps `written_at` close to
-/// the server's last breath even when the feed is quiet, so the
-/// long-outage check in [`restore_snapshot`] errs by at most that much.
-fn snapshot_policy(warmup: chrono::Duration) -> WritePolicy {
-    let quarter = warmup.to_std().unwrap_or(Duration::ZERO) / 4;
-    WritePolicy {
-        min_interval: SNAPSHOT_WRITE_INTERVAL,
-        refresh_interval: quarter.clamp(SNAPSHOT_WRITE_INTERVAL, SNAPSHOT_REFRESH_INTERVAL),
-        warn_interval: SNAPSHOT_WARN_INTERVAL,
     }
 }
 
@@ -800,6 +788,8 @@ fn restore_snapshot(
     };
     let age = now - decoded.written_at;
     let long_outage = age > warmup;
+    // A snapshot from the future (clock skew) is as good as new.
+    let age_std = age.to_std().unwrap_or_default();
     if long_outage {
         decoded.state.filling_since = None;
         decoded.state.warmup_cause = WarmupCause::LongOutage;
@@ -809,17 +799,13 @@ fn restore_snapshot(
         // The store holds what was restored: no rewrite until it changes
         // or the refresh interval runs out. After a long outage the
         // restarted warm-up is not in the store yet: write it at once.
-        writer.mark_restored(
-            src.revision(),
-            age.to_std().unwrap_or(Duration::ZERO),
-            now_instant,
-        );
+        writer.mark_restored(src.revision(), age_std, now_instant);
     }
     tracing::info!(
         "[{collection_id}] cap/wis2: restored {} alert(s) from state snapshot {at} written {} \
          ago ({} expired meanwhile, {} filtered, {} hint(s) dropped by config, {} tombstone(s))",
         s.alerts,
-        hours_minutes(age),
+        hours_minutes(age_std),
         s.expired,
         s.filtered,
         s.hints_dropped,
@@ -830,16 +816,10 @@ fn restore_snapshot(
             "[{collection_id}] cap/wis2: the state snapshot is older than warmup ({}): \
              alerts published during the outage are missing until republished — the \
              warm-up restarts and /health reports degraded until it ends",
-            hours_minutes(warmup)
+            hours_minutes(warmup.to_std().unwrap_or_default())
         );
     }
     true
-}
-
-/// `26h05m` (negative ⇒ `0h00m`).
-fn hours_minutes(d: chrono::Duration) -> String {
-    let minutes = d.num_minutes().max(0);
-    format!("{}h{:02}m", minutes / 60, minutes % 60)
 }
 
 /// The network half of one WIS2 notification (hint download), paired with
@@ -1549,26 +1529,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_policy_refreshes_within_a_quarter_of_the_warmup() {
-        let policy = |iso: &str| snapshot_policy(parse_iso8601_duration(iso).unwrap());
-        assert_eq!(policy("PT24H").min_interval, SNAPSHOT_WRITE_INTERVAL);
-        assert_eq!(
-            policy("PT24H").refresh_interval,
-            SNAPSHOT_REFRESH_INTERVAL,
-            "capped at an hour"
-        );
-        assert_eq!(
-            policy("PT2H").refresh_interval,
-            Duration::from_secs(30 * 60)
-        );
-        assert_eq!(
-            policy("PT10M").refresh_interval,
-            SNAPSHOT_WRITE_INTERVAL,
-            "never more often than the write interval"
-        );
-    }
-
-    #[test]
     fn alerts_that_expired_while_down_are_not_restored() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = wis2_config(None);
@@ -1622,14 +1582,39 @@ mod tests {
         let e = CapEngine::new_with_state(&wis2_config(None), "cap-wis2", store(&blocker)).unwrap();
         push(&e, "a", Utc::now());
         e.refresh().unwrap();
+        // Every write is attempted and fails, the first one WARNs, and the
+        // engine serves on. The outcomes are checked, so a write that was
+        // never attempted fails the test (#1043).
+        assert!(matches!(
+            e.write_snapshot(false),
+            Some(WriteOutcome::Failed {
+                error: StateError::Io(_),
+                warn: true
+            })
+        ));
+        // The retry waits for the write interval; the shutdown flush does
+        // not, and fails without a second warning.
+        assert!(matches!(
+            e.write_snapshot(false),
+            Some(WriteOutcome::NotDue)
+        ));
+        assert!(matches!(
+            e.write_snapshot(true),
+            Some(WriteOutcome::Failed {
+                error: StateError::Io(_),
+                warn: false
+            })
+        ));
         e.shutdown();
         assert_eq!(e.feature_count(), 1);
+        assert!(blocker.is_file());
         // Directory/feed sources ignore state_dir entirely.
         let cfg: CapConfig = serde_json::from_value(serde_json::json!({
             "data_path": concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")
         }))
         .unwrap();
         let local = CapEngine::new_with_state(&cfg, "local", store(dir.path())).unwrap();
+        assert!(local.write_snapshot(true).is_none());
         local.shutdown();
         assert!(!dir.path().join("local.cap.state").exists());
     }

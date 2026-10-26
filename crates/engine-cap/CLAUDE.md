@@ -180,9 +180,10 @@ memory. Things that differ from the pull sources:
   `filling_since` and the warm-up cause; the `data_id` index is rebuilt.
   Written on the poll runtime from the 5 s rebuild tick when the source's
   `revision` moved (every ingest, deletion and eviction bumps it), at most
-  every five minutes (`SNAPSHOT_WRITE_INTERVAL`); an unchanged accumulator
-  is rewritten every quarter of `warmup`, 5 min–1 h
-  (`snapshot_policy`), so `written_at` tracks when the server was last
+  every five minutes; an unchanged accumulator is rewritten every
+  quarter of `warmup`, 5 min–1 h (`ds_core::state::WritePolicy::for_warmup`,
+  shared with engine-bufr; the shutdown flush logs its duration and size at
+  INFO), so `written_at` tracks when the server was last
   alive; and `shutdown()` always flushes it. `shutdown()` seals the
   accumulator first (`Wis2CapSource::seal`, set under the accumulator
   lock, which `apply_with_hint` and `delete` hold while they check it), so
