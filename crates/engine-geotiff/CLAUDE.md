@@ -182,7 +182,7 @@ engine-zarr.
   generation (`RemoteTileInfo::generation`) is unique per header read, so an
   object republished under its path and read again never meets the tiles of
   the bytes it replaced (#1055).
-- **Rendered image cache** (default 256 MB, `[wms] rendered_cache_mb`) shared
+- **Rendered image cache** (default 256 MB, `[server] rendered_cache_mb`) shared
   across WMS/Maps/Tiles; see `crates/api-wms/CLAUDE.md`.
 - **Decoded-chunk cache (#463, #468):** process-global byte-bounded LRU of
   *decoded* native source tiles for local files **and** remote COGs

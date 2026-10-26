@@ -149,12 +149,16 @@ error images never are. Measured on a day of a live deployment's GetMaps
   of them at any size, against ~2 300 for inserting all at 256 MB: most
   repeating URLs come exactly twice, and `quick_cache` already evicts
   never-read entries first. A snapped TIME needs the first render cached too.
-- **Size.** 256 MB, the default (`ds_core::config::DEFAULT_RENDERED_CACHE_MB`),
+- **Size.** `[server] rendered_cache_mb`; 256 MB, the default (`ds_core::config::DEFAULT_RENDERED_CACHE_MB`),
   holds roughly 25 minutes of that traffic's renders. The replay of exact
   repeats gained nothing at 512 MB; about 1 hit in 8 reuses an older image,
   so halving from 512 MB costs at most that share. A miss on a meta-tiled
   view usually costs assembly and encoding (~40 ms), not an engine read:
   give spare memory to `metatile_cache_mb`.
+  The deprecated per-collection `[wms] rendered_cache_mb` counts only while
+  the `[server]` key is unset: the largest value among WMS/Maps/Tiles
+  collections wins (`ds_core::config::select_rendered_cache_mb`, #1028);
+  never pick "the first block found".
 - **Hot allocation.** The same replay with `quick_cache`'s hot ring lowered
   from its 0.97 default (`ByteBoundedCache::new_with_hot_allocation`): at
   256 MB, 0.5 and 0.25 stayed near the default's ~2 300 hits; at 512 MB,

@@ -422,10 +422,11 @@ only in the server log.
   resolved style, format and quality, CRS, box, size, time, parameter,
   level, run, content version and background. One server-wide cache, shared
   with Maps and Tiles, without TTL; a reload evicts a changed collection's
-  entries. Its size is `rendered_cache_mb` in `[collections.wms]`, default
-  256 (MB), read from one collection's block: a block that omits it counts
-  as 256, so set the same value in every `[collections.wms]` block. Empty
-  and error images and multi-layer images are never cached.
+  entries. Its size is `[server] rendered_cache_mb`, default 256 (MB);
+  `0` disables it. While that is unset, the deprecated `rendered_cache_mb`
+  in `[collections.wms]` still sizes it: the largest value among the WMS,
+  Maps and Tiles collections, with a warning. Empty and error images and
+  multi-layer images are never cached.
 - **Meta-tiles.** Decoded 256 × 256 RGBA tiles for the projected CRSs,
   without background, so opaque and transparent views share them.
   `[server] metatile_cache_mb`, default 1024; `0` turns meta-tiling off and
@@ -498,10 +499,11 @@ max = 70.0
 `[collections.wms]` is optional. Its other fields are `color_stops`,
 `[[collections.wms.parameters]]` (per-parameter defaults), `style_bundle`,
 `parameter_defaults = false` (turns off the built-in per-parameter styles)
-and `rendered_cache_mb`. Without a colormap, a parameter layer, and a
-collection layer drawing one parameter, take the built-in default style
-that parameter's name and unit select; a layer no default matches gets a
-generic fallback palette. Palettes, bundles and style rules are
+and the deprecated `rendered_cache_mb`, now `[server] rendered_cache_mb`.
+Without a colormap, a parameter layer, and a collection layer drawing one
+parameter, take the built-in default style that parameter's name and unit
+select; a layer no default matches gets a generic fallback palette.
+Palettes, bundles and style rules are
 documented in the root README's
 [Styling](../../README.md#styling-shared-with-maps-and-tiles) section.
 

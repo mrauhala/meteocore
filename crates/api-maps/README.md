@@ -179,7 +179,7 @@ runs offline on a fixture in `testdata/`. Server-wide settings for Maps:
 | `MC_RENDER_QUEUE_CAPACITY` | 3 × render slots | Renders that may wait for admission; past it a 503 at once |
 | `MC_RENDER_MEMORY_MB` | 1024 | Output-memory budget: 32 bytes per output pixel, 16 more per extra composite band |
 | `MC_RENDER_TIMEOUT_MS` | 3000 | Queue and render deadline |
-| `[wms] rendered_cache_mb` | 256 | Size of the one rendered-image cache shared by WMS, Maps and Tiles; read from one collection's `[wms]` block, so give every block the same value |
+| `[server] rendered_cache_mb` | 256 | Size of the one rendered-image cache shared by WMS, Maps and Tiles; `0` disables it. Unset, the deprecated `[wms] rendered_cache_mb` sizes it: the largest value among the WMS, Maps and Tiles collections |
 
 ## Limits
 
