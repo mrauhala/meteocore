@@ -14,20 +14,28 @@ ds-cache = { path = "../ds-cache" }
 ds-executor = { path = "../ds-executor" }
 bytes = "1"
 flate2 = "1"
-zstd = { version = "0.13", default-features = false, features = ["experimental"] }
+# The bounded decode in `codec_limits` and engine-zarr's own `zstd` codec
+# plugin. `experimental` bounds frames that do not record their size
+# (`Decompressor::upper_bound`). 0.14.3 is the first release past the zstd
+# 0.13 advisories (RUSTSEC-2026-0391, 0395 to 0406).
+zstd = { version = "0.14.3", default-features = false, features = ["experimental"] }
+# Registers the `zstd` codec plugin with zarrs' compile-time registry.
+inventory = "0.3"
 async-trait = { version = "0.1", optional = true }
 rayon = "1"
 # Borrow one output view at a time for serial zarrs decode-into calls.
 unsafe_cell_slice = "0.2"
 futures = { version = "0.3", optional = true }
-# Zarr V2/V3 format + codec pipeline (blosc/zstd/gzip/crc32c/sharding/transpose).
+# Zarr V2/V3 format + codec pipeline (blosc/gzip/crc32c/sharding/transpose).
 # `filesystem` gives the local-directory store used for the Phase-1 backend;
 # `ndarray` is the multi-dimensional element view used to slice chunks.
+# NEVER enable zarrs' `zstd` feature: it pins the zstd 0.13 line (unpatched
+# RustSec advisories) and would register a second, unbounded `zstd` codec.
+# engine-zarr registers its own (`codec_limits/zstd_codec.rs`).
 zarrs = { version = "0.23", default-features = false, features = [
     "filesystem",
     "ndarray",
     "blosc",
-    "zstd",
     "gzip",
     "crc32c",
     "sharding",

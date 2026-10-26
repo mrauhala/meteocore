@@ -34,13 +34,24 @@ pool: they do not use the Icechunk runtime bridge.
 ## Architecture
 
 - The Zarr format + codec pipeline is handled by the `zarrs` crate
-  (blosc/zstd/gzip/crc32c/sharding/transpose + filesystem + ndarray). This
+  (blosc/gzip/crc32c/sharding/transpose + filesystem + ndarray; zstd is
+  ours, below). This
   engine adds CF semantics, the OGC domain mapping, the storage bridge,
   and the poll-and-swap lifecycle. `codec_limits` bounds gzip/zstd/Blosc decoding
   for numeric variable arrays: cap output by the codec representation, retain
   upstream metadata/encoding and actual sharding codecs for partial reads.
   Recurse through inner/index chains; preserve V2 chunk keys and transposes.
   blosc/zstd build from C via `cmake`+`cc`.
+- **zstd is ours.** zarrs' `zstd` feature stays OFF: it pins the zstd 0.13
+  line (RUSTSEC-2026-0391, 0395–0406) and would register a second, unbounded
+  `zstd` codec. `codec_limits/zstd_codec.rs` registers engine-zarr's own
+  V2/V3 `zstd` plugin through `inventory`; its metadata, encoder and
+  capabilities match zarrs 0.23's, and its `decode` is the same bounded
+  `decode_zstd` path `BoundedCodec` (`Kind::Zstd`) runs.
+  `exactly_one_zstd_plugin_is_registered_for_each_zarr_version` guards it.
+  zstd 0.13 stays in Cargo.lock only through the wasm32-only `blusc` and is
+  ignored in `.cargo/audit.toml` (#1294); remove those ignores once
+  zarrs/blusc move to zstd ≥ 0.14.3.
 - **Plain storage = ds-storage:** `src/store.rs` `DsStore`
   implements zarrs' `ReadableStorageTraits` + `ListableStorageTraits` over
   `ds_storage::DataStore`, with a `ds-cache` byte-bounded LRU of full object
