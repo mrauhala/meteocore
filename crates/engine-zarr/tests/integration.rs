@@ -364,6 +364,75 @@ fn area_query_budgets_the_native_read() {
     assert_eq!(qr.ranges["t"].shape, vec![100, 100]);
 }
 
+/// engine-zarr registers its own `zstd` codec; zarrs' `zstd` feature is off.
+/// A V3 array whose codecs name `zstd`, as zarr-python writes it, with a
+/// frame from the zstd library rather than the engine's encoder, opens and
+/// reads through the engine. Without the plugin the name is unknown and the
+/// variable cannot be opened.
+#[test]
+fn zstd_v3_store_opens_and_decodes_through_the_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    write_grid_store(dir.path(), &[52.0, 51.0], &[10.0, 11.0], &[]);
+    let metadata = serde_json::json!({
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [1, 2, 2],
+        "data_type": "float32",
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 2, 2]}},
+        "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+        "fill_value": "NaN",
+        "codecs": [
+            {"name": "bytes", "configuration": {"endian": "little"}},
+            {"name": "zstd", "configuration": {"level": 3, "checksum": true}}
+        ],
+        "attributes": {"units": "K", "long_name": "2 metre temperature"},
+        "dimension_names": ["time", "lat", "lon"]
+    });
+    let array = dir.path().join("t2m");
+    std::fs::create_dir_all(array.join("c/0/0")).unwrap();
+    std::fs::write(
+        array.join("zarr.json"),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
+    // Rows are latitudes 52, 51; columns longitudes 10, 11.
+    let kelvin = [280.0f32, 281.0, 282.0, 283.0];
+    let raw: Vec<u8> = kelvin.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut compressor = zstd::bulk::Compressor::new(3).unwrap();
+    compressor.include_checksum(true).unwrap();
+    std::fs::write(array.join("c/0/0/0"), compressor.compress(&raw).unwrap()).unwrap();
+
+    let cfg = ZarrConfig {
+        data_path: Some(dir.path().to_string_lossy().into_owned()),
+        ..config(None)
+    };
+    let e = ZarrEngine::new("zstd", &cfg).expect("open a zstd store");
+    assert_eq!(e.get_parameters(), ["t2m"]);
+    for (point, expected) in [
+        ("POINT(10 52)", celsius(280.0)),
+        ("POINT(11 51)", celsius(283.0)),
+        ("POINT(10.5 51.5)", celsius(281.5)),
+    ] {
+        let qr = single(e.query_position(point, None, None, None, None).unwrap());
+        let v = qr.ranges["t2m"].values[0].unwrap();
+        assert!(
+            (v - expected).abs() < 1e-4,
+            "{point} = {v}, expected {expected}"
+        );
+    }
+    // The box covers the four cells, not just their centres.
+    let qr = single(
+        e.query_area("9.5,50.5,11.5,52.5", None, None, None, None)
+            .unwrap(),
+    );
+    let nd = &qr.ranges["t2m"];
+    assert_eq!(nd.shape, vec![2, 2]);
+    for (v, k) in nd.values.iter().zip(kelvin) {
+        let v = v.expect("an area cell is null");
+        assert!((v - celsius(f64::from(k))).abs() < 1e-4, "{v} vs {k} K");
+    }
+}
+
 /// Review on #674: an antimeridian-crossing area bbox used to produce an
 /// all-null 200 because the store window needs min ≤ max. It is now read
 /// as one window per side of the seam.
