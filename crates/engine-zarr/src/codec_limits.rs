@@ -1,7 +1,9 @@
 //! Bound compressed output by the codec chain's decoded representation.
 //!
-//! zarrs 0.23 ignores that representation in gzip/zstd/Blosc decoders. Keep
-//! its metadata, encoding and shard machinery, bounding decompression.
+//! zarrs 0.23 ignores that representation in gzip/Blosc decoders. Keep its
+//! metadata, encoding and shard machinery, bounding decompression. The zstd
+//! codec is this crate's own plugin ([`ZstdCodec`]); zarrs' `zstd` feature
+//! stays off because it pins the zstd 0.13 line.
 use std::{borrow::Cow, io::Read, sync::Arc};
 
 use ds_core::{deadline, error::DataServerError};
@@ -13,7 +15,7 @@ use zarrs::{
                 CodecMetadataOptions, CodecOptions, CodecPartialDefault, CodecTraits,
                 PartialDecoderCapability, PartialEncoderCapability, RecommendedConcurrency,
             },
-            BloscCodec, CodecChain, GzipCodec, ShardingCodec, ZstdCodec,
+            BloscCodec, CodecChain, GzipCodec, ShardingCodec,
         },
         Array, ArrayBytesRaw, BytesRepresentation,
     },
@@ -26,6 +28,9 @@ use crate::store::EngineStore;
 
 mod blosc;
 pub(crate) mod headroom;
+mod zstd_codec;
+
+pub(crate) use zstd_codec::ZstdCodec;
 
 pub(crate) fn bounded_array(
     array: Array<EngineStore>,
@@ -78,6 +83,8 @@ fn bounded_chain(chain: &CodecChain) -> Result<Option<CodecChain>, CodecError> {
             let kind = if codec.as_any().is::<GzipCodec>() {
                 Kind::Gzip
             } else if codec.as_any().is::<ZstdCodec>() {
+                // Ours decodes bounded already; wrapping keeps one bounded
+                // codec type per compressed step, as for gzip and Blosc.
                 Kind::Zstd
             } else if codec.as_any().is::<BloscCodec>() {
                 Kind::Blosc
@@ -172,53 +179,30 @@ impl BytesToBytesCodecTraits for BoundedCodec {
         representation: &BytesRepresentation,
         options: &CodecOptions,
     ) -> Result<ArrayBytesRaw<'a>, CodecError> {
-        check_deadline()?;
-        let limit = representation.size().ok_or_else(|| {
-            CodecError::Other("compressed decoding requires a bounded representation".into())
-        })?;
-        let limit = usize::try_from(limit).map_err(|_| exhausted())?;
-        let intermediate = matches!(representation, BytesRepresentation::BoundedSize(_));
-        let output = match self.kind {
-            Kind::Blosc => {
-                let _frame = blosc::validate_and_admit(
-                    &bytes,
-                    representation,
-                    false,
-                    crate::encoded::current().as_ref(),
-                )?;
-                self.inner
-                    .decode(bytes, representation, options)?
-                    .into_owned()
+        bounded(bytes, representation, |bytes, limit, intermediate| {
+            match self.kind {
+                Kind::Blosc => {
+                    let _frame = blosc::validate_and_admit(
+                        &bytes,
+                        representation,
+                        false,
+                        crate::encoded::current().as_ref(),
+                    )?;
+                    Ok(self
+                        .inner
+                        .decode(bytes, representation, options)?
+                        .into_owned())
+                }
+                Kind::Gzip => {
+                    // Keep the upstream single-member gzip semantics. Probe EOF
+                    // after filling the destination to validate trailers/checksums
+                    // and detect excess output without growing past the limit.
+                    let decoder = flate2::bufread::GzDecoder::new(bytes.as_ref());
+                    read_bounded(decoder, limit, intermediate)
+                }
+                Kind::Zstd => decode_zstd(&bytes, limit, intermediate),
             }
-            Kind::Gzip => {
-                // Keep the upstream single-member gzip semantics. Probe EOF
-                // after filling the destination to validate trailers/checksums
-                // and detect excess output without growing past the limit.
-                let decoder = flate2::bufread::GzDecoder::new(bytes.as_ref());
-                read_bounded(decoder, limit, intermediate)?
-            }
-            Kind::Zstd => {
-                // Single-pass decoding never allocates the frame-sized history
-                // window used by streaming zstd. Treat frame headers as hints
-                // bounded by the independently computed codec representation.
-                let capacity = zstd::bulk::Decompressor::upper_bound(&bytes)
-                    .unwrap_or(limit)
-                    .min(limit);
-                let mut output = Vec::new();
-                grow(&mut output, capacity, intermediate)?;
-                let length = zstd::bulk::Decompressor::new()?
-                    .decompress_to_buffer(&bytes, output.as_mut_slice())?;
-                output.truncate(length);
-                output
-            }
-        };
-        check_deadline()?;
-        if matches!(representation, BytesRepresentation::FixedSize(_)) && output.len() != limit {
-            return Err(CodecError::Other(
-                "decoded payload does not match its fixed size".into(),
-            ));
-        }
-        Ok(Cow::Owned(output))
+        })
     }
 
     fn partial_decoder(
@@ -266,6 +250,47 @@ impl BytesToBytesCodecTraits for BoundedCodec {
             )))
         }
     }
+}
+
+/// The checks around every bounded decode: the deadline before and after, a
+/// size from the codec representation as the output limit, and an exact
+/// length for fixed-size outputs. `decode` gets the limit and whether the
+/// output is an intermediate (bounded, admitted as it grows) rather than the
+/// native workspace read_budget already admitted.
+fn bounded<'a>(
+    bytes: ArrayBytesRaw<'a>,
+    representation: &BytesRepresentation,
+    decode: impl FnOnce(ArrayBytesRaw<'a>, usize, bool) -> Result<Vec<u8>, CodecError>,
+) -> Result<ArrayBytesRaw<'a>, CodecError> {
+    check_deadline()?;
+    let limit = representation.size().ok_or_else(|| {
+        CodecError::Other("compressed decoding requires a bounded representation".into())
+    })?;
+    let limit = usize::try_from(limit).map_err(|_| exhausted())?;
+    let intermediate = matches!(representation, BytesRepresentation::BoundedSize(_));
+    let output = decode(bytes, limit, intermediate)?;
+    check_deadline()?;
+    if matches!(representation, BytesRepresentation::FixedSize(_)) && output.len() != limit {
+        return Err(CodecError::Other(
+            "decoded payload does not match its fixed size".into(),
+        ));
+    }
+    Ok(Cow::Owned(output))
+}
+
+/// Single-pass decoding never allocates the frame-sized history window used
+/// by streaming zstd. Treat frame headers as hints bounded by the
+/// independently computed codec representation.
+fn decode_zstd(bytes: &[u8], limit: usize, intermediate: bool) -> Result<Vec<u8>, CodecError> {
+    let capacity = zstd::bulk::Decompressor::upper_bound(bytes)
+        .unwrap_or(limit)
+        .min(limit);
+    let mut output = Vec::new();
+    grow(&mut output, capacity, intermediate)?;
+    let length =
+        zstd::bulk::Decompressor::new()?.decompress_to_buffer(bytes, output.as_mut_slice())?;
+    output.truncate(length);
+    Ok(output)
 }
 
 fn grow(output: &mut Vec<u8>, length: usize, intermediate: bool) -> Result<(), CodecError> {
