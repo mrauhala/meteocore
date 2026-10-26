@@ -249,7 +249,7 @@ api-tiles vector-tile cache key.
 
 | Engine | Feature | `bbox` | `datetime` | `sortby` | Property filters | Spatial / temporal extent | `data_version` |
 |---|---|---|---|---|---|---|---|
-| CSV | one station (Point), in first-observation order | point inside the box | stations with an observation in the interval | 400 | `name`, `latitude`, `longitude` | – / first to last observation | 0 (static) |
+| CSV | one station (Point), in first-observation order | point inside the box | stations with an observation in the interval | 400 | `name`, `latitude`, `longitude` | bounding box of every row / first to last observation | 0 (static) |
 | GeoJSON | each feature of the file | geometry intersects the box | 400: no time dimension | 400 | every property name in the loaded file | yes / – | the file's modification time |
 | CAP | one alert area (Polygon, MultiPolygon or null) | area's bounding box intersects the box; null geometry excluded | alert active window intersects the interval | 400 | the standard CAP alert, info and area properties and derived ones (always), plus producer parameter and `eventCode:` names from loaded alerts | yes / earliest window start to latest window end, extended to the catalog time; none when every window is open | changes with the alert set |
 | PostGIS stations | one station (Point) from the cached station list | point inside the box | 400: no time dimension | 400 | configured `stations.property_cols` (always), plus names the loaded rows carry | yes / – | changes per metadata refresh |
@@ -380,4 +380,4 @@ Shared code paths have tests elsewhere: run `cargo test -p api-edr --test
 items_tests` for EDR `items`, `cargo test -p server --test
 common_discovery` for the shared root and collection discovery, and
 `cargo test -p server --test station_grid_features` for a station grid's
-residuals over HTTP.
+residuals and a CSV station collection's extent over HTTP.

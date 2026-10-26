@@ -22,7 +22,8 @@ pub struct CsvEngine {
     /// history must not be scanned or turned into Features on each page request.
     stations: Vec<Feature>,
     /// The EDR location inventory in first-observation order, built once:
-    /// `get_locations` hands every request this `Arc` (#1083).
+    /// `get_locations` hands every request this `Arc` (#1083), and an area
+    /// query tests its positions instead of scanning the rows (#1262).
     pub(crate) locations: Arc<LocationSnapshot>,
     /// First and last observation time, computed once: the EDR and Features
     /// temporal extents are read per request (Critical Rule 10, #1249).
@@ -344,19 +345,15 @@ impl EdrEngine for CsvEngine {
         let polygon = parse_area_coords(coords)?;
         let param_names = self.selected_parameters(parameters)?;
 
-        // Find unique locations within the polygon
-        let mut seen = HashMap::new();
-        let mut matching_locations = Vec::new();
-
-        for row in &self.store.rows {
-            if seen.contains_key(&row.location) {
-                continue;
-            }
-            seen.insert(&row.location, true);
-            if polygon.contains(row.longitude, row.latitude) {
-                matching_locations.push(row.location.clone());
-            }
-        }
+        // The stations inside the polygon, from the load-time inventory: in
+        // first-observation order, each at its first row's position, as a
+        // scan of the rows would find them, without reading a row (#1262).
+        let matching_locations: Vec<&str> = self
+            .locations
+            .iter()
+            .filter(|location| polygon.contains(location.longitude, location.latitude))
+            .map(|location| location.id.as_str())
+            .collect();
 
         if matching_locations.is_empty() {
             return Err(DataServerError::LocationNotFound(
@@ -376,7 +373,7 @@ impl EdrEngine for CsvEngine {
         // station without a row then is left out, not a 404 for all of them
         // (EDR 1.2 /req/edr/REQ_rc-within-response A), as in engine-bufr.
         let mut coverages = Vec::with_capacity(matching_locations.len());
-        for loc_id in &matching_locations {
+        for loc_id in matching_locations {
             coverages.extend(self.location_series(loc_id, datetime, &param_names)?);
         }
         if coverages.is_empty() {
@@ -398,6 +395,13 @@ impl FeatureEngine for CsvEngine {
     /// stations to those with a row inside it (#682).
     fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         self.time_extent
+    }
+
+    /// The bounding box of every row's coordinates, the load-time snapshot
+    /// EDR and the map layers report too: read per request by collection
+    /// metadata and search (#1262).
+    fn spatial_extent(&self) -> Option<[f64; 4]> {
+        self.spatial_extent
     }
 
     fn filterables(&self) -> ds_core::feature::FilterableProperties {
@@ -881,7 +885,7 @@ mod tests {
 
     /// The temporal and spatial extents are the rows' minima and maxima,
     /// computed once at load and served from that snapshot, never by a scan
-    /// per request (#1249, #27).
+    /// per request (#1249, #27, #1262).
     #[test]
     fn extents_are_the_row_bounds_computed_once() {
         use ds_core::map_engine::MapEngine as _;
@@ -901,6 +905,8 @@ mod tests {
             assert_eq!(engine.get_temporal_extent(), time_span);
             assert_eq!(engine.temporal_extent(), time_span);
             assert_eq!(engine.get_spatial_extent(), Some(bbox));
+            // Features serves the same box (#1262).
+            assert_eq!(engine.spatial_extent(), Some(bbox));
             assert_eq!(engine.raster_info_shared().spatial_extent, Some(bbox));
         };
         check(&engine);
@@ -920,6 +926,7 @@ mod tests {
         assert_eq!(empty.get_temporal_extent(), None);
         assert_eq!(empty.temporal_extent(), None);
         assert_eq!(empty.get_spatial_extent(), None);
+        assert_eq!(empty.spatial_extent(), None);
     }
 
     /// The x of every coverage, in answer order.
@@ -982,6 +989,135 @@ mod tests {
         assert!(matches!(
             engine.query_location("beta", Some((at("2026-01-01T01:00:00Z"), at("2026-01-01T01:00:00Z"))), None, None, None),
             Err(DataServerError::LocationNotFound(m)) if m.contains("no data in time range")
+        ));
+    }
+
+    /// One coverage of an area answer: where it sits, its time axis and
+    /// the values of the fixture's two parameters.
+    #[derive(Debug, PartialEq)]
+    struct Series {
+        x: f64,
+        y: f64,
+        t: Vec<DateTime<Utc>>,
+        temperature: Vec<Option<f64>>,
+        humidity: Vec<Option<f64>>,
+    }
+
+    fn area_series(response: CoverageResponse) -> Vec<Series> {
+        let CoverageResponse::Collection(coverages) = response else {
+            panic!("an area query answers a collection");
+        };
+        coverages
+            .into_iter()
+            .map(|c| {
+                let DomainDescription::PointSeries {
+                    x,
+                    y,
+                    ref t,
+                    z: None,
+                } = c.domain
+                else {
+                    panic!("expected a PointSeries without z: {:?}", c.domain);
+                };
+                assert_eq!(c.ranges.len(), 2);
+                Series {
+                    x,
+                    y,
+                    t: t.clone(),
+                    temperature: c.ranges["temperature"].values.clone(),
+                    humidity: c.ranges["humidity"].values.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// An area answers the stations whose first row lies inside it, in the
+    /// order they first appear in the file, each with its whole series
+    /// (#1262). `tests/fixtures/area_stations.csv` interleaves six
+    /// stations: `kappa`, `alpha` and `leaver` start inside the polygon;
+    /// `north` and `west` lie outside; `drifter` starts outside and moves
+    /// inside, `leaver` starts inside and moves outside. The expected
+    /// series are what the row scan before #1262 answered.
+    #[test]
+    fn area_answers_first_row_stations_in_first_observation_order() {
+        let engine = CsvEngine::new(
+            CsvDataStore::load(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/area_stations.csv"
+            ))
+            .unwrap(),
+        );
+        let at = |hour: u32| {
+            format!("2026-01-01T{hour:02}:00:00Z")
+                .parse::<DateTime<Utc>>()
+                .unwrap()
+        };
+        let area = |coords: &str, datetime| engine.query_area(coords, datetime, None, None, None);
+        let polygon = "POLYGON((23 59,27 59,27 62,23 62,23 59))";
+
+        assert_eq!(
+            area_series(area(polygon, None).unwrap()),
+            [
+                Series {
+                    x: 24.5,
+                    y: 60.5,
+                    t: vec![at(0), at(1), at(2)],
+                    temperature: vec![Some(1.0), Some(3.0), Some(5.0)],
+                    humidity: vec![Some(80.0), Some(81.0), None],
+                },
+                Series {
+                    x: 26.0,
+                    y: 61.0,
+                    t: vec![at(0), at(2)],
+                    temperature: vec![Some(2.0), Some(4.0)],
+                    humidity: vec![None, Some(85.0)],
+                },
+                Series {
+                    x: 25.5,
+                    y: 61.5,
+                    t: vec![at(0), at(1)],
+                    temperature: vec![Some(8.0), Some(12.0)],
+                    humidity: vec![Some(60.0), Some(61.0)],
+                },
+            ]
+        );
+        // In a window the same stations, those without a row in it left out.
+        assert_eq!(
+            area_series(area(polygon, Some((at(2), at(2)))).unwrap()),
+            [
+                Series {
+                    x: 24.5,
+                    y: 60.5,
+                    t: vec![at(2)],
+                    temperature: vec![Some(5.0)],
+                    humidity: vec![None],
+                },
+                Series {
+                    x: 26.0,
+                    y: 61.0,
+                    t: vec![at(2)],
+                    temperature: vec![Some(4.0)],
+                    humidity: vec![Some(85.0)],
+                },
+            ]
+        );
+        // The later positions of `drifter` (25, 60) and `leaver` (30, 70)
+        // match no station, as a polygon, a bbox or a radius.
+        for coords in [
+            "POLYGON((24.8 59.5,30.5 59.5,30.5 60.2,24.8 60.2,24.8 59.5))",
+            "29,69,31,71",
+        ] {
+            assert!(
+                matches!(
+                    area(coords, None),
+                    Err(DataServerError::LocationNotFound(_))
+                ),
+                "{coords}"
+            );
+        }
+        assert!(matches!(
+            engine.query_radius("POINT(25 60)", 20_000.0, None, None, None, None),
+            Err(DataServerError::LocationNotFound(_))
         ));
     }
 
