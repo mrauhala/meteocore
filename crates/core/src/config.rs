@@ -3132,9 +3132,10 @@ pub struct GribConfig {
     /// Default: 0 (disabled). Shared by every level collection of this source.
     #[serde(default)]
     pub message_cache_mb: u64,
-    /// CCSDS point-index cache in MiB (#1300): position queries on
-    /// template 5.42 fields decode only the blocks their points need.
-    /// Default: 16. `0` disables that path; every field is decoded in full.
+    /// Point-index cache in MiB, one shard: position queries on CCSDS
+    /// (5.42, #1300) and complex-packed (5.3, #1302) fields decode only the
+    /// blocks or rows their points need. Default: 16. `0` disables that
+    /// path; every field is decoded in full.
     #[serde(default = "default_point_index_cache_mb")]
     pub point_index_cache_mb: u64,
     /// Model run hours to poll. Default: all (00, 06, 12, 18)
