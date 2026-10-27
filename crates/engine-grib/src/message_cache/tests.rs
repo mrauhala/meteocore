@@ -333,7 +333,8 @@ fn sample(engine: &GribEngine, coords: &str) -> Vec<Option<f64>> {
 fn changed_coordinates_and_apis_reuse_messages_when_decoded_grids_do_not_fit() {
     let expected = reader::decode_message(ECMWF, "q").unwrap();
     // The full decode, and the CCSDS point path (#1300), which loads no grid
-    // and so counts no grid-cache miss.
+    // and so counts no grid-cache miss, and without a message cache fetches
+    // only the RSIs of messages it has indexed (#1301).
     for (message_mb, index_mb) in [(0, 0), (4, 0), (0, 16), (4, 16)] {
         // One global decoded field is already larger than this grid cache.
         let (_source, owner, observed) = forecast(6, 1, message_mb, index_mb, Duration::ZERO);
@@ -350,7 +351,18 @@ fn changed_coordinates_and_apis_reuse_messages_when_decoded_grids_do_not_fit() {
             engine.message_cache_metrics()
         );
         let downloads = if message_mb == 0 { 12 } else { 6 };
-        assert_eq!(owner.storage_bytes_read(), downloads * ECMWF.len() as u64);
+        let read = owner.storage_bytes_read();
+        let message = ECMWF.len() as u64;
+        if message_mb == 0 && index_mb > 0 {
+            // Without a message cache the second coordinate fetches only the
+            // RSIs it needs, one range GET per field (#1301).
+            assert!(
+                read > 6 * message && read < 6 * message + 6 * 16384,
+                "{read}"
+            );
+        } else {
+            assert_eq!(read, downloads * message);
+        }
         assert_eq!(
             observed
                 .reads

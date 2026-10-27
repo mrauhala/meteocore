@@ -1237,6 +1237,31 @@ static GRIB_POINT_FIELDS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     REGISTRY.register(Box::new(counter.clone())).unwrap();
     counter
 });
+static GRIB_POINT_FETCHES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "grib_point_fetches_total",
+            "GRIB position-query GETs by mode: whole messages, prefixes of unindexed \
+             CCSDS messages, ranges of indexed blocks, continuations of short reads",
+        ),
+        &["collection", "mode"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+static GRIB_POINT_FETCH_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "grib_point_fetch_bytes_total",
+            "Bytes GRIB position queries fetched by mode, as grib_point_fetches_total",
+        ),
+        &["collection", "mode"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
 static ZARR_DECODED_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
     CollectionCacheMetricSet::new("zarr_decoded_cache", "Zarr decoded chunk cache")
 });
@@ -1340,6 +1365,9 @@ struct CacheCounterState {
     /// GRIB position fields `(partial, full)` per source (#1300), same
     /// reload-rebaseline scheme.
     grib_point_fields: HashMap<String, (u64, u64)>,
+    /// GRIB point-path `(GETs, bytes)` per mode, per source (#1301), same
+    /// reload-rebaseline scheme.
+    grib_point_fetches: HashMap<String, [(u64, u64); 4]>,
     zarr_decoded: HashMap<String, (u64, u64)>,
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
@@ -7462,6 +7490,30 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
                 }
             }
             *previous = fields;
+            let fetches = engine.point_fetch_counts();
+            let previous = counter_state
+                .grib_point_fetches
+                .entry(collection.to_owned())
+                .or_default();
+            let advanced = fetches.iter().zip(previous.iter()).all(
+                |(&(_, gets, bytes), &(was_gets, was_bytes))| {
+                    gets >= was_gets && bytes >= was_bytes
+                },
+            );
+            if advanced {
+                for (&(mode, gets, bytes), &(was_gets, was_bytes)) in
+                    fetches.iter().zip(previous.iter())
+                {
+                    // Always touched, so every series exists before traffic.
+                    GRIB_POINT_FETCHES
+                        .with_label_values(&[collection, mode])
+                        .inc_by(gets - was_gets);
+                    GRIB_POINT_FETCH_BYTES
+                        .with_label_values(&[collection, mode])
+                        .inc_by(bytes - was_bytes);
+                }
+            }
+            *previous = fetches.map(|(_, gets, bytes)| (gets, bytes));
             let (hits, misses) = engine.grid_cache_stats();
             let entry = counter_state
                 .grid

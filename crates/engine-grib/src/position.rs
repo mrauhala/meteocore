@@ -1,6 +1,7 @@
 //! Sample every requested coordinate while each forecast field is resident.
 
 use super::*;
+use crate::point_index::PointField;
 #[cfg(test)]
 use crate::runtime::run_fetches;
 use crate::runtime::run_field_jobs;
@@ -58,7 +59,8 @@ impl GribEngine {
             source: self.source.clone(),
         });
         let mut values: Vec<HashMap<String, Vec<Option<f64>>>> = vec![HashMap::new(); coords.len()];
-        let samples = worker.sample_parameters(&params, &steps, &level_keys, &coords)?;
+        let samples =
+            worker.sample_parameters(run.reference_time, &params, &steps, &level_keys, &coords)?;
         for (name, samples) in params.iter().zip(samples) {
             for (point, samples) in values.iter_mut().zip(samples) {
                 point.insert(name.clone(), samples);
@@ -215,10 +217,11 @@ impl GribEngine {
     /// the time/level axes, and cache size does not affect reuse across
     /// coordinates within this request. Every parameter's fields go through
     /// one scheduler run, under one [`FieldPlan`] for the whole query
-    /// (#1297): its concurrency, and whether the decoded-grid cache can
-    /// hold all of them.
+    /// (#1297): its concurrency, whether the decoded-grid cache can hold all
+    /// of them, and whether the compressed-message cache can (#1301).
     fn sample_parameters(
         self: &Arc<Self>,
+        run: DateTime<Utc>,
         params: &[String],
         steps: &[(DateTime<Utc>, &StepFile)],
         level_keys: &[Arc<ParameterKeys>],
@@ -248,7 +251,10 @@ impl GribEngine {
                     })
             })
             .collect();
-        let plan = self.field_plan(fields.len());
+        // What the messages weigh in the compressed-message cache; a tail
+        // record of unknown length is fetched whole and not counted.
+        let message_bytes = fields.iter().filter_map(|field| field.3.length).sum();
+        let plan = self.field_plan(fields.len(), Some(message_bytes));
         let engine = self.clone();
         let coords = coords.clone();
         let names: Arc<[String]> = params.into();
@@ -258,16 +264,22 @@ impl GribEngine {
             move |(param, index, url, entry, keys)| {
                 // Missing/unreadable fields stay null in position series. Deadlines
                 // and worker failures are fatal and are handled by the scheduler.
-                // CCSDS fields read only the blocks the points need (#1300).
-                let values = engine
-                    .position_samples(&url, &entry, plan.fill, &coords)
-                    .map(|samples| {
-                        let meta = engine.param_metadata_for(&keys, &names[param]);
-                        samples
-                            .into_iter()
-                            .map(|v| v.map(|v| meta.display.convert(v)))
-                            .collect::<Vec<_>>()
-                    });
+                // CCSDS fields read only the blocks the points need (#1300),
+                // and fetch only their bytes when not cached whole (#1301).
+                let field = PointField {
+                    url: &url,
+                    entry: &entry,
+                    run,
+                    coords: &coords,
+                    plan,
+                };
+                let values = engine.position_samples(&field).map(|samples| {
+                    let meta = engine.param_metadata_for(&keys, &names[param]);
+                    samples
+                        .into_iter()
+                        .map(|v| v.map(|v| meta.display.convert(v)))
+                        .collect::<Vec<_>>()
+                });
                 Ok((param, index, values))
             },
             |(param, index, values)| {

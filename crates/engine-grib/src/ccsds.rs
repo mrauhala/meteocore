@@ -41,6 +41,28 @@ const MAX_BINARY_SCALE: i32 = 126;
 /// The largest payload an index addresses: its bit offsets are `u32`.
 const MAX_PAYLOAD_BYTES: usize = (u32::MAX / 8) as usize;
 
+/// The least a cold prefix read fetches (#1301): enough for any usual
+/// header, Sections 0 to 6 and Section 7's own, which a prefix must hold.
+const MIN_PREFIX: usize = 4096;
+
+/// How far past a prediction a partial read reaches (#1301): scaled from a
+/// sibling message's index, which predicted within ±0.5 % in research; and
+/// linear in the needed sample's position, −10 % to +18 %.
+const SIBLING_MARGIN: f64 = 1.02;
+const LINEAR_MARGIN: f64 = 1.20;
+
+/// A read on from known data that would cover more of the message than
+/// this reads all of it instead.
+const MOST_OF_A_MESSAGE: f64 = 0.8;
+
+/// A read on with no sibling to shape it predicts the rest at the denser of
+/// two rates: the last [`LOCAL_RSIS`] indexed RSIs' and the rest of the
+/// payload's on average, then [`READ_ON_MARGIN`]. On the IFS 0.1° and
+/// 0.25° and AIFS test files that estimate fell short by at most ×1.59
+/// (precipitation one RSI ahead); the average alone by up to ×4.2.
+const LOCAL_RSIS: usize = 8;
+const READ_ON_MARGIN: f64 = 1.6;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CcsdsError {
     /// A message this reader does not handle: decode it in full.
@@ -130,6 +152,60 @@ impl Header {
             .iter()
             .next()
             .ok_or_else(|| invalid("no submessage"))?;
+        let section7 = submessage.7.body;
+        Self::read(&submessage, section7.offset, section7.size, message.len())
+    }
+
+    /// [`Self::parse`] of a message `message_len` bytes long from its first
+    /// bytes `prefix` (#1301), which must hold Sections 0 to 6 and Section
+    /// 7's 5-byte header; the packed values may stop anywhere. `None` when
+    /// the prefix ends before that.
+    ///
+    /// `grib` reads a message to Section 8 and rejects one cut short, so it
+    /// reads Sections 0 to 6 as they are, followed by an empty Section 7 and
+    /// Section 8; the payload's position comes from the real Section 7.
+    pub(crate) fn parse_prefix(
+        prefix: &[u8],
+        message_len: usize,
+    ) -> Result<Option<Self>, CcsdsError> {
+        let Some((section7, section7_len)) = find_section7(prefix)? else {
+            return Ok(None);
+        };
+        if prefix.len() < 16
+            || u64::from_be_bytes(prefix[8..16].try_into().unwrap()) != message_len as u64
+        {
+            return Err(invalid("message length differs from the index"));
+        }
+        // One field per message: Section 8 follows Section 7.
+        if section7
+            .checked_add(section7_len)
+            .and_then(|end| end.checked_add(4))
+            != Some(message_len)
+        {
+            return Err(invalid("Section 7 does not end the message"));
+        }
+        let mut stub = prefix[..section7].to_vec();
+        stub.extend([0, 0, 0, 5, 7]);
+        stub.extend(b"7777");
+        let stub_len = stub.len() as u64;
+        stub[8..16].copy_from_slice(&stub_len.to_be_bytes());
+        let grib2 = grib::from_reader(Cursor::new(&stub[..])).map_err(invalid)?;
+        let (_, submessage) = grib2
+            .iter()
+            .next()
+            .ok_or_else(|| invalid("no submessage"))?;
+        Self::read(&submessage, section7, section7_len, message_len).map(Some)
+    }
+
+    /// The header of a parsed submessage whose Section 7 starts at
+    /// `section7` and is `section7_len` bytes long, in a message of
+    /// `message_len` bytes.
+    fn read<R>(
+        submessage: &grib::SubMessage<'_, R>,
+        section7: usize,
+        section7_len: usize,
+        message_len: usize,
+    ) -> Result<Self, CcsdsError> {
         let section5 = submessage.section5().map_err(invalid)?;
         let DataRepresentationTemplate::_5_42(template) = &section5.payload.template else {
             return Err(CcsdsError::Unsupported("not CCSDS packing"));
@@ -210,13 +286,12 @@ impl Header {
             aec.check()?;
         }
 
-        let section7 = submessage.7.body;
-        let payload_start = section7.offset.checked_add(5);
-        let payload_end = section7.offset.checked_add(section7.size);
+        let payload_start = section7.checked_add(5);
+        let payload_end = section7.checked_add(section7_len);
         let (Some(payload_start), Some(payload_end)) = (payload_start, payload_end) else {
             return Err(invalid("section 7 overflows"));
         };
-        if payload_end > message.len() || payload_start > payload_end {
+        if payload_end > message_len || payload_start > payload_end {
             return Err(invalid("section 7 outside the message"));
         }
         if payload_end - payload_start > MAX_PAYLOAD_BYTES {
@@ -233,7 +308,7 @@ impl Header {
             },
             constant,
             metadata,
-            message_len: message.len(),
+            message_len,
             payload_start,
             payload_len: payload_end - payload_start,
         })
@@ -277,7 +352,7 @@ impl Header {
         if raw.len() != plan.nodes.len() {
             return Err(invalid("decode ended before the sampled nodes"));
         }
-        let rsi_offsets = self.rsi_offsets(&offsets, payload.len())?;
+        let rsi_offsets = self.rsi_offsets(&offsets, true)?;
         let values: Vec<f32> = raw.into_iter().map(|r| self.packing.value(r)).collect();
         let index = CcsdsIndex {
             header: self,
@@ -298,20 +373,22 @@ impl Header {
     }
 
     /// The RSI starts libaec recorded, checked against the field: one per
-    /// RSI, the first at bit 0, increasing, inside the payload.
-    fn rsi_offsets(&self, offsets: &[usize], payload_len: usize) -> Result<Box<[u32]>, CcsdsError> {
-        let count = self.packing.values.div_ceil(self.packing.aec.rsi_samples());
+    /// RSI when `complete`, else those of the first RSIs; the first at bit
+    /// 0, increasing, inside the payload.
+    fn rsi_offsets(&self, offsets: &[usize], complete: bool) -> Result<Box<[u32]>, CcsdsError> {
+        let count = self.rsi_count();
         // libaec records an RSI's start when decoding reaches it, the first
         // at bit 0; when the field ends exactly on an RSI boundary it may
         // also record where an RSI after the last would start.
-        if !(count..=count + 1).contains(&offsets.len()) {
+        let least = if complete { count } else { 1 };
+        if !(least..=count + 1).contains(&offsets.len()) {
             return Err(invalid(format!(
                 "{} RSI offsets for {count} RSIs",
                 offsets.len()
             )));
         }
-        let offsets = &offsets[..count];
-        let bits = payload_len * 8;
+        let offsets = &offsets[..offsets.len().min(count)];
+        let bits = self.payload_len * 8;
         let ordered = offsets.first().is_none_or(|&first| first == 0)
             && offsets.windows(2).all(|pair| pair[0] < pair[1])
             && offsets.last().is_none_or(|&last| last < bits);
@@ -322,6 +399,190 @@ impl Header {
             .iter()
             .map(|&offset| u32::try_from(offset).map_err(invalid))
             .collect()
+    }
+
+    fn rsi_count(&self) -> usize {
+        self.packing.values.div_ceil(self.packing.aec.rsi_samples())
+    }
+
+    /// Decode on from the RSIs `prior` indexes, or from the payload's start,
+    /// over `bytes`, the message's bytes from offset `start` on (#1301):
+    /// sample `coords`, recording where each RSI the decode enters starts,
+    /// through the end of the last RSI they need. The bytes must begin at or
+    /// before the RSI the decode starts at: the first one the points need,
+    /// or the last one `prior` knows the start of. Bytes that end first are
+    /// [`Extended::Short`], with what they did reveal.
+    pub(crate) fn extend(
+        self,
+        prior: Option<&CcsdsIndex>,
+        bytes: &[u8],
+        start: usize,
+        coords: &[(f64, f64)],
+    ) -> Result<Extended, CcsdsError> {
+        let plan = Plan::new(&self.lattice, coords);
+        let known: &[u32] = match prior {
+            Some(prior) if !prior.rsi_offsets.is_empty() => &prior.rsi_offsets[..],
+            _ => &[0],
+        };
+        let (Some(&first), Some(&last), None) =
+            (plan.nodes.first(), plan.nodes.last(), self.constant)
+        else {
+            // Nothing to decode: a constant field, or no point on the grid.
+            let rsi_offsets = if self.constant.is_some() {
+                Box::from([])
+            } else {
+                known.into()
+            };
+            let values = plan.sample(|_| self.constant.unwrap_or(f32::NAN));
+            return Ok(Extended::Done {
+                index: CcsdsIndex {
+                    header: self,
+                    rsi_offsets,
+                },
+                values,
+            });
+        };
+        let params = self.packing.aec;
+        let width = params.bytes_per_sample();
+        let per_rsi = params.rsi_samples();
+        let from_rsi = (first / per_rsi).min(known.len() - 1);
+        let bit = known[from_rsi] as usize;
+        let skipped = from_rsi * per_rsi;
+        let end_sample = ((last / per_rsi + 1) * per_rsi).min(self.packing.values);
+        let input_start = (self.payload_start + bit / 8)
+            .checked_sub(start)
+            .ok_or_else(|| invalid("bytes start after the RSI the decode needs"))?;
+        let input_end = (self.payload_start + self.payload_len)
+            .saturating_sub(start)
+            .min(bytes.len());
+        let mut raw = Vec::with_capacity(plan.nodes.len());
+        let decoded = match bytes
+            .get(input_start..input_end)
+            .filter(|input| !input.is_empty())
+        {
+            Some(input) => aec::decode_from(
+                &params,
+                input,
+                bit % 8,
+                end_sample - skipped,
+                CHUNK_SAMPLES,
+                |first, chunk| {
+                    ds_core::deadline::check().map_err(CcsdsError::Fatal)?;
+                    let first = skipped + first;
+                    let end = first + chunk.len() / width;
+                    while let Some(&node) = plan.nodes.get(raw.len()).filter(|&&node| node < end) {
+                        raw.push(packed(chunk, node - first, width));
+                    }
+                    Ok::<_, CcsdsError>(())
+                },
+            )?,
+            None => aec::Decoded {
+                samples: 0,
+                offsets: vec![bit % 8],
+            },
+        };
+        // The decode's RSI starts, counted from the input's first byte, and
+        // those `prior` already knew: where both know one, they must agree.
+        let base = 8 * (bit / 8);
+        let mut offsets: Vec<usize> = known[..from_rsi].iter().map(|&o| o as usize).collect();
+        offsets.extend(decoded.offsets.iter().map(|&o| base + o));
+        let agree = known
+            .iter()
+            .zip(&offsets)
+            .skip(from_rsi)
+            .all(|(&known, &found)| known as usize == found);
+        if !agree {
+            return Err(invalid("RSI offsets differ from the index"));
+        }
+        if known.len() > offsets.len() {
+            offsets.extend(known[offsets.len()..].iter().map(|&o| o as usize));
+        }
+        let rsi_offsets = self.rsi_offsets(&offsets, false)?;
+        let index = CcsdsIndex {
+            header: self,
+            rsi_offsets,
+        };
+        if raw.len() < plan.nodes.len() {
+            return Ok(Extended::Short { index });
+        }
+        let values: Vec<f32> = raw.into_iter().map(|r| self.packing.value(r)).collect();
+        Ok(Extended::Done {
+            index,
+            values: plan.sample(|i| values[i]),
+        })
+    }
+}
+
+/// What [`Header::extend`] made of its bytes.
+#[derive(Debug)]
+pub(crate) enum Extended {
+    /// Every point sampled, the values raw as [`Header::index`]'s; the
+    /// index reaches at least the RSIs they need.
+    Done {
+        index: CcsdsIndex,
+        values: Vec<Option<f64>>,
+    },
+    /// The bytes ended first: the RSIs they revealed, which
+    /// [`CcsdsIndex::read_on`] predicts a read on from.
+    Short { index: CcsdsIndex },
+}
+
+/// How an index that predicts a read relates to the message read (#1301).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kin {
+    /// The same parameter in the same run: its RSIs lie as the message's
+    /// do, within ±0.5 % in research, so [`SIBLING_MARGIN`] covers them.
+    SameRun,
+    /// The same parameter in another run: the same shape over the grid,
+    /// less closely, with [`LINEAR_MARGIN`].
+    OtherRun,
+    /// Another parameter on the same grid: only where the samples lie.
+    OtherParameter,
+}
+
+impl Kin {
+    fn margin(self) -> f64 {
+        match self {
+            Self::SameRun => SIBLING_MARGIN,
+            Self::OtherRun | Self::OtherParameter => LINEAR_MARGIN,
+        }
+    }
+}
+
+/// Which RSIs a batch of points needs decoded on one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Needs {
+    first_rsi: usize,
+    last_rsi: usize,
+    /// The sample after the last RSI's last.
+    end_sample: usize,
+}
+
+/// Where Section 7 starts in a message whose first bytes are `prefix`, and
+/// how long it is: `None` when Sections 1 to 6 or Section 7's header do not
+/// fit in the prefix.
+fn find_section7(prefix: &[u8]) -> Result<Option<(usize, usize)>, CcsdsError> {
+    let Some(indicator) = prefix.get(..16) else {
+        return Ok(None);
+    };
+    if &indicator[..4] != b"GRIB" || indicator[7] != 2 {
+        return Err(invalid("not a GRIB edition 2 message"));
+    }
+    let mut at = 16usize;
+    loop {
+        let Some(header) = prefix.get(at..at + 5) else {
+            return Ok(None);
+        };
+        let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        match header[4] {
+            7 if len >= 5 => return Ok(Some((at, len))),
+            1..=6 if len >= 5 => {
+                at = at
+                    .checked_add(len)
+                    .ok_or_else(|| invalid("section length overflows"))?
+            }
+            _ => return Err(invalid("unexpected section before Section 7")),
+        }
     }
 }
 
@@ -334,15 +595,31 @@ impl CcsdsIndex {
         message: &[u8],
         coords: &[(f64, f64)],
     ) -> Result<Vec<Option<f64>>, CcsdsError> {
+        self.header.payload(message)?;
+        self.sample_bytes(message, 0, coords)
+    }
+
+    /// [`Self::sample`] from `bytes`, the message's bytes from offset
+    /// `start` on: the whole message, or the range [`Self::rsi_bytes`] names
+    /// (#1301). Bytes that end before a needed sample are
+    /// [`CcsdsError::Invalid`].
+    pub(crate) fn sample_bytes(
+        &self,
+        bytes: &[u8],
+        start: usize,
+        coords: &[(f64, f64)],
+    ) -> Result<Vec<Option<f64>>, CcsdsError> {
         let header = &self.header;
         let plan = Plan::new(&header.lattice, coords);
-        let payload = header.payload(message)?;
         if let Some(value) = header.constant {
             return Ok(plan.sample(|_| value));
         }
         let params = header.packing.aec;
         let width = params.bytes_per_sample();
         let per_rsi = params.rsi_samples();
+        let payload_end = (header.payload_start + header.payload_len)
+            .saturating_sub(start)
+            .min(bytes.len());
         let mut values = Vec::with_capacity(plan.nodes.len());
         let mut buffer = Vec::new();
         for nodes in plan.nodes.chunk_by(|a, b| a / per_rsi == b / per_rsi) {
@@ -350,20 +627,176 @@ impl CcsdsIndex {
                 continue;
             };
             let rsi = first / per_rsi;
-            let start = rsi * per_rsi;
+            let rsi_start = rsi * per_rsi;
             let bit = *self
                 .rsi_offsets
                 .get(rsi)
-                .ok_or_else(|| invalid(format!("RSI {rsi} is not indexed")))?;
-            buffer.resize((last - start + 1) * width, 0);
-            aec::decode_rsi(&params, payload, bit as usize, &mut buffer)?;
-            values.extend(
-                nodes
-                    .iter()
-                    .map(|&node| header.packing.value(packed(&buffer, node - start, width))),
-            );
+                .ok_or_else(|| invalid(format!("RSI {rsi} is not indexed")))?
+                as usize;
+            let input = (header.payload_start + bit / 8)
+                .checked_sub(start)
+                .and_then(|from| bytes.get(from..payload_end))
+                .ok_or_else(|| invalid(format!("RSI {rsi} is outside the bytes read")))?;
+            buffer.resize((last - rsi_start + 1) * width, 0);
+            aec::decode_rsi(&params, input, bit % 8, &mut buffer)?;
+            values.extend(nodes.iter().map(|&node| {
+                header
+                    .packing
+                    .value(packed(&buffer, node - rsi_start, width))
+            }));
         }
         Ok(plan.sample(|i| values[i]))
+    }
+
+    /// The RSIs `coords` need decoded; `None` when none: a constant field,
+    /// or no point on the grid.
+    pub(crate) fn needs(&self, coords: &[(f64, f64)]) -> Option<Needs> {
+        let header = &self.header;
+        if header.constant.is_some() {
+            return None;
+        }
+        let per_rsi = header.packing.aec.rsi_samples();
+        let plan = Plan::new(&header.lattice, coords);
+        let (first, last) = (*plan.nodes.first()?, *plan.nodes.last()?);
+        Some(Needs {
+            first_rsi: first / per_rsi,
+            last_rsi: last / per_rsi,
+            end_sample: ((last / per_rsi + 1) * per_rsi).min(header.packing.values),
+        })
+    }
+
+    /// Whether the index knows where RSI `rsi` ends: the next one's start,
+    /// or the payload's end after the last RSI.
+    fn end_bits(&self, rsi: usize) -> Option<usize> {
+        match self.rsi_offsets.get(rsi + 1) {
+            Some(&next) => Some(next as usize),
+            None if rsi + 1 == self.header.rsi_count() && self.rsi_offsets.len() > rsi => {
+                Some(self.header.payload_len * 8)
+            }
+            None => None,
+        }
+    }
+
+    /// Whether every RSI `needs` names is indexed, start and end.
+    pub(crate) fn covers(&self, needs: &Needs) -> bool {
+        self.end_bits(needs.last_rsi).is_some()
+    }
+
+    /// Whether `coords` can be sampled through this index alone.
+    pub(crate) fn reaches(&self, coords: &[(f64, f64)]) -> bool {
+        self.needs(coords).is_none_or(|needs| self.covers(&needs))
+    }
+
+    /// The message bytes holding the RSIs `needs` names, from the first
+    /// one's first byte to the last one's last (#1301); `None` when they are
+    /// not all indexed.
+    pub(crate) fn rsi_bytes(&self, needs: &Needs) -> Option<std::ops::Range<usize>> {
+        let first = *self.rsi_offsets.get(needs.first_rsi)? as usize;
+        let end = self.end_bits(needs.last_rsi)?;
+        let payload_start = self.header.payload_start;
+        Some(payload_start + first / 8..payload_start + end.div_ceil(8))
+    }
+
+    /// Where a read on from this index's RSIs starts and should reach to
+    /// decode what `needs` names (#1301): from the first needed RSI, or the
+    /// last whose start is known if that comes first, to a prediction from
+    /// that last start. A sibling of the same parameter predicts from its
+    /// own RSIs between the two points, scaled by the payloads' ratio, with
+    /// its [`Kin`]'s margin; without one, [`Self::read_on_bits`]. A
+    /// prediction past [`MOST_OF_A_MESSAGE`] reads the whole rest of the
+    /// message.
+    pub(crate) fn read_on(
+        &self,
+        needs: &Needs,
+        sibling: Option<(&CcsdsIndex, Kin)>,
+    ) -> std::ops::Range<usize> {
+        let header = &self.header;
+        let anchor = self.rsi_offsets.len().saturating_sub(1);
+        let anchor_bits = self.rsi_offsets.get(anchor).map_or(0, |&o| o as usize) as f64;
+        let from_rsi = needs.first_rsi.min(anchor);
+        let from = self.rsi_offsets.get(from_rsi).map_or(0, |&o| o as usize);
+        let payload_bits = header.payload_len as f64 * 8.0;
+        let shaped = sibling
+            .filter(|(_, kin)| *kin != Kin::OtherParameter)
+            .and_then(|(sibling, kin)| {
+                let sibling_anchor = *sibling.rsi_offsets.get(anchor)? as f64;
+                let sibling_end = sibling.end_bits(needs.last_rsi)? as f64;
+                let sibling_bits = sibling.header.payload_len.max(1) as f64 * 8.0;
+                Some(kin.margin() * (sibling_end - sibling_anchor) * payload_bits / sibling_bits)
+            });
+        let rest = shaped.unwrap_or_else(|| self.read_on_bits(needs.end_sample));
+        let until = header.payload_start + ((anchor_bits + rest.max(0.0)) / 8.0).ceil() as usize;
+        let until = if until as f64 > MOST_OF_A_MESSAGE * header.message_len as f64 {
+            header.message_len
+        } else {
+            until.min(header.message_len)
+        };
+        header.payload_start + from / 8..until
+    }
+
+    /// The bits from the last indexed RSI start to `end_sample`, predicted
+    /// from this index alone: the denser of the last [`LOCAL_RSIS`] RSIs'
+    /// rate and the rest of the payload's average, with [`READ_ON_MARGIN`].
+    fn read_on_bits(&self, end_sample: usize) -> f64 {
+        let header = &self.header;
+        let per_rsi = header.packing.aec.rsi_samples();
+        let anchor = self.rsi_offsets.len().saturating_sub(1);
+        let bit = |rsi: usize| self.rsi_offsets.get(rsi).map_or(0.0, |&o| f64::from(o));
+        let anchor_sample = anchor * per_rsi;
+        let payload_bits = header.payload_len as f64 * 8.0;
+        let average = (payload_bits - bit(anchor))
+            / header.packing.values.saturating_sub(anchor_sample).max(1) as f64;
+        let back = anchor.saturating_sub(LOCAL_RSIS);
+        let local = if anchor > back {
+            (bit(anchor) - bit(back)) / ((anchor - back) * per_rsi) as f64
+        } else {
+            0.0
+        };
+        let samples = end_sample.saturating_sub(anchor_sample) as f64;
+        (READ_ON_MARGIN * average.max(local) * samples).min(payload_bits - bit(anchor))
+    }
+
+    /// How long a prefix of another message `message_len` bytes long, on
+    /// this one's grid, should be to sample `coords` there (#1301). When this
+    /// index is of the same parameter ([`Kin::SameRun`] or
+    /// [`Kin::OtherRun`]) and reaches the last needed RSI, the share of its
+    /// payload before that RSI's end, with the kin's margin; else the share
+    /// of samples before it, with [`LINEAR_MARGIN`]. The other message's
+    /// header is taken to be this one's size. At least [`MIN_PREFIX`], at
+    /// most the message.
+    pub(crate) fn predict_prefix(
+        &self,
+        coords: &[(f64, f64)],
+        message_len: usize,
+        kin: Kin,
+    ) -> usize {
+        let header = &self.header;
+        let overhead = header.message_len - header.payload_len;
+        let payload = message_len.saturating_sub(overhead) as f64;
+        let share = match self.needs(coords) {
+            None => 0.0,
+            Some(needs) => match self
+                .end_bits(needs.last_rsi)
+                .filter(|_| kin != Kin::OtherParameter)
+            {
+                Some(bits) => {
+                    kin.margin() * bits.div_ceil(8) as f64 / header.payload_len.max(1) as f64
+                }
+                None => LINEAR_MARGIN * needs.end_sample as f64 / header.packing.values as f64,
+            },
+        };
+        let until = header.payload_start + (share * payload).ceil() as usize;
+        until.max(MIN_PREFIX).min(message_len)
+    }
+
+    /// The decode settings, kept apart from the indexed RSI starts.
+    pub(crate) fn header(&self) -> Header {
+        self.header
+    }
+
+    /// RSI starts indexed: every RSI's when complete, else the first ones'.
+    pub(crate) fn indexed_rsis(&self) -> usize {
+        self.rsi_offsets.len()
     }
 
     /// What a full decode of the message reports to the metadata caches.

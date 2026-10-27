@@ -46,10 +46,31 @@ pub(crate) struct MessageCache {
 }
 
 impl MessageCache {
+    /// One shard: a position query plans whether its messages stay resident
+    /// (#1301, [`Self::holds`]). Sharded from a 0.5 MiB entry hint, a
+    /// 1024 MiB cache was four shards per CPU, 64 of 16 MiB on 12 CPUs, so
+    /// a 41-step 0.1° window (55 MB) that fits the total could still
+    /// overflow the shards its messages hash to. Lookups are one per field
+    /// or map tile, so one lock costs nothing.
     pub fn new(size_mb: u64) -> Option<Self> {
         (size_mb > 0).then(|| Self {
-            cache: ByteBoundedCache::new(size_mb.saturating_mul(MIB), MIB / 2, weight),
+            cache: ByteBoundedCache::new_single_shard(size_mb.saturating_mul(MIB), MIB / 2, weight),
         })
+    }
+
+    /// Whether messages of `bytes` together stay resident: within one
+    /// shard's budget, all of it for this one-shard cache.
+    pub(crate) fn holds(&self, bytes: u64) -> bool {
+        bytes <= self.cache.shard_capacity_bytes()
+    }
+
+    /// The message's bytes when resident, counting a hit; nothing when
+    /// absent, for a reader that then fetches only part of the message and
+    /// never fills the cache (#1301).
+    pub(crate) fn get_resident(&self, key: &MessageKey) -> Option<Bytes> {
+        let bytes = self.cache.get_untracked(key)?;
+        self.cache.record_hit();
+        Some(bytes)
     }
 
     pub fn read(

@@ -18,6 +18,8 @@ mod metadata;
 mod moisture_tests;
 #[cfg(test)]
 mod parameter_times_tests;
+#[cfg(test)]
+mod point_fetch_tests;
 mod point_index;
 #[cfg(test)]
 mod point_index_tests;
@@ -223,6 +225,8 @@ struct GribSource {
     point_index: Option<point_index::PointIndex>,
     /// Position fields served by the point index and by decoded grids.
     point_fields: point_index::PointFields,
+    /// GETs and bytes the point path fetched, by mode (#1301).
+    point_fetches: point_index::PointFetches,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
     /// Allowed parameters (None = all).
@@ -264,12 +268,26 @@ pub(crate) enum GridFill {
     Bypass,
 }
 
+/// How a position query fetches the messages it reads through the CCSDS
+/// point index (#1301).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldFetch {
+    /// The whole message, kept in the compressed-message cache when one is
+    /// set: it then serves every later point query and map from memory.
+    Whole,
+    /// Only the bytes the points need: a prefix of an unindexed message,
+    /// else its indexed RSIs. Never kept in the message cache. For a source
+    /// without one, or a query whose messages it cannot hold together.
+    Partial,
+}
+
 /// How one EDR query reads its fields ([`GribEngine::field_plan`], #1297).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FieldPlan {
     /// Field jobs in flight at once.
     pub concurrency: usize,
     pub fill: GridFill,
+    pub fetch: FieldFetch,
 }
 
 impl GribEngine {
@@ -365,6 +383,12 @@ impl GribEngine {
         self.source.point_fields.counts()
     }
 
+    /// GETs and bytes the point path fetched per source, as `(mode, GETs,
+    /// bytes)` for `whole`, `prefix`, `range` and `continuation` (#1301).
+    pub fn point_fetch_counts(&self) -> [(&'static str, u64, u64); 4] {
+        self.source.point_fetches.counts()
+    }
+
     /// Create a new GRIB engine from config.
     pub fn new(collection_id: &str, config: &GribConfig) -> Result<Self, DataServerError> {
         // Parsed once: an invalid window fails the load instead of silently
@@ -446,6 +470,7 @@ impl GribEngine {
                 message_cache,
                 point_index: point_index::PointIndex::new(config.point_index_cache_mb),
                 point_fields: point_index::PointFields::default(),
+                point_fetches: point_index::PointFetches::default(),
                 shutdown: Shutdown::new(),
                 param_filter: config.parameters.clone(),
                 time_window,
@@ -1165,7 +1190,13 @@ impl GribEngine {
     /// when the decoded-grid cache cannot hold all of them
     /// ([`GridCache::holds`]). Before the geometry is published the query
     /// reads as before #1297: four at a time, filling the cache.
-    pub(crate) fn field_plan(&self, fields: usize) -> FieldPlan {
+    ///
+    /// `point_bytes` is the indexed length of the messages a position query
+    /// reads through the point index, `None` for other queries: those fetch
+    /// whole messages. A position query fetches only parts of them
+    /// ([`FieldFetch::Partial`], #1301) when the source has no message cache,
+    /// or one that cannot hold them all.
+    pub(crate) fn field_plan(&self, fields: usize, point_bytes: Option<u64>) -> FieldPlan {
         // Cells count the intervals between nodes, a global grid's cyclic
         // closing cell included, so one more per axis bounds the decoded
         // values from above.
@@ -1177,9 +1208,19 @@ impl GribEngine {
             (Some(cache), Some(nodes)) if !cache.holds(fields, nodes) => GridFill::Bypass,
             _ => GridFill::Insert,
         };
+        let fetch = match (
+            point_bytes,
+            &self.source.point_index,
+            &self.source.message_cache,
+        ) {
+            (Some(bytes), Some(_), Some(cache)) if !cache.holds(bytes) => FieldFetch::Partial,
+            (Some(_), Some(_), None) => FieldFetch::Partial,
+            _ => FieldFetch::Whole,
+        };
         FieldPlan {
             concurrency: runtime::field_concurrency(nodes),
             fill,
+            fetch,
         }
     }
 

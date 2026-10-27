@@ -134,7 +134,7 @@ impl GribEngine {
         // One plan for every field of the query, the first one included
         // (#1297): how many run at once, and whether the decoded-grid cache
         // can hold them all.
-        let plan = self.field_plan(slots.clone().filter_map(field).count());
+        let plan = self.field_plan(slots.clone().filter_map(field).count(), None);
         // The first field supplies the geometry and its own output values.
         // Protect synchronous cache-fill waits just like the parallel jobs.
         let grid = run_fetches(async {

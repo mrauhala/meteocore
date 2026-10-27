@@ -259,6 +259,9 @@ on the request path. Single-level and legacy views require exact metadata.
   admit bytes only after decoding succeeds, or, for a CCSDS point read, after
   the index build or RSI decode succeeds (#1300). Reuse that cold decode;
   failed reads, invalid payloads and expired fills must remain retryable.
+- The cache is one shard (`new_single_shard`): a position query plans
+  residency with `holds` (#1301). Sharded, 1024 MiB was 64 shards of 16 MiB
+  on 12 CPUs.
 - Key by source-local path, offset and indexed length. Like the decoded cache,
   this assumes immutable files at a given path/offset; engine reconstruction
   clears both caches. Changing the cache configuration triggers reconstruction
@@ -470,6 +473,50 @@ ones only in the legacy layout.
 - Trajectory, area/radius and cube still decode in full. #1301: the index
   carries `payload_start` and the offsets; a partial index of the first m
   RSIs fails reads beyond them.
+
+## Partial fetches (#1301)
+
+- `FieldPlan::fetch`, one decision per query: a position query fetches only
+  parts of its messages (`FieldFetch::Partial`) when the source has no
+  message cache or the sum of its fields' `entry.length` exceeds
+  `MessageCache::holds`; else whole, through the message cache. Other
+  queries pass `None` (whole). No `entry.length` ⇒ whole. Partial bytes
+  never enter the message cache; a resident message is used
+  (`get_resident`: a hit, never a miss).
+- Warm (`CcsdsIndex::covers`): ONE range GET, `rsi_bytes`, decoded by
+  `sample_bytes` at the bit relative to the slice. Always one GET per
+  field: multi-range returns the whole object and the ECMWF bucket 503s
+  extra requests.
+- Cold: ONE prefix GET from byte 0 to `predict_prefix` (≥ 4 KiB) from
+  `PointIndex::sibling`: `Kin::SameRun` (+2 %), `OtherRun` (its layout's
+  shape, +20 %), `OtherParameter` (linear in samples, +20 %). No index in
+  the source yet ⇒ whole. `Header::parse_prefix` parses Sections 0–6 plus
+  an empty 7 and 8 (grib rejects a truncated message); Section 7 must end
+  the message at its indexed length.
+- `Header::extend` decodes from the furthest known RSI start (or the first
+  needed RSI) with offsets enabled, through the last needed RSI's end,
+  merging RSI starts with `prior`'s (they must agree). Short ⇒ ONE
+  continuation to max(sibling shape, `read_on_bits`: denser of the last 8
+  RSIs' rate and the rest's average, ×1.6), or the message end past 80 %;
+  still short ⇒ whole. The 1.6 is measured (the local files fell short by
+  up to ×1.59 one RSI ahead).
+- Beyond a partial index: one read-on GET from its furthest known start
+  (`read_on`), never a longer prefix. libaec's offsets after a seek count
+  from the byte after the sought one when the bit is mid-byte;
+  `aec::decode_from` converts them. Tests compare every recorded start with
+  a whole decode's, mid-byte starts included: keep them.
+- Fallback to one whole GET (outside the message cache) on a header beyond
+  the prefix, a short read, a mismatching index, a continuation still
+  short. Unsupported in a prefix ⇒ fetch the rest, full decode, mark
+  unreadable. Storage errors fail the field.
+- Siblings are weak per (ParameterKey, run), pruned on catalog publish.
+- `/metrics`: `grib_point_fetches_total` and `grib_point_fetch_bytes_total`
+  `{collection, mode=whole|prefix|range|continuation}`.
+- Tests: `ccsds/tests.rs` (`assert_partial_reads`), `point_fetch_tests.rs`
+  (GETs and bytes over `TestStore`). Ignored, `--release --ignored
+  --nocapture`: `ccsds_files_are_bit_identical` (now also partial reads,
+  sibling accuracy, read-on shortfalls) and `point_fetch_replay`
+  (`MC_CCSDS_REPLAY`, 41 steps × 2 runs).
 
 ## Trajectory queries (#926)
 

@@ -1010,6 +1010,20 @@ are decoded in full as before. `grib_point_index_cache_*` report the index
 cache, and `grib_point_fields_total{path="partial"|"full"}` counts position
 fields by how they were read.
 
+Without a compressed-message cache, or when a query's messages would not all
+fit in it, such a query also fetches only the bytes it needs. A message
+already indexed costs one range GET of the blocks holding the points, a few
+kilobytes. One not yet indexed costs one GET of a prefix, from the message
+start to past the last block the points need, predicted from an indexed
+message of the same parameter, and at most one more GET when the prediction
+falls short. Northern points need little of a message, about 15 % at 60°N;
+southern ones most of it, about 80 % at 34°S. The first messages a source
+reads are fetched whole: nothing is indexed yet to predict from. A message
+cache that holds a query's messages keeps them whole as before, so later
+queries and maps read them from memory. `grib_point_fetches_total` and
+`grib_point_fetch_bytes_total` count these GETs and their bytes by `mode`:
+`whole`, `prefix`, `range` or `continuation`.
+
 Area and radius queries also load up to four parameter/level fields concurrently.
 The first field determines the grid and supplies its own output values; it is
 not fetched twice when the cache is disabled. The combined output and polygon

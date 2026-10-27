@@ -3,21 +3,28 @@
 //! bilinear neighbours are decoded, no grid is built, and nothing enters
 //! the decoded-grid cache. Other fields, and every field when
 //! `point_index_cache_mb` is 0, take the full decode as before.
+//!
+//! Under [`FieldFetch::Partial`] such a field also fetches only the bytes it
+//! needs (#1301): one range GET of the indexed RSIs, or a predicted prefix
+//! of a message not yet indexed, read on by at most one continuation.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
+use chrono::{DateTime, Utc};
 use ds_cache::{ByteBoundedCache, CacheMetrics, MIB};
 use ds_core::error::DataServerError;
+use ds_storage::bytes::Bytes;
 use ds_storage::object_store::path::Path;
 
 use crate::cache::DecodedGrid;
 use crate::catalog::{MessageEntry, ParameterKey};
-use crate::ccsds::{CcsdsError, CcsdsIndex, Header};
+use crate::ccsds::{CcsdsError, CcsdsIndex, Extended, Header, Kin};
 use crate::message_cache::MessageKey;
 use crate::metadata::MessageMetadata;
-use crate::{reader, GribEngine, GridFill};
+use crate::{reader, FieldFetch, FieldPlan, GribEngine, GridFill};
 
 fn weight(key: &MessageKey, index: &Arc<CcsdsIndex>) -> u64 {
     // The index, its key and Arc/cache-node overhead.
@@ -34,7 +41,13 @@ pub(crate) struct PointIndex {
     /// published ([`Self::forget_layouts`]), so one odd message cannot cost a
     /// parameter the point path for the engine's lifetime.
     readable: RwLock<HashMap<ParameterKey, bool>>,
+    /// The latest index of each parameter's messages, per run, held weakly:
+    /// what a prefix of a sibling message is predicted from (#1301).
+    siblings: RwLock<HashMap<ParameterKey, Vec<RunIndex>>>,
 }
+
+/// One run's latest index of a parameter's messages.
+type RunIndex = (DateTime<Utc>, Weak<CcsdsIndex>);
 
 impl PointIndex {
     /// `None` for 0: the point path off, every field decoded in full.
@@ -43,6 +56,7 @@ impl PointIndex {
             // A 0.25° global field's index is about 1 KB, a 0.1° one 6.3 KB.
             cache: ByteBoundedCache::new(size_mb.saturating_mul(MIB), 4096, weight),
             readable: RwLock::new(HashMap::new()),
+            siblings: RwLock::new(HashMap::new()),
         })
     }
 
@@ -69,8 +83,67 @@ impl PointIndex {
 
     /// Forget which parameters could be read, when the catalog publishes
     /// new runs or steps: each parameter's next message is tried again.
+    /// Siblings whose indexes the cache has dropped go too.
     pub(crate) fn forget_layouts(&self) {
         self.readable.write().unwrap().clear();
+        self.siblings.write().unwrap().retain(|_, runs| {
+            runs.retain(|(_, index)| index.strong_count() > 0);
+            !runs.is_empty()
+        });
+    }
+
+    /// Keep `built` unless the cache already holds an index of the message
+    /// reaching further; the one kept is returned.
+    fn store(&self, key: &MessageKey, built: CcsdsIndex) -> Arc<CcsdsIndex> {
+        match self.cache.get_untracked(key) {
+            Some(cached) if cached.indexed_rsis() >= built.indexed_rsis() => cached,
+            _ => {
+                let built = Arc::new(built);
+                self.cache.insert(key.clone(), built.clone());
+                built
+            }
+        }
+    }
+
+    /// Record `index` as `key`'s sibling in `run`.
+    fn note_sibling(&self, key: ParameterKey, run: DateTime<Utc>, index: &Arc<CcsdsIndex>) {
+        let mut siblings = self.siblings.write().unwrap();
+        let runs = siblings.entry(key).or_default();
+        match runs.iter_mut().find(|(at, _)| *at == run) {
+            Some((_, kept)) => {
+                let shorter = kept
+                    .upgrade()
+                    .is_none_or(|kept| kept.indexed_rsis() <= index.indexed_rsis());
+                if shorter {
+                    *kept = Arc::downgrade(index);
+                }
+            }
+            None => runs.push((run, Arc::downgrade(index))),
+        }
+    }
+
+    /// The index a partial read predicts from, and its kin: `key`'s in
+    /// `run`, else `key`'s in another run, else any parameter's, for its
+    /// grid. `None` before any index exists.
+    fn sibling(&self, key: &ParameterKey, run: DateTime<Utc>) -> Option<(Arc<CcsdsIndex>, Kin)> {
+        let siblings = self.siblings.read().unwrap();
+        let alive = |runs: &Vec<RunIndex>| runs.iter().find_map(|(_, index)| index.upgrade());
+        if let Some(runs) = siblings.get(key) {
+            let same = runs
+                .iter()
+                .find(|(at, _)| *at == run)
+                .and_then(|(_, index)| index.upgrade());
+            if let Some(index) = same {
+                return Some((index, Kin::SameRun));
+            }
+            if let Some(index) = alive(runs) {
+                return Some((index, Kin::OtherRun));
+            }
+        }
+        siblings
+            .values()
+            .find_map(alive)
+            .map(|index| (index, Kin::OtherParameter))
     }
 }
 
@@ -92,6 +165,68 @@ impl PointFields {
     }
 }
 
+/// How the point path fetched message bytes (#1301).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FetchMode {
+    /// The whole message.
+    Whole,
+    /// A predicted prefix of a message not yet indexed.
+    Prefix,
+    /// The indexed RSIs a query needs, or a read on from those an index
+    /// knows.
+    Range,
+    /// The rest a short prefix or range needed.
+    Continuation,
+}
+
+impl FetchMode {
+    pub(crate) const ALL: [Self; 4] = [Self::Whole, Self::Prefix, Self::Range, Self::Continuation];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Whole => "whole",
+            Self::Prefix => "prefix",
+            Self::Range => "range",
+            Self::Continuation => "continuation",
+        }
+    }
+}
+
+/// GETs and bytes the point path fetched, by [`FetchMode`], per source.
+#[derive(Default)]
+pub(crate) struct PointFetches {
+    gets: [AtomicU64; 4],
+    bytes: [AtomicU64; 4],
+}
+
+impl PointFetches {
+    fn record(&self, mode: FetchMode, bytes: usize) {
+        self.gets[mode as usize].fetch_add(1, Ordering::Relaxed);
+        self.bytes[mode as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// `(mode, GETs, bytes)` for each [`FetchMode`].
+    pub(crate) fn counts(&self) -> [(&'static str, u64, u64); 4] {
+        FetchMode::ALL.map(|mode| {
+            (
+                mode.label(),
+                self.gets[mode as usize].load(Ordering::Relaxed),
+                self.bytes[mode as usize].load(Ordering::Relaxed),
+            )
+        })
+    }
+}
+
+/// One position field to read: its message, the run it belongs to, the
+/// query's points and plan.
+pub(crate) struct PointField<'a> {
+    pub url: &'a str,
+    pub entry: &'a MessageEntry,
+    pub run: DateTime<Utc>,
+    pub coords: &'a [(f64, f64)],
+    pub plan: FieldPlan,
+}
+
 /// How one position field was read.
 enum FieldRead {
     /// Samples from the CCSDS index, and what the message reports to the
@@ -104,21 +239,28 @@ enum FieldRead {
     Grid(Arc<DecodedGrid>),
 }
 
+impl FieldRead {
+    fn points(index: &CcsdsIndex, values: Vec<Option<f64>>) -> Self {
+        Self::Points {
+            values,
+            metadata: *index.metadata(),
+        }
+    }
+}
+
 impl GribEngine {
-    /// The raw samples of `coords` in one position field, before display
-    /// conversion: from its CCSDS index when [`Self::point_index_for`]
-    /// allows, else from the decoded grid [`Self::fetch_grid_by_entry`]
-    /// reads under `fill`. Both interpolate alike ([`crate::cache::Bilinear`]),
-    /// bit for bit.
+    /// The raw samples of `field`'s points, before display conversion: from
+    /// its CCSDS index when [`Self::point_index_for`] allows, else from the
+    /// decoded grid [`Self::fetch_grid_by_entry`] reads under the plan's
+    /// fill. Both interpolate alike ([`crate::cache::Bilinear`]), bit for
+    /// bit.
     pub(crate) fn position_samples(
         &self,
-        url: &str,
-        entry: &MessageEntry,
-        fill: GridFill,
-        coords: &[(f64, f64)],
+        field: &PointField<'_>,
     ) -> Result<Vec<Option<f64>>, DataServerError> {
+        let (url, entry, fill) = (field.url, field.entry, field.plan.fill);
         let read = match self.point_index_for(entry, fill) {
-            Some(index) => self.read_points(index, url, entry, fill, coords)?,
+            Some(index) => self.read_points(index, field)?,
             None => FieldRead::Grid(self.fetch_grid_by_entry(url, entry, fill)?),
         };
         let fields = &self.source.point_fields;
@@ -129,7 +271,8 @@ impl GribEngine {
             }
             FieldRead::Grid(grid) => {
                 fields.full.fetch_add(1, Ordering::Relaxed);
-                coords
+                field
+                    .coords
                     .iter()
                     .map(|&(lon, lat)| grid.bilinear_value(lon, lat))
                     .collect()
@@ -153,20 +296,21 @@ impl GribEngine {
 
     /// One field through the point index: a resident decoded grid as it is
     /// (looked up without joining a fill or inserting), else the message's
-    /// bytes from the compressed-message cache or storage, sampled through
-    /// its index, built on first read. A message the index cannot read is
-    /// decoded in full from the same bytes, never fetched twice. The grid
-    /// cache counts a hit for a resident grid and a miss for a full decode,
-    /// as the full path would, and nothing for a field read through the
-    /// index.
+    /// bytes sampled through its index. [`FieldFetch::Whole`] takes the
+    /// whole message from the compressed-message cache or storage, and
+    /// builds the index on first read; [`FieldFetch::Partial`] fetches only
+    /// the bytes the points need ([`Self::fetch_points`]), and the whole
+    /// message, outside the cache, when that goes wrong. A message the
+    /// index cannot read is decoded in full from bytes already read, never
+    /// fetched twice. The grid cache counts a hit for a resident grid and a
+    /// miss for a full decode, as the full path would, and nothing for a
+    /// field read through the index.
     fn read_points(
         &self,
         index: &PointIndex,
-        url: &str,
-        entry: &MessageEntry,
-        fill: GridFill,
-        coords: &[(f64, f64)],
+        field: &PointField<'_>,
     ) -> Result<FieldRead, DataServerError> {
+        let (url, entry, plan) = (field.url, field.entry, field.plan);
         // Only a grid found, or one decoded in full, counts in the grid
         // cache: a field read through the index loads none.
         if let Some(cache) = &self.source.grid_cache {
@@ -179,19 +323,36 @@ impl GribEngine {
         ds_core::deadline::check()?;
         let path = Path::from(url);
         let key = MessageKey::new(path.as_ref(), entry);
-        let sample = |bytes: &[u8]| self.points_from(index, &key, entry, bytes, coords);
-        let (bytes, on_fill) = match &self.source.message_cache {
-            Some(cache) => cache.get_with(&self.source.store, &path, entry, sample)?,
-            None => {
-                let bytes = reader::fetch_message_bytes(&self.source.store, &path, entry)?;
-                ds_core::deadline::check()?;
-                let read = sample(&bytes)?;
-                (bytes, Some(read))
+        let fetches = &self.source.point_fetches;
+        let sample = |bytes: &[u8]| self.points_from(index, &key, field, bytes);
+        let read = if plan.fetch == FieldFetch::Partial && entry.length.is_some() {
+            match self.fetch_points(index, field, &path, &key)? {
+                Some(read) => read,
+                None => {
+                    let bytes = reader::fetch_message_bytes(&self.source.store, &path, entry)?;
+                    fetches.record(FetchMode::Whole, bytes.len());
+                    ds_core::deadline::check()?;
+                    sample(&bytes)?
+                }
             }
-        };
-        let read = match on_fill {
-            Some(read) => read,
-            None => sample(&bytes)?,
+        } else {
+            let (bytes, on_fill) = match &self.source.message_cache {
+                Some(cache) => cache.get_with(&self.source.store, &path, entry, |bytes| {
+                    fetches.record(FetchMode::Whole, bytes.len());
+                    sample(bytes)
+                })?,
+                None => {
+                    let bytes = reader::fetch_message_bytes(&self.source.store, &path, entry)?;
+                    fetches.record(FetchMode::Whole, bytes.len());
+                    ds_core::deadline::check()?;
+                    let read = sample(&bytes)?;
+                    (bytes, Some(read))
+                }
+            };
+            match on_fill {
+                Some(read) => read,
+                None => sample(&bytes)?,
+            }
         };
         match &read {
             FieldRead::Points { metadata, .. } => {
@@ -203,7 +364,7 @@ impl GribEngine {
                 }
             }
             FieldRead::Grid(grid) => {
-                if let (Some(cache), GridFill::Insert) = (&self.source.grid_cache, fill) {
+                if let (Some(cache), GridFill::Insert) = (&self.source.grid_cache, plan.fill) {
                     cache.insert(url, entry.offset, grid.clone());
                 }
                 self.note_grid(url, entry, grid);
@@ -212,18 +373,204 @@ impl GribEngine {
         Ok(read)
     }
 
-    /// `coords` from `bytes` through the message's index, built (and the
-    /// points sampled during that one decode) on first read. Decodes the
-    /// message in full when the index cannot read it; only the deadline and
-    /// that full decode's own errors fail the field.
+    /// `field` from only the bytes its points need (#1301): a message the
+    /// compressed-message cache holds is read from there; one whose index
+    /// covers the needed RSIs with one range GET of them; one indexed short
+    /// of them with one GET from the RSIs it knows on; one not indexed with
+    /// a predicted prefix, from a sibling's index. A prefix or read on that
+    /// ends early gets one continuation. `None` for the caller to fetch the
+    /// whole message: no index of the source yet to predict from, a header
+    /// beyond the prefix, a short read, an index that does not match, a
+    /// continuation still short. Storage errors and the deadline fail the
+    /// field, as on the full path.
+    fn fetch_points(
+        &self,
+        index: &PointIndex,
+        field: &PointField<'_>,
+        path: &Path,
+        key: &MessageKey,
+    ) -> Result<Option<FieldRead>, DataServerError> {
+        let (entry, run, coords) = (field.entry, field.run, field.coords);
+        let Some(len) = entry.length.and_then(|len| usize::try_from(len).ok()) else {
+            return Ok(None);
+        };
+        if let Some(bytes) = self
+            .source
+            .message_cache
+            .as_ref()
+            .and_then(|cache| cache.get_resident(key))
+        {
+            return self.points_from(index, key, field, &bytes).map(Some);
+        }
+        let unexpected = |error: CcsdsError| match error {
+            CcsdsError::Fatal(error) => Err(error),
+            error => {
+                tracing::debug!(parameter = %entry.param, error = %error, "GRIB point field fetched whole");
+                Ok(None)
+            }
+        };
+        let sibling = index.sibling(&entry.key(), run);
+        let sibling = sibling.as_ref().map(|(index, kin)| (&**index, *kin));
+        let cached = index.cache.get_untracked(key);
+        let (header, mut prior, mut bytes, start) = match cached {
+            Some(ccsds) => match ccsds.needs(coords) {
+                Some(needs) if ccsds.covers(&needs) => {
+                    index.cache.record_hit();
+                    let Some(range) = ccsds.rsi_bytes(&needs) else {
+                        return Ok(None);
+                    };
+                    let start = range.start;
+                    let Some(bytes) = self.fetch_part(path, entry, range, FetchMode::Range)? else {
+                        return Ok(None);
+                    };
+                    return match ccsds.sample_bytes(&bytes, start, coords) {
+                        Ok(values) => Ok(Some(FieldRead::points(&ccsds, values))),
+                        Err(error) => unexpected(error),
+                    };
+                }
+                None => {
+                    index.cache.record_hit();
+                    return match ccsds.sample_bytes(&[], 0, coords) {
+                        Ok(values) => Ok(Some(FieldRead::points(&ccsds, values))),
+                        Err(error) => unexpected(error),
+                    };
+                }
+                Some(needs) => {
+                    index.cache.record_miss();
+                    let range = ccsds.read_on(&needs, sibling);
+                    let start = range.start;
+                    let Some(bytes) = self.fetch_part(path, entry, range, FetchMode::Range)? else {
+                        return Ok(None);
+                    };
+                    (ccsds.header(), Some(ccsds), bytes, start)
+                }
+            },
+            None => {
+                // Nothing indexed yet to predict a prefix from: the first
+                // whole read indexes the message, and seeds the predictions.
+                let Some((sibling, kin)) = sibling else {
+                    return Ok(None);
+                };
+                let until = sibling.predict_prefix(coords, len, kin);
+                let Some(bytes) = self.fetch_part(path, entry, 0..until, FetchMode::Prefix)? else {
+                    return Ok(None);
+                };
+                match Header::parse_prefix(&bytes, len) {
+                    Ok(Some(header)) => {
+                        index.cache.record_miss();
+                        (header, None, bytes, 0)
+                    }
+                    Ok(None) => return Ok(None),
+                    // Another layout: read the rest and decode it in full.
+                    Err(CcsdsError::Unsupported(_)) if until < len => {
+                        let Some(rest) =
+                            self.fetch_part(path, entry, until..len, FetchMode::Continuation)?
+                        else {
+                            return Ok(None);
+                        };
+                        let whole = [&bytes[..], &rest[..]].concat();
+                        return self.points_from(index, key, field, &whole).map(Some);
+                    }
+                    Err(CcsdsError::Unsupported(_)) => {
+                        return self.points_from(index, key, field, &bytes).map(Some);
+                    }
+                    Err(error) => return unexpected(error),
+                }
+            }
+        };
+        let mut continued = false;
+        loop {
+            match header.extend(prior.as_deref(), &bytes, start, coords) {
+                Ok(Extended::Done {
+                    index: built,
+                    values,
+                }) => {
+                    let kept = index.store(key, built);
+                    index.note_sibling(entry.key(), run, &kept);
+                    index.remember(entry.key(), true);
+                    return Ok(Some(FieldRead::points(&kept, values)));
+                }
+                Ok(Extended::Short { index: partial }) => {
+                    let kept = index.store(key, partial);
+                    index.note_sibling(entry.key(), run, &kept);
+                    let end = start + bytes.len();
+                    let Some(needs) = kept.needs(coords).filter(|_| !continued) else {
+                        return Ok(None);
+                    };
+                    // The prediction already fell short once: read on as far
+                    // as either the sibling or an even packing of the rest
+                    // says, and the rest of the message when neither passes
+                    // what was read.
+                    let until = Some(kept.read_on(&needs, sibling).end)
+                        .max(Some(kept.read_on(&needs, None).end))
+                        .filter(|&until| until > end)
+                        .unwrap_or(len);
+                    continued = true;
+                    let Some(more) =
+                        self.fetch_part(path, entry, end..until, FetchMode::Continuation)?
+                    else {
+                        return Ok(None);
+                    };
+                    bytes = Bytes::from([&bytes[..], &more[..]].concat());
+                    prior = Some(kept);
+                }
+                Err(error) => return unexpected(error),
+            }
+        }
+    }
+
+    /// Bytes `range` of the message, one GET counted under `mode`; `None`
+    /// for a read shorter than asked. Checks the deadline first.
+    fn fetch_part(
+        &self,
+        path: &Path,
+        entry: &MessageEntry,
+        range: Range<usize>,
+        mode: FetchMode,
+    ) -> Result<Option<Bytes>, DataServerError> {
+        ds_core::deadline::check()?;
+        let Some(absolute) = usize::try_from(entry.offset)
+            .ok()
+            .and_then(|offset| {
+                Some(offset.checked_add(range.start)?..offset.checked_add(range.end)?)
+            })
+            .filter(|absolute| !absolute.is_empty())
+        else {
+            return Ok(None);
+        };
+        let bytes = self.source.store.get_range(path, absolute).map_err(|e| {
+            DataServerError::Storage(format!(
+                "Failed to fetch GRIB message range {}/{}: {e}",
+                entry.param,
+                entry.level.map_or("sfc".to_string(), |l| l.to_string()),
+            ))
+        })?;
+        self.source.point_fetches.record(mode, bytes.len());
+        if bytes.len() != range.len() {
+            tracing::debug!(
+                parameter = %entry.param,
+                expected = range.len(),
+                got = bytes.len(),
+                "Short GRIB point range read"
+            );
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
+    /// `field`'s points from `bytes`, the whole message, through its index:
+    /// the cached one when it reaches them, else one built (and the points
+    /// sampled during that one decode) from these bytes, replacing a partial
+    /// one. Decodes the message in full when the index cannot read it; only
+    /// the deadline and that full decode's own errors fail the field.
     fn points_from(
         &self,
         index: &PointIndex,
         key: &MessageKey,
-        entry: &MessageEntry,
+        field: &PointField<'_>,
         bytes: &[u8],
-        coords: &[(f64, f64)],
     ) -> Result<FieldRead, DataServerError> {
+        let (entry, run, coords) = (field.entry, field.run, field.coords);
         let full = |error: CcsdsError| match error {
             CcsdsError::Fatal(error) => Err(error),
             error => {
@@ -239,14 +586,11 @@ impl GribEngine {
                     .map(|grid| FieldRead::Grid(Arc::new(grid)))
             }
         };
-        let points = |ccsds: &CcsdsIndex, values| FieldRead::Points {
-            values,
-            metadata: *ccsds.metadata(),
-        };
-        if let Some(ccsds) = index.cache.get_untracked(key) {
+        let cached = index.cache.get_untracked(key);
+        if let Some(ccsds) = cached.as_ref().filter(|ccsds| ccsds.reaches(coords)) {
             index.cache.record_hit();
             return match ccsds.sample(bytes, coords) {
-                Ok(values) => Ok(points(&ccsds, values)),
+                Ok(values) => Ok(FieldRead::points(ccsds, values)),
                 Err(error) => full(error),
             };
         }
@@ -255,21 +599,31 @@ impl GribEngine {
             Err(error) => return full(error),
         };
         let mut sampled = None;
-        let built = index.cache.get_or_insert_with(key, || {
-            let (ccsds, values) = header.index(bytes, coords)?;
-            sampled = Some(values);
-            Ok::<_, CcsdsError>(Arc::new(ccsds))
-        });
+        let built = if cached.is_some() {
+            // A partial index from an earlier range read: replace it.
+            index.cache.record_miss();
+            header.index(bytes, coords).map(|(ccsds, values)| {
+                sampled = Some(values);
+                index.store(key, ccsds)
+            })
+        } else {
+            index.cache.get_or_insert_with(key, || {
+                let (ccsds, values) = header.index(bytes, coords)?;
+                sampled = Some(values);
+                Ok::<_, CcsdsError>(Arc::new(ccsds))
+            })
+        };
         let ccsds = match built {
             Ok(ccsds) => ccsds,
             Err(error) => return full(error),
         };
         index.remember(entry.key(), true);
+        index.note_sibling(entry.key(), run, &ccsds);
         match sampled {
-            Some(values) => Ok(points(&ccsds, values)),
+            Some(values) => Ok(FieldRead::points(&ccsds, values)),
             // Another reader built the index meanwhile.
             None => match ccsds.sample(bytes, coords) {
-                Ok(values) => Ok(points(&ccsds, values)),
+                Ok(values) => Ok(FieldRead::points(&ccsds, values)),
                 Err(error) => full(error),
             },
         }
