@@ -2,8 +2,18 @@
 # fan one request's decode out over a global pool, which the server forbids
 # on concurrent paths (root CLAUDE.md, Performance & Concurrency Rules):
 # read serially.
+#
+# Its default open gives every file a 64 MiB chunk cache, and `read_array`
+# keeps a copy of a chunked dataset of up to 32 MiB on the open file: both
+# held a second copy of every decode outside every budget (#1316). Open with
+# `reader::open_options` and decode through `reader::read_raw_pixels_2d`.
 disallowed-methods = [
-    { path = "hdf5_reader::Dataset::read_array_parallel", reason = "rayon fan-out; use read_array" },
-    { path = "hdf5_reader::Dataset::read_array_in_pool", reason = "rayon fan-out; use read_array" },
+    { path = "hdf5_reader::Dataset::read_array_parallel", reason = "rayon fan-out; use reader::read_raw_pixels_2d" },
+    { path = "hdf5_reader::Dataset::read_array_in_pool", reason = "rayon fan-out; use reader::read_raw_pixels_2d" },
     { path = "hdf5_reader::Dataset::read_slice_parallel", reason = "rayon fan-out; use read_slice" },
+    { path = "hdf5_reader::Dataset::read_array", reason = "keeps a copy of a chunked dataset on the file; use reader::read_raw_pixels_2d" },
+    { path = "hdf5_reader::Hdf5File::open", reason = "64 MiB chunk cache; open with reader::open_options" },
+    { path = "hdf5_reader::Hdf5File::from_bytes", reason = "64 MiB chunk cache; use reader::open_bytes" },
+    { path = "hdf5_reader::Hdf5File::from_vec", reason = "64 MiB chunk cache; use reader::open_bytes" },
+    { path = "hdf5_reader::Hdf5File::from_storage", reason = "64 MiB chunk cache; use reader::open_storage" },
 ]
