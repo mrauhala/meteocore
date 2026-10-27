@@ -182,6 +182,14 @@ engine-zarr.
   generation (`RemoteTileInfo::generation`) is unique per header read, so an
   object republished under its path and read again never meets the tiles of
   the bytes it replaced (#1055).
+  A local source builds it with capacity 0 (#1318). Built with hot
+  allocation 0.5 (`cache::HOT_ALLOCATION`, as #992): the pre-warm fills it
+  ahead of reads, and under quick_cache's 0.97 a full cache evicts a
+  pre-warmed frame first. `APPROX_TILE_BYTES` (32 KiB) sets the shard
+  floor: a tile under 512 KiB is admitted at any power-of-two
+  `tile_cache_mb` whatever the CPU count. Re-check
+  `a_tile_under_half_a_mebibyte_is_admitted_at_every_size` before lowering
+  either.
 - **Rendered image cache** (default 256 MB, `[server] rendered_cache_mb`) shared
   across WMS/Maps/Tiles; see `crates/api-wms/CLAUDE.md`.
 - **Decoded-chunk cache (#463, #468):** process-global byte-bounded LRU of
@@ -241,6 +249,14 @@ engine-zarr.
   burst at poll time leaves the new frame cold. It logs `Pre-warmed N new
   frame(s) for first views: …` per poll, and a WARN for reads that failed,
   were cut off by `PREWARM_BUDGET` or gave up on a busy budget.
+  Requests take the tile cache through `request_tile_cache`, which stamps
+  `prewarm::LastRead`; never pass `&self.tile_cache` on a request path, or
+  that read does not count (#1318). An engine starts as if read, so a
+  restart pre-warms as before. A collection not read within
+  `prewarm::read_window` (max(2 × poll, 30 min)) warms only
+  `select_timestamp(None)`'s frame when it is fresh, and
+  `TileCache::keep_only` drops every other object's tiles, because an LRU
+  never shrinks on its own. The switch logs once at INFO.
 - A render cut off by its deadline keeps every tile it already fetched:
   each tile is cached as it lands and only in-flight reads are dropped, so
   the client's retry fetches the rest

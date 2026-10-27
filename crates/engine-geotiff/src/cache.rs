@@ -40,6 +40,31 @@ fn weigh_tile(_key: &TileCacheKey, val: &Bytes) -> u64 {
 /// Source of [`TileCache::namespace`] ids; never reused within a process.
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
+/// Share of each cache shard's budget targeted for `quick_cache`'s "hot"
+/// ring (#1318, as #992 did for the PVOL pixel cache). The poll-time
+/// pre-warm fills this cache ahead of reads. Under the library default,
+/// `0.97`, the hot ring stays full of whatever was inserted first, and once
+/// the cache is full every pre-warmed frame competes for the 3 % cold ring,
+/// where it is evicted before its first view. At `0.5` half the budget is
+/// cold, four frames at the pre-warm's per-frame cap of an eighth, and a
+/// tile read while cold still moves to the hot ring.
+///
+/// The hot target also caps the largest tile the cache admits:
+/// `0.5 × capacity / shards`. See [`APPROX_TILE_BYTES`].
+const HOT_ALLOCATION: f64 = 0.5;
+
+/// A typical compressed tile, the hash map sizing hint. It also sets the
+/// shard floor: `quick_cache` halves its shards until each one's estimate
+/// reaches 32 tiles, so a shard holds at least about 31 × 32 KiB, and a
+/// tile up to about 496 KiB is admitted whatever the CPU count. At a
+/// power-of-two `tile_cache_mb`, such as the default, the floor is 1 MiB
+/// and the tile 512 KiB. Fewer cores mean fewer, larger shards: at the
+/// default 256 MiB the largest tile is 2 MiB on 16 cores and 512 KiB from
+/// 64. The largest tile of the radar fixtures is 165 KB of DEFLATE Float32;
+/// an uncompressed 512 × 512 Float32 tile, 1 MiB, can miss on a many-core
+/// host.
+const APPROX_TILE_BYTES: u64 = 32 * 1024;
+
 /// Thread-safe tile cache backed by the shared byte-bounded LRU (#480).
 pub struct TileCache {
     inner: ByteBoundedCache<TileCacheKey, Bytes>,
@@ -50,9 +75,13 @@ impl TileCache {
     /// Create a new tile cache with the given capacity in bytes.
     /// Pass 0 to create a no-op cache that never stores anything.
     pub fn new(max_bytes: u64) -> Self {
-        // ~16 KB per compressed tile for initial hash map sizing.
         TileCache {
-            inner: ByteBoundedCache::new(max_bytes, 16 * 1024, weigh_tile),
+            inner: ByteBoundedCache::new_with_hot_allocation(
+                max_bytes,
+                APPROX_TILE_BYTES,
+                weigh_tile,
+                HOT_ALLOCATION,
+            ),
             namespace: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -118,6 +147,18 @@ impl TileCache {
             ifd_index,
         };
         self.inner.insert(key, data);
+    }
+
+    /// Drop every tile not of the object at `file_path`, every tile for
+    /// `None`, and return about how many bytes that freed. Visits every
+    /// entry: for the poll's pre-warm of an unread collection (#1318), never
+    /// per request.
+    pub(crate) fn keep_only(&self, file_path: Option<&Path>) -> u64 {
+        let keep = file_path.map(|path| path.to_string_lossy().into_owned());
+        let before = self.weight();
+        self.inner
+            .retain(|key, _| keep.as_deref() == Some(&*key.file_path));
+        before.saturating_sub(self.weight())
     }
 
     /// Return (hits, misses) counters for logging.
@@ -216,6 +257,85 @@ mod tests {
             found
         );
         assert!(found > 0, "Expected some entries to survive");
+    }
+
+    /// #1318, as #992 for the PVOL pixel cache: a freshly pre-warmed frame
+    /// stays until it is read. The cache is first filled to twice its budget
+    /// with tiles nobody reads (a full cache: the hot ring holds the oldest),
+    /// then one frame is pre-warmed at the per-frame cap of an eighth of the
+    /// budget, then the next poll's frame. Under the default 0.97 hot target
+    /// the cold ring is 3 % of the budget and the first frame is evicted
+    /// before its first view; at 0.5 both frames fit the cold ring.
+    #[test]
+    fn a_full_cache_keeps_a_freshly_prewarmed_frame_until_it_is_read() {
+        let budget = 8 * 1024 * 1024;
+        let cache = TileCache::new(budget);
+        let tile = Bytes::from(vec![0u8; 4096]);
+        let tiles = |bytes: u64| 0..(bytes / (tile.len() as u64 + 32)) as u32;
+        let old = Path::new("old.tif");
+        for chunk in tiles(2 * budget) {
+            cache.insert(old, 1, chunk, 0, tile.clone());
+        }
+        let (fresh, next) = (Path::new("fresh.tif"), Path::new("next.tif"));
+        for chunk in tiles(budget / 8) {
+            cache.insert(fresh, 1, chunk, 0, tile.clone());
+        }
+        for chunk in tiles(budget / 8) {
+            cache.insert(next, 1, chunk, 0, tile.clone());
+        }
+        let evicted = tiles(budget / 8)
+            .filter(|&chunk| !cache.contains_untracked(fresh, 1, chunk, 0))
+            .count();
+        assert_eq!(
+            evicted, 0,
+            "pre-warmed tiles evicted before their first view"
+        );
+    }
+
+    /// #1318: the hot target caps the largest admitted tile. At a
+    /// power-of-two `tile_cache_mb` a shard holds at least 1 MiB, so a tile
+    /// just under 512 KiB is admitted whatever the CPU count. At 1 and 4 MiB
+    /// every host has its shards at that floor (one and four of 1 MiB), so
+    /// a tile one byte heavier is refused there.
+    #[test]
+    fn a_tile_under_half_a_mebibyte_is_admitted_at_every_size() {
+        const MIB: u64 = 1024 * 1024;
+        let largest = Bytes::from(vec![0u8; 512 * 1024 - 32]);
+        let path = Path::new("large.tif");
+        for mb in [1, 4, 16, 64, 256] {
+            let cache = TileCache::new(mb * MIB);
+            cache.insert(path, 1, 0, 0, largest.clone());
+            assert!(
+                cache.contains_untracked(path, 1, 0, 0),
+                "a {} byte tile is cached at {mb} MiB",
+                largest.len()
+            );
+        }
+        let heavier = Bytes::from(vec![0u8; largest.len() + 1]);
+        for mb in [1, 4] {
+            let cache = TileCache::new(mb * MIB);
+            cache.insert(path, 1, 0, 0, heavier.clone());
+            assert!(!cache.contains_untracked(path, 1, 0, 0), "{mb} MiB");
+        }
+    }
+
+    /// #1318: an unread collection's cache keeps one object's tiles, every
+    /// level and layout generation of it, and `None` keeps nothing.
+    #[test]
+    fn keep_only_drops_every_other_object() {
+        let cache = TileCache::new(1024 * 1024);
+        let (newest, older) = (Path::new("d/newest.tif"), Path::new("d/older.tif"));
+        let tile = Bytes::from(vec![1u8; 100]);
+        for (path, generation, ifd) in [(newest, 1, 0), (newest, 2, 1), (older, 3, 0)] {
+            cache.insert(path, generation, 0, ifd, tile.clone());
+        }
+        let freed = cache.keep_only(Some(newest));
+        assert_eq!(freed, tile.len() as u64 + 32);
+        assert!(cache.contains_untracked(newest, 1, 0, 0));
+        assert!(cache.contains_untracked(newest, 2, 0, 1));
+        assert!(!cache.contains_untracked(older, 3, 0, 0));
+        cache.keep_only(None);
+        assert_eq!((cache.len(), cache.weight()), (0, 0));
     }
 
     #[test]

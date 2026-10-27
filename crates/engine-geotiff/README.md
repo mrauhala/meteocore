@@ -42,10 +42,14 @@ tiles a request touches, so a remote COG is not downloaded whole.
   time, the first one for a time before the series, and the newest one
   without a time. `resolve_time` shares this rule, so caches key on it.
 - **Caching.** Each collection caches compressed tiles of remote sources
-  (`tile_cache_mb`); one process-wide cache keeps decoded tiles. A poll
-  that finds new remote frames reads the tiles of the newest four into the
-  tile cache, coarsest level first and up to `MC_COG_PREWARM_MB` each, so
-  their first views mostly skip the storage round trip.
+  (`tile_cache_mb`; a local collection builds no such cache); one
+  process-wide cache keeps decoded tiles. A poll that finds new remote
+  frames reads the tiles of the newest four into the tile cache, coarsest
+  level first and up to `MC_COG_PREWARM_MB` each, so their first views
+  mostly skip the storage round trip. A collection no request has read for
+  two poll intervals, and at least 30 minutes, warms only its newest frame
+  and keeps only that frame's tiles; the poll after a read warms every new
+  frame again. Start-up counts as a read.
 - **Republished frames.** A timestep can get a new file: a new object
   under another key that wins the timestamp, a remote object overwritten
   in place, or a local file replaced by rename. Cached tiles are keyed on
@@ -161,7 +165,7 @@ Pick one source. `data_path` is a collection field, outside `[geotiff]`.
 | `poll_interval_secs` | `30` | must be > 0; failing polls back off up to 16× |
 | `exclude_patterns` | `["*.tmp", "*.part"]` | basenames to skip: `*.ext` or an exact name |
 | `max_files` | none | keep the newest N timesteps |
-| `tile_cache_mb` | `256` | compressed tile cache for remote sources; `0` disables it |
+| `tile_cache_mb` | `256` | compressed tile cache for remote sources, none for a local one; `0` disables it |
 | `endpoint`, `bucket` | – | S3-compatible endpoint and bucket, both or neither |
 | `prefix_pattern` | `""` | object prefix with date or hour specifiers; an hour specifier needs a `time_window` of at most 24 h |
 | `time_window` | none | ISO 8601 duration, bucket mode only: `-PT2H` past, `PT6H` future |
@@ -177,7 +181,7 @@ Process-wide environment variables:
 | `MC_GEOTIFF_DECODE_MEMORY_MB` | `1024` | memory for transient tile decoding across all GeoTIFF collections; past it a request is a 503 |
 | `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` | `512` | decoded-tile cache; `0` disables it |
 | `MC_COG_TILE_CONCURRENCY` | `16` | remote tile fetches in flight across all requests (1–1024) |
-| `MC_COG_PREWARM_MB` | `32` | per-frame cap on the poll-time pre-warm, also at most 1/8 of `tile_cache_mb`; `0` turns it off |
+| `MC_COG_PREWARM_MB` | `32` | per-frame cap on the poll-time pre-warm, also at most 1/8 of `tile_cache_mb`; an unread collection warms its newest frame only; `0` turns it off |
 | `MC_COG_RANGE_BATCH_TILES` | `1` (off) | coalesce up to N nearby tile reads into one range request (max 16) |
 
 Runnable examples: `radar-no-composite-dbzh-local-cog-wgs84.toml` and

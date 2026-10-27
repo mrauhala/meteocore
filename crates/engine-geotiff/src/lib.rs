@@ -35,7 +35,7 @@ pub mod fuzz_exports {
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -198,7 +198,16 @@ pub struct GeoTiffEngine {
     /// metadata fetch — on every Maps/Tiles call (#211). The expensive
     /// derivation runs at startup and on the background poll runtime.
     raster_info: ArcSwap<ds_core::map_engine::RasterInfo>,
+    /// Compressed tiles of remote sources. A local source reads none, so
+    /// its cache holds nothing (capacity 0). Requests take it through
+    /// [`Self::request_tile_cache`], which notes the read.
     tile_cache: cache::TileCache,
+    /// When a request last read tiles, which decides how much a poll
+    /// pre-warms (#1318). Starts at construction, as if read then.
+    last_read: prewarm::LastRead,
+    /// Whether the last pre-warm was the unread collection's newest frame
+    /// only, so a change of scope is logged once (#1318).
+    prewarm_newest_only: AtomicBool,
     store_mode: StoreMode,
     /// Matches data filenames and reads their timestamps. `None` for a STAC
     /// source, whose timestamps come from item properties.
@@ -381,6 +390,7 @@ fn area_pixel_window(
 /// Most newly discovered remote frames one poll cycle pre-warms (#1004),
 /// newest first: the frames a client animates first. A cold start or a poll
 /// after an outage can discover a backlog; older frames load on first view.
+/// A collection not read recently warms only its newest frame (#1318).
 const PREWARM_MAX_FRAMES: usize = 4;
 /// Wall-clock cap on one poll cycle's pre-warm (#1004): a stalling store
 /// delays the next catalog poll by at most this. Unfinished reads are left
@@ -609,6 +619,14 @@ impl GeoTiffEngine {
         &self.collection_id
     }
 
+    /// The tile cache for a request's reads, map renders and EDR queries,
+    /// noting the read (#1318): a relaxed store, so take it once per
+    /// request. The poll's pre-warm uses the field and is no read.
+    fn request_tile_cache(&self) -> &cache::TileCache {
+        self.last_read.note();
+        &self.tile_cache
+    }
+
     /// Return (hits, misses) for the tile cache.
     pub fn tile_cache_stats(&self) -> (u64, u64) {
         self.tile_cache.stats()
@@ -757,7 +775,12 @@ impl GeoTiffEngine {
             ));
         };
 
-        let cache_bytes = config.tile_cache_mb * 1024 * 1024;
+        // Local files are read through the page cache and the decoded-chunk
+        // cache, never the compressed tile cache.
+        let cache_bytes = match store_mode {
+            StoreMode::Local { .. } => 0,
+            _ => config.tile_cache_mb * 1024 * 1024,
+        };
         let tile_cache = cache::TileCache::new(cache_bytes);
 
         let band_index = (config.band.max(1) - 1) as usize; // 1-based config → 0-based index
@@ -780,6 +803,8 @@ impl GeoTiffEngine {
                 native_grid: None,
             }),
             tile_cache,
+            last_read: prewarm::LastRead::now(),
+            prewarm_newest_only: AtomicBool::new(false),
             store_mode,
             filename_matcher,
             parameter: config.parameter.clone(),
@@ -1639,8 +1664,16 @@ impl GeoTiffEngine {
     /// from memory instead of paying a storage round trip per meta-tile. At
     /// most `PREWARM_MAX_FRAMES` frames, within the per-frame cap of
     /// [`prewarm::frame_cap`] and `PREWARM_BUDGET`; runs on the poll runtime
-    /// with bounded concurrency, see [`prewarm`]. Returns the paths of the
-    /// frames it had tiles to fetch for.
+    /// with bounded concurrency, see [`prewarm`].
+    ///
+    /// A collection no request has read within [`prewarm::read_window`]
+    /// warms only the frame a view without a time shows, when it is one of
+    /// them, and its tile cache keeps only that frame's tiles (#1318): an
+    /// LRU never shrinks on its own, so frames merely left unwarmed would
+    /// still fill it. The next poll after a read warms every new frame again.
+    /// The engine counts as read when it starts, so the polls after a
+    /// restart warm as before.
+    /// Returns the paths of the frames it had tiles to fetch for.
     async fn prewarm_new_frames(&self, previous: &Catalog) -> Vec<PathBuf> {
         if matches!(self.store_mode, StoreMode::Local { .. }) || self.shutdown.is_shutdown() {
             return Vec::new();
@@ -1649,10 +1682,49 @@ impl GeoTiffEngine {
         if cap == 0 {
             return Vec::new();
         }
+        let window = prewarm::read_window(self.poll_interval);
+        let newest_only = self.last_read.scope(window) == prewarm::Scope::Newest;
+        let changed = self
+            .prewarm_newest_only
+            .swap(newest_only, Ordering::Relaxed)
+            != newest_only;
         let plans: Vec<prewarm::FramePlan> = {
-            let catalog = self.catalog.load();
+            let catalog = self.catalog.load_full();
+            let newest = catalog.select_timestamp(None);
+            if newest_only {
+                let keep = newest
+                    .and_then(|time| catalog.entries.get(&time))
+                    .map(|entry| entry.path.as_path());
+                let freed = self.tile_cache.keep_only(keep);
+                if changed {
+                    tracing::info!(
+                        "[{}] No read in the last {} min: pre-warming only the newest frame, \
+                         and the tile cache keeps only its tiles{}",
+                        self.collection_id,
+                        window.as_secs() / 60,
+                        if freed > 0 {
+                            format!(" ({} of other frames dropped)", format_bytes(freed))
+                        } else {
+                            String::new()
+                        }
+                    );
+                } else if freed > 0 {
+                    tracing::debug!(
+                        "[{}] Unread: dropped {} of tiles other than the newest frame's",
+                        self.collection_id,
+                        format_bytes(freed)
+                    );
+                }
+            } else if changed {
+                tracing::info!(
+                    "[{}] Read in the last {} min: pre-warming every new frame",
+                    self.collection_id,
+                    window.as_secs() / 60
+                );
+            }
             catalog
                 .fresh_since(previous)
+                .filter(|(time, _)| !newest_only || Some(**time) == newest)
                 .filter_map(|(_, entry)| {
                     prewarm::plan_frame(
                         &entry.path,
@@ -1838,6 +1910,7 @@ impl GeoTiffEngine {
 
         let mut times = Vec::with_capacity(entries.len());
         let mut values = Vec::with_capacity(entries.len());
+        let tile_cache = self.request_tile_cache();
 
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
@@ -1858,7 +1931,7 @@ impl GeoTiffEngine {
                         metadata,
                         col,
                         row,
-                        Some(&self.tile_cache),
+                        Some(tile_cache),
                         &entry.path,
                         self.band_index,
                     );
@@ -1975,6 +2048,7 @@ impl GeoTiffEngine {
         let has_time = entries.len() > 1;
         let mut times = Vec::with_capacity(entries.len());
         let mut all_values = Vec::with_capacity(entries.len() * ny * nx);
+        let tile_cache = self.request_tile_cache();
 
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
@@ -1994,7 +2068,7 @@ impl GeoTiffEngine {
                 row_start,
                 col_end,
                 row_end,
-                Some(&self.tile_cache),
+                Some(tile_cache),
                 &entry.path,
                 self.band_index,
             );
@@ -2490,6 +2564,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 }
                 None => {
                     // Boxed fallback: read from overview or full resolution.
+                    let tile_cache = self.request_tile_cache();
                     let pixels = if let Some(ov) = overview {
                         reader::read_bbox_overview(
                             source,
@@ -2499,7 +2574,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                             row_start,
                             col_end,
                             row_end,
-                            Some(&self.tile_cache),
+                            Some(tile_cache),
                             &entry.path,
                             self.band_index,
                         )
@@ -2511,7 +2586,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                             row_start,
                             col_end,
                             row_end,
-                            Some(&self.tile_cache),
+                            Some(tile_cache),
                             &entry.path,
                             self.band_index,
                         )

@@ -95,6 +95,13 @@ into the collection's compressed tile cache before the next poll
 
 - the newest 4 frames that were not in the previous catalog; the poll loop
   also warms the startup catalog's newest frames before its first sleep;
+- for a collection no request has read for two poll intervals, and at
+  least 30 minutes, only the newest frame, and its tile cache keeps only
+  that frame's tiles (#1318). Its first view needs the newest frame, and
+  an LRU never shrinks on its own, so frames merely left unwarmed would
+  still fill the cache. The poll after a read warms every new frame again.
+  A collection that just started counts as read, so a restart pre-warms
+  as before, and one nobody reads switches once the window has passed;
 - levels coarsest first while the frame stays within `MC_COG_PREWARM_MB`
   (default 32 MiB, `0` turns it off) and an eighth of the tile cache, so a
   file too large for the cap still gets its overviews. An OPERA frame is
@@ -114,12 +121,20 @@ the decoded-chunk cache that every GeoTIFF collection shares, and pre-warming
 one per poll would evict other collections' chunks, while the request path
 decodes the 10–20 tiles a view touches in milliseconds.
 
+The tile cache keeps half its budget for tiles not read yet (a hot
+allocation of 0.5, #1318). Under `quick_cache`'s default of 0.97 a full
+cache gave new entries a ring of 3 % of the budget, smaller than one frame
+at the per-frame cap, so a pre-warmed frame was the first evicted, before
+its first view.
+
 The frame is published before it is warmed. The client asks for a new frame
 about 30 s after the poll publishes it and the warm takes a fraction of a
 second, and a request that races it still finds the tiles that have landed.
 
 Each poll that warms something logs
 `Pre-warmed N new frame(s) for first views: T tiles, B in R range reads, M ms`.
+A collection that changes between warming every frame and its newest only
+logs that once, at INFO.
 After deploying, the collection's `tile_cache_bytes` holds the newest frames
 and the cold-render 503s and slow first views should disappear; the
 remaining first-view cost is the decode and render, about 0.6 s for this
