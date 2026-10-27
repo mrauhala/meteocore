@@ -232,8 +232,9 @@ impl Storage for Recorder {
 }
 
 /// The spans one moment's decode reads: what opening the file, resolving
-/// the dataset and loading each chunk reads, the reads
-/// `Dataset::read_array` makes on a chunked dataset. `None` for a moment
+/// the dataset and loading each chunk reads, the reads the whole-dataset
+/// selection `reader::read_raw_pixels_2d` makes on a chunked dataset (a
+/// band of rows reads a subset of them). `None` for a moment
 /// that is not chunked (contiguous or compact storage) or that the reader
 /// cannot follow.
 fn probe_moment(recorder: &Arc<Recorder>, path: &str) -> Option<Box<[Span]>> {
@@ -258,9 +259,7 @@ fn recorded_reads(recorder: &Arc<Recorder>, path: &str) -> Option<Vec<Range<u64>
     recorder.failed.store(false, Ordering::Relaxed);
     let options = OpenOptions {
         filter_registry: Some(probe_filters()),
-        // Nothing is decoded, so nothing is worth keeping.
-        chunk_cache_bytes: 0,
-        ..OpenOptions::default()
+        ..crate::reader::open_options()
     };
     let file = Hdf5File::from_storage_with_options(recorder.clone(), options).ok()?;
     let dataset = file.dataset(path).ok()?;
@@ -344,7 +343,7 @@ pub(crate) mod tests {
     /// A one-sweep volume whose one moment is the 2-D dataset `path` of
     /// `bytes`, as long as `bytes`, with no spans recorded yet.
     pub(crate) fn one_moment_volume(bytes: &Bytes, path: &str) -> PolarVolume {
-        let file = Hdf5File::from_bytes(bytes).unwrap();
+        let file = crate::reader::open_bytes(bytes).unwrap();
         let shape = file.dataset(path).unwrap().shape().to_vec();
         PolarVolume {
             site: RadarSite {

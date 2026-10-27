@@ -30,7 +30,7 @@ use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use ds_storage::bytes::Bytes;
 use hdf5_reader::{Attribute, Hdf5File};
 
-use crate::reader::{open_bytes, BytesStorage, RawPixels, ReadError};
+use crate::reader::{open_bytes, open_storage, BytesStorage, RawPixels, ReadError};
 
 /// Radar site metadata parsed from `/where` plus the `/what/source`
 /// identifier string.
@@ -154,14 +154,21 @@ fn parse_source(source: &str) -> (Option<String>, Option<String>, Option<String>
 /// `/datasetN/dataM/data` dataset, selecting the storage type from the
 /// dataset's actual HDF5 datatype (u8/u16/i16/f64) — see
 /// [`crate::reader::read_raw_pixels_2d`].
+///
+/// The dataset is resolved through its group, not with `Hdf5File::dataset`,
+/// which keeps every dataset it resolves on the open file, with the chunk
+/// index its read loads (#1316): a batch over a whole FMI volume held
+/// 6.8 MiB of indexes until the file dropped. The same objects are read.
 fn read_moment_array(
     file: &Hdf5File,
     path: &str,
     nrays: usize,
     nbins: usize,
 ) -> Result<RawPixels, ReadError> {
+    let (group, name) = path.rsplit_once('/').unwrap_or(("", path));
     let ds = file
-        .dataset(path)
+        .group(group)
+        .and_then(|g| g.dataset(name))
         .map_err(|_| ReadError::MissingGroup(path.to_string()))?;
     crate::reader::read_raw_pixels_2d(&ds, nrays, nbins, path)
 }
@@ -454,7 +461,7 @@ pub(crate) fn visit_moments_pixels_in<'a>(
     requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
     mut visit: impl FnMut(&str, Result<RawPixels, ReadError>),
 ) -> Result<(), ReadError> {
-    let file = Hdf5File::from_storage(storage).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
+    let file = open_storage(storage)?;
     for (path, nrays, nbins) in requests {
         visit(path, read_moment_array(&file, path, nrays, nbins));
     }
@@ -614,15 +621,18 @@ mod tests {
     }
 
     /// #1261: a file opened from shared bytes ([`BytesStorage`]) decodes as
-    /// the copying `Hdf5File::from_bytes` open does, every moment of the
-    /// committed volume and the chunked composite alike, and the reader is
-    /// handed only what it reads: decoding the composite's one dataset from
-    /// a 4 MiB file copies less than its 36 kB of HDF5.
+    /// the copying `Hdf5File::from_bytes_with_options` open does, every
+    /// moment of the committed volume and the chunked composite alike, and
+    /// the reader is handed only what it reads: decoding the composite's one
+    /// dataset from a 4 MiB file copies less than its 36 kB of HDF5.
     #[test]
     fn shared_bytes_decode_as_a_copy_and_copy_only_what_is_read() {
         use crate::layout::tests::{one_moment_volume, padded, same_pixels, COMP, COMP_DATA};
         let bytes = Bytes::from_static(COLD_BATCH);
-        let copied = Hdf5File::from_bytes(&bytes).unwrap();
+        let open_copy = |bytes: &Bytes| {
+            Hdf5File::from_bytes_with_options(bytes, crate::reader::open_options()).unwrap()
+        };
+        let copied = open_copy(&bytes);
         let vol = read_polar_volume(&bytes).unwrap();
         for sweep in &vol.sweeps {
             for moment in &sweep.moments {
@@ -636,13 +646,7 @@ mod tests {
         let bytes = padded(COMP, 4 << 20);
         let volume = one_moment_volume(&bytes, COMP_DATA);
         let (nrays, nbins) = (volume.sweeps[0].nrays, volume.sweeps[0].nbins);
-        let copy = read_moment_array(
-            &Hdf5File::from_bytes(&bytes).unwrap(),
-            COMP_DATA,
-            nrays,
-            nbins,
-        )
-        .unwrap();
+        let copy = read_moment_array(&open_copy(&bytes), COMP_DATA, nrays, nbins).unwrap();
         let storage = BytesStorage::new(&bytes);
         let mut shared = None;
         visit_moments_pixels_in(storage.clone(), [(COMP_DATA, nrays, nbins)], |_, r| {

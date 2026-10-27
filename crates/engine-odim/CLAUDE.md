@@ -277,6 +277,23 @@ around `ds-storage` calls (Critical Rules 6–7).
   copies only its range: a metadata parse or a one-moment decode copies
   kilobytes, not 20–40 MB. Pinned by
   `shared_bytes_decode_as_a_copy_and_copy_only_what_is_read`.
+- **Decodes keep no hidden copy (#1316).** Open every HDF5 file through
+  `reader::open_options` (`open_bytes`, `open_storage`; the layout probe adds
+  its filters to it): hdf5-reader's default 64 MiB per-file chunk cache never
+  hits, because a decode reads each chunk once and then drops the file.
+  Decode through `reader::read_raw_pixels_2d`, never `Dataset::read_array`:
+  on a chunked dataset of up to 32 MiB it copies the dataset into its handle,
+  and `Hdf5File::dataset` keeps that handle on the file until the file drops,
+  so a whole-volume batch held every moment twice. A batch resolves each
+  moment through its group (`read_moment_array`), because `Hdf5File::dataset`
+  also keeps each chunk index. f64 datasets decode one row of chunks at a
+  time into f32 with the same `as f32` cast. `clippy.toml` disallows the
+  default-option opens and `read_array`. Pinned by `tests/decode_memory.rs`
+  (peak under 1.25× the decoded array) and
+  `reader::tests::decodes_as_read_array_did`; the ignored
+  `decode_peak_allocation` measures the uncommitted fixtures (a whole FMI
+  volume batch: 0.4 MiB on top of 74 MiB of arrays; an OPERA composite:
+  27.5 MiB on top of 64 MiB).
 - **Cold single-moment misses (#293, #994):** only a map render reads one
   moment at a time. A `Pixels::moment` miss reads the moment's byte ranges
   (previous bullet) or else fetches the source-qualified file once, decodes

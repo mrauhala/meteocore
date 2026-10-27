@@ -49,8 +49,12 @@ use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use ds_core::geo::Crs;
 use ds_storage::bytes::Bytes;
 use hdf5_reader::error::{Error as Hdf5Error, Result as Hdf5Result};
-use hdf5_reader::{Attribute, Dataset, Datatype, Hdf5File, Storage, StorageBuffer};
-use ndarray::Array2;
+use hdf5_reader::storage::DynStorage;
+use hdf5_reader::{
+    Attribute, Dataset, Datatype, H5Type, Hdf5File, OpenOptions, SliceInfo, SliceInfoElem, Storage,
+    StorageBuffer,
+};
+use ndarray::{Array2, ArrayD};
 
 use crate::proj;
 
@@ -103,10 +107,27 @@ impl Storage for BytesStorage {
     }
 }
 
+/// The options every HDF5 open in this crate starts from: no chunk cache
+/// (#1316). A file is opened per decode and a decode reads each chunk once,
+/// so hdf5-reader's default 64 MiB cache saved nothing and only held a
+/// second copy of what was decoded until the file dropped, outside every
+/// budget. `clippy.toml` disallows the opens that take the defaults.
+pub(crate) fn open_options() -> OpenOptions {
+    OpenOptions {
+        chunk_cache_bytes: 0,
+        ..OpenOptions::default()
+    }
+}
+
+/// Open the HDF5 file `storage` serves, with [`open_options`].
+pub(crate) fn open_storage(storage: DynStorage) -> Result<Hdf5File, ReadError> {
+    Hdf5File::from_storage_with_options(storage, open_options())
+        .map_err(|e| ReadError::OpenFailed(e.to_string()))
+}
+
 /// Open the HDF5 file `bytes` hold without copying it ([`BytesStorage`]).
 pub(crate) fn open_bytes(bytes: &Bytes) -> Result<Hdf5File, ReadError> {
-    Hdf5File::from_storage(BytesStorage::new(bytes))
-        .map_err(|e| ReadError::OpenFailed(e.to_string()))
+    open_storage(BytesStorage::new(bytes))
 }
 
 /// Errors from [`read_composite`].
@@ -351,23 +372,13 @@ pub(crate) fn read_raw_pixels_2d(
 
     macro_rules! read_2d {
         ($t:ty, $variant:ident) => {{
-            let arr = ds
-                .read_array::<$t>()
-                .map_err(|e| ReadError::DatasetRead(format!("{path}: {e}")))?;
-            let a2 = arr
-                .into_dimensionality::<ndarray::Ix2>()
-                .map_err(|e| ReadError::DatasetRead(format!("{path}: reshape failed: {e}")))?;
-            if a2.dim() != (rows, cols) {
-                return Err(ReadError::DatasetRead(format!(
-                    "{path}: array shape {:?} doesn't match metadata {rows}x{cols}",
-                    a2.dim()
-                )));
-            }
-            RawPixels::$variant(a2)
+            let arr =
+                read_whole::<$t>(ds).map_err(|e| ReadError::DatasetRead(format!("{path}: {e}")))?;
+            RawPixels::$variant(into_2d(arr, rows, cols, path)?)
         }};
     }
 
-    // `byte_order` is intentionally wildcarded: `read_array::<T>()` applies any
+    // `byte_order` is intentionally wildcarded: the typed reads apply any
     // byte-swapping internally, so the storage variant is fixed by (size, signed)
     // alone. Matching on `signed` is what's load-bearing (the size-only read in
     // hdf5-reader 0.6 would otherwise let a signed array bit-reinterpret as the
@@ -390,26 +401,14 @@ pub(crate) fn read_raw_pixels_2d(
         } => read_2d!(i16, I16),
         // Native f32 datasets (#393) store directly.
         Datatype::FloatingPoint { size: 4, .. } => read_2d!(f32, F32),
-        // f64 datasets (OPERA v2.4) are read at full width, then downcast to
-        // f32 storage (#464): radar physical values don't use the extra
-        // precision, and halving the element size halves the composite /
-        // pixel cache footprint (OPERA 4400×3800: 134 → 67 MB). Sentinel
-        // equality survives the rounding — `sample_class` rounds the declared
-        // sentinels through f32 the same way.
+        // f64 datasets (OPERA v2.4) are downcast to f32 storage (#464): radar
+        // physical values don't use the extra precision, and halving the
+        // element size halves the composite / pixel cache footprint (OPERA
+        // 4400×3800: 134 → 67 MB). Sentinel equality survives the rounding —
+        // `sample_class` rounds the declared sentinels through f32 the same
+        // way.
         Datatype::FloatingPoint { size: 8, .. } => {
-            let arr = ds
-                .read_array::<f64>()
-                .map_err(|e| ReadError::DatasetRead(format!("{path}: {e}")))?;
-            let a2 = arr
-                .into_dimensionality::<ndarray::Ix2>()
-                .map_err(|e| ReadError::DatasetRead(format!("{path}: reshape failed: {e}")))?;
-            if a2.dim() != (rows, cols) {
-                return Err(ReadError::DatasetRead(format!(
-                    "{path}: array shape {:?} doesn't match metadata {rows}x{cols}",
-                    a2.dim()
-                )));
-            }
-            RawPixels::F32(a2.mapv(|v| v as f32))
+            RawPixels::F32(read_f64_as_f32(ds, rows, cols, path)?)
         }
         // `warn!` (not `debug!`): an unsupported dtype means the data won't
         // load at all, which an operator needs to see in production — and the
@@ -422,6 +421,93 @@ pub(crate) fn read_raw_pixels_2d(
         }
     };
     Ok(pixels)
+}
+
+/// The whole of `ds` as `T`. A chunked dataset is read as a full selection,
+/// never with `Dataset::read_array` (#1316): on a chunked dataset of up to
+/// 32 MiB, `read_array` also copies the dataset's bytes into its handle,
+/// which `Hdf5File::dataset` keeps on the open file until the file drops,
+/// so a batch decoding a volume's moments in one open held each of them
+/// twice. The selection reads the same chunks and copies the same bytes.
+/// Contiguous and compact datasets keep no copy and are read as before.
+#[allow(clippy::disallowed_methods)] // read_array only where it keeps no copy
+fn read_whole<T: H5Type>(ds: &Dataset) -> Hdf5Result<ArrayD<T>> {
+    if ds.chunks().is_some() {
+        ds.read_slice(&SliceInfo::all(ds.ndim()))
+    } else {
+        ds.read_array()
+    }
+}
+
+/// `arr` as the `rows × cols` array the metadata declares.
+fn into_2d<T>(
+    arr: ArrayD<T>,
+    rows: usize,
+    cols: usize,
+    path: &str,
+) -> Result<Array2<T>, ReadError> {
+    let a2 = arr
+        .into_dimensionality::<ndarray::Ix2>()
+        .map_err(|e| ReadError::DatasetRead(format!("{path}: reshape failed: {e}")))?;
+    if a2.dim() != (rows, cols) {
+        return Err(ReadError::DatasetRead(format!(
+            "{path}: array shape {:?} doesn't match metadata {rows}x{cols}",
+            a2.dim()
+        )));
+    }
+    Ok(a2)
+}
+
+/// An f64 dataset as f32 (#464), each value narrowed `as f32` as the
+/// whole-array read did. A chunked one is read one row of chunks at a time
+/// (#1316): each chunk is still decompressed once, but the whole dataset
+/// never exists at f64. OPERA's 4400 × 3800 composite reads 760-row bands
+/// of 23 MB instead of a 134 MB f64 array next to its 67 MB result.
+fn read_f64_as_f32(
+    ds: &Dataset,
+    rows: usize,
+    cols: usize,
+    path: &str,
+) -> Result<Array2<f32>, ReadError> {
+    let read_failed = |e: Hdf5Error| ReadError::DatasetRead(format!("{path}: {e}"));
+    let band = match ds.chunks().as_deref() {
+        Some(&[chunk_rows, _]) => (chunk_rows as usize).max(1),
+        _ => {
+            let arr = read_whole::<f64>(ds).map_err(read_failed)?;
+            return Ok(into_2d(arr, rows, cols, path)?.mapv(|v| v as f32));
+        }
+    };
+    if ds.shape() != [rows as u64, cols as u64] {
+        return Err(ReadError::DatasetRead(format!(
+            "{path}: array shape {:?} doesn't match metadata {rows}x{cols}",
+            ds.shape()
+        )));
+    }
+    let mut values = Vec::new();
+    rows.checked_mul(cols)
+        .and_then(|len| values.try_reserve_exact(len).ok())
+        .ok_or_else(|| ReadError::DatasetRead(format!("{path}: {rows}x{cols} does not fit")))?;
+    for start in (0..rows).step_by(band) {
+        let end = rows.min(start.saturating_add(band));
+        let selection = SliceInfo {
+            selections: vec![
+                SliceInfoElem::Slice {
+                    start: start as u64,
+                    end: end as u64,
+                    step: 1,
+                },
+                SliceInfoElem::Slice {
+                    start: 0,
+                    end: cols as u64,
+                    step: 1,
+                },
+            ],
+        };
+        let part = ds.read_slice::<f64>(&selection).map_err(read_failed)?;
+        values.extend(part.iter().map(|&v| v as f32));
+    }
+    Array2::from_shape_vec((rows, cols), values)
+        .map_err(|e| ReadError::DatasetRead(format!("{path}: reshape failed: {e}")))
 }
 
 /// A parsed ODIM composite ready for sampling. Carries the raw
@@ -1110,5 +1196,99 @@ mod tests {
             "non-f32-exact nodata sentinel must still mask its own pixels"
         );
         assert_eq!(px.sample(0, 1, 1.0, 0.0, sentinel, None), Some(25.0));
+    }
+
+    /// The decode before #1316: `read_array`, f64 narrowed afterwards.
+    #[allow(clippy::disallowed_methods)]
+    fn read_array_pixels(file: &Hdf5File, path: &str) -> RawPixels {
+        let ds = file.dataset(path).unwrap();
+        fn two_d<T>(arr: ArrayD<T>) -> Array2<T> {
+            arr.into_dimensionality().unwrap()
+        }
+        match ds.dtype() {
+            Datatype::FixedPoint {
+                size: 1,
+                signed: false,
+                ..
+            } => RawPixels::U8(two_d(ds.read_array().unwrap())),
+            Datatype::FixedPoint {
+                size: 2,
+                signed: false,
+                ..
+            } => RawPixels::U16(two_d(ds.read_array().unwrap())),
+            Datatype::FixedPoint {
+                size: 2,
+                signed: true,
+                ..
+            } => RawPixels::I16(two_d(ds.read_array().unwrap())),
+            Datatype::FloatingPoint { size: 4, .. } => {
+                RawPixels::F32(two_d(ds.read_array().unwrap()))
+            }
+            Datatype::FloatingPoint { size: 8, .. } => {
+                RawPixels::F32(two_d(ds.read_array::<f64>().unwrap()).mapv(|v| v as f32))
+            }
+            dt => panic!("{path}: {dt:?}"),
+        }
+    }
+
+    /// #1316: composites and volume batches decode bit for bit as
+    /// `read_array` did, f64 OPERA bands and edge chunks included: the
+    /// committed DMI composite (chunked) and volume (contiguous), and the
+    /// first file of each uncommitted radar fixture directory when present.
+    #[test]
+    fn decodes_as_read_array_did() {
+        use crate::layout::tests::same_pixels;
+        use crate::pvol::{read_moments_pixels, read_polar_volume};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata");
+        let first_h5 = |dir: &str| {
+            let mut paths: Vec<_> = std::fs::read_dir(root.join(dir))
+                .ok()?
+                .filter_map(|e| Some(e.ok()?.path()))
+                .filter(|p| p.extension().is_some_and(|e| e == "h5"))
+                .collect();
+            paths.sort();
+            paths.into_iter().next()
+        };
+        let read = |path: std::path::PathBuf| Bytes::from(std::fs::read(path).unwrap());
+
+        let mut composites = vec![root.join("odim-dmi-fixture.h5")];
+        composites.extend(
+            ["radar-opera", "radar-dwd", "radar-dmi", "radar-smhi"]
+                .into_iter()
+                .filter_map(first_h5),
+        );
+        for path in composites {
+            let bytes = read(path.clone());
+            let decoded = read_composite(&bytes).unwrap().pixels;
+            let before = read_array_pixels(&open_bytes(&bytes).unwrap(), "/dataset1/data1/data");
+            assert!(same_pixels(&decoded, &before), "{path:?}");
+        }
+
+        let mut volumes = vec![root.join("pvol-cold-batch.h5")];
+        volumes.extend(
+            ["radar-fmi-pvol", "radar-smhi-pvol", "radar-dmi-pvol"]
+                .into_iter()
+                .filter_map(first_h5),
+        );
+        for path in volumes {
+            let bytes = read(path.clone());
+            let volume = read_polar_volume(&bytes).unwrap();
+            let requests: Vec<_> = volume
+                .sweeps
+                .iter()
+                .flat_map(|s| {
+                    s.moments
+                        .iter()
+                        .map(move |m| (m.dataset_path.as_str(), s.nrays, s.nbins))
+                })
+                .collect();
+            let decoded = read_moments_pixels(&bytes, requests.iter().copied()).unwrap();
+            assert_eq!(decoded.len(), requests.len(), "{path:?}");
+            let file = open_bytes(&bytes).unwrap();
+            for (moment, px) in &decoded {
+                let before = read_array_pixels(&file, moment);
+                assert!(same_pixels(px, &before), "{path:?}: {moment}");
+            }
+        }
     }
 }
