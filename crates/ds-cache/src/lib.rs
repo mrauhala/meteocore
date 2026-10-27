@@ -422,6 +422,19 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         self.capacity_bytes
     }
 
+    /// The budget of one shard in bytes: what entries that must all stay
+    /// resident may weigh together. Equal to [`Self::capacity_bytes`] for a
+    /// [`Self::new_single_shard`] cache; a sharded cache splits its budget,
+    /// so entries that fit the total can still overflow the shard they hash
+    /// to.
+    pub fn shard_capacity_bytes(&self) -> u64 {
+        if self.capacity_bytes == 0 {
+            0
+        } else {
+            self.cache.shard_capacity()
+        }
+    }
+
     /// Number of resident entries.
     pub fn len(&self) -> usize {
         self.cache.len()
@@ -484,6 +497,21 @@ mod tests {
             .count();
         assert!(found < 20, "expected evictions, all {found} survived");
         assert!(found > 0, "expected some entries to survive");
+    }
+
+    /// A sharded cache splits its budget: one shard holds less than the
+    /// total, so a caller planning residency must compare against
+    /// `shard_capacity_bytes`, which a single-shard cache makes the total.
+    #[test]
+    fn shard_capacity_is_the_planning_budget() {
+        // 64 estimated items of 100 bytes: quick_cache starts from 4 shards
+        // per CPU and halves them until each holds ≥ 32 items, so two.
+        let sharded = ByteBoundedCache::new(64 * 100, 100, weigh_str);
+        assert_eq!(sharded.shard_capacity_bytes(), 32 * 100);
+        let single = ByteBoundedCache::new_single_shard(64 * 100, 100, weigh_str);
+        assert_eq!(single.shard_capacity_bytes(), 64 * 100);
+        let disabled = ByteBoundedCache::new_single_shard(0, 100, weigh_str);
+        assert_eq!(disabled.shard_capacity_bytes(), 0);
     }
 
     /// One shard: entries that together weigh the whole budget all stay.

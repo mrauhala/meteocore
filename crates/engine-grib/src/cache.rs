@@ -643,9 +643,11 @@ impl GridCache {
         if size_mb == 0 {
             return None;
         }
-        // Estimate: each grid is ~4 MiB (1440*721*4 bytes).
+        // Estimate: each grid is ~4 MiB (1440*721*4 bytes). One shard:
+        // [`Self::holds`] plans which windows stay resident, and a sharded
+        // budget would evict fields of a window that fits the total.
         Some(Self {
-            cache: ByteBoundedCache::new(
+            cache: ByteBoundedCache::new_single_shard(
                 size_mb.saturating_mul(ds_cache::MIB),
                 4 * ds_cache::MIB,
                 weigh_grid,
@@ -689,18 +691,20 @@ impl GridCache {
     #[cfg(test)]
     pub(crate) fn with_capacity_bytes(bytes: u64) -> Self {
         Self {
-            cache: ByteBoundedCache::new(bytes, 4 * ds_cache::MIB, weigh_grid),
+            cache: ByteBoundedCache::new_single_shard(bytes, 4 * ds_cache::MIB, weigh_grid),
         }
     }
 
     /// Whether `fields` decoded grids of `nodes` values each fit this
     /// cache's budget together (#1297): their estimated weight, as
-    /// [`weigh_grid`] would count each, against the configured capacity.
+    /// [`weigh_grid`] would count each, against the budget of the one shard
+    /// they share (the whole capacity: the cache is never sharded).
     /// A query whose fields do not fit reads them with [`Self::get_or_join`]
     /// instead of filling the cache, which would evict them, and every grid
     /// a map keeps there, before the query could reuse any of them.
     pub(crate) fn holds(&self, fields: usize, nodes: u64) -> bool {
-        (fields as u64).saturating_mul(Self::estimated_weight(nodes)) <= self.cache.capacity_bytes()
+        (fields as u64).saturating_mul(Self::estimated_weight(nodes))
+            <= self.cache.shard_capacity_bytes()
     }
 
     /// The weight [`weigh_grid`] gives a decoded grid of `nodes` values
@@ -783,6 +787,22 @@ mod sampler_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `holds` plans which windows stay resident (#1297), so the grid cache
+    /// is one shard: its whole budget holds a window `holds` admits. At
+    /// 256 MiB a sharded cache was two 128 MiB halves, each holding five
+    /// 0.1° fields, while `holds` admitted ten.
+    #[test]
+    fn grid_cache_is_one_shard_so_admitted_windows_stay_resident() {
+        let cache = GridCache::new(256).unwrap();
+        assert_eq!(
+            cache.cache.shard_capacity_bytes(),
+            cache.cache.capacity_bytes()
+        );
+        let nodes = 3600 * 1801;
+        assert!(cache.holds(10, nodes));
+        assert!(!cache.holds(11, nodes));
+    }
 
     #[test]
     fn compact_grid_fits_small_cache_without_redecoding() {
