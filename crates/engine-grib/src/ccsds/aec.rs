@@ -222,31 +222,84 @@ pub(crate) fn decode_indexed<E: From<AecError>>(
     payload: &[u8],
     samples: usize,
     chunk: usize,
-    mut sink: impl FnMut(usize, &[u8]) -> Result<(), E>,
+    sink: impl FnMut(usize, &[u8]) -> Result<(), E>,
 ) -> Result<Vec<usize>, E> {
-    let mut decoder = Decoder::new(params, payload)?;
+    let decoded = decode_from(params, payload, 0, samples, chunk, sink)?;
+    if decoded.samples != samples {
+        let width = params.bytes_per_sample();
+        return Err(AecError::Short {
+            decoded: decoded.samples * width,
+            wanted: samples.saturating_mul(width),
+        }
+        .into());
+    }
+    Ok(decoded.offsets)
+}
+
+/// What [`decode_from`] decoded.
+#[derive(Debug)]
+pub(crate) struct Decoded {
+    /// Samples produced, from the RSI the decode started at.
+    pub samples: usize,
+    /// The bit of the input at which each RSI the decode reached starts:
+    /// first the one it started at, then each the decode entered.
+    pub offsets: Vec<usize>,
+}
+
+/// Decode up to `samples` samples from the RSI whose first bit is `bit` of
+/// `input`, `chunk` at a time through one reused buffer, handing `sink`
+/// each chunk with the index of its first sample, counted from that RSI's
+/// first; and record where each RSI the decode enters starts. An input that
+/// ends first is no error: a prefix of a payload, or the bytes from one RSI
+/// on, decode as far as they reach (#1301).
+pub(crate) fn decode_from<E: From<AecError>>(
+    params: &Params,
+    input: &[u8],
+    bit: usize,
+    samples: usize,
+    chunk: usize,
+    mut sink: impl FnMut(usize, &[u8]) -> Result<(), E>,
+) -> Result<Decoded, E> {
+    let mut decoder = Decoder::new(params, input)?;
+    decoder.seek(bit)?;
     decoder.enable_offsets()?;
     let width = decoder.bytes_per_sample;
-    let wanted = samples
-        .checked_mul(width)
-        .ok_or(AecError::Output(usize::MAX))?;
     let chunk = chunk.clamp(1, samples.max(1));
-    let mut buffer = vec![0; chunk * width];
+    let mut buffer = vec![
+        0;
+        chunk
+            .checked_mul(width)
+            .ok_or(AecError::Output(usize::MAX))?
+    ];
     let mut first = 0;
     while first < samples {
         let out = &mut buffer[..chunk.min(samples - first) * width];
+        let wanted = out.len();
         let written = decoder.decode(out)?;
-        if written != out.len() {
-            return Err(AecError::Short {
-                decoded: first * width + written,
-                wanted,
-            }
-            .into());
+        if written > 0 {
+            sink(first, &out[..written])?;
         }
-        sink(first, out)?;
-        first += out.len() / width;
+        first += written / width;
+        if written < wanted {
+            break; // the input ended
+        }
     }
-    Ok(decoder.offsets()?)
+    let mut offsets = decoder.offsets()?;
+    // libaec counts from where it started reading: past the sought byte when
+    // `bit` falls inside one (`aec_buffer_seek` loads that byte), and in
+    // `size_t`, so a position inside that byte wraps. Its first entry is
+    // the placeholder `aec_decode_enable_offsets` pushes: the RSI at `bit`.
+    let base = 8 * (bit / 8) + if bit.is_multiple_of(8) { 0 } else { 8 };
+    for offset in offsets.iter_mut().skip(1) {
+        *offset = base.wrapping_add(*offset);
+    }
+    if let Some(start) = offsets.first_mut() {
+        *start = bit;
+    }
+    Ok(Decoded {
+        samples: first,
+        offsets,
+    })
 }
 
 /// Decode `out.len()` bytes of samples from the RSI whose first bit is

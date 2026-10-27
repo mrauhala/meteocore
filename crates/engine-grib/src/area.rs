@@ -121,7 +121,7 @@ impl GribEngine {
                     .count()
             })
             .sum();
-        let plan = self.field_plan(field_count);
+        let plan = self.field_plan(field_count, None);
         // This first field supplies the geometry and its own output values.
         // Protect synchronous cache-fill waits just like the parallel jobs.
         let first_file = steps[first_step].1;

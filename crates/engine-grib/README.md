@@ -47,7 +47,12 @@ level type) exposes every parameter; each retained run is an EDR instance.
   where each block starts (about 1.2 KB at 0.25°, 6.5 KB at 0.1°;
   `point_index_cache_mb`). A grid already in the cache is used as it is;
   nothing is inserted. Other packings, bitmaps, and fields the grid cache
-  would keep while no message cache is set are decoded in full.
+  would keep while no message cache is set are decoded in full. Without a
+  message cache, or one too small for the query's messages, the query also
+  fetches only bytes: one range GET of an indexed message's needed blocks,
+  else a prefix predicted from an indexed message of the same parameter,
+  plus at most one continuation. About 15 % of a message at 60°N, 80 % at
+  34°S, a few kilobytes once indexed.
 - **Sampling.** Points, paths and map pixels are interpolated bilinearly in
   `f64`, then converted to display units; map tiles store `f32`. Projected
   output CRSs map pixels through a coarse projection grid. An EDR query
@@ -174,7 +179,9 @@ at one canonical level: the lowest height above ground up to 100 m, then
 surface, then mean sea level. `/metrics` reports `grid_cache_*`,
 `grib_message_cache_*` and `grib_point_index_cache_*` per source, and
 `grib_point_fields_total` by `path`: `partial` through the point index,
-`full` from a decoded grid.
+`full` from a decoded grid. `grib_point_fetches_total` and
+`grib_point_fetch_bytes_total` count the point path's GETs and bytes by
+`mode`: `whole`, `prefix`, `range` or `continuation`.
 
 Runnable examples read public buckets
 ([`ecmwf-ifs`](../../collections.d/ecmwf-ifs.toml),

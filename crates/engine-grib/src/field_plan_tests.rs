@@ -325,7 +325,7 @@ fn a_small_grid_runs_sixteen_field_reads_at_once() {
     assert_eq!(store.reads.lock().unwrap().attempts.len(), STEPS as usize);
     assert_eq!(store.peak.load(Ordering::SeqCst), MAX_FIELD_JOBS);
     assert_eq!(store.active.load(Ordering::SeqCst), 0);
-    let plan = engine.field_plan(STEPS as usize);
+    let plan = engine.field_plan(STEPS as usize, None);
     assert_eq!(plan.concurrency, MAX_FIELD_JOBS);
     assert_eq!(plan.fill, GridFill::Insert, "no cache, nothing to bypass");
 }
@@ -342,12 +342,13 @@ fn the_plan_bypasses_only_a_window_the_cache_cannot_hold() {
         (CACHE_FIELDS as usize + 1, GridFill::Bypass),
         (STEPS as usize, GridFill::Bypass),
     ] {
-        let plan = engine.field_plan(fields);
+        let plan = engine.field_plan(fields, None);
         assert_eq!(
             plan,
             FieldPlan {
                 concurrency: MAX_FIELD_JOBS,
-                fill
+                fill,
+                fetch: FieldFetch::Whole,
             },
             "{fields} fields"
         );

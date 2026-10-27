@@ -145,7 +145,7 @@ impl GribEngine {
                 })
             })
             .collect();
-        let plan = self.field_plan(jobs.len());
+        let plan = self.field_plan(jobs.len(), None);
         let engine = Arc::new(Self {
             collection_id: self.collection_id.clone(),
             family: self.family,

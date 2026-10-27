@@ -302,6 +302,9 @@ fn synthetic_layouts_are_bit_identical() {
             }
             let index = assert_identical(&message, &coords);
             assert_full_decode_metadata(&message);
+            for coords in [&coords[..], &[(24.0, 60.0)], &[(150.0, -34.0)]] {
+                assert_partial_reads(&message, coords);
+            }
             if bits > 0 {
                 let grid = decode_message(&message, "q").unwrap();
                 let per_rsi = header.packing.aec.rsi_samples();
@@ -541,16 +544,22 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
     ));
     // Offset tables libaec could not have produced.
     let offsets: Vec<usize> = index.rsi_offsets.iter().map(|&o| o as usize).collect();
-    let payload_len = header.payload_len;
-    assert!(header.rsi_offsets(&offsets, payload_len).is_ok());
-    assert!(header.rsi_offsets(&offsets[..253], payload_len).is_err());
+    assert!(header.rsi_offsets(&offsets, true).is_ok());
+    assert!(header.rsi_offsets(&offsets[..253], true).is_err());
+    // A prefix's first RSIs are a partial index, but never none.
+    assert!(header.rsi_offsets(&offsets[..253], false).is_ok());
+    assert!(header.rsi_offsets(&[], false).is_err());
     let mut swapped = offsets.clone();
     swapped.swap(3, 4);
-    assert!(header.rsi_offsets(&swapped, payload_len).is_err());
+    assert!(header.rsi_offsets(&swapped, false).is_err());
     let mut late = offsets.clone();
     late[0] = 1;
-    assert!(header.rsi_offsets(&late, payload_len).is_err());
-    assert!(header.rsi_offsets(&offsets, 1000).is_err());
+    assert!(header.rsi_offsets(&late, false).is_err());
+    let small = Header {
+        payload_len: 1000,
+        ..header
+    };
+    assert!(small.rsi_offsets(&offsets, true).is_err());
 }
 
 #[test]
@@ -577,6 +586,235 @@ fn rsi_decodes_check_their_input_and_output() {
         Err(AecError::Short { .. })
     ));
     aec::decode_rsi(&params, payload, 0, &mut out).unwrap();
+}
+
+/// What the partial reads of #1301 did on one message, for the summary the
+/// ignored local-file test prints.
+#[derive(Debug, Default)]
+struct PartialReads {
+    /// Bytes the needed RSIs span, and the message bytes a prefix through
+    /// them holds.
+    span: usize,
+    prefix: usize,
+    /// Whether a read on from a partial index began mid-byte, and whether
+    /// a short prefix needed its continuation.
+    mid_byte: bool,
+    continued: bool,
+}
+
+/// Every partial read of `message` for `coords` gives the full decode's
+/// values, bit for bit, and indexes exactly the RSI starts a whole decode
+/// records:
+/// - warm: the one span of the needed RSIs [`CcsdsIndex::rsi_bytes`] names;
+/// - cold: a prefix through them, parsed without the rest of the message;
+/// - cold and short: a prefix ending halfway into them, then one
+///   continuation to the read-on its partial index predicts;
+/// - extended: a partial index read on from where it ends, over only the
+///   bytes [`CcsdsIndex::extension`] names, one continuation if short.
+fn assert_partial_reads(message: &[u8], coords: &[(f64, f64)]) -> PartialReads {
+    let expected = bits(&decoded(message, coords));
+    let len = message.len();
+    let header = Header::parse(message).unwrap();
+    let (complete, _) = header.index(message, &[]).unwrap();
+    let exact = |index: &CcsdsIndex| {
+        assert_eq!(
+            index.rsi_offsets[..],
+            complete.rsi_offsets[..index.rsi_offsets.len()],
+            "RSI starts"
+        );
+    };
+    let mut reads = PartialReads::default();
+    let Some(needs) = complete.needs(coords) else {
+        // A constant field, or no point on the grid: the header suffices.
+        let prefix = &message[..MIN_PREFIX.min(len)];
+        let header = Header::parse_prefix(prefix, len).unwrap().unwrap();
+        let Extended::Done { values, .. } = header.extend(None, prefix, 0, coords).unwrap() else {
+            panic!("nothing to decode")
+        };
+        assert_eq!(bits(&values), expected);
+        return reads;
+    };
+    let span = complete.rsi_bytes(&needs).unwrap();
+    reads.span = span.len();
+    reads.prefix = span.end;
+    let warm = complete
+        .sample_bytes(&message[span.clone()], span.start, coords)
+        .unwrap();
+    assert_eq!(bits(&warm), expected, "warm range");
+    // Bytes that begin after the first needed RSI does.
+    assert!(matches!(
+        complete.sample_bytes(&message[span.start + 1..span.end], span.start + 1, coords),
+        Err(CcsdsError::Invalid(_))
+    ));
+
+    // Cold, through the needed RSIs.
+    let prefix = &message[..span.end];
+    let parsed = Header::parse_prefix(prefix, len).unwrap().unwrap();
+    assert_eq!(parsed, header);
+    let Extended::Done { index, values } = parsed.extend(None, prefix, 0, coords).unwrap() else {
+        panic!("a prefix through the needed RSIs is enough")
+    };
+    assert_eq!(bits(&values), expected, "prefix");
+    assert!(index.covers(&needs));
+    exact(&index);
+
+    // Cold and short: one continuation.
+    let short = ((span.start + span.end) / 2).max(header.payload_start + 1);
+    let read = |prior: Option<&CcsdsIndex>, bytes: &[u8], start: usize| {
+        header.extend(prior, bytes, start, coords).unwrap()
+    };
+    let partial = match read(None, &message[..short], 0) {
+        // The needed samples lay in the first half after all.
+        Extended::Done { index, values } => {
+            assert_eq!(bits(&values), expected, "half a prefix");
+            exact(&index);
+            index
+        }
+        Extended::Short { index: partial } => {
+            exact(&partial);
+            let until = partial.read_on(&needs, None).end;
+            assert!(until > short && until <= len);
+            reads.continued = true;
+            match read(Some(&partial), &message[..until], 0) {
+                Extended::Done { index, values } => {
+                    exact(&index);
+                    assert_eq!(bits(&values), expected, "continued prefix");
+                }
+                Extended::Short { .. } => panic!("the continuation's prediction fell short"),
+            }
+            partial
+        }
+    };
+
+    // Extended from the short prefix's partial index.
+    let range = partial.read_on(&needs, None);
+    let from_rsi = needs.first_rsi.min(partial.rsi_offsets.len() - 1);
+    reads.mid_byte = partial.rsi_offsets[from_rsi] % 8 != 0;
+    assert_eq!(
+        range.start,
+        header.payload_start + partial.rsi_offsets[from_rsi] as usize / 8
+    );
+    let values = match read(Some(&partial), &message[range.clone()], range.start) {
+        Extended::Done { index, values } => {
+            exact(&index);
+            values
+        }
+        Extended::Short { index } => {
+            exact(&index);
+            let until = index.read_on(&needs, None).end;
+            let Extended::Done { index, values } =
+                read(Some(&index), &message[range.start..until], range.start)
+            else {
+                panic!("the extension's continuation fell short")
+            };
+            exact(&index);
+            values
+        }
+    };
+    assert_eq!(bits(&values), expected, "extended");
+    reads
+}
+
+/// `grib` rejects a message cut short, so a prefix is parsed through a stub
+/// of its sections: the same header as the whole message's, from any cut
+/// past Section 7's header.
+#[test]
+fn a_prefix_parses_as_the_whole_message() {
+    let message = fixture();
+    let len = message.len();
+    let header = Header::parse(&message).unwrap();
+    assert!(Header::parse(&message[..MIN_PREFIX]).is_err());
+    for cut in [
+        header.payload_start,
+        header.payload_start + 1,
+        MIN_PREFIX,
+        len / 2,
+        len,
+    ] {
+        assert_eq!(
+            Header::parse_prefix(&message[..cut], len).unwrap(),
+            Some(header),
+            "cut {cut}"
+        );
+    }
+    for cut in [0, 10, 16, 40, header.payload_start - 1] {
+        assert_eq!(Header::parse_prefix(&message[..cut], len).unwrap(), None);
+    }
+    // The indexed length must be the message's, Section 7 its last.
+    assert!(Header::parse_prefix(&message[..MIN_PREFIX], len - 1).is_err());
+    let mut two = message.clone();
+    two.extend(&message);
+    let total = two.len() as u64;
+    two[8..16].copy_from_slice(&total.to_be_bytes());
+    assert!(Header::parse_prefix(&two[..MIN_PREFIX], two.len()).is_err());
+    let mut other = message.clone();
+    other[0] = b'X';
+    assert!(Header::parse_prefix(&other[..MIN_PREFIX], len).is_err());
+    let simple = crate::test_support::message(0, 280.0, [0, 2, 4, 6], 103, 2);
+    assert!(matches!(
+        Header::parse_prefix(&simple, simple.len()),
+        Err(CcsdsError::Unsupported("not CCSDS packing"))
+    ));
+}
+
+/// Cold, short, extended and warm reads on the committed field: north,
+/// south, the last RSI, a MULTIPOINT batch spanning most of the field, and
+/// points off the grid. A read on from a partial index starts mid-byte at
+/// least once, so libaec's offsets after a seek are proved exact.
+#[test]
+fn partial_reads_sample_like_the_full_decode() {
+    let message = fixture();
+    let (mut mid_byte, mut continued) = (false, false);
+    for coords in [
+        vec![(24.96, 60.32)],
+        vec![(151.2, -33.9)],
+        vec![(0.0, -89.9), (-180.0, -90.0)],
+        vec![
+            (24.96, 60.32),
+            (139.8, 35.6),
+            (151.2, -33.9),
+            (-70.0, -60.0),
+        ],
+        vec![(0.0, 89.9)],
+    ] {
+        let reads = assert_partial_reads(&message, &coords);
+        mid_byte |= reads.mid_byte;
+        continued |= reads.continued;
+    }
+    assert!(mid_byte, "no read on from a partial index started mid-byte");
+    assert!(continued, "no short prefix needed a continuation");
+    assert_partial_reads(&message, &[(10.0, 91.0)]);
+}
+
+/// A prefix predicted from the message's own index as a same-run sibling
+/// holds the needed RSIs with at most 2 % to spare; a linear prediction
+/// stays within the message.
+#[test]
+fn prefix_predictions_cover_the_needed_bytes() {
+    let message = fixture();
+    let len = message.len();
+    let (index, _) = Header::parse(&message)
+        .unwrap()
+        .index(&message, &[])
+        .unwrap();
+    for lat in [89.0, 60.0, 35.0, 0.0, -34.0, -89.9] {
+        let coords = [(24.0, lat)];
+        let needed = index.rsi_bytes(&index.needs(&coords).unwrap()).unwrap().end;
+        let sibling = index.predict_prefix(&coords, len, Kin::SameRun);
+        assert!(sibling >= needed.min(MIN_PREFIX).max(needed), "{lat}");
+        assert!(
+            sibling <= (needed as f64 * SIBLING_MARGIN).ceil() as usize + 1
+                || sibling == MIN_PREFIX,
+            "{lat}: {sibling} for {needed}"
+        );
+        let linear = index.predict_prefix(&coords, len, Kin::OtherParameter);
+        assert!((MIN_PREFIX..=len).contains(&linear), "{lat}");
+    }
+    // Nothing to decode: just the header.
+    assert_eq!(
+        index.predict_prefix(&[(0.0, 95.0)], len, Kin::SameRun),
+        MIN_PREFIX
+    );
 }
 
 /// Bit identity and timings on any local GRIB2 files, one message each:
@@ -665,6 +903,93 @@ fn ccsds_files_are_bit_identical() {
             index.size_bytes(),
             coords.len(),
             coords.len(),
+        );
+        // #1301: cold, short, extended and warm partial reads, bit for bit.
+        let mut shares = Vec::new();
+        for (name, coords) in [
+            ("60°N", vec![(24.96, 60.32)]),
+            ("35°N", vec![(139.8, 35.6)]),
+            ("34°S", vec![(151.2, -33.9)]),
+            (
+                "MULTIPOINT",
+                vec![(24.96, 60.32), (151.2, -33.9), (0.0, -89.9)],
+            ),
+        ] {
+            let reads = assert_partial_reads(&message, &coords);
+            shares.push(format!(
+                "{name} prefix {:.1} % span {} B",
+                100.0 * reads.prefix as f64 / message.len() as f64,
+                reads.span
+            ));
+        }
+        assert_partial_reads(&message, &edge_points());
+        eprintln!("  partial reads bit-identical: {}", shares.join(", "));
+        // Reads on predicted without a sibling, from every RSI start to 1,
+        // 3, 10 and 60 RSIs ahead: how many fell short, and the most a
+        // prediction overshot.
+        let complete = index.rsi_offsets.len();
+        let (mut short, mut reads, mut overshoot) = (0, 0, 0f64);
+        for anchor in 1..complete - 1 {
+            let partial = CcsdsIndex {
+                header,
+                rsi_offsets: index.rsi_offsets[..=anchor].into(),
+            };
+            for ahead in [0, 2, 9, 59] {
+                let last = (anchor + ahead).min(complete - 1);
+                let actual = index.end_bits(last).unwrap() - index.rsi_offsets[anchor] as usize;
+                let end_sample = ((last + 1) * per_rsi).min(header.packing.values);
+                let predicted = partial.read_on_bits(end_sample);
+                reads += 1;
+                if predicted < actual as f64 {
+                    short += 1;
+                }
+                overshoot = overshoot.max(predicted / actual as f64);
+            }
+        }
+        eprintln!(
+            "  read on without a sibling: {short} of {reads} short, at most ×{overshoot:.2} the bits needed"
+        );
+    }
+    // Messages of one parameter at other steps of the run, named `x.grib2`
+    // and `x-9h.grib2`: header sizes, and the prefix one predicts for the
+    // other against what the other needs.
+    let paths: Vec<&str> = files.split(':').filter(|p| !p.is_empty()).collect();
+    for path in &paths {
+        let Some(other) = paths
+            .iter()
+            .find(|other| **other == path.replace(".grib2", "-9h.grib2"))
+        else {
+            continue;
+        };
+        let (a, b) = (std::fs::read(path).unwrap(), std::fs::read(other).unwrap());
+        let (index_a, _) = Header::parse(&a).unwrap().index(&a, &[]).unwrap();
+        let (index_b, _) = Header::parse(&b).unwrap().index(&b, &[]).unwrap();
+        let (ha, hb) = (index_a.header, index_b.header);
+        let mut errors = Vec::new();
+        for lat in [75.0, 60.0, 45.0, 35.0, 10.0, -10.0, -34.0, -60.0] {
+            let coords = [(24.0, lat)];
+            let needed = index_b
+                .rsi_bytes(&index_b.needs(&coords).unwrap())
+                .unwrap()
+                .end;
+            for (index, kin) in [(&index_a, Kin::SameRun), (&index_a, Kin::OtherParameter)] {
+                let predicted = index.predict_prefix(&coords, b.len(), kin);
+                errors.push(format!(
+                    "{lat}° {kin:?} {:+.2} %",
+                    100.0 * (predicted as f64 / needed as f64 - 1.0)
+                ));
+                if kin == Kin::SameRun {
+                    assert!(predicted >= needed, "{lat}: {predicted} < {needed}");
+                }
+            }
+        }
+        eprintln!(
+            "{other} from {path}: header {} / {} B, overhead {} / {} B; prediction past need: {}",
+            ha.payload_start,
+            hb.payload_start,
+            ha.message_len - ha.payload_len,
+            hb.message_len - hb.payload_len,
+            errors.join(", ")
         );
     }
 }
