@@ -391,7 +391,10 @@ ones only in the legacy layout.
     deadline), else the field is read without inserting; the message cache
     still fills. A window that fits is `GridFill::Insert`, cached as before;
     maps (`fetch_grid`) always insert. Never insert an oversized window: it
-    evicts its own fields, and the maps' grids, before any reuse.
+    evicts its own fields, and the maps' grids, before any reuse. The grid
+    cache is one shard (`new_single_shard`) because `holds` plans
+    residency: at 256 MiB a sharded cache is two 128 MiB halves, so six
+    0.1° fields that "fit" could all hash to one half and evict each other.
 - Jobs run on the dedicated query runtime with `block_in_place`, including
   synchronous cache-fill waits; never move storage calls to `spawn_blocking`.
   Direct off-runtime callers share one fallback runtime.
