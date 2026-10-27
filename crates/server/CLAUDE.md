@@ -455,3 +455,19 @@ styles and collection metadata. Config validation reserves derived IDs even
 before data arrives. The background recovery loop also compares GRIB family
 registration with the live catalog, reusing accepted config and warm engines
 when new families appear. Reload eviction already covers `{base}-*` IDs.
+
+## Allocator (jemalloc, #1310)
+
+- `main` is a plain `fn`: it parses the CLI, starts tracing and calls
+  `jemalloc::configure` (`src/jemalloc.rs`) before it builds the request
+  runtime. Process-wide allocator settings go there, before any runtime
+  starts, not in `serve()`.
+- Background threads are turned on by a runtime `mallctl` write, never a
+  build-time `malloc_conf`: `background_thread:true` compiled in makes
+  jemalloc fail to initialise on macOS, which has no background threads.
+  There the write fails with ENOENT, logged at INFO; any other failure is a
+  WARN.
+- jemalloc's symbols are prefixed, so it reads `_RJEM_MALLOC_CONF`, never
+  `MALLOC_CONF`; a `background_thread` set there wins over the server's.
+- `jemalloc_retained_bytes` is address space, not memory: keep it off any
+  panel plotted against RSS.
