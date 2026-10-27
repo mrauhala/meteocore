@@ -108,12 +108,30 @@ impl GribEngine {
                     "No requested parameter/level is present in this forecast step".into(),
                 )
             })?;
+        // One plan for every field of the query, the first one included
+        // (#1297): how many run at once, and whether the decoded-grid cache
+        // can hold them all.
+        let field_count: usize = steps
+            .iter()
+            .map(|(_, file)| {
+                level_keys
+                    .iter()
+                    .flat_map(|keys| query_params.iter().filter_map(|name| keys.get(*name)))
+                    .filter(|key| file.messages.iter().any(|entry| key.matches(entry)))
+                    .count()
+            })
+            .sum();
+        let plan = self.field_plan(field_count);
         // This first field supplies the geometry and its own output values.
         // Protect synchronous cache-fill waits just like the parallel jobs.
         let first_file = steps[first_step].1;
         let grid = run_fetches(async {
             tokio::task::block_in_place(|| {
-                self.fetch_grid_by_entry(first_file.message_url(first_entry), first_entry)
+                self.fetch_grid_by_entry(
+                    first_file.message_url(first_entry),
+                    first_entry,
+                    plan.fill,
+                )
             })
         })?;
         ds_core::deadline::check()?;
@@ -209,9 +227,10 @@ impl GribEngine {
         let worker_keys = level_keys.clone();
         let names: Vec<_> = query_params.iter().map(|name| (*name).to_owned()).collect();
         run_field_jobs(
+            plan.concurrency,
             fields,
             move |(step, param, level, url, entry)| {
-                let grid = engine.fetch_grid_by_entry(&url, &entry)?;
+                let grid = engine.fetch_grid_by_entry(&url, &entry, plan.fill)?;
                 let name = &names[param];
                 let meta = engine.param_metadata_for(&worker_keys[level], name);
                 let values = worker_layout.sample(&grid, name, meta.display)?;

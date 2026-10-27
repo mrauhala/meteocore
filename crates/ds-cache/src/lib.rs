@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub use quick_cache::Equivalent;
 
 mod entry;
-pub use entry::{CacheEntry, CacheFillGuard};
+pub use entry::{CacheEntry, CacheFillGuard, Joined};
 
 /// One mebibyte, for `*_MB` → bytes conversions.
 pub const MIB: u64 = 1024 * 1024;
@@ -360,6 +360,39 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         }
     }
 
+    /// Look up `key` without ever inserting it: a resident value, else the
+    /// value of a fill another caller already has in flight, waiting up to
+    /// `timeout` for it (`None` waits as long as the fill takes), else
+    /// [`Joined::Absent`]. The caller then computes the value itself and
+    /// does not offer it to the cache, so nothing resident is evicted for
+    /// it. For a reader whose values would evict more than they could ever
+    /// reuse (a GRIB query over more fields than the cache holds, #1297),
+    /// which should still share an identical concurrent fill.
+    ///
+    /// Counts a hit for a value and a miss when absent, like
+    /// [`Self::get_or_insert_with`]; a timeout counts nothing. Its own
+    /// computation is not shared: a caller arriving while it runs claims a
+    /// fill of its own. Finding the key absent takes and drops a fill claim
+    /// at once, so a caller arriving in that instant may become the owner of
+    /// the fill, as after a failed one.
+    pub fn get_or_join<Q>(&self, key: &Q, timeout: Option<std::time::Duration>) -> Joined<V>
+    where
+        Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
+    {
+        match self.cache.get_value_or_guard(key, timeout) {
+            quick_cache::sync::GuardResult::Value(value) => {
+                self.record_hit();
+                Joined::Value(value)
+            }
+            quick_cache::sync::GuardResult::Guard(guard) => {
+                drop(guard);
+                self.record_miss();
+                Joined::Absent
+            }
+            quick_cache::sync::GuardResult::Timeout => Joined::Timeout,
+        }
+    }
+
     /// Count one hit (for wrappers using [`Self::get_untracked`]).
     pub fn record_hit(&self) {
         self.hits.fetch_add(1, Ordering::Relaxed);
@@ -646,6 +679,77 @@ mod tests {
             Ok(vec![42])
         );
         assert_eq!(cache.stats(), (0, 2));
+    }
+
+    /// A joining lookup reads what is resident and never inserts: a full
+    /// cache keeps every entry it had, and the absent key leaves no claim
+    /// behind for the next caller.
+    #[test]
+    fn get_or_join_reads_resident_values_and_never_inserts() {
+        let cache = ByteBoundedCache::new_single_shard(4 * 100, 100, weigh_str);
+        let keys: Vec<String> = (0..4).map(|i| format!("{i:02}")).collect();
+        for key in &keys {
+            cache.insert(key.clone(), vec![0u8; 34]); // 100 bytes each: full
+        }
+        assert_eq!(
+            cache.get_or_join(&keys[1], None),
+            Joined::Value(vec![0u8; 34])
+        );
+        assert_eq!(cache.get_or_join(&"new".to_string(), None), Joined::Absent);
+        assert_eq!(cache.stats(), (1, 1));
+        assert_eq!((cache.len(), cache.weight()), (4, 400));
+        assert!(keys.iter().all(|key| cache.contains_key(key)));
+        // No claim was kept: the next filling caller computes at once.
+        assert_eq!(
+            cache.get_or_insert_with_timeout(
+                &"new".to_string(),
+                std::time::Duration::ZERO,
+                || Ok::<_, &str>(vec![1]),
+                || "a claim was left behind",
+            ),
+            Ok(vec![1])
+        );
+    }
+
+    /// A joining lookup waits for a fill another caller has in flight and
+    /// takes its value; a short wait times out, and a failed fill leaves it
+    /// absent rather than claimed.
+    #[test]
+    fn get_or_join_shares_a_fill_in_flight() {
+        use std::{sync::mpsc, time::Duration};
+        let cache = ByteBoundedCache::new(MIB, 1024, weigh_str);
+        for (outcome, expected) in [
+            (Ok(vec![42]), Joined::Value(vec![42])),
+            (Err("offline"), Joined::Absent),
+        ] {
+            let key = format!("{outcome:?}");
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            std::thread::scope(|scope| {
+                let (cache, key, fill) = (&cache, &key, outcome.clone());
+                let owner = scope.spawn(move || {
+                    cache.get_or_insert_with(key, || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        fill
+                    })
+                });
+                started_rx.recv().unwrap();
+                assert_eq!(
+                    cache.get_or_join(key, Some(Duration::from_millis(10))),
+                    Joined::Timeout
+                );
+                let joiner = scope.spawn(move || cache.get_or_join(key, None));
+                std::thread::sleep(Duration::from_millis(20));
+                release_tx.send(()).unwrap();
+                assert_eq!(owner.join().unwrap(), outcome);
+                assert_eq!(joiner.join().unwrap(), expected);
+            });
+        }
+        // Owner misses for both fills, the joined value's hit, the failed
+        // fill's miss; timeouts count nothing.
+        assert_eq!(cache.stats(), (1, 3));
+        assert!(!cache.contains_key(&format!("{:?}", Err::<Vec<u8>, _>("offline"))));
     }
 
     #[test]

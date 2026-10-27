@@ -339,7 +339,9 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   mirroring `ds-render`.
 - **Byte-bounded LRU caches go through `ds-cache`** (#480):
   `ds_cache::ByteBoundedCache` owns the weigher/env-parse/hit-miss-counter/
-  metrics plumbing (including single-flight `get_or_insert_with`); call
+  metrics plumbing (including single-flight `get_or_insert_with`, and
+  `get_or_join`, which reads a resident value or joins a fill in flight
+  without ever inserting: a reader that must not evict, #1297); call
   sites keep their key type, weight fn, `MC_*_CACHE_MB` env var name and
   defaults. Don't hand-roll a `quick_cache` byte-weighted cache — before
   extraction the same ~40 lines were copy-pasted 12×. In `server/src/

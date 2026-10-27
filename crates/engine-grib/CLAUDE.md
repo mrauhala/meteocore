@@ -273,7 +273,9 @@ on the request path. Single-level and legacy views require exact metadata.
   two different coordinates over 120 real global fields with 150 ms simulated
   GET latency, comparing 256 MiB decoded-only caching with an additional
   128 MiB message cache. It checks identical samples and reports timings/read
-  bytes; no wall-clock thresholds belong in CI.
+  bytes; no wall-clock thresholds belong in CI. Its 120-field window exceeds
+  the 256 MiB grid cache, so it reads around it (#1297); the message cache is
+  what serves the second coordinate.
 
 Default Maps parameter selection preserves the first previously supported
 near-surface product before considering acc/ave records, regardless of index
@@ -371,9 +373,26 @@ ones only in the legacy layout.
 
 - `query_positions` samples every requested coordinate from each field once,
   even when the decoded-grid cache is disabled or smaller than the forecast
-  window. Single-point, single-level and profile queries share this path.
-- Keep at most four field fetch/decode jobs in flight per admitted EDR query.
-  Jobs run on the dedicated query runtime with `block_in_place`, including
+  window. Single-point, single-level and profile queries share this path;
+  every parameter's fields go through one `run_field_jobs` run.
+- Every EDR field query (position, trajectory, area/radius, cube) reads
+  under one `GribEngine::field_plan` (#1297), built from the count of all
+  its fields, the first geometry field included, and the view's published
+  `RasterInfo::grid_size` (an `Arc` clone, never a decode):
+  - concurrency: `runtime::field_concurrency`, `FIELD_MEMORY` (256 MiB of
+    decoded f32) over one field, clamped to `FIELD_CONCURRENCY` (4) ..
+    `MAX_FIELD_JOBS` (16): 16 at 0.25°, 10 at 0.1°, 4 without a published
+    geometry. EDR admits at most `query_workers()` (≤ 8) queries, so GRIB
+    EDR queries together hold ≤ 2 GiB decoded plus decode transients;
+    there is no GRIB read budget. Change the constants with that sum in mind.
+  - fill: `GridFill::Bypass` when fields × `GridCache::estimated_weight`
+    exceed `grid_cache_mb` (`GridCache::holds`). `GridCache::get_or_join`
+    uses a resident grid or awaits a fill in flight (no longer than the
+    deadline), else the field is read without inserting; the message cache
+    still fills. A window that fits is `GridFill::Insert`, cached as before;
+    maps (`fetch_grid`) always insert. Never insert an oversized window: it
+    evicts its own fields, and the maps' grids, before any reuse.
+- Jobs run on the dedicated query runtime with `block_in_place`, including
   synchronous cache-fill waits; never move storage calls to `spawn_blocking`.
   Direct off-runtime callers share one fallback runtime.
 - Propagate the absolute EDR deadline to each job and its storage calls. Stop
@@ -381,10 +400,16 @@ ones only in the legacy layout.
 - Validate all coordinates and the complete points × times × levels × parameters
   value budget before fetching. Preserve point/time/level ordering regardless of
   job completion order, and sample missing fields as null for every point.
+- Tests: `field_plan_tests.rs` (an oversized window in every query kind
+  leaves the cache's entries and bytes as they were and answers bit for bit
+  as with no cache or a large one; resident fields are reused; the message
+  cache still fills; a fitting window repeats as hits; 16 concurrent GETs on
+  the fixture grid) and `runtime::tests` (the concurrency per grid size).
 - Run the ignored `position::tests::position_latency_replay` test with
-  `--ignored --nocapture` to compare serial and batched reads over 120 steps,
-  with 150 ms simulated per-read latency and the grid cache disabled. It checks
-  equal samples and prints timings/bytes; wall-clock times are not CI gates.
+  `--ignored --nocapture` to compare serial and planned batch reads over 120
+  steps (16 at a time on the fixture grid), with 150 ms simulated per-read
+  latency and the grid cache disabled. It checks equal samples and prints
+  timings/bytes; wall-clock times are not CI gates.
 
 ## Trajectory queries (#926)
 
@@ -397,7 +422,8 @@ ones only in the legacy layout.
   `ds_core::trajectory::TrajectoryPlan`. Densify at the published
   representative geometry's spacing (`RasterInfo` extent / grid cells;
   0.1° before the probe has run).
-- One `run_field_jobs` job per (parameter, planned field = step × level):
+- One `run_field_jobs` job per (parameter, planned field = step × level),
+  under the query's `FieldPlan`:
   fetch/decode once, sample every point that reads it with the position
   query's `bilinear_value` + display conversion. Missing or unreadable
   fields stay null; deadlines stay fatal. Never a job per sample.
@@ -410,8 +436,9 @@ ones only in the legacy layout.
   disabled. Select its axes without extracting values, check the combined
   output and mask budgets, then sample and release the grid before loading
   remaining fields.
-- Use `runtime::run_field_jobs`, shared with positions, for at most four
-  parameter/level jobs per admitted query. It is a thin wrapper over
+- Use `runtime::run_field_jobs`, shared with positions, for the query's
+  `FieldPlan` (4–16 parameter/level jobs per admitted query, the bypass rule
+  of Position queries). It is a thin wrapper over
   `ds_executor::field_jobs::run_field_jobs` (moved there for engine-netcdf,
   #1067) with the GRIB I/O runtime as the off-runtime fallback. Keep deadline
   propagation, blocking cache waits and drain-on-error behavior in that
@@ -454,7 +481,7 @@ ones only in the legacy layout.
   horizontal resolutions given ⇒ the full check), then again after the
   first field supplies the geometry, before allocating output or fetching
   another field. The first field's values are reused, like area.
-- Remaining fields go through `runtime::run_field_jobs` (four in flight);
+- Remaining fields go through `runtime::run_field_jobs` (the query's `FieldPlan`);
   workers return the resampled `ny × nx` plane only. Skip levels no
   `resolution-z` position samples. Every field must have the first field's
   native subset axes, else the "different grid" 400.

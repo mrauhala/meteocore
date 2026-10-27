@@ -131,10 +131,16 @@ impl GribEngine {
                 )
             })?;
 
+        // One plan for every field of the query, the first one included
+        // (#1297): how many run at once, and whether the decoded-grid cache
+        // can hold them all.
+        let plan = self.field_plan(slots.clone().filter_map(field).count());
         // The first field supplies the geometry and its own output values.
         // Protect synchronous cache-fill waits just like the parallel jobs.
         let grid = run_fetches(async {
-            tokio::task::block_in_place(|| self.fetch_grid_by_entry(&first_url, &first_entry))
+            tokio::task::block_in_place(|| {
+                self.fetch_grid_by_entry(&first_url, &first_entry, plan.fill)
+            })
         })?;
         ds_core::deadline::check()?;
         let wsen = [bbox.west, bbox.south, bbox.east, bbox.north];
@@ -188,9 +194,10 @@ impl GribEngine {
         let worker_keys = Arc::new(level_keys.clone());
         let names = Arc::new(params.clone());
         run_field_jobs(
+            plan.concurrency,
             fields,
             move |(step, level, param, url, entry)| {
-                let grid = engine.fetch_grid_by_entry(&url, &entry)?;
+                let grid = engine.fetch_grid_by_entry(&url, &entry, plan.fill)?;
                 let name = &names[param];
                 let meta = engine.param_metadata_for(&worker_keys[level], name);
                 let subset = worker_layout.subset(&grid, name)?;

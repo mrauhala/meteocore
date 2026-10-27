@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::FIELD_CONCURRENCY;
+use crate::runtime::{FIELD_CONCURRENCY, MAX_FIELD_JOBS};
 use crate::test_support::{message, store::TestStore, TestSource};
 use ds_storage::object_store::{limit::LimitStore, path::Path, ObjectStoreExt};
 use std::sync::atomic::Ordering;
@@ -204,7 +204,7 @@ fn area_preserves_requested_level_order_missing_fields_units_and_polygon_holes()
             store.reads.lock().unwrap().completed.last().unwrap(),
             "f00-00.grib2"
         );
-        assert!((2..=FIELD_CONCURRENCY).contains(&store.peak.load(Ordering::SeqCst)));
+        assert!((2..=MAX_FIELD_JOBS).contains(&store.peak.load(Ordering::SeqCst)));
         assert_eq!(store.active.load(Ordering::SeqCst), 0);
     }
 }
@@ -411,7 +411,7 @@ fn single_and_legacy_radius_queries_fetch_each_field_once() {
         }
         assert_eq!(engine.storage_bytes_read(), 9 * 183);
         assert_eq!(store.reads.lock().unwrap().attempts.len(), 9);
-        assert!((2..=FIELD_CONCURRENCY).contains(&store.peak.load(Ordering::SeqCst)));
+        assert!((2..=MAX_FIELD_JOBS).contains(&store.peak.load(Ordering::SeqCst)));
     }
 }
 
@@ -625,7 +625,7 @@ fn invalid_requests_and_oversized_areas_stop_before_loading_other_fields() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn area_errors_and_deadlines_drain_workers_and_stop_dispatch() {
     for deadline in [false, true] {
-        let (source, mut owner) = fixture(None, 12, 1, &[]);
+        let (source, mut owner) = fixture(None, 24, 1, &[]);
         let delay = if deadline {
             Duration::from_secs(30)
         } else {
@@ -654,14 +654,15 @@ async fn area_errors_and_deadlines_drain_workers_and_stop_dispatch() {
         let references = Arc::strong_count(&owner.source);
         let _deadline =
             ds_core::deadline::enter(deadline.then(|| Instant::now() + Duration::from_millis(100)));
-        let params: Vec<_> = (0..12).map(parameter).collect();
+        let params: Vec<_> = (0..24).map(parameter).collect();
         let result = owner.query_area("0,0,1,1", None, Some(&params), None, None);
         if deadline {
             assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
         } else {
             assert!(matches!(result, Err(DataServerError::Storage(_))));
         }
-        assert!(store.reads.lock().unwrap().attempts.len() <= 1 + FIELD_CONCURRENCY);
+        // More fields than a full round of jobs: dispatch stopped.
+        assert!(store.reads.lock().unwrap().attempts.len() <= 1 + MAX_FIELD_JOBS);
         assert_eq!(store.active.load(Ordering::SeqCst), 0);
         assert_eq!(Arc::strong_count(&owner.source), references);
     }

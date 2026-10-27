@@ -4,7 +4,7 @@ use crate::test_support::{
 };
 use crate::{
     catalog::{Catalog, ForecastRun, StepFile},
-    reader, GribEngine,
+    reader, GribEngine, GridFill,
 };
 use ds_core::edr_engine::EdrEngine;
 use ds_storage::object_store::{GetRange, ObjectStoreExt};
@@ -309,7 +309,7 @@ async fn engine(count: usize, delay: Duration, cache_mb: u64) -> (GribEngine, Ve
 async fn background_probes_preserve_the_query_grid_cache() {
     let (engine, entries) = engine(32, Duration::ZERO, 8).await;
     let grid = engine
-        .fetch_grid_by_entry("f000.grib2", &entries[0])
+        .fetch_grid_by_entry("f000.grib2", &entries[0], GridFill::Insert)
         .unwrap();
     let before = engine.storage_bytes_read();
     engine.probe_new_parameters();
@@ -332,7 +332,11 @@ async fn metadata_probe_replay() {
         } else {
             for entry in entries {
                 engine
-                    .fetch_grid_by_entry(entry.source_url.as_deref().unwrap(), &entry)
+                    .fetch_grid_by_entry(
+                        entry.source_url.as_deref().unwrap(),
+                        &entry,
+                        GridFill::Insert,
+                    )
                     .unwrap();
             }
         }

@@ -863,6 +863,7 @@ impl NetcdfEngine {
             let decodes: Arc<AtomicU64> = self.decodes.clone();
             ds_executor::field_jobs::run_field_jobs(
                 ds_executor::query_runtime(),
+                ds_executor::field_jobs::FIELD_CONCURRENCY,
                 jobs.into_iter(),
                 move |job: Job| {
                     let read = {
