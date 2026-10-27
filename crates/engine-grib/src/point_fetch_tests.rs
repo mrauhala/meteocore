@@ -8,7 +8,7 @@ use crate::runtime::run_fetches;
 use crate::test_support::{message, store::TestStore, Ccsds, TestSource};
 use ds_storage::object_store::{path::Path, GetRange, ObjectStoreExt};
 
-const RUN: &str = "2026040500";
+pub(crate) const RUN: &str = "2026040500";
 
 fn fixture() -> Vec<u8> {
     std::fs::read(concat!(
@@ -21,7 +21,7 @@ fn fixture() -> Vec<u8> {
 /// Step files `{prefix}f000`… of the run at `date`, each holding
 /// `fields` (parameter, message) at 150 hPa; a tail record after them gives
 /// each an indexed length unless `tail` is false.
-fn write_run(
+pub(crate) fn write_run(
     source: &TestSource,
     prefix: &str,
     date: &str,
@@ -48,7 +48,7 @@ fn write_run(
 
 /// The pressure view of `source` with these budgets in MiB, 0 disabling
 /// each, reading through an instrumented in-memory copy of its files.
-fn counted(
+pub(crate) fn counted(
     source: &TestSource,
     point_index_mb: u64,
     message_mb: u64,
@@ -85,7 +85,7 @@ fn counted(
 }
 
 /// The GETs since the last call, as `(path, first byte, bytes)`.
-fn gets(store: &TestStore) -> Vec<(String, u64, u64)> {
+pub(crate) fn gets(store: &TestStore) -> Vec<(String, u64, u64)> {
     let mut reads = store.reads.lock().unwrap();
     let gets = reads
         .ranges
@@ -108,7 +108,7 @@ fn at(date: &str, hour: u32) -> DateTime<Utc> {
 
 /// `parameter`'s series at `points` over the run at `date`, steps
 /// `first..=last` (all when `None`), values as bits.
-fn series(
+pub(crate) fn series(
     engine: &GribEngine,
     parameter: &str,
     points: &[(f64, f64)],

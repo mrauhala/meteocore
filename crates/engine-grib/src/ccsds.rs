@@ -13,7 +13,7 @@
 //! integer → `f32` scaling of the `grib` crate operation for operation, and
 //! the [`Bilinear`] interpolation a [`crate::cache::DecodedGrid`] uses.
 //! Anything else, another packing, a bitmap, another scan order or a byte
-//! layout `grib` reads differently, is [`CcsdsError::Unsupported`]: the
+//! layout `grib` reads differently, is [`PointError::Unsupported`]: the
 //! caller decodes that message in full.
 
 mod aec;
@@ -22,38 +22,38 @@ mod tests;
 
 use std::io::Cursor;
 
-use ds_core::error::DataServerError;
 use grib::def::grib2::DataRepresentationTemplate;
 
 use crate::cache::{Bilinear, Lattice};
 use crate::metadata::{GridGeometry, MessageMetadata};
+use crate::point_index::PointError;
 
 /// Samples per libaec call while indexing: the reused buffer holds this
 /// many (48 KiB of 24-bit samples), never the field.
 const CHUNK_SAMPLES: usize = 16 * 1024;
 
-/// The largest binary scale factor `E` read here. `grib` computes `2^E` as
-/// `2_f32.powi(E)`, and so does this; within ±126 every such power is an
-/// exact normal `f32`, so the two cannot differ however the compiler
-/// lowers them.
-const MAX_BINARY_SCALE: i32 = 126;
+/// The largest binary scale factor `E` read here and by the 5.3 reader
+/// ([`crate::complex`]). `grib` computes `2^E` as `2_f32.powi(E)`, and so
+/// do they; within ±126 every such power is an exact normal `f32`, so the
+/// two cannot differ however the compiler lowers them.
+pub(crate) const MAX_BINARY_SCALE: i32 = 126;
 
 /// The largest payload an index addresses: its bit offsets are `u32`.
-const MAX_PAYLOAD_BYTES: usize = (u32::MAX / 8) as usize;
+pub(crate) const MAX_PAYLOAD_BYTES: usize = (u32::MAX / 8) as usize;
 
 /// The least a cold prefix read fetches (#1301): enough for any usual
 /// header, Sections 0 to 6 and Section 7's own, which a prefix must hold.
-const MIN_PREFIX: usize = 4096;
+pub(crate) const MIN_PREFIX: usize = 4096;
 
 /// How far past a prediction a partial read reaches (#1301): scaled from a
 /// sibling message's index, which predicted within ±0.5 % in research; and
 /// linear in the needed sample's position, −10 % to +18 %.
 const SIBLING_MARGIN: f64 = 1.02;
-const LINEAR_MARGIN: f64 = 1.20;
+pub(crate) const LINEAR_MARGIN: f64 = 1.20;
 
 /// A read on from known data that would cover more of the message than
 /// this reads all of it instead.
-const MOST_OF_A_MESSAGE: f64 = 0.8;
+pub(crate) const MOST_OF_A_MESSAGE: f64 = 0.8;
 
 /// A read on with no sibling to shape it predicts the rest at the denser of
 /// two rates: the last [`LOCAL_RSIS`] indexed RSIs' and the rest of the
@@ -61,30 +61,16 @@ const MOST_OF_A_MESSAGE: f64 = 0.8;
 /// 0.25° and AIFS test files that estimate fell short by at most ×1.59
 /// (precipitation one RSI ahead); the average alone by up to ×4.2.
 const LOCAL_RSIS: usize = 8;
-const READ_ON_MARGIN: f64 = 1.6;
+pub(crate) const READ_ON_MARGIN: f64 = 1.6;
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum CcsdsError {
-    /// A message this reader does not handle: decode it in full.
-    #[error("not read through a CCSDS index: {0}")]
-    Unsupported(&'static str),
-    /// The message, its payload or the index does not hold together, or
-    /// libaec failed: the full decode decides what the message holds.
-    #[error("invalid CCSDS message: {0}")]
-    Invalid(String),
-    /// The query's deadline passed: fatal, as on every other path.
-    #[error(transparent)]
-    Fatal(DataServerError),
-}
-
-impl From<aec::AecError> for CcsdsError {
+impl From<aec::AecError> for PointError {
     fn from(error: aec::AecError) -> Self {
         Self::Invalid(error.to_string())
     }
 }
 
-fn invalid(reason: impl std::fmt::Display) -> CcsdsError {
-    CcsdsError::Invalid(reason.to_string())
+fn invalid(reason: impl std::fmt::Display) -> PointError {
+    PointError::Invalid(reason.to_string())
 }
 
 /// Section 5's simple-packing parameters and CCSDS coding.
@@ -133,7 +119,7 @@ pub(crate) struct Header {
 /// `payload_start + offset / 8` on, so a reader holding only the index can
 /// fetch just the RSIs it needs (#1301); and they may cover only the first
 /// RSIs, as a decode of a message prefix finds them. A read past the
-/// indexed RSIs is [`CcsdsError::Invalid`], never a guess.
+/// indexed RSIs is [`PointError::Invalid`], never a guess.
 #[derive(Debug)]
 pub(crate) struct CcsdsIndex {
     header: Header,
@@ -144,9 +130,9 @@ impl Header {
     /// Read a message's sections the way [`crate::reader::decode_message`]
     /// does, without touching its packed values. Template 5.42 with no
     /// bitmap on a regular lat/lon grid in the canonical scan order is
-    /// readable; another layout is [`CcsdsError::Unsupported`], and what
-    /// the full decode would reject is [`CcsdsError::Invalid`].
-    pub(crate) fn parse(message: &[u8]) -> Result<Self, CcsdsError> {
+    /// readable; another layout is [`PointError::Unsupported`], and what
+    /// the full decode would reject is [`PointError::Invalid`].
+    pub(crate) fn parse(message: &[u8]) -> Result<Self, PointError> {
         let grib2 = grib::from_reader(Cursor::new(message)).map_err(invalid)?;
         let (_, submessage) = grib2
             .iter()
@@ -167,34 +153,16 @@ impl Header {
     pub(crate) fn parse_prefix(
         prefix: &[u8],
         message_len: usize,
-    ) -> Result<Option<Self>, CcsdsError> {
-        let Some((section7, section7_len)) = find_section7(prefix)? else {
+    ) -> Result<Option<Self>, PointError> {
+        let Some(stub) = Stub::of(prefix, message_len)? else {
             return Ok(None);
         };
-        if prefix.len() < 16
-            || u64::from_be_bytes(prefix[8..16].try_into().unwrap()) != message_len as u64
-        {
-            return Err(invalid("message length differs from the index"));
-        }
-        // One field per message: Section 8 follows Section 7.
-        if section7
-            .checked_add(section7_len)
-            .and_then(|end| end.checked_add(4))
-            != Some(message_len)
-        {
-            return Err(invalid("Section 7 does not end the message"));
-        }
-        let mut stub = prefix[..section7].to_vec();
-        stub.extend([0, 0, 0, 5, 7]);
-        stub.extend(b"7777");
-        let stub_len = stub.len() as u64;
-        stub[8..16].copy_from_slice(&stub_len.to_be_bytes());
-        let grib2 = grib::from_reader(Cursor::new(&stub[..])).map_err(invalid)?;
+        let grib2 = grib::from_reader(Cursor::new(&stub.bytes[..])).map_err(invalid)?;
         let (_, submessage) = grib2
             .iter()
             .next()
             .ok_or_else(|| invalid("no submessage"))?;
-        Self::read(&submessage, section7, section7_len, message_len).map(Some)
+        Self::read(&submessage, stub.section7, stub.section7_len, message_len).map(Some)
     }
 
     /// The header of a parsed submessage whose Section 7 starts at
@@ -205,10 +173,10 @@ impl Header {
         section7: usize,
         section7_len: usize,
         message_len: usize,
-    ) -> Result<Self, CcsdsError> {
+    ) -> Result<Self, PointError> {
         let section5 = submessage.section5().map_err(invalid)?;
         let DataRepresentationTemplate::_5_42(template) = &section5.payload.template else {
-            return Err(CcsdsError::Unsupported("not CCSDS packing"));
+            return Err(PointError::Unsupported("not CCSDS packing"));
         };
         if submessage
             .section6()
@@ -217,16 +185,16 @@ impl Header {
             .bitmap_indicator
             != 255
         {
-            return Err(CcsdsError::Unsupported("bitmap"));
+            return Err(PointError::Unsupported("bitmap"));
         }
         // `grib` decodes only original field type 0 (floating point).
         if template.orig_field_type != 0 {
-            return Err(CcsdsError::Unsupported("original field type"));
+            return Err(PointError::Unsupported("original field type"));
         }
         let grid_def = submessage.grid_def();
         let (lattice, canonical) = crate::reader::lattice(grid_def).map_err(invalid)?;
         if !canonical {
-            return Err(CcsdsError::Unsupported("scan mode"));
+            return Err(PointError::Unsupported("scan mode"));
         }
         let nodes = lattice
             .ni
@@ -269,19 +237,19 @@ impl Header {
             // `grib` reads each sample as `ceil(bits / 8)` bytes, most
             // significant first, unsigned: libaec must have written it so.
             if aec.bytes_per_sample() != usize::from(simple.num_bits).div_ceil(8) {
-                return Err(CcsdsError::Unsupported("sample width"));
+                return Err(PointError::Unsupported("sample width"));
             }
             if aec.bytes_per_sample() > 1 && !aec.has(aec::DATA_MSB) {
-                return Err(CcsdsError::Unsupported("least significant byte first"));
+                return Err(PointError::Unsupported("least significant byte first"));
             }
             if aec.has(aec::DATA_SIGNED) {
-                return Err(CcsdsError::Unsupported("signed samples"));
+                return Err(PointError::Unsupported("signed samples"));
             }
             if aec.has(aec::PAD_RSI) {
-                return Err(CcsdsError::Unsupported("padded RSIs"));
+                return Err(PointError::Unsupported("padded RSIs"));
             }
             if exp.abs() > MAX_BINARY_SCALE {
-                return Err(CcsdsError::Unsupported("binary scale factor"));
+                return Err(PointError::Unsupported("binary scale factor"));
             }
             aec.check()?;
         }
@@ -295,7 +263,7 @@ impl Header {
             return Err(invalid("section 7 outside the message"));
         }
         if payload_end - payload_start > MAX_PAYLOAD_BYTES {
-            return Err(CcsdsError::Unsupported("payload over 512 MiB"));
+            return Err(PointError::Unsupported("payload over 512 MiB"));
         }
         Ok(Self {
             lattice,
@@ -322,7 +290,7 @@ impl Header {
         self,
         message: &[u8],
         coords: &[(f64, f64)],
-    ) -> Result<(CcsdsIndex, Vec<Option<f64>>), CcsdsError> {
+    ) -> Result<(CcsdsIndex, Vec<Option<f64>>), PointError> {
         let plan = Plan::new(&self.lattice, coords);
         let payload = self.payload(message)?;
         if let Some(value) = self.constant {
@@ -341,12 +309,12 @@ impl Header {
             self.packing.values,
             CHUNK_SAMPLES,
             |first, bytes| {
-                ds_core::deadline::check().map_err(CcsdsError::Fatal)?;
+                ds_core::deadline::check().map_err(PointError::Fatal)?;
                 let end = first + bytes.len() / width;
                 while let Some(&node) = plan.nodes.get(raw.len()).filter(|&&node| node < end) {
                     raw.push(packed(bytes, node - first, width));
                 }
-                Ok::<_, CcsdsError>(())
+                Ok::<_, PointError>(())
             },
         )?;
         if raw.len() != plan.nodes.len() {
@@ -362,8 +330,8 @@ impl Header {
     }
 
     /// Section 7's packed bytes of `message`, the message this header was
-    /// read from: same length, else [`CcsdsError::Invalid`].
-    fn payload<'m>(&self, message: &'m [u8]) -> Result<&'m [u8], CcsdsError> {
+    /// read from: same length, else [`PointError::Invalid`].
+    fn payload<'m>(&self, message: &'m [u8]) -> Result<&'m [u8], PointError> {
         if message.len() != self.message_len {
             return Err(invalid("message length differs from the index"));
         }
@@ -375,7 +343,7 @@ impl Header {
     /// The RSI starts libaec recorded, checked against the field: one per
     /// RSI when `complete`, else those of the first RSIs; the first at bit
     /// 0, increasing, inside the payload.
-    fn rsi_offsets(&self, offsets: &[usize], complete: bool) -> Result<Box<[u32]>, CcsdsError> {
+    fn rsi_offsets(&self, offsets: &[usize], complete: bool) -> Result<Box<[u32]>, PointError> {
         let count = self.rsi_count();
         // libaec records an RSI's start when decoding reaches it, the first
         // at bit 0; when the field ends exactly on an RSI boundary it may
@@ -418,7 +386,7 @@ impl Header {
         bytes: &[u8],
         start: usize,
         coords: &[(f64, f64)],
-    ) -> Result<Extended, CcsdsError> {
+    ) -> Result<Extended, PointError> {
         let plan = Plan::new(&self.lattice, coords);
         let known: &[u32] = match prior {
             Some(prior) if !prior.rsi_offsets.is_empty() => &prior.rsi_offsets[..],
@@ -467,13 +435,13 @@ impl Header {
                 end_sample - skipped,
                 CHUNK_SAMPLES,
                 |first, chunk| {
-                    ds_core::deadline::check().map_err(CcsdsError::Fatal)?;
+                    ds_core::deadline::check().map_err(PointError::Fatal)?;
                     let first = skipped + first;
                     let end = first + chunk.len() / width;
                     while let Some(&node) = plan.nodes.get(raw.len()).filter(|&&node| node < end) {
                         raw.push(packed(chunk, node - first, width));
                     }
-                    Ok::<_, CcsdsError>(())
+                    Ok::<_, PointError>(())
                 },
             )?,
             None => aec::Decoded {
@@ -541,7 +509,7 @@ pub(crate) enum Kin {
 }
 
 impl Kin {
-    fn margin(self) -> f64 {
+    pub(crate) fn margin(self) -> f64 {
         match self {
             Self::SameRun => SIBLING_MARGIN,
             Self::OtherRun | Self::OtherParameter => LINEAR_MARGIN,
@@ -558,10 +526,78 @@ pub(crate) struct Needs {
     end_sample: usize,
 }
 
+/// Sections 0 to 6 of a message as `grib` parses them from a prefix
+/// (#1301), shared with the 5.3 reader ([`crate::complex`]): `grib` reads a
+/// message to Section 8 and rejects one cut short, so the stub is the
+/// prefix's Sections 0 to 6, an empty Section 7 and Section 8, and the
+/// indicator's length its own. Sections 0 to 6 lie at their offsets in the
+/// message.
+pub(crate) struct Stub {
+    pub bytes: Vec<u8>,
+    /// Where the real Section 7 starts in the message, and its length.
+    pub section7: usize,
+    pub section7_len: usize,
+}
+
+impl Stub {
+    /// The stub of a message `message_len` bytes long from its first bytes
+    /// `prefix`; `None` when the prefix ends before Section 7's header.
+    pub(crate) fn of(prefix: &[u8], message_len: usize) -> Result<Option<Self>, PointError> {
+        let Some((section7, section7_len)) = find_section7(prefix)? else {
+            return Ok(None);
+        };
+        if prefix.len() < 16
+            || u64::from_be_bytes(prefix[8..16].try_into().unwrap()) != message_len as u64
+        {
+            return Err(invalid("message length differs from the index"));
+        }
+        // One field per message: Section 8 follows Section 7.
+        if section7
+            .checked_add(section7_len)
+            .and_then(|end| end.checked_add(4))
+            != Some(message_len)
+        {
+            return Err(invalid("Section 7 does not end the message"));
+        }
+        let mut bytes = prefix[..section7].to_vec();
+        bytes.extend([0, 0, 0, 5, 7]);
+        bytes.extend(b"7777");
+        let stub_len = bytes.len() as u64;
+        bytes[8..16].copy_from_slice(&stub_len.to_be_bytes());
+        Ok(Some(Self {
+            bytes,
+            section7,
+            section7_len,
+        }))
+    }
+}
+
+/// Section 5's data representation template number of a message whose
+/// first bytes are `prefix`: which point reader takes it. `None` when
+/// Section 5 does not fit in the prefix, or the bytes are not GRIB2.
+pub(crate) fn data_template(prefix: &[u8]) -> Option<u16> {
+    if prefix.get(..4)? != b"GRIB" || *prefix.get(7)? != 2 {
+        return None;
+    }
+    let mut at = 16usize;
+    loop {
+        let header = prefix.get(at..at + 5)?;
+        let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        match header[4] {
+            5 => {
+                let template = prefix.get(at + 9..at + 11)?;
+                return Some(u16::from_be_bytes([template[0], template[1]]));
+            }
+            1..=4 if len >= 5 => at = at.checked_add(len)?,
+            _ => return None,
+        }
+    }
+}
+
 /// Where Section 7 starts in a message whose first bytes are `prefix`, and
 /// how long it is: `None` when Sections 1 to 6 or Section 7's header do not
 /// fit in the prefix.
-fn find_section7(prefix: &[u8]) -> Result<Option<(usize, usize)>, CcsdsError> {
+fn find_section7(prefix: &[u8]) -> Result<Option<(usize, usize)>, PointError> {
     let Some(indicator) = prefix.get(..16) else {
         return Ok(None);
     };
@@ -594,7 +630,7 @@ impl CcsdsIndex {
         &self,
         message: &[u8],
         coords: &[(f64, f64)],
-    ) -> Result<Vec<Option<f64>>, CcsdsError> {
+    ) -> Result<Vec<Option<f64>>, PointError> {
         self.header.payload(message)?;
         self.sample_bytes(message, 0, coords)
     }
@@ -602,13 +638,13 @@ impl CcsdsIndex {
     /// [`Self::sample`] from `bytes`, the message's bytes from offset
     /// `start` on: the whole message, or the range [`Self::rsi_bytes`] names
     /// (#1301). Bytes that end before a needed sample are
-    /// [`CcsdsError::Invalid`].
+    /// [`PointError::Invalid`].
     pub(crate) fn sample_bytes(
         &self,
         bytes: &[u8],
         start: usize,
         coords: &[(f64, f64)],
-    ) -> Result<Vec<Option<f64>>, CcsdsError> {
+    ) -> Result<Vec<Option<f64>>, PointError> {
         let header = &self.header;
         let plan = Plan::new(&header.lattice, coords);
         if let Some(value) = header.constant {
@@ -812,13 +848,13 @@ impl CcsdsIndex {
 
 /// The nodes a batch of points reads: each point's [`Bilinear`] over
 /// positions in `nodes`, the distinct nodes in storage order.
-struct Plan {
+pub(crate) struct Plan {
     points: Vec<Option<Bilinear>>,
-    nodes: Vec<usize>,
+    pub nodes: Vec<usize>,
 }
 
 impl Plan {
-    fn new(lattice: &Lattice, coords: &[(f64, f64)]) -> Self {
+    pub(crate) fn new(lattice: &Lattice, coords: &[(f64, f64)]) -> Self {
         let points: Vec<_> = coords
             .iter()
             .map(|&(lon, lat)| lattice.bilinear(lon, lat))
@@ -834,7 +870,7 @@ impl Plan {
     }
 
     /// Each point interpolated over `value(i)`, the value of `nodes[i]`.
-    fn sample(&self, value: impl Fn(usize) -> f32) -> Vec<Option<f64>> {
+    pub(crate) fn sample(&self, value: impl Fn(usize) -> f32) -> Vec<Option<f64>> {
         self.points
             .iter()
             .map(|point| point.as_ref()?.interpolate(|i| f64::from(value(i))))

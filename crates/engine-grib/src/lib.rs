@@ -2,6 +2,9 @@ mod area;
 pub mod cache;
 pub mod catalog;
 mod ccsds;
+mod complex;
+#[cfg(test)]
+mod complex_fetch_tests;
 mod cube;
 mod diagnostics;
 mod discovery;

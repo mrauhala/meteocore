@@ -331,7 +331,7 @@ fn other_layouts_are_unsupported() {
     let unsupported = |spec: Ccsds| {
         let message = spec.message(&raw);
         match Header::parse(&message) {
-            Err(CcsdsError::Unsupported(reason)) => reason,
+            Err(PointError::Unsupported(reason)) => reason,
             other => panic!("{spec:?}: {other:?}"),
         }
     };
@@ -392,7 +392,7 @@ fn other_layouts_are_unsupported() {
     let simple = crate::test_support::message(0, 280.0, [0, 2, 4, 6], 103, 2);
     assert!(matches!(
         Header::parse(&simple),
-        Err(CcsdsError::Unsupported("not CCSDS packing"))
+        Err(PointError::Unsupported("not CCSDS packing"))
     ));
 }
 
@@ -414,7 +414,7 @@ fn invalid_coding_parameters_are_errors() {
         assert!(
             matches!(
                 result,
-                Err(CcsdsError::Invalid(_) | CcsdsError::Unsupported(_))
+                Err(PointError::Invalid(_) | PointError::Unsupported(_))
             ),
             "octet {offset} = {value}: {result:?}"
         );
@@ -494,7 +494,7 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
         Header::parse(&truncated)
             .unwrap()
             .index(&truncated, &coords),
-        Err(CcsdsError::Invalid(_))
+        Err(PointError::Invalid(_))
     ));
 
     // Corrupt payload bytes.
@@ -509,7 +509,7 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
                 assert_eq!(bits(&values), expected);
                 assert_eq!(bits(&index.sample(&corrupt, &coords).unwrap()), expected);
             }
-            Err(CcsdsError::Invalid(_)) => {}
+            Err(PointError::Invalid(_)) => {}
             Err(other) => panic!("{other:?}"),
         }
     }
@@ -524,7 +524,7 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
     assert!(partial.sample(&message, &[(0.0, 89.9)]).is_ok());
     assert!(matches!(
         partial.sample(&message, &south),
-        Err(CcsdsError::Invalid(_))
+        Err(PointError::Invalid(_))
     ));
     let mut past = index.rsi_offsets.to_vec();
     *past.last_mut().unwrap() = u32::MAX;
@@ -534,13 +534,13 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
     };
     assert!(matches!(
         past.sample(&message, &south),
-        Err(CcsdsError::Invalid(_))
+        Err(PointError::Invalid(_))
     ));
     let mut longer = message.clone();
     longer.push(0);
     assert!(matches!(
         index.sample(&longer, &south),
-        Err(CcsdsError::Invalid(_))
+        Err(PointError::Invalid(_))
     ));
     // Offset tables libaec could not have produced.
     let offsets: Vec<usize> = index.rsi_offsets.iter().map(|&o| o as usize).collect();
@@ -644,7 +644,7 @@ fn assert_partial_reads(message: &[u8], coords: &[(f64, f64)]) -> PartialReads {
     // Bytes that begin after the first needed RSI does.
     assert!(matches!(
         complete.sample_bytes(&message[span.start + 1..span.end], span.start + 1, coords),
-        Err(CcsdsError::Invalid(_))
+        Err(PointError::Invalid(_))
     ));
 
     // Cold, through the needed RSIs.
@@ -753,7 +753,7 @@ fn a_prefix_parses_as_the_whole_message() {
     let simple = crate::test_support::message(0, 280.0, [0, 2, 4, 6], 103, 2);
     assert!(matches!(
         Header::parse_prefix(&simple, simple.len()),
-        Err(CcsdsError::Unsupported("not CCSDS packing"))
+        Err(PointError::Unsupported("not CCSDS packing"))
     ));
 }
 
