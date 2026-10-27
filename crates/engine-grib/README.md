@@ -53,6 +53,18 @@ level type) exposes every parameter; each retained run is an EDR instance.
   else a prefix predicted from an indexed message of the same parameter,
   plus at most one continuation. About 15 % of a message at 60°N, 80 % at
   34°S, a few kilobytes once indexed.
+- **Point reads of GFS fields.** Template 5.3 (complex packing with
+  spatial differencing, all of GFS 0.25°) reads alike, by grid rows: every
+  value is a running sum of the differences before it, so the index keeps
+  the decoder's state at each row's first value and the message's group
+  descriptors: about 110 KB per message at 0.25°, against 1–6 KB for a
+  CCSDS index. A point then decodes two rows, bit for bit the full decode's
+  values. Partial fetches: a prefix
+  through the point's last value, about 24 % of a message at 60°N, 39 % at
+  35°N and 78 % at 34°S, then one range GET of the point's rows, 1.3–2.3 KB.
+  A field with a bitmap (soil and other land fields) places its values
+  through the bitmap, which precedes the data: it always reads a prefix,
+  about 55 % of SOILW at 60°N.
 - **Sampling.** Points, paths and map pixels are interpolated bilinearly in
   `f64`, then converted to display units; map tiles store `f32`. Projected
   output CRSs map pixels through a coarse projection grid. An EDR query
@@ -163,7 +175,7 @@ parameters = ["2t", "10u", "10v", "msl", "tp", "t", "z"]
 | `time_window` | none | ISO 8601 duration relative to the current time: `-PT12H` keeps steps valid in the last 12 h, `P5D` in the next 5 days. |
 | `grid_cache_mb` | `256` | Decoded-grid cache per source; `0` disables it. An EDR query over more fields than it holds reads around it. |
 | `message_cache_mb` | `0` | Compressed-message cache per source; `0` disables it. |
-| `point_index_cache_mb` | `16` | CCSDS point-index cache per source; `0` decodes every position field in full. |
+| `point_index_cache_mb` | `16` | Point-index cache per source, one shard, for CCSDS and template 5.3 fields; `0` decodes every position field in full. An index is 1–6 KB for CCSDS and about 110 KB for GFS 0.25°, so 16 MiB holds about 145 GFS messages. |
 
 With `level_types`, the collection id names a source, and the server
 registers one view per enabled family once data for it is found:

@@ -201,31 +201,14 @@ impl Ccsds {
     /// order, below `2^bits`.
     pub fn message(&self, raw: &[u32]) -> Vec<u8> {
         assert_eq!(raw.len(), (self.ni * self.nj) as usize);
-        let signed = |v: i16| -> [u8; 2] {
-            let magnitude = v.unsigned_abs();
-            (if v < 0 { magnitude | 0x8000 } else { magnitude }).to_be_bytes()
-        };
-        let mut bytes = message(0, 0.0, [0; 4], 103, 2);
-        // Indicator 16 bytes, Section 1 21: Section 3 at 37, 4 at 109,
-        // 5 at 143 (template 5.0's 21 octets), 6 at 164, 7 at 170.
-        let (s3, s5) = (37, 143);
-        u32_at(&mut bytes, s3 + 6, self.ni * self.nj);
-        u32_at(&mut bytes, s3 + 30, self.ni);
-        u32_at(&mut bytes, s3 + 34, self.nj);
-        let lat = |v: i32| v.unsigned_abs() | if v < 0 { 1 << 31 } else { 0 };
-        u32_at(&mut bytes, s3 + 46, lat(self.lat_first));
-        u32_at(&mut bytes, s3 + 50, self.lon_first);
-        let last_lat = self.lat_first - ((self.nj - 1) * self.step) as i32;
-        u32_at(&mut bytes, s3 + 55, lat(last_lat));
-        u32_at(
-            &mut bytes,
-            s3 + 59,
-            (self.lon_first + (self.ni - 1) * self.step) % 360_000_000,
+        let mut bytes = grid_sections(
+            self.ni,
+            self.nj,
+            self.lon_first,
+            self.lat_first,
+            self.step,
+            self.scan,
         );
-        u32_at(&mut bytes, s3 + 63, self.step);
-        u32_at(&mut bytes, s3 + 67, self.step);
-        bytes[s3 + 71] = self.scan;
-        bytes.truncate(s5);
 
         let mut s5 = section(5, 25);
         u32_at(&mut s5, 5, self.ni * self.nj);
@@ -263,6 +246,379 @@ impl Ccsds {
         };
         let mut s7 = section(7, 5 + payload.len());
         s7[5..].copy_from_slice(&payload);
+        for part in [s5, s6, s7] {
+            bytes.extend(part);
+        }
+        bytes.extend(b"7777");
+        let length = bytes.len() as u64;
+        bytes[8..16].copy_from_slice(&length.to_be_bytes());
+        bytes
+    }
+}
+
+/// A GRIB2 2-byte sign-and-magnitude integer.
+fn signed(v: i16) -> [u8; 2] {
+    let magnitude = v.unsigned_abs();
+    (if v < 0 { magnitude | 0x8000 } else { magnitude }).to_be_bytes()
+}
+
+/// Sections 0 to 4 of a [`message`] on another regular lat/lon grid:
+/// `ni` × `nj` nodes in micro-degrees from (`lon_first`, `lat_first`),
+/// `step` apart, in scan mode `scan`. Sections 5 to 8 follow.
+fn grid_sections(ni: u32, nj: u32, lon_first: u32, lat_first: i32, step: u32, scan: u8) -> Vec<u8> {
+    let mut bytes = message(0, 0.0, [0; 4], 103, 2);
+    // Indicator 16 bytes, Section 1 21: Section 3 at 37, 4 at 109, 5 at 143.
+    let (s3, s5) = (37, 143);
+    u32_at(&mut bytes, s3 + 6, ni * nj);
+    u32_at(&mut bytes, s3 + 30, ni);
+    u32_at(&mut bytes, s3 + 34, nj);
+    let lat = |v: i32| v.unsigned_abs() | if v < 0 { 1 << 31 } else { 0 };
+    u32_at(&mut bytes, s3 + 46, lat(lat_first));
+    u32_at(&mut bytes, s3 + 50, lon_first);
+    // Rows run north to south, or south to north when scan bit 2 is set.
+    let rows = ((nj - 1) * step) as i32;
+    let last_lat = if scan & 64 != 0 {
+        lat_first + rows
+    } else {
+        lat_first - rows
+    };
+    u32_at(&mut bytes, s3 + 55, lat(last_lat));
+    u32_at(
+        &mut bytes,
+        s3 + 59,
+        (lon_first + (ni - 1) * step) % 360_000_000,
+    );
+    u32_at(&mut bytes, s3 + 63, step);
+    u32_at(&mut bytes, s3 + 67, step);
+    bytes[s3 + 71] = scan;
+    bytes.truncate(s5);
+    bytes
+}
+
+/// Bits written most significant first, as GRIB2 packs them.
+#[derive(Default)]
+struct BitWriter {
+    bytes: Vec<u8>,
+    bits: usize,
+}
+
+impl BitWriter {
+    fn push(&mut self, value: u64, width: u32) {
+        assert!(
+            width == 64 || value >> width == 0,
+            "{value} in {width} bits"
+        );
+        for bit in (0..width).rev() {
+            if self.bits.is_multiple_of(8) {
+                self.bytes.push(0);
+            }
+            if value >> bit & 1 == 1 {
+                *self.bytes.last_mut().unwrap() |= 0x80 >> (self.bits % 8);
+            }
+            self.bits += 1;
+        }
+    }
+
+    /// The bytes, the last one padded with zeros.
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Bits needed to write `v`.
+fn bits_for(v: u64) -> u32 {
+    64 - v.leading_zeros()
+}
+
+/// One packed value of a [`Complex`] field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Value {
+    /// An integer before scaling.
+    Present(i64),
+    /// Missing, as the primary or the secondary missing value (missing
+    /// value management 1 or 2).
+    Missing,
+    SecondaryMissing,
+}
+
+/// A field in complex packing with spatial differencing (data
+/// representation template 5.3) on a regular lat/lon grid, for the 5.3
+/// point reader's tests (#1302). Encoded here from the WMO template, as
+/// NCEP's packers lay it out; the `grib` crate decodes it independently.
+#[derive(Debug, Clone)]
+pub struct Complex {
+    pub ni: u32,
+    pub nj: u32,
+    pub lon_first: u32,
+    pub lat_first: i32,
+    pub step: u32,
+    pub scan: u8,
+    /// Simple packing: `(R + v × 2^E) × 10^-D`.
+    pub reference: f32,
+    pub binary: i16,
+    pub decimal: i16,
+    /// Code table 5.6: first (1) or second (2) order differences.
+    pub order: u8,
+    /// Octets per extra descriptor, 1 to 4.
+    pub octets: u8,
+    /// Code table 5.5: missing value management 0, 1 or 2.
+    pub missing: u8,
+    /// Group lengths, repeated; the last group takes what is left.
+    pub lengths: Vec<u32>,
+    /// Code table 5.4's length increment; every length but the last must
+    /// differ from the shortest by a multiple of it.
+    pub length_increment: u8,
+    /// Which nodes hold a value, Section 6's bitmap; `None` for every node.
+    pub bitmap: Option<Vec<bool>>,
+}
+
+impl Complex {
+    /// GFS's coding on a 1° global grid from 0°E, 90°N, 360 × 181 nodes:
+    /// second order, two-octet descriptors, no missing values, groups of
+    /// 1 to 40 values.
+    pub fn global() -> Self {
+        Self {
+            ni: 360,
+            nj: 181,
+            lon_first: 0,
+            lat_first: 90_000_000,
+            step: 1_000_000,
+            scan: 0,
+            reference: 22314.25,
+            binary: 0,
+            decimal: 2,
+            order: 2,
+            octets: 2,
+            missing: 0,
+            lengths: vec![7, 1, 23, 40, 12, 3, 31, 9],
+            length_increment: 1,
+            bitmap: None,
+        }
+    }
+
+    /// The message holding `values`, one per packed value (every node, or
+    /// every node the bitmap sets) in storage order.
+    pub fn message(&self, values: &[Value]) -> Vec<u8> {
+        let nodes = (self.ni * self.nj) as usize;
+        let encoded = match &self.bitmap {
+            Some(bitmap) => {
+                assert_eq!(bitmap.len(), nodes);
+                bitmap.iter().filter(|&&set| set).count()
+            }
+            None => nodes,
+        };
+        assert_eq!(values.len(), encoded);
+        let order = usize::from(self.order);
+
+        // Spatial differences of the values present, the first `order`
+        // kept whole as the extra descriptors.
+        enum Packed {
+            Value(i64),
+            Missing(u8),
+        }
+        let mut first = Vec::new();
+        let (mut prev1, mut prev2) = (0i64, 0i64);
+        let mut diffs: Vec<Option<Packed>> = Vec::new();
+        for value in values {
+            diffs.push(match value {
+                Value::Missing => Some(Packed::Missing(1)),
+                Value::SecondaryMissing => Some(Packed::Missing(2)),
+                Value::Present(v) => {
+                    let d = if first.len() < order {
+                        first.push(*v);
+                        None
+                    } else if order == 1 {
+                        Some(v - prev1)
+                    } else {
+                        Some(v - 2 * prev1 + prev2)
+                    };
+                    (prev2, prev1) = (prev1, *v);
+                    d.map(Packed::Value)
+                }
+            });
+        }
+        let minimum = diffs
+            .iter()
+            .filter_map(|d| match d {
+                Some(Packed::Value(v)) => Some(*v),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(0);
+        // A first value's own slot holds the minimum: 0 once it is removed.
+        let packed: Vec<Packed> = diffs
+            .into_iter()
+            .map(|d| match d {
+                None => Packed::Value(0),
+                Some(Packed::Value(v)) => Packed::Value(v - minimum),
+                Some(missing) => missing,
+            })
+            .collect();
+
+        // Groups of the given lengths, the last one what is left.
+        let mut groups: Vec<&[Packed]> = Vec::new();
+        let mut rest = &packed[..];
+        for &length in self.lengths.iter().cycle() {
+            if rest.len() <= length as usize {
+                groups.push(rest);
+                break;
+            }
+            let (group, after) = rest.split_at(length as usize);
+            groups.push(group);
+            rest = after;
+        }
+        let reserved = u64::from(self.missing);
+        // Per group: its reference, its width, and whether it is wholly
+        // missing (a constant group whose reference says so).
+        struct Coded {
+            reference: Option<u64>,
+            width: u32,
+            all_missing: Option<u8>,
+        }
+        let coded: Vec<Coded> = groups
+            .iter()
+            .map(|group| {
+                let present: Vec<u64> = group
+                    .iter()
+                    .filter_map(|p| match p {
+                        Packed::Value(v) => Some(*v as u64),
+                        Packed::Missing(_) => None,
+                    })
+                    .collect();
+                let kinds: Vec<u8> = group
+                    .iter()
+                    .filter_map(|p| match p {
+                        Packed::Missing(kind) => Some(*kind),
+                        Packed::Value(_) => None,
+                    })
+                    .collect();
+                match (present.iter().min(), present.iter().max()) {
+                    (Some(&low), Some(&high)) => Coded {
+                        reference: Some(low),
+                        width: if kinds.is_empty() && low == high {
+                            0
+                        } else {
+                            bits_for(high - low + reserved).max(1)
+                        },
+                        all_missing: None,
+                    },
+                    _ if kinds.iter().all(|&kind| kind == kinds[0]) => Coded {
+                        reference: None,
+                        width: 0,
+                        all_missing: Some(kinds[0]),
+                    },
+                    // Both kinds of missing value: values in two bits.
+                    _ => Coded {
+                        reference: Some(0),
+                        width: 2,
+                        all_missing: None,
+                    },
+                }
+            })
+            .collect();
+        let max_reference = coded.iter().filter_map(|c| c.reference).max().unwrap_or(0);
+        let ref_bits = bits_for(max_reference + reserved).max(1);
+        let reference_of = |c: &Coded| match (c.reference, c.all_missing) {
+            (Some(reference), _) => reference,
+            (None, Some(kind)) => (1u64 << ref_bits) - u64::from(kind),
+            (None, None) => unreachable!(),
+        };
+        let width_ref = coded.iter().map(|c| c.width).min().unwrap();
+        let width_bits = bits_for(u64::from(
+            coded.iter().map(|c| c.width).max().unwrap() - width_ref,
+        ));
+        let lengths: Vec<u32> = groups.iter().map(|g| g.len() as u32).collect();
+        let (body, last) = lengths.split_at(lengths.len() - 1);
+        let len_ref = body.iter().copied().min().unwrap_or(0);
+        let increment = u32::from(self.length_increment);
+        let entries: Vec<u64> = body
+            .iter()
+            .map(|&length| {
+                assert_eq!((length - len_ref) % increment, 0);
+                u64::from((length - len_ref) / increment)
+            })
+            .collect();
+        let len_bits = bits_for(entries.iter().copied().max().unwrap_or(0));
+
+        let mut s7 = section(7, 5);
+        let magnitude_bits = 8 * u32::from(self.octets) - 1;
+        for v in first.iter().copied().chain([minimum]) {
+            assert!(v.unsigned_abs() >> magnitude_bits == 0);
+            let raw = v.unsigned_abs() | if v < 0 { 1 << magnitude_bits } else { 0 };
+            s7.extend(&raw.to_be_bytes()[8 - usize::from(self.octets)..]);
+        }
+        let mut refs = BitWriter::default();
+        let mut widths = BitWriter::default();
+        let mut lens = BitWriter::default();
+        let mut data = BitWriter::default();
+        for (i, (group, c)) in groups.iter().zip(&coded).enumerate() {
+            let reference = reference_of(c);
+            refs.push(reference, ref_bits);
+            widths.push(u64::from(c.width - width_ref), width_bits);
+            lens.push(entries.get(i).copied().unwrap_or(0), len_bits);
+            if c.width == 0 {
+                continue;
+            }
+            let all_ones = (1u64 << c.width) - 1;
+            for p in group.iter() {
+                data.push(
+                    match p {
+                        Packed::Value(v) => *v as u64 - reference,
+                        Packed::Missing(kind) => all_ones + 1 - u64::from(*kind),
+                    },
+                    c.width,
+                );
+            }
+        }
+        for part in [refs, widths, lens, data] {
+            s7.extend(part.finish());
+        }
+        let s7_len = s7.len() as u32;
+        u32_at(&mut s7, 0, s7_len);
+
+        let mut s5 = section(5, 49);
+        u32_at(&mut s5, 5, encoded as u32);
+        s5[9..11].copy_from_slice(&3u16.to_be_bytes());
+        s5[11..15].copy_from_slice(&self.reference.to_be_bytes());
+        s5[15..17].copy_from_slice(&signed(self.binary));
+        s5[17..19].copy_from_slice(&signed(self.decimal));
+        s5[19] = ref_bits as u8;
+        s5[20] = 0; // floating-point original values
+        s5[21] = 1; // general group splitting
+        s5[22] = self.missing;
+        u32_at(&mut s5, 23, 9999);
+        u32_at(&mut s5, 27, u32::MAX);
+        u32_at(&mut s5, 31, groups.len() as u32);
+        s5[35] = width_ref as u8;
+        s5[36] = width_bits as u8;
+        u32_at(&mut s5, 37, len_ref);
+        s5[41] = self.length_increment;
+        u32_at(&mut s5, 42, last[0]);
+        s5[46] = len_bits as u8;
+        s5[47] = self.order;
+        s5[48] = self.octets;
+        let mut s6 = section(6, 6);
+        match &self.bitmap {
+            None => s6[5] = 255,
+            Some(bitmap) => {
+                let mut bits = BitWriter::default();
+                for &set in bitmap {
+                    bits.push(u64::from(set), 1);
+                }
+                s6.extend(bits.finish());
+                let s6_len = s6.len() as u32;
+                u32_at(&mut s6, 0, s6_len);
+            }
+        }
+
+        let mut bytes = grid_sections(
+            self.ni,
+            self.nj,
+            self.lon_first,
+            self.lat_first,
+            self.step,
+            self.scan,
+        );
         for part in [s5, s6, s7] {
             bytes.extend(part);
         }

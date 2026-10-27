@@ -428,7 +428,8 @@ ones only in the legacy layout.
   bit offset per RSI of 4096 values: 1.2 KB at 0.25°, 6.5 KB at 0.1°) in a
   per-source `ByteBoundedCache` keyed by `MessageKey` like the message cache,
   single-flight builds. `point_index_cache_mb` (default 16; `0` = off, the
-  kill switch for comparing paths).
+  kill switch for comparing paths). The cache is one shard (#1302): CCSDS
+  and 5.3 indexes share it.
 - First read: one libaec decode with offsets enabled, streamed through a
   reused 16 Ki-sample buffer (as fast as a whole-field buffer), picking the
   query's samples on the way. Later reads decode each needed RSI from its
@@ -445,7 +446,8 @@ ones only in the legacy layout.
   `DecodedGrid` uses too. Change sampling there, never in one path.
 - Readable: 5.42, bitmap indicator 255, template 3.0 scan mode 0, original
   field type 0, a byte layout `grib` reads alike (MSB, 24-bit samples in 3
-  bytes, unsigned, no `AEC_PAD_RSI`), |E| ≤ 126. Else `Unsupported`: decoded
+  bytes, unsigned, no `AEC_PAD_RSI`), |E| ≤ 126. Template 5.3 goes to its
+  own reader (#1302), never `Unsupported`. Else `Unsupported`: decoded
   in full from the same bytes (never a second GET), and the `ParameterKey`
   is marked unreadable until the catalog next publishes a snapshot: later
   fields of that run take `fetch_grid_by_entry` directly. `Invalid` (libaec
@@ -517,6 +519,58 @@ ones only in the legacy layout.
   --nocapture`: `ccsds_files_are_bit_identical` (now also partial reads,
   sibling accuracy, read-on shortfalls) and `point_fetch_replay`
   (`MC_CCSDS_REPLAY`, 41 steps × 2 runs).
+
+## Complex packing point reads (#1302)
+
+- Template 5.3, all of GFS 0.25°, reads through the same point index:
+  `Index::Complex` beside `Index::Ccsds` in one cache, dispatched on Section
+  5's template (`ccsds::data_template`). Decoder and index in `complex.rs`,
+  the engine's reads in `point_index/complex_reads.rs`; `PointError`
+  (`point_index.rs`) serves both.
+- Every value is a running sum of all differences before it, so
+  `ComplexIndex` keeps one 28 B `Checkpoint` per grid row: the decoder state
+  before the row's first value (packed index, group, offset in it, the
+  group's data bit, values seen, the last two undifferenced). It also keeps
+  the message's packed group descriptors (refs, widths, lengths): a row's
+  three descriptor slices lie about 90 KB apart, so keeping them is what
+  holds a warm read to ONE GET. About 110 KB per GFS 0.25° message (97–118 KB
+  measured), against 1–6 KB for CCSDS; the weigher counts all of it.
+- The point-index cache is single shard (`new_single_shard`), so entries of
+  1 KB to 117 KB share one budget and 16 MiB holds about 145 GFS messages.
+  Sharded from a 4 KiB hint it was 64 slices of 256 KiB and a window's
+  indexes evicted each other; `point_index/tests.rs` pins 121 GFS-sized
+  indexes resident in 16 MiB.
+- Bit identity with `decode_message` is the contract: `grib`'s release-build
+  integer arithmetic (wrapping), its missing values (management 1 and 2)
+  and bitmap, `NonZeroSimplePackingDecoder` op for op, the shared
+  `Bilinear`.
+- Readable: order 1 or 2, group splitting 1, extra descriptors of 1–4
+  octets, descriptor and group widths ≤ 31 bits, |E| ≤ 126, bitmap indicator
+  0 or 255, canonical scan. Else `Unsupported`. Corrupt or truncated bytes
+  are `Invalid`, never a panic: `grib` itself panics on a Section 7 shorter
+  than its groups (#1325), so keep
+  `malformed_messages_fail_or_agree_with_the_full_decode`.
+- Whole message: the first read decodes every value once (about 5 ms
+  against 16 ms for the full decode) and indexes every row; later reads
+  decode from the first needed row's checkpoint, about two rows.
+- Partial reads follow the #1301 rules. Warm: ONE range GET
+  (`ComplexIndex::span`), the start checkpoint's data through the last
+  needed value's byte, 1.3–2.3 KB on GFS; rows past the index read on from
+  the last indexed row. Cold: ONE prefix predicted from a sibling
+  (`predict_prefix`: its share through the row after the last needed one,
+  with the kin margin, else linear); the prefix's own descriptors give the
+  exact end, so a short prefix takes ONE exact continuation. A prefix ending
+  inside the descriptors reads on once to `Header::predict_end`, else whole.
+- Bitmapped fields (SOILW and other land fields): only the bitmap, before
+  Section 7, places the needed values, so every partial read is a prefix; a
+  warm one runs through `prefix_bound`, the row after the last needed one
+  from the checkpoints. A decode records that row's checkpoint when the
+  bytes hold it (`decode_end`).
+- Tests: `complex/tests.rs` (every value of `testdata/grib-gfs-complex` and
+  of `test_support::Complex` layouts, partial reads, malformed input),
+  `complex_fetch_tests.rs` (GETs and bytes), `point_index/tests.rs`.
+  Ignored, `--release --ignored --nocapture`: `complex_files_are_bit_identical`
+  (`MC_COMPLEX_FILES=a:b`); `point_fetch_replay` takes 5.3 files too.
 
 ## Trajectory queries (#926)
 
