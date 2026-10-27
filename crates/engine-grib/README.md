@@ -40,6 +40,14 @@ level type) exposes every parameter; each retained run is an EDR instance.
   windows cheap, set `message_cache_mb`: a compressed GFS 0.25° message is
   about 0.6 MB against 4 MB decoded, an IFS 0.1° one about 1.3 MB against
   26 MB.
+- **Point reads of CCSDS fields.** A position query on a template 5.42
+  field (ECMWF IFS and AIFS) decodes only the blocks of 4096 values that
+  hold its points' neighbours, bit for bit the full decode's values. The
+  first read of a message decodes it once, building no grid, and indexes
+  where each block starts (about 1.2 KB at 0.25°, 6.5 KB at 0.1°;
+  `point_index_cache_mb`). A grid already in the cache is used as it is;
+  nothing is inserted. Other packings, bitmaps, and fields the grid cache
+  would keep while no message cache is set are decoded in full.
 - **Sampling.** Points, paths and map pixels are interpolated bilinearly in
   `f64`, then converted to display units; map tiles store `f32`. Projected
   output CRSs map pixels through a coarse projection grid. An EDR query
@@ -150,6 +158,7 @@ parameters = ["2t", "10u", "10v", "msl", "tp", "t", "z"]
 | `time_window` | none | ISO 8601 duration relative to the current time: `-PT12H` keeps steps valid in the last 12 h, `P5D` in the next 5 days. |
 | `grid_cache_mb` | `256` | Decoded-grid cache per source; `0` disables it. An EDR query over more fields than it holds reads around it. |
 | `message_cache_mb` | `0` | Compressed-message cache per source; `0` disables it. |
+| `point_index_cache_mb` | `16` | CCSDS point-index cache per source; `0` decodes every position field in full. |
 
 With `level_types`, the collection id names a source, and the server
 registers one view per enabled family once data for it is found:
@@ -162,8 +171,10 @@ registers one view per enabled family once data for it is found:
 
 Without it, one collection has no vertical axis and serves each short name
 at one canonical level: the lowest height above ground up to 100 m, then
-surface, then mean sea level. `/metrics` reports `grid_cache_*` and
-`grib_message_cache_*` per source.
+surface, then mean sea level. `/metrics` reports `grid_cache_*`,
+`grib_message_cache_*` and `grib_point_index_cache_*` per source, and
+`grib_point_fields_total` by `path`: `partial` through the point index,
+`full` from a decoded grid.
 
 Runnable examples read public buckets
 ([`ecmwf-ifs`](../../collections.d/ecmwf-ifs.toml),

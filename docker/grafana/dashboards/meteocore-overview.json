@@ -1549,6 +1549,19 @@
                                     "name": "panel-87"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 25,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-115"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -12285,7 +12298,7 @@
         "spec": {
           "id": 83,
           "title": "Per-collection caches",
-          "description": "Caches kept per collection, over the dashboard's time range: GeoTIFF compressed tiles (tile_cache), GRIB decoded grids (grid_cache) and compressed messages (grib_message_cache; its hits measure reuse after grid misses, and its misses need storage reads), Zarr decoded chunks (zarr_decoded_cache; single-flight waiters count as hits). GRIB budgets are per source: grid_cache_mb and message_cache_mb.",
+          "description": "Caches kept per collection, over the dashboard's time range: GeoTIFF compressed tiles (tile_cache), GRIB decoded grids (grid_cache) and compressed messages (grib_message_cache; its hits measure reuse after grid misses, and its misses need storage reads) and CCSDS point indexes (grib_point_index_cache; a miss is one entropy decode of a message a position query reads for the first time), Zarr decoded chunks (zarr_decoded_cache; single-flight waiters count as hits). GRIB budgets are per source: grid_cache_mb, message_cache_mb and point_index_cache_mb.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -12304,7 +12317,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) / ((sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) + sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))) > 0)",
+                        "expr": "sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) / ((sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) + sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))) > 0)",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12327,7 +12340,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))",
+                        "expr": "sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12350,7 +12363,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\")) / (sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\")) / (sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12373,7 +12386,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12396,7 +12409,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\"))",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\"))",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12733,7 +12746,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "topk(12, sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s])) / ((sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s])) + sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__rate_interval:15s]))) > 0))",
+                        "expr": "topk(12, sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s])) / ((sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s])) + sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__rate_interval:15s]))) > 0))",
                         "legendFormat": "{{collection}} · {{cache}}",
                         "range": true,
                         "instant": false,
@@ -12827,7 +12840,7 @@
         "spec": {
           "id": 85,
           "title": "Per-collection cache misses",
-          "description": "Misses per second per cache and collection: decodes (grid, Zarr chunk) and storage reads (GeoTIFF tile, GRIB message).",
+          "description": "Misses per second per cache and collection: decodes (grid, Zarr chunk, GRIB point index) and storage reads (GeoTIFF tile, GRIB message).",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -12846,7 +12859,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "topk(12, sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__rate_interval:15s])))",
+                        "expr": "topk(12, sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__rate_interval:15s])))",
                         "legendFormat": "{{collection}} · {{cache}}",
                         "range": true,
                         "instant": false,
@@ -13119,7 +13132,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|zarr_decoded_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
                         "legendFormat": "{{collection}} · {{cache}}",
                         "range": true,
                         "instant": false,
@@ -16951,6 +16964,118 @@
               },
               "fieldConfig": {
                 "defaults": {},
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-115": {
+        "kind": "Panel",
+        "spec": {
+          "id": 115,
+          "title": "GRIB point fields by path",
+          "description": "Position-query fields read per second per GRIB source, by how: partial reads only the CCSDS blocks the points need through the point index, full samples a decoded grid. CCSDS (ECMWF) fields read in full mean point_index_cache_mb = 0, a window the grid cache keeps without a message cache, a first read of each parameter, or another packing or a bitmap; GFS fields are always full.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection, path) (rate(grib_point_fields_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval]))",
+                        "legendFormat": "{{collection}} · {{path}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "ops",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [
+                    {
+                      "title": "Filter dashboard to ${__field.labels.collection}",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${job:queryparam}&${api:queryparam}&${cache:queryparam}&var-collection=${__field.labels.collection}&dtab=engines&engines-dtab=gridded-sources"
+                    }
+                  ],
+                  "min": 0,
+                  "decimals": 2
+                },
                 "overrides": []
               }
             }

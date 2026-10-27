@@ -272,6 +272,7 @@ fn forecast(
     count: u32,
     grid_mb: u64,
     message_mb: u64,
+    point_index_mb: u64,
     delay: Duration,
 ) -> (TestSource, GribEngine, Arc<TestStore>) {
     let source = TestSource::new();
@@ -288,6 +289,7 @@ fn forecast(
     let mut config = source.config();
     config.grid_cache_mb = grid_mb;
     config.message_cache_mb = message_mb;
+    config.point_index_cache_mb = point_index_mb;
     config.level_types = Some(vec![GribLevelType::Pressure]);
     config.parameters = Some(vec!["q".into()]);
     let mut engine = GribEngine::new("packed", &config).unwrap();
@@ -330,16 +332,19 @@ fn sample(engine: &GribEngine, coords: &str) -> Vec<Option<f64>> {
 #[test]
 fn changed_coordinates_and_apis_reuse_messages_when_decoded_grids_do_not_fit() {
     let expected = reader::decode_message(ECMWF, "q").unwrap();
-    for message_mb in [0, 4] {
+    // The full decode, and the CCSDS point path (#1300), which loads no grid
+    // and so counts no grid-cache miss.
+    for (message_mb, index_mb) in [(0, 0), (4, 0), (0, 16), (4, 16)] {
         // One global decoded field is already larger than this grid cache.
-        let (_source, owner, observed) = forecast(6, 1, message_mb, Duration::ZERO);
+        let (_source, owner, observed) = forecast(6, 1, message_mb, index_mb, Duration::ZERO);
         let engine = owner.level_collections().remove(0);
         for (lon, lat) in [(25.0, 60.0), (28.0, 63.0)] {
             let samples = sample(&engine, &format!("POINT({lon} {lat})"));
             assert_eq!(samples, vec![expected.bilinear_value(lon, lat); 6]);
         }
         assert_eq!(engine.grid_cache_utilization().0, 0);
-        assert_eq!(engine.grid_cache_stats().1, 12);
+        let grid_misses = if index_mb == 0 { 12 } else { 0 };
+        assert_eq!(engine.grid_cache_stats(), (0, grid_misses));
         assert_eq!(
             owner.message_cache_metrics(),
             engine.message_cache_metrics()
@@ -397,8 +402,10 @@ fn changed_coordinates_and_apis_reuse_messages_when_decoded_grids_do_not_fit() {
 #[ignore = "manual repeated-window replay; real global GRIB field with simulated GET latency"]
 fn repeated_forecast_latency_replay() {
     let mut baseline = None;
-    for message_mb in [0, 128] {
-        let (_source, owner, _store) = forecast(120, 256, message_mb, Duration::from_millis(150));
+    // The full decode (point index off) and the CCSDS point path (#1300).
+    for (message_mb, index_mb) in [(0, 0), (128, 0), (0, 16), (128, 16)] {
+        let (_source, owner, _store) =
+            forecast(120, 256, message_mb, index_mb, Duration::from_millis(150));
         let engine = owner.level_collections().remove(0);
         let mut outputs = Vec::new();
         for (pass, coords) in ["POINT(25 60)", "POINT(28 63)"].into_iter().enumerate() {
@@ -407,7 +414,7 @@ fn repeated_forecast_latency_replay() {
             outputs.push(sample(&engine, coords));
             let elapsed = start.elapsed();
             let bytes = owner.storage_bytes_read() - before;
-            eprintln!("message_cache_mb={message_mb} pass={pass} elapsed_ms={} downloaded_bytes={bytes} decoded_bytes={} packed_bytes={}", elapsed.as_millis(), owner.grid_cache_utilization().0, owner.message_cache_metrics().bytes);
+            eprintln!("message_cache_mb={message_mb} point_index_cache_mb={index_mb} pass={pass} elapsed_ms={} downloaded_bytes={bytes} decoded_bytes={} packed_bytes={}", elapsed.as_millis(), owner.grid_cache_utilization().0, owner.message_cache_metrics().bytes);
             if pass == 1 && message_mb > 0 {
                 assert_eq!(bytes, 0);
             }

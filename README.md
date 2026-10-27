@@ -996,6 +996,20 @@ so a working set larger than this budget can still require downloads.
 `grib_message_cache_bytes`, and `grib_message_cache_capacity_bytes` report the
 cache per source collection. Header discovery does not fill this cache.
 
+Position queries on CCSDS-packed fields (template 5.42, as ECMWF IFS and
+AIFS publish them) decode only the blocks of a field their points need. The
+first read of a message decodes its payload once, without building a grid,
+and keeps a small index of where each block of 4096 values starts: about
+1.2 KB for a 0.25° global message, 6.5 KB at 0.1°. Later point queries on
+that message decode just the blocks holding each point's four neighbours,
+from the compressed-message cache or one GET. Values are bit for bit those
+of the full decode. `point_index_cache_mb` (default `16`) bounds the indexes
+per source; `0` turns this path off. Other packings, fields with a bitmap,
+and fields the decoded-grid cache would keep while no message cache is set
+are decoded in full as before. `grib_point_index_cache_*` report the index
+cache, and `grib_point_fields_total{path="partial"|"full"}` counts position
+fields by how they were read.
+
 Area and radius queries also load up to four parameter/level fields concurrently.
 The first field determines the grid and supplies its own output values; it is
 not fetched twice when the cache is disabled. The combined output and polygon
@@ -1049,6 +1063,7 @@ Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
 | `parameters` | no | all | Optional parameter filter, e.g., `["2t", "msl", "tp"]`. Strongly recommended with `index_format = "wgrib2"` (a single GFS file can have ~700 messages). |
 | `grid_cache_mb` | no | `256` | LRU cache size for decoded grids |
 | `message_cache_mb` | no | `0` | Optional compressed GRIB message cache in MiB; additional to `grid_cache_mb`, shared by the source's level collections. `0` disables it. |
+| `point_index_cache_mb` | no | `16` | CCSDS point-index cache in MiB, per source: position queries on template 5.42 fields decode only the blocks their points need. `0` disables that path. |
 | `run_hours` | no | `[0, 6, 12, 18]` | Model run hours to poll, 0–23, substituted into `{run}`. Must not be empty when `prefix_pattern` uses `{run}`; unused without it. |
 
 #### GRIB Config Example

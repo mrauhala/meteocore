@@ -41,6 +41,7 @@ fn grib_config() -> GribConfig {
         parameters: None,
         grid_cache_mb: 64,
         message_cache_mb: 0,
+        point_index_cache_mb: 16,
         run_hours: None,
         index_format: Some("ecmwf-json".to_string()),
         filename_contains: None,

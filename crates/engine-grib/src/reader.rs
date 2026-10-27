@@ -10,7 +10,7 @@ use ds_core::wind::VectorFrame;
 use ds_storage::DataStore;
 use grib::{Grib2SubmessageDecoder, GridDefinitionTemplateValues, GridPointIndex};
 
-use crate::cache::DecodedGrid;
+use crate::cache::{DecodedGrid, Lattice};
 use crate::catalog::MessageEntry;
 
 /// Fetch and decode a single GRIB message from a data store.
@@ -224,6 +224,24 @@ pub(crate) fn grid_geometry(
         grid.lat_inc,
     )
     .ok_or_else(|| "invalid geographic grid bounds".into())
+}
+
+/// A Template 3.0 grid's lattice, normalized as a decode normalizes it, and
+/// whether its scan is canonical (mode 0: rows north to south, columns west
+/// to east), in which packed value `k` is node `k` (#1300).
+pub(crate) fn lattice(grid_def: &grib::GridDefinition) -> Result<(Lattice, bool), String> {
+    let layout = extract_grid_params(grid_def)?;
+    Ok((
+        Lattice {
+            ni: layout.ni,
+            nj: layout.nj,
+            lon_first: layout.lon_first,
+            lat_first: layout.lat_first,
+            lon_inc: layout.lon_inc,
+            lat_inc: layout.lat_inc,
+        },
+        layout.canonical_scan,
+    ))
 }
 
 /// Normalize the regular-grid geometry to west→east / north→south. The

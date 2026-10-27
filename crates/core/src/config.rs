@@ -3025,6 +3025,10 @@ fn default_grid_cache_mb() -> u64 {
     256
 }
 
+fn default_point_index_cache_mb() -> u64 {
+    16
+}
+
 /// Mutually exclusive GRIB collection families. A single-level collection
 /// carries fixed-height products as parameters, without a vertical axis.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -3096,6 +3100,11 @@ pub struct GribConfig {
     /// Default: 0 (disabled). Shared by every level collection of this source.
     #[serde(default)]
     pub message_cache_mb: u64,
+    /// CCSDS point-index cache in MiB (#1300): position queries on
+    /// template 5.42 fields decode only the blocks their points need.
+    /// Default: 16. `0` disables that path; every field is decoded in full.
+    #[serde(default = "default_point_index_cache_mb")]
+    pub point_index_cache_mb: u64,
     /// Model run hours to poll. Default: all (00, 06, 12, 18)
     pub run_hours: Option<Vec<u32>>,
     /// Index file format: "ecmwf-json" (default) or "wgrib2".
@@ -3135,6 +3144,7 @@ impl GribConfig {
             parameters: None,
             grid_cache_mb: default_grid_cache_mb(),
             message_cache_mb: 0,
+            point_index_cache_mb: default_point_index_cache_mb(),
             run_hours: None,
             index_format,
             filename_contains: None,
@@ -5903,6 +5913,26 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             updated, original,
             "changed cache budgets must rebuild the engine"
         );
+    }
+
+    #[test]
+    fn grib_point_index_cache_defaults_on_and_changes_reload_identity() {
+        let cfg = grib_collection("data_path = \"testdata/grib-local\"\n");
+        let original = cfg.collections[0].grib.as_ref().unwrap();
+        assert_eq!(original.point_index_cache_mb, 16);
+        let local = GribConfig::auto_local(
+            "x".into(),
+            ".idx".into(),
+            ".grib2".into(),
+            Some("wgrib2".into()),
+        );
+        assert_eq!(local.point_index_cache_mb, 16);
+        let disabled =
+            grib_collection("data_path = \"testdata/grib-local\"\npoint_index_cache_mb = 0\n");
+        disabled.validate().unwrap();
+        let updated = disabled.collections[0].grib.as_ref().unwrap();
+        assert_eq!(updated.point_index_cache_mb, 0);
+        assert_ne!(updated, original, "the kill switch must rebuild the engine");
     }
 
     #[test]
