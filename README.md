@@ -1015,9 +1015,12 @@ and keeps a small index of where each block of 4096 values starts: about
 that message decode just the blocks holding each point's four neighbours,
 from the compressed-message cache or one GET. Values are bit for bit those
 of the full decode. `point_index_cache_mb` (default `16`) bounds the indexes
-per source; `0` turns this path off. Other packings, fields with a bitmap,
-and fields the decoded-grid cache would keep while no message cache is set
-are decoded in full as before. `grib_point_index_cache_*` report the index
+per source; `0` turns this path off. Complex packing with spatial
+differencing (template 5.3, all of GFS 0.25°) reads alike by grid rows, from
+an index of about 110 KB per message (#1302); fields with a bitmap read a
+prefix holding it. Other packings, CCSDS fields with a bitmap, and fields the
+decoded-grid cache would keep while no message cache is set are decoded in
+full as before. `grib_point_index_cache_*` report the index
 cache, and `grib_point_fields_total{path="partial"|"full"}` counts position
 fields by how they were read.
 
@@ -1088,7 +1091,7 @@ Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
 | `parameters` | no | all | Optional parameter filter, e.g., `["2t", "msl", "tp"]`. Strongly recommended with `index_format = "wgrib2"` (a single GFS file can have ~700 messages). |
 | `grid_cache_mb` | no | `256` | LRU cache size for decoded grids |
 | `message_cache_mb` | no | `0` | Optional compressed GRIB message cache in MiB; additional to `grid_cache_mb`, shared by the source's level collections. `0` disables it. |
-| `point_index_cache_mb` | no | `16` | CCSDS point-index cache in MiB, per source: position queries on template 5.42 fields decode only the blocks their points need. `0` disables that path. |
+| `point_index_cache_mb` | no | `16` | Point-index cache in MiB, per source, one shard: position queries on CCSDS (5.42) and complex-packed (5.3) fields decode only the blocks or rows their points need. An index is 1–6 KB for CCSDS and about 110 KB for GFS 0.25°, so 16 MiB holds about 145 GFS messages. `0` disables that path. |
 | `run_hours` | no | `[0, 6, 12, 18]` | Model run hours to poll, 0–23, substituted into `{run}`. Must not be empty when `prefix_pattern` uses `{run}`; unused without it. |
 
 #### GRIB Config Example

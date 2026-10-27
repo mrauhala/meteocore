@@ -365,8 +365,9 @@ impl GribEngine {
             })
     }
 
-    /// CCSDS point-index cache counters and resident bytes, per source
-    /// (#1300); zeroes when `point_index_cache_mb` is 0.
+    /// Point-index cache counters and resident bytes, per source: CCSDS
+    /// (#1300) and complex-packed (#1302) indexes; zeroes when
+    /// `point_index_cache_mb` is 0.
     pub fn point_index_cache_metrics(&self) -> ds_cache::CacheMetrics {
         self.source
             .point_index
