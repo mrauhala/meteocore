@@ -499,9 +499,6 @@ mod tests {
         assert!(found > 0, "expected some entries to survive");
     }
 
-    /// One shard: entries that together weigh the whole budget all stay.
-    /// Sharded, each shard holds an equal slice, so the same entries could
-    /// overflow the shard most of them hash to.
     /// A sharded cache splits its budget: one shard holds less than the
     /// total, so a caller planning residency must compare against
     /// `shard_capacity_bytes`, which a single-shard cache makes the total.
@@ -517,6 +514,9 @@ mod tests {
         assert_eq!(disabled.shard_capacity_bytes(), 0);
     }
 
+    /// One shard: entries that together weigh the whole budget all stay.
+    /// Sharded, each shard holds an equal slice, so the same entries could
+    /// overflow the shard most of them hash to.
     #[test]
     fn single_shard_keeps_everything_that_fits_the_budget() {
         let cache = ByteBoundedCache::new_single_shard(64 * 100, 100, weigh_str);
