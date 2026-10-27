@@ -32,6 +32,7 @@ pub use bytes;
 pub use error::StorageError;
 pub use gauge::HostRequests;
 pub use object_store;
+pub use throttle::throttled_answers;
 
 /// Widen a byte range for `object_store`, which switched `get_range` from
 /// `Range<usize>` to `Range<u64>` in 0.12 so 32-bit targets can still address
@@ -1011,7 +1012,8 @@ impl DataStore {
     /// declared length or its body read so far passes it, and is limited
     /// to the request deadline when one is in scope, else to `budget`. A
     /// 429, a 5xx or a failed connection is retried twice, as object_store
-    /// retries. Any other store answers a plain GET, capped as it streams.
+    /// retries; a 429 without `Retry-After` after the host's retry delay
+    /// (#1290). Any other store answers a plain GET, capped as it streams.
     /// The outer `Err` is a runtime-bridge failure or an expired deadline.
     #[allow(clippy::type_complexity)]
     pub fn get_documents(
@@ -1764,8 +1766,8 @@ impl<S: object_store::client::HttpService + Clone> object_store::client::HttpCon
 /// Use for feeds and allowlisted document URLs, including S3-hosted objects.
 /// The source query string is preserved on each request.
 ///
-/// It has no request limit, but it honours its host's `Retry-After` with
-/// every other store on the host ([`build_http_store_limited`]).
+/// It has no request limit, but it honours its host's `Retry-After` and
+/// pace with every other store on the host ([`build_http_store_limited`]).
 pub fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
     http_store(data_path, http_object_store)
 }
@@ -1782,11 +1784,13 @@ fn http_store(
 }
 
 /// A host store [`build_http_store_limited`] built: its configured limit,
-/// the limited store, its adaptive limit, and its request counters.
+/// the limited store, its adaptive limit, its host's throttle, and its
+/// request counters.
 #[derive(Clone)]
 struct HostStore {
     limit: usize,
     adaptive: Arc<throttle::AdaptiveLimit>,
+    throttle: Arc<throttle::HostThrottle>,
     store: Arc<dyn ObjectStore>,
     gauges: Arc<gauge::HostGauges>,
 }
@@ -1813,8 +1817,10 @@ static HOST_STORES: std::sync::LazyLock<
 /// Requests halves it, never below 1 and at most once a second, and each
 /// 30 s without one adds one back, up to the configured limit. Requests in
 /// flight when it is cut finish. A 429's `Retry-After` pauses new requests
-/// to the host, from every store on it, for at most a minute
-/// (`throttle.rs`).
+/// to the host, from every store on it, for at most a minute; a 429 also
+/// spaces the host's requests apart, from 0.25 s up to 2 s, until it is
+/// quiet, and one without `Retry-After` is retried after 2 s (#1290,
+/// `throttle.rs`).
 pub fn build_http_store_limited(
     data_path: &str,
     max_requests: usize,
@@ -1847,7 +1853,8 @@ fn limited_http_store(
                 http_label(&base_url),
                 max_requests,
             ));
-            throttle::for_url(&base_url).add_limit(adaptive.clone());
+            let throttle = throttle::for_url(&base_url);
+            throttle.add_limit(adaptive.clone());
             let limited: Arc<dyn ObjectStore> = Arc::new(throttle::Limited {
                 inner: counted,
                 limit: adaptive.clone(),
@@ -1855,6 +1862,7 @@ fn limited_http_store(
             let host = HostStore {
                 limit: max_requests,
                 adaptive,
+                throttle,
                 store: Arc::new(gauge::Gauged {
                     inner: limited,
                     count: gauges.requested.clone(),
@@ -1876,10 +1884,11 @@ fn limited_http_store(
 }
 
 /// The requests in flight and waiting under each limit
-/// [`build_http_store_limited`] has made, and the limit as it is now: the
-/// configured one, or less while the host backs off from a 429 (#1235).
-/// One entry per host and port: the bases of one host that differ in
-/// their query strings are summed. One entry per configured host, so a
+/// [`build_http_store_limited`] has made, the limit as it is now: the
+/// configured one, or less while the host backs off from a 429 (#1235),
+/// and the 429s the host has answered (#1290). One entry per host and
+/// port: the bases of one host that differ in their query strings are
+/// summed, their 429s counted once. One entry per configured host, so a
 /// bounded label set for `/metrics`.
 pub fn host_requests() -> Vec<HostRequests> {
     requests_to(|_| true)
@@ -1894,6 +1903,9 @@ fn requests_to(wanted: impl Fn(&str) -> bool) -> Vec<HostRequests> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut by_host: std::collections::BTreeMap<String, HostRequests> = Default::default();
+    // The throttles counted, per label: http and https of one host have
+    // one each, the bases of one scheme share one.
+    let mut counted: Vec<(String, Arc<throttle::HostThrottle>)> = Vec::new();
     for (base, host) in hosts.iter() {
         let label = url::Url::parse(base)
             .ok()
@@ -1906,14 +1918,22 @@ fn requests_to(wanted: impl Fn(&str) -> bool) -> Vec<HostRequests> {
         let entry = by_host
             .entry(label.clone())
             .or_insert_with(|| HostRequests {
-                host: label,
+                host: label.clone(),
                 limit: 0,
                 in_flight: 0,
                 queued: 0,
+                throttled: 0,
             });
         entry.limit += host.adaptive.limits(tokio::time::Instant::now()).0;
         entry.in_flight += in_flight;
         entry.queued += queued;
+        let seen = counted
+            .iter()
+            .any(|(at, throttle)| *at == label && Arc::ptr_eq(throttle, &host.throttle));
+        if !seen {
+            entry.throttled += host.throttle.answers();
+            counted.push((label, host.throttle.clone()));
+        }
     }
     by_host.into_values().collect()
 }

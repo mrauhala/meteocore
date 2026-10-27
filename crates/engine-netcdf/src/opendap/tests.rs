@@ -22,6 +22,8 @@ use crate::source::Reader;
 use crate::test_server::{thredds_catalog, Request, TestServer};
 use crate::NetcdfEngine;
 
+mod burst;
+mod catch_up;
 mod windows;
 
 const CATALOGS: &str = "thredds/catalog/meps25epsarchive";

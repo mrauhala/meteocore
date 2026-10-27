@@ -218,6 +218,49 @@ pub struct RemoteTraffic {
     pub bytes: u64,
 }
 
+/// Opens of one scan that may fail while their host answers 429 before
+/// the scan starts no more (#1290): the rest wait for the next poll, the
+/// newest run's first. A catch-up after an outage then asks a throttling
+/// host for about this many opens and the [`REMOTE_OPEN_CONCURRENCY`] in
+/// flight, not for every listed file again each poll.
+const MAX_THROTTLED_OPENS: usize = 3;
+
+/// What one scan's opens came to, for its line ([`NetcdfEngine::log_scan`])
+/// and its stop ([`MAX_THROTTLED_OPENS`]).
+#[derive(Default)]
+struct Tally {
+    /// Files opened and admitted.
+    opened: AtomicUsize,
+    /// Opens whose read failed, tried again next poll.
+    failed: AtomicUsize,
+    /// Those that failed while their host answered 429.
+    throttling: AtomicUsize,
+    /// The first failure: the file and why.
+    first: Mutex<Option<(PathBuf, String)>>,
+}
+
+impl Tally {
+    fn failed(&self, file: &Listed, reason: &str, throttling: bool) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        if throttling {
+            self.throttling.fetch_add(1, Ordering::Relaxed);
+        }
+        self.first
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| (file.path.clone(), reason.to_string()));
+    }
+
+    /// Whether the scan opens no more: [`MAX_THROTTLED_OPENS`] opens failed
+    /// while the host throttled.
+    fn throttled(&self) -> bool {
+        self.throttling.load(Ordering::Relaxed) >= MAX_THROTTLED_OPENS
+    }
+}
+
+/// The ingested files of one run: each file's newest valid time and path.
+type RunFiles<'a> = Vec<(DateTime<Utc>, &'a PathBuf)>;
+
 /// How much one scan may open.
 struct Limits {
     opens: usize,
@@ -597,6 +640,7 @@ impl NetcdfEngine {
         let present: HashSet<&PathBuf> = listed.iter().map(|l| &l.path).collect();
         state.known.retain(|path, _| present.contains(path));
 
+        let tally = Tally::default();
         let mut opens = limits.opens;
         let mut deferred = 0usize;
         let mut new = Vec::new();
@@ -618,10 +662,10 @@ impl NetcdfEngine {
             opens -= 1;
             new.push(file.clone());
         }
-        deferred += self.open_files(new, &mut state, limits);
+        deferred += self.open_files(new, &mut state, limits, &tally);
 
         let keep = self.retained(&mut state);
-        let mut reopen = Vec::new();
+        let mut closed = Vec::new();
         let paths: Vec<PathBuf> = state.known.keys().cloned().collect();
         for path in paths {
             let kept = keep.contains(&path);
@@ -634,29 +678,35 @@ impl NetcdfEngine {
                     };
                     state.known.insert(path, closed);
                 }
-                Some(Known::Closed { identity, .. }) if kept => {
-                    if opens == 0 {
-                        deferred += 1;
-                        continue;
-                    }
-                    opens -= 1;
-                    // Stays `Closed` until it is open again.
-                    reopen.push(Listed {
+                // Stays `Closed` until it is open again.
+                Some(Known::Closed {
+                    identity,
+                    run,
+                    newest,
+                }) if kept => closed.push((
+                    *run,
+                    *newest,
+                    Listed {
                         path: path.clone(),
                         identity: identity.clone(),
-                    });
-                }
+                    },
+                )),
                 _ => {}
             }
         }
-        deferred += self.open_files(reopen, &mut state, limits);
-        if deferred > 0 {
-            tracing::info!(
-                "[{}] opened {} files this scan, {deferred} left for the next",
-                self.collection_id,
-                limits.opens - opens
-            );
+        // The newest run first, each in time order, as new files are.
+        closed.sort_by_key(|(run, newest, _)| (Reverse(*run), *newest));
+        let mut reopen = Vec::new();
+        for (_, _, file) in closed {
+            if opens == 0 {
+                deferred += 1;
+                continue;
+            }
+            opens -= 1;
+            reopen.push(file);
         }
+        deferred += self.open_files(reopen, &mut state, limits, &tally);
+        self.log_scan(&tally, deferred, past(limits));
 
         let catalog = self.build_catalog(&mut state, &keep);
         tracing::debug!(
@@ -672,7 +722,9 @@ impl NetcdfEngine {
 
     /// Probe a remote source and list the published files of its newest
     /// `max_runs` runs, the newest first, each run's in lead order: an
-    /// older run would be opened only for the retention to close it.
+    /// older run would be opened only for the retention to close it. The
+    /// open files of an older run that serves stay listed until `max_runs`
+    /// newer runs serve, so the retention can keep them (#1290).
     /// Files a read found replaced are forgotten and probed again first. A
     /// file the prober withdraws while its run is still in the window and
     /// does not list again was removed, or replaced by a version not
@@ -744,14 +796,33 @@ impl NetcdfEngine {
         }
         let mut files = prober.files();
         files.sort_by_key(|file| (Reverse(file.time), file.lead));
-        let mut runs = 0;
+        let open = |file: &ProbedFile| {
+            matches!(
+                state.known.get(std::path::Path::new(&file.key)),
+                Some(Known::Open(_))
+            )
+        };
+        let serving: HashSet<DateTime<Utc>> = files
+            .iter()
+            .filter(|file| open(file))
+            .map(|file| file.time)
+            .collect();
+        // The newest `max_runs` slots are listed whole, to be opened. An
+        // older slot that serves keeps its open files listed until
+        // `max_runs` newer slots serve (#1290): runs listed but not open
+        // yet must not drop the runs that serve meanwhile.
+        let (mut slots, mut served) = (0, 0);
         let mut last = None;
+        let mut listed = false;
         files.retain(|file| {
             if last != Some(file.time) {
                 last = Some(file.time);
-                runs += 1;
+                let serves = serving.contains(&file.time);
+                listed = slots < self.max_runs || (serves && served < self.max_runs);
+                slots += 1;
+                served += usize::from(serves);
             }
-            runs <= self.max_runs
+            listed && (slots <= self.max_runs || open(file))
         });
         for file in withdrawn {
             if files.iter().any(|listed| listed.key == file.key) {
@@ -778,9 +849,15 @@ impl NetcdfEngine {
 
     /// Open, inspect and admit `files` in order, up to `limits.concurrency`
     /// at a time once the collection's layout is known; returns how many
-    /// were left for the next poll (a failed remote read, or the scan's
-    /// time limit).
-    fn open_files(&self, files: Vec<Listed>, state: &mut PollState, limits: &Limits) -> usize {
+    /// were left for the next poll (a failed remote read, the scan's time
+    /// limit, or its host throttling: [`MAX_THROTTLED_OPENS`]).
+    fn open_files(
+        &self,
+        files: Vec<Listed>,
+        state: &mut PollState,
+        limits: &Limits,
+        tally: &Tally,
+    ) -> usize {
         let mut files = files.into_iter();
         let mut retry = 0;
         // The first servable file sets the layout, and with it which
@@ -789,11 +866,11 @@ impl NetcdfEngine {
             let Some(file) = files.next() else {
                 return retry;
             };
-            if past(limits) {
+            if past(limits) || tally.throttled() {
                 return retry + 1 + files.count();
             }
-            let opened = self.open_inspect(&file, &Wanted::All);
-            match self.admit(&file, opened, state, past(limits)) {
+            let opened = self.open_counted(&file, &Wanted::All, tally);
+            match self.admit(&file, opened, state, tally) {
                 Some(known) => self.record(state, file.path, known),
                 None => retry += 1,
             }
@@ -812,15 +889,76 @@ impl NetcdfEngine {
             (None, None) => unreachable!("the layout is set when there is no allowlist"),
         };
         let wanted = Wanted::Listed(&names);
-        let opened = self.open_parallel(&files, &wanted, limits);
-        let cut = past(limits);
+        let opened = self.open_parallel(&files, &wanted, limits, tally);
         for (file, opened) in files.into_iter().zip(opened) {
-            match opened.and_then(|opened| self.admit(&file, opened, state, cut)) {
+            match opened.and_then(|opened| self.admit(&file, opened, state, tally)) {
                 Some(known) => self.record(state, file.path, known),
                 None => retry += 1,
             }
         }
         retry
+    }
+
+    /// The 429s the source's host has answered: compared before and after
+    /// an open, whether it throttled meanwhile. 0 for a local directory.
+    fn throttled_answers(&self) -> u64 {
+        match &self.source {
+            Source::Local { .. } => 0,
+            Source::Remote(remote) => ds_storage::throttled_answers(&remote.origin),
+        }
+    }
+
+    /// [`Self::open_inspect`], a read that failed noted in `tally`, as
+    /// throttled when the host answered 429 meanwhile. Opens run together,
+    /// so a failure among them may be another's 429: either way the host
+    /// was refusing requests.
+    fn open_counted(&self, file: &Listed, wanted: &Wanted, tally: &Tally) -> Opened {
+        let before = self.throttled_answers();
+        let opened = self.open_inspect(file, wanted);
+        if let Opened::Retry(reason) = &opened {
+            tally.failed(file, reason, self.throttled_answers() > before);
+        }
+        opened
+    }
+
+    /// One line for the scan's opens: how many opened, how many wait for
+    /// the next poll, and the reads that failed with the first of them. A
+    /// WARN when a read failed, unless the scan's time limit cut it short,
+    /// when failed reads are expected.
+    fn log_scan(&self, tally: &Tally, left: usize, cut: bool) {
+        let failed = tally.failed.load(Ordering::Relaxed);
+        if left == 0 && failed == 0 {
+            return;
+        }
+        let opened = tally.opened.load(Ordering::Relaxed);
+        let id = &self.collection_id;
+        if failed == 0 {
+            tracing::info!("[{id}] opened {opened} files this scan, {left} left for the next");
+            return;
+        }
+        let throttled = tally.throttling.load(Ordering::Relaxed);
+        let stopped = if tally.throttled() {
+            ", so the scan opened no more"
+        } else {
+            ""
+        };
+        let (path, reason) = tally
+            .first
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default();
+        let line = format!(
+            "[{id}] opened {opened} files this scan, {left} left for the next: {failed} could \
+             not be read now, {throttled} while the host answered 429 Too Many \
+             Requests{stopped}; first {}: {reason}",
+            path.display()
+        );
+        if cut {
+            tracing::info!("{line}");
+        } else {
+            tracing::warn!("{line}");
+        }
     }
 
     /// Remember what an open made of `path`. When it takes the place of
@@ -845,24 +983,27 @@ impl NetcdfEngine {
 
     /// [`Self::open_inspect`] every file, `limits.concurrency` at a time on
     /// threads of their own (Critical Rule 9), in Background mode. `None`
-    /// for a file not started before `limits.until`.
+    /// for a file not started before `limits.until`, or once
+    /// [`MAX_THROTTLED_OPENS`] opens failed while the host throttled: the
+    /// opens in flight finish, and the rest wait for the next poll.
     fn open_parallel(
         &self,
         files: &[Listed],
         wanted: &Wanted,
         limits: &Limits,
+        tally: &Tally,
     ) -> Vec<Option<Opened>> {
         let next = AtomicUsize::new(0);
         let results: Vec<Mutex<Option<Opened>>> = files.iter().map(|_| Mutex::new(None)).collect();
         let work = || {
             let _mode = io::enter(Mode::Background);
             let _deadline = deadline::enter(limits.until);
-            while limits.until.is_none_or(|until| Instant::now() < until) {
+            while !past(limits) && !tally.throttled() {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(file) = files.get(i) else {
                     break;
                 };
-                let opened = self.open_inspect(file, wanted);
+                let opened = self.open_counted(file, wanted, tally);
                 *results[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(opened);
             }
         };
@@ -967,15 +1108,15 @@ impl NetcdfEngine {
 
     /// What the poll remembers of `file` once opened: an open file that
     /// fits the collection's layout (setting it when there is none yet), a
-    /// skipped one, or `None` to try it again next poll. `cut`: the scan's
-    /// time limit has passed, so a failed read is expected, and only the
-    /// scan's summary logs it.
+    /// skipped one, or `None` to try it again next poll. A failed read is
+    /// left to the scan's one line ([`Self::log_scan`]); `tally` counts the
+    /// files opened.
     fn admit(
         &self,
         file: &Listed,
         opened: Opened,
         state: &mut PollState,
-        cut: bool,
+        tally: &Tally,
     ) -> Option<Known> {
         let skipped = |reason: String| {
             tracing::warn!(
@@ -989,13 +1130,11 @@ impl NetcdfEngine {
         };
         match opened {
             Opened::Retry(reason) => {
-                if !cut {
-                    tracing::warn!(
-                        "[{}] cannot read {} now (will retry next poll): {reason}",
-                        self.collection_id,
-                        file.path.display()
-                    );
-                }
+                tracing::debug!(
+                    "[{}] cannot read {} now (will retry next poll): {reason}",
+                    self.collection_id,
+                    file.path.display()
+                );
                 None
             }
             Opened::Skip(reason) => Some(skipped(reason)),
@@ -1008,6 +1147,7 @@ impl NetcdfEngine {
                 if let Err(e) = self.fits_layout(&inspected, state) {
                     return Some(skipped(e));
                 }
+                tally.opened.fetch_add(1, Ordering::Relaxed);
                 Some(Known::Open(Arc::new(OpenFile {
                     id,
                     path: file.path.clone(),
@@ -1204,16 +1344,23 @@ impl NetcdfEngine {
         Ok(())
     }
 
-    /// The ingested files the catalog keeps: the newest `max_runs` runs, as
-    /// many of them, newest first, as `max_files` holds; without runs, the
-    /// `max_files` files with the newest times. A directory mixing files
-    /// with and without a run keeps the runs.
+    /// The ingested files the catalog keeps: the newest `max_runs` runs
+    /// with an open file, as many of them, newest first, as `max_files`
+    /// holds; without runs, the `max_files` files with the newest times. A
+    /// run counts once a file of it is open, so a run whose files are all
+    /// closed never displaces a run that serves (#1290): one among the
+    /// newest `max_runs` is kept after them, in the room they leave, for
+    /// its files to be opened again. A directory mixing files with and
+    /// without a run keeps the runs.
     fn retained(&self, state: &mut PollState) -> HashSet<PathBuf> {
-        // Per run, each file's newest valid time and path.
-        let mut groups: BTreeMap<RunKey, Vec<(DateTime<Utc>, &PathBuf)>> = BTreeMap::new();
+        // Per run, whether a file of it is open, and each file's newest
+        // valid time and path.
+        let mut groups: BTreeMap<RunKey, (bool, RunFiles)> = BTreeMap::new();
         for (path, known) in &state.known {
             if let Some((run, newest)) = known.place() {
-                groups.entry(run).or_default().push((newest, path));
+                let group = groups.entry(run).or_default();
+                group.0 |= matches!(known, Known::Open(_));
+                group.1.push((newest, path));
             }
         }
         let has_runs = groups.keys().any(Option::is_some);
@@ -1225,11 +1372,24 @@ impl NetcdfEngine {
                 self.collection_id
             );
         }
+        let limit = if has_runs { self.max_runs } else { 1 };
+        let (mut serving, mut reopening) = (Vec::new(), Vec::new());
+        for (newer, (open, files)) in groups.into_values().rev().enumerate() {
+            if open && serving.len() < limit {
+                serving.push(files);
+            } else if !open && newer < limit {
+                reopening.push(files);
+            }
+        }
+        serving.extend(reopening);
+        self.fill(serving, has_runs)
+    }
+
+    /// The files of `runs`, newest run first, as many whole runs as
+    /// `max_files` holds; a first run past it alone keeps its earliest
+    /// times, or without runs its newest files.
+    fn fill(&self, runs: Vec<RunFiles>, has_runs: bool) -> HashSet<PathBuf> {
         let mut keep = HashSet::new();
-        let runs = groups
-            .into_values()
-            .rev()
-            .take(if has_runs { self.max_runs } else { 1 });
         for mut files in runs {
             let room = self.max_files - keep.len();
             if room == 0 {

@@ -142,6 +142,9 @@ pub struct HostRequests {
     pub in_flight: usize,
     /// Requests waiting for one.
     pub queued: usize,
+    /// The 429 Too Many Requests answers the host has given since the
+    /// process started, to every store on it (#1290).
+    pub throttled: u64,
 }
 
 /// The two counters of one limited host store.

@@ -1282,8 +1282,8 @@
                                 "spec": {
                                   "x": 0,
                                   "y": 8,
-                                  "width": 12,
-                                  "height": 6,
+                                  "width": 6,
+                                  "height": 8,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-48"
@@ -1293,13 +1293,26 @@
                               {
                                 "kind": "GridLayoutItem",
                                 "spec": {
-                                  "x": 12,
+                                  "x": 6,
                                   "y": 8,
-                                  "width": 12,
-                                  "height": 6,
+                                  "width": 8,
+                                  "height": 8,
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-49"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 14,
+                                  "y": 8,
+                                  "width": 10,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-119"
                                   }
                                 }
                               }
@@ -17420,6 +17433,113 @@
                       "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${job:queryparam}&${api:queryparam}&${cache:queryparam}&var-collection=${__field.labels.collection}&dtab=engines&engines-dtab=gridded-sources"
                     }
                   ],
+                  "min": 0,
+                  "decimals": 2
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-119": {
+        "kind": "Panel",
+        "spec": {
+          "id": 119,
+          "title": "429 answers per host",
+          "description": "429 Too Many Requests answers from each rate-limited remote host (today the remote NetCDF sources), per second, to every store and collection on it. Each one spaces the host's requests apart and can halve its request limit (the panel above), and the request it refused is retried after 2 s. Zero is normal. A rate that stays up means the host is refusing work: polls open a few files each and catch up over several, and requests to the host wait their turn against their deadline.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (host) (rate(storage_host_throttled_total{job=~\"$job\"}[$__rate_interval]))",
+                        "legendFormat": "{{host}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "reqps",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
                   "min": 0,
                   "decimals": 2
                 },

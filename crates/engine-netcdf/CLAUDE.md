@@ -190,7 +190,8 @@ ds-storage's `TemplateProber` over `Schedule::Runs` (`prefix_pattern` with
 HEADs through the host's background share. Its published files of the
 newest `max_runs` run slots, newest run first, lead order, are the listing
 (an older run's files would be opened only for the retention to close
-them: ~80 MB a MEPS run); a key is the `Known` map's path. A run is
+them: ~80 MB a MEPS run), plus the open files of an older slot that serves,
+until `max_runs` newer slots serve (#1290); a key is the `Known` map's path. A run is
 published whole (or after its grace), so the engine never sees a run
 half-uploaded. Every request of a probe failing (`ProbeReport::unreachable`,
 HEADs and THREDDS catalogs) is an `Err` (the catalog stays, `/health`
@@ -229,8 +230,13 @@ size, modification time or `Last-Modified`, ETag):
   then does `content_version` move (#1067 decision 7), with the catalog
   that serves the new version; a new file moves nothing
   (`scan_tests`, a cap of one);
-- the newest `max_runs` runs are kept, as many as `max_files` holds
-  (without runs the `max_files` newest files); files outside are closed
+- runs count once a file of theirs is open (#1290): the newest `max_runs`
+  runs with an open file are kept, as many as `max_files` holds (without
+  runs the `max_files` newest files). A closed-only run among the newest
+  `max_runs` is kept after them, in the room they leave, to be reopened.
+  With the probe's listing above, a run listed but not yet open never
+  drops a serving one (`catch_up::served_runs_stay_until_a_newer_run_serves`).
+  Files outside are closed
   (`Known::Closed`, run and newest time remembered, never reopened unless
   they come back into the kept set); unservable files are remembered as
   `Skipped` and not opened again until they change.
@@ -242,7 +248,12 @@ in listing order (`fits_layout`). Without an allowlist the first servable
 file is opened alone, since it fixes which variables the rest are read
 for. A remote open that failed on a read (network, deadline, replaced) is
 `Opened::Retry`: forgotten, tried next poll; any other failure is
-`Skipped`. A remote poll may open `max(MAX_OPENS_PER_POLL, leads)` files,
+`Skipped`. Once `MAX_THROTTLED_OPENS` (3) opens of a scan fail while the
+host answered 429 (`ds_storage::throttled_answers` before and after the
+open), the scan starts no more opens; those in flight finish. Reopens go
+newest run first, like new files. A scan logs one line for its opens: WARN
+if a read failed, INFO if its time limit cut it; the per-file line is
+DEBUG. A remote poll may open `max(MAX_OPENS_PER_POLL, leads)` files,
 so at least one whole run.
 
 `NetcdfEngine::new` scans once, synchronously, as engine-grib does, so the
@@ -348,8 +359,13 @@ Read in place by HTTP range, never downloaded whole (decision 4).
   `inner()`.
   The 8 adapt (#1235): a 429 halves them, at most once a second, never
   below 1; each quiet 30 s adds one back. A 429's `Retry-After` (≤ 60 s)
-  pauses every request to the host. Permit and `Retry-After` waits count
-  against the deadline. `ds_storage::host_requests` reports the current
+  pauses every request to the host. After a 429 the host's requests
+  start at least the pace apart (#1290): 250 ms, doubling at most once a
+  second to 2 s, halving per quiet 30 s, off below 250 ms. A 429 without
+  `Retry-After` is retried after 2 s. Both are shared by every store on
+  the host; `storage_host_throttled_total{host}` counts the 429s. Permit,
+  pace and `Retry-After` waits count against the deadline. Tests against
+  a throttling `TestServer` use `ds_storage::test_util::quick_backoff`. `ds_storage::host_requests` reports the current
   limit, in flight and queued per host.
 - **Blocks** (`BLOCKS`, `MC_NETCDF_BLOCK_CACHE_MB`, default 64 MiB, floor
   8): reads ≤ `Tuning::bypass_over` (256 KiB) come from 64 KiB blocks keyed
