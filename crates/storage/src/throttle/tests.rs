@@ -758,6 +758,12 @@ fn a_429_on_a_catalog_poll_backs_off_the_host() {
     assert_eq!(retries.len(), 1, "{retries:#?}");
     assert_eq!(retries[0]["span"]["collection"], "meps-sfc");
     assert_eq!(retries[0]["span"]["path"], "catalog.xml");
+    // The wait was the host's back-off, not the layer's 100 ms.
+    let message = retries[0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("after the host's 429 back-off (attempt 1 of 3)"),
+        "{message}"
+    );
     let listed = prober.files();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].key, "files/run_20261019T06Z.nc");
