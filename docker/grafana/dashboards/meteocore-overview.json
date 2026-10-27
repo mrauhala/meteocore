@@ -12474,7 +12474,7 @@
         "spec": {
           "id": 83,
           "title": "Per-collection caches",
-          "description": "Caches kept per collection, over the dashboard's time range: GeoTIFF compressed tiles (tile_cache), GRIB decoded grids (grid_cache) and compressed messages (grib_message_cache; its hits measure reuse after grid misses, and its misses need storage reads) and CCSDS point indexes (grib_point_index_cache; a miss is one entropy decode of a message a position query reads for the first time), Zarr decoded chunks (zarr_decoded_cache; single-flight waiters count as hits). GRIB budgets are per source: grid_cache_mb, message_cache_mb and point_index_cache_mb.",
+          "description": "Caches kept per collection, over the dashboard's time range: GeoTIFF compressed tiles (tile_cache), GRIB decoded grids (grid_cache) and compressed messages (grib_message_cache; its hits measure reuse after grid misses, and its misses need storage reads) and point indexes of CCSDS and complex-packed messages (grib_point_index_cache; a miss is one decode of a message a position query reads for the first time), Zarr decoded chunks (zarr_decoded_cache; single-flight waiters count as hits). GRIB budgets are per source: grid_cache_mb, message_cache_mb and point_index_cache_mb.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -17151,7 +17151,7 @@
         "spec": {
           "id": 115,
           "title": "GRIB point fields by path",
-          "description": "Position-query fields read per second per GRIB source, by how: partial reads only the CCSDS blocks the points need through the point index, full samples a decoded grid. CCSDS (ECMWF) fields read in full mean point_index_cache_mb = 0, a window the grid cache keeps without a message cache, a first read of each parameter, or another packing or a bitmap; GFS fields are always full.",
+          "description": "Position-query fields read per second per GRIB source, by how: partial reads only the CCSDS blocks (ECMWF) or complex-packed rows (GFS) the points need through the point index, full samples a decoded grid. Fields read in full mean point_index_cache_mb = 0, a window the grid cache keeps without a message cache, a first read of each parameter, or a packing or layout the point index does not read.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -17263,7 +17263,7 @@
         "spec": {
           "id": 116,
           "title": "GRIB point fetches by mode",
-          "description": "GETs per second GRIB position queries make, by mode: whole messages, prefixes of CCSDS messages not yet indexed, ranges of the indexed blocks a query needs, and continuations of a prefix or range that came up short. Partial modes run without a message cache, or for a window it cannot hold; a steady continuation rate means prefix predictions run short.",
+          "description": "GETs per second GRIB position queries make, by mode: whole messages, prefixes of messages not yet indexed, ranges of the indexed blocks or rows a query needs, and continuations of a prefix or range that came up short. Partial modes run without a message cache, or for a window it cannot hold; a steady continuation rate means prefix predictions run short.",
           "links": [],
           "data": {
             "kind": "QueryGroup",

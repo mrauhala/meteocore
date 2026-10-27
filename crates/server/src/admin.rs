@@ -1309,16 +1309,18 @@ impl CollectionCacheMetricSet {
 static GRIB_MESSAGE_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
     CollectionCacheMetricSet::new("grib_message_cache", "GRIB compressed-message cache")
 });
-// CCSDS point indexes (#1300), per source like the message cache.
+// Point indexes of CCSDS (#1300) and complex-packed (#1302) messages, per
+// source like the message cache.
 static GRIB_POINT_INDEX_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
-    CollectionCacheMetricSet::new("grib_point_index_cache", "GRIB CCSDS point-index cache")
+    CollectionCacheMetricSet::new("grib_point_index_cache", "GRIB point-index cache")
 });
 static GRIB_POINT_FIELDS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
             "grib_point_fields_total",
-            "GRIB position-query fields by path: partial (the CCSDS blocks \
-             the points need) or full (a decoded grid)",
+            "GRIB position-query fields by path: partial (through a point index, \
+             the CCSDS blocks or complex-packed rows the points need) or full \
+             (a decoded grid)",
         ),
         &["collection", "path"],
     )
@@ -1331,7 +1333,7 @@ static GRIB_POINT_FETCHES: LazyLock<IntCounterVec> = LazyLock::new(|| {
         Opts::new(
             "grib_point_fetches_total",
             "GRIB position-query GETs by mode: whole messages, prefixes of unindexed \
-             CCSDS messages, ranges of indexed blocks, continuations of short reads",
+             messages, ranges of indexed blocks or rows, continuations of short reads",
         ),
         &["collection", "mode"],
     )
