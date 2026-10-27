@@ -256,8 +256,9 @@ on the request path. Single-level and legacy views require exact metadata.
   and all query APIs share it. Keep metadata header probes out of both caches.
 - A decoded-grid miss can reuse the compressed message and decode it again.
   On a compressed-cache miss, share the fetch through `ByteBoundedCache` and
-  admit bytes only after decoding succeeds. Reuse that cold decode; failed
-  reads, invalid payloads and expired fills must remain retryable.
+  admit bytes only after decoding succeeds, or, for a CCSDS point read, after
+  the index build or RSI decode succeeds (#1300). Reuse that cold decode;
+  failed reads, invalid payloads and expired fills must remain retryable.
 - Key by source-local path, offset and indexed length. Like the decoded cache,
   this assumes immutable files at a given path/offset; engine reconstruction
   clears both caches. Changing the cache configuration triggers reconstruction
@@ -374,7 +375,9 @@ ones only in the legacy layout.
 - `query_positions` samples every requested coordinate from each field once,
   even when the decoded-grid cache is disabled or smaller than the forecast
   window. Single-point, single-level and profile queries share this path;
-  every parameter's fields go through one `run_field_jobs` run.
+  every parameter's fields go through one `run_field_jobs` run. Fields go
+  through `position_samples`: CCSDS fields through the point index (see
+  "CCSDS point reads"), others through `fetch_grid_by_entry`.
 - Every EDR field query (position, trajectory, area/radius, cube) reads
   under one `GribEngine::field_plan` (#1297), built from the count of all
   its fields, the first geometry field included, and the view's published
@@ -413,6 +416,60 @@ ones only in the legacy layout.
   steps (16 at a time on the fixture grid), with 150 ms simulated per-read
   latency and the grid cache disabled. It checks equal samples and prints
   timings/bytes; wall-clock times are not CI gates.
+
+## CCSDS point reads (#1300)
+
+- Position queries (POINT, MULTIPOINT) sample template 5.42 fields through
+  `point_index.rs` (`position_samples`): a per-message `ccsds::CcsdsIndex`
+  (Section 5 coding, lattice, `MessageMetadata`, payload position, one `u32`
+  bit offset per RSI of 4096 values: 1.2 KB at 0.25°, 6.5 KB at 0.1°) in a
+  per-source `ByteBoundedCache` keyed by `MessageKey` like the message cache,
+  single-flight builds. `point_index_cache_mb` (default 16; `0` = off, the
+  kill switch for comparing paths).
+- First read: one libaec decode with offsets enabled, streamed through a
+  reused 16 Ki-sample buffer (as fast as a whole-field buffer), picking the
+  query's samples on the way. Later reads decode each needed RSI from its
+  start to the last needed sample. Never build a grid or insert into the grid
+  cache here; a resident grid is used through `GridCache::get_untracked`.
+- Grid-cache counters measure grid loads: a resident grid counts a hit, a
+  full decode (the fallback below) a miss, as the full path would; a field
+  read through the index counts nothing. Never count a lookup that loads no
+  grid, or the hit and miss rates stop sizing the cache.
+- Bit identity with `decode_message` + `bilinear_value` is the contract: the
+  same libaec stream, `grib`'s `NonZeroSimplePackingDecoder` scaling op for
+  op (`(R + raw as f32 × 2^E) × 10^-D`; zero bits `R × 10^-D`), and one
+  interpolation, `Lattice::bilinear_at` + `Bilinear::interpolate`, which
+  `DecodedGrid` uses too. Change sampling there, never in one path.
+- Readable: 5.42, bitmap indicator 255, template 3.0 scan mode 0, original
+  field type 0, a byte layout `grib` reads alike (MSB, 24-bit samples in 3
+  bytes, unsigned, no `AEC_PAD_RSI`), |E| ≤ 126. Else `Unsupported`: decoded
+  in full from the same bytes (never a second GET), and the `ParameterKey`
+  is marked unreadable until the catalog next publishes a snapshot: later
+  fields of that run take `fetch_grid_by_entry` directly. `Invalid` (libaec
+  error, short payload, offsets that do not match) also decodes in full from
+  the same bytes, without marking: the full path's outcome, which may
+  succeed (`grib` zero-fills a short payload). Deadlines stay fatal.
+- Skipped when the plan would `Insert` into a grid cache and there is no
+  message cache: the kept grid serves repeats with no request.
+- Bytes come from `MessageCache::get_with` (admitted once the index build,
+  the fallback decode or, for an evicted message with a warm index, the RSI
+  decode succeeds) or one GET. Metadata and geometry come from the index's
+  header and equal a decode's (`header_metadata_is_the_full_decode_metadata`).
+- `ccsds/aec.rs` holds the crate's only `unsafe`, each with `SAFETY:`; check
+  every length and offset before libaec. Never `aec_decode_range` (copies
+  uninitialized memory on short input, leaks on error); `decode_rsi` seeks
+  and decodes into the caller's buffer and requires every byte.
+- `/metrics`: `grib_point_index_cache_{hits_total,misses_total,bytes,
+  capacity_bytes}` and `grib_point_fields_total{collection,path}` (`partial`
+  | `full`) per source.
+- Tests: `ccsds/tests.rs`, `point_index_tests.rs`. Ignored, `--release
+  --ignored --nocapture`, measurements only: `ccsds_files_are_bit_identical`
+  (`MC_CCSDS_FILES=a:b`, every sample of every RSI, and the header metadata)
+  and `point_index_replay` (`MC_CCSDS_REPLAY=file`, 41 steps);
+  `repeated_forecast_latency_replay` compares the index on and off.
+- Trajectory, area/radius and cube still decode in full. #1301: the index
+  carries `payload_start` and the offsets; a partial index of the first m
+  RSIs fails reads beyond them.
 
 ## Trajectory queries (#926)
 

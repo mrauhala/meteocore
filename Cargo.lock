@@ -1499,6 +1499,7 @@ dependencies = [
  "ds-storage",
  "futures",
  "grib",
+ "libaec-sys",
  "serde",
  "serde_json",
  "thiserror",

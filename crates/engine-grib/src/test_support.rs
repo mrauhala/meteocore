@@ -150,6 +150,129 @@ pub fn statistically_processed(
     bytes
 }
 
+/// A CCSDS-packed field (data representation template 5.42) on a regular
+/// lat/lon grid, for the point-index tests (#1300): coordinates in
+/// micro-degrees, the first node at (`lon_first`, `lat_first`), nodes
+/// `step` apart, rows north to south in the canonical scan.
+#[derive(Debug, Clone)]
+pub struct Ccsds {
+    pub ni: u32,
+    pub nj: u32,
+    pub lon_first: u32,
+    pub lat_first: i32,
+    pub step: u32,
+    pub scan: u8,
+    /// Simple packing: `(R + raw × 2^E) × 10^-D`.
+    pub reference: f32,
+    pub binary: i16,
+    pub decimal: i16,
+    pub bits: u8,
+    /// libaec flags (Code table 5.42 note 3's mask), block size and RSI.
+    pub flags: u8,
+    pub block: u8,
+    pub rsi: u16,
+    /// Section 6's bit-map indicator: 255 for none.
+    pub bitmap: u8,
+}
+
+impl Ccsds {
+    /// A 1° global grid from 0°E, 90°N: 360 × 181 nodes, 16-bit samples
+    /// with ECMWF's coding (flags 14, block 32, RSI 128), so 16 RSIs.
+    pub fn global() -> Self {
+        Self {
+            ni: 360,
+            nj: 181,
+            lon_first: 0,
+            lat_first: 90_000_000,
+            step: 1_000_000,
+            scan: 0,
+            reference: 250.0,
+            binary: -6,
+            decimal: 0,
+            bits: 16,
+            flags: 14,
+            block: 32,
+            rsi: 128,
+            bitmap: 255,
+        }
+    }
+
+    /// The message holding packed integers `raw`, one per node in storage
+    /// order, below `2^bits`.
+    pub fn message(&self, raw: &[u32]) -> Vec<u8> {
+        assert_eq!(raw.len(), (self.ni * self.nj) as usize);
+        let signed = |v: i16| -> [u8; 2] {
+            let magnitude = v.unsigned_abs();
+            (if v < 0 { magnitude | 0x8000 } else { magnitude }).to_be_bytes()
+        };
+        let mut bytes = message(0, 0.0, [0; 4], 103, 2);
+        // Indicator 16 bytes, Section 1 21: Section 3 at 37, 4 at 109,
+        // 5 at 143 (template 5.0's 21 octets), 6 at 164, 7 at 170.
+        let (s3, s5) = (37, 143);
+        u32_at(&mut bytes, s3 + 6, self.ni * self.nj);
+        u32_at(&mut bytes, s3 + 30, self.ni);
+        u32_at(&mut bytes, s3 + 34, self.nj);
+        let lat = |v: i32| v.unsigned_abs() | if v < 0 { 1 << 31 } else { 0 };
+        u32_at(&mut bytes, s3 + 46, lat(self.lat_first));
+        u32_at(&mut bytes, s3 + 50, self.lon_first);
+        let last_lat = self.lat_first - ((self.nj - 1) * self.step) as i32;
+        u32_at(&mut bytes, s3 + 55, lat(last_lat));
+        u32_at(
+            &mut bytes,
+            s3 + 59,
+            (self.lon_first + (self.ni - 1) * self.step) % 360_000_000,
+        );
+        u32_at(&mut bytes, s3 + 63, self.step);
+        u32_at(&mut bytes, s3 + 67, self.step);
+        bytes[s3 + 71] = self.scan;
+        bytes.truncate(s5);
+
+        let mut s5 = section(5, 25);
+        u32_at(&mut s5, 5, self.ni * self.nj);
+        s5[9..11].copy_from_slice(&42u16.to_be_bytes());
+        s5[11..15].copy_from_slice(&self.reference.to_be_bytes());
+        s5[15..17].copy_from_slice(&signed(self.binary));
+        s5[17..19].copy_from_slice(&signed(self.decimal));
+        s5[19] = self.bits;
+        s5[20] = 0; // floating-point original values
+        s5[21] = self.flags;
+        s5[22] = self.block;
+        s5[23..25].copy_from_slice(&self.rsi.to_be_bytes());
+        let mut s6 = section(6, 6);
+        s6[5] = self.bitmap;
+        let payload = if self.bits == 0 {
+            Vec::new()
+        } else {
+            let width = match self.bits {
+                1..=8 => 1,
+                9..=16 => 2,
+                17..=24 if self.flags & 2 != 0 => 3,
+                _ => 4,
+            };
+            let samples: Vec<u8> = raw
+                .iter()
+                .flat_map(|v| v.to_be_bytes()[4 - width..].to_vec())
+                .collect();
+            crate::ccsds::encode(
+                self.bits.into(),
+                self.block.into(),
+                self.rsi.into(),
+                self.flags.into(),
+                &samples,
+            )
+        };
+        let mut s7 = section(7, 5 + payload.len());
+        s7[5..].copy_from_slice(&payload);
+        for part in [s5, s6, s7] {
+            bytes.extend(part);
+        }
+        bytes.extend(b"7777");
+        let length = bytes.len() as u64;
+        bytes[8..16].copy_from_slice(&length.to_be_bytes());
+        bytes
+    }
+}
+
 pub struct TestSource {
     pub dir: PathBuf,
 }

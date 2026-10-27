@@ -258,16 +258,14 @@ impl GribEngine {
             move |(param, index, url, entry, keys)| {
                 // Missing/unreadable fields stay null in position series. Deadlines
                 // and worker failures are fatal and are handled by the scheduler.
+                // CCSDS fields read only the blocks the points need (#1300).
                 let values = engine
-                    .fetch_grid_by_entry(&url, &entry, plan.fill)
-                    .map(|grid| {
+                    .position_samples(&url, &entry, plan.fill, &coords)
+                    .map(|samples| {
                         let meta = engine.param_metadata_for(&keys, &names[param]);
-                        coords
-                            .iter()
-                            .map(|&(lon, lat)| {
-                                grid.bilinear_value(lon, lat)
-                                    .map(|v| meta.display.convert(v))
-                            })
+                        samples
+                            .into_iter()
+                            .map(|v| v.map(|v| meta.display.convert(v)))
                             .collect::<Vec<_>>()
                     });
                 Ok((param, index, values))

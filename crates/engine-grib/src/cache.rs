@@ -91,6 +91,169 @@ pub(crate) struct GridSubset {
     rows: std::ops::Range<usize>,
 }
 
+/// A regular latitude/longitude grid in storage order: rows run from
+/// `lat_first` by `lat_inc` (negative north to south), columns east from
+/// `lon_first`. A [`DecodedGrid`] samples its values on it, and a CCSDS
+/// point read ([`crate::ccsds`], #1300) samples a field's packed values on
+/// it without decoding the grid; both through [`Self::bilinear_at`] and
+/// [`Bilinear::interpolate`], so the two cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Lattice {
+    pub ni: usize,
+    pub nj: usize,
+    pub lon_first: f64,
+    pub lat_first: f64,
+    pub lon_inc: f64,
+    pub lat_inc: f64,
+}
+
+/// The four storage indices one bilinear sample reads and its weights, from
+/// [`Lattice::bilinear_at`]. `nodes` is `[v00, v10, v01, v11]`: the node at
+/// or west and north of the point, its eastern neighbour, the node below it
+/// and that node's eastern neighbour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Bilinear {
+    pub nodes: [usize; 4],
+    dx: f64,
+    dy: f64,
+}
+
+impl Lattice {
+    /// The column count of one full turn when this grid spans 360° (so a
+    /// column index wraps), `None` for regional grids. The ONE home for
+    /// the global-grid test and modulus: `wrap_col` (sampling) and
+    /// `extract_bbox` (area queries) both use it, so they cannot disagree
+    /// on which storage column a longitude names — including on grids that
+    /// store a duplicate seam column (`ni == cols_per_360 + 1`), where a
+    /// modulo-`ni` wrap would name the duplicate for some longitudes.
+    pub(crate) fn wrap_modulus(&self) -> Option<f64> {
+        longitude_wrap_columns(self.ni, self.lon_inc)
+    }
+
+    /// Wrap a fractional column into `[0, ni)` for (near-)global grids — a
+    /// column outside the grid on a 360°-spanning grid names the same meridian
+    /// one wrap away. Regional grids (span < 360°) don't wrap, so an
+    /// out-of-range column stays out of range (genuine nodata).
+    ///
+    /// The wrap lives here (and is idempotent via `rem_euclid`) rather than in
+    /// [`Self::lonlat_to_src_px`], so the lon→col mapping stays continuous for
+    /// [`ProjectionGrid::build_2d`]'s node interpolation while
+    /// [`DecodedGrid::nearest_value`] and [`Self::bilinear_at`] still resolve
+    /// wrapped meridians.
+    ///
+    /// [`ProjectionGrid::build_2d`]: ds_core::resample::ProjectionGrid::build_2d
+    pub(crate) fn wrap_col(&self, col_f: f64) -> f64 {
+        if let Some(cols_per_360) = self.wrap_modulus() {
+            col_f.rem_euclid(cols_per_360)
+        } else {
+            col_f
+        }
+    }
+
+    /// Map (lon, lat) to fractional source-grid pixel `(col_f, row_f)` — the
+    /// cheap affine inverse of the grid's regular lat/lon spacing.
+    ///
+    /// **No longitude wrap here.** The wrap is applied in [`Self::bilinear_at`]
+    /// instead, so this mapping stays *continuous* in longitude. That matters
+    /// because [`ProjectionGrid::build_2d`] bilinearly interpolates the `col_f`
+    /// values between coarse nodes: if this wrapped, two adjacent nodes
+    /// straddling `lon_first` (e.g. a projected viewport crossing Greenwich on a
+    /// 0–360° global grid) would get `col_f` like 1428 and 12, and the midpoint
+    /// would interpolate to ~720 — sampling ~180° away. No bounds/finiteness
+    /// check: that is [`Self::bilinear_at`]'s job.
+    ///
+    /// [`ProjectionGrid::build_2d`]: ds_core::resample::ProjectionGrid::build_2d
+    pub(crate) fn lonlat_to_src_px(&self, lon: f64, lat: f64) -> (f64, f64) {
+        (
+            (lon - self.lon_first) / self.lon_inc,
+            (lat - self.lat_first) / self.lat_inc,
+        )
+    }
+
+    /// The bilinear neighbours of (lon, lat): [`Self::bilinear_at`] its pixel.
+    pub(crate) fn bilinear(&self, lon: f64, lat: f64) -> Option<Bilinear> {
+        let (col_f, row_f) = self.lonlat_to_src_px(lon, lat);
+        self.bilinear_at(col_f, row_f)
+    }
+
+    /// The nodes and weights of a bilinear sample at fractional source pixel
+    /// `(col_f, row_f)`.
+    ///
+    /// Returns `None` (transparent) for non-finite inputs or points outside the
+    /// grid. Non-finite is the out-of-domain projected pixel case (`project_node`
+    /// → NaN): it must be rejected up front because `NaN` comparisons are false
+    /// and `NaN as isize` saturates to 0, so the bounds guard would otherwise
+    /// pass and return grid-origin data rendered as a colour.
+    pub(crate) fn bilinear_at(&self, col_f: f64, row_f: f64) -> Option<Bilinear> {
+        if !col_f.is_finite() || !row_f.is_finite() {
+            return None;
+        }
+        // Apply the deferred ±360° longitude wrap here (once, idempotently —
+        // replacing the old sequential-`if` that could double-adjust).
+        let col_f = self.wrap_col(col_f);
+        let col = col_f.floor() as isize;
+        let row = row_f.floor() as isize;
+        if col < 0 || col >= self.ni as isize || row < 0 || row >= self.nj as isize {
+            return None;
+        }
+        let (col, row) = (col as usize, row as usize);
+        let dx = col_f - col as f64;
+        let dy = row_f - row as f64;
+
+        // Global longitude is cyclic, including grids with a duplicate seam
+        // column. Only a regional grid clamps its right neighbor.
+        let col1 = match self.wrap_modulus() {
+            Some(period) if col + 1 >= self.ni || (col + 1) as f64 >= period => 0,
+            _ => (col + 1).min(self.ni - 1),
+        };
+        let row1 = (row + 1).min(self.nj - 1);
+        Some(Bilinear {
+            nodes: [
+                row * self.ni + col,
+                row * self.ni + col1,
+                row1 * self.ni + col,
+                row1 * self.ni + col1,
+            ],
+            dx,
+            dy,
+        })
+    }
+}
+
+impl Bilinear {
+    /// The same sample over other storage: `nodes` replaced by `node(n)`,
+    /// such as positions in a compact array of just the nodes a query reads.
+    pub(crate) fn map_nodes(self, node: impl FnMut(usize) -> usize) -> Self {
+        Self {
+            nodes: self.nodes.map(node),
+            ..self
+        }
+    }
+
+    /// Interpolate the node values `value(node)` returns, already widened
+    /// from the decoder's `f32`: converting BEFORE arithmetic preserves the
+    /// original f64 interpolation exactly, including values between the
+    /// decoder's representable nodes.
+    pub(crate) fn interpolate(&self, value: impl Fn(usize) -> f64) -> Option<f64> {
+        let [v00, v10, v01, v11] = self.nodes.map(value);
+        let (dx, dy) = (self.dx, self.dy);
+
+        // Skip interpolation if any neighbor is NaN
+        if v00.is_nan() || v10.is_nan() || v01.is_nan() || v11.is_nan() {
+            // Fall back to the nearest non-NaN of the four neighbours (not just
+            // v00 — otherwise a NaN at v00 with valid v10/v01/v11 would widen the
+            // nodata hole by one source pixel).
+            return [v00, v10, v01, v11].into_iter().find(|v| !v.is_nan());
+        }
+
+        let val = v00 * (1.0 - dx) * (1.0 - dy)
+            + v10 * dx * (1.0 - dy)
+            + v01 * (1.0 - dx) * dy
+            + v11 * dx * dy;
+        Some(val)
+    }
+}
+
 impl DecodedGrid {
     /// Memory size estimate in bytes.
     fn size_bytes(&self) -> usize {
@@ -124,43 +287,38 @@ impl DecodedGrid {
         ))
     }
 
-    /// The column count of one full turn when this grid spans 360° (so a
-    /// column index wraps), `None` for regional grids. The ONE home for
-    /// the global-grid test and modulus: `wrap_col` (sampling) and
-    /// `extract_bbox` (area queries) both use it, so they cannot disagree
-    /// on which storage column a longitude names — including on grids that
-    /// store a duplicate seam column (`ni == cols_per_360 + 1`), where a
-    /// modulo-`ni` wrap would name the duplicate for some longitudes.
-    fn wrap_modulus(&self) -> Option<f64> {
-        longitude_wrap_columns(self.ni, self.lon_inc)
+    /// The grid's regular lat/lon geometry, for the sampling helpers shared
+    /// with the CCSDS point path (#1300).
+    pub(crate) fn lattice(&self) -> Lattice {
+        Lattice {
+            ni: self.ni,
+            nj: self.nj,
+            lon_first: self.lon_first,
+            lat_first: self.lat_first,
+            lon_inc: self.lon_inc,
+            lat_inc: self.lat_inc,
+        }
     }
 
-    /// Wrap a fractional column into `[0, ni)` for (near-)global grids — a
-    /// column outside the grid on a 360°-spanning grid names the same meridian
-    /// one wrap away. Regional grids (span < 360°) don't wrap, so an
-    /// out-of-range column stays out of range (genuine nodata).
-    ///
-    /// The wrap lives here (and is idempotent via `rem_euclid`) rather than in
-    /// [`Self::lonlat_to_src_px`], so the lon→col mapping stays continuous for
-    /// [`ProjectionGrid::build_2d`]'s node interpolation while [`Self::nearest_value`]
-    /// and [`Self::bilinear_at`] still resolve wrapped meridians.
+    /// [`Lattice::wrap_modulus`].
+    fn wrap_modulus(&self) -> Option<f64> {
+        self.lattice().wrap_modulus()
+    }
+
+    /// [`Lattice::wrap_col`].
     fn wrap_col(&self, col_f: f64) -> f64 {
-        if let Some(cols_per_360) = self.wrap_modulus() {
-            col_f.rem_euclid(cols_per_360)
-        } else {
-            col_f
-        }
+        self.lattice().wrap_col(col_f)
     }
 
     /// `lon` moved by whole turns into the grid's own longitude frame,
     /// `[lon_first, lon_first + 360)`, for the map sampler. A map viewport
     /// may reach past ±180°: OGC API Maps unwraps a bbox crossing the
     /// antimeridian (#828), and WMS CRS:84 boxes can too. On a regional
-    /// grid, which [`Self::wrap_col`] leaves unwrapped, the meridian such a
+    /// grid, which [`Lattice::wrap_col`] leaves unwrapped, the meridian such a
     /// pixel shows is one turn away: 185° is 175°W on a grid stored from
     /// 179.5°W, and 170°W is 190° on one stored from 160°E. A longitude
     /// west of `lon_first` lands a turn east, still off a regional grid.
-    /// Global grids wrap in [`Self::wrap_col`] instead, and a longitude
+    /// Global grids wrap in [`Lattice::wrap_col`] instead, and a longitude
     /// already in the frame is returned as is, so neither sample moves by
     /// a rounding error. Non-finite input stays non-finite.
     fn lon_in_frame(&self, lon: f64) -> f64 {
@@ -180,75 +338,19 @@ impl DecodedGrid {
         self.bilinear_at(col_f, row_f)
     }
 
-    /// Map (lon, lat) to fractional source-grid pixel `(col_f, row_f)` — the
-    /// cheap affine inverse of the grid's regular lat/lon spacing.
-    ///
-    /// **No longitude wrap here.** The wrap is applied in [`Self::bilinear_at`]
-    /// instead, so this mapping stays *continuous* in longitude. That matters
-    /// because [`ProjectionGrid::build_2d`] bilinearly interpolates the `col_f`
-    /// values between coarse nodes: if this wrapped, two adjacent nodes
-    /// straddling `lon_first` (e.g. a projected viewport crossing Greenwich on a
-    /// 0–360° global grid) would get `col_f` like 1428 and 12, and the midpoint
-    /// would interpolate to ~720 — sampling ~180° away. No bounds/finiteness
-    /// check: that is [`Self::bilinear_at`]'s job.
+    /// [`Lattice::lonlat_to_src_px`].
     fn lonlat_to_src_px(&self, lon: f64, lat: f64) -> (f64, f64) {
-        (
-            (lon - self.lon_first) / self.lon_inc,
-            (lat - self.lat_first) / self.lat_inc,
-        )
+        self.lattice().lonlat_to_src_px(lon, lat)
     }
 
-    /// Bilinearly sample the grid at fractional source pixel `(col_f, row_f)`.
-    ///
-    /// Returns `None` (transparent) for non-finite inputs or points outside the
-    /// grid. Non-finite is the out-of-domain projected pixel case (`project_node`
-    /// → NaN): it must be rejected up front because `NaN` comparisons are false
-    /// and `NaN as isize` saturates to 0, so the bounds guard would otherwise
-    /// pass and return grid-origin data rendered as a colour.
+    /// Bilinearly sample the grid at fractional source pixel `(col_f, row_f)`:
+    /// [`Lattice::bilinear_at`]'s neighbours, [`Bilinear::interpolate`]d over
+    /// the decoded values. `None` (transparent) off the grid or for
+    /// non-finite input.
     fn bilinear_at(&self, col_f: f64, row_f: f64) -> Option<f64> {
-        if !col_f.is_finite() || !row_f.is_finite() {
-            return None;
-        }
-        // Apply the deferred ±360° longitude wrap here (once, idempotently —
-        // replacing the old sequential-`if` that could double-adjust).
-        let col_f = self.wrap_col(col_f);
-        let col = col_f.floor() as isize;
-        let row = row_f.floor() as isize;
-        if col < 0 || col >= self.ni as isize || row < 0 || row >= self.nj as isize {
-            return None;
-        }
-        let (col, row) = (col as usize, row as usize);
-        let dx = col_f - col as f64;
-        let dy = row_f - row as f64;
-
-        // Global longitude is cyclic, including grids with a duplicate seam
-        // column. Only a regional grid clamps its right neighbor.
-        let col1 = match self.wrap_modulus() {
-            Some(period) if col + 1 >= self.ni || (col + 1) as f64 >= period => 0,
-            _ => (col + 1).min(self.ni - 1),
-        };
-        let row1 = (row + 1).min(self.nj - 1);
-
-        // Convert BEFORE arithmetic to preserve the original f64 interpolation
-        // exactly, including values between the decoder's representable nodes.
-        let v00 = f64::from(self.values[row * self.ni + col]);
-        let v10 = f64::from(self.values[row * self.ni + col1]);
-        let v01 = f64::from(self.values[row1 * self.ni + col]);
-        let v11 = f64::from(self.values[row1 * self.ni + col1]);
-
-        // Skip interpolation if any neighbor is NaN
-        if v00.is_nan() || v10.is_nan() || v01.is_nan() || v11.is_nan() {
-            // Fall back to the nearest non-NaN of the four neighbours (not just
-            // v00 — otherwise a NaN at v00 with valid v10/v01/v11 would widen the
-            // nodata hole by one source pixel).
-            return [v00, v10, v01, v11].into_iter().find(|v| !v.is_nan());
-        }
-
-        let val = v00 * (1.0 - dx) * (1.0 - dy)
-            + v10 * dx * (1.0 - dy)
-            + v01 * (1.0 - dx) * dy
-            + v11 * dx * dy;
-        Some(val)
+        self.lattice()
+            .bilinear_at(col_f, row_f)?
+            .interpolate(|node| f64::from(self.values[node]))
     }
 
     /// Extract a grid subset for the given bbox [west, south, east, north].
@@ -560,6 +662,28 @@ impl GridCache {
             offset,
         };
         self.cache.get(&key)
+    }
+
+    /// A resident grid, without counting a hit or a miss: a lookup that
+    /// may load no grid at all, as a CCSDS point read (#1300), which counts
+    /// [`Self::record_hit`] when it finds one and [`Self::record_miss`] only
+    /// when it decodes the field in full.
+    pub(crate) fn get_untracked(&self, url: &str, offset: u64) -> Option<Arc<DecodedGrid>> {
+        let key = GridKey {
+            url: Arc::from(url),
+            offset,
+        };
+        self.cache.get_untracked(&key)
+    }
+
+    /// Count one hit, for [`Self::get_untracked`] callers.
+    pub(crate) fn record_hit(&self) {
+        self.cache.record_hit();
+    }
+
+    /// Count one miss, for [`Self::get_untracked`] callers.
+    pub(crate) fn record_miss(&self) {
+        self.cache.record_miss();
     }
 
     /// A byte-capacity cache for tests: [`Self::new`] counts whole MiB, far

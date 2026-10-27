@@ -1,6 +1,7 @@
 mod area;
 pub mod cache;
 pub mod catalog;
+mod ccsds;
 mod cube;
 mod diagnostics;
 mod discovery;
@@ -17,6 +18,9 @@ mod metadata;
 mod moisture_tests;
 #[cfg(test)]
 mod parameter_times_tests;
+mod point_index;
+#[cfg(test)]
+mod point_index_tests;
 mod position;
 pub mod reader;
 #[cfg(test)]
@@ -214,6 +218,11 @@ struct GribSource {
     scan_mode: ScanMode,
     grid_cache: Option<GridCache>,
     message_cache: Option<message_cache::MessageCache>,
+    /// CCSDS indexes for position queries (#1300); `None` when
+    /// `point_index_cache_mb` is 0.
+    point_index: Option<point_index::PointIndex>,
+    /// Position fields served by the point index and by decoded grids.
+    point_fields: point_index::PointFields,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
     /// Allowed parameters (None = all).
@@ -335,6 +344,27 @@ impl GribEngine {
             })
     }
 
+    /// CCSDS point-index cache counters and resident bytes, per source
+    /// (#1300); zeroes when `point_index_cache_mb` is 0.
+    pub fn point_index_cache_metrics(&self) -> ds_cache::CacheMetrics {
+        self.source
+            .point_index
+            .as_ref()
+            .map(|index| index.metrics())
+            .unwrap_or(ds_cache::CacheMetrics {
+                hits: 0,
+                misses: 0,
+                bytes: 0,
+                capacity_bytes: 0,
+            })
+    }
+
+    /// Position-query fields served `(partial, full)`: sampled through the
+    /// CCSDS point index, and from a decoded grid. Per source.
+    pub fn point_field_counts(&self) -> (u64, u64) {
+        self.source.point_fields.counts()
+    }
+
     /// Create a new GRIB engine from config.
     pub fn new(collection_id: &str, config: &GribConfig) -> Result<Self, DataServerError> {
         // Parsed once: an invalid window fails the load instead of silently
@@ -414,6 +444,8 @@ impl GribEngine {
                 scan_mode,
                 grid_cache,
                 message_cache,
+                point_index: point_index::PointIndex::new(config.point_index_cache_mb),
+                point_fields: point_index::PointFields::default(),
                 shutdown: Shutdown::new(),
                 param_filter: config.parameters.clone(),
                 time_window,
@@ -1187,15 +1219,21 @@ impl GribEngine {
             }
             (None, _) => load()?,
         };
-        self.populate_metadata(&entry.key(), &grid, entry.step_kind);
+        self.note_grid(grib_url, entry, &grid);
+        Ok(grid)
+    }
+
+    /// Record what a decoded (or resident) field reports: its parameter
+    /// metadata and, for a representative message, its geometry.
+    fn note_grid(&self, grib_url: &str, entry: &catalog::MessageEntry, grid: &DecodedGrid) {
+        self.populate_metadata(&entry.key(), grid, entry.step_kind);
         if self.populate_geometry(
             grib_url,
             entry,
-            metadata::MessageMetadata::from(grid.as_ref()).geometry,
+            metadata::MessageMetadata::from(grid).geometry,
         ) {
             self.refresh_discovery();
         }
-        Ok(grid)
     }
 
     /// Populate the parameter metadata cache from a decoded grid, using the

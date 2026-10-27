@@ -1220,6 +1220,23 @@ impl CollectionCacheMetricSet {
 static GRIB_MESSAGE_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
     CollectionCacheMetricSet::new("grib_message_cache", "GRIB compressed-message cache")
 });
+// CCSDS point indexes (#1300), per source like the message cache.
+static GRIB_POINT_INDEX_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
+    CollectionCacheMetricSet::new("grib_point_index_cache", "GRIB CCSDS point-index cache")
+});
+static GRIB_POINT_FIELDS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "grib_point_fields_total",
+            "GRIB position-query fields by path: partial (the CCSDS blocks \
+             the points need) or full (a decoded grid)",
+        ),
+        &["collection", "path"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
 static ZARR_DECODED_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
     CollectionCacheMetricSet::new("zarr_decoded_cache", "Zarr decoded chunk cache")
 });
@@ -1319,6 +1336,10 @@ struct CacheCounterState {
     tile: HashMap<String, (u64, u64)>,
     grid: HashMap<String, (u64, u64)>,
     grib_message: HashMap<String, (u64, u64)>,
+    grib_point_index: HashMap<String, (u64, u64)>,
+    /// GRIB position fields `(partial, full)` per source (#1300), same
+    /// reload-rebaseline scheme.
+    grib_point_fields: HashMap<String, (u64, u64)>,
     zarr_decoded: HashMap<String, (u64, u64)>,
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
@@ -7416,6 +7437,31 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
                     .entry(collection.to_owned())
                     .or_default(),
             );
+            GRIB_POINT_INDEX_CACHE_METRICS.update(
+                collection,
+                engine.point_index_cache_metrics(),
+                counter_state
+                    .grib_point_index
+                    .entry(collection.to_owned())
+                    .or_default(),
+            );
+            let fields = engine.point_field_counts();
+            let previous = counter_state
+                .grib_point_fields
+                .entry(collection.to_owned())
+                .or_default();
+            if fields.0 >= previous.0 && fields.1 >= previous.1 {
+                for (path, delta) in [
+                    ("partial", fields.0 - previous.0),
+                    ("full", fields.1 - previous.1),
+                ] {
+                    // Always touched, so both series exist before traffic.
+                    GRIB_POINT_FIELDS
+                        .with_label_values(&[collection, path])
+                        .inc_by(delta);
+                }
+            }
+            *previous = fields;
             let (hits, misses) = engine.grid_cache_stats();
             let entry = counter_state
                 .grid

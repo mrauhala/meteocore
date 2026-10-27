@@ -74,6 +74,11 @@ fn catalogs(catalog: &Catalog) -> impl Iterator<Item = (Option<GribLevelType>, &
 impl GribEngine {
     pub(super) fn publish_catalog(&self, catalog: Catalog) {
         self.source.catalog.store(Arc::new(catalog));
+        // A new run may pack a parameter differently: let the CCSDS point
+        // path try each parameter again (#1300).
+        if let Some(index) = &self.source.point_index {
+            index.forget_layouts();
+        }
         self.refresh_discovery();
     }
 
