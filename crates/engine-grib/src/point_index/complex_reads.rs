@@ -34,7 +34,7 @@ impl GribEngine {
         bytes: &[u8],
     ) -> Result<FieldRead, DataServerError> {
         let (entry, run, coords) = (field.entry, field.run, field.coords);
-        let full = |error: PointError| self.decode_in_full(index, entry, bytes, error);
+        let full = |error: PointError| self.decode_in_full(index, field, bytes, error);
         let cached = match index.cache.get_untracked(key) {
             Some(Index::Complex(complex)) => Some(complex),
             _ => None,

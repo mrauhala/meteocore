@@ -51,10 +51,12 @@ impl MessageCache {
     /// 1024 MiB cache was four shards per CPU, 64 of 16 MiB on 12 CPUs, so
     /// a 41-step 0.1° window (55 MB) that fits the total could still
     /// overflow the shards its messages hash to. Lookups are one per field
-    /// or map tile, so one lock costs nothing.
+    /// or map tile, so one lock costs nothing. A ghost ring tells whether a
+    /// larger cache would keep a window's messages (#1308).
     pub fn new(size_mb: u64) -> Option<Self> {
         (size_mb > 0).then(|| Self {
-            cache: ByteBoundedCache::new_single_shard(size_mb.saturating_mul(MIB), MIB / 2, weight),
+            cache: ByteBoundedCache::new_single_shard(size_mb.saturating_mul(MIB), MIB / 2, weight)
+                .with_ghosts(),
         })
     }
 

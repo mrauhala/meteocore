@@ -383,6 +383,26 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
         assert!(metrics.contains(&line), "{line}");
     }
 
+    // Churn families (#1308): every cache's evictions; ghost hits for a
+    // cache with a ring only; GRIB reads around the grid cache by source.
+    for series in [
+        "metatile_cache_evictions_total{ring=\"cold\"} ",
+        "metatile_cache_ghost_hits_total{depth=\"0.5\"} ",
+        "station_frame_cache_inserted_bytes_total ",
+        "grid_cache_ghost_hits_total{collection=\"grib-default\",depth=\"2\"} ",
+        "grid_cache_bypass_total{collection=\"grib-default\"} ",
+    ] {
+        assert!(
+            metrics.lines().any(|line| line.starts_with(series)),
+            "{series}"
+        );
+    }
+    assert!(!metrics.contains("station_frame_cache_ghost_hits_total{"));
+    assert!(rows
+        .iter()
+        .filter(|row| row.entry.kind == Kind::Cache)
+        .all(|row| row.usage.churn.is_some()));
+
     // The log block and the endpoint list the same entries and sizes.
     assert_log_and_json_agree(&rows);
 
@@ -453,7 +473,15 @@ fn row(id: &'static str, scope: Scope, kind: Kind, source: SizeSource, capacity:
             entries: counted(3),
             hits: counted(5),
             misses: counted(7),
+            churn: (kind == Kind::Cache).then(|| Churn {
+                inserted_bytes: capacity,
+                evicted_cold: 2,
+                evicted_hot: 1,
+                evicted_bytes: capacity / 2,
+                ..Churn::default()
+            }),
         },
+        window: None,
     }
 }
 
@@ -526,6 +554,16 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
             "entries": 3,
             "hits": 5,
             "misses": 7,
+            "churn": {
+                "inserted_bytes": 1536 * MIB,
+                "refused": 0,
+                "evictions": {"cold": 2, "hot": 1},
+                "evicted_bytes": 768 * MIB,
+                "bypasses": 0,
+                "ghost_hits": null,
+                "prewarmed": false,
+            },
+            "last_hour": null,
         })
     );
     assert_eq!(
@@ -541,6 +579,8 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
             "entries": null,
             "hits": null,
             "misses": null,
+            "churn": null,
+            "last_hour": null,
         }])
     );
     let caches = (8192 + 4096 + 256 + 1536) * MIB;
@@ -556,6 +596,61 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
         json!({"process_resident_memory_bytes": 42, "jemalloc_allocated_bytes": null})
     );
     assert_log_and_json_agree(&rows);
+}
+
+/// #1308: a cache's last hour in the document: its label, turnover, the
+/// ghost hits as a share of misses, the hit ratio of a larger cache, and a
+/// pre-warmed cache's caveat.
+#[test]
+fn the_last_hour_says_whether_a_cache_needs_memory() {
+    let thrashing = plan::Activity {
+        secs: 3600,
+        capacity_bytes: 1000,
+        hits: 60,
+        misses: 40,
+        churn: Churn {
+            inserted_bytes: 4000,
+            evicted_cold: 30,
+            evicted_hot: 10,
+            ghost_hits: Some([10, 20, 30]),
+            prewarmed: true,
+            ..Churn::default()
+        },
+    };
+    assert_eq!(
+        last_hour_json(&thrashing),
+        json!({
+            "window_secs": 3600,
+            "lookups": 100,
+            "lookups_per_hour": 100.0,
+            "hit_ratio": 0.6,
+            "turnover_per_hour": 4.0,
+            "evictions": 40,
+            "cold_eviction_share": 0.75,
+            "refused": 0,
+            "bypasses": 0,
+            "ghost_hit_share": {"0.5": 0.25, "1": 0.5, "2": 0.75},
+            "estimated_hit_ratio": {"1.5x": 0.7, "2x": 0.8, "3x": 0.9},
+            "label": "thrashing",
+            "caveat": PREWARMED,
+        })
+    );
+    // A full cache nobody asked: idle, and without a ring no estimate.
+    let idle = plan::Activity {
+        hits: 0,
+        misses: 0,
+        churn: Churn {
+            ghost_hits: None,
+            prewarmed: false,
+            ..thrashing.churn
+        },
+        ..thrashing
+    };
+    let json = last_hour_json(&idle);
+    assert_eq!(json["label"], "idle");
+    assert_eq!(json["hit_ratio"], Value::Null);
+    assert_eq!(json["estimated_hit_ratio"], Value::Null);
+    assert_eq!(json["caveat"], Value::Null);
 }
 
 /// One line per entry, grouped by scope under a heading with the totals.

@@ -155,6 +155,9 @@ struct CacheMetricSet {
     bytes: IntGauge,
     capacity: IntGauge,
     entries: Option<IntGauge>,
+    churn: ChurnMetricSet,
+    /// The churn the last scrape fed.
+    churn_seen: Mutex<ds_cache::Churn>,
 }
 
 impl CacheMetricSet {
@@ -196,6 +199,16 @@ impl CacheMetricSet {
                     &format!("Number of entries currently in the {display}"),
                 )
             }),
+            churn: ChurnMetricSet::new(
+                &format!("{prefix}_evictions_total"),
+                &format!("{prefix}_evicted_bytes_total"),
+                &format!("{prefix}_inserted_bytes_total"),
+                &format!("{prefix}_refused_total"),
+                &format!("{prefix}_ghost_hits_total"),
+                &capitalized,
+                false,
+            ),
+            churn_seen: Mutex::new(ds_cache::Churn::default()),
         }
     }
 
@@ -209,6 +222,130 @@ impl CacheMetricSet {
         if let (Some(gauge), Some(n)) = (&self.entries, entries) {
             gauge.set(n as i64);
         }
+        let mut seen = self.churn_seen.lock().unwrap_or_else(|e| e.into_inner());
+        self.churn.update(&[], m.churn, &mut seen);
+    }
+}
+
+/// One cache family's churn (#1308): `{prefix}_evictions_total{ring}`,
+/// `{prefix}_evicted_bytes_total`, `{prefix}_inserted_bytes_total`,
+/// `{prefix}_refused_total` and, for a cache with a ghost ring,
+/// `{prefix}_ghost_hits_total{depth}`. A per-collection family leads with a
+/// `collection` label and registers [`per_collection`], so a reload that
+/// removes a collection drops its series. Fed from cumulative
+/// [`ds_cache::Churn`] snapshots against the caller's last-seen one: a
+/// backward step (a replaced cache) rebaselines without a spike, as the hit
+/// and miss counters do. Every feed touches every series but the ghost
+/// ones, which a cache without a ring never has.
+struct ChurnMetricSet {
+    evictions: IntCounterVec,
+    evicted_bytes: IntCounterVec,
+    inserted_bytes: IntCounterVec,
+    refused: IntCounterVec,
+    ghost_hits: IntCounterVec,
+}
+
+impl ChurnMetricSet {
+    /// `display` names the cache in the help texts; the families carry a
+    /// `collection` label when `by_collection`.
+    fn new(
+        evictions: &str,
+        evicted_bytes: &str,
+        inserted_bytes: &str,
+        refused: &str,
+        ghost_hits: &str,
+        display: &str,
+        by_collection: bool,
+    ) -> Self {
+        ChurnMetricSet {
+            evictions: churn_family(
+                evictions,
+                &format!(
+                    "{display}: entries evicted. ring: cold = never read since inserted, once \
+                     the cache is full; hot = read since. Refused inserts and replaced values \
+                     are not evictions"
+                ),
+                &["ring"],
+                by_collection,
+            ),
+            evicted_bytes: churn_family(
+                evicted_bytes,
+                &format!("{display}: bytes of the entries evicted"),
+                &[],
+                by_collection,
+            ),
+            inserted_bytes: churn_family(
+                inserted_bytes,
+                &format!(
+                    "{display}: bytes admitted for keys not resident. Turnover per hour is \
+                     its rate × 3600 over the capacity"
+                ),
+                &[],
+                by_collection,
+            ),
+            refused: churn_family(
+                refused,
+                &format!("{display}: inserts refused, heavier than a shard's hot target"),
+                &[],
+                by_collection,
+            ),
+            ghost_hits: churn_family(
+                ghost_hits,
+                &format!(
+                    "{display}: misses of a key evicted within depth × the capacity, \
+                     cumulative over depths: the hits a cache 1.5, 2 or 3 times as large \
+                     would have had. Only caches with a ghost ring"
+                ),
+                &["depth"],
+                by_collection,
+            ),
+        }
+    }
+
+    /// Feed one scrape's snapshot of the cache labelled `labels` (none for a
+    /// process-wide family, its collection for a per-collection one), whose
+    /// previous snapshot is `seen`. Returns what changed since.
+    fn update(
+        &self,
+        labels: &[&str],
+        churn: ds_cache::Churn,
+        seen: &mut ds_cache::Churn,
+    ) -> ds_cache::Churn {
+        let delta = churn.since(seen).unwrap_or(ds_cache::Churn {
+            ghost_hits: churn.ghost_hits.map(|_| [0; 3]),
+            ..ds_cache::Churn::default()
+        });
+        *seen = churn;
+        let inc = |family: &IntCounterVec, extra: &[&str], by: u64| {
+            let values: Vec<&str> = labels.iter().chain(extra).copied().collect();
+            family.with_label_values(&values).inc_by(by);
+        };
+        inc(&self.evictions, &["cold"], delta.evicted_cold);
+        inc(&self.evictions, &["hot"], delta.evicted_hot);
+        inc(&self.evicted_bytes, &[], delta.evicted_bytes);
+        inc(&self.inserted_bytes, &[], delta.inserted_bytes);
+        inc(&self.refused, &[], delta.refused);
+        if let Some(hits) = delta.ghost_hits {
+            for (depth, hits) in ds_cache::GHOST_DEPTHS.iter().zip(hits) {
+                inc(&self.ghost_hits, &[depth], hits);
+            }
+        }
+        delta
+    }
+}
+
+/// One family of a [`ChurnMetricSet`], labelled `extra` after a leading
+/// `collection` when `by_collection`, which also registers it
+/// [`per_collection`].
+fn churn_family(name: &str, help: &str, extra: &[&str], by_collection: bool) -> IntCounterVec {
+    let collection: &[&str] = if by_collection { &["collection"] } else { &[] };
+    let labels: Vec<&str> = collection.iter().chain(extra).copied().collect();
+    let family = IntCounterVec::new(Opts::new(name, help), &labels).unwrap();
+    if by_collection {
+        per_collection(family)
+    } else {
+        REGISTRY.register(Box::new(family.clone())).unwrap();
+        family
     }
 }
 
@@ -578,8 +715,9 @@ static HTTP_RESPONSE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
 });
 
 // GeoTIFF tile cache (per collection): compressed bytes of remote COGs.
-static TILE_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> =
-    LazyLock::new(|| CollectionCacheMetricSet::new("tile_cache", "GeoTIFF tile cache", true));
+static TILE_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
+    CollectionCacheMetricSet::new("tile_cache", "GeoTIFF tile cache", true, false)
+});
 
 // GeoTIFF decoded-chunk cache (#463) — process-global, byte-bounded LRU of
 // decoded (native) source tiles for LOCAL files, so the ~50–190 meta-tile
@@ -1411,10 +1549,21 @@ struct CollectionCacheMetricSet {
     counters: [IntCounterVec; 2],
     gauges: [IntGaugeVec; 2],
     entries: Option<IntGaugeVec>,
+    churn: ChurnMetricSet,
+    /// `{prefix}_bypass_total`: reads that went around the cache (#1308).
+    bypass: Option<IntCounterVec>,
+}
+
+/// What a scrape last fed a [`CollectionCacheMetricSet`] for one
+/// collection's cache.
+#[derive(Debug, Clone, Copy, Default)]
+struct CacheSeen {
+    hits_misses: (u64, u64),
+    churn: ds_cache::Churn,
 }
 
 impl CollectionCacheMetricSet {
-    fn new(prefix: &str, display: &str, with_entries: bool) -> Self {
+    fn new(prefix: &str, display: &str, with_entries: bool, with_bypass: bool) -> Self {
         let counters = ["hits", "misses"].map(|suffix| {
             per_collection(
                 IntCounterVec::new(
@@ -1452,10 +1601,36 @@ impl CollectionCacheMetricSet {
                 .unwrap(),
             )
         });
+        let churn = ChurnMetricSet::new(
+            &format!("{prefix}_evictions_total"),
+            &format!("{prefix}_evicted_bytes_total"),
+            &format!("{prefix}_inserted_bytes_total"),
+            &format!("{prefix}_refused_total"),
+            &format!("{prefix}_ghost_hits_total"),
+            display,
+            true,
+        );
+        let bypass = with_bypass.then(|| {
+            per_collection(
+                IntCounterVec::new(
+                    Opts::new(
+                        format!("{prefix}_bypass_total"),
+                        format!(
+                            "{display}: reads that went around it, a window of more fields \
+                             than it holds, read without inserting. Neither hits nor misses"
+                        ),
+                    ),
+                    &["collection"],
+                )
+                .unwrap(),
+            )
+        });
         Self {
             counters,
             gauges,
             entries,
+            churn,
+            bypass,
         }
     }
 
@@ -1466,16 +1641,17 @@ impl CollectionCacheMetricSet {
         collection: &str,
         metrics: ds_cache::CacheMetrics,
         entries: Option<u64>,
-        previous: &mut (u64, u64),
+        previous: &mut CacheSeen,
     ) {
         let current = (metrics.hits, metrics.misses);
+        let seen = previous.hits_misses;
         // A backward step is a replaced cache: rebaseline without a spike.
-        let deltas = if current.0 >= previous.0 && current.1 >= previous.1 {
-            [current.0 - previous.0, current.1 - previous.1]
+        let deltas = if current.0 >= seen.0 && current.1 >= seen.1 {
+            [current.0 - seen.0, current.1 - seen.1]
         } else {
             [0, 0]
         };
-        *previous = current;
+        previous.hits_misses = current;
         // Always touched, so both series exist before the first lookup.
         for (counter, delta) in self.counters.iter().zip(deltas) {
             counter.with_label_values(&[collection]).inc_by(delta);
@@ -1494,17 +1670,35 @@ impl CollectionCacheMetricSet {
                 .with_label_values(&[collection])
                 .set(n.min(i64::MAX as u64) as i64);
         }
+        let delta = self
+            .churn
+            .update(&[collection], metrics.churn, &mut previous.churn);
+        if let Some(bypass) = &self.bypass {
+            bypass
+                .with_label_values(&[collection])
+                .inc_by(delta.bypasses);
+        }
     }
 }
 
 // Compressed GRIB messages are shared by all level views of a source.
 static GRIB_MESSAGE_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
-    CollectionCacheMetricSet::new("grib_message_cache", "GRIB compressed-message cache", false)
+    CollectionCacheMetricSet::new(
+        "grib_message_cache",
+        "GRIB compressed-message cache",
+        false,
+        false,
+    )
 });
 // Point indexes of CCSDS (#1300) and complex-packed (#1302) messages, per
 // source like the message cache.
 static GRIB_POINT_INDEX_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
-    CollectionCacheMetricSet::new("grib_point_index_cache", "GRIB point-index cache", false)
+    CollectionCacheMetricSet::new(
+        "grib_point_index_cache",
+        "GRIB point-index cache",
+        false,
+        false,
+    )
 });
 static GRIB_POINT_FIELDS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -1543,11 +1737,16 @@ static GRIB_POINT_FETCH_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     per_collection(counter)
 });
 static ZARR_DECODED_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
-    CollectionCacheMetricSet::new("zarr_decoded_cache", "Zarr decoded chunk cache", false)
+    CollectionCacheMetricSet::new(
+        "zarr_decoded_cache",
+        "Zarr decoded chunk cache",
+        false,
+        false,
+    )
 });
 // A plain Zarr store's object cache (`[zarr] cache_mb`, #1307).
 static ZARR_OBJECT_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
-    CollectionCacheMetricSet::new("zarr_object_cache", "Zarr object cache", false)
+    CollectionCacheMetricSet::new("zarr_object_cache", "Zarr object cache", false, false)
 });
 static ZARR_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
@@ -1576,9 +1775,10 @@ static ZARR_READ_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
 
 // GRIB grid cache (per source, shared by its level collections).
 static GRID_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> =
-    LazyLock::new(|| CollectionCacheMetricSet::new("grid_cache", "GRIB grid cache", true));
+    LazyLock::new(|| CollectionCacheMetricSet::new("grid_cache", "GRIB grid cache", true, true));
 
-/// Tracks the last observed (hits, misses) snapshot per (cache_kind, collection)
+/// Tracks the last observed (hits, misses) snapshot, and for the cache
+/// families a cache's churn ([`CacheSeen`]), per (cache_kind, collection)
 /// for the **labelled per-collection** cache families, so that the metrics
 /// handler can convert cumulative cache counters into monotonically-increasing
 /// Prometheus counters via delta tracking. (The unlabelled global caches use
@@ -1592,18 +1792,18 @@ static CACHE_COUNTER_STATE: LazyLock<Mutex<CacheCounterState>> =
 
 #[derive(Default)]
 struct CacheCounterState {
-    tile: HashMap<String, (u64, u64)>,
-    grid: HashMap<String, (u64, u64)>,
-    grib_message: HashMap<String, (u64, u64)>,
-    grib_point_index: HashMap<String, (u64, u64)>,
+    tile: HashMap<String, CacheSeen>,
+    grid: HashMap<String, CacheSeen>,
+    grib_message: HashMap<String, CacheSeen>,
+    grib_point_index: HashMap<String, CacheSeen>,
     /// GRIB position fields `(partial, full)` per source (#1300), same
     /// reload-rebaseline scheme.
     grib_point_fields: HashMap<String, (u64, u64)>,
     /// GRIB point-path `(GETs, bytes)` per mode, per source (#1301), same
     /// reload-rebaseline scheme.
     grib_point_fetches: HashMap<String, [(u64, u64); 4]>,
-    zarr_decoded: HashMap<String, (u64, u64)>,
-    zarr_object: HashMap<String, (u64, u64)>,
+    zarr_decoded: HashMap<String, CacheSeen>,
+    zarr_object: HashMap<String, CacheSeen>,
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
     /// the scrape rebaselines on a backward step — see `metrics_handler`.
@@ -7797,16 +7997,10 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
     if let Ok(engines) = state.geotiff_engines.read() {
         for engine in engines.iter() {
             let collection = engine.collection_id();
-            let (hits, misses) = engine.tile_cache_stats();
-            let (bytes, capacity_bytes, entries) = engine.tile_cache_utilization();
+            let entries = engine.tile_cache_utilization().2;
             TILE_CACHE_METRICS.update(
                 collection,
-                ds_cache::CacheMetrics {
-                    hits,
-                    misses,
-                    bytes,
-                    capacity_bytes,
-                },
+                engine.tile_cache_metrics(),
                 Some(entries as u64),
                 counter_state.tile.entry(collection.to_owned()).or_default(),
             );
@@ -7920,16 +8114,10 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                 }
             }
             *previous = fetches.map(|(_, gets, bytes)| (gets, bytes));
-            let (hits, misses) = engine.grid_cache_stats();
-            let (bytes, capacity_bytes, entries) = engine.grid_cache_utilization();
+            let entries = engine.grid_cache_utilization().2;
             GRID_CACHE_METRICS.update(
                 collection,
-                ds_cache::CacheMetrics {
-                    hits,
-                    misses,
-                    bytes,
-                    capacity_bytes,
-                },
+                engine.grid_cache_metrics(),
                 Some(entries as u64),
                 counter_state.grid.entry(collection.to_owned()).or_default(),
             );
@@ -8745,6 +8933,91 @@ mod tests {
             .unwrap_or_else(|| panic!("no health entry for {id}"))
     }
 
+    /// #1308: a per-collection cache family's churn feeds the deltas of
+    /// cumulative counters and rebaselines a replaced cache without a spike;
+    /// it has ghost series only for a cache with a ghost ring and a bypass
+    /// series only where built with one; and a reload that removes the
+    /// collection drops every one of them (#1307).
+    #[test]
+    fn churn_metrics_track_deltas_and_go_with_their_collection() {
+        use prometheus::core::Collector;
+        let metrics = |cold: u64, hot: u64, bypasses: u64, ghost_hits: Option<[u64; 3]>| {
+            ds_cache::CacheMetrics {
+                churn: ds_cache::Churn {
+                    evicted_cold: cold,
+                    evicted_hot: hot,
+                    evicted_bytes: 10 * (cold + hot),
+                    inserted_bytes: 100,
+                    bypasses,
+                    ghost_hits,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        };
+        let labelled = |family: &prometheus::IntCounterVec, value: &str| -> usize {
+            family
+                .collect()
+                .iter()
+                .flat_map(|family| family.get_metric())
+                .filter(|metric| metric.get_label().iter().any(|l| l.value() == value))
+                .count()
+        };
+        let collection = "grid-churn-metrics-test";
+        let grid = &*super::GRID_CACHE_METRICS;
+        let bypass = grid
+            .bypass
+            .as_ref()
+            .expect("the grid cache counts bypasses");
+        let count = |family: &prometheus::IntCounterVec, extra: &[&str]| {
+            let labels: Vec<&str> = std::iter::once(collection)
+                .chain(extra.iter().copied())
+                .collect();
+            family.with_label_values(&labels).get()
+        };
+        let mut seen = super::CacheSeen::default();
+        for (fed, cold, ghost_within_1, bypasses) in [
+            (metrics(3, 1, 2, Some([1, 2, 2])), 3, 2, 2),
+            (metrics(3, 1, 2, Some([1, 2, 2])), 3, 2, 2), // repeated scrape
+            (metrics(5, 1, 7, Some([2, 4, 4])), 5, 4, 7),
+            (metrics(1, 0, 1, Some([0, 1, 1])), 5, 4, 7), // replaced: rebaselined
+            (metrics(2, 0, 3, Some([0, 2, 2])), 6, 5, 9),
+        ] {
+            grid.update(collection, fed, None, &mut seen);
+            assert_eq!(count(&grid.churn.evictions, &["cold"]), cold);
+            assert_eq!(count(&grid.churn.ghost_hits, &["1"]), ghost_within_1);
+            assert_eq!(count(bypass, &[]), bypasses);
+        }
+        assert_eq!(count(&grid.churn.evictions, &["hot"]), 1);
+        assert_eq!(count(&grid.churn.evicted_bytes, &[]), 70);
+        assert_eq!(count(&grid.churn.inserted_bytes, &[]), 100);
+
+        let no_ring = "tile-churn-metrics-test";
+        let tile = &*super::TILE_CACHE_METRICS;
+        tile.update(
+            no_ring,
+            metrics(1, 0, 0, None),
+            None,
+            &mut super::CacheSeen::default(),
+        );
+        assert_eq!(labelled(&tile.churn.evictions, no_ring), 2);
+        assert_eq!(labelled(&tile.churn.ghost_hits, no_ring), 0);
+        assert!(tile.bypass.is_none());
+
+        super::prune_collection_series(&[collection, no_ring].into_iter().collect());
+        for family in [
+            &grid.churn.evictions,
+            &grid.churn.evicted_bytes,
+            &grid.churn.inserted_bytes,
+            &grid.churn.refused,
+            &grid.churn.ghost_hits,
+            bypass,
+        ] {
+            assert_eq!(labelled(family, collection), 0);
+        }
+        assert_eq!(labelled(&tile.churn.evictions, no_ring), 0);
+    }
+
     #[test]
     fn collection_cache_metrics_track_deltas_and_rebaseline_on_reload() {
         for (metrics, collection) in [
@@ -8758,7 +9031,7 @@ mod tests {
             ),
             (&*super::TILE_CACHE_METRICS, "tile-cache-metrics-test"),
         ] {
-            let mut previous = (0, 0);
+            let mut previous = super::CacheSeen::default();
             for (hits, misses, bytes, capacity_bytes, expected) in [
                 (0, 0, 0, 1024, [0, 0]), // no lookup yet: the series at 0
                 (3, 5, 100, 1024, [3, 5]),
@@ -8774,6 +9047,7 @@ mod tests {
                         misses,
                         bytes,
                         capacity_bytes,
+                        ..Default::default()
                     },
                     Some(hits),
                     &mut previous,

@@ -341,6 +341,17 @@ impl GribEngine {
             .unwrap_or((0, 0))
     }
 
+    /// The grid cache's counters, its evictions, admitted bytes, ghost hits
+    /// and the reads that went around it (#1308) included; zeroes if it is
+    /// disabled.
+    pub fn grid_cache_metrics(&self) -> ds_cache::CacheMetrics {
+        self.source
+            .grid_cache
+            .as_ref()
+            .map(|c| c.metrics())
+            .unwrap_or_default()
+    }
+
     /// Return grid cache utilization as (bytes_used, capacity_bytes, entries).
     /// Zeroes if the cache is disabled.
     pub fn grid_cache_utilization(&self) -> (u64, u64, usize) {
@@ -357,12 +368,7 @@ impl GribEngine {
             .message_cache
             .as_ref()
             .map(|cache| cache.metrics())
-            .unwrap_or(ds_cache::CacheMetrics {
-                hits: 0,
-                misses: 0,
-                bytes: 0,
-                capacity_bytes: 0,
-            })
+            .unwrap_or_default()
     }
 
     /// Point-index cache counters and resident bytes, per source: CCSDS
@@ -373,12 +379,7 @@ impl GribEngine {
             .point_index
             .as_ref()
             .map(|index| index.metrics())
-            .unwrap_or(ds_cache::CacheMetrics {
-                hits: 0,
-                misses: 0,
-                bytes: 0,
-                capacity_bytes: 0,
-            })
+            .unwrap_or_default()
     }
 
     /// Position-query fields served `(partial, full)`: sampled through the

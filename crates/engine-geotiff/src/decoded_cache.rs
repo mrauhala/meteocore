@@ -204,12 +204,15 @@ static CACHE: std::sync::LazyLock<ChunkCache> = std::sync::LazyLock::new(|| {
         "MC_GEOTIFF_DECODED_CHUNK_CACHE_MB",
         DEFAULT_DECODED_CHUNK_CACHE_MB,
     );
-    // Estimate item slots at one 512×512 Byte tile (256 KB) each.
-    ChunkCache::new(bytes, 256 * 1024, weigh_chunk).registered(
-        "geotiff_decoded_chunk_cache",
-        ds_cache::plan::Scope::Engine("geotiff"),
-        source,
-    )
+    // Estimate item slots at one 512×512 Byte tile (256 KB) each. A ghost
+    // ring tells whether a larger cache would hit more (#1308).
+    ChunkCache::new(bytes, 256 * 1024, weigh_chunk)
+        .with_ghosts()
+        .registered(
+            "geotiff_decoded_chunk_cache",
+            ds_cache::plan::Scope::Engine("geotiff"),
+            source,
+        )
 });
 
 /// Snapshot of the process-global decoded-chunk cache for `/metrics`.

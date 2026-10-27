@@ -72,18 +72,28 @@ RULE = ("Every /metrics family needs a dashboard panel, and every metric a "
 # argument that gates it (None: always registered). `parts` is every
 # name-like string literal in the builder's body. When the body changes, the
 # check fails until `families` has been reviewed and `parts` updated.
+# The churn families (#1308) are named in each builder's body and registered
+# by ChurnMetricSet::new, whose own callers outside these bodies pass literals.
+CHURN_PARTS = {"{prefix}_evictions_total", "{prefix}_evicted_bytes_total",
+               "{prefix}_inserted_bytes_total", "{prefix}_refused_total",
+               "{prefix}_ghost_hits_total"}
+CHURN_FAMILIES = {"evictions_total": None, "evicted_bytes_total": None,
+                  "inserted_bytes_total": None, "refused_total": None,
+                  "ghost_hits_total": None}
 TEMPLATES: dict[str, dict] = {
     "CacheMetricSet::new": {
         "parts": {"{prefix}_hits_total", "{prefix}_misses_total", "{prefix}_bytes",
-                  "{prefix}_capacity_bytes", "{prefix}_entries"},
+                  "{prefix}_capacity_bytes", "{prefix}_entries"} | CHURN_PARTS,
         "families": {"hits_total": None, "misses_total": None, "bytes": None,
-                     "capacity_bytes": None, "entries": 4},
+                     "capacity_bytes": None, "entries": 4} | CHURN_FAMILIES,
     },
     "CollectionCacheMetricSet::new": {
         "parts": {"hits", "misses", "bytes", "capacity_bytes", "collection",
-                  "{prefix}_{suffix}_total", "{prefix}_{suffix}", "{prefix}_entries"},
+                  "{prefix}_{suffix}_total", "{prefix}_{suffix}", "{prefix}_entries",
+                  "{prefix}_bypass_total"} | CHURN_PARTS,
         "families": {"hits_total": None, "misses_total": None, "bytes": None,
-                     "capacity_bytes": None, "entries": 2},
+                     "capacity_bytes": None, "entries": 2, "bypass_total": 3}
+        | CHURN_FAMILIES,
     },
 }
 

@@ -1,6 +1,7 @@
 use std::hash::Hash;
 
-use crate::WeighFn;
+use crate::churn::Counting;
+use crate::Placeholder;
 
 /// An uncounted lookup that separates single-flight ownership from computing.
 pub enum CacheEntry<'a, K, V> {
@@ -28,23 +29,25 @@ pub enum Joined<V> {
 
 /// A single-flight fill claim. Drop without inserting to permit a retry.
 /// This holds no cache lock while the caller admits or computes a value.
-pub struct CacheFillGuard<'a, K, V>(
-    pub(crate)  quick_cache::sync::PlaceholderGuard<
-        'a,
-        K,
-        V,
-        WeighFn<K, V>,
-        quick_cache::DefaultHashBuilder,
-        quick_cache::sync::DefaultLifecycle<K, V>,
-    >,
-);
+pub struct CacheFillGuard<'a, K, V> {
+    pub(crate) claim: Placeholder<'a, K, V>,
+    /// The claimed key, to weigh the value it is filled with (`None` for a
+    /// disabled cache, which counts nothing).
+    pub(crate) key: Option<K>,
+    pub(crate) lifecycle: &'a Counting<K, V>,
+}
 
 impl<K: Eq + Hash, V: Clone> CacheFillGuard<'_, K, V> {
     /// Publish the value to waiters and attempt cache retention. Returns the
     /// value if an explicit cache insertion/invalidation displaced this claim.
-    /// Neither claiming nor publishing updates the cache's hit/miss counters.
+    /// Neither claiming nor publishing updates the cache's hit/miss counters;
+    /// a retained value counts as inserted ([`crate::Churn`]).
     pub fn insert(self, value: V) -> Result<(), V> {
-        self.0.insert(value)
+        let weight = self
+            .key
+            .as_ref()
+            .map(|key| self.lifecycle.weigh(key, &value));
+        crate::publish(self.lifecycle, self.claim, value, weight)
     }
 }
 

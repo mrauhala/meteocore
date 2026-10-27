@@ -189,14 +189,8 @@ pub struct PixelCacheMetrics {
 
 /// Snapshot of the process-global PVOL pixel cache for `/metrics`.
 pub fn pixel_cache_metrics() -> PixelCacheMetrics {
-    let (hits, misses) = PIXEL_CACHE.stats();
     PixelCacheMetrics {
-        cache: ds_cache::CacheMetrics {
-            hits,
-            misses,
-            bytes: PIXEL_CACHE.weight(),
-            capacity_bytes: PIXEL_CACHE.capacity(),
-        },
+        cache: PIXEL_CACHE.metrics(),
         inserts: PIXEL_CACHE.inserts(),
         entries: PIXEL_CACHE.len() as u64,
         read_failures: PIXEL_READ_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
@@ -2033,7 +2027,7 @@ impl<'a> Pixels<'a> {
             if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
                 return Ok(None);
             }
-            PIXEL_CACHE.record_miss();
+            PIXEL_CACHE.record_miss(&cache_id, &moment.dataset_path);
             let path = moment.dataset_path.as_str();
             // A read the deadline cuts off is finished in the background,
             // for this moment (#1046).

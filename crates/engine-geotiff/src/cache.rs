@@ -76,12 +76,15 @@ impl TileCache {
     /// Pass 0 to create a no-op cache that never stores anything.
     pub fn new(max_bytes: u64) -> Self {
         TileCache {
+            // Filled ahead of reads by the COG pre-warm (#1318): its
+            // eviction and ghost numbers undervalue it.
             inner: ByteBoundedCache::new_with_hot_allocation(
                 max_bytes,
                 APPROX_TILE_BYTES,
                 weigh_tile,
                 HOT_ALLOCATION,
-            ),
+            )
+            .prewarmed(),
             namespace: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -180,6 +183,12 @@ impl TileCache {
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    /// Snapshot for `/metrics` and the memory plan: counters, churn
+    /// (#1308) and occupancy.
+    pub fn metrics(&self) -> ds_cache::CacheMetrics {
+        self.inner.metrics()
     }
 }
 

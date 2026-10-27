@@ -180,6 +180,28 @@ fn only_grids_the_cache_would_keep_skip_the_index_without_a_message_cache() {
     );
 }
 
+/// #1308 acceptance: a window the grid cache cannot hold is read around
+/// it, and each such read counts as a bypass, not a miss, so a meteogram's
+/// one-pass read stays out of the map workload's hit ratio. It inserts
+/// nothing and evicts nothing.
+#[test]
+fn a_window_read_around_the_grid_cache_counts_bypasses_not_misses() {
+    let source = source("q", "150 mb", &vec![fixture(); 4]);
+    let points = points();
+    let expected = query(&view(&source, 0, 0, 0), "q", 150.0, &points);
+    // No point index: the full decode, of four 0.25° grids that do not fit
+    // 8 MiB.
+    let bypassing = view(&source, 0, 0, 8);
+    assert_eq!(query(&bypassing, "q", 150.0, &points), expected);
+    let metrics = bypassing.grid_cache_metrics();
+    assert_eq!((metrics.hits, metrics.misses), (0, 0));
+    assert_eq!(metrics.churn.bypasses, 4);
+    assert_eq!(
+        (metrics.churn.inserted_bytes, metrics.churn.evictions()),
+        (0, 0)
+    );
+}
+
 /// A decoded grid a map left in the cache serves its field as it is.
 #[test]
 fn resident_grids_are_used_as_they_are() {

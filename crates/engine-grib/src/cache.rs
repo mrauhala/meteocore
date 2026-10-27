@@ -645,13 +645,16 @@ impl GridCache {
         }
         // Estimate: each grid is ~4 MiB (1440*721*4 bytes). One shard:
         // [`Self::holds`] plans which windows stay resident, and a sharded
-        // budget would evict fields of a window that fits the total.
+        // budget would evict fields of a window that fits the total. A
+        // ghost ring: whether a larger cache would keep an animation's
+        // fields is what its size is set from (#1308).
         Some(Self {
             cache: ByteBoundedCache::new_single_shard(
                 size_mb.saturating_mul(ds_cache::MIB),
                 4 * ds_cache::MIB,
                 weigh_grid,
-            ),
+            )
+            .with_ghosts(),
         })
     }
 
@@ -681,9 +684,20 @@ impl GridCache {
         self.cache.record_hit();
     }
 
-    /// Count one miss, for [`Self::get_untracked`] callers.
-    pub(crate) fn record_miss(&self) {
-        self.cache.record_miss();
+    /// Count one miss of the message at `url`, `offset`, for
+    /// [`Self::get_untracked`] callers.
+    pub(crate) fn record_miss(&self, url: &str, offset: u64) {
+        let key = GridKey {
+            url: Arc::from(url),
+            offset,
+        };
+        self.cache.record_miss_for(&key);
+    }
+
+    /// Count one read around the cache, for [`Self::get_untracked`]
+    /// callers whose read keeps no grid: neither a hit nor a miss (#1308).
+    pub(crate) fn record_bypass(&self) {
+        self.cache.record_bypass();
     }
 
     /// A byte-capacity cache for tests: [`Self::new`] counts whole MiB, far
@@ -691,7 +705,8 @@ impl GridCache {
     #[cfg(test)]
     pub(crate) fn with_capacity_bytes(bytes: u64) -> Self {
         Self {
-            cache: ByteBoundedCache::new_single_shard(bytes, 4 * ds_cache::MIB, weigh_grid),
+            cache: ByteBoundedCache::new_single_shard(bytes, 4 * ds_cache::MIB, weigh_grid)
+                .with_ghosts(),
         }
     }
 
@@ -717,7 +732,9 @@ impl GridCache {
     /// A resident grid, or the grid another caller's fill of the same
     /// message produces, waiting up to `timeout` (`None`: as long as it
     /// takes); never claims or inserts one. [`Joined::Absent`] leaves the
-    /// read to the caller, who does not offer its grid to the cache.
+    /// read to the caller, who does not offer its grid to the cache, and
+    /// counts a bypass, not a miss: a one-pass read stays out of the map
+    /// workload's hit ratio (#1308).
     pub(crate) fn get_or_join(
         &self,
         url: &str,
@@ -778,6 +795,11 @@ impl GridCache {
     /// Whether the cache is currently empty.
     pub fn is_empty(&self) -> bool {
         self.cache.len() == 0
+    }
+
+    /// Snapshot for `/metrics` and the memory plan.
+    pub fn metrics(&self) -> ds_cache::CacheMetrics {
+        self.cache.metrics()
     }
 }
 

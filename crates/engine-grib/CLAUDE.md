@@ -273,6 +273,7 @@ on the request path. Single-level and legacy views require exact metadata.
 - `/metrics` exposes `grib_message_cache_{hits_total,misses_total,bytes,
   capacity_bytes}` under the source collection ID, once per owner. Message hits
   count reuse after decoded-grid misses, not every query field.
+  The grid and message caches keep a ghost ring (#1308).
 - The server enters the grid, message and point-index caches in the memory
   plan (`cache_plan::register_grib`, #1306) through the same accessors
   `/metrics` reads, scoped to the source's collection id. A new per-source
@@ -405,6 +406,9 @@ ones only in the legacy layout.
     cache is one shard (`new_single_shard`) because `holds` plans
     residency: at 256 MiB a sharded cache is two 128 MiB halves, so six
     0.1° fields that "fit" could all hash to one half and evict each other.
+    A field read around the cache (`get_or_join`, or `decode_in_full` under a
+    Bypass plan) counts in `grid_cache_bypass_total`, never as a miss
+    (#1308).
 - Jobs run on the dedicated query runtime with `block_in_place`, including
   synchronous cache-fill waits; never move storage calls to `spawn_blocking`.
   Direct off-runtime callers share one fallback runtime.
