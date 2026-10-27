@@ -8,9 +8,12 @@ use zarrs::array::{Array, ArrayShardedExt, ArraySubset};
 use crate::store::EngineStore;
 
 pub(crate) static BUDGET: LazyLock<Arc<Budget>> = LazyLock::new(|| {
-    Arc::new(Budget::new(
-        ds_cache::env_mb("MC_ZARR_READ_MEMORY_MB", 1024).saturating_mul(ds_cache::MIB),
-    ))
+    let (bytes, source) = ds_cache::plan::env_bytes("MC_ZARR_READ_MEMORY_MB", 1024);
+    let budget = Budget::new(bytes);
+    budget
+        .bytes
+        .register("zarr_read", ds_cache::plan::Scope::Engine("zarr"), source);
+    Arc::new(budget)
 });
 
 /// Zarr's admission planning and deadline checks over the shared fail-fast

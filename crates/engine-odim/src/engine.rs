@@ -91,11 +91,12 @@ fn weigh_composite(key: &Arc<str>, val: &Arc<OdimComposite>) -> u64 {
 static COMPOSITE_CACHE: std::sync::LazyLock<
     ds_cache::ByteBoundedCache<Arc<str>, Arc<OdimComposite>>,
 > = std::sync::LazyLock::new(|| {
-    ds_cache::ByteBoundedCache::from_env(
-        "MC_ODIM_COMPOSITE_CACHE_MB",
-        DEFAULT_COMPOSITE_CACHE_MB,
-        67 * 1024 * 1024,
-        weigh_composite,
+    let (bytes, source) =
+        ds_cache::plan::env_bytes("MC_ODIM_COMPOSITE_CACHE_MB", DEFAULT_COMPOSITE_CACHE_MB);
+    ds_cache::ByteBoundedCache::new(bytes, 67 * 1024 * 1024, weigh_composite).registered(
+        "odim_composite_cache",
+        ds_cache::plan::Scope::Engine("odim"),
+        source,
     )
 });
 

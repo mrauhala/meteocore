@@ -118,7 +118,12 @@ fn weigh(key: &FieldKey, values: &Values) -> u64 {
 /// Decoded fields, `MC_NETCDF_FIELD_CACHE_MB` (default 256 MiB), shared by
 /// every NetCDF collection.
 static FIELDS: LazyLock<ByteBoundedCache<FieldKey, Values>> = LazyLock::new(|| {
-    ByteBoundedCache::from_env("MC_NETCDF_FIELD_CACHE_MB", 256, TYPICAL_FIELD_BYTES, weigh)
+    let (bytes, source) = ds_cache::plan::env_bytes("MC_NETCDF_FIELD_CACHE_MB", 256);
+    ByteBoundedCache::new(bytes, TYPICAL_FIELD_BYTES, weigh).registered(
+        "netcdf_field_cache",
+        ds_cache::plan::Scope::Engine("netcdf"),
+        source,
+    )
 });
 
 /// The field cache's counters and occupancy.

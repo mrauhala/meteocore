@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, LazyLock};
 
 use axum::body::Bytes;
+use ds_cache::plan::{Scope, SizeSource};
 use ds_executor::budget::{ByteBudget, BytePermit};
 
 /// The smallest buffer a [`Writer`] allocates, and how many bytes it writes
@@ -27,8 +28,15 @@ static BUDGET: LazyLock<Arc<ByteBudget>> = LazyLock::new(|| {
              response memory budget, MC_EDR_RESPONSE_MEMORY_MB (default 512)"
         );
     }
-    let bytes = env_usize("MC_EDR_RESPONSE_MEMORY_MB", 512).saturating_mul(MIB);
-    Arc::new(ByteBudget::new(u64::try_from(bytes).unwrap_or(u64::MAX)))
+    const VAR: &str = "MC_EDR_RESPONSE_MEMORY_MB";
+    let source = match parse_env::<usize>(VAR) {
+        Some(_) => SizeSource::Env(VAR),
+        None => SizeSource::Default,
+    };
+    let bytes = env_usize(VAR, 512).saturating_mul(MIB);
+    let budget = Arc::new(ByteBudget::new(u64::try_from(bytes).unwrap_or(u64::MAX)));
+    budget.register("edr_response", Scope::Process, source);
+    budget
 });
 
 /// The per-response cap of a `/locations` body.
@@ -36,10 +44,11 @@ static LOCATIONS_LIMIT: LazyLock<usize> =
     LazyLock::new(|| env_usize("MC_EDR_LOCATIONS_MAX_BYTES", 16 * MIB));
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    parse_env(name).unwrap_or(default)
+}
+
+fn parse_env<T: std::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
 /// Read the budget's environment now, so a retired variable is reported

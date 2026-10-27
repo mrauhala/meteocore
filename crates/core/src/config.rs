@@ -889,15 +889,7 @@ pub fn select_rendered_cache_mb(
     server: Option<u64>,
     collections: &[CollectionConfig],
 ) -> (u64, Vec<String>) {
-    let mut keyed: Vec<(&str, u64)> = collections
-        .iter()
-        .filter(|c| {
-            c.apis
-                .iter()
-                .any(|api| matches!(api.as_str(), "wms" | "maps" | "tiles"))
-        })
-        .filter_map(|c| Some((c.id.as_str(), c.wms.as_ref()?.rendered_cache_mb?)))
-        .collect();
+    let mut keyed: Vec<(&str, u64)> = rendered_cache_keyed(collections).collect();
     keyed.sort_unstable();
     let ids: Vec<&str> = keyed.iter().map(|&(id, _)| id).collect();
     let mut sizes: Vec<u64> = keyed.iter().map(|&(_, mb)| mb).collect();
@@ -935,6 +927,21 @@ pub fn select_rendered_cache_mb(
     (largest, warnings)
 }
 
+/// The deprecated `[wms] rendered_cache_mb` of the collections that serve
+/// WMS, Maps or Tiles, by collection id.
+fn rendered_cache_keyed(
+    collections: &[CollectionConfig],
+) -> impl Iterator<Item = (&str, u64)> + '_ {
+    collections
+        .iter()
+        .filter(|c| {
+            c.apis
+                .iter()
+                .any(|api| matches!(api.as_str(), "wms" | "maps" | "tiles"))
+        })
+        .filter_map(|c| Some((c.id.as_str(), c.wms.as_ref()?.rendered_cache_mb?)))
+}
+
 /// `collection 'a'`, `collections 'a', 'b'`, or the first few ids of a long
 /// list and how many more, for a WARN line.
 fn quoted_collection_ids(ids: &[&str]) -> String {
@@ -959,10 +966,26 @@ impl ServerConfig {
     pub fn rendered_cache_mb(&self) -> (u64, Vec<String>) {
         select_rendered_cache_mb(self.server.rendered_cache_mb, &self.collections)
     }
+
+    /// The key [`Self::rendered_cache_mb`] took the size from:
+    /// `[server] rendered_cache_mb`, the deprecated `[wms]
+    /// rendered_cache_mb` of a collection, or `None` for the default (#1306).
+    pub fn rendered_cache_key(&self) -> Option<&'static str> {
+        if self.server.rendered_cache_mb.is_some() {
+            Some("[server] rendered_cache_mb")
+        } else if rendered_cache_keyed(&self.collections).next().is_some() {
+            Some("[wms] rendered_cache_mb")
+        } else {
+            None
+        }
+    }
 }
 
+/// Default `[server] metatile_cache_mb`.
+pub const DEFAULT_METATILE_CACHE_MB: u64 = 1024;
+
 fn default_metatile_cache_mb() -> u64 {
-    1024
+    DEFAULT_METATILE_CACHE_MB
 }
 
 fn default_watch_debounce_ms() -> u64 {
@@ -1187,7 +1210,7 @@ pub struct GeoTiffConfig {
     pub max_files: Option<usize>,
     /// Tile cache size in megabytes for remote COG byte-range reads.
     /// Caches compressed tile bytes to avoid repeated S3/HTTP fetches.
-    /// Default: 64 MB (~3700 tiles). Set to 0 to disable.
+    /// Default: [`DEFAULT_TILE_CACHE_MB`]. Set to 0 to disable.
     #[serde(default = "default_tile_cache_mb")]
     pub tile_cache_mb: u64,
 
@@ -1240,8 +1263,11 @@ fn default_stac_asset_key() -> String {
     "data".to_string()
 }
 
+/// Default `[geotiff] tile_cache_mb`.
+pub const DEFAULT_TILE_CACHE_MB: u64 = 256;
+
 fn default_tile_cache_mb() -> u64 {
-    256
+    DEFAULT_TILE_CACHE_MB
 }
 
 fn default_band() -> u32 {
@@ -3021,12 +3047,18 @@ fn default_grib_poll_interval() -> u64 {
     600
 }
 
+/// Default `[grib] grid_cache_mb`.
+pub const DEFAULT_GRID_CACHE_MB: u64 = 256;
+
+/// Default `[grib] point_index_cache_mb`.
+pub const DEFAULT_POINT_INDEX_CACHE_MB: u64 = 16;
+
 fn default_grid_cache_mb() -> u64 {
-    256
+    DEFAULT_GRID_CACHE_MB
 }
 
 fn default_point_index_cache_mb() -> u64 {
-    16
+    DEFAULT_POINT_INDEX_CACHE_MB
 }
 
 /// Mutually exclusive GRIB collection families. A single-level collection
@@ -3156,8 +3188,11 @@ fn default_zarr_poll_interval() -> u64 {
     300
 }
 
+/// Default `[zarr] cache_mb` and `[zarr.icechunk] decoded_cache_mb`.
+pub const DEFAULT_ZARR_CACHE_MB: u64 = 256;
+
 fn default_zarr_cache_mb() -> u64 {
-    256
+    DEFAULT_ZARR_CACHE_MB
 }
 
 /// Configuration for the Zarr engine (`engine_type = "zarr"`).
@@ -7464,6 +7499,34 @@ description = "X"
         ] {
             assert_eq!(select_rendered_cache_mb(None, &order), forward);
         }
+    }
+
+    /// #1306: the plan names the key the rendered cache's size came from,
+    /// as `select_rendered_cache_mb` chose it.
+    #[test]
+    fn rendered_cache_key_names_the_chosen_key() {
+        let config = |server: Option<u64>, collections: Vec<CollectionConfig>| {
+            let mut config = ServerConfig::default_for_auto();
+            config.server.rendered_cache_mb = server;
+            config.collections = collections;
+            config
+        };
+        assert_eq!(config(None, vec![]).rendered_cache_key(), None);
+        // A collection that serves no map API does not size it.
+        let edr_only = cache_keyed("edr", &["edr"], Some(512));
+        assert_eq!(
+            config(None, vec![edr_only.clone()]).rendered_cache_key(),
+            None
+        );
+        let wms = cache_keyed("a", &["wms"], Some(512));
+        assert_eq!(
+            config(None, vec![edr_only, wms.clone()]).rendered_cache_key(),
+            Some("[wms] rendered_cache_mb")
+        );
+        assert_eq!(
+            config(Some(64), vec![wms]).rendered_cache_key(),
+            Some("[server] rendered_cache_mb")
+        );
     }
 
     #[test]

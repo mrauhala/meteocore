@@ -200,7 +200,7 @@ not re-scan the auto roots.
 | `CONFIG_PATH` | `./config.toml` | Path to the server configuration file (the `--config` flag takes priority) |
 | `LOG_FORMAT` | human-readable | Set to `json` for newline-delimited JSON logs (production / Loki ingestion) |
 | `RUST_LOG` | `info` | Log level filter, e.g. `server=debug,engine_geotiff=warn` |
-| `ADMIN_TOKEN` | _(none — unauthenticated)_ | Bearer token required for `POST /admin/collections/reload`. When unset, the admin endpoint is open. |
+| `ADMIN_TOKEN` | _(none — admin endpoints off)_ | Bearer token required for the admin endpoints, `POST /admin/collections/reload` and `GET /admin/cache-plan`. When unset, they answer 403. |
 | `MC_RENDER_TIMEOUT_MS` | `3000` | Absolute queue + raster render deadline for WMS/Maps/Tiles (and MVT encoding), in milliseconds; 0 rejects uncached work, maximum one day. Timeout returns 503 + Retry-After. In-flight CPU work keeps its permits until completion; remote GeoTIFF reads stop at the same deadline. Restart to change. |
 | `MC_FEATURE_INFO_TIMEOUT_MS` | `10000` | Absolute deadline of a WMS GetFeatureInfo, in milliseconds, counted from admission: it covers the wait for a slot in the shared render queue and the engine's reads (a position query, or a pick of the features a layer draws), which run on the query runtime EDR queries also use. Its own, apart from `MC_RENDER_TIMEOUT_MS`, because a cold position query can take longer than a render, and apart from EDR's fixed 30 s query deadline. 0 turns every GetFeatureInfo that reads a value into a 503, maximum one day. Timeout returns 503 + Retry-After. Restart to change. |
 | `MC_RENDER_QUEUE_CAPACITY` | `3 × render slots` | Process-wide cap on requests waiting for raster memory or a shared render slot. A full queue returns immediate 503 + Retry-After; 0 allows only immediately available slots. Cached responses bypass admission. Restart to change. |
@@ -411,6 +411,7 @@ the shared root serves all three):
 /workbench/{hash}/{file}                       The HTML pages' stylesheets and scripts, at immutable content-hashed URLs
 
 /admin/collections/reload                      POST: reload config and swap engines
+/admin/cache-plan                              GET: every cache and admission budget, its size and where the size came from
 /health                                        Per-collection health status
 /metrics                                       Prometheus metrics (text format)
 /robots.txt                                    Crawler rules: landing pages, API, conformance, collection lists and collection pages only, plus the pages' styles and scripts
@@ -2511,6 +2512,21 @@ OpenAPI specs are generated dynamically from configured collections. A spec take
 
 `POST /admin/collections/reload` re-reads `config.toml` (and `collections_dir` if configured), creates new engines, and atomically swaps them into the running server. If the reload produces zero working collections, the old state is preserved. A WIS2-fed CAP or BUFR collection whose config changed gets a new engine that takes over, in memory, every alert or report the replaced engine had received, with or without `state_dir`.
 
+### Memory and caches
+
+`GET /admin/cache-plan` lists every cache and admission budget the server holds, its size, and where that size came from. It takes the same `ADMIN_TOKEN` as the reload endpoint:
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/admin/cache-plan
+```
+
+- `caches` and `budgets` hold one object each: `id`, its `/metrics` family (`metatile_cache` for `metatile_cache_bytes`, `geotiff_decode` for `geotiff_decode_capacity_bytes`); `scope`, which is `process`, `engine` (one per process for the collections of one engine type), `collection`, or `source` (a GRIB source, shared by its level collections); `engine`; `collection`; `capacity_bytes`; `source`; `used_bytes`, which a budget has reserved now; and for caches `entries`, `hits` and `misses` since the cache was built.
+- `source` says where the size came from: `default`, `env:MC_…`, `config:[server] …`, `collection:[grib] grid_cache_mb` and the like, or `constant`, fixed in code. The MVT cache (128 MiB) and the solid-image memo (32 MiB) are constants, and so is the empty tile cache of a local GeoTIFF collection, which reads its files through the page cache. A collection key set to its default value reads as `default`.
+- `totals` counts the caches and the budgets, with their capacity and use. Capacity is not memory: a cache allocates as it fills, and a budget is reserved only while work runs.
+- `memory` repeats the process and allocator gauges of `/metrics` (`process_resident_memory_bytes`, `jemalloc_*_bytes`), `null` where they cannot be read: RSS and swap off Linux.
+
+The server logs the same list at INFO at boot and after every accepted reload: one line per cache and budget, grouped by scope, with its size in MiB and its source, the totals, and after a reload the old size of each one that changed. On `/metrics`, `cache_size_source{cache,collection,source}` is 1 for each entry and `memory_capacity_total_bytes{kind}` sums the capacities of the caches and of the budgets. The Grafana dashboard's Memory & admission tab shows both in its Cache plan row.
+
 ### Health Endpoint
 
 `GET /health` returns per-collection health status:
@@ -2612,6 +2628,13 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `pvol_voxel_grid_cache_bytes` | gauge | — | Bytes currently held |
 | `pvol_voxel_grid_cache_capacity_bytes` | gauge | — | Configured capacity |
 | `pvol_voxel_grid_cache_entries` | gauge | — | Number of cached entries |
+
+**Memory plan** (one series per entry of [`/admin/cache-plan`](#memory-and-caches)):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `cache_size_source` | gauge | cache, collection, source | 1 for each cache and admission budget; `cache` is its `/metrics` family, `collection` empty for a process-wide one, `source` where its size came from |
+| `memory_capacity_total_bytes` | gauge | kind | Configured capacity of every cache (`cache`) or admission budget (`budget`), summed |
 
 **Render & storage:**
 

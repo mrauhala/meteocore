@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
+use ds_cache::plan;
+
 use crate::frame::Frame;
 
 /// A scan: the engine that ingested it, its collection, parameter and scan
@@ -50,16 +52,22 @@ type StripCache = ds_cache::ByteBoundedCache<BlockKey, Arc<[u16]>>;
 /// overflow one slice and evict each other on every poll. Few, large
 /// entries at a low lookup rate make one lock free.
 pub(crate) static FRAMES: LazyLock<FrameCache> = LazyLock::new(|| {
-    FrameCache::from_env_single_shard("MC_SATELLITE_FRAME_CACHE_MB", 1024, 30 << 20, |_, frame| {
-        frame.weight
-    })
+    let (bytes, source) = plan::env_bytes("MC_SATELLITE_FRAME_CACHE_MB", 1024);
+    FrameCache::new_single_shard(bytes, 30 << 20, |_, frame| frame.weight).registered(
+        "satellite_frame_cache",
+        plan::Scope::Engine("satellite"),
+        source,
+    )
 });
 
 /// Decoded blocks, ~260 KB each for a 24-row 2 km full-disk strip.
 pub(crate) static STRIPS: LazyLock<StripCache> = LazyLock::new(|| {
-    StripCache::from_env("MC_SATELLITE_STRIP_CACHE_MB", 256, 256 << 10, |_, strip| {
-        strip.len() as u64 * 2
-    })
+    let (bytes, source) = plan::env_bytes("MC_SATELLITE_STRIP_CACHE_MB", 256);
+    StripCache::new(bytes, 256 << 10, |_, strip| strip.len() as u64 * 2).registered(
+        "satellite_strip_cache",
+        plan::Scope::Engine("satellite"),
+        source,
+    )
 });
 
 /// Snapshot of the scan cache for `/metrics`.

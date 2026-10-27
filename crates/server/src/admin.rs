@@ -317,11 +317,21 @@ static JEMALLOC_GAUGES: LazyLock<[IntGauge; 5]> = LazyLock::new(|| {
     ]
 });
 
-/// Refresh the process/allocator memory gauges. Called per `/metrics` scrape.
-fn update_memory_gauges() {
+/// The process and allocator memory one read of the gauges below found,
+/// by gauge name; `None` where it could not be read (RSS and swap off
+/// Linux).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MemoryReading(pub Vec<(&'static str, Option<u64>)>);
+
+/// Refresh the process/allocator memory gauges and return what they read.
+/// Called per `/metrics` scrape.
+fn update_memory_gauges() -> MemoryReading {
     // Touch the family even where /proc is unavailable so dashboards see the
     // series (it just stays 0 off-Linux).
     LazyLock::force(&PROCESS_MEM_GAUGES);
+    let mut reading = MemoryReading::default();
+    #[allow(unused_mut)] // Assigned on Linux only.
+    let mut process: [Option<u64>; 2] = [None, None];
     #[cfg(target_os = "linux")]
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         let kb = |key: &str| -> Option<i64> {
@@ -330,31 +340,98 @@ fn update_memory_gauges() {
         };
         if let Some(rss_kb) = kb("VmRSS:") {
             PROCESS_MEM_GAUGES[0].set(rss_kb * 1024);
+            process[0] = u64::try_from(rss_kb * 1024).ok();
         }
         if let Some(swap_kb) = kb("VmSwap:") {
             PROCESS_MEM_GAUGES[1].set(swap_kb * 1024);
+            process[1] = u64::try_from(swap_kb * 1024).ok();
         }
     }
+    reading.0.extend([
+        ("process_resident_memory_bytes", process[0]),
+        ("process_swap_memory_bytes", process[1]),
+    ]);
 
     #[cfg(not(target_env = "msvc"))]
     {
         use tikv_jemalloc_ctl::{epoch, stats};
         // Stats are snapshotted inside jemalloc; advancing the epoch refreshes
         // them before reading.
-        if epoch::advance().is_ok() {
-            let stats: [Result<usize, _>; 5] = [
-                stats::allocated::read(),
-                stats::active::read(),
-                stats::resident::read(),
-                stats::mapped::read(),
-                stats::retained::read(),
-            ];
-            for (gauge, value) in JEMALLOC_GAUGES.iter().zip(stats) {
-                if let Ok(v) = value {
-                    gauge.set(v as i64);
-                }
+        let advanced = epoch::advance().is_ok();
+        let names = [
+            "jemalloc_allocated_bytes",
+            "jemalloc_active_bytes",
+            "jemalloc_resident_bytes",
+            "jemalloc_mapped_bytes",
+            "jemalloc_retained_bytes",
+        ];
+        let stats: [Option<usize>; 5] = if advanced {
+            [
+                stats::allocated::read().ok(),
+                stats::active::read().ok(),
+                stats::resident::read().ok(),
+                stats::mapped::read().ok(),
+                stats::retained::read().ok(),
+            ]
+        } else {
+            [None; 5]
+        };
+        for ((gauge, name), value) in JEMALLOC_GAUGES.iter().zip(names).zip(stats) {
+            if let Some(v) = value {
+                gauge.set(v as i64);
             }
+            reading.0.push((name, value.map(|v| v as u64)));
         }
+    }
+    reading
+}
+
+// The memory plan (#1306): one series per cache and admission budget naming
+// where its size came from, and the sum of the capacities of each kind.
+static CACHE_SIZE_SOURCE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "cache_size_source",
+            "1 per cache and admission budget of /admin/cache-plan, labelled with where its size \
+             came from: default, env:<variable>, config:<key>, collection:<key> or constant. \
+             cache is the /metrics family, collection empty for a process-wide one",
+        ),
+        &["cache", "collection", "source"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static MEMORY_CAPACITY_TOTAL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "memory_capacity_total_bytes",
+            "Configured capacity of every cache (kind=cache) or admission budget (kind=budget) \
+             of /admin/cache-plan, summed. Capacity, not memory: an unfilled cache holds less",
+        ),
+        &["kind"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// Set the plan gauges from `rows`, dropping series of entries gone since
+/// the last scrape.
+fn update_cache_plan_gauges(rows: &[ds_cache::plan::Row]) {
+    CACHE_SIZE_SOURCE.reset();
+    for row in rows {
+        let collection = row.entry.scope.collection().unwrap_or("");
+        CACHE_SIZE_SOURCE
+            .with_label_values(&[row.entry.id, collection, &row.entry.source.to_string()])
+            .set(1);
+    }
+    for kind in [ds_cache::plan::Kind::Cache, ds_cache::plan::Kind::Budget] {
+        let total = crate::cache_plan::Totals::of(rows, kind);
+        MEMORY_CAPACITY_TOTAL
+            .with_label_values(&[kind.as_str()])
+            .set(total.capacity_bytes.min(i64::MAX as u64) as i64);
     }
 }
 
@@ -2820,6 +2897,7 @@ pub fn load_collections(
                 }
 
                 geotiff_engines.push(engine.clone());
+                crate::cache_plan::register_geotiff(collection, &engine);
 
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
@@ -3116,6 +3194,7 @@ pub fn load_collections(
                 }
 
                 grib_engines.push(engine.clone());
+                crate::cache_plan::register_grib(collection, &engine);
 
                 let views: Vec<_> = if grib_config.level_types.is_some() {
                     engine
@@ -3289,6 +3368,7 @@ pub fn load_collections(
                 }
 
                 zarr_engines.push(engine.clone());
+                crate::cache_plan::register_zarr(collection, &engine);
 
                 let (map_engine, edr_engine) = derived_wrapped(
                     &collection.id,
@@ -5795,37 +5875,41 @@ pub fn update_health_gauges(health: &[CollectionHealth]) -> HealthCounts {
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// POST /admin/collections/reload — re-read config and swap engines atomically.
-pub async fn reload_handler(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    // Check admin token authentication
+/// The `ADMIN_TOKEN` guard of every `/admin` endpoint: 403 while no token
+/// is set, 401 unless the request carries it as a Bearer token.
+pub(crate) fn require_admin_token(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     match &state.admin_token {
-        None => {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": "Admin endpoint is disabled. Set ADMIN_TOKEN env var or admin_token in [server] config to enable."
-                })),
-            ));
-        }
+        None => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "Admin endpoint is disabled. Set ADMIN_TOKEN env var or admin_token in [server] config to enable."
+            })),
+        )),
         Some(expected_token) => {
             let provided = headers
                 .get(header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "));
             match provided {
-                Some(token) if token == expected_token => {} // OK
-                _ => {
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        Json(json!({ "error": "Invalid or missing Bearer token" })),
-                    ));
-                }
+                Some(token) if token == expected_token => Ok(()),
+                _ => Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Invalid or missing Bearer token" })),
+                )),
             }
         }
     }
+}
+
+/// POST /admin/collections/reload — re-read config and swap engines atomically.
+pub async fn reload_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_admin_token(&state, &headers)?;
 
     // Serialize reload requests — prevent concurrent reloads from racing
     let _reload_guard = state.reload_lock.try_lock().map_err(|_| {
@@ -6002,6 +6086,8 @@ pub struct AcceptedLoad {
     metatile_cache_mb: u64,
     /// Resolved from `[server]` or the deprecated `[wms]` fallback (#1028).
     rendered_cache_mb: u64,
+    /// Where the two render cache sizes came from, for the memory plan.
+    render_cache_sources: crate::cache_plan::RenderCacheSources,
     mcp_enabled: bool,
     fingerprint: u64,
 }
@@ -6020,9 +6106,14 @@ impl AcceptedLoad {
             trust_proxy_headers: config.server.trust_proxy_headers,
             metatile_cache_mb: config.server.metatile_cache_mb,
             rendered_cache_mb: config.rendered_cache_mb().0,
+            render_cache_sources: crate::cache_plan::RenderCacheSources::of(config),
             mcp_enabled: config.mcp.as_ref().is_some_and(|m| m.enabled),
             fingerprint,
         }
+    }
+
+    pub(crate) fn render_cache_sources(&self) -> &crate::cache_plan::RenderCacheSources {
+        &self.render_cache_sources
     }
 }
 
@@ -6651,6 +6742,15 @@ fn apply_load(
         "Reload complete: {ready} ready ({degraded} degraded) of {} configured",
         config.collections.len()
     );
+    crate::cache_plan::register_render_caches(state);
+    crate::cache_plan::log(
+        state,
+        if recovery {
+            crate::cache_plan::Occasion::Recovery
+        } else {
+            crate::cache_plan::Occasion::Reload
+        },
+    );
 
     // `ready` = fully-working collections; `degraded` wire no servable routes
     // (e.g. an empty odim-volume source) but aren't failures.
@@ -7219,9 +7319,29 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
 /// Updates gauge-style metrics from engine/cache state before gathering,
 /// so Prometheus always gets a fresh snapshot.
 pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    refresh_metrics(&state);
+    let encoder = TextEncoder::new();
+    let metric_families = REGISTRY.gather();
+    let mut buffer = Vec::new();
+    encoder.encode(&metric_families, &mut buffer).unwrap();
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        buffer,
+    )
+}
+
+/// Bring every `/metrics` family up to date from engine and cache state,
+/// returning the process memory read. Reading a process-wide cache's or
+/// budget's figures builds it, which enters it in the memory plan: the
+/// plan's log and endpoint call this first, so they list what `/metrics`
+/// reports (#1306).
+pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
     // First, before any metrics lock.
-    refresh_health_gauges(&state);
-    refresh_data_age_gauge(&state);
+    refresh_health_gauges(state);
+    refresh_data_age_gauge(state);
 
     // Read from current WMS state (survives reloads via ArcSwap)
     let wms = state.wms.load();
@@ -7236,7 +7356,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     let memory = &*ds_executor::budget::RENDER_MEMORY;
     RENDER_MEMORY_AVAILABLE.set(memory.available().min(i64::MAX as u64) as i64);
     RENDER_MEMORY_TOTAL.set(memory.capacity().min(i64::MAX as u64) as i64);
-    update_memory_gauges();
+    let reading = update_memory_gauges();
 
     // Delta-tracked cache counters: cache implementations expose cumulative
     // (hits, misses) values but may be replaced on reload; each CacheMetricSet
@@ -7883,17 +8003,10 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
 
     drop(counter_state);
 
-    let encoder = TextEncoder::new();
-    let metric_families = REGISTRY.gather();
-    let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    (
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
-        buffer,
-    )
+    // Last: every process-wide cache and budget read above is now built,
+    // and so in the plan.
+    update_cache_plan_gauges(&crate::cache_plan::snapshot(state));
+    reading
 }
 
 /// Middleware that records HTTP request metrics.

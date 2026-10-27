@@ -130,11 +130,12 @@ fn cell_set_weight_bytes(key: &CellSetKey, set: &Arc<CellSet>) -> u64 {
 /// re-segments). Item slots are estimated at ~16 KB each.
 static CELL_SET_CACHE: std::sync::LazyLock<ds_cache::ByteBoundedCache<CellSetKey, Arc<CellSet>>> =
     std::sync::LazyLock::new(|| {
-        ds_cache::ByteBoundedCache::from_env(
-            "MC_PVOL_CELL_SET_CACHE_MB",
-            DEFAULT_CELL_SET_CACHE_MB,
-            16 * 1024,
-            cell_set_weight_bytes,
+        let (bytes, source) =
+            ds_cache::plan::env_bytes("MC_PVOL_CELL_SET_CACHE_MB", DEFAULT_CELL_SET_CACHE_MB);
+        ds_cache::ByteBoundedCache::new(bytes, 16 * 1024, cell_set_weight_bytes).registered(
+            "pvol_cell_set_cache",
+            ds_cache::plan::Scope::Engine("odim-volume"),
+            source,
         )
     });
 

@@ -22,7 +22,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use ds_cache::{ByteBoundedCache, CacheFillGuard, CacheMetrics, MIB};
+use ds_cache::{plan, ByteBoundedCache, CacheFillGuard, CacheMetrics, MIB};
 use ds_executor::budget::{ByteBudget, BytePermit};
 
 /// A grid's cache key.
@@ -66,14 +66,24 @@ pub(crate) fn grid_bytes(cells: usize) -> u64 {
 
 pub(crate) static CACHE: LazyLock<ByteBoundedCache<GridKey, Arc<AnalysisGrid>>> =
     LazyLock::new(|| {
-        ByteBoundedCache::from_env_single_shard("MC_STATION_GRID_CACHE_MB", 256, 4 * MIB, weigh)
+        let (bytes, source) = plan::env_bytes("MC_STATION_GRID_CACHE_MB", 256);
+        ByteBoundedCache::new_single_shard(bytes, 4 * MIB, weigh).registered(
+            "station_grid_cache",
+            plan::Scope::Engine("station-grid"),
+            source,
+        )
     });
 
 /// Admission for grids being computed.
 pub(crate) static BUDGET: LazyLock<Arc<ByteBudget>> = LazyLock::new(|| {
-    Arc::new(ByteBudget::new(
-        ds_cache::env_mb("MC_STATION_GRID_MEMORY_MB", 512).saturating_mul(MIB),
-    ))
+    let (bytes, source) = plan::env_bytes("MC_STATION_GRID_MEMORY_MB", 512);
+    let budget = Arc::new(ByteBudget::new(bytes));
+    budget.register(
+        "station_grid_compute",
+        plan::Scope::Engine("station-grid"),
+        source,
+    );
+    budget
 });
 
 /// Bytes a computation holds besides its grid: the station slice, its

@@ -10,6 +10,8 @@ api-common = { path = "../api-common" }
 # Features API's own bbox/datetime parsing, GeoJSON encoding and paging links.
 api-features = { path = "../api-features" }
 ds-core = { path = "../core" }
+# The response budget's entry in the memory plan (#1306).
+ds-cache = { path = "../ds-cache" }
 # The shared query runtime (#1103); EDR keeps its own admission and deadline.
 ds-executor = { path = "../ds-executor" }
 ds-render = { path = "../render" }

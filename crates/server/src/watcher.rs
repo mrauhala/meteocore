@@ -404,7 +404,7 @@ pub(crate) mod tests {
             ReusableCaches::default(),
             EngineReuse::default(),
         );
-        Arc::new(ServerState {
+        let state = Arc::new(ServerState {
             edr: Arc::new(ArcSwap::from_pointee(result.edr_state)),
             mcp: None,
             features: Arc::new(ArcSwap::from_pointee(result.features_state)),
@@ -449,7 +449,9 @@ pub(crate) mod tests {
             ),
             engine_handles: RwLock::new(result.engines_by_id),
             wind_handles: RwLock::new(result.wind_by_id),
-        })
+        });
+        crate::cache_plan::register_render_caches(&state);
+        state
     }
 
     /// A NetCDF collection's layers come from its files (#1067): loaded

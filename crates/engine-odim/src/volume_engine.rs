@@ -98,17 +98,17 @@ use crate::reader::{PixelClass, RawPixels, ReadError};
 /// holding every sweep stack in RAM (#289).
 pub(crate) const DEFAULT_PIXEL_CACHE_MB: u64 = 1024;
 
-/// Read the configured lazy-pixel cache size from the environment, or the
-/// default. `0` disables caching (every sample re-reads — diagnostic only).
-fn pixel_cache_mb() -> u64 {
-    ds_cache::env_mb("MC_PVOL_PIXEL_CACHE_MB", DEFAULT_PIXEL_CACHE_MB)
-}
-
 /// Process-global decoded-pixel LRU, shared by every PVOL collection so a
 /// single byte-budget bounds resident pixels across the whole radar
-/// network. Sized once from the environment on first use (#289).
-static PIXEL_CACHE: std::sync::LazyLock<PixelCache> =
-    std::sync::LazyLock::new(|| PixelCache::new(pixel_cache_mb()));
+/// network. Sized once from the environment on first use (#289):
+/// `MC_PVOL_PIXEL_CACHE_MB`, else the default. `0` disables caching (every
+/// sample re-reads — diagnostic only).
+static PIXEL_CACHE: std::sync::LazyLock<PixelCache> = std::sync::LazyLock::new(|| {
+    let (mb, source) = ds_cache::plan::env_size("MC_PVOL_PIXEL_CACHE_MB", DEFAULT_PIXEL_CACHE_MB);
+    let cache = PixelCache::new(mb);
+    cache.register(source);
+    cache
+});
 
 /// Accessor for the global pixel cache, for tests to seed/inspect it.
 #[cfg(test)]
@@ -242,11 +242,12 @@ fn weigh_voxel_grid(key: &VoxelGridKey, val: &VoxelGridEntry) -> u64 {
 static VOXEL_GRID_CACHE: std::sync::LazyLock<
     ds_cache::ByteBoundedCache<VoxelGridKey, VoxelGridEntry>,
 > = std::sync::LazyLock::new(|| {
-    ds_cache::ByteBoundedCache::from_env(
-        "MC_PVOL_VOXEL_GRID_CACHE_MB",
-        DEFAULT_VOXEL_GRID_CACHE_MB,
-        21 * 1024 * 1024,
-        weigh_voxel_grid,
+    let (bytes, source) =
+        ds_cache::plan::env_bytes("MC_PVOL_VOXEL_GRID_CACHE_MB", DEFAULT_VOXEL_GRID_CACHE_MB);
+    ds_cache::ByteBoundedCache::new(bytes, 21 * 1024 * 1024, weigh_voxel_grid).registered(
+        "pvol_voxel_grid_cache",
+        ds_cache::plan::Scope::Engine("odim-volume"),
+        source,
     )
 });
 

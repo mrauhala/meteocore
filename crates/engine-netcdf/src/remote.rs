@@ -177,11 +177,16 @@ const MIN_BLOCK_CACHE_MB: u64 = 8;
 /// Metadata blocks, `MC_NETCDF_BLOCK_CACHE_MB` (default 64 MiB, at least
 /// [`MIN_BLOCK_CACHE_MB`]), shared by every NetCDF collection.
 static BLOCKS: LazyLock<ByteBoundedCache<BlockKey, Bytes>> = LazyLock::new(|| {
-    let mb = ds_cache::env_mb("MC_NETCDF_BLOCK_CACHE_MB", 64).max(MIN_BLOCK_CACHE_MB);
-    ByteBoundedCache::new(
-        mb.saturating_mul(ds_cache::MIB),
+    let (mb, source) = ds_cache::plan::env_size("MC_NETCDF_BLOCK_CACHE_MB", 64);
+    ByteBoundedCache::<BlockKey, Bytes>::new(
+        mb.max(MIN_BLOCK_CACHE_MB).saturating_mul(ds_cache::MIB),
         Tuning::DEFAULT.block,
         |key, bytes| bytes.len() as u64 + key.file.url.len() as u64 + 96,
+    )
+    .registered(
+        "netcdf_block_cache",
+        ds_cache::plan::Scope::Engine("netcdf"),
+        source,
     )
 });
 
@@ -193,17 +198,18 @@ static BLOCKS: LazyLock<ByteBoundedCache<BlockKey, Bytes>> = LazyLock::new(|| {
 /// constraint's (428 bytes and about 80 for a 2 × 2 MEPS window: a
 /// request of 16 variables' windows has a constraint of over 1 KB).
 static CHUNKS: LazyLock<ByteBoundedCache<ChunkKey, Bytes>> = LazyLock::new(|| {
-    ByteBoundedCache::from_env(
-        "MC_NETCDF_CHUNK_CACHE_MB",
-        512,
-        3 * ds_cache::MIB / 2,
-        |key, bytes| {
-            let constraint = match &key.part {
-                Part::Range { .. } => 0,
-                Part::Dap(constraint) => constraint.len(),
-            };
-            (bytes.len() + key.file.url.len() + constraint) as u64 + 96
-        },
+    let (bytes, source) = ds_cache::plan::env_bytes("MC_NETCDF_CHUNK_CACHE_MB", 512);
+    ByteBoundedCache::<ChunkKey, Bytes>::new(bytes, 3 * ds_cache::MIB / 2, |key, bytes| {
+        let constraint = match &key.part {
+            Part::Range { .. } => 0,
+            Part::Dap(constraint) => constraint.len(),
+        };
+        (bytes.len() + key.file.url.len() + constraint) as u64 + 96
+    })
+    .registered(
+        "netcdf_chunk_cache",
+        ds_cache::plan::Scope::Engine("netcdf"),
+        source,
     )
 });
 

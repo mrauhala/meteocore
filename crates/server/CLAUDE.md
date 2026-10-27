@@ -228,6 +228,22 @@ served render ran. No `collection` label: queue wait belongs to the shared
 slots, the per-collection tail is `render_duration_seconds`, and fixed labels
 need no reload pruning.
 
+## Memory plan (#1306)
+
+- `cache_plan.rs` owns `/admin/cache-plan`, the INFO block and the plan
+  gauges, all from `cache_plan::snapshot`. Both the endpoint and the block
+  call `admin::refresh_metrics` first: a process-wide cache exists only
+  once read. The snapshot drops collection- and source-scoped entries whose
+  id is not in `last_collections` (a replaced engine a request still holds).
+- `register_render_caches` runs after every accepted load (`main`,
+  `apply_load`, the test `build_state`). Per-collection caches register in
+  `load_collections` right after their engine is pushed, reused engines
+  too; registering an owner again replaces its entry.
+- A recovery-loop reload logs the block only when the plan changed.
+- The plan test runs in a child process: the `MC_*` statics read the
+  environment once.
+- Without `ADMIN_TOKEN` every admin route answers 403 (`require_admin_token`).
+
 ## Health: data age and poll age (#1007)
 
 - `/health` `data_age_secs` and the `/metrics` gauge

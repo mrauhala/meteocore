@@ -501,7 +501,18 @@ static SOLID_IMAGE_CACHE: std::sync::LazyLock<
         4 * 1024,
         weigh_cached::<SolidImageKey>,
     )
+    .registered(
+        "solid_image_cache",
+        ds_cache::plan::Scope::Process,
+        ds_cache::plan::SizeSource::Constant,
+    )
 });
+
+/// Build the solid-image memo now, which enters it in the memory plan
+/// (#1306); otherwise the first all-nodata or error image builds it.
+pub fn init_solid_image_cache() {
+    std::sync::LazyLock::force(&SOLID_IMAGE_CACHE);
+}
 
 /// An all-nodata `width`×`height` image in `format` as a ready-to-serve
 /// [`CachedRendered`], encoded once per distinct size and format and cloned
@@ -704,6 +715,12 @@ impl RenderedCache {
     /// Snapshot for `/metrics`.
     pub fn metrics(&self) -> ds_cache::CacheMetrics {
         self.cache.metrics()
+    }
+
+    /// Enter this cache in the memory plan (#1306), sized from `source`.
+    pub fn register(&self, source: ds_cache::plan::SizeSource) {
+        self.cache
+            .register("rendered_cache", ds_cache::plan::Scope::Process, source);
     }
 
     /// Drop every cached image belonging to `collection` — targeted

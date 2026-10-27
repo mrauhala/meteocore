@@ -273,6 +273,10 @@ on the request path. Single-level and legacy views require exact metadata.
 - `/metrics` exposes `grib_message_cache_{hits_total,misses_total,bytes,
   capacity_bytes}` under the source collection ID, once per owner. Message hits
   count reuse after decoded-grid misses, not every query field.
+- The server enters the grid, message and point-index caches in the memory
+  plan (`cache_plan::register_grib`, #1306) through the same accessors
+  `/metrics` reads, scoped to the source's collection id. A new per-source
+  cache adds its entry there.
 - The ignored `message_cache::tests::repeated_forecast_latency_replay` replays
   two different coordinates over 120 real global fields with 150 ms simulated
   GET latency, comparing 256 MiB decoded-only caching with an additional

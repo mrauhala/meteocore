@@ -7,6 +7,7 @@
 //! bytes/output pixel), rather than counting only the final four-byte RGBA
 //! buffer. [`ByteBudget`] admits an engine's transient source buffers and
 //! never waits.
+use ds_cache::plan;
 use ds_core::error::DataServerError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -68,9 +69,10 @@ pub fn layered_raster_bytes(width: u32, height: u32, planes: usize) -> Option<u6
 /// again later" with `Retry-After: 1`, although retrying an oversized request
 /// cannot succeed ("Pixel budgets" in the root CLAUDE.md, #120).
 pub static RENDER_MEMORY: LazyLock<Arc<RenderBudget>> = LazyLock::new(|| {
-    Arc::new(RenderBudget::new(
-        ds_cache::env_mb("MC_RENDER_MEMORY_MB", 1024).saturating_mul(1024 * 1024),
-    ))
+    let (bytes, source) = plan::env_bytes("MC_RENDER_MEMORY_MB", 1024);
+    let budget = Arc::new(RenderBudget::new(bytes));
+    budget.register("render_budget", plan::Scope::Process, source);
+    budget
 });
 
 /// Waiting admission for render output buffers: a charge that does not fit
@@ -101,6 +103,20 @@ impl RenderBudget {
     pub fn capacity(&self) -> u64 {
         self.capacity
     }
+
+    /// Enter this budget in the memory plan (`ds_cache::plan`, #1306) as
+    /// `id`, its `/metrics` family, sized from `source`.
+    pub fn register(
+        self: &Arc<Self>,
+        id: &'static str,
+        scope: plan::Scope,
+        source: plan::SizeSource,
+    ) {
+        plan::register(plan::Entry::budget(id, scope, source), self, |budget| {
+            plan::Usage::budget(budget.capacity, budget.used.load(Ordering::Relaxed))
+        });
+    }
+
     pub fn available(&self) -> u64 {
         self.capacity
             .saturating_sub(self.used.load(Ordering::Relaxed))
@@ -212,6 +228,21 @@ impl ByteBudget {
 
     pub fn capacity(&self) -> u64 {
         self.capacity
+    }
+
+    /// Enter this budget in the memory plan (`ds_cache::plan`, #1306) as
+    /// `id`, its `/metrics` family (`geotiff_decode` for
+    /// `geotiff_decode_capacity_bytes`), sized from `source`. Listed while
+    /// the budget lives.
+    pub fn register(
+        self: &Arc<Self>,
+        id: &'static str,
+        scope: plan::Scope,
+        source: plan::SizeSource,
+    ) {
+        plan::register(plan::Entry::budget(id, scope, source), self, |budget| {
+            plan::Usage::budget(budget.capacity, budget.used.load(Ordering::Relaxed))
+        });
     }
 
     /// (reserved bytes, capacity bytes, rejected admissions), the triple each
@@ -478,5 +509,49 @@ mod tests {
             .is_none());
         // An odd capacity rounds the background half down.
         assert_eq!(ByteBudget::new(101).background_limit(), 50);
+    }
+
+    /// A registered budget is in the memory plan with its reservations
+    /// (#1306), and leaves it when dropped.
+    #[test]
+    fn registered_budgets_report_capacity_and_reservations() {
+        let listed = |id: &str| {
+            plan::snapshot()
+                .into_iter()
+                .find(|row| row.entry.id == id)
+                .map(|row| (row.entry.kind, row.entry.source, row.usage))
+        };
+        let bytes = Arc::new(ByteBudget::new(100));
+        bytes.register(
+            "budget_test_bytes",
+            plan::Scope::Engine("test"),
+            plan::SizeSource::Default,
+        );
+        let render = Arc::new(RenderBudget::new(10 * BYTES_PER_PIXEL));
+        render.register(
+            "budget_test_render",
+            plan::Scope::Process,
+            plan::SizeSource::Env("MC_BUDGET_TEST_MB"),
+        );
+        let held = bytes.reserve(30).unwrap();
+        let _rendering = render.try_reserve(raster_bytes(2, 1, 1)).unwrap();
+        assert_eq!(
+            listed("budget_test_bytes"),
+            Some((
+                plan::Kind::Budget,
+                plan::SizeSource::Default,
+                plan::Usage::budget(100, 30)
+            ))
+        );
+        assert_eq!(
+            listed("budget_test_render"),
+            Some((
+                plan::Kind::Budget,
+                plan::SizeSource::Env("MC_BUDGET_TEST_MB"),
+                plan::Usage::budget(10 * BYTES_PER_PIXEL, 2 * BYTES_PER_PIXEL)
+            ))
+        );
+        drop((held, bytes));
+        assert_eq!(listed("budget_test_bytes"), None);
     }
 }

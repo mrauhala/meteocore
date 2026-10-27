@@ -15,9 +15,14 @@ pub(crate) use ds_executor::budget::{ByteBudget as Budget, BytePermit as Permit}
 /// storm-cell reads are not charged. A reservation that does not fit fails
 /// at once with `ResourceExhausted`: HTTP 503 in EDR and GetFeatureInfo.
 pub(crate) static BUDGET: LazyLock<Arc<Budget>> = LazyLock::new(|| {
-    Arc::new(Budget::new(
-        ds_cache::env_mb("MC_PVOL_READ_MEMORY_MB", 1024).saturating_mul(ds_cache::MIB),
-    ))
+    let (bytes, source) = ds_cache::plan::env_bytes("MC_PVOL_READ_MEMORY_MB", 1024);
+    let budget = Arc::new(Budget::new(bytes));
+    budget.register(
+        "pvol_read",
+        ds_cache::plan::Scope::Engine("odim-volume"),
+        source,
+    );
+    budget
 });
 
 /// (reserved bytes, capacity bytes, rejected admissions).

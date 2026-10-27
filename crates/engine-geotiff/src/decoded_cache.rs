@@ -200,12 +200,15 @@ const DEFAULT_DECODED_CHUNK_CACHE_MB: u64 = 512;
 type ChunkCache = ds_cache::ByteBoundedCache<ChunkKey, Arc<DecodingResult>>;
 
 static CACHE: std::sync::LazyLock<ChunkCache> = std::sync::LazyLock::new(|| {
-    // Estimate item slots at one 512×512 Byte tile (256 KB) each.
-    ChunkCache::from_env(
+    let (bytes, source) = ds_cache::plan::env_bytes(
         "MC_GEOTIFF_DECODED_CHUNK_CACHE_MB",
         DEFAULT_DECODED_CHUNK_CACHE_MB,
-        256 * 1024,
-        weigh_chunk,
+    );
+    // Estimate item slots at one 512×512 Byte tile (256 KB) each.
+    ChunkCache::new(bytes, 256 * 1024, weigh_chunk).registered(
+        "geotiff_decoded_chunk_cache",
+        ds_cache::plan::Scope::Engine("geotiff"),
+        source,
     )
 });
 
