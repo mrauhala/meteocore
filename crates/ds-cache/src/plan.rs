@@ -286,6 +286,16 @@ pub fn snapshot() -> Vec<Row> {
     rows.into_iter().map(|(_, row)| row).collect()
 }
 
+/// Serializes the tests that read the registry. A [`snapshot`] holds every
+/// live owner while it reads its usage, so one running in a parallel test
+/// keeps an owner a test has just dropped alive that long, and the test
+/// then still finds it listed.
+#[cfg(test)]
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +307,7 @@ mod tests {
     }
 
     /// Rows of this test's own ids: tests share the process-wide registry.
+    /// Take [`serial`] first.
     fn rows(prefix: &str) -> Vec<Row> {
         snapshot()
             .into_iter()
@@ -306,6 +317,7 @@ mod tests {
 
     #[test]
     fn a_dropped_owner_leaves_the_plan() {
+        let _serial = serial();
         let owner = Arc::new(Fixed(7));
         register(
             Entry::budget("plan_test_dropped", Scope::Process, SizeSource::Constant),
@@ -319,6 +331,7 @@ mod tests {
 
     #[test]
     fn registering_an_owner_again_replaces_its_entry() {
+        let _serial = serial();
         let owner = Arc::new(Fixed(7));
         for source in [SizeSource::Default, SizeSource::Env("MC_PLAN_TEST_MB")] {
             register(
@@ -337,6 +350,7 @@ mod tests {
     /// a request. The newer one is listed; other scopes are not affected.
     #[test]
     fn the_newest_of_two_live_owners_is_listed() {
+        let _serial = serial();
         let scope = |id: &str| Scope::Collection {
             engine: "geotiff",
             id: id.to_string(),
@@ -372,6 +386,7 @@ mod tests {
 
     #[test]
     fn rows_are_ordered_caches_first_then_by_scope() {
+        let _serial = serial();
         let owner = Arc::new(Fixed(1));
         let entries = [
             Entry::budget("plan_test_order_b", Scope::Process, SizeSource::Default),

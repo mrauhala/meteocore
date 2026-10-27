@@ -867,6 +867,7 @@ mod tests {
     /// it when dropped (#1306).
     #[test]
     fn a_registered_cache_reports_its_usage_until_dropped() {
+        let _serial = plan::serial();
         let listed = || {
             plan::snapshot()
                 .into_iter()
