@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use ds_cache::ByteBoundedCache;
+use ds_cache::{ByteBoundedCache, Joined};
 use ds_core::map_engine::OutputCrs;
 
 pub(crate) fn longitude_wrap_columns(ni: usize, lon_inc: f64) -> Option<f64> {
@@ -25,9 +25,18 @@ struct GridKey {
 
 /// Weight function: count the byte size of each cached grid.
 fn weigh_grid(key: &GridKey, val: &Arc<DecodedGrid>) -> u64 {
-    // Include the key, its Arc header and a small cache-node allowance.
-    (val.size_bytes() + size_of::<GridKey>() + key.url.len() + 2 * size_of::<usize>() + 64) as u64
+    entry_weight(val.size_bytes(), key.url.len())
 }
+
+/// A cached grid's weight: its `grid_bytes` ([`DecodedGrid::size_bytes`])
+/// plus the key, its Arc header and a small cache-node allowance.
+fn entry_weight(grid_bytes: usize, url_len: usize) -> u64 {
+    (grid_bytes + size_of::<GridKey>() + url_len + 2 * size_of::<usize>() + 64) as u64
+}
+
+/// The URL length [`GridCache::holds`] assumes for a field it has not read:
+/// a long object key. Only small grids notice it.
+const URL_ALLOWANCE: usize = 128;
 
 /// A decoded grid with its metadata.
 #[derive(Debug, Clone)]
@@ -87,7 +96,12 @@ impl DecodedGrid {
     fn size_bytes(&self) -> usize {
         // Both the grid and its Vec are Arc allocations. Count capacity rather
         // than length so a decoder's allocation slack stays inside the budget.
-        self.values.capacity() * size_of::<f32>()
+        Self::size_for(self.values.capacity())
+    }
+
+    /// [`Self::size_bytes`] of a grid holding `values` values.
+    fn size_for(values: usize) -> usize {
+        values.saturating_mul(size_of::<f32>())
             + size_of::<Self>()
             + size_of::<Vec<f32>>()
             + 4 * size_of::<usize>()
@@ -544,6 +558,49 @@ impl GridCache {
             offset,
         };
         self.cache.get(&key)
+    }
+
+    /// A byte-capacity cache for tests: [`Self::new`] counts whole MiB, far
+    /// more than a window of tiny synthetic grids.
+    #[cfg(test)]
+    pub(crate) fn with_capacity_bytes(bytes: u64) -> Self {
+        Self {
+            cache: ByteBoundedCache::new(bytes, 4 * ds_cache::MIB, weigh_grid),
+        }
+    }
+
+    /// Whether `fields` decoded grids of `nodes` values each fit this
+    /// cache's budget together (#1297): their estimated weight, as
+    /// [`weigh_grid`] would count each, against the configured capacity.
+    /// A query whose fields do not fit reads them with [`Self::get_or_join`]
+    /// instead of filling the cache, which would evict them, and every grid
+    /// a map keeps there, before the query could reuse any of them.
+    pub(crate) fn holds(&self, fields: usize, nodes: u64) -> bool {
+        (fields as u64).saturating_mul(Self::estimated_weight(nodes)) <= self.cache.capacity_bytes()
+    }
+
+    /// The weight [`weigh_grid`] gives a decoded grid of `nodes` values
+    /// whose key is [`URL_ALLOWANCE`] long.
+    pub(crate) fn estimated_weight(nodes: u64) -> u64 {
+        let values = usize::try_from(nodes).unwrap_or(usize::MAX);
+        entry_weight(DecodedGrid::size_for(values), URL_ALLOWANCE)
+    }
+
+    /// A resident grid, or the grid another caller's fill of the same
+    /// message produces, waiting up to `timeout` (`None`: as long as it
+    /// takes); never claims or inserts one. [`Joined::Absent`] leaves the
+    /// read to the caller, who does not offer its grid to the cache.
+    pub(crate) fn get_or_join(
+        &self,
+        url: &str,
+        offset: u64,
+        timeout: Option<std::time::Duration>,
+    ) -> Joined<Arc<DecodedGrid>> {
+        let key = GridKey {
+            url: Arc::from(url),
+            offset,
+        };
+        self.cache.get_or_join(&key, timeout)
     }
 
     /// Share one fetch/decode among concurrent requests for the same message.

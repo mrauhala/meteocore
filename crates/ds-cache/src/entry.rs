@@ -12,6 +12,20 @@ pub enum CacheEntry<'a, K, V> {
     Timeout,
 }
 
+/// What [`crate::ByteBoundedCache::get_or_join`] found: a lookup that shares
+/// another caller's fill but never claims one of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Joined<V> {
+    /// A resident value, or the value another caller's fill published while
+    /// this caller waited.
+    Value(V),
+    /// Neither resident nor being filled, or the fill it waited for failed:
+    /// the caller computes the value itself and the cache stays as it was.
+    Absent,
+    /// Another caller's fill was still running when the wait expired.
+    Timeout,
+}
+
 /// A single-flight fill claim. Drop without inserting to permit a retry.
 /// This holds no cache lock while the caller admits or computes a value.
 pub struct CacheFillGuard<'a, K, V>(

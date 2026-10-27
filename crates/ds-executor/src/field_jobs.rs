@@ -2,7 +2,8 @@
 //!
 //! A gridded engine answers an EDR time series or area by reading one field
 //! per (parameter, step, level). [`run_field_jobs`] runs those reads a few
-//! at a time ([`FIELD_CONCURRENCY`]) as tasks on the runtime the query runs
+//! at a time, as many as its caller allows ([`FIELD_CONCURRENCY`] unless it
+//! has its own memory bound, #1297), as tasks on the runtime the query runs
 //! on (the shared query runtime, [`crate::query_runtime`]), each inside
 //! `block_in_place` and under the query's `ds_core::deadline`, and hands
 //! each job's small result (samples, a subset) to the caller in completion
@@ -16,8 +17,10 @@ use ds_core::error::DataServerError;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::JoinSet;
 
-/// Field jobs in flight per admitted query: bounds its field I/O, decoding
-/// and live decoded fields.
+/// The default number of field jobs in flight per admitted query, which
+/// bounds its field I/O, decoding and live decoded fields: engine-netcdf's.
+/// An engine that bounds a job's memory itself passes its own number to
+/// [`run_field_jobs`] (engine-grib, #1297).
 pub const FIELD_CONCURRENCY: usize = 4;
 
 /// Run `future` to completion from synchronous engine code: on the calling
@@ -52,8 +55,9 @@ where
     }
 }
 
-/// Run `work` over `fields`, at most [`FIELD_CONCURRENCY`] at once, on the
-/// runtime [`block_on`] picks, and pass each result to `consume` in
+/// Run `work` over `fields`, at most `concurrency` at once (at least one;
+/// [`FIELD_CONCURRENCY`] unless the engine bounds a job's memory itself), on
+/// the runtime [`block_on`] picks, and pass each result to `consume` in
 /// completion order. Workers should return small samples or subsets rather
 /// than keep decoded fields alive.
 ///
@@ -64,6 +68,7 @@ where
 /// nothing of the query outlives it here.
 pub fn run_field_jobs<J, T>(
     fallback: &Handle,
+    concurrency: usize,
     fields: impl Iterator<Item = J> + Send,
     work: impl Fn(J) -> Result<T, DataServerError> + Send + Sync + 'static,
     mut consume: impl FnMut(T) -> Result<(), DataServerError> + Send,
@@ -72,6 +77,7 @@ where
     J: Send + 'static,
     T: Send + 'static,
 {
+    let concurrency = concurrency.max(1);
     let mut fields = fields.fuse();
     let work = Arc::new(work);
     let deadline = ds_core::deadline::current();
@@ -82,7 +88,7 @@ where
             if let Err(error) = ds_core::deadline::check() {
                 fatal = Some(error);
             }
-            while jobs.len() < FIELD_CONCURRENCY && fatal.is_none() {
+            while jobs.len() < concurrency && fatal.is_none() {
                 let Some(field) = fields.next() else { break };
                 let work = work.clone();
                 jobs.spawn(async move {
@@ -139,6 +145,7 @@ mod tests {
         let mut seen = Vec::new();
         run_field_jobs(
             fallback(),
+            FIELD_CONCURRENCY,
             0..12,
             move |field: usize| {
                 let now = r.fetch_add(1, Ordering::SeqCst) + 1;
@@ -159,6 +166,48 @@ mod tests {
         assert!((2..=FIELD_CONCURRENCY).contains(&peak.load(Ordering::SeqCst)));
     }
 
+    /// The caller's bound, the default or an engine's own (#1297), is
+    /// reached and never exceeded: every job waits until that many run at
+    /// once (or ten seconds pass), so a scheduler holding fewer fails the
+    /// peak check instead of passing on timing.
+    #[test]
+    fn the_callers_bound_is_reached_and_never_exceeded() {
+        use std::sync::{Condvar, Mutex};
+        for bound in [1, FIELD_CONCURRENCY, 16] {
+            let gate = Arc::new((Mutex::new((0usize, false)), Condvar::new()));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let (g, p) = (gate.clone(), peak.clone());
+            let mut done = 0;
+            run_field_jobs(
+                fallback(),
+                bound,
+                0..3 * bound,
+                move |_: usize| {
+                    let (lock, changed) = &*g;
+                    let mut state = lock.lock().unwrap();
+                    state.0 += 1;
+                    p.fetch_max(state.0, Ordering::SeqCst);
+                    if state.0 >= bound {
+                        state.1 = true; // the bound was reached once
+                        changed.notify_all();
+                    }
+                    let (mut state, _) = changed
+                        .wait_timeout_while(state, Duration::from_secs(10), |s| !s.1)
+                        .unwrap();
+                    state.0 -= 1;
+                    Ok(())
+                },
+                |()| {
+                    done += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(done, 3 * bound);
+            assert_eq!(peak.load(Ordering::SeqCst), bound, "bound {bound}");
+        }
+    }
+
     /// The first error stops dispatching: the remaining fields never start,
     /// and the running ones finish before the call returns.
     #[test]
@@ -168,6 +217,7 @@ mod tests {
         let (s, f) = (started.clone(), finished.clone());
         let result = run_field_jobs(
             fallback(),
+            FIELD_CONCURRENCY,
             0..100,
             move |field: usize| {
                 s.fetch_add(1, Ordering::SeqCst);
@@ -202,6 +252,7 @@ mod tests {
             let mut seen = Vec::new();
             run_field_jobs(
                 fallback(),
+                FIELD_CONCURRENCY,
                 0..6,
                 move |field: usize| {
                     assert_eq!(ds_core::deadline::current(), Some(end));
@@ -229,6 +280,7 @@ mod tests {
         let _deadline = ds_core::deadline::enter(Some(Instant::now()));
         let result = run_field_jobs(
             fallback(),
+            FIELD_CONCURRENCY,
             0..4,
             |_: usize| -> Result<(), DataServerError> { panic!("a job started") },
             |()| Ok(()),

@@ -58,8 +58,8 @@ impl GribEngine {
             source: self.source.clone(),
         });
         let mut values: Vec<HashMap<String, Vec<Option<f64>>>> = vec![HashMap::new(); coords.len()];
-        for name in &params {
-            let samples = worker.sample_parameter(name, &steps, &level_keys, &coords)?;
+        let samples = worker.sample_parameters(&params, &steps, &level_keys, &coords)?;
+        for (name, samples) in params.iter().zip(samples) {
             for (point, samples) in values.iter_mut().zip(samples) {
                 point.insert(name.clone(), samples);
             }
@@ -210,61 +210,77 @@ impl GribEngine {
             .collect()
     }
 
-    /// Results are small point samples, not retained global grids. Completion
-    /// order cannot reorder the time/level axes, and cache size does not affect
-    /// reuse across coordinates within this request.
-    fn sample_parameter(
+    /// `samples[parameter][point][step × level]`. Results are small point
+    /// samples, not retained global grids. Completion order cannot reorder
+    /// the time/level axes, and cache size does not affect reuse across
+    /// coordinates within this request. Every parameter's fields go through
+    /// one scheduler run, under one [`FieldPlan`] for the whole query
+    /// (#1297): its concurrency, and whether the decoded-grid cache can
+    /// hold all of them.
+    fn sample_parameters(
         self: &Arc<Self>,
-        name: &str,
+        params: &[String],
         steps: &[(DateTime<Utc>, &StepFile)],
         level_keys: &[Arc<ParameterKeys>],
         coords: &Arc<Vec<(f64, f64)>>,
-    ) -> Result<Vec<Vec<Option<f64>>>, DataServerError> {
-        let mut samples = vec![vec![None; steps.len() * level_keys.len()]; coords.len()];
-        let fields = steps
+    ) -> Result<Vec<Vec<Vec<Option<f64>>>>, DataServerError> {
+        let mut samples =
+            vec![vec![vec![None; steps.len() * level_keys.len()]; coords.len()]; params.len()];
+        let fields: Vec<_> = params
             .iter()
-            .flat_map(|(_, file)| level_keys.iter().map(move |keys| (*file, keys)))
             .enumerate()
-            .filter_map(|(index, (file, keys))| {
-                let entry = keys
-                    .get(name)
-                    .and_then(|key| file.messages.iter().find(|m| key.matches(m)))?;
-                Some((
-                    index,
-                    file.message_url(entry).to_owned(),
-                    entry.clone(),
-                    keys.clone(),
-                ))
-            });
+            .flat_map(|(param, name)| {
+                steps
+                    .iter()
+                    .flat_map(|(_, file)| level_keys.iter().map(move |keys| (*file, keys)))
+                    .enumerate()
+                    .filter_map(move |(index, (file, keys))| {
+                        let entry = keys
+                            .get(name)
+                            .and_then(|key| file.messages.iter().find(|m| key.matches(m)))?;
+                        Some((
+                            param,
+                            index,
+                            file.message_url(entry).to_owned(),
+                            entry.clone(),
+                            keys.clone(),
+                        ))
+                    })
+            })
+            .collect();
+        let plan = self.field_plan(fields.len());
         let engine = self.clone();
         let coords = coords.clone();
-        let parameter = name.to_owned();
+        let names: Arc<[String]> = params.into();
         run_field_jobs(
-            fields,
-            move |(index, url, entry, keys)| {
+            plan.concurrency,
+            fields.into_iter(),
+            move |(param, index, url, entry, keys)| {
                 // Missing/unreadable fields stay null in position series. Deadlines
                 // and worker failures are fatal and are handled by the scheduler.
-                let values = engine.fetch_grid_by_entry(&url, &entry).map(|grid| {
-                    let meta = engine.param_metadata_for(&keys, &parameter);
-                    coords
-                        .iter()
-                        .map(|&(lon, lat)| {
-                            grid.bilinear_value(lon, lat)
-                                .map(|v| meta.display.convert(v))
-                        })
-                        .collect::<Vec<_>>()
-                });
-                Ok((index, values))
+                let values = engine
+                    .fetch_grid_by_entry(&url, &entry, plan.fill)
+                    .map(|grid| {
+                        let meta = engine.param_metadata_for(&keys, &names[param]);
+                        coords
+                            .iter()
+                            .map(|&(lon, lat)| {
+                                grid.bilinear_value(lon, lat)
+                                    .map(|v| meta.display.convert(v))
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                Ok((param, index, values))
             },
-            |(index, values)| {
+            |(param, index, values)| {
                 match values {
                     Ok(values) => {
-                        for (point, value) in samples.iter_mut().zip(values) {
+                        for (point, value) in samples[param].iter_mut().zip(values) {
                             point[index] = value;
                         }
                     }
                     Err(error) => {
-                        tracing::debug!(parameter = name, error = %error, "GRIB position field unavailable")
+                        tracing::debug!(parameter = %params[param], error = %error, "GRIB position field unavailable")
                     }
                 }
                 Ok(())

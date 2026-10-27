@@ -30,10 +30,23 @@ level type) exposes every parameter; each retained run is an EDR instance.
   `f32` grid, kept in an LRU cache (`grid_cache_mb`). An optional cache of
   compressed messages (`message_cache_mb`) saves the download on a
   decoded-grid miss. Both caches are per source, shared by its level views.
+- **Long EDR windows.** An EDR query (position, trajectory, area, radius,
+  cube) whose fields, at the grid's decoded size, add up to more than
+  `grid_cache_mb` reads them without keeping them: inserting them would
+  evict its own fields before any reuse, and every grid the maps keep
+  there. It still uses a grid already in the cache, waits for one another
+  request is decoding, and fills the message cache. A window that fits is
+  cached as before, so a repeat is all hits. To make repeats of long
+  windows cheap, set `message_cache_mb`: a compressed GFS 0.25° message is
+  about 0.6 MB against 4 MB decoded, an IFS 0.1° one about 1.3 MB against
+  26 MB.
 - **Sampling.** Points, paths and map pixels are interpolated bilinearly in
   `f64`, then converted to display units; map tiles store `f32`. Projected
   output CRSs map pixels through a coarse projection grid. An EDR query
-  reads at most four fields at a time, sampling every point from each once.
+  reads each field once, sampling every point from it, up to 16 fields at a
+  time: as many as keep 256 MiB of decoded values in flight, at least four.
+  A 0.25° global grid (4 MB a field) reads 16 at a time, a 0.1° one (26 MB)
+  ten. Before the grid's geometry is known, four.
 - **Units.** The source unit comes from a built-in subset of WMO Code
   Table 4.2 plus ECMWF local numbers (cloud cover, land-sea mask,
   precipitation and snow in metres of water). Display conversions: K → °C
@@ -135,7 +148,7 @@ parameters = ["2t", "10u", "10v", "msl", "tp", "t", "z"]
 | `poll_interval_secs` | `600` | Poll cadence, > 0. |
 | `max_runs` | none | Keep the newest N runs; unset keeps every run found. |
 | `time_window` | none | ISO 8601 duration relative to the current time: `-PT12H` keeps steps valid in the last 12 h, `P5D` in the next 5 days. |
-| `grid_cache_mb` | `256` | Decoded-grid cache per source; `0` disables it. |
+| `grid_cache_mb` | `256` | Decoded-grid cache per source; `0` disables it. An EDR query over more fields than it holds reads around it. |
 | `message_cache_mb` | `0` | Compressed-message cache per source; `0` disables it. |
 
 With `level_types`, the collection id names a source, and the server

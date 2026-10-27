@@ -97,10 +97,11 @@ impl GribEngine {
     }
 
     /// `values[parameter][field][point]` for every planned field. One job
-    /// per (parameter, field) on the shared four-worker scheduler: the
-    /// field is fetched and decoded once, sampled at every point the path
-    /// reads from it, and released. A missing or unreadable field stays
-    /// null, as in a position series; deadlines are fatal.
+    /// per (parameter, field) on the shared scheduler, under the query's
+    /// [`FieldPlan`] (#1297): the field is fetched and decoded once,
+    /// sampled at every point the path reads from it, and released. A
+    /// missing or unreadable field stays null, as in a position series;
+    /// deadlines are fatal.
     fn sample_trajectory(
         &self,
         plan: &TrajectoryPlan,
@@ -122,43 +123,51 @@ impl GribEngine {
                 .entry(field.level.map(f64::to_bits))
                 .or_insert_with(|| Arc::new(Self::keys_at_level(keys, field.level)));
         }
-        let jobs = params.iter().enumerate().flat_map(|(p, name)| {
-            let level_keys = &level_keys;
-            fields.iter().enumerate().filter_map(move |(f, field)| {
-                let (_, file) = steps[field.time];
-                let keys = level_keys[&field.level.map(f64::to_bits)].clone();
-                let entry = keys
-                    .get(name)
-                    .and_then(|key| file.messages.iter().find(|m| key.matches(m)))?;
-                Some((
-                    p,
-                    f,
-                    name.clone(),
-                    file.message_url(entry).to_owned(),
-                    entry.clone(),
-                    keys,
-                ))
+        let jobs: Vec<_> = params
+            .iter()
+            .enumerate()
+            .flat_map(|(p, name)| {
+                let level_keys = &level_keys;
+                fields.iter().enumerate().filter_map(move |(f, field)| {
+                    let (_, file) = steps[field.time];
+                    let keys = level_keys[&field.level.map(f64::to_bits)].clone();
+                    let entry = keys
+                        .get(name)
+                        .and_then(|key| file.messages.iter().find(|m| key.matches(m)))?;
+                    Some((
+                        p,
+                        f,
+                        name.clone(),
+                        file.message_url(entry).to_owned(),
+                        entry.clone(),
+                        keys,
+                    ))
+                })
             })
-        });
+            .collect();
+        let plan = self.field_plan(jobs.len());
         let engine = Arc::new(Self {
             collection_id: self.collection_id.clone(),
             family: self.family,
             source: self.source.clone(),
         });
         run_field_jobs(
-            jobs,
+            plan.concurrency,
+            jobs.into_iter(),
             move |(p, f, name, url, entry, keys)| {
-                let samples = engine.fetch_grid_by_entry(&url, &entry).map(|grid| {
-                    let meta = engine.param_metadata_for(&keys, &name);
-                    field_points[f]
-                        .iter()
-                        .map(|&i| {
-                            let (lon, lat) = points[i];
-                            grid.bilinear_value(lon, lat)
-                                .map(|v| meta.display.convert(v))
-                        })
-                        .collect::<Vec<_>>()
-                });
+                let samples = engine
+                    .fetch_grid_by_entry(&url, &entry, plan.fill)
+                    .map(|grid| {
+                        let meta = engine.param_metadata_for(&keys, &name);
+                        field_points[f]
+                            .iter()
+                            .map(|&i| {
+                                let (lon, lat) = points[i];
+                                grid.bilinear_value(lon, lat)
+                                    .map(|v| meta.display.convert(v))
+                            })
+                            .collect::<Vec<_>>()
+                    });
                 Ok((p, f, samples))
             },
             |(p, f, samples)| {

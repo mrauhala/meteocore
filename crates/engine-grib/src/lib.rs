@@ -7,6 +7,8 @@ mod discovery;
 #[cfg(test)]
 mod display_units_tests;
 #[cfg(test)]
+mod field_plan_tests;
+#[cfg(test)]
 mod geopotential_tests;
 pub mod index;
 mod message_cache;
@@ -238,6 +240,27 @@ struct GribSource {
     discovery: RwLock<discovery::Discovery>,
     /// Last attempted name, so failing probes cannot starve later parameters.
     probe_cursor: Mutex<Option<String>>,
+}
+
+/// Whether a field read may keep its decoded grid in the decoded-grid cache
+/// (#1297).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GridFill {
+    /// Share the read with concurrent readers and keep the grid: maps, and
+    /// EDR queries whose fields the cache can hold.
+    Insert,
+    /// Use a resident grid or a fill already in flight, else read without
+    /// inserting: an EDR query over more fields than the cache holds,
+    /// which would otherwise evict its own fields and every map's grids.
+    Bypass,
+}
+
+/// How one EDR query reads its fields ([`GribEngine::field_plan`], #1297).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FieldPlan {
+    /// Field jobs in flight at once.
+    pub concurrency: usize,
+    pub fill: GridFill,
 }
 
 impl GribEngine {
@@ -1027,7 +1050,7 @@ impl GribEngine {
                     "Parameter '{param}' at its canonical level not found in forecast step"
                 ))
             })?;
-        self.fetch_grid_by_entry(step_file.message_url(entry), entry)
+        self.fetch_grid_by_entry(step_file.message_url(entry), entry, GridFill::Insert)
     }
 
     /// The level a map field of `run` is drawn at: the requested `z`, which
@@ -1104,10 +1127,41 @@ impl GribEngine {
         })
     }
 
+    /// How one EDR query reads its `fields` (#1297), from the view's
+    /// published grid geometry (`RasterInfo::grid_size`, an `Arc` clone):
+    /// [`runtime::field_concurrency`] jobs at once, and [`GridFill::Bypass`]
+    /// when the decoded-grid cache cannot hold all of them
+    /// ([`GridCache::holds`]). Before the geometry is published the query
+    /// reads as before #1297: four at a time, filling the cache.
+    pub(crate) fn field_plan(&self, fields: usize) -> FieldPlan {
+        // Cells count the intervals between nodes, a global grid's cyclic
+        // closing cell included, so one more per axis bounds the decoded
+        // values from above.
+        let nodes = self
+            .raster_info_shared()
+            .grid_size
+            .map(|[x, y]| (u64::from(x) + 1) * (u64::from(y) + 1));
+        let fill = match (&self.source.grid_cache, nodes) {
+            (Some(cache), Some(nodes)) if !cache.holds(fields, nodes) => GridFill::Bypass,
+            _ => GridFill::Insert,
+        };
+        FieldPlan {
+            concurrency: runtime::field_concurrency(nodes),
+            fill,
+        }
+    }
+
+    /// One decoded field. [`GridFill::Insert`] shares the fetch with
+    /// concurrent readers of the message and keeps the grid in the
+    /// decoded-grid cache; [`GridFill::Bypass`] uses a resident grid or
+    /// waits for a fill already in flight, else reads the field without
+    /// inserting it (#1297). Both fill the compressed-message cache when it
+    /// is enabled.
     fn fetch_grid_by_entry(
         &self,
         grib_url: &str,
         entry: &catalog::MessageEntry,
+        fill: GridFill,
     ) -> Result<Arc<DecodedGrid>, DataServerError> {
         let load = || {
             let path = ds_storage::object_store::path::Path::from(grib_url);
@@ -1117,9 +1171,21 @@ impl GribEngine {
             }
             .map(Arc::new)
         };
-        let grid = match &self.source.grid_cache {
-            Some(cache) => cache.get_or_insert_with(grib_url, entry.offset, load)?,
-            None => load()?,
+        let grid = match (&self.source.grid_cache, fill) {
+            (Some(cache), GridFill::Insert) => {
+                cache.get_or_insert_with(grib_url, entry.offset, load)?
+            }
+            (Some(cache), GridFill::Bypass) => {
+                // Wait for another reader's fill no longer than the query.
+                let wait = ds_core::deadline::current()
+                    .map(|end| end.saturating_duration_since(Instant::now()));
+                match cache.get_or_join(grib_url, entry.offset, wait) {
+                    ds_cache::Joined::Value(grid) => grid,
+                    ds_cache::Joined::Absent => load()?,
+                    ds_cache::Joined::Timeout => return Err(DataServerError::DeadlineExceeded),
+                }
+            }
+            (None, _) => load()?,
         };
         self.populate_metadata(&entry.key(), &grid, entry.step_kind);
         if self.populate_geometry(
