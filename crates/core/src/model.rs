@@ -115,6 +115,17 @@ impl LocationSnapshot {
     }
 }
 
+impl crate::heap::HeapSize for LocationSnapshot {
+    /// The locations and the id order; the point index too once a request
+    /// built it.
+    fn heap_size(&self) -> usize {
+        use crate::heap::HeapSize;
+        self.locations.heap_size()
+            + self.id_order.heap_size()
+            + self.by_point.get().map_or(0, HeapSize::heap_size)
+    }
+}
+
 impl Deref for LocationSnapshot {
     type Target = [Location];
 

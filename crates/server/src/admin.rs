@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Instant;
@@ -8,8 +8,9 @@ use axum::extract::{MatchedPath, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
+use prometheus::core::{Collector, MetricVec, MetricVecBuilder};
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
     IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use serde::Serialize;
@@ -34,6 +35,70 @@ fn int_gauge(name: &str, help: &str) -> IntGauge {
     let gauge = IntGauge::new(name, help).unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
+}
+
+/// Drops the series of the collections it is given from one family.
+type SeriesPruner = Box<dyn Fn(&HashSet<&str>) + Send + Sync>;
+
+/// Every family labelled by `collection`, by name, with its pruner
+/// ([`prune_collection_series`], #1307).
+static COLLECTION_FAMILIES: Mutex<Vec<(String, SeriesPruner)>> = Mutex::new(Vec::new());
+
+/// Register a family labelled by `collection`. Its series stay until a
+/// reload removes their collection, which drops them, whatever its other
+/// labels ([`prune_collection_series`]); a rebuilt collection keeps them.
+fn per_collection<T: MetricVecBuilder + 'static>(family: MetricVec<T>) -> MetricVec<T> {
+    REGISTRY.register(Box::new(family.clone())).unwrap();
+    let name = family.desc()[0].fq_name.clone();
+    let pruned = family.clone();
+    COLLECTION_FAMILIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name, Box::new(move |removed| drop_series(&pruned, removed))));
+    family
+}
+
+/// Remove every series of `family` whose `collection` is in `removed`.
+fn drop_series<T: MetricVecBuilder>(family: &MetricVec<T>, removed: &HashSet<&str>) {
+    for metrics in family.collect() {
+        for metric in metrics.get_metric() {
+            let labels: HashMap<&str, &str> = metric
+                .get_label()
+                .iter()
+                .map(|l| (l.name(), l.value()))
+                .collect();
+            if labels
+                .get("collection")
+                .is_some_and(|c| removed.contains(c))
+            {
+                // Err = removed meanwhile by a concurrent prune.
+                let _ = family.remove(&labels);
+            }
+        }
+    }
+}
+
+/// Drop every per-collection series of the collections a reload removed:
+/// their last values would stay on `/metrics` forever, and in every sum
+/// over the family (#1307). Under the scrape's counter-state lock, after
+/// the engine lists were swapped: a scrape that read the old lists has
+/// finished, and the next reads the new ones. Their counter state goes
+/// too, so a collection added again starts from its new engine's counts.
+fn prune_collection_series(removed: &HashSet<&str>) {
+    if removed.is_empty() {
+        return;
+    }
+    let mut counter_state = CACHE_COUNTER_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    counter_state.forget(removed);
+    for (_, prune) in COLLECTION_FAMILIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        prune(removed);
+    }
 }
 
 /// A Prometheus counter fed from a *cumulative* in-process value: each
@@ -198,8 +263,7 @@ static RENDER_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
         &["api", "collection", "outcome"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(histogram.clone())).unwrap();
-    histogram
+    per_collection(histogram)
 });
 
 /// Where served raster renders spend their time (#147), by API and phase:
@@ -285,6 +349,35 @@ static PROCESS_MEM_GAUGES: LazyLock<[IntGauge; 2]> = LazyLock::new(|| {
         ),
     ]
 });
+
+/// When this process started, as Prometheus's standard family has it: the
+/// uptime that turns the cumulative counters into rates per hour, so "no
+/// demand yet" reads apart from "ineffective" (#1307).
+static PROCESS_START_TIME: LazyLock<Gauge> = LazyLock::new(|| {
+    let gauge = Gauge::new(
+        "process_start_time_seconds",
+        "Start time of the process since the Unix epoch, in seconds",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// Seconds since the Unix epoch when [`record_process_start`] ran.
+static PROCESS_STARTED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64())
+}
+
+/// Remember now as the process start, for `process_start_time_seconds`.
+/// `main` calls it first thing; without it (tests) the first scrape's time
+/// stands in.
+pub fn record_process_start() {
+    PROCESS_STARTED.get_or_init(unix_now);
+}
 
 #[cfg(not(target_env = "msvc"))]
 static JEMALLOC_GAUGES: LazyLock<[IntGauge; 5]> = LazyLock::new(|| {
@@ -399,8 +492,7 @@ static CACHE_SIZE_SOURCE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["cache", "collection", "source"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 
 static MEMORY_CAPACITY_TOTAL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -485,65 +577,9 @@ static HTTP_RESPONSE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter
 });
 
-// Tile cache (per-collection).
-static TILE_CACHE_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    let counter = IntCounterVec::new(
-        Opts::new("tile_cache_hits_total", "GeoTIFF tile cache hits"),
-        &["collection"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static TILE_CACHE_MISSES: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    let counter = IntCounterVec::new(
-        Opts::new("tile_cache_misses_total", "GeoTIFF tile cache misses"),
-        &["collection"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static TILE_CACHE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    let gauge = IntGaugeVec::new(
-        Opts::new(
-            "tile_cache_bytes",
-            "Bytes currently held in the GeoTIFF tile cache",
-        ),
-        &["collection"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static TILE_CACHE_CAPACITY_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    let gauge = IntGaugeVec::new(
-        Opts::new(
-            "tile_cache_capacity_bytes",
-            "Configured GeoTIFF tile cache capacity in bytes",
-        ),
-        &["collection"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static TILE_CACHE_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    let gauge = IntGaugeVec::new(
-        Opts::new(
-            "tile_cache_entries",
-            "Number of entries currently in the GeoTIFF tile cache",
-        ),
-        &["collection"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
+// GeoTIFF tile cache (per collection): compressed bytes of remote COGs.
+static TILE_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> =
+    LazyLock::new(|| CollectionCacheMetricSet::new("tile_cache", "GeoTIFF tile cache", true));
 
 // GeoTIFF decoded-chunk cache (#463) — process-global, byte-bounded LRU of
 // decoded (native) source tiles for LOCAL files, so the ~50–190 meta-tile
@@ -568,9 +604,7 @@ static SATELLITE_FRAME_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|
 // download scans. Set per scrape from the live engines, reset first so a
 // removed collection's series goes too.
 fn collection_gauge(name: &str, help: &str) -> IntGaugeVec {
-    let gauge = IntGaugeVec::new(Opts::new(name, help), &["collection"]).unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(IntGaugeVec::new(Opts::new(name, help), &["collection"]).unwrap())
 }
 
 static SATELLITE_FRAME_WINDOW_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -620,6 +654,12 @@ static GEOTIFF_DECODE_USED: LazyLock<IntGauge> = LazyLock::new(|| {
         "Reserved transient GeoTIFF decode memory",
     )
 });
+static GEOTIFF_DECODE_PEAK: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "geotiff_decode_reserved_peak_bytes",
+        "Most transient GeoTIFF decode memory reserved at once since the previous scrape",
+    )
+});
 static GEOTIFF_DECODE_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "geotiff_decode_capacity_bytes",
@@ -644,10 +684,25 @@ static NETCDF_FIELD_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
         false,
     )
 });
+// The open file handles of each NetCDF catalog (#1307): what the readers
+// parsed, held for as long as a file is catalogued.
+static NETCDF_OPEN_FILE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "netcdf_open_file_bytes",
+        "Estimated heap bytes of a NetCDF collection's open file handles: their parsed \
+         metadata",
+    )
+});
 static NETCDF_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "netcdf_read_reserved_bytes",
         "Reserved transient NetCDF field-read memory",
+    )
+});
+static NETCDF_READ_PEAK: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "netcdf_read_reserved_peak_bytes",
+        "Most transient NetCDF field-read memory reserved at once since the previous scrape",
     )
 });
 static NETCDF_READ_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -771,14 +826,24 @@ static STATION_FRAME_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| 
 // per-query duration/rows/error histograms are a follow-up — see the metrics
 // block in metrics_handler).
 fn pg_int_gauge(name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
-    let gauge = IntGaugeVec::new(Opts::new(name, help), labels).unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    labelled(
+        IntGaugeVec::new(Opts::new(name, help), labels).unwrap(),
+        labels,
+    )
 }
 fn pg_int_counter(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
-    let counter = IntCounterVec::new(Opts::new(name, help), labels).unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    labelled(
+        IntCounterVec::new(Opts::new(name, help), labels).unwrap(),
+        labels,
+    )
+}
+/// Register `family`, [`per_collection`] when `labels` has `collection`.
+fn labelled<T: MetricVecBuilder + 'static>(family: MetricVec<T>, labels: &[&str]) -> MetricVec<T> {
+    if labels.contains(&"collection") {
+        return per_collection(family);
+    }
+    REGISTRY.register(Box::new(family.clone())).unwrap();
+    family
 }
 static POSTGIS_UP: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     pg_int_gauge(
@@ -874,8 +939,7 @@ static WIS2_LAST_MESSAGE_AGE_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 static WIS2_NOTIFICATION_LAG_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
     let gauge = GaugeVec::new(
@@ -886,8 +950,7 @@ static WIS2_NOTIFICATION_LAG_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 static WIS2_MESSAGES_RECEIVED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     pg_int_counter(
@@ -932,6 +995,20 @@ static WIS2_INTEGRITY_UNVERIFIED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
         &["collection"],
     )
 });
+// The duplicate filter of each WIS2 subscription (#1307): PT1H by default,
+// at most 200000 data_ids.
+static WIS2_DEDUP_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "wis2_dedup_entries",
+        "WIS2 data_ids the duplicate filter remembers (cap 200000)",
+    )
+});
+static WIS2_DEDUP_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "wis2_dedup_bytes",
+        "Estimated heap bytes of the WIS2 duplicate filter: data_ids and message ids",
+    )
+});
 // CAP engine (every source mode).
 static CAP_ALERTS_ACTIVE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     pg_int_gauge(
@@ -945,6 +1022,16 @@ static CAP_ALERTS_HELD: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         "cap_alerts_held",
         "Alerts held in the WIS2 accumulator (WIS2 mode only)",
         &["collection"],
+    )
+});
+// Memory the CAP engine holds outside every cache (#1307).
+static CAP_ALERT_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "cap_alert_bytes",
+        "Estimated heap bytes a CAP collection holds, by part: accumulator = the WIS2 alerts \
+         held with their hints and tombstones, catalog = the published alert areas and \
+         features, geocode = the geocode_geometry zone lookup",
+        &["collection", "part"],
     )
 });
 static CAP_ALERTS_SUPERSEDED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -998,6 +1085,33 @@ static BUFR_REPORTS_STORED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
 });
+// Memory the BUFR store holds outside every cache (#1307), estimated when
+// the store's metadata snapshot is rebuilt.
+static BUFR_STORE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "bufr_store_bytes",
+        "Estimated heap bytes of the BUFR observation store: stations and report rows",
+    )
+});
+static BUFR_SNAPSHOT_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "bufr_snapshot_bytes",
+        "Estimated heap bytes of the BUFR store's metadata snapshot: stations, locations, \
+         features",
+    )
+});
+static BUFR_DELETION_INDEX_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "bufr_deletion_index_entries",
+        "WIS2 data_ids the BUFR deletion index remembers, the rows each produced (cap 200000)",
+    )
+});
+static BUFR_DELETION_INDEX_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "bufr_deletion_index_bytes",
+        "Estimated heap bytes of the BUFR WIS2 deletion index",
+    )
+});
 static BUFR_SCANS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     pg_int_counter(
         "bufr_scans_total",
@@ -1038,6 +1152,12 @@ fn scrape_wis2_status(
     WIS2_BROKER_CONNECTED
         .with_label_values(&[cid])
         .set((snap.connected && snap.subscribed) as i64);
+    WIS2_DEDUP_ENTRIES
+        .with_label_values(&[cid])
+        .set(snap.dedup_entries.min(i64::MAX as u64) as i64);
+    WIS2_DEDUP_BYTES
+        .with_label_values(&[cid])
+        .set(snap.dedup_bytes.min(i64::MAX as u64) as i64);
     if let Some(age) = snap.last_message_age_secs {
         WIS2_LAST_MESSAGE_AGE_SECONDS
             .with_label_values(&[cid])
@@ -1106,8 +1226,7 @@ static POSTGIS_METADATA_REFRESH_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 
 // Rendered image cache (global — shared across all collections that render).
@@ -1158,10 +1277,25 @@ static PVOL_PIXEL_READ_ABORTS: LazyLock<[DeltaCounter; 2]> = LazyLock::new(|| {
 
 // PVOL EDR read admission (#1041): the bytes an EDR walk's volume batches
 // fetch and decode, process-global like the GeoTIFF/Zarr budgets.
+// The PVOL catalog of each odim-volume source (#1307): parsed volume
+// metadata, no pixels.
+static PVOL_CATALOG_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "pvol_catalog_bytes",
+        "Estimated heap bytes of a PVOL source's catalog: the parsed metadata of its volumes \
+         and sites",
+    )
+});
 static PVOL_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "pvol_read_reserved_bytes",
         "Reserved PVOL EDR read memory: volume bytes fetched and moments decoded",
+    )
+});
+static PVOL_READ_PEAK: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "pvol_read_reserved_peak_bytes",
+        "Most PVOL EDR read memory reserved at once since the previous scrape",
     )
 });
 static PVOL_READ_LIMIT: LazyLock<IntGauge> =
@@ -1233,6 +1367,30 @@ static METATILE_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
     CacheMetricSet::new("metatile_cache", "meta-tile pixel cache", None, None, true)
 });
 
+// MVT tile cache (#1307): process-wide, encoded vector tiles of every
+// Tiles collection, 128 MiB.
+static VECTOR_TILE_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "vector_tile_cache",
+        "MVT tile cache",
+        None,
+        Some("tile encodes"),
+        true,
+    )
+});
+
+// Solid-image memo (#1307): the encoded all-nodata images and WMS error
+// tiles, 32 MiB.
+static SOLID_IMAGE_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "solid_image_cache",
+        "solid-image memo",
+        None,
+        Some("image encodes"),
+        true,
+    )
+});
+
 static METATILE_DECLINES: LazyLock<DeltaCounter> = LazyLock::new(|| {
     DeltaCounter::new(
         "metatile_declines_total",
@@ -1244,55 +1402,84 @@ static METATILE_DECLINES: LazyLock<DeltaCounter> = LazyLock::new(|| {
     )
 });
 
-/// Standard cache metrics labelled by collection; callers hold the scrape-state lock.
+/// Standard cache metrics labelled by collection; callers hold the
+/// scrape-state lock. Every series of a collection exists from the first
+/// scrape that finds its engine, counters at 0 before any lookup, so a
+/// hit-ratio panel shows a cache no one has read yet; a reload that removes
+/// the collection drops them ([`per_collection`], #1307).
 struct CollectionCacheMetricSet {
     counters: [IntCounterVec; 2],
     gauges: [IntGaugeVec; 2],
+    entries: Option<IntGaugeVec>,
 }
 
 impl CollectionCacheMetricSet {
-    fn new(prefix: &str, display: &str) -> Self {
+    fn new(prefix: &str, display: &str, with_entries: bool) -> Self {
         let counters = ["hits", "misses"].map(|suffix| {
-            let counter = IntCounterVec::new(
-                Opts::new(
-                    format!("{prefix}_{suffix}_total"),
-                    format!("{display} {suffix}"),
-                ),
-                &["collection"],
+            per_collection(
+                IntCounterVec::new(
+                    Opts::new(
+                        format!("{prefix}_{suffix}_total"),
+                        format!("{display} {suffix}"),
+                    ),
+                    &["collection"],
+                )
+                .unwrap(),
             )
-            .unwrap();
-            REGISTRY.register(Box::new(counter.clone())).unwrap();
-            counter
         });
         let gauges = [
             ("bytes", "Resident bytes"),
             ("capacity_bytes", "Configured capacity in bytes"),
         ]
         .map(|(suffix, help)| {
-            let gauge = IntGaugeVec::new(
-                Opts::new(format!("{prefix}_{suffix}"), format!("{display}: {help}")),
-                &["collection"],
+            per_collection(
+                IntGaugeVec::new(
+                    Opts::new(format!("{prefix}_{suffix}"), format!("{display}: {help}")),
+                    &["collection"],
+                )
+                .unwrap(),
             )
-            .unwrap();
-            REGISTRY.register(Box::new(gauge.clone())).unwrap();
-            gauge
         });
-        Self { counters, gauges }
+        let entries = with_entries.then(|| {
+            per_collection(
+                IntGaugeVec::new(
+                    Opts::new(
+                        format!("{prefix}_entries"),
+                        format!("{display}: Entries held"),
+                    ),
+                    &["collection"],
+                )
+                .unwrap(),
+            )
+        });
+        Self {
+            counters,
+            gauges,
+            entries,
+        }
     }
 
-    fn update(&self, collection: &str, metrics: ds_cache::CacheMetrics, previous: &mut (u64, u64)) {
+    /// Feed one scrape's snapshot. `entries` only lands if the set was
+    /// built `with_entries`.
+    fn update(
+        &self,
+        collection: &str,
+        metrics: ds_cache::CacheMetrics,
+        entries: Option<u64>,
+        previous: &mut (u64, u64),
+    ) {
         let current = (metrics.hits, metrics.misses);
-        // Match the per-source grid cache's reload rebaselining policy.
-        if current.0 >= previous.0 && current.1 >= previous.1 {
-            for (counter, delta) in self
-                .counters
-                .iter()
-                .zip([current.0 - previous.0, current.1 - previous.1])
-            {
-                counter.with_label_values(&[collection]).inc_by(delta);
-            }
-        }
+        // A backward step is a replaced cache: rebaseline without a spike.
+        let deltas = if current.0 >= previous.0 && current.1 >= previous.1 {
+            [current.0 - previous.0, current.1 - previous.1]
+        } else {
+            [0, 0]
+        };
         *previous = current;
+        // Always touched, so both series exist before the first lookup.
+        for (counter, delta) in self.counters.iter().zip(deltas) {
+            counter.with_label_values(&[collection]).inc_by(delta);
+        }
         for (gauge, value) in self
             .gauges
             .iter()
@@ -1302,17 +1489,22 @@ impl CollectionCacheMetricSet {
                 .with_label_values(&[collection])
                 .set(value.min(i64::MAX as u64) as i64);
         }
+        if let (Some(gauge), Some(n)) = (&self.entries, entries) {
+            gauge
+                .with_label_values(&[collection])
+                .set(n.min(i64::MAX as u64) as i64);
+        }
     }
 }
 
 // Compressed GRIB messages are shared by all level views of a source.
 static GRIB_MESSAGE_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
-    CollectionCacheMetricSet::new("grib_message_cache", "GRIB compressed-message cache")
+    CollectionCacheMetricSet::new("grib_message_cache", "GRIB compressed-message cache", false)
 });
 // Point indexes of CCSDS (#1300) and complex-packed (#1302) messages, per
 // source like the message cache.
 static GRIB_POINT_INDEX_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
-    CollectionCacheMetricSet::new("grib_point_index_cache", "GRIB point-index cache")
+    CollectionCacheMetricSet::new("grib_point_index_cache", "GRIB point-index cache", false)
 });
 static GRIB_POINT_FIELDS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -1325,8 +1517,7 @@ static GRIB_POINT_FIELDS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection", "path"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 static GRIB_POINT_FETCHES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -1338,8 +1529,7 @@ static GRIB_POINT_FETCHES: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection", "mode"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 static GRIB_POINT_FETCH_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -1350,16 +1540,25 @@ static GRIB_POINT_FETCH_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection", "mode"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 static ZARR_DECODED_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
-    CollectionCacheMetricSet::new("zarr_decoded_cache", "Zarr decoded chunk cache")
+    CollectionCacheMetricSet::new("zarr_decoded_cache", "Zarr decoded chunk cache", false)
+});
+// A plain Zarr store's object cache (`[zarr] cache_mb`, #1307).
+static ZARR_OBJECT_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
+    CollectionCacheMetricSet::new("zarr_object_cache", "Zarr object cache", false)
 });
 static ZARR_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "zarr_read_reserved_bytes",
         "Reserved Zarr source/decode working-set estimate",
+    )
+});
+static ZARR_READ_PEAK: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "zarr_read_reserved_peak_bytes",
+        "Most Zarr source/decode working-set estimate reserved at once since the previous scrape",
     )
 });
 static ZARR_READ_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -1375,65 +1574,9 @@ static ZARR_READ_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
     )
 });
 
-// GRIB grid cache (per-collection).
-static GRID_CACHE_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    let counter = IntCounterVec::new(
-        Opts::new("grid_cache_hits_total", "GRIB grid cache hits"),
-        &["collection"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static GRID_CACHE_MISSES: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    let counter = IntCounterVec::new(
-        Opts::new("grid_cache_misses_total", "GRIB grid cache misses"),
-        &["collection"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static GRID_CACHE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    let gauge = IntGaugeVec::new(
-        Opts::new(
-            "grid_cache_bytes",
-            "Bytes currently held in the GRIB grid cache",
-        ),
-        &["collection"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static GRID_CACHE_CAPACITY_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    let gauge = IntGaugeVec::new(
-        Opts::new(
-            "grid_cache_capacity_bytes",
-            "Configured GRIB grid cache capacity in bytes",
-        ),
-        &["collection"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static GRID_CACHE_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    let gauge = IntGaugeVec::new(
-        Opts::new(
-            "grid_cache_entries",
-            "Number of entries currently in the GRIB grid cache",
-        ),
-        &["collection"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
+// GRIB grid cache (per source, shared by its level collections).
+static GRID_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> =
+    LazyLock::new(|| CollectionCacheMetricSet::new("grid_cache", "GRIB grid cache", true));
 
 /// Tracks the last observed (hits, misses) snapshot per (cache_kind, collection)
 /// for the **labelled per-collection** cache families, so that the metrics
@@ -1460,6 +1603,7 @@ struct CacheCounterState {
     /// reload-rebaseline scheme.
     grib_point_fetches: HashMap<String, [(u64, u64); 4]>,
     zarr_decoded: HashMap<String, (u64, u64)>,
+    zarr_object: HashMap<String, (u64, u64)>,
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
     /// the scrape rebaselines on a backward step — see `metrics_handler`.
@@ -1488,6 +1632,49 @@ struct CacheCounterState {
     storage_host_throttled: HashMap<String, [u64; 1]>,
 }
 
+impl CacheCounterState {
+    /// Drop the last-seen counts of `removed` collections (#1307). Hosts
+    /// are not collections and keep theirs.
+    fn forget(&mut self, removed: &HashSet<&str>) {
+        fn drop_keys<V>(map: &mut HashMap<String, V>, removed: &HashSet<&str>) {
+            map.retain(|id, _| !removed.contains(id.as_str()));
+        }
+        let Self {
+            tile,
+            grid,
+            grib_message,
+            grib_point_index,
+            grib_point_fields,
+            grib_point_fetches,
+            zarr_decoded,
+            zarr_object,
+            postgis,
+            nowcast,
+            nowcast_tracks,
+            wis2,
+            cap,
+            bufr,
+            station_grid,
+            storage_host_throttled: _,
+        } = self;
+        drop_keys(tile, removed);
+        drop_keys(grid, removed);
+        drop_keys(grib_message, removed);
+        drop_keys(grib_point_index, removed);
+        drop_keys(grib_point_fields, removed);
+        drop_keys(grib_point_fetches, removed);
+        drop_keys(zarr_decoded, removed);
+        drop_keys(zarr_object, removed);
+        drop_keys(postgis, removed);
+        drop_keys(nowcast, removed);
+        drop_keys(nowcast_tracks, removed);
+        drop_keys(wis2, removed);
+        drop_keys(cap, removed);
+        drop_keys(bufr, removed);
+        drop_keys(station_grid, removed);
+    }
+}
+
 // Station grids (#1082): the stations behind the latest analysis is the
 // first thing to check when one looks wrong.
 static STATION_GRID_STATIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -1499,8 +1686,7 @@ static STATION_GRID_STATIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["collection", "parameter"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 
 static STATION_GRID_ANALYSES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1512,8 +1698,7 @@ static STATION_GRID_ANALYSES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 
 static STATION_GRID_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1525,8 +1710,7 @@ static STATION_GRID_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 
 static STATION_GRID_LAST_ANALYSIS_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -1538,8 +1722,7 @@ static STATION_GRID_LAST_ANALYSIS_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 
 // Leave-one-out residuals (#1206): how well the analysis fits its stations.
@@ -1553,8 +1736,7 @@ static STATION_GRID_LOO_RMSE: LazyLock<GaugeVec> = LazyLock::new(|| {
         &["collection", "parameter"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 
 static STATION_GRID_LOO_RESIDUALS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -1567,8 +1749,7 @@ static STATION_GRID_LOO_RESIDUALS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["collection", "parameter"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 
 /// Set the leave-one-out gauges from each engine's latest analyses,
@@ -1609,6 +1790,12 @@ static STATION_GRID_COMPUTE_USED: LazyLock<IntGauge> = LazyLock::new(|| {
         "Bytes reserved by station-grid analyses being computed",
     )
 });
+static STATION_GRID_COMPUTE_PEAK: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "station_grid_compute_reserved_peak_bytes",
+        "Most bytes station-grid analyses reserved at once since the previous scrape",
+    )
+});
 static STATION_GRID_COMPUTE_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "station_grid_compute_capacity_bytes",
@@ -1631,8 +1818,7 @@ static NOWCAST_CELL_BIRTHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 
 static NOWCAST_CELL_DEATHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1644,8 +1830,7 @@ static NOWCAST_CELL_DEATHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 
 static NOWCAST_CELL_PASS1_MATCHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1657,8 +1842,7 @@ static NOWCAST_CELL_PASS1_MATCHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 
 static NOWCAST_CELL_PASS2_MATCHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1670,8 +1854,7 @@ static NOWCAST_CELL_PASS2_MATCHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 
 static NOWCAST_CELL_VELOCITY_CLAMPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1683,8 +1866,7 @@ static NOWCAST_CELL_VELOCITY_CLAMPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::n
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 
 static NOWCAST_GENERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1696,8 +1878,7 @@ static NOWCAST_GENERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 
 static NOWCAST_GENERATION_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -1709,8 +1890,7 @@ static NOWCAST_GENERATION_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 
 static NOWCAST_LAST_GENERATION_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -1722,8 +1902,7 @@ static NOWCAST_LAST_GENERATION_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 
 static NOWCAST_SOURCE_LAG_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -1735,8 +1914,7 @@ static NOWCAST_SOURCE_LAG_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 
 static NOWCAST_RETAINED_GENERATIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -1748,8 +1926,7 @@ static NOWCAST_RETAINED_GENERATIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 
 static NOWCAST_FRAMES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -1761,8 +1938,16 @@ static NOWCAST_FRAMES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
+});
+
+// The frames the retained generations hold (#1307): exact, width × height
+// × frames × 1 byte (u8 source) or 4 (f32 fallback).
+static NOWCAST_FRAME_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "nowcast_frame_bytes",
+        "Bytes of the frames a nowcast collection's retained generations hold",
+    )
 });
 
 static NOWCAST_LEAD1_CSI: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -1775,8 +1960,7 @@ static NOWCAST_LEAD1_CSI: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 
 static NOWCAST_LEAD1_PERSISTENCE_CSI: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -1789,8 +1973,7 @@ static NOWCAST_LEAD1_PERSISTENCE_CSI: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["collection"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+    per_collection(gauge)
 });
 
 static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -1848,6 +2031,12 @@ static RENDER_MEMORY_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
         "Available transient raster render budget",
     )
 });
+static RENDER_MEMORY_PEAK: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "render_budget_reserved_peak_bytes",
+        "Most transient raster render budget reserved at once since the previous scrape",
+    )
+});
 static RENDER_MEMORY_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "render_budget_total_bytes",
@@ -1875,6 +2064,12 @@ static EDR_RESPONSE_USED: LazyLock<IntGauge> = LazyLock::new(|| {
         "Reserved EDR response body memory",
     )
 });
+static EDR_RESPONSE_PEAK: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "edr_response_reserved_peak_bytes",
+        "Most EDR response body memory reserved at once since the previous scrape",
+    )
+});
 static EDR_RESPONSE_LIMIT: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "edr_response_capacity_bytes",
@@ -1888,6 +2083,37 @@ static EDR_RESPONSE_REJECTED: LazyLock<DeltaCounter> = LazyLock::new(|| {
     )
 });
 
+/// The `*_reserved_peak_bytes` gauge of an admission budget, by its id in
+/// the memory plan (#1307). A budget missing here gets no peak gauge, which
+/// `cache_plan::tests::every_cache_and_budget_on_metrics_is_in_the_plan`
+/// catches.
+fn budget_peak_gauge(id: &str) -> Option<&'static IntGauge> {
+    let gauge = match id {
+        "render_budget" => &RENDER_MEMORY_PEAK,
+        "edr_response" => &EDR_RESPONSE_PEAK,
+        "geotiff_decode" => &GEOTIFF_DECODE_PEAK,
+        "zarr_read" => &ZARR_READ_PEAK,
+        "netcdf_read" => &NETCDF_READ_PEAK,
+        "pvol_read" => &PVOL_READ_PEAK,
+        "station_grid_compute" => &STATION_GRID_COMPUTE_PEAK,
+        _ => return None,
+    };
+    Some(LazyLock::force(gauge))
+}
+
+/// Set each admission budget's `*_reserved_peak_bytes` to the most it held
+/// at once since the previous scrape, which restarts its mark (#1307). Only
+/// `/metrics` takes the marks: `/admin/cache-plan` and the plan's log block
+/// refresh the other families, and a mark taken there would hide a burst
+/// from the next scrape.
+fn update_budget_peaks() {
+    for (entry, peak) in ds_cache::plan::take_peaks() {
+        if let Some(gauge) = budget_peak_gauge(entry.id) {
+            gauge.set(peak.min(i64::MAX as u64) as i64);
+        }
+    }
+}
+
 static STORAGE_BYTES_READ: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
@@ -1897,8 +2123,7 @@ static STORAGE_BYTES_READ: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["collection", "engine_type"],
     )
     .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
+    per_collection(counter)
 });
 
 // ---------------------------------------------------------------------------
@@ -6744,6 +6969,15 @@ fn apply_load(
         "Reload complete: {ready} ready ({degraded} degraded) of {} configured",
         config.collections.len()
     );
+    // Metric-label hygiene for every per-collection family (#1307): a
+    // removed collection's series go, a rebuilt one's stay. After the
+    // engine lists, so no scrape re-creates them from the old ones.
+    let removed: HashSet<&str> = old_collections
+        .keys()
+        .filter(|id| !config.collections.iter().any(|c| &c.id == *id))
+        .map(String::as_str)
+        .collect();
+    prune_collection_series(&removed);
     crate::cache_plan::register_render_caches(state);
     crate::cache_plan::log(
         state,
@@ -7322,6 +7556,7 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
 /// so Prometheus always gets a fresh snapshot.
 pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoResponse {
     refresh_metrics(&state);
+    update_budget_peaks();
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
     let mut buffer = Vec::new();
@@ -7359,6 +7594,7 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
     RENDER_MEMORY_AVAILABLE.set(memory.available().min(i64::MAX as u64) as i64);
     RENDER_MEMORY_TOTAL.set(memory.capacity().min(i64::MAX as u64) as i64);
     let reading = update_memory_gauges();
+    PROCESS_START_TIME.set(*PROCESS_STARTED.get_or_init(unix_now));
 
     // Delta-tracked cache counters: cache implementations expose cumulative
     // (hits, misses) values but may be replaced on reload; each CacheMetricSet
@@ -7385,6 +7621,13 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
     // Meta-tile pixel cache: global, same delta-tracking as the rendered cache.
     METATILE_CACHE_METRICS.update(wms.tile_cache.metrics(), Some(wms.tile_cache.len() as u64));
     METATILE_DECLINES.feed(ds_render::metatile::budget_declines_total());
+    // MVT tile cache and solid-image memo (#1307): process-wide, kept or
+    // rebuilt with the render caches.
+    let tiles = state.tiles.load();
+    let vector = &tiles.vector_tile_cache;
+    VECTOR_TILE_CACHE_METRICS.update(vector.metrics(), Some(vector.len() as u64));
+    let (solid, solid_entries) = ds_render::solid_image_cache_metrics();
+    SOLID_IMAGE_CACHE_METRICS.update(solid, Some(solid_entries));
 
     // PVOL lazy pixel cache: process-global (never replaced on reload). Only
     // emit when PVOL collections are loaded, so non-radar deployments don't
@@ -7412,6 +7655,16 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
         // Voxel-grid + storm-cell set caches: same process-global shape.
         PVOL_VOXEL_GRID_CACHE_METRICS.update(engine_odim::voxel_grid_cache_metrics(), None);
         PVOL_CELL_SET_CACHE_METRICS.update(engine_odim::cell_set_cache_metrics(), None);
+        for engine in state
+            .odim_volume_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            PVOL_CATALOG_BYTES
+                .with_label_values(&[engine.collection_id()])
+                .set(engine.catalog_bytes().min(i64::MAX as u64) as i64);
+        }
     }
 
     // COMP composite cache: same process-global shape as the PVOL caches.
@@ -7467,6 +7720,16 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
         NETCDF_DETACHED_PENDING.set(pending.min(i64::MAX as usize) as i64);
         NETCDF_DETACHED_TOTAL.feed(detached);
         NETCDF_DETACHED_INLINE.feed(inline);
+        for engine in state
+            .netcdf_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            NETCDF_OPEN_FILE_BYTES
+                .with_label_values(&[engine.collection_id()])
+                .set(engine.open_file_bytes().min(i64::MAX as u64) as i64);
+        }
     }
     // Hosts behind `ds_storage::build_http_store_limited`: today the remote
     // NetCDF sources.
@@ -7530,41 +7793,23 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
         None,
     );
 
-    // Tile cache: per-collection
+    // Tile cache: per-collection, every collection's series from boot.
     if let Ok(engines) = state.geotiff_engines.read() {
         for engine in engines.iter() {
             let collection = engine.collection_id();
             let (hits, misses) = engine.tile_cache_stats();
-            let entry = counter_state
-                .tile
-                .entry(collection.to_string())
-                .or_insert((0, 0));
-            if hits < entry.0 || misses < entry.1 {
-                *entry = (hits, misses);
-            } else {
-                let dh = hits - entry.0;
-                let dm = misses - entry.1;
-                if dh > 0 {
-                    TILE_CACHE_HITS.with_label_values(&[collection]).inc_by(dh);
-                }
-                if dm > 0 {
-                    TILE_CACHE_MISSES
-                        .with_label_values(&[collection])
-                        .inc_by(dm);
-                }
-                *entry = (hits, misses);
-            }
-
-            let (bytes_used, capacity_bytes, entries) = engine.tile_cache_utilization();
-            TILE_CACHE_BYTES
-                .with_label_values(&[collection])
-                .set(bytes_used as i64);
-            TILE_CACHE_CAPACITY_BYTES
-                .with_label_values(&[collection])
-                .set(capacity_bytes as i64);
-            TILE_CACHE_ENTRIES
-                .with_label_values(&[collection])
-                .set(entries as i64);
+            let (bytes, capacity_bytes, entries) = engine.tile_cache_utilization();
+            TILE_CACHE_METRICS.update(
+                collection,
+                ds_cache::CacheMetrics {
+                    hits,
+                    misses,
+                    bytes,
+                    capacity_bytes,
+                },
+                Some(entries as u64),
+                counter_state.tile.entry(collection.to_owned()).or_default(),
+            );
 
             // Update per-collection storage bytes
             let bytes = engine.storage_bytes_read();
@@ -7591,11 +7836,24 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
             ZARR_DECODED_CACHE_METRICS.update(
                 collection,
                 engine.decoded_cache_metrics(),
+                None,
                 counter_state
                     .zarr_decoded
                     .entry(collection.to_owned())
                     .or_default(),
             );
+            // A plain store's; an Icechunk repository has none.
+            if let Some(metrics) = engine.object_cache_metrics() {
+                ZARR_OBJECT_CACHE_METRICS.update(
+                    collection,
+                    metrics,
+                    None,
+                    counter_state
+                        .zarr_object
+                        .entry(collection.to_owned())
+                        .or_default(),
+                );
+            }
         }
     }
 
@@ -7606,6 +7864,7 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
             GRIB_MESSAGE_CACHE_METRICS.update(
                 collection,
                 engine.message_cache_metrics(),
+                None,
                 counter_state
                     .grib_message
                     .entry(collection.to_owned())
@@ -7614,6 +7873,7 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
             GRIB_POINT_INDEX_CACHE_METRICS.update(
                 collection,
                 engine.point_index_cache_metrics(),
+                None,
                 counter_state
                     .grib_point_index
                     .entry(collection.to_owned())
@@ -7661,36 +7921,18 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
             }
             *previous = fetches.map(|(_, gets, bytes)| (gets, bytes));
             let (hits, misses) = engine.grid_cache_stats();
-            let entry = counter_state
-                .grid
-                .entry(collection.to_string())
-                .or_insert((0, 0));
-            if hits < entry.0 || misses < entry.1 {
-                *entry = (hits, misses);
-            } else {
-                let dh = hits - entry.0;
-                let dm = misses - entry.1;
-                if dh > 0 {
-                    GRID_CACHE_HITS.with_label_values(&[collection]).inc_by(dh);
-                }
-                if dm > 0 {
-                    GRID_CACHE_MISSES
-                        .with_label_values(&[collection])
-                        .inc_by(dm);
-                }
-                *entry = (hits, misses);
-            }
-
-            let (bytes_used, capacity_bytes, entries) = engine.grid_cache_utilization();
-            GRID_CACHE_BYTES
-                .with_label_values(&[collection])
-                .set(bytes_used as i64);
-            GRID_CACHE_CAPACITY_BYTES
-                .with_label_values(&[collection])
-                .set(capacity_bytes as i64);
-            GRID_CACHE_ENTRIES
-                .with_label_values(&[collection])
-                .set(entries as i64);
+            let (bytes, capacity_bytes, entries) = engine.grid_cache_utilization();
+            GRID_CACHE_METRICS.update(
+                collection,
+                ds_cache::CacheMetrics {
+                    hits,
+                    misses,
+                    bytes,
+                    capacity_bytes,
+                },
+                Some(entries as u64),
+                counter_state.grid.entry(collection.to_owned()).or_default(),
+            );
 
             let bytes = engine.storage_bytes_read();
             if bytes > 0 {
@@ -7799,23 +8041,20 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                 .nowcast
                 .entry(collection.to_string())
                 .or_insert((0, 0));
-            if generations < entry.0 || failures < entry.1 {
-                *entry = (generations, failures);
+            // A backward step rebaselines; touched either way, so the
+            // series exist from boot (#1307).
+            let (dg, df) = if generations < entry.0 || failures < entry.1 {
+                (0, 0)
             } else {
-                let dg = generations - entry.0;
-                let df = failures - entry.1;
-                if dg > 0 {
-                    NOWCAST_GENERATIONS
-                        .with_label_values(&[collection])
-                        .inc_by(dg);
-                }
-                if df > 0 {
-                    NOWCAST_GENERATION_FAILURES
-                        .with_label_values(&[collection])
-                        .inc_by(df);
-                }
-                *entry = (generations, failures);
-            }
+                (generations - entry.0, failures - entry.1)
+            };
+            *entry = (generations, failures);
+            NOWCAST_GENERATIONS
+                .with_label_values(&[collection])
+                .inc_by(dg);
+            NOWCAST_GENERATION_FAILURES
+                .with_label_values(&[collection])
+                .inc_by(df);
             NOWCAST_LAST_GENERATION_MS
                 .with_label_values(&[collection])
                 .set(last_ms as i64);
@@ -7828,32 +8067,30 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
             NOWCAST_FRAMES
                 .with_label_values(&[collection])
                 .set(frames as i64);
+            NOWCAST_FRAME_BYTES
+                .with_label_values(&[collection])
+                .set(engine.frame_bytes().min(i64::MAX as u64) as i64);
             let tracks = engine.track_metrics();
             let t = counter_state
                 .nowcast_tracks
                 .entry(collection.to_string())
                 .or_insert((0, 0, 0, 0, 0));
-            if tracks.0 < t.0
+            let backward = tracks.0 < t.0
                 || tracks.1 < t.1
                 || tracks.2 < t.2
                 || tracks.3 < t.3
-                || tracks.4 < t.4
-            {
-                *t = tracks;
-            } else {
-                for (delta, counter) in [
-                    (tracks.0 - t.0, &*NOWCAST_CELL_BIRTHS_TOTAL),
-                    (tracks.1 - t.1, &*NOWCAST_CELL_DEATHS_TOTAL),
-                    (tracks.2 - t.2, &*NOWCAST_CELL_PASS1_MATCHES_TOTAL),
-                    (tracks.3 - t.3, &*NOWCAST_CELL_PASS2_MATCHES_TOTAL),
-                    (tracks.4 - t.4, &*NOWCAST_CELL_VELOCITY_CLAMPS_TOTAL),
-                ] {
-                    if delta > 0 {
-                        counter.with_label_values(&[collection]).inc_by(delta);
-                    }
-                }
-                *t = tracks;
+                || tracks.4 < t.4;
+            let since = |now: u64, was: u64| if backward { 0 } else { now - was };
+            for (delta, counter) in [
+                (since(tracks.0, t.0), &*NOWCAST_CELL_BIRTHS_TOTAL),
+                (since(tracks.1, t.1), &*NOWCAST_CELL_DEATHS_TOTAL),
+                (since(tracks.2, t.2), &*NOWCAST_CELL_PASS1_MATCHES_TOTAL),
+                (since(tracks.3, t.3), &*NOWCAST_CELL_PASS2_MATCHES_TOTAL),
+                (since(tracks.4, t.4), &*NOWCAST_CELL_VELOCITY_CLAMPS_TOTAL),
+            ] {
+                counter.with_label_values(&[collection]).inc_by(delta);
             }
+            *t = tracks;
             if let Some((csi, persistence)) = engine.skill_permille() {
                 NOWCAST_LEAD1_CSI
                     .with_label_values(&[collection])
@@ -7913,6 +8150,18 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
             CAP_ALERTS_ACTIVE
                 .with_label_values(&[cid])
                 .set(engine.record_count() as i64);
+            let memory = engine.memory();
+            for (part, bytes) in [
+                ("accumulator", memory.accumulator_bytes),
+                ("catalog", Some(memory.catalog_bytes)),
+                ("geocode", memory.geocode_bytes),
+            ] {
+                if let Some(bytes) = bytes {
+                    CAP_ALERT_BYTES
+                        .with_label_values(&[cid, part])
+                        .set(bytes.min(i64::MAX as u64) as i64);
+                }
+            }
             let src = engine.wis2_source_stats().unwrap_or([0; 8]);
             let cur = [
                 engine.superseded_total(),
@@ -7967,6 +8216,22 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
             BUFR_REPORTS_STORED
                 .with_label_values(&[cid])
                 .set(reports as i64);
+            let memory = engine.store_memory();
+            let clamp = |n: u64| n.min(i64::MAX as u64) as i64;
+            BUFR_STORE_BYTES
+                .with_label_values(&[cid])
+                .set(clamp(memory.store_bytes));
+            BUFR_SNAPSHOT_BYTES
+                .with_label_values(&[cid])
+                .set(clamp(memory.snapshot_bytes));
+            if let Some((entries, bytes)) = memory.deletion_index {
+                BUFR_DELETION_INDEX_ENTRIES
+                    .with_label_values(&[cid])
+                    .set(clamp(entries));
+                BUFR_DELETION_INDEX_BYTES
+                    .with_label_values(&[cid])
+                    .set(clamp(bytes));
+            }
             let d = delta_counts(&mut counter_state.bufr, cid, engine.health.counters());
             BUFR_SCANS_TOTAL
                 .with_label_values(&[cid, "ok"])
@@ -8491,9 +8756,11 @@ mod tests {
                 &*super::ZARR_DECODED_CACHE_METRICS,
                 "zarr-decoded-metrics-test",
             ),
+            (&*super::TILE_CACHE_METRICS, "tile-cache-metrics-test"),
         ] {
             let mut previous = (0, 0);
             for (hits, misses, bytes, capacity_bytes, expected) in [
+                (0, 0, 0, 1024, [0, 0]), // no lookup yet: the series at 0
                 (3, 5, 100, 1024, [3, 5]),
                 (3, 5, 100, 1024, [3, 5]), // repeated scrape
                 (5, 6, 200, 1024, [5, 6]),
@@ -8508,6 +8775,7 @@ mod tests {
                         bytes,
                         capacity_bytes,
                     },
+                    Some(hits),
                     &mut previous,
                 );
                 for (counter, expected) in metrics.counters.iter().zip(expected) {
@@ -8519,8 +8787,13 @@ mod tests {
                         expected as i64
                     );
                 }
+                if let Some(entries) = &metrics.entries {
+                    assert_eq!(entries.with_label_values(&[collection]).get(), hits as i64);
+                }
             }
         }
+        assert!(super::TILE_CACHE_METRICS.entries.is_some());
+        assert!(super::GRIB_MESSAGE_CACHE_METRICS.entries.is_none());
     }
 
     /// #897: u/v components give a derived speed on every API, styled with
@@ -11236,6 +11509,200 @@ prewarm_sweeps = 0
         super::do_reload(&state).unwrap();
         assert_eq!(render_series(gone), series(&[]), "removed collection");
         assert_eq!(render_series(kept), series(&[("cold", 1), ("hit", 1)]));
+    }
+
+    /// `/metrics` scraped through the handler.
+    async fn scrape(state: &super::AdminState) -> String {
+        use axum::response::IntoResponse;
+        let response = super::metrics_handler(axum::extract::State(state.clone()))
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    /// The series of `collection` in a scrape, `family{labels}` → value.
+    fn series_of(text: &str, collection: &str) -> std::collections::BTreeMap<String, f64> {
+        let label = format!("collection=\"{collection}\"");
+        text.lines()
+            .filter(|line| !line.starts_with('#') && line.contains(&label))
+            .filter_map(|line| {
+                let (series, value) = line.rsplit_once(' ')?;
+                Some((series.to_string(), value.parse().ok()?))
+            })
+            .collect()
+    }
+
+    /// #1307: every GeoTIFF collection has its tile-cache counters from the
+    /// first scrape, at 0 before any lookup; the BUFR, CAP and nowcast
+    /// stores report their memory; and a reload that removes a collection
+    /// removes its per-collection series, whatever the family, while a
+    /// kept one's stay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_collection_series_exist_from_boot_and_go_with_their_collection() {
+        let radar = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/radar-tm35fin");
+        let geotiff = |id: &str| {
+            format!(
+                "[[collections]]\nid = \"{id}\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 data_path = \"{radar}\"\nengine_type = \"geotiff\"\napis = [\"wms\"]\n\
+                 [collections.geotiff]\nfilename_template = \"radar_tm35_%Y%m%dT%H%MZ.tif\"\n\
+                 parameter = \"reflectivity\"\nunit = \"dBZ\"\n"
+            )
+        };
+        let (kept, gone) = ("series-kept", "series-gone");
+        let (bufr, cap, nowcast) = ("series-bufr", "series-cap", "series-nowcast");
+        let stores = format!(
+            "[[collections]]\nid = \"{bufr}\"\ntitle = \"t\"\ndescription = \"d\"\n\
+             engine_type = \"bufr\"\napis = [\"edr\"]\n\
+             [collections.bufr]\nretention = \"P36500D\"\n[collections.bufr.wis2]\n\
+             topics = [\"cache/a/wis2/test/data/core/weather/surface-based-observations/synop\"]\n\
+             [[collections]]\nid = \"{nowcast}\"\ntitle = \"t\"\ndescription = \"d\"\n\
+             engine_type = \"nowcast\"\napis = [\"wms\"]\n\
+             [collections.nowcast]\nsource = \"{kept}\"\n"
+        );
+        let wis2_cap = format!(
+            "[[collections]]\nid = \"{cap}\"\ntitle = \"t\"\ndescription = \"d\"\n\
+             engine_type = \"cap\"\napis = [\"features\"]\n\
+             [collections.cap]\n[collections.cap.wis2]\n\
+             topics = [\"cache/a/wis2/test/data/core/weather/advisories-warnings\"]\n"
+        );
+        let server = "[server]\nhost = \"127.0.0.1\"\nport = 8000\n";
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let all = [server, &geotiff(kept), &geotiff(gone), &stores, &wis2_cap].concat();
+        std::fs::write(&config_path, all).unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+        let bufr_engine = state.bufr_engines.read().unwrap()[0].clone();
+        let fixture = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/bufr-synop/synop_se-smhi_20260912T0800Z.bufr"
+        ))
+        .unwrap();
+        assert!(bufr_engine.ingest_bytes(&fixture, "fixture", chrono::Utc::now()) > 0);
+        bufr_engine.snapshot_if_dirty();
+
+        let text = scrape(&state).await;
+        for id in [kept, gone] {
+            let series = series_of(&text, id);
+            for family in ["tile_cache_hits_total", "tile_cache_misses_total"] {
+                let line = format!("{family}{{collection=\"{id}\"}}");
+                assert_eq!(series.get(&line), Some(&0.0), "{line} in {series:?}");
+            }
+            assert!(series.contains_key(&format!("tile_cache_entries{{collection=\"{id}\"}}")));
+        }
+        let bufr_series = series_of(&text, bufr);
+        let value = |series: &std::collections::BTreeMap<String, f64>, line: &str| {
+            *series
+                .get(line)
+                .unwrap_or_else(|| panic!("no {line} in {series:?}"))
+        };
+        assert!(
+            value(
+                &bufr_series,
+                &format!("bufr_store_bytes{{collection=\"{bufr}\"}}")
+            ) > 0.0
+        );
+        assert!(
+            value(
+                &bufr_series,
+                &format!("bufr_snapshot_bytes{{collection=\"{bufr}\"}}")
+            ) > 0.0
+        );
+        assert_eq!(
+            value(
+                &bufr_series,
+                &format!("bufr_deletion_index_entries{{collection=\"{bufr}\"}}")
+            ),
+            0.0,
+            "no WIS2 message yet"
+        );
+        let cap_series = series_of(&text, cap);
+        for part in ["accumulator", "catalog"] {
+            let line = format!("cap_alert_bytes{{collection=\"{cap}\",part=\"{part}\"}}");
+            assert!(cap_series.contains_key(&line), "{line} in {cap_series:?}");
+        }
+        assert!(
+            !cap_series.keys().any(|l| l.contains("part=\"geocode\"")),
+            "no lookup configured"
+        );
+        let line = format!("nowcast_frame_bytes{{collection=\"{nowcast}\"}}");
+        assert!(series_of(&text, nowcast).contains_key(&line), "{line}");
+        for family in [
+            "process_start_time_seconds",
+            "render_budget_reserved_peak_bytes",
+        ] {
+            assert!(
+                text.lines().any(|l| l.starts_with(&format!("{family} "))),
+                "{family}"
+            );
+        }
+
+        // Remove one GeoTIFF collection and the CAP one; keep the rest.
+        let fewer = [server, &geotiff(kept), &stores].concat();
+        std::fs::write(&config_path, fewer).unwrap();
+        super::do_reload(&state).unwrap();
+        let text = scrape(&state).await;
+        assert_eq!(
+            series_of(&text, gone),
+            Default::default(),
+            "removed collection"
+        );
+        assert_eq!(
+            series_of(&text, cap),
+            Default::default(),
+            "removed collection"
+        );
+        let line = format!("tile_cache_hits_total{{collection=\"{kept}\"}}");
+        assert!(
+            series_of(&text, kept).contains_key(&line),
+            "kept collection"
+        );
+        assert!(series_of(&text, bufr)
+            .contains_key(&format!("bufr_store_bytes{{collection=\"{bufr}\"}}")));
+    }
+
+    /// Every family labelled by `collection` goes through `per_collection`,
+    /// so a reload prunes it (#1307): one registered another way would keep
+    /// a removed collection's series.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_family_with_a_collection_label_is_pruned_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let radar = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/radar-tm35fin");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                 [[collections]]\nid = \"pruned-families\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 data_path = \"{radar}\"\nengine_type = \"geotiff\"\napis = [\"wms\"]\n\
+                 [collections.geotiff]\nfilename_template = \"radar_tm35_%Y%m%dT%H%MZ.tif\"\n\
+                 parameter = \"reflectivity\"\nunit = \"dBZ\"\n"
+            ),
+        )
+        .unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+        scrape(&state).await;
+        let pruned: std::collections::HashSet<String> = super::COLLECTION_FAMILIES
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        for family in super::REGISTRY.gather() {
+            let labelled = family
+                .get_metric()
+                .iter()
+                .any(|m| m.get_label().iter().any(|l| l.name() == "collection"));
+            if labelled {
+                assert!(
+                    pruned.contains(family.name()),
+                    "{} has a collection label but is not registered per_collection",
+                    family.name()
+                );
+            }
+        }
     }
 
     #[test]

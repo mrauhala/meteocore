@@ -1071,6 +1071,58 @@
                                 "spec": {
                                   "x": 0,
                                   "y": 8,
+                                  "width": 4,
+                                  "height": 4,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-125"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 12,
+                                  "width": 4,
+                                  "height": 4,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-127"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 4,
+                                  "y": 8,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-122"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 16,
+                                  "y": 8,
+                                  "width": 8,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-123"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 16,
                                   "width": 8,
                                   "height": 8,
                                   "element": {
@@ -1083,7 +1135,7 @@
                                 "kind": "GridLayoutItem",
                                 "spec": {
                                   "x": 8,
-                                  "y": 8,
+                                  "y": 16,
                                   "width": 16,
                                   "height": 8,
                                   "element": {
@@ -1128,6 +1180,19 @@
                                   "height": 8,
                                   "element": {
                                     "kind": "ElementReference",
+                                    "name": "panel-124"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 16,
+                                  "y": 8,
+                                  "width": 8,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
                                     "name": "panel-61"
                                   }
                                 }
@@ -1137,7 +1202,7 @@
                                 "spec": {
                                   "x": 0,
                                   "y": 8,
-                                  "width": 24,
+                                  "width": 16,
                                   "height": 8,
                                   "element": {
                                     "kind": "ElementReference",
@@ -1964,6 +2029,19 @@
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-110"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 29,
+                                  "width": 24,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-126"
                                   }
                                 }
                               }
@@ -9118,7 +9196,7 @@
         "spec": {
           "id": 60,
           "title": "Admission budgets",
-          "description": "Each budget's reserved bytes now, its capacity, the use, and requests it rejected over the dashboard's time range (oversize and expired memory waits for render).",
+          "description": "Each budget's reserved bytes now, its capacity, the use, the most it held at once over the dashboard's time range (Peak, from *_reserved_peak_bytes), and requests it rejected over the dashboard's time range (oversize and expired memory waits for render).",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -9215,6 +9293,29 @@
                       }
                     }
                   }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "E",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "label_replace(max(max_over_time(geotiff_decode_reserved_peak_bytes{job=~\"$job\"}[$__range])), \"budget\", \"geotiff_decode\", \"\", \"\") or label_replace(max(max_over_time(zarr_read_reserved_peak_bytes{job=~\"$job\"}[$__range])), \"budget\", \"zarr_read\", \"\", \"\") or label_replace(max(max_over_time(netcdf_read_reserved_peak_bytes{job=~\"$job\"}[$__range])), \"budget\", \"netcdf_read\", \"\", \"\") or label_replace(max(max_over_time(station_grid_compute_reserved_peak_bytes{job=~\"$job\"}[$__range])), \"budget\", \"station_grid_compute\", \"\", \"\") or label_replace(max(max_over_time(edr_response_reserved_peak_bytes{job=~\"$job\"}[$__range])), \"budget\", \"edr_response\", \"\", \"\") or label_replace(max(max_over_time(pvol_read_reserved_peak_bytes{job=~\"$job\"}[$__range])), \"budget\", \"pvol_read\", \"\", \"\") or label_replace(max(max_over_time(render_budget_reserved_peak_bytes{job=~\"$job\"}[$__range])), \"budget\", \"render\", \"\", \"\")",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
                 }
               ],
               "transformations": [
@@ -9241,14 +9342,16 @@
                         "Value #A": 1,
                         "Value #B": 2,
                         "Value #C": 3,
-                        "Value #D": 4
+                        "Value #D": 4,
+                        "Value #E": 5
                       },
                       "renameByName": {
                         "budget": "Budget",
                         "Value #A": "Reserved",
                         "Value #B": "Capacity",
                         "Value #C": "Use",
-                        "Value #D": "Rejected"
+                        "Value #D": "Rejected",
+                        "Value #E": "Peak"
                       }
                     }
                   }
@@ -12474,7 +12577,7 @@
         "spec": {
           "id": 83,
           "title": "Per-collection caches",
-          "description": "Caches kept per collection, over the dashboard's time range: GeoTIFF compressed tiles (tile_cache), GRIB decoded grids (grid_cache) and compressed messages (grib_message_cache; its hits measure reuse after grid misses, and its misses need storage reads) and point indexes of CCSDS and complex-packed messages (grib_point_index_cache; a miss is one decode of a message a position query reads for the first time), Zarr decoded chunks (zarr_decoded_cache; single-flight waiters count as hits). GRIB budgets are per source: grid_cache_mb, message_cache_mb and point_index_cache_mb.",
+          "description": "Caches kept per collection, over the dashboard's time range: GeoTIFF compressed tiles (tile_cache), GRIB decoded grids (grid_cache) and compressed messages (grib_message_cache; its hits measure reuse after grid misses, and its misses need storage reads) and point indexes of CCSDS and complex-packed messages (grib_point_index_cache; a miss is one decode of a message a position query reads for the first time), Zarr decoded chunks (zarr_decoded_cache; single-flight waiters count as hits) and a plain Zarr store's objects (zarr_object_cache). GRIB budgets are per source: grid_cache_mb, message_cache_mb and point_index_cache_mb.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -12493,7 +12596,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) / ((sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) + sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))) > 0)",
+                        "expr": "sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) / ((sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) + sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))) > 0)",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12516,7 +12619,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))",
+                        "expr": "sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12539,7 +12642,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\")) / (sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\")) / (sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12562,7 +12665,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12585,7 +12688,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\"))",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\"))",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -13308,7 +13411,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
                         "legendFormat": "{{collection}} · {{cache}}",
                         "range": true,
                         "instant": false,
@@ -17927,6 +18030,763 @@
                     }
                   ],
                   "decimals": 1
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-122": {
+        "kind": "Panel",
+        "spec": {
+          "id": 122,
+          "title": "Memory outside caches",
+          "description": "RSS less every *_cache_bytes, stacked by where it is: stores = the in-memory stores that report their size (BUFR reports and snapshot, the WIS2 dedup and BUFR deletion indexes, CAP alerts, nowcast frames, PVOL catalogs, NetCDF open files; see Store memory), heap without a gauge = jemalloc allocated less the caches and the stores, allocator slack = active less allocated (fragmentation), dirty pages = resident less active (freed pages awaiting purge), outside jemalloc = RSS less jemalloc resident (thread stacks, mapped files). A growing heap without a gauge is memory no gauge explains yet. RSS is read on Linux only, so the top band is empty elsewhere.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes\"}) or vector(0)",
+                        "legendFormat": "stores",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes\"}) or vector(0)), 0)",
+                        "legendFormat": "heap without a gauge",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "C",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum(jemalloc_active_bytes{job=~\"$job\"}) - sum(jemalloc_allocated_bytes{job=~\"$job\"})",
+                        "legendFormat": "allocator slack",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "D",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum(jemalloc_resident_bytes{job=~\"$job\"}) - sum(jemalloc_active_bytes{job=~\"$job\"})",
+                        "legendFormat": "dirty pages",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "E",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "(sum(process_resident_memory_bytes{job=~\"$job\"}) > 0) - sum(jemalloc_resident_bytes{job=~\"$job\"})",
+                        "legendFormat": "outside jemalloc",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Max",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 30,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "normal",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-123": {
+        "kind": "Panel",
+        "spec": {
+          "id": 123,
+          "title": "Store memory",
+          "description": "Heap the in-memory stores hold, per collection, stacked: estimates weighed like cache entries (buffer capacities, map tables and nodes), computed when the store changes. bufr_store and bufr_snapshot follow retention and max_stations; bufr_deletion_index and wis2_dedup grow to 200000 data_ids (about 145 and 130 MB); cap is the WIS2 accumulator, the published catalog and the geocode lookup; nowcast_frame is exact, max_pixels × frames × generations × 1 or 4 bytes; pvol_catalog is parsed volume metadata; netcdf_open_file the readers' parsed metadata, modelled per file.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (store, collection) (label_replace({job=~\"$job\", __name__=~\"(bufr_store|bufr_snapshot|bufr_deletion_index|wis2_dedup|nowcast_frame|pvol_catalog|netcdf_open_file)_bytes\", collection=~\"$collection\"}, \"store\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
+                        "legendFormat": "{{collection}} · {{store}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (part, collection) (cap_alert_bytes{job=~\"$job\", collection=~\"$collection\"})",
+                        "legendFormat": "{{collection}} · cap {{part}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Max",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 30,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "normal",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-124": {
+        "kind": "Panel",
+        "spec": {
+          "id": 124,
+          "title": "Admission budgets — peak",
+          "description": "The most each budget held at once since the previous scrape (*_reserved_peak_bytes, taken and restarted at every scrape), as a share of its capacity: bursts between scrapes that Admission budgets — use, a sample at scrape time, misses. 1 = full; near 1 often means a raised capacity would be used. Each scrape restarts the marks, so a second scraper of the same server sees only what came after the other's scrape.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute|edr_response|pvol_read)_reserved_peak_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_reserved_peak_bytes\")) / (sum by (budget) (label_replace({job=~\"$job\", __name__=~\"(geotiff_decode|zarr_read|netcdf_read|station_grid_compute|edr_response|pvol_read)_capacity_bytes\"}, \"budget\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)",
+                        "legendFormat": "{{budget}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum(render_budget_reserved_peak_bytes{job=~\"$job\"}) / (sum(render_budget_total_bytes{job=~\"$job\"}) > 0)",
+                        "legendFormat": "render",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Max",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percentunit",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 0,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "max": 1
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-125": {
+        "kind": "Panel",
+        "spec": {
+          "id": 125,
+          "title": "Uptime",
+          "description": "Time since the server process started (process_start_time_seconds). Read cumulative counters against it: a cache with few lookups in a short uptime has had no demand yet.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "time() - max(process_start_time_seconds{job=~\"$job\"})",
+                        "legendFormat": "uptime",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "fields": "",
+                  "values": false
+                },
+                "orientation": "auto",
+                "textMode": "auto",
+                "colorMode": "background",
+                "graphMode": "area",
+                "justifyMode": "auto",
+                "wideLayout": true,
+                "showPercentChange": false
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "dtdurations",
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "blue",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "mappings": [],
+                  "links": [
+                    {
+                      "title": "Open memory outside caches",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${__all_variables}&dtab=memory-admission&viewPanel=panel-122"
+                    }
+                  ],
+                  "decimals": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-127": {
+        "kind": "Panel",
+        "spec": {
+          "id": 127,
+          "title": "Heap without a gauge",
+          "description": "jemalloc allocated less every cache and every store that reports its size: heap no gauge explains. Should stay flat; a steady climb is a store or leak to meter next.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes\"}) or vector(0)), 0)",
+                        "legendFormat": "heap without a gauge",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "fields": "",
+                  "values": false
+                },
+                "orientation": "auto",
+                "textMode": "auto",
+                "colorMode": "background",
+                "graphMode": "area",
+                "justifyMode": "auto",
+                "wideLayout": true,
+                "showPercentChange": false
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "blue",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "mappings": [],
+                  "links": [
+                    {
+                      "title": "Open memory outside caches",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${__all_variables}&dtab=memory-admission&viewPanel=panel-122"
+                    }
+                  ],
+                  "decimals": 1
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-126": {
+        "kind": "Panel",
+        "spec": {
+          "id": 126,
+          "title": "WIS2 dedup and deletion indexes",
+          "description": "data_ids each WIS2 subscription's duplicate filter remembers (dedup: dedup_window, PT1H by default, at most 200000), and the data_ids whose rows a BUFR collection remembers to honour rel=deletion (deletion index, at most 200000, about 5 h of a global feed). Both reach their cap on a busy subscription; their bytes are in Memory & admission › Store memory.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (wis2_dedup_entries{job=~\"$job\", collection=~\"$collection\"})",
+                        "legendFormat": "{{collection}} dedup",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (bufr_deletion_index_entries{job=~\"$job\", collection=~\"$collection\"})",
+                        "legendFormat": "{{collection}} deletion index",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Max",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 0,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
                 },
                 "overrides": []
               }

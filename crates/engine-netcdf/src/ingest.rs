@@ -12,6 +12,7 @@
 //! is a scalar `forecast_reference_time`, eight bytes. See the crate's
 //! CLAUDE.md.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -423,6 +424,10 @@ impl FileGrid {
 pub(crate) struct Field {
     pub variable: Variable,
     pub read: FieldRead,
+    /// Entries of the variable's chunk index, which the ingest's warm-up
+    /// leaves cached on the open file (#1307): 0 for a contiguous
+    /// variable, a classic file or OPeNDAP.
+    pub chunk_entries: u64,
 }
 
 /// What a file holds, as far as the catalog is concerned.
@@ -435,6 +440,8 @@ pub(crate) struct Inspected {
     /// Candidate variables not served, with why: logged when the file
     /// sets the collection's layout.
     pub skipped: Vec<(String, String)>,
+    /// Coordinate variables the inspection read (#1307).
+    pub coordinates_read: usize,
 }
 
 /// Why [`inspect`] serves nothing from a file.
@@ -557,12 +564,29 @@ pub(crate) fn inspect(
         .ok_or_else(|| format!("time axis '{time_dim}' has no coordinate variable"))?;
     let times = times(reader, time_var)?;
     let run = reference_time(reader, variables)?;
+    // The coordinates read above, whose dataset lookups stay cached on the
+    // open file (#1307): the served variables' axes, the run's, and a
+    // curvilinear grid's two auxiliaries.
+    let axes: HashSet<&str> = fields
+        .iter()
+        .filter_map(|f| variables.iter().find(|v| *v.name == *f.variable.name))
+        .flat_map(|v| &v.dimensions)
+        .filter(|d| coordinate(&d.name).is_some())
+        .map(|d| d.name.as_str())
+        .collect();
+    let curvilinear = if matches!(grid, FileGrid::Curvilinear(_)) {
+        2
+    } else {
+        0
+    };
+    let coordinates_read = axes.len() + usize::from(run.is_some()) + curvilinear;
     Ok(Inspected {
         run,
         times,
         grid,
         fields,
         skipped,
+        coordinates_read,
     })
 }
 
@@ -798,7 +822,14 @@ fn field(
     // Saturating: an OPeNDAP DDS states any size it likes, and a field
     // past the decode budget is refused before it is read (`crate::field`).
     let field_bytes = ny.saturating_mul(nx).saturating_mul(stored.size());
-    let chunk_bytes = chunk_bytes(h5, var, stored).unwrap_or(field_bytes);
+    let chunks = h5.and_then(|h5| h5.dataset(&var.name).ok()?.chunks());
+    let chunk_bytes = chunks
+        .as_deref()
+        .and_then(|chunks| chunk_bytes(chunks, stored))
+        .unwrap_or(field_bytes);
+    let chunk_entries = chunks
+        .as_deref()
+        .map_or(0, |chunks| chunk_entries(chunks, var));
     let name: Arc<str> = var.name.as_str().into();
     let key = (
         roles[roles.len() - 2].0.clone(),
@@ -830,6 +861,7 @@ fn field(
             field_bytes,
             levels: level_index,
         },
+        chunk_entries,
     };
     Ok((
         Candidate {
@@ -1180,17 +1212,21 @@ fn reference_time(
     Ok(run.first().copied())
 }
 
-/// Decoded bytes of one of `var`'s chunks, when it is chunked: from the
-/// HDF5 layout. `None` for a contiguous variable or a classic file.
-fn chunk_bytes(
-    h5: Option<&hdf5_reader::Hdf5File>,
-    var: &NcVariable,
-    stored: Stored,
-) -> Option<u64> {
-    let chunks = h5?.dataset(&var.name).ok()?.chunks()?;
+/// Decoded bytes of one chunk of a variable chunked as `chunks` (from the
+/// HDF5 layout; a contiguous variable or a classic file has none).
+fn chunk_bytes(chunks: &[u32], stored: Stored) -> Option<u64> {
     chunks
         .iter()
         .try_fold(stored.size(), |bytes, &n| bytes.checked_mul(u64::from(n)))
+}
+
+/// The chunks `var`'s `chunks` shape cuts it into: its index's entries.
+fn chunk_entries(chunks: &[u32], var: &NcVariable) -> u64 {
+    var.dimensions
+        .iter()
+        .zip(chunks)
+        .map(|(dim, &chunk)| dim.size.div_ceil(u64::from(chunk.max(1))))
+        .fold(1u64, u64::saturating_mul)
 }
 
 /// The coordinate variable of dimension `dim`: 1-D, named after it.

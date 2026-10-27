@@ -27,6 +27,7 @@
 //! into the engine, `MapEngine`, EDR, or the server.
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use ds_core::heap::HeapSize;
 use ds_storage::bytes::Bytes;
 use hdf5_reader::{Attribute, Hdf5File};
 
@@ -117,6 +118,35 @@ pub struct PolarVolume {
     pub sweeps: Vec<Sweep>,
     /// Length of the file the volume was read from, in bytes.
     pub(crate) file_len: u64,
+}
+
+impl HeapSize for RadarSite {
+    fn heap_size(&self) -> usize {
+        self.nod.heap_size() + self.plc.heap_size() + self.wmo.heap_size()
+    }
+}
+
+impl HeapSize for PolarMoment {
+    fn heap_size(&self) -> usize {
+        self.quantity.heap_size()
+            + self.dataset_path.heap_size()
+            + self.spans.as_ref().map_or(0, |spans| {
+                std::mem::size_of_val::<[crate::layout::Span]>(spans)
+            })
+    }
+}
+
+impl HeapSize for Sweep {
+    fn heap_size(&self) -> usize {
+        self.moments.heap_size()
+    }
+}
+
+impl HeapSize for PolarVolume {
+    /// The parsed metadata a catalog keeps per volume (#1307): no pixels.
+    fn heap_size(&self) -> usize {
+        self.site.heap_size() + self.object.heap_size() + self.sweeps.heap_size()
+    }
 }
 
 /// Parse an ODIM `/what/source` string into `(NOD, PLC, WMO)`.

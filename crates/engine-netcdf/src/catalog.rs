@@ -49,6 +49,31 @@ pub(crate) struct OpenFile {
     pub times: Vec<DateTime<Utc>>,
     /// How to read each of [`Layout::variables`], in its order.
     pub reads: Vec<FieldRead>,
+    /// The estimated heap this open file holds, its reader's metadata
+    /// with it, weighed at the open (#1307): `netcdf_open_file_bytes`.
+    pub heap_bytes: u64,
+}
+
+impl OpenFile {
+    /// The heap of this file's own parts, its reader aside: the open
+    /// file behind its `Arc`, its path, times and reads (#1307).
+    pub(crate) fn own_heap_bytes(&self) -> u64 {
+        use ds_core::heap::{HeapSize, ARC_COUNTS};
+        use std::mem::size_of;
+        let reads = self.reads.capacity() * size_of::<FieldRead>()
+            + self
+                .reads
+                .iter()
+                .map(|read| {
+                    read.name.heap_size()
+                        + read.dims.capacity() * size_of::<crate::ingest::Dim>()
+                        + read.packing.fill.heap_size()
+                        + read.levels.heap_size()
+                })
+                .sum::<usize>();
+        (ARC_COUNTS + size_of::<OpenFile>() + self.path.capacity() + self.times.heap_size() + reads)
+            as u64
+    }
 }
 
 /// The collection's variables and grid, fixed by the first file ingested:

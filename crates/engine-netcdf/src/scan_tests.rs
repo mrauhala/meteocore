@@ -140,6 +140,7 @@ fn a_closed_run_never_displaces_one_that_serves() {
             run: Some(run),
             times: vec![run],
             reads: Vec::new(),
+            heap_bytes: 0,
         }))
     };
     let older = fixture("meps_sfc_00_20261015T06Z.nc");

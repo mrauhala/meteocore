@@ -182,6 +182,10 @@ curl 'localhost:8000/features/collections/obs-bufr-local/items?bbox=10,55,30,70'
   `skipped`, and `nil` for NIL bulletins),
   `bufr_decode_failures_total{reason,kind}`, and the shared `wis2_*`
   families.
+- Memory: `bufr_store_bytes` and `bufr_snapshot_bytes`, estimated at each
+  snapshot rebuild; in WIS2 mode `bufr_deletion_index_entries` and
+  `bufr_deletion_index_bytes` (about 145 MB at the 200 000 cap) and
+  `wis2_dedup_entries` and `wis2_dedup_bytes` (about 130 MB at its cap).
 
 ## Limits
 

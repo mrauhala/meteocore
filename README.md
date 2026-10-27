@@ -2530,6 +2530,14 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/admin/cach
 
 The server logs the same list at INFO at boot and after every accepted reload: one line per cache and budget, grouped by scope, with its size in MiB and its source, the totals, and after a reload the old size of each one that changed. On `/metrics`, `cache_size_source{cache,collection,source}` is 1 for each entry and `memory_capacity_total_bytes{kind}` sums the capacities of the caches and of the budgets. The Grafana dashboard's Memory & admission tab shows both in its Cache plan row.
 
+Memory outside the caches has gauges too ([Memory outside caches](#prometheus-metrics)):
+
+- The in-memory stores report the heap they hold: the BUFR report store, its metadata snapshot and its WIS2 deletion index, each WIS2 subscription's duplicate filter, the CAP accumulator, catalog and geocode lookup, the nowcast frames, the PVOL catalogs and the NetCDF open files. Each is an estimate weighed like a cache entry, from buffer capacities and map tables, except the nowcast frames, which are exact. A store computes its figure when it changes, so a scrape only reads it.
+- Every admission budget reports `<budget>_reserved_peak_bytes`: the most it held at once since the previous scrape, which the scrape restarts. A burst between two scrapes shows in it, where `<budget>_reserved_bytes` samples only the scrape instant. With two Prometheus servers scraping one MeteoCore, each sees the peaks since the other's scrape.
+- `process_start_time_seconds` gives the uptime that turns the cumulative counters into rates per hour: a cache with few lookups in a short uptime has had no demand yet.
+
+The Memory & admission tab stacks RSS less the caches into the stores, the heap no gauge explains, allocator slack, dirty pages and memory outside jemalloc, lists each store per collection, and plots each budget's peak against its capacity.
+
 ### Health Endpoint
 
 `GET /health` returns per-collection health status:
@@ -2551,7 +2559,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 
 ### Prometheus Metrics
 
-`GET /metrics` returns Prometheus text format. Path labels are the matched route template (e.g. `/edr/collections/{id}/position`), not the raw URL, so cardinality stays bounded. The `api` label names the serving API: a per-API route's mount (`edr`, `features`, `maps`, `tiles`, `wms`, `3dtiles`), or for the shared OGC API root the building block that served it (`maps`, `tiles`, `features`) and `common` for its discovery resources; empty for operational routes.
+`GET /metrics` returns Prometheus text format. Path labels are the matched route template (e.g. `/edr/collections/{id}/position`), not the raw URL, so cardinality stays bounded. A per-collection cache's counters exist from the first scrape after its collection loads, at 0 before any lookup, so a hit ratio reads 0 rather than nothing. A reload that removes a collection removes every series labelled with it; a collection the reload rebuilds keeps its series. The `api` label names the serving API: a per-API route's mount (`edr`, `features`, `maps`, `tiles`, `wms`, `3dtiles`), or for the shared OGC API root the building block that served it (`maps`, `tiles`, `features`) and `common` for its discovery resources; empty for operational routes.
 
 **HTTP:**
 
@@ -2572,7 +2580,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `collection_data_age_seconds` | gauge | collection | Seconds since the newest data a collection serves, its `/health` `data_age_secs`; only collections that hold data |
 | `collection_has_data` | gauge | collection | 1 while a collection whose engine reports a data age (GeoTIFF, QueryData, BUFR, satellite, NetCDF, nowcast) holds data, 0 when it holds none: it never loaded any, or all of it aged out of a satellite `time_window` or a BUFR `retention`. Alert on it next to the data age, which has no series then |
 
-**GeoTIFF tile cache** (per-collection, compressed byte cache for remote COGs):
+**GeoTIFF tile cache** (per-collection, compressed byte cache for remote COGs; every GeoTIFF collection has the series, a local one with capacity 0):
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -2632,6 +2640,30 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `pvol_voxel_grid_cache_capacity_bytes` | gauge | — | Configured capacity |
 | `pvol_voxel_grid_cache_entries` | gauge | — | Number of cached entries |
 
+**Other caches** (the same five families as the caches above, `entries` where noted):
+
+| Metric prefix | Labels | Cache |
+|---------------|--------|-------|
+| `vector_tile_cache_*` | — | MVT tiles of every Tiles collection, 128 MiB; with `entries` |
+| `solid_image_cache_*` | — | The encoded all-nodata images and WMS error tiles, 32 MiB; with `entries` |
+| `zarr_object_cache_*` | collection | A plain Zarr store's objects, `[zarr] cache_mb` |
+
+**Memory outside caches** (estimates computed when the store changes, except where exact):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `bufr_store_bytes` | gauge | collection | Estimated heap of the BUFR report store: stations and report rows |
+| `bufr_snapshot_bytes` | gauge | collection | Estimated heap of the BUFR store's metadata snapshot |
+| `bufr_deletion_index_entries` | gauge | collection | WIS2 mode: data_ids whose rows the BUFR deletion index remembers, at most 200 000 |
+| `bufr_deletion_index_bytes` | gauge | collection | WIS2 mode: estimated heap of the deletion index |
+| `wis2_dedup_entries` | gauge | collection | data_ids a WIS2 subscription's duplicate filter remembers, at most 200 000 |
+| `wis2_dedup_bytes` | gauge | collection | Estimated heap of the duplicate filter |
+| `cap_alert_bytes` | gauge | collection, part | Estimated heap of a CAP collection: `accumulator` (WIS2 mode), `catalog`, `geocode` (with `geocode_geometry`) |
+| `nowcast_frame_bytes` | gauge | collection | Bytes of the frames the retained nowcast generations hold, exact |
+| `pvol_catalog_bytes` | gauge | collection | Estimated heap of a PVOL source's catalog of parsed volume metadata |
+| `netcdf_open_file_bytes` | gauge | collection | Estimated heap of a NetCDF collection's open file handles, modelled per file |
+| `process_start_time_seconds` | gauge | — | Start time of the process since the Unix epoch |
+
 **Memory plan** (one series per entry of [`/admin/cache-plan`](#memory-and-caches)):
 
 | Metric | Type | Labels | Description |
@@ -2646,6 +2678,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `render_semaphore_available` | gauge | — | Available render permits |
 | `render_budget_available_bytes` | gauge | — | Available transient render memory estimate |
 | `render_budget_total_bytes` | gauge | — | Configured transient render memory budget |
+| `render_budget_reserved_peak_bytes` | gauge | — | Most transient render memory reserved at once since the previous scrape; every admission budget has its `<budget>_reserved_peak_bytes` next to `<budget>_reserved_bytes` (`geotiff_decode`, `zarr_read`, `netcdf_read`, `pvol_read`, `station_grid_compute`, `edr_response`) |
 | `render_budget_rejected_total` | counter | reason | Requests rejected at memory admission: `oversize` at once, `deadline` after an expired memory wait |
 | `render_deadline_exceeded_total` | counter | stage | Render deadline expiries: `queue` waiting for memory or a slot, `render` after admission |
 | `render_phase_seconds` | histogram | api, phase | Served WMS/Maps/Tiles render time per phase: `queue`, `engine`, `assemble` (WMS meta-tiles), `encode` |

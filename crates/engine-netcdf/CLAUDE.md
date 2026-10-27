@@ -319,6 +319,11 @@ chunk cache is off (`chunk_cache_bytes = 0`) either way.
   2026-10-17, heap allocated by a second open of the same three files from
   the block cache). Handles alone hold 820 KB × 67 leads × `max_runs`:
   **110 MB** at the remote example's `max_runs = 2`, 220 MB at 4.
+- `open_file_bytes()` (#1307) sums `OpenFile::heap_bytes` at the end of
+  each scan. A NetCDF-4 handle is a fitted model (`source::HANDLE_BYTES`
+  and the constants after it), within 5 % on the fixtures and 10 % under
+  a real 820 KB MEPS surface file; an OPeNDAP handle is walked. Refit the
+  constants when netcdf-reader or hdf5-reader change what an open keeps.
 
 ## Remote files (`remote.rs`, `io.rs`) — #1067 PR 5
 

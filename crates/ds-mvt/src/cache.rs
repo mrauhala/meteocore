@@ -125,6 +125,20 @@ impl VectorTileCache {
         self.cache.stats().1
     }
 
+    /// Hits, misses, resident bytes and capacity, for `/metrics` (#1307).
+    pub fn metrics(&self) -> ds_cache::CacheMetrics {
+        self.cache.metrics()
+    }
+
+    /// Tiles currently held.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
     /// Enter this cache in the memory plan (#1306), sized from `source`.
     pub fn register(&self, source: ds_cache::plan::SizeSource) {
         self.cache

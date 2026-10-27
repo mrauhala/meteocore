@@ -173,6 +173,15 @@ pub struct Catalog {
     /// Precomputed temporal extent `(start, end)` so the per-request accessor is
     /// O(1) (#211). `None` when there are no records or no concrete time bound.
     temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// The estimated heap this snapshot holds (#1307), computed when it is
+    /// built: `cap_alert_bytes{part="catalog"}`.
+    pub heap_bytes: u64,
+}
+
+impl ds_core::heap::HeapSize for AreaRecord {
+    fn heap_size(&self) -> usize {
+        self.id.heap_size() + self.geometry.heap_size() + self.properties.heap_size()
+    }
 }
 
 impl Catalog {
@@ -189,7 +198,31 @@ impl Catalog {
             data_version: 0,
             geocode_only_count: 0,
             temporal_extent: None,
+            heap_bytes: 0,
         }
+    }
+
+    /// The estimated heap of this snapshot (#1307): the area records with
+    /// their geometry and properties, the id index, the R-tree, the
+    /// filterable names and the raster metadata. The shared static schema
+    /// of an empty catalog counts as its own.
+    fn heap_estimate(&self) -> u64 {
+        use ds_core::heap::{HeapSize, ARC_COUNTS};
+        use std::mem::size_of;
+        // One rstar node per indexed area, and after a bulk load about one
+        // parent per five nodes below it.
+        let tree = self.tree.size() * size_of::<rstar::RTreeNode<IndexedArea>>() * 6 / 5;
+        let info = ARC_COUNTS
+            + size_of::<RasterInfo>()
+            + self.info.native_crs.heap_size()
+            + self.info.times.heap_size()
+            + self.info.parameter.heap_size()
+            + self.info.unit.heap_size();
+        (self.records.heap_size()
+            + self.id_index.heap_size()
+            + tree
+            + self.filterables.heap_size()
+            + info) as u64
     }
 
     /// Build a snapshot from parsed alerts.
@@ -322,7 +355,7 @@ impl Catalog {
         let mut filterables =
             ds_core::feature::property_names(records.iter().map(|r| r.properties.as_ref()));
         Arc::make_mut(&mut filterables).extend(STANDARD_FILTERABLES.iter().cloned());
-        Catalog {
+        let mut catalog = Catalog {
             filterables,
             records,
             id_index,
@@ -333,7 +366,10 @@ impl Catalog {
             data_version,
             geocode_only_count,
             temporal_extent,
-        }
+            heap_bytes: 0,
+        };
+        catalog.heap_bytes = catalog.heap_estimate();
+        catalog
     }
 
     /// Record indices whose bbox intersects `bbox` (geometry areas only).
@@ -384,6 +420,7 @@ impl Catalog {
         info.times = build_times(&self.records, as_of);
         next.info = Arc::new(info);
         next.temporal_extent = compute_temporal_extent(&self.records, as_of);
+        next.heap_bytes = next.heap_estimate();
         next
     }
 

@@ -247,6 +247,11 @@ memory. Things that differ from the pull sources:
 - **Fixtures** for the offline tests live in `tests/wis2-fixtures/` (NOT
   under `tests/fixtures/` — the directory source lists recursively and
   would pick the CAP XML up as a demo alert).
+- Memory (#1307): `memory()` reads figures kept when each part changes:
+  the accumulator's in `snapshot()` (a hint polygon several areas share
+  counted once), the catalog's in build/`at_time`, the geocode lookup's at
+  load. A new owned field in `CapAlert`/`CapInfo`/`CapArea` or `AreaRecord`
+  goes into its `HeapSize` impl (`src/memory.rs`, `catalog.rs`).
 
 ## Feature model
 

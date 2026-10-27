@@ -15,6 +15,7 @@ pub mod feature_pick;
 pub mod geo;
 pub mod geopotential;
 pub mod health;
+pub mod heap;
 pub mod html;
 pub mod http_cache;
 pub mod instances;

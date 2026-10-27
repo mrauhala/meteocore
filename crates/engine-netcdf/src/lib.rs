@@ -115,6 +115,8 @@ pub struct NetcdfEngine {
     state: Mutex<PollState>,
     /// Fields this engine decoded (cache fills), for tests and diagnostics.
     decodes: Arc<AtomicU64>,
+    /// The open files' estimated heap, summed when a scan ends (#1307).
+    open_file_bytes: AtomicU64,
     /// What remote reads found replaced, for the poll and `content_version`.
     changes: Arc<Changes>,
     shutdown: Shutdown,
@@ -396,6 +398,7 @@ impl NetcdfEngine {
                 prewarmed: HashSet::new(),
             }),
             decodes: Arc::new(AtomicU64::new(0)),
+            open_file_bytes: AtomicU64::new(0),
             changes: Arc::new(Changes::default()),
             shutdown: Shutdown::new(),
         };
@@ -553,6 +556,16 @@ impl NetcdfEngine {
     pub fn grid(&self) -> Option<GeoTransform> {
         let catalog = self.catalog.load();
         catalog.layout.as_ref()?.grid.transform().cloned()
+    }
+
+    /// The estimated heap the catalog's open files hold (#1307): each
+    /// file's reader with the metadata it parsed (a model for a
+    /// NetCDF-4 file, see `source::HANDLE_BYTES`; walked for OPeNDAP) and
+    /// the file's own times and reads. Summed when a scan ends, so a read
+    /// is O(1). Request-time lookups add a little to each, as do the
+    /// files of a run an older catalog still serves to a request.
+    pub fn open_file_bytes(&self) -> u64 {
+        self.open_file_bytes.load(Ordering::Relaxed)
     }
 
     /// Fields this engine has decoded, every cache fill counted once.
@@ -717,6 +730,15 @@ impl NetcdfEngine {
             catalog.info.times.len()
         );
         self.catalog.store(Arc::new(catalog));
+        let open: u64 = state
+            .known
+            .values()
+            .map(|known| match known {
+                Known::Open(file) => file.heap_bytes,
+                Known::Closed { .. } | Known::Skipped { .. } => 0,
+            })
+            .sum();
+        self.open_file_bytes.store(open, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1148,7 +1170,13 @@ impl NetcdfEngine {
                     return Some(skipped(e));
                 }
                 tally.opened.fetch_add(1, Ordering::Relaxed);
-                Some(Known::Open(Arc::new(OpenFile {
+                let chunk_entries = inspected.fields.iter().map(|f| f.chunk_entries).sum();
+                let reader_bytes = reader.heap_estimate(
+                    inspected.fields.len(),
+                    chunk_entries,
+                    inspected.coordinates_read,
+                );
+                let mut file = OpenFile {
                     id,
                     path: file.path.clone(),
                     identity: file.identity.clone(),
@@ -1156,7 +1184,10 @@ impl NetcdfEngine {
                     run: inspected.run,
                     times: inspected.times,
                     reads: inspected.fields.into_iter().map(|f| f.read).collect(),
-                })))
+                    heap_bytes: 0,
+                };
+                file.heap_bytes = reader_bytes + file.own_heap_bytes();
+                Some(Known::Open(Arc::new(file)))
             }
         }
     }

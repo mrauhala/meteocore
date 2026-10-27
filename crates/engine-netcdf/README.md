@@ -28,7 +28,9 @@ or downloaded whole.
   opens new and changed files and keeps them open: the newest `max_runs`
   runs, at most `max_files` files. A run counts once a file of it is open:
   the runs served stay served until newer ones have opened. Requests never
-  open a file.
+  open a file. An open file keeps the metadata it was read through, about
+  0.8 MB for a MEPS surface file; `netcdf_open_file_bytes` estimates what
+  a collection's open files hold.
 - **Time comes from the file, never its name:** valid times from the
   `time` axis, the model run from `forecast_reference_time`. Files without
   a run form one timeline without runs.

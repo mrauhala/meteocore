@@ -21,6 +21,7 @@
 mod catalog;
 mod engine;
 mod geocode;
+mod memory;
 mod parser;
 mod persist;
 mod source;
@@ -29,4 +30,5 @@ pub mod wis2;
 
 pub use catalog::severity_code;
 pub use engine::{CapEngine, CAP_PARAMETER};
+pub use memory::CapMemory;
 pub use parser::{CapAlert, CapArea, CapAreaHint, CapInfo};

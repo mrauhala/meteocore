@@ -167,8 +167,9 @@ A named source that is missing or of the wrong kind fails the collection.
 
 - `/health` reports the collection degraded until the first generation.
 - `/metrics` exports per-collection `nowcast_*` series: generation counts,
-  duration and source lag, tracker counters, and the previous generation's
-  lead-1 CSI next to persistence (`nowcast_lead1_csi_permille`).
+  duration and source lag, tracker counters, the previous generation's
+  lead-1 CSI next to persistence (`nowcast_lead1_csi_permille`), and
+  `nowcast_frame_bytes`, the exact bytes of the retained frames.
 - A reload with unchanged config and source engine keeps generations, cell
   history and track ids.
 

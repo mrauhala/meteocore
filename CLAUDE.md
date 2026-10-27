@@ -1456,6 +1456,12 @@ no `url` are rejected.
   INFO block at boot and after each accepted reload logs (#1306). Sizes
   from a config key with a serde default are inferred by
   `SizeSource::unless_default` until #1313 makes the keys `Option`.
+  Memory outside the caches is metered too (#1307): each in-memory store
+  keeps an estimate of its heap through `ds_core::heap` (`HeapSize`),
+  computed when it changes and read O(1) by `/metrics`; a new store adds its
+  `*_bytes` gauge and a test against `ds_core::heap::Counting` (within
+  25 %). Budgets hand the plan a high-water mark that only `/metrics` takes
+  (`plan::take_peaks` → `<budget>_reserved_peak_bytes`).
 - **Grafana dashboards live in this repo:**
   `docker/grafana/dashboards/meteocore-overview.json`, provisioned via
   `docker/grafana/provisioning/`: a `dashboard.grafana.app/v2` resource
@@ -1481,6 +1487,9 @@ no `url` are rejected.
   cache to the Engines › Gridded sources regex, and a memory budget
   `<name>_{reserved_bytes,capacity_bytes,rejected_total}` to the
   admission-budget panels in Memory & admission.
+  A family labelled by `collection` registers through
+  `admin::per_collection`, so a reload that removes the collection drops
+  its series (`every_family_with_a_collection_label_is_pruned_on_reload`).
 - **State:** API state wrapped in `ArcSwap` for lock-free reads. Render
   semaphore (`[server] render_concurrency`, default 2× CPU cores, min 8;
   fixed at boot, so restart to change) shared across Maps/Tiles/WMS. Engine

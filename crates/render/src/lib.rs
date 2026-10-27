@@ -514,6 +514,12 @@ pub fn init_solid_image_cache() {
     std::sync::LazyLock::force(&SOLID_IMAGE_CACHE);
 }
 
+/// The solid-image memo's hits, misses, bytes and capacity, and its entry
+/// count, for `/metrics` (#1307).
+pub fn solid_image_cache_metrics() -> (ds_cache::CacheMetrics, u64) {
+    (SOLID_IMAGE_CACHE.metrics(), SOLID_IMAGE_CACHE.len() as u64)
+}
+
 /// An all-nodata `width`×`height` image in `format` as a ready-to-serve
 /// [`CachedRendered`], encoded once per distinct size and format and cloned
 /// thereafter (#171): transparent in PNG and WebP, white in JPEG, which has

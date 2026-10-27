@@ -2257,6 +2257,37 @@ pub(crate) struct Catalog {
     /// function of this snapshot, computed once at swap time instead of per
     /// (future) vector-tile render.
     feature_version: u64,
+    /// The estimated heap this catalog and the engine's parse cache hold
+    /// (#1307), computed in [`derive_catalog`]: `pvol_catalog_bytes`.
+    pub(crate) heap_bytes: u64,
+}
+
+/// The estimated heap of one site's derived metadata (#1307).
+fn site_meta_bytes(meta: &SiteMeta) -> usize {
+    use ds_core::heap::{HeapSize, ARC_COUNTS};
+    use std::mem::size_of;
+    let parameters = meta.parameters.capacity() * size_of::<ds_core::map_engine::ParameterInfo>()
+        + meta
+            .parameters
+            .iter()
+            .map(|p| p.name.heap_size() + p.title.heap_size() + p.unit.heap_size())
+            .sum::<usize>();
+    let vertical = meta.vertical.as_ref().map_or(0, |v| v.levels.heap_size());
+    let info = &meta.volume_info;
+    let volume_info = ARC_COUNTS
+        + size_of::<VolumeInfo>()
+        + info.quantities.heap_size()
+        + info.times.heap_size()
+        + info.default_quantity.heap_size()
+        + info.default_unit.heap_size();
+    meta.plc.heap_size()
+        + meta.wmo.heap_size()
+        + parameters
+        + meta.quantities.heap_size()
+        + meta.times.heap_size()
+        + vertical
+        + volume_info
+        + meta.location.heap_size()
 }
 
 /// Round an elevation angle to 0.1° so near-identical sweep angles from
@@ -3099,12 +3130,18 @@ fn derive_catalog(
     // Evict parse-cache entries the catalog no longer references —
     // files dropped from the source, plus volumes aged out of a site's
     // `max_files` window. `kept` is a set, so this is O(cache).
-    {
+    let cache_bytes = {
         let kept: std::collections::HashSet<&FileId> =
             by_site.values().flatten().map(|e| &e.id).collect();
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         guard.retain(|k, _| kept.contains(k));
-    }
+        // Its table and keys; its volumes are the catalog's, counted below.
+        ds_core::heap::hash_table::<(FileId, Arc<PolarVolume>)>(guard.capacity())
+            + guard
+                .keys()
+                .map(ds_core::heap::HeapSize::heap_size)
+                .sum::<usize>()
+    };
 
     // Per-site metadata snapshots: one `SiteMeta` per site so
     // each `PolarVolumeSiteView` answers capability queries scoped to its
@@ -3122,6 +3159,9 @@ fn derive_catalog(
     let features_time = features_time_of(&by_site_meta);
     let feature_version = feature_version_of(&sorted_nods, &by_site_meta);
 
+    let heap_bytes = cache_bytes
+        + catalog_bytes(&by_site, &by_site_meta)
+        + ds_core::heap::HeapSize::heap_size(&sorted_nods);
     Catalog {
         by_site,
         by_site_meta,
@@ -3129,7 +3169,35 @@ fn derive_catalog(
         features_extent,
         features_time,
         feature_version,
+        heap_bytes: heap_bytes as u64,
     }
+}
+
+/// The estimated heap of a catalog's per-site parts (#1307): the volume
+/// lists, each parsed volume once (the parse cache shares the same `Arc`s),
+/// and the per-site metadata.
+fn catalog_bytes(
+    by_site: &HashMap<String, Vec<VolumeEntry>>,
+    by_site_meta: &HashMap<String, SiteMeta>,
+) -> usize {
+    use ds_core::heap::{hash_table, HeapSize};
+    use std::mem::size_of;
+    let volumes = by_site
+        .values()
+        .flatten()
+        .map(|e| e.id.heap_size() + e.volume.heap_size())
+        .sum::<usize>();
+    let lists = hash_table::<(String, Vec<VolumeEntry>)>(by_site.capacity())
+        + by_site
+            .iter()
+            .map(|(nod, list)| nod.heap_size() + list.capacity() * size_of::<VolumeEntry>())
+            .sum::<usize>();
+    let metas = hash_table::<(String, SiteMeta)>(by_site_meta.capacity())
+        + by_site_meta
+            .iter()
+            .map(|(nod, meta)| nod.heap_size() + site_meta_bytes(meta))
+            .sum::<usize>();
+    volumes + lists + metas
 }
 
 /// Derive one site's [`SiteMeta`] from its time-sorted volume list.
@@ -3532,6 +3600,15 @@ impl PolarVolumeEngine {
     /// `poll_loop` starts.
     pub fn shutdown(&self) {
         self.shutdown.shutdown();
+    }
+
+    /// The estimated heap of the catalog this engine holds, with its parse
+    /// cache (#1307): every catalogued volume's parsed metadata (no pixels,
+    /// which the process-wide pixel cache holds), each site's derived
+    /// metadata and the indexes. Computed when the catalog is derived, so a
+    /// read is O(1).
+    pub fn catalog_bytes(&self) -> u64 {
+        self.catalog.load().heap_bytes
     }
 
     /// Re-scan the source and atomically swap the catalog.

@@ -6,7 +6,9 @@
 //! ([`Scope`]), where its size came from ([`SizeSource`]), and a way to read
 //! its [`Usage`]. The server lists the entries (`/admin/cache-plan`, a log
 //! block at boot and on reload, `cache_size_source` on `/metrics`), so an
-//! operator sees every size and its knob in one place.
+//! operator sees every size and its knob in one place. A budget registered
+//! with [`register_budget`] also hands over its high-water mark
+//! ([`take_peaks`], #1307).
 //!
 //! Entries are weak: an entry reads its owner through a `Weak`, and one
 //! whose owner was dropped (a rebuilt or removed collection's engine) leaves
@@ -216,6 +218,9 @@ pub struct Row {
     pub usage: Usage,
 }
 
+/// Reads an owner's figure while it lives.
+type Reader<V> = Box<dyn Fn() -> Option<V> + Send + Sync>;
+
 struct Registered {
     seq: u64,
     entry: Entry,
@@ -223,7 +228,9 @@ struct Registered {
     /// replaces this entry.
     owner_addr: usize,
     owner: Weak<dyn Any + Send + Sync>,
-    read: Box<dyn Fn() -> Option<Usage> + Send + Sync>,
+    read: Reader<Usage>,
+    /// A budget's high-water mark, taken and restarted ([`take_peaks`]).
+    take_peak: Option<Reader<u64>>,
 }
 
 static REGISTRY: Mutex<Vec<Arc<Registered>>> = Mutex::new(Vec::new());
@@ -233,14 +240,40 @@ static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// alive. Registering the same owner under the same id again replaces the
 /// entry (a reload that keeps a cache, or a changed size source).
 pub fn register<T: Send + Sync + 'static>(entry: Entry, owner: &Arc<T>, usage: fn(&T) -> Usage) {
+    insert(entry, owner, usage, None);
+}
+
+/// [`register`] a budget whose high-water mark `take_peak` returns: the
+/// most it held at once since the previous call, which restarts the mark
+/// from what it holds now (#1307).
+pub fn register_budget<T: Send + Sync + 'static>(
+    entry: Entry,
+    owner: &Arc<T>,
+    usage: fn(&T) -> Usage,
+    take_peak: fn(&T) -> u64,
+) {
+    insert(entry, owner, usage, Some(take_peak));
+}
+
+fn insert<T: Send + Sync + 'static>(
+    entry: Entry,
+    owner: &Arc<T>,
+    usage: fn(&T) -> Usage,
+    take_peak: Option<fn(&T) -> u64>,
+) {
     let weak = Arc::downgrade(owner);
     let owner_addr = Arc::as_ptr(owner).cast::<()>() as usize;
     let any: Weak<dyn Any + Send + Sync> = weak.clone();
+    let take_peak = take_peak.map(|take_peak| {
+        let weak = weak.clone();
+        Box::new(move || weak.upgrade().map(|owner| take_peak(&owner))) as Reader<u64>
+    });
     let registered = Arc::new(Registered {
         seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
         owner_addr,
         owner: any,
         read: Box::new(move || weak.upgrade().map(|owner| usage(&owner))),
+        take_peak,
         entry,
     });
     let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
@@ -284,6 +317,36 @@ pub fn snapshot() -> Vec<Row> {
         later.entry.id == kept.entry.id && later.entry.scope == kept.entry.scope
     });
     rows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// Every live budget registered with a high-water mark
+/// ([`register_budget`]) and the most it held at once since the previous
+/// call, which restarts each mark: `/metrics` takes them once per scrape,
+/// so the marks are per scrape interval (#1307). Where two live entries
+/// share an id and scope, the one registered last is taken, as
+/// [`snapshot`] lists it.
+pub fn take_peaks() -> Vec<(Entry, u64)> {
+    let mut registered: Vec<Arc<Registered>> = {
+        let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        registry.retain(|r| r.owner.strong_count() > 0);
+        registry
+            .iter()
+            .filter(|r| r.take_peak.is_some())
+            .cloned()
+            .collect()
+    };
+    registered.sort_by(|a, b| {
+        (a.entry.id, &a.entry.scope)
+            .cmp(&(b.entry.id, &b.entry.scope))
+            .then(b.seq.cmp(&a.seq))
+    });
+    registered.dedup_by(|later, kept| {
+        later.entry.id == kept.entry.id && later.entry.scope == kept.entry.scope
+    });
+    registered
+        .iter()
+        .filter_map(|r| Some((r.entry.clone(), (r.take_peak.as_ref()?)()?)))
+        .collect()
 }
 
 /// Serializes the tests that read the registry. A [`snapshot`] holds every
@@ -382,6 +445,50 @@ mod tests {
             "the older owner is listed again"
         );
         drop((old, other));
+    }
+
+    /// A budget's high-water mark is taken through the plan, newest owner
+    /// first, and only while the budget lives.
+    #[test]
+    fn peaks_are_taken_from_live_budgets() {
+        let _serial = serial();
+        struct Marked(AtomicU64);
+        fn take(marked: &Marked) -> u64 {
+            marked.0.swap(0, Ordering::Relaxed)
+        }
+        let taken = || -> Vec<u64> {
+            take_peaks()
+                .into_iter()
+                .filter(|(entry, _)| entry.id == "plan_test_peak")
+                .map(|(_, peak)| peak)
+                .collect()
+        };
+        let old = Arc::new(Marked(AtomicU64::new(5)));
+        let new = Arc::new(Marked(AtomicU64::new(9)));
+        for owner in [&old, &new] {
+            register_budget(
+                Entry::budget("plan_test_peak", Scope::Process, SizeSource::Default),
+                owner,
+                |_| Usage::budget(10, 0),
+                take,
+            );
+        }
+        assert_eq!(taken(), [9], "the newest owner");
+        assert_eq!(taken(), [0], "taking restarts the mark");
+        // A budget registered without a mark has none to take.
+        let plain = Arc::new(Fixed(3));
+        register(
+            Entry::budget("plan_test_peak_none", Scope::Process, SizeSource::Default),
+            &plain,
+            usage,
+        );
+        assert!(take_peaks()
+            .iter()
+            .all(|(entry, _)| entry.id != "plan_test_peak_none"));
+        drop(new);
+        assert_eq!(taken(), [5], "the older owner again");
+        drop(old);
+        assert!(taken().is_empty());
     }
 
     #[test]

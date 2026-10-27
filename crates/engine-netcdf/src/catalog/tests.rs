@@ -45,6 +45,7 @@ fn file() -> Arc<OpenFile> {
         run: None,
         times: Vec::new(),
         reads: Vec::new(),
+        heap_bytes: 0,
     })
 }
 

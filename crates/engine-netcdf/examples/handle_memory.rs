@@ -1,5 +1,7 @@
 //! Heap the catalog's open file handles hold (#1067), with a counting
-//! allocator: what one poll leaves allocated, divided by the files it opened.
+//! allocator: what the engine's first scan leaves allocated (its layout and
+//! catalog with the files), divided by the files it opened, beside the
+//! engine's own estimate of the open files (#1307).
 //! Every catalogued file stays open with the metadata it was read through,
 //! so this times the files a collection keeps (`max_runs` × files per run)
 //! is resident.
@@ -58,15 +60,17 @@ fn main() {
                 .is_ok_and(|e| e.file_name().to_string_lossy().ends_with(".nc"))
         })
         .count();
-    let engine = NetcdfEngine::new("measure", &config).expect("engine");
+    // The engine's first scan opens every file.
     let before = ALLOCATED.load(Ordering::Relaxed);
-    engine.poll_once();
+    let engine = NetcdfEngine::new("measure", &config).expect("engine");
     let held = ALLOCATED.load(Ordering::Relaxed) - before;
     let info = ds_core::map_engine::MapEngine::raster_info(&engine);
     println!(
-        "{files} files, {} variables served, {} valid times: {held} bytes held, {} per file",
+        "{files} files, {} variables served, {} valid times: {held} bytes held, {} per file; \
+         netcdf_open_file_bytes {}",
         info.parameters.len(),
         info.times.len(),
-        held / files.max(1) as isize
+        held / files.max(1) as isize,
+        engine.open_file_bytes()
     );
 }

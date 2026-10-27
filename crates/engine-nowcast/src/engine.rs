@@ -177,6 +177,16 @@ enum FrameData {
     F32(Vec<f32>),
 }
 
+impl FrameData {
+    /// The bytes its buffer holds: 1 per pixel raw, 4 decoded.
+    fn bytes(&self) -> u64 {
+        match self {
+            FrameData::U8 { data, .. } => data.capacity() as u64,
+            FrameData::F32(field) => (field.capacity() * std::mem::size_of::<f32>()) as u64,
+        }
+    }
+}
+
 /// One generation: the analysis frame plus extrapolated leads, anchored on a
 /// source frame (`reference_time`).
 type TrackReplay = (Vec<CellTrack>, Vec<CellTrack>, DateTime<Utc>, DateTime<Utc>);
@@ -303,6 +313,9 @@ pub struct NowcastEngine {
     /// Seconds between the source anchor frame and the wall clock at the end
     /// of the last generation (how far the nowcast lags reality).
     source_lag_secs: AtomicU64,
+    /// Bytes of the frames the retained generations hold, set whenever the
+    /// state swaps in a generation ([`Self::frame_bytes`]).
+    frame_bytes: AtomicU64,
     /// One-shot latch for the lead-cap warning (source-cadence default step
     /// only; an explicit step is validated at construction).
     lead_cap_warned: std::sync::atomic::AtomicBool,
@@ -446,6 +459,7 @@ impl NowcastEngine {
             generation_failures_total: AtomicU64::new(0),
             last_generation_ms: AtomicU64::new(0),
             source_lag_secs: AtomicU64::new(0),
+            frame_bytes: AtomicU64::new(0),
             lead_cap_warned: std::sync::atomic::AtomicBool::new(false),
             lead_csi_permille: AtomicU64::new(u64::MAX),
             lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
@@ -504,6 +518,14 @@ impl NowcastEngine {
             state.generations.len(),
             frames,
         )
+    }
+
+    /// Bytes of the frames the retained generations hold (#1307): each
+    /// one's analysis frame and leads, 1 byte per pixel from a raw `U8`
+    /// source, 4 on the f32 fallback. Exact, from the buffers' capacities,
+    /// set when a generation is swapped in.
+    pub fn frame_bytes(&self) -> u64 {
+        self.frame_bytes.load(Ordering::Relaxed)
     }
 
     /// Cumulative tracker counters (#643): `(births, deaths, pass1_matches,
@@ -690,6 +712,11 @@ impl NowcastEngine {
                     generations.remove(&oldest);
                 }
                 let info = build_info(&source_info, &generations);
+                let frame_bytes: u64 = generations
+                    .values()
+                    .flat_map(|g| &g.frames)
+                    .map(FrameData::bytes)
+                    .sum();
                 let generation_ref = generations.get(&anchor).expect("just inserted");
                 // Impact areas: ONE bounded fetch per generation covering the
                 // whole working grid, never one per cell (the `EventSource`
@@ -776,6 +803,7 @@ impl NowcastEngine {
                     info,
                     cell_history,
                 }));
+                self.frame_bytes.store(frame_bytes, Ordering::Relaxed);
                 self.generations_total.fetch_add(1, Ordering::Relaxed);
                 self.last_generation_ms.store(elapsed_ms, Ordering::Relaxed);
                 let lag = (Utc::now() - anchor).num_seconds().max(0) as u64;

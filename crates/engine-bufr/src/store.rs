@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
+use ds_core::heap::{btree, hash_table, HeapSize};
 
 use crate::decode::ObsReport;
 use crate::params::ParameterTable;
@@ -26,6 +27,14 @@ pub struct StationInfo {
     pub last_report: DateTime<Utc>,
     /// Receipt time of the newest report (eviction order under `max_stations`).
     pub last_seen: DateTime<Utc>,
+}
+
+/// A station's own heap: its name. Its id is one `Arc` shared by the
+/// store's key and every snapshot, counted once by [`ObsStore::heap_bytes`].
+impl HeapSize for StationInfo {
+    fn heap_size(&self) -> usize {
+        self.name.heap_size()
+    }
 }
 
 #[derive(Debug)]
@@ -83,6 +92,24 @@ impl ObsStore {
 
     pub fn stations(&self) -> impl Iterator<Item = &StationSeries> {
         self.stations.values()
+    }
+
+    /// Estimated heap bytes of the store (#1307): the station table, each
+    /// station's id and name, its rows' B-tree nodes and each row's values.
+    /// O(stations + reports): the snapshot rebuild calls it, never a
+    /// request.
+    pub fn heap_bytes(&self) -> u64 {
+        let stations: usize = self
+            .stations
+            .values()
+            .map(|s| {
+                s.info.id.heap_size()
+                    + s.info.heap_size()
+                    + btree::<DateTime<Utc>, Box<[f32]>>(s.rows.len())
+                    + s.rows.values().map(HeapSize::heap_size).sum::<usize>()
+            })
+            .sum();
+        (hash_table::<(Arc<str>, StationSeries)>(self.stations.capacity()) + stations) as u64
     }
 
     /// Add a report. `now` is the receipt time. Station metadata (name,
