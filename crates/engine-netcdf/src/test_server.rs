@@ -11,14 +11,17 @@
 //! OPeNDAP (DAP2) datasets, as thredds.met.no's `dodsC` answers for a
 //! NetCDF file (#1264): `.dds`, `.das` and `.dods` with a constraint
 //! expression, chunked, without `Last-Modified` unless asked
-//! ([`TestServer::put_opendap`]). Shared by the lib's tests and
+//! ([`TestServer::put_opendap`]). It can answer 429 Too Many Requests,
+//! without `Retry-After` as thredds.met.no does, to every request under a
+//! path ([`TestServer::throttle`]) or to those over a rate
+//! ([`TestServer::rate_limit`]). Shared by the lib's tests and
 //! `tests/integration.rs` (`#[path]`).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
@@ -47,6 +50,44 @@ struct State {
     slow: Option<(u64, Duration)>,
     /// Whole (unranged) GETs are answered chunked.
     chunked: bool,
+    /// Requests under these paths are answered 429.
+    throttled: Vec<String>,
+    /// Requests over this rate are answered 429.
+    rate: Option<Rate>,
+    /// Every request it serves takes this long; a 429 comes back at once.
+    latency: Option<Duration>,
+}
+
+/// A token bucket: `burst` requests at once, refilled at `per_second`.
+#[derive(Debug, Clone, Copy)]
+struct Rate {
+    per_second: f64,
+    burst: f64,
+    tokens: f64,
+    at: Instant,
+}
+
+impl State {
+    /// Whether to answer the request for `path` 429: it is under a
+    /// throttled path, or over the rate. A request answered 429 takes no
+    /// token, as a server counts only what it serves.
+    fn refuses(&mut self, path: &str) -> bool {
+        if self.throttled.iter().any(|prefix| path.starts_with(prefix)) {
+            return true;
+        }
+        let Some(rate) = &mut self.rate else {
+            return false;
+        };
+        let now = Instant::now();
+        let refill = now.duration_since(rate.at).as_secs_f64() * rate.per_second;
+        rate.tokens = (rate.tokens + refill).min(rate.burst);
+        rate.at = now;
+        if rate.tokens < 1.0 {
+            return true;
+        }
+        rate.tokens -= 1.0;
+        false
+    }
 }
 
 pub(crate) struct TestServer {
@@ -152,6 +193,38 @@ impl TestServer {
         self.state.lock().unwrap().slow = Some((bytes, delay));
     }
 
+    /// Answer every request under `/prefix` 429 Too Many Requests, without
+    /// `Retry-After`, as thredds.met.no does.
+    pub fn throttle(&self, prefix: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .throttled
+            .push(prefix.trim_start_matches('/').to_string());
+    }
+
+    /// Stop answering 429 under the paths [`Self::throttle`] named.
+    pub fn unthrottle(&self) {
+        self.state.lock().unwrap().throttled.clear();
+    }
+
+    /// Answer requests over `per_second`, after a burst of `burst`, 429
+    /// Too Many Requests without `Retry-After`.
+    pub fn rate_limit(&self, per_second: f64, burst: f64) {
+        self.state.lock().unwrap().rate = Some(Rate {
+            per_second,
+            burst,
+            tokens: burst,
+            at: Instant::now(),
+        });
+    }
+
+    /// Take `latency` to serve each request, as a distant server does; a
+    /// 429 still comes back at once.
+    pub fn latency(&self, latency: Duration) {
+        self.state.lock().unwrap().latency = Some(latency);
+    }
+
     /// The requests answered since the last call.
     pub fn take(&self) -> Vec<Request> {
         std::mem::take(&mut self.state.lock().unwrap().log)
@@ -207,6 +280,23 @@ fn serve(mut stream: std::net::TcpStream, state: &Mutex<State>) {
         .and_then(|r| r.split_once('-'))
         .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)));
     let since = header("if-unmodified-since").and_then(|d| DateTime::parse_from_rfc2822(d).ok());
+    if state.lock().unwrap().refuses(&path) {
+        state.lock().unwrap().log.push(Request {
+            method,
+            path,
+            range,
+            status: 429,
+            chunked: false,
+        });
+        let _ = stream.write_all(
+            b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        return;
+    }
+    let latency = state.lock().unwrap().latency;
+    if let Some(latency) = latency {
+        std::thread::sleep(latency);
+    }
     let (stem, query) = path.split_once('?').unwrap_or((path.as_str(), ""));
     let dap = [".dds", ".das", ".dods"].iter().find_map(|suffix| {
         let dataset = stem.strip_suffix(suffix)?;

@@ -356,3 +356,28 @@ impl ObjectStore for StalledBody {
         self.inner.copy_opts(from, to, options).await
     }
 }
+
+/// What [`quick_backoff`] returns: the host keeps the shorter times while
+/// this lives.
+#[derive(Debug)]
+pub struct QuickBackoff(#[allow(dead_code)] Arc<crate::throttle::HostThrottle>);
+
+/// Back off from the host of `url` with times a hundredth of the real
+/// ones (#1290): its pace from 2.5 ms up to 20 ms, a request it refuses
+/// retried after 20 ms. A test of a crate reading a host that answers 429
+/// in real time then waits milliseconds where the server would wait
+/// seconds; ds-storage's own tests pin the real times on a paused clock.
+/// The limit's cut and growth, the quiet interval and `Retry-After` keep
+/// theirs. Build the stores on the host while the guard lives: the
+/// throttle is the host's for as long as something holds it.
+pub fn quick_backoff(url: &str) -> QuickBackoff {
+    use crate::throttle::{Timing, PACE_CAP, PACE_FLOOR, RETRY_DELAY};
+    let url = url::Url::parse(url).expect("an absolute URL");
+    let host = crate::throttle::for_url(&url);
+    host.set_timing(Timing {
+        pace_floor: PACE_FLOOR / 100,
+        pace_cap: PACE_CAP / 100,
+        retry_delay: RETRY_DELAY / 100,
+    });
+    QuickBackoff(host)
+}

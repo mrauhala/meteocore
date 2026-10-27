@@ -20,8 +20,10 @@
 //!   `Content-Length` over the cap fails before the body is read, and a
 //!   body that grows past it fails at that chunk;
 //! - retried as object_store retries: a 429, a 5xx or a failed connection
-//!   up to [`ATTEMPTS`] times, each attempt after the host's `Retry-After`,
-//!   within the caller's budget and deadline;
+//!   up to [`ATTEMPTS`] times, each attempt after the host's `Retry-After`
+//!   and in its turn under the host's pace, a 429 without `Retry-After`
+//!   after the host's retry delay (#1290), within the caller's budget and
+//!   deadline;
 //! - with the query string the mark carries, if any: an OPeNDAP constraint
 //!   expression (#1264). The result is marked [`Sent`], so a caller can
 //!   tell that the query reached the server: any other store ignores it.
@@ -49,7 +51,8 @@ use crate::throttle::Throttled;
 pub(crate) const ATTEMPTS: u32 = 3;
 
 /// The wait before the first retry, doubled before each next one, after
-/// whatever `Retry-After` the host asked for.
+/// whatever `Retry-After` the host asked for, or its retry delay after a
+/// 429 without one (`throttle::RETRY_DELAY`).
 const BACKOFF: Duration = Duration::from_millis(100);
 
 /// The mark on a GET's [`GetOptions::extensions`] that asks for the whole

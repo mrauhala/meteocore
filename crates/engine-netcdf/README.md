@@ -26,7 +26,9 @@ or downloaded whole.
   seen yet, and the other leads once it appears. With a `catalog_url`, the
   server's THREDDS catalogs answer instead of the HEADs (below). Each poll
   opens new and changed files and keeps them open: the newest `max_runs`
-  runs, at most `max_files` files. Requests never open a file.
+  runs, at most `max_files` files. A run counts once a file of it is open:
+  the runs served stay served until newer ones have opened. Requests never
+  open a file.
 - **Time comes from the file, never its name:** valid times from the
   `time` axis, the model run from `forecast_reference_time`. Files without
   a run form one timeline without runs.
@@ -41,8 +43,12 @@ or downloaded whole.
   and a later poll opens the new version. At most 8 requests go to one
   host at once, over every collection on it; polls use at most 2 of them.
   A host answering 429 gets fewer: the 8 halve per 429 and grow back by
-  one per quiet 30 s, and its `Retry-After` pauses every collection on it
-  (ds-storage's host back-off).
+  one per quiet 30 s, its requests start at least 0.25 s apart (up to
+  2 s while it keeps refusing), a refused request is retried after 2 s,
+  and its `Retry-After` pauses every collection on it (ds-storage's host
+  back-off). While it refuses, a poll opens the newest run first and stops
+  after 3 opens fail: the rest wait for the next poll, and the poll logs
+  one line for them all.
   A retried request's log line names its collection, host and file
   (ds-storage's `storage` span).
 - **OPeNDAP** (`access = "opendap"`, #1264). Remote files read through a

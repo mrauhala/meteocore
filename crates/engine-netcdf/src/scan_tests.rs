@@ -114,3 +114,60 @@ fn a_replaced_file_draws_its_old_version_until_its_new_one_opens() {
     engine.scan(&one, 1).unwrap();
     assert_eq!(engine.content_version(), version, "nothing changed");
 }
+
+/// A run whose files are all closed never displaces a run that serves
+/// (#1290). With `max_runs = 1`, a newer run closed (the runs newer than
+/// it were withdrawn, say, and opening it again failed) and an older one
+/// open are both kept: the open one serves, the closed one is opened
+/// again. Once a file of the newer run is open, it alone is kept.
+#[test]
+fn a_closed_run_never_displaces_one_that_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let config: NetcdfConfig = toml::from_str(&format!(
+        "data_path = {:?}\nmax_runs = 1",
+        dir.path().display().to_string()
+    ))
+    .unwrap();
+    let engine = NetcdfEngine::new("meps", &config).unwrap();
+    let (six, nine) = (at("2026-10-15T06:00:00Z"), at("2026-10-15T09:00:00Z"));
+    let open = |name: &str, run: DateTime<Utc>| {
+        let path = fixture(name);
+        Known::Open(Arc::new(OpenFile {
+            id: next_file_id(),
+            path: path.clone(),
+            identity: Identity::sized(1),
+            reader: ingest::open(&path).unwrap(),
+            run: Some(run),
+            times: vec![run],
+            reads: Vec::new(),
+        }))
+    };
+    let older = fixture("meps_sfc_00_20261015T06Z.nc");
+    let newer = fixture("meps_sfc_00_20261015T09Z.nc");
+    let mut state = PollState {
+        known: HashMap::from([
+            (older.clone(), open("meps_sfc_00_20261015T06Z.nc", six)),
+            (
+                newer.clone(),
+                Known::Closed {
+                    identity: Identity::sized(1),
+                    run: Some(nine),
+                    newest: nine,
+                },
+            ),
+        ]),
+        layout: None,
+        content_version: 0,
+        warned_mixed: false,
+        prewarmed: HashSet::new(),
+    };
+    assert_eq!(
+        engine.retained(&mut state),
+        HashSet::from([older.clone(), newer.clone()])
+    );
+
+    state
+        .known
+        .insert(newer.clone(), open("meps_sfc_00_20261015T09Z.nc", nine));
+    assert_eq!(engine.retained(&mut state), HashSet::from([newer]));
+}

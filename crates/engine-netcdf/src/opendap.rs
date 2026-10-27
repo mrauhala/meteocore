@@ -27,7 +27,7 @@
 //!   [`DapFile::read_fields`]): one projection each in the constraint, one
 //!   reply listing them in dataset order.
 //! - **Requests** go through the host's stores ([`Host`]): its request
-//!   limit and 429 back-off, its `storage` span, under the calling thread's
+//!   limit, pace and 429 back-off, its `storage` span, under the calling thread's
 //!   [`Mode`], on the I/O runtime ([`io::blocking`]). THREDDS streams every
 //!   reply chunked, without `Content-Length`: they are read as documents
 //!   (`DataStore::get_documents_on`).

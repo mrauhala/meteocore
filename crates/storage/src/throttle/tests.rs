@@ -1,4 +1,4 @@
-//! Host back-off (#1235) through the stores [`crate::build_http_store`] and
+//! Host back-off (#1235, #1290) through the stores [`crate::build_http_store`] and
 //! [`crate::build_http_store_limited`] build: over a scripted transport in
 //! paused time, and once over a real server.
 
@@ -16,7 +16,10 @@ use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, RETRY_AFTER};
 use reqwest::StatusCode;
 use tokio::time::Instant;
 
-use super::{retry_after, CUT_WINDOW, MAX_RETRY_AFTER, QUIET_INTERVAL, WARN_INTERVAL};
+use super::{
+    for_url, retry_after, throttled_answers, CUT_WINDOW, MAX_RETRY_AFTER, PACE_CAP, PACE_FLOOR,
+    QUIET_INTERVAL, RETRY_DELAY, WARN_INTERVAL,
+};
 use crate::test_store::{JsonLog, RangeServer};
 use crate::{DataStore, FetchBudget, StorageError};
 
@@ -173,6 +176,22 @@ fn requests(host: &str) -> (usize, usize, usize) {
     (host.limit, host.in_flight, host.queued)
 }
 
+/// The pace of `host` now.
+fn pace(host: &str) -> Duration {
+    for_url(&url::Url::parse(&format!("http://{host}/")).unwrap()).pace()
+}
+
+/// The times `host`'s requests from `from` on were sent at, from the first
+/// of them.
+fn spacing(host: &Scripted, from: usize) -> Vec<Duration> {
+    let sent = host.sent();
+    let first = sent[from].0;
+    sent[from..].iter().map(|(at, _)| *at - first).collect()
+}
+
+/// object_store's wait before its first retry: its `init_backoff`.
+const FIRST_BACKOFF: Duration = Duration::from_millis(100);
+
 /// `n` HEADs of `path` at once through `store`, all successful.
 async fn heads(store: &DataStore, path: &Path, n: usize) {
     let all = futures::future::join_all((0..n).map(|_| store.inner().head(path))).await;
@@ -188,22 +207,17 @@ async fn peak(host: &Scripted, store: &DataStore, path: &Path, n: usize) -> usiz
     host.take_peak()
 }
 
-/// A 429 halves a limited host's limit; the 429s answering requests sent
-/// together cut it once; each quiet interval adds one back, up to the
-/// configured limit and no further.
+/// A 429 halves a limited host's limit, and paces it; the 429s answering
+/// requests sent together cut it once and raise the pace once; each quiet
+/// interval adds one back, up to the configured limit and no further, and
+/// the first one ends the pace.
 #[tokio::test(start_paused = true)]
 async fn a_429_halves_the_limit_once_per_window_and_quiet_time_restores_it() {
     const HOST: &str = "cut.backoff.test";
-    let host = Scripted::new(Duration::from_millis(100));
+    let host = Scripted::new(Duration::from_secs(1));
     let (store, path) = limited(&format!("http://{HOST}/meps.nc"), 8, &host);
     assert_eq!(peak(&host, &store, &path, 16).await, 8);
 
-    host.throttle(None);
-    store.inner().head(&path).await.unwrap();
-    assert_eq!(requests(HOST), (4, 0, 0));
-    assert_eq!(peak(&host, &store, &path, 16).await, 4);
-
-    tokio::time::sleep(CUT_WINDOW).await;
     for _ in 0..4 {
         host.throttle(None);
     }
@@ -213,12 +227,15 @@ async fn a_429_halves_the_limit_once_per_window_and_quiet_time_restores_it() {
         .iter()
         .filter(|(_, status)| *status == 429)
         .count();
-    assert_eq!(throttled, 5);
-    assert_eq!(requests(HOST), (2, 0, 0), "four 429s at once cut once");
-    assert_eq!(peak(&host, &store, &path, 16).await, 2);
+    assert_eq!(throttled, 4);
+    assert_eq!(requests(HOST), (4, 0, 0), "four 429s at once cut once");
+    assert_eq!(pace(HOST), PACE_FLOOR, "and raise the pace once");
+    // Requests of 1 s starting 0.25 s apart: four at once, the limit.
+    assert_eq!(peak(&host, &store, &path, 16).await, 4);
 
     tokio::time::sleep(QUIET_INTERVAL).await;
-    assert_eq!(requests(HOST).0, 3);
+    assert_eq!(requests(HOST).0, 5);
+    assert_eq!(pace(HOST), Duration::ZERO);
     tokio::time::sleep(QUIET_INTERVAL * 5).await;
     assert_eq!(requests(HOST).0, 8);
     tokio::time::sleep(QUIET_INTERVAL * 5).await;
@@ -226,9 +243,109 @@ async fn a_429_halves_the_limit_once_per_window_and_quiet_time_restores_it() {
     assert_eq!(peak(&host, &store, &path, 16).await, 8);
 }
 
+/// After a 429 every store on the host, limited or not, starts its
+/// requests the pace apart (#1290). Each 429 in a later window doubles the
+/// pace, up to [`PACE_CAP`]; each quiet interval halves it, and under
+/// [`PACE_FLOOR`] it is off: requests go out at once again.
+#[tokio::test(start_paused = true)]
+async fn a_429_paces_every_store_on_the_host_until_it_is_quiet() {
+    const HOST: &str = "pace.backoff.test";
+    let host = Scripted::new(Duration::ZERO);
+    let (sfc, path) = limited(&format!("http://{HOST}/sfc/meps.nc"), 8, &host);
+    let (feed, _) = unlimited(&format!("http://{HOST}/feed.xml"), &host);
+    host.throttle(Some("0"));
+    sfc.inner().head(&path).await.unwrap();
+    assert_eq!(pace(HOST), PACE_FLOOR);
+    let from = host.sent().len();
+    heads(&feed, &path, 3).await;
+    let quarter = PACE_FLOOR;
+    assert_eq!(spacing(&host, from), [Duration::ZERO, quarter, quarter * 2]);
+
+    let mut paces = Vec::new();
+    for _ in 0..5 {
+        tokio::time::sleep(CUT_WINDOW).await;
+        host.throttle(Some("0"));
+        sfc.inner().head(&path).await.unwrap();
+        paces.push(pace(HOST));
+    }
+    let ms = Duration::from_millis;
+    assert_eq!(paces, [ms(500), ms(1000), PACE_CAP, PACE_CAP, PACE_CAP]);
+    let from = host.sent().len();
+    heads(&feed, &path, 3).await;
+    assert_eq!(
+        spacing(&host, from),
+        [Duration::ZERO, PACE_CAP, PACE_CAP * 2]
+    );
+
+    let mut paces = Vec::new();
+    for _ in 0..4 {
+        tokio::time::sleep(QUIET_INTERVAL).await;
+        paces.push(pace(HOST));
+    }
+    assert_eq!(paces, [ms(1000), ms(500), ms(250), Duration::ZERO]);
+    let from = host.sent().len();
+    heads(&feed, &path, 3).await;
+    assert_eq!(spacing(&host, from), [Duration::ZERO; 3], "at once again");
+    assert_eq!(throttled_answers(&format!("http://{HOST}/any/path")), 6);
+}
+
+/// A request refused with a 429 without `Retry-After`, as thredds.met.no
+/// refuses, is retried after [`RETRY_DELAY`] and object_store's own
+/// backoff, not after the backoff alone (#1290); one carrying
+/// `Retry-After` when it says.
+#[tokio::test(start_paused = true)]
+async fn a_bare_429_is_retried_after_the_retry_delay() {
+    let host = Scripted::new(Duration::ZERO);
+    let (store, path) = limited("http://retry.backoff.test/x", 8, &host);
+    host.throttle(None);
+    store.inner().head(&path).await.unwrap();
+    let sent = host.sent();
+    let [(refused, 429), (retried, 200)] = sent.as_slice() else {
+        panic!("a 429 and its retry: {sent:?}");
+    };
+    assert_eq!(*retried - *refused, RETRY_DELAY + FIRST_BACKOFF);
+
+    tokio::time::sleep(QUIET_INTERVAL * 4).await;
+    host.throttle(Some("1"));
+    store.inner().head(&path).await.unwrap();
+    let sent = host.sent();
+    let [.., (refused, 429), (retried, 200)] = sent.as_slice() else {
+        panic!("a 429 and its retry: {sent:?}");
+    };
+    assert_eq!(*retried - *refused, Duration::from_secs(1));
+}
+
+/// `throttled_answers` and `host_requests` count each 429 of a host once,
+/// whichever store on it was refused: two bases of one host, which differ
+/// in their query strings, share a throttle.
+#[tokio::test(start_paused = true)]
+async fn the_429s_of_a_host_are_counted_once() {
+    const HOST: &str = "count.backoff.test";
+    let host = Scripted::new(Duration::ZERO);
+    let (sfc, path) = limited(&format!("http://{HOST}/sfc/meps.nc?a=1"), 8, &host);
+    let (pl, _) = limited(&format!("http://{HOST}/pl/meps.nc?b=2"), 8, &host);
+    let (feed, _) = unlimited(&format!("http://{HOST}/feed.xml"), &host);
+    let throttled = || {
+        let all = crate::requests_to(|label| label == HOST);
+        let [host] = all.as_slice() else {
+            panic!("one entry for {HOST}: {all:?}");
+        };
+        host.throttled
+    };
+    assert_eq!(throttled(), 0);
+    for store in [&sfc, &pl, &feed] {
+        host.throttle(Some("0"));
+        store.inner().head(&path).await.unwrap();
+    }
+    assert_eq!(throttled(), 3);
+    assert_eq!(throttled_answers(&format!("http://{HOST}/")), 3);
+    assert_eq!(throttled_answers("http://unseen.backoff.test/"), 0);
+    assert_eq!(throttled_answers("not a url"), 0);
+}
+
 /// `Retry-After: 2` holds every request to the host for 2 s: the retry of
 /// the throttled one, another collection's on the host's limited store,
-/// and an unlimited store's.
+/// and an unlimited store's. Then they go out the pace apart, not at once.
 #[tokio::test(start_paused = true)]
 async fn a_retry_after_pauses_every_store_on_the_host() {
     const HOST: &str = "pause.backoff.test";
@@ -253,7 +370,12 @@ async fn a_retry_after_pauses_every_store_on_the_host() {
     let resumed = start + Duration::from_secs(2);
     assert_eq!(
         host.sent(),
-        [(start, 429), (resumed, 200), (resumed, 200), (resumed, 200)]
+        [
+            (start, 429),
+            (resumed, 200),
+            (resumed + PACE_FLOOR, 200),
+            (resumed + PACE_FLOOR * 2, 200)
+        ]
     );
 }
 
@@ -270,8 +392,9 @@ async fn pause(host: &Scripted, store: &DataStore, path: &Path, retry_after: &st
 }
 
 /// An HTTP-date `Retry-After` waits until then; a huge one waits
-/// [`MAX_RETRY_AFTER`]; a date already past pauses nothing, leaving
-/// object_store's own backoff.
+/// [`MAX_RETRY_AFTER`]; a date already past pauses nothing: the retry
+/// waits only for the pace, which the minutes between these 429s took back
+/// to the floor.
 #[tokio::test(start_paused = true)]
 async fn retry_after_takes_dates_and_is_capped() {
     let host = Scripted::new(Duration::ZERO);
@@ -287,7 +410,7 @@ async fn retry_after_takes_dates_and_is_capped() {
         assert_eq!(pause(&host, &store, &path, huge).await, MAX_RETRY_AFTER);
     }
     let past = pause(&host, &store, &path, "Sun, 06 Nov 1994 08:49:37 GMT").await;
-    assert!(past < Duration::from_secs(1), "{past:?}");
+    assert_eq!(past, PACE_FLOOR);
 }
 
 /// A `Retry-After` past the request deadline fails the operation at the
@@ -377,8 +500,8 @@ async fn a_get_holds_its_permit_until_its_body_is_read() {
     store.inner().head(&path).await.unwrap();
 }
 
-/// A host that never answers 429 keeps its limit and its pace, and logs
-/// nothing.
+/// A host that never answers 429 keeps its limit, has no pace, and logs
+/// nothing: its requests wait for nothing (#1290).
 #[tokio::test(start_paused = true)]
 async fn a_host_that_never_throttles_keeps_its_limit_and_pace() {
     const HOST: &str = "calm.backoff.test";
@@ -391,6 +514,8 @@ async fn a_host_that_never_throttles_keeps_its_limit_and_pace() {
     assert_eq!(start.elapsed(), Duration::from_millis(400), "four rounds");
     tokio::time::sleep(QUIET_INTERVAL * 4).await;
     assert_eq!(requests(HOST), (4, 0, 0));
+    assert_eq!(pace(HOST), Duration::ZERO);
+    assert_eq!(throttled_answers(&format!("http://{HOST}/")), 0);
     assert_eq!(log.lines(), Vec::<serde_json::Value>::new());
 }
 
@@ -407,8 +532,8 @@ fn at_level(log: &JsonLog, level: &str) -> Vec<serde_json::Value> {
 }
 
 /// A cut logs one WARN per host per minute naming the host, the limit,
-/// the configured limit and the `Retry-After`; the limit's return to the
-/// configured one logs one INFO.
+/// the configured limit, the pace and the `Retry-After`; the pace's end
+/// and the limit's return to the configured one log one INFO each.
 #[tokio::test(start_paused = true)]
 async fn a_cut_warns_once_a_minute_and_the_return_is_logged() {
     const HOST: &str = "log.backoff.test";
@@ -430,44 +555,55 @@ async fn a_cut_warns_once_a_minute_and_the_return_is_logged() {
     assert_eq!(warn["host"], HOST);
     assert_eq!(warn["limit"], 4);
     assert_eq!(warn["configured_limit"], 8);
+    assert_eq!(warn["pace_secs"], 0.25);
     assert_eq!(warn["retry_after_secs"], 2.0);
     assert_eq!(
         warn["message"],
         format!(
             "{HOST} answered 429 Too Many Requests: request limit cut to 4 of 8; \
-             new requests wait 2.0 s (Retry-After)"
+             requests start 250 ms apart; new requests wait 2.0 s (Retry-After)"
         )
     );
     assert_eq!(warn["span"]["collection"], "meps-sfc", "{warn:#}");
 
     tokio::time::sleep(WARN_INTERVAL).await;
     assert_eq!(requests(HOST).0, 4, "two quiet intervals");
+    assert!(at_level(&log, "INFO").is_empty());
     host.throttle(None);
     store.inner().head(&path).await.unwrap();
-    let warns = at_level(&log, "WARN");
-    assert_eq!(warns.len(), 2, "{warns:#?}");
-    assert_eq!(
-        warns[1]["message"],
-        format!("{HOST} answered 429 Too Many Requests: request limit cut to 2 of 8")
-    );
-    assert!(warns[1].get("retry_after_secs").is_none(), "{:#}", warns[1]);
-
-    assert!(at_level(&log, "INFO").is_empty());
-    tokio::time::sleep(QUIET_INTERVAL * 6).await;
-    assert_eq!(requests(HOST).0, 8);
-    assert_eq!(requests(HOST).0, 8);
     let infos = at_level(&log, "INFO");
     assert_eq!(infos.len(), 1, "{infos:#?}");
     assert_eq!(
         infos[0]["message"],
+        format!("{HOST} has answered no 429 for 60 s: its requests are no longer paced")
+    );
+    let warns = at_level(&log, "WARN");
+    assert_eq!(warns.len(), 2, "{warns:#?}");
+    assert_eq!(
+        warns[1]["message"],
+        format!(
+            "{HOST} answered 429 Too Many Requests: request limit cut to 2 of 8; \
+             requests start 250 ms apart"
+        )
+    );
+    assert!(warns[1].get("retry_after_secs").is_none(), "{:#}", warns[1]);
+
+    tokio::time::sleep(QUIET_INTERVAL * 6).await;
+    assert_eq!(requests(HOST).0, 8);
+    assert_eq!(requests(HOST).0, 8);
+    let infos = at_level(&log, "INFO");
+    assert_eq!(infos.len(), 2, "{infos:#?}");
+    assert_eq!(
+        infos[1]["message"],
         format!("{HOST} has answered no 429 for 30 s: its request limit is back at 8")
     );
 }
 
-/// An unlimited store's 429 without `Retry-After` changes nothing for the
-/// host: no pause, no line.
+/// A bare 429 to an unlimited store paces the host and holds the refused
+/// request's retry: the request asked for with it, not sent yet when the
+/// 429 came back, waits its turn.
 #[tokio::test(start_paused = true)]
-async fn a_bare_429_on_an_unlimited_host_pauses_nothing() {
+async fn a_bare_429_on_an_unlimited_host_paces_it() {
     let log = JsonLog::default();
     let _logging = tracing::subscriber::set_default(log.subscriber());
     let host = Scripted::new(Duration::ZERO);
@@ -476,9 +612,17 @@ async fn a_bare_429_on_an_unlimited_host_pauses_nothing() {
     let (first, second) = tokio::join!(store.inner().head(&path), store.inner().head(&path));
     first.unwrap();
     second.unwrap();
-    let sent = host.sent();
-    assert_eq!(sent[0].0, sent[1].0, "the other request went out at once");
-    assert!(at_level(&log, "WARN").is_empty());
+    assert_eq!(
+        spacing(&host, 0),
+        [Duration::ZERO, PACE_FLOOR, RETRY_DELAY + FIRST_BACKOFF]
+    );
+    assert_eq!(pace("bare.backoff.test"), PACE_FLOOR);
+    let warns = at_level(&log, "WARN");
+    assert_eq!(warns.len(), 1, "{warns:#?}");
+    assert_eq!(
+        warns[0]["message"],
+        "bare.backoff.test answered 429 Too Many Requests: requests start 250 ms apart"
+    );
 }
 
 /// `Retry-After` in delta-seconds and in each HTTP-date form, measured

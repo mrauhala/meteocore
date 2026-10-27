@@ -192,8 +192,8 @@ GET fails a response without one. Catalogs are therefore read with
 host's adaptive limit and request gauges, each held until the body is
 read) and is sent, at the bottom of every HTTP store this crate builds, by
 the store's own transport (`document.rs`): the host's throttled `reqwest`
-client, so its `Retry-After` holds the request and a 429 cuts the host's
-limit, with no redirect followed and nothing decompressed. The body is read
+client, so its `Retry-After` and pace hold the request and a 429 cuts the
+host's limit, with no redirect followed and nothing decompressed. The body is read
 whole with a size cap checked against a declared length first and then
 while it streams, never after; a 429, a 5xx or a failed connection is
 retried twice, within the request deadline or the fetch budget. Any other
@@ -261,15 +261,28 @@ A concurrency limit is not a rate limit, and object_store retries a 429 Too
 Many Requests one request at a time, after a 0.1 s backoff, while the other
 requests to the host go on. So every HTTP store, limited or not, sends its
 requests through one throttle per scheme, host and port (`throttle.rs`,
-#1235). It sees the response to every attempt, object_store's retries
-included, and on a 429:
+#1235, #1290). It sees the response to every attempt, object_store's
+retries included, and on a 429:
 
 - **`Retry-After`**, in seconds or as an HTTP-date, pauses new requests to
   the host, from every store and collection on it, until then, at most 60 s
   (`MAX_RETRY_AFTER`). The wait comes before the request is sent and is
   part of the operation, so its fetch budget and the request deadline bound
   it: one longer than the deadline fails the operation at the deadline.
-  A 429 without `Retry-After` pauses nothing.
+- **The pace.** A 429 comes back at once, so even a limit of 1 can send
+  several requests a second. After one, the host's requests, from every
+  store on it, start at least the pace apart: 0.25 s (`PACE_FLOOR`),
+  doubled by each 429 in a later second (`CUT_WINDOW`) up to 2 s
+  (`PACE_CAP`), halved by each 30 s without one (`QUIET_INTERVAL`), and off
+  below the floor. A request takes its turn before it is sent, after any
+  `Retry-After`; the turn counts against its budget and deadline as the
+  pause does. A host that has never answered 429 has no pace, and its
+  requests wait for nothing.
+- **The retry delay.** A request refused without `Retry-After` is handed
+  back to object_store, or to the document layer, after 2 s
+  (`RETRY_DELAY`), so its retry goes out under the cut limit and the
+  raised pace instead of 0.1 s later. It holds its request permit
+  meanwhile.
 - **The adaptive limit** of a `build_http_store_limited` host halves, never
   below 1 and at most once per second (`CUT_WINDOW`), so the 429s of one
   burst cut it once. Each 30 s without a 429 (`QUIET_INTERVAL`) adds one
@@ -279,9 +292,19 @@ included, and on a 429:
   within it.
 
 `storage_host_request_limit{host}` shows the limit as it is now, so a cut
-shows on the dashboard's host panel. A cut, or a `Retry-After` pause, logs
-one WARN per host per minute naming the host, the limit, the configured
-limit and the wait; the limit's return to the configured one logs an INFO.
+shows on the dashboard's host panel, and `storage_host_throttled_total{host}`
+counts the host's 429s, from `host_requests()` (each host's throttle counted
+once), on the panel under it. `throttled_answers(url)` reads the same count
+for a caller that wants to know whether its host throttled meanwhile:
+engine-netcdf stops a scan's opens with it. A cut, a raised pace or a
+`Retry-After` pause logs one WARN per host per minute naming the host, the
+limit, the configured limit, the pace and the wait; the pace's end and the
+limit's return to the configured one log an INFO each.
+
+`test_util::quick_backoff(url)` (feature `test-util`) runs a host's pace and
+retry delay a hundred times faster, for other crates' tests against a real
+server that answers 429; this crate's own tests pin the real times on a
+paused clock.
 S3 is out of scope: it throttles with 503 SlowDown, which object_store
 retries.
 

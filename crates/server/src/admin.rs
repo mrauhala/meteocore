@@ -649,6 +649,18 @@ static STORAGE_HOST_REQUEST_LIMIT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
          or less while it backs off from a 429",
     )
 });
+static STORAGE_HOST_THROTTLED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "storage_host_throttled_total",
+            "429 Too Many Requests answers from a remote host, to every store on it (#1290)",
+        ),
+        &["host"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
 
 // Lightning strike-window cache (#504) — process-global, byte-bounded LRU of
 // decoded event windows for the events-shape map layer, so the ~50-190
@@ -1391,6 +1403,10 @@ struct CacheCounterState {
     bufr: HashMap<String, [u64; engine_bufr::health::COUNTERS]>,
     /// Station-grid per-collection `[analyses, failures]` (#1082).
     station_grid: HashMap<String, [u64; 2]>,
+    /// The 429s each rate-limited remote host has answered (#1290). They
+    /// count from process start and never reset; the same delta scheme
+    /// as the others all the same.
+    storage_host_throttled: HashMap<String, [u64; 1]>,
 }
 
 // Station grids (#1082): the stations behind the latest analysis is the
@@ -7343,6 +7359,14 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         STORAGE_HOST_REQUEST_LIMIT
             .with_label_values(&label)
             .set(host.limit.min(i64::MAX as usize) as i64);
+        let [throttled] = delta_counts(
+            &mut counter_state.storage_host_throttled,
+            &host.host,
+            [host.throttled],
+        );
+        STORAGE_HOST_THROTTLED_TOTAL
+            .with_label_values(&label)
+            .inc_by(throttled);
     }
     let satellite_engines = state
         .satellite_engines
