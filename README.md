@@ -97,8 +97,17 @@ Each GitHub release carries the server, named `dataserver`, for:
   gracefully, flushing engine state; closing the console window stops it
   without the final `state_dir` save.
 - **Memory:** jemalloc, and with it the `jemalloc_*` metrics, is in every
-  build but the Windows one. `process_resident_memory_bytes` and
-  `process_swap_memory_bytes` are read from `/proc` and stay 0 off Linux.
+  build but the Windows one. The server turns on jemalloc's background
+  threads at startup, so freed pages go back to the OS over jemalloc's 10 s
+  decay even in an arena that has gone quiet. On macOS jemalloc has no
+  background threads; the server logs that at INFO and carries on. The
+  `jemalloc options` startup log line shows the effective values. jemalloc's
+  symbols are prefixed, so it reads its options from `_RJEM_MALLOC_CONF`,
+  never `MALLOC_CONF`, and a `background_thread` set there wins over the
+  server's.
+  `MALLOC_ARENA_MAX` reaches only C libraries that use glibc `malloc`.
+  `process_resident_memory_bytes` and `process_swap_memory_bytes` are read
+  from `/proc` and stay 0 off Linux.
 
 ### Command-Line Options
 
@@ -218,6 +227,7 @@ not re-scan the auto roots.
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool, across all renders. A projected WMS view (EPSG:3857/3067/3035) renders one meta-tile at a time with only a few fetches in flight, so raising this does not shorten its first view; a whole-viewport render (WMS EPSG:4326, a Maps image) fetches all its missing tiles at once and does wait on the pool. Raise it (e.g. 32–64) when cold renders queue on a high-latency object store. Value must be ≥ 1. |
 | `MC_COG_PREWARM_MB` | `32` | Per-frame cap, in MiB of encoded tiles, on the poll-time pre-warm of newly discovered remote COG frames, which reads them into the collection's tile cache so their first view needs no storage round trips. Also at most 1/8 of the collection's `tile_cache_mb`. Levels are taken coarsest first while they fit, so a larger file still gets its overviews. `0` turns the pre-warm off. Restart to change. |
 | `MC_ALLOW_INLINE_DB_URL` | _(unset)_ | Set to `1` to allow a literal `postgres://` URL in TOML instead of `dsn_env` (development only). |
+| `_RJEM_MALLOC_CONF` | _(unset)_ | jemalloc options, e.g. `background_thread:false` to turn off the background purging the server enables at startup. Plain `MALLOC_CONF` is not read: jemalloc's symbols are prefixed. Not on Windows. |
 
 ### Sizing render memory on larger hosts
 

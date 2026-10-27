@@ -1,6 +1,8 @@
 mod admin;
 mod auto;
 mod colormaps;
+#[cfg(not(target_env = "msvc"))]
+mod jemalloc;
 mod preview;
 mod robots;
 mod sld;
@@ -16,6 +18,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 /// jemalloc's size-classed extents and dirty-page decay return freed memory
 /// to the OS instead. Allocator stats are exported on `/metrics` as the
 /// `jemalloc_*` gauges (see `admin.rs`) to watch the multiplier in prod.
+/// `jemalloc::configure` turns on background purging at startup (#1310).
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -281,12 +284,23 @@ fn parse_collection_list(s: &str) -> Vec<String> {
         .collect()
 }
 
-#[tokio::main]
-async fn main() {
-    init_tracing();
-
+fn main() {
+    // Before logging starts, so `--help` and argument errors print only
+    // their own text.
     let cli = parse_cli_args();
+    init_tracing();
+    // Before any runtime starts its worker threads (#1310).
+    #[cfg(not(target_env = "msvc"))]
+    jemalloc::configure();
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build request runtime")
+        .block_on(serve(cli));
+}
+
+async fn serve(cli: CliArgs) {
     // Resolve the config path: --config flag > CONFIG_PATH env > ./config.toml.
     let config_path = cli
         .config

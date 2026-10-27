@@ -1071,7 +1071,20 @@
                                 "spec": {
                                   "x": 0,
                                   "y": 8,
-                                  "width": 24,
+                                  "width": 8,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-118"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 8,
+                                  "y": 8,
+                                  "width": 16,
                                   "height": 8,
                                   "element": {
                                     "kind": "ElementReference",
@@ -8003,7 +8016,7 @@
         "spec": {
           "id": 56,
           "title": "Process memory",
-          "description": "Healthy: RSS ≈ jemalloc resident, and resident within ~1.5× of allocated (live application bytes). resident ≫ allocated = allocator retention or fragmentation. RSS ≫ jemalloc resident = memory outside the allocator (mapped files, thread stacks). Swap > 0 = host memory pressure. `caches` is the sum of every byte-bounded cache, the floor the process cannot go below. retained growing without allocated = arena fragmentation. RSS and swap are read on Linux only.",
+          "description": "Healthy: RSS ≈ jemalloc resident, and resident within ~1.5× of allocated (live application bytes). resident ≫ allocated = allocator retention or fragmentation; resident ≫ active = freed pages awaiting purge, which jemalloc's background threads return over its 10 s decay. RSS ≫ jemalloc resident = memory outside the allocator (mapped files, thread stacks). Swap > 0 = host memory pressure. `caches` is the sum of every byte-bounded cache, the floor the process cannot go below. RSS and swap are read on Linux only. jemalloc retained is address space, not memory: see Retained address space.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -8162,28 +8175,6 @@
                       }
                     }
                   }
-                },
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "refId": "H",
-                    "hidden": false,
-                    "query": {
-                      "kind": "DataQuery",
-                      "group": "prometheus",
-                      "version": "v0",
-                      "datasource": {
-                        "name": "${DS_PROMETHEUS}"
-                      },
-                      "spec": {
-                        "expr": "sum(jemalloc_retained_bytes{job=~\"$job\"})",
-                        "legendFormat": "jemalloc retained",
-                        "range": true,
-                        "instant": false,
-                        "editorMode": "code"
-                      }
-                    }
-                  }
                 }
               ],
               "transformations": [],
@@ -8286,7 +8277,7 @@
                   {
                     "matcher": {
                       "id": "byRegexp",
-                      "options": "/mapped|retained/"
+                      "options": "/mapped/"
                     },
                     "properties": [
                       {
@@ -8302,6 +8293,112 @@
                     ]
                   }
                 ]
+              }
+            }
+          }
+        }
+      },
+      "panel-118": {
+        "kind": "Panel",
+        "spec": {
+          "id": 118,
+          "title": "Retained address space",
+          "description": "Virtual memory jemalloc keeps mapped for reuse instead of unmapping it (jemalloc_retained_bytes). It is address space, not memory: its pages were purged or never touched, so it is not part of RSS, and tens of GiB are normal on a 64-bit host. Worth a look only when it keeps growing while allocated stays flat in Process memory, a sign of arena fragmentation.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum(jemalloc_retained_bytes{job=~\"$job\"})",
+                        "legendFormat": "retained",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Max",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 0,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
+                },
+                "overrides": []
               }
             }
           }
