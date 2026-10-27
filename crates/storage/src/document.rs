@@ -89,8 +89,23 @@ fn generic(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> objec
 
 /// Why one attempt failed, and whether another may succeed.
 enum Failure {
-    Retry(object_store::Error),
+    /// Another attempt may succeed. `throttled`: the host answered 429,
+    /// so the transport has already waited its retry delay, and the next
+    /// attempt waits its turn under the host's pace and `Retry-After`.
+    Retry {
+        error: object_store::Error,
+        throttled: bool,
+    },
     Fail(object_store::Error),
+}
+
+impl Failure {
+    fn retry(error: object_store::Error) -> Self {
+        Self::Retry {
+            error,
+            throttled: false,
+        }
+    }
 }
 
 impl<S: HttpService + Clone> Documents<S> {
@@ -112,17 +127,28 @@ impl<S: HttpService + Clone> Documents<S> {
         loop {
             match self.attempt(location, &url, document.max_bytes).await {
                 Ok(result) => return Ok(result),
-                Err(Failure::Retry(e)) if attempt < ATTEMPTS => {
+                Err(Failure::Retry {
+                    error: e,
+                    throttled,
+                }) if attempt < ATTEMPTS => {
                     let wait = BACKOFF * 2u32.pow(attempt - 1);
-                    tracing::info!(
-                        "retrying document GET of {url} in {} ms (attempt {attempt} of \
-                         {ATTEMPTS}): {e}",
-                        wait.as_millis()
-                    );
+                    if throttled {
+                        // The back-off is the host's, not this `wait` (#1290).
+                        tracing::info!(
+                            "retrying document GET of {url} after the host's 429 back-off \
+                             (attempt {attempt} of {ATTEMPTS}): {e}"
+                        );
+                    } else {
+                        tracing::info!(
+                            "retrying document GET of {url} in {} ms (attempt {attempt} of \
+                             {ATTEMPTS}): {e}",
+                            wait.as_millis()
+                        );
+                    }
                     tokio::time::sleep(wait).await;
                     attempt += 1;
                 }
-                Err(Failure::Retry(e) | Failure::Fail(e)) => return Err(e),
+                Err(Failure::Retry { error: e, .. } | Failure::Fail(e)) => return Err(e),
             }
         }
     }
@@ -151,7 +177,7 @@ impl<S: HttpService + Clone> Documents<S> {
                 );
                 let e = generic(e);
                 return Err(if retry {
-                    Failure::Retry(e)
+                    Failure::retry(e)
                 } else {
                     Failure::Fail(e)
                 });
@@ -172,9 +198,12 @@ impl<S: HttpService + Clone> Documents<S> {
             let e = generic(format!(
                 "Server returned non-2xx status code: {status}: {url}"
             ));
-            let retry = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-            return Err(if retry {
-                Failure::Retry(e)
+            let throttled = status == StatusCode::TOO_MANY_REQUESTS;
+            return Err(if throttled || status.is_server_error() {
+                Failure::Retry {
+                    error: e,
+                    throttled,
+                }
             } else {
                 Failure::Fail(e)
             });
@@ -205,7 +234,7 @@ impl<S: HttpService + Clone> Documents<S> {
         let mut body = response.into_body().bytes_stream();
         let mut read = BytesMut::new();
         while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| Failure::Retry(generic(e)))?;
+            let chunk = chunk.map_err(|e| Failure::retry(generic(e)))?;
             let total = (read.len() + chunk.len()) as u64;
             if total > max_bytes {
                 return Err(over(total));
