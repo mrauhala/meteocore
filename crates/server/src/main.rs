@@ -1,5 +1,6 @@
 mod admin;
 mod auto;
+mod cache_plan;
 mod colormaps;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc;
@@ -690,17 +691,12 @@ async fn serve(cli: CliArgs) {
     if admin_token.is_some() {
         info!("Admin endpoint authentication enabled");
     } else {
-        info!("Admin endpoint authentication disabled (no ADMIN_TOKEN set)");
-        // Loopback default is safe; a non-loopback bind (e.g. `--host 0.0.0.0`)
-        // with no token exposes POST /admin/collections/reload to the network.
-        let host = config.server.host.as_str();
-        if !matches!(host, "127.0.0.1" | "::1" | "localhost") {
-            tracing::warn!(
-                "Admin endpoint is UNAUTHENTICATED and bound to a non-loopback host ({host}): \
-                 POST /admin/collections/reload is reachable from the network. Set ADMIN_TOKEN, \
-                 or bind to 127.0.0.1."
-            );
-        }
+        // Without a token `require_admin_token` refuses every admin request
+        // with 403, whatever the bind address.
+        info!(
+            "Admin endpoints disabled (no ADMIN_TOKEN set): POST /admin/collections/reload \
+             and GET /admin/cache-plan answer 403"
+        );
     }
 
     // Resolve the directories to watch (issues #318, #571) before
@@ -797,6 +793,10 @@ async fn serve(cli: CliArgs) {
         engine_handles: RwLock::new(result.engines_by_id),
         wind_handles: RwLock::new(result.wind_by_id),
     });
+
+    // The memory plan (#1306): what every cache and budget holds and why.
+    cache_plan::register_render_caches(&server_state);
+    cache_plan::log(&server_state, cache_plan::Occasion::Boot);
 
     let recovery_state = server_state.clone();
     poll_runtime().spawn(async move {
@@ -925,10 +925,15 @@ async fn serve(cli: CliArgs) {
         info!("MCP endpoint enabled at /mcp (bearer auth required)");
     }
 
-    let admin_routes = Router::new().route(
-        "/admin/collections/reload",
-        post(admin::reload_handler).with_state(server_state.clone()),
-    );
+    let admin_routes = Router::new()
+        .route(
+            "/admin/collections/reload",
+            post(admin::reload_handler).with_state(server_state.clone()),
+        )
+        .route(
+            "/admin/cache-plan",
+            get(cache_plan::handler).with_state(server_state.clone()),
+        );
 
     // The 404 page's base URL comes from the reloadable EDR state, as every
     // API's links do, so a reload that changes `base_url` or

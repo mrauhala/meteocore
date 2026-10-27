@@ -126,6 +126,12 @@ impl DsStore {
         }
     }
 
+    /// The object cache's counters and occupancy, shared by every
+    /// generation.
+    pub(crate) fn cache_metrics(&self) -> ds_cache::CacheMetrics {
+        self.shared.cache.metrics()
+    }
+
     pub(crate) fn fresh(&self) -> Self {
         Self {
             shared: self.shared.clone(),

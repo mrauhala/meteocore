@@ -125,6 +125,12 @@ impl VectorTileCache {
         self.cache.stats().1
     }
 
+    /// Enter this cache in the memory plan (#1306), sized from `source`.
+    pub fn register(&self, source: ds_cache::plan::SizeSource) {
+        self.cache
+            .register("vector_tile_cache", ds_cache::plan::Scope::Process, source);
+    }
+
     /// Drop every cached tile belonging to `collection` — targeted
     /// invalidation for a reload that rebuilt (or removed) one collection. A
     /// rebuilt engine restarts its `data_version` counter, so old entries

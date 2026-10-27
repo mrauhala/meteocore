@@ -259,6 +259,16 @@ impl PixelCache {
         }
     }
 
+    /// Enter the decoded-pixel cache in the memory plan (#1306), sized from
+    /// `source`.
+    pub(crate) fn register(&self, source: ds_cache::plan::SizeSource) {
+        self.inner.register(
+            "pvol_pixel_cache",
+            ds_cache::plan::Scope::Engine("odim-volume"),
+            source,
+        );
+    }
+
     /// Remember that the store refused `file_id` for good (#1046), until
     /// `until`. `true` when it was not refused already, so the caller logs
     /// a refusal once per period rather than once per request.

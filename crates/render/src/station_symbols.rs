@@ -228,7 +228,12 @@ fn frame_weight(k: &FrameKey, v: &Arc<Vec<Marker>>) -> u64 {
 pub fn frame_cache() -> &'static ByteBoundedCache<FrameKey, Arc<Vec<Marker>>> {
     static CACHE: OnceLock<ByteBoundedCache<FrameKey, Arc<Vec<Marker>>>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        ByteBoundedCache::from_env("MC_STATION_FRAME_CACHE_MB", 32, 1024 * 1024, frame_weight)
+        let (bytes, source) = ds_cache::plan::env_bytes("MC_STATION_FRAME_CACHE_MB", 32);
+        ByteBoundedCache::new(bytes, 1024 * 1024, frame_weight).registered(
+            "station_frame_cache",
+            ds_cache::plan::Scope::Process,
+            source,
+        )
     })
 }
 

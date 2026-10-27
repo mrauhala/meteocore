@@ -1149,6 +1149,46 @@
                           }
                         }
                       }
+                    },
+                    {
+                      "kind": "RowsLayoutRow",
+                      "spec": {
+                        "title": "Cache plan",
+                        "collapse": false,
+                        "layout": {
+                          "kind": "GridLayout",
+                          "spec": {
+                            "items": [
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 0,
+                                  "width": 6,
+                                  "height": 12,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-121"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 6,
+                                  "y": 0,
+                                  "width": 18,
+                                  "height": 12,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-120"
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
                     }
                   ]
                 }
@@ -17542,6 +17582,351 @@
                   "links": [],
                   "min": 0,
                   "decimals": 2
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-120": {
+        "kind": "Panel",
+        "spec": {
+          "id": 120,
+          "title": "Cache plan",
+          "description": "Every cache and admission budget with where its size came from: default, env:<variable>, config:<[server] key>, collection:<collection key> or constant (/admin/cache-plan has the same list). Capacity is the configured size and Used what the cache holds or the budget has reserved now. A cache without a byte gauge yet (MVT, solid images, plain-Zarr objects) shows no Used.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (cache, collection, source) (cache_size_source{job=~\"$job\"})",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (cache, collection) (label_replace({job=~\"$job\", __name__=~\".+_capacity_bytes\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) or label_replace(max(render_budget_total_bytes{job=~\"$job\"}), \"cache\", \"render_budget\", \"\", \"\")",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "C",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (cache, collection) (label_replace({job=~\"$job\", __name__=~\".+_cache_bytes\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\")) or max by (cache) (label_replace({job=~\"$job\", __name__=~\".+_reserved_bytes\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_reserved_bytes\")) or label_replace(max(render_budget_total_bytes{job=~\"$job\"}) - max(render_budget_available_bytes{job=~\"$job\"}), \"cache\", \"render_budget\", \"\", \"\")",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [
+                {
+                  "kind": "Transformation",
+                  "group": "merge",
+                  "spec": {
+                    "options": {}
+                  }
+                },
+                {
+                  "kind": "Transformation",
+                  "group": "filterByValue",
+                  "spec": {
+                    "options": {
+                      "filters": [
+                        {
+                          "fieldName": "source",
+                          "config": {
+                            "id": "isNull",
+                            "options": {}
+                          }
+                        }
+                      ],
+                      "type": "exclude",
+                      "match": "any"
+                    }
+                  }
+                },
+                {
+                  "kind": "Transformation",
+                  "group": "organize",
+                  "spec": {
+                    "options": {
+                      "excludeByName": {
+                        "Time": true,
+                        "job": true,
+                        "instance": true,
+                        "__name__": true,
+                        "Value #A": true
+                      },
+                      "indexByName": {
+                        "cache": 0,
+                        "collection": 1,
+                        "source": 2,
+                        "Value #B": 3,
+                        "Value #C": 4
+                      },
+                      "renameByName": {
+                        "cache": "Cache",
+                        "collection": "Collection",
+                        "source": "Source",
+                        "Value #B": "Capacity",
+                        "Value #C": "Used"
+                      }
+                    }
+                  }
+                }
+              ],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "table",
+            "version": "",
+            "spec": {
+              "options": {
+                "showHeader": true,
+                "cellHeight": "sm",
+                "footer": {
+                  "show": true,
+                  "reducer": [
+                    "sum"
+                  ],
+                  "countRows": false,
+                  "fields": [
+                    "Capacity",
+                    "Used"
+                  ]
+                },
+                "sortBy": [
+                  {
+                    "displayName": "Capacity",
+                    "desc": true
+                  }
+                ]
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "custom": {
+                    "align": "auto",
+                    "cellOptions": {
+                      "type": "auto"
+                    },
+                    "inspect": false,
+                    "filterable": false
+                  },
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "blue",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "mappings": [
+                    {
+                      "type": "special",
+                      "options": {
+                        "match": "nan",
+                        "result": {
+                          "text": "–"
+                        }
+                      }
+                    },
+                    {
+                      "type": "special",
+                      "options": {
+                        "match": "null",
+                        "result": {
+                          "text": "–"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Cache"
+                    },
+                    "properties": []
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Capacity"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "bytes"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 0
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Used"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "bytes"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 1
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "panel-121": {
+        "kind": "Panel",
+        "spec": {
+          "id": 121,
+          "title": "Planned capacity",
+          "description": "Configured capacity of every cache and of every admission budget, summed (memory_capacity_total_bytes). Capacity, not memory: a cache holds no more than it is asked for, and budgets are reserved only while work runs. The Cache plan table lists each one.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (kind) (memory_capacity_total_bytes{job=~\"$job\"})",
+                        "legendFormat": "{{kind}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "fields": "",
+                  "values": false
+                },
+                "orientation": "auto",
+                "textMode": "auto",
+                "colorMode": "value",
+                "graphMode": "none",
+                "justifyMode": "auto",
+                "wideLayout": true,
+                "showPercentChange": false
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "blue",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "mappings": [],
+                  "links": [
+                    {
+                      "title": "Open cache plan",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${__all_variables}&dtab=memory-admission&viewPanel=panel-120"
+                    }
+                  ],
+                  "decimals": 1
                 },
                 "overrides": []
               }

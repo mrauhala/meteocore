@@ -14,15 +14,20 @@
 //! Deliberately dependency-light (only `quick_cache` + `std`) so every crate
 //! — including the framework-free `ds-render`/`ds-mvt`/`ds-3dtiles` tier —
 //! can depend on it. Domain types stay out; this is mechanism only.
+//!
+//! [`plan`] is the process-wide registry of every cache and admission
+//! budget, with where each size came from (#1306).
 
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Re-exported so call sites can name the borrowed-key-lookup bound without
 /// depending on `quick_cache` directly.
 pub use quick_cache::Equivalent;
 
 mod entry;
+pub mod plan;
 pub use entry::{CacheEntry, CacheFillGuard, Joined};
 
 /// One mebibyte, for `*_MB` → bytes conversions.
@@ -31,11 +36,16 @@ pub const MIB: u64 = 1024 * 1024;
 /// Parse a cache size (in MB) from the environment: `MC_*_CACHE_MB`-style
 /// variables are trimmed and parsed as `u64`, with unset/unparseable values
 /// falling back to `default_mb`. `0` conventionally disables the cache.
+/// [`plan::env_size`] also says whether the variable set it.
 pub fn env_mb(var: &str, default_mb: u64) -> u64 {
+    parse_env_mb(var).unwrap_or(default_mb)
+}
+
+/// `var` trimmed and parsed as a whole number, if it is set to one.
+fn parse_env_mb(var: &str) -> Option<u64> {
     std::env::var(var)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(default_mb)
 }
 
 /// Snapshot of a cache's counters and occupancy for `/metrics`.
@@ -92,10 +102,27 @@ impl<K, V> quick_cache::Weighter<K, V> for WeighFn<K, V> {
 ///   accounting (e.g. a negative-cache check between lookup and miss) keep
 ///   the counters truthful.
 pub struct ByteBoundedCache<K: Eq + Hash, V: Clone> {
+    /// Shared so the memory plan can read it weakly ([`Self::register`]).
+    inner: Arc<Inner<K, V>>,
+}
+
+struct Inner<K: Eq + Hash, V: Clone> {
     cache: quick_cache::sync::Cache<K, V, WeighFn<K, V>>,
     capacity_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
+}
+
+impl<K: Eq + Hash, V: Clone> Inner<K, V> {
+    fn usage(&self) -> plan::Usage {
+        plan::Usage {
+            capacity_bytes: self.capacity_bytes,
+            used_bytes: self.cache.weight(),
+            entries: Some(self.cache.len() as u64),
+            hits: Some(self.hits.load(Ordering::Relaxed)),
+            misses: Some(self.misses.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
@@ -183,22 +210,27 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
             options.hot_allocation(hot_allocation);
         }
         ByteBoundedCache {
-            cache: quick_cache::sync::Cache::with_options(
-                options
-                    .build()
-                    .expect("item estimate and weight capacity are set"),
-                WeighFn { weigh },
-                Default::default(),
-                Default::default(),
-            ),
-            capacity_bytes,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            inner: Arc::new(Inner {
+                cache: quick_cache::sync::Cache::with_options(
+                    options
+                        .build()
+                        .expect("item estimate and weight capacity are set"),
+                    WeighFn { weigh },
+                    Default::default(),
+                    Default::default(),
+                ),
+                capacity_bytes,
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+            }),
         }
     }
 
     /// Build a cache sized from the environment: `var` (MB, [`env_mb`]) with
-    /// `default_mb` as the fallback. `0` disables retention.
+    /// `default_mb` as the fallback. `0` disables retention. Not in the
+    /// memory plan: a cache the server keeps is sized by
+    /// [`plan::env_bytes`], which also says where the size came from, and
+    /// built [`Self::registered`].
     pub fn from_env(
         var: &str,
         default_mb: u64,
@@ -231,11 +263,11 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        let result = self.cache.get(key);
+        let result = self.inner.cache.get(key);
         if result.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.inner.hits.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            self.inner.misses.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
@@ -247,7 +279,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.cache.get(key)
+        self.inner.cache.get(key)
     }
 
     /// Whether `key` is resident — no recency bump, no counter change.
@@ -255,13 +287,13 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.cache.contains_key(key)
+        self.inner.cache.contains_key(key)
     }
 
     /// Insert an entry. At capacity 0 the entry is never admitted (see the
     /// type-level docs), so this is effectively a no-op there.
     pub fn insert(&self, key: K, value: V) {
-        self.cache.insert(key, value);
+        self.inner.cache.insert(key, value);
     }
 
     /// Remove `key`, returning its value if it was resident. No counter
@@ -270,7 +302,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
-        self.cache.remove(key).map(|(_, value)| value)
+        self.inner.cache.remove(key).map(|(_, value)| value)
     }
 
     /// Keep only the entries for which `keep` returns `true`, dropping the
@@ -278,7 +310,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// entries on an incremental reload) — visits every entry, so call it on
     /// reload-frequency paths, not per request.
     pub fn retain(&self, keep: impl Fn(&K, &V) -> bool) {
-        self.cache.retain(keep);
+        self.inner.cache.retain(keep);
     }
 
     /// Fetch `key` from the cache, or run `with` and insert its result.
@@ -296,13 +328,13 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
     {
         let mut computed = false;
-        let value = self.cache.get_or_insert_with(key, || {
+        let value = self.inner.cache.get_or_insert_with(key, || {
             computed = true;
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            self.inner.misses.fetch_add(1, Ordering::Relaxed);
             with()
         })?;
         if !computed {
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.inner.hits.fetch_add(1, Ordering::Relaxed);
         }
         Ok(value)
     }
@@ -320,7 +352,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     where
         Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
     {
-        match self.cache.get_value_or_guard(key, Some(timeout)) {
+        match self.inner.cache.get_value_or_guard(key, Some(timeout)) {
             quick_cache::sync::GuardResult::Value(value) => {
                 self.record_hit();
                 Ok(value)
@@ -351,7 +383,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     where
         Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
     {
-        match self.cache.get_value_or_guard(key, Some(timeout)) {
+        match self.inner.cache.get_value_or_guard(key, Some(timeout)) {
             quick_cache::sync::GuardResult::Value(value) => CacheEntry::Value(value),
             quick_cache::sync::GuardResult::Guard(guard) => {
                 CacheEntry::Vacant(CacheFillGuard(guard))
@@ -379,7 +411,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     where
         Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
     {
-        match self.cache.get_value_or_guard(key, timeout) {
+        match self.inner.cache.get_value_or_guard(key, timeout) {
             quick_cache::sync::GuardResult::Value(value) => {
                 self.record_hit();
                 Joined::Value(value)
@@ -395,31 +427,31 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
 
     /// Count one hit (for wrappers using [`Self::get_untracked`]).
     pub fn record_hit(&self) {
-        self.hits.fetch_add(1, Ordering::Relaxed);
+        self.inner.hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count one miss (for wrappers using [`Self::get_untracked`]).
     pub fn record_miss(&self) {
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.inner.misses.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Cumulative `(hits, misses)`.
     pub fn stats(&self) -> (u64, u64) {
         (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
+            self.inner.hits.load(Ordering::Relaxed),
+            self.inner.misses.load(Ordering::Relaxed),
         )
     }
 
     /// Current resident weight (bytes, as measured by the weight function).
     pub fn weight(&self) -> u64 {
-        self.cache.weight()
+        self.inner.cache.weight()
     }
 
     /// The **configured** capacity in bytes (`0` = disabled), not the
     /// internal 1-byte clamp.
     pub fn capacity_bytes(&self) -> u64 {
-        self.capacity_bytes
+        self.inner.capacity_bytes
     }
 
     /// The budget of one shard in bytes: what entries that must all stay
@@ -428,21 +460,21 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// so entries that fit the total can still overflow the shard they hash
     /// to.
     pub fn shard_capacity_bytes(&self) -> u64 {
-        if self.capacity_bytes == 0 {
+        if self.inner.capacity_bytes == 0 {
             0
         } else {
-            self.cache.shard_capacity()
+            self.inner.cache.shard_capacity()
         }
     }
 
     /// Number of resident entries.
     pub fn len(&self) -> usize {
-        self.cache.len()
+        self.inner.cache.len()
     }
 
     /// Whether the cache currently holds no entries.
     pub fn is_empty(&self) -> bool {
-        self.cache.len() == 0
+        self.inner.cache.len() == 0
     }
 
     /// Snapshot for `/metrics`.
@@ -452,8 +484,36 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
             hits,
             misses,
             bytes: self.weight(),
-            capacity_bytes: self.capacity_bytes,
+            capacity_bytes: self.inner.capacity_bytes,
         }
+    }
+}
+
+impl<K, V> ByteBoundedCache<K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Enter this cache in the memory plan ([`plan`]) as `id`, its
+    /// `/metrics` family, sized from `source`. Listed while the cache lives;
+    /// registering it again replaces the entry.
+    pub fn register(&self, id: &'static str, scope: plan::Scope, source: plan::SizeSource) {
+        plan::register(
+            plan::Entry::cache(id, scope, source),
+            &self.inner,
+            Inner::usage,
+        );
+    }
+
+    /// [`Self::register`], returning the cache.
+    pub fn registered(
+        self,
+        id: &'static str,
+        scope: plan::Scope,
+        source: plan::SizeSource,
+    ) -> Self {
+        self.register(id, scope, source);
+        self
     }
 }
 
@@ -801,5 +861,40 @@ mod tests {
         assert_eq!(env_mb("DS_CACHE_TEST_SET_VAR", 42), 128);
         std::env::set_var("DS_CACHE_TEST_BAD_VAR", "lots");
         assert_eq!(env_mb("DS_CACHE_TEST_BAD_VAR", 42), 42);
+    }
+
+    /// A registered cache is in the plan with what it holds now, and leaves
+    /// it when dropped (#1306).
+    #[test]
+    fn a_registered_cache_reports_its_usage_until_dropped() {
+        let listed = || {
+            plan::snapshot()
+                .into_iter()
+                .find(|row| row.entry.id == "ds_cache_test_registered")
+        };
+        let cache = ByteBoundedCache::new(MIB, 1024, weigh_str).registered(
+            "ds_cache_test_registered",
+            plan::Scope::Engine("test"),
+            plan::SizeSource::Env("MC_DS_CACHE_TEST_MB"),
+        );
+        cache.insert("a".to_string(), vec![0u8; 36]); // 1 + 36 + 64 bytes
+        assert!(cache.get(&"a".to_string()).is_some());
+        assert!(cache.get(&"b".to_string()).is_none());
+        let row = listed().expect("registered");
+        assert_eq!(row.entry.kind, plan::Kind::Cache);
+        assert_eq!(row.entry.source.to_string(), "env:MC_DS_CACHE_TEST_MB");
+        assert_eq!(
+            row.usage,
+            plan::Usage {
+                capacity_bytes: MIB,
+                used_bytes: 101,
+                entries: Some(1),
+                hits: Some(1),
+                misses: Some(1),
+            }
+        );
+        assert_eq!(row.usage, plan::Usage::cache(cache.metrics(), Some(1)));
+        drop(cache);
+        assert!(listed().is_none());
     }
 }

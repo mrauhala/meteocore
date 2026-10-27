@@ -356,6 +356,16 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   unread fresh inserts share 3 %: a cache filled ahead of reads (a
   pre-warm) uses `new_with_hot_allocation` (engine-odim's `PIXEL_CACHE`,
   0.5, #992). The hot share also caps the largest entry a shard admits.
+  Every cache and admission budget is entered in the memory plan,
+  `ds_cache::plan` (#1306), under its `/metrics` family as id
+  (`metatile_cache`, `geotiff_decode`), a scope and its size source. A
+  process-wide cache is built from `plan::env_bytes(VAR, default)` and
+  `.registered(id, Scope::Engine(..), source)`; a `ByteBudget` or
+  `RenderBudget` calls `.register`; per-collection caches are entered in
+  `server/src/cache_plan.rs`. `cache_plan::tests::
+  every_cache_and_budget_on_metrics_is_in_the_plan` fails when a
+  `*_cache_bytes` or `*_capacity_bytes` family has no entry: a new engine
+  type adds its fixture collection there.
 - **API crates depend on ds-core and api-common** (shared Common HTTP glue),
   plus ds-executor for bounded render execution and the shared query runtime,
   ds-render for
@@ -1441,6 +1451,11 @@ no `url` are rejected.
   `collection_has_data` 0 (#1055).
 - **Metrics:** `GET /metrics` — Prometheus format. Path labels use route
   patterns, never raw URLs (cardinality explosion).
+- **Memory plan:** `GET /admin/cache-plan` (behind `ADMIN_TOKEN`) lists
+  every cache and budget with its size and size source, the same list the
+  INFO block at boot and after each accepted reload logs (#1306). Sizes
+  from a config key with a serde default are inferred by
+  `SizeSource::unless_default` until #1313 makes the keys `Option`.
 - **Grafana dashboards live in this repo:**
   `docker/grafana/dashboards/meteocore-overview.json`, provisioned via
   `docker/grafana/provisioning/`: a `dashboard.grafana.app/v2` resource

@@ -632,6 +632,12 @@ impl GeoTiffEngine {
         self.tile_cache.stats()
     }
 
+    /// Whether the collection reads local files, which go through the page
+    /// cache and never the tile cache: its tile cache is built empty.
+    pub fn reads_local_files(&self) -> bool {
+        matches!(self.store_mode, StoreMode::Local { .. })
+    }
+
     /// Return current tile cache utilization as (bytes_used, capacity_bytes, entries).
     pub fn tile_cache_utilization(&self) -> (u64, u64, usize) {
         (

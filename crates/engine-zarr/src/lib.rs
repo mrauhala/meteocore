@@ -142,6 +142,12 @@ impl ZarrEngine {
         self.decoded_cache.metrics()
     }
 
+    /// A plain store's object cache (`[zarr] cache_mb`), shared by its
+    /// catalog generations; `None` for an Icechunk repository.
+    pub fn object_cache_metrics(&self) -> Option<ds_cache::CacheMetrics> {
+        self.source.object_cache_metrics()
+    }
+
     fn poll_once(&self) {
         let published = self.catalog.load().revision.clone();
         let rebuilt = self

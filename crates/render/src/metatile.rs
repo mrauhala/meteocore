@@ -256,6 +256,12 @@ impl TilePixelCache {
         self.cache.metrics()
     }
 
+    /// Enter this cache in the memory plan (#1306), sized from `source`.
+    pub fn register(&self, source: ds_cache::plan::SizeSource) {
+        self.cache
+            .register("metatile_cache", ds_cache::plan::Scope::Process, source);
+    }
+
     /// Drop every cached tile belonging to `collection` — same match rule as
     /// [`crate::RenderedCache::evict_collection`].
     pub fn evict_collection(&self, collection: &str) {

@@ -11,9 +11,14 @@ pub(crate) use ds_executor::budget::ByteBudget as Budget;
 /// fit fails at once with `ResourceExhausted`, HTTP 503: the reader holds a
 /// render slot, and waiting could deadlock it.
 pub(crate) static BUDGET: LazyLock<Arc<Budget>> = LazyLock::new(|| {
-    Arc::new(Budget::new(
-        ds_cache::env_mb("MC_NETCDF_READ_MEMORY_MB", 1024).saturating_mul(ds_cache::MIB),
-    ))
+    let (bytes, source) = ds_cache::plan::env_bytes("MC_NETCDF_READ_MEMORY_MB", 1024);
+    let budget = Arc::new(Budget::new(bytes));
+    budget.register(
+        "netcdf_read",
+        ds_cache::plan::Scope::Engine("netcdf"),
+        source,
+    );
+    budget
 });
 
 /// (reserved bytes, capacity bytes, rejected admissions).

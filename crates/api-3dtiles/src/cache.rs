@@ -206,10 +206,15 @@ impl ContentCache {
 
 /// The process-global content cache, sized once from the environment.
 pub static CONTENT_CACHE: LazyLock<ContentCache> = LazyLock::new(|| {
-    ContentCache::new(ds_cache::env_mb(
-        "MC_3DTILES_CONTENT_CACHE_MB",
-        DEFAULT_CONTENT_CACHE_MB,
-    ))
+    let (mb, source) =
+        ds_cache::plan::env_size("MC_3DTILES_CONTENT_CACHE_MB", DEFAULT_CONTENT_CACHE_MB);
+    let cache = ContentCache::new(mb);
+    cache.cache.register(
+        "tiles3d_content_cache",
+        ds_cache::plan::Scope::Process,
+        source,
+    );
+    cache
 });
 
 /// Snapshot of the global cache for `/metrics`.

@@ -36,6 +36,16 @@ impl Source {
         })
     }
 
+    /// The plain store's object cache (`[zarr] cache_mb`); `None` for
+    /// Icechunk, whose payload cache is the library's own.
+    pub(crate) fn object_cache_metrics(&self) -> Option<ds_cache::CacheMetrics> {
+        match self {
+            Self::Plain(source) => Some(source.store.cache_metrics()),
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(_) => None,
+        }
+    }
+
     /// `None` means the source is still at the published revision. A changed
     /// session is returned separately, so a failed catalog build never mutates
     /// the session used by requests or marks the new revision as published.

@@ -115,7 +115,9 @@ must keep immediate sheds and deadline expiries apart.
 not render admission: engine-geotiff's `decode_budget::BUDGET`
 (`MC_GEOTIFF_DECODE_MEMORY_MB`) and engine-zarr's `read_budget::BUDGET`
 (`MC_ZARR_READ_MEMORY_MB`) are instances, and the next engine's budget is
-another one, never a copy (#1067). Outside the engines, api-edr's
+another one, never a copy (#1067). Each instance enters the memory plan
+with `register(id, scope, source)`, the id its `/metrics` family prefix
+(`geotiff_decode`); `RENDER_MEMORY` registers as `render_budget` (#1306). Outside the engines, api-edr's
 `response_budget` (`MC_EDR_RESPONSE_MEMORY_MB`, #1041) admits response
 bodies on the same type. Keep it apart from `RenderBudget`: it
 never waits, because its callers hold an executor slot and may hold another

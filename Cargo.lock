@@ -153,6 +153,7 @@ dependencies = [
  "arc-swap",
  "axum",
  "chrono",
+ "ds-cache",
  "ds-core",
  "ds-executor",
  "ds-render",
