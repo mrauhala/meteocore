@@ -22,11 +22,19 @@
 //! requests keep. A read that finds requests holding more waits for them, up
 //! to [`BUSY_WAIT`], and is then left to the request path: a burst of
 //! renders must not make the poll skip the frame it is warming for them.
+//!
+//! A collection no request has read within [`read_window`] warms only its
+//! newest frame, and its tile cache keeps only that frame's tiles (#1318):
+//! its first view needs the newest frame, not the frames an animation
+//! would. [`LastRead`] tells the poll which case it is in. An engine starts
+//! as if read, so a restart pre-warms as before, and one nobody reads
+//! switches once the window has passed.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -71,6 +79,73 @@ fn parse_frame_cap(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_FRAME_CAP_MB)
         .saturating_mul(1024 * 1024)
+}
+
+/// The shortest [`read_window`].
+const MIN_READ_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+/// How long after its last read a collection still pre-warms every new
+/// frame (#1318): two poll intervals, and at least half an hour, so a
+/// client that looks in now and then keeps its frames warm.
+pub(crate) fn read_window(poll_interval: Duration) -> Duration {
+    poll_interval.saturating_mul(2).max(MIN_READ_WINDOW)
+}
+
+/// Which new frames a poll pre-warms (#1318).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// Read within the window: the newest new frames, as many as the poll's
+    /// cap allows (#1004).
+    Every,
+    /// No read within the window: the newest frame only, when it is new,
+    /// and the tile cache keeps nothing else.
+    Newest,
+}
+
+/// Seconds on the monotonic clock [`LastRead`] counts on, so a wall-clock
+/// step cannot make a collection look read or unread.
+fn clock_secs() -> i64 {
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    i64::try_from(START.elapsed().as_secs()).unwrap_or(i64::MAX)
+}
+
+/// When a request last read an engine's tiles (#1318). Each request that
+/// reads stores the time once, a relaxed store; the poll loads it to choose
+/// its [`Scope`].
+pub(crate) struct LastRead(AtomicI64);
+
+impl LastRead {
+    /// Read now. An engine starts with this, as if read at boot, so the
+    /// polls after a restart pre-warm every new frame, as a busy
+    /// collection needs; one nobody reads keeps its newest frame only once
+    /// the window has passed.
+    pub(crate) fn now() -> Self {
+        Self(AtomicI64::new(clock_secs()))
+    }
+
+    /// A request is reading the tiles now.
+    pub(crate) fn note(&self) {
+        self.0.store(clock_secs(), Ordering::Relaxed);
+    }
+
+    /// [`Scope::Every`] if a request read the tiles within `window`, else
+    /// [`Scope::Newest`].
+    pub(crate) fn scope(&self, window: Duration) -> Scope {
+        let last = self.0.load(Ordering::Relaxed);
+        let window = i64::try_from(window.as_secs()).unwrap_or(i64::MAX);
+        if clock_secs().saturating_sub(last) < window {
+            Scope::Every
+        } else {
+            Scope::Newest
+        }
+    }
+
+    /// A request read the tiles `ago`.
+    #[cfg(test)]
+    pub(crate) fn note_ago(&self, ago: Duration) {
+        let ago = i64::try_from(ago.as_secs()).unwrap();
+        self.0.store(clock_secs() - ago, Ordering::Relaxed);
+    }
 }
 
 /// One coalesced read: tiles of one IFD that lie next to each other in the
@@ -382,5 +457,31 @@ mod tests {
             parse_frame_cap(Some("lots")),
             DEFAULT_FRAME_CAP_MB * 1024 * 1024
         );
+    }
+
+    /// #1318: two poll intervals, at least half an hour.
+    #[test]
+    fn the_read_window_is_two_polls_and_at_least_half_an_hour() {
+        let minutes = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(read_window(Duration::from_secs(30)), minutes(30));
+        assert_eq!(read_window(minutes(15)), minutes(30));
+        assert_eq!(read_window(minutes(60)), minutes(120));
+    }
+
+    /// #1318: read at the start, read within the window after a read,
+    /// unread once the window has passed.
+    #[test]
+    fn last_read_scopes_the_prewarm_by_the_window() {
+        let window = Duration::from_secs(30 * 60);
+        let last = LastRead::now();
+        assert_eq!(last.scope(window), Scope::Every, "read at the start");
+        last.note_ago(window + Duration::from_secs(60));
+        assert_eq!(last.scope(window), Scope::Newest);
+        last.note();
+        assert_eq!(last.scope(window), Scope::Every);
+        last.note_ago(window - Duration::from_secs(60));
+        assert_eq!(last.scope(window), Scope::Every);
+        last.note_ago(window + Duration::from_secs(60));
+        assert_eq!(last.scope(window), Scope::Newest);
     }
 }

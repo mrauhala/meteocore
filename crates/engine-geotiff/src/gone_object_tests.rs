@@ -198,8 +198,9 @@ impl Drop for EmptyDir {
 
 /// An engine over two frames of the fixture in `store`, five minutes apart.
 /// `new` builds a remote engine only for s3:// or http(s):// URLs, so it
-/// starts on an empty local directory and is then pointed at the store; the
-/// poll's header reads catalogue both frames.
+/// starts on an empty local directory and is then pointed at the store,
+/// with the tile cache a remote source gets; the poll's header reads
+/// catalogue both frames.
 fn two_frame_engine(local: &EmptyDir, store: &Arc<RefusingStore>) -> GeoTiffEngine {
     let fixture = std::fs::read(FIXTURE).unwrap();
     for key in [OLDER, NEWER] {
@@ -221,6 +222,7 @@ fn two_frame_engine(local: &EmptyDir, store: &Arc<RefusingStore>) -> GeoTiffEngi
         store: DataStore::new(store.clone()),
         prefix: ObjectPath::from("d"),
     };
+    engine.tile_cache = cache::TileCache::new(config.tile_cache_mb * 1024 * 1024);
     engine.poll_once();
     assert_eq!(times(&engine), [older(), newer()]);
     engine

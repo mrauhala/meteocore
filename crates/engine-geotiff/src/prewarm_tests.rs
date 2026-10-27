@@ -76,7 +76,7 @@ fn publish(remote: &TempDir, frame: &str) {
 /// An engine whose catalog is the object store under `remote/d`, read by
 /// byte range like a bucket. `new` builds a remote engine only for s3:// or
 /// http(s):// URLs, so it starts on an empty local directory and is then
-/// pointed at the store.
+/// pointed at the store, with the tile cache a remote source gets.
 fn remote_engine(local: &TempDir, remote: &TempDir) -> GeoTiffEngine {
     let mut engine = GeoTiffEngine::new("prewarm", local.0.to_str(), &config()).unwrap();
     let (store, _) = ds_storage::build_store(remote.0.to_str().unwrap()).unwrap();
@@ -84,6 +84,7 @@ fn remote_engine(local: &TempDir, remote: &TempDir) -> GeoTiffEngine {
         store,
         prefix: ObjectPath::from("d"),
     };
+    engine.tile_cache = TileCache::new(config().tile_cache_mb * 1024 * 1024);
     engine
 }
 
@@ -534,6 +535,7 @@ async fn benchmark_first_view_over_latency() {
             store: store.clone(),
             prefix: ObjectPath::from(""),
         };
+        engine.tile_cache = TileCache::new(config().tile_cache_mb * 1024 * 1024);
         engine.catalog.store(Arc::new(catalog));
         engine
     };
@@ -607,6 +609,222 @@ async fn benchmark_first_view_over_latency() {
         frames.len()
     );
     timed("pre-warmed first view", &|| view(&warmed));
+}
+
+// ---- An unread collection warms its newest frame only (#1318) ----
+
+/// A copy of a fixture frame published as the frame `minute` minutes past
+/// 2026-03-25T00:00Z, as many as a test needs; its timestep.
+fn publish_minute(remote: &TempDir, minute: u32) -> DateTime<Utc> {
+    let name = format!("radar_20260325T{:02}{:02}Z.tif", minute / 60, minute % 60);
+    put(
+        remote,
+        &name,
+        &fixture(FRAMES[minute as usize % FRAMES.len()]),
+    );
+    frame_time(&name)
+}
+
+/// The encoded bytes of every tile of the frame at `time`, all levels: what
+/// pre-warming it whole reads.
+fn encoded_bytes(engine: &GeoTiffEngine, time: DateTime<Utc>) -> u64 {
+    let catalog = engine.catalog.load();
+    let entry = &catalog.entries[&time];
+    let DataSource::Remote { tile_info, .. } = entry.source().unwrap().as_ref() else {
+        panic!("remote source expected");
+    };
+    std::iter::once(tile_info)
+        .chain(
+            entry
+                .metadata()
+                .unwrap()
+                .overviews
+                .iter()
+                .map(|ov| ov.tile_info.as_ref().unwrap()),
+        )
+        .flat_map(|info| &info.tile_byte_counts)
+        .sum()
+}
+
+/// The catalogued timesteps the tile cache holds any tile of.
+fn cached_times(engine: &GeoTiffEngine) -> Vec<DateTime<Utc>> {
+    let times: Vec<_> = engine.catalog.load().entries.keys().copied().collect();
+    times
+        .into_iter()
+        .filter(|&time| cached_tiles(engine, time).0 > 0)
+        .collect()
+}
+
+/// One poll cycle, and the bytes its pre-warm read from storage.
+async fn poll_measured(engine: &GeoTiffEngine) -> u64 {
+    let previous = engine.catalog.load_full();
+    engine.poll_once();
+    let before = engine.storage_bytes_read();
+    engine.prewarm_new_frames(&previous).await;
+    engine.storage_bytes_read() - before
+}
+
+/// No request has read `engine` since a read window before now: the window
+/// has passed since it started, or since its last read.
+fn idle(engine: &GeoTiffEngine) {
+    let window = prewarm::read_window(engine.poll_interval);
+    engine.last_read.note_ago(window + Duration::from_secs(60));
+}
+
+/// After an unread collection's poll: the frame at `newest` is warm, and the
+/// tile cache holds nothing else.
+fn holds_only(engine: &GeoTiffEngine, newest: DateTime<Utc>) {
+    let (cached, total) = cached_tiles(engine, newest);
+    assert_eq!(cached, total, "{newest} is warm");
+    assert_eq!(cached_times(engine), [newest], "and no other frame");
+    assert_eq!(engine.tile_cache.len(), total, "nor any other object");
+}
+
+/// #1318: a collection nothing has read for a read window warms only its
+/// newest frame, however many new frames a poll finds, and its tile cache
+/// keeps only that frame:
+/// about one frame resident across polls, and one frame read from storage
+/// per poll, not the four a read collection warms. Its first view, after
+/// all those polls, reads nothing from storage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unread_collection_warms_and_keeps_only_its_newest_frame() {
+    let (local, remote) = (TempDir::new("unread_local"), TempDir::new("unread_remote"));
+    publish_minute(&remote, 0);
+    let engine = remote_engine(&local, &remote);
+    engine.poll_once();
+    idle(&engine);
+
+    for first in [5, 25, 45] {
+        let times: Vec<_> = (0..PREWARM_MAX_FRAMES as u32)
+            .map(|i| publish_minute(&remote, first + 5 * i))
+            .collect();
+        let fetched = poll_measured(&engine).await;
+        let newest = *times.last().unwrap();
+        holds_only(&engine, newest);
+        let frame = encoded_bytes(&engine, newest);
+        assert!(
+            (frame..2 * frame).contains(&fetched),
+            "one frame read: {fetched} bytes for a {frame} byte frame"
+        );
+    }
+    assert!(engine.prewarm_newest_only.load(Ordering::Relaxed));
+
+    let newest = engine.catalog.load().select_timestamp(None).unwrap();
+    let before = engine.storage_bytes_read();
+    render(&engine, newest);
+    assert_eq!(
+        engine.storage_bytes_read(),
+        before,
+        "the first view reads nothing from storage"
+    );
+}
+
+/// #1318: the poll after a read warms every new frame again and drops
+/// nothing. Once the read is older than the window, the next poll keeps
+/// only the newest frame, which the first view after that idle then finds
+/// warm; that view is a read, so the poll after it warms every frame again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_resumes_full_prewarm_and_a_long_idle_keeps_the_newest_frame() {
+    let (local, remote) = (TempDir::new("idle_local"), TempDir::new("idle_remote"));
+    let first = publish_minute(&remote, 0);
+    let engine = remote_engine(&local, &remote);
+    engine.poll_once();
+    render(&engine, first);
+    assert!(cached_tiles(&engine, first).0 > 0, "the read cached tiles");
+
+    let (t1, t2) = (publish_minute(&remote, 5), publish_minute(&remote, 10));
+    poll_measured(&engine).await;
+    for time in [t1, t2] {
+        let (cached, total) = cached_tiles(&engine, time);
+        assert_eq!(
+            cached, total,
+            "{time}: a read collection warms every new frame"
+        );
+    }
+    assert_eq!(cached_times(&engine), [first, t1, t2], "and drops nothing");
+    assert!(!engine.prewarm_newest_only.load(Ordering::Relaxed));
+
+    // The last read falls out of the window.
+    idle(&engine);
+    let (_, t4) = (publish_minute(&remote, 15), publish_minute(&remote, 20));
+    poll_measured(&engine).await;
+    holds_only(&engine, t4);
+    assert!(engine.prewarm_newest_only.load(Ordering::Relaxed));
+
+    let before = engine.storage_bytes_read();
+    render(&engine, t4);
+    assert_eq!(
+        engine.storage_bytes_read(),
+        before,
+        "the first view after the idle reads nothing from storage"
+    );
+
+    let (t5, t6) = (publish_minute(&remote, 25), publish_minute(&remote, 30));
+    poll_measured(&engine).await;
+    for time in [t4, t5, t6] {
+        let (cached, total) = cached_tiles(&engine, time);
+        assert_eq!(cached, total, "{time} warm after the view");
+    }
+    assert!(!engine.prewarm_newest_only.load(Ordering::Relaxed));
+}
+
+/// #1318: an engine starts as if read, so the polls after a restart
+/// pre-warm every new frame, as before. With no read after the start, the
+/// first poll past the read window keeps only the newest frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_read_after_start_prewarms_in_full_until_the_window_passes() {
+    let (local, remote) = (TempDir::new("boot_local"), TempDir::new("boot_remote"));
+    let first = publish_minute(&remote, 0);
+    let engine = remote_engine(&local, &remote);
+    engine.poll_once();
+
+    let (t1, t2) = (publish_minute(&remote, 5), publish_minute(&remote, 10));
+    poll_measured(&engine).await;
+    for time in [t1, t2] {
+        let (cached, total) = cached_tiles(&engine, time);
+        assert_eq!(
+            cached, total,
+            "{time}: the first poll after the start warms every new frame"
+        );
+    }
+    assert!(!engine.prewarm_newest_only.load(Ordering::Relaxed));
+
+    // The window passes with no read since the start.
+    idle(&engine);
+    let (_, t4) = (publish_minute(&remote, 15), publish_minute(&remote, 20));
+    poll_measured(&engine).await;
+    holds_only(&engine, t4);
+    assert!(engine.prewarm_newest_only.load(Ordering::Relaxed));
+    assert_eq!(cached_tiles(&engine, first).0, 0);
+}
+
+/// #1318: a poll that finds only an older frame, a late upload, warms
+/// nothing for an unread collection: its first view shows the newest
+/// frame, which is already warm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unread_collection_does_not_warm_a_late_older_frame() {
+    let (local, remote) = (TempDir::new("late_local"), TempDir::new("late_remote"));
+    publish_minute(&remote, 0);
+    let engine = remote_engine(&local, &remote);
+    engine.poll_once();
+    idle(&engine);
+    let newest = publish_minute(&remote, 10);
+    poll_measured(&engine).await;
+    holds_only(&engine, newest);
+
+    publish_minute(&remote, 5);
+    assert_eq!(poll_measured(&engine).await, 0, "nothing read");
+    holds_only(&engine, newest);
+}
+
+/// #1318: a local collection reads no compressed tiles, so it builds no
+/// tile cache and reports no capacity for one.
+#[test]
+fn a_local_collection_has_no_tile_cache() {
+    let dir = TempDir::new("local_tile_cache");
+    std::fs::copy(fixture_dir().join(FRAMES[0]), dir.0.join(FRAMES[0])).unwrap();
+    let engine = GeoTiffEngine::new("local", dir.0.to_str(), &config()).unwrap();
+    assert_eq!(engine.tile_cache_utilization(), (0, 0, 0));
 }
 
 // ---- Frames republished under a catalogued timestamp (#1055) ----

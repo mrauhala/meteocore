@@ -50,8 +50,9 @@ impl Drop for EmptyDir {
 
 /// An engine reading the fixture by byte range from `flaky` under the prefix
 /// `d`. `new` builds a remote engine only for s3:// or http(s):// URLs, so it
-/// starts on an empty local directory and is then pointed at the store; the
-/// poll's header read catalogues the frame.
+/// starts on an empty local directory and is then pointed at the store,
+/// with the tile cache a remote source gets; the poll's header read
+/// catalogues the frame.
 fn remote_engine(local: &EmptyDir, flaky: &Arc<FlakyStore>) -> GeoTiffEngine {
     let config: GeoTiffConfig = serde_json::from_value(serde_json::json!({
         "filename_template": "radar_%Y%m%dT%H%MZ.tif",
@@ -64,6 +65,7 @@ fn remote_engine(local: &EmptyDir, flaky: &Arc<FlakyStore>) -> GeoTiffEngine {
         store: DataStore::new(flaky.clone()),
         prefix: ObjectPath::from("d"),
     };
+    engine.tile_cache = cache::TileCache::new(config.tile_cache_mb * 1024 * 1024);
     engine.poll_once();
     assert_eq!(
         engine.catalog.load().entries.len(),

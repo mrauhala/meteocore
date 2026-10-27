@@ -216,7 +216,7 @@ not re-scan the auto roots.
 | `MC_STATION_GRID_MEMORY_MB` | `512` | Admission budget for station-grid analyses being computed, in MiB: each reserves its grid plus 4 MiB before it is queued. A request that does not fit is a 503 at once; the background pre-compute takes only what leaves half the budget to requests. A collection whose one analysis needs more than half fails at load. Restart to change. |
 | `MC_STATION_GRID_WORKERS` | half the CPUs, 1–4 | Station-grid analyses computed at once, on their own pool, never on the request runtime. Restart to change. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool, across all renders. A projected WMS view (EPSG:3857/3067/3035) renders one meta-tile at a time with only a few fetches in flight, so raising this does not shorten its first view; a whole-viewport render (WMS EPSG:4326, a Maps image) fetches all its missing tiles at once and does wait on the pool. Raise it (e.g. 32–64) when cold renders queue on a high-latency object store. Value must be ≥ 1. |
-| `MC_COG_PREWARM_MB` | `32` | Per-frame cap, in MiB of encoded tiles, on the poll-time pre-warm of newly discovered remote COG frames, which reads them into the collection's tile cache so their first view needs no storage round trips. Also at most 1/8 of the collection's `tile_cache_mb`. Levels are taken coarsest first while they fit, so a larger file still gets its overviews. `0` turns the pre-warm off. Restart to change. |
+| `MC_COG_PREWARM_MB` | `32` | Per-frame cap, in MiB of encoded tiles, on the poll-time pre-warm of newly discovered remote COG frames, which reads them into the collection's tile cache so their first view needs no storage round trips. Also at most 1/8 of the collection's `tile_cache_mb`. Levels are taken coarsest first while they fit, so a larger file still gets its overviews. A collection no request has read for two poll intervals, and at least 30 minutes, warms only its newest frame and keeps only that frame in its tile cache; the poll after a read warms every new frame again. Start-up counts as a read, so the polls after a restart warm every new frame. `0` turns the pre-warm off. Restart to change. |
 | `MC_ALLOW_INLINE_DB_URL` | _(unset)_ | Set to `1` to allow a literal `postgres://` URL in TOML instead of `dsn_env` (development only). |
 
 ### Sizing render memory on larger hosts
@@ -834,7 +834,7 @@ colormap = "radar_dbz"
 
 #### Tile Caching
 
-The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free LRU cache (~58x better memory efficiency than caching decoded tiles). Default cache size is 256 MB (`tile_cache_mb`). Set to 0 to disable.
+The engine caches **compressed** tile bytes of remote sources (not decoded pixels) in a lock-free LRU cache (~58x better memory efficiency than caching decoded tiles). Default cache size is 256 MB (`tile_cache_mb`). Set to 0 to disable. A local collection reads its files through the page cache and builds no tile cache.
 
 #### Security Limits
 
@@ -856,7 +856,7 @@ The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free 
 | `parameter` | yes | — | Parameter name, e.g., `"reflectivity"` |
 | `unit` | yes | — | Unit of measurement, e.g., `"dBZ"` |
 | `poll_interval_secs` | no | `30` | Directory poll interval in seconds. Must be > 0. |
-| `tile_cache_mb` | no | `256` | Tile cache size in MB. Set to 0 to disable. |
+| `tile_cache_mb` | no | `256` | Remote tile cache size in MB. Set to 0 to disable. A local `data_path` builds none. |
 | `band` | no | `1` | Band number to read (1-based). |
 | `max_files` | no | none | Keep only the N most recent files by timestamp. |
 | `nodata` | no | from file | Override nodata value. |
