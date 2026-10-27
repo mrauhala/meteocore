@@ -28,7 +28,7 @@ use ds_core::state::{
 };
 use ds_poll::{FirstTick, Shutdown};
 
-use crate::decode::{is_nil_bulletin, DecodeError, Decoder};
+use crate::decode::{is_nil_bulletin, DecodeError, Decoder, ObsReport};
 use crate::health::Health;
 use crate::metadata::Snapshot;
 use crate::params::ParameterTable;
@@ -64,6 +64,20 @@ pub struct IngestOutcome {
     pub decoded_reports: usize,
     /// Per-message decode failures (a concatenated bulletin keeps going).
     pub failed: Vec<DecodeError>,
+}
+
+/// Estimated heap the collection holds outside every cache (#1307), for the
+/// `bufr_*_bytes` gauges. Kept when the store changes (the store and
+/// snapshot figures at each snapshot rebuild), so reading it costs nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreMemory {
+    /// The report store, as of the last snapshot rebuild.
+    pub store_bytes: u64,
+    /// The published metadata snapshot.
+    pub snapshot_bytes: u64,
+    /// WIS2 mode: the `rel=deletion` index's `(data_ids, bytes)`; `None`
+    /// for a `data_path` source.
+    pub deletion_index: Option<(u64, u64)>,
 }
 
 pub struct BufrEngine {
@@ -464,6 +478,20 @@ impl BufrEngine {
         (s.stations.len(), s.report_count)
     }
 
+    /// Estimated heap of the store, its snapshot and the WIS2 deletion
+    /// index (#1307). O(1): the figures kept when they last changed.
+    pub fn store_memory(&self) -> StoreMemory {
+        let snapshot = self.snapshot.load();
+        StoreMemory {
+            store_bytes: snapshot.store_bytes,
+            snapshot_bytes: snapshot.bytes,
+            deletion_index: match &self.source {
+                Source::Wis2(w) => Some(w.deletion_index()),
+                Source::Local(_) => None,
+            },
+        }
+    }
+
     /// Newest report time across stations (for `/health` data age).
     pub fn latest_report(&self) -> Option<DateTime<Utc>> {
         self.snapshot.load().temporal_extent.map(|(_, b)| b)
@@ -595,6 +623,35 @@ impl BufrEngine {
         })
     }
 
+    /// Ingest already decoded reports as a payload's are, no decoder
+    /// involved. Returns how many landed. For the heap-gauge test (#1307),
+    /// which needs a network of thousands of stations no fixture carries;
+    /// not part of the engine's API.
+    #[doc(hidden)]
+    pub fn ingest_reports(&self, reports: &[ObsReport], now: DateTime<Utc>) -> usize {
+        let landed = {
+            let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+            reports
+                .iter()
+                .filter(|r| store.ingest(r, &self.table, now) != Ingest::OutOfWindow)
+                .count()
+        };
+        if landed > 0 {
+            self.dirty.store(true, Ordering::Release);
+        }
+        landed
+    }
+
+    /// Remember the rows `data_id` produced in the WIS2 deletion index, as
+    /// an accepted notification's are; a no-op for a `data_path` source.
+    /// For the heap-gauge test (#1307); not part of the engine's API.
+    #[doc(hidden)]
+    pub fn record_deletion_keys(&self, data_id: String, keys: Vec<(String, DateTime<Utc>)>) {
+        if let Source::Wis2(w) = &self.source {
+            w.record_produced(data_id, keys);
+        }
+    }
+
     /// Withdraw specific reports (WIS2 `rel=deletion`). Returns how many
     /// existed.
     pub fn remove_reports(&self, keys: &[(String, DateTime<Utc>)]) -> usize {
@@ -660,7 +717,9 @@ impl BufrEngine {
     }
 
     /// Rebuild the snapshot when the store changed since the last build.
-    pub(crate) fn snapshot_if_dirty(&self) {
+    /// Public for the heap-gauge test (#1307) only.
+    #[doc(hidden)]
+    pub fn snapshot_if_dirty(&self) {
         if self.dirty.swap(false, Ordering::AcqRel) {
             self.rebuild_snapshot();
         }
@@ -1227,6 +1286,48 @@ mod tests {
             Some(&[h(8, 0), h(9, 0)][..])
         );
         assert_eq!(e.get_available_times(), None);
+    }
+
+    /// The memory figures (#1307) are the snapshot's: kept at each rebuild,
+    /// as the store stood then; a `data_path` source has no deletion index.
+    #[test]
+    fn store_memory_is_kept_at_each_snapshot_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BufrConfig {
+            data_path: Some(dir.path().to_string_lossy().into_owned()),
+            wis2: None,
+            poll_interval_secs: 60,
+            retention: "P36500D".to_string(),
+            max_stations: 50_000,
+            stale_after: "PT2H".to_string(),
+            position_radius_km: 25.0,
+            builtin_parameters: true,
+            parameters: Vec::new(),
+            map: None,
+        };
+        let e = BufrEngine::new(&cfg, "bufr-memory").unwrap();
+        let empty = e.store_memory();
+        assert_eq!((empty.store_bytes, empty.deletion_index), (0, None));
+        assert!(empty.snapshot_bytes > 0, "the map layers' metadata");
+        let h = |hh: u32| Utc.with_ymd_and_hms(2026, 9, 12, hh, 0, 0).unwrap();
+        {
+            let mut store = e.store.write().unwrap();
+            for (id, t) in [("a", h(8)), ("a", h(9)), ("b", h(9))] {
+                store.ingest(&report(id, t), &e.table, h(9));
+            }
+        }
+        assert_eq!(e.store_memory(), empty, "nothing until the rebuild");
+        e.rebuild_snapshot();
+        let held = e.store_memory();
+        assert_eq!(
+            held.store_bytes,
+            e.store.read().unwrap().heap_bytes(),
+            "the store as of the rebuild"
+        );
+        assert!(held.snapshot_bytes > empty.snapshot_bytes);
+        assert_eq!(e.remove_reports(&[("b".to_string(), h(9))]), 1);
+        e.rebuild_snapshot();
+        assert!(e.store_memory().store_bytes < held.store_bytes);
     }
 
     // ---- area: the value budget is the only bound (#1062) ------------------

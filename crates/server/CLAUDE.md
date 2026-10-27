@@ -243,6 +243,15 @@ need no reload pruning.
 - The plan test runs in a child process: the `MC_*` statics read the
   environment once.
 - Without `ADMIN_TOKEN` every admin route answers 403 (`require_admin_token`).
+- `metrics_handler` takes the budgets' high-water marks after
+  `refresh_metrics` (`update_budget_peaks`); the plan endpoint and log block
+  do not, or a burst would vanish before the next scrape (#1307).
+- `apply_load` calls `prune_collection_series` with the config ids a reload
+  removed, after the engine lists are swapped and under the scrape's
+  counter-state lock, so no scrape re-creates the series; their counter
+  state goes too.
+- `process_start_time_seconds` comes from `admin::record_process_start`,
+  the first call in `main`.
 
 ## Health: data age and poll age (#1007)
 

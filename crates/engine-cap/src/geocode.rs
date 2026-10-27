@@ -31,6 +31,13 @@ pub struct GeocodeLookup {
     value_name: Option<String>,
 }
 
+impl ds_core::heap::HeapSize for GeocodeLookup {
+    /// The zone table with every zone's geometry (#1307).
+    fn heap_size(&self) -> usize {
+        self.by_code.heap_size() + self.value_name.heap_size()
+    }
+}
+
 impl GeocodeLookup {
     /// Load a GeoJSON `FeatureCollection` of zone polygons. `property` is the
     /// feature property holding the zone code; `value_name` optionally restricts

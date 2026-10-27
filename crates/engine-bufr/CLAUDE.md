@@ -165,6 +165,11 @@ no opt-out, as for GRIB; a client wanting kelvin converts back.
   `sortby` ∈ `last_report,
   first_report, report_count, name` via `ds_core::feature::sort_features`;
   `data_version` = snapshot version.
+- Memory gauges (#1307): `store_memory()`'s store and snapshot bytes are
+  computed in `Snapshot::build` under its read lock, so they lag the store
+  by at most the 10 s rebuild. The WIS2 deletion index's (data ids, bytes)
+  is kept incrementally in `Produced::held` and published to atomics, so
+  `/metrics` never takes the produced lock; about 720 B per data id.
 
 ## Lifecycle & runtime rules
 

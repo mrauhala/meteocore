@@ -289,6 +289,9 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
         "satellite_frame_cache",
         "satellite_strip_cache",
         "station_grid_cache",
+        "vector_tile_cache",
+        "solid_image_cache",
+        "zarr_object_cache",
         "render_budget",
         "edr_response",
         "geotiff_decode",
@@ -299,6 +302,17 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
     ];
     for id in expected {
         assert!(checked.contains(id), "{id} not on /metrics: {checked:?}");
+    }
+
+    // Every budget has a high-water mark (#1307): its `*_reserved_peak_bytes`.
+    for row in rows.iter().filter(|row| row.entry.kind == Kind::Budget) {
+        let family = format!("{}_reserved_peak_bytes", row.entry.id);
+        assert!(
+            metrics
+                .lines()
+                .any(|l| l.starts_with(&format!("{family} "))),
+            "{family} not on /metrics"
+        );
     }
 
     // Where the sizes came from.

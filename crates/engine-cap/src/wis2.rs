@@ -170,7 +170,32 @@ struct Accumulator {
     data_id_index: HashMap<String, Vec<AlertKey>>,
 }
 
+impl ds_core::heap::HeapSize for Entry {
+    fn heap_size(&self) -> usize {
+        self.alert.heap_size() + self.current_data_id.heap_size()
+    }
+}
+
+impl ds_core::heap::HeapSize for Tombstone {
+    fn heap_size(&self) -> usize {
+        0
+    }
+}
+
 impl Accumulator {
+    /// The estimated heap the accumulator holds (#1307): its maps' tables,
+    /// the held alerts with their hints (a part several areas share counted
+    /// once), the tombstones and the `data_id` index.
+    fn heap_bytes(&self) -> u64 {
+        use ds_core::heap::HeapSize;
+        let total = self.alerts.heap_size()
+            + self.tombstones.heap_size()
+            + self.data_tombstones.heap_size()
+            + self.data_id_index.heap_size();
+        let shared = crate::memory::shared_hint_bytes(self.alerts.values().map(|e| &e.alert));
+        total.saturating_sub(shared) as u64
+    }
+
     /// Drop `identifier` from `data_id`'s index entry (and the entry itself
     /// once empty).
     fn unindex(&mut self, data_id: &str, identifier: &AlertKey) {
@@ -210,6 +235,10 @@ pub struct Wis2SourceStats {
     /// Alerts held right now (kept in step with the accumulator so
     /// `/metrics` never takes the accumulator lock from a request worker).
     pub held: AtomicUsize,
+    /// The accumulator's estimated heap bytes as of the last rebuild
+    /// ([`Wis2CapSource::snapshot`], #1307): computed there, where every
+    /// held alert is walked anyway, never per `/metrics` scrape.
+    pub heap_bytes: AtomicU64,
 }
 
 pub struct Wis2CapSource {
@@ -841,6 +870,9 @@ impl Wis2CapSource {
         prune_tombstones(&mut acc.tombstones, now, grace);
         prune_tombstones(&mut acc.data_tombstones, now, grace);
         self.stats.held.store(acc.alerts.len(), Ordering::Relaxed);
+        self.stats
+            .heap_bytes
+            .store(acc.heap_bytes(), Ordering::Relaxed);
         acc.alerts.values().map(|e| e.alert.clone()).collect()
     }
 }

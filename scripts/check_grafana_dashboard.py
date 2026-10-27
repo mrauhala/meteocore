@@ -81,9 +81,9 @@ TEMPLATES: dict[str, dict] = {
     },
     "CollectionCacheMetricSet::new": {
         "parts": {"hits", "misses", "bytes", "capacity_bytes", "collection",
-                  "{prefix}_{suffix}_total", "{prefix}_{suffix}"},
+                  "{prefix}_{suffix}_total", "{prefix}_{suffix}", "{prefix}_entries"},
         "families": {"hits_total": None, "misses_total": None, "bytes": None,
-                     "capacity_bytes": None},
+                     "capacity_bytes": None, "entries": 2},
     },
 }
 

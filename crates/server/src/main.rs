@@ -286,6 +286,8 @@ fn parse_collection_list(s: &str) -> Vec<String> {
 }
 
 fn main() {
+    // `process_start_time_seconds` (#1307).
+    admin::record_process_start();
     // Before logging starts, so `--help` and argument errors print only
     // their own text.
     let cli = parse_cli_args();

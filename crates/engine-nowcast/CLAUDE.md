@@ -89,6 +89,10 @@ make it expensive to HAVE). Until the generation-thinning follow-up in #523
 (full frames only for the latest generation), set `max_generations = 2`
 in production configs.
 
+`frame_bytes()` is that formula measured from the frame buffers'
+capacities, set when a generation is swapped in, exported as
+`nowcast_frame_bytes` (#1307).
+
 ## Verification (V2.1, #542)
 
 - `objects` module = dependency-free 2D cell segmentation (threshold

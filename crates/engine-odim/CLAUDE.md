@@ -38,6 +38,11 @@ around `ds-storage` calls (Critical Rules 6–7).
   snapshot — sites added later surface on the next reload. An initially
   empty remote source is re-expanded automatically by server startup recovery
   once its poll finds sites (#190).
+- `catalog_bytes()` (#1307) is computed in `derive_catalog`: each
+  catalogued volume's parsed metadata once (the parse cache shares the
+  `Arc`s), the parse cache's table and keys, and `SiteMeta`. A new owned
+  field in `PolarVolume`/`Sweep`/`PolarMoment` goes into its `HeapSize` impl
+  in `pvol.rs`.
 
 ## Parameters & labels
 

@@ -285,7 +285,10 @@ async fn run(
                             continue;
                         }
                     };
-                    match dedup.accept(&n) {
+                    let verdict = dedup.accept(&n);
+                    // Accepting records, and every call may expire entries.
+                    status.record_dedup(dedup.len() as u64, dedup.heap_bytes());
+                    match verdict {
                         Verdict::Accept => {}
                         Verdict::DuplicateId | Verdict::DuplicateData => {
                             status.record_dropped(DropReason::Duplicate);

@@ -28,6 +28,7 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_core::config::Wis2Config;
 use ds_core::health::{LiveStatus, WarmupCause};
+use ds_core::heap::{hash_table, HeapSize};
 use ds_poll::{FirstTick, Shutdown};
 use ds_wis2::{Notification, Resolved, Status, StatusSnapshot};
 
@@ -64,6 +65,10 @@ pub struct Wis2Source {
     degrade_after: Duration,
     status: ArcSwap<Option<Arc<Status>>>,
     produced: Mutex<Produced>,
+    /// `produced`'s `data_id`s and estimated heap bytes, set after every
+    /// change (#1307), so `/metrics` never takes its lock.
+    deletion_entries: AtomicU64,
+    deletion_bytes: AtomicU64,
     /// `(centre, kind)` pairs already logged at WARN with a sample
     /// `data_id` — every further failure of that kind is counted only (a
     /// centre with an unsupported template would otherwise WARN on every
@@ -93,6 +98,9 @@ struct Produced {
     by_data_id: HashMap<String, Vec<(String, DateTime<Utc>)>>,
     owner: HashMap<(String, DateTime<Utc>), String>,
     order: VecDeque<String>,
+    /// Heap the entries own (their strings and key lists), kept as they
+    /// change: the variable part of [`Self::heap_bytes`].
+    held: usize,
 }
 
 impl Produced {
@@ -100,27 +108,41 @@ impl Produced {
     /// whichever `data_id` produced it before.
     fn record(&mut self, data_id: String, keys: Vec<(String, DateTime<Utc>)>) {
         for k in &keys {
-            if let Some(prev) = self.owner.insert(k.clone(), data_id.clone()) {
-                if prev != data_id {
-                    if let Some(list) = self.by_data_id.get_mut(&prev) {
-                        list.retain(|x| x != k);
+            let (key, owner) = (k.clone(), data_id.clone());
+            let (key_bytes, owner_bytes) = (key.heap_size(), owner.heap_size());
+            match self.owner.insert(key, owner) {
+                // The map keeps its own key; only the owner changed.
+                Some(prev) => {
+                    self.held = self.held + owner_bytes - prev.heap_size();
+                    if prev != data_id {
+                        if let Some(list) = self.by_data_id.get_mut(&prev) {
+                            let before = list.heap_size();
+                            list.retain(|x| x != k);
+                            self.held = self.held + list.heap_size() - before;
+                        }
                     }
                 }
+                None => self.held += key_bytes + owner_bytes,
             }
         }
         match self.by_data_id.get_mut(&data_id) {
             Some(list) => {
+                let before = list.heap_size();
                 for k in keys {
                     if !list.contains(&k) {
                         list.push(k);
                     }
                 }
+                self.held = self.held + list.heap_size() - before;
             }
             None => {
-                self.by_data_id.insert(data_id.clone(), keys);
+                let id = data_id.clone();
+                self.held += id.heap_size() + keys.heap_size() + data_id.heap_size();
+                self.by_data_id.insert(id, keys);
                 self.order.push_back(data_id);
                 while self.order.len() > MAX_REMEMBERED {
                     if let Some(old) = self.order.pop_front() {
+                        self.held -= old.heap_size();
                         self.forget(&old);
                     }
                 }
@@ -130,13 +152,33 @@ impl Produced {
 
     /// Drop `data_id`'s bookkeeping, returning the keys it still owns.
     fn forget(&mut self, data_id: &str) -> Vec<(String, DateTime<Utc>)> {
-        let keys = self.by_data_id.remove(data_id).unwrap_or_default();
+        let Some((id, keys)) = self.by_data_id.remove_entry(data_id) else {
+            return Vec::new();
+        };
+        self.held -= id.heap_size() + keys.heap_size();
         for k in &keys {
             if self.owner.get(k).is_some_and(|d| d == data_id) {
-                self.owner.remove(k);
+                if let Some((key, owner)) = self.owner.remove_entry(k) {
+                    self.held -= key.heap_size() + owner.heap_size();
+                }
             }
         }
         keys
+    }
+
+    /// `data_id`s remembered.
+    fn len(&self) -> usize {
+        self.by_data_id.len()
+    }
+
+    /// Estimated heap bytes of the index (#1307): the strings and key lists
+    /// its entries own, both hash tables and the order queue's buffer.
+    /// O(1).
+    fn heap_bytes(&self) -> usize {
+        self.held
+            + hash_table::<(String, Vec<(String, DateTime<Utc>)>)>(self.by_data_id.capacity())
+            + hash_table::<((String, DateTime<Utc>), String)>(self.owner.capacity())
+            + self.order.capacity() * std::mem::size_of::<String>()
     }
 }
 
@@ -153,6 +195,8 @@ impl Wis2Source {
             degrade_after,
             status: ArcSwap::from_pointee(None),
             produced: Mutex::new(Produced::default()),
+            deletion_entries: AtomicU64::new(0),
+            deletion_bytes: AtomicU64::new(0),
             warned: Mutex::new(HashSet::new()),
             failures: Mutex::new(HashMap::new()),
             warmup,
@@ -193,9 +237,33 @@ impl Wis2Source {
     /// reload (#1036), so a `rel=deletion` of a report it received still
     /// withdraws it. Not in the state snapshot, so a restart loses it.
     pub(crate) fn take_deletions(&self, from: &Wis2Source) {
-        let produced =
-            std::mem::take(&mut *from.produced.lock().unwrap_or_else(|e| e.into_inner()));
-        *self.produced.lock().unwrap_or_else(|e| e.into_inner()) = produced;
+        let produced = {
+            let mut from_produced = from.produced.lock().unwrap_or_else(|e| e.into_inner());
+            let produced = std::mem::take(&mut *from_produced);
+            from.publish_deletions(&from_produced);
+            produced
+        };
+        let mut own = self.produced.lock().unwrap_or_else(|e| e.into_inner());
+        *own = produced;
+        self.publish_deletions(&own);
+    }
+
+    /// The deletion index's `(data_ids, estimated heap bytes)` as of its
+    /// last change (#1307).
+    pub(crate) fn deletion_index(&self) -> (u64, u64) {
+        (
+            self.deletion_entries.load(Ordering::Relaxed),
+            self.deletion_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Keep `produced`'s size for [`Self::deletion_index`]; called under
+    /// its lock after every change.
+    fn publish_deletions(&self, produced: &Produced) {
+        self.deletion_entries
+            .store(produced.len() as u64, Ordering::Relaxed);
+        self.deletion_bytes
+            .store(produced.heap_bytes() as u64, Ordering::Relaxed);
     }
 
     /// Install a broker status without a pipeline (tests drive it by hand).
@@ -389,10 +457,14 @@ impl Wis2Source {
         if keys.is_empty() {
             return;
         }
-        self.produced
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .record(n.data_id, keys);
+        self.record_produced(n.data_id, keys);
+    }
+
+    /// Remember the rows `data_id` produced, for its deletion.
+    pub(crate) fn record_produced(&self, data_id: String, keys: Vec<(String, DateTime<Utc>)>) {
+        let mut produced = self.produced.lock().unwrap_or_else(|e| e.into_inner());
+        produced.record(data_id, keys);
+        self.publish_deletions(&produced);
     }
 
     /// Count a failure for the hourly per-centre summary, and WARN the
@@ -439,11 +511,12 @@ impl Wis2Source {
     }
 
     fn delete(&self, engine: &BufrEngine, data_id: &str) {
-        let keys = self
-            .produced
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .forget(data_id);
+        let keys = {
+            let mut produced = self.produced.lock().unwrap_or_else(|e| e.into_inner());
+            let keys = produced.forget(data_id);
+            self.publish_deletions(&produced);
+            keys
+        };
         if !keys.is_empty() {
             let n = engine.remove_reports(&keys);
             tracing::debug!(
@@ -629,6 +702,77 @@ mod tests {
             after.by_id("0-20000-0-68155").unwrap().id,
             "0-20000-0-68155"
         );
+    }
+
+    /// What a full walk of the index finds its entries own: what
+    /// `Produced::held` keeps incrementally.
+    fn walked(p: &Produced) -> usize {
+        p.by_data_id
+            .iter()
+            .map(|(id, keys)| id.heap_size() + keys.heap_size())
+            .sum::<usize>()
+            + p.owner
+                .iter()
+                .map(|(key, owner)| key.heap_size() + owner.heap_size())
+                .sum::<usize>()
+            + p.order.iter().map(HeapSize::heap_size).sum::<usize>()
+    }
+
+    /// The deletion index's estimate (#1307) follows records, take-overs of
+    /// a key by a later `data_id` and deletions, as a full walk would.
+    #[test]
+    fn deletion_index_bytes_follow_every_change() {
+        let t = |h: u32| {
+            use chrono::TimeZone;
+            Utc.with_ymd_and_hms(2026, 10, 27, h, 0, 0).unwrap()
+        };
+        let keys = |ids: &[&str], h| -> Vec<(String, DateTime<Utc>)> {
+            ids.iter().map(|id| (id.to_string(), t(h))).collect()
+        };
+        let mut p = Produced::default();
+        assert_eq!((p.len(), p.heap_bytes()), (0, 0));
+        p.record(
+            "wis2/a".into(),
+            keys(&["0-20000-0-02598", "0-20000-0-02974"], 6),
+        );
+        p.record(
+            "wis2/b".into(),
+            keys(&["0-20000-0-02974", "0-20000-0-01001"], 6),
+        );
+        p.record(
+            "wis2/a".into(),
+            keys(&["0-20000-0-02598", "0-20000-0-03005"], 7),
+        );
+        assert_eq!(p.held, walked(&p));
+        assert_eq!(p.len(), 2);
+        let full = p.heap_bytes();
+        assert!(full > p.held);
+        assert_eq!(p.forget("wis2/b").len(), 2);
+        assert_eq!(p.held, walked(&p));
+        assert!(p.heap_bytes() < full);
+        p.forget("wis2/a");
+        // Only the order queue's strings are left until they reach its front.
+        assert_eq!(p.held, "wis2/a".len() + "wis2/b".len());
+        assert_eq!(p.held, walked(&p));
+
+        // The source publishes the index's size after each change.
+        let e = engine();
+        let Source::Wis2(src) = e.source() else {
+            panic!()
+        };
+        assert_eq!(e.store_memory().deletion_index, Some((0, 0)));
+        src.apply(
+            &e,
+            resolved(
+                "se-smhi/a",
+                Some(fixture("synop_se-smhi_20260912T0800Z.bufr")),
+            ),
+        );
+        let (entries, bytes) = e.store_memory().deletion_index.unwrap();
+        assert_eq!(entries, 1);
+        assert_eq!(bytes, src.produced.lock().unwrap().heap_bytes() as u64);
+        src.apply(&e, resolved("se-smhi/a", None));
+        assert_eq!(e.store_memory().deletion_index.unwrap().0, 0);
     }
 
     #[test]

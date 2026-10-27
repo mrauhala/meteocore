@@ -82,6 +82,8 @@ pub static RENDER_MEMORY: LazyLock<Arc<RenderBudget>> = LazyLock::new(|| {
 pub struct RenderBudget {
     capacity: u64,
     used: AtomicU64,
+    /// The most reserved at once since [`Self::take_peak`] last read it.
+    peak: AtomicU64,
     /// Requests larger than the whole budget, shed before queueing.
     oversize: AtomicU64,
     /// Requests whose deadline expired while waiting for memory.
@@ -94,6 +96,7 @@ impl RenderBudget {
         Self {
             capacity,
             used: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
             oversize: AtomicU64::new(0),
             expired: AtomicU64::new(0),
             released: Notify::new(),
@@ -105,16 +108,27 @@ impl RenderBudget {
     }
 
     /// Enter this budget in the memory plan (`ds_cache::plan`, #1306) as
-    /// `id`, its `/metrics` family, sized from `source`.
+    /// `id`, its `/metrics` family, sized from `source`, with its
+    /// high-water mark ([`Self::take_peak`]).
     pub fn register(
         self: &Arc<Self>,
         id: &'static str,
         scope: plan::Scope,
         source: plan::SizeSource,
     ) {
-        plan::register(plan::Entry::budget(id, scope, source), self, |budget| {
-            plan::Usage::budget(budget.capacity, budget.used.load(Ordering::Relaxed))
-        });
+        plan::register_budget(
+            plan::Entry::budget(id, scope, source),
+            self,
+            |budget| plan::Usage::budget(budget.capacity, budget.used.load(Ordering::Relaxed)),
+            Self::take_peak,
+        );
+    }
+
+    /// The most reserved at once since the previous call, which restarts the
+    /// mark from what is reserved now (#1307): `/metrics` reads it once per
+    /// scrape, so a burst between two scrapes shows.
+    pub fn take_peak(&self) -> u64 {
+        take_peak(&self.peak, &self.used)
     }
 
     pub fn available(&self) -> u64 {
@@ -164,14 +178,14 @@ impl RenderBudget {
 
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: Option<u64>) -> Option<RenderPermit> {
         if let Some(bytes) = bytes {
-            if self
+            if let Ok(before) = self
                 .used
                 .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                     used.checked_add(bytes)
                         .filter(|&total| total <= self.capacity)
                 })
-                .is_ok()
             {
+                self.peak.fetch_max(before + bytes, Ordering::Relaxed);
                 return Some(RenderPermit {
                     budget: self.clone(),
                     bytes,
@@ -212,6 +226,8 @@ impl Drop for RenderPermit {
 pub struct ByteBudget {
     capacity: u64,
     used: AtomicU64,
+    /// The most reserved at once since [`Self::take_peak`] last read it.
+    peak: AtomicU64,
     /// Request admissions turned away. Probes and background refusals are
     /// never counted.
     rejected: AtomicU64,
@@ -222,6 +238,7 @@ impl ByteBudget {
         Self {
             capacity,
             used: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
         }
     }
@@ -232,17 +249,26 @@ impl ByteBudget {
 
     /// Enter this budget in the memory plan (`ds_cache::plan`, #1306) as
     /// `id`, its `/metrics` family (`geotiff_decode` for
-    /// `geotiff_decode_capacity_bytes`), sized from `source`. Listed while
-    /// the budget lives.
+    /// `geotiff_decode_capacity_bytes`), sized from `source`, with its
+    /// high-water mark ([`Self::take_peak`]). Listed while the budget lives.
     pub fn register(
         self: &Arc<Self>,
         id: &'static str,
         scope: plan::Scope,
         source: plan::SizeSource,
     ) {
-        plan::register(plan::Entry::budget(id, scope, source), self, |budget| {
-            plan::Usage::budget(budget.capacity, budget.used.load(Ordering::Relaxed))
-        });
+        plan::register_budget(
+            plan::Entry::budget(id, scope, source),
+            self,
+            |budget| plan::Usage::budget(budget.capacity, budget.used.load(Ordering::Relaxed)),
+            Self::take_peak,
+        );
+    }
+
+    /// The most reserved at once since the previous call, which restarts the
+    /// mark from what is reserved now (#1307), as [`RenderBudget::take_peak`].
+    pub fn take_peak(&self) -> u64 {
+        take_peak(&self.peak, &self.used)
     }
 
     /// (reserved bytes, capacity bytes, rejected admissions), the triple each
@@ -293,16 +319,26 @@ impl ByteBudget {
     }
 
     fn admit(self: &Arc<Self>, bytes: u64, limit: u64) -> Option<BytePermit> {
-        self.used
+        let before = self
+            .used
             .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|&n| n <= limit)
             })
             .ok()?;
+        self.peak.fetch_max(before + bytes, Ordering::Relaxed);
         Some(BytePermit {
             budget: self.clone(),
             bytes,
         })
     }
+}
+
+/// Swap a high-water mark for what is reserved now, returning the most
+/// reserved at once since the previous swap. A reservation racing the swap
+/// lands in this mark or the next.
+fn take_peak(peak: &AtomicU64, used: &AtomicU64) -> u64 {
+    let now = used.load(Ordering::Relaxed);
+    peak.swap(now, Ordering::Relaxed).max(now)
 }
 
 /// Bytes held from a [`ByteBudget`], released when the permit drops,
@@ -511,6 +547,31 @@ mod tests {
         assert_eq!(ByteBudget::new(101).background_limit(), 50);
     }
 
+    /// The high-water mark is the most reserved at once since the previous
+    /// read, then restarts from what is reserved now (#1307).
+    #[test]
+    fn peaks_hold_the_most_reserved_since_the_last_read() {
+        let bytes = Arc::new(ByteBudget::new(100));
+        assert_eq!(bytes.take_peak(), 0);
+        let a = bytes.reserve(30).unwrap();
+        let b = bytes.try_reserve(50).unwrap();
+        assert!(bytes.try_reserve(30).is_none(), "refused: no peak");
+        drop(b);
+        let _c = bytes.try_reserve_background(10).unwrap();
+        assert_eq!(bytes.take_peak(), 80);
+        assert_eq!(bytes.take_peak(), 40, "what is still reserved");
+        drop(a);
+        assert_eq!(bytes.take_peak(), 40, "until the next read");
+        assert_eq!(bytes.take_peak(), 10);
+
+        let render = Arc::new(RenderBudget::new(10 * BYTES_PER_PIXEL));
+        let first = render.try_reserve(raster_bytes(2, 1, 1)).unwrap();
+        let second = render.try_reserve(raster_bytes(3, 1, 1)).unwrap();
+        drop((first, second));
+        assert_eq!(render.take_peak(), 5 * BYTES_PER_PIXEL);
+        assert_eq!(render.take_peak(), 0);
+    }
+
     /// A registered budget is in the memory plan with its reservations
     /// (#1306), and leaves it when dropped.
     #[test]
@@ -551,6 +612,11 @@ mod tests {
                 plan::Usage::budget(10 * BYTES_PER_PIXEL, 2 * BYTES_PER_PIXEL)
             ))
         );
+        // The plan hands over each one's high-water mark (#1307).
+        let peaks = plan::take_peaks();
+        let peak = |id: &str| peaks.iter().find(|(e, _)| e.id == id).map(|(_, p)| *p);
+        assert_eq!(peak("budget_test_bytes"), Some(30));
+        assert_eq!(peak("budget_test_render"), Some(2 * BYTES_PER_PIXEL));
         drop((held, bytes));
         assert_eq!(listed("budget_test_bytes"), None);
     }

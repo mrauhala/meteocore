@@ -944,6 +944,7 @@ mod tests {
             run: None,
             times: Vec::new(),
             reads: vec![inspected.fields[0].read.clone()],
+            heap_bytes: 0,
         });
         storage.slow.store(true, Ordering::Relaxed);
         let decodes = Arc::new(AtomicU64::new(0));

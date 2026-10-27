@@ -76,6 +76,10 @@ serde data); everything with a socket lives here.
 - Errors carry URLs and broker details — log them; the `From<Wis2Error>
   for DataServerError` impl maps to the generic `Engine` variant so nothing
   reaches an HTTP client.
+- Dedup memory (#1307): `Dedup::heap_bytes()` is O(1), string capacities
+  kept on every insert, re-queue, expiry and eviction. The subscriber
+  publishes (len, bytes) through `Status::record_dedup` after every accept.
+  About 660 B per data id, about 130 MB at `MAX_ENTRIES`.
 
 ## Smoke test
 

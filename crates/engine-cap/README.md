@@ -175,6 +175,9 @@ MeteoAlarm warnings topic.
   warm-up.
 - `/metrics`: `cap_alerts_active`, `cap_alerts_superseded_total`; in WIS2
   mode also `cap_alerts_held` and the `cap_wis2_*` families.
+  `cap_alert_bytes{part}` estimates the heap of the `catalog`, in WIS2
+  mode of the `accumulator`, and with `geocode_geometry` of the `geocode`
+  lookup.
 
 ## Limits
 

@@ -24,6 +24,7 @@ use ds_render::rasterize::{fill_polygon, Combine};
 use ds_wis2::{Fetcher, Resolved, Status as Wis2Status, StatusSnapshot as Wis2StatusSnapshot};
 
 use crate::catalog::{BuildConfig, Catalog, CatalogStore};
+use crate::memory::CapMemory;
 use crate::parser::CapAreaHint;
 use crate::persist;
 use crate::source::{Source, SourceLoad};
@@ -89,6 +90,8 @@ pub struct CapEngine {
     /// WIS2 mode with a state store: the accumulator snapshot's key and its
     /// write policy (#1000). `None` = no persistence.
     snapshots: Option<Mutex<StateWriter>>,
+    /// The geocode lookup's estimated heap, weighed once at load (#1307).
+    geocode_bytes: Option<u64>,
 }
 
 /// WIS2-mode state shared between `poll_loop` and the health/metrics readers.
@@ -221,6 +224,10 @@ impl CapEngine {
             }
             _ => None,
         };
+        let geocode_bytes = build_cfg
+            .geocode_lookup
+            .as_ref()
+            .map(|lookup| ds_core::heap::HeapSize::heap_size(lookup) as u64);
         let engine = CapEngine {
             catalog,
             source: Arc::new(source),
@@ -234,6 +241,7 @@ impl CapEngine {
             superseded: std::sync::atomic::AtomicU64::new(0),
             superseded_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
             snapshots,
+            geocode_bytes,
         };
 
         // Best-effort initial load (so local fixtures populate immediately).
@@ -395,6 +403,19 @@ impl CapEngine {
     /// Collection id (for logging / health).
     pub fn collection_id(&self) -> &str {
         &self.collection_id
+    }
+
+    /// The estimated heap this collection holds outside every cache, for
+    /// `/metrics` (#1307): figures kept when each part last changed, so a
+    /// read is O(1).
+    pub fn memory(&self) -> CapMemory {
+        CapMemory {
+            accumulator_bytes: self
+                .wis2_source()
+                .map(|source| source.stats.heap_bytes.load(Ordering::Relaxed)),
+            catalog_bytes: self.catalog.load().heap_bytes,
+            geocode_bytes: self.geocode_bytes,
+        }
     }
 
     /// Whether at least one load has succeeded (regardless of record count).

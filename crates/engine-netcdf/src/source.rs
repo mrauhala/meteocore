@@ -13,6 +13,63 @@ use crate::ingest::{FieldRead, Packing, Span, Stored};
 use crate::opendap::DapFile;
 use crate::remote::{ReadFailure, RemoteFile};
 
+// What a netcdf-reader file holds (#1307), fitted to the heap the
+// committed NetCDF-4 fixtures leave allocated (5 to 19 variables, 15 to 86
+// attributes, 2 to 8 served, 0 to 156 chunk-index entries, 3 to 8
+// coordinates read; every fixture within 7 %): an open (superblock, root
+// group), each variable and attribute `variables()` parses with its HDF5
+// object header, and each dataset lookup the ingest leaves cached: a served
+// variable's with its chunk index, a coordinate's. A real MEPS sfc file,
+// 221 variables, comes out 10 % under the 820 KB measured per handle.
+/// Bytes of an open NetCDF-4 file before its metadata is read.
+const HANDLE_BYTES: u64 = 24_400;
+/// Bytes per variable of the file's metadata.
+const VARIABLE_BYTES: u64 = 1_960;
+/// Bytes per attribute of the file's variables.
+const ATTRIBUTE_BYTES: u64 = 200;
+/// Bytes per served variable's dataset lookup.
+const SERVED_BYTES: u64 = 3_700;
+/// Bytes per entry of a served variable's cached chunk index.
+const CHUNK_ENTRY_BYTES: u64 = 78;
+/// Bytes per coordinate variable's dataset lookup.
+const COORDINATE_BYTES: u64 = 3_500;
+
+/// The heap a NetCDF variable's metadata owns: its name, dimensions and
+/// attributes (#1307).
+pub(crate) fn variable_bytes(var: &NcVariable) -> usize {
+    use netcdf_reader::{NcAttrValue, NcAttribute, NcDimension};
+    use std::mem::size_of;
+    let value = |value: &NcAttrValue| match value {
+        NcAttrValue::Bytes(v) => v.capacity(),
+        NcAttrValue::UBytes(v) => v.capacity(),
+        NcAttrValue::Chars(s) => s.capacity(),
+        NcAttrValue::Shorts(v) => v.capacity() * 2,
+        NcAttrValue::UShorts(v) => v.capacity() * 2,
+        NcAttrValue::Ints(v) => v.capacity() * 4,
+        NcAttrValue::UInts(v) => v.capacity() * 4,
+        NcAttrValue::Floats(v) => v.capacity() * 4,
+        NcAttrValue::Doubles(v) => v.capacity() * 8,
+        NcAttrValue::Int64s(v) => v.capacity() * 8,
+        NcAttrValue::UInt64s(v) => v.capacity() * 8,
+        NcAttrValue::Strings(v) => {
+            v.capacity() * size_of::<String>() + v.iter().map(String::capacity).sum::<usize>()
+        }
+    };
+    var.name.capacity()
+        + var.dimensions.capacity() * size_of::<NcDimension>()
+        + var
+            .dimensions
+            .iter()
+            .map(|d| d.name.capacity())
+            .sum::<usize>()
+        + var.attributes.capacity() * size_of::<NcAttribute>()
+        + var
+            .attributes
+            .iter()
+            .map(|a| a.name.capacity() + value(&a.value))
+            .sum::<usize>()
+}
+
 /// One open file's reader.
 pub(crate) enum Reader {
     /// netcdf-reader over a local file, or a remote one read by HTTP range
@@ -165,6 +222,37 @@ impl Reader {
                 ..
             } | Reader::Dap(_)
         )
+    }
+
+    /// The estimated heap this open file's reader holds (#1307) once the
+    /// ingest has read `coordinates` coordinate variables and warmed
+    /// `served` variables, caching `chunk_entries` chunk-index entries
+    /// ([`crate::ingest::Field::chunk_entries`]). A netcdf-reader file
+    /// holds trees no API reports, so it is a model ([`HANDLE_BYTES`] and
+    /// the rest), fitted to counting-allocator measurements of the
+    /// committed fixtures. An OPeNDAP file's metadata is plain data,
+    /// walked.
+    pub(crate) fn heap_estimate(
+        &self,
+        served: usize,
+        chunk_entries: u64,
+        coordinates: usize,
+    ) -> u64 {
+        match self {
+            Reader::Nc { nc, .. } => {
+                let (variables, attributes) = nc.variables().map_or((0, 0), |variables| {
+                    let attributes = variables.iter().map(|v| v.attributes.len()).sum();
+                    (variables.len(), attributes)
+                });
+                HANDLE_BYTES
+                    + VARIABLE_BYTES * variables as u64
+                    + ATTRIBUTE_BYTES * attributes as u64
+                    + SERVED_BYTES * served as u64
+                    + CHUNK_ENTRY_BYTES * chunk_entries
+                    + COORDINATE_BYTES * coordinates as u64
+            }
+            Reader::Dap(dap) => dap.heap_bytes() as u64,
+        }
     }
 
     /// Whether a remote read of the file has failed (network, deadline,

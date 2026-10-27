@@ -21,7 +21,9 @@ available.
   timestamped files. A background poll repeats it every
   `poll_interval_secs` and swaps the catalog atomically; a failed poll keeps
   the previous one. Temporary names (`.name.h5`, `*.tmp`, `*.part`) are
-  skipped, and so are remote objects over 64 MiB.
+  skipped, and so are remote objects over 64 MiB. A polar source's catalog
+  holds each volume's parsed metadata, never its pixels;
+  `pvol_catalog_bytes` estimates its heap.
 - **Composites (`OdimEngine`).** The filename template (or regex) gives
   each file's time. The newest file is decoded at startup for the grid, CRS
   and extent, so a source with no matching file fails to load. That grid is

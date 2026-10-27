@@ -229,6 +229,38 @@ impl DapFile {
         &self.metadata.variables
     }
 
+    /// The heap this file holds (#1307): its key, the parsed DDS and DAS,
+    /// and the coordinate values read at open.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use ds_core::heap::{hash_table, HeapSize};
+        use std::mem::size_of;
+        let metadata = &self.metadata;
+        let variables = metadata.variables.capacity() * size_of::<NcVariable>()
+            + metadata
+                .variables
+                .iter()
+                .map(crate::source::variable_bytes)
+                .sum::<usize>();
+        let projections = metadata.projections.capacity() * size_of::<dap::Projection>()
+            + metadata
+                .projections
+                .iter()
+                .map(|p| p.path.capacity() + p.leaf.capacity())
+                .sum::<usize>();
+        self.key.heap_size()
+            + ds_core::heap::ARC_COUNTS
+            + size_of::<remote::FileId>()
+            + self.id.url.heap_size()
+            + variables
+            + projections
+            + hash_table::<(String, Vec<f64>)>(self.coordinates.capacity())
+            + self
+                .coordinates
+                .iter()
+                .map(|(name, values)| name.heap_size() + values.heap_size())
+                .sum::<usize>()
+    }
+
     /// Whether a read of this file has failed.
     pub(crate) fn read_failed(&self) -> bool {
         self.failed.load(Ordering::Relaxed)

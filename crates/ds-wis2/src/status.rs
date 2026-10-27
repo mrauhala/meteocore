@@ -81,6 +81,10 @@ pub struct Status {
     /// Integrity methods this build cannot verify (sha3-*), counted so an
     /// operator can see that "verified" is not "checked".
     integrity_unverified_total: AtomicU64,
+    /// The duplicate filter's `data_id`s and estimated heap bytes, as of
+    /// its last change ([`crate::Dedup::heap_bytes`]).
+    dedup_entries: AtomicU64,
+    dedup_bytes: AtomicU64,
 }
 
 /// Point-in-time copy of [`Status`] for metrics / health.
@@ -101,6 +105,10 @@ pub struct StatusSnapshot {
     pub downloads_total: u64,
     pub download_failures_total: u64,
     pub integrity_unverified_total: u64,
+    /// `data_id`s the duplicate filter remembers.
+    pub dedup_entries: u64,
+    /// Estimated heap bytes of the duplicate filter.
+    pub dedup_bytes: u64,
 }
 
 fn now_millis() -> u64 {
@@ -182,6 +190,13 @@ impl Status {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The duplicate filter's size after a change: its `data_id`s and
+    /// estimated heap bytes.
+    pub fn record_dedup(&self, entries: u64, bytes: u64) {
+        self.dedup_entries.store(entries, Ordering::Relaxed);
+        self.dedup_bytes.store(bytes, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> StatusSnapshot {
         let now = now_millis();
         let age = |millis: u64| (millis > 0).then(|| now.saturating_sub(millis) / 1000);
@@ -210,6 +225,8 @@ impl Status {
             downloads_total: self.downloads_total.load(Ordering::Relaxed),
             download_failures_total: self.download_failures_total.load(Ordering::Relaxed),
             integrity_unverified_total: self.integrity_unverified_total.load(Ordering::Relaxed),
+            dedup_entries: self.dedup_entries.load(Ordering::Relaxed),
+            dedup_bytes: self.dedup_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -257,6 +274,10 @@ mod tests {
         assert_eq!(snap.download_failures_total, 1);
         assert_eq!(snap.last_message_age_secs, Some(0));
         assert!(snap.last_lag_secs.unwrap() >= 89);
+        assert_eq!((snap.dedup_entries, snap.dedup_bytes), (0, 0));
+        s.record_dedup(3, 1200);
+        let snap = s.snapshot();
+        assert_eq!((snap.dedup_entries, snap.dedup_bytes), (3, 1200));
 
         assert!(s.set_disconnected());
         assert!(!s.set_disconnected());

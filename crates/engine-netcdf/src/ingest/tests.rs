@@ -771,6 +771,7 @@ fn field_on(name: &str, pressure: Option<&[f64]>) -> Field {
             field_bytes: 16,
             levels: Vec::new(),
         },
+        chunk_entries: 0,
     }
 }
 
