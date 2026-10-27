@@ -124,6 +124,9 @@ around `ds-storage` calls (Critical Rules 6–7).
   floored at ~31 × the 256 KiB entry estimate ⇒ ≥ ~3.9 MiB from 8 MiB up),
   and a 720 × 1000 f32 sweep (2.75 MiB) must fit — pinned by
   `full_f32_sweep_is_admitted_at_every_sensible_size`.
+  Built `.with_ghosts().prewarmed()` (#1308); the loader counts misses with
+  `PixelCache::record_miss(file_id, path)` so they are looked up among recent
+  evictions.
 - **Multi-moment walks prefetch per file (#994).** Every walk over several
   moments of one volume file — EDR profiles (`profile_targets`),
   `level_series` (volume-major: one volume's batch at a time, all levels

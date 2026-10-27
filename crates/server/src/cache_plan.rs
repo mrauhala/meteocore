@@ -14,6 +14,11 @@
 //! gauges. The first two refresh the `/metrics` families first: reading a
 //! process-wide cache's figures builds it, and so enters it, so all three
 //! list what `/metrics` reports.
+//!
+//! The endpoint also says what each cache did over the last hour and
+//! whether it needs memory (#1308): idle, thrashing, scan or healthy, with
+//! the hit ratio a cache 1.5, 2 or 3 times as large would have had. The
+//! hour is sampled by `/metrics` scrapes ([`ds_cache::plan::SAMPLE_EVERY`]).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -22,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use ds_cache::plan::{self, Entry, Kind, Row, Scope, SizeSource, Usage};
-use ds_cache::MIB;
+use ds_cache::plan::{self, Activity, Entry, Kind, Row, Scope, SizeSource, Usage};
+use ds_cache::{Churn, MIB};
 use ds_core::config::{
     CollectionConfig, ServerConfig, DEFAULT_GRID_CACHE_MB, DEFAULT_METATILE_CACHE_MB,
     DEFAULT_POINT_INDEX_CACHE_MB, DEFAULT_TILE_CACHE_MB, DEFAULT_ZARR_CACHE_MB,
@@ -108,15 +113,8 @@ pub(crate) fn register_geotiff(
         id: collection.id.clone(),
     };
     plan::register(Entry::cache("tile_cache", scope, source), engine, |e| {
-        let (used, capacity, entries) = e.tile_cache_utilization();
-        let (hits, misses) = e.tile_cache_stats();
-        Usage {
-            capacity_bytes: capacity,
-            used_bytes: used,
-            entries: Some(entries as u64),
-            hits: Some(hits),
-            misses: Some(misses),
-        }
+        let entries = e.tile_cache_utilization().2 as u64;
+        Usage::cache(e.tile_cache_metrics(), Some(entries))
     });
 }
 
@@ -137,15 +135,8 @@ pub(crate) fn register_grib(collection: &CollectionConfig, engine: &Arc<engine_g
         SizeSource::Collection("[grib] grid_cache_mb"),
     );
     plan::register(Entry::cache("grid_cache", scope(), grid), engine, |e| {
-        let (used, capacity, entries) = e.grid_cache_utilization();
-        let (hits, misses) = e.grid_cache_stats();
-        Usage {
-            capacity_bytes: capacity,
-            used_bytes: used,
-            entries: Some(entries as u64),
-            hits: Some(hits),
-            misses: Some(misses),
-        }
+        let entries = e.grid_cache_utilization().2 as u64;
+        Usage::cache(e.grid_cache_metrics(), Some(entries))
     });
     let message = SizeSource::unless_default(
         grib.message_cache_mb,
@@ -264,7 +255,10 @@ pub async fn handler(
 }
 
 /// The endpoint's document: `caches` and `budgets`, one object each, their
-/// totals, and the process and allocator memory `/metrics` reports.
+/// totals, and the process and allocator memory `/metrics` reports. A cache
+/// also has its cumulative `churn` and, once sampled for a while, what it
+/// did over the `last_hour` ([`last_hour_json`]); both are null for a
+/// budget.
 pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading) -> Value {
     let entries = |kind: Kind| -> Vec<Value> {
         rows.iter()
@@ -282,6 +276,8 @@ pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading) -> Value {
                     "entries": usage.entries,
                     "hits": usage.hits,
                     "misses": usage.misses,
+                    "churn": usage.churn.as_ref().map(churn_json),
+                    "last_hour": row.window.as_ref().map(last_hour_json),
                 })
             })
             .collect()
@@ -308,6 +304,65 @@ pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading) -> Value {
         },
         "memory": memory,
     })
+}
+
+/// What a cache admitted, refused and evicted since it was built.
+fn churn_json(churn: &Churn) -> Value {
+    json!({
+        "inserted_bytes": churn.inserted_bytes,
+        "refused": churn.refused,
+        "evictions": {"cold": churn.evicted_cold, "hot": churn.evicted_hot},
+        "evicted_bytes": churn.evicted_bytes,
+        "bypasses": churn.bypasses,
+        "ghost_hits": churn.ghost_hits.map(by_depth),
+        "prewarmed": churn.prewarmed,
+    })
+}
+
+/// The caveat a pre-warmed cache's numbers carry.
+const PREWARMED: &str = "pre-warmed: entries are inserted long before they are read, so \
+                         evictions and ghost hits undervalue them (#992)";
+
+/// What a cache did over its window, up to the last hour: lookups, hit
+/// ratio, turnover (capacities admitted per hour), the ghost hits at each
+/// depth as a share of misses, the hit ratio a cache 1.5, 2 or 3 times as
+/// large would have had, and its label (#1308).
+pub(crate) fn last_hour_json(window: &Activity) -> Value {
+    let evictions = window.churn.evictions();
+    json!({
+        "window_secs": window.secs,
+        "lookups": window.lookups(),
+        "lookups_per_hour": rounded(window.per_hour(window.lookups())),
+        "hit_ratio": window.hit_ratio().map(rounded),
+        "turnover_per_hour": window.turnover_per_hour().map(rounded),
+        "evictions": evictions,
+        "cold_eviction_share": (evictions > 0)
+            .then(|| rounded(window.churn.evicted_cold as f64 / evictions as f64)),
+        "refused": window.churn.refused,
+        "bypasses": window.churn.bypasses,
+        "ghost_hit_share": window.ghost_share().map(|share| by_depth(share.map(rounded))),
+        "estimated_hit_ratio": window.estimated_hit_ratios().map(|ratios| {
+            let [larger_1_5, larger_2, larger_3] = ratios.map(rounded);
+            json!({"1.5x": larger_1_5, "2x": larger_2, "3x": larger_3})
+        }),
+        "label": window.label().map(plan::Label::as_str),
+        "caveat": window.churn.prewarmed.then_some(PREWARMED),
+    })
+}
+
+/// Values at each of [`ds_cache::GHOST_DEPTHS`], keyed by depth.
+fn by_depth<T: Into<Value>>(values: [T; 3]) -> Value {
+    ds_cache::GHOST_DEPTHS
+        .iter()
+        .zip(values)
+        .map(|(depth, value)| (depth.to_string(), value.into()))
+        .collect::<serde_json::Map<String, Value>>()
+        .into()
+}
+
+/// A ratio to four decimals.
+fn rounded(value: f64) -> f64 {
+    (value * 1e4).round() / 1e4
 }
 
 /// When the plan is logged.

@@ -991,6 +991,124 @@
                           }
                         }
                       }
+                    },
+                    {
+                      "kind": "RowsLayoutRow",
+                      "spec": {
+                        "title": "Cache churn",
+                        "collapse": false,
+                        "layout": {
+                          "kind": "GridLayout",
+                          "spec": {
+                            "items": [
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 0,
+                                  "width": 24,
+                                  "height": 10,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-128"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 10,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-129"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 12,
+                                  "y": 10,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-130"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 18,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-131"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 12,
+                                  "y": 18,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-132"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 26,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-133"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 12,
+                                  "y": 26,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-134"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 34,
+                                  "width": 24,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-135"
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
                     }
                   ]
                 }
@@ -18759,6 +18877,1496 @@
                     "drawStyle": "line",
                     "lineWidth": 1,
                     "fillOpacity": 0,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-128": {
+        "kind": "Panel",
+        "spec": {
+          "id": 128,
+          "title": "Cache churn, last hour",
+          "description": "One row per cache family picked in Cache, over the last hour (#1308): does it need memory? Label, as /admin/cache-plan labels it: idle = under 60 lookups, so fill and hit ratio say nothing yet; thrashing = turnover above 1 and ghost hits within 1 × capacity at least 20 % of misses, so more memory helps; scan = turnover above 1 and ghost hits within 2 × under 5 % of misses, a one-pass read that a bypass fixes, not memory; churning = turnover above 1 in a cache without a ghost ring, which cannot tell: give that cache a ring (ByteBoundedCache::with_ghosts) to find out; healthy = the rest, which can lend memory. Turnover is capacities admitted per hour. Cold share is the evictions of entries never read since inserted. Ghost hits are misses of keys evicted recently, as a share of misses; with hits they give the hit ratio of a cache twice as large. Ghost columns are empty for caches without a ring: the meta-tile, rendered, GeoTIFF decoded-chunk, PVOL pixel and GRIB grid and message caches keep one. Per-collection families sum their collections; pick one in Collection to see it alone. Pre-warmed caches (PVOL pixel, GeoTIFF tiles) insert ahead of reads, so their evictions and ghost hits undervalue them. The thresholds are starting points.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "((sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[1h:1m])) + sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[1h:1m]))) < 60) * 0 + 1 or (((sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_inserted_bytes_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_inserted_bytes_total\")[1h:1m])) / (sum by (cache) (label_replace({job=~\"$job\", __name__=~\"(${cache})_capacity_bytes\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)) > 1) and ((sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_ghost_hits_total\", collection=~\"$collection|\", depth=\"1\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_ghost_hits_total\")[1h:1m])) / sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[1h:1m]))) >= 0.2)) * 0 + 2 or (((sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_inserted_bytes_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_inserted_bytes_total\")[1h:1m])) / (sum by (cache) (label_replace({job=~\"$job\", __name__=~\"(${cache})_capacity_bytes\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)) > 1) and ((sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_ghost_hits_total\", collection=~\"$collection|\", depth=\"2\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_ghost_hits_total\")[1h:1m])) / sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[1h:1m]))) < 0.05)) * 0 + 3 or (((sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_inserted_bytes_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_inserted_bytes_total\")[1h:1m])) / (sum by (cache) (label_replace({job=~\"$job\", __name__=~\"(${cache})_capacity_bytes\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)) > 1) unless (sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_ghost_hits_total\", collection=~\"$collection|\", depth=\"1\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_ghost_hits_total\")[1h:1m])) / sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[1h:1m])))) * 0 + 4 or (sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[1h:1m])) + sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[1h:1m]))) * 0",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "(sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[1h:1m])) + sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[1h:1m])))",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "C",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[1h:1m])) / ((sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[1h:1m])) + sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[1h:1m]))) > 0)",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "D",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "(sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_inserted_bytes_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_inserted_bytes_total\")[1h:1m])) / (sum by (cache) (label_replace({job=~\"$job\", __name__=~\"(${cache})_capacity_bytes\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0))",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "E",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_evictions_total\", collection=~\"$collection|\", ring=\"cold\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_evictions_total\")[1h:1m])) / (sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_evictions_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_evictions_total\")[1h:1m])) > 0)",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "F",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "(sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_ghost_hits_total\", collection=~\"$collection|\", depth=\"1\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_ghost_hits_total\")[1h:1m])) / sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[1h:1m])))",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "G",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "(sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_ghost_hits_total\", collection=~\"$collection|\", depth=\"2\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_ghost_hits_total\")[1h:1m])) / sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[1h:1m])))",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "H",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "(sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[1h:1m])) + sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_ghost_hits_total\", collection=~\"$collection|\", depth=\"1\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_ghost_hits_total\")[1h:1m]))) / ((sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[1h:1m])) + sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[1h:1m]))) > 0)",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "I",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_refused_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_refused_total\")[1h:1m]))",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [
+                {
+                  "kind": "Transformation",
+                  "group": "merge",
+                  "spec": {
+                    "options": {}
+                  }
+                },
+                {
+                  "kind": "Transformation",
+                  "group": "organize",
+                  "spec": {
+                    "options": {
+                      "excludeByName": {
+                        "Time": true,
+                        "job": true,
+                        "instance": true,
+                        "__name__": true
+                      },
+                      "indexByName": {
+                        "cache": 0,
+                        "Value #A": 1,
+                        "Value #B": 2,
+                        "Value #C": 3,
+                        "Value #D": 4,
+                        "Value #E": 5,
+                        "Value #F": 6,
+                        "Value #G": 7,
+                        "Value #H": 8,
+                        "Value #I": 9
+                      },
+                      "renameByName": {
+                        "cache": "Cache",
+                        "Value #A": "Label",
+                        "Value #B": "Lookups",
+                        "Value #C": "Hit ratio",
+                        "Value #D": "Turnover/h",
+                        "Value #E": "Cold share",
+                        "Value #F": "Ghosts ≤1×",
+                        "Value #G": "Ghosts ≤2×",
+                        "Value #H": "Hit ratio at 2×",
+                        "Value #I": "Refused"
+                      }
+                    }
+                  }
+                }
+              ],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "table",
+            "version": "",
+            "spec": {
+              "options": {
+                "showHeader": true,
+                "cellHeight": "sm",
+                "footer": {
+                  "show": false,
+                  "reducer": [
+                    "sum"
+                  ],
+                  "countRows": false,
+                  "fields": ""
+                },
+                "sortBy": [
+                  {
+                    "displayName": "Lookups",
+                    "desc": true
+                  }
+                ]
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "custom": {
+                    "align": "auto",
+                    "cellOptions": {
+                      "type": "auto"
+                    },
+                    "inspect": false,
+                    "filterable": false
+                  },
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "blue",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "mappings": [
+                    {
+                      "type": "special",
+                      "options": {
+                        "match": "nan",
+                        "result": {
+                          "text": "–"
+                        }
+                      }
+                    },
+                    {
+                      "type": "special",
+                      "options": {
+                        "match": "null",
+                        "result": {
+                          "text": "–"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Cache"
+                    },
+                    "properties": [
+                      {
+                        "id": "custom.width",
+                        "value": 240
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Label"
+                    },
+                    "properties": [
+                      {
+                        "id": "mappings",
+                        "value": [
+                          {
+                            "type": "value",
+                            "options": {
+                              "0": {
+                                "text": "healthy",
+                                "color": "green",
+                                "index": 0
+                              },
+                              "1": {
+                                "text": "idle",
+                                "color": "text",
+                                "index": 1
+                              },
+                              "2": {
+                                "text": "thrashing",
+                                "color": "red",
+                                "index": 2
+                              },
+                              "3": {
+                                "text": "scan",
+                                "color": "orange",
+                                "index": 3
+                              },
+                              "4": {
+                                "text": "churning",
+                                "color": "yellow",
+                                "index": 4
+                              }
+                            }
+                          }
+                        ]
+                      },
+                      {
+                        "id": "custom.cellOptions",
+                        "value": {
+                          "type": "color-background",
+                          "mode": "basic"
+                        }
+                      },
+                      {
+                        "id": "custom.width",
+                        "value": 110
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Lookups"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "short"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 0
+                      },
+                      {
+                        "id": "thresholds",
+                        "value": {
+                          "mode": "absolute",
+                          "steps": [
+                            {
+                              "color": "text",
+                              "value": null
+                            },
+                            {
+                              "color": "blue",
+                              "value": 60
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "id": "custom.cellOptions",
+                        "value": {
+                          "type": "color-text"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Hit ratio"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "percentunit"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 1
+                      },
+                      {
+                        "id": "thresholds",
+                        "value": {
+                          "mode": "absolute",
+                          "steps": [
+                            {
+                              "color": "blue",
+                              "value": null
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "id": "custom.cellOptions",
+                        "value": {
+                          "type": "color-text"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Turnover/h"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "short"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 2
+                      },
+                      {
+                        "id": "thresholds",
+                        "value": {
+                          "mode": "absolute",
+                          "steps": [
+                            {
+                              "color": "green",
+                              "value": null
+                            },
+                            {
+                              "color": "orange",
+                              "value": 1
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "id": "custom.cellOptions",
+                        "value": {
+                          "type": "color-text"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Cold share"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "percentunit"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 1
+                      },
+                      {
+                        "id": "thresholds",
+                        "value": {
+                          "mode": "absolute",
+                          "steps": [
+                            {
+                              "color": "blue",
+                              "value": null
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "id": "custom.cellOptions",
+                        "value": {
+                          "type": "color-text"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Ghosts ≤1×"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "percentunit"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 1
+                      },
+                      {
+                        "id": "thresholds",
+                        "value": {
+                          "mode": "absolute",
+                          "steps": [
+                            {
+                              "color": "green",
+                              "value": null
+                            },
+                            {
+                              "color": "red",
+                              "value": 0.2
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "id": "custom.cellOptions",
+                        "value": {
+                          "type": "color-text"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Ghosts ≤2×"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "percentunit"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 1
+                      },
+                      {
+                        "id": "thresholds",
+                        "value": {
+                          "mode": "absolute",
+                          "steps": [
+                            {
+                              "color": "orange",
+                              "value": null
+                            },
+                            {
+                              "color": "green",
+                              "value": 0.05
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "id": "custom.cellOptions",
+                        "value": {
+                          "type": "color-text"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Hit ratio at 2×"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "percentunit"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 1
+                      },
+                      {
+                        "id": "thresholds",
+                        "value": {
+                          "mode": "absolute",
+                          "steps": [
+                            {
+                              "color": "blue",
+                              "value": null
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "id": "custom.cellOptions",
+                        "value": {
+                          "type": "color-text"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Refused"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "short"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 0
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "panel-129": {
+        "kind": "Panel",
+        "spec": {
+          "id": 129,
+          "title": "Evictions by cache and ring",
+          "description": "Entries evicted per second (#1308). cold = never read since inserted, once the cache is full: evicted before a second use; hot = read since. Refused inserts and new values of a resident key are not evictions. Evictions alone are normal for a full cache: whether they cost hits is the ghost-hit panel's question.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache, ring) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_evictions_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_evictions_total\")[$__rate_interval:15s]))",
+                        "legendFormat": "{{cache}} {{ring}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "ops",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-130": {
+        "kind": "Panel",
+        "spec": {
+          "id": 130,
+          "title": "Turnover by cache",
+          "description": "Capacities admitted per hour: bytes inserted for keys not resident, per hour, over the configured capacity (#1308). Above 1 a cache replaces its contents within the hour: thrashing when the ghost hits say evicted keys come back, a scan when they do not.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "3600 * sum by (cache) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_inserted_bytes_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_inserted_bytes_total\")[$__rate_interval:15s])) / (sum by (cache) (label_replace({job=~\"$job\", __name__=~\"(${cache})_capacity_bytes\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)",
+                        "legendFormat": "{{cache}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-131": {
+        "kind": "Panel",
+        "spec": {
+          "id": 131,
+          "title": "Ghost hits as a share of misses",
+          "description": "Misses of a key the cache evicted within depth × its capacity of evictions, as a share of its misses (#1308): the misses a cache 1.5, 2 or 3 times as large would have hit. At least 20 % within 1 × with turnover above 1 is thrashing; under 5 % within 2 × is a scan. Only caches with a ghost ring report.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache, depth) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_ghost_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_ghost_hits_total\")[$__rate_interval:15s])) / on (cache) group_left () (sum by (cache) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__rate_interval:15s])) > 0)",
+                        "legendFormat": "{{cache}} within {{depth}} ×",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percentunit",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "max": 1,
+                  "decimals": 1
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-132": {
+        "kind": "Panel",
+        "spec": {
+          "id": 132,
+          "title": "Estimated hit ratio with more memory",
+          "description": "The hit ratio now (depth 0) and what a cache 1.5, 2 or 3 times as large would have had: hits plus the ghost hits within 0.5, 1 or 2 × its capacity, over lookups (#1308). A wide gap is memory well spent; none means a larger cache buys nothing. Only caches with a ghost ring.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s])) / (sum by (cache) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s])) + sum by (cache) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__rate_interval:15s])) > 0)",
+                        "legendFormat": "{{cache}} now",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "(sum by (cache, depth) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_ghost_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_ghost_hits_total\")[$__rate_interval:15s])) + on (cache) group_left () sum by (cache) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s]))) / on (cache) group_left () (sum by (cache) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_hits_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s])) + sum by (cache) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_misses_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__rate_interval:15s])) > 0)",
+                        "legendFormat": "{{cache}} +{{depth}} × capacity",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percentunit",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "max": 1,
+                  "decimals": 1
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-133": {
+        "kind": "Panel",
+        "spec": {
+          "id": 133,
+          "title": "Inserted and evicted bytes",
+          "description": "Bytes admitted for keys not resident, and bytes evicted, per second (#1308). Evictions trail inserts by a full cache while it fills; once full they match, and the inserts over the capacity are its turnover.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_inserted_bytes_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_inserted_bytes_total\")[$__rate_interval:15s]))",
+                        "legendFormat": "{{cache}} inserted",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_evicted_bytes_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_evicted_bytes_total\")[$__rate_interval:15s]))",
+                        "legendFormat": "{{cache}} evicted",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "Bps",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-134": {
+        "kind": "Panel",
+        "spec": {
+          "id": 134,
+          "title": "Refused inserts",
+          "description": "Inserts a cache refused because the entry outweighs its shard's hot target, so it was never cached (#1308). Not evictions. A steady rate means entries too large for the cache's shards: a larger cache, fewer shards or a higher hot share.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache) (rate(label_replace({job=~\"$job\", __name__=~\"(${cache})_refused_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_refused_total\")[$__rate_interval:15s]))",
+                        "legendFormat": "{{cache}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "ops",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-135": {
+        "kind": "Panel",
+        "spec": {
+          "id": 135,
+          "title": "GRIB reads around the grid cache",
+          "description": "Field reads per second that went around the GRIB grid cache, by source: a window of more fields than it holds, read without inserting (#1297), against its misses (#1308). Bypasses are neither hits nor misses, so a meteogram's one-pass read stays out of the map workload's hit ratio.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (rate(grid_cache_bypass_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval]))",
+                        "legendFormat": "{{collection}} bypass",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (rate(grid_cache_misses_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval]))",
+                        "legendFormat": "{{collection}} miss",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "ops",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
                     "gradientMode": "none",
                     "showPoints": "never",
                     "pointSize": 4,

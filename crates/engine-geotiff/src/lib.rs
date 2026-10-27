@@ -632,6 +632,12 @@ impl GeoTiffEngine {
         self.tile_cache.stats()
     }
 
+    /// The tile cache's counters, its evictions and admitted bytes (#1308)
+    /// included.
+    pub fn tile_cache_metrics(&self) -> ds_cache::CacheMetrics {
+        self.tile_cache.metrics()
+    }
+
     /// Whether the collection reads local files, which go through the page
     /// cache and never the tile cache: its tile cache is built empty.
     pub fn reads_local_files(&self) -> bool {

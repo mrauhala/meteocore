@@ -17,6 +17,11 @@
 //!
 //! [`plan`] is the process-wide registry of every cache and admission
 //! budget, with where each size came from (#1306).
+//!
+//! Every cache also counts what it evicts, refuses and admits, and a cache
+//! built [`ByteBoundedCache::with_ghosts`] how many misses asked for a key it
+//! evicted recently: the signal that more memory would help ([`Churn`],
+//! #1308).
 
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,9 +31,13 @@ use std::sync::Arc;
 /// depending on `quick_cache` directly.
 pub use quick_cache::Equivalent;
 
+mod churn;
 mod entry;
 pub mod plan;
+pub use churn::{Churn, GHOST_DEPTHS};
 pub use entry::{CacheEntry, CacheFillGuard, Joined};
+
+use churn::{Counters, Counting, Insert};
 
 /// One mebibyte, for `*_MB` → bytes conversions.
 pub const MIB: u64 = 1024 * 1024;
@@ -54,18 +63,20 @@ fn parse_env_mb(var: &str) -> Option<u64> {
 /// layer delta-tracks them into Prometheus counters); `bytes` is the current
 /// resident weight; `capacity_bytes` is the **configured** budget — `0` for a
 /// disabled cache, even though the underlying store is clamped to a 1-byte
-/// budget internally (see [`ByteBoundedCache::new`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// budget internally (see [`ByteBoundedCache::new`]). `churn` is cumulative
+/// like the hits, and all zero for a disabled cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheMetrics {
     pub hits: u64,
     pub misses: u64,
     pub bytes: u64,
     pub capacity_bytes: u64,
+    pub churn: Churn,
 }
 
 /// Adapts a plain `fn(&K, &V) -> u64` to `quick_cache`'s `Weighter` trait so
 /// call sites pass a function instead of hand-rolling a unit-struct impl.
-struct WeighFn<K, V> {
+pub(crate) struct WeighFn<K, V> {
     weigh: fn(&K, &V) -> u64,
 }
 
@@ -98,16 +109,36 @@ impl<K, V> quick_cache::Weighter<K, V> for WeighFn<K, V> {
 ///   no-op. [`Self::capacity_bytes`] still reports the configured `0`.
 /// - **Counting is explicit.** [`Self::get`] and [`Self::get_or_insert_with`]
 ///   count hits/misses; [`Self::get_untracked`]/[`Self::contains_key`] don't,
-///   and [`Self::record_hit`]/[`Self::record_miss`] let wrappers with custom
-///   accounting (e.g. a negative-cache check between lookup and miss) keep
-///   the counters truthful.
+///   and [`Self::record_hit`]/[`Self::record_miss_for`] let wrappers with
+///   custom accounting (e.g. a negative-cache check between lookup and miss)
+///   keep the counters truthful.
+/// - **Churn is counted on every insert** ([`Churn`], #1308): bytes admitted,
+///   entries refused, entries evicted from each ring. A cache built
+///   [`Self::with_ghosts`] also counts the misses that ask for a key it
+///   evicted recently.
 pub struct ByteBoundedCache<K: Eq + Hash, V: Clone> {
     /// Shared so the memory plan can read it weakly ([`Self::register`]).
     inner: Arc<Inner<K, V>>,
 }
 
+/// The `quick_cache` store under a [`ByteBoundedCache`].
+type Store<K, V> =
+    quick_cache::sync::Cache<K, V, WeighFn<K, V>, quick_cache::DefaultHashBuilder, Counting<K, V>>;
+
+/// A single-flight claim on the store.
+type Placeholder<'a, K, V> = quick_cache::sync::PlaceholderGuard<
+    'a,
+    K,
+    V,
+    WeighFn<K, V>,
+    quick_cache::DefaultHashBuilder,
+    Counting<K, V>,
+>;
+
 struct Inner<K: Eq + Hash, V: Clone> {
-    cache: quick_cache::sync::Cache<K, V, WeighFn<K, V>>,
+    cache: Store<K, V>,
+    /// The store's lifecycle, to count the requests the cache finishes.
+    lifecycle: Counting<K, V>,
     capacity_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -121,8 +152,48 @@ impl<K: Eq + Hash, V: Clone> Inner<K, V> {
             entries: Some(self.cache.len() as u64),
             hits: Some(self.hits.load(Ordering::Relaxed)),
             misses: Some(self.misses.load(Ordering::Relaxed)),
+            churn: Some(self.counters().snapshot()),
         }
     }
+
+    fn counters(&self) -> &Counters {
+        self.lifecycle.counters()
+    }
+
+    /// Count a miss of `key`, and look it up among recent evictions.
+    fn miss<Q: Hash + ?Sized>(&self, key: &Q) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.counters().record_ghost(key);
+    }
+
+    /// Publish `value` to a single-flight claim on `key` and count the
+    /// insert. The weight function takes the owned key, so `key` is cloned:
+    /// only on a fill, which follows a computation.
+    fn fill<Q>(&self, key: &Q, claim: Placeholder<'_, K, V>, value: V)
+    where
+        Q: ToOwned<Owned = K> + ?Sized,
+    {
+        let weight = self
+            .counters()
+            .counting()
+            .then(|| self.lifecycle.weigh(&key.to_owned(), &value));
+        let _ = publish(&self.lifecycle, claim, value, weight);
+    }
+}
+
+/// Publish `value` (of weight `weight`, `None` for a disabled cache) to a
+/// single-flight claim and count the insert. Returns the value if the claim
+/// was displaced by an explicit insert or removal of the key.
+fn publish<K: Eq + Hash, V: Clone>(
+    lifecycle: &Counting<K, V>,
+    claim: Placeholder<'_, K, V>,
+    value: V,
+    weight: Option<u64>,
+) -> Result<(), V> {
+    let evicted = claim.insert_with_lifecycle(value)?;
+    let insert = weight.map(|weight| Insert { weight });
+    lifecycle.record(evicted, insert);
+    Ok(())
 }
 
 impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
@@ -209,21 +280,53 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         if let Some(hot_allocation) = hot_allocation {
             options.hot_allocation(hot_allocation);
         }
+        let hasher = quick_cache::DefaultHashBuilder::default();
+        let counters = Arc::new(Counters::new(capacity_bytes, hasher.clone()));
+        let lifecycle = Counting::new(Arc::clone(&counters), WeighFn { weigh });
+        let cache = quick_cache::sync::Cache::with_options(
+            options
+                .build()
+                .expect("item estimate and weight capacity are set"),
+            WeighFn { weigh },
+            hasher,
+            lifecycle.clone(),
+        );
+        counters.set_hot_target(
+            cache.shard_capacity(),
+            hot_allocation.unwrap_or(churn::DEFAULT_HOT_ALLOCATION),
+        );
         ByteBoundedCache {
             inner: Arc::new(Inner {
-                cache: quick_cache::sync::Cache::with_options(
-                    options
-                        .build()
-                        .expect("item estimate and weight capacity are set"),
-                    WeighFn { weigh },
-                    Default::default(),
-                    Default::default(),
-                ),
+                cache,
+                lifecycle,
                 capacity_bytes,
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Keep a ghost ring: the hashes of recently evicted keys, back over
+    /// twice the capacity of evicted weight, so [`Churn::ghost_hits`] counts
+    /// the misses that a cache 1.5 ×, 2 × or 3 × as large would have hit
+    /// (#1308). About 32 bytes per remembered eviction, up to 32 MiB. A
+    /// miss takes one more hash of its key and the lock of one of the ring's
+    /// stripes, and an eviction the same; a hit costs nothing (the
+    /// `churn_bench` example measures it). Misses counted by
+    /// [`Self::record_miss`] are not looked up: count them with
+    /// [`Self::record_miss_for`]. No ring for a disabled cache.
+    pub fn with_ghosts(self) -> Self {
+        self.inner.counters().keep_ghosts();
+        self
+    }
+
+    /// Mark the cache as filled ahead of its reads, by a pre-warm: its
+    /// entries are inserted long before they are read, so a recency signal
+    /// (evictions, ghost hits) undervalues them (#992). Reports show its
+    /// numbers with that caveat ([`Churn::prewarmed`]).
+    pub fn prewarmed(self) -> Self {
+        self.inner.counters().set_prewarmed();
+        self
     }
 
     /// Build a cache sized from the environment: `var` (MB, [`env_mb`]) with
@@ -267,7 +370,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         if result.is_some() {
             self.inner.hits.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.inner.misses.fetch_add(1, Ordering::Relaxed);
+            self.inner.miss(key);
         }
         result
     }
@@ -293,7 +396,11 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// Insert an entry. At capacity 0 the entry is never admitted (see the
     /// type-level docs), so this is effectively a no-op there.
     pub fn insert(&self, key: K, value: V) {
-        self.inner.cache.insert(key, value);
+        let insert = self.inner.counters().counting().then(|| Insert {
+            weight: self.inner.lifecycle.weigh(&key, &value),
+        });
+        let evicted = self.inner.cache.insert_with_lifecycle(key, value);
+        self.inner.lifecycle.record(evicted, insert);
     }
 
     /// Remove `key`, returning its value if it was resident. No counter
@@ -327,16 +434,21 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     where
         Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
     {
-        let mut computed = false;
-        let value = self.inner.cache.get_or_insert_with(key, || {
-            computed = true;
-            self.inner.misses.fetch_add(1, Ordering::Relaxed);
-            with()
-        })?;
-        if !computed {
-            self.inner.hits.fetch_add(1, Ordering::Relaxed);
+        match self.inner.cache.get_value_or_guard(key, None) {
+            quick_cache::sync::GuardResult::Value(value) => {
+                self.record_hit();
+                Ok(value)
+            }
+            quick_cache::sync::GuardResult::Guard(claim) => {
+                self.inner.miss(key);
+                let value = with()?;
+                self.inner.fill(key, claim, value.clone());
+                Ok(value)
+            }
+            quick_cache::sync::GuardResult::Timeout => {
+                unreachable!("a lookup without a timeout waits for the fill")
+            }
         }
-        Ok(value)
     }
 
     /// Single-flight lookup with a bounded wait for another caller's fill.
@@ -357,10 +469,10 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
                 self.record_hit();
                 Ok(value)
             }
-            quick_cache::sync::GuardResult::Guard(guard) => {
-                self.record_miss();
+            quick_cache::sync::GuardResult::Guard(claim) => {
+                self.inner.miss(key);
                 let value = with()?;
-                let _ = guard.insert(value.clone());
+                self.inner.fill(key, claim, value.clone());
                 Ok(value)
             }
             quick_cache::sync::GuardResult::Timeout => Err(timed_out()),
@@ -385,9 +497,11 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     {
         match self.inner.cache.get_value_or_guard(key, Some(timeout)) {
             quick_cache::sync::GuardResult::Value(value) => CacheEntry::Value(value),
-            quick_cache::sync::GuardResult::Guard(guard) => {
-                CacheEntry::Vacant(CacheFillGuard(guard))
-            }
+            quick_cache::sync::GuardResult::Guard(claim) => CacheEntry::Vacant(CacheFillGuard {
+                claim,
+                key: self.inner.counters().counting().then(|| key.to_owned()),
+                lifecycle: &self.inner.lifecycle,
+            }),
             quick_cache::sync::GuardResult::Timeout => CacheEntry::Timeout,
         }
     }
@@ -401,12 +515,13 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// reuse (a GRIB query over more fields than the cache holds, #1297),
     /// which should still share an identical concurrent fill.
     ///
-    /// Counts a hit for a value and a miss when absent, like
-    /// [`Self::get_or_insert_with`]; a timeout counts nothing. Its own
-    /// computation is not shared: a caller arriving while it runs claims a
-    /// fill of its own. Finding the key absent takes and drops a fill claim
-    /// at once, so a caller arriving in that instant may become the owner of
-    /// the fill, as after a failed one.
+    /// Counts a hit for a value and a bypass when absent
+    /// ([`Churn::bypasses`]): the caller reads around the cache, so its read
+    /// is not a miss of the cache's workload (#1308). A timeout counts
+    /// nothing. Its own computation is not shared: a caller arriving while
+    /// it runs claims a fill of its own. Finding the key absent takes and
+    /// drops a fill claim at once, so a caller arriving in that instant may
+    /// become the owner of the fill, as after a failed one.
     pub fn get_or_join<Q>(&self, key: &Q, timeout: Option<std::time::Duration>) -> Joined<V>
     where
         Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
@@ -416,9 +531,9 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
                 self.record_hit();
                 Joined::Value(value)
             }
-            quick_cache::sync::GuardResult::Guard(guard) => {
-                drop(guard);
-                self.record_miss();
+            quick_cache::sync::GuardResult::Guard(claim) => {
+                drop(claim);
+                self.inner.counters().record_bypass();
                 Joined::Absent
             }
             quick_cache::sync::GuardResult::Timeout => Joined::Timeout,
@@ -430,9 +545,27 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         self.inner.hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count one miss (for wrappers using [`Self::get_untracked`]).
+    /// Count one miss (for wrappers using [`Self::get_untracked`]), without
+    /// looking for it among recent evictions: a cache built
+    /// [`Self::with_ghosts`] counts its misses with [`Self::record_miss_for`].
     pub fn record_miss(&self) {
         self.inner.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one read around the cache (for wrappers using
+    /// [`Self::get_untracked`]), as [`Self::get_or_join`] counts one that
+    /// finds the key absent: neither a hit nor a miss ([`Churn::bypasses`]).
+    pub fn record_bypass(&self) {
+        self.inner.counters().record_bypass();
+    }
+
+    /// Count one miss of `key` (for wrappers using [`Self::get_untracked`]),
+    /// and look it up among recent evictions as [`Self::get`] does.
+    pub fn record_miss_for<Q>(&self, key: &Q)
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.inner.miss(key);
     }
 
     /// Cumulative `(hits, misses)`.
@@ -477,6 +610,11 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         self.inner.cache.len() == 0
     }
 
+    /// Cumulative evictions, refusals, admitted bytes and ghost hits.
+    pub fn churn(&self) -> Churn {
+        self.inner.counters().snapshot()
+    }
+
     /// Snapshot for `/metrics`.
     pub fn metrics(&self) -> CacheMetrics {
         let (hits, misses) = self.stats();
@@ -485,6 +623,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
             misses,
             bytes: self.weight(),
             capacity_bytes: self.inner.capacity_bytes,
+            churn: self.churn(),
         }
     }
 }
@@ -784,7 +923,9 @@ mod tests {
             Joined::Value(vec![0u8; 34])
         );
         assert_eq!(cache.get_or_join(&"new".to_string(), None), Joined::Absent);
-        assert_eq!(cache.stats(), (1, 1));
+        // The absent key is read around the cache: a bypass, not a miss.
+        assert_eq!(cache.stats(), (1, 0));
+        assert_eq!(cache.churn().bypasses, 1);
         assert_eq!((cache.len(), cache.weight()), (4, 400));
         assert!(keys.iter().all(|key| cache.contains_key(key)));
         // No claim was kept: the next filling caller computes at once.
@@ -835,8 +976,9 @@ mod tests {
             });
         }
         // Owner misses for both fills, the joined value's hit, the failed
-        // fill's miss; timeouts count nothing.
-        assert_eq!(cache.stats(), (1, 3));
+        // fill's bypass; timeouts count nothing.
+        assert_eq!(cache.stats(), (1, 2));
+        assert_eq!(cache.churn().bypasses, 1);
         assert!(!cache.contains_key(&format!("{:?}", Err::<Vec<u8>, _>("offline"))));
     }
 
@@ -892,10 +1034,203 @@ mod tests {
                 entries: Some(1),
                 hits: Some(1),
                 misses: Some(1),
+                churn: Some(Churn {
+                    inserted_bytes: 101,
+                    ..Churn::default()
+                }),
             }
         );
         assert_eq!(row.usage, plan::Usage::cache(cache.metrics(), Some(1)));
         drop(cache);
         assert!(listed().is_none());
+    }
+
+    /// Weight = the value, in a one-shard cache of `entries` entries of
+    /// 1000 bytes with a ghost ring.
+    fn ghost_cache(entries: u64) -> ByteBoundedCache<String, u64> {
+        ByteBoundedCache::new_single_shard(entries * 1000, 1000, weigh_declared).with_ghosts()
+    }
+
+    /// Look `key` up and insert it on a miss, as a cache's caller does.
+    fn read_through(cache: &ByteBoundedCache<String, u64>, key: String) {
+        if cache.get(&key).is_none() {
+            cache.insert(key, 1000);
+        }
+    }
+
+    /// #1308 acceptance: a cyclic access over 1.2 × the entries a cache
+    /// holds asks for every evicted key again after 0.2 × its capacity of
+    /// other evictions, so its misses are ghost hits within 0.5 × and the
+    /// cache is labelled thrashing.
+    ///
+    /// The issue expected ~0 hits, an LRU's answer. `quick_cache` is not an
+    /// LRU: its hot ring keeps most of the first pass and the rest churn
+    /// through the cold ring, so about 70 % of the cycle hits here. Either
+    /// way, every miss after the first pass is a ghost hit at the shallowest
+    /// depth.
+    #[test]
+    fn cyclic_access_over_capacity_is_thrashing() {
+        const N: u64 = 100;
+        let cache = ghost_cache(N);
+        let keys: Vec<String> = (0..N * 12 / 10).map(|i| format!("k{i}")).collect();
+        for key in &keys {
+            read_through(&cache, key.clone());
+        }
+        let start = plan::Usage::cache(cache.metrics(), None);
+        for _ in 0..20 {
+            for key in &keys {
+                read_through(&cache, key.clone());
+            }
+        }
+        let end = plan::Usage::cache(cache.metrics(), None);
+        let window = plan::Activity::between(&start, &end, 3600).unwrap();
+        let ghost_hits = window.churn.ghost_hits.unwrap();
+        assert!(window.misses >= 20 * (N / 5), "{window:?}");
+        assert_eq!(ghost_hits[0], window.misses, "{window:?}");
+        assert_eq!(ghost_hits, [window.misses; 3]);
+        assert!(window.churn.evictions() >= window.misses - 1, "{window:?}");
+        assert_eq!(window.label(), Some(plan::Label::Thrashing), "{window:?}");
+        assert_eq!(
+            window.estimated_hit_ratios(),
+            Some([1.0; 3]),
+            "a cache 1.5 × as large holds the cycle"
+        );
+    }
+
+    /// #1308 acceptance: one pass over 3 × the entries a cache holds evicts
+    /// two thirds of them and asks for none again: no ghost hits. It turns
+    /// over twice in the window and is labelled scan.
+    #[test]
+    fn one_pass_over_three_capacities_evicts_without_ghost_hits() {
+        const N: u64 = 100;
+        let cache = ghost_cache(N);
+        let start = plan::Usage::cache(cache.metrics(), None);
+        for i in 0..3 * N {
+            read_through(&cache, format!("k{i}"));
+        }
+        let churn = cache.churn();
+        assert_eq!(cache.stats(), (0, 3 * N));
+        assert_eq!(churn.evictions(), 2 * N);
+        assert_eq!(churn.evicted_bytes, 2 * N * 1000);
+        assert_eq!(churn.inserted_bytes, 3 * N * 1000);
+        assert_eq!(churn.ghost_hits, Some([0; 3]));
+        let end = plan::Usage::cache(cache.metrics(), None);
+        let window = plan::Activity::between(&start, &end, 3600).unwrap();
+        assert_eq!(window.turnover_per_hour(), Some(3.0));
+        assert_eq!(window.label(), Some(plan::Label::Scan));
+    }
+
+    /// Entries inserted once the hot ring is full enter the cold ring and,
+    /// never read, leave it first: cold evictions.
+    #[test]
+    fn unread_inserts_past_the_hot_ring_are_cold_evictions() {
+        let cache = ByteBoundedCache::new_single_shard(100 * 1000, 1000, weigh_declared);
+        for i in 0..200 {
+            cache.insert(format!("k{i}"), 1000);
+        }
+        let churn = cache.churn();
+        assert_eq!((churn.evicted_cold, churn.evicted_hot), (100, 0));
+        assert_eq!(churn.ghost_hits, None, "no ring unless asked for");
+    }
+
+    /// #1308 acceptance: an entry heavier than its shard's hot target is
+    /// refused, not admitted, and counts as a refusal, not an eviction,
+    /// whatever the shards and hot share; one at the target is admitted.
+    #[test]
+    fn a_refusal_is_not_an_eviction() {
+        for (shards, hot_allocation) in [(Some(1), None), (Some(1), Some(0.5)), (None, None)] {
+            let cache =
+                ByteBoundedCache::build(64 * 1000, 1000, weigh_declared, shards, hot_allocation)
+                    .with_ghosts();
+            let shard = cache.shard_capacity_bytes();
+            let target = (shard as f64 * hot_allocation.unwrap_or(0.97)) as u64;
+            cache.insert("resident".to_string(), 1000);
+            cache.insert("too-big".to_string(), target + 1);
+            assert!(!cache.contains_key(&"too-big".to_string()));
+            // A refused fill of a claim, too.
+            let refused =
+                cache.get_or_insert_with(&"too-big-fill".to_string(), || Ok::<_, ()>(target + 1));
+            assert_eq!(refused, Ok(target + 1));
+            let churn = cache.churn();
+            assert_eq!(churn.refused, 2, "{shards:?} {hot_allocation:?}");
+            assert_eq!(churn.evictions(), 0);
+            assert_eq!(churn.inserted_bytes, 1000);
+            cache.insert("fits".to_string(), target);
+            assert!(cache.contains_key(&"fits".to_string()));
+            assert_eq!(cache.churn().refused, 2);
+            assert_eq!(cache.churn().inserted_bytes, 1000 + target);
+        }
+    }
+
+    /// A new value for a resident key replaces the old one: no eviction and
+    /// nothing admitted, and a refused new value removes the old one without
+    /// an eviction either.
+    #[test]
+    fn a_replaced_value_is_not_an_eviction() {
+        let cache = ghost_cache(10);
+        cache.insert("a".to_string(), 1000);
+        cache.insert("a".to_string(), 900);
+        assert_eq!(cache.weight(), 900);
+        cache.insert("a".to_string(), 10 * 1000);
+        assert!(!cache.contains_key(&"a".to_string()));
+        let churn = cache.churn();
+        assert_eq!(churn.evictions(), 0);
+        assert_eq!((churn.inserted_bytes, churn.refused), (1000, 1));
+    }
+
+    /// Every fill path counts its insert, and every miss path looks the key
+    /// up among recent evictions: `get`, the single-flight fills, a claim's
+    /// guard, and `record_miss_for`; `record_miss` does not.
+    #[test]
+    fn every_fill_counts_and_every_keyed_miss_finds_ghosts() {
+        let cache = ghost_cache(10);
+        let keys: Vec<String> = (0..20).map(|i| format!("k{i}")).collect();
+        for key in &keys {
+            cache.insert(key.clone(), 1000);
+        }
+        let evicted: Vec<&String> = keys.iter().filter(|k| !cache.contains_key(*k)).collect();
+        assert_eq!(evicted.len(), 10);
+        assert!(cache.get(evicted[0]).is_none());
+        let _ = cache.get_or_insert_with(evicted[1], || Ok::<_, ()>(1000));
+        let _ = cache.get_or_insert_with_timeout(
+            evicted[2],
+            std::time::Duration::ZERO,
+            || Ok::<_, ()>(1000),
+            || (),
+        );
+        let CacheEntry::Vacant(claim) =
+            cache.get_value_or_guard_untracked(evicted[3], std::time::Duration::ZERO)
+        else {
+            panic!("{} was evicted", evicted[3]);
+        };
+        cache.record_miss_for(evicted[3]);
+        claim.insert(1000).unwrap();
+        cache.record_miss();
+        let churn = cache.churn();
+        assert_eq!(churn.inserted_bytes, 23 * 1000);
+        assert_eq!(cache.stats(), (0, 5));
+        // Each missed key had 9 or 10 capacity-tenths evicted since its own
+        // eviction began: within 1 ×, not 0.5 ×.
+        assert_eq!(churn.ghost_hits, Some([0, 4, 4]), "{churn:?}");
+    }
+
+    /// A disabled cache counts lookups only: it admits nothing, so it
+    /// refuses and evicts nothing either, and keeps no ring.
+    #[test]
+    fn a_disabled_cache_counts_no_churn() {
+        let cache = ByteBoundedCache::new(0, 1000, weigh_declared).with_ghosts();
+        cache.insert("a".to_string(), 1000);
+        assert!(cache.get(&"a".to_string()).is_none());
+        let _ = cache.get_or_insert_with(&"b".to_string(), || Ok::<_, ()>(1000));
+        assert_eq!(cache.churn(), Churn::default());
+        assert_eq!(cache.stats(), (0, 2));
+    }
+
+    /// The pre-warm flag travels with the cache's metrics.
+    #[test]
+    fn a_prewarmed_cache_says_so() {
+        let cache = ByteBoundedCache::new(MIB, 1000, weigh_declared).prewarmed();
+        assert!(cache.metrics().churn.prewarmed);
+        assert!(!ghost_cache(1).churn().prewarmed);
     }
 }

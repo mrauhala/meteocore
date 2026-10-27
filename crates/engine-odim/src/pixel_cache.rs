@@ -242,13 +242,17 @@ impl PixelCache {
         // One FMI moment ≈ 360×500×2 ≈ 360 KB; estimate items at ~256 KB.
         // The estimate also sets the shard floor that bounds the largest
         // admitted entry (see `PIXEL_CACHE_HOT_ALLOCATION`).
+        // Filled ahead of reads by the pre-warm (#992), with a ghost ring
+        // to tell whether a larger cache would hit more (#1308).
         PixelCache {
             inner: ByteBoundedCache::new_with_hot_allocation(
                 capacity_mb.saturating_mul(ds_cache::MIB),
                 256 * 1024,
                 weigh_pixels,
                 PIXEL_CACHE_HOT_ALLOCATION,
-            ),
+            )
+            .with_ghosts()
+            .prewarmed(),
             negative: Cache::new(NEGATIVE_CAPACITY_ITEMS),
             inserts: AtomicU64::new(0),
             loading: Mutex::new(HashMap::new()),
@@ -417,7 +421,7 @@ impl PixelCache {
                 if let Some(raw) = self.get(file_id, path) {
                     pixels.insert(path.to_string(), raw);
                 } else if !self.is_known_bad(file_id, path) {
-                    self.record_miss();
+                    self.record_miss(file_id, path);
                     missing.push((path, nrays, nbins));
                 }
             }
@@ -440,9 +444,11 @@ impl PixelCache {
     }
 
     /// Count one genuine positive-cache miss — i.e. a key that is neither
-    /// cached nor known-bad, so the loader is about to fetch + decode it.
-    pub fn record_miss(&self) {
-        self.inner.record_miss();
+    /// cached nor known-bad, so the loader is about to fetch + decode it —
+    /// and look it up among recent evictions (#1308).
+    pub fn record_miss(&self, file_id: &str, dataset_path: &str) {
+        let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
+        self.inner.record_miss_for(&key);
     }
 
     /// Serialize cold loads of sibling datasets in a source-qualified file.
@@ -543,6 +549,11 @@ impl PixelCache {
     /// Cumulative `(hits, misses)`.
     pub fn stats(&self) -> (u64, u64) {
         self.inner.stats()
+    }
+
+    /// Snapshot for `/metrics`: counters, churn (#1308) and occupancy.
+    pub fn metrics(&self) -> ds_cache::CacheMetrics {
+        self.inner.metrics()
     }
 
     /// Cumulative inserts (request-time decodes, their background sibling
@@ -721,8 +732,30 @@ mod tests {
         let (h0, m0) = c.stats();
         assert!(c.get("absent", "/d").is_none());
         assert_eq!(c.stats(), (h0, m0), "get() miss must not be counted");
-        c.record_miss();
+        c.record_miss("absent", "/d");
         assert_eq!(c.stats(), (h0, m0 + 1), "record_miss() counts the miss");
+    }
+
+    /// The loader's miss of an evicted moment is a ghost hit (#1308): the
+    /// pixel cache keeps a ghost ring, and says it is pre-warmed.
+    #[test]
+    fn a_recorded_miss_of_an_evicted_moment_is_a_ghost_hit() {
+        use ndarray::Array2;
+        let c = PixelCache::new(4);
+        let paths: Vec<String> = (0..32).map(|i| format!("/d{i}")).collect();
+        for path in &paths {
+            c.insert(
+                "f",
+                path,
+                Arc::new(RawPixels::U8(Array2::zeros((512, 512)))),
+            );
+        }
+        let evicted = paths.iter().find(|path| !c.contains("f", path)).unwrap();
+        c.record_miss("f", evicted);
+        let churn = c.metrics().churn;
+        assert!(churn.evictions() > 0, "{churn:?}");
+        assert_eq!(churn.ghost_hits.map(|hits| hits[2]), Some(1), "{churn:?}");
+        assert!(churn.prewarmed);
     }
 
     #[test]

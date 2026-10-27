@@ -2527,8 +2527,20 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/admin/cach
 - `source` says where the size came from: `default`, `env:MC_…`, `config:[server] …`, `collection:[grib] grid_cache_mb` and the like, or `constant`, fixed in code. The MVT cache (128 MiB) and the solid-image memo (32 MiB) are constants, and so is the empty tile cache of a local GeoTIFF collection, which reads its files through the page cache. A collection key set to its default value reads as `default`.
 - `totals` counts the caches and the budgets, with their capacity and use. Capacity is not memory: a cache allocates as it fills, and a budget is reserved only while work runs.
 - `memory` repeats the process and allocator gauges of `/metrics` (`process_resident_memory_bytes`, `jemalloc_*_bytes`), `null` where they cannot be read: RSS and swap off Linux.
+- A cache's `churn` counts, since it was built, the bytes it admitted for keys not resident (`inserted_bytes`), the inserts it refused because the entry outweighs its shard's hot target (`refused`), the entries it evicted from the cold and hot rings (`evictions`) and their bytes (`evicted_bytes`), the reads that went around it (`bypasses`: a GRIB window larger than the grid cache), and, for a cache that keeps a ghost ring, `ghost_hits`: misses whose key it evicted within 0.5, 1 or 2 times its capacity of evictions, cumulative. `prewarmed` marks a cache filled ahead of its reads (PVOL pixels, GeoTIFF tiles).
+- A cache's `last_hour` says whether it needs memory, from the counters `/metrics` scrapes sample every five minutes (without a scraper, since the previous plan read; `null` until a cache has five minutes of samples): `lookups` and `lookups_per_hour`, `hit_ratio`, `turnover_per_hour` (capacities admitted per hour), `cold_eviction_share` (evicted before a second use), `ghost_hit_share` by depth, `estimated_hit_ratio` of a cache 1.5, 2 or 3 times as large, a `caveat` for a pre-warmed cache, and its `label`:
 
-The server logs the same list at INFO at boot and after every accepted reload: one line per cache and budget, grouped by scope, with its size in MiB and its source, the totals, and after a reload the old size of each one that changed. On `/metrics`, `cache_size_source{cache,collection,source}` is 1 for each entry and `memory_capacity_total_bytes{kind}` sums the capacities of the caches and of the budgets. The Grafana dashboard's Memory & admission tab shows both in its Cache plan row.
+  | Label | Meaning |
+  |---|---|
+  | `idle` | Under 60 lookups an hour: no demand yet, so fill and hit ratio say nothing |
+  | `thrashing` | Turnover above 1 an hour, and ghost hits within 1 × capacity at least 20 % of misses: more memory helps |
+  | `scan` | Turnover above 1 an hour, and ghost hits within 2 × capacity under 5 % of misses: a one-pass read evicts entries nobody asks for again; a bypass fixes it, not memory |
+  | `churning` | Turnover above 1 an hour in a cache without a ghost ring, which cannot tell thrashing from a scan. To tell, give that cache a ring: `ByteBoundedCache::with_ghosts` where it is built |
+  | `healthy` | Everything else: it can lend memory |
+
+  The ghost ring costs a hash and a lock on every miss, so it is kept only by the meta-tile, rendered-image, GeoTIFF decoded-chunk, PVOL pixel and GRIB grid and message caches. The thresholds are starting points.
+
+The server logs the same list at INFO at boot and after every accepted reload: one line per cache and budget, grouped by scope, with its size in MiB and its source, the totals, and after a reload the old size of each one that changed. On `/metrics`, `cache_size_source{cache,collection,source}` is 1 for each entry and `memory_capacity_total_bytes{kind}` sums the capacities of the caches and of the budgets. The Grafana dashboard's Memory & admission tab shows both in its Cache plan row. Its Rendering & caches tab shows each cache's churn and label in the Cache churn row.
 
 Memory outside the caches has gauges too ([Memory outside caches](#prometheus-metrics)):
 
@@ -2619,6 +2631,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `grid_cache_bytes` | gauge | collection | Bytes currently held |
 | `grid_cache_capacity_bytes` | gauge | collection | Configured capacity |
 | `grid_cache_entries` | gauge | collection | Number of cached entries |
+| `grid_cache_bypass_total` | counter | collection | Field reads that went around the grid cache: a window of more fields than it holds, read without inserting. Neither hits nor misses |
 
 **3D Tiles content cache** (global, encoded `.pnts`/`.glb`/voxel bytes):
 
@@ -2647,6 +2660,16 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `vector_tile_cache_*` | — | MVT tiles of every Tiles collection, 128 MiB; with `entries` |
 | `solid_image_cache_*` | — | The encoded all-nodata images and WMS error tiles, 32 MiB; with `entries` |
 | `zarr_object_cache_*` | collection | A plain Zarr store's objects, `[zarr] cache_mb` |
+
+**Cache churn** (every cache family above and every other `*_cache_hits_total` family, with a `collection` label where the family has one; [`/admin/cache-plan`](#memory-and-caches) turns them into a label per cache):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `*_cache_evictions_total` | counter | ring | Entries evicted. `cold`: never read since inserted, once the cache is full; `hot`: read since. Refused inserts and new values of a resident key are not evictions |
+| `*_cache_evicted_bytes_total` | counter | — | Bytes of the entries evicted |
+| `*_cache_inserted_bytes_total` | counter | — | Bytes admitted for keys not resident. Turnover per hour is `3600 × rate / capacity_bytes` |
+| `*_cache_refused_total` | counter | — | Inserts refused: the entry outweighs its shard's hot target |
+| `*_cache_ghost_hits_total` | counter | depth | Misses of a key evicted within `depth` (0.5, 1, 2) × the capacity, cumulative over depths: the hits a cache 1.5, 2 or 3 times as large would have had. Only the meta-tile, rendered, GeoTIFF decoded-chunk, PVOL pixel and GRIB grid and message caches keep the ring |
 
 **Memory outside caches** (estimates computed when the store changes, except where exact):
 

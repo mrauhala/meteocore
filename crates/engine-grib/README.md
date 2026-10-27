@@ -35,11 +35,13 @@ level type) exposes every parameter; each retained run is an EDR instance.
   `grid_cache_mb` reads them without keeping them: inserting them would
   evict its own fields before any reuse, and every grid the maps keep
   there. It still uses a grid already in the cache, waits for one another
-  request is decoding, and fills the message cache. A window that fits is
-  cached as before, so a repeat is all hits. To make repeats of long
-  windows cheap, set `message_cache_mb`: a compressed GFS 0.25° message is
-  about 0.6 MB against 4 MB decoded, an IFS 0.1° one about 1.3 MB against
-  26 MB.
+  request is decoding, and fills the message cache. Each field it reads
+  around the cache counts in `grid_cache_bypass_total`, not as a miss, so
+  a meteogram's one-pass read stays out of the maps' hit ratio. A window
+  that fits is cached as before, so a repeat is all hits. To make repeats
+  of long windows cheap, set `message_cache_mb`: a compressed GFS 0.25°
+  message is about 0.6 MB against 4 MB decoded, an IFS 0.1° one about
+  1.3 MB against 26 MB.
 - **Point reads of CCSDS fields.** A position query on a template 5.42
   field (ECMWF IFS and AIFS) decodes only the blocks of 4096 values that
   hold its points' neighbours, bit for bit the full decode's values. The
@@ -189,7 +191,9 @@ registers one view per enabled family once data for it is found:
 Without it, one collection has no vertical axis and serves each short name
 at one canonical level: the lowest height above ground up to 100 m, then
 surface, then mean sea level. `/metrics` reports `grid_cache_*`,
-`grib_message_cache_*` and `grib_point_index_cache_*` per source, and
+`grib_message_cache_*` and `grib_point_index_cache_*` per source, their
+evictions, admitted bytes and refusals, and, for the grid and message
+caches, the misses of recently evicted keys (`*_ghost_hits_total`), and
 `grib_point_fields_total` by `path`: `partial` through the point index,
 `full` from a decoded grid. `grib_point_fetches_total` and
 `grib_point_fetch_bytes_total` count the point path's GETs and bytes by

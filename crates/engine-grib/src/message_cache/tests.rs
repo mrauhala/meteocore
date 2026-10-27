@@ -344,8 +344,11 @@ fn changed_coordinates_and_apis_reuse_messages_when_decoded_grids_do_not_fit() {
             assert_eq!(samples, vec![expected.bilinear_value(lon, lat); 6]);
         }
         assert_eq!(engine.grid_cache_utilization().0, 0);
-        let grid_misses = if index_mb == 0 { 12 } else { 0 };
-        assert_eq!(engine.grid_cache_stats(), (0, grid_misses));
+        // The full decode reads each field around the grid cache: a bypass,
+        // not a miss (#1308).
+        let bypasses = if index_mb == 0 { 12 } else { 0 };
+        assert_eq!(engine.grid_cache_stats(), (0, 0));
+        assert_eq!(engine.grid_cache_metrics().churn.bypasses, bypasses);
         assert_eq!(
             owner.message_cache_metrics(),
             engine.message_cache_metrics()

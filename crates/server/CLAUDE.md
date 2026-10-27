@@ -252,6 +252,13 @@ need no reload pruning.
   state goes too.
 - `process_start_time_seconds` comes from `admin::record_process_start`,
   the first call in `main`.
+- Churn families (#1308) come from `ChurnMetricSet`, a field of
+  `CacheMetricSet` and `CollectionCacheMetricSet`, registered
+  `per_collection` so reload pruning covers them.
+  `CollectionCacheMetricSet::new(prefix, display, with_entries, with_bypass)`:
+  only the grid cache has `grid_cache_bypass_total`. A cache without a ghost
+  ring has no `*_ghost_hits_total` series. A new churn family goes in
+  `CHURN_PARTS`/`CHURN_FAMILIES` in `scripts/check_grafana_dashboard.py`.
 
 ## Health: data age and poll age (#1007)
 

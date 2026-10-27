@@ -225,13 +225,15 @@ pub struct TilePixelCache {
 
 impl TilePixelCache {
     pub fn new(capacity_mb: u64) -> Self {
-        // ~256 KB per RGBA tile for initial map sizing.
+        // ~256 KB per RGBA tile for initial map sizing. A ghost ring tells
+        // whether a larger cache would hit more (#1308).
         Self {
             cache: ds_cache::ByteBoundedCache::new(
                 capacity_mb.saturating_mul(ds_cache::MIB),
                 256 * 1024,
                 weigh_tile_pixels,
-            ),
+            )
+            .with_ghosts(),
         }
     }
 

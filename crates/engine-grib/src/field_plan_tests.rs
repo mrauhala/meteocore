@@ -203,13 +203,17 @@ fn an_oversized_window_leaves_the_cache_as_it_was() {
             before,
             "{kind}: nothing inserted or evicted"
         );
-        assert_eq!(cache(&engine).stats(), (0, 3 + u64::from(STEPS)), "{kind}");
+        // Reads around the cache are bypasses, not misses (#1308).
+        assert_eq!(cache(&engine).stats(), (0, 3), "{kind}");
+        let churn = cache(&engine).metrics().churn;
+        assert_eq!(churn.bypasses, u64::from(STEPS), "{kind}");
+        assert_eq!(churn.evictions(), 0, "{kind}");
 
         // The earlier window is still resident: all hits, nothing read.
         let read = engine.storage_bytes_read();
         series(&engine, "RH", 0, 2);
         assert_eq!(engine.storage_bytes_read(), read, "{kind}");
-        assert_eq!(cache(&engine).stats(), (3, 3 + u64::from(STEPS)), "{kind}");
+        assert_eq!(cache(&engine).stats(), (3, 3), "{kind}");
 
         let expected = fingerprint(&response);
         let uncached = view(&source, None);
@@ -244,7 +248,12 @@ fn an_oversized_window_reuses_resident_fields() {
         u64::from(STEPS - 3) * field_bytes()
     );
     assert_eq!(residents(&engine), before);
-    assert_eq!(cache(&engine).stats(), (3, u64::from(STEPS)));
+    // The resident three are hits; the rest are read around the cache.
+    assert_eq!(cache(&engine).stats(), (3, 3));
+    assert_eq!(
+        cache(&engine).metrics().churn.bypasses,
+        u64::from(STEPS - 3)
+    );
     // Its first three steps are the earlier window's samples.
     let values = |response: &CoverageResponse| match response {
         CoverageResponse::Single(result) => result.ranges["TMP"].values.clone(),

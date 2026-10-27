@@ -190,6 +190,8 @@ engine-zarr.
   `tile_cache_mb` whatever the CPU count. Re-check
   `a_tile_under_half_a_mebibyte_is_admitted_at_every_size` before lowering
   either.
+  Marked `prewarmed()` (#1308): its eviction and ghost-hit numbers undervalue
+  pre-warmed tiles.
 - **Rendered image cache** (default 256 MB, `[server] rendered_cache_mb`) shared
   across WMS/Maps/Tiles; see `crates/api-wms/CLAUDE.md`.
 - **Decoded-chunk cache (#463, #468):** process-global byte-bounded LRU of

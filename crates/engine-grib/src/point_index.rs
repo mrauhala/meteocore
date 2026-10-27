@@ -700,7 +700,7 @@ impl GribEngine {
             return self.complex_points_from(index, key, field, bytes);
         }
         let (entry, run, coords) = (field.entry, field.run, field.coords);
-        let full = |error: PointError| self.decode_in_full(index, entry, bytes, error);
+        let full = |error: PointError| self.decode_in_full(index, field, bytes, error);
         let cached = index.cache.get_untracked(key);
         if let Some(ccsds) = cached
             .as_ref()
@@ -754,18 +754,20 @@ impl GribEngine {
         }
     }
 
-    /// `entry`'s message, `bytes`, decoded in full after a point reader
+    /// `field`'s message, `bytes`, decoded in full after a point reader
     /// gave `error`: fatal errors fail the field, and a layout the reader
     /// does not take marks the parameter unreadable until the catalog next
-    /// publishes. Counts the grid-cache miss the full path counts before it
-    /// decodes.
+    /// publishes. Counts what the full path counts before it decodes: a
+    /// grid-cache miss for a grid the cache keeps, a bypass for one read
+    /// around it (#1308).
     fn decode_in_full(
         &self,
         index: &PointIndex,
-        entry: &MessageEntry,
+        field: &PointField<'_>,
         bytes: &[u8],
         error: PointError,
     ) -> Result<FieldRead, DataServerError> {
+        let entry = field.entry;
         if let PointError::Fatal(error) = error {
             return Err(error);
         }
@@ -774,7 +776,10 @@ impl GribEngine {
             index.remember(entry.key(), false);
         }
         if let Some(cache) = &self.source.grid_cache {
-            cache.record_miss();
+            match field.plan.fill {
+                GridFill::Insert => cache.record_miss(field.url, entry.offset),
+                GridFill::Bypass => cache.record_bypass(),
+            }
         }
         reader::decode_message(bytes, &entry.param).map(|grid| FieldRead::Grid(Arc::new(grid)))
     }

@@ -366,6 +366,15 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   every_cache_and_budget_on_metrics_is_in_the_plan` fails when a
   `*_cache_bytes` or `*_capacity_bytes` family has no entry: a new engine
   type adds its fixture collection there.
+  Every cache counts churn (#1308, `ds_cache::Churn`) in its `quick_cache`
+  `Lifecycle`: evictions by ring, admitted and evicted bytes, refusals
+  (heavier than a shard's hot target, not evictions) and bypasses. The hooks
+  only move entries into the request state; counting happens after the shard
+  lock is released, so never weigh, hash or lock under it. `with_ghosts()`
+  adds an opt-in ring of evicted key hashes (2 × capacity, 16 stripes, about
+  10–20 ns per miss) for ghost hits at 0.5, 1 and 2 × capacity; count such a
+  cache's misses with `record_miss_for(key)`. `prewarmed()` marks a cache
+  filled ahead of its reads.
 - **API crates depend on ds-core and api-common** (shared Common HTTP glue),
   plus ds-executor for bounded render execution and the shared query runtime,
   ds-render for
@@ -1462,6 +1471,10 @@ no `url` are rejected.
   `*_bytes` gauge and a test against `ds_core::heap::Counting` (within
   25 %). Budgets hand the plan a high-water mark that only `/metrics` takes
   (`plan::take_peaks` → `<budget>_reserved_peak_bytes`).
+  Each cache row also carries `churn` and a `last_hour` label (#1308):
+  `idle`, `thrashing`, `scan`, `churning` (no ghost ring to tell) or
+  `healthy`, with the hit ratio at 1.5, 2 and 3 × the size; the Grafana Cache
+  churn row mirrors it.
 - **Grafana dashboards live in this repo:**
   `docker/grafana/dashboards/meteocore-overview.json`, provisioned via
   `docker/grafana/provisioning/`: a `dashboard.grafana.app/v2` resource
