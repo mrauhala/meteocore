@@ -68,7 +68,9 @@ level type) exposes every parameter; each retained run is an EDR instance.
   through the bitmap, which precedes the data: it always reads a prefix,
   about 55 % of SOILW at 60°N.
 - **Sampling.** Points, paths and map pixels are interpolated bilinearly in
-  `f64`, then converted to display units; map tiles store `f32`. Projected
+  `f64`, then converted to display units; map tiles store `f32`. CRS:84 and
+  Web Mercator output map each column's longitude and each row's latitude
+  once, and sample every pixel exactly where they cross. Projected
   output CRSs map pixels through a coarse projection grid. An EDR query
   reads each field once, sampling every point from it, up to 16 fields at a
   time: as many as keep 256 MiB of decoded values in flight, at least four.
