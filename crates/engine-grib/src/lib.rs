@@ -1218,7 +1218,9 @@ impl GribEngine {
             &self.source.point_index,
             &self.source.message_cache,
         ) {
-            (Some(bytes), Some(_), Some(cache)) if !cache.holds(bytes) => FieldFetch::Partial,
+            (Some(bytes), Some(_), Some(cache)) if !cache.holds(fields, bytes) => {
+                FieldFetch::Partial
+            }
             (Some(_), Some(_), None) => FieldFetch::Partial,
             _ => FieldFetch::Whole,
         };

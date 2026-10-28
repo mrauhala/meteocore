@@ -161,6 +161,11 @@ impl Counters {
         self.hot_target.store(target, Ordering::Relaxed);
     }
 
+    /// The weight above which a shard refuses an entry.
+    pub(crate) fn hot_target(&self) -> u64 {
+        self.hot_target.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn set_prewarmed(&self) {
         self.prewarmed.store(true, Ordering::Relaxed);
     }

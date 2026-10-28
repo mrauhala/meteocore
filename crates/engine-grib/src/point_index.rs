@@ -452,10 +452,18 @@ impl GribEngine {
             }
         } else {
             let (bytes, on_fill) = match &self.source.message_cache {
-                Some(cache) => cache.get_with(&self.source.store, &path, entry, |bytes| {
-                    fetches.record(FetchMode::Whole, bytes.len());
-                    sample(bytes)
-                })?,
+                // A window `holds` approved stays for the query's next run
+                // (#1340).
+                Some(cache) => cache.get_with(
+                    &self.source.store,
+                    &path,
+                    entry,
+                    plan.fetch == FieldFetch::Whole,
+                    |bytes| {
+                        fetches.record(FetchMode::Whole, bytes.len());
+                        sample(bytes)
+                    },
+                )?,
                 None => {
                     let bytes = reader::fetch_message_bytes(&self.source.store, &path, entry)?;
                     fetches.record(FetchMode::Whole, bytes.len());

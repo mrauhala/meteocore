@@ -36,7 +36,12 @@ fn entry_weight(grid_bytes: usize, url_len: usize) -> u64 {
 
 /// The URL length [`GridCache::holds`] assumes for a field it has not read:
 /// a long object key. Only small grids notice it.
-const URL_ALLOWANCE: usize = 128;
+pub(crate) const URL_ALLOWANCE: usize = 128;
+
+/// The nodes of the largest grid a source decodes, a 0.1° global field,
+/// which the caches' cold rings are sized to hold (#1332). A cache is built
+/// before the first decode tells its source's geometry.
+pub(crate) const LARGEST_GRID_NODES: u64 = 3600 * 1801;
 
 /// A decoded grid with its metadata.
 #[derive(Debug, Clone)]
@@ -640,22 +645,7 @@ impl GridCache {
     /// Create a new grid cache with the given size limit in MB.
     /// Returns None if size_mb is 0 (cache disabled).
     pub fn new(size_mb: u64) -> Option<Self> {
-        if size_mb == 0 {
-            return None;
-        }
-        // Estimate: each grid is ~4 MiB (1440*721*4 bytes). One shard:
-        // [`Self::holds`] plans which windows stay resident, and a sharded
-        // budget would evict fields of a window that fits the total. A
-        // ghost ring: whether a larger cache would keep an animation's
-        // fields is what its size is set from (#1308).
-        Some(Self {
-            cache: ByteBoundedCache::new_single_shard(
-                size_mb.saturating_mul(ds_cache::MIB),
-                4 * ds_cache::MIB,
-                weigh_grid,
-            )
-            .with_ghosts(),
-        })
+        (size_mb > 0).then(|| Self::with_capacity_bytes(size_mb.saturating_mul(ds_cache::MIB)))
     }
 
     /// Get a cached grid, or None if not cached.
@@ -700,13 +690,28 @@ impl GridCache {
         self.cache.record_bypass();
     }
 
-    /// A byte-capacity cache for tests: [`Self::new`] counts whole MiB, far
-    /// more than a window of tiny synthetic grids.
-    #[cfg(test)]
+    /// A cache of `bytes`. [`Self::new`] counts whole MiB, and tests size it
+    /// for windows of tiny synthetic grids.
+    ///
+    /// Estimate: each grid is ~4 MiB (1440*721*4 bytes). One shard:
+    /// [`Self::holds`] plans which windows stay resident, and a sharded
+    /// budget would evict fields of a window that fits the total. A hot
+    /// share whose cold ring holds a 0.1° field ([`LARGEST_GRID_NODES`]):
+    /// a meta-tiled map frame reads its field once per covering tile, and
+    /// at `quick_cache`'s default a fill that size, once the hot ring is
+    /// full, evicted itself before the next tile read it (#1332). A ghost
+    /// ring: whether a larger cache would keep an animation's fields is
+    /// what its size is set from (#1308).
     pub(crate) fn with_capacity_bytes(bytes: u64) -> Self {
+        let largest = Self::estimated_weight(LARGEST_GRID_NODES);
         Self {
-            cache: ByteBoundedCache::new_single_shard(bytes, 4 * ds_cache::MIB, weigh_grid)
-                .with_ghosts(),
+            cache: ByteBoundedCache::new_single_shard_with_hot_allocation(
+                bytes,
+                4 * ds_cache::MIB,
+                weigh_grid,
+                ds_cache::hot_allocation_holding(bytes, largest),
+            )
+            .with_ghosts(),
         }
     }
 
@@ -821,9 +826,75 @@ mod tests {
             cache.cache.shard_capacity_bytes(),
             cache.cache.capacity_bytes()
         );
-        let nodes = 3600 * 1801;
+        let nodes = LARGEST_GRID_NODES;
         assert!(cache.holds(10, nodes));
         assert!(!cache.holds(11, nodes));
+    }
+
+    /// Whether the grid of `url`, `offset` is resident, without marking it
+    /// read.
+    fn resident(cache: &GridCache, url: &str, offset: u64) -> bool {
+        cache.cache.contains_key(&GridKey {
+            url: Arc::from(url),
+            offset,
+        })
+    }
+
+    /// `frames` frames of a map loop over fields of `ni` × `nj` nodes, each
+    /// frame's field looked up once per covering meta-tile, as WMS reads
+    /// it. Asserts each new field is resident after the lookup that
+    /// decoded it; returns the decodes.
+    fn map_loop(cache: &GridCache, ni: usize, nj: usize, frames: u64, tiles: u32) -> usize {
+        // One allocation shared by every field: the cache weighs capacity.
+        let values = Arc::new(vec![0.0_f32; ni * nj]);
+        let mut decodes = 0;
+        for frame in 0..frames {
+            for _ in 0..tiles {
+                cache
+                    .get_or_insert_with("field", frame, || {
+                        decodes += 1;
+                        Ok::<_, ()>(Arc::new(DecodedGrid {
+                            ni,
+                            nj,
+                            values: values.clone(),
+                            ..grid_2x2()
+                        }))
+                    })
+                    .unwrap();
+                assert!(resident(cache, "field", frame), "frame {frame}");
+            }
+        }
+        decodes
+    }
+
+    /// #1332: a full 256 MiB grid cache keeps a 0.1° field from the lookup
+    /// that decoded it to the next. Its hot ring holds ten such fields;
+    /// at `quick_cache`'s default share the cold ring then had 8.7 MiB, and
+    /// each later field evicted itself on its fill, so its next tile
+    /// decoded it again: 46 decodes. Each field now decodes once, the cache
+    /// full from the tenth, and no miss is of a field evicted (#1308).
+    #[test]
+    fn a_full_grid_cache_keeps_a_tenth_degree_field_for_its_next_lookup() {
+        let cache = GridCache::new(256).unwrap();
+        assert_eq!(map_loop(&cache, 3600, 1801, 24, 25), 24);
+        assert!(
+            cache.weight() > cache.capacity() - 2 * GridCache::estimated_weight(LARGEST_GRID_NODES)
+        );
+        let churn = cache.metrics().churn;
+        assert_eq!(churn.ghost_hits, Some([0; 3]));
+        assert_eq!(churn.evictions(), 24 - cache.len() as u64);
+    }
+
+    /// GFS 0.25° fields fit the cold ring at either share: a loop longer
+    /// than the hot ring decodes each once, and a second pass over a loop
+    /// the cache holds decodes none.
+    #[test]
+    fn quarter_degree_fields_decode_once_per_frame() {
+        let cache = GridCache::new(256).unwrap();
+        assert_eq!(map_loop(&cache, 1440, 721, 96, 25), 96);
+        let cache = GridCache::new(256).unwrap();
+        assert_eq!(map_loop(&cache, 1440, 721, 24, 25), 24);
+        assert_eq!(map_loop(&cache, 1440, 721, 24, 1), 0);
     }
 
     #[test]

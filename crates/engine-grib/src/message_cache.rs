@@ -9,7 +9,11 @@ use ds_cache::{ByteBoundedCache, CacheMetrics, MIB};
 use ds_core::{deadline, error::DataServerError};
 use ds_storage::{bytes::Bytes, object_store::path::Path, DataStore};
 
-use crate::{cache::DecodedGrid, catalog::MessageEntry, reader};
+use crate::{
+    cache::{DecodedGrid, GridCache, LARGEST_GRID_NODES, URL_ALLOWANCE},
+    catalog::MessageEntry,
+    reader,
+};
 
 /// One indexed message: source-local path, offset and indexed length. The
 /// CCSDS point index cache keys its entries the same way (#1300).
@@ -37,8 +41,13 @@ impl MessageKey {
 }
 
 fn weight(key: &MessageKey, bytes: &Bytes) -> u64 {
-    // Count the owned payload, key and Arc/cache-node overhead.
-    (bytes.len() + key.size_bytes() + size_of::<Bytes>() + 96) as u64
+    entry_weight(bytes.len(), key.size_bytes())
+}
+
+/// A cached message's weight: the owned payload, the key's `key_bytes`
+/// ([`MessageKey::size_bytes`]) and Arc/cache-node overhead.
+fn entry_weight(payload: usize, key_bytes: usize) -> u64 {
+    (payload + key_bytes + size_of::<Bytes>() + 96) as u64
 }
 
 pub(crate) struct MessageCache {
@@ -51,19 +60,37 @@ impl MessageCache {
     /// 1024 MiB cache was four shards per CPU, 64 of 16 MiB on 12 CPUs, so
     /// a 41-step 0.1° window (55 MB) that fits the total could still
     /// overflow the shards its messages hash to. Lookups are one per field
-    /// or map tile, so one lock costs nothing. A ghost ring tells whether a
-    /// larger cache would keep a window's messages (#1308).
+    /// or map tile, so one lock costs nothing. A hot share whose cold ring
+    /// holds a message the size of a decoded 0.1° field, which bounds a
+    /// packed one: a fill heavier than that ring would evict itself
+    /// (#1332). From 1 GiB that is `quick_cache`'s default. A ghost ring
+    /// tells whether a larger cache would keep a window's messages (#1308).
     pub fn new(size_mb: u64) -> Option<Self> {
-        (size_mb > 0).then(|| Self {
-            cache: ByteBoundedCache::new_single_shard(size_mb.saturating_mul(MIB), MIB / 2, weight)
+        (size_mb > 0).then(|| {
+            let capacity = size_mb.saturating_mul(MIB);
+            let largest = GridCache::estimated_weight(LARGEST_GRID_NODES);
+            Self {
+                cache: ByteBoundedCache::new_single_shard_with_hot_allocation(
+                    capacity,
+                    MIB / 2,
+                    weight,
+                    ds_cache::hot_allocation_holding(capacity, largest),
+                )
                 .with_ghosts(),
+            }
         })
     }
 
-    /// Whether messages of `bytes` together stay resident: within one
-    /// shard's budget, all of it for this one-shard cache.
-    pub(crate) fn holds(&self, bytes: u64) -> bool {
-        bytes <= self.cache.shard_capacity_bytes()
+    /// Whether `messages` messages of `bytes` together stay resident: their
+    /// weight, each key counted with a long path ([`URL_ALLOWANCE`]),
+    /// within one shard's budget, all of it for this one-shard cache. A
+    /// window read with `window` set ([`Self::get_with`]) then does.
+    pub(crate) fn holds(&self, messages: usize, bytes: u64) -> bool {
+        let overhead = entry_weight(0, URL_ALLOWANCE + size_of::<MessageKey>());
+        (messages as u64)
+            .saturating_mul(overhead)
+            .saturating_add(bytes)
+            <= self.cache.shard_capacity_bytes()
     }
 
     /// The message's bytes when resident, counting a hit; nothing when
@@ -81,7 +108,7 @@ impl MessageCache {
         path: &Path,
         entry: &MessageEntry,
     ) -> Result<DecodedGrid, DataServerError> {
-        let (bytes, decoded) = self.get_with(store, path, entry, |bytes| {
+        let (bytes, decoded) = self.get_with(store, path, entry, false, |bytes| {
             reader::decode_message(bytes, &entry.param)
         })?;
         let grid = match decoded {
@@ -97,11 +124,19 @@ impl MessageCache {
     /// truncated, corrupt or unsupported payload stays retryable, like a
     /// failed GET. Returns what `validate` produced on that fill, `None` on
     /// a hit: [`Self::read`] decodes, a CCSDS point read (#1300) indexes.
+    ///
+    /// `window`: the message is one of a window [`Self::holds`] approved,
+    /// which the query samples from its own copy and reads again on its
+    /// next run. Its fill is kept ([`ByteBoundedCache::keep`]): promoted to
+    /// the hot ring rather than evicted from the cold one by the window's
+    /// later fills. Unkept, a full cache held only the last 3 % of a window
+    /// (#1340). A map's fills are not kept: a one-off read leaves first.
     pub(crate) fn get_with<T>(
         &self,
         store: &DataStore,
         path: &Path,
         entry: &MessageEntry,
+        window: bool,
         validate: impl FnOnce(&[u8]) -> Result<T, DataServerError>,
     ) -> Result<(Bytes, Option<T>), DataServerError> {
         deadline::check()?;
@@ -121,6 +156,9 @@ impl MessageCache {
                 bytes
             })
         })?;
+        if window && validated.is_some() {
+            self.cache.keep(key, bytes.clone());
+        }
         deadline::check()?;
         Ok((bytes, validated))
     }

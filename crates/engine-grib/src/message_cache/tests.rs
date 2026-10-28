@@ -268,6 +268,108 @@ async fn concurrent_misses_share_one_download_and_deadlines_do_not_fill_the_cach
     assert!(empty.metrics().bytes > 0);
 }
 
+/// #1340: in a full message cache, a window of messages one point query
+/// filled is resident at its next run, for every window [`MessageCache::holds`]
+/// approves. The cache is full of fills nobody read again, a map's or an
+/// earlier query's; not kept, as those are, a window keeps what the cold
+/// ring holds, 3 % of the budget: two of these.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_cache_keeps_every_window_holds_approves() {
+    const SIZE: usize = 16 * 1024;
+    let observed = instrumented(Duration::ZERO);
+    let store = DataStore::new(observed.clone());
+    let (old, new) = (Path::from("old.grib2"), Path::from("window.grib2"));
+    put(&observed, &old, &vec![1; 128 * SIZE]).await;
+    put(&observed, &new, &vec![2; 128 * SIZE]).await;
+    let at = |offset: usize| MessageEntry {
+        offset: (offset * SIZE) as u64,
+        ..entry(Some(SIZE))
+    };
+    let held = |window| {
+        let cache = MessageCache::new(1).unwrap();
+        for offset in 0..128 {
+            cache
+                .get_with(&store, &old, &at(offset), false, |_| Ok(()))
+                .unwrap();
+        }
+        assert!(cache.metrics().bytes > MIB - 2 * SIZE as u64, "full");
+        for offset in 0..window {
+            cache
+                .get_with(&store, &new, &at(offset), true, |_| Ok(()))
+                .unwrap();
+        }
+        let unkept = MessageCache::new(1).unwrap();
+        for (path, count) in [(&old, 128), (&new, window)] {
+            for offset in 0..count {
+                unkept
+                    .get_with(&store, path, &at(offset), false, |_| Ok(()))
+                    .unwrap();
+            }
+        }
+        let resident = |cache: &MessageCache| {
+            (0..window)
+                .filter(|&offset| {
+                    cache
+                        .cache
+                        .contains_key(&MessageKey::new(new.as_ref(), &at(offset)))
+                })
+                .count()
+        };
+        (resident(&cache), resident(&unkept))
+    };
+    let cache = MessageCache::new(1).unwrap();
+    let largest = (1..)
+        .take_while(|&window| cache.holds(window, (window * SIZE) as u64))
+        .last()
+        .unwrap();
+    assert_eq!(largest, 62);
+    for window in 1..=largest {
+        assert_eq!(held(window).0, window, "a window of {window}");
+    }
+    assert_eq!(held(largest), (largest, 2));
+}
+
+/// #1340 replay: once the message cache is full of earlier windows, a cold
+/// position query's window is resident for its next run, which reads
+/// nothing from storage. Not kept, its fills displaced each other in the
+/// cold ring, and the next run fetched every message again.
+#[test]
+fn a_full_cache_keeps_a_cold_position_window_for_its_next_run() {
+    // 20 MiB holds 36 of these messages, `holds` approving 36.
+    let (_source, owner, _observed) = forecast(73, 1, 20, 16, Duration::ZERO);
+    let engine = owner.level_collections().remove(0);
+    let run = chrono::DateTime::parse_from_rfc3339("2026-04-05T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let steps = |first: i64, last: i64| {
+        let hours = chrono::TimeDelta::hours;
+        Some((run + hours(first), run + hours(last)))
+    };
+    let query = |window| {
+        engine
+            .query_position(
+                "POINT(25 60)",
+                window,
+                Some(&["q".into()]),
+                Some(&[150.0]),
+                None,
+            )
+            .unwrap();
+    };
+    query(steps(0, 17));
+    query(steps(18, 36));
+    let full = owner.message_cache_metrics();
+    assert!(
+        full.bytes > full.capacity_bytes - ECMWF.len() as u64,
+        "{full:?}"
+    );
+    query(steps(37, 72));
+    let before = owner.storage_bytes_read();
+    query(steps(37, 72));
+    assert_eq!(owner.storage_bytes_read(), before);
+    assert_eq!(owner.message_cache_metrics().churn.ghost_hits, Some([0; 3]));
+}
+
 fn forecast(
     count: u32,
     grid_mb: u64,

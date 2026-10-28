@@ -30,6 +30,9 @@ level type) exposes every parameter; each retained run is an EDR instance.
   `f32` grid, kept in an LRU cache (`grid_cache_mb`). An optional cache of
   compressed messages (`message_cache_mb`) saves the download on a
   decoded-grid miss. Both caches are per source, shared by its level views.
+  A full cache keeps a new entry until its next read in a ring sized for
+  one decoded 0.1° field, which takes a `grid_cache_mb` of 52 or more:
+  below, a 0.1° map decodes each frame several times.
 - **Long EDR windows.** An EDR query (position, trajectory, area, radius,
   cube) whose fields, at the grid's decoded size, add up to more than
   `grid_cache_mb` reads them without keeping them: inserting them would
@@ -41,7 +44,8 @@ level type) exposes every parameter; each retained run is an EDR instance.
   that fits is cached as before, so a repeat is all hits. To make repeats
   of long windows cheap, set `message_cache_mb`: a compressed GFS 0.25°
   message is about 0.6 MB against 4 MB decoded, an IFS 0.1° one about
-  1.3 MB against 26 MB.
+  1.3 MB against 26 MB. A position query whose messages fit it keeps them
+  for its next run, even once the cache is full.
 - **Point reads of CCSDS fields.** A position query on a template 5.42
   field (ECMWF IFS and AIFS) decodes only the blocks of 4096 values that
   hold its points' neighbours, bit for bit the full decode's values. The

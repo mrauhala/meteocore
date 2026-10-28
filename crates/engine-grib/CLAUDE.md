@@ -244,6 +244,19 @@ on the request path. Single-level and legacy views require exact metadata.
   sampler change that breaks it is a drift from the shared rules.
 - Cache weights include allocated value capacity and key/structure overhead.
   Keep the entry-size estimate aligned with the 4 MiB typical global field.
+- The grid cache's hot share leaves its cold ring room for a 0.1° field
+  (`ds_cache::hot_allocation_holding` over `LARGEST_GRID_NODES`, #1332):
+  0.894 at 256 MiB, 0.947 at 512 MiB, 0.97 from 1 GiB, and the default
+  0.97 below 52 MiB, where no share both admits such a field and leaves it
+  room. Once the hot ring is full quick_cache admits a new entry to the
+  cold ring, and a single-flight fill links it there before evicting, so a
+  fill heavier than that ring evicts itself unread: at 0.97 each 0.1°
+  meta-tiled frame decoded its field again at its next tile, 46 decodes
+  for a 24-frame loop. `LARGEST_GRID_NODES` is an assumption, since the
+  cache is built before the first decode publishes the geometry; raise it
+  before serving a finer global grid. Its cost: a small cache of coarser
+  grids gives up hot ring, at 64 MiB a 0.25° one-lookup-per-frame loop
+  longer than the cache decodes 15 instead of 9 on its first pass.
 - Run `cargo run --release -p engine-grib --example bench_grid_cache` for a
   reproducible memory/cache replay and sampling benchmark using the committed
   ECMWF fixture. It prints a query-output fingerprint for before/after checks;
@@ -259,9 +272,21 @@ on the request path. Single-level and legacy views require exact metadata.
   admit bytes only after decoding succeeds, or, for a CCSDS point read, after
   the index build or RSI decode succeeds (#1300). Reuse that cold decode;
   failed reads, invalid payloads and expired fills must remain retryable.
-- The cache is one shard (`new_single_shard`): a position query plans
-  residency with `holds` (#1301). Sharded, 1024 MiB was 64 shards of 16 MiB
-  on 12 CPUs.
+- The cache is one shard (`new_single_shard_with_hot_allocation`): a
+  position query plans residency with `holds(messages, bytes)` (#1301),
+  which counts each message's key and node overhead, not only its indexed
+  length. Sharded, 1024 MiB was 64 shards of 16 MiB on 12 CPUs. Its hot
+  share follows the grid cache's rule for a message as large as a decoded
+  0.1° field, which bounds a packed one: 0.97 from 1 GiB.
+- A window `holds` approved is filled with `get_with(.., window = true, ..)`,
+  which `keep`s each fill (#1340). Marked read, quick_cache promotes it to
+  the hot ring instead of evicting it from the cold one; a fill that a
+  concurrent burst of fills evicted before the mark is inserted again,
+  which quick_cache admits to the hot ring. Unkept, a full 1 GiB cache held
+  only the last ~30 MiB of a window, and a repeated query took four runs to
+  stick. Map fills (`read`) are never kept: one-off reads must leave first.
+  `message_cache::tests::a_full_cache_keeps_a_cold_position_window_for_its_next_run`
+  pins it through the real position path.
 - Key by source-local path, offset and indexed length. Like the decoded cache,
   this assumes immutable files at a given path/offset; engine reconstruction
   clears both caches. Changing the cache configuration triggers reconstruction
@@ -403,9 +428,12 @@ ones only in the legacy layout.
     still fills. A window that fits is `GridFill::Insert`, cached as before;
     maps (`fetch_grid`) always insert. Never insert an oversized window: it
     evicts its own fields, and the maps' grids, before any reuse. The grid
-    cache is one shard (`new_single_shard`) because `holds` plans
-    residency: at 256 MiB a sharded cache is two 128 MiB halves, so six
-    0.1° fields that "fit" could all hash to one half and evict each other.
+    cache is one shard (`new_single_shard_with_hot_allocation`) because
+    `holds` plans residency: at 256 MiB a sharded cache is two 128 MiB
+    halves, so six 0.1° fields that "fit" could all hash to one half and
+    evict each other. An `Insert` window's fills are not kept
+    (`ByteBoundedCache::keep`), so in a full cache only what the cold ring
+    holds, about one 0.1° field, survives to the next query.
     A field read around the cache (`get_or_join`, or `decode_in_full` under a
     Bypass plan) counts in `grid_cache_bypass_total`, never as a miss
     (#1308).
@@ -488,8 +516,9 @@ ones only in the legacy layout.
 
 - `FieldPlan::fetch`, one decision per query: a position query fetches only
   parts of its messages (`FieldFetch::Partial`) when the source has no
-  message cache or the sum of its fields' `entry.length` exceeds
-  `MessageCache::holds`; else whole, through the message cache. Other
+  message cache or the sum of its fields' `entry.length`, plus each
+  message's cache overhead, exceeds `MessageCache::holds`; else whole,
+  through the message cache, each fill kept for the next run. Other
   queries pass `None` (whole). No `entry.length` ⇒ whole. Partial bytes
   never enter the message cache; a resident message is used
   (`get_resident`: a hit, never a miss).
