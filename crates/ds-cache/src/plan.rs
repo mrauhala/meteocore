@@ -93,7 +93,8 @@ impl Scope {
 
 /// Where a size came from, in the words `/admin/cache-plan` and the
 /// `cache_size_source` metric use: `default`, `env:MC_…`,
-/// `config:[server] …`, `collection:[grib] …` or `constant`.
+/// `config:[server] …`, `collection:[grib] …`, `derived:[grib] …` or
+/// `constant`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SizeSource {
     /// The built-in default: nothing set this size.
@@ -104,6 +105,9 @@ pub enum SizeSource {
     Config(&'static str),
     /// A collection's config key, e.g. `[grib] grid_cache_mb`.
     Collection(&'static str),
+    /// Computed from another collection key's size, this one unset: the
+    /// GRIB point-index cache from `[grib] message_cache_mb` (#1333).
+    Derived(&'static str),
     /// Fixed in code, with no setting.
     Constant,
 }
@@ -131,6 +135,7 @@ impl fmt::Display for SizeSource {
             SizeSource::Env(var) => write!(f, "env:{var}"),
             SizeSource::Config(key) => write!(f, "config:{key}"),
             SizeSource::Collection(key) => write!(f, "collection:{key}"),
+            SizeSource::Derived(key) => write!(f, "derived:{key}"),
             SizeSource::Constant => f.write_str("constant"),
         }
     }
@@ -753,6 +758,7 @@ mod tests {
             SizeSource::Env("MC_PVOL_PIXEL_CACHE_MB"),
             SizeSource::Config("[server] metatile_cache_mb"),
             SizeSource::Collection("[grib] grid_cache_mb"),
+            SizeSource::Derived("[grib] message_cache_mb"),
             SizeSource::Constant,
         ]
         .iter()
@@ -765,6 +771,7 @@ mod tests {
                 "env:MC_PVOL_PIXEL_CACHE_MB",
                 "config:[server] metatile_cache_mb",
                 "collection:[grib] grid_cache_mb",
+                "derived:[grib] message_cache_mb",
                 "constant",
             ]
         );

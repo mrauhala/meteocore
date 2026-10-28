@@ -1007,22 +1007,24 @@ so a working set larger than this budget can still require downloads.
 `grib_message_cache_bytes`, and `grib_message_cache_capacity_bytes` report the
 cache per source collection. Header discovery does not fill this cache.
 
-Position queries on CCSDS-packed fields (template 5.42, as ECMWF IFS and
-AIFS publish them) decode only the blocks of a field their points need. The
-first read of a message decodes its payload once, without building a grid,
-and keeps a small index of where each block of 4096 values starts: about
-1.2 KB for a 0.25° global message, 6.5 KB at 0.1°. Later point queries on
-that message decode just the blocks holding each point's four neighbours,
-from the compressed-message cache or one GET. Values are bit for bit those
-of the full decode. `point_index_cache_mb` (default `16`) bounds the indexes
-per source; `0` turns this path off. Complex packing with spatial
-differencing (template 5.3, all of GFS 0.25°) reads alike by grid rows, from
-an index of about 110 KB per message (#1302); fields with a bitmap read a
-prefix holding it. Other packings, CCSDS fields with a bitmap, and fields the
-decoded-grid cache would keep while no message cache is set are decoded in
-full as before. `grib_point_index_cache_*` report the index
-cache, and `grib_point_fields_total{path="partial"|"full"}` counts position
-fields by how they were read.
+Position queries on CCSDS-packed fields (template 5.42, as ECMWF IFS and AIFS
+publish them) decode only the blocks of a field their points need. The first
+read of a message decodes its payload once, without building a grid, and
+keeps a small index of where each block of 4096 values starts: about 1.2 KB
+for a 0.25° global message, 6.5 KB at 0.1°. Later point queries on that
+message decode just the blocks holding each point's four neighbours, from the
+compressed-message cache or one GET. Values are bit for bit those of the full
+decode. `point_index_cache_mb` bounds the indexes per source; `0` turns this
+path off. Complex packing with spatial differencing (template 5.3, all of GFS
+0.25°) reads alike by grid rows, from an index of 100–140 KB per message
+(#1302); fields with a bitmap read a prefix holding it. Unset,
+`point_index_cache_mb` is 25 % of `message_cache_mb`, never below 16 MiB, so
+the indexes of the GFS messages the message cache keeps stay resident with
+them (#1333); without a message cache it is 16. Other packings, CCSDS fields
+with a bitmap, and fields the decoded-grid cache would keep while no message
+cache is set are decoded in full as before. `grib_point_index_cache_*` report
+the index cache, and `grib_point_fields_total{path="partial"|"full"}` counts
+position fields by how they were read.
 
 Without a compressed-message cache, or when a query's messages would not all
 fit in it, such a query also fetches only the bytes it needs. A message
@@ -1091,7 +1093,7 @@ Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
 | `parameters` | no | all | Optional parameter filter, e.g., `["2t", "msl", "tp"]`. Strongly recommended with `index_format = "wgrib2"` (a single GFS file can have ~700 messages). |
 | `grid_cache_mb` | no | `256` | LRU cache size for decoded grids |
 | `message_cache_mb` | no | `0` | Optional compressed GRIB message cache in MiB; additional to `grid_cache_mb`, shared by the source's level collections. `0` disables it. |
-| `point_index_cache_mb` | no | `16` | Point-index cache in MiB, per source, one shard: position queries on CCSDS (5.42) and complex-packed (5.3) fields decode only the blocks or rows their points need. An index is 1–6 KB for CCSDS and about 110 KB for GFS 0.25°, so 16 MiB holds about 145 GFS messages. `0` disables that path. |
+| `point_index_cache_mb` | no | 25 % of `message_cache_mb`, at least `16` | Point-index cache in MiB, per source, one shard: position queries on CCSDS (5.42) and complex-packed (5.3) fields decode only the blocks or rows their points need. An index is 1–6 KB for CCSDS and 100–140 KB for GFS 0.25°: 13–20 % of a temperature message, up to 23 % of a precipitation one. Unset, it is 25 % of `message_cache_mb`, room for the index of every GFS message that cache keeps: 256 MiB for `1024`; 16 MiB without a message cache. A CCSDS source fills only a small part of it. A value set, `0` included, is the size. `0` disables that path. |
 | `run_hours` | no | `[0, 6, 12, 18]` | Model run hours to poll, 0–23, substituted into `{run}`. Must not be empty when `prefix_pattern` uses `{run}`; unused without it. |
 
 #### GRIB Config Example
@@ -2524,7 +2526,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/admin/cach
 ```
 
 - `caches` and `budgets` hold one object each: `id`, its `/metrics` family (`metatile_cache` for `metatile_cache_bytes`, `geotiff_decode` for `geotiff_decode_capacity_bytes`); `scope`, which is `process`, `engine` (one per process for the collections of one engine type), `collection`, or `source` (a GRIB source, shared by its level collections); `engine`; `collection`; `capacity_bytes`; `source`; `used_bytes`, which a budget has reserved now; and for caches `entries`, `hits` and `misses` since the cache was built.
-- `source` says where the size came from: `default`, `env:MC_…`, `config:[server] …`, `collection:[grib] grid_cache_mb` and the like, or `constant`, fixed in code. The MVT cache (128 MiB) and the solid-image memo (32 MiB) are constants, and so is the empty tile cache of a local GeoTIFF collection, which reads its files through the page cache. A collection key set to its default value reads as `default`.
+- `source` says where the size came from: `default`, `env:MC_…`, `config:[server] …`, `collection:[grib] grid_cache_mb` and the like, `derived:[grib] message_cache_mb`, computed from that key, or `constant`, fixed in code. The MVT cache (128 MiB) and the solid-image memo (32 MiB) are constants, and so is the empty tile cache of a local GeoTIFF collection, which reads its files through the page cache. A GRIB point-index cache with no `point_index_cache_mb` takes 25 % of `message_cache_mb` and reads as `derived:` when that is above its 16 MiB default. A collection key set to its default value reads as `default`, except `point_index_cache_mb`, which reads as its key whenever it is set.
 - `totals` counts the caches and the budgets, with their capacity and use. Capacity is not memory: a cache allocates as it fills, and a budget is reserved only while work runs.
 - `memory` repeats the process and allocator gauges of `/metrics` (`process_resident_memory_bytes`, `jemalloc_*_bytes`), `null` where they cannot be read: RSS and swap off Linux.
 - A cache's `churn` counts, since it was built, the bytes it admitted for keys not resident (`inserted_bytes`), the inserts it refused because the entry outweighs its shard's hot target (`refused`), the entries it evicted from the cold and hot rings (`evictions`) and their bytes (`evicted_bytes`), the reads that went around it (`bypasses`: a GRIB window larger than the grid cache), and, for a cache that keeps a ghost ring, `ghost_hits`: misses whose key it evicted within 0.5, 1 or 2 times its capacity of evictions, cumulative. `prewarmed` marks a cache filled ahead of its reads (PVOL pixels, GeoTIFF tiles).

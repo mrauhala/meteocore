@@ -3050,15 +3050,21 @@ fn default_grib_poll_interval() -> u64 {
 /// Default `[grib] grid_cache_mb`.
 pub const DEFAULT_GRID_CACHE_MB: u64 = 256;
 
-/// Default `[grib] point_index_cache_mb`.
+/// Default `[grib] point_index_cache_mb` without a message cache, and the
+/// floor of the size derived from one ([`GribConfig::effective_point_index_cache_mb`]).
 pub const DEFAULT_POINT_INDEX_CACHE_MB: u64 = 16;
+
+/// The share of `[grib] message_cache_mb`, in percent, an unset
+/// `point_index_cache_mb` takes (#1333). Over 48 real GFS 0.25° template
+/// 5.3 messages an index was 13–20 % of a TMP message and 20–23 % of a
+/// PRATE one, 18 % on average. The index is mostly group descriptors, so it
+/// barely shrinks with the message. 25 % covers the largest, so the GFS
+/// indexes stay resident with the messages the message cache holds; a
+/// CCSDS source, at 1–6 KB an index, fills only a small part of it.
+const POINT_INDEX_SHARE_OF_MESSAGE_CACHE_PERCENT: u64 = 25;
 
 fn default_grid_cache_mb() -> u64 {
     DEFAULT_GRID_CACHE_MB
-}
-
-fn default_point_index_cache_mb() -> u64 {
-    DEFAULT_POINT_INDEX_CACHE_MB
 }
 
 /// Mutually exclusive GRIB collection families. A single-level collection
@@ -3134,10 +3140,13 @@ pub struct GribConfig {
     pub message_cache_mb: u64,
     /// Point-index cache in MiB, one shard: position queries on CCSDS
     /// (5.42, #1300) and complex-packed (5.3, #1302) fields decode only the
-    /// blocks or rows their points need. Default: 16. `0` disables that
-    /// path; every field is decoded in full.
-    #[serde(default = "default_point_index_cache_mb")]
-    pub point_index_cache_mb: u64,
+    /// blocks or rows their points need. Unset: 25 % of `message_cache_mb`,
+    /// never below 16, so the indexes stay resident with the messages kept
+    /// (#1333); 16 without a message cache. A value set here, `0` included,
+    /// is the size. `0` disables that path; every field is decoded in full.
+    /// The size is [`Self::effective_point_index_cache_mb`].
+    #[serde(default)]
+    pub point_index_cache_mb: Option<u64>,
     /// Model run hours to poll. Default: all (00, 06, 12, 18)
     pub run_hours: Option<Vec<u32>>,
     /// Index file format: "ecmwf-json" (default) or "wgrib2".
@@ -3177,11 +3186,24 @@ impl GribConfig {
             parameters: None,
             grid_cache_mb: default_grid_cache_mb(),
             message_cache_mb: 0,
-            point_index_cache_mb: default_point_index_cache_mb(),
+            point_index_cache_mb: None,
             run_hours: None,
             index_format,
             filename_contains: None,
         }
+    }
+
+    /// The point-index cache size in MiB: `point_index_cache_mb` when set,
+    /// else 25 % of `message_cache_mb`, never below
+    /// [`DEFAULT_POINT_INDEX_CACHE_MB`] (#1333).
+    pub fn effective_point_index_cache_mb(&self) -> u64 {
+        self.point_index_cache_mb.unwrap_or_else(|| {
+            (self
+                .message_cache_mb
+                .saturating_mul(POINT_INDEX_SHARE_OF_MESSAGE_CACHE_PERCENT)
+                / 100)
+                .max(DEFAULT_POINT_INDEX_CACHE_MB)
+        })
     }
 }
 
@@ -5955,20 +5977,72 @@ url = "https://creativecommons.org/licenses/by/4.0/"
     fn grib_point_index_cache_defaults_on_and_changes_reload_identity() {
         let cfg = grib_collection("data_path = \"testdata/grib-local\"\n");
         let original = cfg.collections[0].grib.as_ref().unwrap();
-        assert_eq!(original.point_index_cache_mb, 16);
+        assert_eq!(original.point_index_cache_mb, None);
+        assert_eq!(original.effective_point_index_cache_mb(), 16);
         let local = GribConfig::auto_local(
             "x".into(),
             ".idx".into(),
             ".grib2".into(),
             Some("wgrib2".into()),
         );
-        assert_eq!(local.point_index_cache_mb, 16);
+        assert_eq!(local.point_index_cache_mb, None);
+        assert_eq!(local.effective_point_index_cache_mb(), 16);
         let disabled =
             grib_collection("data_path = \"testdata/grib-local\"\npoint_index_cache_mb = 0\n");
         disabled.validate().unwrap();
         let updated = disabled.collections[0].grib.as_ref().unwrap();
-        assert_eq!(updated.point_index_cache_mb, 0);
+        assert_eq!(updated.point_index_cache_mb, Some(0));
+        assert_eq!(updated.effective_point_index_cache_mb(), 0);
         assert_ne!(updated, original, "the kill switch must rebuild the engine");
+    }
+
+    /// #1333: an unset point-index cache takes 25 % of the message cache,
+    /// never below 16 MiB; a size set, 0 included, wins. An unchanged
+    /// config compares equal, so a reload keeps the engine.
+    #[test]
+    fn grib_point_index_cache_follows_the_message_cache_unless_set() {
+        let grib = |body: &str| {
+            let cfg = grib_collection(&format!("data_path = \"testdata/grib-local\"\n{body}"));
+            cfg.validate().unwrap();
+            cfg.collections[0].grib.clone().unwrap()
+        };
+        for (body, set, effective) in [
+            ("", None, 16),
+            ("message_cache_mb = 32\n", None, 16),
+            ("message_cache_mb = 64\n", None, 16),
+            ("message_cache_mb = 100\n", None, 25),
+            ("message_cache_mb = 1024\n", None, 256),
+            ("message_cache_mb = 4096\n", None, 1024),
+            (
+                "message_cache_mb = 1024\npoint_index_cache_mb = 16\n",
+                Some(16),
+                16,
+            ),
+            (
+                "message_cache_mb = 1024\npoint_index_cache_mb = 0\n",
+                Some(0),
+                0,
+            ),
+            ("point_index_cache_mb = 64\n", Some(64), 64),
+        ] {
+            let config = grib(body);
+            assert_eq!(config.point_index_cache_mb, set, "{body}");
+            assert_eq!(config.effective_point_index_cache_mb(), effective, "{body}");
+            assert_eq!(
+                config,
+                grib(body),
+                "{body}: an unchanged config reloads as it is"
+            );
+        }
+        // A 0.25° GFS template 5.3 window: the indexes, about 115 KB each,
+        // of every 0.81 MB message the message cache holds.
+        let derived = grib("message_cache_mb = 1024\n").effective_point_index_cache_mb();
+        assert!(derived * (1 << 20) / 115_000 >= 1024 * (1 << 20) / 810_000);
+        assert_ne!(
+            grib("message_cache_mb = 1024\n"),
+            grib("message_cache_mb = 1024\npoint_index_cache_mb = 16\n"),
+            "setting the size rebuilds the engine"
+        );
     }
 
     #[test]
