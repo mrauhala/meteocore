@@ -401,6 +401,12 @@ scan. A layer whose engine `layer_picks_features` answers the features
 `MapEngine::pick_features` returns for the pixel: CAP alerts, ODIM
 `CELLS`, PostGIS events (#1100).
 
+The value is written as EDR writes it: `Sample` carries the range's
+`ds_core::model::RangeValue` (#1341), serialised in the JSON form and
+displayed in text and HTML, so GetFeatureInfo and EDR `position` give
+the same number byte for byte (`server/tests/wms_get_feature_info.rs`
+compares them). Never unwrap it to `f64` on the way out.
+
 - **Engines.** `WmsState::point_engines` holds the `EdrEngine` of every WMS
   collection whose engine answers position queries
   (`feature_info::answers_position`, `supported_query_types` containing

@@ -398,7 +398,7 @@ reservation lives in the body's `Bytes` owner, so it is released only when
 the last clone drops: the body delivered, or the client gone. Nothing
 waits: a body that does not fit is 503 `ServerBusy` with `Retry-After: 1`
 (`api_common::JsonError` adds it to every `ServerBusy`), an expired query
-504. `coverage_response_to_json` is `CoverageJson` through `to_value`, so the
+504. `coverage_response_to_json` is the `CoverageJson` body parsed back (`to_value`), so the
 HTML page and the JSON cannot drift: change member order in `CoverageJson`
 only, where it is the order the `Value` builder it replaced wrote, byte for
 byte under the server build's serde_json `preserve_order`. Not counted:
@@ -408,6 +408,17 @@ document. `/metrics` exports `edr_response_{reserved,capacity}_bytes` and
 `coverage_tests::the_body_streams_in_the_document_order` and
 `performance_tests`' `large_bodies_over_the_response_budget_are_503` and
 `a_disconnected_client_releases_its_response_bytes`.
+
+Range values (#1341) are written at `NdArray::precision` through
+`ds_core::model::RangeValue`: `F32` with `serialize_f32` (a value `f32`
+cannot hold keeps its `f64` form), `F64` exactly as before. EDR GeoJSON
+shares `response::Values`, CSV writes serde_json's text of the same
+`RangeValue`, and WMS GetFeatureInfo serialises it too, so every body
+answers a point with the same number; never write range values through
+`serde_json::to_value` or `json!`, which keep an `f32` widened. `to_value`
+parses the serialised body back for the same reason. A `datetime` list's
+merged range keeps the finer precision of its steps; derived ranges take
+the coarsest of their inputs (ds-core `derive`).
 
 ## `limit` and locations paging (EDR 1.2, #922)
 
