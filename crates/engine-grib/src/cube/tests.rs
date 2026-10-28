@@ -216,6 +216,60 @@ fn native_cube_keeps_only_the_nodes_whose_cell_meets_the_bbox() {
 }
 
 #[test]
+fn native_cube_on_a_tenth_degree_grid_has_the_nodes_decimals() {
+    // #1342: the cube's axes come from `bbox_subset`, whose nodes on ECMWF's
+    // 0.1° global grid read 20.100000000000023 and the like.
+    let source = TestSource::new();
+    let mut field = crate::test_support::constant_message(
+        3600,
+        1801,
+        180_000_000,
+        90_000_000,
+        100_000,
+        0,
+        250.0,
+    );
+    // Section 4 starts at 109: isobaric surface, 500 hPa in Pa.
+    field[109 + 22] = 100;
+    field[109 + 24..109 + 28].copy_from_slice(&50_000u32.to_be_bytes());
+    source.write(
+        "P0-500-0",
+        &[
+            ("P0", "500 mb", field),
+            ("TAIL", "surface", message(0, 0.0, [0; 4], 1, 0)),
+        ],
+        0,
+    );
+    let mut config = source.config();
+    config.grid_cache_mb = 0;
+    config.level_types = Some(vec![GribLevelType::Pressure]);
+    config.parameters = Some(vec!["P0".into()]);
+    let owner = GribEngine::new("cube", &config).unwrap();
+    let engine = owner.level_collections().into_iter().next().unwrap();
+    let result = grid(
+        engine
+            .query_cube(
+                &bbox(20.0, 55.0, 30.0, 65.0),
+                None,
+                Some(&["P0".to_string()]),
+                Some(&[500.0]),
+                CubeResolution::default(),
+                None,
+            )
+            .unwrap(),
+    );
+    let DomainDescription::Grid { x, y, .. } = result.domain else {
+        panic!("expected a Grid")
+    };
+    let nodes =
+        |from: i32, to: i32| -> Vec<f64> { (from..=to).map(|k| f64::from(k) / 10.0).collect() };
+    assert_eq!((x, y), (nodes(200, 300), nodes(550, 650)));
+    let range = &result.ranges["P0"];
+    assert_eq!(range.shape, [1, 1, 101, 101]);
+    assert!(range.values.iter().all(|v| v.is_some()));
+}
+
+#[test]
 fn resolution_resamples_by_nearest_neighbour_and_reads_only_sampled_levels() {
     let (_source, engine) = fixture(Some(GribLevelType::Pressure));
     let probed = engine.storage_bytes_read(); // discovery's header probes

@@ -678,6 +678,16 @@ ones only in the legacy layout.
   is a 404; the vertex fallback never applies to it. Keep
   `bbox_subset` enclosing (and `extract_bbox` with it): the cube trims its
   own axes from it instead.
+- Section 3 angles convert with one division by the subdivisions, last
+  (`units × basic / subdivisions`; microdegrees: `units / 1e6`), never a
+  multiply by a precomputed 1e-6: 100 000 × 1e-6 is one ulp below 0.1 and
+  added a null column and row to every 0.1° area (#1342). `bbox_subset`
+  snaps a grid position within 1e-6 of a cell onto its node before
+  `floor`/`ceil` (`snap_to_node`, the wrap modulus too), since node-aligned
+  edges drift even with an exact increment, and emits axis nodes through
+  `node_coordinate` (the f64 nearest the whole microdegree: `19.9`, never
+  `19.900000000000006`). `cache::tests::bbox_edges_on_nodes_keep_exactly_those_nodes`
+  and `seam_box_columns_are_pinned_on_global_grids` pin both.
 - Steps come from `grid_steps`: no datetime is the run's last step and an
   instant its exact step, both a t-less `[z,]y,x` Grid; an interval every
   step inside it on a `t` axis (`[t, z, y, x]` like cube), even one step.

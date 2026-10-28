@@ -256,6 +256,33 @@ impl Ccsds {
     }
 }
 
+/// A field of `value` at every node of [`grid_sections`]' grid: simple
+/// packing at zero bits per value, so a 0.1° global grid of 6.5 M nodes is a
+/// message of a few hundred bytes.
+pub fn constant_message(
+    ni: u32,
+    nj: u32,
+    lon_first: u32,
+    lat_first: i32,
+    step: u32,
+    scan: u8,
+    value: f32,
+) -> Vec<u8> {
+    let mut bytes = grid_sections(ni, nj, lon_first, lat_first, step, scan);
+    let mut s5 = section(5, 21);
+    u32_at(&mut s5, 5, ni * nj);
+    s5[11..15].copy_from_slice(&value.to_be_bytes());
+    let mut s6 = section(6, 6);
+    s6[5] = 255; // no bitmap
+    for part in [s5, s6, section(7, 5)] {
+        bytes.extend(part);
+    }
+    bytes.extend(b"7777");
+    let length = bytes.len() as u64;
+    bytes[8..16].copy_from_slice(&length.to_be_bytes());
+    bytes
+}
+
 /// A GRIB2 2-byte sign-and-magnitude integer.
 fn signed(v: i16) -> [u8; 2] {
     let magnitude = v.unsigned_abs();
