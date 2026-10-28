@@ -118,6 +118,7 @@ impl EdrEngine for ForecastMock {
                 shape: vec![3],
                 axis_names: vec!["t".to_string()],
                 values: vec![Some(marker); 3],
+                precision: ValuePrecision::F64,
             },
         );
         Ok(CoverageResponse::Single(QueryResult {
@@ -243,6 +244,7 @@ impl EdrEngine for NonForecastMock {
                 shape: vec![1],
                 axis_names: vec!["t".to_string()],
                 values: vec![Some(1.0)],
+                precision: ValuePrecision::F64,
             },
         );
         Ok(CoverageResponse::Single(QueryResult {

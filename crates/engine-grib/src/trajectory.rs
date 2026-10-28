@@ -93,7 +93,11 @@ impl GribEngine {
         )?;
         plan.require_extent(info.spatial_extent)?;
         let values = self.sample_trajectory(&plan, &params, &steps, &keys)?;
-        plan.into_response(&self.position_descriptions(&params, &keys), &values)
+        plan.into_response(
+            &self.position_descriptions(&params, &keys),
+            &vec![VALUE_PRECISION; params.len()],
+            &values,
+        )
     }
 
     /// `values[parameter][field][point]` for every planned field. One job

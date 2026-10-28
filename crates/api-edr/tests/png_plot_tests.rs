@@ -42,6 +42,7 @@ fn profile_result() -> QueryResult {
             shape: vec![3],
             axis_names: vec!["z".into()],
             values: vec![Some(10.0), Some(20.0), None],
+            precision: ValuePrecision::F64,
         },
     );
     QueryResult {
@@ -80,6 +81,7 @@ fn series_result() -> QueryResult {
             shape: vec![3],
             axis_names: vec!["t".into()],
             values: vec![Some(-2.5), Some(-2.8), None],
+            precision: ValuePrecision::F64,
         },
     );
     QueryResult {
@@ -382,6 +384,7 @@ impl EdrEngine for SectionEngine {
                         Some(5.0),
                         Some(25.0),
                     ],
+                    precision: ValuePrecision::F64,
                 },
             );
         }

@@ -80,6 +80,7 @@ impl Stub {
                         shape: vec![1],
                         axis_names: vec!["t".into()],
                         values: vec![Some(273.0)],
+                        precision: ValuePrecision::F64,
                     },
                 )]),
             })),

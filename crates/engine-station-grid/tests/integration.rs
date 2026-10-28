@@ -16,7 +16,7 @@ use ds_core::feature::{parse_area_coords, Bbox};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterTile, RasterValues};
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use engine_station_grid::StationGridEngine;
 
@@ -222,6 +222,8 @@ fn csv_fixture_serves_maps_and_edr() {
     assert_eq!(times.as_deref(), Some(&[t][..]));
     let values = &area.ranges["temperature"];
     assert_eq!(values.shape, vec![1, 20, 20]);
+    // The analysis grids are `f32` (#1341).
+    assert_eq!(values.precision, ValuePrecision::F32);
     let ix = x.iter().position(|v| (v - 24.95).abs() < 1e-9).unwrap();
     let iy = y.iter().position(|v| (v - 60.25).abs() < 1e-9).unwrap();
     assert_eq!(
@@ -310,6 +312,7 @@ fn edr_time_and_parameter_rules() {
             .unwrap(),
     );
     assert_eq!(series.ranges["temperature"].values.len(), 3);
+    assert_eq!(series.ranges["temperature"].precision, ValuePrecision::F32);
     // A whole month is more analyses than one query may read.
     assert!(matches!(
         engine.query_position(
@@ -485,6 +488,7 @@ impl EdrEngine for Synthetic {
                                 shape: vec![obs.len()],
                                 axis_names: vec!["t".into()],
                                 values: obs.iter().map(|(_, v)| Some(*v)).collect(),
+                                precision: ValuePrecision::F64,
                             },
                         )]),
                     }

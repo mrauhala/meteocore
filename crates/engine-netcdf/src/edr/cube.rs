@@ -43,6 +43,7 @@ use ds_core::feature::Bbox;
 use ds_core::model::{CoverageResponse, DomainDescription, NdArray, QueryResult, VerticalCoord};
 
 use super::{on_grid, Limits, Positions, Sampling, Window};
+use crate::field::VALUE_PRECISION;
 use crate::NetcdfEngine;
 
 impl NetcdfEngine {
@@ -200,6 +201,7 @@ impl NetcdfEngine {
                         shape,
                         axis_names: axis_names.into_iter().map(String::from).collect(),
                         values,
+                        precision: VALUE_PRECISION,
                     },
                 )
             })

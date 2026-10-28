@@ -229,6 +229,82 @@ pub struct NdArray {
     pub shape: Vec<usize>,
     pub axis_names: Vec<String>,
     pub values: Vec<Option<f64>>,
+    /// The precision `values` carry, from the source's metadata (#1341).
+    pub precision: ValuePrecision,
+}
+
+/// The precision a range's values carry: what the source stores, never
+/// guessed from a parameter name (#1341). EDR and WMS GetFeatureInfo write
+/// each value in the shortest form that reads back as the same number at
+/// this precision ([`RangeValue`]), so an `f32` field is not written with
+/// the 16–17 digits of its `f64` widening.
+///
+/// A value computed from others (interpolated, unit-converted, derived)
+/// carries no more than its inputs: the coarsest of theirs, `.min()`.
+/// Values of different sources joined into one range (a `datetime` list's
+/// steps) keep the finest, `.max()`, so none loses digits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ValuePrecision {
+    /// Single precision: `f32` samples and values computed from them.
+    F32,
+    /// Double precision: `f64` sources (a database's `double precision`,
+    /// numbers parsed from text), and the default.
+    #[default]
+    F64,
+}
+
+/// One range value at the precision its range carries (#1341): what EDR
+/// (CoverageJSON, GeoJSON, CSV) and WMS GetFeatureInfo write, so the two
+/// answer a point with the same number. An `f32` range's value is narrowed
+/// to `f32`, whose shortest text, `10.531`, reads back as the same `f32`;
+/// its `f64` widening would print `10.530998535156414`. A value `f32` cannot
+/// hold (beyond its range, or nonzero under its smallest step) keeps its
+/// `f64` form.
+///
+/// It serialises as a JSON number, `serialize_f32` or `serialize_f64`, and
+/// displays as Rust's shortest round-trip text of the same `f32` or `f64`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RangeValue {
+    F32(f32),
+    F64(f64),
+}
+
+impl RangeValue {
+    /// `value` at `precision`; `None` for a missing or non-finite value,
+    /// which JSON writes as `null`, never `0`, which would read as a genuine
+    /// zero.
+    pub fn new(value: Option<f64>, precision: ValuePrecision) -> Option<Self> {
+        let value = value.filter(|v| v.is_finite())?;
+        Some(match precision {
+            ValuePrecision::F32 => {
+                let narrowed = value as f32;
+                if narrowed.is_finite() && (narrowed != 0.0 || value == 0.0) {
+                    Self::F32(narrowed)
+                } else {
+                    Self::F64(value)
+                }
+            }
+            ValuePrecision::F64 => Self::F64(value),
+        })
+    }
+}
+
+impl serde::Serialize for RangeValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            Self::F32(v) => serializer.serialize_f32(v),
+            Self::F64(v) => serializer.serialize_f64(v),
+        }
+    }
+}
+
+impl std::fmt::Display for RangeValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::F32(v) => v.fmt(f),
+            Self::F64(v) => v.fmt(f),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -327,5 +403,36 @@ mod tests {
         assert!(a.is_empty());
         assert!(a.by_id("").is_none());
         assert!(Arc::ptr_eq(&a, &b), "no allocation per call");
+    }
+
+    /// #1341: an `f32` range's value is the `f32` nearest it, shown as its
+    /// shortest text; an `f64` range's is unchanged; what `f32` cannot hold
+    /// keeps its `f64` form; missing and non-finite values are `None`.
+    #[test]
+    fn range_values_take_their_range_precision() {
+        use ValuePrecision::{F32, F64};
+        let celsius = f64::from(283.681_f32) - 273.15;
+        assert_eq!(celsius.to_string(), "10.530999755859398");
+        let narrowed = RangeValue::new(Some(celsius), F32).unwrap();
+        assert_eq!(narrowed, RangeValue::F32(celsius as f32));
+        assert_eq!(narrowed.to_string(), "10.531");
+        let kept = RangeValue::new(Some(celsius), F64).unwrap();
+        assert_eq!(kept, RangeValue::F64(celsius));
+        assert_eq!(kept.to_string(), "10.530999755859398");
+        for value in [1e300, -1e300, 1e-300] {
+            assert_eq!(
+                RangeValue::new(Some(value), F32),
+                Some(RangeValue::F64(value))
+            );
+        }
+        assert_eq!(
+            RangeValue::new(Some(-0.0), F32),
+            Some(RangeValue::F32(-0.0))
+        );
+        for precision in [F32, F64] {
+            for value in [None, Some(f64::NAN), Some(f64::INFINITY)] {
+                assert_eq!(RangeValue::new(value, precision), None);
+            }
+        }
     }
 }

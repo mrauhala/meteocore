@@ -7,10 +7,12 @@
 //! - **A parameter's value** is the collection's EDR position query at the
 //!   centre of pixel `(I, J)`: the same engine call, at the same point,
 //!   time, run and level, answers EDR `position` and GetFeatureInfo, so the
-//!   two report the same value. It is the source value there, sampled as
-//!   the engine's position query samples it (bilinear for GRIB, QueryData
-//!   and Zarr), not the colour of the pixel, which an EPSG:3857/3067/3035
-//!   GetMap resamples from meta-tiles by nearest neighbour.
+//!   two report the same value, written alike at the precision its range
+//!   carries (`ds_core::model::RangeValue`, #1341). It is the source value
+//!   there, sampled as the engine's position query samples it (bilinear
+//!   for GRIB, QueryData and Zarr), not the colour of the pixel, which an
+//!   EPSG:3857/3067/3035 GetMap resamples from meta-tiles by nearest
+//!   neighbour.
 //! - **An RGB composite** answers each band's value, from one position
 //!   query of its bands at the scan the composite is drawn from (#1100).
 //! - **A layer that draws features** (CAP alert areas, the ODIM `CELLS`
@@ -42,7 +44,7 @@ use ds_core::error::DataServerError;
 use ds_core::feature::{Geometry, PropertyValue};
 use ds_core::feature_pick::{FeaturePick, PickMap, PickedFeature, PickedFeatures};
 use ds_core::map_engine::MapEngine;
-use ds_core::model::{CoverageResponse, DomainDescription, QueryResult};
+use ds_core::model::{CoverageResponse, DomainDescription, QueryResult, RangeValue};
 
 use crate::error::WmsError;
 use crate::handlers::{cache_control_value, resolve_layers, Paint, ResolvedLayer, WmsState};
@@ -100,8 +102,8 @@ pub(crate) fn composite_is_queryable(
 struct Value {
     parameter: Option<String>,
     /// `None` is nodata: no value at the point, or the point outside the
-    /// data or outside the CRS.
-    value: Option<f64>,
+    /// data or outside the CRS. At its range's precision, as EDR writes it.
+    value: Option<RangeValue>,
     unit: Option<String>,
 }
 
@@ -610,7 +612,8 @@ async fn read_layers(
 /// What a position query answered for the queried parameter, time and level.
 #[derive(Default)]
 struct Sample {
-    value: Option<f64>,
+    /// The value at the precision its range carries (#1341).
+    value: Option<RangeValue>,
     unit: Option<String>,
     /// The time of the value, read from the coverage when the map resolved
     /// none.
@@ -697,12 +700,7 @@ fn sample_coverage(
         .filter(|&index| index < size)?;
         flat = flat * size + index;
     }
-    let value = range
-        .values
-        .get(flat)
-        .copied()
-        .flatten()
-        .filter(|value| value.is_finite());
+    let value = RangeValue::new(range.values.get(flat).copied().flatten(), range.precision);
     let unit = coverage
         .parameters
         .get(name)
@@ -889,7 +887,7 @@ fn json(features: &[FeatureInfo]) -> axum::Json<impl Serialize + '_> {
     struct Properties<'a> {
         layer: &'a str,
         parameter: Option<&'a str>,
-        value: Option<f64>,
+        value: Option<RangeValue>,
         unit: Option<&'a str>,
         time: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]

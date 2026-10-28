@@ -101,6 +101,7 @@ impl Recorder {
                     shape: vec![1],
                     axis_names: vec!["t".into()],
                     values: vec![Some(f64::from(t.hour()))],
+                    precision: ValuePrecision::F64,
                 },
             )]),
         }))

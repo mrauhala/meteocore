@@ -271,6 +271,7 @@ impl GribEngine {
                     shape,
                     axis_names,
                     values: all_values,
+                    precision: VALUE_PRECISION,
                 },
             );
         }

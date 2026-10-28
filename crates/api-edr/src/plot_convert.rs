@@ -407,7 +407,7 @@ fn finite_range(values: &[Option<f64>]) -> (f64, f64) {
 mod tests {
     use std::collections::HashMap;
 
-    use ds_core::model::NdArray;
+    use ds_core::model::{NdArray, ValuePrecision};
     use ds_core::vertical::VerticalKind;
 
     use super::*;
@@ -431,6 +431,7 @@ mod tests {
                 shape: vec![levels.len()],
                 axis_names: vec!["z".into()],
                 values: vals,
+                precision: ValuePrecision::F64,
             },
         );
         QueryResult {
@@ -515,6 +516,7 @@ mod tests {
                 shape: vec![2],
                 axis_names: vec!["t".into()],
                 values: vec![Some(280.0), None],
+                precision: ValuePrecision::F64,
             },
         );
         let q = QueryResult {
@@ -563,6 +565,7 @@ mod tests {
                         shape: vec![1, 1],
                         axis_names: vec!["y".into(), "x".into()],
                         values: vec![Some(1.0)],
+                        precision: ValuePrecision::F64,
                     },
                 );
                 m
@@ -586,6 +589,7 @@ mod tests {
                 shape: vec![1],
                 axis_names: vec!["t".into()],
                 values: vec![Some(280.0)],
+                precision: ValuePrecision::F64,
             },
         );
         let ts = QueryResult {
@@ -679,6 +683,7 @@ mod tests {
                     Some(5.0),
                     Some(25.0),
                 ],
+                precision: ValuePrecision::F64,
             },
         );
         QueryResult {

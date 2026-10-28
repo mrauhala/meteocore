@@ -52,7 +52,7 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use ds_core::wind::DerivedWind;
 use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
@@ -1061,6 +1061,7 @@ impl EdrEngine for Probe {
                     shape: vec![1],
                     axis_names: vec!["t".into()],
                     values: vec![Some(1.0)],
+                    precision: ValuePrecision::F64,
                 },
             )]),
         }))

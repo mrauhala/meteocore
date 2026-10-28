@@ -372,6 +372,8 @@ fn append_steps(series: &mut QueryResult, from: &QueryResult) {
                 .values
                 .extend_from_slice(&source.values[i * stride..(i + 1) * stride]);
             range.shape[0] += 1;
+            // The finer of the two, so no step's values lose digits (#1341).
+            range.precision = range.precision.max(source.precision);
         }
     }
 }
@@ -405,7 +407,7 @@ fn sort_steps(coverage: &mut QueryResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ds_core::model::ParameterDescription;
+    use ds_core::model::{ParameterDescription, ValuePrecision};
     use ds_core::vertical::VerticalKind;
     use std::collections::HashMap;
 
@@ -440,6 +442,7 @@ mod tests {
                     shape: vec![steps.len()],
                     axis_names: vec!["t".into()],
                     values: steps.iter().map(|&(_, v)| Some(v)).collect(),
+                    precision: ValuePrecision::F64,
                 },
             )]),
         }
@@ -461,6 +464,7 @@ mod tests {
                     shape: vec![1, 2, 2],
                     axis_names: vec!["t".into(), "y".into(), "x".into()],
                     values: vec![Some(v); 4],
+                    precision: ValuePrecision::F64,
                 },
             )]),
         }
@@ -495,6 +499,7 @@ mod tests {
                     shape,
                     axis_names,
                     values: vec![Some(v); cells],
+                    precision: ValuePrecision::F64,
                 },
             )]),
         }
@@ -518,6 +523,7 @@ mod tests {
                     shape: vec![2],
                     axis_names: vec!["z".into()],
                     values: vec![Some(270.0), Some(250.0)],
+                    precision: ValuePrecision::F64,
                 },
             )]),
         }
@@ -564,6 +570,32 @@ mod tests {
         assert_eq!(times(&q), vec![at(1), at(2), at(3)]);
         assert_eq!(values(&q), vec![Some(1.0), Some(2.0), Some(3.0)]);
         assert_eq!(q.ranges["temperature"].shape, vec![3]);
+    }
+
+    /// A merged range keeps every step's digits (#1341): `f32` steps stay
+    /// `f32`, and an `f64` step among them makes the range `f64`.
+    #[test]
+    fn merged_steps_keep_the_finest_precision() {
+        let f32_series = |hour, v| {
+            let mut q = series(24.0, &[(hour, v)]);
+            q.ranges.get_mut("temperature").unwrap().precision = ValuePrecision::F32;
+            CoverageResponse::Single(q)
+        };
+        let precision = |response| match merge(response) {
+            CoverageResponse::Single(q) => q.ranges["temperature"].precision,
+            CoverageResponse::Collection(_) => panic!("expected one series"),
+        };
+        assert_eq!(
+            precision(vec![f32_series(1, 1.0), f32_series(2, 2.0)]),
+            ValuePrecision::F32
+        );
+        assert_eq!(
+            precision(vec![
+                f32_series(1, 1.0),
+                CoverageResponse::Single(series(24.0, &[(2, 2.0)])),
+            ]),
+            ValuePrecision::F64
+        );
     }
 
     #[test]
@@ -718,6 +750,7 @@ mod tests {
                     shape: vec![2],
                     axis_names: vec!["composite".into()],
                     values: vec![Some(270.0), Some(271.0)],
+                    precision: ValuePrecision::F64,
                 },
             )]),
         }

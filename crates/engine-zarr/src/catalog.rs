@@ -25,6 +25,7 @@ use ds_core::cf::{
 use ds_core::error::DataServerError;
 use ds_core::instances;
 use ds_core::map_engine::RasterInfo;
+use ds_core::model::ValuePrecision;
 use ds_core::units::{cf_display_conversion, DisplayConversion};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 
@@ -104,6 +105,20 @@ impl Variable {
             &self.fill_values,
             self.display,
         )
+    }
+
+    /// The precision of the values served, by the array's data type
+    /// (#1341): a `float32` array's are `f32` samples, to which CF
+    /// unpacking, display conversion and interpolation add no digits. Any
+    /// other type keeps `f64`: a `float64` holds more, and an integer
+    /// array's unpacked type is not stated, its `scale_factor` being an
+    /// untyped JSON number.
+    pub fn precision(&self) -> ValuePrecision {
+        if *self.array.data_type() == data_type::float32() {
+            ValuePrecision::F32
+        } else {
+            ValuePrecision::F64
+        }
     }
 }
 

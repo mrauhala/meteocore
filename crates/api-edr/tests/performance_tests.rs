@@ -117,6 +117,7 @@ impl EdrEngine for ScalableEngine {
                     shape: vec![self.timestep_count],
                     axis_names: vec!["t".to_string()],
                     values: (0..self.timestep_count).map(|v| Some(v as f64)).collect(),
+                    precision: ValuePrecision::F64,
                 },
             );
         }
@@ -521,6 +522,7 @@ impl EdrEngine for MillionValuesEngine {
                     values: (0..steps)
                         .map(|i| Some((p * steps + i) as f64 / 7.0))
                         .collect(),
+                    precision: ValuePrecision::F64,
                 },
             );
         }

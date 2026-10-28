@@ -1922,6 +1922,8 @@ impl GeoTiffEngine {
 
         let mut times = Vec::with_capacity(entries.len());
         let mut values = Vec::with_capacity(entries.len());
+        // The finest of the files read, so no file's values lose digits.
+        let mut precision = None;
         let tile_cache = self.request_tile_cache();
 
         for (timestamp, entry) in &entries {
@@ -1934,6 +1936,7 @@ impl GeoTiffEngine {
                     continue;
                 }
             };
+            precision = precision.max(Some(metadata.value_precision()));
 
             let pixel = metadata.geo_transform.world_to_pixel(lon, lat);
             let value = match pixel {
@@ -1993,6 +1996,7 @@ impl GeoTiffEngine {
                 shape: vec![values.len()],
                 axis_names: vec!["t".to_string()],
                 values,
+                precision: precision.unwrap_or_default(),
             },
         );
 
@@ -2060,6 +2064,8 @@ impl GeoTiffEngine {
         let has_time = entries.len() > 1;
         let mut times = Vec::with_capacity(entries.len());
         let mut all_values = Vec::with_capacity(entries.len() * ny * nx);
+        // The finest of the files read, so no file's values lose digits.
+        let mut precision = None;
         let tile_cache = self.request_tile_cache();
 
         for (timestamp, entry) in &entries {
@@ -2072,6 +2078,7 @@ impl GeoTiffEngine {
                     continue;
                 }
             };
+            precision = precision.max(Some(metadata.value_precision()));
 
             let read = reader::read_bbox(
                 source,
@@ -2141,6 +2148,7 @@ impl GeoTiffEngine {
                 shape,
                 axis_names,
                 values: all_values,
+                precision: precision.unwrap_or_default(),
             },
         );
 
@@ -3846,6 +3854,29 @@ mod tests {
         let ndarray = &result.ranges["reflectivity"];
         assert_eq!(ndarray.shape, vec![5, y.len(), x.len()]);
         assert_eq!(ndarray.values.len(), 5 * y.len() * x.len());
+    }
+
+    /// A range's precision is its files' sample type (#1341): the float32
+    /// radar fixture's values are `f32`, the 8-bit TM35FIN fixture's keep
+    /// `f64`, an integer's unpacked type not being stated.
+    #[test]
+    fn ranges_carry_the_sample_type_precision() {
+        let float32 = radar_engine();
+        let area = float32
+            .query_bbox(24.5, 60.0, 25.0, 60.5, None, None)
+            .unwrap();
+        assert_eq!(area.ranges["reflectivity"].precision, ValuePrecision::F32);
+        let point = float32.query_point(60.2, 24.7, None, None).unwrap();
+        assert_eq!(point.ranges["reflectivity"].precision, ValuePrecision::F32);
+
+        let integer = GeoTiffEngine::new(
+            "radar-tm35fin",
+            Some("../../testdata/radar-tm35fin"),
+            &tm35fin_test_config(),
+        )
+        .unwrap();
+        let point = integer.query_point(61.0, 25.0, None, None).unwrap();
+        assert_eq!(point.ranges["reflectivity"].precision, ValuePrecision::F64);
     }
 
     /// A closed WKT ring of `n` vertices on a circle of `r` degrees around

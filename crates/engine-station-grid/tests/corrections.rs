@@ -26,7 +26,7 @@ use ds_core::map_engine::{
 };
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use engine_station_grid::{Auxiliary, StationGridEngine};
 
@@ -202,6 +202,7 @@ impl EdrEngine for Source {
                                     shape: vec![times.len()],
                                     axis_names: vec!["t".into()],
                                     values: vec![Some(*v); times.len()],
+                                    precision: ValuePrecision::F64,
                                 },
                             )
                         })

@@ -45,7 +45,7 @@ use ds_core::instances::{build_instances, format_instance_id, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
@@ -2516,6 +2516,7 @@ impl EdrEngine for NowcastEngine {
                         .zip(&mask)
                         .map(|(&v, &inside)| inside.then(|| round_to(v, 2)))
                         .collect(),
+                    precision: ValuePrecision::F64,
                 },
             );
         }

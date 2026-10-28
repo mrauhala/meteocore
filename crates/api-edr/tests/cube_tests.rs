@@ -167,6 +167,7 @@ impl EdrEngine for CubeMock {
                     shape: vec![1, levels.len(), ny, nx],
                     axis_names: ["t", "z", "y", "x"].map(String::from).to_vec(),
                     values,
+                    precision: ValuePrecision::F64,
                 },
             )]),
         }))

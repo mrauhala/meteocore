@@ -79,6 +79,7 @@ impl EdrEngine for MockEngine {
                 shape: vec![3],
                 axis_names: vec!["t".to_string()],
                 values: vec![Some(-2.5), Some(-2.8), Some(-3.1)],
+                precision: ValuePrecision::F64,
             },
         );
         Ok(CoverageResponse::Single(QueryResult {

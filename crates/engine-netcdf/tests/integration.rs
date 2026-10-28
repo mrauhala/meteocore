@@ -630,7 +630,7 @@ fn renders_on_render_jobs_and_async_workers() {
 // ---------------------------------------------------------------------------
 
 use ds_core::edr_engine::EdrEngine;
-use ds_core::model::{CoverageResponse, DomainDescription, QueryResult};
+use ds_core::model::{CoverageResponse, DomainDescription, QueryResult, ValuePrecision};
 
 fn single(response: CoverageResponse) -> QueryResult {
     match response {
@@ -939,6 +939,9 @@ fn values_are_served_in_display_units() {
         let series = position(&engine, (j, i), name, None, None).unwrap();
         assert_eq!(series_hours(&series), [9, 10, 11]);
         assert_eq!(series.ranges[name].values[2], Some(queried), "{name}");
+        // Decoded to `f32` whatever the stored type, packed `short`s
+        // included, so the range says so (#1341).
+        assert_eq!(series.ranges[name].precision, ValuePrecision::F32, "{name}");
 
         let advertised = info.parameters.iter().find(|p| p.name == name).unwrap();
         assert_eq!(advertised.unit, display, "{name}: RasterInfo");
@@ -1000,6 +1003,7 @@ fn values_are_served_in_display_units() {
     );
     for name in ["relative_humidity_2m", "cloud_area_fraction"] {
         assert_eq!(area.parameters[name].unit, "%", "{name}");
+        assert_eq!(area.ranges[name].precision, ValuePrecision::F32, "{name}");
         let cells: Vec<f64> = area.ranges[name].values.iter().flatten().copied().collect();
         assert!(!cells.is_empty(), "{name}");
         assert!(

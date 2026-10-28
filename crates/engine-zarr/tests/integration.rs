@@ -713,6 +713,56 @@ fn single(resp: CoverageResponse) -> ds_core::model::QueryResult {
     }
 }
 
+/// A range's precision is its array's data type (#1341): the float32
+/// arrays' values are `f32`, unit conversion and interpolation adding no
+/// digits; the packed int16 `t2m_packed` keeps `f64`, as its unpacked type
+/// is not stated. Position, area and trajectory alike.
+#[test]
+fn ranges_carry_their_array_precision() {
+    use ds_core::model::{QueryResult, ValuePrecision};
+
+    let e = engine();
+    let t = e.get_available_times().unwrap()[0];
+    let coverages = |response: CoverageResponse| -> Vec<QueryResult> {
+        match response {
+            CoverageResponse::Single(qr) => vec![qr],
+            CoverageResponse::Collection(qrs) => qrs,
+        }
+    };
+    let position = e
+        .query_position("POINT(5.5 54.5)", None, None, None, None)
+        .unwrap();
+    let area = e
+        .query_area(
+            "POLYGON((3 52, 8 52, 3 57, 3 52))",
+            Some((t, t)),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let trajectory = e
+        .query_trajectory("LINESTRING(1 50, 5 54, 9 54)", None, None, None, None)
+        .unwrap();
+    for (query, response) in [
+        ("position", position),
+        ("area", area),
+        ("trajectory", trajectory),
+    ] {
+        for qr in coverages(response) {
+            assert_eq!(qr.ranges.len(), 4, "{query}");
+            for (name, range) in &qr.ranges {
+                let want = if name == "t2m_packed" {
+                    ValuePrecision::F64
+                } else {
+                    ValuePrecision::F32
+                };
+                assert_eq!(range.precision, want, "{query} {name}");
+            }
+        }
+    }
+}
+
 #[test]
 fn lists_data_variables_sorted() {
     let params = engine().get_parameters();

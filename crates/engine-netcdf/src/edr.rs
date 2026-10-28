@@ -1064,6 +1064,7 @@ impl NetcdfEngine {
                     shape: vec![values.len()],
                     axis_names: vec![axis.to_string()],
                     values,
+                    precision: field::VALUE_PRECISION,
                 },
             )
         };
@@ -1196,6 +1197,7 @@ impl NetcdfEngine {
                         shape,
                         axis_names: axis_names.into_iter().map(String::from).collect(),
                         values,
+                        precision: field::VALUE_PRECISION,
                     },
                 )
             })

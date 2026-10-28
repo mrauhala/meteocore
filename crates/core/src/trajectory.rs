@@ -48,7 +48,8 @@ use crate::error::DataServerError;
 use crate::feature::{Bbox, MAX_AREA_VALUES, MAX_WKT_LENGTH};
 use crate::geo::{intermediate_point, wrap_lon};
 use crate::model::{
-    CoverageResponse, DomainDescription, NdArray, ParameterDescription, QueryResult, VerticalCoord,
+    CoverageResponse, DomainDescription, NdArray, ParameterDescription, QueryResult,
+    ValuePrecision, VerticalCoord,
 };
 use crate::vertical::{VerticalDimension, VerticalKind};
 
@@ -651,13 +652,16 @@ impl TrajectoryPlan {
     /// and Z paths) × level (2-D and M paths), a bare `Coverage` when there
     /// is one. `values[p][f][k]` is parameter `p` of field `f` at its `k`-th
     /// point, parallel to `parameters`, [`Self::fields`] and
-    /// [`TrajectoryField::points`].
+    /// [`TrajectoryField::points`]; `precisions[p]` is the precision
+    /// parameter `p`'s values carry (#1341).
     pub fn into_response(
         self,
         parameters: &[(String, ParameterDescription)],
+        precisions: &[ValuePrecision],
         values: &[Vec<Vec<Option<f64>>>],
     ) -> Result<CoverageResponse, DataServerError> {
         let shaped = values.len() == parameters.len()
+            && precisions.len() == parameters.len()
             && values.iter().all(|by_field| {
                 by_field.len() == self.fields.len()
                     && by_field
@@ -698,8 +702,9 @@ impl TrajectoryPlan {
                 .transpose()?;
             let ranges = parameters
                 .iter()
+                .zip(precisions)
                 .zip(values)
-                .map(|((name, _), by_field)| {
+                .map(|(((name, _), &precision), by_field)| {
                     let values = coverage
                         .nodes
                         .iter()
@@ -711,6 +716,7 @@ impl TrajectoryPlan {
                             shape: vec![coverage.nodes.len()],
                             axis_names: vec!["composite".into()],
                             values,
+                            precision,
                         },
                     )
                 })
@@ -956,8 +962,9 @@ mod tests {
         assert_eq!(plan.fields()[1].time, 1);
         assert_eq!(plan.fields()[1].points, [0, 1, 2]);
         let values = fill(&plan, 1);
-        let CoverageResponse::Collection(covs) =
-            plan.into_response(&[desc("t2m")], &values).unwrap()
+        let CoverageResponse::Collection(covs) = plan
+            .into_response(&[desc("t2m")], &[ValuePrecision::F32], &values)
+            .unwrap()
         else {
             panic!("two timesteps → a collection")
         };
@@ -971,6 +978,8 @@ mod tests {
         assert_eq!(range.shape, [3]);
         assert_eq!(range.axis_names, ["composite"]);
         assert_eq!(range.values, [Some(1000.0), Some(1001.0), Some(1002.0)]);
+        // Each range carries its parameter's precision (#1341).
+        assert_eq!(range.precision, ValuePrecision::F32);
     }
 
     #[test]
@@ -993,7 +1002,9 @@ mod tests {
         let used: Vec<usize> = plan.fields().iter().map(|f| f.time).collect();
         assert_eq!(used, [0, 1, 2]);
         let values = fill(&plan, 1);
-        let CoverageResponse::Single(cov) = plan.into_response(&[desc("t")], &values).unwrap()
+        let CoverageResponse::Single(cov) = plan
+            .into_response(&[desc("t")], &[ValuePrecision::F64], &values)
+            .unwrap()
         else {
             panic!("an M path is one coverage")
         };
@@ -1044,7 +1055,9 @@ mod tests {
         let levels: Vec<_> = plan.fields().iter().map(|f| f.level).collect();
         assert_eq!(levels, [Some(1000.0), Some(850.0), Some(700.0)]);
         let values = fill(&plan, 1);
-        let CoverageResponse::Single(cov) = plan.into_response(&[desc("t")], &values).unwrap()
+        let CoverageResponse::Single(cov) = plan
+            .into_response(&[desc("t")], &[ValuePrecision::F64], &values)
+            .unwrap()
         else {
             panic!()
         };
@@ -1081,7 +1094,9 @@ mod tests {
         let flat_plan = TrajectoryPlan::new(&path, deg(1.0), flat_z, 1).unwrap();
         assert!(flat_plan.fields().iter().all(|f| f.level.is_none()));
         let values = fill(&plan, 1);
-        let CoverageResponse::Single(cov) = plan.into_response(&[desc("t")], &values).unwrap()
+        let CoverageResponse::Single(cov) = plan
+            .into_response(&[desc("t")], &[ValuePrecision::F64], &values)
+            .unwrap()
         else {
             panic!()
         };
@@ -1162,7 +1177,9 @@ mod tests {
             1
         );
         let values = fill(&plan, 1);
-        let CoverageResponse::Single(cov) = plan.into_response(&[desc("t")], &values).unwrap()
+        let CoverageResponse::Single(cov) = plan
+            .into_response(&[desc("t")], &[ValuePrecision::F64], &values)
+            .unwrap()
         else {
             panic!()
         };
@@ -1184,7 +1201,9 @@ mod tests {
         };
         let plan = TrajectoryPlan::new(&path, deg(1.0), axes, 1).unwrap();
         let values = fill(&plan, 1);
-        let CoverageResponse::Single(cov) = plan.into_response(&[desc("t")], &values).unwrap()
+        let CoverageResponse::Single(cov) = plan
+            .into_response(&[desc("t")], &[ValuePrecision::F64], &values)
+            .unwrap()
         else {
             panic!()
         };
@@ -1258,7 +1277,13 @@ mod tests {
         // A sampler that returns the wrong shape is an engine error.
         let err = plan
             .clone()
-            .into_response(&[desc("t")], &[vec![]])
+            .into_response(&[desc("t")], &[ValuePrecision::F64], &[vec![]])
+            .unwrap_err();
+        assert!(matches!(err, DataServerError::Engine(_)));
+        // So is a precision list that is not one per parameter.
+        let err = plan
+            .clone()
+            .into_response(&[desc("t")], &[], &fill(&plan, 1))
             .unwrap_err();
         assert!(matches!(err, DataServerError::Engine(_)));
     }

@@ -24,7 +24,7 @@ use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::MapEngine;
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use engine_station_grid::residuals::Summary;
 use engine_station_grid::StationGridEngine;
@@ -338,6 +338,7 @@ impl EdrEngine for Lattice {
                             shape: vec![1],
                             axis_names: vec!["t".into()],
                             values: vec![Some(value)],
+                            precision: ValuePrecision::F64,
                         },
                     )]),
                 })

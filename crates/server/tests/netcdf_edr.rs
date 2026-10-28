@@ -623,9 +623,18 @@ async fn netcdf_per_step_precipitation_responses_validate() {
     let raw = values(series, "precipitation_amount_acc");
     let per_step = values(series, "precipitation_amount");
     assert!(raw[1] > 1.0 && raw[3] > raw[1], "it rains here: {raw:?}");
+    // A step's amount is its accumulation less the previous one, each
+    // written at the `f32` precision of the fields (#1341), so the
+    // difference holds to within their `f32` rounding.
     for k in 0..raw.len() {
         let before = if k == 0 { 0.0 } else { raw[k - 1] };
-        assert_eq!(per_step[k], (raw[k] - before).max(0.0), "step {k}");
+        let expected = (raw[k] - before).max(0.0);
+        let tolerance = 2.0 * f64::from(f32::EPSILON) * raw[k].abs().max(1.0);
+        assert!(
+            (per_step[k] - expected).abs() <= tolerance,
+            "step {k}: {} vs {expected}",
+            per_step[k]
+        );
     }
     assert_eq!(
         series["parameters"]["precipitation_amount"]["unit"]["symbol"]["type"],

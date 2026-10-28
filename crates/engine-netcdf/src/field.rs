@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use ds_cache::{ByteBoundedCache, CacheEntry};
 use ds_core::deadline;
 use ds_core::error::DataServerError;
+use ds_core::model::ValuePrecision;
 use ds_core::resample::{CellWindow, SourceGrid};
 
 use crate::catalog::OpenFile;
@@ -53,6 +54,12 @@ use crate::source::Reader;
 
 /// A decoded 2-D field: rows north to south, NaN for nodata.
 pub(crate) type Values = Arc<[f32]>;
+
+/// The precision of every EDR range (#1341): each value is sampled from
+/// decoded [`Values`], which are `f32` whatever the stored type (CF
+/// unpacking decodes to `f32`). Interpolation and display conversion add no
+/// digits.
+pub(crate) const VALUE_PRECISION: ValuePrecision = ValuePrecision::F32;
 
 /// One variable's decoded fields of a read: a plane per stored level of its
 /// [`Span`], in stored order; one for a field with one level.

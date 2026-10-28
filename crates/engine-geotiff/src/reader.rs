@@ -6,6 +6,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use bytes::Bytes;
 use ds_core::error::DataServerError;
+use ds_core::model::ValuePrecision;
 use ds_storage::{RangeAnswer, RangeRefusal};
 use memmap2::Mmap;
 use tiff::decoder::{Decoder, DecodingResult};
@@ -72,7 +73,7 @@ pub enum TiffCompression {
 }
 
 /// Sample data type from BitsPerSample + SampleFormat.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleType {
     U8,
     U16,
@@ -82,6 +83,19 @@ pub enum SampleType {
 }
 
 impl SampleType {
+    /// The type a `BitsPerSample` and `SampleFormat` pair names, `None` for
+    /// one the engine does not decode.
+    fn from_tags(bits_per_sample: u16, sample_format: u32) -> Option<Self> {
+        match (bits_per_sample, sample_format) {
+            (8, 1) => Some(SampleType::U8),
+            (16, 1) => Some(SampleType::U16),
+            (16, 2) => Some(SampleType::I16),
+            (32, 3) => Some(SampleType::F32),
+            (64, 3) => Some(SampleType::F64),
+            _ => None,
+        }
+    }
+
     fn bytes_per_sample(self) -> usize {
         match self {
             SampleType::U8 => 1,
@@ -667,6 +681,9 @@ pub struct TiffMetadata {
     pub nodata: Option<f64>,
     pub scale: Option<f64>,
     pub offset: Option<f64>,
+    /// The samples' type (`BitsPerSample`, `SampleFormat`), `None` for one
+    /// the engine does not decode.
+    pub sample_type: Option<SampleType>,
     /// COG overview levels, sorted by decreasing resolution (largest first).
     /// Empty if the file has no overviews.
     pub overviews: Vec<OverviewLevel>,
@@ -725,6 +742,10 @@ impl TiffMetadata {
         // samples_per_pixel could be large in multi-band files, so we use
         // the real value rather than assuming worst-case 8 bytes/sample.
         let bps = Self::bits_per_sample_from_decoder(decoder);
+        let sample_format = read_tag_u32(decoder, Tag::SampleFormat).unwrap_or(1);
+        let sample_type = u16::try_from(bps)
+            .ok()
+            .and_then(|bits| SampleType::from_tags(bits, sample_format));
         let bytes_per_sample = (bps as usize).div_ceil(8);
         let decoded_tile_bytes = (tile_width as usize)
             .checked_mul(tile_height as usize)
@@ -816,6 +837,7 @@ impl TiffMetadata {
             nodata,
             scale,
             offset,
+            sample_type,
             overviews,
             epsg,
         })
@@ -938,6 +960,18 @@ impl TiffMetadata {
                 None => HttpHeaderRead::NotCog,
             },
         )
+    }
+
+    /// The precision of the values read from this file (#1341): `f32`
+    /// for float32 samples, to which scale, offset and interpolation add no
+    /// digits; `f64` for the rest, as a float64 sample holds more and an
+    /// integer's unpacked type is not stated.
+    pub fn value_precision(&self) -> ValuePrecision {
+        if self.sample_type == Some(SampleType::F32) {
+            ValuePrecision::F32
+        } else {
+            ValuePrecision::F64
+        }
     }
 
     /// Apply scale/offset to convert raw value to physical value.
@@ -1159,15 +1193,8 @@ fn extract_tile_info(
 
     let bits_per_sample = read_tag_u32(decoder, Tag::BitsPerSample).unwrap_or(8) as u16;
     let sample_format = read_tag_u32(decoder, Tag::SampleFormat).unwrap_or(1);
-
-    let sample_type = match (bits_per_sample, sample_format) {
-        (8, 1) => SampleType::U8,
-        (16, 1) => SampleType::U16,
-        (16, 2) => SampleType::I16,
-        (32, 3) => SampleType::F32,
-        (64, 3) => SampleType::F64,
-        _ => return None, // unsupported sample type
-    };
+    // An unsupported sample type: the caller falls back to a full download.
+    let sample_type = SampleType::from_tags(bits_per_sample, sample_format)?;
 
     let predictor = read_tag_u32(decoder, Tag::Predictor).unwrap_or(1) as u16;
     if predictor > 2 {
@@ -1209,15 +1236,7 @@ fn extract_tile_info_at_level(
 
     let bits_per_sample = read_tag_u32(decoder, Tag::BitsPerSample).unwrap_or(8) as u16;
     let sample_format = read_tag_u32(decoder, Tag::SampleFormat).unwrap_or(1);
-
-    let sample_type = match (bits_per_sample, sample_format) {
-        (8, 1) => SampleType::U8,
-        (16, 1) => SampleType::U16,
-        (16, 2) => SampleType::I16,
-        (32, 3) => SampleType::F32,
-        (64, 3) => SampleType::F64,
-        _ => return None,
-    };
+    let sample_type = SampleType::from_tags(bits_per_sample, sample_format)?;
 
     let predictor = read_tag_u32(decoder, Tag::Predictor).unwrap_or(1) as u16;
     if predictor > 2 {
@@ -2129,6 +2148,7 @@ fn overview_metadata(metadata: &TiffMetadata, overview: &OverviewLevel) -> TiffM
         nodata: metadata.nodata,
         scale: metadata.scale,
         offset: metadata.offset,
+        sample_type: metadata.sample_type,
         overviews: Vec::new(),
         epsg: metadata.epsg,
     }
@@ -4838,6 +4858,7 @@ mod tests {
             nodata: Some(255.0),
             scale: None,
             offset: None,
+            sample_type: None,
             overviews: vec![
                 ov(1, 2481, 3658),
                 ov(2, 1240, 1829),
@@ -4997,6 +5018,7 @@ mod tests {
             nodata: Some(nodata),
             scale: None,
             offset: None,
+            sample_type: None,
             overviews: Vec::new(),
             epsg: None,
         }
@@ -5106,6 +5128,7 @@ mod tests {
             nodata: Some(255.0),
             scale: None,
             offset: None,
+            sample_type: None,
             overviews: Vec::new(),
             epsg: None,
         }

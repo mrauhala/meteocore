@@ -512,6 +512,7 @@ impl EdrEngine for ZarrEngine {
                     shape,
                     axis_names,
                     values,
+                    precision: v.precision(),
                 },
             );
         }
@@ -568,6 +569,7 @@ impl EdrEngine for ZarrEngine {
                     shape: vec![out_times.len()],
                     axis_names: vec!["t".to_string()],
                     values,
+                    precision: v.precision(),
                 },
             );
         }

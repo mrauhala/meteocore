@@ -60,6 +60,7 @@ impl EdrEngine for MockEngine {
                 shape: vec![1],
                 axis_names: vec!["t".to_string()],
                 values: vec![Some(-2.5)],
+                precision: ValuePrecision::F64,
             },
         );
 

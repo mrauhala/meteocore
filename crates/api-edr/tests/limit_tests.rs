@@ -54,6 +54,7 @@ fn coverage(x: f64, y: f64) -> QueryResult {
             shape: vec![1],
             axis_names: vec!["t".into()],
             values: vec![Some(1.0)],
+            precision: ValuePrecision::F64,
         },
     );
     QueryResult {

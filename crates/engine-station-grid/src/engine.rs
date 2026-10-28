@@ -53,7 +53,7 @@ use ds_core::map_engine::{
 };
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
@@ -699,6 +699,7 @@ impl StationGridEngine {
                     shape: vec![times.len(), ny, nx],
                     axis_names: vec!["t".into(), "y".into(), "x".into()],
                     values,
+                    precision: VALUE_PRECISION,
                 },
             );
         }
@@ -714,6 +715,10 @@ impl StationGridEngine {
         }))
     }
 }
+
+/// The precision of every EDR range (#1341): the analysis grids are `f32`
+/// ([`value`]).
+const VALUE_PRECISION: ValuePrecision = ValuePrecision::F32;
 
 /// A cell's value: `None` for nodata. The `f64` with the stored `f32`'s
 /// shortest decimal spelling, `-5.8676414` rather than the widened
@@ -1381,6 +1386,7 @@ impl EdrEngine for StationGridEngine {
                     shape: vec![times.len()],
                     axis_names: vec!["t".into()],
                     values: grids.iter().map(|g| value(g, cell)).collect(),
+                    precision: VALUE_PRECISION,
                 },
             );
         }

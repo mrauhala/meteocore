@@ -130,8 +130,10 @@ locations (`EdrEngine::serves_station_series`: CSV, BUFR, PostGIS stations).
   `location_id,label,longitude,latitude,datetime,parameter,value,unit`.
   UTF-8, CRLF, RFC 4180 quoting, sent as
   `text/csv; charset=utf-8; header=present`. A missing value is an empty
-  field. A text cell a spreadsheet would read as a formula gets a leading
-  `'` (OWASP CSV injection guidance). A body over 64 MiB is a 400.
+  field. A value is the CoverageJSON's text, at its range's precision
+  (see Value precision below). A text cell a spreadsheet would read as a
+  formula gets a leading `'` (OWASP CSV injection guidance). A body over
+  64 MiB is a 400.
 - **PNG.** A time-series or profile plot (`width` × `height`, default
   800 × 600), or for a radar cross-section one heatmap panel per parameter.
   Each panel uses its parameter's own default map style, the one the WMS
@@ -278,6 +280,24 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   it is a 503 `ResponseLimit` suggesting `limit`. A body is never
   truncated. `MC_EDR_LOCATIONS_MEMORY_MB` is retired: it is ignored, with a
   warning at startup.
+- **Value precision.** Each range value is written in the shortest text
+  that reads back as the same number at its source's precision (#1341).
+  Values sampled from `f32` data are written as the shortest `f32` text,
+  `10.531` rather than the `f64` widening `10.530998535156414`. So are
+  values interpolated or unit-converted from them, and a derived parameter
+  takes the coarsest precision of its inputs. Other values are written as
+  the shortest `f64` text, as before. A value beyond `f32`'s range keeps its
+  `f64` form. `dataType` is `float` for both. GeoJSON and CSV values are
+  the CoverageJSON's text, and WMS GetFeatureInfo writes the same number.
+  A `datetime` list's merged range takes the finer precision of its
+  instants. Per engine:
+
+  | Engine | Precision |
+  |---|---|
+  | GRIB | `f32`: every packing the engine reads decodes to `f32`; template 5.4 IEEE fields are not readable |
+  | QueryData, NetCDF, ODIM composite and PVOL, Station grid | `f32`: QueryData stores `f32`, NetCDF decodes every stored type to `f32`, ODIM's raws are 8- or 16-bit or `f32`, the analysis grids are `f32` |
+  | Zarr, GeoTIFF | the array's or file's data type: `float32` is `f32`; `float64`, and integers, whose unpacked type is not stated, are `f64` |
+  | CSV, BUFR, PostGIS, Satellite, Nowcast | `f64` |
 
 ## Parameter metadata
 

@@ -21,7 +21,7 @@ use ds_core::geo::great_circle_distance_m;
 use ds_core::health::{LiveStatus, WarmupCause};
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use ds_core::state::{
     collection_key, hours_minutes, StateError, StateStore, StateWriter, WriteOutcome, WritePolicy,
@@ -812,6 +812,7 @@ impl BufrEngine {
                     shape: vec![times.len()],
                     axis_names: vec!["t".to_string()],
                     values,
+                    precision: ValuePrecision::F64,
                 },
             );
             descs.insert(

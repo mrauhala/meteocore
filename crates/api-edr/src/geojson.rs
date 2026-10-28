@@ -43,7 +43,7 @@ use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use crate::response::build_parameter;
+use crate::response::{build_parameter, Values};
 
 /// Property names a feature defines itself; a parameter of the same name
 /// cannot be encoded next to them.
@@ -391,23 +391,11 @@ impl Serialize for Properties<'_> {
         map.serialize_entry("edrqueryendpoint", &summary.edrqueryendpoint)?;
         map.serialize_entry("time", &s.times)?;
         for name in names {
-            map.serialize_entry(name, &Values(&s.result.ranges[name].values))?;
+            // As CoverageJSON writes them: a number at the range's
+            // precision, or `null` for a missing or non-finite one.
+            map.serialize_entry(name, &Values(&s.result.ranges[name]))?;
         }
         map.end()
-    }
-}
-
-/// A range's values: a number, or `null` for a missing or non-finite one
-/// (as in CoverageJSON).
-struct Values<'a>(&'a [Option<f64>]);
-
-impl Serialize for Values<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-        for v in self.0 {
-            seq.serialize_element(&v.filter(|v| v.is_finite()))?;
-        }
-        seq.end()
     }
 }
 
@@ -415,7 +403,7 @@ impl Serialize for Values<'_> {
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
-    use ds_core::model::{NdArray, ParameterDescription};
+    use ds_core::model::{NdArray, ParameterDescription, ValuePrecision};
     use std::collections::HashMap;
 
     fn series(x: f64, y: f64, hours: &[u32], values: &[(&str, Vec<Option<f64>>)]) -> QueryResult {
@@ -441,6 +429,7 @@ mod tests {
                     shape: vec![v.len()],
                     axis_names: vec!["t".into()],
                     values: v.clone(),
+                    precision: ValuePrecision::F64,
                 },
             );
         }
@@ -543,6 +532,34 @@ mod tests {
         assert_eq!(ids, ["air_temperature", "wind_speed"]);
         assert_eq!(params[0]["type"], "Parameter");
         assert!(params[0]["observedProperty"]["label"]["en"].is_string());
+    }
+
+    /// A series is written at its range's precision, as in CoverageJSON
+    /// (#1341).
+    #[test]
+    fn values_keep_the_range_precision() {
+        let mut q = series(
+            24.26,
+            63.09,
+            &[0, 1, 2],
+            &[(
+                "t2m",
+                vec![Some(f64::from(10.531_f32)), None, Some(f64::NAN)],
+            )],
+        );
+        q.ranges.get_mut("t2m").unwrap().precision = ValuePrecision::F32;
+        let mut out = Vec::new();
+        write_station_series(
+            &CoverageResponse::Single(q),
+            |_, _| None,
+            "https://example.org/edr/collections/obs",
+            &[],
+            None,
+            &mut out,
+        )
+        .unwrap();
+        let body = String::from_utf8(out).unwrap();
+        assert!(body.contains(r#""t2m":[10.531,null,null]"#), "{body}");
     }
 
     #[test]

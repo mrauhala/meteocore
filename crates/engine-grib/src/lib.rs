@@ -1788,6 +1788,13 @@ fn no_step_within(start: DateTime<Utc>, end: DateTime<Utc>) -> DataServerError {
 // Engine trait (EDR)
 // ---------------------------------------------------------------------------
 
+/// The precision of every EDR range (#1341): each value is sampled from
+/// `f32`s, as the `grib` crate decodes every packing it reads and the CCSDS
+/// point reader decodes alike. Neither reads template 5.4's IEEE values, the
+/// one packing that can hold `f64`. Interpolation and display conversion add
+/// no digits.
+const VALUE_PRECISION: ValuePrecision = ValuePrecision::F32;
+
 impl EdrEngine for GribEngine {
     fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         // Gridded data has no discrete locations
