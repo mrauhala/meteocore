@@ -41,7 +41,8 @@ fn node_coordinate(first: f64, index: f64, inc: f64) -> f64 {
     let micro = degrees * 1e6;
     let whole = micro.round();
     if (micro - whole).abs() <= 1e-3 {
-        whole / 1e6
+        // `+ 0.0` turns a −0.0 node (0° as 359.9 − 3599 × 0.1) into 0.
+        whole / 1e6 + 0.0
     } else {
         degrees
     }
@@ -1532,6 +1533,18 @@ mod tests {
                     assert_eq!(subset.rows, rows, "{inc} {s}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_node_on_zero_is_positive_zero() {
+        // 359.9 − 3599 × 0.1 is −5.7e-14, which rounds to −0.0 and would
+        // print as `-0.0` for the 0° node of a wrapped 0.1° grid.
+        for zero in [
+            node_coordinate(359.9, -3599.0, 0.1),
+            node_coordinate(359.9, 3599.0, -0.1),
+        ] {
+            assert_eq!(zero.to_bits(), 0.0_f64.to_bits());
         }
     }
 
