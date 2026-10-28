@@ -489,6 +489,58 @@ fn rectangle_past_a_regional_grid_edge_is_404_beyond_half_a_cell() {
 }
 
 #[test]
+fn area_on_ecmwf_global_grids_returns_exactly_the_nodes_of_the_polygon() {
+    // #1342: ECMWF's global grids as Section 3 states them, from 180°E and
+    // 90°N in microdegrees. On the 0.1° grid the polygon gained a null
+    // column at 19.900000000000006 and a null row at 54.900000000000006
+    // (102 × 102); the 0.25° grid gave 41 × 41 and still does.
+    for (step, per_degree) in [(100_000u32, 10.0), (250_000, 4.0)] {
+        let source = TestSource::new();
+        let (ni, nj) = (360_000_000 / step, 180_000_000 / step + 1);
+        let field =
+            crate::test_support::constant_message(ni, nj, 180_000_000, 90_000_000, step, 0, 280.0);
+        source.write(
+            "f00",
+            &[
+                ("P0", "2 m above ground", field),
+                ("TAIL", "surface", message(0, 0.0, [0; 4], 1, 0)),
+            ],
+            0,
+        );
+        let mut config = source.config();
+        config.grid_cache_mb = 0;
+        config.parameters = Some(vec![parameter(0)]);
+        let engine = GribEngine::new("area", &config).unwrap();
+        for coords in ["POLYGON((20 55,30 55,30 65,20 65,20 55))", "20,55,30,65"] {
+            let result = single(
+                engine
+                    .query_area(coords, None, Some(&[parameter(0)]), None, None)
+                    .unwrap(),
+            );
+            let DomainDescription::Grid { x, y, .. } = &result.domain else {
+                panic!("expected a grid")
+            };
+            // Every node from 20°E and 55°N by one step, both edges
+            // included, each the f64 nearest its decimal: 19.9 prints as
+            // 19.9, never 19.900000000000006.
+            let nodes = |from: f64, to: f64| -> Vec<f64> {
+                let (from, to) = ((from * per_degree) as i32, (to * per_degree) as i32);
+                (from..=to).map(|k| f64::from(k) / per_degree).collect()
+            };
+            assert_eq!(x, &nodes(20.0, 30.0), "{step} {coords}");
+            assert_eq!(y, &nodes(55.0, 65.0), "{step} {coords}");
+            let values = &result.ranges["P0"].values;
+            assert_eq!(values.len(), x.len() * y.len());
+            assert!(
+                values.iter().all(|v| v.is_some()),
+                "{step} {coords}: {} nulls",
+                values.iter().filter(|v| v.is_none()).count()
+            );
+        }
+    }
+}
+
+#[test]
 fn area_and_radius_default_to_every_parameter_of_the_view() {
     // /req/edr/parameter-name-response A (#966): without `parameter-name`,
     // every parameter, as position and cube answer, not one default.

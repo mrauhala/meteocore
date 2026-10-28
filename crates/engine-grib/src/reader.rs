@@ -257,15 +257,23 @@ fn extract_grid_params(grid_def: &grib::GridDefinition) -> Result<GridLayout, St
     if grid.ni == 0 || grid.nj == 0 || grid.ni == u32::MAX || grid.nj == u32::MAX {
         return Err("missing or zero grid dimensions".into());
     }
-    let angle = if grid.initial_production_domain_basic_angle == 0 {
-        1e-6
+    // Section 3 angles are whole multiples of `basic / subdivisions` degrees,
+    // microdegrees without a basic angle. Convert each with one division by
+    // the subdivisions, last: 100 000 / 1e6 is the f64 nearest 0.1, but
+    // 100 000 × 1e-6 is one ulp below it, which moved the bbox edges and
+    // axes of every area on a 0.1° grid (#1342).
+    let (basic, subdivisions) = if grid.initial_production_domain_basic_angle == 0 {
+        (1.0, 1e6)
     } else {
         if grid.basic_angle_subdivisions == 0 || grid.basic_angle_subdivisions == u32::MAX {
             return Err("invalid basic-angle subdivisions".into());
         }
-        f64::from(grid.initial_production_domain_basic_angle)
-            / f64::from(grid.basic_angle_subdivisions)
+        (
+            f64::from(grid.initial_production_domain_basic_angle),
+            f64::from(grid.basic_angle_subdivisions),
+        )
     };
+    let degrees = |units: f64| units * basic / subdivisions;
     if ll.i_direction_inc == 0
         || ll.j_direction_inc == 0
         || ll.i_direction_inc == u32::MAX
@@ -275,22 +283,28 @@ fn extract_grid_params(grid_def: &grib::GridDefinition) -> Result<GridLayout, St
     }
     let ni = grid.ni as usize;
     let nj = grid.nj as usize;
-    let lon_inc = f64::from(ll.i_direction_inc) * angle;
-    let lat_inc = f64::from(ll.j_direction_inc) * angle;
+    let (i_inc, j_inc) = (f64::from(ll.i_direction_inc), f64::from(ll.j_direction_inc));
     let reverse_i = !ll.scanning_mode.scans_positively_for_i();
     let reverse_j = ll.scanning_mode.scans_positively_for_j();
-    let lon_first = f64::from(grid.first_point_lon) * angle
-        - if reverse_i {
-            (ni - 1) as f64 * lon_inc
-        } else {
-            0.0
-        };
-    let lat_first = f64::from(grid.first_point_lat) * angle
-        + if reverse_j {
-            (nj - 1) as f64 * lat_inc
-        } else {
-            0.0
-        };
+    // The western and northern nodes in Section 3 units, whole numbers and
+    // so exact in f64, before the one conversion.
+    let lon_first = degrees(
+        f64::from(grid.first_point_lon)
+            - if reverse_i {
+                (ni - 1) as f64 * i_inc
+            } else {
+                0.0
+            },
+    );
+    let lat_first = degrees(
+        f64::from(grid.first_point_lat)
+            + if reverse_j {
+                (nj - 1) as f64 * j_inc
+            } else {
+                0.0
+            },
+    );
+    let (lon_inc, lat_inc) = (degrees(i_inc), degrees(j_inc));
     Ok(GridLayout {
         ni,
         nj,
@@ -361,6 +375,38 @@ mod tests {
         );
         bytes[s3 + 71] = 1; // unsupported staggered/offset grid flag
         assert!(decode_message(&bytes, "TMP").is_err());
+    }
+
+    #[test]
+    fn microdegrees_convert_to_the_f64_nearest_each_angle() {
+        // #1342: ECMWF's 0.1° global grid as its Section 3 states it, rows
+        // north to south and, in scan mode 0x40, south to north from 90°S.
+        // 100 000 × 1e-6 made the increment 0.09999999999999999, and the
+        // northern row from 90°S 89.99999999999997.
+        for (scan, lat_first) in [(0x00, 90_000_000), (0x40, -90_000_000)] {
+            let bytes = crate::test_support::constant_message(
+                3600,
+                1801,
+                180_000_000,
+                lat_first,
+                100_000,
+                scan,
+                0.0,
+            );
+            let grib2 = grib::from_reader(std::io::Cursor::new(bytes)).unwrap();
+            let (_, message) = grib2.iter().next().unwrap();
+            let (lattice, _) = lattice(message.grid_def()).unwrap();
+            assert_eq!(
+                (
+                    lattice.lon_first,
+                    lattice.lat_first,
+                    lattice.lon_inc,
+                    lattice.lat_inc
+                ),
+                (180.0, 90.0, 0.1, -0.1),
+                "scan {scan:#x}"
+            );
+        }
     }
 
     #[test]

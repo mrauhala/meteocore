@@ -9,8 +9,42 @@ use ds_cache::{ByteBoundedCache, Joined};
 use ds_core::map_engine::OutputCrs;
 
 pub(crate) fn longitude_wrap_columns(ni: usize, lon_inc: f64) -> Option<f64> {
-    let cols_per_360 = 360.0 / lon_inc;
+    let cols_per_360 = snap_to_node(360.0 / lon_inc);
     ((ni as f64) >= cols_per_360 - 0.5).then_some(cols_per_360)
+}
+
+/// How far a grid position may lie from a whole number and still name that
+/// node: f64 rounding, never a real offset, which is a millimetre even on a
+/// 0.01° grid. A bbox edge on a node of a 0.1° grid comes out as a position
+/// like (−179.9 − 180) / 0.1 = −3598.9999999999995 (#1342).
+const NODE_TOLERANCE: f64 = 1e-6;
+
+/// A fractional grid `position` moved onto the node it names when it lies
+/// within [`NODE_TOLERANCE`] of one, so `floor`/`ceil` of a bbox edge on a
+/// node keep that node rather than step one cell past it.
+fn snap_to_node(position: f64) -> f64 {
+    let node = position.round();
+    if (position - node).abs() <= NODE_TOLERANCE {
+        node
+    } else {
+        position
+    }
+}
+
+/// The coordinate of node `index` from `first` by `inc`, in degrees,
+/// without f64 noise: on a grid of whole microdegrees, Section 3's default
+/// unit, the f64 nearest that microdegree, so 180 − 1601 × 0.1 is 19.9 and
+/// not 19.900000000000006 (#1342). A coordinate more than a nanodegree
+/// from a whole microdegree (a grid in basic-angle units) is left as is.
+fn node_coordinate(first: f64, index: f64, inc: f64) -> f64 {
+    let degrees = first + index * inc;
+    let micro = degrees * 1e6;
+    let whole = micro.round();
+    if (micro - whole).abs() <= 1e-3 {
+        whole / 1e6
+    } else {
+        degrees
+    }
 }
 
 /// Cache key: identifies a specific GRIB message.
@@ -388,8 +422,8 @@ impl DecodedGrid {
         // happens AFTER clamping; a negative `isize as usize` once turned a
         // Finnish bbox into a ~1.8e19-element allocation and a 502.
         let wrap = self.wrap_modulus();
-        let mut c0 = ((west - self.lon_first) / self.lon_inc).floor();
-        let mut c1 = ((east - self.lon_first) / self.lon_inc).ceil();
+        let mut c0 = snap_to_node((west - self.lon_first) / self.lon_inc).floor();
+        let mut c1 = snap_to_node((east - self.lon_first) / self.lon_inc).ceil();
         if !(c0.is_finite() && c1.is_finite()) {
             return None;
         }
@@ -431,16 +465,11 @@ impl DecodedGrid {
         };
 
         // Row range (lat_inc is negative for N→S grids), clamped before cast.
+        let row = |lat: f64| snap_to_node((lat - self.lat_first) / self.lat_inc);
         let (r0, r1) = if self.lat_inc < 0.0 {
-            (
-                ((north - self.lat_first) / self.lat_inc).floor(),
-                ((south - self.lat_first) / self.lat_inc).ceil(),
-            )
+            (row(north).floor(), row(south).ceil())
         } else {
-            (
-                ((south - self.lat_first) / self.lat_inc).floor(),
-                ((north - self.lat_first) / self.lat_inc).ceil(),
-            )
+            (row(south).floor(), row(north).ceil())
         };
         if !(r0.is_finite() && r1.is_finite()) {
             return None;
@@ -457,13 +486,13 @@ impl DecodedGrid {
         // independently would move it 360° ahead of the remaining axis.
         let x_coords: Vec<f64> = positions
             .iter()
-            .map(|&pos| self.lon_first + (pos - column_shift) * self.lon_inc)
+            .map(|&pos| node_coordinate(self.lon_first, pos - column_shift, self.lon_inc))
             .collect();
 
         let ny = row_end - row_start;
         let mut y_coords = Vec::with_capacity(ny);
         for r in row_start..row_end {
-            y_coords.push(self.lat_first + r as f64 * self.lat_inc);
+            y_coords.push(node_coordinate(self.lat_first, r as f64, self.lat_inc));
         }
         // y_coords should be in ascending order for CoverageJSON
         if self.lat_inc < 0.0 {
@@ -1445,5 +1474,107 @@ mod tests {
         // 360.0 is column 0 (the sampler's answer), not the duplicate 1440.
         assert_eq!(&v[..3], &[Some(1439.0), Some(0.0), Some(1.0)]);
         assert_eq!(g.nearest_value(360.0, 0.0), Some(0.0));
+    }
+
+    /// A global grid of `per_degree` nodes per degree from (`lon_first`,
+    /// 90°N), stepping `inc`. `bbox_subset` reads no values, so it has none.
+    fn global_lattice(per_degree: i32, lon_first: f64, inc: f64) -> DecodedGrid {
+        DecodedGrid {
+            ni: (360 * per_degree) as usize,
+            nj: (180 * per_degree + 1) as usize,
+            lon_first,
+            lat_first: 90.0,
+            lon_inc: inc,
+            lat_inc: -inc,
+            values: Arc::new(Vec::new()),
+            triple: (0, 0, 0),
+            centre: 0,
+            first_surface_type: 1,
+            first_surface_value: None,
+            statistic: None,
+            uv_frame: ds_core::wind::VectorFrame::Earth,
+        }
+    }
+
+    /// Nodes `from..=to`, in nodes from 0°, as the f64 nearest each decimal.
+    fn decimal_nodes(from: i32, to: i32, per_degree: i32) -> Vec<f64> {
+        (from..=to)
+            .map(|k| f64::from(k) / f64::from(per_degree))
+            .collect()
+    }
+
+    #[test]
+    fn bbox_edges_on_nodes_keep_exactly_those_nodes() {
+        // #1342: on a 0.1° grid (west − lon_first) / lon_inc lands a hair
+        // off a whole number for many node longitudes, even with the
+        // increment the f64 nearest 0.1, and `floor` then took one more
+        // column outside the bbox. The second increment is what Section 3's
+        // 100 000 microdegrees became as 100 000 × 1e-6, one ulp below 0.1.
+        for inc in [0.1, 100_000.0 * 1e-6] {
+            for lon_first in [180.0, 0.0, -180.0] {
+                let g = global_lattice(10, lon_first, inc);
+                // One turn is whole columns, which the wrap steps by.
+                assert_eq!(g.wrap_modulus(), Some(3600.0), "{inc}");
+                for west in -1800..1795 {
+                    let (w, e) = (f64::from(west) / 10.0, f64::from(west + 5) / 10.0);
+                    let s = g.bbox_subset([w, 60.0, e, 60.0]).unwrap();
+                    assert_eq!(
+                        s.x,
+                        decimal_nodes(west, west + 5, 10),
+                        "{inc} {lon_first} {w}"
+                    );
+                }
+                for south in -900..=895 {
+                    let (s, n) = (f64::from(south) / 10.0, f64::from(south + 5) / 10.0);
+                    let subset = g.bbox_subset([24.0, s, 24.0, n]).unwrap();
+                    assert_eq!(subset.y, decimal_nodes(south, south + 5, 10), "{inc} {s}");
+                    let rows = (900 - south - 5) as usize..(900 - south + 1) as usize;
+                    assert_eq!(subset.rows, rows, "{inc} {s}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seam_box_columns_are_pinned_on_global_grids() {
+        // The seam test box 170,10,−170,20 in both unwrapped forms and its
+        // halves either side of ±180, on a 180°-first (ECMWF) and a
+        // 0°-first (GFS) grid. #1342 left the 0.25° columns as they were:
+        // the axis stays continuous in the requester's frame and each
+        // storage column is the node's longitude modulo one turn.
+        for (per_degree, inc) in [(4, 0.25), (10, 0.1)] {
+            let turn = 360 * per_degree;
+            for lon_first in [180.0, 0.0] {
+                let g = global_lattice(per_degree, lon_first, inc);
+                let first = (lon_first as i32) * per_degree;
+                for [west, east] in [[170, 190], [-190, -170], [170, 180], [-180, -170]] {
+                    let (west, east) = (west * per_degree, east * per_degree);
+                    let s = g
+                        .bbox_subset([
+                            f64::from(west) / f64::from(per_degree),
+                            10.0,
+                            f64::from(east) / f64::from(per_degree),
+                            20.0,
+                        ])
+                        .unwrap();
+                    let context = format!("{inc} {lon_first} {west}..{east}");
+                    assert_eq!(s.x, decimal_nodes(west, east, per_degree), "{context}");
+                    let cols: Vec<usize> = (west..=east)
+                        .map(|k| (k - first).rem_euclid(turn) as usize)
+                        .collect();
+                    assert_eq!(s.cols, cols, "{context}");
+                    assert_eq!(
+                        s.y,
+                        decimal_nodes(10 * per_degree, 20 * per_degree, per_degree),
+                        "{context}"
+                    );
+                    let rows = (70 * per_degree) as usize..(80 * per_degree + 1) as usize;
+                    assert_eq!(s.rows, rows, "{context}");
+                }
+            }
+        }
+        // EDR never asks for it as `west > east`: that is a 400 upstream.
+        let g = global_lattice(4, 180.0, 0.25);
+        assert!(g.bbox_subset([170.0, 10.0, -170.0, 20.0]).is_none());
     }
 }
