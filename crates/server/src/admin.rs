@@ -92,6 +92,7 @@ fn prune_collection_series(removed: &HashSet<&str>) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     counter_state.forget(removed);
+    ds_storage::forget_retryable_responses(removed.iter().copied());
     for (_, prune) in COLLECTION_FAMILIES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -930,6 +931,20 @@ static STORAGE_HOST_THROTTLED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
     .unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
     counter
+});
+// One series per collection, host and status that has had one: the
+// configured collections, the hosts their stores read and a few statuses.
+static STORAGE_RETRYABLE_RESPONSES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "storage_retryable_responses_total",
+            "Answers object_store retries (5xx, 429, 408) from a remote store's host, one \
+             per attempt, by the collection whose request it answered (#1336)",
+        ),
+        &["collection", "host", "status"],
+    )
+    .unwrap();
+    per_collection(counter)
 });
 
 // Lightning strike-window cache (#504) — process-global, byte-bounded LRU of
@@ -7953,6 +7968,30 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
             .with_label_values(&label)
             .inc_by(throttled);
     }
+    // Every remote store's retryable answers (#1336), S3 and HTTP. Only the
+    // accepted config's collections, and the stores no engine named: a
+    // request a removed collection still had in flight cannot bring its
+    // pruned series back. Each series follows its cumulative count, which
+    // only a reload removing its collection resets, together with the
+    // series and under this lock (`prune_collection_series`).
+    let live = state
+        .last_collections
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    for answers in ds_storage::retryable_responses() {
+        let collection = answers.collection.as_deref();
+        if collection.is_some_and(|id| !live.contains_key(id)) {
+            continue;
+        }
+        let status = answers.status.to_string();
+        let series = STORAGE_RETRYABLE_RESPONSES.with_label_values(&[
+            collection.unwrap_or_default(),
+            &answers.host,
+            &status,
+        ]);
+        series.inc_by(answers.count.saturating_sub(series.get()));
+    }
+    drop(live);
     let satellite_engines = state
         .satellite_engines
         .read()
@@ -11977,6 +12016,96 @@ prewarm_sweeps = 0
                 );
             }
         }
+    }
+
+    /// #1336: a remote store's retryable answers are on `/metrics` by the
+    /// collection that read, the host and the status, retries included. A
+    /// store named for a collection the config lacks shows none, and a
+    /// reload that removes a collection drops its series for good: a
+    /// request it still had in flight does not bring them back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retryable_answers_are_counted_per_collection_and_pruned_on_reload() {
+        use std::io::{Read, Write};
+
+        // Answers each request with the next queued status line, else 200.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let queued = Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<&str>::new(),
+        ));
+        let answering = queued.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut head = Vec::new();
+                let mut buf = [0; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let response = match answering.lock().unwrap().pop_front() {
+                    Some(status) => format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                    None => "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd"
+                        .to_string(),
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let read = |collection: &str, statuses: &[&'static str]| {
+            queued.lock().unwrap().extend(statuses);
+            let url = format!("http://{host}/object");
+            let (store, path) = ds_storage::build_http_store(&url).unwrap();
+            let store = store.for_collection(collection);
+            assert_eq!(store.get(&path).unwrap(), &b"abcd"[..]);
+        };
+        let line = |id: &str, status: u16| {
+            format!(
+                "storage_retryable_responses_total\
+                 {{collection=\"{id}\",host=\"{host}\",status=\"{status}\"}}"
+            )
+        };
+
+        let radar = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/radar-tm35fin");
+        let geotiff = |id: &str| {
+            format!(
+                "[[collections]]\nid = \"{id}\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 data_path = \"{radar}\"\nengine_type = \"geotiff\"\napis = [\"wms\"]\n\
+                 [collections.geotiff]\nfilename_template = \"radar_tm35_%Y%m%dT%H%MZ.tif\"\n\
+                 parameter = \"reflectivity\"\nunit = \"dBZ\"\n"
+            )
+        };
+        let (kept, gone) = ("retryable-kept", "retryable-gone");
+        let server = "[server]\nhost = \"127.0.0.1\"\nport = 8000\n";
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            [server, &geotiff(kept), &geotiff(gone)].concat(),
+        )
+        .unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+
+        read(kept, &["503 Slow Down"]);
+        read(gone, &["502 Bad Gateway", "502 Bad Gateway"]);
+        read("retryable-unconfigured", &["503 Slow Down"]);
+        let text = scrape(&state).await;
+        assert_eq!(series_of(&text, kept).get(&line(kept, 503)), Some(&1.0));
+        assert_eq!(series_of(&text, gone).get(&line(gone, 502)), Some(&2.0));
+        assert!(!text.contains("retryable-unconfigured"), "{text}");
+        read(kept, &["503 Slow Down"]);
+        let text = scrape(&state).await;
+        assert_eq!(series_of(&text, kept).get(&line(kept, 503)), Some(&2.0));
+
+        std::fs::write(&config_path, [server, &geotiff(kept)].concat()).unwrap();
+        super::do_reload(&state).unwrap();
+        read(gone, &["502 Bad Gateway"]);
+        let text = scrape(&state).await;
+        assert!(!text.contains(&format!("collection=\"{gone}\"")), "{text}");
+        assert_eq!(series_of(&text, kept).get(&line(kept, 503)), Some(&2.0));
     }
 
     #[test]
