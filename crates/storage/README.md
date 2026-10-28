@@ -306,7 +306,7 @@ retry delay a hundred times faster, for other crates' tests against a real
 server that answers 429; this crate's own tests pin the real times on a
 paused clock.
 S3 is out of scope: it throttles with 503 SlowDown, which object_store
-retries.
+retries. Those answers are counted (Retryable answers, below), not backed off.
 
 # The storage span
 
@@ -341,3 +341,29 @@ collection, so an operation is in exactly one `storage` span, and stores of
 one host limit that name different collections still share that limit
 (`DataStore::same_store`). `inner()` returns the store with the span, for
 callers that hand it to another library.
+
+# Retryable answers
+
+object_store retries a 5xx, a 429 and a 408 with back-off, from 0.1 s
+doubling, and a public S3 bucket answers `503 SlowDown` to a large share
+of GETs once a few are in flight. So every remote store this crate builds
+counts those answers (`retryable.rs`, #1336): an HTTP store's transport
+under its host's throttle, an S3 store's through `CountingConnector`,
+object_store's own reqwest client built from the store's options. It sees
+the response to every attempt, object_store's retries and the document
+layer's included, and counts a retryable one by:
+
+- `collection`: the one the operation's `storage` span names. The span's
+  layer sets it for the transport, around the operation and each poll of
+  its GET body or listing, so collections that share one host's store are
+  counted apart. `None` for a store no engine has named.
+- `host`: the `host[:port]` that answered, from the request's URL: never
+  its userinfo, path or query.
+- `status`: the status code.
+
+`retryable_responses()` reads the counts, for the server's
+`storage_retryable_responses_total{collection,host,status}` in the
+dashboard's Remote reads row. `forget_retryable_responses(ids)` drops
+the counts of collections a reload removed. A store built elsewhere
+and labelled with `DataStore::remote` is not counted: its transport is not
+this crate's.

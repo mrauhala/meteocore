@@ -250,6 +250,13 @@ need no reload pruning.
   removed, after the engine lists are swapped and under the scrape's
   counter-state lock, so no scrape re-creates the series; their counter
   state goes too.
+- `storage_retryable_responses_total{collection,host,status}` (#1336) is fed
+  from ds-storage's process-wide counts (`ds_storage::retryable_responses`),
+  not from an engine list: the scrape exports only ids in `last_collections`
+  (plus `collection=""`, stores no engine named), so a removed collection's
+  in-flight request cannot re-create its series, and `prune_collection_series`
+  also calls `ds_storage::forget_retryable_responses`. Each series follows the
+  cumulative count (`inc_by(count - series.get())`) under the counter-state lock.
 - `process_start_time_seconds` comes from `admin::record_process_start`,
   the first call in `main`.
 - Churn families (#1308) come from `ChurnMetricSet`, a field of

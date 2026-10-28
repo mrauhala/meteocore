@@ -399,9 +399,12 @@ impl ObjectStore for MetaStore {
     }
 }
 
-/// The object a [`RangeServer`] serves at `/object`.
+/// The object a [`RangeServer`] serves.
 #[derive(Debug)]
 pub(crate) struct RangeObject {
+    /// Where: `/object`, or `/bucket/object` for an S3 store's path-style
+    /// request.
+    pub path: String,
     pub body: Vec<u8>,
     pub last_modified: DateTime<Utc>,
     /// Answer a GET whatever its `If-Unmodified-Since`, as a server that
@@ -420,11 +423,11 @@ pub(crate) struct RangeObject {
 }
 
 /// A one-object HTTP/1.1 server on 127.0.0.1, for the range read tests:
-/// HEAD and ranged GET (206) of `/object`, whatever the query string, a
-/// 412 when the object was modified after a request's
-/// `If-Unmodified-Since`, a 416 for a range starting past its end, and a
-/// 404 for any other path. One connection at a time, each closed after its
-/// response.
+/// HEAD and ranged GET (206) of the object, at `/object` unless the test
+/// moves it, whatever the query string, a 412 when the object was modified
+/// after a request's `If-Unmodified-Since`, a 416 for a range starting
+/// past its end, and a 404 for any other path. One connection at a time,
+/// each closed after its response.
 pub(crate) struct RangeServer {
     pub url: String,
     pub object: Arc<Mutex<RangeObject>>,
@@ -439,6 +442,7 @@ impl RangeServer {
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let object = Arc::new(Mutex::new(RangeObject {
+            path: "/object".to_string(),
             body: body.to_vec(),
             last_modified,
             ignore_preconditions: false,
@@ -513,7 +517,7 @@ fn respond(object: &mut RangeObject, request: &str) -> Vec<u8> {
     };
     let status =
         |code: &str| format!("HTTP/1.1 {code}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-    if path != "/object" {
+    if path != object.path {
         return status("404 Not Found").into_bytes();
     }
     if let Some(code) = object.fail_next.pop_front().or(object.status) {

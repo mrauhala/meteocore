@@ -30,7 +30,7 @@
 //!
 //! [`throttled_answers`] counts each host's 429s, for its callers and
 //! `/metrics`. S3 stores are not throttled here: S3 answers 503 SlowDown,
-//! which object_store retries.
+//! which object_store retries and `retryable.rs` counts (#1336).
 
 mod limit;
 #[cfg(test)]

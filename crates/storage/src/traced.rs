@@ -9,11 +9,16 @@
 //! operation: the request and object_store's retries, and the body stream
 //! of a GET or the stream of a LIST, where object_store retries body reads.
 //!
+//! The layer also sets the collection for the store's transport to count
+//! the answers object_store retries under (`retryable.rs`, #1336), for the
+//! same operation and the same body and listing polls.
+//!
 //! [`crate::DataStore`] keeps its store without this layer and rebuilds the
 //! layer when it is limited or names its collection, so one operation has
 //! exactly one `storage` span. Local and in-memory stores have no layer:
 //! they never retry.
 
+use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,6 +32,8 @@ use object_store::{
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
 };
 use tracing::Instrument;
+
+use crate::retryable::COLLECTION;
 
 /// What the `storage` span names.
 #[derive(Debug, Clone)]
@@ -102,13 +109,29 @@ impl Traced {
             path = path.map(|path| -> &str { path.as_ref() }),
         )
     }
+
+    /// `operation` inside `span`, with the collection set for the
+    /// transport ([`COLLECTION`]).
+    fn run<F: Future>(&self, span: tracing::Span, operation: F) -> impl Future<Output = F::Output> {
+        COLLECTION.scope(self.labels.collection.clone(), operation.instrument(span))
+    }
+
+    /// `inner`, polled inside `span` with the collection set.
+    fn in_span<T>(&self, span: tracing::Span, inner: BoxStream<'static, Result<T>>) -> InSpan<T> {
+        InSpan {
+            inner,
+            span,
+            collection: self.labels.collection.clone(),
+        }
+    }
 }
 
-/// A stream polled inside `span`: a GET body or a LIST, whose retries run
-/// while it is polled.
+/// A stream polled inside `span` with `collection` set: a GET body or a
+/// LIST, whose retries run while it is polled.
 struct InSpan<T> {
     inner: BoxStream<'static, Result<T>>,
     span: tracing::Span,
+    collection: Option<Arc<str>>,
 }
 
 impl<T> Stream for InSpan<T> {
@@ -117,7 +140,7 @@ impl<T> Stream for InSpan<T> {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
         let _entered = this.span.enter();
-        this.inner.poll_next_unpin(cx)
+        COLLECTION.sync_scope(this.collection.clone(), || this.inner.poll_next_unpin(cx))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -139,9 +162,8 @@ impl ObjectStore for Traced {
         payload: PutPayload,
         options: PutOptions,
     ) -> Result<PutResult> {
-        self.inner
-            .put_opts(location, payload, options)
-            .instrument(self.span(Some(location)))
+        let span = self.span(Some(location));
+        self.run(span, self.inner.put_opts(location, payload, options))
             .await
     }
 
@@ -150,22 +172,19 @@ impl ObjectStore for Traced {
         location: &Path,
         options: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        self.inner
-            .put_multipart_opts(location, options)
-            .instrument(self.span(Some(location)))
+        let span = self.span(Some(location));
+        self.run(span, self.inner.put_multipart_opts(location, options))
             .await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let span = self.span(Some(location));
         let mut result = self
-            .inner
-            .get_opts(location, options)
-            .instrument(span.clone())
+            .run(span.clone(), self.inner.get_opts(location, options))
             .await?;
         result.payload = match result.payload {
             GetResultPayload::Stream(inner) => {
-                GetResultPayload::Stream(InSpan { inner, span }.boxed())
+                GetResultPayload::Stream(self.in_span(span, inner).boxed())
             }
             local => local,
         };
@@ -173,9 +192,8 @@ impl ObjectStore for Traced {
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        self.inner
-            .get_ranges(location, ranges)
-            .instrument(self.span(Some(location)))
+        let span = self.span(Some(location));
+        self.run(span, self.inner.get_ranges(location, ranges))
             .await
     }
 
@@ -185,13 +203,13 @@ impl ObjectStore for Traced {
     ) -> BoxStream<'static, Result<Path>> {
         let span = self.span(None);
         let inner = span.in_scope(|| self.inner.delete_stream(locations));
-        InSpan { inner, span }.boxed()
+        self.in_span(span, inner).boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         let span = self.span(prefix);
         let inner = span.in_scope(|| self.inner.list(prefix));
-        InSpan { inner, span }.boxed()
+        self.in_span(span, inner).boxed()
     }
 
     fn list_with_offset(
@@ -201,27 +219,23 @@ impl ObjectStore for Traced {
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         let span = self.span(prefix);
         let inner = span.in_scope(|| self.inner.list_with_offset(prefix, offset));
-        InSpan { inner, span }.boxed()
+        self.in_span(span, inner).boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        self.inner
-            .list_with_delimiter(prefix)
-            .instrument(self.span(prefix))
-            .await
+        let span = self.span(prefix);
+        self.run(span, self.inner.list_with_delimiter(prefix)).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        self.inner
-            .copy_opts(from, to, options)
-            .instrument(self.span(Some(from)))
+        let span = self.span(Some(from));
+        self.run(span, self.inner.copy_opts(from, to, options))
             .await
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-        self.inner
-            .rename_opts(from, to, options)
-            .instrument(self.span(Some(from)))
+        let span = self.span(Some(from));
+        self.run(span, self.inner.rename_opts(from, to, options))
             .await
     }
 }
@@ -238,9 +252,14 @@ mod tests {
 
     /// An in-memory store whose GET bodies and LISTs log a line each time
     /// they yield, as object_store's body-read retries do while a body is
-    /// polled.
+    /// polled, with the collection a retryable answer would count under
+    /// then.
     #[derive(Debug, Default)]
     struct Chatty(InMemory);
+
+    fn counted_as() -> Option<Arc<str>> {
+        COLLECTION.try_with(Clone::clone).ok().flatten()
+    }
 
     impl std::fmt::Display for Chatty {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -271,8 +290,10 @@ mod tests {
             let mut result = self.0.get_opts(location, options).await?;
             result.payload = match result.payload {
                 GetResultPayload::Stream(body) => GetResultPayload::Stream(
-                    body.inspect(|_| tracing::info!(target: "chatty", "body"))
-                        .boxed(),
+                    body.inspect(|_| {
+                        tracing::info!(target: "chatty", counted_as = counted_as().as_deref(), "body")
+                    })
+                    .boxed(),
                 ),
                 local => local,
             };
@@ -289,7 +310,9 @@ mod tests {
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
             self.0
                 .list(prefix)
-                .inspect(|_| tracing::info!(target: "chatty", "listed"))
+                .inspect(|_| {
+                    tracing::info!(target: "chatty", counted_as = counted_as().as_deref(), "listed")
+                })
                 .boxed()
         }
 
@@ -333,8 +356,9 @@ mod tests {
         Arc::new(chatty)
     }
 
-    /// A GET body and a LIST are polled inside the operation's span, after
-    /// the call that made them has returned.
+    /// A GET body and a LIST are polled inside the operation's span, with
+    /// the collection set for the transport, after the call that made them
+    /// has returned.
     #[tokio::test]
     async fn bodies_and_listings_are_polled_inside_the_span() {
         let store = DataStore::remote(chatty().await, "example.test").for_collection("radar");
@@ -352,14 +376,17 @@ mod tests {
         assert_eq!(lines[0]["span"], span("dir/obj"));
         assert_eq!(lines[1]["message"], "listed");
         assert_eq!(lines[1]["span"], span("dir"));
+        assert!(lines.iter().all(|line| line["counted_as"] == "radar"));
     }
 
-    /// A store built without a source, local or in memory, has no span.
+    /// A store built without a source, local or in memory, has no span and
+    /// sets no collection.
     #[tokio::test]
     async fn a_store_without_a_source_has_no_span() {
         let store = DataStore::new(chatty().await).for_collection("radar");
         let lines = read_and_list(&store).await;
         assert_eq!(lines.len(), 2, "{lines:#?}");
         assert!(lines.iter().all(|line| line.get("span").is_none()));
+        assert!(lines.iter().all(|line| line.get("counted_as").is_none()));
     }
 }

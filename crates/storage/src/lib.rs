@@ -8,6 +8,7 @@ pub mod discovery;
 mod document;
 mod error;
 mod gauge;
+mod retryable;
 #[cfg(test)]
 mod test_store;
 #[cfg(any(test, feature = "test-util"))]
@@ -32,6 +33,7 @@ pub use bytes;
 pub use error::StorageError;
 pub use gauge::HostRequests;
 pub use object_store;
+pub use retryable::{forget_retryable_responses, retryable_responses, RetryableResponses};
 pub use throttle::throttled_answers;
 
 /// Widen a byte range for `object_store`, which switched `get_range` from
@@ -1598,6 +1600,7 @@ pub fn build_s3_store_from_parts(
         .with_endpoint(endpoint)
         .with_allow_http(allow_http)
         .with_skip_signature(true)
+        .with_http_connector(retryable::CountingConnector)
         .build()
         .map_err(|e| {
             DataServerError::Storage(format!(
@@ -1648,7 +1651,9 @@ fn build_s3_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServer
         None => (without_scheme, ""),
     };
 
-    let builder = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+    let builder = object_store::aws::AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .with_http_connector(retryable::CountingConnector);
     // The endpoint and region object_store will use (`AWS_ENDPOINT_URL_S3`
     // over `AWS_ENDPOINT`), for the span's label only.
     let config = |key| builder.get_config_value(&key);
@@ -1731,7 +1736,9 @@ fn build_s3_from_http_url(data_path: &str) -> Result<(DataStore, ObjectPath), Da
         .with_allow_http(url.scheme() == "http");
 
     // For public buckets, skip signing
-    builder = builder.with_skip_signature(true);
+    builder = builder
+        .with_skip_signature(true)
+        .with_http_connector(retryable::CountingConnector);
 
     let store = builder
         .build()
@@ -1985,13 +1992,14 @@ fn http_object_store(base_url: &url::Url) -> Result<Arc<dyn ObjectStore>, DataSe
 
 /// An HTTP object store on `base_url` sending every request, object_store's
 /// retries included, through `transport` under the throttle of the base's
-/// scheme, host and port ([`throttle`]).
+/// scheme, host and port ([`throttle`]), each retryable answer counted
+/// ([`retryable`]).
 fn throttled_http_store<S: object_store::client::HttpService + Clone>(
     base_url: &url::Url,
     transport: S,
 ) -> Result<Arc<dyn ObjectStore>, DataServerError> {
     let throttled = throttle::Throttled {
-        inner: transport,
+        inner: retryable::Counted(transport),
         host: throttle::for_url(base_url),
     };
     let connector = NoRedirectConnector(throttled.clone());
