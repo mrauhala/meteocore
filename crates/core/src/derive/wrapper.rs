@@ -2,6 +2,7 @@
 //! `MapEngine` + `EdrEngine`, the way a nowcast wraps its source.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use chrono::{DateTime, Utc};
@@ -26,6 +27,8 @@ use crate::wind::{OutcomeLog, WindFacts, WindSource};
 type Times = Arc<[DateTime<Utc>]>;
 type Datetime = Option<(DateTime<Utc>, DateTime<Utc>)>;
 type OutcomeKey = (&'static str, String, String);
+/// The valid time and model run a frame is rendered at.
+type TimeAndRun = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
 /// An engine with parameters derived from its own (wind speed and direction
 /// from u/v components, #897; geopotential height from geopotential, #948;
@@ -185,37 +188,7 @@ impl Derived {
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let names: Vec<&str> = d.inputs.iter().map(String::as_str).collect();
-        // One input renders as the engine renders it. Several render from
-        // one run: the one the cache key names
-        // (`resolve_parameter_reference_time`). Unpinned, an engine whose
-        // run depends on the parameter would otherwise pick one for each,
-        // and pair a new run's u with an older run's v (#1026).
-        let (time, reference_time) = if names.len() < 2 {
-            (time, reference_time)
-        } else {
-            let reference_time = reference_time.or_else(|| {
-                self.map
-                    .resolve_parameters_reference_time(&names, time, None)
-            });
-            // Inputs on time axes of their own render from one timestep
-            // they share: the one the cache key names
-            // (`resolve_parameter_time`).
-            let time = if names.iter().any(|p| self.map.parameter_times(p).is_some()) {
-                let shared = self
-                    .map
-                    .resolve_parameters_time(&names, time, reference_time)
-                    .ok_or_else(|| {
-                        DataServerError::InvalidParameter(format!(
-                            "{} share no timestep",
-                            DerivedParameter::quoted(&d.inputs)
-                        ))
-                    })?;
-                Some(shared)
-            } else {
-                time
-            };
-            (time, reference_time)
-        };
+        let (time, reference_time) = self.input_frame(d, &names, time, reference_time)?;
         // The pressure of the level the inputs are drawn at, in Pa.
         let pressure = if d.formula.reads_level_pressure() {
             Some(self.level_pressure(d, names[0], z, time, reference_time)?)
@@ -282,6 +255,49 @@ impl Derived {
             height,
             values: RasterValues::F32 { data, nodata: None },
         })
+    }
+
+    /// The time and run `d`'s inputs (`names`) render at for a request at
+    /// `time` and `reference_time`. `derived_tile` and
+    /// `content_version_for` share it, so a version names the input frames
+    /// rendered (#1334).
+    ///
+    /// One input renders as the engine renders it. Several render from one
+    /// run: the one the cache key names (`resolve_parameter_reference_time`).
+    /// Unpinned, an engine whose run depends on the parameter would
+    /// otherwise pick one for each, and pair a new run's u with an older
+    /// run's v (#1026).
+    fn input_frame(
+        &self,
+        d: &DerivedParameter,
+        names: &[&str],
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<TimeAndRun, DataServerError> {
+        if names.len() < 2 {
+            return Ok((time, reference_time));
+        }
+        let reference_time = reference_time.or_else(|| {
+            self.map
+                .resolve_parameters_reference_time(names, time, None)
+        });
+        // Inputs on time axes of their own render from one timestep they
+        // share: the one the cache key names (`resolve_parameter_time`).
+        let time = if names.iter().any(|p| self.map.parameter_times(p).is_some()) {
+            let shared = self
+                .map
+                .resolve_parameters_time(names, time, reference_time)
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!(
+                        "{} share no timestep",
+                        DerivedParameter::quoted(&d.inputs)
+                    ))
+                })?;
+            Some(shared)
+        } else {
+            time
+        };
+        Ok((time, reference_time))
     }
 
     /// The pressure, in Pa, of the isobaric level the engine draws `input`
@@ -619,6 +635,23 @@ fn level_pressures(domain: &DomainDescription, range: &NdArray) -> Option<Vec<f6
         .then(|| hpa.into_iter().map(|p| p * 100.0).collect())
 }
 
+/// The content version of a frame drawn from several frames: `0` while none
+/// of theirs is ever revised, so an immutable engine keeps `immutable`
+/// responses, else a nonzero hash that moves with any of them.
+fn combined_version(versions: impl IntoIterator<Item = u64>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut revised = false;
+    for version in versions {
+        revised |= version != 0;
+        version.hash(&mut hasher);
+    }
+    if revised {
+        hasher.finish().max(1)
+    } else {
+        0
+    }
+}
+
 fn description(d: &DerivedParameter) -> ParameterDescription {
     ParameterDescription {
         label: d.title.clone(),
@@ -817,6 +850,34 @@ impl MapEngine for Derived {
 
     fn content_version(&self) -> u64 {
         self.map.content_version()
+    }
+
+    /// A derived parameter is drawn from its inputs' frames: their versions
+    /// at the time and run `derived_tile` renders them at, combined, so a
+    /// change to any input's message moves it (#1334). Every other layer is
+    /// the wrapped engine's.
+    fn content_version_for(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+        z: Option<f64>,
+    ) -> u64 {
+        let plan = self.plan();
+        let Some(d) = parameter.and_then(|p| plan.get(p)) else {
+            return self
+                .map
+                .content_version_for(parameter, time, reference_time, z);
+        };
+        let names: Vec<&str> = d.inputs.iter().map(String::as_str).collect();
+        match self.input_frame(d, &names, time, reference_time) {
+            Ok((time, reference_time)) => combined_version(names.iter().map(|&input| {
+                self.map
+                    .content_version_for(Some(input), time, reference_time, z)
+            })),
+            // The render fails the same way and caches nothing.
+            Err(_) => self.map.content_version(),
+        }
     }
 
     fn parameter_times(&self, parameter: &str) -> Option<Times> {

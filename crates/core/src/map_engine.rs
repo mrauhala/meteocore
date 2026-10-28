@@ -1006,8 +1006,43 @@ pub trait MapEngine: Send + Sync {
     /// revalidating `Cache-Control` for explicit-`TIME` responses. **O(1)
     /// from a snapshot** — this runs on the hot render path before the
     /// cache lookup.
+    ///
+    /// This is the collection-wide value: the API layers read it through
+    /// [`Self::content_version_for`], whose default it is.
     fn content_version(&self) -> u64 {
         0
+    }
+
+    /// [`Self::content_version`] for one frame: a value that changes
+    /// whenever the pixels [`Self::get_raster_tile`] renders for this
+    /// `parameter`, `time`, `reference_time` and `z` can change. The API
+    /// layers pass the arguments they render with, the time and run
+    /// resolved by [`Self::resolve_parameter_time`] and
+    /// [`Self::resolve_parameter_reference_time`] and the requested `z`, and
+    /// key the rendered and meta-tile caches on the result.
+    ///
+    /// An engine whose collection-wide version moves with every catalog
+    /// change, while most frames keep their pixels, overrides this so that
+    /// a change orphans only the frames it touches (#1334). GRIB hashes the
+    /// identity of the message the render reads, selected through the SAME
+    /// helpers `get_raster_tile` uses: share them so the two cannot drift.
+    /// A wrapper that derives a layer from other parameters combines their
+    /// versions; every wrapper forwards it.
+    ///
+    /// The same rules as [`Self::content_version`]: `0` only for content
+    /// never revised in place, and unchanged when nothing the frame draws
+    /// changed. Default: [`Self::content_version`]. **From a snapshot, no
+    /// I/O**: it runs on the hot render path before the cache lookup, hits
+    /// included.
+    fn content_version_for(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+        z: Option<f64>,
+    ) -> u64 {
+        let _ = (parameter, time, reference_time, z);
+        self.content_version()
     }
 
     /// The timesteps of one parameter, when a multi-parameter collection's
@@ -1637,6 +1672,42 @@ mod tests {
         }
         assert!(Plain.composites().is_empty());
         assert!(Arc::ptr_eq(&Plain.composites(), &Plain.composites()));
+    }
+
+    /// By default every frame's version is the collection's (#1334): an
+    /// immutable engine stays `0`, a revised one keeps its value.
+    #[test]
+    fn default_content_version_for_is_the_collections() {
+        struct Revised(u64);
+        impl MapEngine for Revised {
+            fn get_raster_tile(
+                &self,
+                _: [f64; 4],
+                _: u32,
+                _: u32,
+                _: Option<DateTime<Utc>>,
+                _: &OutputCrs,
+                _: Option<&str>,
+                _: Option<f64>,
+                _: Option<DateTime<Utc>>,
+            ) -> Result<RasterTile, DataServerError> {
+                unreachable!()
+            }
+            fn raster_info(&self) -> RasterInfo {
+                unreachable!()
+            }
+            fn content_version(&self) -> u64 {
+                self.0
+            }
+        }
+        for version in [0, 7] {
+            let engine = Revised(version);
+            assert_eq!(engine.content_version_for(None, None, None, None), version);
+            assert_eq!(
+                engine.content_version_for(Some("t"), Some(hour(1)), Some(hour(0)), Some(850.0)),
+                version
+            );
+        }
     }
 
     /// By default a map draws the requested level, else the first

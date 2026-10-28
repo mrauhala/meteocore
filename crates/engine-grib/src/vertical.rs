@@ -62,12 +62,16 @@ impl GribEngine {
 
     pub(crate) fn keys_at_level(keys: &ParameterKeys, level: Option<f64>) -> ParameterKeys {
         let mut keys = keys.clone();
-        if let Some(level) = level {
-            for key in keys.values_mut() {
-                key.level = Some(level as u32);
-            }
+        for key in keys.values_mut() {
+            key.level = Self::key_level(key, level);
         }
         keys
+    }
+
+    /// The level [`Self::keys_at_level`] moves `key` to: `level`, else the
+    /// key's own.
+    pub(crate) fn key_level(key: &ParameterKey, level: Option<f64>) -> Option<u32> {
+        level.map_or(key.level, |level| Some(level as u32))
     }
 
     pub(crate) fn validate_parameters(
@@ -269,6 +273,13 @@ mod tests {
             let single_version = single.content_version();
             assert_ne!(version, 0, "explicit-TIME responses must revalidate");
             assert_eq!(render(None) as f32, -23.15);
+            // The version the map caches key one frame on (#1334).
+            let frame = |engine: &GribEngine, z| {
+                engine.content_version_for(Some("TMP"), Some(reference), Some(reference), z)
+            };
+            let drawn = frame(view, None);
+            let single_frame = frame(single, None);
+            assert_ne!(drawn, 0, "explicit-TIME responses must revalidate");
 
             source.write(
                 "later",
@@ -299,6 +310,17 @@ mod tests {
             assert_eq!(render(Some(first_level)) as f32, -23.15);
             assert_ne!(view.content_version(), version);
             assert_eq!(single.content_version(), single_version);
+            // The frame without z draws the late level now, and its version
+            // moves with it; the first level's frame still draws its message.
+            let later_level = if family == GribLevelType::Pressure {
+                850.0
+            } else {
+                137.0
+            };
+            assert_ne!(frame(view, None), drawn);
+            assert_eq!(frame(view, None), frame(view, Some(later_level)));
+            assert_eq!(frame(view, Some(first_level)), drawn);
+            assert_eq!(frame(single, None), single_frame);
 
             let updated = view.content_version();
             // A new file in another family forces catalog rebuilding, but
@@ -311,6 +333,8 @@ mod tests {
             engine.scan_once().unwrap();
             assert_eq!(view.content_version(), updated);
             assert_ne!(single.content_version(), single_version);
+            // The single view's frame does not draw the new product.
+            assert_eq!(frame(single, None), single_frame);
             engine.scan_once().unwrap();
             assert_eq!(view.content_version(), updated);
         }
@@ -353,6 +377,14 @@ mod tests {
                 .unwrap()
             };
             let version = view.content_version();
+            // One frame's version, at the time and run the API layers
+            // resolve and render (#1334).
+            let frame = || {
+                let run = view.resolve_parameter_reference_time(Some("TMP"), None, None);
+                let time = view.resolve_parameter_time(Some("TMP"), None, run);
+                view.content_version_for(Some("TMP"), time, run, None)
+            };
+            let drawn = frame();
             assert_eq!(render() as f32, 6.85);
             source.write(
                 "air",
@@ -362,6 +394,7 @@ mod tests {
             engine.scan_once().unwrap();
             assert_eq!(render() as f32, 16.85);
             assert_ne!(view.content_version(), version);
+            assert_ne!(frame(), drawn, "the frame draws the new canonical level");
         }
     }
 

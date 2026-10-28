@@ -518,6 +518,11 @@ fn a_height_resolves_as_its_geopotential() {
     // The wind speed keeps the plural selection over u and v together.
     assert_eq!(rt("10si"), Some(hour(9)));
     assert_eq!(t("10si"), Some(hour(9)));
+    // Over an engine that never revises a frame, a derived frame is never
+    // revised either: its explicit-TIME responses stay immutable (#1334).
+    for p in ["gh", "10si"] {
+        assert_eq!(derived.content_version_for(Some(p), t(p), rt(p), None), 0);
+    }
 }
 
 /// #1100: the wrapper forwards the wrapped engine's feature picks, and a

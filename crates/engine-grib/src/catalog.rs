@@ -48,9 +48,13 @@ fn is_near_surface(levtype: &str, level: Option<u32>) -> bool {
 
 impl ParameterKey {
     pub fn matches(&self, message: &MessageEntry) -> bool {
-        self.param == message.param
-            && self.levtype == message.levtype
-            && self.level == message.level
+        self.matches_at(message, self.level)
+    }
+
+    /// [`Self::matches`] with `level` in place of the key's own: a map
+    /// field at the level it is drawn at, without a copy of the key.
+    pub fn matches_at(&self, message: &MessageEntry, level: Option<u32>) -> bool {
+        self.param == message.param && self.levtype == message.levtype && level == message.level
     }
 }
 
