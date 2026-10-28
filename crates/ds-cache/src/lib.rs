@@ -50,6 +50,28 @@ pub fn env_mb(var: &str, default_mb: u64) -> u64 {
     parse_env_mb(var).unwrap_or(default_mb)
 }
 
+/// The hot share for a one-shard cache of `capacity_bytes` whose cold ring
+/// keeps a fill of `entry_bytes` until its next read:
+/// `1 − 1.1 × entry_bytes / capacity_bytes`, at most `quick_cache`'s
+/// default `0.97` (#1332).
+///
+/// Once the hot ring is full, `quick_cache` admits a new entry to the cold
+/// ring. A single-flight fill ([`ByteBoundedCache::get_or_insert_with`] and
+/// the other claims) links the entry there before it evicts, oldest first,
+/// so a fill heavier than the room the hot ring leaves evicts itself,
+/// unread. The default leaves 3 % of the budget. A cache too small to give
+/// the cold ring that room and still admit the entry to the hot ring
+/// (under 2.1 entries) keeps the default.
+pub fn hot_allocation_holding(capacity_bytes: u64, entry_bytes: u64) -> f64 {
+    let share = entry_bytes as f64 / capacity_bytes.max(1) as f64;
+    let hot = 1.0 - 1.1 * share;
+    if hot < share {
+        churn::DEFAULT_HOT_ALLOCATION
+    } else {
+        hot.min(churn::DEFAULT_HOT_ALLOCATION)
+    }
+}
+
 /// `var` trimmed and parsed as a whole number, if it is set to one.
 fn parse_env_mb(var: &str) -> Option<u64> {
     std::env::var(var)
@@ -214,9 +236,12 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// first-out unless an entry was read while there (it is then promoted
     /// to hot). Under the default, once the first 97 % of the budget has
     /// been inserted, every later entry that is not read soon competes for
-    /// the remaining 3 %. A cache filled ahead of reads (a background
-    /// pre-warm) needs a lower value so fresh entries survive until they
-    /// are wanted (#992).
+    /// the remaining 3 %. A miss of a key the cold ring evicted recently is
+    /// admitted to the hot ring, so an evicted working set sticks only over
+    /// repeats. A cache filled ahead of reads (a background pre-warm) needs
+    /// a lower value so fresh entries survive until they are wanted (#992);
+    /// a caller that will read an entry again can instead [`Self::keep`]
+    /// it.
     ///
     /// The cost: `quick_cache` never admits an entry heavier than the hot
     /// target of its shard, `hot_allocation × capacity / shards`. Shards are
@@ -258,6 +283,29 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         weigh: fn(&K, &V) -> u64,
     ) -> Self {
         Self::build(capacity_bytes, approx_entry_bytes, weigh, Some(1), None)
+    }
+
+    /// [`Self::new_single_shard`] with `hot_allocation` (in `(0, 1]`) of the
+    /// budget as the hot ring's target, as [`Self::new_with_hot_allocation`]
+    /// describes. [`hot_allocation_holding`] picks one whose cold ring keeps
+    /// a fill until its next read.
+    pub fn new_single_shard_with_hot_allocation(
+        capacity_bytes: u64,
+        approx_entry_bytes: u64,
+        weigh: fn(&K, &V) -> u64,
+        hot_allocation: f64,
+    ) -> Self {
+        assert!(
+            hot_allocation > 0.0 && hot_allocation <= 1.0,
+            "hot_allocation must be in (0, 1], got {hot_allocation}"
+        );
+        Self::build(
+            capacity_bytes,
+            approx_entry_bytes,
+            weigh,
+            Some(1),
+            Some(hot_allocation),
+        )
     }
 
     fn build(
@@ -383,6 +431,30 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         Q: Hash + Equivalent<K> + ?Sized,
     {
         self.inner.cache.get(key)
+    }
+
+    /// Keep `value`, just filled for `key`, until its filler reads it again
+    /// (#1340), counting no hit. For an entry the filler samples from its
+    /// own copy now: unread, it waits in the cold ring and is evicted when
+    /// later fills reach it. Marked read, it is promoted to the hot ring
+    /// instead. Concurrent fills can evict it before the mark, when their
+    /// burst outweighs the cold ring: it is then inserted again, which
+    /// `quick_cache` admits to the hot ring for a key it evicted recently,
+    /// and an insert never evicts its own entry. An entry heavier than the
+    /// hot target was refused, not evicted, and stays out. Fills not kept
+    /// leave the cache resistant to a scan of one-off reads.
+    pub fn keep(&self, key: K, value: V)
+    where
+        K: Clone,
+    {
+        if self.inner.cache.get(&key).is_some() {
+            return;
+        }
+        if self.inner.lifecycle.weigh(&key, &value) > self.inner.counters().hot_target() {
+            return;
+        }
+        self.insert(key.clone(), value);
+        let _ = self.inner.cache.get(&key);
     }
 
     /// Whether `key` is resident — no recency bump, no counter change.
@@ -792,6 +864,167 @@ mod tests {
     #[should_panic(expected = "hot_allocation must be in (0, 1]")]
     fn zero_hot_allocation_is_rejected() {
         let _ = ByteBoundedCache::new_with_hot_allocation(MIB, 1024, weigh_declared, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "hot_allocation must be in (0, 1]")]
+    fn a_single_shard_hot_allocation_over_one_is_rejected() {
+        let _ =
+            ByteBoundedCache::new_single_shard_with_hot_allocation(MIB, 1024, weigh_declared, 1.5);
+    }
+
+    /// A 0.1° global field decoded to f32, as the GRIB grid cache weighs it.
+    const TENTH_DEGREE_GRID: u64 = 25_934_700;
+
+    /// Fill `key` through a single-flight claim, as a cache's readers do.
+    fn fill(cache: &ByteBoundedCache<String, u64>, key: &str, weight: u64) {
+        let _ = cache.get_or_insert_with(&key.to_string(), || Ok::<_, ()>(weight));
+    }
+
+    /// #1332: once the hot ring is full, a fill heavier than the room it
+    /// leaves evicts itself. At the default 0.97, 256 MiB holds ten 0.1°
+    /// grids in the hot ring, leaves 8.7 MiB, and keeps neither of the next
+    /// two; a plain insert evicts before it links, so it keeps its own.
+    /// [`hot_allocation_holding`] leaves room for one.
+    #[test]
+    fn a_fill_heavier_than_the_cold_ring_evicts_itself() {
+        let resident = |cache: &ByteBoundedCache<String, u64>| {
+            (0..12)
+                .filter(|i| cache.contains_key(&format!("grid{i}")))
+                .collect::<Vec<_>>()
+        };
+        let default = ByteBoundedCache::new_single_shard(256 * MIB, 4 * MIB, weigh_declared);
+        for i in 0..12 {
+            fill(&default, &format!("grid{i}"), TENTH_DEGREE_GRID);
+        }
+        assert_eq!(resident(&default), (0..10).collect::<Vec<_>>());
+        assert_eq!(default.churn().evicted_cold, 2);
+
+        let inserted = ByteBoundedCache::new_single_shard(256 * MIB, 4 * MIB, weigh_declared);
+        for i in 0..12 {
+            inserted.insert(format!("grid{i}"), TENTH_DEGREE_GRID);
+        }
+        assert!(resident(&inserted).contains(&11));
+
+        let hot = hot_allocation_holding(256 * MIB, TENTH_DEGREE_GRID);
+        let holding = ByteBoundedCache::new_single_shard_with_hot_allocation(
+            256 * MIB,
+            4 * MIB,
+            weigh_declared,
+            hot,
+        );
+        for i in 0..12 {
+            fill(&holding, &format!("grid{i}"), TENTH_DEGREE_GRID);
+            assert!(holding.contains_key(&format!("grid{i}")), "grid{i}");
+        }
+    }
+
+    /// The cold ring keeps a tenth more than the entry; a cache that cannot
+    /// also admit it to the hot ring, or a large one, keeps the default.
+    #[test]
+    fn hot_allocation_holding_leaves_the_entry_and_a_tenth() {
+        let hot = hot_allocation_holding(256 * MIB, TENTH_DEGREE_GRID);
+        assert!((0.89..0.90).contains(&hot), "{hot}");
+        let cold = 256 * MIB - (256.0 * MIB as f64 * hot) as u64;
+        assert!(cold >= TENTH_DEGREE_GRID * 11 / 10, "{cold}");
+        let hot = hot_allocation_holding(64 * MIB, TENTH_DEGREE_GRID);
+        assert!((0.57..0.58).contains(&hot), "{hot}");
+        // Over 2.1 entries: both fit. Under: neither can, so the default.
+        assert!(hot_allocation_holding(52 * MIB, TENTH_DEGREE_GRID) < 0.5);
+        assert_eq!(hot_allocation_holding(51 * MIB, TENTH_DEGREE_GRID), 0.97);
+        assert_eq!(hot_allocation_holding(1024 * MIB, TENTH_DEGREE_GRID), 0.97);
+        assert_eq!(hot_allocation_holding(0, TENTH_DEGREE_GRID), 0.97);
+        assert_eq!(hot_allocation_holding(MIB, 0), 0.97);
+    }
+
+    /// Concurrent fills that outweigh the cold ring can evict a fill before
+    /// its filler marks it: at 1 GiB, ten threads filling a window of 164
+    /// entries of 1.4 MB lost one or two in most runs when only marked
+    /// read.
+    /// [`ByteBoundedCache::keep`] inserts such a fill again.
+    #[test]
+    fn kept_fills_survive_a_burst_of_concurrent_fills() {
+        use std::sync::atomic::AtomicU64;
+        const MESSAGE: u64 = 1_400_000;
+        for _ in 0..20 {
+            let cache = ByteBoundedCache::new_single_shard(1024 * MIB, MIB / 2, weigh_declared);
+            for i in 0..800 {
+                fill(&cache, &format!("old{i}"), MESSAGE);
+            }
+            let next = AtomicU64::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..10 {
+                    scope.spawn(|| loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= 164 {
+                            break;
+                        }
+                        let key = format!("window{i}");
+                        fill(&cache, &key, MESSAGE);
+                        cache.keep(key, MESSAGE);
+                    });
+                }
+            });
+            let lost: Vec<_> = (0..164)
+                .filter(|i| !cache.contains_key(&format!("window{i}")))
+                .collect();
+            assert!(lost.is_empty(), "{lost:?}");
+        }
+    }
+
+    /// A refused fill stays out: keeping it inserts nothing.
+    #[test]
+    fn keeping_a_refused_fill_inserts_nothing() {
+        let cache = ghost_cache(10);
+        fill(&cache, "big", 20 * 1000);
+        cache.keep("big".to_string(), 20 * 1000);
+        assert!(!cache.contains_key(&"big".to_string()));
+        assert_eq!(
+            (cache.churn().refused, cache.churn().inserted_bytes),
+            (1, 0)
+        );
+    }
+
+    /// A one-shard cache of 200 entries of 1000 bytes, filled past its
+    /// budget by fills nobody read again; then a window of `window` fills,
+    /// each kept when `keep`; then `scan` one-off fills. How many of the
+    /// window are resident at the end.
+    fn window_resident(hot_allocation: Option<f64>, keep: bool, window: u64, scan: u64) -> u64 {
+        let cache =
+            ByteBoundedCache::build(200 * 1000, 1000, weigh_declared, Some(1), hot_allocation);
+        for i in 0..400 {
+            fill(&cache, &format!("old{i}"), 1000);
+        }
+        for i in 0..window {
+            let key = format!("window{i}");
+            fill(&cache, &key, 1000);
+            if keep {
+                cache.keep(key, 1000);
+            }
+        }
+        for i in 0..scan {
+            fill(&cache, &format!("scan{i}"), 1000);
+        }
+        (0..window)
+            .filter(|i| cache.contains_key(&format!("window{i}")))
+            .count() as u64
+    }
+
+    /// #1340: in a full cache, a window of fills nobody reads until its
+    /// next query keeps what the cold ring holds, at the default 3 % six
+    /// of 200. Kept, every window up to the whole budget stays, and
+    /// survives a scan of one-off fills twice the budget. A lower hot share
+    /// alone keeps a window up to its cold ring, until a scan pushes it out.
+    #[test]
+    fn a_kept_window_stays_resident_in_a_full_cache() {
+        assert_eq!(window_resident(None, false, 100, 0), 6);
+        for window in 1..=200 {
+            assert_eq!(window_resident(None, true, window, 0), window);
+        }
+        assert_eq!(window_resident(None, true, 100, 400), 100);
+        assert_eq!(window_resident(Some(0.5), false, 100, 0), 100);
+        assert_eq!(window_resident(Some(0.5), false, 150, 0), 100);
+        assert_eq!(window_resident(Some(0.5), false, 100, 400), 0);
     }
 
     #[test]

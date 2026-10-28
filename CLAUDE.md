@@ -356,6 +356,12 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   unread fresh inserts share 3 %: a cache filled ahead of reads (a
   pre-warm) uses `new_with_hot_allocation` (engine-odim's `PIXEL_CACHE`,
   0.5, #992). The hot share also caps the largest entry a shard admits.
+  A single-flight fill links its entry into that 3 % before evicting, so a
+  fill heavier than it evicts itself unread: a one-shard cache whose
+  entries can be that large uses `new_single_shard_with_hot_allocation(..,
+  hot_allocation_holding(capacity, largest))` (the GRIB caches, #1332). A
+  caller that will read a fill again but samples its own copy now `keep`s
+  it, or the fills after it push it out of the cold ring (#1340).
   Every cache and admission budget is entered in the memory plan,
   `ds_cache::plan` (#1306), under its `/metrics` family as id
   (`metatile_cache`, `geotiff_decode`), a scope and its size source. A
