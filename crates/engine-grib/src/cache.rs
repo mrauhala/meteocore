@@ -531,8 +531,11 @@ impl DecodedGrid {
     /// pixel's lon/lat comes from the shared [`OutputCrs::project_node`], so the
     /// output axes follow the requested CRS.
     ///
-    /// - `Wgs84` / `WebMercator`: `project_node` is cheap (no projection), so we
-    ///   sample per pixel. This path also keeps the ±360° longitude wrap that a
+    /// - `Wgs84` / `WebMercator`: a pixel's longitude depends only on its
+    ///   column and its latitude only on its row, so the output column's
+    ///   source column and the output row's source row are mapped once each,
+    ///   never per pixel (#1331), and every pixel is sampled exactly where
+    ///   they cross. This path also keeps the ±360° longitude wrap that a
     ///   global grid needs for viewports crossing the antimeridian.
     /// - `Projected` (EPSG:3067/3035): `project_node` runs `Crs::inverse` per
     ///   node — so map output→source through a [`ProjectionGrid`] (coarse
@@ -618,12 +621,28 @@ impl DecodedGrid {
                 }
             }
             OutputCrs::Wgs84 | OutputCrs::WebMercator => {
+                // Separable (#1331): `project_node` spreads `fx` over the
+                // bbox's longitudes and `fy` over its latitudes (or Mercator
+                // northings), and `lonlat_to_src_px` maps a longitude to a
+                // source column and a latitude to a source row, each axis
+                // alone. So a column's source column and a row's source row
+                // are computed once, by the expressions a per-pixel walk
+                // evaluates on the same inputs: its bits
+                // (`cache/sampler_tests.rs`) without its EPSG:3857
+                // transcendentals at every pixel.
+                let cols: Vec<f64> = (0..w)
+                    .map(|col| {
+                        let fx = (col as f64 + 0.5) / w as f64;
+                        let lon = self.lon_in_frame(output_crs.project_node(bbox, fx, 0.5).0);
+                        self.lonlat_to_src_px(lon, 0.0).0
+                    })
+                    .collect();
                 for row in 0..h {
                     let fy = (row as f64 + 0.5) / h as f64;
-                    for col in 0..w {
-                        let fx = (col as f64 + 0.5) / w as f64;
-                        let (lon, lat) = output_crs.project_node(bbox, fx, fy);
-                        emit(self.bilinear_value(self.lon_in_frame(lon), lat));
+                    let lat = output_crs.project_node(bbox, 0.5, fy).1;
+                    let row_f = self.lonlat_to_src_px(0.0, lat).1;
+                    for &col_f in &cols {
+                        emit(self.bilinear_at(col_f, row_f));
                     }
                 }
             }

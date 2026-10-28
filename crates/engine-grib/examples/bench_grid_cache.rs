@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut decode_times = Vec::with_capacity(iterations);
     let mut render_times = Vec::with_capacity(iterations);
     let mut render_f32_times = Vec::with_capacity(iterations);
+    let mut tile_3857_times = Vec::with_capacity(iterations);
     let bbox = [19.0, 59.0, 32.0, 71.0];
     for _ in 0..iterations {
         let start = Instant::now();
@@ -49,12 +50,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start = Instant::now();
         black_box(grid.resample_f32(black_box(bbox), 512, 256, &OutputCrs::Wgs84, |v| v));
         render_f32_times.push(start.elapsed());
+        // One 256² EPSG:3857 map tile over the same box (#1331).
+        let start = Instant::now();
+        black_box(grid.resample_f32(black_box(bbox), 256, 256, &OutputCrs::WebMercator, |v| v));
+        tile_3857_times.push(start.elapsed());
     }
     println!("decode_median_us={}", median(decode_times).as_micros());
     println!("resample_median_us={}", median(render_times).as_micros());
     println!(
         "resample_f32_median_us={}",
         median(render_f32_times).as_micros()
+    );
+    println!(
+        "tile_3857_256_median_us={}",
+        median(tile_3857_times).as_micros()
     );
     println!(
         "tile_buffer_bytes boxed_f64={} f32={}",

@@ -233,6 +233,15 @@ on the request path. Single-level and legacy views require exact metadata.
   4 B/px instead of a boxed 16. Values are exactly the old f64 ones `as f32`
   (`tests/local_source.rs` pins this on the fixture for all three CRS paths);
   keep `resample` returning f64 for the bench fingerprint.
+- CRS:84 and EPSG:3857 map tiles are sampled separably (#1331). On these two
+  outputs `project_node`'s longitude never reads `fy` and its latitude never
+  reads `fx`, and `lonlat_to_src_px` is per axis too, so `resample_each` maps
+  each output column to a source column and each output row to a source row
+  once, then calls `bilinear_at` per pixel. Never call `project_node` per
+  pixel there (Critical Rule 5). `cache/sampler_tests.rs` keeps the old
+  per-pixel walk as the bit-for-bit reference. An `OutputCrs` whose longitude
+  depends on the row, or latitude on the column, belongs on `ProjectionGrid`,
+  not in this arm.
 - This sampler is not `ds_core::resample::SourceGrid` (#1172), and moving to
   it changes pixels: EPSG:3857 maps each pixel exactly here, SourceGrid
   through its projection grid; a regional grid draws nothing west or north
