@@ -13,7 +13,8 @@ fn testdata(path: &str) -> std::path::PathBuf {
 
 /// A config of one collection of every engine type with a cache or budget
 /// of its own that loads from committed fixtures, written to `dir`: a local
-/// GeoTIFF radar, two GRIB sources (one with `grid_cache_mb = 512`), Zarr,
+/// GeoTIFF radar, two GRIB sources (one with `grid_cache_mb = 512` and
+/// `message_cache_mb = 1024`), Zarr,
 /// NetCDF (an empty directory), a PVOL with 3D Tiles, an ODIM composite,
 /// a satellite collection and a station grid over the CSV stations.
 fn every_engine_config(dir: &Path) -> std::path::PathBuf {
@@ -71,6 +72,7 @@ apis = ["edr", "wms"]
 [collections.grib]
 data_path = {grib:?}
 grid_cache_mb = 512
+message_cache_mb = 1024
 
 [[collections]]
 id = "zarr"
@@ -333,8 +335,21 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
         ("default".into(), 256 * MIB)
     );
     assert_eq!(
-        source("grib_message_cache", Some("grib-sized")),
+        source("grib_message_cache", Some("grib-default")),
         ("default".into(), 0)
+    );
+    assert_eq!(
+        source("grib_message_cache", Some("grib-sized")),
+        ("collection:[grib] message_cache_mb".into(), 1024 * MIB)
+    );
+    // An unset point-index cache follows the message cache (#1333).
+    assert_eq!(
+        source("grib_point_index_cache", Some("grib-default")),
+        ("default".into(), 16 * MIB)
+    );
+    assert_eq!(
+        source("grib_point_index_cache", Some("grib-sized")),
+        ("derived:[grib] message_cache_mb".into(), 256 * MIB)
     );
     // A local GeoTIFF reads no tiles through its tile cache.
     assert_eq!(source("tile_cache", Some("radar")), ("constant".into(), 0));
@@ -364,9 +379,14 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
     );
 
     // `cache_size_source` has one series per entry, with its source.
-    let line = "cache_size_source{cache=\"grid_cache\",collection=\"grib-sized\",\
-                source=\"collection:[grib] grid_cache_mb\"} 1";
-    assert!(metrics.contains(line), "{line}");
+    for line in [
+        "cache_size_source{cache=\"grid_cache\",collection=\"grib-sized\",\
+         source=\"collection:[grib] grid_cache_mb\"} 1",
+        "cache_size_source{cache=\"grib_point_index_cache\",collection=\"grib-sized\",\
+         source=\"derived:[grib] message_cache_mb\"} 1",
+    ] {
+        assert!(metrics.contains(line), "{line}");
+    }
     let sources = metrics
         .lines()
         .filter(|l| l.starts_with("cache_size_source{"))
@@ -733,6 +753,39 @@ fn render_cache_sources_follow_the_config() {
         RenderCacheSources::of(&config).rendered,
         SizeSource::Collection("[wms] rendered_cache_mb")
     );
+}
+
+/// A GRIB point-index cache size names its key when set, whatever the
+/// value; unset, `message_cache_mb` when that sets it above the default
+/// (#1333).
+#[test]
+fn point_index_sources_follow_the_config() {
+    let source = |body: &str| {
+        let grib: GribConfig = toml::from_str(&format!("data_path = \"x\"\n{body}")).unwrap();
+        point_index_source(&grib).to_string()
+    };
+    for (body, expected) in [
+        ("", "default"),
+        ("message_cache_mb = 64\n", "default"),
+        (
+            "message_cache_mb = 1024\n",
+            "derived:[grib] message_cache_mb",
+        ),
+        (
+            "message_cache_mb = 1024\npoint_index_cache_mb = 16\n",
+            "collection:[grib] point_index_cache_mb",
+        ),
+        (
+            "message_cache_mb = 1024\npoint_index_cache_mb = 0\n",
+            "collection:[grib] point_index_cache_mb",
+        ),
+        (
+            "point_index_cache_mb = 16\n",
+            "collection:[grib] point_index_cache_mb",
+        ),
+    ] {
+        assert_eq!(source(body), expected, "{body}");
+    }
 }
 
 /// The endpoint takes `/admin/collections/reload`'s guard: off without a

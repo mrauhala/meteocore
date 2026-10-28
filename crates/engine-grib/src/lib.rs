@@ -473,7 +473,7 @@ impl GribEngine {
                 scan_mode,
                 grid_cache,
                 message_cache,
-                point_index: point_index::PointIndex::new(config.point_index_cache_mb),
+                point_index: point_index::PointIndex::new(config.effective_point_index_cache_mb()),
                 point_fields: point_index::PointFields::default(),
                 point_fetches: point_index::PointFetches::default(),
                 shutdown: Shutdown::new(),

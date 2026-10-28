@@ -30,7 +30,7 @@ use axum::Json;
 use ds_cache::plan::{self, Activity, Entry, Kind, Row, Scope, SizeSource, Usage};
 use ds_cache::{Churn, MIB};
 use ds_core::config::{
-    CollectionConfig, ServerConfig, DEFAULT_GRID_CACHE_MB, DEFAULT_METATILE_CACHE_MB,
+    CollectionConfig, GribConfig, ServerConfig, DEFAULT_GRID_CACHE_MB, DEFAULT_METATILE_CACHE_MB,
     DEFAULT_POINT_INDEX_CACHE_MB, DEFAULT_TILE_CACHE_MB, DEFAULT_ZARR_CACHE_MB,
 };
 use serde_json::{json, Value};
@@ -148,16 +148,24 @@ pub(crate) fn register_grib(collection: &CollectionConfig, engine: &Arc<engine_g
         engine,
         |e| Usage::cache(e.message_cache_metrics(), None),
     );
-    let point_index = SizeSource::unless_default(
-        grib.point_index_cache_mb,
-        DEFAULT_POINT_INDEX_CACHE_MB,
-        SizeSource::Collection("[grib] point_index_cache_mb"),
-    );
     plan::register(
-        Entry::cache("grib_point_index_cache", scope(), point_index),
+        Entry::cache("grib_point_index_cache", scope(), point_index_source(grib)),
         engine,
         |e| Usage::cache(e.point_index_cache_metrics(), None),
     );
+}
+
+/// Where a GRIB source's point-index cache size came from: its key when
+/// set, whatever the value; unset, `message_cache_mb` when its share of it
+/// is above the default floor (#1333).
+fn point_index_source(grib: &GribConfig) -> SizeSource {
+    match grib.point_index_cache_mb {
+        Some(_) => SizeSource::Collection("[grib] point_index_cache_mb"),
+        None if grib.effective_point_index_cache_mb() > DEFAULT_POINT_INDEX_CACHE_MB => {
+            SizeSource::Derived("[grib] message_cache_mb")
+        }
+        None => SizeSource::Default,
+    }
 }
 
 /// A Zarr collection's decoded-chunk cache (Icechunk only; a plain store

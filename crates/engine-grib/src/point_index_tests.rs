@@ -36,7 +36,7 @@ fn source(param: &str, level: &str, messages: &[Vec<u8>]) -> TestSource {
 /// MiB, 0 disabling each.
 fn view(source: &TestSource, point_index_mb: u64, message_mb: u64, grid_mb: u64) -> GribEngine {
     let mut config = source.config();
-    config.point_index_cache_mb = point_index_mb;
+    config.point_index_cache_mb = Some(point_index_mb);
     config.message_cache_mb = message_mb;
     config.grid_cache_mb = grid_mb;
     config.level_types = Some(vec![GribLevelType::Pressure]);
@@ -320,6 +320,56 @@ fn publishing_the_catalog_forgets_unreadable_parameters() {
     let series = query(&engine, "TMP", 850.0, &points);
     assert_eq!(series[0].0.len(), 3);
     assert!(!index.may_read(&key), "learned again from the new run");
+}
+
+/// An unset `point_index_cache_mb` follows `message_cache_mb` (#1333): the
+/// indexes of a window of GFS 0.25° template 5.3 messages, about 115 KB for
+/// 0.81 MB each, fit the index cache whenever the messages fit the message
+/// cache. A size set, 0 included, is kept; with neither set, 16 MiB.
+#[test]
+fn an_unset_point_index_cache_holds_the_indexes_of_the_cached_messages() {
+    const MESSAGE: u64 = 810_000;
+    const INDEX: u64 = 115_000;
+    let source = TestSource::new();
+    // The budgets as a config file sets them.
+    let capacities = |budgets: serde_json::Value| {
+        let mut config = serde_json::json!({
+            "data_path": source.dir.to_str().unwrap(),
+            "index_format": "wgrib2", "index_suffix": ".idx",
+        });
+        let fields = config.as_object_mut().unwrap();
+        fields.extend(budgets.as_object().unwrap().clone());
+        let config: GribConfig = serde_json::from_value(config).unwrap();
+        let engine = GribEngine::new("budgets", &config).unwrap();
+        (
+            engine.point_index_cache_metrics().capacity_bytes,
+            engine.message_cache_metrics().capacity_bytes,
+        )
+    };
+    let mib = ds_cache::MIB;
+    let (index, message) = capacities(serde_json::json!({ "message_cache_mb": 1024 }));
+    assert_eq!(message, 1024 * mib);
+    assert!(
+        index / INDEX >= message / MESSAGE,
+        "{} indexes for {} messages",
+        index / INDEX,
+        message / MESSAGE
+    );
+    for (budgets, expected) in [
+        // Never below 16 MiB, whatever the message cache.
+        (serde_json::json!({ "message_cache_mb": 64 }), 16),
+        (serde_json::json!({}), 16),
+        (
+            serde_json::json!({ "message_cache_mb": 1024, "point_index_cache_mb": 16 }),
+            16,
+        ),
+        (
+            serde_json::json!({ "message_cache_mb": 1024, "point_index_cache_mb": 0 }),
+            0,
+        ),
+    ] {
+        assert_eq!(capacities(budgets.clone()).0, expected * mib, "{budgets}");
+    }
 }
 
 /// A payload the index cannot decode (Section 7 cut short, which the full

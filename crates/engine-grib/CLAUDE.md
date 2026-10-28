@@ -435,8 +435,9 @@ ones only in the legacy layout.
   (Section 5 coding, lattice, `MessageMetadata`, payload position, one `u32`
   bit offset per RSI of 4096 values: 1.2 KB at 0.25°, 6.5 KB at 0.1°) in a
   per-source `ByteBoundedCache` keyed by `MessageKey` like the message cache,
-  single-flight builds. `point_index_cache_mb` (default 16; `0` = off, the
-  kill switch for comparing paths). The cache is one shard (#1302): CCSDS
+  single-flight builds. `point_index_cache_mb` (unset: 25 % of
+  `message_cache_mb`, at least 16, see Complex packing point reads; `0` =
+  off, the kill switch for comparing paths). The cache is one shard (#1302): CCSDS
   and 5.3 indexes share it.
 - First read: one libaec decode with offsets enabled, streamed through a
   reused 16 Ki-sample buffer (as fast as a whole-field buffer), picking the
@@ -541,13 +542,26 @@ ones only in the legacy layout.
   group's data bit, values seen, the last two undifferenced). It also keeps
   the message's packed group descriptors (refs, widths, lengths): a row's
   three descriptor slices lie about 90 KB apart, so keeping them is what
-  holds a warm read to ONE GET. About 110 KB per GFS 0.25° message (97–118 KB
-  measured), against 1–6 KB for CCSDS; the weigher counts all of it.
+  holds a warm read to ONE GET. 100–142 KB per GFS 0.25° message, against
+  1–6 KB for CCSDS; the weigher counts all of it. The descriptors dominate,
+  so the size barely follows the message's: 13–20 % of a TMP message,
+  20–23 % of a PRATE one, 18 % on average (48 real messages, #1333).
 - The point-index cache is single shard (`new_single_shard`), so entries of
-  1 KB to 117 KB share one budget and 16 MiB holds about 145 GFS messages.
-  Sharded from a 4 KiB hint it was 64 slices of 256 KiB and a window's
-  indexes evicted each other; `point_index/tests.rs` pins 121 GFS-sized
-  indexes resident in 16 MiB.
+  1 KB to 142 KB share one budget. Sharded from a 4 KiB hint it was 64
+  slices of 256 KiB and a window's indexes evicted each other;
+  `point_index/tests.rs` pins 121 GFS-sized indexes resident in 16 MiB.
+- Its size follows the message cache (#1333): `point_index_cache_mb` unset
+  is 25 % of `message_cache_mb`, never below 16 MiB, which covers the
+  largest ratio measured. Read the size through
+  `GribConfig::effective_point_index_cache_mb`, never the raw `Option`; only
+  `cache_plan::point_index_source` reads it, to name the plan source. A value
+  set, `0` included, wins. At a fixed 16 MiB (about 145 GFS indexes) a warm
+  query over 565 resident messages rebuilt 535–565 indexes at about 17 ms
+  CPU each. Capacity fills only as positions are indexed; a CCSDS source
+  uses a small part of it. The plan reports a derived size as
+  `derived:[grib] message_cache_mb`, a set key as its key whatever the
+  value. `point_index_tests.rs` pins 1024 MiB → room for the 115 KB index
+  of every 0.81 MB message.
 - Bit identity with `decode_message` is the contract: `grib`'s release-build
   integer arithmetic (wrapping), its missing values (management 1 and 2)
   and bitmap, `NonZeroSimplePackingDecoder` op for op, the shared

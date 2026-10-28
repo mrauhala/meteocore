@@ -177,7 +177,7 @@ parameters = ["2t", "10u", "10v", "msl", "tp", "t", "z"]
 | `time_window` | none | ISO 8601 duration relative to the current time: `-PT12H` keeps steps valid in the last 12 h, `P5D` in the next 5 days. |
 | `grid_cache_mb` | `256` | Decoded-grid cache per source; `0` disables it. An EDR query over more fields than it holds reads around it. |
 | `message_cache_mb` | `0` | Compressed-message cache per source; `0` disables it. |
-| `point_index_cache_mb` | `16` | Point-index cache per source, one shard, for CCSDS and template 5.3 fields; `0` decodes every position field in full. An index is 1–6 KB for CCSDS and about 110 KB for GFS 0.25°, so 16 MiB holds about 145 GFS messages. |
+| `point_index_cache_mb` | 25 % of `message_cache_mb`, at least `16` | Point-index cache per source, one shard, for CCSDS and template 5.3 fields; `0` decodes every position field in full. An index is 1–6 KB for CCSDS and 100–140 KB for GFS 0.25°, 13–23 % of its message. Unset, it follows the message cache, so the indexes of the messages it keeps stay resident: 256 MiB for `message_cache_mb = 1024`. A value set, `0` included, is the size. |
 
 With `level_types`, the collection id names a source, and the server
 registers one view per enabled family once data for it is found:
