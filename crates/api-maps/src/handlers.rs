@@ -1545,8 +1545,14 @@ async fn render_map(
         // query parameter is a follow-up (#337 Phase 4).
         reference_time,
         // Content revised in place under the same instant (a push-fed alert
-        // set) must not hit a stale entry.
-        content_version: engine.content_version(),
+        // set, a late GRIB file) must not hit a stale entry: the version of
+        // the frame drawn, so a change elsewhere keeps its entry (#1334).
+        content_version: engine.content_version_for(
+            effective_parameter.as_deref(),
+            time,
+            reference_time,
+            validated.z,
+        ),
         // The default (transparent, no `bgcolor`) keys as WMS
         // `TRANSPARENT=TRUE` does, and `transparent=false` as WMS's opaque
         // `BGCOLOR`, so those views keep sharing entries.

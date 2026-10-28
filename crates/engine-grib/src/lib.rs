@@ -15,6 +15,8 @@ mod field_plan_tests;
 #[cfg(test)]
 mod geopotential_tests;
 pub mod index;
+#[cfg(test)]
+mod map_version_tests;
 mod message_cache;
 mod metadata;
 #[cfg(test)]
@@ -43,6 +45,7 @@ pub mod wgrib2_index;
 mod wind_tests;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -528,8 +531,10 @@ impl GribEngine {
     }
 
     /// Perform one scan cycle: list index files across multiple dates and
-    /// run hours, parse new ones, merge into the catalog.
-    fn scan_once(&self) -> Result<(), DataServerError> {
+    /// run hours, parse new ones, merge into the catalog. The poll loop's
+    /// body: blocking storage I/O, for the poll runtime (Critical Rules 6
+    /// and 7) or a test, never a request handler.
+    pub fn scan_once(&self) -> Result<(), DataServerError> {
         self.scan_at(Utc::now())
     }
 
@@ -1090,28 +1095,14 @@ impl GribEngine {
 
     /// Resolve the run's canonical level exactly; never substitute another
     /// level when that product is absent from an individual forecast step.
-    /// A parameter the run lacks is a bad request; a step without its field
-    /// (a level one step of a pressure view lacks) is missing data, a 404.
+    #[cfg(test)]
     fn fetch_grid(
         &self,
         step_file: &StepFile,
         param: &str,
         keys: &ParameterKeys,
     ) -> Result<Arc<DecodedGrid>, DataServerError> {
-        let key = keys.get(param).ok_or_else(|| {
-            DataServerError::InvalidParameter(format!(
-                "Parameter '{param}' is unavailable in this collection and run"
-            ))
-        })?;
-        let entry = step_file
-            .messages
-            .iter()
-            .find(|m| key.matches(m))
-            .ok_or_else(|| {
-                DataServerError::LocationNotFound(format!(
-                    "Parameter '{param}' at its canonical level not found in forecast step"
-                ))
-            })?;
+        let entry = canonical_message(step_file, param, keys.get(param), None)?;
         self.fetch_grid_by_entry(step_file.message_url(entry), entry, GridFill::Insert)
     }
 
@@ -1126,10 +1117,56 @@ impl GribEngine {
         run: DateTime<Utc>,
         z: Option<f64>,
     ) -> Result<Option<f64>, DataServerError> {
+        // Without `z`: the run's first level, the first `selected_levels`
+        // keeps, as a run's levels are a set. Read directly: every map
+        // request, cache hits included, selects its frame's message through
+        // here (#1334), and listing a model view's 137 levels checks each
+        // against every other.
+        if z.is_none() {
+            if self.vertical_kind().is_none() {
+                return Ok(None);
+            }
+            if let Some(&first) = catalog.levels.get(&run).and_then(|levels| levels.first()) {
+                return Ok(Some(first));
+            }
+        }
         let requested = z.map(|v| [v]);
         let levels =
             self.selected_levels(catalog, run, requested.as_ref().map(|a| a.as_slice()))?;
         Ok(levels[0])
+    }
+
+    /// The message a map field of `run`'s `step_file` draws: `parameter`,
+    /// else the step's default product, at the run's canonical key moved to
+    /// the map level ([`Self::map_level`]). `render_field` and
+    /// `content_version_for` share it, so a frame's cache-key version names
+    /// the message rendered (#1334). From the snapshot, without copying the
+    /// run's keys.
+    fn map_message<'a>(
+        &self,
+        catalog: &'a Catalog,
+        run: &ForecastRun,
+        step_file: &'a StepFile,
+        parameter: Option<&'a str>,
+        z: Option<f64>,
+    ) -> Result<MapMessage<'a>, DataServerError> {
+        let level = self.map_level(catalog, run.reference_time, z)?;
+        // Without a parameter: the first near-surface product.
+        let name = parameter.unwrap_or_else(|| {
+            step_file
+                .default_message()
+                .map(|m| m.param.as_str())
+                .unwrap_or("2t")
+        });
+        let key = catalog
+            .parameter_keys(&run.reference_time)
+            .and_then(|keys| keys.get(name));
+        let entry = canonical_message(step_file, name, key, level)?;
+        Ok(MapMessage {
+            name,
+            entry,
+            url: step_file.message_url(entry),
+        })
     }
 
     /// One map field of `run`'s `step_file`: `parameter` (else the step's
@@ -1143,28 +1180,14 @@ impl GribEngine {
         parameter: Option<&str>,
         field: &MapField<'_>,
     ) -> Result<RasterTile, DataServerError> {
-        let keys = catalog
-            .parameter_keys(&run.reference_time)
-            .cloned()
-            .unwrap_or_default();
-        let level = self.map_level(catalog, run.reference_time, field.z)?;
-        let keys = Self::keys_at_level(&keys, level);
-
-        // Determine parameter to render
-        let param_name = parameter.unwrap_or_else(|| {
-            // Default to first near-surface parameter
-            step_file
-                .default_message()
-                .map(|m| m.param.as_str())
-                .unwrap_or("2t")
-        });
-
-        let grid = self.fetch_grid(step_file, param_name, &keys)?;
+        let drawn = self.map_message(catalog, run, step_file, parameter, field.z)?;
+        let grid = self.fetch_grid_by_entry(drawn.url, drawn.entry, GridFill::Insert)?;
 
         // Apply unit conversion so colormap ranges use display units.
-        // fetch_grid populates the metadata cache from the decoded message's
-        // WMO triple on first decode, so this lookup is safe here.
-        let meta = self.param_metadata_for(&keys, param_name);
+        // fetch_grid_by_entry populates the metadata cache from the decoded
+        // message's WMO triple on first decode, so this lookup is safe here.
+        // The message's own key is its run's canonical key at the map level.
+        let meta = self.param_metadata_at(Some(&drawn.entry.key()), drawn.name);
         let MapField {
             bbox,
             width,
@@ -1365,9 +1388,13 @@ impl GribEngine {
     }
 
     fn param_metadata_for(&self, keys: &ParameterKeys, short_name: &str) -> ParamMetadata {
+        self.param_metadata_at(keys.get(short_name), short_name)
+    }
+
+    /// [`Self::param_metadata_for`] at `short_name`'s key itself.
+    fn param_metadata_at(&self, key: Option<&ParameterKey>, short_name: &str) -> ParamMetadata {
         let metadata = self.source.param_meta.read().unwrap();
-        let mut meta = keys
-            .get(short_name)
+        let mut meta = key
             .and_then(|key| metadata.get(key, self.vertical_kind().is_some()))
             .cloned()
             .unwrap_or_else(|| ParamMetadata::placeholder(short_name));
@@ -1390,6 +1417,58 @@ struct MapField<'a> {
     height: u32,
     output_crs: &'a OutputCrs,
     z: Option<f64>,
+}
+
+/// The message a map field draws ([`GribEngine::map_message`]).
+struct MapMessage<'a> {
+    /// The parameter drawn: the requested one, else the step's default.
+    name: &'a str,
+    entry: &'a catalog::MessageEntry,
+    /// The file it is read from ([`StepFile::message_url`]).
+    url: &'a str,
+}
+
+impl MapMessage<'_> {
+    /// The cache-key version of the frame drawing this message (#1334):
+    /// the message's identity, its origin, offset and indexed length. A
+    /// late file that changes the message a frame draws (another default or
+    /// canonical level of its step) changes it; a file at another step or
+    /// run does not, so the frames it leaves alone keep their cache
+    /// entries. Nonzero: explicit-`TIME` responses still revalidate, since
+    /// a newer run can take over a valid time.
+    fn content_version(&self) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        (self.url, self.entry.offset, self.entry.length).hash(&mut hasher);
+        hasher.finish().max(1)
+    }
+}
+
+/// `param`'s message in `step_file` at its run's canonical `key`, moved to
+/// `level` when one is given: exactly, never another level when that
+/// product is absent from an individual forecast step. A parameter the run
+/// lacks is a bad request; a step without its field (a level one step of a
+/// pressure view lacks) is missing data, a 404.
+fn canonical_message<'a>(
+    step_file: &'a StepFile,
+    param: &str,
+    key: Option<&ParameterKey>,
+    level: Option<f64>,
+) -> Result<&'a catalog::MessageEntry, DataServerError> {
+    let key = key.ok_or_else(|| {
+        DataServerError::InvalidParameter(format!(
+            "Parameter '{param}' is unavailable in this collection and run"
+        ))
+    })?;
+    let level = GribEngine::key_level(key, level);
+    step_file
+        .messages
+        .iter()
+        .find(|m| key.matches_at(m, level))
+        .ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "Parameter '{param}' at its canonical level not found in forecast step"
+            ))
+        })
 }
 
 /// The run+step a map render (WMS/Maps/Tiles) of `parameters` reads at
@@ -1904,7 +1983,31 @@ impl MapEngine for GribEngine {
         // level without changing either resolved time. Each view's immutable
         // snapshot carries its own version; unrelated families keep cache hits.
         // Nonzero also prevents explicit-TIME HTTP responses being immutable.
+        // The map caches key on `content_version_for`, one frame's.
         self.catalog().content_version.max(1)
+    }
+
+    /// One frame's cache-key version (#1334): the identity of the message
+    /// `get_raster_tile` draws, through the SAME `select_run_step` and
+    /// `map_message`. A scan that adds steps or runs the frame does not
+    /// draw from keeps it, where the catalog's version orphaned every
+    /// cached frame; a late file that changes the frame's message moves
+    /// it. A failed selection is the catalog's version: the render fails
+    /// the same way and caches nothing.
+    fn content_version_for(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+        z: Option<f64>,
+    ) -> u64 {
+        let catalog = self.catalog();
+        select_run_step(&catalog, parameter.as_slice(), reference_time, time)
+            .and_then(|(run, _, step_file)| {
+                self.map_message(&catalog, run, step_file, parameter, z)
+            })
+            .map(|drawn| drawn.content_version())
+            .unwrap_or_else(|_| catalog.content_version.max(1))
     }
 
     #[allow(clippy::too_many_arguments)] // bbox/size/time/crs/parameter/z/reference_time are all genuine selectors

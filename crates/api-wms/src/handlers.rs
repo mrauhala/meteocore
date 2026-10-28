@@ -450,7 +450,8 @@ pub(crate) struct ResolvedLayer {
     /// with an elevation dimension; `None` for one without, which ignores it
     /// (#1181), and when none was sent.
     pub elevation: Option<f64>,
-    /// [`MapEngine::content_version`], read right after the time resolved.
+    /// [`MapEngine::content_version_for`] the frame drawn, read right after
+    /// the time resolved.
     pub content_version: u64,
 }
 
@@ -638,9 +639,13 @@ fn resolve_layer(
     // time axis snaps on that axis.
     let time = engine.resolve_parameter_time(parameter.as_deref(), time, reference_time);
     // Content revised in place under the same instant (a push-fed
-    // alert set) must not hit a stale entry: the engine's content
-    // version is part of every rendered/meta-tile key.
-    let content_version = engine.content_version();
+    // alert set, a late GRIB file that changes the message a frame draws)
+    // must not hit a stale entry: the version of the frame drawn, at the
+    // time, run and level rendered, is part of every rendered/meta-tile
+    // key. One frame's, so a change elsewhere keeps this frame's entries
+    // (#1334).
+    let content_version =
+        engine.content_version_for(parameter.as_deref(), time, reference_time, elevation);
 
     ResolvedLayer {
         layer: layer.to_string(),

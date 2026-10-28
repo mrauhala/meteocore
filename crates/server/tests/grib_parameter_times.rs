@@ -5,6 +5,9 @@
 //! that has it, instead of the red error tile. With two runs, every map
 //! API renders and keys the run that has the window at that time.
 //!
+//! A scan that adds steps a frame does not draw from keeps its cached
+//! image and meta-tiles (#1334).
+//!
 //! The fields are the real ARPEGE 10 m wind messages of
 //! `testdata/grib-arpege-wind`, written into GFS-style step files with
 //! wgrib2 sidecars: u and v at every step, the wind speed as a GFS-style
@@ -60,32 +63,48 @@ fn write_steps(dir: &Path) {
     );
 }
 
-/// One run's step files, `date` as wgrib2 writes it (`YYYYMMDDHH`): u and v
-/// at every step, and the wind speed under the step's window when it has one.
-fn write_run(dir: &Path, date: &str, steps: &[(u32, &str, Option<&str>)]) {
-    let source = std::fs::read(
+/// The ARPEGE messages: 10wdir, 10si, 10u, 10v.
+fn arpege() -> Vec<u8> {
+    std::fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../testdata/grib-arpege-wind/arpege-10m-wind.grib2"),
     )
-    .unwrap();
-    let message = |index: usize| &source[index * MESSAGE..(index + 1) * MESSAGE];
+    .unwrap()
+}
+
+/// The ARPEGE message at `index`.
+fn arpege_message(source: &[u8], index: usize) -> &[u8] {
+    &source[index * MESSAGE..(index + 1) * MESSAGE]
+}
+
+/// One run's step files, `date` as wgrib2 writes it (`YYYYMMDDHH`): u and v
+/// at every step, and the wind speed under the step's window when it has one.
+fn write_run(dir: &Path, date: &str, steps: &[(u32, &str, Option<&str>)]) {
+    let source = arpege();
+    let message = |index| arpege_message(&source, index);
     let (speed, u, v) = (message(1), message(2), message(3));
+    let level = "10 m above ground";
     for &(step, forecast, window) in steps {
-        let mut records = vec![("UGRD", forecast, u), ("VGRD", forecast, v)];
-        records.extend(window.map(|window| ("WIND", window, speed)));
-        let (mut data, mut index) = (Vec::new(), String::new());
-        for (i, (param, forecast, bytes)) in records.into_iter().enumerate() {
-            index.push_str(&format!(
-                "{}:{}:d={date}:{param}:10 m above ground:{forecast}:\n",
-                i + 1,
-                data.len()
-            ));
-            data.extend_from_slice(bytes);
-        }
-        let name = format!("{date}-f{step:03}");
-        std::fs::write(dir.join(format!("{name}.grib2")), data).unwrap();
-        std::fs::write(dir.join(format!("{name}.idx")), index).unwrap();
+        let mut records = vec![("UGRD", level, forecast, u), ("VGRD", level, forecast, v)];
+        records.extend(window.map(|window| ("WIND", level, window, speed)));
+        write_file(dir, &format!("{date}-f{step:03}"), date, &records);
     }
+}
+
+/// The step file `name` of the run `date` and its wgrib2 sidecar: each
+/// record's parameter, level, forecast field and message.
+fn write_file(dir: &Path, name: &str, date: &str, records: &[(&str, &str, &str, &[u8])]) {
+    let (mut data, mut index) = (Vec::new(), String::new());
+    for (i, (param, level, forecast, bytes)) in records.iter().enumerate() {
+        index.push_str(&format!(
+            "{}:{}:d={date}:{param}:{level}:{forecast}:\n",
+            i + 1,
+            data.len()
+        ));
+        data.extend_from_slice(bytes);
+    }
+    std::fs::write(dir.join(format!("{name}.grib2")), data).unwrap();
+    std::fs::write(dir.join(format!("{name}.idx")), index).unwrap();
 }
 
 fn grib_config(dir: &Path) -> GribConfig {
@@ -98,7 +117,10 @@ fn grib_config(dir: &Path) -> GribConfig {
 
 /// The engine as the server registers it: wrapped for derived wind.
 fn engine(dir: &Path) -> Arc<DerivedWind> {
-    let grib = Arc::new(GribEngine::new(ID, &grib_config(dir)).unwrap());
+    wrapped(Arc::new(GribEngine::new(ID, &grib_config(dir)).unwrap()))
+}
+
+fn wrapped(grib: Arc<GribEngine>) -> Arc<DerivedWind> {
     Arc::new(DerivedWind::new(
         ID,
         grib,
@@ -158,6 +180,15 @@ fn styles() -> HashMap<String, HashMap<String, StyleInfo>> {
 }
 
 fn wms(engine: Arc<DerivedWind>, dir: &Path) -> axum::Router {
+    wms_with(engine, dir, Arc::new(ds_render::TilePixelCache::new(64)))
+}
+
+/// [`wms`] over the meta-tile cache `tile_cache`.
+fn wms_with(
+    engine: Arc<DerivedWind>,
+    dir: &Path,
+    tile_cache: Arc<ds_render::TilePixelCache>,
+) -> axum::Router {
     api_wms::router(Arc::new(ArcSwap::from_pointee(api_wms::WmsState {
         engines: HashMap::from([(ID.to_string(), engine as Arc<dyn MapEngine>)]),
         collections: HashMap::from([(ID.to_string(), collection(dir, "wms"))]),
@@ -165,7 +196,7 @@ fn wms(engine: Arc<DerivedWind>, dir: &Path) -> axum::Router {
         point_engines: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
-        tile_cache: Arc::new(ds_render::TilePixelCache::new(64)),
+        tile_cache,
         base_url: String::new(),
         trust_proxy_headers: false,
     })))
@@ -533,4 +564,120 @@ async fn an_analysis_only_run_keeps_the_windows_on_every_api() {
         .unwrap();
     assert!(values[2].is_number(), "{values:?}");
     assert!(values[0].is_null() && values[1].is_null() && values[3].is_null());
+}
+
+/// GRIB map caches key on the message a frame draws (#1334). A scan that
+/// adds another step of the frame's run and a newer run leaves the frame's
+/// image and meta-tiles hitting, in WMS, Maps and Tiles, where keyed on the
+/// catalog's version every cached frame missed; a late file that changes
+/// the message the frame draws misses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scan_adding_other_steps_keeps_a_frames_cached_tiles() {
+    let dir = tempfile::tempdir().unwrap();
+    write_run(
+        dir.path(),
+        "2026051100",
+        &[
+            (0, "anl", None),
+            (3, "3 hour fcst", Some("0-3 hour ave fcst")),
+        ],
+    );
+    let grib = Arc::new(GribEngine::new(ID, &grib_config(dir.path())).unwrap());
+    let tile_cache = Arc::new(ds_render::TilePixelCache::new(64));
+    let app = wms_with(wrapped(grib.clone()), dir.path(), tile_cache.clone());
+    // Web Mercator: drawn from meta-tiles.
+    let map = |extra: &str| {
+        format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={ID}/UGRD&STYLES=\
+             &FORMAT=image/png&CRS=EPSG:3857&BBOX=0,5000000,1000000,6000000\
+             &WIDTH=64&HEIGHT=64&TIME=2026-05-11T03:00:00Z{extra}"
+        )
+    };
+    let first = get(&app, &map("")).await;
+    assert_eq!(
+        (first.status, first.x_cache.as_str()),
+        (StatusCode::OK, "MISS")
+    );
+    let (_, misses) = tile_cache.stats();
+    assert!(misses > 0, "drawn from meta-tiles");
+    let maps = maps(wrapped(grib.clone()), dir.path());
+    let tiles = tiles(wrapped(grib.clone()), dir.path());
+    let frame = "parameter-name=UGRD&datetime=2026-05-11T03:00:00Z";
+    let others = [
+        (
+            &maps,
+            format!("/collections/{ID}/map?bbox={BBOX}&width=64&height=64&{frame}"),
+        ),
+        (
+            &tiles,
+            format!("/collections/{ID}/tiles/WebMercatorQuad/2/1/2?{frame}"),
+        ),
+    ];
+    for (app, uri) in &others {
+        let reply = get(app, uri).await;
+        assert_eq!(
+            (reply.status, reply.x_cache.as_str()),
+            (StatusCode::OK, "MISS"),
+            "{uri}"
+        );
+    }
+
+    // Another step of the frame's run, and a newer run whose analysis does
+    // not cover the frame's valid time.
+    write_run(
+        dir.path(),
+        "2026051100",
+        &[(6, "6 hour fcst", Some("0-6 hour ave fcst"))],
+    );
+    write_run(dir.path(), "2026051106", &[(0, "anl", None)]);
+    let catalog = grib.content_version();
+    grib.scan_once().unwrap();
+    assert_eq!(grib.raster_info_shared().reference_times, [at(0), at(6)]);
+    assert_ne!(grib.content_version(), catalog);
+
+    let reply = get(&app, &map("")).await;
+    assert_eq!(
+        (reply.status, reply.x_cache.as_str()),
+        (StatusCode::OK, "HIT")
+    );
+    assert_eq!(reply.body, first.body);
+    // A transparent view of the frame is another image, from the same
+    // meta-tiles: every one of them hits.
+    let (hits, _) = tile_cache.stats();
+    let reply = get(&app, &map("&TRANSPARENT=TRUE")).await;
+    assert_eq!(
+        (reply.status, reply.x_cache.as_str()),
+        (StatusCode::OK, "MISS")
+    );
+    let (now_hits, now_misses) = tile_cache.stats();
+    assert!(now_hits > hits);
+    assert_eq!(now_misses, misses, "no meta-tile rendered again");
+    for (app, uri) in &others {
+        assert_eq!(get(app, uri).await.x_cache, "HIT", "{uri}");
+    }
+
+    // A late file of the frame's own step with u at 2 m, the run's new
+    // canonical level: the frame draws another message.
+    let source = arpege();
+    write_file(
+        dir.path(),
+        "2026051100-f003-late",
+        "2026051100",
+        &[(
+            "UGRD",
+            "2 m above ground",
+            "3 hour fcst",
+            arpege_message(&source, 2),
+        )],
+    );
+    grib.scan_once().unwrap();
+    let reply = get(&app, &map("")).await;
+    assert_eq!(
+        (reply.status, reply.x_cache.as_str()),
+        (StatusCode::OK, "MISS")
+    );
+    assert_eq!(get(&app, &map("")).await.x_cache, "HIT");
+    for (app, uri) in &others {
+        assert_eq!(get(app, uri).await.x_cache, "MISS", "{uri}");
+    }
 }

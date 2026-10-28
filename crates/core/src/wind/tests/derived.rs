@@ -45,6 +45,11 @@ struct Mock {
     /// Per-parameter time axes, like a satellite collection's.
     axes: HashMap<&'static str, Arc<[DateTime<Utc>]>>,
     tiles: Mutex<Vec<Call>>,
+    /// The frames `content_version_for` was asked for, as `tiles` records
+    /// the frames rendered.
+    versions: Mutex<Vec<Call>>,
+    /// Each parameter's frame version; the collection's 42 when absent.
+    revisions: Mutex<HashMap<&'static str, u64>>,
     queries: Mutex<Vec<Option<Vec<String>>>>,
     /// Values per parameter in a position series: [`field`] repeated.
     samples: usize,
@@ -76,6 +81,8 @@ impl Mock {
             }),
             axes: HashMap::new(),
             tiles: Mutex::new(Vec::new()),
+            versions: Mutex::new(Vec::new()),
+            revisions: Mutex::new(HashMap::new()),
             queries: Mutex::new(Vec::new()),
             samples: 4,
         })
@@ -179,6 +186,22 @@ impl MapEngine for Mock {
 
     fn content_version(&self) -> u64 {
         42
+    }
+
+    fn content_version_for(
+        &self,
+        parameter: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+        z: Option<f64>,
+    ) -> u64 {
+        let parameter = parameter.unwrap_or("2t");
+        self.versions
+            .lock()
+            .unwrap()
+            .push((parameter.to_string(), time, z, reference_time));
+        let revisions = self.revisions.lock().unwrap();
+        revisions.get(parameter).copied().unwrap_or(42)
     }
 
     fn default_time(&self) -> Option<DateTime<Utc>> {
@@ -572,6 +595,54 @@ fn a_derived_speed_resolves_time_on_the_shared_component_axis() {
     );
 }
 
+/// A derived speed's version is its components' frames', asked for at the
+/// time, run and level its render reads them at, so a late file that
+/// changes either component's message reaches the speed's cache key, and
+/// nothing else does (#1334).
+#[test]
+fn a_derived_speeds_version_follows_its_component_frames() {
+    let mut mock = Mock::new(VectorFrame::Earth);
+    // Axes of their own: both components are read at a timestep they share.
+    let axes = &mut Arc::get_mut(&mut mock).unwrap().axes;
+    axes.insert("10u", vec![hour(0), hour(1), hour(2)].into());
+    axes.insert("10v", vec![hour(0), hour(2)].into());
+    let (wind, _) = wrap(&mock);
+    let version =
+        |parameter| wind.content_version_for(Some(parameter), Some(hour(1)), None, Some(850.0));
+    let speed = version("10si");
+    wind.get_raster_tile(
+        [0.0, 0.0, 1.0, 1.0],
+        2,
+        2,
+        Some(hour(1)),
+        &OutputCrs::WebMercator,
+        Some("10si"),
+        Some(850.0),
+        None,
+    )
+    .unwrap();
+    let asked = std::mem::take(&mut *mock.versions.lock().unwrap());
+    let rendered = std::mem::take(&mut *mock.tiles.lock().unwrap());
+    let call = |p: &str| (p.to_string(), Some(hour(0)), Some(850.0), Some(hour(2)));
+    assert_eq!(asked, [call("10u"), call("10v")]);
+    assert_eq!(asked, rendered);
+
+    assert_ne!(speed, 0, "a revised component revalidates");
+    assert_eq!(version("10si"), speed, "nothing changed");
+    mock.revisions.lock().unwrap().insert("10v", 7);
+    let revised = version("10si");
+    assert_ne!(revised, speed, "a component's frame changed");
+    // Every other layer is the engine's own frame.
+    assert_eq!(version("10u"), 42);
+    assert_eq!(version("10v"), 7);
+    // Components never revised in place: neither is the speed.
+    mock.revisions
+        .lock()
+        .unwrap()
+        .extend([("10u", 0), ("10v", 0)]);
+    assert_eq!(version("10si"), 0);
+}
+
 /// Everything that is not a derived parameter is the wrapped engine's.
 #[test]
 fn every_other_method_delegates() {
@@ -611,6 +682,7 @@ fn every_other_method_delegates() {
         Some(hour(0))
     );
     assert_eq!(wind.content_version(), 42);
+    assert_eq!(wind.content_version_for(Some("2t"), None, None, None), 42);
     assert_eq!(wind.default_time(), Some(hour(5)));
     assert!(wind.composites().is_empty());
     assert!(wind.has_instances());
