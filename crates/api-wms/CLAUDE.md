@@ -217,12 +217,16 @@ error images never are. Measured on a day of a live deployment's GetMaps
   GetMap validates `DIM_REFERENCE_TIME` against `RasterInfo.reference_times`
   itself (`binary_search`, the list is ascending by contract), never the
   advertised text. Never hand-format a time dimension's values.
-- **Content version.** Both keys also carry the engine's
-  `MapEngine::content_version()` (`CacheKey.content_version`,
-  `TileKeyPrefix.content_version`), read right after `resolve_time`. It is
-  `0` for immutable-timestep engines; an engine whose content for a fixed
-  instant is revised in place (engine-cap) bumps it, so an explicit
+- **Content version.** Both keys also carry the frame's
+  `MapEngine::content_version_for(parameter, time, reference_time,
+  elevation)` (`CacheKey.content_version`, `TileKeyPrefix.content_version`),
+  read in `resolve_layer` right after the time and run resolved, with the
+  arguments the render gets. It is `0` for immutable-timestep engines (the
+  default forwards `content_version()`); an engine whose content for a
+  fixed instant is revised in place (engine-cap) bumps it, so an explicit
   `TIME=` render can't be served stale forever from the no-TTL caches.
+  GRIB's is per message drawn (#1334), so a scan adding other steps keeps
+  a frame's image and meta-tiles.
 - **Several layers (#1181).** `handlers::resolve_layers` gives `TIME`,
   `ELEVATION` and `DIM_REFERENCE_TIME` to the listed layers that have the
   dimension (`!info.times.is_empty()`, `info.vertical`,

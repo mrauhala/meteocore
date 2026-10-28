@@ -496,9 +496,18 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    active at instants already rendered), it MUST override
    `MapEngine::content_version` with a value that moves with the content
    (engine-cap returns its `data_version`) — the no-TTL rendered and
-   meta-tile caches key on it, and explicit-`TIME` responses then carry a
-   short, revalidating `Cache-Control` instead of `immutable`.
-   Immutable-timestep engines keep the default `0`.
+   meta-tile caches key on it, through `MapEngine::content_version_for`
+   (default: `content_version()`), and explicit-`TIME` responses then carry
+   a short, revalidating `Cache-Control` instead of `immutable`.
+   Immutable-timestep engines keep the default `0`. **If that value moves
+   with every catalog change while most frames keep their pixels**, also
+   override `content_version_for(parameter, time, reference_time, z)` with
+   one frame's version, selected through the SAME helpers `get_raster_tile`
+   uses (GRIB: `select_run_step` + `map_message`, hashing the drawn
+   message's origin, offset and length, #1334) — otherwise every scan
+   orphans every cached frame. A wrapper that forwards `MapEngine` methods
+   forwards it too; a derived layer combines its inputs' versions
+   (`ds_core::derive`).
    **If a parameter is derived from two steps** (engine-netcdf's per-step
    amount: the step and the run's step before, #1165), `resolve_time` /
    `resolve_reference_time` name only the step drawn, so the engine MUST

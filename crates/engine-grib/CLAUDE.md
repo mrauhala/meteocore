@@ -90,11 +90,19 @@ unlike GeoTIFF's one band per collection.
   ordering hint, not the layer identity or an exposed vertical coordinate.
 - `StepFile` can combine several source files at one run/step. Always use
   `StepFile::message_url(entry)` for reads; offsets are local to that origin.
-- Each catalog carries a nonzero render content version, hashed on the scan
-  path from its runs and message identities. Late files can change default
-  levels at an existing time: Maps/Tiles/WMS caches must follow that revision,
-  and explicit-time HTTP images must revalidate. No-op rebuilds and changes
-  confined to other families preserve a view's version.
+- Each catalog carries a nonzero content version, hashed on the scan path
+  from its runs and message identities (`content_version()`). The map
+  caches key on one frame's instead (`content_version_for`, #1334): a hash
+  of the drawn message's origin, offset and indexed length, selected by
+  `select_run_step` and `map_message`, which `render_field` shares
+  (`map_level`, the step's default product, the canonical key at the map
+  level). A scan adding other steps or runs keeps a frame's cache entries; a
+  late file that changes the message a frame draws (another default or
+  canonical level of its step) moves its version, and explicit-time HTTP
+  images still revalidate. A failed selection returns the catalog's
+  version. `map_message` runs on every map request, cache hits included:
+  keep it free of key copies (no `ParameterKeys` clone; `map_level` reads
+  the run's first level directly without `z`).
 - Upper-air queries use exact levels, with no canonical-level fallback.
   Missing parameter/level pairs are null in EDR and errors in Maps. Pressure/
   model labels omit a fixed-level qualifier. The shared vertical descriptor
@@ -157,8 +165,8 @@ Two selections, never mixed (#967):
 - **Maps** (`select_run_step`): without a parameter (the default layer;
   M trajectories use its `covering_run`) the newest run whose published
   valid-time extent covers the time, at its nearest step; with one, only
-  the steps carrying it (#1005, below). `get_raster_tile(s)` and every
-  `resolve_*` override go through it: they key the #507/#521 caches, so it
+  the steps carrying it (#1005, below). `get_raster_tile(s)`, every
+  `resolve_*` override and `content_version_for` go through it: they key the #507/#521 caches, so it
   must stay the render's own selection.
 - **EDR** (`resolve_run`, `grid_steps`; position, area, radius, cube, 2-D
   and Z trajectories): by intersection (`/req/core/datetime-response` A, F).
