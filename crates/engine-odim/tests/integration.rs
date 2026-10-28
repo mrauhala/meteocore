@@ -16,7 +16,7 @@ use ds_core::edr_engine::{EdrEngine, TrajectoryShape};
 use ds_core::feature::{Bbox, FeatureQuery, Geometry, PropertyValue};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs};
-use ds_core::model::{CoverageResponse, DomainDescription};
+use ds_core::model::{CoverageResponse, DomainDescription, ValuePrecision};
 
 /// Construct an `OdimEngine` over `testdata/odim-dmi-fixture.h5`
 /// (a real DMI v2.0 ODIM_H5 composite shipped in this repo). Returns
@@ -259,6 +259,8 @@ fn edr_query_position_returns_point_series() {
     assert_eq!(range.shape, vec![1]);
     assert_eq!(range.axis_names, vec!["t".to_string()]);
     assert_eq!(range.values.len(), 1);
+    // Sampled from 8-bit raws through gain and offset (#1341).
+    assert_eq!(range.precision, ValuePrecision::F32);
 }
 
 /// A position query for a point far outside the composite still
@@ -331,6 +333,7 @@ fn edr_query_area_returns_grid() {
         ny * nx,
         "NdArray length must equal the product of shape dims"
     );
+    assert_eq!(range.precision, ValuePrecision::F32);
 }
 
 /// An unbounded area query (`datetime = None`) over a catalog with more
@@ -1658,6 +1661,7 @@ fn pvol_edr_query_position_returns_vertical_profiles() {
                 for arr in qr.ranges.values() {
                     assert_eq!(arr.shape, vec![z.values.len()]);
                     assert_eq!(arr.axis_names, vec!["z".to_string()]);
+                    assert_eq!(arr.precision, ValuePrecision::F32);
                 }
             }
             other => panic!("expected VerticalProfile, got {other:?}"),
@@ -1843,6 +1847,7 @@ fn pvol_edr_query_trajectory_returns_section() {
 
     let dbzh = qr.ranges.get("DBZH").expect("DBZH range");
     assert_eq!(dbzh.shape, vec![nodes.len(), z.values.len()]);
+    assert_eq!(dbzh.precision, ValuePrecision::F32);
     assert_eq!(
         dbzh.axis_names,
         vec!["composite".to_string(), "z".to_string()]

@@ -82,6 +82,13 @@ fn kenya_parameters_report_their_newbase_units() {
             .unwrap(),
     );
     assert_eq!(units(&trajectory), want);
+    // Every range carries the stored `f32`s' precision (#1341).
+    for result in [&position, &area, &trajectory] {
+        assert!(!result.ranges.is_empty());
+        for range in result.ranges.values() {
+            assert_eq!(range.precision, ValuePrecision::F32);
+        }
+    }
 
     assert_eq!(
         map_units(&engine),

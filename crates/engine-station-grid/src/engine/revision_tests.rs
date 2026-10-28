@@ -11,7 +11,9 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::parse_area_coords;
 use ds_core::map_engine::MapEngine;
-use ds_core::model::{CoverageResponse, DomainDescription, LocationSnapshot, NdArray, QueryResult};
+use ds_core::model::{
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, QueryResult, ValuePrecision,
+};
 
 use super::{StationGridEngine, RECHECK_PER_CYCLE};
 use crate::compute::CACHE;
@@ -127,6 +129,7 @@ impl EdrEngine for Source {
                                 shape: vec![obs.len()],
                                 axis_names: vec!["t".into()],
                                 values: obs.iter().map(|(_, v)| Some(*v)).collect(),
+                                precision: ValuePrecision::F64,
                             },
                         )]),
                     }

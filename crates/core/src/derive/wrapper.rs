@@ -571,6 +571,9 @@ impl EdrSelection {
                             d.value(&samples)
                         })
                         .collect(),
+                    // No more digits than the coarsest input carries (#1341);
+                    // the level pressure is a coordinate, exact.
+                    precision: ranges.iter().map(|r| r.precision).min().unwrap_or_default(),
                 }
             } else {
                 // An input missing throughout, or no level pressure:
@@ -579,6 +582,7 @@ impl EdrSelection {
                     shape: first.shape.clone(),
                     axis_names: first.axis_names.clone(),
                     values: vec![None; first.values.len()],
+                    precision: first.precision,
                 }
             };
             result.ranges.insert(d.name.clone(), range);

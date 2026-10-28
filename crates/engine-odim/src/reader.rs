@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use ds_core::geo::Crs;
+use ds_core::model::ValuePrecision;
 use ds_storage::bytes::Bytes;
 use hdf5_reader::error::{Error as Hdf5Error, Result as Hdf5Result};
 use hdf5_reader::storage::DynStorage;
@@ -192,6 +193,12 @@ pub enum RawPixels {
     I16(Array2<i16>),
     F32(Array2<f32>),
 }
+
+/// The precision of every EDR range sampled from [`RawPixels`] (#1341):
+/// `f32` floats, or 8- and 16-bit raws, whose levels `f32`'s 24-bit
+/// significand keeps apart after `gain` and `offset`. Interpolation adds no
+/// digits.
+pub const VALUE_PRECISION: ValuePrecision = ValuePrecision::F32;
 
 /// Classification of a single sampled radar pixel, distinguishing the two
 /// kinds of "no value": clear air vs genuinely unmeasured. Returned by

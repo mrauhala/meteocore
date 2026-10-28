@@ -70,6 +70,7 @@ impl MockEngine {
                 shape: vec![3],
                 axis_names: vec!["t".into()],
                 values: vec![Some(-2.5), Some(-2.8), None],
+                precision: ValuePrecision::F64,
             },
         );
 
@@ -1849,6 +1850,7 @@ mod unimplemented_queries {
                             Some(5.0),
                             Some(25.0),
                         ],
+                        precision: ValuePrecision::F64,
                     },
                 );
                 Ok(CoverageResponse::Single(QueryResult {
@@ -2017,7 +2019,7 @@ mod unimplemented_queries {
                         standard_name: None,
                     },
                 )];
-                plan.into_response(&parameters, &values)
+                plan.into_response(&parameters, &[ValuePrecision::F64], &values)
             }
         }
 

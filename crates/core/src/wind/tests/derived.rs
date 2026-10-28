@@ -11,7 +11,7 @@ use crate::error::DataServerError;
 use crate::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile};
 use crate::model::{
     CoverageResponse, DomainDescription, Location, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use crate::wind::*;
 
@@ -346,6 +346,7 @@ impl EdrEngine for Mock {
                             shape: vec![self.samples],
                             axis_names: vec!["t".into()],
                             values: field(p).into_iter().cycle().take(self.samples).collect(),
+                            precision: ValuePrecision::F64,
                         },
                     )
                 })

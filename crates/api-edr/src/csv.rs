@@ -26,8 +26,10 @@
 //!   single location sits at has an empty `location_id` and the label
 //!   `POINT(lon lat)`.
 //! - `longitude`, `latitude` and `value` are written as the JSON writes
-//!   them, the shortest text that reads back as the same `f64`, so CSV
-//!   carries the CoverageJSON's precision.
+//!   them, the shortest text that reads back as the same number, so CSV
+//!   carries the CoverageJSON's precision: a value at its range's
+//!   precision (`ds_core::model::RangeValue`, #1341), a coordinate as
+//!   `f64`.
 //! - `datetime` is RFC 3339 in UTC with a `Z`; `unit` is the parameter's
 //!   unit as CoverageJSON labels it, empty when it has none.
 //!
@@ -64,7 +66,7 @@
 use std::fmt;
 
 use chrono::SecondsFormat;
-use ds_core::model::{CoverageResponse, QueryResult};
+use ds_core::model::{CoverageResponse, QueryResult, RangeValue, ValuePrecision};
 
 use crate::geojson::{station_series_axes, unnamed_label, FeatureIdentity};
 
@@ -198,9 +200,9 @@ fn write_rows<'n>(
             None => push_text(&mut location, &unnamed_label(x, y))?,
         }
         location.push(',');
-        push_number(&mut location, Some(x))?;
+        push_number(&mut location, Some(x), ValuePrecision::F64)?;
         location.push(',');
-        push_number(&mut location, Some(y))?;
+        push_number(&mut location, Some(y), ValuePrecision::F64)?;
         location.push(',');
 
         let mut names: Vec<&String> = q.ranges.keys().collect();
@@ -223,12 +225,13 @@ fn write_rows<'n>(
         for (step, time) in times.iter().enumerate() {
             let datetime = time.to_rfc3339_opts(SecondsFormat::AutoSi, true);
             for (k, name) in names.iter().enumerate() {
-                let value = q.ranges[*name].values.get(step).copied().flatten();
+                let range = &q.ranges[*name];
+                let value = range.values.get(step).copied().flatten();
                 out.write_str(&location)?;
                 out.write_str(&datetime)?;
                 out.write_char(',')?;
                 out.write_str(&parameters[k])?;
-                push_number(out, value)?;
+                push_number(out, value, range.precision)?;
                 out.write_char(',')?;
                 out.write_str(&units[k])?;
                 out.write_str("\r\n")?;
@@ -238,13 +241,22 @@ fn write_rows<'n>(
     Ok(())
 }
 
-/// A number as the JSON writes it (`serde_json`'s shortest round-trip
-/// text), or nothing for a missing or non-finite one.
-fn push_number(out: &mut impl fmt::Write, value: Option<f64>) -> fmt::Result {
-    match value.and_then(serde_json::Number::from_f64) {
-        Some(n) => write!(out, "{n}"),
-        None => Ok(()),
-    }
+/// A number as the JSON writes it at `precision` (`serde_json`'s shortest
+/// round-trip text), or nothing for a missing or non-finite one.
+fn push_number(
+    out: &mut impl fmt::Write,
+    value: Option<f64>,
+    precision: ValuePrecision,
+) -> fmt::Result {
+    let Some(value) = RangeValue::new(value, precision) else {
+        return Ok(());
+    };
+    // The longest finite `f64`, `-2.2250738585072014e-308`, is 24 bytes.
+    let mut buf = [0u8; 32];
+    let mut rest = &mut buf[..];
+    serde_json::to_writer(&mut rest, &value).map_err(|_| fmt::Error)?;
+    let len = 32 - rest.len();
+    out.write_str(std::str::from_utf8(&buf[..len]).map_err(|_| fmt::Error)?)
 }
 
 /// A text cell: RFC 4180 quoting, and the formula guard (module docs).
@@ -324,6 +336,7 @@ mod tests {
                     shape: vec![v.len()],
                     axis_names: vec!["t".into()],
                     values: v.clone(),
+                    precision: ValuePrecision::F64,
                 },
             );
         }
@@ -418,6 +431,40 @@ mod tests {
             .unwrap()
             .starts_with(",POINT(0 0),0.0,0.0,"));
         assert!(csv.lines().nth(1).unwrap().ends_with(",0.1,"));
+    }
+
+    /// A value cell carries its range's precision as the CoverageJSON
+    /// does (#1341): an `f32` range's values as their shortest `f32` text.
+    /// Coordinates stay `f64`.
+    #[test]
+    fn values_keep_the_range_precision() {
+        let values = [
+            f64::from(10.531_f32),
+            f64::from(283.681_f32) - 273.15,
+            f64::from(0.1_f32),
+            1e300,
+        ];
+        let mut q = series(
+            24.1,
+            60.2,
+            &[0, 1, 2, 3],
+            &[("t2m", "°C", values.iter().map(|v| Some(*v)).collect())],
+        );
+        q.ranges.get_mut("t2m").unwrap().precision = ValuePrecision::F32;
+        let json = serde_json::to_string(&crate::response::Values(&q.ranges["t2m"])).unwrap();
+        let csv = unadmitted(&CoverageResponse::Single(q), |_, _| None, MAX_BYTES).unwrap();
+        let written: Vec<&str> = csv
+            .lines()
+            .skip(1)
+            .map(|row| row.split(',').nth(6).unwrap())
+            .collect();
+        assert_eq!(written, ["10.531", "10.531", "0.1", "1e+300"]);
+        assert_eq!(format!("[{}]", written.join(",")), json);
+        assert!(csv
+            .lines()
+            .nth(1)
+            .unwrap()
+            .starts_with(",POINT(24.1 60.2),24.1,60.2,"));
     }
 
     /// The byte cap: a body of exactly `max_bytes` is written, one byte

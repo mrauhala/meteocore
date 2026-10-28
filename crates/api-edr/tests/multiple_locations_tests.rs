@@ -76,6 +76,7 @@ fn coverage_with_values(x: f64, values: Vec<Option<f64>>) -> QueryResult {
             shape: vec![values.len()],
             axis_names: vec!["t".into()],
             values,
+            precision: ValuePrecision::F64,
         },
     );
     QueryResult {

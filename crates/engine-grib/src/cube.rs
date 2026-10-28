@@ -229,6 +229,7 @@ impl GribEngine {
                     shape: vec![nt, nz, layout.y.len(), layout.x.len()],
                     axis_names: vec!["t".into(), "z".into(), "y".into(), "x".into()],
                     values,
+                    precision: VALUE_PRECISION,
                 },
             );
         }

@@ -569,6 +569,13 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    projdef with its ellipsoid), never one derived from the `Crs`. A grid on
    several bands reports the default parameter's. Wrappers forward the
    source's grid, or report their own if they resample (#1237).
+   **Set each EDR range's `NdArray::precision` from source metadata**
+   (#1341), never from a parameter name: `ValuePrecision::F32` when the
+   values are sampled from `f32`s (a decoder or cache holding `f32`, a
+   float32 array or sample type), `F64` otherwise. A value computed from
+   others (interpolated, unit-converted, derived) carries the coarsest of
+   its inputs. EDR and WMS GetFeatureInfo write values through
+   `ds_core::model::RangeValue`, so an `F32` value is its shortest `f32` text.
 8. Ship a runnable (enabled) example collection config AND do an end-to-end
    server + curl smoke test against real data. Unit tests alone miss
    integration and unit-conversion bugs.

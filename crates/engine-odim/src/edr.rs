@@ -38,7 +38,7 @@ use ds_core::model::{
 
 use crate::catalog::CatalogEntry;
 use crate::engine::OdimEngine;
-use crate::reader::OdimComposite;
+use crate::reader::{OdimComposite, VALUE_PRECISION};
 
 /// Per-dimension cap on the area-query output grid. An ODIM
 /// composite can be ~4400 px across; without a cap an area query
@@ -260,6 +260,7 @@ impl OdimEngine {
                 shape: vec![values.len()],
                 axis_names: vec!["t".to_string()],
                 values,
+                precision: VALUE_PRECISION,
             },
         );
 
@@ -390,6 +391,7 @@ impl OdimEngine {
                 shape,
                 axis_names,
                 values: all_values,
+                precision: VALUE_PRECISION,
             },
         );
 

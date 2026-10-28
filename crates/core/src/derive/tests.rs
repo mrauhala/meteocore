@@ -15,7 +15,7 @@ use crate::geopotential::STANDARD_GRAVITY;
 use crate::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile};
 use crate::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use crate::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindSource};
 
@@ -42,6 +42,14 @@ fn unit(parameter: &str) -> &'static str {
         "z" => "m2 s-2",
         "2t" => "°C",
         _ => "m s-1",
+    }
+}
+
+/// One wind component `f32`, the rest `f64` (#1341).
+fn precision(parameter: &str) -> ValuePrecision {
+    match parameter {
+        "10u" => ValuePrecision::F32,
+        _ => ValuePrecision::F64,
     }
 }
 
@@ -310,6 +318,7 @@ impl EdrEngine for Mock {
                             shape: vec![self.samples],
                             axis_names: vec!["t".into()],
                             values: field(p).into_iter().cycle().take(self.samples).collect(),
+                            precision: precision(p),
                         },
                     )
                 })
@@ -596,6 +605,21 @@ fn edr_serves_the_height_from_the_queried_geopotential() {
     let result = position(&derived, None);
     assert_eq!(result.ranges.len(), 7);
     assert_eq!(result.ranges["gh"].values, heights());
+}
+
+/// A derived range carries no more digits than its coarsest input
+/// (#1341): the wind from an `f32` and an `f64` component is `f32`, the
+/// height from an `f64` geopotential `f64`.
+#[test]
+fn a_derived_range_takes_the_coarsest_input_precision() {
+    let mock = Mock::new();
+    let (derived, _) = wrap(&mock, Derivations::ALL);
+    let result = position(&derived, None);
+    assert_eq!(result.ranges["10u"].precision, ValuePrecision::F32);
+    assert_eq!(result.ranges["10v"].precision, ValuePrecision::F64);
+    assert_eq!(result.ranges["10si"].precision, ValuePrecision::F32);
+    assert_eq!(result.ranges["10wdir"].precision, ValuePrecision::F32);
+    assert_eq!(result.ranges["gh"].precision, ValuePrecision::F64);
 }
 
 /// The budget message names the derivation when the derived parameters

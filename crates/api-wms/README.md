@@ -219,7 +219,11 @@ answers the same question elsewhere:
   NetCDF; a station grid's analysis cell under the point), not the pixel's
   colour: a projected GetMap is assembled by nearest neighbour. The answer
   names the value's unit, the one EDR serves: GRIB, Zarr and NetCDF convert
-  a temperature stored in K to °C and a pressure in Pa to hPa.
+  a temperature stored in K to °C and a pressure in Pa to hPa. Every format
+  writes the value as EDR does, at the precision of its source: a value
+  from `f32` data as its shortest `f32` text, `10.531` rather than
+  `10.530998535156414`. The [EDR README](../api-edr/README.md) lists each
+  engine's precision (#1341).
 - **An RGB composite** (`{collection}/{composite}`) answers each band's
   value at the point, with its band name and unit: one position query of
   its bands at the scan the composite is drawn from, the latest scan every

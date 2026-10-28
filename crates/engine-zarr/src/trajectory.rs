@@ -73,7 +73,8 @@ pub(crate) fn query(
             )
         })
         .collect();
-    plan.into_response(&descriptions, &values)
+    let precisions: Vec<_> = selected.iter().map(|v| v.precision()).collect();
+    plan.into_response(&descriptions, &precisions, &values)
 }
 
 /// A run of consecutive path samples read through one window.

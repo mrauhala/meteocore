@@ -1089,6 +1089,7 @@ mod tests {
             nodata: None,
             scale: None,
             offset: None,
+            sample_type: None,
             overviews: vec![],
             epsg: None,
         }

@@ -60,6 +60,7 @@ fn make_query_result(
                 shape: vec![times.len()],
                 axis_names: vec!["t".to_string()],
                 values: values.clone(),
+                precision: ValuePrecision::F64,
             },
         );
     }
@@ -370,6 +371,7 @@ fn make_grid_query_result(
                 shape,
                 axis_names,
                 values: values.clone(),
+                precision: ValuePrecision::F64,
             },
         );
     }
@@ -626,6 +628,7 @@ fn vertical_profile_validates() {
             shape: vec![levels.len()],
             axis_names: vec!["z".to_string()],
             values: vec![Some(20.0), Some(18.0), None, Some(5.0)],
+            precision: ValuePrecision::F64,
         },
     );
     let result = QueryResult {
@@ -669,6 +672,7 @@ fn vertical_profile_collection_validates() {
                 shape: vec![2],
                 axis_names: vec!["z".to_string()],
                 values: vec![Some(10.0), Some(8.0)],
+                precision: ValuePrecision::F64,
             },
         );
         QueryResult {
@@ -715,6 +719,7 @@ fn grid_with_z_validates() {
             shape: vec![2, 2, 2],
             axis_names: vec!["z".to_string(), "y".to_string(), "x".to_string()],
             values: (0..8).map(|i| Some(i as f64)).collect(),
+            precision: ValuePrecision::F64,
         },
     );
     let result = QueryResult {
@@ -759,6 +764,7 @@ fn cube_grid_with_t_and_z_validates() {
             shape: vec![2, 3, 2, 4],
             axis_names: vec!["t".into(), "z".into(), "y".into(), "x".into()],
             values: (0..48).map(|i| (i % 5 != 0).then_some(i as f64)).collect(),
+            precision: ValuePrecision::F64,
         },
     );
     let result = QueryResult {
@@ -815,6 +821,7 @@ fn section_coverage_validates_against_schema() {
             shape: vec![nodes.len(), heights.len()],
             axis_names: vec!["composite".to_string(), "z".to_string()],
             values,
+            precision: ValuePrecision::F64,
         },
     );
 
@@ -878,6 +885,7 @@ fn section_coverage_floor_foreign_member_validates() {
             shape: vec![nodes.len(), heights.len()],
             axis_names: vec!["composite".to_string(), "z".to_string()],
             values: vec![Some(1.0); nodes.len() * heights.len()],
+            precision: ValuePrecision::F64,
         },
     );
 
@@ -929,6 +937,7 @@ fn make_point_result(hour: u32, params: Vec<(&str, &str, Option<f64>)>) -> Query
                 shape: vec![],
                 axis_names: vec![],
                 values: vec![*value],
+                precision: ValuePrecision::F64,
             },
         );
     }
@@ -1148,7 +1157,11 @@ fn trajectory_json(
             standard_name: None,
         },
     )];
-    coverage_response_to_json(&plan.into_response(&parameters, &values).unwrap())
+    coverage_response_to_json(
+        &plan
+            .into_response(&parameters, &[ValuePrecision::F32], &values)
+            .unwrap(),
+    )
 }
 
 fn pressure_levels() -> ds_core::vertical::VerticalDimension {
@@ -1285,6 +1298,7 @@ fn trajectory_schema_rejects_repeated_tuples() {
                 shape: vec![3],
                 axis_names: vec!["composite".into()],
                 values: vec![Some(1.0), None, Some(3.0)],
+                precision: ValuePrecision::F64,
             },
         );
         QueryResult {

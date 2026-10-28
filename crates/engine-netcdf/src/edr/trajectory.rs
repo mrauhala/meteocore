@@ -46,6 +46,7 @@ use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, Trajector
 
 use super::{layout, on_grid, Limits, Positions, Reads, Sampling, Window};
 use crate::catalog::Step;
+use crate::field::VALUE_PRECISION;
 use crate::NetcdfEngine;
 
 impl NetcdfEngine {
@@ -160,6 +161,10 @@ impl NetcdfEngine {
             "the datetime window"
         };
         let values = self.sample_fields(&reads, &fields, limits, time)?;
-        plan.into_response(&Self::described(&catalog, layout, &reads.params), &values)
+        plan.into_response(
+            &Self::described(&catalog, layout, &reads.params),
+            &vec![VALUE_PRECISION; reads.params.len()],
+            &values,
+        )
     }
 }

@@ -61,6 +61,63 @@ fn prate_is_served_in_mm_per_hour() {
     assert!((value - pixels[0]).abs() < 1e-6, "{value} vs {}", pixels[0]);
 }
 
+/// Every EDR range is sampled from decoded `f32`s, the display conversion
+/// adding no digits, so each carries `f32` precision (#1341): CoverageJSON
+/// writes the rate as the `f32` nearest it, `0.90000004`, not as its `f64`
+/// `0.9000000427477062`.
+#[test]
+fn edr_ranges_carry_f32_precision() {
+    let source = TestSource::new();
+    source.write("f000", &[("PRATE", "surface", prate(2.5e-4))], 0);
+    let engine = GribEngine::new("gfs", &source.config()).unwrap();
+    let names = ["PRATE".to_string()];
+    let ranges = |response: CoverageResponse| -> Vec<NdArray> {
+        let coverages = match response {
+            CoverageResponse::Single(q) => vec![q],
+            CoverageResponse::Collection(v) => v,
+        };
+        coverages
+            .into_iter()
+            .flat_map(|q| q.ranges.into_values())
+            .collect()
+    };
+    let position = engine
+        .query_position("POINT(0.5 0.5)", None, Some(&names), None, None)
+        .unwrap();
+    let position = ranges(position);
+    let value = position[0].values[0].unwrap();
+    assert_eq!(value.to_string(), "0.9000000427477062");
+    assert_eq!((value as f32).to_string(), "0.90000004");
+    let area = engine
+        .query_area(
+            "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))",
+            None,
+            Some(&names),
+            None,
+            None,
+        )
+        .unwrap();
+    let trajectory = engine
+        .query_trajectory(
+            "LINESTRING(0.25 0.25, 0.75 0.75)",
+            None,
+            Some(&names),
+            None,
+            None,
+        )
+        .unwrap();
+    for (query, ranges) in [
+        ("position", position),
+        ("area", ranges(area)),
+        ("trajectory", ranges(trajectory)),
+    ] {
+        assert!(!ranges.is_empty(), "{query}");
+        for range in ranges {
+            assert_eq!(range.precision, ValuePrecision::F32, "{query}");
+        }
+    }
+}
+
 /// #886: ECMWF `tcw` and `cp` as ECMWF open data encodes them (read from
 /// the live 2026-10-24 00Z headers; see `units::tests`), each served with
 /// its name and in mm: the reported unit, the map pixel and the EDR value

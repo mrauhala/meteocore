@@ -2,7 +2,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use ds_core::model::{
-    CoverageResponse, DomainDescription, Location, ParameterDescription, QueryResult, VerticalCoord,
+    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    RangeValue, VerticalCoord,
 };
 use ds_core::units::qudt_unit;
 use serde::ser::{SerializeMap, Serializer};
@@ -215,13 +216,14 @@ impl Serialize for Ranges<'_> {
     }
 }
 
-struct NdArrayJson<'a>(&'a ds_core::model::NdArray);
+struct NdArrayJson<'a>(&'a NdArray);
 
 impl Serialize for NdArrayJson<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let ndarray = self.0;
         let mut obj = serializer.serialize_map(None)?;
         obj.serialize_entry("type", "NdArray")?;
+        // `float` whatever the precision: CoverageJSON's one type for both.
         obj.serialize_entry("dataType", "float")?;
         // A 0-d scalar range (a `Point` coverage's single value) omits
         // `axisNames`/`shape` per the CoverageJSON spec; any dimensioned
@@ -230,20 +232,27 @@ impl Serialize for NdArrayJson<'_> {
             obj.serialize_entry("axisNames", &ndarray.axis_names)?;
             obj.serialize_entry("shape", &ndarray.shape)?;
         }
-        obj.serialize_entry("values", &Values(&ndarray.values))?;
+        obj.serialize_entry("values", &Values(ndarray))?;
         obj.end()
     }
 }
 
-/// A range's values, written one by one from the engine's result.
-struct Values<'a>(&'a [Option<f64>]);
+/// A range's values, written one by one from the engine's result at the
+/// precision they carry (`ds_core::model::RangeValue`, #1341), as WMS
+/// GetFeatureInfo writes them. A non-finite value is `null`, never `0`,
+/// which would read as a genuine zero (PR #275). EDR GeoJSON writes its
+/// series through it too.
+pub(crate) struct Values<'a>(pub &'a NdArray);
 
 impl Serialize for Values<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // JSON has no NaN / ±inf: a non-finite measurement must encode as
-        // `null`, not `0`, which would be indistinguishable from a genuine
-        // zero reading. Flagged by claude-review on PR #275.
-        serializer.collect_seq(self.0.iter().map(|v| v.filter(|f| f.is_finite())))
+        let precision = self.0.precision;
+        serializer.collect_seq(
+            self.0
+                .values
+                .iter()
+                .map(|&value| RangeValue::new(value, precision)),
+        )
     }
 }
 
@@ -316,10 +325,13 @@ impl Serialize for Coverages<'_> {
 }
 
 /// A CoverageJSON document as a `Value`: what the HTML page lays out and
-/// tests inspect. The same serialisation as the response body
-/// ([`CoverageJson`]), so the two cannot drift.
+/// tests inspect. The response body ([`CoverageJson`]) parsed back, so the
+/// two cannot drift: an `f32` range value is the number its shortest text
+/// reads as, `10.531`, where `serde_json::to_value` would keep the `f32`
+/// widened to `10.531000137329102` (#1341).
 fn to_value(document: impl Serialize) -> Value {
-    serde_json::to_value(document).expect("a CoverageJSON document has only string keys")
+    let body = serde_json::to_vec(&document).expect("a CoverageJSON document has only string keys");
+    serde_json::from_slice(&body).expect("a serialised CoverageJSON document parses")
 }
 
 pub fn query_result_to_coverage_json(result: &QueryResult) -> Value {
@@ -737,7 +749,7 @@ impl serde::Serialize for LocationFeatures<'_> {
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
-    use ds_core::model::NdArray;
+    use ds_core::model::ValuePrecision;
 
     /// The body is written member by member in the document's order, the
     /// order the `Value` tree it replaced serialised to, whatever
@@ -762,6 +774,7 @@ mod coverage_tests {
                     shape: vec![3],
                     axis_names: vec!["z".into()],
                     values: vec![Some(1.5), Some(f64::NAN), None],
+                    precision: ValuePrecision::F64,
                 },
             )]),
         });
@@ -782,6 +795,237 @@ mod coverage_tests {
         assert_eq!(
             serde_json::to_string(&CoverageJson(&empty)).unwrap(),
             r#"{"type":"CoverageCollection","coverages":[]}"#
+        );
+    }
+}
+
+/// Range values at the precision the source carries (#1341).
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+    use ds_core::model::ValuePrecision;
+
+    fn range(values: Vec<Option<f64>>, precision: ValuePrecision) -> NdArray {
+        NdArray {
+            shape: vec![values.len()],
+            axis_names: vec!["t".into()],
+            values,
+            precision,
+        }
+    }
+
+    /// The `values` array as written, one text per value.
+    fn texts(range: &NdArray) -> Vec<String> {
+        let body = serde_json::to_string(&Values(range)).unwrap();
+        let inner = &body[1..body.len() - 1];
+        inner.split(',').map(str::to_owned).collect()
+    }
+
+    /// The significant digits of a number's text: `-10.5310e0` → `10531`.
+    fn digits(text: &str) -> String {
+        let mantissa = text
+            .trim_start_matches('-')
+            .split(['e', 'E'])
+            .next()
+            .unwrap();
+        let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+        digits
+            .trim_start_matches('0')
+            .trim_end_matches('0')
+            .to_owned()
+    }
+
+    /// Finite `f32`s across every exponent, both signs and the subnormals:
+    /// every 65 521st bit pattern.
+    fn f32_samples() -> Vec<f32> {
+        (0..=u32::MAX)
+            .step_by(65_521)
+            .map(f32::from_bits)
+            .filter(|v| v.is_finite())
+            .collect()
+    }
+
+    #[test]
+    fn an_f32_value_is_its_shortest_text_and_reads_back_bit_for_bit() {
+        let samples = f32_samples();
+        assert!(samples.len() > 60_000);
+        let values = range(
+            samples.iter().map(|&v| Some(f64::from(v))).collect(),
+            ValuePrecision::F32,
+        );
+        let written = texts(&values);
+        assert_eq!(written.len(), samples.len());
+        for (text, &v) in written.iter().zip(&samples) {
+            let back: f32 = text.parse().unwrap();
+            assert_eq!(back.to_bits(), v.to_bits(), "{text} is not {v:e}");
+            // As few digits as the shortest text that reads back as `v`,
+            // Rust's `{:e}` (which may pick the other digit of a tie).
+            assert_eq!(
+                digits(text).len(),
+                digits(&format!("{v:e}")).len(),
+                "{text} vs {v:e}"
+            );
+        }
+        // The issue's examples: the f64 widening's digits are gone.
+        let issue = range(
+            vec![
+                Some(f64::from(10.531_f32)),
+                Some(f64::from(1.490_413_9_f32)),
+            ],
+            ValuePrecision::F32,
+        );
+        assert_eq!(texts(&issue), ["10.531", "1.4904139"]);
+    }
+
+    /// A value computed from `f32` samples in `f64`, as a display conversion
+    /// (K → °C) does, is written as the `f32` nearest it.
+    #[test]
+    fn a_value_computed_from_f32_samples_is_written_as_the_nearest_f32() {
+        let kelvin = 283.681_f32;
+        let celsius = f64::from(kelvin) - 273.15;
+        assert_eq!(celsius.to_string(), "10.530999755859398");
+        let written = texts(&range(vec![Some(celsius)], ValuePrecision::F32));
+        assert_eq!(written, ["10.531"]);
+        assert_eq!(written[0].parse::<f32>().unwrap(), celsius as f32);
+    }
+
+    /// An `f64` range is written exactly as before #1341: the shortest
+    /// text that reads back as the same `f64`, `null` for a missing or
+    /// non-finite value.
+    #[test]
+    fn an_f64_value_is_byte_identical_to_the_old_writer() {
+        let values = vec![
+            Some(10.530998535156414),
+            Some(1.4904138764798391),
+            Some(7.0954500000000005),
+            Some(f64::from(0.1_f32)),
+            Some(-0.0),
+            Some(0.0),
+            Some(12.0),
+            Some(1e300),
+            Some(5e-324),
+            Some(f64::MAX),
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+        ];
+        // The writer before #1341.
+        let before: Vec<Option<f64>> = values.iter().map(|v| v.filter(|f| f.is_finite())).collect();
+        let before = serde_json::to_string(&before).unwrap();
+        let after = serde_json::to_string(&Values(&range(values, ValuePrecision::F64))).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            after,
+            "[10.530998535156414,1.4904138764798391,7.0954500000000005,\
+             0.10000000149011612,-0.0,0.0,12.0,1e+300,5e-324,\
+             1.7976931348623157e+308,null,null,null,null]"
+        );
+    }
+
+    /// `f32` cannot hold every `f64`: a value beyond its range, or nonzero
+    /// under its smallest step, keeps its `f64` form rather than turning
+    /// into infinity (`null`) or zero. Missing and non-finite values are
+    /// `null` at either precision.
+    #[test]
+    fn a_value_f32_cannot_hold_keeps_its_f64_form() {
+        let values = vec![
+            Some(1e300),
+            Some(-1e300),
+            Some(1e-300),
+            Some(0.0),
+            Some(-0.0),
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ];
+        assert_eq!(
+            texts(&range(values, ValuePrecision::F32)),
+            ["1e+300", "-1e+300", "1e-300", "0.0", "-0.0", "null", "null", "null"]
+        );
+    }
+
+    /// The `Value` the HTML page lays out is the body read back: an `f32`
+    /// value is the number its text reads as, not the `f32` widened.
+    #[test]
+    fn the_value_tree_holds_the_numbers_the_body_reads_as() {
+        let result = QueryResult {
+            domain: DomainDescription::Point {
+                x: 24.0,
+                y: 60.0,
+                z: None,
+                t: None,
+            },
+            parameters: HashMap::new(),
+            ranges: HashMap::from([(
+                "t2m".to_owned(),
+                NdArray {
+                    shape: vec![],
+                    axis_names: vec![],
+                    values: vec![Some(f64::from(10.531_f32))],
+                    precision: ValuePrecision::F32,
+                },
+            )]),
+        };
+        let value = query_result_to_coverage_json(&result);
+        assert_eq!(value["ranges"]["t2m"]["values"][0].as_f64(), Some(10.531));
+        let body = serde_json::to_string(&CoverageJson(&CoverageResponse::Single(result))).unwrap();
+        assert!(body.contains(r#""values":[10.531]"#), "{body}");
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), value);
+    }
+
+    /// Acceptance of #1341: the body of a 10° × 10° area of a 0.1° GRIB
+    /// field shrinks by at least 40 %. The field is decoded as `grib`
+    /// decodes simple packing, `(R + X × 2^E) × 10^-D` in `f32`, sampled at
+    /// its nodes and converted K → °C in `f64`, as engine-grib serves it;
+    /// the axes are the engine's `origin + i × step` coordinates.
+    #[test]
+    fn a_grib_area_body_shrinks_by_at_least_40_percent() {
+        let n = 102;
+        let (reference, exponent) = (24_000.0_f32, 2.0_f32.powi(-6));
+        let decimal = 10.0_f32.powi(-2);
+        let values: Vec<Option<f64>> = (0..n * n)
+            .map(|i| {
+                let (row, column) = ((i / n) as f32, (i % n) as f32);
+                // 0 … 2^15 packed integers: a smooth field with some noise.
+                let packed = (row * 40.0 + column * 25.0 + (i % 7) as f32 * 3.0).round();
+                let kelvin = (reference + packed * exponent) * decimal;
+                Some(f64::from(kelvin) - 273.15)
+            })
+            .collect();
+        let axis = |origin: f64| -> Vec<f64> { (0..n).map(|i| origin + i as f64 * 0.1).collect() };
+        let body = |precision| {
+            let result = CoverageResponse::Single(QueryResult {
+                domain: DomainDescription::Grid {
+                    x: axis(19.9),
+                    y: axis(54.95),
+                    t: None,
+                    z: None,
+                },
+                parameters: HashMap::new(),
+                ranges: HashMap::from([(
+                    "2t".to_owned(),
+                    NdArray {
+                        shape: vec![n, n],
+                        axis_names: vec!["y".into(), "x".into()],
+                        values: values.clone(),
+                        precision,
+                    },
+                )]),
+            });
+            serde_json::to_vec(&CoverageJson(&result)).unwrap().len()
+        };
+        let (wide, narrow) = (body(ValuePrecision::F64), body(ValuePrecision::F32));
+        let saved = 1.0 - narrow as f64 / wide as f64;
+        eprintln!(
+            "{} values: {wide} → {narrow} bytes, {:.1} % smaller",
+            n * n,
+            saved * 100.0
+        );
+        assert!(
+            saved >= 0.40,
+            "{wide} → {narrow} bytes: {:.1} %",
+            saved * 100.0
         );
     }
 }

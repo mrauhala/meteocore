@@ -90,7 +90,7 @@ use crate::pixel_cache::{MomentPixels, MomentRequest, PixelCache};
 use crate::pvol::{read_polar_volume, PolarMoment, PolarVolume, Sweep};
 use crate::quantities;
 use crate::read_budget::{Budget, Permit, BUDGET as READ_BUDGET};
-use crate::reader::{PixelClass, RawPixels, ReadError};
+use crate::reader::{PixelClass, RawPixels, ReadError, VALUE_PRECISION};
 
 /// Default lazy-pixel cache size (MB) when `MC_PVOL_PIXEL_CACHE_MB` is
 /// unset. One shared budget bounds resident decoded pixels across every
@@ -4431,6 +4431,7 @@ fn sample_profile(
                 shape: vec![levels.len()],
                 axis_names: vec!["z".to_string()],
                 values,
+                precision: VALUE_PRECISION,
             },
         );
         param_descs.insert(quantity.clone(), quantity_description(quantity));
@@ -4552,6 +4553,7 @@ fn level_series<'v>(
                         shape: vec![times.len()],
                         axis_names: vec!["t".to_string()],
                         values,
+                        precision: VALUE_PRECISION,
                     },
                 );
                 param_descs.insert(quantity.clone(), quantity_description(quantity));
@@ -5085,6 +5087,7 @@ fn sample_section(
                 shape: vec![nn, nz],
                 axis_names: vec!["composite".to_string(), "z".to_string()],
                 values,
+                precision: VALUE_PRECISION,
             },
         );
         param_descs.insert(quantity.clone(), quantity_description(quantity));

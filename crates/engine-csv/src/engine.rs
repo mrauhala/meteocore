@@ -230,6 +230,7 @@ impl CsvEngine {
                     shape: vec![times.len()],
                     axis_names: vec!["t".to_string()],
                     values,
+                    precision: ValuePrecision::F64,
                 },
             );
         }

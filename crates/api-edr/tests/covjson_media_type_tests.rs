@@ -56,6 +56,7 @@ fn point_series() -> CoverageResponse {
             shape: vec![2],
             axis_names: vec!["t".to_string()],
             values: vec![Some(1.5), Some(2.5)],
+            precision: ValuePrecision::F64,
         },
     );
     CoverageResponse::Single(QueryResult {

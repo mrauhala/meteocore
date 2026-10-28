@@ -60,6 +60,7 @@ impl MockEngine {
                     shape: vec![3],
                     axis_names: vec!["t".into()],
                     values: vec![Some(-2.5), Some(-2.8), None],
+                    precision: ValuePrecision::F64,
                 },
             );
         }

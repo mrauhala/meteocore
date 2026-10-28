@@ -139,7 +139,7 @@ fn fingerprint(stations: &[Station]) -> u64 {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use ds_core::model::NdArray;
+    use ds_core::model::{NdArray, ValuePrecision};
     use std::collections::HashMap;
 
     fn series(x: f64, y: f64, t: Vec<DateTime<Utc>>, values: Vec<Option<f64>>) -> QueryResult {
@@ -152,6 +152,7 @@ mod tests {
                     shape: vec![values.len()],
                     axis_names: vec!["t".into()],
                     values,
+                    precision: ValuePrecision::F64,
                 },
             )]),
         }

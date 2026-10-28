@@ -65,6 +65,7 @@ fn coverage(
                 shape: shape.to_vec(),
                 axis_names: axes.iter().map(|a| a.to_string()).collect(),
                 values: values.iter().map(|&v| Some(v)).collect(),
+                precision: ValuePrecision::F64,
             },
         )]),
     }

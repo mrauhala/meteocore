@@ -94,6 +94,7 @@ impl GribEngine {
                                     shape: vec![steps.len()],
                                     axis_names: vec!["t".into()],
                                     values,
+                                    precision: VALUE_PRECISION,
                                 },
                             )
                         })
@@ -122,6 +123,7 @@ impl GribEngine {
                                             shape: vec![nz],
                                             axis_names: vec!["z".into()],
                                             values: values[i * nz..(i + 1) * nz].to_vec(),
+                                            precision: VALUE_PRECISION,
                                         },
                                     )
                                 })

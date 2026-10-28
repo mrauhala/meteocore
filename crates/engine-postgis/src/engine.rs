@@ -25,7 +25,7 @@ use ds_core::feature::{
 use ds_core::feature_pick::{FeaturePick, PickedFeature, PickedFeatures};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use ds_poll::Shutdown;
 use tokio_postgres::Row;
@@ -1870,6 +1870,7 @@ fn assemble_event_coverages(
                         shape: vec![],
                         axis_names: vec![],
                         values: vec![*v],
+                        precision: ValuePrecision::F64,
                     },
                 );
             }
@@ -1920,6 +1921,7 @@ fn series_coverage(
                 shape: vec![n],
                 axis_names: vec!["t".into()],
                 values,
+                precision: ValuePrecision::F64,
             },
         );
         param_descs.insert(pname, desc);
@@ -1959,6 +1961,7 @@ fn wide_coverage(
                 shape: vec![n],
                 axis_names: vec!["t".into()],
                 values,
+                precision: ValuePrecision::F64,
             },
         );
         param_descs.insert(pname, desc);

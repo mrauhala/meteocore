@@ -118,6 +118,7 @@ fn series(x: f64, y: f64) -> QueryResult {
                 shape: vec![values.len()],
                 axis_names: vec!["t".into()],
                 values,
+                precision: ValuePrecision::F64,
             },
         );
     }

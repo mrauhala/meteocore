@@ -14,7 +14,7 @@ use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use ds_core::moisture::MoistureRole;
 use ds_core::temp_files;
@@ -23,6 +23,10 @@ use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindRole, 
 
 use crate::parse::{ParamInfo, QueryData};
 use crate::units;
+
+/// The precision of every EDR range (#1341): QueryData stores each value as
+/// a 4-byte `f32` ([`QueryData::value`]), and interpolation adds no digits.
+const VALUE_PRECISION: ValuePrecision = ValuePrecision::F32;
 
 /// One retained model run: a parsed `.sqd` file plus its source path (for
 /// change detection on poll). Keyed in [`RunSet`] by the file's origin time.
@@ -365,7 +369,11 @@ impl EdrEngine for QueryDataEngine {
             .iter()
             .map(|parameter| (parameter.key.to_string(), description(parameter.param)))
             .collect();
-        plan.into_response(&descriptions, &values)
+        plan.into_response(
+            &descriptions,
+            &vec![VALUE_PRECISION; descriptions.len()],
+            &values,
+        )
     }
 
     /// Area query: a CRS84 `Grid` over the polygon's bbox at the source's
@@ -461,6 +469,7 @@ impl EdrEngine for QueryDataEngine {
                     shape,
                     axis_names,
                     values,
+                    precision: VALUE_PRECISION,
                 },
             );
         }
@@ -525,6 +534,7 @@ impl EdrEngine for QueryDataEngine {
                     shape: vec![values.len()],
                     axis_names: vec!["t".to_string()],
                     values,
+                    precision: VALUE_PRECISION,
                 },
             );
         }

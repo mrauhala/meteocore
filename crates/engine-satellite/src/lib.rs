@@ -38,7 +38,7 @@ use ds_core::map_engine::{
 };
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    QueryResult, ValuePrecision,
 };
 use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
@@ -1100,6 +1100,7 @@ impl EdrEngine for SatelliteEngine {
                     shape: vec![times.len()],
                     axis_names: vec!["t".into()],
                     values,
+                    precision: ValuePrecision::F64,
                 },
             );
         }
@@ -1227,6 +1228,7 @@ impl EdrEngine for SatelliteEngine {
                     shape,
                     axis_names: axis_names.into_iter().map(String::from).collect(),
                     values,
+                    precision: ValuePrecision::F64,
                 },
             );
         }

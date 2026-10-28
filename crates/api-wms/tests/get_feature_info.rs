@@ -29,7 +29,7 @@ use ds_core::map_engine::{
 };
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, VerticalCoord,
+    QueryResult, ValuePrecision, VerticalCoord,
 };
 use ds_core::vertical::{VerticalDimension, VerticalKind};
 use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
@@ -53,6 +53,8 @@ const LEVELS: [f64; 2] = [850.0, 500.0];
 #[derive(Clone, Copy)]
 enum Answer {
     Value(f64),
+    /// A value sampled from `f32` data: its range carries `f32` precision.
+    F32(f64),
     Nodata,
     /// `LocationNotFound`: no data at the point.
     NotFound,
@@ -268,9 +270,10 @@ impl EdrEngine for Nwp {
             reference_time,
         });
         std::thread::sleep(self.delay);
-        let value = match self.answer {
-            Answer::Value(value) => Some(value),
-            Answer::Nodata => None,
+        let (value, precision) = match self.answer {
+            Answer::Value(value) => (Some(value), ValuePrecision::F64),
+            Answer::F32(value) => (Some(value), ValuePrecision::F32),
+            Answer::Nodata => (None, ValuePrecision::F64),
             Answer::NotFound => {
                 return Err(DataServerError::LocationNotFound("outside".into()));
             }
@@ -311,6 +314,7 @@ impl EdrEngine for Nwp {
                     shape: vec![1],
                     axis_names: vec!["t".into()],
                     values: vec![value],
+                    precision,
                 },
             )]),
         }))
@@ -762,6 +766,28 @@ async fn other_requests_get_their_wms_exceptions() {
             reply.body
         );
     }
+}
+
+/// A value sampled from `f32` data is written as EDR writes it (#1341), in
+/// every format: its shortest `f32` text, `10.531`, not the `f64`
+/// `10.530999755859398` the engine computed from it.
+#[tokio::test]
+async fn an_f32_value_is_written_at_its_precision() {
+    let celsius = f64::from(283.681_f32) - 273.15;
+    assert_eq!(celsius.to_string(), "10.530999755859398");
+    let app = router(Nwp::new(Answer::F32(celsius)));
+    let reply = get(&app, &gfi("nwp/t2m", 0, 0, "")).await;
+    assert!(reply.body.contains("\nvalue: 10.531\n"), "{}", reply.body);
+    let reply = get(&app, &gfi("nwp/t2m", 0, 0, "&INFO_FORMAT=application/json")).await;
+    assert!(reply.body.contains(r#""value":10.531,"#), "{}", reply.body);
+    let reply = get(&app, &gfi("nwp/t2m", 0, 0, "&INFO_FORMAT=text/html")).await;
+    assert!(
+        reply
+            .body
+            .contains("<tr><th>value</th><td>10.531</td></tr>"),
+        "{}",
+        reply.body
+    );
 }
 
 /// `text/plain` and `text/html` carry the same fields; HTML escapes every
@@ -1603,6 +1629,7 @@ impl EdrEngine for Sat {
                     shape: vec![1],
                     axis_names: vec!["t".into()],
                     values: vec![self.axis(band).contains(&time).then_some(value)],
+                    precision: ValuePrecision::F64,
                 },
             );
         }
