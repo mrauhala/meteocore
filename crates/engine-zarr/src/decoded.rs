@@ -59,6 +59,9 @@ pub(crate) struct DecodedArray {
     name: Arc<str>,
     grid: ChunkGrid,
     headroom: crate::codec_limits::headroom::Plan,
+    /// Shard indexes kept for this snapshot (#1353); `None` reads each
+    /// cold inner chunk with a fresh sharding decoder.
+    shards: Option<shards::ShardIndexes>,
 }
 
 struct PreparedChunk<'a> {
@@ -112,7 +115,14 @@ impl DecodedArray {
             name: name.into(),
             grid: array.subchunk_grid(),
             headroom: crate::codec_limits::headroom::Plan::new(array),
+            shards: shards::ShardIndexes::new(array),
         })
+    }
+
+    /// The resident shard indexes, which catalog build loads ahead for
+    /// the default run.
+    pub(crate) fn shard_indexes(&self) -> Option<&shards::ShardIndexes> {
+        self.shards.as_ref()
     }
 
     pub(crate) fn read(
@@ -329,7 +339,14 @@ impl DecodedArray {
             let result = {
                 let _encoded =
                     crate::encoded::enter_prepaid(budget, chunk.permit.clone(), chunk.credit);
-                read_native(array, &chunk.source, options)
+                match &self.shards {
+                    Some(shards) => match shards.read(array, &chunk.source, options) {
+                        Ok(Some(bytes)) => Ok(bytes),
+                        Ok(None) => read_native(array, &chunk.source, options),
+                        Err(error) => Err(error),
+                    },
+                    None => read_native(array, &chunk.source, options),
+                }
             };
             // End encoded admission before an error drops the chunk's native
             // permit and then its fill claim. A successor must be able to admit
@@ -412,6 +429,8 @@ fn copy_overlap(
 fn error(error: impl std::fmt::Display) -> DataServerError {
     DataServerError::Engine(format!("Zarr decoded chunk read: {error}"))
 }
+
+mod shards;
 
 #[cfg(test)]
 mod tests;

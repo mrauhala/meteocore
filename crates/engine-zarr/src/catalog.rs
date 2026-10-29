@@ -34,6 +34,8 @@ use crate::decoded::{DecodedArray, DecodedCache};
 use crate::read_budget::{self, Budget, Permit};
 use crate::store::EngineStore;
 
+mod preload;
+
 /// The store type backing every Zarr collection. A backend-agnostic wrapper so
 /// the catalog stays non-generic across the plain (`ds-storage`) and Icechunk
 /// backends (#125 Phase 2, #335).
@@ -586,13 +588,15 @@ pub fn build(
     param_filter: Option<&[String]>,
     decoded_cache: Arc<DecodedCache>,
 ) -> Result<Catalog, DataServerError> {
-    build_with_codec_setup(
+    let catalog = build_with_codec_setup(
         store,
         collection_id,
         param_filter,
         decoded_cache,
         crate::codec_limits::bounded_array,
-    )
+    )?;
+    preload::run(&catalog, collection_id);
+    Ok(catalog)
 }
 
 fn build_with_codec_setup(
