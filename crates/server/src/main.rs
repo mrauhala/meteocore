@@ -506,13 +506,16 @@ async fn serve(cli: CliArgs) {
         tracing::warn!("{warning}");
     }
 
+    // The WCMP2 records WIS2-fed collections learn (#1356): one registry
+    // for the process, which every load and engine shares.
+    let learned_records = Arc::new(ds_core::discovery::LearnedRecords::default());
     let result = admin::load_collections(
         &style_ctx,
         &config.collections,
         &config.style_bundles,
         &base_url,
         config.server.trust_proxy_headers,
-        &config.discovery(),
+        &config.discovery(learned_records.clone()),
         config.server.metatile_cache_mb,
         rendered_cache_mb,
         // Startup builds the render caches fresh; reloads reuse them.
@@ -759,6 +762,7 @@ async fn serve(cli: CliArgs) {
             &config,
             style_ctx,
             colormaps::style_config_fingerprint(&config, config_dir.as_deref()),
+            learned_records.clone(),
         )))),
         recovery_shutdown: ds_poll::Shutdown::new(),
         config_path,
@@ -778,6 +782,7 @@ async fn serve(cli: CliArgs) {
         nowcast_engines: RwLock::new(result.nowcast_engines),
         station_grid_engines: RwLock::new(result.station_grid_engines),
         reload_lock: tokio::sync::Mutex::new(()),
+        learned_records,
         admin_token,
         style_fingerprint: std::sync::atomic::AtomicU64::new(colormaps::style_config_fingerprint(
             &config,

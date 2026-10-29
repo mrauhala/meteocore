@@ -276,6 +276,15 @@ impl CapEngine {
         self.source.wis2()
     }
 
+    /// Learn the WCMP2 records this collection's WIS2 notifications name
+    /// into `records`, the server's registry (#1356). No-op for a file or
+    /// feed source.
+    pub fn learn_records_into(&self, records: Arc<ds_core::discovery::LearnedRecords>) {
+        if let Some(source) = self.source.wis2() {
+            source.records.connect(records);
+        }
+    }
+
     /// Live health: latest acquisition outcome for directory/feed sources,
     /// or broker session readiness in WIS2 mode.
     /// A disconnect shorter than `degrade_after_secs` is not reported — the

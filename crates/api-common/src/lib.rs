@@ -484,7 +484,7 @@ pub fn collection_metadata(
             );
         }
     }
-    for record in discovery.records(config) {
+    for record in discovery.records(config).iter() {
         links.push(json!({
             "href": discovery.catalogue().record_url(record),
             "rel": "describedby",

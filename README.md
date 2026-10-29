@@ -630,6 +630,11 @@ wcmp2_record = "urn:wmo:md:int-ecmwf:aifs:oper:forecast"
   (default `https://wis2-gdc.weather.gc.ca`, http(s) only); a collection's
   own `[discovery]` cannot set it. A reload that changes only the catalogue
   rebuilds no engine.
+- A WIS2-fed collection without `wcmp2_record` links the records its
+  notifications name instead: each valid `properties.metadata_id`, sorted
+  by id, at most 64 per collection. They are kept in memory: a reload keeps
+  them, removing the collection drops them, and after a restart they return
+  with the next notifications.
 - `/collections?q=` and `query=` also match the topic: `/` separates words,
   so `q=weather/prediction` finds every collection classified below it. The
   HTML collection page and catalog rows show the topic as a chip that runs

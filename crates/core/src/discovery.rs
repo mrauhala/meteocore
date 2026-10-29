@@ -12,10 +12,12 @@
 //! the topics its WIS2 subscriptions name ([`Wis2Topic::from_subscription`]).
 //!
 //! The API layer serializes [`themes`] and links each of
-//! [`Discovery::records`] at [`Catalogue::record_url`].
+//! [`Discovery::records`] at [`Catalogue::record_url`]: the configured
+//! `[discovery] wcmp2_record`, or else the records a WIS2-fed collection
+//! learned from its notifications ([`LearnedRecords`]).
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -215,10 +217,26 @@ impl std::fmt::Display for Wis2Topic {
     }
 }
 
+/// A collection's WIS2 subscriptions: `[cap.wis2]`, `[bufr.wis2]`. An
+/// engine gaining a WIS2 source adds its subscription here.
+fn subscriptions(config: &CollectionConfig) -> impl Iterator<Item = &crate::config::Wis2Config> {
+    [
+        config.cap.as_ref().and_then(|c| c.wis2.as_ref()),
+        config.bufr.as_ref().and_then(|b| b.wis2.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+/// Whether a WIS2 subscription feeds `config`: such a collection learns
+/// records from its notifications ([`LearnedRecords`]).
+pub fn is_wis2_fed(config: &CollectionConfig) -> bool {
+    subscriptions(config).next().is_some()
+}
+
 /// A collection's WIS2 topics: its configured `[discovery] wis2_topic`, or
-/// else the distinct topics its WIS2 subscriptions (`[cap.wis2]`,
-/// `[bufr.wis2]`) name, in subscription order. An engine gaining a WIS2
-/// source adds its subscriptions here.
+/// else the distinct topics its WIS2 subscriptions name, in subscription
+/// order.
 pub fn topics(config: &CollectionConfig) -> Vec<Wis2Topic> {
     if let Some(topic) = config
         .discovery
@@ -227,12 +245,8 @@ pub fn topics(config: &CollectionConfig) -> Vec<Wis2Topic> {
     {
         return vec![topic.clone()];
     }
-    let subscriptions = [
-        config.cap.as_ref().and_then(|c| c.wis2.as_ref()),
-        config.bufr.as_ref().and_then(|b| b.wis2.as_ref()),
-    ];
     let mut topics: Vec<Wis2Topic> = Vec::new();
-    for filter in subscriptions.into_iter().flatten().flat_map(|w| &w.topics) {
+    for filter in subscriptions(config).flat_map(|w| &w.topics) {
         if let Some(topic) = Wis2Topic::from_subscription(filter) {
             if !topics.contains(&topic) {
                 topics.push(topic);
@@ -298,7 +312,7 @@ pub struct RecordIdError(String);
 /// A WCMP2 discovery record identifier, `urn:wmo:md:<centre-id>:<local-id>`.
 /// Its characters are ASCII letters, digits and `-_.:`, all of which a URL
 /// path segment and HTML carry as they are.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(try_from = "String")]
 pub struct RecordId(String);
 
@@ -410,36 +424,182 @@ fn path_segment(value: &str) -> String {
     out
 }
 
+/// The most WCMP2 records one collection learns from its notifications.
+pub const MAX_LEARNED_RECORDS: usize = 64;
+
+/// What [`LearnedRecords::learn`] made of one notification's `metadata_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Learned {
+    /// The collection already has the record.
+    Known,
+    /// A record new to the collection, now listed.
+    New,
+    /// Not a record id ([`RecordId::parse`]); ignored.
+    Invalid,
+    /// The collection has [`MAX_LEARNED_RECORDS`]; ignored. `first` is set
+    /// only for the first record turned away, so a caller logs once.
+    Full { first: bool },
+}
+
+/// One collection's learned records, sorted by id, and whether one was
+/// turned away for want of room.
+#[derive(Debug, Default)]
+struct LearnedEntry {
+    records: Arc<[RecordId]>,
+    full: bool,
+}
+
+/// The WCMP2 records WIS2-fed collections learn from their notifications'
+/// `properties.metadata_id`, by collection id. The server holds one for its
+/// whole life, in every load's [`Discovery`] and in the engines that
+/// learn, so a reload or a rebuilt engine keeps what was learned; a
+/// restart starts empty until the next notification. Notifications come
+/// from public brokers: an id must parse as a [`RecordId`], and a
+/// collection keeps at most [`MAX_LEARNED_RECORDS`].
+#[derive(Debug, Default)]
+pub struct LearnedRecords {
+    by_collection: RwLock<HashMap<String, LearnedEntry>>,
+}
+
+impl LearnedRecords {
+    /// Learn `metadata_id` for `collection`. An id the collection already
+    /// has costs a read lock.
+    pub fn learn(&self, collection: &str, metadata_id: &str) -> Learned {
+        {
+            let map = self
+                .by_collection
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = map.get(collection) {
+                let known = entry
+                    .records
+                    .binary_search_by(|r| r.as_str().cmp(metadata_id))
+                    .is_ok();
+                if known {
+                    return Learned::Known;
+                }
+                if entry.full {
+                    return Learned::Full { first: false };
+                }
+            }
+        }
+        let Ok(record) = RecordId::parse(metadata_id) else {
+            return Learned::Invalid;
+        };
+        let mut map = self
+            .by_collection
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entry = map.entry(collection.to_owned()).or_default();
+        let Err(at) = entry.records.binary_search(&record) else {
+            return Learned::Known;
+        };
+        if entry.records.len() >= MAX_LEARNED_RECORDS {
+            let first = !entry.full;
+            entry.full = true;
+            return Learned::Full { first };
+        }
+        let mut records = entry.records.to_vec();
+        records.insert(at, record);
+        entry.records = records.into();
+        Learned::New
+    }
+
+    /// `collection`'s learned records, sorted by id: one lookup and a
+    /// reference count, whatever their number.
+    pub fn get(&self, collection: &str) -> Option<Arc<[RecordId]>> {
+        let map = self
+            .by_collection
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        map.get(collection).map(|entry| entry.records.clone())
+    }
+
+    /// Forget every collection `keep` rejects: those a reload removed or
+    /// that no longer subscribe to WIS2.
+    pub fn retain(&self, keep: impl Fn(&str) -> bool) {
+        let mut map = self
+            .by_collection
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        map.retain(|collection, _| keep(collection));
+    }
+}
+
+/// The records describing one collection, sorted by id.
+#[derive(Debug, Clone)]
+pub enum Records<'a> {
+    None,
+    /// Its `[discovery] wcmp2_record`.
+    Configured(&'a RecordId),
+    /// What its WIS2 notifications named.
+    Learned(Arc<[RecordId]>),
+}
+
+impl std::ops::Deref for Records<'_> {
+    type Target = [RecordId];
+
+    fn deref(&self) -> &[RecordId] {
+        match self {
+            Records::None => &[],
+            Records::Configured(record) => std::slice::from_ref(*record),
+            Records::Learned(records) => records,
+        }
+    }
+}
+
 /// What a collection description reads beyond the collection's own
-/// config: the catalogue its records resolve in. The server builds one per
-/// accepted load from `[discovery] catalogue` and gives it to every API, so
-/// a reload changing only the catalogue rebuilds no engine.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// config: the catalogue its records resolve in, and the records WIS2-fed
+/// collections learned. The server builds one per accepted load from
+/// `[discovery] catalogue` and its one [`LearnedRecords`], and gives it to
+/// every API, so a reload changing only the catalogue rebuilds no engine.
+#[derive(Debug, Clone, Default)]
 pub struct Discovery {
     catalogue: Catalogue,
+    learned: Arc<LearnedRecords>,
 }
 
 impl Discovery {
+    /// A discovery over `catalogue` with records of its own; the server's
+    /// loads share one through [`Self::with_learned`].
     pub fn new(catalogue: Catalogue) -> Self {
-        Self { catalogue }
+        Self {
+            catalogue,
+            learned: Arc::default(),
+        }
+    }
+
+    /// This discovery reading the records in `learned`.
+    pub fn with_learned(self, learned: Arc<LearnedRecords>) -> Self {
+        Self { learned, ..self }
     }
 
     pub fn catalogue(&self) -> &Catalogue {
         &self.catalogue
     }
 
+    /// Where WIS2 sources put the records they learn.
+    pub fn learned(&self) -> &Arc<LearnedRecords> {
+        &self.learned
+    }
+
     /// The WCMP2 records describing `config`: its `[discovery]
-    /// wcmp2_record`. Records a collection's WIS2 notifications name are
-    /// to join these, looked up by the collection's id.
-    pub fn records<'a>(
-        &'a self,
-        config: &'a CollectionConfig,
-    ) -> impl Iterator<Item = &'a RecordId> {
-        config
+    /// wcmp2_record`, which replaces the learned ones, else what its WIS2
+    /// notifications named. Learned records are keyed by the collection's
+    /// own id: only CAP and BUFR collections learn, and neither registers
+    /// views under other ids.
+    pub fn records<'a>(&self, config: &'a CollectionConfig) -> Records<'a> {
+        if let Some(record) = config
             .discovery
             .as_ref()
             .and_then(|d| d.wcmp2_record.as_ref())
-            .into_iter()
+        {
+            return Records::Configured(record);
+        }
+        match self.learned.get(&config.id) {
+            Some(records) if !records.is_empty() => Records::Learned(records),
+            _ => Records::None,
+        }
     }
 }
 
@@ -652,6 +812,7 @@ topics = ["cache/a/wis2/eu-eumetnet-warnings/data/core/weather/advisories-warnin
         );
         assert_eq!(names(&configured), ["weather"]);
         assert!(names(&collection("")).is_empty());
+        assert!(is_wis2_fed(&synop) && is_wis2_fed(&cap) && !is_wis2_fed(&collection("")));
     }
 
     #[test]
@@ -731,5 +892,96 @@ topics = ["cache/a/wis2/eu-eumetnet-warnings/data/core/weather/advisories-warnin
             assert!(Catalogue::parse(bad).is_err(), "{bad}");
         }
         assert_eq!(path_segment("a b/c:d%"), "a%20b%2Fc:d%25");
+    }
+
+    fn ids(records: &[RecordId]) -> Vec<&str> {
+        records.iter().map(RecordId::as_str).collect()
+    }
+
+    /// Learned records (#1356): valid ids only, each once, sorted by id,
+    /// per collection.
+    #[test]
+    fn records_are_learned_once_sorted_and_only_when_valid() {
+        let learned = LearnedRecords::default();
+        assert_eq!(
+            learned.learn("obs", "urn:wmo:md:se-smhi:synop"),
+            Learned::New
+        );
+        assert_eq!(
+            learned.learn("obs", "urn:wmo:md:fi-fmi:synop"),
+            Learned::New
+        );
+        assert_eq!(
+            learned.learn("obs", "urn:wmo:md:se-smhi:synop"),
+            Learned::Known
+        );
+        assert_eq!(
+            learned.learn("obs", " urn:wmo:md:se-smhi:synop "),
+            Learned::Known
+        );
+        for bad in ["", "smhi", "urn:wmo:md:x:<script>", "urn:x-wmo:md:x:y"] {
+            assert_eq!(learned.learn("obs", bad), Learned::Invalid, "{bad}");
+        }
+        assert_eq!(
+            learned.learn("cap", "urn:wmo:md:eu-eumetnet:warnings"),
+            Learned::New
+        );
+        assert_eq!(
+            ids(&learned.get("obs").unwrap()),
+            ["urn:wmo:md:fi-fmi:synop", "urn:wmo:md:se-smhi:synop"]
+        );
+        assert_eq!(
+            ids(&learned.get("cap").unwrap()),
+            ["urn:wmo:md:eu-eumetnet:warnings"]
+        );
+        assert!(learned.get("other").is_none());
+        learned.retain(|id| id == "cap");
+        assert!(learned.get("obs").is_none());
+        assert!(learned.get("cap").is_some());
+    }
+
+    /// A collection keeps at most [`MAX_LEARNED_RECORDS`]; the first id
+    /// turned away says so, for one log line, and known ids stay known.
+    #[test]
+    fn learned_records_are_capped() {
+        let learned = LearnedRecords::default();
+        let id = |i: usize| format!("urn:wmo:md:c:r{i:03}");
+        for i in 0..MAX_LEARNED_RECORDS {
+            assert_eq!(learned.learn("obs", &id(i)), Learned::New);
+        }
+        assert_eq!(
+            learned.learn("obs", &id(MAX_LEARNED_RECORDS)),
+            Learned::Full { first: true }
+        );
+        assert_eq!(
+            learned.learn("obs", &id(MAX_LEARNED_RECORDS + 1)),
+            Learned::Full { first: false }
+        );
+        assert_eq!(learned.learn("obs", &id(0)), Learned::Known);
+        assert_eq!(learned.get("obs").unwrap().len(), MAX_LEARNED_RECORDS);
+    }
+
+    /// A configured `wcmp2_record` replaces the learned ones; a collection
+    /// without one reads what it learned under its own id.
+    #[test]
+    fn a_configured_record_replaces_the_learned_ones() {
+        let learned = Arc::new(LearnedRecords::default());
+        let discovery = Discovery::default().with_learned(learned.clone());
+        let plain = collection("");
+        assert!(discovery.records(&plain).is_empty());
+        learned.learn("c", "urn:wmo:md:c:learned");
+        learned.learn("c", "urn:wmo:md:c:also-learned");
+        assert_eq!(
+            ids(&discovery.records(&plain)),
+            ["urn:wmo:md:c:also-learned", "urn:wmo:md:c:learned"]
+        );
+        let configured = collection("[discovery]\nwcmp2_record = \"urn:wmo:md:c:configured\"");
+        assert_eq!(
+            ids(&discovery.records(&configured)),
+            ["urn:wmo:md:c:configured"]
+        );
+        // Another load's discovery over the same records reads them too.
+        let reloaded = Discovery::new(Catalogue::default()).with_learned(learned);
+        assert_eq!(reloaded.records(&plain).len(), 2);
     }
 }

@@ -421,6 +421,25 @@ impl BufrEngine {
         matches!(self.source, Source::Wis2(_))
     }
 
+    /// Learn the WCMP2 records this collection's WIS2 notifications name
+    /// into `records`, the server's registry (#1356). No-op for a
+    /// `data_path` source.
+    pub fn learn_records_into(&self, records: Arc<ds_core::discovery::LearnedRecords>) {
+        if let Source::Wis2(src) = &self.source {
+            src.records.connect(records);
+        }
+    }
+
+    /// Apply one resolved WIS2 notification as the poll loop does: its
+    /// record learned, its payload ingested or its deletion applied.
+    /// No-op for a `data_path` source. Lets tests feed notifications
+    /// without a broker.
+    pub fn apply_notification(&self, r: ds_wis2::Resolved) {
+        if let Source::Wis2(src) = &self.source {
+            src.apply(self, r);
+        }
+    }
+
     /// WIS2 broker / pipeline counters for `/metrics` (`None` unless WIS2
     /// mode and the pipeline has started).
     pub fn wis2_status(&self) -> Option<ds_wis2::StatusSnapshot> {

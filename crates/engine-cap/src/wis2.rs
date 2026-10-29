@@ -255,6 +255,8 @@ pub struct Wis2CapSource {
     /// Set by [`Self::seal`], under the accumulator lock: notifications
     /// are no longer applied.
     sealed: AtomicBool,
+    /// The WCMP2 records notifications name (#1356).
+    pub(crate) records: ds_wis2::RecordLearner,
     pub stats: Wis2SourceStats,
 }
 
@@ -268,6 +270,7 @@ impl Wis2CapSource {
             filling_since: AtomicI64::new(NOT_FILLING),
             after_outage: AtomicBool::new(false),
             sealed: AtomicBool::new(false),
+            records: ds_wis2::RecordLearner::default(),
             stats: Wis2SourceStats::default(),
         }
     }
@@ -527,6 +530,10 @@ impl Wis2CapSource {
         now: DateTime<Utc>,
     ) {
         let n = r.notification;
+        // A sealed source belongs to a replaced or removed collection.
+        if !self.sealed.load(Ordering::Relaxed) {
+            self.records.learn(&self.cfg.label, &n);
+        }
         let Some(payload) = r.payload else {
             // Tombstone in pubtime space like every other ordering decision
             // here: a QoS-1 backlog replays a deletion and a later re-issue
