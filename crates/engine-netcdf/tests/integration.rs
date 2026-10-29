@@ -1896,12 +1896,9 @@ fn pressure_in_pa_is_served_in_hpa_with_wind_direction_per_level() {
     {
         let speed = profiles[0].ranges["ws"].values[n].unwrap();
         let direction = profiles[0].ranges["wdir"].values[n].unwrap();
-        assert!((speed - u.hypot(v)).abs() < 1e-4, "{n}: {speed}");
+        assert!((speed - u.hypot(v)).abs() < 1e-4, "wind speed off");
         let expected = (-u).atan2(-v).to_degrees().rem_euclid(360.0);
-        assert!(
-            (direction - expected).abs() < 1e-3,
-            "{n}: {direction} {expected}"
-        );
+        assert!((direction - expected).abs() < 1e-3, "wind direction off");
     }
 }
 
@@ -2752,8 +2749,8 @@ fn derived_dew_point_from_temperature_and_relative_humidity() {
     );
     let result = query(&derived, &["dew_point_temperature_2m"]);
     let value = result.ranges["dew_point_temperature_2m"].values[0].unwrap();
-    assert!((value - dew_point(t, rh)).abs() < 1e-9, "{value}");
-    assert!(value < t && value > t - 30.0, "{value} vs {t}");
+    assert!((value - dew_point(t, rh)).abs() < 1e-9, "2 m dew point off");
+    assert!(value < t && value > t - 30.0, "2 m dew point out of range");
     let description = &result.parameters["dew_point_temperature_2m"];
     assert_eq!(description.unit, "°C");
     assert_eq!(
@@ -2813,7 +2810,10 @@ fn derived_dew_point_from_temperature_and_relative_humidity() {
         let t = inputs.ranges["air_temperature_pl"].values[i].unwrap();
         let rh = inputs.ranges["relative_humidity_pl"].values[i].unwrap();
         let value = result.ranges["dew_point_temperature_pl"].values[i].unwrap();
-        assert!((value - dew_point(t, rh)).abs() < 1e-9, "{hpa}: {value}");
+        assert!(
+            (value - dew_point(t, rh)).abs() < 1e-9,
+            "pressure-level dew point off"
+        );
         let want = dew_point(
             drawn(pl.as_ref(), "air_temperature_pl", Some(hpa)),
             drawn(pl.as_ref(), "relative_humidity_pl", Some(hpa)),

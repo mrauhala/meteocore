@@ -108,7 +108,10 @@ fn z_is_served_in_m2_s2() {
     assert_eq!(result.parameters["z"].unit, "m2 s-2");
     // The grid's centre: the mean of its four nodes.
     let value = result.ranges["z"].values[0].unwrap();
-    assert!((value - 57_615.0).abs() < 1e-6, "{value}");
+    assert!(
+        (value - 57_615.0).abs() < 1e-6,
+        "interpolated geopotential off"
+    );
 }
 
 /// A pressure view with geopotential and no height gets `gh` = z / g₀,
@@ -144,7 +147,10 @@ fn pressure_level_z_gives_gh_derived_after_sampling() {
         let z = position(pressure.as_ref(), &["z"], Some(&at)).ranges["z"].values[0].unwrap();
         let result = position(&derived, &["gh"], Some(&at));
         let gh = result.ranges["gh"].values[0].unwrap();
-        assert!((gh - z / STANDARD_GRAVITY).abs() < 1e-9, "{level}: {gh}");
+        assert!(
+            (gh - z / STANDARD_GRAVITY).abs() < 1e-9,
+            "derived height off"
+        );
         assert_eq!(result.parameters["gh"].unit, "gpm");
         assert!(!result.ranges.contains_key("z"), "z only fed the height");
         let want: Vec<Option<f64>> = tile(pressure.as_ref(), "z", Some(level))
@@ -155,7 +161,7 @@ fn pressure_level_z_gives_gh_derived_after_sampling() {
     }
     // 500 hPa geopotential of 57 615 m² s⁻² is about 5875 gpm.
     let gh = position(&derived, &["gh"], Some(&[500.0])).ranges["gh"].values[0].unwrap();
-    assert!((gh - 5875.1).abs() < 0.1, "{gh}");
+    assert!((gh - 5875.1).abs() < 0.1, "500 hPa height off");
     // Time, run and level resolve as z's.
     for t in [None, Some(reference())] {
         assert_eq!(
@@ -233,7 +239,7 @@ fn surface_z_gives_the_terrain_height_next_to_wind() {
     let z = position(engine.as_ref(), &["z"], None).ranges["z"].values[0].unwrap();
     let terrain = position(&derived, &["gh"], None).ranges["gh"].values[0].unwrap();
     assert!((terrain - z / STANDARD_GRAVITY).abs() < 1e-9);
-    assert!((terrain - 103.5).abs() < 0.1, "{terrain} gpm");
+    assert!((terrain - 103.5).abs() < 0.1, "terrain height off");
     let speed = position(&derived, &["10si"], None).ranges["10si"].values[0];
     assert!(speed.is_some());
 
