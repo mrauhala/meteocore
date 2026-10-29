@@ -635,7 +635,8 @@ fn derived_heights_count_against_the_response_budget() {
         let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         match derived.query_position("POINT(0.5 0.5)", None, Some(&names), None, None) {
             Err(DataServerError::QueryTooLarge(message)) => message,
-            other => panic!("{names:?}: expected QueryTooLarge, got {other:?}"),
+            Err(_) => panic!("expected QueryTooLarge, got another error"),
+            Ok(_) => panic!("expected QueryTooLarge, got a coverage"),
         }
     };
     assert!(message(&["gh", "z", "2t"]).starts_with(&format!(
