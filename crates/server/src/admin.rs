@@ -1800,6 +1800,41 @@ static ZARR_DECODED_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock
 static ZARR_OBJECT_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
     CollectionCacheMetricSet::new("zarr_object_cache", "Zarr object cache", false, false)
 });
+// An Icechunk repository's payload cache (`[zarr] cache_mb`, #1353): the
+// compressed byte ranges read from its chunk objects.
+static ZARR_ICECHUNK_PAYLOAD_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> =
+    LazyLock::new(|| {
+        CollectionCacheMetricSet::new(
+            "zarr_icechunk_payload_cache",
+            "Zarr Icechunk payload cache",
+            false,
+            false,
+        )
+    });
+// Icechunk does its own storage I/O, outside ds-storage's counters (#1353).
+static ZARR_ICECHUNK_STORAGE_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "zarr_icechunk_storage_requests_total",
+            "Storage requests an Icechunk repository issued: each part of a ranged \
+             read, listing and Icechunk retry; HTTP-client retries not included",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
+static ZARR_ICECHUNK_STORAGE_READ_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "zarr_icechunk_storage_read_bytes_total",
+            "Bytes the bodies of an Icechunk repository's storage reads yielded",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
 static ZARR_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "zarr_read_reserved_bytes",
@@ -1858,6 +1893,9 @@ struct CacheCounterState {
     grib_prewarm: HashMap<String, [u64; 3]>,
     zarr_decoded: HashMap<String, CacheSeen>,
     zarr_object: HashMap<String, CacheSeen>,
+    zarr_icechunk_payload: HashMap<String, CacheSeen>,
+    /// Icechunk storage `[requests, bytes]` per collection (#1353).
+    zarr_icechunk_storage: HashMap<String, [u64; 2]>,
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
     /// the scrape rebaselines on a backward step — see `metrics_handler`.
@@ -1903,6 +1941,8 @@ impl CacheCounterState {
             grib_prewarm,
             zarr_decoded,
             zarr_object,
+            zarr_icechunk_payload,
+            zarr_icechunk_storage,
             postgis,
             nowcast,
             nowcast_tracks,
@@ -1921,6 +1961,8 @@ impl CacheCounterState {
         drop_keys(grib_prewarm, removed);
         drop_keys(zarr_decoded, removed);
         drop_keys(zarr_object, removed);
+        drop_keys(zarr_icechunk_payload, removed);
+        drop_keys(zarr_icechunk_storage, removed);
         drop_keys(postgis, removed);
         drop_keys(nowcast, removed);
         drop_keys(nowcast_tracks, removed);
@@ -8138,6 +8180,35 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                         .or_default(),
                 );
             }
+            // An Icechunk repository's; a plain store has neither.
+            if let Some(metrics) = engine.icechunk_payload_cache_metrics() {
+                ZARR_ICECHUNK_PAYLOAD_CACHE_METRICS.update(
+                    collection,
+                    metrics,
+                    None,
+                    counter_state
+                        .zarr_icechunk_payload
+                        .entry(collection.to_owned())
+                        .or_default(),
+                );
+            }
+            if let Some((requests, bytes)) = engine.icechunk_storage_counts() {
+                let deltas = delta_counts(
+                    &mut counter_state.zarr_icechunk_storage,
+                    collection,
+                    [requests, bytes],
+                );
+                for (family, delta) in [
+                    &ZARR_ICECHUNK_STORAGE_REQUESTS,
+                    &ZARR_ICECHUNK_STORAGE_READ_BYTES,
+                ]
+                .into_iter()
+                .zip(deltas)
+                {
+                    // Always touched, so both series exist before a read.
+                    family.with_label_values(&[collection]).inc_by(delta);
+                }
+            }
         }
     }
 
@@ -9133,6 +9204,10 @@ mod tests {
             (
                 &*super::ZARR_DECODED_CACHE_METRICS,
                 "zarr-decoded-metrics-test",
+            ),
+            (
+                &*super::ZARR_ICECHUNK_PAYLOAD_CACHE_METRICS,
+                "zarr-icechunk-payload-metrics-test",
             ),
             (&*super::TILE_CACHE_METRICS, "tile-cache-metrics-test"),
         ] {

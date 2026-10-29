@@ -1889,6 +1889,32 @@
                                     "name": "panel-142"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 49,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-143"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 12,
+                                  "y": 49,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-144"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -12747,7 +12773,7 @@
         "spec": {
           "id": 83,
           "title": "Per-collection caches",
-          "description": "Caches kept per collection, over the dashboard's time range: GeoTIFF compressed tiles (tile_cache), GRIB decoded grids (grid_cache) and compressed messages (grib_message_cache; its hits measure reuse after grid misses, and its misses need storage reads) and point indexes of CCSDS and complex-packed messages (grib_point_index_cache; a miss is one decode of a message a position query reads for the first time), Zarr decoded chunks (zarr_decoded_cache; single-flight waiters count as hits) and a plain Zarr store's objects (zarr_object_cache). GRIB budgets are per source: grid_cache_mb, message_cache_mb and point_index_cache_mb.",
+          "description": "Caches kept per collection, over the dashboard's time range: GeoTIFF compressed tiles (tile_cache), GRIB decoded grids (grid_cache) and compressed messages (grib_message_cache; its hits measure reuse after grid misses, and its misses need storage reads) and point indexes of CCSDS and complex-packed messages (grib_point_index_cache; a miss is one decode of a message a position query reads for the first time), Zarr decoded chunks (zarr_decoded_cache; single-flight waiters count as hits), a plain Zarr store's objects (zarr_object_cache) and the compressed chunk ranges an Icechunk repository reads (zarr_icechunk_payload_cache; its misses are storage requests). GRIB budgets are per source: grid_cache_mb, message_cache_mb and point_index_cache_mb.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -12766,7 +12792,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) / ((sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) + sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))) > 0)",
+                        "expr": "sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache|zarr_icechunk_payload_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) / ((sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache|zarr_icechunk_payload_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__range:1m])) + sum by (cache, collection) (increase(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache|zarr_icechunk_payload_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))) > 0)",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12789,7 +12815,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))",
+                        "expr": "sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache|zarr_icechunk_payload_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__range:1m]))",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12812,7 +12838,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\")) / (sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache|zarr_icechunk_payload_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\")) / (sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache|zarr_icechunk_payload_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\")) > 0)",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12835,7 +12861,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache|zarr_icechunk_payload_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -12858,7 +12884,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\"))",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache|zarr_icechunk_payload_cache)_capacity_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_capacity_bytes\"))",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -13195,7 +13221,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "topk(12, sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s])) / ((sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s])) + sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__rate_interval:15s]))) > 0))",
+                        "expr": "topk(12, sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_icechunk_payload_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s])) / ((sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_icechunk_payload_cache)_hits_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_hits_total\")[$__rate_interval:15s])) + sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_icechunk_payload_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__rate_interval:15s]))) > 0))",
                         "legendFormat": "{{collection}} · {{cache}}",
                         "range": true,
                         "instant": false,
@@ -13289,7 +13315,7 @@
         "spec": {
           "id": 85,
           "title": "Per-collection cache misses",
-          "description": "Misses per second per cache and collection: decodes (grid, Zarr chunk, GRIB point index) and storage reads (GeoTIFF tile, GRIB message).",
+          "description": "Misses per second per cache and collection: decodes (grid, Zarr chunk, GRIB point index) and storage reads (GeoTIFF tile, GRIB message, Icechunk chunk range).",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -13308,7 +13334,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "topk(12, sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__rate_interval:15s])))",
+                        "expr": "topk(12, sum by (cache, collection) (rate(label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_icechunk_payload_cache)_misses_total\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_misses_total\")[$__rate_interval:15s])))",
                         "legendFormat": "{{collection}} · {{cache}}",
                         "range": true,
                         "instant": false,
@@ -13581,7 +13607,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
+                        "expr": "sum by (cache, collection) (label_replace({job=~\"$job\", __name__=~\"(tile_cache|grid_cache|grib_message_cache|grib_point_index_cache|zarr_decoded_cache|zarr_object_cache|zarr_icechunk_payload_cache)_bytes\", collection=~\"$collection\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
                         "legendFormat": "{{collection}} · {{cache}}",
                         "range": true,
                         "instant": false,
@@ -20918,6 +20944,228 @@
                   "min": 0,
                   "decimals": 1,
                   "max": 1
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-143": {
+        "kind": "Panel",
+        "spec": {
+          "id": 143,
+          "title": "Icechunk storage requests",
+          "description": "Storage requests per second each Icechunk repository issues: every part of a ranged read, listings, and Icechunk's own retries; retries inside the HTTP client are not counted. A catalog build after a snapshot change reads the new snapshot, the manifests and the default run's shard indexes; after that a cold position read is one request per inner chunk that misses the payload cache. Requests that do not follow traffic or snapshot changes point at retries.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (rate(zarr_icechunk_storage_requests_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval]))",
+                        "legendFormat": "{{collection}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "reqps",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [
+                    {
+                      "title": "Filter dashboard to ${__field.labels.collection}",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${job:queryparam}&${api:queryparam}&${cache:queryparam}&var-collection=${__field.labels.collection}&dtab=engines&engines-dtab=gridded-sources"
+                    }
+                  ],
+                  "min": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-144": {
+        "kind": "Panel",
+        "spec": {
+          "id": 144,
+          "title": "Icechunk storage bytes",
+          "description": "Bytes per second the bodies of each Icechunk repository's storage reads yield: snapshots, manifests, shard indexes, and chunk ranges that missed the payload cache (zarr_icechunk_payload_cache). Divided by the requests beside it, this is the mean size of a read.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (rate(zarr_icechunk_storage_read_bytes_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval]))",
+                        "legendFormat": "{{collection}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "Bps",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [
+                    {
+                      "title": "Filter dashboard to ${__field.labels.collection}",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${job:queryparam}&${api:queryparam}&${cache:queryparam}&var-collection=${__field.labels.collection}&dtab=engines&engines-dtab=gridded-sources"
+                    }
+                  ],
+                  "min": 0
                 },
                 "overrides": []
               }

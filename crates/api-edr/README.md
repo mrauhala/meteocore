@@ -230,6 +230,11 @@ with a 404.
 - The run axis is not advertised as an `extent.custom` dimension, and data
   queries take no `reference_time` parameter: select a run by its instance
   path.
+- A Zarr run is listed once its reference time is in the store version the
+  engine last read, with every lead of the lead axis. Steps the store has
+  not written yet are null; dynamical.org's materialized Icechunk stores
+  publish only finished runs. See
+  [engine-zarr](../engine-zarr/README.md#what-it-serves).
 
 ## Parameters
 

@@ -46,7 +46,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 arc-swap = "1"
 tracing = "0.1"
-tokio = { version = "1", features = ["sync", "time", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "rt-multi-thread", "io-util"] }
 thiserror = "2"
 
 # Icechunk support (#335) — optional/feature-gated; heavy transactional engine.
@@ -67,9 +67,24 @@ zarrs_icechunk = { version = "0.5.1", optional = true, default-features = false,
     "object-store-s3",
     "object-store-fs",
 ] }
+# `icechunk/metered.rs` implements Icechunk's `Storage` trait to count its
+# requests and bytes and to hold its payload cache (#1353). The trait's
+# `Sealed` supertrait lives in icechunk-storage, and implementations register
+# with `typetag`, as icechunk's own wrappers do; keep both on icechunk's lines.
+icechunk-storage = { version = "2.3", optional = true }
+typetag = { version = "0.2", optional = true }
 
 [features]
-icechunk = ["dep:icechunk", "dep:zarrs_icechunk", "dep:futures", "dep:async-trait", "zarrs/async"]
+icechunk = [
+    "dep:icechunk",
+    "dep:zarrs_icechunk",
+    "dep:icechunk-storage",
+    "dep:typetag",
+    "dep:futures",
+    "dep:async-trait",
+    "serde/rc",
+    "zarrs/async",
+]
 
 [dev-dependencies]
 tempfile = "3"

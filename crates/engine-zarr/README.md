@@ -54,15 +54,25 @@ or map window. Nothing is converted or copied first.
   Concurrent requests for one object share one download.
 - **Icechunk repositories** (Cargo feature `icechunk`) use Icechunk's own
   storage, pinned to one snapshot per catalog. Reads fetch byte ranges,
-  decoded inner chunks are cached (`decoded_cache_mb`), and up to four
-  chunks decode in parallel.
+  kept compressed in a payload cache (`cache_mb`); decoded inner chunks are
+  cached too (`decoded_cache_mb`), and up to four chunks decode in
+  parallel. The payload cache is engine-zarr's, in a wrapper around the
+  repository's storage that also counts its requests and bytes.
+- **Loading ahead.** An Icechunk catalog build loads each variable's
+  manifest and the default run's shard indexes (a store without runs: its
+  latest step's), eight at a time, before the snapshot is published. The
+  shard indexes stay with the catalog, up to 256 KiB per variable, so a
+  cold inner chunk is one request.
 - **Memory admission.** A read first reserves its estimated source buffers
   from one process-wide budget, `MC_ZARR_READ_MEMORY_MB` (default 1024 MiB,
   an estimate, not a RAM limit); one that does not fit fails at once with
   503. gzip, zstd and Blosc output is capped at the chunk's decoded size.
 - **Diagnostics.** Catalog builds log chunk shapes and warn when each time
   step is one whole-field chunk (a point time series then decodes whole
-  fields). `/metrics` has `zarr_read_*` and `zarr_decoded_cache_*`.
+  fields). `/metrics` has `zarr_read_*` and `zarr_decoded_cache_*`; for
+  Icechunk also `zarr_icechunk_payload_cache_*` and
+  `zarr_icechunk_storage_{requests,read_bytes}_total`, per collection.
+  `/admin/cache-plan` lists the payload cache.
 
 ## What it serves
 
@@ -99,6 +109,21 @@ grid, never per pixel.
 `init_time` and `lead_time`), each run is an EDR instance and a WMS
 `DIM_REFERENCE_TIME` value. The latest run is the default; its valid times
 (run + lead) are the time axis.
+
+**When a run is published.** A run is served once its reference time is in
+the version a poll read: the Icechunk branch tip, tag or snapshot, or a
+plain store as it stands. It gets every lead on the lead axis; the engine
+does not check which steps hold data.
+
+- dynamical.org's materialized Icechunk forecasts move `main` straight to
+  each finished update commit, so a half-written run is never served.
+- A store that writes a run in pieces, committing each to its tip or
+  updating a plain store in place, serves the steps not yet written as
+  nulls until a later write fills them. dynamical.org's `*_virtual` stores
+  commit this way; this engine cannot read them, since their chunks are
+  virtual (see Limits).
+- dynamical.org's `ingested_forecast_length` coordinate is not read: their
+  materialized stores leave it NaN for every run.
 
 **Derived wind.** Components are paired by CF `standard_name`
 (`eastward_wind`/`northward_wind` or `x_wind`/`y_wind`); `wind_u_10m` gives
@@ -150,7 +175,7 @@ styles draws a generic palette.
 | `path` | – | Store path in the bucket, or a sub-path under `data_path`; relative, no `..` |
 | `parameters` | every variable | Variables to serve (names ignore case) |
 | `poll_interval_secs` | `300` | Catalog rebuild period; must be above 0 |
-| `cache_mb` | `256` | Plain: whole-object byte cache. Icechunk: compressed chunk cache. `0` keeps nothing |
+| `cache_mb` | `256` | Plain: whole-object byte cache. Icechunk: compressed chunk-range cache (`zarr_icechunk_payload_cache`). `0` keeps nothing |
 | `zarr_version` | – | `2` or `3`; validated only, the version is read from the metadata |
 
 **Icechunk.** A `[zarr.icechunk]` table reads the source (a local
