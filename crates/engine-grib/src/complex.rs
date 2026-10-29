@@ -9,7 +9,9 @@
 //! before it, so none decodes on its own. A [`ComplexIndex`] keeps the
 //! group descriptors and the decoder's state at each grid row's first value
 //! (a checkpoint); the rows a query needs then decode from the first one's
-//! checkpoint, over only their own data bits.
+//! checkpoint, over only their own data bits. A position query indexes a
+//! whole message only through the rows its points read
+//! ([`Header::index_to`], #1337), and later points extend that index.
 //!
 //! Values are bit for bit the `grib` crate's full decode: its integer
 //! arithmetic (wrapping, as its release build does), its missing values and
@@ -623,6 +625,24 @@ impl Header {
         Ok((index, plan.sample(|i| values[i])))
     }
 
+    /// [`Self::index`] only through the rows `coords` read (#1337): their
+    /// values, decoded from the field's start through the start of the row
+    /// after the last one they read, and the checkpoints of the rows passed.
+    /// A later point past them reads on from the last
+    /// ([`ComplexIndex::read_message`]). The groups past those rows are not
+    /// decoded, so not checked, as in a prefix read (#1302).
+    pub(crate) fn index_to(
+        self,
+        message: &[u8],
+        coords: &[(f64, f64)],
+    ) -> Result<(ComplexIndex, Vec<Option<f64>>), PointError> {
+        let start = self
+            .start_index(message)
+            .ok_or_else(|| invalid("payload outside the message"))?;
+        let (values, extended) = start.read_message(message, coords)?;
+        Ok((extended.unwrap_or(start), values))
+    }
+
     /// Where a read on from a prefix that ends before the data should reach
     /// to sample `coords` (#1302): the descriptors, then the share of the
     /// data before the end of the last row the points read, with
@@ -684,6 +704,12 @@ impl ComplexIndex {
         self.rows.len()
     }
 
+    /// Whether every row's checkpoint is indexed, as [`Header::index`]
+    /// indexes them: any point can then be read from its own rows.
+    pub(crate) fn complete(&self) -> bool {
+        self.rows.len() >= self.header.lattice.nj
+    }
+
     /// Whether Section 6 holds a bitmap: a read must then hold it too, to
     /// place the needed nodes among the packed values.
     pub(crate) fn bitmapped(&self) -> bool {
@@ -733,10 +759,22 @@ impl ComplexIndex {
         message: &[u8],
         coords: &[(f64, f64)],
     ) -> Result<Vec<Option<f64>>, PointError> {
+        self.read_message(message, coords).map(|(values, _)| values)
+    }
+
+    /// [`Self::read`] from `message`, the whole message this index is of:
+    /// raw values, and this index extended by the rows the decode passed
+    /// when the points lie past those indexed (#1337). A message of another
+    /// length is [`PointError::Invalid`].
+    pub(crate) fn read_message(
+        &self,
+        message: &[u8],
+        coords: &[(f64, f64)],
+    ) -> Result<(Vec<Option<f64>>, Option<ComplexIndex>), PointError> {
         if message.len() != self.header.message_len {
             return Err(invalid("message length differs from the index"));
         }
-        self.read(message, 0, coords).map(|(values, _)| values)
+        self.read(message, 0, coords)
     }
 
     /// Sample `coords` from `part`, the message's bytes from offset `start`
@@ -925,7 +963,10 @@ impl ComplexIndex {
     /// bytes from offset `start` on, and the checkpoints of the rows after
     /// those indexed that the decode reached. The decode starts at the
     /// checkpoint of the first row with a needed value, or the last indexed
-    /// before it, and runs through the last needed value, or through every
+    /// before it, and runs through the last needed value, on to the start
+    /// of the row after the last node's, masked or not, when `part` holds
+    /// the values before it ([`Self::decode_end`]): the index then has the
+    /// checkpoint of every row `nodes` lie in (#1337). Or through every
     /// value when `whole` (from the field's start: an index without rows).
     fn decode_nodes(
         &self,
@@ -947,9 +988,9 @@ impl ComplexIndex {
         let data = self.data_in(part, start);
         let (from, end) = match (targets.first(), targets.last()) {
             _ if whole => (Checkpoint::default(), header.values),
-            (Some(&(_, first)), Some(&(last, slot))) => {
+            (Some(&(_, first)), Some(&(last, _))) => {
                 let from = self.start_at(nodes[first] / ni);
-                let next_row = nodes[slot] / ni + 1;
+                let next_row = nodes[nodes.len() - 1] / ni + 1;
                 (from, self.decode_end(&from, last, next_row, bitmap, &data))
             }
             _ => return Ok((Vec::new(), values)),
@@ -993,9 +1034,9 @@ impl ComplexIndex {
 
     /// Where a decode from `from` for values through packed index `last`
     /// stops (exclusive): just after it, or at the start of row `next_row`
-    /// when `data` holds every value before that row. Its checkpoint then
-    /// bounds a later prefix read of the rows before it
-    /// ([`Self::prefix_bound`]).
+    /// (the field's end past the last row) when `data` holds every value
+    /// before that row. Its checkpoint then bounds a later prefix read of
+    /// the rows before it ([`Self::prefix_bound`]).
     fn decode_end(
         &self,
         from: &Checkpoint,
@@ -1005,10 +1046,7 @@ impl ComplexIndex {
         data: &Data<'_>,
     ) -> usize {
         let header = &self.header;
-        if next_row >= header.lattice.nj {
-            return last + 1;
-        }
-        let node = next_row * header.lattice.ni;
+        let node = next_row.min(header.lattice.nj) * header.lattice.ni;
         let next = match bitmap {
             Some(bitmap) => Ranks::new(bitmap).rank(node),
             None => node,

@@ -6,8 +6,10 @@
 //! ECMWF IFS and AIFS fields, each decodable on its own from its first bit.
 //! A [`CcsdsIndex`] holds those bit offsets. [`Header::index`] builds it
 //! with one decode of the payload, streamed through a small buffer, that
-//! also picks out the samples its query needs; [`CcsdsIndex::sample`] then
-//! decodes only the RSIs holding a query's bilinear neighbours.
+//! also picks out the samples its query needs; [`Header::index_to`] stops
+//! after the last RSI those samples lie in, and extends such an index for
+//! later points (#1337). [`CcsdsIndex::sample`] then decodes only the RSIs
+//! holding a query's bilinear neighbours.
 //!
 //! Values are bit for bit the full decode's: the same libaec stream, the
 //! integer → `f32` scaling of the `grib` crate operation for operation, and
@@ -327,6 +329,25 @@ impl Header {
             rsi_offsets,
         };
         Ok((index, plan.sample(|i| values[i])))
+    }
+
+    /// [`Self::index`] only as far as `coords` need (#1337): [`Self::extend`]
+    /// over `message`, the whole message, on from the RSIs `prior` indexes
+    /// when given, through the end of the last RSI the points need. A later
+    /// point past it extends the index from the same bytes. A payload that
+    /// ends first is [`PointError::Invalid`]; the RSIs past the last needed
+    /// one are not decoded, so not checked, as in a prefix read (#1301).
+    pub(crate) fn index_to(
+        self,
+        prior: Option<&CcsdsIndex>,
+        message: &[u8],
+        coords: &[(f64, f64)],
+    ) -> Result<(CcsdsIndex, Vec<Option<f64>>), PointError> {
+        self.payload(message)?;
+        match self.extend(prior, message, 0, coords)? {
+            Extended::Done { index, values } => Ok((index, values)),
+            Extended::Short { .. } => Err(invalid("payload ended before the sampled RSIs")),
+        }
     }
 
     /// Section 7's packed bytes of `message`, the message this header was
@@ -833,6 +854,12 @@ impl CcsdsIndex {
     /// RSI starts indexed: every RSI's when complete, else the first ones'.
     pub(crate) fn indexed_rsis(&self) -> usize {
         self.rsi_offsets.len()
+    }
+
+    /// Whether every RSI is indexed, as [`Header::index`] indexes them: any
+    /// point can then be sampled through this index alone.
+    pub(crate) fn complete(&self) -> bool {
+        self.header.constant.is_some() || self.rsi_offsets.len() >= self.header.rsi_count()
     }
 
     /// What a full decode of the message reports to the metadata caches.

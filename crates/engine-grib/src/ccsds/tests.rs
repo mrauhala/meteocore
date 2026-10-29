@@ -496,6 +496,20 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
             .index(&truncated, &coords),
         Err(PointError::Invalid(_))
     ));
+    // Through the points only (#1337): a point the missing tail holds fails,
+    // one before it is the full decode's.
+    let cut = Header::parse(&truncated).unwrap();
+    assert!(matches!(
+        cut.index_to(None, &truncated, &coords),
+        Err(PointError::Invalid(_))
+    ));
+    let north = [(24.96, 60.32)];
+    let (_, values) = cut.index_to(None, &truncated, &north).unwrap();
+    assert_eq!(bits(&values), bits(&decoded(&truncated, &north)));
+    assert!(matches!(
+        cut.index_to(None, &message, &north),
+        Err(PointError::Invalid(_))
+    ));
 
     // Corrupt payload bytes.
     for (at, len, byte) in [(0, 64, 0xff), (5000, 4096, 0), (100_000, 8, 0x55)] {
@@ -508,8 +522,15 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
                 let expected = bits(&decoded(&corrupt, &coords));
                 assert_eq!(bits(&values), expected);
                 assert_eq!(bits(&index.sample(&corrupt, &coords).unwrap()), expected);
+                let (_, values) = header.index_to(None, &corrupt, &coords).unwrap();
+                assert_eq!(bits(&values), expected, "through the points");
             }
-            Err(PointError::Invalid(_)) => {}
+            // Through the points only, the decode may stop before what the
+            // complete index refused: no panic, no other error.
+            Err(PointError::Invalid(_)) => assert!(matches!(
+                header.index_to(None, &corrupt, &coords),
+                Ok(_) | Err(PointError::Invalid(_))
+            )),
             Err(other) => panic!("{other:?}"),
         }
     }
@@ -610,12 +631,16 @@ struct PartialReads {
 /// - cold and short: a prefix ending halfway into them, then one
 ///   continuation to the read-on its partial index predicts;
 /// - extended: a partial index read on from where it ends, over only the
-///   bytes [`CcsdsIndex::extension`] names, one continuation if short.
+///   bytes [`CcsdsIndex::extension`] names, one continuation if short;
+/// - whole (#1337): the whole message indexed only through the needed
+///   RSIs, and an index of the first RSI's points extended to them and on
+///   to the complete index, from the same bytes.
 fn assert_partial_reads(message: &[u8], coords: &[(f64, f64)]) -> PartialReads {
     let expected = bits(&decoded(message, coords));
     let len = message.len();
     let header = Header::parse(message).unwrap();
     let (complete, _) = header.index(message, &[]).unwrap();
+    assert!(complete.complete());
     let exact = |index: &CcsdsIndex| {
         assert_eq!(
             index.rsi_offsets[..],
@@ -632,8 +657,13 @@ fn assert_partial_reads(message: &[u8], coords: &[(f64, f64)]) -> PartialReads {
             panic!("nothing to decode")
         };
         assert_eq!(bits(&values), expected);
+        let (index, values) = header.index_to(None, message, coords).unwrap();
+        assert_eq!(bits(&values), expected, "whole");
+        assert!(index.reaches(coords));
+        assert_eq!(index.complete(), header.constant.is_some());
         return reads;
     };
+    assert_whole_reads(message, &complete, coords, &expected);
     let span = complete.rsi_bytes(&needs).unwrap();
     reads.span = span.len();
     reads.prefix = span.end;
@@ -713,6 +743,61 @@ fn assert_partial_reads(message: &[u8], coords: &[(f64, f64)]) -> PartialReads {
     };
     assert_eq!(bits(&values), expected, "extended");
     reads
+}
+
+/// The whole message indexed only through the RSIs `coords` need (#1337),
+/// bit for bit `expected`, recording exactly the RSI starts `complete`
+/// does: from nothing, stopping at the start of the RSI after the last
+/// needed one; on from an index of the first row's points; then on to the
+/// last row, which completes the index.
+fn assert_whole_reads(
+    message: &[u8],
+    complete: &CcsdsIndex,
+    coords: &[(f64, f64)],
+    expected: &[Option<u64>],
+) {
+    let header = complete.header;
+    let lattice = header.lattice;
+    let exact = |index: &CcsdsIndex| {
+        assert_eq!(
+            index.rsi_offsets[..],
+            complete.rsi_offsets[..index.rsi_offsets.len()],
+            "RSI starts"
+        );
+    };
+    let needs = complete.needs(coords).unwrap();
+    let (through, values) = header.index_to(None, message, coords).unwrap();
+    assert_eq!(bits(&values), expected, "whole, through the points");
+    exact(&through);
+    assert!(through.covers(&needs) && through.reaches(coords));
+    assert!(through.rsi_offsets.len() <= needs.last_rsi + 2);
+    assert_eq!(
+        bits(&through.sample(message, coords).unwrap()),
+        expected,
+        "through the partial index"
+    );
+
+    let first = [(lattice.lon_first, lattice.lat_first)];
+    let (north, _) = header.index_to(None, message, &first).unwrap();
+    exact(&north);
+    let (extended, values) = header.index_to(Some(&north), message, coords).unwrap();
+    assert_eq!(bits(&values), expected, "extended");
+    exact(&extended);
+    assert!(extended.reaches(coords));
+    assert!(extended.indexed_rsis() >= north.indexed_rsis());
+
+    let last = lattice.lat_first + (lattice.nj - 1) as f64 * lattice.lat_inc;
+    let south: Vec<_> = (0..lattice.ni)
+        .map(|i| (lattice.lon_first + i as f64 * lattice.lon_inc, last))
+        .collect();
+    assert_eq!(
+        complete.needs(&south).unwrap().last_rsi,
+        complete.indexed_rsis() - 1
+    );
+    let (whole, values) = header.index_to(Some(&extended), message, &south).unwrap();
+    assert_eq!(bits(&values), bits(&decoded(message, &south)), "last row");
+    assert!(whole.complete());
+    assert_eq!(whole.rsi_offsets, complete.rsi_offsets);
 }
 
 /// `grib` rejects a message cut short, so a prefix is parsed through a stub
@@ -924,6 +1009,38 @@ fn ccsds_files_are_bit_identical() {
         }
         assert_partial_reads(&message, &edge_points());
         eprintln!("  partial reads bit-identical: {}", shares.join(", "));
+        // #1337: a cold index of the whole message for one point, complete
+        // as before and through the point's RSIs, best of five each.
+        let best = |f: &mut dyn FnMut()| {
+            (0..5)
+                .map(|_| {
+                    let start = Instant::now();
+                    f();
+                    start.elapsed().as_secs_f64() * 1e3
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let mut cold = Vec::new();
+        for (name, point) in [
+            ("60°N", (24.96, 60.32)),
+            ("35°N", (139.8, 35.6)),
+            ("34°S", (151.2, -33.9)),
+        ] {
+            let complete_ms = best(&mut || {
+                header.index(&message, &[point]).unwrap();
+            });
+            let through_ms = best(&mut || {
+                header.index_to(None, &message, &[point]).unwrap();
+            });
+            cold.push(format!(
+                "{name} {through_ms:.2} of {complete_ms:.2} ms ({:.0} %)",
+                100.0 * through_ms / complete_ms
+            ));
+        }
+        eprintln!(
+            "  cold index through the point against complete: {}",
+            cold.join(", ")
+        );
         // Reads on predicted without a sibling, from every RSI start to 1,
         // 3, 10 and 60 RSIs ahead: how many fell short, and the most a
         // prediction overshot.

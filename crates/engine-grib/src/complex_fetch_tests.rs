@@ -44,8 +44,11 @@ const MIDDLE: (f64, f64) = (139.8, 35.6);
 const SOUTH: (f64, f64) = (151.2, -33.9);
 
 /// With every message in the compressed-message cache, fields read through
-/// the index: built on the first read of each message, which decodes every
-/// value once, and reused by the next query. No grid is decoded.
+/// the index: built on the first read of each message, which decodes only
+/// through the rows its points read (#1337); a query further south extends
+/// those indexes from the cached bytes, with no GET, and a repeat reuses
+/// them. Each index weighs as one built that far at once. No grid is
+/// decoded.
 #[test]
 fn whole_messages_read_through_the_index_bit_for_bit() {
     for message in [temperature(), soil()] {
@@ -54,19 +57,38 @@ fn whole_messages_read_through_the_index_bit_for_bit() {
         write_run(&source, "", RUN, &steps, true);
         let full = counted(&source, 0, 64, 0).0;
         let (engine, store) = counted(&source, 16, 64, 0);
-        for points in [vec![NORTH], vec![SOUTH, MIDDLE, (0.0, -89.5)]] {
+        let south = vec![SOUTH, MIDDLE, (0.0, -89.5)];
+        let mut weights = Vec::new();
+        for (round, points) in [vec![NORTH], south.clone(), vec![NORTH, SOUTH]]
+            .into_iter()
+            .enumerate()
+        {
             assert_eq!(
                 series(&engine, "q", &points, RUN, None),
                 series(&full, "q", &points, RUN, None)
             );
+            let gets = gets(&store);
+            if round == 0 {
+                assert_eq!(gets.len(), 4);
+                assert!(gets
+                    .iter()
+                    .all(|&(_, first, bytes)| first == 0 && bytes == message.len() as u64));
+            } else {
+                assert_eq!(gets, [], "{points:?} from the cached messages");
+            }
+            weights.push(engine.point_index_cache_metrics().bytes);
         }
-        assert_eq!(full.point_field_counts(), (0, 8));
-        assert_eq!(engine.point_field_counts(), (8, 0));
+        assert_eq!(full.point_field_counts(), (0, 12));
+        assert_eq!(engine.point_field_counts(), (12, 0));
         let index = engine.point_index_cache_metrics();
-        assert_eq!((index.hits, index.misses), (4, 4));
-        assert!(gets(&store)
-            .iter()
-            .all(|&(_, first, bytes)| first == 0 && bytes == message.len() as u64));
+        assert_eq!((index.hits, index.misses), (4, 8));
+        assert!(
+            weights[0] < weights[1] && weights[1] == weights[2],
+            "{weights:?}"
+        );
+        let direct = counted(&source, 16, 64, 0).0;
+        series(&direct, "q", &south, RUN, None);
+        assert_eq!(direct.point_index_cache_metrics().bytes, weights[1]);
         assert_eq!(engine.grid_cache_stats(), (0, 0), "no grid loaded");
     }
 }

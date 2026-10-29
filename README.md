@@ -1009,18 +1009,22 @@ cache per source collection. Header discovery does not fill this cache.
 
 Position queries on CCSDS-packed fields (template 5.42, as ECMWF IFS and AIFS
 publish them) decode only the blocks of a field their points need. The first
-read of a message decodes its payload once, without building a grid, and
-keeps a small index of where each block of 4096 values starts: about 1.2 KB
-for a 0.25° global message, 6.5 KB at 0.1°. Later point queries on that
-message decode just the blocks holding each point's four neighbours, from the
-compressed-message cache or one GET. Values are bit for bit those of the full
-decode. `point_index_cache_mb` bounds the indexes per source; `0` turns this
-path off. Complex packing with spatial differencing (template 5.3, all of GFS
-0.25°) reads alike by grid rows, from an index of 100–140 KB per message
-(#1302); fields with a bitmap read a prefix holding it. Unset,
-`point_index_cache_mb` is 25 % of `message_cache_mb`, never below 16 MiB, so
-the indexes of the GFS messages the message cache keeps stay resident with
-them (#1333); without a message cache it is 16. Other packings, CCSDS fields
+read of a message decodes its payload, without building a grid, and keeps a
+small index of where each block of 4096 values starts: about 1.2 KB for a
+0.25° global message, 6.5 KB at 0.1°. A message the compressed-message cache
+keeps is decoded only through the last block the query's points need, and a
+later point further on extends the index from the cached bytes, with no GET
+(#1337); the pre-warm, and a message read for one field alone, index all of
+it. Later point queries on that message decode just the blocks holding each
+point's four neighbours, from the compressed-message cache or one GET. Values
+are bit for bit those of the full decode. `point_index_cache_mb` bounds the
+indexes per source; `0` turns this path off. Complex packing with spatial
+differencing (template 5.3, all of GFS 0.25°) reads alike by grid rows, from
+an index of 100–140 KB per message (#1302); fields with a bitmap read a
+prefix holding it. Unset, `point_index_cache_mb` is 25 % of
+`message_cache_mb`, never below 16 MiB, so the indexes of the GFS messages
+the message cache keeps stay resident with them (#1333); without a message
+cache it is 16. Other packings, CCSDS fields
 with a bitmap, and fields the decoded-grid cache would keep while no message
 cache is set are decoded in full as before. `grib_point_index_cache_*` report
 the index cache, and `grib_point_fields_total{path="partial"|"full"}` counts

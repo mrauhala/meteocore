@@ -2,9 +2,12 @@
 //! 5.3 (GFS), through their [`ComplexIndex`] (#1302): the CCSDS reads of
 //! #1300 and #1301 over grid rows instead of RSIs.
 //!
-//! - From a whole message (the compressed-message cache, or one whole GET):
-//!   the first read decodes every value once, indexing every row; later
-//!   reads decode from the checkpoint of the first row they need.
+//! - From a whole message the compressed-message cache keeps: the first
+//!   read decodes from the field's start through the row after the last
+//!   one it reads, indexing the rows it passes; a later read decodes from
+//!   the checkpoint of the first row it needs, or on from the last row
+//!   indexed, extending the index without a GET (#1337). A whole message
+//!   read for one field alone, which no cache keeps, is indexed in full.
 //! - Warm, partial: ONE range GET from that checkpoint's data through the
 //!   last needed value. The index holds the group descriptors, so the span
 //!   is exact; a row past the indexed ones reads on from the last.
@@ -23,68 +26,104 @@ use crate::complex::ComplexIndex;
 impl GribEngine {
     /// [`Self::points_from`] for a 5.3 message: `field`'s points from
     /// `bytes`, the whole message, through its index; the cached one when it
-    /// has every row they read, else one built while decoding every value,
-    /// replacing a partial one. Decodes the message in full when the index
-    /// cannot read it.
+    /// serves them as `reach` asks, else one built from these bytes: under
+    /// [`Reach::Points`] through the row after the last one they read, on
+    /// from the last row a cached index has (#1337), under [`Reach::Full`]
+    /// decoding every value. The index reaching further is kept. Decodes
+    /// the message in full when the index cannot read it.
     pub(super) fn complex_points_from(
         &self,
         index: &PointIndex,
         key: &MessageKey,
         field: &PointField<'_>,
         bytes: &[u8],
+        reach: Reach,
     ) -> Result<FieldRead, DataServerError> {
         let (entry, run, coords) = (field.entry, field.run, field.coords);
         let full = |error: PointError| self.decode_in_full(index, field, bytes, error);
-        let cached = match index.cache.get_untracked(key) {
-            Some(Index::Complex(complex)) => Some(complex),
+        let serves = |complex: &ComplexIndex| match reach {
+            Reach::Full => complex.complete(),
+            Reach::Points => complex.reaches(coords),
+        };
+        let cached = index.cache.get_untracked(key);
+        let prior = match &cached {
+            Some(Index::Complex(complex)) => Some(complex.clone()),
             _ => None,
         };
-        if let Some(complex) = cached.as_ref().filter(|complex| complex.reaches(coords)) {
+        if let Some(complex) = prior.as_ref().filter(|complex| serves(complex)) {
             index.cache.record_hit();
             return match complex.sample(bytes, coords) {
                 Ok(values) => Ok(FieldRead::points(complex.metadata(), values)),
                 Err(error) => full(error),
             };
         }
-        let header = match complex::Header::parse(bytes) {
-            Ok(header) => header,
-            Err(error) => return full(error),
+        // A layout the reader does not take is decoded in full before the
+        // cache counts a lookup.
+        let header = match prior.as_ref().map(|prior| *prior.header()) {
+            Some(header) => header,
+            None => match complex::Header::parse(bytes) {
+                Ok(header) => header,
+                Err(error) => return full(error),
+            },
+        };
+        // The index `reach` asks for, on from `prior`, an index of the
+        // message the cache holds, and the points sampled on the way.
+        let build = |prior: Option<&Arc<ComplexIndex>>| match (reach, prior) {
+            (Reach::Points, Some(prior)) => {
+                prior.read_message(bytes, coords).map(|(values, extended)| {
+                    (extended.map_or_else(|| prior.clone(), Arc::new), values)
+                })
+            }
+            (Reach::Points, None) => header
+                .index_to(bytes, coords)
+                .map(|(complex, values)| (Arc::new(complex), values)),
+            (Reach::Full, _) => header
+                .index(bytes, coords)
+                .map(|(complex, values)| (Arc::new(complex), values)),
         };
         let mut sampled = None;
         let built = if cached.is_some() {
-            // A partial index from an earlier prefix or range read.
+            // An index of other points, from an earlier read: extend it.
             index.cache.record_miss();
-            header.index(bytes, coords).map(|(complex, values)| {
+            build(prior.as_ref()).map(|(complex, values)| {
                 sampled = Some(values);
-                index.store_complex(key, Arc::new(complex))
+                index.store_complex(key, complex)
             })
         } else {
             index
                 .cache
                 .get_or_insert_with(key, || {
-                    let (complex, values) = header.index(bytes, coords)?;
+                    let (complex, values) = build(None)?;
                     sampled = Some(values);
-                    Ok::<_, PointError>(Index::Complex(Arc::new(complex)))
+                    Ok::<_, PointError>(Index::Complex(complex))
                 })
                 .and_then(|built| match built {
                     Index::Complex(complex) => Ok(complex),
                     Index::Ccsds(_) => Err(PointError::Invalid("a CCSDS index".into())),
                 })
         };
-        let complex = match built {
+        let mut complex = match built {
             Ok(complex) => complex,
             Err(error) => return full(error),
         };
+        let values = match sampled {
+            Some(values) => values,
+            // Another reader built the index meanwhile, for its points.
+            None if serves(&complex) => match complex.sample(bytes, coords) {
+                Ok(values) => values,
+                Err(error) => return full(error),
+            },
+            None => match build(Some(&complex)) {
+                Ok((built, values)) => {
+                    complex = index.store_complex(key, built);
+                    values
+                }
+                Err(error) => return full(error),
+            },
+        };
         index.remember(entry.key(), true);
         index.note_sibling(entry.key(), run, &Index::Complex(complex.clone()));
-        match sampled {
-            Some(values) => Ok(FieldRead::points(complex.metadata(), values)),
-            // Another reader built the index meanwhile.
-            None => match complex.sample(bytes, coords) {
-                Ok(values) => Ok(FieldRead::points(complex.metadata(), values)),
-                Err(error) => full(error),
-            },
-        }
+        Ok(FieldRead::points(complex.metadata(), values))
     }
 
     /// A 5.3 field whose message the point index holds an index of, from
@@ -168,7 +207,9 @@ impl GribEngine {
                 } else {
                     prefix.to_vec()
                 };
-                return self.points_from(index, key, field, &whole).map(Some);
+                return self
+                    .points_from(index, key, field, &whole, Reach::Full)
+                    .map(Some);
             }
             Err(error) => return unexpected(entry, error),
         };

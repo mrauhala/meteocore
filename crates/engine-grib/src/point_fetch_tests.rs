@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::ccsds::{Header, Kin};
+use crate::point_index::PointField;
 use crate::runtime::run_fetches;
 use crate::test_support::{message, store::TestStore, Ccsds, TestSource};
 use ds_storage::object_store::{path::Path, GetRange, ObjectStoreExt};
@@ -417,6 +418,107 @@ fn the_message_cache_decides_whole_or_partial() {
         kept,
         "parts are never kept"
     );
+}
+
+/// #1337 acceptance: with the messages in the compressed-message cache, a
+/// cold 60°N query fetches each whole and indexes it only through the RSIs
+/// it needs; a later 34°S query extends those indexes from the cached
+/// bytes, with no GET, and the pole completes them. Each step's index
+/// weighs as one built that far at once. Every value is the full decode's.
+#[test]
+fn cached_messages_index_their_points_and_extend_without_a_get() {
+    let q = fixture();
+    let source = TestSource::new();
+    let steps: Vec<_> = (0..4).map(|_| vec![("q", q.clone())]).collect();
+    write_run(&source, "", RUN, &steps, true);
+    let full = counted(&source, 0, 0, 0).0;
+    let (engine, store) = counted(&source, 16, 64, 0);
+    let pole = (0.0, -90.0);
+    let mut weights = Vec::new();
+    for (round, points) in [vec![NORTH], vec![SOUTH], vec![NORTH, SOUTH], vec![pole]]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            series(&engine, "q", &points, RUN, None),
+            series(&full, "q", &points, RUN, None),
+            "{points:?}"
+        );
+        let gets = gets(&store);
+        if round == 0 {
+            assert_eq!(gets.len(), 4);
+            assert!(gets
+                .iter()
+                .all(|&(_, first, bytes)| first == 0 && bytes == q.len() as u64));
+        } else {
+            assert_eq!(gets, [], "{points:?} from the cached messages");
+        }
+        weights.push(engine.point_index_cache_metrics().bytes);
+    }
+    // Built through 60°N, extended to 34°S, used for both, completed.
+    let index = engine.point_index_cache_metrics();
+    assert_eq!((index.hits, index.misses), (4, 12));
+    assert!(
+        weights[0] < weights[1] && weights[1] == weights[2] && weights[2] < weights[3],
+        "{weights:?}"
+    );
+    let messages = engine.message_cache_metrics();
+    assert_eq!((messages.hits, messages.misses), (12, 4));
+    assert_eq!(engine.point_fetch_counts()[0].1, 4, "four whole GETs");
+    // The pole's RSIs run to the payload's end, before Section 8: the
+    // indexes are complete, weighed as indexes built complete at once.
+    let complete = indexed(&q);
+    let needs = complete.needs(&[pole]).unwrap();
+    assert_eq!(complete.rsi_bytes(&needs).unwrap().end, q.len() - 4);
+    let (direct, _) = counted(&source, 16, 64, 0);
+    series(&direct, "q", &[pole], RUN, None);
+    assert_eq!(direct.point_index_cache_metrics().bytes, weights[3]);
+}
+
+/// The pre-warm indexes for points no query has named (#1335):
+/// `index_message` builds the complete index, also over one a query left
+/// short, so the next query of any point builds none (#1337).
+#[test]
+fn indexing_a_message_for_the_prewarm_completes_its_index() {
+    let q = fixture();
+    let source = TestSource::new();
+    write_run(&source, "", RUN, &[vec![("q", q.clone())]], true);
+    let full = counted(&source, 0, 0, 0).0;
+    let (engine, store) = counted(&source, 16, 64, 0);
+    series(&engine, "q", &[NORTH], RUN, None);
+    gets(&store);
+    let short = engine.point_index_cache_metrics().bytes;
+    let catalog = engine.catalog();
+    let run = catalog.latest_run().unwrap();
+    let file = run.steps.values().next().unwrap();
+    let entry = file.messages.iter().find(|m| m.param == "q").unwrap();
+    let field = PointField {
+        url: file.message_url(entry),
+        entry,
+        run: run.reference_time,
+        coords: &[],
+        plan: FieldPlan {
+            concurrency: 1,
+            fill: GridFill::Bypass,
+            fetch: FieldFetch::Whole,
+        },
+    };
+    engine.index_message(&field, &q).unwrap();
+    let before = engine.point_index_cache_metrics();
+    assert!(before.bytes > short, "{} after {short}", before.bytes);
+    for points in [vec![(0.0, -90.0)], vec![SOUTH, NORTH]] {
+        assert_eq!(
+            series(&engine, "q", &points, RUN, None),
+            series(&full, "q", &points, RUN, None)
+        );
+    }
+    let after = engine.point_index_cache_metrics();
+    assert_eq!(
+        (after.hits - before.hits, after.misses - before.misses),
+        (2, 0),
+        "no index built"
+    );
+    assert_eq!(gets(&store), []);
 }
 
 /// A field without an indexed length, a wgrib2 tail record, is fetched
