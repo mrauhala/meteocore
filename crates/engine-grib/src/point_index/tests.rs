@@ -64,3 +64,51 @@ fn point_index_is_one_shard_so_a_window_of_gfs_indexes_stays_resident() {
         .all(|key| index.cache.get_untracked(key).is_some()));
     assert_eq!(index.cache.len(), 121);
 }
+
+/// Queries extending one message's index at once (#1337): whatever order
+/// their stores land in, the index reaching furthest stays, weighed as
+/// itself. Each is an index of the committed CCSDS field through one
+/// latitude, from the whole message.
+#[test]
+fn concurrent_extensions_keep_the_index_reaching_furthest() {
+    let message = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/grib-local/sample-message.grib2"
+    ))
+    .unwrap();
+    let header = ccsds::Header::parse(&message).unwrap();
+    let lats = [80.0, 60.0, 30.0, 0.0, -30.0, -60.0, -89.9];
+    let index = PointIndex::new(16).unwrap();
+    let key = key(0);
+    for round in 0..8 {
+        index.cache.remove(&key);
+        let built: Vec<CcsdsIndex> = lats
+            .iter()
+            .map(|&lat| header.index_to(None, &message, &[(24.0, lat)]).unwrap().0)
+            .collect();
+        let furthest = built.iter().map(CcsdsIndex::indexed_rsis).max().unwrap();
+        let barrier = std::sync::Barrier::new(built.len());
+        std::thread::scope(|scope| {
+            // A different order each round.
+            for (i, built) in built.into_iter().enumerate() {
+                let (index, key, barrier) = (&index, &key, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..(i + round) % 3 {
+                        std::thread::yield_now();
+                    }
+                    index.store_ccsds(key, built);
+                });
+            }
+        });
+        let Some(Index::Ccsds(kept)) = index.cache.get_untracked(&key) else {
+            panic!("no index kept")
+        };
+        assert_eq!(kept.indexed_rsis(), furthest, "round {round}");
+        assert_eq!(
+            index.cache.weight(),
+            weight(&key, &Index::Ccsds(kept)),
+            "round {round}"
+        );
+    }
+}

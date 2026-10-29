@@ -8,9 +8,9 @@
 //! and level of every message they read ([`RecentReads`]). When a poll
 //! catalogues new steps of the newest run, [`GribEngine::prewarm_new_steps`]
 //! fetches those steps' messages of the keys read within [`READ_WINDOW`]
-//! into the compressed-message cache and builds their point index as a
-//! position query's first read would, so the first query afterwards reads
-//! nothing from storage.
+//! into the compressed-message cache and builds their complete point
+//! index, for any point, so the first query afterwards reads nothing from
+//! storage and builds no index.
 //!
 //! Bounds, per source: only keys a position query read within the window,
 //! so the cost follows real use and a source nobody reads fetches nothing;
@@ -477,8 +477,9 @@ impl GribEngine {
             }
             Ok(bytes)
         };
-        // As a position query's first read: the point index when the
-        // message takes one, else a full decode, before admission.
+        // Validated before admission as a position query's first read is:
+        // the complete point index when the message takes one, whatever
+        // the coordinates (#1337), else a full decode.
         let field = PointField {
             url: &fetch.url,
             entry,

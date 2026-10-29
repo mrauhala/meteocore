@@ -287,7 +287,8 @@ on the request path. Single-level and legacy views require exact metadata.
 - A decoded-grid miss can reuse the compressed message and decode it again.
   On a compressed-cache miss, share the fetch through `ByteBoundedCache` and
   admit bytes only after decoding succeeds, or, for a CCSDS point read, after
-  the index build or RSI decode succeeds (#1300). Reuse that cold decode;
+  the index build (through the query's points, #1337) or RSI decode succeeds
+  (#1300). Reuse that cold decode;
   failed reads, invalid payloads and expired fills must remain retryable.
 - The cache is one shard (`new_single_shard_with_hot_allocation`): a
   position query plans residency with `holds(messages, bytes)` (#1301),
@@ -320,9 +321,9 @@ on the request path. Single-level and legacy views require exact metadata.
   512 MiB cache. Fetches run as `run_field_jobs` at 2 in flight on the
   scan's runtime (the poll runtime), each a
   `get_range_on_with_budget(.., FetchBudget::Background)`, under a 120 s
-  deadline per poll, which the poll loop waits for. Each message is
-  accepted as a query's first read accepts it (`index_message`: point
-  index, else full decode) before admission. Messages a poll did not fetch
+  deadline per poll, which the poll loop waits for. Before admission,
+  `index_message` builds the complete point index (`Reach::Full`, #1337),
+  else decodes in full. Messages a poll did not fetch
   (failed, cut off, over the share) are left to queries; later polls
   consider only newer messages.
 - `MessageCache::prewarm` fetches outside the single-flight, so a request
@@ -518,7 +519,9 @@ ones only in the legacy layout.
   and 5.3 indexes share it.
 - First read: one libaec decode with offsets enabled, streamed through a
   reused 16 Ki-sample buffer (as fast as a whole-field buffer), picking the
-  query's samples on the way. Later reads decode each needed RSI from its
+  query's samples on the way: through the last needed RSI for a message the
+  message cache keeps (#1337), every RSI otherwise. Later reads decode each
+  needed RSI from its
   start to the last needed sample. Never build a grid or insert into the grid
   cache here; a resident grid is used through `GridCache::get_untracked`.
 - Grid-cache counters measure grid loads: a resident grid counts a hit, a
@@ -650,9 +653,11 @@ ones only in the legacy layout.
   are `Invalid`, never a panic: `grib` itself panics on a Section 7 shorter
   than its groups (#1325), so keep
   `malformed_messages_fail_or_agree_with_the_full_decode`.
-- Whole message: the first read decodes every value once (about 5 ms
-  against 16 ms for the full decode) and indexes every row; later reads
-  decode from the first needed row's checkpoint, about two rows.
+- Whole message: the first read of a message the message cache keeps
+  decodes through the row after the last needed one (#1337); one read for
+  a single field decodes every value once (about 5 ms against 16 ms for the
+  full decode) and indexes every row. Later reads decode from the first
+  needed row's checkpoint, about two rows.
 - Partial reads follow the #1301 rules. Warm: ONE range GET
   (`ComplexIndex::span`), the start checkpoint's data through the last
   needed value's byte, 1.3–2.3 KB on GFS; rows past the index read on from
@@ -671,6 +676,51 @@ ones only in the legacy layout.
   `complex_fetch_tests.rs` (GETs and bytes), `point_index/tests.rs`.
   Ignored, `--release --ignored --nocapture`: `complex_files_are_bit_identical`
   (`MC_COMPLEX_FILES=a:b`); `point_fetch_replay` takes 5.3 files too.
+
+## Cold indexes through the points (#1337)
+
+- `Reach` (`point_index.rs`) says how far a whole message's index is built.
+  `Reach::Points` applies to a message the compressed-message cache keeps
+  (a `get_with` fill or hit, `get_resident`): CCSDS decodes through the
+  last needed RSI (`ccsds::Header::index_to`, `Header::extend` over the
+  whole message), 5.3 through the row after the last needed one
+  (`complex::Header::index_to`, `ComplexIndex::read_message`). At 60°N that
+  is 11 % of the complete build on the committed 0.25° IFS field and 18 %
+  on the 1° GFS one; the ignored `*_files_are_bit_identical` print it. A
+  later point past the index extends it from the cached bytes: CPU only, an
+  index miss, never a GET while the message is resident. An evicted
+  message's partial index takes the #1301 read-on path, unchanged.
+- `Reach::Full` applies to the pre-warm's `index_message`, whatever
+  `field.coords` holds (its points are unknown; it also completes a cached
+  partial index), and to whole bytes read for one field alone (no message
+  cache, the Partial plan's whole fallback, an unsupported layout). No
+  cache keeps those, so an extension would cost a GET, and a complete index
+  keeps the #1301 exact ranges and same-run (+2 %) predictions. Never pass
+  empty coords to mean "complete".
+- Bytes are admitted once the partial decode succeeds. RSIs or rows past
+  the last needed one are not decoded, so not checked, as in a prefix read:
+  a corrupt tail answers points before it, and a point in it falls back to
+  the full decode of the same bytes.
+- Every index of a message is a prefix of the complete one, so the longer
+  has all the shorter has. `store_ccsds` / `store_complex` replace if
+  longer under the `stores` mutex: concurrent extenders both decode and the
+  longer stays; an insert re-weighs the entry
+  (`concurrent_extensions_keep_the_index_reaching_furthest`).
+  `note_sibling` likewise keeps the sibling reaching further, so a complete
+  pre-warmed index is not replaced by a query's partial one.
+- Parse the header before `get_or_insert_with`: an unsupported layout must
+  count no index miss (`other_packings_are_read_once_then_decoded_directly`).
+- 5.3 `decode_nodes` runs to the start of the row after the last needed
+  node's, masked or not, when the bytes hold it, so the index `reaches` its
+  points. Points whose every node the bitmap masks decode nothing and index
+  no row: their repeats count misses.
+- Siblings built this way reach only their query's points: a later
+  Partial-plan read further south predicts its prefix linearly (×1.2)
+  until an index reaching there is noted.
+- Tests: `assert_whole_reads` in `ccsds/tests.rs` and `complex/tests.rs`,
+  `point_fetch_tests::cached_messages_index_their_points_and_extend_without_a_get`
+  and `indexing_a_message_for_the_prewarm_completes_its_index`,
+  `complex_fetch_tests::whole_messages_read_through_the_index_bit_for_bit`.
 
 ## Trajectory queries (#926)
 

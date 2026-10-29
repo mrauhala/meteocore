@@ -91,7 +91,10 @@ fn edge_points() -> Vec<(f64, f64)> {
 /// - warm: the span of the complete index alone, or for a bitmapped field
 ///   the prefix [`ComplexIndex::prefix_bound`] names;
 /// - read on: the span of indexes of only the first rows, whose new
-///   checkpoints are the complete index's.
+///   checkpoints are the complete index's;
+/// - whole (#1337): the whole message indexed only through the rows read,
+///   and an index of the first row's points extended to them and on to the
+///   last rows, the complete index, from the same bytes.
 fn assert_partial_reads(
     message: &[u8],
     index: &ComplexIndex,
@@ -160,6 +163,72 @@ fn assert_partial_reads(
             assert_eq!(extended.rows[..], index.rows[..extended.rows.len()]);
         }
     }
+    assert_whole_reads(message, index, coords, expected);
+}
+
+/// The whole message indexed only through the rows `coords` read (#1337),
+/// bit for bit `expected`, with exactly the checkpoints `index`, the
+/// complete index, has: from nothing, stopping at the row after the last
+/// one read when no bitmap masks the rows after it; on from an index of the
+/// first row's points; then on to the last value and the last row, which
+/// completes the index.
+fn assert_whole_reads(
+    message: &[u8],
+    index: &ComplexIndex,
+    coords: &[(f64, f64)],
+    expected: &[Option<u64>],
+) {
+    let header = *index.header();
+    let lattice = header.lattice;
+    let exact = |partial: &ComplexIndex| {
+        assert_eq!(partial.rows[..], index.rows[..partial.rows.len()], "rows");
+    };
+    // A decode passes rows only to read a value: points whose every node
+    // the bitmap masks read none, and index no row.
+    let plan = Plan::new(&lattice, coords);
+    let bitmap = index.bitmap_in(message, 0).unwrap();
+    let read = packed_indices(&plan.nodes, bitmap)
+        .iter()
+        .any(Option::is_some);
+    let (through, values) = header.index_to(message, coords).unwrap();
+    assert_eq!(
+        bits(&values),
+        expected,
+        "whole, through the rows {coords:?}"
+    );
+    exact(&through);
+    assert!(through.reaches(coords) || !read, "{coords:?}");
+    if let (Some(&last), false) = (plan.nodes.last(), index.bitmapped()) {
+        assert!(through.indexed_rows() <= last / lattice.ni + 2);
+    }
+
+    let first = [(lattice.lon_first, lattice.lat_first)];
+    let (north, _) = header.index_to(message, &first).unwrap();
+    let (values, extended) = north.read_message(message, coords).unwrap();
+    assert_eq!(bits(&values), expected, "extended {coords:?}");
+    let extended = extended.unwrap_or(north);
+    exact(&extended);
+    assert!(extended.reaches(coords) || !read, "{coords:?}");
+
+    // The last value's node and the field's last node, which a bitmap may
+    // mask, with the rows after the last value.
+    let nodes = lattice.ni * lattice.nj;
+    let last_value = (0..nodes)
+        .rev()
+        .find(|&n| bitmap.is_none_or(|bitmap| is_set(bitmap, n)))
+        .unwrap();
+    let node = |n: usize| {
+        (
+            lattice.lon_first + (n % lattice.ni) as f64 * lattice.lon_inc,
+            lattice.lat_first + (n / lattice.ni) as f64 * lattice.lat_inc,
+        )
+    };
+    let south = [node(last_value), node(nodes - 1)];
+    let (values, whole) = extended.read_message(message, &south).unwrap();
+    assert_eq!(bits(&values), bits(&decoded(message, &south)), "last rows");
+    let whole = whole.unwrap_or(extended);
+    assert!(whole.complete());
+    assert_eq!(whole.rows[..], index.rows[..]);
 }
 
 /// Every value bit for bit the full decode's; `coords` sampled while
@@ -553,6 +622,17 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
                 matches!(ours, Ok(Err(PointError::Invalid(_)))),
                 "less {less}"
             );
+            // Through the points only (#1337), the decode may stop before
+            // the missing data: never a panic, never another error.
+            for coords in [&coords[..], &[(24.96, 60.32)]] {
+                let through =
+                    catch_unwind(|| Header::parse(&cut).and_then(|h| h.index_to(&cut, coords)));
+                assert!(
+                    matches!(through, Ok(Ok(_) | Err(PointError::Invalid(_)))),
+                    "less {less}, through {} points",
+                    coords.len()
+                );
+            }
         }
 
         // Corrupt extra descriptors, descriptors and data.
@@ -576,6 +656,11 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
                 let Ok(ours) = ours else {
                     panic!("panicked on corrupt bytes at {at}")
                 };
+                let Ok(through) = catch_unwind(|| {
+                    Header::parse(&corrupt).and_then(|h| h.index_to(&corrupt, &coords))
+                }) else {
+                    panic!("panicked on corrupt bytes at {at}, through the points")
+                };
                 if let (Ok(Ok(grid)), Ok((index, values))) = (full, ours) {
                     let expected: Vec<_> = coords
                         .iter()
@@ -586,6 +671,8 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
                         bits(&index.sample(&corrupt, &coords).unwrap()),
                         bits(&expected)
                     );
+                    let (_, values) = through.unwrap();
+                    assert_eq!(bits(&values), bits(&expected), "through, corrupt at {at}");
                 }
             }
         }
@@ -752,9 +839,19 @@ fn complex_files_are_bit_identical() {
             } else {
                 index.span(&coords, None).unwrap().len()
             };
+            // #1337: a cold index of the whole message, complete as before
+            // and through the point's rows.
+            let complete_ms = best(&mut || {
+                header.index(&message, &coords).unwrap();
+            });
+            let through_ms = best(&mut || {
+                header.index_to(&message, &coords).unwrap();
+            });
             reads.push(format!(
-                "{name} cold {cold} B ({:.1} %), warm {warm} B",
-                100.0 * cold as f64 / len as f64
+                "{name} cold {cold} B ({:.1} %), warm {warm} B, cold index through the point \
+                 {through_ms:.2} of {complete_ms:.2} ms ({:.0} %)",
+                100.0 * cold as f64 / len as f64,
+                100.0 * through_ms / complete_ms
             ));
         }
         eprintln!(

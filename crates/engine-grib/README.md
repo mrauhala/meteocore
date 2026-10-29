@@ -49,9 +49,13 @@ level type) exposes every parameter; each retained run is an EDR instance.
 - **Point reads of CCSDS fields.** A position query on a template 5.42
   field (ECMWF IFS and AIFS) decodes only the blocks of 4096 values that
   hold its points' neighbours, bit for bit the full decode's values. The
-  first read of a message decodes it once, building no grid, and indexes
-  where each block starts (about 1.2 KB at 0.25°, 6.5 KB at 0.1°;
-  `point_index_cache_mb`). A grid already in the cache is used as it is;
+  first read of a message the message cache keeps decodes it, building no
+  grid, only through the last block its points need (11 % of the decode
+  at 60°N, 0.25°), and indexes where each of those blocks starts; a later
+  point further on extends the index from the cached message, with no GET.
+  A complete index is about 1.2 KB at 0.25°, 6.5 KB at 0.1°
+  (`point_index_cache_mb`); the pre-warm, and a message read for one field
+  alone, index all of it. A grid already in the cache is used as it is;
   nothing is inserted. Other packings, bitmaps, and fields the grid cache
   would keep while no message cache is set are decoded in full. Without a
   message cache, or one too small for the query's messages, the query also
@@ -65,9 +69,12 @@ level type) exposes every parameter; each retained run is an EDR instance.
   the decoder's state at each row's first value and the message's group
   descriptors: about 110 KB per message at 0.25°, against 1–6 KB for a
   CCSDS index. A point then decodes two rows, bit for bit the full decode's
-  values. Partial fetches: a prefix
-  through the point's last value, about 24 % of a message at 60°N, 39 % at
-  35°N and 78 % at 34°S, then one range GET of the point's rows, 1.3–2.3 KB.
+  values. From a cached message the first read decodes only through the
+  row after its point's (18 % of the values at 60°N), and later points
+  extend the index, as for CCSDS.
+  Partial fetches: a prefix through the point's last value, about 24 % of
+  a message at 60°N, 39 % at 35°N and 78 % at 34°S, then one range GET of
+  the point's rows, 1.3–2.3 KB.
   A field with a bitmap (soil and other land fields) places its values
   through the bitmap, which precedes the data: it always reads a prefix,
   about 55 % of SOILW at 60°N.

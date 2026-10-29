@@ -5,6 +5,10 @@
 //! enters the decoded-grid cache. Other fields, and every field when
 //! `point_index_cache_mb` is 0, take the full decode as before.
 //!
+//! A message the compressed-message cache keeps is indexed only as far as
+//! its first query's points need, and later points extend the index from
+//! the cached bytes, with no GET ([`Reach`], #1337).
+//!
 //! Under [`FieldFetch::Partial`] such a field also fetches only the bytes it
 //! needs (#1301): one range GET of the indexed RSIs or rows, or a predicted
 //! prefix of a message not yet indexed, read on by at most one
@@ -17,7 +21,7 @@ mod tests;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use chrono::{DateTime, Utc};
 use ds_cache::{ByteBoundedCache, CacheMetrics, MIB};
@@ -50,6 +54,23 @@ pub(crate) enum PointError {
 
 /// Data representation template 5.3, read by [`complex`].
 const COMPLEX_TEMPLATE: u16 = 3;
+
+/// How far a read of a whole message indexes it (#1337).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Every RSI or row. For the pre-warm, which indexes for points no
+    /// query has named yet, and for bytes read for this field alone, which
+    /// no cache keeps: a later point past a partial index would cost a GET
+    /// there, and the complete index serves any point with one exact range
+    /// and predicts the prefixes of the parameter's other messages (#1301).
+    Full,
+    /// Through the last RSI or row the points need, on from an index the
+    /// cache holds: for a message the compressed-message cache keeps, whose
+    /// bytes extend the index for a later point without a GET. At 60°N 11 %
+    /// of the complete build on the committed 0.25° IFS field, 18 % on the
+    /// 1° GFS one.
+    Points,
+}
 
 /// One message's index: CCSDS RSI offsets (template 5.42), or 5.3 row
 /// checkpoints and group descriptors.
@@ -141,6 +162,12 @@ pub(crate) struct PointIndex {
     /// The latest index of each parameter's messages, per run, held weakly:
     /// what a prefix of a sibling message is predicted from (#1301).
     siblings: RwLock<HashMap<ParameterKey, Vec<RunIndex>>>,
+    /// Held across [`Self::store_ccsds`]'s and [`Self::store_complex`]'s
+    /// lookup and insert, so of two queries extending one message's index
+    /// at once the one reaching further stays (#1337). Every index of a
+    /// message holds the first RSIs or rows of the complete one, so the
+    /// longer one has all the shorter one has.
+    stores: Mutex<()>,
 }
 
 /// One run's latest index of a parameter's messages.
@@ -160,6 +187,7 @@ impl PointIndex {
             cache: ByteBoundedCache::new_single_shard(size_mb.saturating_mul(MIB), 4096, weight),
             readable: RwLock::new(HashMap::new()),
             siblings: RwLock::new(HashMap::new()),
+            stores: Mutex::new(()),
         })
     }
 
@@ -196,8 +224,10 @@ impl PointIndex {
     }
 
     /// Keep `built` unless the cache already holds an index of the message
-    /// reaching further; the one kept is returned.
+    /// reaching further; the one kept is returned. Replacing an entry
+    /// weighs it again, so the cache counts the index it holds.
     fn store_ccsds(&self, key: &MessageKey, built: CcsdsIndex) -> Arc<CcsdsIndex> {
+        let _store = self.stores.lock().unwrap();
         match self.cache.get_untracked(key) {
             Some(Index::Ccsds(cached)) if cached.indexed_rsis() >= built.indexed_rsis() => cached,
             _ => {
@@ -210,6 +240,7 @@ impl PointIndex {
 
     /// [`Self::store_ccsds`] for a 5.3 index (#1302).
     fn store_complex(&self, key: &MessageKey, built: Arc<ComplexIndex>) -> Arc<ComplexIndex> {
+        let _store = self.stores.lock().unwrap();
         match self.cache.get_untracked(key) {
             Some(Index::Complex(cached)) if cached.indexed_rows() >= built.indexed_rows() => cached,
             _ => {
@@ -395,11 +426,13 @@ impl GribEngine {
         })
     }
 
-    /// Accept `bytes`, `field`'s whole message, as a position query's first
-    /// read of it does before the message cache admits it, for the
-    /// pre-warm (#1335): build its point index when [`Self::point_index_for`]
-    /// allows, else decode it in full. `field.coords` is empty: nothing is
-    /// sampled, and a later query samples from the index alone.
+    /// Accept `bytes`, `field`'s whole message, before the message cache
+    /// admits it, for the pre-warm (#1335): build its complete point index
+    /// when [`Self::point_index_for`] allows, else decode it in full, as a
+    /// position query's first read validates it. Complete whatever
+    /// `field.coords` holds ([`Reach::Full`], #1337): the points of the
+    /// queries to come are not known yet, and each then samples from the
+    /// index alone, building none.
     pub(crate) fn index_message(
         &self,
         field: &PointField<'_>,
@@ -409,7 +442,8 @@ impl GribEngine {
         match self.point_index_for(entry, field.plan.fill) {
             Some(index) => {
                 let key = MessageKey::new(Path::from(field.url).as_ref(), entry);
-                self.points_from(index, &key, field, bytes).map(drop)
+                self.points_from(index, &key, field, bytes, Reach::Full)
+                    .map(drop)
             }
             None => reader::decode_message(bytes, &entry.param).map(drop),
         }
@@ -432,14 +466,16 @@ impl GribEngine {
     /// One field through the point index: a resident decoded grid as it is
     /// (looked up without joining a fill or inserting), else the message's
     /// bytes sampled through its index. [`FieldFetch::Whole`] takes the
-    /// whole message from the compressed-message cache or storage, and
-    /// builds the index on first read; [`FieldFetch::Partial`] fetches only
-    /// the bytes the points need ([`Self::fetch_points`]), and the whole
-    /// message, outside the cache, when that goes wrong. A message the
-    /// index cannot read is decoded in full from bytes already read, never
-    /// fetched twice. The grid cache counts a hit for a resident grid and a
-    /// miss for a full decode, as the full path would, and nothing for a
-    /// field read through the index.
+    /// whole message from the compressed-message cache or storage: a cached
+    /// message is indexed only through the points it is read for, and the
+    /// index extended from its bytes for later points ([`Reach::Points`]);
+    /// one read without a message cache is indexed in full.
+    /// [`FieldFetch::Partial`] fetches only the bytes the points need
+    /// ([`Self::fetch_points`]), and the whole message, outside the cache,
+    /// when that goes wrong. A message the index cannot read is decoded in
+    /// full from bytes already read, never fetched twice. The grid cache
+    /// counts a hit for a resident grid and a miss for a full decode, as the
+    /// full path would, and nothing for a field read through the index.
     fn read_points(
         &self,
         index: &PointIndex,
@@ -459,7 +495,7 @@ impl GribEngine {
         let path = Path::from(url);
         let key = MessageKey::new(path.as_ref(), entry);
         let fetches = &self.source.point_fetches;
-        let sample = |bytes: &[u8]| self.points_from(index, &key, field, bytes);
+        let sample = |bytes: &[u8], reach| self.points_from(index, &key, field, bytes, reach);
         let read = if plan.fetch == FieldFetch::Partial && entry.length.is_some() {
             match self.fetch_points(index, field, &path, &key)? {
                 Some(read) => read,
@@ -467,7 +503,7 @@ impl GribEngine {
                     let bytes = reader::fetch_message_bytes(&self.source.store, &path, entry)?;
                     fetches.record(FetchMode::Whole, bytes.len());
                     ds_core::deadline::check()?;
-                    sample(&bytes)?
+                    sample(&bytes, Reach::Full)?
                 }
             }
         } else {
@@ -481,20 +517,22 @@ impl GribEngine {
                     plan.fetch == FieldFetch::Whole,
                     |bytes| {
                         fetches.record(FetchMode::Whole, bytes.len());
-                        sample(bytes)
+                        sample(bytes, Reach::Points)
                     },
                 )?,
                 None => {
                     let bytes = reader::fetch_message_bytes(&self.source.store, &path, entry)?;
                     fetches.record(FetchMode::Whole, bytes.len());
                     ds_core::deadline::check()?;
-                    let read = sample(&bytes)?;
+                    let read = sample(&bytes, Reach::Full)?;
                     (bytes, Some(read))
                 }
             };
             match on_fill {
                 Some(read) => read,
-                None => sample(&bytes)?,
+                // The cached message: an index short of the points extends
+                // from its bytes (#1337).
+                None => sample(&bytes, Reach::Points)?,
             }
         };
         match &read {
@@ -544,7 +582,9 @@ impl GribEngine {
             .as_ref()
             .and_then(|cache| cache.get_resident(key))
         {
-            return self.points_from(index, key, field, &bytes).map(Some);
+            return self
+                .points_from(index, key, field, &bytes, Reach::Points)
+                .map(Some);
         }
         let unexpected = |error: PointError| match error {
             PointError::Fatal(error) => Err(error),
@@ -621,10 +661,14 @@ impl GribEngine {
                             return Ok(None);
                         };
                         let whole = [&bytes[..], &rest[..]].concat();
-                        return self.points_from(index, key, field, &whole).map(Some);
+                        return self
+                            .points_from(index, key, field, &whole, Reach::Full)
+                            .map(Some);
                     }
                     Err(PointError::Unsupported(_)) => {
-                        return self.points_from(index, key, field, &bytes).map(Some);
+                        return self
+                            .points_from(index, key, field, &bytes, Reach::Full)
+                            .map(Some);
                     }
                     Err(error) => return unexpected(error),
                 }
@@ -711,9 +755,12 @@ impl GribEngine {
     }
 
     /// `field`'s points from `bytes`, the whole message, through its index:
-    /// the cached one when it reaches them, else one built (and the points
-    /// sampled during that one decode) from these bytes, replacing a partial
-    /// one. A 5.3 message goes to its own reader
+    /// the cached one when it serves them as `reach` asks, else one built
+    /// from these bytes, the points sampled during that one decode. Under
+    /// [`Reach::Points`] the decode runs through the last RSI the points
+    /// need, on from a cached index short of them (#1337); under
+    /// [`Reach::Full`] it indexes every RSI. The index reaching further is
+    /// kept. A 5.3 message goes to its own reader
     /// ([`Self::complex_points_from`]). Decodes the message in full when the
     /// index cannot read it; only the deadline and that full decode's own
     /// errors fail the field.
@@ -723,33 +770,49 @@ impl GribEngine {
         key: &MessageKey,
         field: &PointField<'_>,
         bytes: &[u8],
+        reach: Reach,
     ) -> Result<FieldRead, DataServerError> {
         if ccsds::data_template(bytes) == Some(COMPLEX_TEMPLATE) {
-            return self.complex_points_from(index, key, field, bytes);
+            return self.complex_points_from(index, key, field, bytes, reach);
         }
         let (entry, run, coords) = (field.entry, field.run, field.coords);
         let full = |error: PointError| self.decode_in_full(index, field, bytes, error);
+        let serves = |ccsds: &CcsdsIndex| match reach {
+            Reach::Full => ccsds.complete(),
+            Reach::Points => ccsds.reaches(coords),
+        };
         let cached = index.cache.get_untracked(key);
-        if let Some(ccsds) = cached
-            .as_ref()
-            .and_then(Index::as_ccsds)
-            .filter(|ccsds| ccsds.reaches(coords))
-        {
+        let prior = match &cached {
+            Some(Index::Ccsds(ccsds)) => Some(ccsds.clone()),
+            _ => None,
+        };
+        if let Some(ccsds) = prior.as_ref().filter(|ccsds| serves(ccsds)) {
             index.cache.record_hit();
             return match ccsds.sample(bytes, coords) {
                 Ok(values) => Ok(FieldRead::points(ccsds.metadata(), values)),
                 Err(error) => full(error),
             };
         }
-        let header = match Header::parse(bytes) {
-            Ok(header) => header,
-            Err(error) => return full(error),
+        // A layout the reader does not take is decoded in full before the
+        // cache counts a lookup.
+        let header = match prior.as_ref().map(|prior| prior.header()) {
+            Some(header) => header,
+            None => match Header::parse(bytes) {
+                Ok(header) => header,
+                Err(error) => return full(error),
+            },
+        };
+        // The index `reach` asks for, on from `prior`, an index of the
+        // message the cache holds, and the points sampled on the way.
+        let build = |prior: Option<&CcsdsIndex>| match reach {
+            Reach::Full => header.index(bytes, coords),
+            Reach::Points => header.index_to(prior, bytes, coords),
         };
         let mut sampled = None;
         let built = if cached.is_some() {
-            // A partial index from an earlier range read: replace it.
+            // An index of other points, from an earlier read: extend it.
             index.cache.record_miss();
-            header.index(bytes, coords).map(|(ccsds, values)| {
+            build(prior.as_deref()).map(|(ccsds, values)| {
                 sampled = Some(values);
                 index.store_ccsds(key, ccsds)
             })
@@ -757,7 +820,7 @@ impl GribEngine {
             index
                 .cache
                 .get_or_insert_with(key, || {
-                    let (ccsds, values) = header.index(bytes, coords)?;
+                    let (ccsds, values) = build(None)?;
                     sampled = Some(values);
                     Ok::<_, PointError>(Index::Ccsds(Arc::new(ccsds)))
                 })
@@ -766,20 +829,28 @@ impl GribEngine {
                     Index::Complex(_) => Err(PointError::Invalid("a 5.3 index".into())),
                 })
         };
-        let ccsds = match built {
+        let mut ccsds = match built {
             Ok(ccsds) => ccsds,
             Err(error) => return full(error),
         };
+        let values = match sampled {
+            Some(values) => values,
+            // Another reader built the index meanwhile, for its points.
+            None if serves(&ccsds) => match ccsds.sample(bytes, coords) {
+                Ok(values) => values,
+                Err(error) => return full(error),
+            },
+            None => match build(Some(&ccsds)) {
+                Ok((built, values)) => {
+                    ccsds = index.store_ccsds(key, built);
+                    values
+                }
+                Err(error) => return full(error),
+            },
+        };
         index.remember(entry.key(), true);
         index.note_sibling(entry.key(), run, &Index::Ccsds(ccsds.clone()));
-        match sampled {
-            Some(values) => Ok(FieldRead::points(ccsds.metadata(), values)),
-            // Another reader built the index meanwhile.
-            None => match ccsds.sample(bytes, coords) {
-                Ok(values) => Ok(FieldRead::points(ccsds.metadata(), values)),
-                Err(error) => full(error),
-            },
-        }
+        Ok(FieldRead::points(ccsds.metadata(), values))
     }
 
     /// `field`'s message, `bytes`, decoded in full after a point reader
