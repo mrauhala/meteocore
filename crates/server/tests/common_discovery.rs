@@ -30,6 +30,8 @@ mod schema;
 mod tms;
 
 const BASE: &str = "https://example.test/base";
+/// The WIS2 discovery catalogue every fixture surface resolves records in.
+const CATALOGUE: &str = "https://gdc.example.test";
 const SURFACES: &[&str] = &["edr", "maps", "tiles", "vector-tiles", "features", "shared"];
 const FILTERS: &str =
     "bbox=20,60,30,70&bbox-crs=CRS84&datetime=2024-01-01T00%3A30%3A00Z&q=RaDaR%20%26%20hail&query=%2Bweather%20-wind";
@@ -237,12 +239,22 @@ fn catalog() -> Catalog {
         edr.insert(id.into(), fixture.clone());
         maps.insert(id.into(), fixture.clone());
         features.insert(id.into(), fixture);
-        let config: CollectionConfig = serde_json::from_value(json!({
+        let mut config: CollectionConfig = serde_json::from_value(json!({
             "id": id, "title": if id == "f-wind" { "Wind" } else { "Radar & hail" },
             "description": format!("Discovery fixture {id}"), "keywords": ["weather"],
             "license": {"title": "CC-BY-4.0"}, "apis": ["edr", "maps", "tiles", "features"]
         }))
         .unwrap();
+        // One collection classified for discovery (#1356).
+        if id == "c-match" {
+            config.discovery = Some(
+                serde_json::from_value(json!({
+                    "wis2_topic": "weather/prediction/forecast/medium-range/deterministic/global",
+                    "wcmp2_record": "urn:wmo:md:int-ecmwf:aifs:oper:forecast"
+                }))
+                .unwrap(),
+            );
+        }
         configs.insert(id.into(), config);
     }
     (configs, edr, maps, features)
@@ -277,6 +289,10 @@ fn numbered_catalog(n: usize) -> Catalog {
     catalog
 }
 
+fn discovery() -> ds_core::discovery::Discovery {
+    ds_core::discovery::Discovery::new(ds_core::discovery::Catalogue::parse(CATALOGUE).unwrap())
+}
+
 fn maps_state(
     configs: HashMap<String, CollectionConfig>,
     maps: HashMap<String, Arc<dyn MapEngine>>,
@@ -286,6 +302,7 @@ fn maps_state(
     Arc::new(ArcSwap::from_pointee(api_maps::MapsState {
         engines: maps,
         collections: configs,
+        discovery: discovery(),
         styles: HashMap::new(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
@@ -317,6 +334,7 @@ fn tiles_state(
         vector_tile_cache: Arc::new(ds_mvt::VectorTileCache::new(1)),
         base_url: BASE.into(),
         trust_proxy_headers: false,
+        discovery: discovery(),
     }))
 }
 
@@ -330,6 +348,7 @@ fn features_state(
         vector_tileset_ids: configs.keys().cloned().collect(),
         collection_pages: Default::default(),
         collections: configs,
+        discovery: discovery(),
         base_url: BASE.into(),
         trust_proxy_headers: false,
     }))
@@ -389,6 +408,7 @@ fn app_over(surface: &str, catalog: Catalog) -> (Router, String) {
                 engines: edr,
                 feature_engines: HashMap::new(),
                 collections: configs,
+                discovery: discovery(),
                 styles: HashMap::new(),
                 base_url: BASE.into(),
                 trust_proxy_headers: false,
@@ -646,6 +666,72 @@ async fn query_text_semantics_and_encoding_agree_on_every_surface() {
             assert_eq!(doc["numberMatched"], expected.len());
             let replay = get_json(&app, link(&doc, "self")).await;
             assert_eq!(replay["collections"], doc["collections"]);
+        }
+    }
+}
+
+/// WIS2 discovery (#1356): on every surface a classified collection's
+/// description and its `/collections` entry carry the same `themes` and one
+/// `describedby` link to its WCMP2 record in the surface's catalogue, and
+/// `q` and `query` find it by its topic or a broader one.
+#[tokio::test]
+async fn wis2_topics_and_records_are_described_and_searchable_on_every_surface() {
+    let themes = json!([{
+        "scheme": "https://codes.wmo.int/wis/topic-hierarchy/earth-system-discipline",
+        "concepts": [{
+            "id": "weather/prediction/forecast/medium-range/deterministic/global",
+            "title": "A prediction system that covers the entire globe",
+            "url": "https://codes.wmo.int/wis/topic-hierarchy/earth-system-discipline/weather/prediction/forecast/medium-range/deterministic/global"
+        }]
+    }]);
+    let record = json!({
+        "href": format!(
+            "{CATALOGUE}/collections/wis2-discovery-metadata/items/urn:wmo:md:int-ecmwf:aifs:oper:forecast"
+        ),
+        "rel": "describedby", "type": "application/geo+json",
+        "title": "WIS2 discovery metadata (WCMP2): urn:wmo:md:int-ecmwf:aifs:oper:forecast"
+    });
+    for surface in SURFACES {
+        let (app, prefix) = app(surface);
+        let detail = get_json(&app, &format!("{prefix}/collections/c-match")).await;
+        let list = get_json(&app, &format!("{prefix}/collections")).await;
+        let entry = |id: &str| {
+            list["collections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        for (what, doc) in [("detail", &detail), ("entry", &entry("c-match"))] {
+            assert_eq!(doc["themes"], themes, "{surface} {what}");
+            let records: Vec<&Value> = doc["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|l| l["rel"] == "describedby")
+                .collect();
+            assert_eq!(records, [&record], "{surface} {what}");
+        }
+        assert!(entry("d-match").get("themes").is_none(), "{surface}");
+        for (query, expected) in [
+            ("q=weather/prediction", vec!["c-match"]),
+            (
+                "q=weather%2Fprediction%2Fforecast%2Fmedium-range",
+                vec!["c-match"],
+            ),
+            ("q=weather/predictio", vec![]),
+            ("query=%2Bradar%20%2Bmedium-range", vec!["c-match"]),
+        ] {
+            let doc = get_json(&app, &format!("{prefix}/collections?{query}")).await;
+            let ids: Vec<_> = doc["collections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, expected, "{surface}: {query}");
         }
     }
 }

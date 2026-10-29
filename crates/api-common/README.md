@@ -79,13 +79,16 @@ from `ds_core::collection_search::CollectionParameter`.
 
 ### Text search
 
-`q` and `query` search the title, the description and each keyword, but not
+`q` and `query` search the title, the description, each keyword and each
+theme concept id the description advertises (a WIS2 topic, #1356), but not
 the id. They match each of these separately. Matching ignores case (Unicode
 lowercase), normalises whitespace and treats punctuation literally. A term
 or phrase must match whole words within one property or keyword. So
 `q=sea surface` matches "Sea  surface", but not "undersea surface" or
 "sea-surface". It also does not match a title that ends in "sea" when the
-description starts with "surface".
+description starts with "surface". A `/` separates words like other
+punctuation, so `q=weather/prediction` matches the topic
+`weather/prediction/forecast/…`, and `q=weather/predictio` matches nothing.
 
 - `q` takes comma-separated alternatives. A collection matches if any one
   alternative does.
@@ -119,6 +122,12 @@ for you.
 `collection_metadata` builds the Common fields of a collection:
 
 - `id`, `title` and `description`, plus `keywords` when any are configured.
+- `themes` when the collection has WIS2 topics (`ds_core::discovery::topics`:
+  `[discovery] wis2_topic`, else its WIS2 subscriptions): one theme of the
+  scheme `https://codes.wmo.int/wis/topic-hierarchy/earth-system-discipline`
+  with a concept per topic (`id` the topic path, `url` the scheme plus the
+  path, `title` the hierarchy's description of its last level). The encoding
+  lives in `ds_core::discovery::themes` alone.
 - An HTML alternate of the caller's `self` link.
 - A `license` link when a license is configured:
   - It points to the configured `url`, or to
@@ -126,6 +135,12 @@ for you.
     id.
   - Its `type` is `text/html` unless `[collections.license] type` is set.
   - A free-text title with no `url` gets no link.
+- A `describedby` link of type `application/geo+json` per WCMP2 record
+  describing the collection (`Discovery::records`: `[discovery]
+  wcmp2_record`), into the catalogue of the `Discovery` the caller passes,
+  the server-wide `[discovery] catalogue`. Every API state holds that
+  `Discovery`, built per accepted load; the shared root reads its first
+  block's and adds the link once, since blocks contribute no record links.
 
 The API's own fields, such as `extent`, `crs`, `styles` and `data_queries`,
 are merged on top; EDR instances replace `id` and `title` this way.
@@ -320,7 +335,9 @@ resource as currently filtered and paged.
     EDR (its collection page), WMS (GetCapabilities) and 3D Tiles (the
     tileset). Then the title, the description, a line on what one item is
     when the engine gives one, the keywords as chips that search the
-    catalog, and the licence with its link.
+    catalog, the WIS2 topics as chips that search the catalog for them, the
+    WCMP2 records as links, and the licence with its link. Catalog rows show
+    the topics and records the same way, under the keywords.
   - **Extent.** One box, a row each for the spatial, temporal and vertical
     extent, showing only what the document carries. Spatial: the bounds in
     the bbox's CRS with a Copy bbox button, and the storage CRS with its

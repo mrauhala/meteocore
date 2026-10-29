@@ -13,6 +13,12 @@ colormaps_dir = "colormaps.d"
 # <state_dir>/<collection id>.cap.state / .bufr.state. Needs a writable directory.
 # state_dir = "state"
 
+# The WIS2 Global Discovery Catalogue that collections' WCMP2 records
+# ([discovery] wcmp2_record in a collection) are linked in (#1356).
+# Top-level only; the default is shown.
+# [discovery]
+# catalogue = "https://wis2-gdc.weather.gc.ca"
+
 # Shared WMS style bundles. Collections reference these by id from their
 # [wms] style_bundle field to avoid duplicating the same default + extras
 # block across multiple radar configs.

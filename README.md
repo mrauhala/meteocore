@@ -510,6 +510,9 @@ port = 8000
 # render_concurrency = 24              # optional, render CPU slots (default 2× CPUs, min 8); restart to change
 # state_dir = "/var/lib/meteocore"      # optional, writable dir for engine state snapshots (WIS2 CAP alert sets, WIS2 BUFR report stores)
 
+# [discovery]                                   # optional, top-level config.toml only
+# catalogue = "https://wis2-gdc.weather.gc.ca"  # WIS2 Global Discovery Catalogue of WCMP2 records (default)
+
 [[collections]]
 id = "weather"
 title = "Finnish Weather Observations"
@@ -551,6 +554,10 @@ max_files = 24
 colormap = "radar_dbz"          # built-in colormap (or use color_stops for custom)
 # webp_quality = 80             # optional, default WebP quality 1-100 (100 = lossless,
                                 # the default); lossy suits continuous-tone layers
+
+[collections.discovery]         # optional, see Discovery below
+wis2_topic = "weather/surface-based-observations/weather-radar"
+# wcmp2_record = "urn:wmo:md:<centre-id>:<local-id>"
 ```
 
 ### Server Config Fields
@@ -581,11 +588,52 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"zarr"`, `"postgis"`, `"satellite"`, `"netcdf"`, `"station-grid"` (station observations gridded on the fly) |
 | `keywords` | no | — | Array of discovery keyword strings, e.g. `["radar", "reflectivity"]`. Surfaced in collection JSON, WMS capabilities, and matched by `/collections?q=`. |
 | `license` | no | — | `[collections.license]` table with `title` (required — SPDX id or human name), optional `url` and optional `type`, the media type `url` serves (default `text/html`; only with `url`). When `url` is omitted and `title` is an SPDX id, the URL is synthesized from `https://spdx.org/licenses/<id>.html`. The `rel="license"` link carries the `type`. |
+| `discovery` | no | — | `[collections.discovery]` table: `wis2_topic`, a WIS2 topic served as the collection's `themes`, and `wcmp2_record`, a WCMP2 record id linked as `describedby`. See [Discovery](#discovery-wis2-topics-and-wcmp2-records). |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
 | `csv` | no | — | `engine_type = "csv"` only: `[collections.csv.map]`, the [station symbol layers](#station-symbol-layers). Any other key is a load error. |
 | `derive_wind` | no | on | `grib`, `querydata`, `zarr` and `netcdf` only: serve wind speed and direction derived from u/v components (see [Derived wind](#derived-wind-speed-and-direction)). `false` opts out; the key on any other engine type is a load error. |
 | `derive_geopotential_height` | no | on | `grib`, `zarr` and `netcdf` only: serve geopotential height derived from geopotential where the collection has none at that level (see [Derived geopotential height](#derived-geopotential-height)). `false` opts out; the key on any other engine type is a load error. |
 | `derive_humidity` | no | on | `grib`, `querydata`, `zarr` and `netcdf` only: serve relative humidity and dew point derived from their ingredients where the collection has none at that level (see [Derived relative humidity and dew point](#derived-relative-humidity-and-dew-point)). `false` opts out; the key on any other engine type is a load error. |
+
+### Discovery: WIS2 topics and WCMP2 records
+
+A collection can say what it is in the WMO WIS2 vocabulary (#1356), an
+experiment for the OGC MetOcean Common profile:
+
+```toml
+[collections.discovery]
+wis2_topic = "weather/prediction/forecast/medium-range/deterministic/global"
+wcmp2_record = "urn:wmo:md:int-ecmwf:aifs:oper:forecast"
+```
+
+- `wis2_topic` is a topic of the [WIS2 Topic Hierarchy](https://github.com/wmo-im/wis2-topic-hierarchy)
+  from its earth-system-discipline level down, at any depth (`weather`,
+  `weather/prediction`, …), without the channel, centre or data-policy
+  levels. It is validated against the vendored release 1.3.0: an unknown
+  level is a load error naming the levels allowed there. Levels below an
+  `experimental` level are free. Every collection description (shared root,
+  `/edr`, Maps, Tiles, Features, and each `/collections` entry) then carries
+  it as `themes`: one theme of the scheme
+  `https://codes.wmo.int/wis/topic-hierarchy/earth-system-discipline`, one
+  concept per topic, its `id` the topic path, its `url` the scheme plus `/`
+  plus the path, and its `title` the hierarchy's description of the last
+  level.
+- A collection fed by a WIS2 subscription (`[cap.wis2]`, `[bufr.wis2]`)
+  needs no `wis2_topic`: each subscribed topic, without its
+  `{cache|origin}/a/wis2/{centre-id}/data/{core|recommended}/` levels and cut
+  at its first wildcard, gives a concept, down to the deepest level the
+  hierarchy has. A configured `wis2_topic` replaces them.
+- `wcmp2_record` (`urn:wmo:md:<centre-id>:<local-id>`) adds a link with
+  `rel: describedby` and `type: application/geo+json` to the record in the
+  WIS2 Global Discovery Catalogue, `<catalogue>/collections/wis2-discovery-metadata/items/<record>`.
+  The catalogue is the top-level `[discovery] catalogue` of `config.toml`
+  (default `https://wis2-gdc.weather.gc.ca`, http(s) only); a collection's
+  own `[discovery]` cannot set it. A reload that changes only the catalogue
+  rebuilds no engine.
+- `/collections?q=` and `query=` also match the topic: `/` separates words,
+  so `q=weather/prediction` finds every collection classified below it. The
+  HTML collection page and catalog rows show the topic as a chip that runs
+  that search, and link the record.
 
 ### Per-File Collection Configs
 
@@ -1292,7 +1340,7 @@ Cloud-native multidimensional arrays (Zarr V2/V3) with CF-conventions metadata. 
 **Key characteristics:**
 - **Multi-variable:** every geographic data variable in the store becomes a parameter (and a WMS/Maps/Tiles layer). Restrict with the `parameters` filter.
 - **CF-conventions decoding:** CF time axis, CF packing (`scale_factor`/`add_offset`/`_FillValue`/`missing_value` plus the array's own Zarr fill value). A time axis is **required** (EDR PointSeries needs a `t`).
-- **Storage:** plain local/S3/HTTP stores use `ds-storage`, caching full chunk objects (`cache_mb`). Icechunk owns its storage and uses the same setting to bound compressed payload/range caching.
+- **Storage:** plain local/S3/HTTP stores use `ds-storage`, caching full chunk objects (`cache_mb`). Icechunk owns its storage; the same setting bounds the compressed chunk ranges kept from it, and its requests and bytes are counted per collection.
 - **Read memory:** `MC_ZARR_READ_MEMORY_MB` limits admitted source working sets across Maps/WMS/Tiles and EDR, even for a tiny output image spanning a large native grid. The estimate includes native/typed/f64 buffers and window axes through sampling. Cold reads also reserve four native decode/index buffers, using full stored chunk shapes (including edge padding and forecast leads). Icechunk decoded-cache hits reserve only their pinned buffer capacity, retaining the exact cached bytes even if evicted during the read. Icechunk chunk reservations end after copying into the source window. Common codec layouts include metadata-derived encoded/intermediate/scratch headroom in cold admission; storage and codecs consume that allowance before reserving extra bytes. Unknown layouts and estimates that cannot fit use serial actual-size admission. Encoded full-object/range reads require a two-copy allowance before collection and retain it through retrieval, including compressed-cache reads. Numeric-variable gzip/zstd/Blosc outputs are bounded by their declared codec representation; bounded intermediate outputs acquire additional capacity allowances before allocation. Blosc validates frame/block sizes and partial ranges before native decoding. Its scratch allowance ends with each decoder call and can be reused by sequential calls; encoded/intermediate copies stay admitted through retrieval. Other codecs, compressor-private contexts, transport/internal storage buffers, persistent catalog metadata, resident caches, and API output buffers remain outside the estimate; this is not a total process-RAM limit. See [read-path details](docs/zarr-read-path.md).
 - **EDR position queries** use bilinear interpolation; ascending/descending and irregular axes are handled via CF axis location.
 - **Rendering** reads a 2-D spatial window covering the request bbox (+1 cell margin), then samples per output pixel (geographic/WebMercator) or via a coarse projection grid (projected output CRS — never per-pixel projection).
@@ -1375,11 +1423,12 @@ If a config sets `[collections.zarr.icechunk]` but the binary was built without 
 - The S3 backend uses Icechunk's `object_store` backend (not `aws-sdk-s3`), reusing the same crate `ds-storage` uses (keeps the icechunk feature's binary cost ~8 MB instead of ~28 MB).
 - **Public datasets only.** Anonymous S3 access is used; there is no credential configuration.
 - New snapshots on a branch are picked up on `poll_interval_secs`. Unchanged snapshots retain their catalog and caches; failed refreshes keep the previous snapshot and retry. In-flight queries remain pinned to their original snapshot.
-- `cache_mb` bounds Icechunk's compressed payload cache; `0` disables retention. Snapshot changes preserve immutable payload reuse and invalidate rendered images, including corrections at existing times.
+- `cache_mb` bounds the compressed payload cache, the byte ranges read from the repository's chunk objects; `0` disables retention. The cache is MeteoCore's, not Icechunk's, whose own payload cache stays off: it reports no hits or occupancy. Chunk objects are immutable, so snapshot changes preserve payload reuse and invalidate rendered images, including corrections at existing times.
+- Catalog builds load, on the background poll runtime and before the new snapshot is published, each variable's manifest and the shard indexes of the default run (a store without runs: of its latest time step), at most eight at once. The shard indexes stay with the catalog, at most 256 KiB of them per variable, so a cold inner chunk costs one request, for its own bytes. Shards of other runs join on their first read while the allowance lasts. Failures only log; a read then fetches what is missing.
 - `icechunk.decoded_cache_mb` separately bounds native decoded inner-chunk retention (default 256 MiB, `0` disables). Overlapping maps, pans, forecast leads, and EDR queries share chunks within a snapshot. Concurrent fills for the same chunk are coalesced; waiting observes each request's deadline and holds only its source reservation. On success, the waiter admits the returned buffer capacity; on owner failure, its replacement must acquire cold workspace and headroom before decoding. Snapshot and array identity prevent stale decoded reuse after corrections.
 - Cache fills expand reads only for inner chunks up to 64 MiB that fit the configured budget. Larger chunks and shards with outer transforms use the existing partial-read path. The cache budget covers resident entries, including estimated overhead; it does not bound all active source/codec buffers. Plain mutable Zarr stores do not use this decoded cache.
 - Icechunk reads up to four inner chunks concurrently through a shared four-worker pool, including when decoded retention is disabled. Source-memory admission includes encoded/codec headroom for common cold layouts and reduces concurrency when memory is tight. Unknown layouts and oversized estimates use serial actual-size admission; warm reads reserve their cached buffers. Single-chunk and entirely cached batches stay on the caller; plain Zarr and shards with outer transforms retain serial retrieval. Workers preserve request deadlines and finish before releasing reservations. Storage operations honor request deadlines; background operations have a 30-second timeout.
-- Startup logs report effective inner chunk shapes and native sizes; `/metrics` exposes per-collection `zarr_decoded_cache_*` hits, misses, bytes, and capacity, with Grafana panels. See [read-path measurements and remaining work](docs/zarr-read-path.md).
+- Startup logs report effective inner chunk shapes and native sizes; `/metrics` exposes per-collection `zarr_decoded_cache_*` and `zarr_icechunk_payload_cache_*` hits, misses, bytes, and capacity, and `zarr_icechunk_storage_requests_total` and `zarr_icechunk_storage_read_bytes_total`, with Grafana panels. `/admin/cache-plan` lists the payload cache as `zarr_icechunk_payload_cache`. See [read-path measurements and remaining work](docs/zarr-read-path.md).
 
 ##### Icechunk Config Fields (`[collections.zarr.icechunk]`)
 
@@ -2693,6 +2742,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `vector_tile_cache_*` | — | MVT tiles of every Tiles collection, 128 MiB; with `entries` |
 | `solid_image_cache_*` | — | The encoded all-nodata images and WMS error tiles, 32 MiB; with `entries` |
 | `zarr_object_cache_*` | collection | A plain Zarr store's objects, `[zarr] cache_mb` |
+| `zarr_icechunk_payload_cache_*` | collection | The compressed chunk ranges an Icechunk repository reads, `[zarr] cache_mb`; a miss is a storage request |
 
 **Cache churn** (every cache family above and every other `*_cache_hits_total` family, with a `collection` label where the family has one; [`/admin/cache-plan`](#memory-and-caches) turns them into a label per cache):
 
@@ -2740,6 +2790,8 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `render_phase_seconds` | histogram | api, phase | Served WMS/Maps/Tiles render time per phase: `queue`, `engine`, `assemble` (WMS meta-tiles), `encode` |
 | `render_semaphore_total` | gauge | — | Total render permits (`[server] render_concurrency`, default 2× CPU cores, min 8) |
 | `storage_bytes_read_total` | counter | collection, engine_type | Bytes read from remote storage |
+| `zarr_icechunk_storage_requests_total` | counter | collection | Storage requests an Icechunk repository issued: each part of a ranged read, each listing and each Icechunk retry. Retries inside the HTTP client are not counted |
+| `zarr_icechunk_storage_read_bytes_total` | counter | collection | Bytes the bodies of an Icechunk repository's storage reads yielded |
 
 #### Computing cache hit rates
 

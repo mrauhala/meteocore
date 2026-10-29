@@ -13,3 +13,7 @@ poll_interval_secs = 60
 
 [wms]
 style_bundle = "radar_multi"
+
+# Discovery (#1356): the WIS2 topic is served as the collection's themes.
+[discovery]
+wis2_topic = "weather/surface-based-observations/weather-radar"

@@ -87,6 +87,7 @@ fn features_app(collection: Value, engine: Arc<dyn FeatureEngine>) -> axum::Rout
     api_features::router(Arc::new(ArcSwap::from_pointee(FeaturesState {
         engines: HashMap::from([(collection.id.clone(), engine)]),
         collections: HashMap::from([(collection.id.clone(), collection)]),
+        discovery: Default::default(),
         base_url: "https://example.org".into(),
         trust_proxy_headers: false,
         vector_tileset_ids: Default::default(),

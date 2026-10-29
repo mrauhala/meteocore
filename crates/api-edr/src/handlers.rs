@@ -10,6 +10,7 @@ use serde_json::json;
 
 use api_common::{JsonError, JsonQuery};
 use ds_core::config::CollectionConfig;
+use ds_core::discovery::Discovery;
 use ds_core::edr_engine::{EdrEngine, TrajectoryShape};
 
 use ds_core::error::DataServerError;
@@ -703,6 +704,9 @@ pub struct EdrState {
     /// whether or not they also list `features`.
     pub feature_engines: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
+    /// What collection descriptions read beyond their configs: the WIS2
+    /// discovery catalogue (#1356).
+    pub discovery: Discovery,
     /// Resolved style layers, keyed `"{collection}"` and
     /// `"{collection}/{parameter}"` (same `StyleInfo` instances the
     /// WMS/Maps/Tiles registries hold — resolved once by the server through
@@ -2140,6 +2144,7 @@ pub async fn collections(
                 metadata: build_collection_metadata(
                     engine.as_ref(),
                     config,
+                    &state.discovery,
                     base,
                     None,
                     state.feature_engines.contains_key(&config.id),
@@ -2177,13 +2182,21 @@ pub async fn collection(
         Wanted::Json => Json(build_collection_metadata(
             engine.as_ref(),
             config,
+            &state.discovery,
             base,
             None,
             items,
         ))
         .into_response(),
         Wanted::Html => {
-            let metadata = build_collection_metadata(engine.as_ref(), config, base, None, items);
+            let metadata = build_collection_metadata(
+                engine.as_ref(),
+                config,
+                &state.discovery,
+                base,
+                None,
+                items,
+            );
             Html(api_common::workbench::collection_html(
                 api_common::workbench::Surface {
                     base,
@@ -2298,7 +2311,7 @@ pub async fn instances(
         (None, None) => list_href.clone(),
     };
     let offset = page.map_or(0, |page| page.offset);
-    let metadata = CollectionMetadata::new(engine.as_ref(), config, base, false);
+    let metadata = CollectionMetadata::new(engine.as_ref(), config, &state.discovery, base, false);
     // OGC API - EDR 1.1 §8.2.3 `instancesJSON`: the array field is
     // `instances` (each item a collection-shaped instance), not
     // `collections`. The HTML page renders this same document
@@ -2465,14 +2478,21 @@ pub async fn instance(
         Wanted::Json => Json(build_collection_metadata(
             engine.as_ref(),
             config,
+            &state.discovery,
             base,
             Some(&run),
             false,
         ))
         .into_response(),
         Wanted::Html => {
-            let mut metadata =
-                build_collection_metadata(engine.as_ref(), config, base, Some(&run), false);
+            let mut metadata = build_collection_metadata(
+                engine.as_ref(),
+                config,
+                &state.discovery,
+                base,
+                Some(&run),
+                false,
+            );
             // The page heading names the run; the JSON `title` is the
             // collection's (`/req/instances/src-md-success` C).
             metadata["title"] = json!(format!("{} — run {}", config.title, run.instance_id()));
@@ -3954,11 +3974,12 @@ pub(crate) fn data_query_variables(
 fn build_collection_metadata(
     engine: &dyn EdrEngine,
     config: &CollectionConfig,
+    discovery: &Discovery,
     base_url: &str,
     instance: Option<&ds_core::instances::RunInfo>,
     items: bool,
 ) -> serde_json::Value {
-    CollectionMetadata::new(engine, config, base_url, items).build(instance)
+    CollectionMetadata::new(engine, config, discovery, base_url, items).build(instance)
 }
 
 /// What a collection document and its instance documents share, read from
@@ -3968,6 +3989,7 @@ fn build_collection_metadata(
 struct CollectionMetadata<'a> {
     engine: &'a dyn EdrEngine,
     config: &'a CollectionConfig,
+    discovery: &'a Discovery,
     base_url: &'a str,
     items: bool,
     /// `get_parameter_descriptions`, sorted by name: serde_json's
@@ -3993,6 +4015,7 @@ impl<'a> CollectionMetadata<'a> {
     fn new(
         engine: &'a dyn EdrEngine,
         config: &'a CollectionConfig,
+        discovery: &'a Discovery,
         base_url: &'a str,
         items: bool,
     ) -> Self {
@@ -4001,6 +4024,7 @@ impl<'a> CollectionMetadata<'a> {
         Self {
             engine,
             config,
+            discovery,
             base_url,
             items,
             parameters,
@@ -4238,7 +4262,7 @@ impl<'a> CollectionMetadata<'a> {
         if radius {
             fields["within_units"] = json!(WITHIN_UNITS);
         }
-        api_common::collection_metadata(config, fields, links)
+        api_common::collection_metadata(config, self.discovery, fields, links)
     }
 }
 

@@ -95,6 +95,7 @@ fn features_app(dir: &std::path::Path) -> (Router, Arc<dyn FeatureEngine>) {
             api_features::handlers::FeaturesState {
                 engines: HashMap::from([("cap".into(), engine.clone())]),
                 collections: HashMap::from([("cap".into(), config)]),
+                discovery: Default::default(),
                 base_url: BASE.into(),
                 trust_proxy_headers: false,
                 vector_tileset_ids: Default::default(),

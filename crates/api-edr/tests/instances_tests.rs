@@ -403,6 +403,7 @@ fn config(id: &str, engine_type: &str) -> CollectionConfig {
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        discovery: None,
         derive_humidity: None,
     }
 }
@@ -433,6 +434,7 @@ fn state() -> api_edr::handlers::AppState {
         styles: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
+        discovery: Default::default(),
     }))
 }
 

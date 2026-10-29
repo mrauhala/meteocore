@@ -38,3 +38,9 @@ name = "sd"
 colormap = "viridis"
 min = 0.0
 max = 1000.0
+
+# Discovery (#1356): the WIS2 topic is served as the collection's themes,
+# the WCMP2 record as a describedby link.
+[discovery]
+wis2_topic = "weather/prediction/forecast/medium-range/deterministic/global"
+wcmp2_record = "urn:wmo:md:int-ecmwf:ifs:oper:forecast"

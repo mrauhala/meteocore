@@ -301,8 +301,13 @@ async fn cache_override_preserves_persisted_repository_settings() {
             config.cache_mb = cache_mb;
             let source = Source::open("config-merge", &config).unwrap();
             let mut expected = original.clone();
-            expected.caching.as_mut().unwrap().num_bytes_chunks = Some(cache_mb * ds_cache::MIB);
+            // The payload cache is the meter's; Icechunk's own keeps nothing.
+            expected.caching.as_mut().unwrap().num_bytes_chunks = Some(0);
             assert_eq!(source.repo.config(), &expected);
+            assert_eq!(
+                source.meter().payload_metrics().capacity_bytes,
+                cache_mb * ds_cache::MIB
+            );
         }
         // Opening a reader must not persist its per-server cache override.
         let reopened = Repository::open(storage).execute().await.unwrap();

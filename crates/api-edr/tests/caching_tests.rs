@@ -174,6 +174,7 @@ fn build_router() -> axum::Router {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -184,6 +185,7 @@ fn build_router() -> axum::Router {
         styles: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
+        discovery: Default::default(),
     })))
 }
 

@@ -213,6 +213,7 @@ fn router() -> axum::Router {
         styles: HashMap::new(),
         base_url: "https://example.test".into(),
         trust_proxy_headers: false,
+        discovery: Default::default(),
     })))
 }
 

@@ -109,6 +109,7 @@ fn load(collections: &[CollectionConfig]) -> super::LoadResult {
         &[],
         "http://x",
         false,
+        &Default::default(),
         0,
         ds_core::config::DEFAULT_RENDERED_CACHE_MB,
         super::ReusableCaches::default(),

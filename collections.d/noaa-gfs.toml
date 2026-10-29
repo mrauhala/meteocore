@@ -87,3 +87,7 @@ max = 100.0
 [[wms.parameters]]
 name = "PRATE"
 colormap = "precipitation_rate"
+
+# Discovery (#1356): the WIS2 topic is served as the collection's themes.
+[discovery]
+wis2_topic = "weather/prediction/forecast/medium-range/deterministic/global"

@@ -13,3 +13,7 @@ poll_interval_secs = 60
 # parameter layers take the built-in defaults: 2t temperature (°C), msl
 # pressure (hPa), rr1h precipitation (mm). The collection layer draws its
 # default parameter, 2t, with that layer's style.
+
+# Discovery (#1356): the WIS2 topic is served as the collection's themes.
+[discovery]
+wis2_topic = "weather/prediction/forecast/medium-range/deterministic/global"

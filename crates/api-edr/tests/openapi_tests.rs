@@ -204,6 +204,7 @@ fn config(id: &str) -> CollectionConfig {
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        discovery: None,
         derive_humidity: None,
     }
 }
@@ -232,6 +233,7 @@ fn app() -> axum::Router {
         feature_engines: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
+        discovery: Default::default(),
     };
     api_edr::router(Arc::new(ArcSwap::from_pointee(state)))
 }

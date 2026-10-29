@@ -67,6 +67,7 @@ fn edr_router(id: &str, dir: &str, template: &str, variables: &[&str]) -> axum::
         engines: HashMap::from([(id.to_string(), engine as Arc<dyn EdrEngine>)]),
         feature_engines: HashMap::new(),
         collections: HashMap::from([(id.to_string(), config)]),
+        discovery: Default::default(),
         styles: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,

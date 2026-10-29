@@ -512,6 +512,7 @@ async fn serve(cli: CliArgs) {
         &config.style_bundles,
         &base_url,
         config.server.trust_proxy_headers,
+        &config.discovery(),
         config.server.metatile_cache_mb,
         rendered_cache_mb,
         // Startup builds the render caches fresh; reloads reuse them.

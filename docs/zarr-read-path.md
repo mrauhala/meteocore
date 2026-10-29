@@ -4,7 +4,9 @@ Implementation batches address the map-focused review from 2026-09-22.
 
 ## Implemented
 
-- Icechunk uses `zarr.cache_mb` for compressed chunk/range retention. Zero disables payload caching, including when the repository persists a nonzero cache setting.
+- Icechunk uses `zarr.cache_mb` for compressed chunk/range retention. Zero disables payload caching, including when the repository persists a nonzero cache setting. The cache sits in a wrapper around the repository's object storage, keyed by chunk object path and byte range, because Icechunk's own payload cache reports no counters; Icechunk's is opened at zero.
+- The same storage wrapper counts each repository's storage requests and the bytes their bodies yield ([#1353](https://github.com/mrauhala/meteocore/issues/1353)): `zarr_icechunk_storage_{requests_total,read_bytes_total}` and `zarr_icechunk_payload_cache_{hits_total,misses_total,bytes,capacity_bytes}` per collection, and `zarr_icechunk_payload_cache` in `/admin/cache-plan`.
+- Catalog builds load each variable's manifest and the default run's shard indexes before publishing a snapshot, at most eight loads at once, and keep the shard indexes with the catalog: one bounded-codec sharding decoder per shard, at most 256 KiB of indexes per variable. A variable's first read after a run update then waits for its inner chunk only, not for a manifest and a shard index first (#1353).
 - Icechunk storage uses a persistent I/O runtime. Every operation, including range-stream consumption, observes the request's absolute deadline; background operations have a 30-second timeout. Raster conversion and sampling check deadlines between rows.
 - Sources and published sessions are separate. The Icechunk source retains repository clients and immutable payload caches, resolves the selected version on poll, and builds a new catalog only for a changed snapshot. Failed builds retain the previous catalog and retry.
 - A catalog owns its pinned session and snapshot-derived render content version. In-flight readers stay on their snapshot; same-time corrections invalidate rendered images. No-op polls preserve the catalog and its version.
@@ -177,7 +179,7 @@ collection's reported extent changes with time or parameter.
 ## Remaining review work
 
 1. [#777](https://github.com/mrauhala/meteocore/issues/777): encoded/intermediate allowances now release between stored chunks on serial reads, and Blosc scratch releases after each decoder call. Stacked Blosc chains prepay peak scratch rather than the sum of sequential calls. Further shortening within a single chunk's codec/index chain still needs an ownership proof. Coalesced decoded waiters avoid duplicate cold allowances, and replacement owners must pass admission. Common cold layouts prepay encoded/intermediate/scratch headroom; unknown or oversized estimates use serial actual-size admission. More precise size estimates and additional layouts can improve concurrency. Compressor-private contexts, other codecs, and coordinate/metadata discovery remain outside these explicit bounds.
-2. [#778](https://github.com/mrauhala/meteocore/issues/778): extend layout diagnostics and decoded-cache metrics with requested/decoded-byte amplification, storage requests/bytes, and fetch/decode/resample timings; make a controlled comparison with GRIB on S3.
+2. [#778](https://github.com/mrauhala/meteocore/issues/778): extend layout diagnostics and decoded-cache metrics with requested/decoded-byte amplification and fetch/decode/resample timings (Icechunk storage requests and bytes are counted since #1353); make a controlled comparison with GRIB on S3.
 3. [#779](https://github.com/mrauhala/meteocore/issues/779): replace plain-Zarr whole-object shard reads with efficient range retrieval where appropriate. Parallelizing this backend or outer-transformed Icechunk shards needs a separate runtime/admission design.
 
 ## Regression coverage

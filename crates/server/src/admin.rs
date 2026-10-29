@@ -1800,6 +1800,41 @@ static ZARR_DECODED_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock
 static ZARR_OBJECT_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
     CollectionCacheMetricSet::new("zarr_object_cache", "Zarr object cache", false, false)
 });
+// An Icechunk repository's payload cache (`[zarr] cache_mb`, #1353): the
+// compressed byte ranges read from its chunk objects.
+static ZARR_ICECHUNK_PAYLOAD_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> =
+    LazyLock::new(|| {
+        CollectionCacheMetricSet::new(
+            "zarr_icechunk_payload_cache",
+            "Zarr Icechunk payload cache",
+            false,
+            false,
+        )
+    });
+// Icechunk does its own storage I/O, outside ds-storage's counters (#1353).
+static ZARR_ICECHUNK_STORAGE_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "zarr_icechunk_storage_requests_total",
+            "Storage requests an Icechunk repository issued: each part of a ranged \
+             read, listing and Icechunk retry; HTTP-client retries not included",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
+static ZARR_ICECHUNK_STORAGE_READ_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "zarr_icechunk_storage_read_bytes_total",
+            "Bytes the bodies of an Icechunk repository's storage reads yielded",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
 static ZARR_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "zarr_read_reserved_bytes",
@@ -1858,6 +1893,9 @@ struct CacheCounterState {
     grib_prewarm: HashMap<String, [u64; 3]>,
     zarr_decoded: HashMap<String, CacheSeen>,
     zarr_object: HashMap<String, CacheSeen>,
+    zarr_icechunk_payload: HashMap<String, CacheSeen>,
+    /// Icechunk storage `[requests, bytes]` per collection (#1353).
+    zarr_icechunk_storage: HashMap<String, [u64; 2]>,
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
     /// the scrape rebaselines on a backward step — see `metrics_handler`.
@@ -1903,6 +1941,8 @@ impl CacheCounterState {
             grib_prewarm,
             zarr_decoded,
             zarr_object,
+            zarr_icechunk_payload,
+            zarr_icechunk_storage,
             postgis,
             nowcast,
             nowcast_tracks,
@@ -1921,6 +1961,8 @@ impl CacheCounterState {
         drop_keys(grib_prewarm, removed);
         drop_keys(zarr_decoded, removed);
         drop_keys(zarr_object, removed);
+        drop_keys(zarr_icechunk_payload, removed);
+        drop_keys(zarr_icechunk_storage, removed);
         drop_keys(postgis, removed);
         drop_keys(nowcast, removed);
         drop_keys(nowcast_tracks, removed);
@@ -2954,6 +2996,7 @@ pub fn load_collections(
     style_bundles: &[StyleBundle],
     base_url: &str,
     trust_proxy_headers: bool,
+    discovery: &ds_core::discovery::Discovery,
     metatile_cache_mb: u64,
     rendered_cache_mb: u64,
     reuse: ReusableCaches,
@@ -5675,6 +5718,7 @@ pub fn load_collections(
             engines: edr_engines,
             feature_engines: edr_feature_engines,
             collections: edr_collections,
+            discovery: discovery.clone(),
             styles: edr_styles,
             base_url: base_url.to_string(),
             trust_proxy_headers,
@@ -5682,6 +5726,7 @@ pub fn load_collections(
         features_state: FeaturesState {
             engines: feature_engines,
             collections: feature_collections,
+            discovery: discovery.clone(),
             base_url: base_url.to_string(),
             trust_proxy_headers,
             vector_tileset_ids,
@@ -5701,6 +5746,7 @@ pub fn load_collections(
         maps_state: MapsState {
             engines: maps_engines,
             collections: maps_collections,
+            discovery: discovery.clone(),
             styles: maps_styles,
             render_semaphore: render_semaphore.clone(),
             rendered_cache: rendered_cache.clone(),
@@ -5711,6 +5757,7 @@ pub fn load_collections(
         tiles_state: TilesState {
             map_engines: tiles_engines,
             collections: tiles_collections,
+            discovery: discovery.clone(),
             styles: tiles_styles,
             feature_engines: tiles_feature_engines,
             feature_collections: tiles_feature_collections,
@@ -6566,6 +6613,9 @@ pub struct AcceptedLoad {
     styles: ds_render::StyleContext,
     base_url: String,
     trust_proxy_headers: bool,
+    /// `[discovery]`: outside the collections' configs, so a change to it
+    /// alone redescribes every collection and rebuilds no engine (#1356).
+    discovery: ds_core::discovery::Discovery,
     metatile_cache_mb: u64,
     /// Resolved from `[server]` or the deprecated `[wms]` fallback (#1028).
     rendered_cache_mb: u64,
@@ -6587,6 +6637,7 @@ impl AcceptedLoad {
             styles,
             base_url: config.server.base_url(),
             trust_proxy_headers: config.server.trust_proxy_headers,
+            discovery: config.discovery(),
             metatile_cache_mb: config.server.metatile_cache_mb,
             rendered_cache_mb: config.rendered_cache_mb().0,
             render_cache_sources: crate::cache_plan::RenderCacheSources::of(config),
@@ -6853,6 +6904,7 @@ fn apply_load(
         &config.style_bundles,
         &config.base_url,
         config.trust_proxy_headers,
+        &config.discovery,
         config.metatile_cache_mb,
         config.rendered_cache_mb,
         reuse,
@@ -8128,6 +8180,35 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                         .or_default(),
                 );
             }
+            // An Icechunk repository's; a plain store has neither.
+            if let Some(metrics) = engine.icechunk_payload_cache_metrics() {
+                ZARR_ICECHUNK_PAYLOAD_CACHE_METRICS.update(
+                    collection,
+                    metrics,
+                    None,
+                    counter_state
+                        .zarr_icechunk_payload
+                        .entry(collection.to_owned())
+                        .or_default(),
+                );
+            }
+            if let Some((requests, bytes)) = engine.icechunk_storage_counts() {
+                let deltas = delta_counts(
+                    &mut counter_state.zarr_icechunk_storage,
+                    collection,
+                    [requests, bytes],
+                );
+                for (family, delta) in [
+                    &ZARR_ICECHUNK_STORAGE_REQUESTS,
+                    &ZARR_ICECHUNK_STORAGE_READ_BYTES,
+                ]
+                .into_iter()
+                .zip(deltas)
+                {
+                    // Always touched, so both series exist before a read.
+                    family.with_label_values(&[collection]).inc_by(delta);
+                }
+            }
         }
     }
 
@@ -8911,6 +8992,7 @@ mod tests {
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -8984,6 +9066,7 @@ mod tests {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         }
     }
@@ -9122,6 +9205,10 @@ mod tests {
                 &*super::ZARR_DECODED_CACHE_METRICS,
                 "zarr-decoded-metrics-test",
             ),
+            (
+                &*super::ZARR_ICECHUNK_PAYLOAD_CACHE_METRICS,
+                "zarr-icechunk-payload-metrics-test",
+            ),
             (&*super::TILE_CACHE_METRICS, "tile-cache-metrics-test"),
         ] {
             let mut previous = super::CacheSeen::default();
@@ -9204,6 +9291,7 @@ mod tests {
                 &[],
                 "http://x",
                 false,
+                &Default::default(),
                 0,
                 ds_core::config::DEFAULT_RENDERED_CACHE_MB,
                 super::ReusableCaches::default(),
@@ -9290,6 +9378,7 @@ mod tests {
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -9486,6 +9575,7 @@ mod tests {
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -9580,6 +9670,7 @@ mod tests {
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -9643,6 +9734,7 @@ mod tests {
                 &[],
                 "http://x",
                 false,
+                &Default::default(),
                 0,
                 ds_core::config::DEFAULT_RENDERED_CACHE_MB,
                 super::ReusableCaches::default(),
@@ -9744,6 +9836,7 @@ mod tests {
                 &[],
                 "http://x",
                 false,
+                &Default::default(),
                 0,
                 ds_core::config::DEFAULT_RENDERED_CACHE_MB,
                 super::ReusableCaches::default(),
@@ -9887,6 +9980,7 @@ mod tests {
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -9943,6 +10037,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -10210,6 +10305,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -10243,6 +10339,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -10271,6 +10368,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -10298,6 +10396,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -10337,6 +10436,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -10363,6 +10463,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             64,
             32,
             super::ReusableCaches::default(),
@@ -10408,6 +10509,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             64,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -10425,6 +10527,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             64,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches {
@@ -10456,6 +10559,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             128,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches {
@@ -10487,6 +10591,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             128,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB * 2,
             super::ReusableCaches {
@@ -10523,6 +10628,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -11354,6 +11460,7 @@ prewarm_sweeps = 0
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -11392,6 +11499,7 @@ prewarm_sweeps = 0
                 &[],
                 "http://x",
                 false,
+                &Default::default(),
                 0,
                 ds_core::config::DEFAULT_RENDERED_CACHE_MB,
                 super::ReusableCaches::default(),
@@ -11876,6 +11984,71 @@ prewarm_sweeps = 0
         super::do_reload(&state).unwrap();
         assert_eq!(render_series(gone), series(&[]), "removed collection");
         assert_eq!(render_series(kept), series(&[("cold", 1), ("hit", 1)]));
+    }
+
+    /// `[discovery] catalogue` is server-wide (#1356): a reload that changes
+    /// only it redescribes every collection in the new catalogue, on every
+    /// API, and keeps the live engines.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_catalogue_only_reload_redescribes_collections_and_keeps_engines() {
+        use tower::ServiceExt;
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/radar-tm35fin");
+        let config = |catalogue: &str| {
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                 [discovery]\ncatalogue = \"{catalogue}\"\n\
+                 [[collections]]\nid = \"radar\"\ntitle = \"Radar\"\ndescription = \"d\"\n\
+                 data_path = \"{fixture}\"\nengine_type = \"geotiff\"\napis = [\"edr\", \"maps\"]\n\
+                 [collections.geotiff]\nfilename_template = \"radar_tm35_%Y%m%dT%H%MZ.tif\"\n\
+                 parameter = \"reflectivity\"\nunit = \"dBZ\"\n\
+                 [collections.discovery]\n\
+                 wis2_topic = \"weather/surface-based-observations/weather-radar\"\n\
+                 wcmp2_record = \"urn:wmo:md:fi-fmi:radar\"\n"
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, config("https://one.example")).unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+        let engine = state.geotiff_engines.read().unwrap()[0].clone();
+        let record = |state: &super::AdminState| {
+            let edr = state.edr.clone();
+            async move {
+                let request = axum::http::Request::builder()
+                    .uri("/collections/radar")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let response = api_edr::router(edr).oneshot(request).await.unwrap();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                doc["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|l| l["rel"] == "describedby")
+                    .map(|l| l["href"].as_str().unwrap().to_owned())
+                    .unwrap()
+            }
+        };
+        let item = "/collections/wis2-discovery-metadata/items/urn:wmo:md:fi-fmi:radar";
+        assert_eq!(record(&state).await, format!("https://one.example{item}"));
+
+        std::fs::write(&config_path, config("https://two.example")).unwrap();
+        super::do_reload(&state).unwrap();
+        assert_eq!(record(&state).await, format!("https://two.example{item}"));
+        assert!(
+            Arc::ptr_eq(&engine, &state.geotiff_engines.read().unwrap()[0]),
+            "the engine is kept"
+        );
+        for catalogue in [
+            state.maps.load().discovery.catalogue().clone(),
+            state.tiles.load().discovery.catalogue().clone(),
+            state.features.load().discovery.catalogue().clone(),
+        ] {
+            assert_eq!(catalogue.as_str(), "https://two.example");
+        }
     }
 
     /// `/metrics` scraped through the handler.
@@ -12764,6 +12937,7 @@ colormap = "radar_dbz"
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -12820,6 +12994,7 @@ max = 30.0
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -12921,6 +13096,7 @@ max = 30.0
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -13035,6 +13211,7 @@ max = 30.0
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -13179,6 +13356,7 @@ colormap = "no_such_map"
             &[],
             "http://x",
             false,
+            &Default::default(),
             0,
             ds_core::config::DEFAULT_RENDERED_CACHE_MB,
             super::ReusableCaches::default(),
@@ -13262,6 +13440,7 @@ colormap = "no_such_map"
                 &[],
                 "http://x",
                 false,
+                &Default::default(),
                 0,
                 ds_core::config::DEFAULT_RENDERED_CACHE_MB,
                 super::ReusableCaches::default(),

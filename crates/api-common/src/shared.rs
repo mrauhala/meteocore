@@ -27,6 +27,7 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
 use ds_core::config::CollectionConfig;
+use ds_core::discovery::Discovery;
 use ds_core::html::{FormatParams, LinkView, Wanted};
 use serde_json::{json, map::Entry, Map, Value};
 
@@ -90,6 +91,9 @@ pub trait BuildingBlock: Send + Sync + 'static {
     }
     /// External base URL of this request, per the block's configuration.
     fn base_url(&self, headers: &HeaderMap) -> String;
+    /// What collection descriptions read beyond their configs (#1356),
+    /// per the block's configuration.
+    fn discovery(&self) -> Discovery;
     /// Every collection this block serves, from one registry snapshot.
     fn collections(&self, root: &str) -> Vec<Contribution>;
     /// One collection, or `None` when this block does not serve it.
@@ -191,6 +195,10 @@ impl SharedApi {
 
     fn base(&self, headers: &HeaderMap) -> String {
         self.blocks[0].base_url(headers)
+    }
+
+    fn discovery(&self) -> Discovery {
+        self.blocks[0].discovery()
     }
 }
 
@@ -572,7 +580,7 @@ struct Merged {
 }
 
 /// Merge one collection's contributions (in block order) into a description.
-fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
+fn merge(contributions: Vec<Contribution>, root: &str, discovery: &Discovery) -> Option<Merged> {
     let mut contributions = contributions.into_iter();
     let first = contributions.next()?;
     let (config, mut fields, mut links, mut bbox, mut time, mut items) = (
@@ -623,7 +631,7 @@ fn merge(contributions: Vec<Contribution>, root: &str) -> Option<Merged> {
         "title": config.title
     })];
     all.extend(links);
-    let metadata = crate::collection_metadata(&config, Value::Object(fields), all);
+    let metadata = crate::collection_metadata(&config, discovery, Value::Object(fields), all);
     Some(Merged {
         config,
         metadata,
@@ -686,6 +694,7 @@ async fn collections(
 ) -> Response {
     let base = &api.base(&headers);
     let root = &Mount(api.mount).root(base);
+    let discovery = &api.discovery();
     let mut by_id: BTreeMap<String, Vec<Contribution>> = BTreeMap::new();
     for block in &api.blocks {
         for contribution in block.collections(root) {
@@ -697,7 +706,7 @@ async fn collections(
     }
     let (configs, parts): (Vec<_>, Vec<_>) = by_id
         .into_values()
-        .filter_map(|contributions| merge(contributions, root))
+        .filter_map(|contributions| merge(contributions, root, discovery))
         .map(|m| (m.config, (m.metadata, m.bbox, m.time)))
         .unzip();
     let entries = configs
@@ -794,7 +803,7 @@ async fn collection(
         .iter()
         .filter_map(|b| b.collection(&id, root))
         .collect();
-    let Some(merged) = merge(contributions, root) else {
+    let Some(merged) = merge(contributions, root, &api.discovery()) else {
         return error(
             StatusCode::NOT_FOUND,
             "NotFound",
@@ -929,14 +938,19 @@ mod tests {
         maps.bbox = Some([0.0, 0.0, 1.0, 1.0]);
         let mut tiles = contribution("c", json!({"extent": {"temporal": {}}}), vec![]);
         tiles.time = span;
-        let merged = merge(vec![maps, tiles], "https://x").unwrap();
+        let merged = merge(vec![maps, tiles], "https://x", &Discovery::default()).unwrap();
         assert_eq!(merged.time, None, "Maps' extent advertises no time");
         assert_eq!(merged.bbox, Some([0.0, 0.0, 1.0, 1.0]));
         // Without an extent of its own, the first block defers to the next.
         let first = contribution("c", json!({}), vec![]);
         let mut second = contribution("c", json!({"extent": {"temporal": {}}}), vec![]);
         second.time = span;
-        assert_eq!(merge(vec![first, second], "https://x").unwrap().time, span);
+        assert_eq!(
+            merge(vec![first, second], "https://x", &Discovery::default())
+                .unwrap()
+                .time,
+            span
+        );
     }
 
     #[test]
@@ -952,7 +966,9 @@ mod tests {
         // A raster whose native CRS has no URI: Maps omits and claims it.
         let mut maps = contribution("c", json!({"dataType": "map"}), vec![]);
         maps.claims = &["storageCrs"];
-        let merged = merge(vec![maps, features()], "https://x").unwrap().metadata;
+        let merged = merge(vec![maps, features()], "https://x", &Discovery::default())
+            .unwrap()
+            .metadata;
         assert!(merged.get("storageCrs").is_none(), "{merged}");
         assert_eq!(
             merged["itemType"], "feature",
@@ -960,7 +976,7 @@ mod tests {
         );
         // Vector tiles claim nothing, so Features' CRS84 describes the storage.
         let tiles = contribution("c", json!({"dataType": "vector"}), vec![]);
-        let merged = merge(vec![tiles, features()], "https://x")
+        let merged = merge(vec![tiles, features()], "https://x", &Discovery::default())
             .unwrap()
             .metadata;
         assert_eq!(merged["storageCrs"], crs84);
@@ -979,10 +995,16 @@ mod tests {
         let merged = merge(
             vec![contribution("a", json!({}), vec![]), features],
             "https://x",
+            &Discovery::default(),
         )
         .unwrap();
         assert_eq!(merged.items, Some(overview));
-        let merged = merge(vec![contribution("a", json!({}), vec![])], "https://x").unwrap();
+        let merged = merge(
+            vec![contribution("a", json!({}), vec![])],
+            "https://x",
+            &Discovery::default(),
+        )
+        .unwrap();
         assert_eq!(merged.items, None);
     }
 
@@ -1004,7 +1026,9 @@ mod tests {
                 {"id": "extra", "links": []}]}),
             vec![json!({"rel": rel::TILESETS_MAP, "href": "/map/tiles"})],
         );
-        let merged = merge(vec![maps, tiles], "https://x").unwrap().metadata;
+        let merged = merge(vec![maps, tiles], "https://x", &Discovery::default())
+            .unwrap()
+            .metadata;
         assert_eq!(
             merged["crs"],
             json!(["crs84", "maps", "tiles"]),
@@ -1024,5 +1048,43 @@ mod tests {
         let default_links = styles[0]["links"].as_array().unwrap();
         assert_eq!(default_links.len(), 2, "duplicate link collapses");
         assert_eq!(styles[2]["id"], "extra");
+    }
+
+    /// A collection several blocks describe gets its themes and one
+    /// `describedby` link per record, in the root's catalogue (#1356).
+    #[test]
+    fn merged_descriptions_link_each_record_once() {
+        let described = || {
+            let mut c = contribution("nwp", json!({}), vec![]);
+            c.config.discovery = Some(
+                serde_json::from_value(json!({
+                    "wis2_topic": "weather/prediction",
+                    "wcmp2_record": "urn:wmo:md:int-ecmwf:aifs:oper:forecast"
+                }))
+                .unwrap(),
+            );
+            c
+        };
+        let discovery = Discovery::new(
+            ds_core::discovery::Catalogue::parse("https://gdc.example.org").unwrap(),
+        );
+        let merged = merge(vec![described(), described()], "https://x", &discovery)
+            .unwrap()
+            .metadata;
+        let records: Vec<_> = merged["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|l| l["rel"] == "describedby")
+            .collect();
+        assert_eq!(
+            records,
+            [&json!({
+                "rel": "describedby", "type": "application/geo+json",
+                "title": "WIS2 discovery metadata (WCMP2): urn:wmo:md:int-ecmwf:aifs:oper:forecast",
+                "href": "https://gdc.example.org/collections/wis2-discovery-metadata/items/urn:wmo:md:int-ecmwf:aifs:oper:forecast"
+            })]
+        );
+        assert_eq!(crate::theme_ids(&merged), ["weather/prediction"]);
     }
 }

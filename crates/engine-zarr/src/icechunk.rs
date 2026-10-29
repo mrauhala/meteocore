@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 use icechunk::repository::VersionInfo;
-use icechunk::{Repository, RepositoryConfig};
+use icechunk::{Repository, RepositoryConfig, Storage};
 use zarrs::storage::{
     byte_range::ByteRangeIterator, AsyncListableStorageTraits, AsyncReadableStorageTraits,
     ListableStorageTraits, MaybeBytes, MaybeBytesIterator, ReadableStorageTraits, StorageError,
@@ -30,15 +30,31 @@ use crate::{
     store::{io_err, EngineStore},
 };
 
+mod metered;
+pub(crate) use metered::Meter;
+use metered::MeteredStorage;
+
 /// Repository clients and immutable object caches survive snapshot refreshes.
 pub(crate) struct Source {
     repo: Repository,
     version: VersionInfo,
+    /// The repository's request counters and payload cache (#1353).
+    meter: Arc<Meter>,
 }
 
 impl Source {
     /// Open repository clients once, with the configured payload cache budget.
     pub(crate) fn open(collection_id: &str, config: &ZarrConfig) -> Result<Self, DataServerError> {
+        Self::open_with(collection_id, config, |storage| storage)
+    }
+
+    /// [`Self::open`] over `wrap(backend)`: tests add latency below the
+    /// meter, so every request it counts pays it.
+    pub(crate) fn open_with(
+        collection_id: &str,
+        config: &ZarrConfig,
+        wrap: impl FnOnce(Arc<dyn Storage + Send + Sync>) -> Arc<dyn Storage + Send + Sync> + Send,
+    ) -> Result<Self, DataServerError> {
         let ic = config
             .icechunk
             .as_ref()
@@ -48,16 +64,20 @@ impl Source {
             |msg: String| DataServerError::Config(format!("Collection '{collection_id}': {msg}"));
 
         let version = version_info(collection_id, ic)?;
+        let meter = Arc::new(Meter::new(config.cache_mb.saturating_mul(ds_cache::MIB)));
         let repo = runtime::run(async {
-            let storage = build_storage(collection_id, config).await?;
+            let backend = wrap(build_storage(collection_id, config).await?);
+            let storage = Arc::new(MeteredStorage::new(backend, meter.clone()));
             // Repository::open merges overrides into the persisted config,
             // including a field-by-field CachingConfig::merge. These derived
             // Defaults leave fields as None (unset), so only num_bytes_chunks
             // changes; metadata caches, compression, storage and virtual chunk
             // containers survive. Covered with non-default V1/V2 repositories.
+            // The payload cache is the meter's (`cache_mb`), so Icechunk's own
+            // keeps nothing: it has no counters to report.
             let options = RepositoryConfig {
                 caching: Some(icechunk::config::CachingConfig {
-                    num_bytes_chunks: Some(config.cache_mb.saturating_mul(ds_cache::MIB)),
+                    num_bytes_chunks: Some(0),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -73,7 +93,15 @@ impl Source {
                 .await
                 .map_err(|e| cfg_err(format!("failed to open Icechunk repository: {e}")))
         })?;
-        Ok(Self { repo, version })
+        Ok(Self {
+            repo,
+            version,
+            meter,
+        })
+    }
+
+    pub(crate) fn meter(&self) -> &Meter {
+        &self.meter
     }
 
     pub(crate) fn snapshot(
@@ -364,3 +392,6 @@ fn version_info(collection_id: &str, ic: &IcechunkConfig) -> Result<VersionInfo,
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod preload_tests;

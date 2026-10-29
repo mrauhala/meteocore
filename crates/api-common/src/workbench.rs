@@ -444,7 +444,7 @@ impl Page<'_> {
 <body class="{page_class}"><a class="skip" href="#main">Skip to content</a><div class="shell"><aside class="sidebar" aria-label="API navigation"><a class="brand" href="{base}/?f=html"><span class="brand-mark"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><circle cx="16" cy="16" r="11"/><circle cx="16" cy="16" r="6"/><path d="M16 16 27 5M16 3v3M3 16h3M16 26v3M26 16h3"/></svg></span><span>MeteoCore<small>API WORKBENCH</small></span></a><div class="api-switch enhanced"><label for="api-select">API workspace</label><select id="api-select">{options}</select></div><noscript><nav aria-label="APIs">{api_nav}</nav></noscript><nav id="primary-nav" aria-label="Workspace">{nav}</nav><div class="sidebar-note"><span class="eyebrow">OPEN STANDARDS</span><p>One data platform.<br>Different ways to explore.</p></div><div class="sidebar-footer">MeteoCore<small>OGC API · Developer workspace</small></div></aside>
 <div class="workspace"><header class="topbar"><nav id="breadcrumbs" aria-label="Breadcrumb">{crumbs}</nav><div class="topbar-actions"><button class="quiet enhanced" id="help-button">Help</button><label class="theme-label enhanced" for="theme">Theme<select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label><nav class="representation-switch" aria-label="Representation"><a aria-current="page" href="{html_url}">HTML</a><a rel="alternate" id="json-link" href="{json_url}">JSON</a></nav></div></header>
 {request_context}
-<main id="main" tabindex="-1">{body}</main><footer class="page-footer"><span>MeteoCore · Open weather data</span><span>HTML representation · Times in UTC</span></footer></div></div><dialog id="help-dialog"><div class="dialog-head"><h2>Find a collection, then request data</h2><button class="icon-button" id="close-help" aria-label="Close help">×</button></div><div class="panel-body"><p><strong>1. Find a collection.</strong> Collection search matches titles, descriptions and keywords. Commas separate alternatives; words form a phrase.</p><p>Advanced search adds required (+) and excluded (-) terms. Area and time narrow coverage; unknown extents remain eligible.</p><p><strong>2. Request data.</strong> Open a collection to see its data operations. Feature filters select items within that collection; discovery filters are not copied into the data request. The JSON switch always opens the current resource with its applied filters and paging.</p></div></dialog><div id="toast" role="status" aria-live="polite"></div><script src="{script}"></script></body></html>"##,
+<main id="main" tabindex="-1">{body}</main><footer class="page-footer"><span>MeteoCore · Open weather data</span><span>HTML representation · Times in UTC</span></footer></div></div><dialog id="help-dialog"><div class="dialog-head"><h2>Find a collection, then request data</h2><button class="icon-button" id="close-help" aria-label="Close help">×</button></div><div class="panel-body"><p><strong>1. Find a collection.</strong> Collection search matches titles, descriptions, keywords and WIS2 topics. Commas separate alternatives; words form a phrase.</p><p>Advanced search adds required (+) and excluded (-) terms. Area and time narrow coverage; unknown extents remain eligible.</p><p><strong>2. Request data.</strong> Open a collection to see its data operations. Feature filters select items within that collection; discovery filters are not copied into the data request. The JSON switch always opens the current resource with its applied filters and paging.</p></div></dialog><div id="toast" role="status" aria-live="polite"></div><script src="{script}"></script></body></html>"##,
             document_title = escape(document_title),
             json_url = escape(safe_href(json_url)),
             html_url = escape(safe_href(&html_url)),
@@ -724,7 +724,7 @@ pub fn landing_document(
         crate::shared::WORKSPACE => "Open a collection to see every way to access it: map images, map tiles and vector tiles, as the collection offers them. Related services are linked below.",
         _ => "Choose an API and a collection first. Then request features, environmental values, map images or tiles using that collection's supported operations.",
     };
-    body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="e.g. radar or GFS"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions and keywords. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,discovery=escape(discovery),arrow=icon("arrow")));
+    body.push_str(&format!(r#"<div class="developer-start"><section class="panel panel-body"><span class="eyebrow">COLLECTION DISCOVERY</span><h2>1. Find a collection</h2><form method="get" action="{discovery}/collections"><input type="hidden" name="f" value="html"><label for="q">Search collections <span class="parameter-type">q · optional</span></label><div class="search-row"><input id="q" name="q" placeholder="e.g. radar or GFS"><button class="btn primary">Find collections {arrow}</button></div><p class="field-help">Search dataset titles, descriptions, keywords and WIS2 topics. Area and time filters in the catalog narrow the collection coverage.</p></form></section><section class="panel panel-body"><span class="eyebrow">DATA ACCESS</span><h2>2. Request data</h2><p class="section-note">{data_guidance}</p><p class="field-help">Select a collection to see the available data requests. Discovery filters are not carried over as data filters.</p></section></div>"#,discovery=escape(discovery),arrow=icon("arrow")));
     body.push_str("<section class=\"section-space\"><div class=\"section-header\"><h2>API definitions &amp; resource links</h2></div>");
     body.push_str(&link_table(&doc["links"]));
     body.push_str("</section>");
@@ -1567,7 +1567,8 @@ pub fn collection_page(
     } else {
         format!("<div class=\"row-line heading-keywords\"><span class=\"row-label\">Keywords</span><span class=\"chip-row\">{keywords}</span></div>")
     };
-    let mut body=format!("<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← Back to collections</a><div class=\"detail-heading\"><div class=\"chip-row\" aria-label=\"Available through\">{api_chips}</div><h1>{}</h1><div class=\"mono\">{}</div><p>{}</p>{items_note}{keywords}{}</div><nav class=\"detail-tabs\" aria-label=\"Collection views\"><a data-collection-tab=\"overview\" class=\"active\" href=\"#overview\">Overview</a>",escape(&catalog),escape(&with_format(&catalog,"html")),escape(title),escape(id),escape(doc["description"].as_str().unwrap_or_default()),license_html(license));
+    let discovery = discovery_rows(doc, &catalog, "row-line heading-keywords");
+    let mut body=format!("<a class=\"back-link\" data-back-scope=\"{}\" href=\"{}\">← Back to collections</a><div class=\"detail-heading\"><div class=\"chip-row\" aria-label=\"Available through\">{api_chips}</div><h1>{}</h1><div class=\"mono\">{}</div><p>{}</p>{items_note}{keywords}{discovery}{}</div><nav class=\"detail-tabs\" aria-label=\"Collection views\"><a data-collection-tab=\"overview\" class=\"active\" href=\"#overview\">Overview</a>",escape(&catalog),escape(&with_format(&catalog,"html")),escape(title),escape(id),escape(doc["description"].as_str().unwrap_or_default()),license_html(license));
     let items = links
         .and_then(|ls| ls.iter().find(|l| l["rel"] == "items"))
         .and_then(|l| l["href"].as_str());
@@ -2411,6 +2412,46 @@ pub struct CollectionView<'a> {
 }
 
 // A free-text license may have no JSON link, but must remain visible in HTML.
+/// A collection's WIS2 topics (#1356) as a row of chips, each a catalog
+/// search at `catalog` for the topic, then the WCMP2 records describing it
+/// as a row of links; each row has `class`. Empty without either.
+fn discovery_rows(doc: &Value, catalog: &str, class: &str) -> String {
+    let topics: String = crate::theme_ids(doc)
+        .into_iter()
+        .map(|id| anchor(&query_edit(catalog, "q", Some(id)), id, "chip"))
+        .collect();
+    let records: String = doc["links"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|link| link["rel"] == "describedby")
+        .filter_map(|link| {
+            let href = link["href"].as_str()?;
+            let title = link["title"].as_str().unwrap_or(href);
+            let record = title
+                .strip_prefix(crate::RECORD_LINK_TITLE)
+                .unwrap_or(title);
+            Some(anchor(href, record, "record-link"))
+        })
+        .collect();
+    let row = |label: &str, content: &str| {
+        if content.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<div class=\"{}\"><span class=\"row-label\">{label}</span>{content}</div>",
+                escape(class)
+            )
+        }
+    };
+    let topics = if topics.is_empty() {
+        topics
+    } else {
+        format!("<span class=\"chip-row\">{topics}</span>")
+    };
+    row("WIS2 topic", &topics) + &row("Discovery record", &records)
+}
+
 fn license_html(license: Option<&LicenseConfig>) -> String {
     license
         .map(|license| {
@@ -2873,7 +2914,7 @@ fn catalog_form(
         let current = value(name);
         match parameter {
             CollectionParameter::Format=>{},
-            CollectionParameter::Q=>primary=format!("<div class=\"search-row\"><div class=\"search-main\"><label for=\"collection-search\">Search text <code>q</code></label><div class=\"search-input-wrap\">{}{}</div></div><button class=\"btn primary\">Find collections {}</button></div><p id=\"collection-search-help\" class=\"search-hint\">Searches titles, descriptions and keywords for whole words, not ids. Words match as an exact phrase; separate alternatives with commas.</p>",icon("search"),mark(format!("<input id=\"collection-search\" name=\"q\" value=\"{}\" placeholder=\"e.g. radar or GFS\" aria-describedby=\"collection-search-help\">",escape(current)),name),icon("arrow")),
+            CollectionParameter::Q=>primary=format!("<div class=\"search-row\"><div class=\"search-main\"><label for=\"collection-search\">Search text <code>q</code></label><div class=\"search-input-wrap\">{}{}</div></div><button class=\"btn primary\">Find collections {}</button></div><p id=\"collection-search-help\" class=\"search-hint\">Searches titles, descriptions, keywords and WIS2 topics for whole words, not ids. Words match as an exact phrase; separate alternatives with commas.</p>",icon("search"),mark(format!("<input id=\"collection-search\" name=\"q\" value=\"{}\" placeholder=\"e.g. radar or GFS\" aria-describedby=\"collection-search-help\">",escape(current)),name),icon("arrow")),
             CollectionParameter::Limit|CollectionParameter::Offset=>paging.push_str(&mark(input(name,if name=="limit"{limit}else{offset},"integer","number",false),name)),
             // A rejected order is shown as typed, to be corrected in place.
             CollectionParameter::Sortby if rejected(name).is_some()=>paging.push_str(&mark(input(name,current,"title or id; - descends","text",false).replace("<span>sortby</span>","<span>Order <code>sortby</code></span>"),name)),
@@ -3104,7 +3145,7 @@ pub fn collections_html(
             // searched for some (#1141).
             let given = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.trim().is_empty());
             let advice = if given(&query.q) || given(&query.query) {
-                Some("The search matches whole words in titles, descriptions and keywords, not ids. Remove a word or a filter, or clear them all.")
+                Some("The search matches whole words in titles, descriptions, keywords and WIS2 topics, not ids. Remove a word or a filter, or clear them all.")
             } else if given(&query.bbox) || given(&query.datetime) {
                 Some("Widen the area or the time, or clear the filters.")
             } else {
@@ -3151,7 +3192,8 @@ pub fn collections_html(
             .unwrap_or_default();
         // The title is the row's only link to the collection page: the
         // arrow repeats it for pointers and is skipped by the keyboard.
-        body.push_str(&format!("<article class=\"collection-row\"><div class=\"collection-icon\">{}</div><div class=\"collection-main\"><h3>{}</h3><span class=\"mono\">{}</span>{description}{}{keywords}<div class=\"row-foot\">{}{}</div></div><a class=\"row-arrow\" href=\"{}\" tabindex=\"-1\" aria-hidden=\"true\">{}</a></article>",icon(symbol),anchor(&href,title,""),escape(id),collection_facts(doc),license_html(view.license),entry_details(doc),escape(&href),icon("arrow")));
+        let discovery = discovery_rows(doc, &page_url, "row-line");
+        body.push_str(&format!("<article class=\"collection-row\"><div class=\"collection-icon\">{}</div><div class=\"collection-main\"><h3>{}</h3><span class=\"mono\">{}</span>{description}{}{keywords}{discovery}<div class=\"row-foot\">{}{}</div></div><a class=\"row-arrow\" href=\"{}\" tabindex=\"-1\" aria-hidden=\"true\">{}</a></article>",icon(symbol),anchor(&href,title,""),escape(id),collection_facts(doc),license_html(view.license),entry_details(doc),escape(&href),icon("arrow")));
     }
     body.push_str("</div><div class=\"pagination\">");
     body.push_str("<label class=\"per-page enhanced\">Per page<select data-page-size>");
@@ -3699,7 +3741,7 @@ mod tests {
         .unwrap();
         let search = query.parse().unwrap();
         let html = collections_html(MAPS_PROXY, &query, &search, 0, &[], &[], &json!([]));
-        assert!(html.contains("Searches titles, descriptions and keywords for whole words, not ids. Words match as an exact phrase; separate alternatives with commas."));
+        assert!(html.contains("Searches titles, descriptions, keywords and WIS2 topics for whole words, not ids. Words match as an exact phrase; separate alternatives with commas."));
         assert!(html.contains("<a class=\"btn primary\" href=\"https://example.test/proxy/maps/collections?bbox=1%2C2%2C3%2C4&amp;q=radar%2Ccomposite%2Cgfs&amp;f=html\">Search any of: radar, composite, gfs</a>"), "{html}");
         assert!(!html.contains("Try a broader search"));
         for (i, hint) in ["e.g. 18", "e.g. 58", "e.g. 32", "e.g. 71"]
@@ -3946,6 +3988,76 @@ mod tests {
         let overview = html.split("id=\"metadata\"").next().unwrap();
         assert!(!overview.contains("Storage coordinate system"));
         assert!(!overview.contains("Not advertised"));
+    }
+
+    /// A collection's WIS2 topics are chips searching the catalog for them,
+    /// and its WCMP2 records links (#1356): in the page heading and on its
+    /// catalog row, escaped.
+    #[test]
+    fn topics_search_the_catalog_and_records_are_linked() {
+        let doc = json!({"id": "nwp", "title": "NWP", "description": "",
+            "themes": [{"scheme": ds_core::discovery::TOPIC_SCHEME, "concepts": [
+                {"id": "weather/prediction"}, {"id": "a&<b>"}]}],
+            "links": [{"rel": "describedby", "type": "application/geo+json",
+                "title": "WIS2 discovery metadata (WCMP2): urn:wmo:md:x:<y>",
+                "href": "https://gdc.example.org/collections/wis2-discovery-metadata/items/urn:wmo:md:x:y"}]});
+        let topics = |catalog: &str| {
+            format!(
+                "<span class=\"row-label\">WIS2 topic</span><span class=\"chip-row\">\
+                 <a class=\"chip\" href=\"{catalog}?q=weather%2Fprediction&amp;f=html\">weather/prediction</a>\
+                 <a class=\"chip\" href=\"{catalog}?q=a%26%3Cb%3E&amp;f=html\">a&amp;&lt;b&gt;</a></span></div>"
+            )
+        };
+        let record = "<span class=\"row-label\">Discovery record</span><a class=\"record-link\" \
+             href=\"https://gdc.example.org/collections/wis2-discovery-metadata/items/urn:wmo:md:x:y\">\
+             urn:wmo:md:x:&lt;y&gt;</a></div>";
+
+        let page = collection("https://example.test", "edr", &doc, None);
+        let heading = page
+            .split("<div class=\"detail-heading\">")
+            .nth(1)
+            .unwrap()
+            .split("<nav class=\"detail-tabs\"")
+            .next()
+            .unwrap();
+        let catalog = "https://example.test/edr/collections";
+        assert!(
+            heading.contains(&format!(
+                "<div class=\"row-line heading-keywords\">{}",
+                topics(catalog)
+            )),
+            "{heading}"
+        );
+        assert!(
+            heading.contains(&format!(
+                "<div class=\"row-line heading-keywords\">{record}"
+            )),
+            "{heading}"
+        );
+
+        let query = SearchQueryParams::default();
+        let search = query.parse().unwrap();
+        let views = [CollectionView {
+            metadata: &doc,
+            license: None,
+        }];
+        let html = collections_html(MAPS_PROXY, &query, &search, 1, &views, &[], &json!([]));
+        let row = html
+            .split("<article class=\"collection-row\">")
+            .nth(1)
+            .unwrap();
+        let catalog = "https://example.test/proxy/maps/collections";
+        assert!(
+            row.contains(&format!("<div class=\"row-line\">{}", topics(catalog))),
+            "{row}"
+        );
+        assert!(
+            row.contains(&format!("<div class=\"row-line\">{record}")),
+            "{row}"
+        );
+        // A collection with neither has neither row.
+        let bare = collection("https://example.test", "edr", &json!({"id": "c"}), None);
+        assert!(!bare.contains(">WIS2 topic<") && !bare.contains(">Discovery record<"));
     }
 
     #[test]

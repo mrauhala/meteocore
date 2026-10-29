@@ -69,7 +69,7 @@ Part 1 `core` and Part 2 `collections` with `https://` URIs, the form EDR
 |---|---|
 | `/`, `/conformance` | landing page, conformance |
 | `/api`, `/api/docs` | OpenAPI 3.0 document, Swagger UI (assets embedded, no CDN). `/api` takes only `f`: another parameter, or `f` given twice, is a 400 |
-| `/collections`, `/collections/{id}` | catalog with Common search and paging ([api-common](../api-common/README.md)), collection document |
+| `/collections`, `/collections/{id}` | catalog with Common search and paging ([api-common](../api-common/README.md)), collection document; WIS2 topic `themes`, configured or from a WIS2 subscription, and a WCMP2 `describedby` link where configured (#1356) |
 | `/collections/{id}/locations` | GeoJSON list of named locations |
 | `/collections/{id}/locations/{locId}` | data at one location, or at a comma-separated list |
 | `/collections/{id}/{position,area,radius,trajectory,cube}` | data queries |
@@ -230,6 +230,11 @@ with a 404.
 - The run axis is not advertised as an `extent.custom` dimension, and data
   queries take no `reference_time` parameter: select a run by its instance
   path.
+- A Zarr run is listed once its reference time is in the store version the
+  engine last read, with every lead of the lead axis. Steps the store has
+  not written yet are null; dynamical.org's materialized Icechunk stores
+  publish only finished runs. See
+  [engine-zarr](../engine-zarr/README.md#what-it-serves).
 
 ## Parameters
 

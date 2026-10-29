@@ -22,3 +22,7 @@ style_bundle = "radar_multi"
 # whatever the STAC catalogue advertises.
 [preview]
 time_window = "PT12H"
+
+# Discovery (#1356): the WIS2 topic is served as the collection's themes.
+[discovery]
+wis2_topic = "weather/surface-based-observations/weather-radar"

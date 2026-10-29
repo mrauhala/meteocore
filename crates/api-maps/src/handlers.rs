@@ -14,6 +14,7 @@ use serde_json::json;
 use api_common::workbench::Surface;
 use api_common::{mounts, rel, JsonQuery, Mount};
 use ds_core::config::CollectionConfig;
+use ds_core::discovery::Discovery;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, RasterInfo};
 use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
@@ -27,6 +28,9 @@ use crate::params::{self, LegendFormat, LegendQueryParams, MapQueryParams, MapRe
 pub struct MapsState {
     pub engines: HashMap<String, Arc<dyn MapEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
+    /// What collection descriptions read beyond their configs: the WIS2
+    /// discovery catalogue (#1356).
+    pub discovery: Discovery,
     /// Map of collection_id -> style_name -> StyleInfo.
     pub styles: HashMap<String, HashMap<String, StyleInfo>>,
     pub render_semaphore: Arc<tokio::sync::Semaphore>,
@@ -296,15 +300,17 @@ pub(crate) fn collection_parts(
     (fields, links)
 }
 
+/// The collection document of `config`, with its styles, map tilesets and
+/// discovery as `state` holds them.
 fn build_collection_metadata(
+    state: &MapsState,
     config: &CollectionConfig,
     engine: &dyn MapEngine,
     info: &ds_core::map_engine::RasterInfo,
-    styles: Option<&HashMap<String, StyleInfo>>,
-    map_tilesets: bool,
     base_url: &str,
     root: &str,
 ) -> serde_json::Value {
+    let styles = state.styles.get(&config.id);
     let (fields, access) = collection_parts(config, engine, info, styles, root);
     let mut links = vec![json!({
         "href": format!("{root}/collections/{}", config.id),
@@ -318,7 +324,7 @@ fn build_collection_metadata(
     // tileset", discoverable from the maps collection via the `tilesets-map`
     // relation. Only advertise it when the Tiles service actually registered
     // this collection for raster tiles (the per-API `/tiles` router serves it).
-    if map_tilesets {
+    if state.map_tileset_ids.contains(&config.id) {
         links.push(json!({
             "href": format!("{base_url}{}/collections/{}/tiles", mounts::TILES, config.id),
             "rel": rel::TILESETS_MAP,
@@ -327,7 +333,12 @@ fn build_collection_metadata(
         }));
     }
 
-    api_common::collection_metadata(config, serde_json::Value::Object(fields), links)
+    api_common::collection_metadata(
+        config,
+        &state.discovery,
+        serde_json::Value::Object(fields),
+        links,
+    )
 }
 
 /// Build the OGC API Common Part 2 `extent` object (spatial, temporal,
@@ -1008,15 +1019,8 @@ pub async fn collections(
                 return None;
             };
             let info = engine.raster_info_shared();
-            let metadata = build_collection_metadata(
-                config,
-                engine.as_ref(),
-                &info,
-                state.styles.get(&config.id),
-                state.map_tileset_ids.contains(&config.id),
-                base,
-                root,
-            );
+            let metadata =
+                build_collection_metadata(&state, config, engine.as_ref(), &info, base, root);
             Some(api_common::CollectionEntry {
                 config,
                 metadata,
@@ -1053,14 +1057,11 @@ pub async fn collection(
     Ok(with_vary(match wanted {
         Wanted::Json => {
             let info = engine.raster_info_shared();
-            let styles = state.styles.get(&id);
-            let map_tilesets = state.map_tileset_ids.contains(&id);
             Json(build_collection_metadata(
+                &state,
                 config,
                 engine.as_ref(),
                 &info,
-                styles,
-                map_tilesets,
                 base,
                 root,
             ))
@@ -1068,11 +1069,10 @@ pub async fn collection(
         }
         Wanted::Html => {
             let metadata = build_collection_metadata(
+                &state,
                 config,
                 engine.as_ref(),
                 &engine.raster_info_shared(),
-                state.styles.get(&id),
-                state.map_tileset_ids.contains(&id),
                 base,
                 root,
             );

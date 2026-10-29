@@ -142,6 +142,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -152,6 +153,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
         styles: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
+        discovery: Default::default(),
     }))
 }
 
