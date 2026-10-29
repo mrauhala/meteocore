@@ -3147,6 +3147,13 @@ pub struct GribConfig {
     /// The size is [`Self::effective_point_index_cache_mb`].
     #[serde(default)]
     pub point_index_cache_mb: Option<u64>,
+    /// Pre-warm, as the poll catalogues new steps of the newest run, the
+    /// messages of the parameters and levels EDR position queries read in
+    /// the last 24 hours (#1335), within a quarter of `message_cache_mb`
+    /// per run. Default: `true`; nothing happens without a message cache or
+    /// a recent read. `false` turns it off for this source.
+    #[serde(default = "default_true")]
+    pub prewarm: bool,
     /// Model run hours to poll. Default: all (00, 06, 12, 18)
     pub run_hours: Option<Vec<u32>>,
     /// Index file format: "ecmwf-json" (default) or "wgrib2".
@@ -3187,6 +3194,7 @@ impl GribConfig {
             grid_cache_mb: default_grid_cache_mb(),
             message_cache_mb: 0,
             point_index_cache_mb: None,
+            prewarm: true,
             run_hours: None,
             index_format,
             filename_contains: None,
@@ -6043,6 +6051,28 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             grib("message_cache_mb = 1024\npoint_index_cache_mb = 16\n"),
             "setting the size rebuilds the engine"
         );
+    }
+
+    /// #1335: the pre-warm is on unless a source turns it off, an
+    /// auto-discovered source included, and turning it off rebuilds the
+    /// engine.
+    #[test]
+    fn grib_prewarm_defaults_on_and_changes_reload_identity() {
+        let cfg = grib_collection("data_path = \"testdata/grib-local\"\n");
+        let original = cfg.collections[0].grib.as_ref().unwrap();
+        assert!(original.prewarm);
+        let local = GribConfig::auto_local(
+            "x".into(),
+            ".idx".into(),
+            ".grib2".into(),
+            Some("wgrib2".into()),
+        );
+        assert!(local.prewarm);
+        let off = grib_collection("data_path = \"testdata/grib-local\"\nprewarm = false\n");
+        off.validate().unwrap();
+        let updated = off.collections[0].grib.as_ref().unwrap();
+        assert!(!updated.prewarm);
+        assert_ne!(updated, original, "turning it off must rebuild the engine");
     }
 
     #[test]

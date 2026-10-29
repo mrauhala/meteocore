@@ -3,9 +3,12 @@
 //! Long time windows can exceed the grid cache. Keeping the smaller source
 //! messages lets the next coordinate reuse their bytes, paying only decoding.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use ds_cache::{ByteBoundedCache, CacheMetrics, MIB};
+use ds_cache::{ByteBoundedCache, CacheEntry, CacheMetrics, MIB};
 use ds_core::{deadline, error::DataServerError};
 use ds_storage::{bytes::Bytes, object_store::path::Path, DataStore};
 
@@ -52,6 +55,40 @@ fn entry_weight(payload: usize, key_bytes: usize) -> u64 {
 
 pub(crate) struct MessageCache {
     cache: ByteBoundedCache<MessageKey, Bytes>,
+    /// What the pre-warm fetched and requests then read (#1335).
+    prewarmed: Prewarmed,
+}
+
+/// The most pre-warmed messages [`Prewarmed`] waits on a first read of.
+/// Each pre-warm first forgets those the cache no longer holds, so this
+/// binds only a cache of tiny messages; a fetch past it is not counted when
+/// read.
+const MAX_UNREAD: usize = 4096;
+
+/// Messages the pre-warm fetched that no request has read yet, and how many
+/// it fetched that one then read (#1335): how much of what it fetches is
+/// used.
+#[derive(Default)]
+struct Prewarmed {
+    unread: Mutex<HashSet<MessageKey>>,
+    /// `unread`'s length, so a hit skips the lock while nothing waits.
+    pending: AtomicUsize,
+    hits: AtomicU64,
+}
+
+impl Prewarmed {
+    /// A request read `key` from the cache: count it if the pre-warm
+    /// fetched it and no request had read it yet.
+    fn read(&self, key: &MessageKey) {
+        if self.pending.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut unread = self.unread.lock().unwrap();
+        if unread.remove(key) {
+            self.pending.store(unread.len(), Ordering::Relaxed);
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl MessageCache {
@@ -77,8 +114,29 @@ impl MessageCache {
                     ds_cache::hot_allocation_holding(capacity, largest),
                 )
                 .with_ghosts(),
+                prewarmed: Prewarmed::default(),
             }
         })
+    }
+
+    /// Mark the cache as one the pre-warm fills ahead of its reads (#1335):
+    /// its eviction and ghost-hit numbers undervalue those messages
+    /// ([`ByteBoundedCache::prewarmed`]).
+    pub(crate) fn prewarmed(self) -> Self {
+        Self {
+            cache: self.cache.prewarmed(),
+            ..self
+        }
+    }
+
+    /// The cache's whole budget in bytes.
+    pub(crate) fn capacity_bytes(&self) -> u64 {
+        self.cache.capacity_bytes()
+    }
+
+    /// Whether `key` is resident, without touching its recency or a counter.
+    pub(crate) fn is_resident(&self, key: &MessageKey) -> bool {
+        self.cache.contains_key(key)
     }
 
     /// Whether `messages` messages of `bytes` together stay resident: their
@@ -99,6 +157,7 @@ impl MessageCache {
     pub(crate) fn get_resident(&self, key: &MessageKey) -> Option<Bytes> {
         let bytes = self.cache.get_untracked(key)?;
         self.cache.record_hit();
+        self.prewarmed.read(key);
         Some(bytes)
     }
 
@@ -156,11 +215,76 @@ impl MessageCache {
                 bytes
             })
         })?;
-        if window && validated.is_some() {
+        if validated.is_none() {
+            // A hit, or another reader's fill: the first read of a
+            // pre-warmed message counts (#1335).
+            self.prewarmed.read(&key);
+        } else if window {
             self.cache.keep(key, bytes.clone());
         }
         deadline::check()?;
         Ok((bytes, validated))
+    }
+
+    /// Fill `key` ahead of its first read (#1335): `fetch` the message and
+    /// admit it once `validate` accepts it, as [`Self::get_with`] does,
+    /// kept ([`ByteBoundedCache::keep`]). In a full cache a new entry is
+    /// admitted to the cold ring, which the pre-warm's next fill would evict
+    /// it from unread; kept, it is promoted to the hot ring instead, so a
+    /// pre-warm does not evict its own earlier fills.
+    ///
+    /// The fetch runs outside the single-flight: a request for the message
+    /// meanwhile fetches it itself rather than wait on a background GET
+    /// past its deadline, and the pre-warm then leaves the request's copy.
+    /// Returns the bytes fetched; `None` without a fetch for a resident
+    /// message. Counts no hit and no miss: no request asked for it.
+    pub(crate) fn prewarm(
+        &self,
+        key: &MessageKey,
+        fetch: impl FnOnce() -> Result<Bytes, DataServerError>,
+        validate: impl FnOnce(&[u8]) -> Result<(), DataServerError>,
+    ) -> Result<Option<usize>, DataServerError> {
+        if self.cache.contains_key(key) {
+            return Ok(None);
+        }
+        let bytes = fetch()?;
+        validate(&bytes)?;
+        let fetched = bytes.len();
+        let CacheEntry::Vacant(fill) = self.cache.get_value_or_guard_untracked(key, Duration::ZERO)
+        else {
+            return Ok(Some(fetched));
+        };
+        // An exact copy, as `get_with` admits; the byte cap keeps a
+        // pre-warmed message far below the cache's capacity.
+        let bytes = Bytes::copy_from_slice(&bytes);
+        let _ = fill.insert(bytes.clone());
+        self.cache.keep(key.clone(), bytes);
+        if self.cache.contains_key(key) {
+            let mut unread = self.prewarmed.unread.lock().unwrap();
+            if unread.len() < MAX_UNREAD {
+                unread.insert(key.clone());
+                self.prewarmed
+                    .pending
+                    .store(unread.len(), Ordering::Relaxed);
+            }
+        }
+        Ok(Some(fetched))
+    }
+
+    /// Stop waiting on a first read of pre-warmed messages the cache has
+    /// evicted unread. Once per pre-warm, before it fetches.
+    pub(crate) fn forget_evicted_prewarms(&self) {
+        let mut unread = self.prewarmed.unread.lock().unwrap();
+        unread.retain(|key| self.cache.contains_key(key));
+        self.prewarmed
+            .pending
+            .store(unread.len(), Ordering::Relaxed);
+    }
+
+    /// Pre-warmed messages a request then read, each counted at its first
+    /// read (#1335).
+    pub(crate) fn prewarm_hits(&self) -> u64 {
+        self.prewarmed.hits.load(Ordering::Relaxed)
     }
 
     pub fn metrics(&self) -> CacheMetrics {

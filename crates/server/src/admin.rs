@@ -1751,6 +1751,43 @@ static GRIB_POINT_FETCH_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .unwrap();
     per_collection(counter)
 });
+// The pre-warm of the messages position queries read, as a new run's steps
+// are catalogued (#1335), per source like the message cache it fills.
+static GRIB_PREWARM_GETS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "grib_prewarm_gets_total",
+            "GETs the GRIB pre-warm made for a new run's messages of the parameters \
+             position queries read",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
+static GRIB_PREWARM_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "grib_prewarm_bytes_total",
+            "Bytes the GRIB pre-warm fetched, as grib_prewarm_gets_total",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
+static GRIB_PREWARM_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "grib_prewarm_hits_total",
+            "Pre-warmed GRIB messages a request then read from the message cache, \
+             each counted at its first read",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
 static ZARR_DECODED_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
     CollectionCacheMetricSet::new(
         "zarr_decoded_cache",
@@ -1817,6 +1854,8 @@ struct CacheCounterState {
     /// GRIB point-path `(GETs, bytes)` per mode, per source (#1301), same
     /// reload-rebaseline scheme.
     grib_point_fetches: HashMap<String, [(u64, u64); 4]>,
+    /// GRIB pre-warm `[GETs, bytes, hits]` per source (#1335).
+    grib_prewarm: HashMap<String, [u64; 3]>,
     zarr_decoded: HashMap<String, CacheSeen>,
     zarr_object: HashMap<String, CacheSeen>,
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
@@ -1861,6 +1900,7 @@ impl CacheCounterState {
             grib_point_index,
             grib_point_fields,
             grib_point_fetches,
+            grib_prewarm,
             zarr_decoded,
             zarr_object,
             postgis,
@@ -1878,6 +1918,7 @@ impl CacheCounterState {
         drop_keys(grib_point_index, removed);
         drop_keys(grib_point_fields, removed);
         drop_keys(grib_point_fetches, removed);
+        drop_keys(grib_prewarm, removed);
         drop_keys(zarr_decoded, removed);
         drop_keys(zarr_object, removed);
         drop_keys(postgis, removed);
@@ -8153,6 +8194,19 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                 }
             }
             *previous = fetches.map(|(_, gets, bytes)| (gets, bytes));
+            let (gets, bytes, hits) = engine.prewarm_counts();
+            let deltas = delta_counts(
+                &mut counter_state.grib_prewarm,
+                collection,
+                [gets, bytes, hits],
+            );
+            for (family, delta) in [&GRIB_PREWARM_GETS, &GRIB_PREWARM_BYTES, &GRIB_PREWARM_HITS]
+                .into_iter()
+                .zip(deltas)
+            {
+                // Always touched, so every series exists before a pre-warm.
+                family.with_label_values(&[collection]).inc_by(delta);
+            }
             let entries = engine.grid_cache_utilization().2;
             GRID_CACHE_METRICS.update(
                 collection,

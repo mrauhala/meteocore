@@ -15,6 +15,8 @@ pub struct Reads {
     pub completed: Vec<String>,
     pub fail_once: HashSet<String>,
     pub ranges: Vec<(String, Option<object_store::GetRange>)>,
+    /// The thread each instrumented GET ran on, in `ranges` order.
+    pub threads: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -81,6 +83,10 @@ impl ObjectStore for TestStore {
             let mut reads = self.reads.lock().unwrap();
             *reads.attempts.entry(path.to_string()).or_default() += 1;
             reads.ranges.push((path.to_string(), options.range.clone()));
+            let thread = std::thread::current();
+            reads
+                .threads
+                .push(thread.name().unwrap_or_default().to_owned());
             reads.fail_once.remove(path.as_ref())
         };
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
