@@ -169,7 +169,8 @@ fn point_index_source(grib: &GribConfig) -> SizeSource {
 }
 
 /// A Zarr collection's decoded-chunk cache (Icechunk only; a plain store
-/// builds it empty) and a plain store's object cache.
+/// builds it empty), a plain store's object cache and an Icechunk
+/// repository's payload cache, both sized by `cache_mb`.
 pub(crate) fn register_zarr(collection: &CollectionConfig, engine: &Arc<engine_zarr::ZarrEngine>) {
     let Some(zarr) = collection.zarr.as_ref() else {
         return;
@@ -202,6 +203,22 @@ pub(crate) fn register_zarr(collection: &CollectionConfig, engine: &Arc<engine_z
             engine,
             |e| {
                 e.object_cache_metrics()
+                    .map(|m| Usage::cache(m, None))
+                    .unwrap_or_default()
+            },
+        );
+    }
+    if engine.icechunk_payload_cache_metrics().is_some() {
+        let payload = SizeSource::unless_default(
+            zarr.cache_mb,
+            DEFAULT_ZARR_CACHE_MB,
+            SizeSource::Collection("[zarr] cache_mb"),
+        );
+        plan::register(
+            Entry::cache("zarr_icechunk_payload_cache", scope(), payload),
+            engine,
+            |e| {
+                e.icechunk_payload_cache_metrics()
                     .map(|m| Usage::cache(m, None))
                     .unwrap_or_default()
             },

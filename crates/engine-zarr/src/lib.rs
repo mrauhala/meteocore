@@ -82,7 +82,18 @@ impl ZarrEngine {
     /// Open a Zarr store (local directory or remote S3/HTTP) and build the
     /// initial catalog.
     pub fn new(collection_id: &str, config: &ZarrConfig) -> Result<Self, DataServerError> {
-        let source = source::Source::open(collection_id, config)?;
+        Self::with_source(
+            collection_id,
+            config,
+            source::Source::open(collection_id, config)?,
+        )
+    }
+
+    fn with_source(
+        collection_id: &str,
+        config: &ZarrConfig,
+        source: source::Source,
+    ) -> Result<Self, DataServerError> {
         let store = source.snapshot(None)?.expect("initial snapshot");
 
         let param_filter = config.parameters.clone();
@@ -146,6 +157,20 @@ impl ZarrEngine {
     /// catalog generations; `None` for an Icechunk repository.
     pub fn object_cache_metrics(&self) -> Option<ds_cache::CacheMetrics> {
         self.source.object_cache_metrics()
+    }
+
+    /// An Icechunk repository's payload cache (`[zarr] cache_mb`): the
+    /// compressed byte ranges read from its chunk objects (#1353). `None`
+    /// for a plain store, whose cache is [`Self::object_cache_metrics`].
+    pub fn icechunk_payload_cache_metrics(&self) -> Option<ds_cache::CacheMetrics> {
+        self.source.payload_cache_metrics()
+    }
+
+    /// An Icechunk repository's storage requests and the bytes their bodies
+    /// yielded, cumulative since the engine opened it (#1353); `None` for a
+    /// plain store.
+    pub fn icechunk_storage_counts(&self) -> Option<(u64, u64)> {
+        self.source.storage_counts()
     }
 
     fn poll_once(&self) {

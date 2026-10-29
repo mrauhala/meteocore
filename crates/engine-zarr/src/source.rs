@@ -46,6 +46,26 @@ impl Source {
         }
     }
 
+    /// An Icechunk repository's payload cache (`[zarr] cache_mb`, #1353);
+    /// `None` for a plain store.
+    pub(crate) fn payload_cache_metrics(&self) -> Option<ds_cache::CacheMetrics> {
+        match self {
+            Self::Plain(_) => None,
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(source) => Some(source.meter().payload_metrics()),
+        }
+    }
+
+    /// An Icechunk repository's storage requests and the bytes their
+    /// bodies yielded, cumulative; `None` for a plain store.
+    pub(crate) fn storage_counts(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Plain(_) => None,
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(source) => Some(source.meter().counts()),
+        }
+    }
+
     /// `None` means the source is still at the published revision. A changed
     /// session is returned separately, so a failed catalog build never mutates
     /// the session used by requests or marks the new revision as published.
