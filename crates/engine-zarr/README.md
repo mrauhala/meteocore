@@ -100,6 +100,21 @@ grid, never per pixel.
 `DIM_REFERENCE_TIME` value. The latest run is the default; its valid times
 (run + lead) are the time axis.
 
+**When a run is published.** A run is served once its reference time is in
+the version a poll read: the Icechunk branch tip, tag or snapshot, or a
+plain store as it stands. It gets every lead on the lead axis; the engine
+does not check which steps hold data.
+
+- dynamical.org's materialized Icechunk forecasts move `main` straight to
+  each finished update commit, so a half-written run is never served.
+- A store that writes a run in pieces, committing each to its tip or
+  updating a plain store in place, serves the steps not yet written as
+  nulls until a later write fills them. dynamical.org's `*_virtual` stores
+  commit this way; this engine cannot read them, since their chunks are
+  virtual (see Limits).
+- dynamical.org's `ingested_forecast_length` coordinate is not read: their
+  materialized stores leave it NaN for every run.
+
 **Derived wind.** Components are paired by CF `standard_name`
 (`eastward_wind`/`northward_wind` or `x_wind`/`y_wind`); `wind_u_10m` gives
 `wind_speed_10m` and `wind_direction_10m`. Speed is served on every API,
