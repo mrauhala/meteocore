@@ -55,3 +55,6 @@ relative_humidity_pl = "Relative humidity"
 # The collection's own palette, for a variable no default matches: the
 # temperature palette over its own -90…50 °C, the first variable's.
 colormap = "temperature"
+# A WebP request without a quality of its own is lossy at 80: continuous
+# palettes exceed PNG8's 256 colours (README, "Choosing an image format").
+webp_quality = 80

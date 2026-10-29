@@ -1237,7 +1237,8 @@ style_bundle = "radar_multi"
 # webp_quality = 80      # default WebP quality for WMS/Maps/Tiles, 1-100:
                          # 1-99 lossy, 100 (= unset) lossless. A request's
                          # QUALITY / quality wins. For continuous-tone layers
-                         # (satellite IR); keep discrete radar classes lossless.
+                         # (satellite IR, NWP fields); keep discrete radar
+                         # classes lossless.
 
 # Optional /preview SPA tuning: cap the time slider's `values[]` to the most
 # recent ISO 8601 duration before the latest timestep. Manifest-only; does
